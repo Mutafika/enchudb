@@ -402,7 +402,7 @@ fn tables_path_for(path: &str) -> std::path::PathBuf {
 ///
 /// 並びの索引の宣言 (`orders`、 [`Engine::declare_order`]) は `DIA1` block として一番後ろに足す (`PKS1` / `EXT1` を
 /// 知っている古いバイナリは、 それを読んでから知らない magic の所で止まる)。
-fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16]) -> Vec<u8> {
+fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16], answers: &[AnswerDecl]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -493,13 +493,50 @@ fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16]) ->
             out.extend_from_slice(&u32::from(*h).to_le_bytes());
         }
     }
+    // 宣言された答え ([`Engine::declare_answer`])。 MRK1 の後ろ。 宣言が無ければ書かない。
+    //   ans_magic: "ANS1" (4)
+    //   ans_count: u32
+    //   [(name_len: u32, name (UTF-8), 形 (`AnswerSpec::encode`: 種類 u8 + 中身))] × ans_count
+    if !answers.is_empty() {
+        out.extend_from_slice(b"ANS1");
+        out.extend_from_slice(&(answers.len() as u32).to_le_bytes());
+        for (name, spec) in answers {
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            spec.encode(&mut out);
+        }
+    }
     out
 }
 
 /// 並びの索引の宣言 1 つ: (via の紐, key の紐, 目盛り)。
 type OrderDecl = (u16, u16, Vec<u64>);
-/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐)。
-type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>);
+/// 宣言された答え 1 つ: (名前, 形)。
+type AnswerDecl = (String, crate::live::AnswerSpec);
+/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐, 宣言された答え)。
+type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>, Vec<AnswerDecl>);
+
+/// `ANS1` block の中身 (magic の後ろ) を読む: (宣言, 読んだ byte 数)。 途中で切れている / 名前が UTF-8 でない / 形が
+/// 読めない (`AnswerSpec::decode`) なら None。
+fn deserialize_answers(buf: &[u8]) -> Option<(Vec<AnswerDecl>, usize)> {
+    let mut off = 0usize;
+    let u32_at = |off: &mut usize| -> Option<u32> {
+        let v = u32::from_le_bytes(buf.get(*off..*off + 4)?.try_into().ok()?);
+        *off += 4;
+        Some(v)
+    };
+    let count = u32_at(&mut off)? as usize;
+    // 1 件は最低 10 byte (name_len + 名前 1 byte + 種類 + 条件の数)
+    let mut out = Vec::with_capacity(count.min(buf.len() / 10));
+    for _ in 0..count {
+        let n = u32_at(&mut off)? as usize;
+        let name = std::str::from_utf8(buf.get(off..off.checked_add(n)?)?).ok()?.to_string();
+        off += n;
+        let spec = crate::live::AnswerSpec::decode(buf, &mut off)?;
+        out.push((name, spec));
+    }
+    Some((out, off))
+}
 
 /// `MRK1` block の中身 (magic の後ろ) を読む: (位置の印を持つ紐の番号, 読んだ byte 数)。 途中で切れている / 番号が紐の id に
 /// 入らないなら None。
@@ -613,6 +650,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
     // 末尾の optional block 群 (順不同、 未知の magic で打ち切り)
     let mut orders = Vec::new();
     let mut marks: Vec<u16> = Vec::new();
+    let mut answers: Vec<AnswerDecl> = Vec::new();
     while off + 8 <= buf.len() {
         let magic = &buf[off..off + 4];
         if magic == b"PKS1" {
@@ -688,11 +726,23 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
                     break;
                 }
             }
+        } else if magic == b"ANS1" {
+            // 宣言された答え。 答えは列から作り直せる派生のデータなので、 壊れていたら宣言なしとして読む (sidecar 全体は有効)
+            match deserialize_answers(&buf[off + 4..]) {
+                Some((decls, used)) => {
+                    answers = decls;
+                    off += 4 + used;
+                }
+                None => {
+                    eprintln!("warning: tables sidecar: broken answer declarations (ANS1), ignored");
+                    break;
+                }
+            }
         } else {
             break;
         }
     }
-    Ok((tables, orders, marks))
+    Ok((tables, orders, marks, answers))
 }
 
 /// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。 `orders` は並びの索引の宣言 (`DIA1`)。
@@ -702,8 +752,9 @@ fn persist_tables_to_sidecar(
     tables: &[TableDef],
     orders: &[OrderDecl],
     marks: &[u16],
+    answers: &[AnswerDecl],
 ) -> io::Result<()> {
-    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders, marks))
+    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders, marks, answers))
         .map(|_| ())
 }
 
@@ -4154,6 +4205,13 @@ pub fn is_engine_internal_table(name: &str) -> bool {
 /// 明示指定推奨、 embedded scale (10k-1M) では default で足りる。
 pub const DEFAULT_TABLE_RESERVED: u32 = 1_000_000;
 
+/// 宣言された答え 1 つ ([`Engine::declare_answer`]): 名前、 形、 engine が持つ購読。
+struct AnswerEntry {
+    name: String,
+    spec: crate::live::AnswerSpec,
+    handle: crate::live::AnswerHandle,
+}
+
 pub struct Engine {
     /// #59: 「想定内だが続行不能」 な事象の種別ごとの発生回数。 panic の代替。
     faults: std::sync::Arc<[std::sync::atomic::AtomicU64; FaultKind::COUNT]>,
@@ -4275,6 +4333,8 @@ pub struct Engine {
     /// live query (クエリ購読) の route。 Column 書き込みが `live_set` / `live_remove`
     /// 経由で通知する (`crate::live` module doc)。
     live: std::sync::Arc<crate::live::LiveRegistry>,
+    /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
+    answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
     row_locks: crate::row_lock::RowLocks,
     /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しが中身を指す列を msync する間だけ
@@ -4816,6 +4876,7 @@ impl Engine {
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -5182,13 +5243,16 @@ impl Engine {
         // から再合成できるので、 sidecar 破損で全 DB が unreadable になる失敗
         // モードを避ける。
         match load_tables_from_sidecar(path) {
-            Ok(Some((persisted, orders, marks))) => {
+            Ok(Some((persisted, orders, marks, answers))) => {
                 eng.adopt_persisted_tables(persisted);
                 // 並びの索引の宣言を戻す (table 定義の後: ref の先の表の eid の始まりを使う)。 作るのは最初に読む時
                 // (WAL の replay や Leaf の修理の後)。 作る前の書き込みは何もしないので、 replay は遅くならない
                 eng.restore_orders(orders);
                 // 位置の印の宣言も (表は最初に読む時に取る)
                 eng.restore_marks(marks);
+                // 宣言された答え: 購読の route をここで張る (WAL の再生より前 = 再生で書かれる行も購読が追う)。 種 (表の走査)
+                // は最初の poll が作るので、 開くのも再生も遅くならない
+                eng.restore_answers(answers);
             }
             Ok(None) => {} // 不在: 新規 DB or v4 legacy
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -6059,6 +6123,7 @@ impl Engine {
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -8873,7 +8938,7 @@ impl Engine {
         // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw())?;
+        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw())?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
         // #178: 別名も同じ trigger で
@@ -9038,7 +9103,7 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw()) {
+                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw()) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
@@ -15896,6 +15961,163 @@ impl Engine {
         }
     }
 
+    // ─────────────────────────── 宣言された答え ───────────────────────────
+
+    /// 答え (購読) に名前を付けて宣言する: 形 ([`AnswerSpec`](crate::live::AnswerSpec) = 条件・group・並び) を
+    /// `{db}/tables` (`ANS1`) に保存し、 開き直すと engine が開く時 (WAL の再生の前) に自分で購読を張る。 アプリは
+    /// [`answer`](Self::answer) で名前から購読を取るだけで、 条件を書き直さない。
+    ///
+    /// - 開く時の登録は route を張るだけ。 種 (最初の答え = 表を読む) は最初の poll が作る (`.order()` の索引と同じ: 開くのは
+    ///   遅くならない)。 今宣言した購読も同じ (登録と barrier まで、 走査は最初の poll)
+    /// - 返す handle は engine が持つ購読の clone (poll の状態は 1 つ = 同じ差分はどれか 1 つの clone にだけ届く)。 engine が
+    ///   閉じるまで生きる (アプリの handle を落としても購読は残る)
+    /// - 同じ名前に同じ形をもう一度宣言するのは何もしない (同じ購読を返す)。 違う形なら置き換える (前の購読は、 それを持つ
+    ///   handle が全部落ちた時に外れる)。 外すのは [`drop_answer`](Self::drop_answer)
+    /// - 形の検査は [`subscribe`](Self::subscribe) / [`subscribe_counts`](Self::subscribe_counts) /
+    ///   [`subscribe_top`](Self::subscribe_top) と同じ (`InvalidInput`)。 名前は 1〜255 byte、 NUL なし
+    /// - 宣言を知らない古い binary で開いても壊れない (読まないだけ。 その binary が table 定義を書き直すと宣言は消える)。
+    ///   memory-only の DB と readonly で開いた process は保存しない (その process の中だけ)
+    pub fn declare_answer(&self, name: &str, spec: crate::live::AnswerSpec) -> io::Result<crate::live::AnswerHandle> {
+        if name.is_empty() || name.len() > 255 || name.bytes().any(|b| b == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("declare_answer: bad name {name:?} (1..=255 bytes, no NUL)"),
+            ));
+        }
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(a) = answers.iter().find(|a| a.name == name)
+            && a.spec == spec
+        {
+            return Ok(a.handle.clone());
+        }
+        let handle = self.register_answer(&spec)?;
+        match answers.iter_mut().find(|a| a.name == name) {
+            Some(a) => {
+                a.spec = spec;
+                a.handle = handle.clone();
+            }
+            None => answers.push(AnswerEntry { name: name.to_string(), spec, handle: handle.clone() }),
+        }
+        drop(answers);
+        if !self.is_readonly() {
+            self.try_persist_tables();
+        }
+        Ok(handle)
+    }
+
+    /// 宣言された答えの購読を名前で取る (無ければ None)。 返すのは engine が持つ購読の clone
+    /// ([`declare_answer`](Self::declare_answer))。
+    pub fn answer(&self, name: &str) -> Option<crate::live::AnswerHandle> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|a| a.name == name).map(|a| a.handle.clone())
+    }
+
+    /// 宣言された答えの形を名前で取る (無ければ None)。
+    pub fn answer_spec(&self, name: &str) -> Option<crate::live::AnswerSpec> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|a| a.name == name).map(|a| a.spec.clone())
+    }
+
+    /// 宣言された答えを外す。 外したら true、 無ければ false。 宣言は保存からも消える。 購読そのものは、 それを持つ handle が
+    /// 全部落ちた時に外れる。
+    pub fn drop_answer(&self, name: &str) -> bool {
+        let removed = {
+            let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+            let n = answers.len();
+            answers.retain(|a| a.name != name);
+            answers.len() != n
+        };
+        if removed && !self.is_readonly() {
+            self.try_persist_tables();
+        }
+        removed
+    }
+
+    /// 今の宣言 (名前, 形)。 宣言した順。
+    pub fn answer_declarations(&self) -> Vec<(String, crate::live::AnswerSpec)> {
+        self.answer_decls_raw()
+    }
+
+    /// `{db}/tables` に書く宣言 (名前, 形)。
+    fn answer_decls_raw(&self) -> Vec<AnswerDecl> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|a| (a.name.clone(), a.spec.clone())).collect()
+    }
+
+    /// 開く時: `{db}/tables` の宣言を戻す (route を張るだけ、 種は最初の poll)。 紐が無い / 型が合わないなど張れない宣言は
+    /// 警告して捨てる (答えは列から作り直せる派生のデータ)。 同じ名前が 2 つあれば先のを取る。
+    fn restore_answers(&self, decls: Vec<AnswerDecl>) {
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        for (name, spec) in decls {
+            if answers.iter().any(|a| a.name == name) {
+                eprintln!("warning: dropped a duplicate stored answer declaration '{name}'");
+                continue;
+            }
+            match self.register_answer(&spec) {
+                Ok(handle) => answers.push(AnswerEntry { name, spec, handle }),
+                Err(e) => eprintln!("warning: dropped a stored answer declaration '{name}': {e}"),
+            }
+        }
+    }
+
+    /// 宣言の形で購読を登録する: 検査 → route に載せる → 条件の紐の barrier。 種 (初期候補の走査) は最初の poll が作る
+    /// (`subscribe*` は登録の時に作る)。 ref の逆引きの索引も温めない (最初に読む時に組む)。
+    fn register_answer(&self, spec: &crate::live::AnswerSpec) -> io::Result<crate::live::AnswerHandle> {
+        use crate::live::{AnswerHandle, AnswerSpec};
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
+        let preds = spec.preds().to_vec();
+        self.validate_live_preds(&preds)?;
+        let mut branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
+        let keys: usize = branches.iter().map(|b| crate::live::key_count(b)).fold(0, usize::saturating_add);
+        if keys > crate::live::MAX_KEYS {
+            return Err(bad("In / Or expand to too many keys"));
+        }
+        let check_path = |path: &[u16], himo: u16, what: &str| -> io::Result<()> {
+            if himo as usize >= self.himos.len() || path.iter().any(|&h| h as usize >= self.himos.len()) {
+                return Err(bad(&format!("unknown {what} himo")));
+            }
+            if path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
+                return Err(bad(&format!("{what} path himo is not a Ref himo")));
+            }
+            Ok(())
+        };
+        let handle = match spec {
+            AnswerSpec::Set { .. } => {
+                let q = if branches.len() == 1 {
+                    self.live.register(branches.pop().unwrap_or_default(), false)
+                } else {
+                    self.live.register_any(branches, false)
+                };
+                AnswerHandle::Query(std::sync::Arc::new(q))
+            }
+            AnswerSpec::Counts { group_path, group_himo, sum_himo, .. } => {
+                check_path(group_path, *group_himo, "group")?;
+                if let Some(s) = sum_himo
+                    && !matches!(self.value_type_at(*s as usize), Some(ValueType::Number | ValueType::Number64))
+                {
+                    return Err(bad("sum himo is not a Number / Number64 himo"));
+                }
+                let q = self
+                    .live
+                    .register_counts(branches, (group_path.clone(), *group_himo), *sum_himo)
+                    .map_err(|m| bad(&m))?;
+                AnswerHandle::Counts(std::sync::Arc::new(q))
+            }
+            AnswerSpec::Top { order_path, order_himo, desc, limit, .. } => {
+                if *limit == 0 {
+                    return Err(bad("limit must be at least 1"));
+                }
+                check_path(order_path, *order_himo, "order")?;
+                let q = self
+                    .live
+                    .register_top(branches, (order_path.clone(), *order_himo, *desc), *limit as usize)
+                    .map_err(|m| bad(&m))?;
+                AnswerHandle::Query(std::sync::Arc::new(q))
+            }
+        };
+        for h in handle.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        Ok(handle)
+    }
+
     /// 宣言を確かめて並びの索引を作る (中身は空、 作るのは [`order_ready`](Self::order_ready))。
     fn new_order_index(&self, via_id: usize, key_id: usize, ticks: &[u64]) -> Result<crate::order_index::OrderIndex, String> {
         let (Some(via), Some(key)) = (self.himos.get(via_id), self.himos.get(key_id)) else {
@@ -18089,7 +18311,7 @@ impl Engine {
         // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
         // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
         if !self.tables.is_empty() {
-            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw()))?;
+            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw()))?;
         }
         let eidmap_entries = self.eidmap_entries_with_tombstones();
         if !eidmap_entries.is_empty() {
@@ -23262,15 +23484,15 @@ mod order_decl_sidecar_tests {
         let eng = engine(&path);
         assert!(eng.table_eid_extents("u").unwrap().len() >= 2, "前提: EXT1 を書く");
         assert!(eng.tables.iter().any(|t| t.pk_himo.is_some()), "前提: PKS1 を書く");
-        let without = serialize_tables(&eng.tables, &[], &[]);
+        let without = serialize_tables(&eng.tables, &[], &[], &[]);
         assert!(!without.windows(4).any(|w| w == b"DIA1"), "宣言が無ければ DIA1 を書かない");
         eng.declare_order("u.company", "u.age", &[30, 65]).unwrap();
         let decls = eng.order_decls_raw();
         assert_eq!(decls.len(), 1);
-        let with = serialize_tables(&eng.tables, &decls, &[]);
+        let with = serialize_tables(&eng.tables, &decls, &[], &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"DIA1", "DIA1 は一番後ろに足す");
-        let (t0, o0, _) = deserialize_tables(&without).unwrap();
-        let (t1, o1, _) = deserialize_tables(&with).unwrap();
+        let (t0, o0, _, _) = deserialize_tables(&without).unwrap();
+        let (t1, o1, _, _) = deserialize_tables(&with).unwrap();
         assert!(o0.is_empty());
         assert_eq!(o1, decls);
         assert_eq!(shape(&t0), shape(&eng.tables), "前提: 読み戻した形が元と同じ");
@@ -23278,12 +23500,12 @@ mod order_decl_sidecar_tests {
         // 古い binary の読み方 = DIA1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         old[without.len()..without.len() + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2, _) = deserialize_tables(&old).unwrap();
+        let (t2, o2, _, _) = deserialize_tables(&old).unwrap();
         assert!(o2.is_empty());
         assert_eq!(shape(&t2), shape(&t0), "古い binary に見える table / PK / extent が変わった");
         // 途中で切れた DIA1 は宣言なし (table は有効)
         for cut in [1, 4, 9, 12] {
-            let (t3, o3, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            let (t3, o3, _, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
             assert!(o3.is_empty(), "cut {cut}");
             assert_eq!(shape(&t3), shape(&t0), "cut {cut}");
         }
@@ -23359,20 +23581,20 @@ mod marks_decl_sidecar_tests {
         let eng = engine(&path);
         let (via, age) = (eng.himo_id("u.company").unwrap() as u16, eng.himo_id("u.age").unwrap() as u16);
         let orders = vec![(via, age, vec![30u64, 65])];
-        let without = serialize_tables(&eng.tables, &orders, &[]);
+        let without = serialize_tables(&eng.tables, &orders, &[], &[]);
         assert!(!without.windows(4).any(|w| w == b"MRK1"), "宣言が無ければ MRK1 を書かない");
-        let with = serialize_tables(&eng.tables, &orders, &[age]);
+        let with = serialize_tables(&eng.tables, &orders, &[age], &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"MRK1", "MRK1 は DIA1 の後ろに足す");
-        let (t, o, m) = deserialize_tables(&with).unwrap();
+        let (t, o, m, _) = deserialize_tables(&with).unwrap();
         assert_eq!((t.len(), o, m), (eng.tables.len(), orders.clone(), vec![age]));
         // 古い binary の読み方 = MRK1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         let at = without.len();
         old[at..at + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2, m2) = deserialize_tables(&old).unwrap();
+        let (t2, o2, m2, _) = deserialize_tables(&old).unwrap();
         assert_eq!((t2.len(), o2, m2), (eng.tables.len(), orders.clone(), vec![]));
         // 途中で切れた MRK1 は宣言なし (table と並びは有効)
-        let (t3, o3, m3) = deserialize_tables(&with[..with.len() - 2]).unwrap();
+        let (t3, o3, m3, _) = deserialize_tables(&with[..with.len() - 2]).unwrap();
         assert_eq!((t3.len(), o3, m3), (eng.tables.len(), orders, vec![]));
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
@@ -23399,13 +23621,190 @@ mod marks_decl_sidecar_tests {
         assert!(!eng.declare_marks("u.age").unwrap(), "組む前の宣言は次に組む時から (今は効いていない)");
         assert!(!eng.declare_marks("u.age").unwrap(), "2 度目は何もしない");
         eng.persist_tables().unwrap();
-        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, m, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert_eq!(m, vec![eng.himo_id("u.age").unwrap() as u16], "宣言は sidecar に書く");
         assert!(eng.drop_marks("u.age").unwrap());
         assert!(!eng.drop_marks("u.age").unwrap());
         eng.persist_tables().unwrap();
-        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, m, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert!(m.is_empty(), "外すと sidecar からも消える");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// 宣言された答え (`ANS1`、 `Engine::declare_answer`) の読み書き: MRK1 の後ろに足す、 宣言が無ければ書かない、 古い binary の
+/// 読み方 (知らない magic で止まる) で table / 並び / 印の宣言は同じに読める、 壊れた ANS1 は宣言なしとして読む、 開く時に
+/// 張れない宣言 (紐が無い / 型が合わない) は捨てる、 宣言すると保存され外すと消える、 同じ形は同じ購読、 違う形は置き換え。
+#[cfg(test)]
+mod answer_decl_sidecar_tests {
+    use super::*;
+    use crate::live::{AnswerHandle, AnswerSpec, LivePred};
+
+    fn tmp(name: &str) -> String {
+        let path = format!("/tmp/enchu_answer_decl_{name}_{}.db", std::process::id());
+        let _ = crate::db_files::remove_db(&path);
+        path
+    }
+
+    fn engine(path: &str) -> Engine {
+        let mut eng = Engine::create_growable_opts(
+            path,
+            GrowableOptions {
+                max_entities: 64,
+                max_himos: 16,
+                vocab_data_size: 64 * 1024,
+                content_data_size: Some(64 * 1024),
+                reserve_entities: Some(128),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        eng.define_table("c", 4).unwrap();
+        eng.define_himo_in("c", "city", ValueType::Tag, 0).unwrap();
+        eng.define_table("u", 4).unwrap();
+        eng.define_himo_in("u", "id", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "memo", ValueType::Leaf, 0).unwrap();
+        eng.define_ref_in("u", "company", "c").unwrap();
+        let id = eng.himo_id("u.id").unwrap() as u16;
+        eng.set_table_pk("u", id).unwrap();
+        eng
+    }
+
+    fn h(eng: &Engine, name: &str) -> u16 {
+        eng.himo_id(name).unwrap() as u16
+    }
+
+    fn specs(eng: &Engine) -> Vec<(String, AnswerSpec)> {
+        let (age, company, city) = (h(eng, "u.age"), h(eng, "u.company"), h(eng, "c.city"));
+        vec![
+            ("adults".into(), AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 31, hi: u64::MAX }] }),
+            (
+                "by_city".into(),
+                AnswerSpec::Counts { preds: vec![LivePred::Present { himo_id: age }], group_path: vec![company], group_himo: city, sum_himo: Some(age) },
+            ),
+            (
+                "oldest".into(),
+                AnswerSpec::Top { preds: vec![LivePred::Via { path: vec![company], pred: Box::new(LivePred::EqText { himo_id: city, text: "東京".into() }) }], order_path: vec![], order_himo: age, desc: true, limit: 3 },
+            ),
+        ]
+    }
+
+    #[test]
+    fn ans1_is_appended_after_mrk1_and_round_trips() {
+        let path = tmp("append");
+        let eng = engine(&path);
+        let (via, age) = (h(&eng, "u.company"), h(&eng, "u.age"));
+        let orders = vec![(via, age, vec![30u64, 65])];
+        let answers = specs(&eng);
+        let without = serialize_tables(&eng.tables, &orders, &[age], &[]);
+        assert!(!without.windows(4).any(|w| w == b"ANS1"), "宣言が無ければ ANS1 を書かない");
+        let with = serialize_tables(&eng.tables, &orders, &[age], &answers);
+        assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"ANS1", "ANS1 は MRK1 の後ろに足す");
+        let (t, o, m, a) = deserialize_tables(&with).unwrap();
+        assert_eq!((t.len(), o, m, a), (eng.tables.len(), orders.clone(), vec![age], answers.clone()));
+        // 古い binary の読み方 = ANS1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
+        let mut old = with.clone();
+        let at = without.len();
+        old[at..at + 4].copy_from_slice(b"ZZZ9");
+        let (t2, o2, m2, a2) = deserialize_tables(&old).unwrap();
+        assert_eq!((t2.len(), o2, m2, a2), (eng.tables.len(), orders.clone(), vec![age], vec![]));
+        // 途中で切れた ANS1 は宣言なし (table / 並び / 印は有効)
+        for cut in [1usize, 7, 20, with.len() - at - 5] {
+            let (t3, o3, m3, a3) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            assert_eq!((t3.len(), o3, m3, a3), (eng.tables.len(), orders.clone(), vec![age], vec![]), "cut {cut}");
+        }
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn restore_keeps_only_declarations_it_can_register() {
+        let path = tmp("restore");
+        let eng = engine(&path);
+        let (age, memo, company) = (h(&eng, "u.age"), h(&eng, "u.memo"), h(&eng, "u.company"));
+        let mut decls = specs(&eng);
+        decls.push(("no_such_himo".into(), AnswerSpec::Set { preds: vec![LivePred::Present { himo_id: 999 }] }));
+        decls.push(("path_not_ref".into(), AnswerSpec::Counts { preds: vec![LivePred::Present { himo_id: age }], group_path: vec![age], group_himo: age, sum_himo: None }));
+        decls.push(("sum_is_leaf".into(), AnswerSpec::Counts { preds: vec![LivePred::Present { himo_id: age }], group_path: vec![], group_himo: company, sum_himo: Some(memo) }));
+        decls.push(("limit_zero".into(), AnswerSpec::Top { preds: vec![LivePred::Present { himo_id: age }], order_path: vec![], order_himo: age, desc: false, limit: 0 }));
+        decls.push(("adults".into(), AnswerSpec::Set { preds: vec![LivePred::Present { himo_id: age }] }));
+        eng.restore_answers(decls);
+        let names: Vec<String> = eng.answer_declarations().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["adults", "by_city", "oldest"], "張れない宣言と重複は捨てる");
+        assert_eq!(eng.answer_spec("adults"), Some(specs(&eng)[0].1.clone()), "同じ名前は先の宣言");
+        assert!(matches!(eng.answer("by_city"), Some(AnswerHandle::Counts(_))));
+        assert!(matches!(eng.answer("oldest"), Some(AnswerHandle::Query(_))));
+        assert!(eng.answer("no_such_himo").is_none());
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn declare_persists_same_shape_is_noop_different_shape_replaces_and_drop_removes() {
+        let path = tmp("persist");
+        let eng = engine(&path);
+        let age = h(&eng, "u.age");
+        assert!(eng.declare_answer("", AnswerSpec::Set { preds: vec![LivePred::Present { himo_id: age }] }).is_err(), "空の名前");
+        assert!(eng.declare_answer("x", AnswerSpec::Set { preds: vec![] }).is_err(), "条件なし");
+        let first = AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 31, hi: u64::MAX }] };
+        let a = eng.declare_answer("adults", first.clone()).unwrap();
+        let b = eng.declare_answer("adults", first.clone()).unwrap();
+        assert_eq!(a.id(), b.id(), "同じ形は同じ購読");
+        assert_eq!(eng.answer("adults").map(|x| x.id()), Some(a.id()));
+        eng.persist_tables().unwrap();
+        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert_eq!(stored, vec![("adults".to_string(), first)], "宣言は sidecar に書く");
+        let second = AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 65, hi: u64::MAX }] };
+        let c = eng.declare_answer("adults", second.clone()).unwrap();
+        assert_ne!(c.id(), a.id(), "違う形は置き換え");
+        assert_eq!(eng.answer_spec("adults"), Some(second.clone()));
+        eng.persist_tables().unwrap();
+        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert_eq!(stored, vec![("adults".to_string(), second)]);
+        assert!(eng.drop_answer("adults"));
+        assert!(!eng.drop_answer("adults"));
+        assert!(eng.answer("adults").is_none());
+        eng.persist_tables().unwrap();
+        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert!(stored.is_empty(), "外すと sidecar からも消える");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    /// 開き直すと宣言が戻り、 最初の poll が種を作る (登録の時には表を読まない)。 閉じる前に書いた分も、 開いてから
+    /// poll までに書いた分も答えに入る。
+    #[test]
+    fn reopen_restores_and_first_poll_seeds() {
+        let path = tmp("reopen");
+        let mut eng = engine(&path);
+        let age = h(&eng, "u.age");
+        let before: Vec<u64> = (0..6)
+            .map(|i| {
+                let e = eng.entity_in("u").unwrap();
+                eng.tie(e, "u.age", 20 + i * 10);
+                e
+            })
+            .collect();
+        eng.declare_answer("adults", AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 31, hi: u64::MAX }] }).unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+        let mut eng = Engine::open_standalone(&path).unwrap();
+        let Some(AnswerHandle::Query(q)) = eng.answer("adults") else { panic!("宣言が戻っていない") };
+        let late = eng.entity_in("u").unwrap();
+        eng.tie(late, "u.age", 80);
+        let d = q.poll(&eng);
+        let mut want: Vec<u64> = before.iter().copied().filter(|&e| eng.get(e, "u.age").unwrap() > 30).collect();
+        want.push(late);
+        want.sort_unstable();
+        let mut got = d.added.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "閉じる前の行と開いてから書いた行が最初の poll に入る");
+        assert!(d.removed.is_empty());
+        eng.tie(before[0], "u.age", 99);
+        let d = q.poll(&eng);
+        assert_eq!((d.added, d.removed), (vec![before[0]], vec![]), "宣言された購読に差分が届く");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
     }

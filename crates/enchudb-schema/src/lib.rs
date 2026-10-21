@@ -61,7 +61,7 @@
 //! 時に自動で復元、 himo_id も再 resolve される。 `Drop` で flush が呼ばれるので
 //! 手動 flush は不要 (明示的に呼びたい場合は `db.engine_mut().flush()`)。
 
-use enchudb_engine::{Engine, ValueType};
+use enchudb_engine::{AnswerHandle, AnswerSpec, Engine, ValueType};
 /// #118: growable layout の全 knob を露出する options 型を re-export
 /// (`enchudb_schema::GrowableOptions` / `LeafScale` で使えるように)。
 pub use enchudb_engine::engine::TableEidUsage;
@@ -652,6 +652,58 @@ impl Database {
     /// ある時向け)。 束に入れていない購読 (同じ `Database` を使う他の部品が持つもの) の差分は取り出さない。
     pub fn live_group(&self) -> LiveGroup {
         LiveGroup { inner: self.eng.live_group(), eng: self.eng.clone() }
+    }
+
+    /// 宣言された答え ([`Query::answer`] / [`Query::answer_counts`] / [`Query::answer_sums`]) を名前で取る (無ければ None)。
+    /// 開き直した後も取れる (宣言は `{db}/tables` に保存され、 engine が開く時に購読を張り直す = アプリは条件を書き直さない)。
+    /// 返すのは engine が持つ購読を指す handle で、 poll の状態は 1 つ (同じ名前で 2 回取って両方 poll すると、 差分は
+    /// どちらか一方にだけ届く)。 最初の poll が種を作る (登録時点の全件 / 全 group が added)。
+    pub fn answer(&self, name: &str) -> Option<Answer> {
+        let handle = self.eng.answer(name)?;
+        let spec = self.eng.answer_spec(name)?;
+        Some(self.wrap_answer(handle, &spec))
+    }
+
+    /// 宣言された答えの名前 (宣言した順)。
+    pub fn answers(&self) -> Vec<String> {
+        self.eng.answer_declarations().into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// 宣言された答えを外す (宣言は保存からも消える)。 外したら true、 無ければ false。 購読そのものは、 それを持つ handle が
+    /// 全部落ちた時に外れる。
+    pub fn drop_answer(&self, name: &str) -> bool {
+        self.eng.drop_answer(name)
+    }
+
+    /// engine の handle を schema の購読に (group / 合計の列の型は table の定義から、 無ければ engine の紐の型から)。
+    fn wrap_answer(&self, handle: AnswerHandle, spec: &AnswerSpec) -> Answer {
+        let eng = self.eng.clone();
+        match handle {
+            AnswerHandle::Query(inner) => Answer::Query(LiveQuery { inner, eng }),
+            AnswerHandle::Counts(inner) => {
+                let (group, sum) = match spec {
+                    AnswerSpec::Counts { group_himo, sum_himo, .. } => (*group_himo, *sum_himo),
+                    _ => (0, None),
+                };
+                let ty = self.column_type_of(group).unwrap_or(ColumnType::Number);
+                let sum_big = sum.and_then(|h| self.column_type_of(h)) == Some(ColumnType::BigInt);
+                Answer::Counts(LiveCounts { inner, eng, ty, sum_big, last: Default::default() })
+            }
+        }
+    }
+
+    /// 紐の番号から列の型 (table の定義を先に、 無ければ engine の紐の型から)。
+    fn column_type_of(&self, himo: u16) -> Option<ColumnType> {
+        if let Some(c) = self.tables.iter().flat_map(|t| t.cols.iter()).find(|c| c.himo_id == himo) {
+            return Some(c.ty);
+        }
+        Some(match self.eng.value_type_at(himo as usize)? {
+            ValueType::Number => ColumnType::Number,
+            ValueType::Number64 => ColumnType::BigInt,
+            ValueType::Tag => ColumnType::Tag,
+            ValueType::Leaf => ColumnType::Leaf,
+            ValueType::Ref => ColumnType::Ref,
+        })
     }
 
     /// build phase 用、 `Arc<Engine>` が他に共有されていない (count = 1) 時のみ
@@ -2143,7 +2195,8 @@ impl<'a> RowBuilder<'a> {
 /// engine を `Arc` で抱えているので `Database` を借用しない — struct に入れて持ち回れ、
 /// 別 thread から poll してよい。
 pub struct LiveQuery {
-    inner: enchudb_engine::LiveQuery,
+    /// engine の購読。 宣言された答え ([`Database::answer`]) は engine が持つ購読を指す (clone)。
+    inner: Arc<enchudb_engine::LiveQuery>,
     eng: Arc<Engine>,
 }
 
@@ -2206,7 +2259,8 @@ impl std::fmt::Debug for LiveQuery {
 /// [`Query::subscribe_counts`] の戻り値。 group の値ごとの件数を購読する。 drop で購読解除、
 /// `Database` を借用しない。
 pub struct LiveCounts {
-    inner: enchudb_engine::LiveCounts,
+    /// engine の購読。 宣言された答え ([`Database::answer`]) は engine が持つ購読を指す (clone)。
+    inner: Arc<enchudb_engine::LiveCounts>,
     eng: Arc<Engine>,
     ty: ColumnType,
     /// 合計の列が BigInt (engine の合計を元の値に戻す)。
@@ -2384,6 +2438,32 @@ impl std::fmt::Debug for LiveHaving {
 
 /// 購読の束 ([`Database::live_group`])。 束を drop しても購読はそのまま (差分は各購読の `poll` で受け取れ、
 /// 他の束に入れ直してもよい)。
+/// [`Database::answer`] の戻り値: 宣言された答えの購読 (形は宣言した時のもの)。
+pub enum Answer {
+    /// 集合 / 上位 k 件 ([`Query::answer`])。
+    Query(LiveQuery),
+    /// group ごとの件数 / 合計 ([`Query::answer_counts`] / [`Query::answer_sums`])。
+    Counts(LiveCounts),
+}
+
+impl Answer {
+    /// 集合 / 上位 k 件の購読なら取り出す。
+    pub fn into_query(self) -> Option<LiveQuery> {
+        match self {
+            Answer::Query(q) => Some(q),
+            Answer::Counts(_) => None,
+        }
+    }
+
+    /// 件数 / 合計の購読なら取り出す。
+    pub fn into_counts(self) -> Option<LiveCounts> {
+        match self {
+            Answer::Counts(c) => Some(c),
+            Answer::Query(_) => None,
+        }
+    }
+}
+
 pub struct LiveGroup {
     inner: enchudb_engine::LiveGroup,
     eng: Arc<Engine>,
@@ -2699,7 +2779,7 @@ impl<'a> JoinQuery<'a> {
                 }
                 .map_err(io)?;
                 let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner, eng, ty: cd.ty, sum_big, last: Default::default() })))
+                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big, last: Default::default() })))
             }
             JoinOn::Range(..) => Err(bad("join subscribe_counts: not supported for join_range yet".into())),
             JoinOn::Eq(my, _) => {
@@ -2726,7 +2806,7 @@ impl<'a> JoinQuery<'a> {
                     }
                     .map_err(io)?;
                     let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                    Ok(LiveCounts { inner, eng: eng.clone(), ty, sum_big, last: Default::default() })
+                    Ok(LiveCounts { inner: Arc::new(inner), eng: eng.clone(), ty, sum_big, last: Default::default() })
                 };
                 let lsum = side.as_ref().filter(|s| !s.0).map(|s| &s.1);
                 let rsum = side.as_ref().filter(|s| s.0).map(|s| &s.1);
@@ -6323,7 +6403,7 @@ impl<'a> Query<'a> {
             }
             _ => eng.subscribe(preds).map_err(|e| SchemaError::Io(e.to_string()))?,
         };
-        Ok(LiveQuery { inner, eng })
+        Ok(LiveQuery { inner: Arc::new(inner), eng })
     }
 
     /// ref をたどる条件 (`where_eq("company.city", "Tokyo")`) を **ref の先の row (group) 単位**
@@ -6470,7 +6550,89 @@ impl<'a> Query<'a> {
             None => eng.subscribe_counts(preds, path, cd.himo_id),
         }
         .map_err(|e| SchemaError::BadValue(e.to_string()))?;
-        Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+        Ok(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+    }
+
+    /// この query の答えに名前を付けて **宣言する**: 集合 (`order_by(..).limit(k)` なら先頭 k 件) の購読を engine が持ち、 形は
+    /// DB (`{db}/tables`) に保存されて、 開き直すと engine が開く時に (WAL の再生の前に) 購読を張り直す。 以後は
+    /// [`Database::answer`] で名前から取るだけ (条件を書き直さない)。
+    ///
+    /// ```ignore
+    /// let adults = users.where_gt("age", 30i64).answer("adults")?;   // 宣言 + 今すぐ使える購読
+    /// // 開き直した後
+    /// let adults = db.answer("adults").and_then(Answer::into_query).unwrap();
+    /// adults.poll();   // 最初の poll が種を作る (全件 added)、 以後は差分
+    /// ```
+    ///
+    /// - 返す購読は [`subscribe`](Self::subscribe) と同じ API。 engine が持つ購読を指すので、 落としても購読は残る
+    ///   (poll の状態は 1 つ)。 種 (表の走査) は最初の poll が作る (開くのは遅くならない)
+    /// - 同じ名前に同じ形をもう一度宣言するのは何もしない (同じ購読)。 違う形なら置き換える。 外すのは
+    ///   [`Database::drop_answer`]
+    /// - 形の決まり (`limit` には `order_by` が要る、 など) は `subscribe` と同じ。 readonly で開いた DB の宣言は保存しない
+    pub fn answer(self, name: &str) -> Result<LiveQuery, SchemaError> {
+        let order = self.order_col()?;
+        let limit = self.limit;
+        if limit.is_some() && order.is_none() {
+            return Err(SchemaError::BadValue("answer: limit needs order_by".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue("answer: where_eq on an unknown column or with a mismatched value type".into())
+        })?;
+        let spec = match (order, limit) {
+            (Some((order_path, order_himo, desc)), Some(k)) => AnswerSpec::Top {
+                preds,
+                order_path,
+                order_himo,
+                desc,
+                limit: u32::try_from(k).map_err(|_| SchemaError::BadValue("answer: limit is too large".into()))?,
+            },
+            _ => AnswerSpec::Set { preds },
+        };
+        match eng.declare_answer(name, spec).map_err(|e| SchemaError::BadValue(e.to_string()))? {
+            AnswerHandle::Query(inner) => Ok(LiveQuery { inner, eng }),
+            AnswerHandle::Counts(_) => Err(SchemaError::Internal("answer: engine returned a counts subscription".into())),
+        }
+    }
+
+    /// [`subscribe_counts`](Self::subscribe_counts) の宣言版 (決まりは [`answer`](Self::answer) と同じ)。
+    pub fn answer_counts(self, name: &str, col: &str) -> Result<LiveCounts, SchemaError> {
+        self.answer_agg(name, col, None)
+    }
+
+    /// [`subscribe_sums`](Self::subscribe_sums) の宣言版 (決まりは [`answer`](Self::answer) と同じ)。
+    pub fn answer_sums(self, name: &str, col: &str, sum_col: &str) -> Result<LiveCounts, SchemaError> {
+        let cd = self
+            .table
+            .col(sum_col)
+            .filter(|c| matches!(c.ty, ColumnType::Number | ColumnType::BigInt))
+            .ok_or_else(|| SchemaError::BadValue(format!("answer_sums: {sum_col} is not a Number / BigInt column of this table")))?;
+        let big = cd.ty == ColumnType::BigInt;
+        let h = cd.himo_id;
+        self.answer_agg(name, col, Some((h, big)))
+    }
+
+    fn answer_agg(self, name: &str, col: &str, sum: Option<(u16, bool)>) -> Result<LiveCounts, SchemaError> {
+        if self.limit.is_some() {
+            return Err(SchemaError::BadValue("answer_counts: limit is not supported".into()));
+        }
+        let (group_path, cd) = self
+            .resolve_col(col)
+            .ok_or_else(|| SchemaError::BadValue(format!("answer_counts: unknown column {col}")))?;
+        if cd.ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue("answer_counts: cannot group by a Leaf column".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue("answer: where_eq on an unknown column or with a mismatched value type".into())
+        })?;
+        let spec = AnswerSpec::Counts { preds, group_path, group_himo: cd.himo_id, sum_himo: sum.map(|s| s.0) };
+        match eng.declare_answer(name, spec).map_err(|e| SchemaError::BadValue(e.to_string()))? {
+            AnswerHandle::Counts(inner) => {
+                Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+            }
+            AnswerHandle::Query(_) => Err(SchemaError::Internal("answer_counts: engine returned a set subscription".into())),
+        }
     }
 
     /// ablation / 計測用: engine の `subscribe_expand_always` で購読する (結果は `subscribe`
@@ -6487,7 +6649,7 @@ impl<'a> Query<'a> {
             )
         })?;
         let inner = eng.subscribe_expand_always(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
-        Ok(LiveQuery { inner, eng })
+        Ok(LiveQuery { inner: Arc::new(inner), eng })
     }
 
     /// 条件を engine の `LivePred` に写す。 `None` = 常に 0 件になる条件 (未知の列 / 型不一致の
