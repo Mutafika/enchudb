@@ -1425,30 +1425,59 @@ pub mod write_out_hook {
     }
 }
 
+/// test 用の WAL の割り込み点の置き場 (#579)。 WAL (番地で見分ける) ごとに 1 つ置き、 置いた WAL で 1 回だけ呼ぶ。 前は process に
+/// 置き場が 1 つで、 同じ割り込み点を使う試験が並んで走ると、 後に置いた試験が先の試験の割り込み点を消した。
+#[cfg(test)]
+mod wal_hook {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
+
+    pub(super) struct Slots(Mutex<Vec<(usize, Hook)>>);
+
+    impl Slots {
+        pub(super) const fn new() -> Self {
+            Slots(Mutex::new(Vec::new()))
+        }
+
+        /// WAL `wal` の割り込み点を `f` にする (その WAL に置いた前の物は置き換える)。
+        pub(super) fn set(&self, wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+            let at = wal as *const OpLog as usize;
+            let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            v.retain(|(w, _)| *w != at);
+            v.push((at, Box::new(f)));
+        }
+
+        /// WAL `wal` に置いた割り込み点があれば取り出して呼ぶ。
+        pub(super) fn call(&self, wal: &OpLog) {
+            let me = wal as *const OpLog as usize;
+            let hit = {
+                let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                v.iter().position(|(w, _)| *w == me).map(|i| v.swap_remove(i))
+            };
+            if let Some((_, f)) = hit {
+                f(wal);
+            }
+        }
+    }
+}
+
 /// test 用の割り込み点: `make_wal_room_inner` が 「満杯でない」 を見た後、 開いている group を閉じる Commit を打つ前。
 /// 書き手の thread の Commit が、 その間に WAL の残りを埋める窓を踏むため。 置いた WAL (番地で見分ける) で 1 回だけ呼ぶ
 /// (並んで走る他の test の engine では呼ばない)。 consumer の thread から呼ばれるので thread local ではない。
 #[cfg(test)]
 mod room_commit_hook {
     use enchudb_oplog::oplog::OpLog;
-    use std::sync::Mutex;
 
-    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
-    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
 
     pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+        HOOK.set(wal, f);
     }
 
     pub(super) fn call(wal: &OpLog) {
-        let me = wal as *const OpLog as usize;
-        let hit = {
-            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
-            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
-        };
-        if let Some((_, f)) = hit {
-            f(wal);
-        }
+        HOOK.call(wal);
     }
 }
 
@@ -1457,24 +1486,15 @@ mod room_commit_hook {
 #[cfg(test)]
 mod room_fold_hook {
     use enchudb_oplog::oplog::OpLog;
-    use std::sync::Mutex;
 
-    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
-    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
 
     pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+        HOOK.set(wal, f);
     }
 
     pub(super) fn call(wal: &OpLog) {
-        let me = wal as *const OpLog as usize;
-        let hit = {
-            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
-            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
-        };
-        if let Some((_, f)) = hit {
-            f(wal);
-        }
+        HOOK.call(wal);
     }
 }
 
@@ -1483,24 +1503,15 @@ mod room_fold_hook {
 #[cfg(test)]
 mod room_write_out_hook {
     use enchudb_oplog::oplog::OpLog;
-    use std::sync::Mutex;
 
-    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
-    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
 
     pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+        HOOK.set(wal, f);
     }
 
     pub(super) fn call(wal: &OpLog) {
-        let me = wal as *const OpLog as usize;
-        let hit = {
-            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
-            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
-        };
-        if let Some((_, f)) = hit {
-            f(wal);
-        }
+        HOOK.call(wal);
     }
 }
 
@@ -1721,24 +1732,15 @@ mod wal_room_commit_tests {
 #[cfg(test)]
 mod consumer_sleep_hook {
     use enchudb_oplog::oplog::OpLog;
-    use std::sync::Mutex;
 
-    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
-    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
 
     pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+        HOOK.set(wal, f);
     }
 
     pub(super) fn call(wal: &OpLog) {
-        let me = wal as *const OpLog as usize;
-        let hit = {
-            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
-            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
-        };
-        if let Some((_, f)) = hit {
-            f(wal);
-        }
+        HOOK.call(wal);
     }
 }
 
