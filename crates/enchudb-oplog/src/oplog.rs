@@ -725,6 +725,8 @@ struct ScanOut {
     /// 末尾の **未 commit** batch (Commit で閉じられなかった分)。
     tail: Vec<(Record, u64)>,
     stop: ScanStop,
+    /// 読んだ Commit の直後の offset (古い順)。
+    commit_ends: Vec<u64>,
 }
 
 /// #152: scan の内部表現 `(Record, 終端 offset)` から offset を落とす。
@@ -824,6 +826,8 @@ pub struct OpLog {
     /// group を閉じない record が残す、 閉じの Commit の分の空き (`alloc`)。 普段は `REC_HEADER_SIZE`。 test だけが 0 にする
     /// ([`OpLog::keep_commit_room_for_test`])。
     commit_room: std::sync::atomic::AtomicU64,
+    /// 畳んだ (ring を頭に戻した) 印を、 次の record を書く前に書き出すか ([`OpLog::set_sync_on_reset`])。
+    sync_on_reset: std::sync::atomic::AtomicBool,
     /// #57: append に失敗して WAL に載らなかった record の (author, その author の落ちた HLC の max)
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
@@ -1014,6 +1018,7 @@ impl OpLog {
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
+            sync_on_reset: std::sync::atomic::AtomicBool::new(false),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
@@ -1120,6 +1125,7 @@ impl OpLog {
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
+            sync_on_reset: std::sync::atomic::AtomicBool::new(false),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
@@ -1794,7 +1800,19 @@ impl OpLog {
         self.checkpoint.store(HEADER_SIZE as u64, Ordering::Release);
         mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        if self.sync_on_reset.load(Ordering::Acquire) {
+            // append_lock の下: 次の record が前の周の page を上書きする前に、 頭に戻した header を届ける
+            let _ = self.fsync();
+        }
         true
+    }
+
+    /// 畳んだ印 (head / checkpoint を頭に戻した header) を、 次の record を書く前に書き出す (append_lock の下で fsync 1 回。
+    /// 畳む前に全部を書き出してあるので、 書くのは header の page だけ)。 既定は書き出さない: 電源が落ちると、 前の周の header
+    /// のまま、 新しい周の page だけが OS に先に書かれた姿がありうる。 本体は前の周を当て終えているので困らないが、 WAL の中で
+    /// 記録した record の続きを探す changefeed の記録 (engine の `changefeed.seg`) は、 前の周を途中までしか読めずに取り違える。
+    pub fn set_sync_on_reset(&self, on: bool) {
+        self.sync_on_reset.store(on, Ordering::Release);
     }
 
     /// #608: ring の周を 1 つ進めて header に書く (`append_lock` の下、 ring が空の時)。 v2 の file はここで v3 になる
@@ -2054,6 +2072,21 @@ impl OpLog {
         (strip_offsets(s.out), s.committed_end, strip_offsets(s.tail), end)
     }
 
+    /// changefeed の記録 (engine の `changefeed.seg`) 用: `start` から読んで、 (record, その終端 offset) と読み終えた offset を返す。
+    /// `with_tail` が false なら `limit` (書き出し済みの位置 = checkpoint) までに Commit で閉じた group だけ。 true なら閉じていない
+    /// 末尾も含めて全部 (畳む直前、 全部を書き出した後に呼ぶ)。 読むだけ。
+    pub fn scan_for_change_log(&self, start: u64, limit: u64, with_tail: bool) -> (Vec<(Record, u64)>, u64) {
+        let s = self.scan_from_offset(start);
+        if with_tail {
+            let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
+            let mut out = s.out;
+            out.extend(s.tail);
+            return (out, end);
+        }
+        let end = s.commit_ends.iter().rev().find(|&&c| c <= limit).copied().unwrap_or(start);
+        (s.out.into_iter().filter(|(_, e)| *e <= end).collect(), end)
+    }
+
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
     /// CRC 破損レコードに到達したらそこで打ち切り(uncommitted tail の切り捨て)。
     ///
@@ -2121,6 +2154,7 @@ impl OpLog {
     ) -> ScanOut {
         let mut out = Vec::new();
         let mut batch = Vec::new();
+        let mut commit_ends = Vec::new();
         let mut offset = start_offset;
         let mut committed_end = start_offset;
         // #608: 周の印の有無とこの周。 `written` より先に読む (畳む側は周を進めてから written を戻すので、 周が新しくて
@@ -2206,6 +2240,7 @@ impl OpLog {
                 Some(DecodedOp::Commit) => {
                     out.append(&mut batch);
                     committed_end = next_off as u64;
+                    commit_ends.push(committed_end);
                 }
                 Some(other) => {
                     batch.push((
@@ -2254,7 +2289,7 @@ impl OpLog {
         }
 
         // 未 commit batch は `out` には混ぜず、 呼び手が選べるよう別枠で返す。
-        ScanOut { out, max_lsn, max_hlc, committed_end, tail: batch, stop }
+        ScanOut { out, max_lsn, max_hlc, committed_end, tail: batch, stop, commit_ends }
     }
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。
@@ -2388,6 +2423,7 @@ impl OpLog {
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
+            sync_on_reset: std::sync::atomic::AtomicBool::new(false),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),

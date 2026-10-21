@@ -229,10 +229,19 @@ once it has been flushed: by the background flush (every 100 ms) or by `oplog_sy
 The oplog is a ring. When it fills up, the background thread pauses appends, flushes, and starts
 the ring over. Writers that append in the meantime wait instead of losing their records, so a
 single writer that never pauses no longer overflows it (#388); `Engine::wal_room_folds()` counts
-these pauses. A DB that syncs to peers (or has change listeners) cannot restart the ring until
-those records have been handed on. If that is stuck, writes still land in the DB, but their
-records drop out of the stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch
-up by bootstrap.
+these pauses. A DB that syncs to peers cannot restart the ring until those records have been
+handed on. If that is stuck, writes still land in the DB, but their records drop out of the
+stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch up by bootstrap.
+
+Change listeners (`add_change_listener`) do not hold the ring. Records they have not received
+yet move to an in-memory backlog when the ring restarts; past its cap (64 MiB,
+`set_change_backlog_limit`) the listeners are detached and told so (`on_detached`). To keep the
+stream across restarts, call `enable_change_log(cap)` once: records then go to
+`changefeed.seg` with numbers that never repeat. `on_changes_at(first, records)` tells a
+listener those numbers. Store the next number with your own commit, and after a restart call
+`add_change_listener_from(listener, next)` to continue where you stopped. If the log has
+already dropped that number, the call returns `Truncated { from }`; re-read the current state
+instead.
 
 Starting the ring over leaves the previous lap's records in the file until they are overwritten. Every record therefore
 carries the lap it was written in (an 8-byte mark after the payload, oplog file format 3), and recovery stops at the first

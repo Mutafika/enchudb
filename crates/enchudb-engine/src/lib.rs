@@ -57,6 +57,7 @@ pub mod segment_map;
 pub mod segments;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sync_payload_ring;
+pub mod change_log;
 pub mod db_files;
 pub mod column;
 pub mod vocabulary;
@@ -105,6 +106,8 @@ pub mod sparse_copy;
 pub use engine::{DbState, Engine, EntityValue, EntityValueOwned, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, PkValue, RemoteApply, TieRejected, VocabUsage};
 pub use live::{Agg, GroupedLiveQuery, KeyedDelta, LiveCounts, LiveGroup, LiveDelta, LiveKeyed, LivePred, LiveQuery, TouchedDelta, TouchedLiveQuery, MAX_BRANCHES, MAX_KEYS};
 pub use sparse_copy::copy_sparse;
+/// 番号で受け直す流れ (changefeed の記録・宣言された答え) の 「その位置はもう無い」。
+pub use change_log::Truncated;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::copy_db_dir;
 pub use engine::{EngineStats, Invariants};
