@@ -85,6 +85,20 @@ struct ChangeCursor {
     open_tail: Vec<crate::transport::WireRecord>,
 }
 
+/// [`Engine::verify_invariants`] の答え。 `violations` が空なら不変量は全部成り立つ。 `warnings` は 「今の code では
+/// まだ約束していないが、 約束するつもりの形」 (主キーの重複、 #601 が直るまで)
+#[derive(Debug, Default, Clone)]
+pub struct Invariants {
+    pub violations: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl Invariants {
+    pub fn ok(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
 /// Engine の実行時状態スナップショット。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -5100,7 +5114,14 @@ impl Engine {
         // #414: table の定義が決まった後で — 前は sidecar を読む前に呼んでいて、 engine 内部の table の Leaf 列
         // (辞書の番号を持つ) を LeafStore の offset と見ていた
         if !readonly {
-            eng.rebuild_leaf_free_list()?;
+            // 開く時間: きれいに閉じた時に残した空き一覧 (`leaf.free`、 紐名の辞書の印が CLEAN_LEAF の時だけ信じる) が今の
+            // store と合えば列から作り直さない (Leaf の region を読まない)。 合わなければ (kill / 電源断 / 知らない binary が
+            // 閉じた / file が無い・壊れた) 今まで通り列から作り直す
+            if eng.himo_reg.leaf_free_on_load() && eng.load_leaf_free_list() {
+                eng.ensure_leaf_columns_loaded()?;
+            } else {
+                eng.rebuild_leaf_free_list()?;
+            }
         }
 
         // v10: sync tables を持つ DB は版数列 (`ver/*.seg` / `tomb.seg`) を持つのが不変条件。
@@ -11300,6 +11321,124 @@ impl Engine {
         self.scan_interrupted_deletes(/*repair=*/ true)
     }
 
+    /// 不変量の検査 (診断用、 O(DB の大きさ)。 総当たりの試験・電源断の像の検証・サポートの調査で呼ぶ。 書き手と並走しない
+    /// 所で呼ぶこと = 開いた直後か、 書き手を止めてから)。 見るもの:
+    ///
+    /// - Leaf: 置いてある cell の slot が全部読める (解放の印・切れた header が無い)、 空きの一覧が範囲の中で offset の順に
+    ///   重ならない、 空きの中に live の slot が無い (使い回すと別の値を読む)
+    /// - 途中で切れた delete が無い (tombstone が立っているのに古い cell が生きている entity)
+    /// - Tag の cell (と engine 内部の表の Leaf 列 = 辞書の番号) の語が辞書にある
+    /// - EntitySet: 生きている数と bitmap が合う、 生きている local は next_eid より前
+    /// - 警告: 表ごとに名前 (主キー) の値が生きている行で重複しない (#601 が直るまでは成り立たないので警告)
+    ///
+    /// sync の表の不変量 (配る分の payload と行、 pktombs / pkformer と行) は別の session が足す
+    pub fn verify_invariants(&self) -> Invariants {
+        let mut out = Invariants::default();
+        let names = self.himo_names();
+        let name_of = |hid: usize| names.get(hid).cloned().unwrap_or_else(|| format!("himo {hid}"));
+        // Leaf
+        if let Some(leaf) = self.leaf.as_ref() {
+            let (start, hw) = leaf.bounds_words();
+            let mut live: Vec<u32> = Vec::new();
+            for hid in 0..self.himos.len() {
+                if self.leaf_for(hid).is_none() {
+                    continue;
+                }
+                if let Err(e) = self.himos[hid].ensure_loaded() {
+                    out.violations.push(format!("Leaf の列 {} を開けない: {e}", name_of(hid)));
+                    continue;
+                }
+                let mut bad = 0usize;
+                let mut first = None;
+                self.himos[hid].for_each_set_cell(|local, off| {
+                    let off = off as u32;
+                    live.push(off);
+                    if off < start || off >= hw || !matches!(leaf.try_read(off), LeafRead::Ok(_)) {
+                        bad += 1;
+                        first.get_or_insert((local, off));
+                    }
+                });
+                if let Some((local, off)) = first {
+                    out.violations.push(format!(
+                        "Leaf の列 {} の cell {bad} 個が読めない slot を指す (最初: entity {local} → slot {off}、 範囲 {start}..{hw})",
+                        name_of(hid)
+                    ));
+                }
+            }
+            live.sort_unstable();
+            let mut cur = start;
+            for (off, size) in leaf.holes_snapshot() {
+                if size == 0 || off < cur || off as u64 + size as u64 > hw as u64 {
+                    out.violations.push(format!("Leaf の空き ({off}, {size}) が範囲 {start}..{hw} の外か前の空きと重なる (前の端 {cur})"));
+                }
+                cur = off.saturating_add(size);
+                let i = live.partition_point(|&o| o < off);
+                if let Some(&o) = live.get(i).filter(|&&o| (o as u64) < off as u64 + size as u64) {
+                    out.violations.push(format!("Leaf の空き ({off}, {size}) の中に live の slot {o} がある (使い回すと別の値を読む)"));
+                }
+            }
+        }
+        // 途中で切れた delete
+        let n = self.interrupted_delete_count();
+        if n > 0 {
+            out.violations.push(format!("途中で切れた delete が {n} 件 (tombstone が立っているのに古い cell が生きている)"));
+        }
+        // Tag の語 (と engine 内部の表の Leaf 列 = 辞書の番号)
+        for hid in 0..self.himos.len() {
+            let vt = self.value_types.get(hid).copied();
+            let uses_vocab = vt == Some(ValueType::Tag) || (vt == Some(ValueType::Leaf) && self.leaf_for(hid).is_none());
+            if !uses_vocab || self.himos[hid].ensure_loaded().is_err() {
+                continue;
+            }
+            let mut bad = 0usize;
+            let mut first = None;
+            self.himos[hid].for_each_set_cell(|local, vid| {
+                if self.vocab.get_checked(vid as u32).is_none() {
+                    bad += 1;
+                    first.get_or_insert((local, vid));
+                }
+            });
+            if let Some((local, vid)) = first {
+                out.violations.push(format!("列 {} の cell {bad} 個が辞書に無い語を指す (最初: entity {local} → 語 {vid})", name_of(hid)));
+            }
+        }
+        // EntitySet
+        let live = self.entities.iter();
+        let counted = self.entities.count() as usize;
+        if live.len() != counted {
+            out.violations.push(format!("EntitySet の数 {counted} と bitmap の生きている数 {} が合わない", live.len()));
+        }
+        if let Some(&max) = live.last().filter(|&&m| m >= self.entities.next_eid()) {
+            out.violations.push(format!("生きている local {max} が next_eid {} 以上", self.entities.next_eid()));
+        }
+        // 警告: 表ごとの名前 (主キー) の重複
+        for t in &self.tables {
+            let Some(pk) = t.pk_himo else { continue };
+            let Some(hs) = self.himos.get(pk as usize) else { continue };
+            if hs.ensure_loaded().is_err() {
+                continue;
+            }
+            let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+            for local in t.eid_range_lo..t.eid_range_hi.min(self.entities.next_eid()) {
+                if !self.entities.is_live(local) {
+                    continue;
+                }
+                if let Some(v) = hs.get_value(local) {
+                    *seen.entry(v).or_insert(0) += 1;
+                }
+            }
+            let dups: Vec<(u64, u32)> = seen.into_iter().filter(|&(_, n)| n > 1).collect();
+            if let Some(&(v, n)) = dups.iter().max_by_key(|&&(_, n)| n) {
+                out.warnings.push(format!(
+                    "表 {} の名前 (主キー) が重複: {} 種類 (最多: 値 {v} が生きた行 {n} 個、 #601)",
+                    t.name,
+                    dups.len()
+                ));
+            }
+        }
+        out
+    }
+
     /// crash が delete を途中で切った跡を open 時に掃除する。 戻り値は直した entity 数。
     ///
     /// 対象は **「tombstone が立っているのに、 それより古い cell が生きている」 entity**。
@@ -11795,6 +11934,52 @@ impl Engine {
         self.free_leaf_offset(hid, old);
     }
 
+    /// #534: Leaf の列を全部読む。 列の segment を開けなければ開くのを失敗させる (前は列を初めて開く所で panic した)
+    fn ensure_leaf_columns_loaded(&self) -> io::Result<()> {
+        for hid in 0..self.himos.len() {
+            if self.leaf_for(hid).is_some() {
+                self.himos[hid].ensure_loaded()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 開く時間: 閉じる時に Leaf の空き一覧を `{db}/leaf.free` に書く (fsync まで)。 書けたら true (file のある backing だけ)。
+    /// 呼ぶのは閉じる時の書き出しの後 (`durable_end` で待っていた slot も空きに戻った後)、 印 (`CLEAN_LEAF`) を立てる前
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_leaf_free_list(&self) -> io::Result<bool> {
+        let Some(leaf) = self.leaf.as_ref() else { return Ok(false) };
+        if !matches!(self.backing, Backing::Segments(_)) || self.path.is_empty() {
+            return Ok(false);
+        }
+        let bytes = leaf.free_list_bytes();
+        crate::db_files::write_atomic_if_changed(&crate::db_files::path_for(&self.path, crate::db_files::LEAFFREE), &bytes)?;
+        Ok(true)
+    }
+
+    /// 開く時間: 閉じた時の空き一覧の file を読んで入れる。 無い / 壊れている / 今の store と合わない時は false (列から作り直す)
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_leaf_free_list(&self) -> bool {
+        let Some(leaf) = self.leaf.as_ref() else { return false };
+        if !matches!(self.backing, Backing::Segments(_)) || self.path.is_empty() {
+            return false;
+        }
+        match std::fs::read(crate::db_files::path_for(&self.path, crate::db_files::LEAFFREE)) {
+            Ok(bytes) => leaf.install_free_list(&bytes),
+            Err(_) => false,
+        }
+    }
+
+    /// Leaf の空き (word の合計を byte で。 診断用、 Leaf が無ければ 0)
+    pub fn leaf_free_bytes(&self) -> u64 {
+        self.leaf.as_ref().map_or(0, |l| l.free_bytes())
+    }
+
+    /// 開く時間 (診断用): 開いた時に Leaf の空き一覧を閉じた時の file から入れたか (false = 列から作り直した / Leaf が無い)
+    pub fn leaf_free_list_from_file(&self) -> bool {
+        self.leaf.as_ref().is_some_and(|l| l.free_list_from_file())
+    }
+
     /// v6 (#88): open 時に routed-Leaf の live cell offset を集めて LeafStore の
     /// free-list を再構成する (free-list は非永続 = store の派生)。 writable open の
     /// load 末尾で呼ぶ。 これが無いと過去 session で空いた slot が再利用されない。
@@ -11804,12 +11989,7 @@ impl Engine {
     /// 全部 eager に戻る)。 raw cell の走査に替えて、 index は最初に触る列だけ組む。
     fn rebuild_leaf_free_list(&self) -> io::Result<()> {
         let Some(leaf) = self.leaf.as_ref() else { return Ok(()) };
-        // #534: Leaf の列を全部読む。 列の segment を開けなければ開くのを失敗させる (前は列を初めて開く所で panic した)
-        for hid in 0..self.himos.len() {
-            if self.leaf_for(hid).is_some() {
-                self.himos[hid].ensure_loaded()?;
-            }
-        }
+        self.ensure_leaf_columns_loaded()?;
         // 列から Vec に集めて渡す (並べるのは LeafStore 側。 前は HashSet で、 Leaf の cell 100 万で 33 ms)
         let mut live: Vec<u32> = Vec::new();
         for hid in 0..self.himos.len() {
@@ -18170,12 +18350,14 @@ impl Engine {
     /// mark 前の msync で「flag が指す中身」を先に固める順序が要る (flush() から切り出し)。
     #[cfg(not(target_arch = "wasm32"))]
     fn sync_and_mark_clean(&self) -> io::Result<()> {
-        self.sync_and_mark_clean_with(false)
+        self.sync_and_mark_clean_with(false, false)
     }
 
     /// `refs` = 参照数の file も閉じた時の cell と合っている (`seal_vocab_refs` 済み) → `CLEAN_REFS` を書く (#385)。
+    /// `closing` = 閉じる時 (この後に書き手は居ない) → Leaf の空き一覧を file に残して紐名の辞書に `CLEAN_LEAF` を書く (開く時間)。
+    /// 途中の flush では書かない: 印の後に Leaf を書いてから落ちると、 次の open が古い file を信じて live の slot を使い回す
     #[cfg(not(target_arch = "wasm32"))]
-    fn sync_and_mark_clean_with(&self, refs: bool) -> io::Result<()> {
+    fn sync_and_mark_clean_with(&self, refs: bool, closing: bool) -> io::Result<()> {
         // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
         let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
         // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める。 ring は行より先に
@@ -18194,7 +18376,11 @@ impl Engine {
         } else {
             self.vocab.mark_index_clean(true);
         }
-        self.himo_reg.mark_index_clean(true);
+        if closing && self.persist_leaf_free_list().unwrap_or(false) {
+            self.himo_reg.mark_index_clean_leaf();
+        } else {
+            self.himo_reg.mark_index_clean(true);
+        }
         self.write_out_body(true)?;
         if let Backing::Segments(set) = &self.backing {
             set.write_manifest()?;
@@ -18418,7 +18604,7 @@ impl Drop for Engine {
             self.contents.sync();
             // #385: 参照数を閉じた時の cell の数に揃えて (購読が押さえていた番号を返す)、 file を書き出してから印を立てる
             let refs = self.seal_vocab_refs();
-            let _ = self.sync_and_mark_clean_with(refs);
+            let _ = self.sync_and_mark_clean_with(refs, true);
         }
     }
 }
