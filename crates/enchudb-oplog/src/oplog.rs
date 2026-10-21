@@ -1035,7 +1035,7 @@ impl OpLog {
         Ok(head.iter().all(|&b| b == 0))
     }
 
-    /// 既存 WAL を開く。v2 のみ対応。
+    /// 既存 WAL を開く。 v3 (周の印あり) と v2 (周の印なし。 最初に畳む時に v3 になる) を読む。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &Path) -> io::Result<Self> {
         crate::io_point("oplog.open")?;
