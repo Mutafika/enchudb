@@ -6187,7 +6187,7 @@ impl Engine {
 
         // #77-H6: 既存 DB の再 enable (reopen 経路) では、 body に残る過去 rows /
         // watermark から lsn 採番を復元する。
-        self.rehydrate_next_sync_lsn();
+        self.rehydrate_next_sync_lsn().map_err(|e| e.to_string())?;
 
         // request18: ここが 「この DB は sync に参加する」 と確定する唯一の点。
         // v9 領域 (per-cell version column + tombstone column) はこれ以降に意味を
@@ -6212,25 +6212,24 @@ impl Engine {
     /// 呼ばないと lsn 採番が 1 に戻り、 peer の ack 済み watermark より小さい lsn
     /// が発行されて `pending_sync_ops(since)` が永久に空 = **再起動後の全 write が
     /// 既存 peer に配信されない** silent loss になっていた。
-    fn rehydrate_next_sync_lsn(&self) {
+    ///
+    /// 開く時間: 列を 1 回なめて最大を取る (前は値のある entity の一覧 (Vec、 配る分 100 万行で 4 MB) を作ってから 1 つずつ
+    /// 引いていた)。 呼ぶのは consumer を起こす前 / `&mut self` の中 = 書き手と並走しない (`for_each_set_value` の前提)。
+    /// 列を開けなければ Err (開くのを失敗させる): 黙って低い lsn で進むと #77-H6 の silent loss をそのまま作る。 前は列を初めて
+    /// 読む所で panic していた
+    fn rehydrate_next_sync_lsn(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
-        if !self.sync_tables_enabled() { return; }
+        if !self.sync_tables_enabled() { return Ok(()); }
         let mut max_lsn = 0u32;
-        if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
-            let hid = lsn_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
-            }
-        }
-        if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
-            let hid = cons_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
-            }
+        for name in ["_sync_ops.lsn", "_sync_peers.consumed_lsn"] {
+            let Some(hid) = self.himo_id(name) else { continue };
+            let Some(hs) = self.himos.get(hid) else { continue };
+            hs.ensure_loaded()
+                .map_err(|e| io::Error::new(e.kind(), format!("{name} の列を開けない ({e}) — next_sync_lsn を復元できない")))?;
+            hs.for_each_set_value(|v| {
+                let v = v as u32;
+                if v > max_lsn { max_lsn = v; }
+            });
         }
         if max_lsn > 0 {
             // 既に進んでいる場合は後退させない (enable → open の二重呼び等)
@@ -6239,6 +6238,7 @@ impl Engine {
                 self.next_sync_lsn.store(max_lsn + 1, Ordering::Release);
             }
         }
+        Ok(())
     }
 
     /// 0.7.0 (Phase 3): sync tables が有効化済みか。 schema crate / Syncer が
@@ -16226,7 +16226,7 @@ impl Engine {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let oplog_path = oplog_path_for(path);
         let wal = std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?);
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -16297,7 +16297,7 @@ impl Engine {
             }
             std::sync::Arc::new(w)
         };
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -16808,7 +16808,7 @@ impl Engine {
             }
             std::sync::Arc::new(w)
         };
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
