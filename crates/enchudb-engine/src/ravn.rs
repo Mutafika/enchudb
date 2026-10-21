@@ -60,13 +60,19 @@ impl Ravn {
         None
     }
 
+    /// Ref の cell の値 (local の番号) を、 この peer の頭の付いた eid にする (#556: `reverse_follow` / `pull_raw` と同じ形。
+    /// 前は頭なしで返し、 `bfs` が輪で戻った始点を別の entity と見た)。
+    fn ref_target(&self, val: u64) -> enchudb_oplog::EntityId {
+        enchudb_oplog::make_eid(self.engine.peer_id(), val as u32)
+    }
+
     pub fn follow(&self, start: &[enchudb_oplog::EntityId], steps: &[&str]) -> Vec<enchudb_oplog::EntityId> {
         let mut current: Vec<enchudb_oplog::EntityId> = start.to_vec();
         for step in steps {
             let mut next = Vec::new();
             for &eid in &current {
                 if let Some(val) = self.engine.get(eid, step) {
-                    next.push(val as enchudb_oplog::EntityId);
+                    next.push(self.ref_target(val));
                 }
             }
             current = next;
@@ -439,6 +445,30 @@ mod tests {
         // dept(4) → parent → kanto(1) → parent → japan(0)
         let result = ravn.follow(&[4], &["parent", "parent"]);
         assert_eq!(result, vec![0]);
+    }
+
+    /// #556: peer の頭のある DB で、 `follow` は `reverse_follow` と同じ頭付きの eid を返し、 `bfs` は輪で始点に戻らない。
+    #[test]
+    fn follow_keeps_the_peer_head_and_bfs_stops_on_a_cycle() {
+        let path = "/tmp/enchu_ravn_peer_head.db";
+        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_file(path);
+        let mut eng = Engine::create_standalone(path).unwrap();
+        eng.set_peer_id(7);
+        eng.define_himo("next", ValueType::Ref, 0);
+        let (a, b, c) = (eng.entity().unwrap(), eng.entity().unwrap(), eng.entity().unwrap());
+        assert_eq!(enchudb_oplog::eid_peer(a), 7, "前提: eid に頭がある");
+        eng.tie_ref(a, "next", b);
+        eng.tie_ref(b, "next", c);
+        eng.tie_ref(c, "next", a);
+        eng.rebuild();
+        let ravn = Ravn::new(Arc::new(eng));
+        assert_eq!(ravn.follow(&[a], &["next"]), vec![b]);
+        assert_eq!(ravn.reverse_follow(&[b], "next"), vec![a]);
+        assert_eq!(ravn.reverse_follow(&ravn.follow(&[a], &["next"]), "next"), vec![a], "往復で戻らない");
+        let levels = ravn.bfs(&[a], "next", 6);
+        assert_eq!(levels, vec![(0, vec![a]), (1, vec![b]), (2, vec![c])], "輪で始点を別の entity として再訪した");
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]
