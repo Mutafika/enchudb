@@ -1528,8 +1528,16 @@ impl<'a> TableBuilder<'a> {
 
         // PK 検証
         if let Some(pk_name) = &pk {
-            if !col_specs.iter().any(|(n, _, _)| n == pk_name) {
-                return Err(SchemaError::UnknownColumn(pk_name.clone()));
+            match col_specs.iter().find(|(n, _, _)| n == pk_name) {
+                None => return Err(SchemaError::UnknownColumn(pk_name.clone())),
+                // #551: 名前 (主キー) は辞書の語 (Tag) か数。 Leaf は語を束ねない (値で引けない) ので名前にならない (upsert が
+                // 毎回新しい行を作り、 sync で束ねず、 消した名前も覚えない)。 新しく作る表だけ断る (既にある表は開ける)
+                Some((_, ColumnType::Leaf, _)) => {
+                    return Err(SchemaError::BadValue(format!(
+                        "table '{name}': the name column '{pk_name}' is a leaf column (use tag / number / bigint)"
+                    )));
+                }
+                Some(_) => {}
             }
         }
 
@@ -2013,6 +2021,25 @@ impl<'a> RowBuilder<'a> {
                     }
                 }
             }
+        }
+
+        // #548: 名前 (表で名前と決めた列) の無い行は作らない。 デッキは名前でしかできないので、 名前の無いカードの塊は表の
+        // どこにも現れてはいけない (前は作れてしまい、 表の全部を引く時は出ず、 他の列で引く・数える時は出た)。 upsert で
+        // 当たった既にある行は名前を持っている
+        let name_col = self.table.pk.map(|i| &self.table.cols[i]);
+        if target_eid.is_none()
+            && let Some(nc) = name_col
+            && !resolved.clone().any(|(c, v)| c.name == nc.name && !matches!(v, Value::Null))
+        {
+            return Err(SchemaError::BadValue(format!(
+                "table '{}': a new row needs a value for its name column '{}' (rows without it are not rows)",
+                self.table.name, nc.name
+            )));
+        }
+        // #548: 名前のカードを最初に書く。 sync で書き込みが分かれて届いても、 受け手は名前より先に他のカードを受けない
+        let mut resolved: Vec<_> = resolved.collect();
+        if let Some(nc) = name_col {
+            resolved.sort_by_key(|(c, _)| c.name != nc.name);
         }
 
         let eid = match target_eid {
