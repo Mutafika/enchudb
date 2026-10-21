@@ -5,8 +5,9 @@
 //! - `order_by` + `limit`: 並びの列を値の順にたどって limit 件で止める (全部を引いて並べない)
 //! - `min` / `max` / `min_i64` / `max_i64` / `Table::min` / `Table::max`: 値の順にたどった最初の row の値
 //!
-//! を、 手元の写し (書いた値を全部覚えたもの) をなめた答え (別の道) と比べる。 書き換え・消し・主キーの無い row・
-//! BigInt の負の数と大きな数 (dense と sparse の両方)・Tag の列を混ぜる。
+//! を、 手元の写し (書いた値を全部覚えたもの) をなめた答え (別の道) と比べる。 書き換え・消し・
+//! BigInt の負の数と大きな数 (dense と sparse の両方)・Tag の列を混ぜる。 主キー (名前) の無い row は #548 の後 schema では
+//! 作れないので混ぜない (写しの規則は engine で直に作った row のために残す)。
 //!
 //! 何が row か: 条件がある時は 「条件に合う entity」 (等値・IN・範囲で同じ。 主キーの無い row も入る)、 条件の無い
 //! `.all()` は代表列 (主キー) のある row だけ (`Table::recent` の doc と同じ)。 `Table::min` / `max` は table の eid の
@@ -119,11 +120,9 @@ fn index_paths_match_mirror() {
     for i in 0..n {
         let mut row = Row { alive: true, ..Default::default() };
         let mut b = t.insert();
-        // 17 行に 1 行は主キーなし、 13 行に 1 行は age なし
-        if i % 17 != 3 {
-            row.id = Some(i as i64);
-            b = b.set("id", i as i64);
-        }
+        // 13 行に 1 行は age なし。 名前 (主キー) の無い行は schema では作れない (#548)
+        row.id = Some(i as i64);
+        b = b.set("id", i as i64);
         if i % 13 != 5 {
             let a = rng.below(100) as u32;
             row.age = Some(a);
