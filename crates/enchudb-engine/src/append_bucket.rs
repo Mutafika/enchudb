@@ -1,18 +1,20 @@
-//! `AppendBucket` — 単一 writer / 多 reader の lock-free append-only 列。 #95。
+//! `AppendBucket` — 書き手 1 本 (値の鍵で守る) / 多 reader の lock-free append-only 列。 #95。
 //!
 //! `BucketCylinder` の各 bucket（value → eid 列）の格納をこれに置き換える土台。
 //! 現状の `RwLock<BucketCylinder>` は read が write に相互排他になり、 長い read が
 //! write を stall させる（#95）。 この型は:
 //!
 //! - **read は完全 lock-free**（writer を一切待たない）。 crossbeam-epoch で pin。
-//! - **write は単一 consumer 前提**で直列（append O(1) amortized）。
+//! - **write は値の鍵で bucket ごとに直列**（append O(1) amortized。 前は consumer 1 本の前提だった）。
 //! - 一度 publish した要素は二度と動かさない（append-only）ので、 read は published
 //!   範囲 `[0..len]` を安全に `&[u32]` として読める。
 //! - 容量超過時のみ backing を倍化し、 旧 backing は epoch で全 reader 通過後に解放。
 //!
 //! ## 並行契約
-//! - `push` / `compact_in` は **同時に 1 thread のみ**（HimoStore write_lock 下）。
-//!   複数 writer は未対応（race する）。
+//! - `push` / `compact_in` は **同時に 1 thread のみ**。 守るのは値ごとの鍵 (`HimoStore` の `value_locks`、 0.32.1 の #467。
+//!   円柱を組む前の書き手・sparse・配列の伸長は `write_lock`、 組む時は `write_guard`)。 鍵を持てば読み手でもよい:
+//!   読み直しの詰め直し (#520、 `HimoStore::compact_if_reread`) は読み手が鍵を取って `compact_in` を呼ぶ。
+//!   鍵なしの複数 writer は未対応（race する）。
 //! - `read_to_vec` / `with_read` / `len` は **多 reader 並行可**、 writer と並行可。
 //! - request12 P2: `compact_in` は backing を組み直して swap するため、
 //!   **len は単調非減少ではない** (compaction で縮む)。reader は len の減少を
@@ -40,6 +42,13 @@ const INITIAL_CAP: usize = 4;
 struct Buf {
     data: Box<[UnsafeCell<u32>]>,
     len: AtomicUsize,
+    /// `data[i]` の entity がこの値を出ていったら bit `i` を立てる (書き手が置いた位置を覚えていて、 書き換え・消しの時に
+    /// 立てる)。 読み手は bit の立っていない entry を写すだけ (Column を読まない)。
+    stale: Box<[AtomicU64]>,
+    /// この backing の古い entry が全部印されているか。 書き手が位置を知らずに古くすると false (次に足す前に下げるので、
+    /// 足した分の見える読み手には下がったのも見える)。 組み直した backing は true。 bucket ごとでなく backing ごとに持つ (読み手は
+    /// 控えた backing の flag を読む: 組み直しの前の backing を控えた読み手が、 組み直した後の true を見ないように)。
+    exact: AtomicBool,
 }
 
 // SAFETY: published 範囲 [0..len] は書き換わらない。 writer は spare slot [len] のみ書く。
@@ -54,7 +63,7 @@ impl Buf {
 
     /// `v` を頭に置いた容量 `cap` (`v.len()` 以上) の backing。 `v` は昇順であること (詰め直しの出力。 読み手は昇順を前提に
     /// しないが、 詰め直した直後の bucket が eid の順で読めることを `compact_sorts_by_eid` が確かめる)。
-    /// 空きは 0 で埋める (`vec![0; cap]` は確保の時に 0 の page をもらうだけ)。
+    /// 空きは 0 で埋める (`vec![0; cap]` は確保の時に 0 の page をもらうだけ)。 古い印は無し、 印は全部そろっている (true)。
     fn from_vec(v: Vec<u32>, cap: usize) -> Self {
         debug_assert!(v.len() <= cap && v.is_sorted());
         let len = v.len();
@@ -67,7 +76,12 @@ impl Buf {
         };
         // SAFETY: UnsafeCell<u32> は u32 と同じ表現 (repr(transparent))。 長さはそのまま移る
         let data = unsafe { Box::from_raw(Box::into_raw(data) as *mut [UnsafeCell<u32>]) };
-        Self { data, len: AtomicUsize::new(len) }
+        Self {
+            data,
+            len: AtomicUsize::new(len),
+            stale: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            exact: AtomicBool::new(true),
+        }
     }
     #[inline]
     fn cap(&self) -> usize {
@@ -84,8 +98,8 @@ impl Buf {
 pub struct AppendBucket {
     backing: Atomic<Buf>,
     /// この bucket の値を Column が現在指している eid 数 (= verify 後の正確な件数)。
-    /// request12: 書き込み側 (HimoStore、write_lock 下) が旧値の decrement / 新値の
-    /// increment を行う。read の fast-path 判定と統計・planner の pivot 選択に使う。
+    /// request12: 値の鍵を持つ側 (HimoStore の書き手、 `value_locks` 下) が旧値の decrement / 新値の
+    /// increment を行う (詰め直しは残った数で置き直す)。read の fast-path 判定と統計・planner の pivot 選択に使う。
     live: AtomicU32,
     /// この bucket に stale (値更新/削除の残骸) が居るか。true なら read は
     /// Column verify + dedup を通す。himo 全体 flag (旧 any_removed) の bucket 局所版。
@@ -96,9 +110,35 @@ pub struct AppendBucket {
     rereads: AtomicU32,
 }
 
-// SAFETY: 単一 writer / 多 reader。 全アクセスは atomic len + epoch で同期される。
+// SAFETY: 書き手は値の鍵で 1 本 / 多 reader。 全アクセスは atomic len + epoch で同期される。
 unsafe impl Sync for AppendBucket {}
 unsafe impl Send for AppendBucket {}
+
+/// `s` のうち、 `marks` の bit (位置 i が bit i) が立っていない entry を `out` に足す (古い印の付いた entry を飛ばす)。
+/// 64 個ずつ印の語を読み、 印の無い塊はそのまま写す。
+pub(crate) fn copy_unmarked(s: &[u32], marks: &[AtomicU64], out: &mut Vec<u32>) {
+    let start = out.len();
+    out.reserve(s.len());
+    let mut w = start;
+    // SAFETY: 書く先は reserve した中 (w は start + 読んだ数を超えない)。 最後に w に長さを合わせる
+    unsafe {
+        let dst = out.as_mut_ptr();
+        for (k, chunk) in s.chunks(64).enumerate() {
+            let m = marks[k].load(Ordering::Acquire);
+            if m == 0 {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst.add(w), chunk.len());
+                w += chunk.len();
+                continue;
+            }
+            // 分かれ道なしで詰める: 毎回書いて、 印が無ければ先へ進む
+            for (i, &e) in chunk.iter().enumerate() {
+                *dst.add(w) = e;
+                w += ((m >> i) & 1 == 0) as usize;
+            }
+        }
+        out.set_len(w);
+    }
+}
 
 /// 同じ eid の 2 本目以降を落とし、 eid の昇順にして返す (重複は稀 = re-tie 往復痕。 hash を使わない)。
 /// 前は重複を探すためだけに (eid, 位置) の写しを並べ、 並びは捨てて元の順 (最初に現れた順) で返していた。 今は並べた順で
@@ -221,8 +261,9 @@ impl AppendBucket {
     }
 
     // ──── request12: bucket ローカルメタデータ ────
-    // live/removed は write_lock 下の単一 writer だけが更新する。read 側の
-    // verify 要否は `read_snapshot_verify` の 3 段プロトコル (slice → flag →
+    // live/removed を更新するのは値の鍵を持つ 1 thread だけ (書き手の set / remove と、 #520 の後は読み手の読み直しの
+    // 詰め直し `compact_in` も。 排他は `value_locks`、 write_lock ではない)。read 側の
+    // verify 要否は `read_marked_verify` の 3 段プロトコル (slice → flag →
     // backing ptr 再検証) で判定する。flag 単独の前読み/後読みはどちらも不健全:
     // - 前読み: flag=false load 後に積まれた churn 痕 (往復 churn の dup) を
     //   fast path が素通しする (PR #103 レビューで実証、再現テストあり)
@@ -284,7 +325,7 @@ impl AppendBucket {
         }
     }
 
-    /// 単一 writer append。 spare があれば in-place、 満杯なら倍化 + epoch 遅延解放。
+    /// 値の鍵を持つ 1 thread の append。 spare があれば in-place、 満杯なら倍化 + epoch 遅延解放。
     /// (standalone 用。 hot path は `push_in` — lib 内 caller が居なくても API として維持)
     #[allow(dead_code)]
     pub fn push(&self, eid: u32) {
@@ -299,7 +340,7 @@ impl AppendBucket {
         let cur = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null（new/push で維持）。
         let b = unsafe { cur.deref() };
-        let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
+        let l = b.len.load(Ordering::Relaxed); // 鍵を持つ 1 thread だけが len を進めるので自身の len は Relaxed で可
         if l < b.cap() {
             // spare slot（未 publish の index l）に書いてから len を publish
             unsafe {
@@ -319,6 +360,11 @@ impl AppendBucket {
             unsafe {
                 *nb.data[l].get() = eid;
             }
+            // 古い印も写す (印を立てるのはこの bucket の書き手 1 本 = 自分なので、 写す間に増えない)
+            for (w, x) in b.stale.iter().enumerate() {
+                nb.stale[w].store(x.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            nb.exact.store(b.exact.load(Ordering::Relaxed), Ordering::Relaxed);
             nb.len.store(l + 1, Ordering::Relaxed); // まだ誰も見ていない
             self.backing.store(Owned::new(nb), Ordering::Release);
             // 旧 backing は全 reader が epoch を通過してから解放
@@ -330,7 +376,7 @@ impl AppendBucket {
     }
 
     /// published prefix を `keep` 判定で組み直して backing を atomic swap する
-    /// (request12 P2 = incremental compaction)。単一 writer (write_lock 下) 前提。
+    /// (request12 P2 = incremental compaction)。値の鍵を持つ 1 thread (書き手か、 #520 の読み直しの詰め直しをする読み手) 前提。
     ///
     /// - 同一 eid の重複 slot (re-tie 往復痕) は 1 本だけ残し、 残した entry は eid の昇順に並べ直す (dedup)
     /// - 旧 backing は epoch で全 reader 通過後に解放 — reader は停止しない
@@ -339,11 +385,17 @@ impl AppendBucket {
     ///   flag=false を見た reader は必ず新 backing を見る。
     ///
     /// 戻り値は compaction 後の live 数。
-    pub fn compact_in(&self, guard: &Guard, mut keep: impl FnMut(u32) -> bool) -> usize {
+    pub fn compact_in(&self, guard: &Guard, keep: impl FnMut(u32) -> bool) -> usize {
+        self.compact_in_placed(guard, keep, |_, _| {})
+    }
+
+    /// [`compact_in`](Self::compact_in) の、 残した entry の新しい位置を `placed(eid, 位置)` で知らせる版 (書き手が位置の表を
+    /// 書き直す)。
+    pub fn compact_in_placed(&self, guard: &Guard, mut keep: impl FnMut(u32) -> bool, mut placed: impl FnMut(u32, usize)) -> usize {
         let cur = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null。
         let b = unsafe { cur.deref() };
-        let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
+        let l = b.len.load(Ordering::Relaxed); // 鍵を持つ 1 thread だけが len を進めるので自身の len は Relaxed で可
         let src = unsafe { b.published(l) };
         // 分岐なしで照らす: 先に置いてから、 残すなら次へ進む (残す / 落とすは書き換えの順に入り混じるので、 分岐は半分外れる)
         let mut kept = vec![0u32; src.len()];
@@ -355,8 +407,12 @@ impl AppendBucket {
         kept.truncate(n);
         let kept = dedup_sorted(kept);
         let live = kept.len();
+        // 残した entry の新しい位置を書き手に知らせる (位置の表を書き直す)
+        for (i, &e) in kept.iter().enumerate() {
+            placed(e, i);
+        }
 
-        // 昇順の列をそのまま backing にする (まだ誰も見ていない)
+        // 昇順の列をそのまま backing にする (まだ誰も見ていない。 古い印は無し、 印はそろっている)
         let nb = Buf::from_vec(kept, live.next_power_of_two().max(INITIAL_CAP));
         self.backing.store(Owned::new(nb), Ordering::Release);
         // SAFETY: 旧 backing は全 reader が epoch を通過してから解放。
@@ -368,6 +424,39 @@ impl AppendBucket {
         self.rereads.store(0, Ordering::Relaxed);
         self.removed.store(false, Ordering::Release); // swap 後 — 順序契約はメソッド doc 参照
         live
+    }
+
+    /// 位置 `p` の entry (`eid` のはず) を古いと印す (この bucket の書き手 1 本で)。 位置を知らない (`None`) か、 そこに
+    /// `eid` が無ければ印せないので、 この bucket の印は不完全になる (読みは Column で確かめる)。
+    pub fn mark_stale(&self, at: Option<(usize, u32)>, guard: &Guard) {
+        let b = unsafe { self.backing.load(Ordering::Acquire, guard).deref() };
+        match at {
+            // 位置の表は書き手が足す時と組み直す時に書くので、 その位置には eid がある (中身は読まない: 古い bucket の中身は
+            // 乱れた位置への読みになる)
+            Some((p, eid)) if p < b.len.load(Ordering::Relaxed) => {
+                debug_assert_eq!(unsafe { *b.data[p].get() }, eid, "位置の表が bucket と合わない");
+                let _ = eid;
+                // 印を立てるのはこの bucket の書き手 1 本 (値の鍵の下) なので、 atomic の RMW でなく読んでから書く
+                let w = &b.stale[p / 64];
+                w.store(w.load(Ordering::Relaxed) | (1u64 << (p % 64)), Ordering::Release);
+            }
+            _ => b.exact.store(false, Ordering::Release),
+        }
+    }
+
+    /// [`snapshot_in`](Self::snapshot_in) に、 古い印の列と 「印が全部か」 を足した版。
+    pub fn snapshot_marked_in<'g>(&self, guard: &'g Guard) -> (&'g [u32], &'g [AtomicU64], bool, bool) {
+        let p1 = self.backing.load(Ordering::Acquire, guard);
+        // SAFETY: backing は常に非 null。
+        let b = unsafe { p1.deref() };
+        let n = b.len.load(Ordering::Acquire);
+        // len の後に読む: 印の付かない古い entry の後に足した分が [0..n] に見えるなら、 その前に下げた flag も見える
+        let exact = b.exact.load(Ordering::Acquire);
+        // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
+        let s = unsafe { b.published(n) };
+        let f = self.removed.load(Ordering::Acquire);
+        let p2 = self.backing.load(Ordering::Acquire, guard);
+        (s, &b.stale, f || p2 != p1, exact)
     }
 
     /// 外部 guard 下で published slice を borrow（query 単位 pin 用、 zero-copy）。
@@ -388,32 +477,35 @@ impl AppendBucket {
         self.with_read(&guard, |s| s.to_vec())
     }
 
-    /// snapshot コピー + verify 要否 (request12)。順序が本質 (PR #103 レビュー):
-    ///
-    /// 1. backing p1 の published slice を copy
-    /// 2. removed flag を load — slice より **後**
-    /// 3. backing p2 を再 load、p1 != p2 なら compaction と交差 → verify
-    ///
-    /// 健全性: churn 痕 (dup / 離脱後 slot と新 slot の混在) を slice で観測した
-    /// なら、その push の len Release-store を Acquire で読んでいる ⇒ writer が
-    /// push より前に立てた flag=true が (2) で見える。flag を false に戻すのは
-    /// compaction だけで、その場合 backing が必ず swap されるので (3) が落とす。
-    /// flag=false && p1==p2 で残る観測遅延は「stale をまだ live と見る」方向のみ
-    /// = 読み開始時点への線形化で正当 (旧 any_removed と同等の許容)。
-    /// guard を (1)-(3) で保持し続けるため旧 backing は解放されず ptr ABA なし。
-    pub fn read_snapshot_verify(&self, guard: &Guard) -> (Vec<u32>, bool) {
-        let p1 = self.backing.load(Ordering::Acquire, guard);
-        // SAFETY: backing は常に非 null。
-        let b = unsafe { p1.deref() };
-        let n = b.len.load(Ordering::Acquire);
-        // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
-        let v = unsafe { b.published(n) }.to_vec();
-        let f = self.removed.load(Ordering::Acquire);
-        let p2 = self.backing.load(Ordering::Acquire, guard);
-        (v, f || p2 != p1)
+    /// 控えた slice を写す読み ([`snapshot_marked_in`](Self::snapshot_marked_in) の 3 段: slice → flag → backing の再検証) で、 古い印が全部そろっていれば印の立った entry を飛ばして
+    /// 写す版。 返すのは `(写し, Column の確かめが要るか, 古い entry があるか)`: 印がそろっていれば確かめは要らない (false) が
+    /// 古い entry はある (true。 読み直しの詰め直しはこちらで数える)。 印が欠けていれば前と同じ (全部写して両方 true)。
+    /// `use_marks` が false (印を持たない列) なら印を見ない (古い entry があれば全部写して確かめを求める)。
+    pub fn read_marked_verify(&self, guard: &Guard, use_marks: bool) -> (Vec<u32>, bool, bool) {
+        let (s, marks, stale, exact) = self.snapshot_marked_in(guard);
+        if stale && exact && use_marks {
+            let mut v = Vec::with_capacity(s.len());
+            copy_unmarked(s, marks, &mut v);
+            (v, false, true)
+        } else {
+            (s.to_vec(), stale, stale)
+        }
     }
 
-    /// [`read_snapshot_verify`](Self::read_snapshot_verify) の、 呼び手の buffer の後ろに足す版 (多くの bucket を
+    /// [`read_marked_verify`](Self::read_marked_verify) の、 呼び手の buffer の後ろに足す版。 返すのは
+    /// `(Column の確かめが要るか, 古い entry があるか)`。
+    pub fn read_marked_verify_into(&self, guard: &Guard, out: &mut Vec<u32>, use_marks: bool) -> (bool, bool) {
+        let (s, marks, stale, exact) = self.snapshot_marked_in(guard);
+        if stale && exact && use_marks {
+            copy_unmarked(s, marks, out);
+            (false, true)
+        } else {
+            out.extend_from_slice(s);
+            (stale, stale)
+        }
+    }
+
+    /// [`read_marked_verify`](Self::read_marked_verify) と同じ 3 段の、 印を見ない版 (呼び手の buffer の後ろに足す。 多くの bucket を
     /// 続けて読む時に、 bucket ごとの Vec を作らない)。 3 段の順序は同じ。
     pub fn read_snapshot_verify_into(&self, guard: &Guard, out: &mut Vec<u32>) -> bool {
         let (s, verify) = self.snapshot_in(guard);

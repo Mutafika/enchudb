@@ -115,8 +115,8 @@ fn main() {
         }
         "mmap_ahead" => {
             // race を deterministic に再現:
-            // 1. tie_async で 1 件書き込み
-            // 2. flush_writes で consumer queue を drain (= mmap に反映、 WAL buffer に append)
+            // 1. tie_async で 1 件書き込み (0.34 から呼んだ thread がその場で mmap に当て、 WAL の mmap にも積む)
+            // 2. flush_writes は何もしない (0.33 までの write queue の名残、 互換で呼んでいる)
             // 3. body_msync で mmap dirty page を強制的に disk へ
             // 4. oplog_sync / oplog_commit は呼ばない (= WAL は buffer のまま disk に行かない)
             // 5. abort で Drop を skip (= consumer thread の周期 fsync も走らず)
