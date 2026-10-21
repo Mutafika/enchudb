@@ -72,8 +72,8 @@ type Segment = (u64, u64, Option<usize>);
 /// [`LockFreeCylinder::for_each_part`] が渡す置き場の 1 単位。 `verify` = 古い entry がありうる (Column で今の値を確かめる。
 /// 無ければ全部 live で重複も無い)。
 pub(crate) enum Part<'a> {
-    /// dense の値 1 つの bucket: eid の列 (置いてある順) と、 その頭の昇順 (広義) の長さ。
-    Bucket { value: u64, eids: &'a [u32], head: usize, verify: bool },
+    /// dense の値 1 つの bucket: eid の列 (置いてある順。 並べていない)。
+    Bucket { value: u64, eids: &'a [u32], verify: bool },
     /// sparse の run 1 本の、 値が `lo..=hi` の区間の eid の列 ((値, eid) の順)。 `lo..=hi` は sparse の区間 (`segments`) で
     /// 切ってある: 区間どうしは重ならず、 dense の bucket の値とも重ならない。
     Run { lo: u64, hi: u64, eids: &'a [u32], verify: bool },
@@ -639,17 +639,15 @@ impl LockFreeCylinder {
         (segs, len)
     }
 
-    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, eid の列, 頭の昇順の長さ, Column で確かめるか)`
-    /// に渡す。 eid の列は古い entry・重複込みで並べていない (`HimoStore::walk_values` が確かめて並べる)。 頭の昇順の長さは
-    /// 置き場が渡す (読む側は探さない): dense の bucket は書き手が足すたびに持っている数 ([`AppendBucket::snapshot_sorted_in`])、
-    /// sparse の値は run ごとの区間のつなぎ目を比べた数 ([`SparseSnap::walk`](crate::sparse_runs::SparseSnap::walk))。
+    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, eid の列, Column で確かめるか)` に渡す。
+    /// eid の列は古い entry・重複込みで並べていない (`HimoStore::walk_values` が確かめて、 同じ値の中は置いてある順に出す。 #481)。
     /// dense の空の要素と live が 0 の bucket は渡さない。 `f` が `Break` を返したら止める。
     ///
     /// 区間 ([`segments`](Self::segments)) を値の順に読むので、 混ぜ合わせずに値の順になる。 sparse の版を **配列より
     /// 先に** 控える: 配列を伸ばす書き手は bucket に移して配列を差し替えてから sparse から消すので、 先に控えた版に無い
     /// 値は、 後で読む配列が覆っている。 配列が覆う区間にある sparse の entry (移した直後の残り) は読まない。 古い entry の
     /// 有無は sparse を控える前に見る (`sparse_churned_before_read`)。
-    pub fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], usize, bool) -> ControlFlow<()>) {
+    pub fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], bool) -> ControlFlow<()>) {
         if lo > hi {
             return;
         }
@@ -668,7 +666,7 @@ impl LockFreeCylinder {
                     continue;
                 }
                 let Some(k) = at else {
-                    sp.walk(a, b, desc, |v, eids, head| f(v, eids, head, churned))?;
+                    sp.walk(a, b, desc, |v, eids| f(v, eids, churned))?;
                     continue;
                 };
                 let (i, j) = (self.slot_index(k, a), self.slot_index(k, b));
@@ -676,8 +674,8 @@ impl LockFreeCylinder {
                 let slots = &vecs[k][i0..=i.max(j)];
                 let mut visit = |i: usize, s: &Slot| match s.get() {
                     Some(bk) if bk.live() > 0 => {
-                        let (raw, head, verify) = bk.snapshot_sorted_in(&guard);
-                        if raw.is_empty() { ControlFlow::Continue(()) } else { f(self.slot_value(k, i0 + i), raw, head, verify) }
+                        let (raw, verify) = bk.snapshot_in(&guard);
+                        if raw.is_empty() { ControlFlow::Continue(()) } else { f(self.slot_value(k, i0 + i), raw, verify) }
                     }
                     _ => ControlFlow::Continue(()),
                 };
@@ -724,9 +722,9 @@ impl LockFreeCylinder {
                     if let Some(bk) = s.get()
                         && bk.live() > 0
                     {
-                        let (eids, head, verify) = bk.snapshot_sorted_in(&guard);
+                        let (eids, verify) = bk.snapshot_in(&guard);
                         if !eids.is_empty() {
-                            f(Part::Bucket { value: self.slot_value(k, i0 + d), eids, head, verify });
+                            f(Part::Bucket { value: self.slot_value(k, i0 + d), eids, verify });
                         }
                     }
                 }
@@ -1454,9 +1452,7 @@ mod tests {
     fn walked(c: &LockFreeCylinder, cells: &Cells, lo: u64, hi: u64, desc: bool, limit: usize) -> Vec<(u64, Vec<u32>)> {
         let mut out: Vec<(u64, Vec<u32>)> = Vec::new();
         let mut n = 0;
-        c.walk(lo, hi, desc, |v, raw, head, verify| {
-            // 置き場が渡す頭の長さは、 探した長さとちょうど同じ (短いと遅く、 長いと答えが壊れる)
-            assert_eq!(head, crate::append_bucket::sorted_prefix_len(raw), "値 {v}: 頭の昇順の長さが合わない");
+        c.walk(lo, hi, desc, |v, raw, verify| {
             let mut got: Vec<u32> = raw.iter().copied().filter(|&e| !verify || cells.0.borrow().get(&e) == Some(&v)).collect();
             got.sort_unstable();
             got.dedup();
@@ -1471,13 +1467,12 @@ mod tests {
     }
 
     /// `for_each_part` で置き場の単位に読んだ entry を、 `HimoStore::pull_range_unordered` と同じく確かめて集める (重複を落として
-    /// eid の昇順で返す)。 置き場の形も見る: bucket の頭の長さは探した長さと同じ、 bucket の値と run の区間は問い合わせの範囲の中で
-    /// 重ならない、 古い entry の無い所 (`verify` が false) の eid に重複が無い。
+    /// eid の昇順で返す)。 置き場の形も見る: bucket の値と run の区間は問い合わせの範囲の中で重ならない、 古い entry の無い所
+    /// (`verify` が false) の eid に重複が無い。
     fn parted(c: &LockFreeCylinder, cells: &Cells, lo: u64, hi: u64) -> Vec<u32> {
         let (mut clean, mut checked, mut values, mut spans) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         c.for_each_part(lo, hi, |part| match part {
-            Part::Bucket { value, eids, head, verify } => {
-                assert_eq!(head, crate::append_bucket::sorted_prefix_len(eids), "値 {value}: 頭の昇順の長さが合わない");
+            Part::Bucket { value, eids, verify } => {
                 assert!(lo <= value && value <= hi, "範囲の外の bucket {value}");
                 values.push(value);
                 if verify {

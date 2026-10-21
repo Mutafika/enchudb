@@ -199,11 +199,14 @@ pub struct HimoStore {
     present: PresentCount,
 }
 
-/// 古い entry のある bucket (値 `value`) の eid の列 `eids` (頭 `head` 件が広義の昇順) から、 今の値がちょうど `value` の entity を
-/// 1 回ずつ `out` に足す。 同じ entity が 2 つ以上あるのは往復した時だけで、 頭の中では隣り合い (昇順)、 頭の後ろの分は頭か
-/// 後ろのどこかにもう 1 つある。 頭は確かめて隣の重複を落とすだけ (並べない)。 後ろは確かめた分を並べ、 隣の重複と、 頭に
-/// 入れたものを落とす (頭は昇順なので、 並べた後ろの順に跳びながら探す)。 足した分の順: 頭の分 (昇順) の後ろに後ろの分 (昇順)。
-fn push_live_once(col: &Column, value: u64, eids: &[u32], head: usize, out: &mut Vec<u32>) {
+/// 古い entry のある bucket (値 `value`) の eid の列 `eids` から、 今の値がちょうど `value` の entity を 1 回ずつ `out` に足す。
+/// 頭の昇順 (広義) の長さは読む時に探す ([`sorted_prefix_len`](crate::append_bucket::sorted_prefix_len)、 昇順の塊は 256 個ごとに
+/// 飛ぶので、 entry ごとの確かめの読みより軽い。 書き手は持たない、 #558)。 同じ entity が 2 つ以上あるのは往復した時だけで、
+/// 頭の中では隣り合い (昇順)、 頭の後ろの分は頭か後ろのどこかにもう 1 つある。 頭は確かめて隣の重複を落とすだけ (並べない)。
+/// 後ろは確かめた分を並べ、 隣の重複と、 頭に入れたものを落とす (頭は昇順なので、 並べた後ろの順に跳びながら探す)。 足した分の順:
+/// 頭の分 (昇順) の後ろに後ろの分 (昇順)。
+fn push_live_once(col: &Column, value: u64, eids: &[u32], out: &mut Vec<u32>) {
+    let head = crate::append_bucket::sorted_prefix_len(eids);
     let want = value + 1;
     let start = out.len();
     let mut last = None;
@@ -1203,7 +1206,7 @@ impl HimoStore {
     pub(crate) fn walk_values(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &mut BucketIter<'_>) -> ControlFlow<()>) {
         self.ensure_cylinder_built();
         let col = self.col();
-        self.cyl.walk(lo, hi, desc, |v, raw, _head, verify| f(v, &mut BucketIter::new(raw, verify.then_some((col, v + 1)))));
+        self.cyl.walk(lo, hi, desc, |v, raw, verify| f(v, &mut BucketIter::new(raw, verify.then_some((col, v + 1)))));
     }
 
     /// 値が `lo..=hi` の live な entity の数 (`pull_range(lo, hi).len()` と同じ数)。 dense の値は bucket の live の数を
@@ -1251,7 +1254,7 @@ impl HimoStore {
                 }
                 out.extend_from_slice(&eids);
             }
-            Part::Bucket { value, eids, head, verify: true } => push_live_once(col, value, eids, head, &mut out),
+            Part::Bucket { value, eids, verify: true } => push_live_once(col, value, eids, &mut out),
             Part::Run { lo, hi, eids, verify: true } => loose.extend(eids.iter().copied().filter(|&e| {
                 let s = stored_at(col, e);
                 s != 0 && lo < s && s - 1 <= hi
