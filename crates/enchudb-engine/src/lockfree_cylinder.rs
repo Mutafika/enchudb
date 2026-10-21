@@ -72,8 +72,9 @@ type Segment = (u64, u64, Option<usize>);
 /// [`LockFreeCylinder::for_each_part`] が渡す置き場の 1 単位。 `verify` = 古い entry がありうる (Column で今の値を確かめる。
 /// 無ければ全部 live で重複も無い)。
 pub(crate) enum Part<'a> {
-    /// dense の値 1 つの bucket: eid の列 (置いてある順。 並べていない)。
-    Bucket { value: u64, eids: &'a [u32], verify: bool },
+    /// dense の値 1 つの bucket: eid の列 (置いてある順。 並べていない)。 `marks` = 古い印の列 (印が全部そろっている時だけ。
+    /// あれば Column の確かめの代わりに印で飛ばせる)。
+    Bucket { value: u64, eids: &'a [u32], verify: bool, marks: Option<&'a [AtomicU64]> },
     /// sparse の run 1 本の、 値が `lo..=hi` の区間の eid の列 ((値, eid) の順)。 `lo..=hi` は sparse の区間 (`segments`) で
     /// 切ってある: 区間どうしは重ならず、 dense の bucket の値とも重ならない。
     Run { lo: u64, hi: u64, eids: &'a [u32], verify: bool },
@@ -200,7 +201,42 @@ pub fn dense_grow_count() -> usize {
     DENSE_GROWS.load(Ordering::Relaxed)
 }
 
+/// entity ごとの、 今の値の dense の bucket の中の位置 + 1 (0 = 知らない / sparse)。 列の大きさ (`Column::max_entities`) で組む時に
+/// 1 本、 匿名の mmap で取る (0 の page は触った所だけが実際のメモリになる。 heap を数える道具 (#394 の test) にも乗らない:
+/// readonly の process は触らないので何も増えない)。 読み手は使わない (書き手が値の鍵と行の鍵の下で、 自分の entity の分だけ触る)。
+/// 1 entity 4 B が、 書き換えのある entity の分だけ実際のメモリになる。
+struct SlotTable {
+    map: memmap2::MmapMut,
+    n: usize,
+}
+
+impl SlotTable {
+    fn new(n: usize) -> Option<Self> {
+        if n == 0 {
+            return None;
+        }
+        let map = memmap2::MmapMut::map_anon(n.checked_mul(4)?).ok()?;
+        Some(Self { map, n })
+    }
+
+    #[inline]
+    fn get(&self, eid: u32) -> Option<&AtomicU32> {
+        let i = eid as usize;
+        if i >= self.n {
+            return None;
+        }
+        // SAFETY: map は n × 4 byte で page に揃っている (AtomicU32 の alignment を満たす)。 中身は 0 で始まり、 以後は AtomicU32 と
+        // してだけ読み書きする (`&mut` では触らない)。 map は self が生きている間生きている
+        Some(unsafe { &*(self.map.as_ptr() as *const AtomicU32).add(i) })
+    }
+}
+
 pub struct LockFreeCylinder {
+    /// entity ごとの bucket の中の位置 + 1 ([`SlotTable`]、 組む時に [`init_slots`](Self::init_slots)。 取れなければ None = 印なし)。
+    /// 書き換え・消しの時に古い entry へ印を立てるのに使う ([`note_stale_of_in`](Self::note_stale_of_in))。
+    slots: std::sync::OnceLock<Option<SlotTable>>,
+    /// 位置の印を使うか (表を取れたら true、 [`disable_marks`](Self::disable_marks) で false)。 読み手は印を信用する前に見る。
+    marks_on: AtomicBool,
     /// `dense` の 0 番に当たる値 ([`set_low_base`](Self::set_low_base)、 既定 0)。 組んだ後は変わらない。
     low_base: AtomicU64,
     dense: Atomic<DenseArr>,
@@ -257,6 +293,8 @@ impl LockFreeCylinder {
         // 確保するのは要素 (空の Slot) だけ。 bucket は値が入った時に作る (#358)
         let init: DenseArr = (0..hint).map(|_| Slot::empty()).collect();
         Self {
+            slots: std::sync::OnceLock::new(),
+            marks_on: AtomicBool::new(false),
             low_base: AtomicU64::new(0),
             dense: Atomic::new(init),
             dense_pos: Atomic::new(Vec::new()),
@@ -406,26 +444,89 @@ impl LockFreeCylinder {
         self.dense_slot(value).is_some_and(|(k, i)| i < self.vec_of(k, guard).len())
     }
 
-    /// 値更新 / 削除で `value` の bucket に stale が残ることを記録する (request12)。
-    /// 該当 bucket の removed flag を立て、live を -1。 その bucket の書き手 1 本 (`HimoStore` の値の鍵の下、 sparse の
-    /// 値は write_lock の下) で呼ぶ。
-    /// **Column を書き換える前に呼ぶこと** (reader が「flag 未設定なのに Column は
-    /// 新値」を観測する窓を作らない — 旧 mark_removed と同じ順序契約)。
-    ///
-    /// 戻り値は `(bucket の raw len, 減分後の live)` — 呼び出し側 (HimoStore) が
-    /// incremental compaction の trigger 判定 (stale 率) に使う (P2)。
-    pub fn note_stale(&self, value: u64) -> Option<(usize, u32)> {
-        self.note_stale_in(value, &epoch::pin())
+    /// 値 `value` の bucket から entity `eid` が出ていく (書き換え・消し) ことを、 Column を書く **前** に記す: bucket の `removed`
+    /// flag を立て (読みは Column で確かめるか印で飛ばす)、 覚えている位置の entry に古い印を立てる (位置を知らなければ印は不完全
+    /// になり、 その bucket の読みは Column で確かめる)。 戻り値は `(bucket の raw len, 減分後の live)` — 呼び出し側 (HimoStore) が
+    /// incremental compaction の trigger 判定 (stale 率) に使う (P2)。 書き手が 1 回の書き込みで pin を 1 回にするため guard は外から。
+    pub(crate) fn note_stale_of_in(&self, value: u64, eid: u32, guard: &Guard) -> Option<(usize, u32)> {
+        self.note_stale_at(value, Some(eid), guard)
     }
 
-    /// [`note_stale`](Self::note_stale) の外部 guard 版 (書き手が 1 回の書き込みで pin を 1 回にする)。
-    pub(crate) fn note_stale_in(&self, value: u64, guard: &Guard) -> Option<(usize, u32)> {
+    /// 位置の表を列の大きさ `n` で取る (組む前に 1 回。 2 回目からは何もしない。 取れなければ印なしで動く)。
+    pub(crate) fn init_slots(&self, n: u32) {
+        let on = self.slots.get_or_init(|| SlotTable::new(n as usize)).is_some();
+        self.marks_on.store(on, Ordering::Release);
+    }
+
+    /// 位置の印を使うのをやめる (読みは Column で確かめる道に戻り、 書き手は印を付けない)。 宣言を外した時。
+    pub(crate) fn disable_marks(&self) {
+        self.marks_on.store(false, Ordering::Release);
+    }
+
+    /// 位置の印を使っているか (宣言して組んだ後)。
+    #[inline]
+    pub(crate) fn marks_on(&self) -> bool {
+        self.marks_on.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn slot(&self, eid: u32) -> Option<&AtomicU32> {
+        self.slots.get()?.as_ref()?.get(eid)
+    }
+
+    #[inline]
+    fn slot_get(&self, eid: u32) -> Option<usize> {
+        let v = self.slot(eid)?.load(Ordering::Relaxed);
+        (v != 0).then(|| v as usize - 1)
+    }
+
+    #[inline]
+    fn slot_set(&self, eid: u32, pos: usize) {
+        if let Some(c) = self.slot(eid) {
+            c.store(u32::try_from(pos + 1).unwrap_or(0), Ordering::Relaxed);
+        }
+    }
+
+    /// entity が dense の bucket を離れた (sparse に移った・値が無くなった) 時に位置を消す。
+    #[inline]
+    pub(crate) fn forget_slot(&self, eid: u32) {
+        if let Some(c) = self.slot(eid) {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// 位置の表の entity の行を先に cache に載せる (値は使わない。 鍵を取った後に読み直す — 間に組み直しが入ると位置が
+    /// 変わるので)。 書き換えの最初に呼ぶと、 Column の古い値の読みと並んで待つ。
+    #[inline]
+    pub(crate) fn prefetch_slot(&self, eid: u32) {
+        if let Some(c) = self.slot(eid) {
+            std::hint::black_box(c.load(Ordering::Relaxed));
+        }
+    }
+
+    /// 出ていく entity を知らない版 (印は付けられず、 その bucket の読みは Column で確かめる)。 test が 「印の無い古い entry」 の道を
+    /// 通すのに使う。
+    #[cfg(test)]
+    pub(crate) fn note_stale(&self, value: u64) -> Option<(usize, u32)> {
+        self.note_stale_at(value, None, &epoch::pin())
+    }
+
+    fn note_stale_at(&self, value: u64, eid: Option<u32>, guard: &Guard) -> Option<(usize, u32)> {
         // 立っていれば書かない (書き手が並ぶと、 同じ値の store でも cache line を取り合う)
         if !self.any_removed.load(Ordering::Relaxed) {
             self.any_removed.store(true, Ordering::Relaxed);
         }
         let stats = match self.writer_dense_at(value, guard) {
-            Some(Some(b)) => b.note_stale().map(|prev| (b.len_in(guard), prev - 1)),
+            Some(Some(b)) => {
+                // 印を使う列なら、 覚えている位置の entry に古い印を立てる (印は removed より先に。 読み手は印を見て飛ばす)
+                if self.marks_on() {
+                    match eid {
+                        Some(e) => b.mark_stale(self.slot_get(e).map(|p| (p, e)), guard),
+                        None => b.mark_stale(None, guard),
+                    }
+                }
+                b.note_stale().map(|prev| (b.len_in(guard), prev - 1))
+            }
             Some(None) => {
                 debug_assert!(false, "note_stale: 未確保 bucket (value={value})");
                 None
@@ -465,7 +566,7 @@ impl LockFreeCylinder {
     pub(crate) fn compact_bucket_in(&self, value: u64, guard: &Guard, keep: impl FnMut(u32) -> bool) -> usize {
         match self.writer_dense_at(value, guard) {
             Some(Some(b)) => {
-                b.compact_in(guard, keep)
+                b.compact_in_placed(guard, keep, |e, i| self.slot_set(e, i))
             }
             // 空の要素 / sparse は値ごとに組み直さない (`compact_sparse` が全体で)
             _ => 0,
@@ -647,11 +748,12 @@ impl LockFreeCylinder {
     /// 先に** 控える: 配列を伸ばす書き手は bucket に移して配列を差し替えてから sparse から消すので、 先に控えた版に無い
     /// 値は、 後で読む配列が覆っている。 配列が覆う区間にある sparse の entry (移した直後の残り) は読まない。 古い entry の
     /// 有無は sparse を控える前に見る (`sparse_churned_before_read`)。
-    pub fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], bool) -> ControlFlow<()>) {
+    pub fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], bool, Option<&[AtomicU64]>) -> ControlFlow<()>) {
         if lo > hi {
             return;
         }
         let churned = self.sparse_churned_before_read();
+        let on = self.marks_on();
         let _ = self.sparse.snapshot(|sp| {
             let guard = epoch::pin();
             let vecs = [LOW, POS, NEG].map(|k| self.vec_of(k, &guard));
@@ -666,7 +768,7 @@ impl LockFreeCylinder {
                     continue;
                 }
                 let Some(k) = at else {
-                    sp.walk(a, b, desc, |v, eids| f(v, eids, churned))?;
+                    sp.walk(a, b, desc, |v, eids| f(v, eids, churned, None))?;
                     continue;
                 };
                 let (i, j) = (self.slot_index(k, a), self.slot_index(k, b));
@@ -674,8 +776,8 @@ impl LockFreeCylinder {
                 let slots = &vecs[k][i0..=i.max(j)];
                 let mut visit = |i: usize, s: &Slot| match s.get() {
                     Some(bk) if bk.live() > 0 => {
-                        let (raw, verify) = bk.snapshot_in(&guard);
-                        if raw.is_empty() { ControlFlow::Continue(()) } else { f(self.slot_value(k, i0 + i), raw, verify) }
+                        let (raw, marks, verify, exact) = bk.snapshot_marked_in(&guard);
+                        if raw.is_empty() { ControlFlow::Continue(()) } else { f(self.slot_value(k, i0 + i), raw, verify, (verify && exact && on).then_some(marks)) }
                     }
                     _ => ControlFlow::Continue(()),
                 };
@@ -703,6 +805,7 @@ impl LockFreeCylinder {
             return;
         }
         let churned = self.sparse_churned_before_read();
+        let on = self.marks_on();
         self.sparse.snapshot(|sp| {
             let guard = epoch::pin();
             let vecs = [LOW, POS, NEG].map(|k| self.vec_of(k, &guard));
@@ -722,9 +825,9 @@ impl LockFreeCylinder {
                     if let Some(bk) = s.get()
                         && bk.live() > 0
                     {
-                        let (eids, verify) = bk.snapshot_in(&guard);
+                        let (eids, marks, verify, exact) = bk.snapshot_marked_in(&guard);
                         if !eids.is_empty() {
-                            f(Part::Bucket { value: self.slot_value(k, i0 + d), eids, verify });
+                            f(Part::Bucket { value: self.slot_value(k, i0 + d), eids, verify, marks: (verify && exact && on).then_some(marks) });
                         }
                     }
                 }
@@ -802,6 +905,7 @@ impl LockFreeCylinder {
             self.used[k].fetch_add(1, Ordering::Relaxed);
         }
         let prev_len = b.push_in(eid, guard);
+        self.slot_set(eid, prev_len);
         let prev_live = b.live_inc();
         self.bump_stats(prev_len == 0, prev_live == 0);
     }
@@ -832,6 +936,7 @@ impl LockFreeCylinder {
         let Some((k, i)) = self.dense_slot(value) else {
             // 値の種類数 (unique_count / unique_live) は dense の分だけ数える
             self.sparse.insert(value, eid);
+            self.forget_slot(eid);
             return;
         };
         let dense = self.arr(k);
@@ -846,6 +951,7 @@ impl LockFreeCylinder {
         if !may_grow || self.grow_too_sparse(k, i, vec.len()) {
             // 伸ばさない (伸ばすと空の要素ばかりになる): sparse に置く。 entry が溜まれば、 後で伸ばす時に dense へ移る
             self.sparse.insert(value, eid);
+            self.forget_slot(eid);
             self.waiting[k].fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -906,7 +1012,8 @@ impl LockFreeCylinder {
                 self.used[k].fetch_add(1, Ordering::Relaxed);
                 self.unique_count.fetch_add(1, Ordering::Relaxed);
             }
-            b.push_in(e, guard);
+            let at = b.push_in(e, guard);
+            self.slot_set(e, at);
             if b.live_inc() == 0 {
                 self.unique_live.fetch_add(1, Ordering::Relaxed);
             }
@@ -986,6 +1093,7 @@ impl LockFreeCylinder {
                         self.used[k].fetch_add(1, Ordering::Relaxed);
                     }
                     let prev_len = b.push_in(eid, &guard);
+                    self.slot_set(eid, prev_len);
                     let prev_live = b.live_inc();
                     self.bump_stats(prev_len == 0, prev_live == 0);
                 }
@@ -1038,12 +1146,20 @@ impl LockFreeCylinder {
     }
 
     /// `read_to_vec` + この bucket の read が Column verify を要するか (request12)。
-    /// 判定は `AppendBucket::read_snapshot_verify` の 3 段プロトコル
+    /// 判定は `AppendBucket::read_marked_verify` の 3 段プロトコル
     /// (slice → flag → backing ptr 再検証) — 順序の健全性論証はそちらの doc 参照。
     pub fn read_to_vec_verify(&self, value: u64) -> (Vec<u32>, bool) {
+        let (v, needs, _) = self.read_to_vec_marked(value);
+        (v, needs)
+    }
+
+    /// [`read_to_vec_verify`](Self::read_to_vec_verify) に 「古い entry があるか」 を足した版: `(写し, Column の確かめが要るか,
+    /// 古い entry があるか)`。 古い印のそろった bucket は印の立った entry を飛ばして写すので確かめは要らないが、 古い entry は
+    /// ある (読み直しの詰め直し `HimoStore::compact_if_reread` はこちらで数える)。
+    pub fn read_to_vec_marked(&self, value: u64) -> (Vec<u32>, bool, bool) {
         self.with_value(
             value,
-            |b, guard| b.map_or((Vec::new(), false), |b| b.read_snapshot_verify(guard)),
+            |b, guard| b.map_or((Vec::new(), false, false), |b| b.read_marked_verify(guard, self.marks_on())),
             |sparse| {
                 // 古い entry の有無は **読む前** に見る (`sparse_churned_before_read`)
                 let churned = self.sparse_churned_before_read();
@@ -1053,7 +1169,7 @@ impl LockFreeCylinder {
                 if out.len() > 1 {
                     out.sort_unstable();
                 }
-                (out, churned)
+                (out, churned, churned)
             },
         )
     }
@@ -1061,8 +1177,17 @@ impl LockFreeCylinder {
     /// [`read_to_vec_verify`](Self::read_to_vec_verify) の、 呼び手の buffer の後ろに足す版 (多くの値を続けて
     /// 読む時に、 値ごとの Vec を作らない)。 読み方は [`with_value`](Self::with_value) と同じで、 sparse を読んだ後に
     /// 値が dense に移っていたら、 足した分を捨てて dense を読み直す。 返り値 = 足した分が Column verify を要するか。
-    pub fn read_into_verify(&self, value: u64, out: &mut Vec<u32>) -> bool {
+    #[cfg(test)]
+    pub(crate) fn read_into_verify(&self, value: u64, out: &mut Vec<u32>) -> bool {
+        self.read_into_marked(value, out).0
+    }
+
+    /// [`read_to_vec_marked`](Self::read_to_vec_marked) の、 呼び手の buffer の後ろに足す版 (多くの値を続けて読む時に、 値ごとの
+    /// Vec を作らない)。 読み方は [`with_value`](Self::with_value) と同じで、 sparse を読んだ後に値が dense に移っていたら、 足した分を
+    /// 捨てて dense を読み直す。 返り値 = `(足した分が Column の確かめを要するか, 古い entry があるか)`。
+    pub fn read_into_marked(&self, value: u64, out: &mut Vec<u32>) -> (bool, bool) {
         let start = out.len();
+        let on = self.marks_on();
         let sparse_into = |out: &mut Vec<u32>| {
             // 古い entry の有無は **読む前** に見る (`sparse_churned_before_read`)
             let churned = self.sparse_churned_before_read();
@@ -1072,14 +1197,14 @@ impl LockFreeCylinder {
             if out.len() - start > 1 {
                 out[start..].sort_unstable();
             }
-            churned
+            (churned, churned)
         };
         let guard = epoch::pin();
         let Some((k, i)) = self.dense_slot(value) else {
             return sparse_into(out);
         };
         if let Some(b) = self.dense_at(k, i, &guard) {
-            return b.is_some_and(|b| b.read_snapshot_verify_into(&guard, out));
+            return b.map_or((false, false), |b| b.read_marked_verify_into(&guard, out, on));
         }
         hook::at("reader_missed_dense");
         let r = sparse_into(out);
@@ -1087,7 +1212,7 @@ impl LockFreeCylinder {
         match self.dense_at(k, i, &guard) {
             Some(b) => {
                 out.truncate(start);
-                b.is_some_and(|b| b.read_snapshot_verify_into(&guard, out))
+                b.map_or((false, false), |b| b.read_marked_verify_into(&guard, out, on))
             }
             None => r,
         }
@@ -1452,7 +1577,7 @@ mod tests {
     fn walked(c: &LockFreeCylinder, cells: &Cells, lo: u64, hi: u64, desc: bool, limit: usize) -> Vec<(u64, Vec<u32>)> {
         let mut out: Vec<(u64, Vec<u32>)> = Vec::new();
         let mut n = 0;
-        c.walk(lo, hi, desc, |v, raw, verify| {
+        c.walk(lo, hi, desc, |v, raw, verify, _marks| {
             let mut got: Vec<u32> = raw.iter().copied().filter(|&e| !verify || cells.0.borrow().get(&e) == Some(&v)).collect();
             got.sort_unstable();
             got.dedup();
@@ -1472,7 +1597,7 @@ mod tests {
     fn parted(c: &LockFreeCylinder, cells: &Cells, lo: u64, hi: u64) -> Vec<u32> {
         let (mut clean, mut checked, mut values, mut spans) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         c.for_each_part(lo, hi, |part| match part {
-            Part::Bucket { value, eids, verify } => {
+            Part::Bucket { value, eids, verify, .. } => {
                 assert!(lo <= value && value <= hi, "範囲の外の bucket {value}");
                 values.push(value);
                 if verify {

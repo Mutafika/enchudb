@@ -123,6 +123,10 @@ const CLEAN_GEN: u32 = 2;
 /// 書く。 0.29.0 は `CLEAN_GEN` でないので索引を作り直す (遅いだけ) うえ、 閉じる時に `CLEAN_GEN` を書く = 0.29.0 が
 /// 書いた後の参照数は信じない (数え直す)。
 const CLEAN_REFS: u32 = 3;
+/// 開く時間: `CLEAN_GEN` に加えて、 Leaf の空き一覧の file (`{db}/leaf.free`) が閉じた時の store と合っている印。 engine が閉じる時に
+/// 紐名の辞書 (himo_reg、 語の無い DB にも必ずある) にだけ書く。 知らない binary は `CLEAN_GEN` でないので索引を作り直す (紐名は
+/// 少ないので一瞬) うえ、 閉じる時に `CLEAN_GEN` を書く = その binary が書いた後の file は信じない
+const CLEAN_LEAF: u32 = 4;
 /// #374: 伸びる表 (今の表の位置と大きさを header の `GEN_OFF` に持つ)。
 const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'4'];
 /// 全域の表 (0.14 〜 0.28.5)。 書き手は開いた時に `VIX4` へ作り直す。 readonly はそのまま全域の表として読む。
@@ -303,6 +307,8 @@ pub struct Vocabulary {
     reclaim: std::sync::OnceLock<Reclaim>,
     /// #385: 開いた時の clean flag が `CLEAN_REFS` だった (= 参照数の file を数え直さずに使える)。
     refs_clean_on_load: bool,
+    /// 開く時間: 開いた時の clean flag が `CLEAN_LEAF` だった (= Leaf の空き一覧の file を信じてよい、 紐名の辞書だけ)
+    leaf_free_on_load: bool,
     /// #381: 今の表の中の、 語が入れ替わって死んだ entry の数 (回収で場所を別の語に渡すたびに 1)。 表の埋まりに
     /// 数え、 増えたら表を作り直して落とす。
     stale_entries: AtomicU32,
@@ -364,6 +370,7 @@ impl Vocabulary {
             readonly: false,
             reclaim: std::sync::OnceLock::new(),
             refs_clean_on_load: false,
+            leaf_free_on_load: false,
             stale_entries: AtomicU32::new(0),
         }
     }
@@ -399,7 +406,8 @@ impl Vocabulary {
         let xm = index.slice();
         let index_cap = u32::from_le_bytes(xm[4..8].try_into().unwrap());
         let magic: [u8; 4] = xm[0..4].try_into().unwrap();
-        let usable = magic == INDEX_MAGIC && (is_fresh || clean_flag == CLEAN_GEN || clean_flag == CLEAN_REFS);
+        let usable = magic == INDEX_MAGIC
+            && (is_fresh || clean_flag == CLEAN_GEN || clean_flag == CLEAN_REFS || clean_flag == CLEAN_LEAF);
         // readonly で全域の表 (VIX3) を graceful close のまま読む
         let legacy_clean = readonly && magic == INDEX_MAGIC_V3 && (is_fresh || clean_flag == 1);
 
@@ -420,6 +428,7 @@ impl Vocabulary {
             readonly,
             reclaim: std::sync::OnceLock::new(),
             refs_clean_on_load: usable && !is_fresh && clean_flag == CLEAN_REFS,
+            leaf_free_on_load: usable && !is_fresh && clean_flag == CLEAN_LEAF,
             stale_entries: AtomicU32::new(0),
         };
         if usable {
@@ -1392,6 +1401,20 @@ impl Vocabulary {
             return self.mark_index_clean(true);
         }
         self.data.write_at(CLEAN_FLAG_OFF, &CLEAN_REFS.to_le_bytes());
+        self.clean_on_disk.store(true, Ordering::Release);
+    }
+
+    /// 開く時間: 開いた時の印が `CLEAN_LEAF` だったか (engine が開く時に 1 回見る)
+    pub fn leaf_free_on_load(&self) -> bool {
+        self.leaf_free_on_load
+    }
+
+    /// 開く時間: `CLEAN_LEAF` を書く (閉じる時、 Leaf の空き一覧の file が届いた後に、 engine が紐名の辞書にだけ)
+    pub fn mark_index_clean_leaf(&self) {
+        if self.data.ensure_committed(HEADER).is_err() {
+            return;
+        }
+        self.data.write_at(CLEAN_FLAG_OFF, &CLEAN_LEAF.to_le_bytes());
         self.clean_on_disk.store(true, Ordering::Release);
     }
 
