@@ -1249,6 +1249,47 @@ fn new_tag_word_survives_power_loss_before_write_out() {
     panic!("前提を作れなかった (20 回とも、 像を撮る前に辞書が書き出された)");
 }
 
+/// #550: 主キーのある行を消して `oplog_sync` が返った直後の電源断の像でも、 消した主キー (`pktombs`) が残る。 `oplog_sync` は
+/// checkpoint を進めるので、 開く時に WAL の削除は当て直されず、 本体の主キーの cell も消えている (引き直せない)。 前は
+/// `pktombs` を consumer の周期 (最大 100 ms 後) か flush でしか書かず、 その間の電源断で失った。
+#[test]
+fn deleted_primary_keys_survive_power_loss_after_oplog_sync() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("pktombs");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+    eng.define_table("t", 1_000).unwrap();
+    eng.define_himo_in("t", "key", ValueType::Number, 0).unwrap();
+    let key = eng.himo_id("t.key").expect("t.key") as u16;
+    eng.set_table_pk("t", key).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let e = eng.entity_in("t").unwrap();
+    eng.tie_to_by_id(e, key, 7u32);
+    eng.oplog_sync().unwrap();
+    eng.delete(e);
+    eng.oplog_sync().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    let back = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    let n = back.deleted_primary_key_count();
+    drop(back);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(n, 1, "oplog_sync の返った削除の主キーが電源断の像で消えた");
+}
+
 /// #557: sync の表の無い v9 の DB (cell の版数あり) で、 汚れた終了の後に開いた時、 cell の版数が時計より先にあっても (時計が
 /// 戻った = cell に未来の版数を置いて真似る)、 ローカルの書き込みが弾かれない。 開く時の HLC の種は WAL に残った record だけで、
 /// WAL に無い版数 (畳んだ後) を知らなかった。

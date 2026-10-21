@@ -54,6 +54,11 @@
 //! 主キーは書き換えられる (改名)。 届く順で答えを変えないよう、 受け手は前の名前も覚え (`pk_former.rs`)、 今その名前の
 //! 行が無ければ前にその名前だった生きた行に束ねる (前の名前 = 同じ物)。 主キーの Tie を当てて同じ主キーの行が 2 つに
 //! なったら 1 つに畳む (`Engine::fold_rows_with_same_pk`)。
+//!
+//! 消した名前は、 消した行が持った名前の全部 (#551): 削除は今の名前と前の名前を覚え、 消えた行への改名 (書き込みは捨てる) の
+//! 名前も覚えて、 その名前を今持つ行のうち削除より前にその名前になった行を一緒に消す (`Engine::name_given_to_dead_row`。 改名を
+//! 先に受けた peer では、 改名で畳んでから削除で消している)。 消えた行に別の author のより新しい削除が届いた時も、 その時刻で
+//! 同じように消す。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1608,6 +1613,10 @@ impl Syncer {
                 // 主キーが変わって (改名)、 同じ主キーの別の行があれば 1 つに畳む (主キーが同じなら同じ行、 PK_IDENTITY_PLAN 11-1)
                 if r == ApplyResult::Applied && self.engine.is_pk_himo(*himo_id) {
                     self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value, dying.get(eid).copied());
+                }
+                // 削除優先 (#551): 消えた行への改名は捨てるが、 その名前も消した名前 (改名を先に受けた peer と同じ名前の集まり)
+                if r == ApplyResult::SkippedOlder && self.engine.is_pk_himo(*himo_id) {
+                    self.engine.name_given_to_dead_row(local_eid, *himo_id, value);
                 }
                 r
             }

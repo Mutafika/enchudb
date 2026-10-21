@@ -326,3 +326,59 @@ fn an_unaware_leaf_edit_to_a_deleted_row_is_dropped() {
         assert!(!p.db.engine().is_live(e), "{name}: 消した行が生き返った");
     }
 }
+
+/// 2 人が別々に同じ行を消す (B が先、 A が後)。 その間に作られた同じ名前の行 (C の z) は、 遅い方の削除より前なので同じ行 = 消える
+/// (先に A の行と束ねてから削除を受けた peer では、 B の削除で一緒に消えている)。
+#[test]
+fn a_same_name_row_between_two_deletes_goes_with_the_later() {
+    expect("between-deletes", vec![], |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[1].delete("z");
+        p[2].upsert("z", "c");
+        p[0].delete("z");
+    });
+}
+
+/// 上の形を、 作成の record が 1 度しか届かない配り (中継の重ねなし) で、 record を手で組んで当てる: 生きていた行を B の削除で消した後に、
+/// その間に作られた同じ名前の行 (C) が届き、 最後に A の遅い削除が届く。 消えた行の名前は、 消した時に覚えた名前 (前の名前は無い) から引く。
+#[test]
+fn a_later_delete_finds_the_name_the_row_died_with() {
+    use enchudb_oplog::oplog::DecodedOp;
+    use enchudb_oplog::{make_eid, EntityId};
+    let dir = Dir::new("later-delete-raw");
+    let tr = Arc::new(InMemoryTransport::new());
+    tr.register_peer(10);
+    let mut b = Database::create_with_capacity(&dir.db(10), 4096).unwrap();
+    b.table(T).number("key").tag("title").primary_key("key").build().unwrap();
+    b.enable_sync().unwrap();
+    let db = b.finish_with_oplog(OPLOG).unwrap();
+    db.engine().set_peer_id(10);
+    let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+    let key = db.engine().himo_id("t.key").unwrap() as u16;
+    let rec = |author: u32, wall: u64, op: DecodedOp| enchudb::transport::WireRecord {
+        hlc: Hlc { wall, logical: 0, peer: author },
+        author_peer: author,
+        op,
+        signature: [0; 64],
+        pubkey_fp: [0; 8],
+        signed_bytes: Vec::new(),
+    };
+    let row_a: EntityId = make_eid(1, 5);
+    let row_c: EntityId = make_eid(3, 9);
+    for batch in [
+        vec![rec(1, 100, DecodedOp::Tie { eid: row_a, himo_id: key, value: 7 })],
+        vec![rec(2, 200, DecodedOp::Delete { eid: row_a })],
+        vec![rec(3, 300, DecodedOp::Tie { eid: row_c, himo_id: key, value: 7 })],
+        vec![rec(1, 400, DecodedOp::Delete { eid: row_a })],
+    ] {
+        sync.apply_records(&batch);
+    }
+    db.engine().rebuild();
+    let t = db.get_table(T).unwrap();
+    assert_eq!(
+        t.all().find().unwrap(),
+        Vec::<u64>::new(),
+        "C の行 (遅い削除より前に作られた同じ名前の行) が残った"
+    );
+}

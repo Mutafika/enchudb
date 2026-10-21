@@ -36,7 +36,7 @@ const HEADER_LEN: usize = 8;
 const TAG_NOTE: u8 = 1;
 const TAG_FORGET: u8 = 2;
 /// 記録の record で 「slot 無し」 (まとめ直した file の、 slot の記録の無い主キー)。 slot は `max_entities` 未満。
-const NO_SLOT: u32 = u32::MAX;
+pub(crate) const NO_SLOT: u32 = u32::MAX;
 /// まとめ直す目安: file の record の数が、 生きている記録 (主キー + slot) の 2 倍とこの数の和を越えたら。
 const REWRITE_SLACK: u64 = 1024;
 

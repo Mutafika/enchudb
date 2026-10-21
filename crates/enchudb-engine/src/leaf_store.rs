@@ -52,7 +52,7 @@
 //! rebuild できる (free-list 自体は永続化しない = store の派生)。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::region::Region;
 
@@ -84,6 +84,9 @@ const HOLE_GEN: u32 = 1;
 const RETIRED_SETTLE_MIN: u64 = 4 * 1024 * 1024;
 /// 最小 slot (空 payload = header のみ、 byte)。 これ未満の余りは hole にできない。
 const MIN_SLOT: usize = SLOT_HEADER;
+/// 開く時間: きれいに閉じた時に残す空き一覧の file (`{db}/leaf.free`) の magic と版
+const FREE_LIST_MAGIC: &[u8; 4] = b"ELFL";
+const FREE_LIST_VERSION: u32 = 1;
 /// off_shift の上限 (16B align = 64GB)。 これ以上は padding 過大で不許可。
 pub const MAX_OFF_SHIFT: u32 = 4;
 
@@ -104,6 +107,8 @@ pub struct LeafStore {
     /// insert/free/rebuild を直列化する (writer は `.db.lock` で 1 プロセスだが
     /// in-process では複数スレッドが consumer 経由で触りうる)。
     holes: Mutex<Holes>,
+    /// 開く時間: 空き一覧を閉じた時の file から入れた (列から作り直していない)。 診断用
+    from_file: AtomicBool,
     /// byte_off = word_off << off_shift。 0 = byte offset (v6 互換)。
     off_shift: u32,
     /// #106: slot gen seqlock 用の store-wide 単調カウンタ。 insert ごとに +2 した
@@ -274,6 +279,7 @@ impl LeafStore {
         let s = Self {
             region,
             holes: Mutex::new(Holes::default()),
+            from_file: AtomicBool::new(false),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
@@ -318,6 +324,7 @@ impl LeafStore {
         Ok(Self {
             region,
             holes: Mutex::new(Holes::default()),
+            from_file: AtomicBool::new(false),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
@@ -843,44 +850,52 @@ impl LeafStore {
         (r.pending.len(), r.bytes)
     }
 
-    /// reopen 用: live な slot **word offset** 集合を渡し、 free-list を再構成する。 free-list は永続化しない
-    /// ので open 時に必ず呼ぶ。
+    /// reopen 用: live な slot の **word offset** を渡し (順不同・重複可、 中で並べる)、 free-list を再構成する。
+    /// free-list は永続化しないので open 時に必ず呼ぶ。
     ///
     /// 空き = live の slot の隙間。 live でない slot の header は読まない (#414): 電源断の後は、 分割した
     /// 余りの header / 解放した slot の header がディスクに届いていない (旧い大きな size が残っている) ことが
     /// あり、 それを信じて walk すると live の slot を飛び越して空きにしてしまう。 live の slot の header は
     /// size が読めて、 次の live の slot (無ければ high_water) を越えないことだけを確かめる。 確かめられない
     /// live の offset は返す — 呼び側は cell を外すこと (空きにした場所が使い回されると、 cell が別の値を読む)。
-    pub fn rebuild_free_list(&self, live: &HashSet<u32>) -> HashSet<u32> {
+    ///
+    /// 1 pass で、 slot ごとに header を 1 回読む (開く時間: 前は HashSet を 2 回回して Vec に写し、 slot ごとに
+    /// header を 2 回読んでいて、 Leaf の cell 100 万で 95 ms。 列から集める側も HashSet だった)。
+    pub fn rebuild_free_list(&self, mut live: Vec<u32>) -> HashSet<u32> {
         let hw = self.hw_words();
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
         holes.clear();
+        self.from_file.store(false, Ordering::Relaxed);
         let start = self.b2w(self.data_start_byte());
-        let mut anchors: Vec<u32> = live.iter().copied().filter(|&a| a >= start).collect();
-        anchors.sort_unstable();
-        let mut broken: HashSet<u32> = live.iter().copied().filter(|&a| a < start || a >= hw).collect();
-
-        // 確かめた live の slot を (offset, size) で並べる
-        let mut kept: Vec<(u32, u32)> = Vec::with_capacity(anchors.len());
-        for (i, &a) in anchors.iter().enumerate() {
-            if a >= hw {
+        // 列ごとの offset は昇順 (eid の順に置く) なので、 列が複数なら昇順の run が列の数だけ混ざる。 run を見る sort
+        // (driftsort) は run の併合で済み、 pdqsort (`sort_unstable`) は run を見ないので 300 万で 30 ms 遅かった
+        live.sort();
+        live.dedup();
+        let mut broken: HashSet<u32> = HashSet::new();
+        let min_words = self.min_slot_words();
+        let region_len = self.region.len();
+        // 確かめた live の slot の隙間を空きに (末尾の隙間は high_water を戻す)
+        let mut cur = start;
+        for (i, &a) in live.iter().enumerate() {
+            if a < start || a >= hw {
+                broken.insert(a);
                 continue;
             }
-            let limit = anchors.get(i + 1).copied().unwrap_or(hw).min(hw);
-            let ss = self.b2w(self.slot_size_bytes_at(a) as usize);
-            if ss >= self.min_slot_words() && a as u64 + ss as u64 <= limit as u64 && !self.odd_gen_at(a) {
-                kept.push((a, ss));
+            let limit = live.get(i + 1).copied().unwrap_or(hw).min(hw);
+            let o = self.w2b(a);
+            let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+            let ss = self.b2w((ss_raw & !HAS_GEN) as usize);
+            let freed = ss_raw & HAS_GEN != 0
+                && o + SLOT_HEADER_GEN <= region_len
+                && self.region.as_atomic_u32(o + GEN_OFF).load(Ordering::Relaxed) & 1 != 0;
+            if ss >= min_words && a as u64 + ss as u64 <= limit as u64 && !freed {
+                if a > cur {
+                    self.flush_run(&mut holes, cur, a - cur, hw);
+                }
+                cur = a + ss;
             } else {
                 broken.insert(a);
             }
-        }
-        // 隙間を空きに (末尾の隙間は high_water を戻す)
-        let mut cur = start;
-        for &(a, ss) in &kept {
-            if a > cur {
-                self.flush_run(&mut holes, cur, a - cur, hw);
-            }
-            cur = a + ss;
         }
         if cur < hw {
             self.flush_run(&mut holes, cur, hw - cur, hw);
@@ -888,15 +903,66 @@ impl LeafStore {
         broken
     }
 
-    /// gen 付き slot の gen が奇数 (解放済み = `HOLE_GEN` / 書きかけ) か。 open 時に live の cell がこれを指すのは、
-    /// 解放の印はディスクに届いたが cell の書き換えが届かなかった時 (#414)。 `try_read` は読めず (None)、 借用の
-    /// `get` は旧い len で旧い中身を返す — 読み方で答えが割れるので、 壊れた slot として外す。
-    fn odd_gen_at(&self, word_off: u32) -> bool {
-        let o = self.w2b(word_off);
-        let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
-        ss_raw & HAS_GEN != 0
-            && o + SLOT_HEADER_GEN <= self.region.len()
-            && self.region.as_atomic_u32(o + GEN_OFF).load(Ordering::Relaxed) & 1 != 0
+    /// 開く時間: きれいに閉じる時に空き一覧を file (`{db}/leaf.free`、 engine が書く) に残すための byte 列。 magic `ELFL`、 版、
+    /// high_water (word)、 空きの数、 (offset, size) の列 (offset の順、 word 単位)、 全体の FNV-1a。 開く時は
+    /// [`Self::install_free_list`]。 閉じる時は書き出しの後 (`durable_end` で待っていた slot も空きに戻った後) に呼ぶこと
+    pub fn free_list_bytes(&self) -> Vec<u8> {
+        let holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::with_capacity(20 + holes.by_off.len() * 8);
+        out.extend_from_slice(FREE_LIST_MAGIC);
+        out.extend_from_slice(&FREE_LIST_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.hw_words().to_le_bytes());
+        out.extend_from_slice(&(holes.by_off.len() as u32).to_le_bytes());
+        for (&off, &size) in &holes.by_off {
+            out.extend_from_slice(&off.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+        }
+        let crc = crate::integrity::fnv1a_region(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// 閉じた時に残した空き一覧 ([`Self::free_list_bytes`]) を入れる。 magic / 版 / FNV が合い、 high_water が今の store と同じで、
+    /// 空きが範囲の中で offset の順に重ならない時だけ入れて true。 それ以外は何も変えず false (呼び側は列から作り直す)。
+    /// 信じてよいか (きれいに閉じた印) は呼び側が決める
+    pub fn install_free_list(&self, bytes: &[u8]) -> bool {
+        if bytes.len() < 20 || &bytes[0..4] != FREE_LIST_MAGIC {
+            return false;
+        }
+        let (body, tail) = bytes.split_at(bytes.len() - 4);
+        if crate::integrity::fnv1a_region(body) != u32::from_le_bytes(tail.try_into().unwrap()) {
+            return false;
+        }
+        let version = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let hw = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let n = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+        if version != FREE_LIST_VERSION || hw != self.hw_words() || body.len() != 16 + n * 8 {
+            return false;
+        }
+        let mut pairs = Vec::with_capacity(n);
+        let mut cur = self.b2w(self.data_start_byte());
+        for i in 0..n {
+            let rec = &body[16 + i * 8..24 + i * 8];
+            let off = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+            let size = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+            if size == 0 || off < cur || off as u64 + size as u64 > hw as u64 {
+                return false;
+            }
+            cur = off + size;
+            pairs.push((off, size));
+        }
+        let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
+        holes.clear();
+        for (off, size) in pairs {
+            holes.insert(off, size);
+        }
+        self.from_file.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// 開く時間: 空き一覧を閉じた時の file から入れたか (診断用)
+    pub fn free_list_from_file(&self) -> bool {
+        self.from_file.load(Ordering::Relaxed)
     }
 
     /// rebuild 中: coalesce 済み free run を確定 (word 単位)。 末尾なら high_water 後退。
@@ -1281,8 +1347,8 @@ mod tests {
         let (lo, hi) = (s.w2b(b), s.w2b(d));
         s.region.fill_at(lo, hi - lo, 0);
 
-        let live: HashSet<u32> = [a, b, d].into_iter().collect();
-        let broken = s.rebuild_free_list(&live);
+        let live = vec![a, b, d];
+        let broken = s.rebuild_free_list(live.clone());
         assert_eq!(broken, [b].into_iter().collect::<HashSet<u32>>(), "壊れた slot を指す live だけを返す");
         assert_eq!(s.get(a), b"keep-a");
         assert_eq!(s.get(d), b"keep-d");
@@ -1298,7 +1364,7 @@ mod tests {
         let t = s.insert(b"tail");
         let hw = s.high_water();
         s.region.fill_at(s.w2b(t), (hw as usize) - s.w2b(t), 0);
-        let broken = s.rebuild_free_list(&[a].into_iter().collect());
+        let broken = s.rebuild_free_list(vec![a]);
         assert!(broken.is_empty());
         assert!(s.high_water() < hw, "届かなかった末尾が空きに戻っていない");
         assert_eq!(s.get(a), b"keep-a");
@@ -1321,8 +1387,8 @@ mod tests {
         // x の header がディスクで分割前の big の size のまま (x を書いた page が届かなかった)
         s.region.as_atomic_u32(s.w2b(x)).store(big_ss, Ordering::Relaxed);
 
-        let live: HashSet<u32> = [a, y].into_iter().collect();
-        let broken = s.rebuild_free_list(&live);
+        let live = vec![a, y];
+        let broken = s.rebuild_free_list(live.clone());
         assert!(broken.is_empty(), "旧い size に覆われた live を壊れた扱いにした: {broken:?}");
         assert_eq!(s.get(y), b"keep-y");
         assert_eq!(s.get(a), b"keep-a");
@@ -1343,8 +1409,8 @@ mod tests {
         let d = s.insert(b"keep-d");
         s.free(old); // cell は old を指したまま (書き換えが届かなかった)
 
-        let live: HashSet<u32> = [a, old, d].into_iter().collect();
-        let broken = s.rebuild_free_list(&live);
+        let live = vec![a, old, d];
+        let broken = s.rebuild_free_list(live.clone());
         assert_eq!(broken, [old].into_iter().collect::<HashSet<u32>>());
         assert_eq!(s.get(a), b"keep-a");
         assert_eq!(s.get(d), b"keep-d");
@@ -1363,8 +1429,8 @@ mod tests {
         let hw = s.high_water();
 
         // b, d が dead という前提で reopen を模擬: free-list を捨てて live から rebuild
-        let live: HashSet<u32> = [a, c].into_iter().collect();
-        s.rebuild_free_list(&live);
+        let live = vec![a, c];
+        s.rebuild_free_list(live.clone());
 
         // b の穴が回収されている (free_bytes > 0)、 かつ b サイズが再利用可能
         assert!(s.free_bytes() > 0, "rebuild で dead slot が free-list に載っていない");
