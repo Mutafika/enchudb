@@ -55,11 +55,10 @@ struct Row {
 fn insert(t: &enchudb_schema::Table<'_>, rng: &mut Rng, i: u32) -> Row {
     let mut row = Row { eid: 0, alive: true, id: None, a: None, x: None, g: rng.below(50) as u32 };
     let mut b = t.insert().set("g", row.g as i64);
-    // 11 行に 1 行は主キーなし、 7 行に 1 行は a なし、 5 行に 1 行は x なし
-    if i % 11 != 4 {
-        row.id = Some(i);
-        b = b.set("id", i as i64);
-    }
+    // 7 行に 1 行は a なし、 5 行に 1 行は x なし。 名前 (主キー) の無い行は schema では作れない (#548) ので、 名前の無い
+    // row は churn の engine の untie でだけできる
+    row.id = Some(i);
+    b = b.set("id", i as i64);
     if i % 7 != 2 {
         let a = rng.below(6) as u32;
         row.a = Some(a);
