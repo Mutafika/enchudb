@@ -76,6 +76,7 @@ pub mod cas;
 pub mod hlc_store;
 pub mod eid_translator;
 // #513: 消した主キーの記録 (主キーが同じなら同じ行)。
+pub(crate) mod pk_former;
 pub(crate) mod pk_tombs;
 pub mod transport;
 // `sync::Syncer` は `enchudb-sync` crate に分離済。

@@ -236,6 +236,7 @@ pub enum PkValue<'a> {
     Text(&'a [u8]),
 }
 
+
 /// `remote_*_apply` (sync 受信の apply) の結果 (#210)。
 ///
 /// 旧 `bool` は 「適用した / しなかった」 しか区別できず、 **「LWW で古い」 と
@@ -929,6 +930,41 @@ fn load_eidalias_from_sidecar(db_path: &str) -> io::Result<Option<Vec<(enchudb_o
 #[cfg(not(target_arch = "wasm32"))]
 fn pktombs_path_for(path: &str) -> std::path::PathBuf {
     crate::db_files::path_for(path, crate::db_files::PKTOMBS)
+}
+
+/// `Engine::pk_himo_bits` が覆う himo の数 (これ以上の himo は表をなめて引く)。
+const PK_HIMO_BITS: usize = 2048;
+
+/// 主キーの前の名前の sidecar path (`pkformer`、 中身は `pk_former.rs`)。 不在 = 改名なし。
+#[cfg(not(target_arch = "wasm32"))]
+fn pkformer_path_for(path: &str) -> std::path::PathBuf {
+    crate::db_files::path_for(path, crate::db_files::PKFORMER)
+}
+
+/// 主キーの前の名前を sidecar に atomic 書き換え。 無ければ file を消す。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_pkformer_to_sidecar(db_path: &str, former: &crate::pk_former::PkFormer) -> io::Result<()> {
+    let p = pkformer_path_for(db_path);
+    if former.is_empty() {
+        return match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    crate::db_files::write_atomic_if_changed(&p, &former.serialize()).map(|_| ())
+}
+
+/// 主キーの前の名前の sidecar を読む。 不在なら Ok(None)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_pkformer_from_sidecar(db_path: &str) -> io::Result<Option<crate::pk_former::PkFormer>> {
+    enchudb_oplog::io_point("sidecar.read_pkformer")?;
+    match std::fs::read(pkformer_path_for(db_path)) {
+        Ok(buf) => crate::pk_former::PkFormer::deserialize(&buf)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// #513: `pktombs` を読む。 不在なら Ok(None)。 2 つ目は切れた末尾を捨てたか。
@@ -4127,6 +4163,16 @@ pub struct Engine {
     pk_tombs_empty: std::sync::atomic::AtomicBool,
     /// #513: `pk_tombs` を最後に書き出した後に変えたか (`pktombs` を変わった時だけ書く)。
     pk_tombs_dirty: std::sync::atomic::AtomicBool,
+    /// 主キーの前の名前 (改名の前の値の鍵 → その行の slot、 `pk_former.rs`)。 束ねは、 今その名前の行が無ければ、 前に
+    /// その名前だった行に束ねる (届く順で答えを変えない)。
+    pk_former: std::sync::RwLock<crate::pk_former::PkFormer>,
+    /// `pk_former` が空か (常態で lock を取らない)。 空でなくなったら戻さない。
+    pk_former_empty: std::sync::atomic::AtomicBool,
+    /// `pk_former` を最後に書き出した後に変えたか (`pkformer` を変わった時だけ書く)。
+    pk_former_dirty: std::sync::atomic::AtomicBool,
+    /// 主キーを覚える表 (`pk_tombs_on` と同じ: `_` で始まらない) の主キーの himo の bit (himo 0..PK_HIMO_BITS)。 書き込みの道で
+    /// 「この列は主キーか」 を表をなめずに引く (なめると書き込み 1 回が 22 → 27 ns)。 `refresh_pk_tombs_flag` で引き直す
+    pk_himo_bits: [std::sync::atomic::AtomicU64; PK_HIMO_BITS / 64],
     /// #513: 主キーを覚える DB か (sync の表があり、 `_` で始まらない表に主キーがある)。 削除の道で、 主キーのある表の無い DB
     /// が、 行の表を探さずに抜けるため (探すと主キーの無い表の削除が 2% ほど遅くなった)。 `refresh_sync_tables_flag` と
     /// `set_table_pk` で引き直す。
@@ -4630,6 +4676,10 @@ impl Engine {
             pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
             pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
+            pk_former_empty: std::sync::atomic::AtomicBool::new(true),
+            pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
@@ -5072,6 +5122,20 @@ impl Engine {
                 eprintln!("warning: failed to read eidalias sidecar (aliases dropped): {e}")
             }
             Err(e) => return Err(eng.abandon_open("eidalias", e)),
+        }
+        // 主キーの前の名前。 壊れていたら警告して無しで続ける (今の名前でだけ束ねる = 前の版の動き)
+        match load_pkformer_from_sidecar(path) {
+            Ok(Some(former)) => {
+                if !former.is_empty() {
+                    eng.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+                }
+                *eng.pk_former.write().unwrap() = former;
+            }
+            Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("warning: failed to read pkformer sidecar (former primary keys dropped): {e}")
+            }
+            Err(e) => return Err(eng.abandon_open("pkformer", e)),
         }
 
         // #513: 消した主キーの記録。 不在なら空で続行。 壊れていたら警告して空で続ける (それより前に消した主キーの行が、
@@ -5846,6 +5910,10 @@ impl Engine {
             pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
             pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
+            pk_former_empty: std::sync::atomic::AtomicBool::new(true),
+            pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
@@ -6143,9 +6211,33 @@ impl Engine {
 
     /// #513: `pk_tombs_on` を引き直す。
     fn refresh_pk_tombs_flag(&self) {
+        use std::sync::atomic::Ordering;
         let on = self.sync_tables_enabled()
             && self.tables.iter().any(|t| t.pk_himo.is_some() && !t.name.starts_with('_'));
-        self.pk_tombs_on.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.pk_tombs_on.store(on, Ordering::Relaxed);
+        for w in &self.pk_himo_bits {
+            w.store(0, Ordering::Relaxed);
+        }
+        if !on {
+            return;
+        }
+        for h in self.tables.iter().filter(|t| !t.name.starts_with('_')).filter_map(|t| t.pk_himo) {
+            if let Some(w) = self.pk_himo_bits.get(h as usize / 64) {
+                w.fetch_or(1 << (h % 64), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// himo `h` が主キーを覚える表の主キーで、 主キーを覚える DB (`pk_tombs_on`) か (`pk_himo_bits`、 覆わない himo は表をなめる)。
+    #[inline(always)]
+    fn is_remembered_pk_himo(&self, h: u16) -> bool {
+        match self.pk_himo_bits.get(h as usize / 64) {
+            Some(w) => w.load(std::sync::atomic::Ordering::Relaxed) >> (h % 64) & 1 == 1,
+            None => {
+                self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed)
+                    && self.tables.iter().any(|t| t.pk_himo == Some(h) && !t.name.starts_with('_'))
+            }
+        }
     }
 
     /// 0.7.0 (Phase 4): oplog の `sync_ops_offset` 以降の record を `_sync_ops`
@@ -8629,7 +8721,22 @@ impl Engine {
         persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot())?;
         // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
         self.persist_pk_tombs_if_dirty()?;
+        self.persist_pk_former_if_dirty()?;
         self.persist_vocab_map_if_dirty()
+    }
+
+    /// 主キーの前の名前を、 変わっていれば書き出す。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_pk_former_if_dirty(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if !self.pk_former_dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let r = persist_pkformer_to_sidecar(&self.path, &self.pk_former.read().unwrap());
+        if r.is_err() {
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+        r
     }
 
     /// **sync 由来 state の durability barrier**。
@@ -8767,6 +8874,10 @@ impl Engine {
                 }
                 // #513: 消した主キーの記録も。 変わった時だけ書く。
                 if let Err(e) = self.persist_pk_tombs_if_dirty() {
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // 主キーの前の名前も
+                if let Err(e) = self.persist_pk_former_if_dirty() {
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // text 写像も同格。 dirty のときだけ書く。
@@ -10491,6 +10602,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
+        let renamed_from = self.pk_rename_from(local, himo_id, value);
         // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
         // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
         if !self.live_set(himo_id as usize, local, value) {
@@ -10498,7 +10610,72 @@ impl Engine {
             return false;
         }
         self.store_cell_hlc(local, himo_id, hlc);
+        if let Some(old) = renamed_from {
+            self.note_pk_former(local, himo_id, old);
+        }
         true
+    }
+
+    /// 行 `local` の主キーの cell を `value` に書き換える時の、 今の値 (改名でなければ None)。 呼び手は行の lock を握っている。
+    /// 主キーを覚える DB (`pk_tombs_on`) の主キーの列だけを見る (他の書き込みは bit 1 つ)。 列は表に属するので、 主キーの
+    /// 列への書き込みはその表の行 (`validate_eid_for_himo`)。
+    #[inline(always)]
+    fn pk_rename_from(&self, local: u32, himo_id: u16, value: u64) -> Option<u64> {
+        if !self.is_remembered_pk_himo(himo_id) {
+            return None;
+        }
+        self.himos.get(himo_id as usize)?.get_value(local).filter(|&old| old != value)
+    }
+
+    /// 行 `local` の主キーが `old` から変わった: `old` を前の名前として覚える (`pk_former.rs`)。
+    #[cold]
+    fn note_pk_former(&self, local: u32, himo: u16, old: u64) {
+        use std::sync::atomic::Ordering;
+        let changed = self.with_pk_key(himo, PkValue::Local(old), |k| self.pk_former.write().unwrap().insert(himo, k, local));
+        if changed == Some(true) {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// 前に主キー `value` だった行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 今その名前の行が無い時に引く。
+    /// 消えた行も返す (slot を使い回すまで記録は残る)。 束ねると行は生き返り、 削除より古い書き込みは slot の削除の版数で弾かれる
+    /// (改名して消した行に、 改名を知らずに古い名前で後から作った行を、 届く順によらず同じ行にする)
+    pub fn former_pk_holder(&self, himo: u16, value: PkValue<'_>) -> Option<enchudb_oplog::EntityId> {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let slot = self.with_pk_key(himo, value, |k| self.pk_former.read().unwrap().slot_of(himo, k))??;
+        let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        Some(enchudb_oplog::make_eid(self_peer, slot))
+    }
+
+    /// sync の当て: 行 `eid` の主キーが `value` になった時、 同じ主キーの別の生きた行を 1 つに畳む (主キーが同じなら同じ行)。
+    /// 畳むのは翻訳した行 (自分が産んだ行は畳めない、 `merge_entity_into`)。 戻り値は畳んだ行の数。
+    pub fn fold_rows_with_same_pk(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+        if !self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed) {
+            return 0;
+        }
+        let mut keep = eid;
+        let mut folded = 0;
+        for other in self.query_by_id64(&[(himo, value)]) {
+            if enchudb_oplog::eid_local(other) == enchudb_oplog::eid_local(keep) {
+                continue;
+            }
+            let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
+            let (src, dst) = if translated(other) {
+                (other, keep)
+            } else if translated(keep) {
+                (keep, other)
+            } else {
+                continue;
+            };
+            if self.merge_entity_into(src, dst).is_ok() {
+                folded += 1;
+                keep = dst;
+            }
+        }
+        folded
     }
 
     /// `set_cell` の untie 版 — cell を空にして版数を進める。 untie も
@@ -10585,6 +10762,9 @@ impl Engine {
         self.evict_translation_for_reuse(local);
         // #513: slot ごとの主キーの記録も外す (主キーごとの削除の版数は slot に載っていないので残る)
         self.forget_pk_slot(local);
+        if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) && self.pk_former.write().unwrap().forget_slot(local) {
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
         if local >= self.max_entities() {
             return;
         }
@@ -17268,6 +17448,13 @@ impl Engine {
             let pk_tombs = self.pk_tombs.read().unwrap();
             if !pk_tombs.is_empty() {
                 std::fs::write(pktombs_path_for(target), pk_tombs.snapshot().0)?;
+            }
+        }
+        // 主キーの前の名前も (無いと、 restore した DB で、 改名を知らない peer の古い名前の行が改名した行に束ならない)
+        {
+            let former = self.pk_former.read().unwrap();
+            if !former.is_empty() {
+                std::fs::write(pkformer_path_for(target), former.serialize())?;
             }
         }
         // manifest が無いと snapshot だけ 「切り詰め検出の効かない DB」 になる。 複製は
