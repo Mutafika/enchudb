@@ -355,8 +355,6 @@ fn cmd_stats(eng: &Engine) {
     println!("oplog_capacity   {}", s.oplog_capacity);
     println!("next_lsn       {}", s.oplog_next_lsn);
     println!("durable_lsn    {}", s.durable_lsn);
-    println!("queue_len      {}", s.queue_len);
-    println!("pushed/applied {}/{}", s.pushed, s.applied);
     println!("peer_id        {}", s.peer_id);
     println!("bind_over_local_writes {}", s.bind_over_local_writes);
 }
