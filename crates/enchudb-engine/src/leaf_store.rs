@@ -52,7 +52,7 @@
 //! rebuild できる (free-list 自体は永続化しない = store の派生)。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::region::Region;
 
@@ -84,6 +84,9 @@ const HOLE_GEN: u32 = 1;
 const RETIRED_SETTLE_MIN: u64 = 4 * 1024 * 1024;
 /// 最小 slot (空 payload = header のみ、 byte)。 これ未満の余りは hole にできない。
 const MIN_SLOT: usize = SLOT_HEADER;
+/// 開く時間: きれいに閉じた時に残す空き一覧の file (`{db}/leaf.free`) の magic と版
+const FREE_LIST_MAGIC: &[u8; 4] = b"ELFL";
+const FREE_LIST_VERSION: u32 = 1;
 /// off_shift の上限 (16B align = 64GB)。 これ以上は padding 過大で不許可。
 pub const MAX_OFF_SHIFT: u32 = 4;
 
@@ -104,6 +107,8 @@ pub struct LeafStore {
     /// insert/free/rebuild を直列化する (writer は `.db.lock` で 1 プロセスだが
     /// in-process では複数スレッドが consumer 経由で触りうる)。
     holes: Mutex<Holes>,
+    /// 開く時間: 空き一覧を閉じた時の file から入れた (列から作り直していない)。 診断用
+    from_file: AtomicBool,
     /// byte_off = word_off << off_shift。 0 = byte offset (v6 互換)。
     off_shift: u32,
     /// #106: slot gen seqlock 用の store-wide 単調カウンタ。 insert ごとに +2 した
@@ -274,6 +279,7 @@ impl LeafStore {
         let s = Self {
             region,
             holes: Mutex::new(Holes::default()),
+            from_file: AtomicBool::new(false),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
@@ -318,6 +324,7 @@ impl LeafStore {
         Ok(Self {
             region,
             holes: Mutex::new(Holes::default()),
+            from_file: AtomicBool::new(false),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
@@ -858,6 +865,7 @@ impl LeafStore {
         let hw = self.hw_words();
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
         holes.clear();
+        self.from_file.store(false, Ordering::Relaxed);
         let start = self.b2w(self.data_start_byte());
         // 列ごとの offset は昇順 (eid の順に置く) なので、 列が複数なら昇順の run が列の数だけ混ざる。 run を見る sort
         // (driftsort) は run の併合で済み、 pdqsort (`sort_unstable`) は run を見ないので 300 万で 30 ms 遅かった
@@ -893,6 +901,68 @@ impl LeafStore {
             self.flush_run(&mut holes, cur, hw - cur, hw);
         }
         broken
+    }
+
+    /// 開く時間: きれいに閉じる時に空き一覧を file (`{db}/leaf.free`、 engine が書く) に残すための byte 列。 magic `ELFL`、 版、
+    /// high_water (word)、 空きの数、 (offset, size) の列 (offset の順、 word 単位)、 全体の FNV-1a。 開く時は
+    /// [`Self::install_free_list`]。 閉じる時は書き出しの後 (`durable_end` で待っていた slot も空きに戻った後) に呼ぶこと
+    pub fn free_list_bytes(&self) -> Vec<u8> {
+        let holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::with_capacity(20 + holes.by_off.len() * 8);
+        out.extend_from_slice(FREE_LIST_MAGIC);
+        out.extend_from_slice(&FREE_LIST_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.hw_words().to_le_bytes());
+        out.extend_from_slice(&(holes.by_off.len() as u32).to_le_bytes());
+        for (&off, &size) in &holes.by_off {
+            out.extend_from_slice(&off.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+        }
+        let crc = crate::integrity::fnv1a_region(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// 閉じた時に残した空き一覧 ([`Self::free_list_bytes`]) を入れる。 magic / 版 / FNV が合い、 high_water が今の store と同じで、
+    /// 空きが範囲の中で offset の順に重ならない時だけ入れて true。 それ以外は何も変えず false (呼び側は列から作り直す)。
+    /// 信じてよいか (きれいに閉じた印) は呼び側が決める
+    pub fn install_free_list(&self, bytes: &[u8]) -> bool {
+        if bytes.len() < 20 || &bytes[0..4] != FREE_LIST_MAGIC {
+            return false;
+        }
+        let (body, tail) = bytes.split_at(bytes.len() - 4);
+        if crate::integrity::fnv1a_region(body) != u32::from_le_bytes(tail.try_into().unwrap()) {
+            return false;
+        }
+        let version = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let hw = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let n = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+        if version != FREE_LIST_VERSION || hw != self.hw_words() || body.len() != 16 + n * 8 {
+            return false;
+        }
+        let mut pairs = Vec::with_capacity(n);
+        let mut cur = self.b2w(self.data_start_byte());
+        for i in 0..n {
+            let rec = &body[16 + i * 8..24 + i * 8];
+            let off = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+            let size = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+            if size == 0 || off < cur || off as u64 + size as u64 > hw as u64 {
+                return false;
+            }
+            cur = off + size;
+            pairs.push((off, size));
+        }
+        let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
+        holes.clear();
+        for (off, size) in pairs {
+            holes.insert(off, size);
+        }
+        self.from_file.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// 開く時間: 空き一覧を閉じた時の file から入れたか (診断用)
+    pub fn free_list_from_file(&self) -> bool {
+        self.from_file.load(Ordering::Relaxed)
     }
 
     /// rebuild 中: coalesce 済み free run を確定 (word 単位)。 末尾なら high_water 後退。
