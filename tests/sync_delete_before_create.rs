@@ -247,7 +247,8 @@ fn rows(db: &Database) -> Vec<(Option<enchudb::schema::Value>, Option<enchudb::s
 }
 
 /// 削除より新しい書き込み (B の削除を知らない C の更新) が混ざっても、 受け手が A・B・C を pull する 6 通りの順で
-/// 同じ答えになる。 削除より新しい書き込みをどう見せるか (H3) はここでは決めず、 順によらないことだけを見る。
+/// 同じ答えになる。 答えは 「行は主キーごと生きる」 (#547: 名前の無い行は表の行でない)。 B → C → A の順 (削除が作成より
+/// 先、 C の書き込みが作成より先に行を生き返らせる) では、 後から届いた作成の主キー (削除より古い) が名前として当たる。
 #[test]
 fn newer_write_after_the_delete_lands_the_same_in_any_order() {
     const ORDERS: [[u32; 3]; 6] = [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]];
@@ -292,6 +293,8 @@ fn newer_write_after_the_delete_lands_the_same_in_any_order() {
     for (k, ans) in answers.iter().enumerate() {
         assert_eq!(ans, &answers[0], "{:?} の順と {:?} の順で答えが違う", ORDERS[k], ORDERS[0]);
     }
+    let text = |s: &str| Some(enchudb::schema::Value::Text(s.into()));
+    assert_eq!(answers[0], (vec![(text("x"), text("c"))], 1, 1), "C の書き込みの行が主キーごと残らない");
     eprintln!("答え (6 通り同じ): {:?}", answers[0]);
 
     drop((sa, sb, sc));

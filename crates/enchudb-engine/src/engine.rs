@@ -10599,7 +10599,7 @@ impl Engine {
         }
         let _own = row.is_none().then(|| self.row_locks.write(local));
         debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
-        if !self.accepts_write(local, himo_id, hlc) {
+        if !self.accepts_write(local, himo_id, hlc) && !self.restores_pk_name(local, himo_id, hlc) {
             return false;
         }
         let renamed_from = self.pk_rename_from(local, himo_id, value);
@@ -11191,15 +11191,21 @@ impl Engine {
     ///
     /// 行を握って消す (#349): 他の cell の書き手と同じく、 `read_row` に消している途中の行を見せない。
     /// `apply_delete_local` から来た時は入れ子で素通り。
+    ///
+    /// #547: 主キーのある行で削除より新しい cell が残る (行が生きる) 時は、 主キーの cell も残す。 名前の無い行は表の行で
+    /// ない (主キー = 行の名前、 行が生きている限りその行のもの)。 削除が先に届いて、 新しい cell が後から行を生き返らせた
+    /// peer では [`Self::restore_pk_after_revive`] が同じ cell を戻す。
     fn remove_entity_body(&self, local: u32, hlc: enchudb_oplog::Hlc) {
         let _row = self.row_locks.write(local);
-        let mut survivor = false;
+        let newer = |hid: usize| hlc != enchudb_oplog::Hlc::ZERO && self.version_of(local, hid as u16) > hlc;
+        let survivor = (0..self.himos.len()).any(|hid| self.himos[hid].get_value(local).is_some() && newer(hid));
+        let keep = if survivor && self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed) {
+            self.pk_himo_of_slot(local).map(usize::from)
+        } else {
+            None
+        };
         for hid in 0..self.himos.len() {
-            if self.himos[hid].get_value(local).is_none() {
-                continue;
-            }
-            if hlc != enchudb_oplog::Hlc::ZERO && self.version_of(local, hid as u16) > hlc {
-                survivor = true;
+            if self.himos[hid].get_value(local).is_none() || newer(hid) || keep == Some(hid) {
                 continue;
             }
             self.remove_cell_freeing_leaf(local, hid);
@@ -11207,6 +11213,92 @@ impl Engine {
         if !survivor {
             self.live_free(local);
         }
+    }
+
+    /// #547: 削除より古い主キーの書き込みでも、 行が削除より新しい cell で生きていて主キーの cell が無ければ当てる (主キー
+    /// どうしの LWW は見る)。 新しい cell を先に持っていて削除を受けた peer では、 削除の時に主キーが残る
+    /// (`remove_entity_body`) ので同じ答えになる。 削除が作成より先に届き (#490)、 新しい cell が作成より先に行を
+    /// 生き返らせた順で、 後から届いた作成の主キーがここに当たる。 `accepts_write` が断った時だけ呼ぶ (書き込みの道は増えない)。
+    fn restores_pk_name(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+        if !self.is_remembered_pk_himo(himo_id)
+            || self.himos.get(himo_id as usize).is_none_or(|h| h.get_value(local).is_some())
+            || self.pk_himo_of_slot(local) != Some(himo_id)
+            || !Self::accepts_hlc(self.version_of(local, himo_id), hlc)
+        {
+            return false;
+        }
+        // 生きている = 削除より新しい cell がある (作成より先の削除で取っておいた空の slot (#490) も live なので、 live では見ない)
+        let tomb = self.tombstone_version_of(local);
+        tomb != enchudb_oplog::Hlc::ZERO
+            && (0..self.himos.len()).any(|h| self.himos[h].get_value(local).is_some() && self.version_of(local, h as u16) > tomb)
+    }
+
+    /// #547: 主キーのある行を消した後、 削除より新しい書き込みで行が生き返った時に、 主キーの cell を戻す。 値は消した時の
+    /// 主キー (`pk_tombs` の slot の記録)、 版数は消す前のまま (削除は版数の列を消さない) = 新しい cell を先に持っていて
+    /// 削除を受けた peer (`remove_entity_body` が主キーを残す) と同じ cell。 sync の当てで cell を書いた後に呼ぶ。
+    fn restore_pk_after_revive(&self, local: u32) {
+        use std::sync::atomic::Ordering;
+        if !self.pk_tombs_on.load(Ordering::Relaxed) || self.tombstone_version_of(local) == enchudb_oplog::Hlc::ZERO {
+            return;
+        }
+        let Some(pk) = self.pk_himo_of_slot(local) else { return };
+        if self.himos[pk as usize].get_value(local).is_some() {
+            return;
+        }
+        let key = {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            g.key_of_slot(local).filter(|(h, _)| *h == pk).map(|(_, k)| k.to_vec())
+        };
+        let Some(key) = key else { return };
+        let value = match self.value_types.get(pk as usize) {
+            Some(ValueType::Tag) => u64::from(self.vocab.get_or_insert(&key)),
+            _ => match <[u8; 8]>::try_from(key.as_slice()) {
+                Ok(b) => u64::from_le_bytes(b),
+                Err(_) => return,
+            },
+        };
+        let _row = self.row_locks.write(local);
+        if self.himos[pk as usize].get_value(local).is_none() {
+            self.live_set(pk as usize, local, value);
+        }
+    }
+
+    /// #547: 消した行に削除より新しい書き込みが届いた時、 その行の名前 (消した時の主キー) を今は別の生きた行が持っていれば、
+    /// その行の slot を返す (書き込みはそちらに当てる。 名前が同じなら同じ行)。 消して同じ主キーで作り直した後 (#508) に、
+    /// 消す前の行へ届いた書き込みがこれに当たる。 作り直した author (どちらも自分の行で畳めない) も受け手も同じ行に当てる。
+    /// 当てる先が無ければ `local` のまま (行が生き返り、 [`Self::restore_pk_after_revive`] が名前を戻す)。
+    fn name_holder_for_revive(&self, local: u32, hlc: enchudb_oplog::Hlc) -> u32 {
+        use std::sync::atomic::Ordering;
+        if !self.pk_tombs_on.load(Ordering::Relaxed) || self.entities.is_live(local) {
+            return local;
+        }
+        let tomb = self.tombstone_version_of(local);
+        if tomb == enchudb_oplog::Hlc::ZERO || hlc <= tomb {
+            return local;
+        }
+        let Some(pk) = self.pk_himo_of_slot(local) else { return local };
+        let key = {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            g.key_of_slot(local).filter(|(h, _)| *h == pk).map(|(_, k)| k.to_vec())
+        };
+        let Some(key) = key else { return local };
+        let value = match self.value_types.get(pk as usize) {
+            Some(ValueType::Tag) => match self.vocab_id_bytes(&key) {
+                Some(v) => u64::from(v),
+                None => return local,
+            },
+            _ => match <[u8; 8]>::try_from(key.as_slice()) {
+                Ok(b) => u64::from_le_bytes(b),
+                Err(_) => return local,
+            },
+        };
+        self.query_by_id64(&[(pk, value)])
+            .into_iter()
+            .map(enchudb_oplog::eid_local)
+            .find(|&l| l != local)
+            .unwrap_or(local)
     }
 
     /// entity の削除版数を記録する (A-5)。 `false` = 受信 HLC が古いので不採用。
@@ -11650,9 +11742,10 @@ impl Engine {
         bytes: &[u8],
         hlc: enchudb_oplog::Hlc,
     ) -> RemoteApply {
-        let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return RemoteApply::Stale; }
+        // #547: 消した行の名前を今は別の行が持っていれば、 そちらに当てる
+        let local = self.name_holder_for_revive(enchudb_oplog::eid_local(eid), hlc);
         // request17 step 5: 受信 HLC でローカル clock を進める (これが無いと、
         // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
         self.observe_remote_hlc(hlc);
@@ -11693,6 +11786,8 @@ impl Engine {
         }
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
+        // #547: 消した行が削除より新しい書き込みで生き返ったなら、 主キーの cell を戻す
+        self.restore_pk_after_revive(local);
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         RemoteApply::Applied
@@ -11718,9 +11813,10 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
     ) -> RemoteApply {
         let Some(value) = self.cell_value(value) else { return RemoteApply::Stale };
-        let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return RemoteApply::Stale; }
+        // #547: 消した行の名前を今は別の行が持っていれば、 そちらに当てる
+        let local = self.name_holder_for_revive(enchudb_oplog::eid_local(eid), hlc);
         self.observe_remote_hlc(hlc);
         if self.ensure_cell_room(hid, local).is_err() {
             return RemoteApply::RejectedCapacity;
@@ -11732,6 +11828,8 @@ impl Engine {
         }
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
         self.entities.ensure_live(local);
+        // #547: 消した行が削除より新しい書き込みで生き返ったなら、 主キーの cell を戻す
+        self.restore_pk_after_revive(local);
         // issue #47 fix: foreign local が我々の table eid_range 内に落ちた場合、
         // 次の `entity_in` が同 local を払出して live entity を上書きしないよう
         // `next_local` を `local + 1` まで前進させる。 これは `apply_oplog_op`
@@ -11749,9 +11847,10 @@ impl Engine {
         himo_id: u16,
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
-        let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return false; }
+        // #547: 消した行の名前を今は別の行が持っていれば、 そちらで外す
+        let local = self.name_holder_for_revive(enchudb_oplog::eid_local(eid), hlc);
         self.observe_remote_hlc(hlc);
         if !self.clear_cell_local_freeing_leaf(local, himo_id, hlc) {
             return false;

@@ -208,8 +208,9 @@ fn delete_of_a_key_set_last_reaches_the_other_authors_row() {
 }
 
 /// #508 の形を主キーを後に set して: A が 1 回の配りの中で z を消して z で作り直す。 作り直した行は、 同じ batch で先に
-/// 消える古い行に束ねない (束ねる時の状態は、 前の record を当てた後)。 その後で C が古い行を更新しても、 B は author の A と
-/// 同じ行の集まりになる。
+/// 消える古い行に束ねない (束ねる時の状態は、 前の record を当てた後)。 その後で C が (削除を知らずに) 古い行を更新すると、
+/// その書き込みは今 z の名前を持つ行 (作り直した行) に当たる (#547: 名前が同じなら同じ行。 消えた行は名前の無い行として
+/// 生き返らない)。 author の A も、 B も、 古い行を持っていた C も同じ答え。
 #[test]
 fn recreating_a_key_set_last_in_one_batch_converges_with_the_author() {
     let dir = Dir::new("recreate");
@@ -237,9 +238,15 @@ fn recreating_a_key_set_last_in_one_batch_converges_with_the_author() {
     pull(&sb, 1);
     pull(&sb, 3);
     pull(&sa, 3);
-    let (on_a, on_b) = (rows(&a), rows(&b));
+    pull(&sc, 1);
+    let (on_a, on_b, on_c) = (rows(&a), rows(&b), rows(&c));
     assert_eq!(on_b, on_a, "B の行の集まりが author の A と違う (A: {on_a:?})");
-    assert_eq!(on_a, vec![(text("z"), text("y"), Some(Value::Number(1)))], "前提: A は作り直した z だけ");
+    assert_eq!(on_c, on_a, "C の行の集まりが author の A と違う (A: {on_a:?})");
+    assert_eq!(on_a, vec![(text("z"), text("y"), Some(Value::Number(2)))], "C の書き込みが作り直した z に当たらない");
+    for (name, db) in [("A", &a), ("B", &b), ("C", &c)] {
+        db.engine().rebuild();
+        assert_eq!(db.get_table(T).unwrap().where_eq("n", 2i64).count().unwrap(), 1, "{name}: n = 2 の行が名前の無い行でも残った");
+    }
 
     drop((sa, sb, sc));
     drop((a, b, c));

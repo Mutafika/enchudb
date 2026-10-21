@@ -406,10 +406,12 @@ fn an_early_delete_also_covers_the_same_key_from_another_author() {
     drop((a, b, c, d, e));
 }
 
-/// 削除より新しい書き込みは残る (主キーの cell は削除より古いので消え、 主キーの無い行になる)。 B が (A の削除を見ずに)
-/// title を更新した後: どの peer も主キーのある行は無く、 title b2 の行が 1 つ。
+/// 削除より新しい書き込みは残り、 行は主キー (名前) ごと生きる (#547: 名前の無い行は表の行でない。 前は主キーの cell
+/// だけ消えて、 主キーで引けない行が残り、 同じ主キーの upsert で 2 行目ができた)。 B が (A の削除を見ずに) title を
+/// 更新した後: どの peer も (z, b2) の行が 1 つ。 削除が先に届いた peer (C) と、 新しい title を先に持っていた peer (D) で
+/// 同じ。 その後で同じ主キーを upsert しても行は増えない。
 #[test]
-fn a_write_newer_than_the_delete_survives_without_its_key() {
+fn a_write_newer_than_the_delete_survives_with_its_key() {
     let dir = Dir::new("newer");
     let tr = transport(4);
     let (a, sa) = make(&dir, 1, &tr);
@@ -441,10 +443,68 @@ fn a_write_newer_than_the_delete_survives_without_its_key() {
     pull(&sd, 2);
     pull(&sd, 1);
     for (name, db) in [("A", &a), ("B", &b), ("C (A → B)", &c), ("D (B → A)", &d)] {
-        assert_eq!(rows(db), vec![], "{name}: 削除より古い主キーの cell が残った");
+        assert_eq!(rows(db), vec![(text("z"), text("b2"), None)], "{name}: 削除より新しい title の行が主キーごと残らない");
         assert_eq!((titled(db, "b2"), titled(db, "b")), (1, 0), "{name}: 削除より新しい title の行の数");
+        let before = db.engine().entity_count();
+        db.get_table(T).unwrap().upsert().set("key", "z").set("n", 9i64).commit().unwrap();
+        db.engine().rebuild();
+        assert_eq!(
+            (rows(db), db.engine().entity_count()),
+            (vec![(text("z"), text("b2"), Some(Value::Number(9)))], before),
+            "{name}: 同じ主キーの upsert で行が増えた"
+        );
     }
 
+    drop((sa, sb, sc, sd));
+    drop((a, b, c, d));
+}
+
+/// 削除より新しい書き込みが Leaf の列 (wire では TieLeaf) でも、 行は主キーごと生きる (#547)。
+#[test]
+fn a_newer_leaf_write_also_keeps_the_key() {
+    let dir = Dir::new("newer-leaf");
+    let tr = transport(4);
+    let peer = |id: u32| {
+        let mut bl = Database::create_with_capacity(&dir.db(id), 4096).unwrap();
+        bl.table("notes").tag("key").leaf("body").primary_key("key").build().unwrap();
+        bl.enable_sync().unwrap();
+        let db = bl.finish_with_oplog(OPLOG).unwrap();
+        db.engine().set_peer_id(id);
+        let s = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+        (db, s)
+    };
+    let ((a, sa), (b, sb), (c, sc), (d, sd)) = (peer(1), peer(2), peer(3), peer(4));
+    a.get_table("notes").unwrap().upsert().set("key", "z").set("body", "a").commit().unwrap();
+    publish(&a, &sa);
+    pull(&sb, 1);
+    later();
+    {
+        a.engine().rebuild();
+        let t = a.get_table("notes").unwrap();
+        let e = t.where_eq("key", "z").find_one().unwrap().unwrap();
+        t.entity(e).delete().unwrap();
+    }
+    publish(&a, &sa);
+    later();
+    {
+        b.engine().rebuild();
+        let t = b.get_table("notes").unwrap();
+        let e = t.where_eq("key", "z").find_one().unwrap().unwrap();
+        t.entity(e).set("body", "b2").commit().unwrap();
+    }
+    publish(&b, &sb);
+    pull(&sb, 1);
+    pull(&sa, 2);
+    pull(&sc, 1);
+    pull(&sc, 2);
+    pull(&sd, 2);
+    pull(&sd, 1);
+    for (name, db) in [("A", &a), ("B", &b), ("C (A → B)", &c), ("D (B → A)", &d)] {
+        db.engine().rebuild();
+        let t = db.get_table("notes").unwrap();
+        let rows: Vec<_> = t.all().find().unwrap().into_iter().map(|e| (t.entity(e).get("key"), t.entity(e).get("body"))).collect();
+        assert_eq!(rows, vec![(text("z"), text("b2"))], "{name}: Leaf の新しい書き込みの行が主キーごと残らない");
+    }
     drop((sa, sb, sc, sd));
     drop((a, b, c, d));
 }
