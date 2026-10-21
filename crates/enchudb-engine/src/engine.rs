@@ -10949,6 +10949,7 @@ impl Engine {
             // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い。
             return;
         }
+        self.move_names_to_identities(local, &keys);
         let mut g = self.foreign_tombs.write().unwrap();
         for key in keys {
             let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
@@ -10958,6 +10959,36 @@ impl Engine {
         }
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #545: 消えた行の slot `local` を使い回す前に、 その行の名前 (消えた時の名前と前の名前) を、 slot に写っていた identity に移す。
+    /// slot の記録は使い回しで外れるので、 移さないと、 写像の外れた identity 宛てに後から届いた (別の author の、 より新しい) 削除で
+    /// その名前の削除の時刻を上げられない (`remote_delete_apply_foreign`)。
+    fn move_names_to_identities(&self, local: u32, identities: &[(enchudb_oplog::PeerId, u32)]) {
+        use std::sync::atomic::Ordering;
+        let mut names: Vec<(u16, Box<[u8]>)> = Vec::new();
+        if !self.pk_tombs_empty.load(Ordering::Acquire) || self.pk_pending_nonempty.load(Ordering::Acquire) {
+            self.flush_pk_pending();
+            names.extend(self.pk_tombs.read().unwrap().key_of_slot(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        let former_on = !self.pk_former_empty.load(Ordering::Acquire);
+        if names.is_empty() && !former_on {
+            return;
+        }
+        let mut former = self.pk_former.write().unwrap();
+        if former_on {
+            names.extend(former.names_of(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        let mut changed = false;
+        for &(peer, foreign_local) in identities {
+            for (h, k) in &names {
+                changed |= former.insert_identity(peer, foreign_local, *h, k);
+            }
+        }
+        if changed {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
     }
 
     /// #166: `(author_peer, foreign_local)` に **新しい slot** を払い出した直後に、
@@ -11125,7 +11156,7 @@ impl Engine {
         self.remove_rows_named(local, himo, value, tomb)
     }
 
-    /// 削除優先 (#551): 主キー `value` を今持つ、 行 `local` でない生きた行のうち、 `tomb` より前にその名前になった行を `tomb` で消す
+    /// 削除優先 (#551): 主キー `value` を今持つ、 行 `local` (`u32::MAX` = 除く行なし) でない生きた行のうち、 `tomb` より前にその名前になった行を `tomb` で消す
     /// (同じ名前 = 同じ行)。 呼び手は行の lock を握っていない。 戻り値は消した行の数。
     fn remove_rows_named(&self, local: u32, himo: u16, value: u64, tomb: enchudb_oplog::Hlc) -> usize {
         let mut removed = 0;
@@ -11151,6 +11182,36 @@ impl Engine {
             .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
             .map(|(h, v)| self.remove_rows_named(local, h, v, tomb))
             .sum()
+    }
+
+    /// #545: identity `(peer, foreign_local)` に移した名前 (`move_names_to_identities`) を `tomb` で消した名前にし、 その名前を今持つ
+    /// 行のうち `tomb` より前にその名前になった行を消す。
+    fn raise_identity_names(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, tomb: enchudb_oplog::Hlc) {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let names: Vec<(u16, Box<[u8]>)> = self
+            .pk_former
+            .read()
+            .unwrap()
+            .names_of_identity(peer, foreign_local)
+            .map(|(h, k)| (h, Box::from(k)))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            for (h, k) in &names {
+                self.note_pk_locked(&mut g, *h, k, crate::pk_tombs::NO_SLOT, tomb);
+            }
+        }
+        for (h, k) in names {
+            if let Some(v) = self.pk_value_of_key(h, &k) {
+                self.remove_rows_named(u32::MAX, h, v, tomb);
+            }
+        }
     }
 
     /// 主キーの値の鍵 (`with_pk_key`) から今の値へ。 辞書に無い文字列 (その名前の行は無い) は None。
@@ -12220,11 +12281,19 @@ impl Engine {
         self.observe_remote_hlc(hlc);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        let before = self.foreign_tombstone_of(owner, foreign_local);
         match self
             .eid_translator
             .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
         {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                // #545: 消えた行の slot を使い回して写像が外れた entity に、 より新しい削除が届いた。 その行の名前の削除の時刻を上げ、
+                // その名前を今持つ行のうち、 この削除より前にその名前になった行を消す (`remote_delete_apply` の 2 人目の削除と同じ)
+                if accepted && before.is_some_and(|t| hlc > t) {
+                    self.raise_identity_names(owner, foreign_local, hlc);
+                }
+                accepted
+            }
             Err(local) => {
                 let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
                 self.remote_delete_apply(enchudb_oplog::make_eid(self_peer, local), hlc)
