@@ -7157,7 +7157,7 @@ impl Engine {
     /// `append_commit_marker` の、 WAL が満杯で打てなかった時を数えるかを選べる版。 `count_full = false` は、 満杯なら
     /// 打たなくてよい Commit (畳む直前に開いている group を閉じる Commit、 `make_wal_room_inner`) のため: 満杯で落ちたのは
     /// 打たなかったのと同じで、 「打てなかった Commit」 にも警告にも入れない (満杯以外の失敗は数える)。 Commit は payload 0
-    /// = `REC_HEADER_SIZE` ちょうどなので、 容量 (`OutOfMemory`) で落ちた時は満杯 (`append_dead`) と同値。
+    /// = 最小の record (閉じの Commit の分の空き `commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯 (`append_dead`) と同値。
     fn append_commit_marker_with(&self, wal: &enchudb_oplog::oplog::OpLog, count_full: bool) -> std::io::Result<()> {
         use std::sync::atomic::Ordering;
         match wal.append(enchudb_oplog::oplog::Op::Commit) {
@@ -17932,7 +17932,7 @@ impl Engine {
             // の正体だったので、 呼び出し側に伝える (死区間を除く。 下の `commit_res?`)。
             let commit_res = self.append_commit_marker(wal);
             // 満杯で打てなかったか (= その瞬間の `append_dead`) は失敗の種類で決める。 Commit は
-            // REC_HEADER_SIZE ちょうどなので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
+            // 最小の record (`commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
             // `append_dead()` を読み直すと、 間に consumer が畳んで満杯が解けていれば Err を返してしまう (#407)
             let commit_full = matches!(&commit_res, Err(e) if e.kind() == io::ErrorKind::OutOfMemory);
             // #77-H3: checkpoint 上限と durable_lsn は Commit append 直後に
@@ -17968,7 +17968,7 @@ impl Engine {
             // #268: transfer / listener まで済ませてから失敗を返す (打てた分は配る)。
             //
             // ただし **死区間 (`append_dead`) では返さない**。 Commit は payload 0 =
-            // REC_HEADER_SIZE ちょうどなので 「容量起因の Commit 失敗」 と
+            // 最小の record (`commit_room` と同じ大きさ) なので 「容量起因の Commit 失敗」 と
             // `append_dead()` は同値で、 ここで返すと 「WAL 満杯」 という *設計上の
             // 自己回復経路* (checkpoint を進める → fold が畳む。 `wal_full_fold`
             // 参照、 実運用で発現済み) に居るだけの呼び出し側が Err を受けることに
