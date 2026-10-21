@@ -47,9 +47,19 @@ struct Peer {
     first_row: std::sync::OnceLock<u64>,
 }
 
+thread_local! {
+    /// 表の eid の枠 (None = 既定)。 枠を使い切ると `entity_in` は消えた行の slot を使い回す (#545 の形を作る)。
+    static TABLE_CAPACITY: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 fn make(dir: &Dir, id: u32, tr: &Arc<InMemoryTransport>) -> Peer {
     let mut b = Database::create_with_capacity(&dir.db(id), 4096).unwrap();
-    b.table(T).tag("key").tag("title").primary_key("key").build().unwrap();
+    let t = b.table(T).tag("key").tag("title").primary_key("key");
+    let t = match TABLE_CAPACITY.get() {
+        Some(n) => t.with_capacity(n),
+        None => t,
+    };
+    t.build().unwrap();
     b.enable_sync().unwrap();
     let db = b.finish_with_oplog(OPLOG).unwrap();
     db.engine().set_peer_id(id);
@@ -381,4 +391,85 @@ fn a_later_delete_finds_the_name_the_row_died_with() {
         Vec::<u64>::new(),
         "C の行 (遅い削除より前に作られた同じ名前の行) が残った"
     );
+}
+
+/// #545: 消した行の slot を使い回した後に (B が別の行を足す)、 別の author の遅い削除が届く。 その間に作られた同じ名前の行 (C の z) は
+/// 遅い削除より前なので消える。 B は A の作成を前に受けているので、 A の遅い削除は写像の無い Delete として B に届く (写像は使い回しで外れた)。
+/// B は C の z を先に受けておく (遅い削除が届いた時に生きている C の z も消す)。
+#[test]
+fn a_later_delete_after_slot_reuse_still_raises_the_name() {
+    TABLE_CAPACITY.set(Some(1));
+    expect("reuse-later-delete", vec![(text("w"), text("b"))], |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[1].delete("z");
+        p[1].upsert("w", "b");
+        p[2].upsert("z", "c");
+        p[1].pull(3);
+        p[0].delete("z");
+    });
+}
+
+/// #545 の形に改名を混ぜる: B は A の改名 (z → y) を受けてから y で消し、 slot を使い回す。 C は前の名前 z で作る。 前の名前も同じ行なので、
+/// A の遅い削除で C の z も消える (使い回しで、 前の名前も identity に移す)。
+#[test]
+fn a_later_delete_after_slot_reuse_raises_the_former_name_too() {
+    TABLE_CAPACITY.set(Some(1));
+    expect("reuse-later-delete-former", vec![(text("w"), text("b"))], |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[0].rename("z", "y");
+        p[1].pull(1);
+        p[1].delete("y");
+        p[1].upsert("w", "b");
+        p[2].upsert("z", "c");
+        p[0].delete("y");
+    });
+}
+
+/// #545: 使い回しで identity に移した名前は開き直しても残る (`pkformer`)。 record を手で組んで当てる: A の行 (主キー 7) を B の削除で
+/// 消し、 表の枠が 1 なので次の行が A の行の slot を使い回す。 開き直してから、 間に作られた C の 7 と A の遅い削除が届く。
+#[test]
+fn names_moved_on_slot_reuse_survive_a_reopen() {
+    use enchudb_oplog::oplog::DecodedOp;
+    use enchudb_oplog::{make_eid, EntityId};
+    let dir = Dir::new("reuse-reopen");
+    let path = dir.db(10);
+    let tr = Arc::new(InMemoryTransport::new());
+    tr.register_peer(10);
+    let rec = |author: u32, wall: u64, op: DecodedOp| enchudb::transport::WireRecord {
+        hlc: Hlc { wall, logical: 0, peer: author },
+        author_peer: author,
+        op,
+        signature: [0; 64],
+        pubkey_fp: [0; 8],
+        signed_bytes: Vec::new(),
+    };
+    let row_a: EntityId = make_eid(1, 5);
+    let key = {
+        let mut b = Database::create_with_capacity(&path, 4096).unwrap();
+        b.table(T).number("key").tag("title").primary_key("key").with_capacity(1).build().unwrap();
+        b.enable_sync().unwrap();
+        let db = b.finish_with_oplog(OPLOG).unwrap();
+        db.engine().set_peer_id(10);
+        let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+        let key = db.engine().himo_id("t.key").unwrap() as u16;
+        sync.apply_records(&[rec(1, 100, DecodedOp::Tie { eid: row_a, himo_id: key, value: 7 })]);
+        sync.apply_records(&[rec(2, 200, DecodedOp::Delete { eid: row_a })]);
+        let t = db.get_table(T).unwrap();
+        t.insert().set("key", 8i64).set("title", "w").commit().unwrap();
+        db.engine().oplog_sync().unwrap();
+        key
+    };
+    let db = Database::open_with_oplog(&path, OPLOG).unwrap();
+    db.engine().set_peer_id(10);
+    let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+    sync.apply_records(&[rec(3, 300, DecodedOp::Tie { eid: make_eid(3, 9), himo_id: key, value: 7 })]);
+    db.engine().rebuild();
+    let t = db.get_table(T).unwrap();
+    assert_eq!(t.all().count().unwrap(), 2, "前提: C の 7 は前の削除の後なので生きる (と使い回した行 8)");
+    sync.apply_records(&[rec(1, 400, DecodedOp::Delete { eid: row_a })]);
+    db.engine().rebuild();
+    let keys: Vec<_> = t.all().find().unwrap().into_iter().map(|e| t.entity(e).get("key")).collect();
+    assert_eq!(keys, vec![Some(Value::Number(8))], "開き直した後の遅い削除で C の 7 が消えない (移した名前を失った)");
 }
