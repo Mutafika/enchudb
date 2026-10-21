@@ -2893,6 +2893,8 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// 配り終えるまで畳めない時など)。
 #[cfg(not(target_arch = "wasm32"))]
 const WAL_ROOM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// #560: `oplog_sync()` が、 配っている最中の listener (通知係が呼んでいる) を待つ上限。
+const LISTENER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// sync の DB で満杯の時に、 閉じの Commit を打ち直して畳み直す回数の上限 (`make_wal_room_inner`)。
 const WAL_ROOM_FOLD_ROUNDS: usize = 4;
@@ -4273,7 +4275,7 @@ pub struct Engine {
     /// #560: 溜めの上限を越えて外した listener の数 (累計)。
     change_listeners_detached: std::sync::atomic::AtomicU64,
     /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。
-    change_deliver_lock: std::sync::Mutex<()>,
+    change_deliver_lock: parking_lot::Mutex<()>,
     /// 通知係の thread。 WAL 付きの並行の形で listener が居る時だけ起こす。 Drop で止めて join する。
     notifier_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 通知係を起こす係 (通知係を起こす時に作る)。
@@ -4765,7 +4767,7 @@ impl Engine {
             }),
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
-            change_deliver_lock: std::sync::Mutex::new(()),
+            change_deliver_lock: parking_lot::Mutex::new(()),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
             notifier_pending: std::sync::atomic::AtomicBool::new(false),
@@ -6006,7 +6008,7 @@ impl Engine {
             }),
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
-            change_deliver_lock: std::sync::Mutex::new(()),
+            change_deliver_lock: parking_lot::Mutex::new(()),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
             notifier_pending: std::sync::atomic::AtomicBool::new(false),
@@ -16763,6 +16765,9 @@ impl Engine {
     /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
     /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
     /// 待たない)。
+    ///
+    /// #560: 待つのは [`LISTENER_WAIT`] まで。 配っている listener がそれより長く返らなければ、 配らずに返る (残りは通知係が
+    /// 配る)。 前は止まった listener の後ろで `oplog_sync()` が永久に待った。
     fn deliver_changes(&self, wait: bool) {
         thread_local! {
             /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
@@ -16772,14 +16777,18 @@ impl Engine {
             return;
         }
         let Some(wal) = self.oplog.as_ref() else { return };
-        let _deliver = if wait {
-            self.change_deliver_lock.lock().unwrap_or_else(|p| p.into_inner())
-        } else {
-            match self.change_deliver_lock.try_lock() {
-                Ok(g) => g,
-                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => return,
+        let deliver = if wait { self.change_deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.change_deliver_lock.try_lock() };
+        let Some(_deliver) = deliver else {
+            if wait {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[enchudb] warning: a change listener has not returned for {LISTENER_WAIT:?} — oplog_sync() returns \
+                         without delivering its commit (the notifier delivers it later)"
+                    );
+                }
             }
+            return;
         };
         struct Emitting;
         impl Drop for Emitting {

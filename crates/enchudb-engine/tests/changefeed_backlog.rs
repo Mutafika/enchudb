@@ -21,6 +21,8 @@ struct Recorder {
     gate: AtomicBool,
     /// `on_detached` で受け取った HLC (#560)
     detached: Mutex<Option<enchudb_oplog::Hlc>>,
+    /// `on_changes` に入ったか (門で止まっている間も立つ)
+    entered: AtomicBool,
 }
 
 impl Recorder {
@@ -31,6 +33,7 @@ impl Recorder {
             delay,
             gate: AtomicBool::new(open),
             detached: Mutex::new(None),
+            entered: AtomicBool::new(false),
         })
     }
     fn len(&self) -> usize {
@@ -40,6 +43,7 @@ impl Recorder {
 
 impl ChangeListener for Recorder {
     fn on_changes(&self, recs: &[WireRecord]) {
+        self.entered.store(true, Ordering::Release);
         // 止める受け手: test が門を開けるまで (最大 30 秒) 返らない
         let until = Instant::now() + Duration::from_secs(30);
         while !self.gate.load(Ordering::Acquire) && Instant::now() < until {
@@ -214,4 +218,33 @@ fn prompt_listener_is_not_detached_under_a_small_limit() {
     if let Some(m) = first_mismatch(&got, N) {
         panic!("受け手に順に 1 回ずつ届いていない: {m}");
     }
+}
+
+/// #560: 通知係が止まった受け手に配っている最中でも、 `oplog_sync()` は永久には待たない (上限 5 秒で配らずに返る。 残りは
+/// 通知係が配る)。 前は受け手が返るまで待った (受け手が永久に止まれば `oplog_sync()` も永久)。
+#[test]
+fn oplog_sync_does_not_wait_forever_behind_a_stuck_listener() {
+    let (p, eng) = engine("stuck-sync", 1 << 20);
+    let rec = Recorder::new(Duration::ZERO, false);
+    eng.add_change_listener(rec.clone());
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    eng.tie_to_by_id(a, ts, 1u64);
+    eng.oplog_commit();
+    // 通知係が配り始めて受け手の門で止まるのを待つ (consumer の周期で配る)
+    let until = Instant::now() + Duration::from_secs(10);
+    while !rec.entered.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(rec.entered.load(Ordering::Acquire), "前提: 通知係が受け手に配り始めた");
+    eng.tie_to_by_id(a, ts, 2u64);
+    let started = Instant::now();
+    eng.oplog_sync().unwrap();
+    let took = started.elapsed();
+    rec.gate.store(true, Ordering::Release);
+    let got = wait_for(&rec, 2, Duration::from_secs(30));
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+    assert!(took < Duration::from_secs(10), "oplog_sync が止まった受け手を {took:?} 待った");
+    assert_eq!(got, vec![1, 2], "受け手が戻った後に残りが届かない");
 }
