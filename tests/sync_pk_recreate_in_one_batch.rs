@@ -108,14 +108,17 @@ fn recreating_a_primary_key_in_one_batch_converges_with_the_author() {
     db_c.get_table(TABLE).unwrap().entity(old_on_c).update().set("n", 2i64).commit().unwrap();
     publish_all(&db_c, &sync_c);
 
-    // 4. B は A の batch (消す・作り直す) と C の更新を、 A は C の更新を受け取る
-    for (got, what) in [(sync_b.pull_once(1), "B ← A"), (sync_b.pull_once(3), "B ← C"), (sync_a.pull_once(3), "A ← C")] {
-        assert!(got.received > 0 && got.applied == got.received, "{what}: {got:?}");
+    // 4. B は A の batch (消す・作り直す) と C の更新を、 A は C の更新を受け取る。 C の更新は消した古い行宛てなので、 削除より
+    //    新しくても捨てる (削除優先、 2026-10-21)
+    let got = sync_b.pull_once(1);
+    assert!(got.received > 0 && got.applied == got.received, "B ← A: {got:?}");
+    for (got, what) in [(sync_b.pull_once(3), "B ← C"), (sync_a.pull_once(3), "A ← C")] {
+        assert!(got.received > 0 && got.applied == 0, "{what}: 消した古い行への C の更新が当たった: {got:?}");
     }
 
     let (on_a, on_b) = (rows(&db_a), rows(&db_b));
     assert_eq!(on_b, on_a, "B の行の集まりが author の A と違う (A: {on_a:?})");
-    // C の更新 (古い行の n = 2) が載った行: 表の行として見えなくても、 列の値で引けるものは同じ数
+    assert_eq!(on_a, vec![(Some(Value::Number(7)), Some(Value::Text("y".into())), Some(Value::Number(1)))], "作り直した行だけ");
     let n2 = |db: &Database| db.get_table(TABLE).unwrap().where_eq("n", 2i64).find().unwrap().len();
-    assert_eq!(n2(&db_b), n2(&db_a), "n = 2 の行の数が違う");
+    assert_eq!((n2(&db_a), n2(&db_b)), (0, 0), "消した古い行への C の更新 (n = 2) が残った");
 }

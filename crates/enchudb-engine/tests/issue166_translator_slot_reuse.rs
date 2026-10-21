@@ -164,10 +164,10 @@ fn older_record_does_not_resurrect_a_deleted_foreign_entity_after_slot_reuse() {
     cleanup(&path);
 }
 
-/// 削除より **新しい** record は、 slot が回った後でも正しく適用される
-/// (= tombstone を退避したせいで永久に閉じてしまう、 という過剰防御になっていない)。
+/// 削除優先 (2026-10-21): 削除より **新しい** record も、 slot が回った後に消えた entity には当たらない (消えた entity 宛ての
+/// 書き込みは捨てる)。 新しい住人は巻き込まない。
 #[test]
-fn newer_record_still_applies_after_slot_reuse() {
+fn newer_record_for_a_deleted_entity_is_dropped_after_slot_reuse() {
     let path = tmp("newer_ok");
     let (eng, hid, foreign, translated) = setup(&path);
     let slot = enchudb_oplog::eid_local(translated);
@@ -177,13 +177,13 @@ fn newer_record_still_applies_after_slot_reuse() {
     eng.tie_to(y, "t.age", 555);
     free_one_slot(&eng, &fillers);
 
-    // 削除 (2000) より新しい Tie → LWW 的には採用されるべき
+    // 削除 (2000) より新しい Tie も、 消えた entity 宛てなので捨てる
     let t = eng.resolve_remote_eid(foreign, hid).expect("翻訳できない");
     assert!(
-        eng.remote_tie_apply(t, hid, 111, hlc(3000, 1)),
-        "削除より新しい Tie が適用されない (退避 tombstone が過剰に効いている)",
+        !eng.remote_tie_apply(t, hid, 111, hlc(3000, 1)),
+        "削除より新しい Tie で消えた entity が生き返った (削除優先)",
     );
-    assert_eq!(eng.get(t, "t.age"), Some(111));
+    assert_eq!(eng.get(t, "t.age"), None);
     assert_eq!(eng.get(y, "t.age"), Some(555), "新しい住人を巻き込んだ");
     drop(eng);
     cleanup(&path);

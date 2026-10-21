@@ -1555,8 +1555,16 @@ impl<'a> TableBuilder<'a> {
 
         // PK 検証
         if let Some(pk_name) = &pk {
-            if !col_specs.iter().any(|(n, _, _)| n == pk_name) {
-                return Err(SchemaError::UnknownColumn(pk_name.clone()));
+            match col_specs.iter().find(|(n, _, _)| n == pk_name) {
+                None => return Err(SchemaError::UnknownColumn(pk_name.clone())),
+                // #551: 名前 (主キー) は辞書の語 (Tag) か数。 Leaf は語を束ねない (値で引けない) ので名前にならない (upsert が
+                // 毎回新しい行を作り、 sync で束ねず、 消した名前も覚えない)。 新しく作る表だけ断る (既にある表は開ける)
+                Some((_, ColumnType::Leaf, _)) => {
+                    return Err(SchemaError::BadValue(format!(
+                        "table '{name}': the name column '{pk_name}' is a leaf column (use tag / number / bigint)"
+                    )));
+                }
+                Some(_) => {}
             }
         }
 

@@ -406,10 +406,10 @@ fn an_early_delete_also_covers_the_same_key_from_another_author() {
     drop((a, b, c, d, e));
 }
 
-/// 削除より新しい書き込みは残る (主キーの cell は削除より古いので消え、 主キーの無い行になる)。 B が (A の削除を見ずに)
-/// title を更新した後: どの peer も主キーのある行は無く、 title b2 の行が 1 つ。
+/// 削除優先 (2026-10-21): 削除より新しい書き込みでも、 消した行 (同じ主キーの行) には当たらない。 B が (A の削除を見ずに)
+/// title を更新した後: どの peer も z の行は無く、 title b2 の塊も残らない (前は主キーの無い行で残った、 #547)。
 #[test]
-fn a_write_newer_than_the_delete_survives_without_its_key() {
+fn a_write_newer_than_the_delete_is_dropped() {
     let dir = Dir::new("newer");
     let tr = transport(4);
     let (a, sa) = make(&dir, 1, &tr);
@@ -441,8 +441,8 @@ fn a_write_newer_than_the_delete_survives_without_its_key() {
     pull(&sd, 2);
     pull(&sd, 1);
     for (name, db) in [("A", &a), ("B", &b), ("C (A → B)", &c), ("D (B → A)", &d)] {
-        assert_eq!(rows(db), vec![], "{name}: 削除より古い主キーの cell が残った");
-        assert_eq!((titled(db, "b2"), titled(db, "b")), (1, 0), "{name}: 削除より新しい title の行の数");
+        assert_eq!(rows(db), vec![], "{name}: 消した行が残った");
+        assert_eq!((titled(db, "b2"), titled(db, "b")), (0, 0), "{name}: 消した行への削除より新しい書き込みが残った");
     }
 
     drop((sa, sb, sc, sd));

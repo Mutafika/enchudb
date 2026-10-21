@@ -160,6 +160,7 @@ fn reusing_the_merged_slot_drops_the_alias() {
 }
 
 /// src の削除版数は dst にも当たる (同じ entity の削除): 削除より古い dst の cell は落ち、 削除の後に書かれた src の cell は入る。
+/// 削除優先 (2026-10-21) で消えた行には書けないので、 生きた src に版数が載った形 (前の版の DB の生き残り / 途中で切れた削除の跡) で見る。
 #[test]
 fn merging_applies_the_src_delete_to_dst() {
     let path = tmp_path("tomb");
@@ -172,7 +173,7 @@ fn merging_applies_the_src_delete_to_dst() {
     let src = translated_row(&eng, foreign);
     let t = |w: u64| Hlc { wall: w, logical: 0, peer: OTHER_PEER };
     assert!(eng.remote_tie_apply(src, hid(&eng, "files.size"), 1, t(u64::MAX / 4)));
-    assert!(eng.remote_delete_apply(src, t(u64::MAX / 3)));
+    assert!(eng.set_tombstone(src, t(u64::MAX / 3)));
     assert!(eng.remote_tie_apply(src, hid(&eng, "files.size"), 2, t(u64::MAX / 2)));
 
     eng.merge_entity_into(src, dst).unwrap();
