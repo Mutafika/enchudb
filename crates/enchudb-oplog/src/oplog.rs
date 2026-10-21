@@ -899,6 +899,10 @@ impl OpLog {
         if err.kind() != io::ErrorKind::OutOfMemory {
             return false;
         }
+        // #553: 空の ring にも入らない record は、 畳んでも載らないので待たない (前は上限の 5 秒まで consumer を起こし続けた)
+        if self.larger_than_ring(size) {
+            return false;
+        }
         if self.free_bytes() >= size {
             return true;
         }
@@ -908,6 +912,11 @@ impl OpLog {
         }
         self.warn_wal_full();
         false
+    }
+
+    /// #553: `size` byte (record と閉じの Commit の分) が空の ring にも入らないか。
+    fn larger_than_ring(&self, size: u64) -> bool {
+        size > self.capacity.saturating_sub(HEADER_SIZE as u64)
     }
 
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。
@@ -1489,6 +1498,11 @@ impl OpLog {
             // 閉じるのが遅れるだけ、 #268) ので覚えない (採番もしない)。
             if is_commit {
                 return (e, Hlc::ZERO);
+            }
+            // #553: WAL より大きい record は落ちた record として覚えない (呼び手が断る。 覚えると、 書いていない write の分まで
+            // 相手に取り直させる)。 種類を `InvalidInput` に分ける (満杯 = `OutOfMemory` は畳めば載る)
+            if e.kind() == io::ErrorKind::OutOfMemory && self.larger_than_ring(record_size as u64 + reserve) {
+                return (io::Error::new(io::ErrorKind::InvalidInput, "oplog: the record is larger than the WAL"), Hlc::ZERO);
             }
             let hlc = relay.map(|h| h.hlc).or(hlc_override).unwrap_or_else(|| self.next_hlc());
             self.note_dropped(relay.map(|h| h.author).unwrap_or_else(|| self.peer_id()), hlc);

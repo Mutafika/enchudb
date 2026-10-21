@@ -171,10 +171,13 @@ pub enum FaultKind {
     /// #534: 列の segment を初めて開く I/O が失敗した (一時的な EIO / mmap の失敗など)。 書き込みは何も変えずに断り、
     /// 次に触った時にまた開いてみる
     SegmentIo,
+    /// #553 / #554: 書き込みが WAL に載らない (WAL より大きい record、 または sync の表の無い DB で満杯の WAL を畳めない)。
+    /// 本体にも当てずに断る
+    WalSpace,
 }
 
 impl FaultKind {
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
     pub(crate) fn index(self) -> usize {
         match self {
             FaultKind::EntitySpace => 0,
@@ -184,6 +187,7 @@ impl FaultKind {
             FaultKind::DiskSpace => 4,
             FaultKind::StaleValue => 5,
             FaultKind::SegmentIo => 6,
+            FaultKind::WalSpace => 7,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -195,6 +199,7 @@ impl FaultKind {
             FaultKind::DiskSpace => "filesystem is (nearly) full",
             FaultKind::StaleValue => "stale value id (reclaimed)",
             FaultKind::SegmentIo => "column segment could not be opened",
+            FaultKind::WalSpace => "the write does not fit in the oplog (WAL)",
         }
     }
 }
@@ -1521,6 +1526,28 @@ mod wal_hook {
     }
 }
 
+/// test 用: 置いた WAL の書き出し (`sync_for_checkpoint`) を失敗させる (#554: sync の表の無い DB で満杯の WAL を畳めない形)。
+#[cfg(test)]
+mod write_out_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn active(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
 /// test 用の割り込み点: ローカルの cell の書き込み (`try_tie_to_by_id`) が WAL に積んだ後、 cell に当てる前 (#563)。 同じ cell の
 /// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
 #[cfg(test)]
@@ -1799,6 +1826,58 @@ mod wal_room_commit_tests {
         assert_eq!(eng.wal_dropped_records(), 0, "bridge の lock が取れなかった試しで、 待っている書き手が諦めた");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// #554: sync の表の無い DB で満杯の WAL を畳めない (書き出しが失敗する) 時、 書き込みは `Err` で断られ本体に当たらない。
+/// untie / delete も断られて何も変えない。 書き出せるようになれば書ける。 前は Ok を返して本体にだけ書き、 再起動の再生・
+/// change listener から抜けた (落ちたことを知る相手が居ない)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod wal_reject_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn writes_that_cannot_reach_the_wal_are_rejected_without_sync_tables() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-walreject-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_table("t", 4_000).unwrap();
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 8 * 1024).unwrap();
+        assert!(!eng.sync_tables_enabled(), "前提: sync の表の無い DB");
+        let kept = eng.entity_in("t").unwrap();
+        eng.try_tie_to_by_id(kept, v, 1u32).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        write_out_fault::set(&wal, true);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (e, r) = loop {
+            assert!(Instant::now() < deadline, "満杯にならない (free={} bytes)", wal.free_bytes());
+            let e = eng.entity_in("t").unwrap();
+            if let Err(r) = eng.try_tie_to_by_id(e, v, 7u32) {
+                break (e, r);
+            }
+        };
+        assert_eq!(r, TieRejected::Fault(FaultKind::WalSpace));
+        assert_eq!(eng.get_by_id(e, v), None, "WAL に載らなかった書き込みが本体に当たった");
+        assert_eq!(eng.wal_dropped_records(), 0, "断った書き込みを落ちた record に数えた");
+        let faults = eng.fault_count(FaultKind::WalSpace);
+        eng.untie_by_id(kept, v);
+        eng.delete(kept);
+        assert_eq!(eng.get_by_id(kept, v), Some(1), "WAL に載らなかった untie / delete が本体を変えた");
+        assert!(eng.fault_count(FaultKind::WalSpace) >= faults + 2, "untie / delete を断った数が増えない");
+        write_out_fault::set(&wal, false);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while eng.try_tie_to_by_id(e, v, 8u32).is_err() {
+            assert!(Instant::now() < deadline, "書き出せるようになっても書けない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(eng.get_by_id(e, v), Some(8));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 }
 
@@ -7605,7 +7684,9 @@ impl Engine {
                 // `free_locals` を握ったまま (上の doc)。 #511
                 self.check_writable();
                 let row_local = enchudb_oplog::eid_local(eid);
-                let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) });
+                let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) }) else {
+                    return false;
+                };
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
                 let applied = self.apply_delete_in(row.as_ref(), row_local, hlc);
@@ -9395,7 +9476,7 @@ impl Engine {
     /// #178: `Op::Alias` を自分の oplog に積んで閉じる (bridge が配る)。 WAL の無い DB では何もしない。
     fn emit_alias_record(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) {
         let Some(wal) = self.oplog.as_ref() else { return };
-        self.append_local_op(enchudb_oplog::oplog::Op::Alias { eid, same_as });
+        let _ = self.append_local_op(enchudb_oplog::oplog::Op::Alias { eid, same_as });
         let _ = self.append_commit_marker(wal);
     }
 
@@ -10151,26 +10232,46 @@ impl Engine {
     /// 後から当てた方が残る) では、 読める値と WAL の最後の record (開き直した後・change listener・相手に届く値) が食い違った (#503)。
     /// 版数を持つ DB では、 後から当てる古い方を 「時計が戻った」 と弾いていた (`warn_local_write_rejected`)。
     ///
-    /// oplog 無効は `Hlc::ZERO` = 版数不明。 載らなかった (WAL 満杯) 時は、 落ちた record として覚えた HLC (#57)。
+    /// oplog 無効は `Hlc::ZERO` = 版数不明。
+    ///
+    /// 載らなかった時 (#553 / #554): WAL より大きい record はどの DB でも、 sync の表の無い DB は満杯で畳めなかった時も
+    /// `Err` (呼び手は本体に当てずに断る。 落ちたことを知る相手が居ない = 再起動の再生・change listener から抜けるので)。
+    /// sync の表のある DB の満杯は今まで通り、 落ちた record として覚えた HLC (#57) で本体に書く (相手に floor で知らせて
+    /// 取り直させる)。
     #[inline]
-    fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
+    fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> Result<enchudb_oplog::Hlc, TieRejected> {
         match self.oplog.as_ref() {
             // #57: 載らなかった (満杯) write にも版数を付ける (ZERO = 版数不明だと、 後から届く
             // 古い write に負ける)。 その HLC は WAL が落ちた record として覚えた値 (後で採番し直すと、
             // その間に bridge が floor を決めて版数が floor を越える)。 bridge が floor を上げる
-            Some(wal) => match wal.append_or_dropped(op) {
+            Some(wal) if self.sync_tables_on() => match wal.append_or_dropped(op) {
                 Ok((_, h)) => {
                     self.wal_append_recovered();
-                    h
+                    Ok(h)
                 }
+                Err((e, _)) if e.kind() == io::ErrorKind::InvalidInput => Err(self.wal_rejected(&e)),
                 Err((e, h)) => {
                     // #454: 同期の書き込みで落ちた record も数える
                     self.note_wal_records_dropped(1, &e);
-                    h
+                    Ok(h)
                 }
             },
-            None => enchudb_oplog::Hlc::ZERO,
+            Some(wal) => match wal.append_with_hlc(op) {
+                Ok((_, h)) => {
+                    self.wal_append_recovered();
+                    Ok(h)
+                }
+                Err(e) => Err(self.wal_rejected(&e)),
+            },
+            None => Ok(enchudb_oplog::Hlc::ZERO),
         }
+    }
+
+    /// #553 / #554: WAL に載らなかった書き込みを断る (呼び手は本体に当てない)。 計上して返す。
+    #[cold]
+    fn wal_rejected(&self, e: &io::Error) -> TieRejected {
+        self.record_fault(FaultKind::WalSpace, &format!("WAL に載らない ({e}) — write rejected"));
+        TieRejected::Fault(FaultKind::WalSpace)
     }
 
     /// #268: append が通った。 落ちていた episode の後なら、 次の episode でまた 1 行警告できるよう戻す (立っている時だけ書く:
@@ -10183,11 +10284,19 @@ impl Engine {
         }
     }
 
-    /// #454: cell を持たない record (Vocab) を同期の書き込みの中で積む。 落ちたら数える。
-    fn append_vocab_record(&self, wal: &enchudb_oplog::oplog::OpLog, vid: u32, bytes: &[u8]) {
+    /// #454: cell を持たない record (Vocab) を同期の書き込みの中で積む。 落ちたら数える。 断る場合は `append_local_op` と同じ
+    /// (#553 / #554: 呼び手は続く Tie を積まずに断る)。
+    fn append_vocab_record(&self, wal: &enchudb_oplog::oplog::OpLog, vid: u32, bytes: &[u8]) -> Result<(), TieRejected> {
         match wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes }) {
-            Ok(_) => self.wal_append_recovered(),
-            Err(e) => self.note_wal_records_dropped(1, &e),
+            Ok(_) => {
+                self.wal_append_recovered();
+                Ok(())
+            }
+            Err(e) if self.sync_tables_on() && e.kind() != io::ErrorKind::InvalidInput => {
+                self.note_wal_records_dropped(1, &e);
+                Ok(())
+            }
+            Err(e) => Err(self.wal_rejected(&e)),
         }
     }
 
@@ -12937,12 +13046,18 @@ impl Engine {
             // **今 insert した payload** を捨てる (cell は旧 offset を指したままなので
             // 旧 payload は生きている)。
             let oplog_eid = self.oplog_eid(eid);
-            let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
+            let hlc = match self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
                 eid: oplog_eid,
                 himo_name: &self.himo_names[hid],
                 himo_kind: self.value_types[hid] as u8,
                 bytes,
-            });
+            }) {
+                Ok(h) => h,
+                Err(r) => {
+                    leaf.free(off);
+                    return Err(r);
+                }
+            };
             if !self.set_cell_in(Some(&row), eid, himo_id, off, hlc) {
                 leaf.free(off);
                 self.warn_local_write_rejected(eid, himo_id, hlc);
@@ -12983,13 +13098,22 @@ impl Engine {
             enchudb_oplog::Hlc::ZERO
         } else {
             let oplog_eid = self.oplog_eid(eid);
-            if let Some(wal) = self.oplog.as_ref() {
-                // Vocab は cell を持たない (= 版数の対象外)。
-                self.append_vocab_record(wal, vid, value.as_bytes());
+            // Vocab は cell を持たない (= 版数の対象外)。
+            let appended = match self.oplog.as_ref() {
+                Some(wal) => self.append_vocab_record(wal, vid, value.as_bytes()),
+                None => Ok(()),
             }
-            self.append_local_op(
-                enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
-            )
+            .and_then(|()| {
+                self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 })
+            });
+            match appended {
+                Ok(h) => h,
+                Err(r) => {
+                    drop(row);
+                    self.vocab_unpin(hid, vid);
+                    return Err(r);
+                }
+            }
         };
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
         drop(row);
@@ -13113,12 +13237,15 @@ impl Engine {
             }
             // request17 step 4: WAL 先行で採番。 不採用なら今 insert した payload を捨てる。
             let oplog_eid = self.oplog_eid(eid);
-            let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
+            let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
                 eid: oplog_eid,
                 himo_name: &self.himo_names[hid],
                 himo_kind: self.value_types[hid] as u8,
                 bytes: value,
-            });
+            }) else {
+                leaf.free(off);
+                return;
+            };
             if !self.set_cell_in(Some(&row), eid, himo_id, off, hlc) {
                 leaf.free(off);
                 self.warn_local_write_rejected(eid, himo_id, hlc);
@@ -13154,22 +13281,31 @@ impl Engine {
             enchudb_oplog::Hlc::ZERO
         } else {
             let oplog_eid = self.oplog_eid(eid);
-            if let Some(wal) = self.oplog.as_ref() {
-                // Vocab は cell を持たない (= 版数の対象外)。
-                self.append_vocab_record(wal, vid, value);
+            // Vocab は cell を持たない (= 版数の対象外)。
+            let appended = match self.oplog.as_ref() {
+                Some(wal) => self.append_vocab_record(wal, vid, value),
+                None => Ok(()),
             }
-            if self.himo_is_content(hid) {
-                // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
-                self.append_local_op(enchudb_oplog::oplog::Op::TieNamed {
-                    eid: oplog_eid,
-                    himo_name: &self.himo_names[hid],
-                    himo_kind: self.value_types[hid] as u8,
-                    value: vid as u64,
-                })
-            } else {
-                self.append_local_op(
-                    enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
-                )
+            .and_then(|()| {
+                if self.himo_is_content(hid) {
+                    // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
+                    self.append_local_op(enchudb_oplog::oplog::Op::TieNamed {
+                        eid: oplog_eid,
+                        himo_name: &self.himo_names[hid],
+                        himo_kind: self.value_types[hid] as u8,
+                        value: vid as u64,
+                    })
+                } else {
+                    self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 })
+                }
+            });
+            match appended {
+                Ok(h) => h,
+                Err(_) => {
+                    drop(row);
+                    self.vocab_unpin(hid, vid);
+                    return;
+                }
             }
         };
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
@@ -13226,7 +13362,16 @@ impl Engine {
             enchudb_oplog::Hlc::ZERO
         } else {
             let oplog_eid = self.oplog_eid(eid);
-            self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value })
+            match self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value }) {
+                Ok(h) => h,
+                Err(r) => {
+                    drop(row);
+                    if pinned {
+                        self.vocab.release(value as u32);
+                    }
+                    return Err(r);
+                }
+            }
         };
         #[cfg(test)]
         if let Some(wal) = self.oplog.as_ref() {
@@ -13281,7 +13426,7 @@ impl Engine {
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(
             enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: target_eid as u64 },
-        );
+        )?;
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, target_eid, hlc);
         drop(row);
         if !written {
@@ -13337,9 +13482,9 @@ impl Engine {
         // 蘇る)。 Leaf payload の解放は **採用が決まってから**。 行を握ってから積む (`append_local_op` の doc)
         let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
-        let hlc = self.append_local_op(
-            enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id },
-        );
+        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id }) else {
+            return;
+        };
         let cleared = self.clear_cell_in_freeing_leaf(row.as_ref(), eid, himo_id, hlc);
         drop(row);
         if !cleared {
@@ -13363,7 +13508,9 @@ impl Engine {
         // 行を握ってから積む (`append_local_op` の doc)
         let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
-        let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid });
+        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }) else {
+            return;
+        };
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc);
         drop(row);
         if !applied {
@@ -17826,6 +17973,10 @@ impl Engine {
     /// checkpoint を進める前の oplog fsync + 本体の書き出し。 どちらかが失敗したら false (#317: 空き不足で
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
+        #[cfg(test)]
+        if write_out_fault::active(wal) {
+            return false;
+        }
         let wal_ok = wal.fsync().is_ok();
         // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
         // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
