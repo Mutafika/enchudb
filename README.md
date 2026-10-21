@@ -234,6 +234,13 @@ those records have been handed on. If that is stuck, writes still land in the DB
 records drop out of the stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch
 up by bootstrap.
 
+Starting the ring over leaves the previous lap's records in the file until they are overwritten. Every record therefore
+carries the lap it was written in (an 8-byte mark after the payload, oplog file format 3), and recovery stops at the first
+record whose lap is not the current one. Without it, a power loss right after a restart of the ring could present the old
+records as the continuation of the new ones when the OS had written the header page before the data pages (#608).
+A format-3 oplog cannot be opened by 0.35 and earlier; to go back, close the DB cleanly and delete `{db}/oplog`
+(after a clean close everything in it is already applied).
+
 ### RAG (`enchudb-rag`)
 
 ```rust

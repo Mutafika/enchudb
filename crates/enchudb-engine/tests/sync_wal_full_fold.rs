@@ -6,7 +6,7 @@
 //! 1. 満杯で空きを待つ書き手は `pending_writes` に入ったまま待ち、 sync の DB が畳む道 (`OpLog::try_reset_if`) はそれが
 //!    0 でないと畳まなかった。 → 見ない (sync の無い DB の道 `checkpoint_and_reset` と同じ。 全 append は `append_lock` の
 //!    下で書き終える)
-//! 2. 1 を直しても、 満杯の時に空きが Commit (112 byte) より小さいと閉じの Commit を打てず、 開いた group を畳む時に
+//! 2. 1 を直しても、 満杯の時に空きが Commit (120 byte、 周の印込み) より小さいと閉じの Commit を打てず、 開いた group を畳む時に
 //!    孤児の group として配りから落とした (#450 の死区間の例外。 しかも `wal_dropped_records` に数えていなかった)。
 //!    → data の record は閉じの Commit 1 つ分の空きを残してしか場所を取らない (`OpLog::alloc`)。 孤児の group の落ちも数える
 //! 3. 書き手が積み続けている間に空き作りが走ると (頼まれてから動き出すまでに空きができていた、 前の満杯の時の頼みが

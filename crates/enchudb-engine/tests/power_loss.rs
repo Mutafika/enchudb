@@ -1055,14 +1055,14 @@ fn writes_dropped_from_a_full_wal_are_covered_by_a_floor_after_power_loss() {
     let img = root.join("img");
     let captured = {
         let _no_fold = eng.transfer_lock_for_fold();
-        // 閉じた group で WAL を埋め、 残りを 100 B (Tie 128 B も Commit 112 B も入らない) にする。 TieLeaf の record は
+        // 閉じた group で WAL を埋め、 残りを 100 B (Tie 136 B も Commit 120 B も入らない) にする。 TieLeaf の record は
         // 文字列の長さ + c B
         let e0 = eng.entity_in("notes").unwrap();
         let h0 = wal.head();
         eng.tie_text_to(e0, "notes.body", "x");
         let c = wal.head() - h0 - 1;
         eng.oplog_commit();
-        let pad = wal.free_bytes() - 112 - 100 - c;
+        let pad = wal.free_bytes() - wal.record_size_of(0) as u64 - 100 - c;
         let e1 = eng.entity_in("notes").unwrap();
         eng.tie_text_to(e1, "notes.body", &"p".repeat(pad as usize));
         eng.oplog_commit();
