@@ -83,6 +83,20 @@ struct ChangeCursor {
     committed: Vec<crate::transport::WireRecord>,
     /// 畳む時に Commit で閉じていなかった末尾の record。 その group が閉じたら (cursor の先に Commit が来たら)、 頭として渡す。
     open_tail: Vec<crate::transport::WireRecord>,
+    /// #560: `committed` と `open_tail` の大きさの見積もり (byte、 [`change_record_bytes`])。 上限を越えたら溜めを捨てて
+    /// listener を外す。
+    bytes: usize,
+    /// #560: 溜めの上限を越えて外した listener (通知係が `on_detached` を呼ぶまで置く) と、 渡せなかった最初の record の HLC。
+    detached: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+    lost_from: Option<enchudb_oplog::Hlc>,
+}
+
+/// #560: 溜めの既定の上限 (byte)。 `Engine::set_change_backlog_limit` で変える。
+pub const DEFAULT_CHANGE_BACKLOG_LIMIT: usize = 64 << 20;
+
+/// #560: 溜めの 1 record の大きさの見積もり (構造体 + 署名した bytes)。
+fn change_record_bytes(r: &crate::transport::WireRecord) -> usize {
+    std::mem::size_of::<crate::transport::WireRecord>() + r.signed_bytes.len()
 }
 
 /// [`Engine::verify_invariants`] の答え。 `violations` が空なら不変量は全部成り立つ。 `warnings` は 「今の code では
@@ -4437,6 +4451,10 @@ pub struct Engine {
     /// 巻き戻す所をこの lock で直列にする (#337: 並走すると、 fold が巻き戻した cursor を配信が古い終端で上書きし、 新しい
     /// ring の record を飛ばした)。 listener の callback はこの lock の外で呼ぶ。
     change_emit: std::sync::Mutex<ChangeCursor>,
+    /// #560: 溜めの上限 (byte)。 畳む時に移す分で越えたら、 溜めを捨てて listener を全部外す
+    change_backlog_limit: std::sync::atomic::AtomicUsize,
+    /// #560: 溜めの上限を越えて外した listener の数 (累計)。
+    change_listeners_detached: std::sync::atomic::AtomicU64,
     /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。
     change_deliver_lock: std::sync::Mutex<()>,
     /// 通知係の thread。 WAL 付きの並行の形で listener が居る時だけ起こす。 Drop で止めて join する。
@@ -4924,7 +4942,12 @@ impl Engine {
                 offset: enchudb_oplog::oplog::HEADER_SIZE as u64,
                 committed: Vec::new(),
                 open_tail: Vec::new(),
+                bytes: 0,
+                detached: Vec::new(),
+                lost_from: None,
             }),
+            change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
+            change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
             change_deliver_lock: std::sync::Mutex::new(()),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
@@ -6167,7 +6190,12 @@ impl Engine {
                 offset: enchudb_oplog::oplog::HEADER_SIZE as u64,
                 committed: Vec::new(),
                 open_tail: Vec::new(),
+                bytes: 0,
+                detached: Vec::new(),
+                lost_from: None,
             }),
+            change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
+            change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
             change_deliver_lock: std::sync::Mutex::new(()),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
@@ -17311,6 +17339,16 @@ impl Engine {
         }
         EMITTING.with(|e| e.set(true));
         let _emitting = Emitting;
+        // #560: 溜めの上限を越えて外した listener に知らせる (lock の外で呼ぶ)
+        let (detached, lost_from) = {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            (std::mem::take(&mut c.detached), c.lost_from.take())
+        };
+        if let Some(from) = lost_from {
+            for l in &detached {
+                l.on_detached(from);
+            }
+        }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
         // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
         let listeners = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
@@ -17329,6 +17367,7 @@ impl Engine {
                 batch.extend(recs.into_iter().map(crate::transport::WireRecord::from));
                 c.offset = committed_end;
             }
+            c.bytes = c.open_tail.iter().map(change_record_bytes).sum();
             batch
         };
         if batch.is_empty() {
@@ -17343,18 +17382,48 @@ impl Engine {
     /// 移す。 Commit で閉じた分は `committed` に (前に閉じていなかった末尾を頭に付けて)、 閉じていない末尾は `open_tail` に
     /// 足す。 cursor は読み終えた終端に進める (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。
     /// listener が居なければ何もしない。 戻り値は移した record の数。
+    ///
+    /// #560: 移すと溜めが上限 (`change_backlog_limit`) を越えるなら、 移さずに溜めごと捨て、 listener を全部外す (止まった・遅すぎる
+    /// listener のために書き手を止めない・メモリを使い切らない。 前は上限が無く、 止まった listener の間は畳むたびに ring の
+    /// 全部を `append_lock` の下で写して溜め続けた)。 外した listener には通知係が `on_detached` で知らせる。
     fn spill_changes_for_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor) -> usize {
+        use std::sync::atomic::Ordering;
         if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
             return 0;
         }
         let (recs, committed_end, tail, end) = wal.iter_from_with_tail(c.offset);
         let moved = recs.len() + tail.len();
+        let recs: Vec<crate::transport::WireRecord> = recs.into_iter().map(crate::transport::WireRecord::from).collect();
+        let tail: Vec<crate::transport::WireRecord> = tail.into_iter().map(crate::transport::WireRecord::from).collect();
+        let add: usize = recs.iter().chain(tail.iter()).map(change_record_bytes).sum();
+        if c.bytes + add > self.change_backlog_limit.load(Ordering::Relaxed) {
+            let first = c.committed.iter().chain(c.open_tail.iter()).chain(recs.iter()).chain(tail.iter()).map(|r| r.hlc).min();
+            c.committed = Vec::new();
+            c.open_tail = Vec::new();
+            c.bytes = 0;
+            c.offset = end;
+            let gone = std::mem::take(&mut *self.change_listeners.write().unwrap_or_else(|p| p.into_inner()));
+            self.change_listeners_detached.fetch_add(gone.len() as u64, Ordering::Relaxed);
+            c.lost_from = match (c.lost_from, first) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            c.detached.extend(gone);
+            eprintln!(
+                "[enchudb] warning: change listeners fell more than {} bytes behind — dropped the backlog and detached them \
+                 (Engine::set_change_backlog_limit; ChangeListener::on_detached tells each one)",
+                self.change_backlog_limit.load(Ordering::Relaxed),
+            );
+            self.notify_listeners();
+            return 0;
+        }
         if committed_end > c.offset {
             let open = std::mem::take(&mut c.open_tail);
             c.committed.extend(open);
-            c.committed.extend(recs.into_iter().map(crate::transport::WireRecord::from));
+            c.committed.extend(recs);
         }
-        c.open_tail.extend(tail.into_iter().map(crate::transport::WireRecord::from));
+        c.open_tail.extend(tail);
+        c.bytes += add;
         c.offset = end;
         moved
     }
@@ -17406,6 +17475,17 @@ impl Engine {
     pub fn change_backlog_len(&self) -> usize {
         let c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         c.committed.len() + c.open_tail.len()
+    }
+
+    /// #560: 溜めの上限 (byte、 既定 [`DEFAULT_CHANGE_BACKLOG_LIMIT`] = 64 MiB)。 畳む時に移す分で越えたら、 溜めを捨てて listener を
+    /// 全部外す (`ChangeListener::on_detached` で知らせる)。 書き手は止めない。
+    pub fn set_change_backlog_limit(&self, bytes: usize) {
+        self.change_backlog_limit.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #560: 溜めの上限を越えて外した listener の数 (累計)。
+    pub fn change_listeners_detached(&self) -> u64 {
+        self.change_listeners_detached.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// changefeed: 通知係の thread を起こす (まだ居なければ)。 listener の callback を WAL の書き出し係 (consumer) から外す:
