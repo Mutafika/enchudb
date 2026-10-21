@@ -8,6 +8,9 @@
 //! - (主キーの himo, 前の値の鍵) → 行の slot。 値の鍵は `pk_tombs.rs` と同じ (Tag は文字列の bytes、 それ以外は値の 8 byte)
 //! - 行が消えても残す (改名して消した行に、 改名を知らずに後から古い名前で作った行も同じ行にする)。 slot を別の行に
 //!   使い回す時に外す
+//! - 消えた行への改名 (書き込みは捨てる) の名前も、 その行の前の名前に足す (#551。 後から別の author のより新しい削除が
+//!   届いた時に、 その名前の削除の時刻も上げる)
+//! - 行を消す時、 前の名前も消した名前として覚える (`pk_tombs.rs`、 #551)
 //!
 //! 永続化は DB directory の `pkformer` に、 変わった時にまるごと書く (改名の数だけなので小さい)。 無ければ空。 読まない旧
 //! binary は前の名前を知らないだけ (前と同じ、 今の名前でだけ束ねる)。
@@ -39,6 +42,11 @@ impl PkFormer {
     /// 前に `(himo, key)` だった行の slot。
     pub(crate) fn slot_of(&self, himo: u16, key: &[u8]) -> Option<u32> {
         self.by_key.get(&(himo, Box::<[u8]>::from(key))).copied()
+    }
+
+    /// 行 `slot` の前の名前 (主キーの himo, 値の鍵)。
+    pub(crate) fn names_of(&self, slot: u32) -> impl Iterator<Item = (u16, &[u8])> {
+        self.by_slot.get(&slot).into_iter().flatten().map(|(h, k)| (*h, &k[..]))
     }
 
     /// 行 `slot` の前の名前に `(himo, key)` を足す。 別の行の前の名前だったなら、 後から改名した方 (この行) にする。
