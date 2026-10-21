@@ -899,6 +899,10 @@ impl OpLog {
         if err.kind() != io::ErrorKind::OutOfMemory {
             return false;
         }
+        // #553: 空の ring にも入らない record は、 畳んでも載らないので待たない (前は上限の 5 秒まで consumer を起こし続けた)
+        if self.larger_than_ring(size) {
+            return false;
+        }
         if self.free_bytes() >= size {
             return true;
         }
@@ -908,6 +912,11 @@ impl OpLog {
         }
         self.warn_wal_full();
         false
+    }
+
+    /// #553: `size` byte (record と閉じの Commit の分) が空の ring にも入らないか。
+    fn larger_than_ring(&self, size: u64) -> bool {
+        size > self.capacity.saturating_sub(HEADER_SIZE as u64)
     }
 
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。
@@ -1489,6 +1498,11 @@ impl OpLog {
             // 閉じるのが遅れるだけ、 #268) ので覚えない (採番もしない)。
             if is_commit {
                 return (e, Hlc::ZERO);
+            }
+            // #553: WAL より大きい record は落ちた record として覚えない (呼び手が断る。 覚えると、 書いていない write の分まで
+            // 相手に取り直させる)。 種類を `InvalidInput` に分ける (満杯 = `OutOfMemory` は畳めば載る)
+            if e.kind() == io::ErrorKind::OutOfMemory && self.larger_than_ring(record_size as u64 + reserve) {
+                return (io::Error::new(io::ErrorKind::InvalidInput, "oplog: the record is larger than the WAL"), Hlc::ZERO);
             }
             let hlc = relay.map(|h| h.hlc).or(hlc_override).unwrap_or_else(|| self.next_hlc());
             self.note_dropped(relay.map(|h| h.author).unwrap_or_else(|| self.peer_id()), hlc);
@@ -2119,13 +2133,23 @@ impl OpLog {
     /// この OpLog を開いている間、 WAL の flock を持ちっぱなしにする (閉じると OS が外す)。 以後の append は record ごとに
     /// flock を取らない (system call 2 回を省く)。 engine が書き手の lock (`.db.lock`、 書き手の process は 1 つ) を持って WAL を
     /// 開いた時に呼ぶ: その間、 同じ WAL に追記する別の process は居ない。 何度呼んでもよい。 別の process が record ごとの
-    /// flock で追記する使い方 (この crate を直に使う時) では呼ばない — 呼ぶと、 その process は閉じるまで待つ。
+    /// flock で追記する使い方 (この crate を直に使う時) では呼ばない。
+    ///
+    /// 待たずに試す (#561): 他が持っていれば (別の process / 同じ process で同じ file を開いた別の `OpLog` がまだ生きている —
+    /// engine より長く生きた `Arc<OpLog>` など) `ErrorKind::WouldBlock` を返し、 record ごとに取るままにする。 前は `append_lock`
+    /// を持ったまま待ち、 同じ process の前の `OpLog` が残っていると開き直しが永久に止まった。 lock を持たない FS は排他なしで
+    /// 開いている間の lock を持ったことにする (`flock_exclusive` と同じ)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn lock_session(&self) -> io::Result<()> {
         let _in_proc = self.append_lock.lock();
         if !self.session_locked.load(Ordering::Relaxed) {
             crate::io_point("oplog.lock_session")?;
-            let _ = crate::filelock::lock_exclusive(&self._file)?;
+            if crate::filelock::try_lock_exclusive_outcome(&self._file)?.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "oplog: the WAL is locked by another open (another process, or an OpLog of this process that outlived its engine)",
+                ));
+            }
             self.session_locked.store(true, Ordering::Relaxed);
         }
         Ok(())
@@ -2771,6 +2795,31 @@ mod tests {
         let _ = crate::filelock::unlock(&other);
         let ties = OpLog::open(&p).unwrap().recover().iter().filter(|r| matches!(r.op, DecodedOp::Tie { .. })).count();
         assert_eq!(ties, 21);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #561: 同じ file を開いた前の `OpLog` が開いている間の lock を持ったまま生きていても、 後から開いた `OpLog` の
+    /// `lock_session` は待たずに Err を返す (前は永久に待った)。 前のが閉じれば取れる。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn session_lock_held_by_a_live_oplog_fails_fast() {
+        let p = tmp("session_held");
+        let first = OpLog::create(&p, 1 << 20).unwrap();
+        first.lock_session().unwrap();
+        let second = OpLog::open(&p).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::sync::Arc::new(second);
+        let s2 = second.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(s2.lock_session().map_err(|e| e.kind()));
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("lock_session が待ち続けた");
+        assert_eq!(r, Err(io::ErrorKind::WouldBlock));
+        assert!(!second.session_locked());
+        drop(first);
+        second.lock_session().unwrap();
+        assert!(second.session_locked());
+        drop(second);
         let _ = std::fs::remove_file(&p);
     }
 
