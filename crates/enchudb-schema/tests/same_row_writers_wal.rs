@@ -7,10 +7,16 @@
 use enchudb_oplog::oplog::{DecodedOp, HEADER_SIZE};
 use enchudb_oplog::eid_local;
 use enchudb_schema::{Database, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const WRITERS: i64 = 8;
 const COMMITS: i64 = 1500;
+/// 書き手全体でこの回数の `commit()` ごとに、 書き手が揃って止まり、 読み手が 1 回読み終えるのを待つ (上限 READ_WAIT)。 書き手 8 本が
+/// 同じ行を書き続けると、 読み手は行の版が動くたびに読み直して読み終えられない。 CPU が混むと、 書き手が終わるまでに 100 回も読めな
+/// かった (#523: 負荷をかけて 30 回中 8 回)。 止まる回数 = 読めた回数の下限 (WRITERS * COMMITS / PAUSE_EVERY = 300)
+const PAUSE_EVERY: u64 = 40;
+const READ_WAIT: Duration = Duration::from_millis(200);
 const COLS: [&str; 4] = ["hash", "mtime", "kind", "memo"];
 
 struct Cleanup(String);
@@ -45,28 +51,38 @@ fn eight_writers_on_one_row_keep_rows_whole_and_end_on_the_last_wal_record() {
     // WAL の最後の record と比べるので、 書き終えるまで畳ませない
     let no_fold = eng.transfer_lock_for_fold();
     let writing = AtomicBool::new(true);
+    // 読み手が読み終えた回数と、 書き手が次に書く前に待つ回数
+    let (reads_done, wait_for, commits) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let (reads, torn) = std::thread::scope(|s| {
         let writers: Vec<_> = (0..WRITERS)
             .map(|w| {
-                let db = &db;
+                let (db, reads_done, wait_for, commits) = (&db, &reads_done, &wait_for, &commits);
                 s.spawn(move || {
                     let t = db.get_table("files").unwrap();
                     for k in 0..COMMITS {
+                        let since = Instant::now();
+                        while reads_done.load(Ordering::Acquire) < wait_for.load(Ordering::Acquire) && since.elapsed() < READ_WAIT {
+                            std::thread::yield_now();
+                        }
                         let [a, b, c, d] = row(1 + w + WRITERS * k).map(Option::unwrap);
                         t.entity(e).update().set("hash", a).set("mtime", b).set("kind", c).set("memo", d).commit().unwrap();
+                        if commits.fetch_add(1, Ordering::AcqRel) % PAUSE_EVERY == PAUSE_EVERY - 1 {
+                            wait_for.store(reads_done.load(Ordering::Acquire) + 1, Ordering::Release);
+                        }
                     }
                 })
             })
             .collect();
         let readers: Vec<_> = (0..2)
             .map(|_| {
-                let (db, writing) = (&db, &writing);
+                let (db, writing, reads_done) = (&db, &writing, &reads_done);
                 s.spawn(move || {
                     let t = db.get_table("files").unwrap();
                     let (mut reads, mut torn) = (0u64, Vec::new());
                     while writing.load(Ordering::Relaxed) {
                         let got = t.entity(e).get_many(&COLS);
                         reads += 1;
+                        reads_done.fetch_add(1, Ordering::AcqRel);
                         let Some(Value::Number(i)) = got[0] else { panic!("hash が読めない: {got:?}") };
                         if got != row(i) && torn.len() < 3 {
                             torn.push(got);
