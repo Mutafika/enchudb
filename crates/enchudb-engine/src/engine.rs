@@ -102,6 +102,10 @@ struct ChangeCursor {
 /// #560: 溜めの既定の上限 (byte)。 `Engine::set_change_backlog_limit` で変える。
 pub const DEFAULT_CHANGE_BACKLOG_LIMIT: usize = 64 << 20;
 
+/// 差分の記録 (`LiveQuery::poll_since` / `LiveCounts::poll_since`) の 1 購読あたりの既定の上限 (byte)。
+/// `Engine::set_answer_log_limit` で変える。
+pub const DEFAULT_ANSWER_LOG_LIMIT: usize = 16 << 20;
+
 /// #560: 溜めの 1 record の大きさの見積もり (構造体 + 署名した bytes)。
 fn change_record_bytes(r: &crate::transport::WireRecord) -> usize {
     std::mem::size_of::<crate::transport::WireRecord>() + r.signed_bytes.len()
@@ -4311,6 +4315,28 @@ pub fn is_engine_internal_table(name: &str) -> bool {
 /// 明示指定推奨、 embedded scale (10k-1M) では default で足りる。
 pub const DEFAULT_TABLE_RESERVED: u32 = 1_000_000;
 
+/// 名前付きの位置 ([`Engine::cursor_get`] / [`Engine::cursor_set`]、 `_cursors` の 1 行): どの流れの (`kind`) どこまで (`pos`)
+/// 処理したか。 changefeed は次に受ける番号 (`Engine::add_change_listener_from`)、 宣言された答えは版
+/// ([`crate::live::LiveQuery::poll_since`])。 `hlc` は手がかり (audit で取り直す時など。 無くてよい)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    /// 流れの種類 ([`CURSOR_CHANGEFEED`] / [`CURSOR_ANSWER`] / アプリが決めた番号)。
+    pub kind: u32,
+    /// 位置 (changefeed = 次に受ける番号、 宣言された答え = 版)。 `u64::MAX` 未満。
+    pub pos: u64,
+    /// 手がかりの HLC (無くてよい)。
+    pub hlc: Option<enchudb_oplog::Hlc>,
+}
+
+/// [`Cursor::kind`]: changefeed の記録の番号。
+pub const CURSOR_CHANGEFEED: u32 = 1;
+/// [`Cursor::kind`]: 宣言された答えの版。
+pub const CURSOR_ANSWER: u32 = 2;
+/// 名前付きの位置を置く表 (local-only、 [`Engine::prepare_cursors`])。
+pub const CURSORS_TABLE: &str = "_cursors";
+/// `_cursors` の枠 (行)。
+const CURSORS_CAPACITY: u32 = 4096;
+
 /// 宣言された答え 1 つ ([`Engine::declare_answer`]): 名前、 形、 engine が持つ購読。
 struct AnswerEntry {
     name: String,
@@ -4531,6 +4557,8 @@ pub struct Engine {
     change_emit: std::sync::Mutex<ChangeCursor>,
     /// #560: 溜めの上限 (byte)。 畳む時に移す分で越えたら、 溜めを捨てて listener を全部外す
     change_backlog_limit: std::sync::atomic::AtomicUsize,
+    /// 差分の記録 (`LiveQuery::poll_since` / `LiveCounts::poll_since`) の 1 購読あたりの上限 (byte)。
+    answer_log_limit: std::sync::atomic::AtomicUsize,
     /// #560: 溜めの上限を越えて外した listener の数 (累計)。
     change_listeners_detached: std::sync::atomic::AtomicU64,
     /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。
@@ -5034,6 +5062,7 @@ impl Engine {
                 log_detached: Vec::new(),
             }),
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
+            answer_log_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_ANSWER_LOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
             change_deliver_lock: parking_lot::Mutex::new(()),
             change_log: std::sync::OnceLock::new(),
@@ -6296,6 +6325,7 @@ impl Engine {
                 log_detached: Vec::new(),
             }),
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
+            answer_log_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_ANSWER_LOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
             change_deliver_lock: parking_lot::Mutex::new(()),
             change_log: std::sync::OnceLock::new(),
@@ -17187,6 +17217,125 @@ impl Engine {
         self.answer_decls_raw()
     }
 
+    /// 差分の記録 ([`crate::live::LiveQuery::poll_since`] / [`crate::live::LiveCounts::poll_since`]) の 1 購読あたりの上限 (byte)。
+    pub fn answer_log_limit(&self) -> usize {
+        self.answer_log_limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 差分の記録の 1 購読あたりの上限 (byte、 既定 [`DEFAULT_ANSWER_LOG_LIMIT`] = 16 MiB)。 越えたら古い差分から捨て、 そこより
+    /// 前の版を渡した `poll_since` は `Truncated` (いちばん新しい差分 1 つは残す)。 これから記録を始める購読に効く (宣言された
+    /// 答えは登録時 = 開く時 / 宣言した時に始めるので、 その前に設定すること)。
+    pub fn set_answer_log_limit(&self, bytes: usize) {
+        self.answer_log_limit.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ─────────────────────── 差分の位置 (`_cursors`) ───────────────────────
+
+    /// 名前付きの位置 ([`Cursor`]) を置く表 `_cursors` を作る (build phase、 `&mut self`。 何度呼んでもよい)。 列は `name` (Tag) /
+    /// `kind` (Number) / `pos` (Number64) / `hlc_wall` / `hlc_rest` (Number64、 HLC が無ければ値なし)。 枠は 4096 行。
+    ///
+    /// local-only の表 (request19): 普通の表と同じく WAL に載り、 落ちた後は再生されるが、 peer には配らない。 snapshot / bootstrap
+    /// で受け取った側は [`clear_local_only_tables`](Self::clear_local_only_tables) で空にする (位置はこの端末の処理の事実)。
+    pub fn prepare_cursors(&mut self) -> Result<(), String> {
+        if !self.has_reserved_table(CURSORS_TABLE) {
+            self.define_reserved_table(CURSORS_TABLE, CURSORS_CAPACITY)?;
+        }
+        for (col, ty) in [
+            ("name", ValueType::Tag),
+            ("kind", ValueType::Number),
+            ("pos", ValueType::Number64),
+            ("hlc_wall", ValueType::Number64),
+            ("hlc_rest", ValueType::Number64),
+        ] {
+            if self.himo_id(&format!("{CURSORS_TABLE}.{col}")).is_none() {
+                self.define_himo_in(CURSORS_TABLE, col, ty, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `_cursors` が在るか ([`prepare_cursors`](Self::prepare_cursors) 済みの DB)。
+    pub fn cursors_ready(&self) -> bool {
+        self.cursor_himos().is_some()
+    }
+
+    /// `_cursors` の列の紐の番号 (name, kind, pos, hlc_wall, hlc_rest)。 表が無ければ None。
+    fn cursor_himos(&self) -> Option<[u16; 5]> {
+        let h = |c: &str| self.himo_id(&format!("{CURSORS_TABLE}.{c}")).map(|x| x as u16);
+        Some([h("name")?, h("kind")?, h("pos")?, h("hlc_wall")?, h("hlc_rest")?])
+    }
+
+    /// 名前 `name` の位置 (無ければ None、 `_cursors` が無くても None)。 行の lock の下で読む = [`cursor_set`](Self::cursor_set)
+    /// で置いた組のまま。
+    pub fn cursor_get(&self, name: &str) -> Option<Cursor> {
+        let [name_h, kind_h, pos_h, wall_h, rest_h] = self.cursor_himos()?;
+        let vid = self.vocab_id(name)?;
+        let eid = self.query_by_id(&[(name_h, vid)]).into_iter().next()?;
+        self.read_row(eid, || {
+            let pos = self.get_by_id(eid, pos_h)?;
+            let kind = self.get_by_id(eid, kind_h).unwrap_or(0) as u32;
+            let hlc = match (self.get_by_id(eid, wall_h), self.get_by_id(eid, rest_h)) {
+                (Some(wall), Some(rest)) => Some(enchudb_oplog::Hlc { wall, logical: (rest >> 32) as u32, peer: rest as u32 }),
+                _ => None,
+            };
+            Some(Cursor { kind, pos, hlc })
+        })
+    }
+
+    /// 名前 `name` の位置を置く (無ければ行を作り、 在れば書き換える。 行の lock の下で書く = 読み手は置いた組だけを見る)。
+    /// 普通の書き込みと同じ道: WAL に載り、 落ちた後は再生され、 peer には配らない。 **処理の書き込みの後に置く**こと —
+    /// WAL は書いた順に残るので、 再生された DB に位置だけが在って処理の書き込みが無いことは無い (逆は在りうる = もう一度
+    /// 処理する、 at-least-once)。
+    ///
+    /// `_cursors` が無ければ `NotFound` ([`prepare_cursors`](Self::prepare_cursors) を build phase で)。 名前は 1〜255 byte で
+    /// NUL なし、 `pos` と `hlc.wall` は `u64::MAX` 未満 (`InvalidInput`)。 列の書き込みが拒否されたら (空き不足など) `Other`
+    /// (中は [`TieRejected`] の文、 新しい行なら消す)。
+    pub fn cursor_set(&self, name: &str, cursor: Cursor) -> io::Result<()> {
+        let Some([name_h, kind_h, pos_h, wall_h, rest_h]) = self.cursor_himos() else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "_cursors is missing — call prepare_cursors in the build phase"));
+        };
+        if name.is_empty() || name.len() > 255 || name.bytes().any(|b| b == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cursor_set: bad name {name:?} (1..=255 bytes, no NUL)"),
+            ));
+        }
+        if cursor.pos == u64::MAX || cursor.hlc.is_some_and(|h| h.wall == u64::MAX) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cursor_set: pos / hlc.wall must be < u64::MAX"));
+        }
+        let existing = self.vocab_id(name).and_then(|vid| self.query_by_id(&[(name_h, vid)]).into_iter().next());
+        let (eid, fresh) = match existing {
+            Some(e) => (e, false),
+            None => (self.entity_in(CURSORS_TABLE).map_err(io::Error::other)?, true),
+        };
+        let write = || -> Result<(), TieRejected> {
+            let _row = self.write_row(eid);
+            self.try_tie_text_to_by_id(eid, name_h, name)?;
+            self.try_tie_to_by_id(eid, kind_h, cursor.kind)?;
+            self.try_tie_to_by_id(eid, pos_h, cursor.pos)?;
+            match cursor.hlc {
+                Some(h) => {
+                    self.try_tie_to_by_id(eid, wall_h, h.wall)?;
+                    self.try_tie_to_by_id(eid, rest_h, ((h.logical as u64) << 32) | h.peer as u64)?;
+                }
+                None => {
+                    self.untie_by_id(eid, wall_h);
+                    self.untie_by_id(eid, rest_h);
+                }
+            }
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if fresh {
+                    self.delete(eid);
+                }
+                Err(io::Error::other(format!("cursor_set: {e}")))
+            }
+        }
+    }
+
     /// `{db}/tables` に書く宣言 (名前, 形)。
     fn answer_decls_raw(&self) -> Vec<AnswerDecl> {
         self.answers.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|a| (a.name.clone(), a.spec.clone())).collect()
@@ -17265,6 +17414,12 @@ impl Engine {
         };
         for h in handle.himos() {
             self.himos[h as usize].write_barrier();
+        }
+        // 差分の記録 (`poll_since`) は登録時から
+        let cap = self.answer_log_limit();
+        match &handle {
+            AnswerHandle::Query(q) => q.enable_log(cap),
+            AnswerHandle::Counts(c) => c.enable_log(cap),
         }
         Ok(handle)
     }
