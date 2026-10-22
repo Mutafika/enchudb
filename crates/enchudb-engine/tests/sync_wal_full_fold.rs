@@ -74,12 +74,16 @@ struct Round {
     dropped: u64,
     folds: u64,
     reclaims: u64,
+    /// WAL の空きを待つ書き手が、 待ちの上限 (5 秒) まで待った回数 (`Engine::wal_room_wait_timeouts`)
+    wait_timeouts: u64,
 }
 
 /// 1 回分: 新しい DB に、 書き手 `writers` 本で 1000 行に合わせて `writes` 回書く (書き手どうしで行は重ならない)。 `reclaim`
 /// なら書き手 0 が 1000 回ごとに相手の ack を取り込んで reclaim する (相手が追いついている形)。 書き手は切り離した thread で
-/// 回し (固まった時に test ごと止まらないよう、 scope で join しない)、 reclaim 1 回が 4 秒 (待ちの上限 `WAL_ROOM_WAIT` =
-/// 5 秒の手前) を越えたら落とす。 WAL は `WAL` byte。
+/// 回し (固まった時に test ごと止まらないよう、 scope で join しない)、 reclaim 1 回が 30 秒を越えたら落とす (固まった時の
+/// 番兵)。 reclaim が空きを待って止まったかは時間でなく `Engine::wal_room_wait_timeouts` (待ちの上限 5 秒まで待った回数) で
+/// 見る (呼び手の test)。 前は reclaim 1 回が 4 秒を越えたら落としていて、 2 core の CI で 4.00 秒の回が出た (#615 の CI)。
+/// WAL は `WAL` byte。
 fn round(tag: &str, sync: bool, writers: u64, writes: u64, reclaim: bool) -> Round {
     round_in(WAL, tag, sync, writers, writes, reclaim)
 }
@@ -116,8 +120,12 @@ fn round_in(wal: usize, tag: &str, sync: bool, writers: u64, writes: u64, reclai
             })
         })
         .collect();
-    let limit = Duration::from_secs(4);
+    let limit = Duration::from_secs(30);
     while !hs.iter().all(|h| h.is_finished()) {
+        if eng.wal_room_wait_timeouts() > 0 {
+            stop.store(true, Ordering::Relaxed);
+            panic!("{tag}: 空きを待つ書き手が待ちの上限 (5 秒) まで待った (WAL が満杯の間、 空きを作る係が待っている書き手を待っている)");
+        }
         let started = reclaim_since.load(Ordering::Acquire);
         if started != 0 {
             let running = base.elapsed().saturating_sub(Duration::from_micros(started - 1));
@@ -135,6 +143,7 @@ fn round_in(wal: usize, tag: &str, sync: bool, writers: u64, writes: u64, reclai
         dropped: eng.wal_dropped_records(),
         folds: eng.wal_room_folds(),
         reclaims: reclaims.load(Ordering::Relaxed),
+        wait_timeouts: eng.wal_room_wait_timeouts(),
     };
     drop(eng);
     cleanup(&path);
@@ -177,19 +186,22 @@ fn reclaiming_writer_drops_few_records() {
     for n in 0..16 {
         let r = round(&format!("reclaim1-{n}"), true, 1, 100_000, true);
         assert_eq!(r.dropped, 0, "{n} 回目: reclaim しながら {} 件落ちた (満杯で畳んだ {} 回)", r.dropped, r.folds);
+        assert_eq!(r.wait_timeouts, 0, "{n} 回目: 空きを待つ書き手が待ちの上限まで待った");
         assert!(r.reclaims > 0 && r.folds > 0, "前提: reclaim {} 回・畳んだ {} 回", r.reclaims, r.folds);
     }
 }
 
 /// 書き手 8 本 (書き手 0 が reclaim) を新しい DB で何回もくり返し、 WAL が満杯でも reclaim が止まらない (`round` が見る)。
 ///
-/// falsify: 直し 4 (purge は WAL に積んでから `free_locals` を握る) を外すと、 reclaim 1 回が待ちの上限で止まって落ちる。
+/// falsify: 直し 4 (purge は WAL に積んでから `free_locals` を握る) を外すと、 purge が待ちの上限まで空きを待って落ちる
+/// (`wal_room_wait_timeouts` が数える)。
 #[test]
 fn reclaim_does_not_stall_while_the_wal_is_full() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     for n in 0..12 {
         let r = round(&format!("stall{n}"), true, 8, 100_000, true);
         assert!(r.reclaims > 0 && r.folds > 0, "前提: reclaim {} 回・畳んだ {} 回", r.reclaims, r.folds);
+        assert_eq!(r.wait_timeouts, 0, "{n} 回目: 空きを待つ書き手が待ちの上限まで待った (reclaim {} 回)", r.reclaims);
     }
 }
 

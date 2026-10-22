@@ -131,6 +131,40 @@ db.drop_answer("spent");        // forget it (the declaration is removed from th
 - Declaring the same name with the same shape again does nothing; a different shape replaces it.
 - An older binary that does not know the declarations opens the DB normally (it just does not register them, and if it rewrites the table definitions they are gone).
 
+### Positions: process a result incrementally and resume after a restart
+
+`poll()` hands you the difference since the previous `poll()`, so if the app crashes between a poll and finishing its own work, that difference is gone. `poll_since(version)` makes the position explicit: every difference a subscription hands out gets a version number, and asking for "everything since version v" composes the differences since then (a row that entered and left in between is not reported; a row that left and re-entered is in both lists). Declared answers record from the moment they are declared (or re-registered at open); a plain `subscribe()` starts recording at its first `poll_since` / `snapshot`.
+
+Where to keep the version: in the DB, next to the rows the app writes, so the position cannot run ahead of the work. `prepare_cursors()` (build phase) adds a local-only table `_cursors`; `cursor_set` / `cursor_get` store a named position (`kind` = what it belongs to, `pos`, an optional HLC as a hint). The table goes through the oplog like any other write but is never sent to peers.
+
+```rust
+let mut db = Database::create("/tmp/app.db")?;
+db.prepare_cursors()?;                      // once, in the build phase
+let users = db.table("users").number("id").number("age").primary_key("id").build()?;
+let adults = users.all().where_gt("age", 30i64).answer("adults")?;
+
+// each run: continue from the stored position, or start over when it is no longer available
+let adults = db.answer("adults").and_then(Answer::into_query).unwrap();
+let (delta, version) = match db.cursor_get("adults") {
+    Some(c) => match adults.poll_since(c.pos) {
+        Ok(x) => x,
+        Err(Truncated { from: _ }) => {       // older than this open, or dropped from the record
+            let (all, version) = adults.snapshot();
+            (LiveDelta { added: all, removed: vec![] }, version)
+        }
+    },
+    None => { let (all, version) = adults.snapshot(); (LiveDelta { added: all, removed: vec![] }, version) }
+};
+process(&delta);                              // write your own rows first ...
+db.cursor_set("adults", Cursor { kind: CURSOR_ANSWER, pos: version, hlc: None })?;   // ... then the position
+```
+
+- `poll_since` returns `Err(Truncated { from })` when the record cannot produce the difference: the version is from before this open (versions never repeat across opens, so a stored one is always refused after a restart), it was dropped from the record (16 MiB per subscription by default, `Engine::set_answer_log_limit`), or it is ahead of the current version. `from` is the oldest version that still works. `snapshot()` returns the whole current result with its version, and `poll_since` continues from there.
+- Differences handed out by `poll()` or a `LiveGroup` are recorded too, so `poll_since(v)` is the same whichever way the app consumed them.
+- `LiveCounts::poll_since` / `snapshot` do the same for aggregates (the groups that moved, with their current count and sum).
+- The oplog keeps writes in order: after a crash the replayed DB never has the position without the rows written before it. The other way round (rows without the position) can happen and means "process that batch again".
+- The same table holds changefeed positions: `Cursor { kind: CURSOR_CHANGEFEED, pos }` where `pos` is the next number to receive (`first + records.len()` from the last `on_changes_at`), passed to `add_change_listener_from` after a restart. Writes to local-only tables (`_cursors` included) are not handed to change listeners, so storing the position inside `on_changes_at` does not feed itself back into the stream.
+
 ### Engine layer (for graph ops / custom dispatch)
 
 ```rust
@@ -265,7 +299,9 @@ stream across restarts, call `enable_change_log(cap)` once: records then go to
 listener those numbers. Store the next number with your own commit, and after a restart call
 `add_change_listener_from(listener, next)` to continue where you stopped. If the log has
 already dropped that number, the call returns `Truncated { from }`; re-read the current state
-instead.
+instead. Writes to local-only tables (names starting with `_`, `define_reserved_table`, such as
+`_cursors`) are not handed to listeners, just as they are not sent to peers, so a listener can store
+its position in one of them without receiving its own writes back.
 
 Starting the ring over leaves the previous lap's records in the file until they are overwritten. Every record therefore
 carries the lap it was written in (an 8-byte mark after the payload, oplog file format 3), and recovery stops at the first

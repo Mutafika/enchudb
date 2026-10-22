@@ -68,6 +68,9 @@ pub use enchudb_engine::engine::TableEidUsage;
 pub use enchudb_engine::{GrowableOptions, LeafScale};
 pub use enchudb_engine::LiveDelta;
 pub use enchudb_engine::TouchedDelta;
+/// 差分の位置: 名前付きの位置 ([`Database::cursor_get`] / [`Database::cursor_set`]) と、 組めない位置の印
+/// ([`LiveQuery::poll_since`])。
+pub use enchudb_engine::{Cursor, Truncated, CURSOR_ANSWER, CURSOR_CHANGEFEED};
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
@@ -766,6 +769,37 @@ impl Database {
     /// 0.7.0: sync table が有効化済みか (`enable_sync` 後 / open 時に既存)。
     pub fn sync_enabled(&self) -> bool {
         self.eng.sync_tables_enabled()
+    }
+
+    /// 名前付きの位置を置く表 `_cursors` を作る ([`Engine::prepare_cursors`]、 build phase で 1 回。 何度呼んでもよい)。
+    /// 「ここまで処理した」 位置 (changefeed の番号 / 宣言された答えの版) を、 処理の書き込みと同じ DB に置く
+    /// ([`cursor_set`](Self::cursor_set))。 `finish_*` の後は呼べない (`SchemaError::Internal`)。
+    pub fn prepare_cursors(&mut self) -> Result<(), SchemaError> {
+        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+            SchemaError::Internal("Database already shared via Arc — call prepare_cursors before finish_*".into())
+        })?;
+        eng_mut.prepare_cursors().map_err(|e| SchemaError::Internal(format!("prepare_cursors: {e}")))
+    }
+
+    /// `_cursors` が在るか ([`prepare_cursors`](Self::prepare_cursors) 済み / 開いた DB に在る)。
+    pub fn cursors_ready(&self) -> bool {
+        self.eng.cursors_ready()
+    }
+
+    /// 名前 `name` の位置 ([`Engine::cursor_get`]。 無ければ None)。
+    pub fn cursor_get(&self, name: &str) -> Option<Cursor> {
+        self.eng.cursor_get(name)
+    }
+
+    /// 名前 `name` の位置を置く ([`Engine::cursor_set`]: 無ければ行を作り、 在れば書き換える。 普通の書き込みと同じく WAL に載り、
+    /// 落ちた後は再生され、 peer には配らない)。 **処理の書き込みの後に置く**こと (WAL は書いた順 = 再生された DB に位置だけが
+    /// 在って処理の書き込みが無いことは無い。 逆は在りうる = もう一度処理する)。 `_cursors` が無い / 名前や値が不正なら
+    /// `BadValue`、 列の書き込みの拒否 (空き不足など) は `Io`。
+    pub fn cursor_set(&self, name: &str, cursor: Cursor) -> Result<(), SchemaError> {
+        self.eng.cursor_set(name, cursor).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => SchemaError::BadValue(e.to_string()),
+            _ => SchemaError::Io(e.to_string()),
+        })
     }
 
     /// 新規 table 定義 builder。
@@ -2177,6 +2211,11 @@ impl<'a> RowBuilder<'a> {
         // #548: 名前のカードを最初に書く。 sync で書き込みが分かれて届いても、 受け手は名前より先に他のカードを受けない
         let mut resolved: Vec<_> = resolved.collect();
         if let Some(nc) = name_col {
+            // #581: upsert が名前で当たった行には名前のカードを書き直さない (引いた値と同じ。 書き直すと名前の版数が上がり、 その
+            // 名前になった時刻 = 行の作成が分からなくなる。 sync は束ねた行の切り離しを作成の時刻で決める)
+            if target_eid.is_some() {
+                resolved.retain(|(c, _)| c.name != nc.name);
+            }
             resolved.sort_by_key(|(c, _)| c.name != nc.name);
         }
 
@@ -2229,6 +2268,27 @@ impl LiveQuery {
         self.inner.poll(&self.eng)
     }
 
+    /// `pos` (前に受け取った版) から今までの差分と今の版 ([`enchudb_engine::LiveQuery::poll_since`])。 `pos` が今の版なら空。
+    /// `Err(Truncated { from })` = `pos` から先を組めない (記録が始まる前の版 — 開き直した後に前の process の版を渡した時も、
+    /// 記録の上限 (`Engine::set_answer_log_limit`) を越えて捨てた、 今の版より先): [`snapshot`](Self::snapshot) で今の全体と版を
+    /// 取り直す。
+    ///
+    /// - 宣言された答え ([`Database::answer`]) は登録時 (開く時) から記録し、 `subscribe` の購読は最初の `poll_since` / `snapshot` から
+    /// - 版は差分を記録するたびに +1、 開き直すと前より大きい始まりから (前の process の版は必ず `Truncated`)
+    /// - `poll` / 束の poll で渡した差分も記録に残る (どの道で受けても `pos` からの差分は同じ)
+    /// - 差分は row ごとに最初と最後の出入りで決める: 入って出た row は出ない、 出て入り直した row は removed と added の両方。
+    ///   removed → added の順に積めば `pos` の時点の集合から今の集合になる
+    /// - 版を [`Database::cursor_set`] で処理の書き込みの後に置けば、 開き直して続きから (`Truncated` なら全体から) 処理できる
+    pub fn poll_since(&self, pos: u64) -> Result<(LiveDelta, u64), Truncated> {
+        self.inner.poll_since(&self.eng, pos)
+    }
+
+    /// 今の結果全体 (eid 昇順) と今の版。 ここから [`poll_since`](Self::poll_since) を続けられる (この時点までの差分は渡した扱い =
+    /// 次の `poll` も空から)。
+    pub fn snapshot(&self) -> (Vec<EntityId>, u64) {
+        self.inner.snapshot(&self.eng)
+    }
+
     /// 今の件数 (`find()?.len()` と同じ)。
     pub fn count(&self) -> usize {
         self.inner.count(&self.eng)
@@ -2277,6 +2337,9 @@ impl std::fmt::Debug for LiveQuery {
         self.inner.fmt(f)
     }
 }
+
+/// group 1 つの (値, 件数, 合計) ([`LiveCounts::poll_since`] / [`LiveCounts::snapshot`]、 合計しない購読では合計は 0)。
+pub type GroupSums = (Value, u64, i128);
 
 /// [`Query::subscribe_counts`] の戻り値。 group の値ごとの件数を購読する。 drop で購読解除、
 /// `Database` を借用しない。
@@ -2347,6 +2410,46 @@ impl LiveCounts {
     /// group、 件数 0 = group が消えた)。 `poll` と報告状態を共有する。 合計しない購読では合計は 0。
     pub fn poll_sums(&self) -> Vec<(Value, u64, i128)> {
         self.poll_raw()
+    }
+
+    /// `pos` (前に受け取った版) から今までに件数か合計が動いた group と今の (件数, 合計)、 今の版 (件数 0 = group が消えた、
+    /// 合計しない購読では合計は 0)。 値で上書きすれば `pos` の時点の表から今の表になる (動いて戻った group も届く)。
+    /// `Truncated` と記録の決まりは [`LiveQuery::poll_since`] と同じ ([`snapshot`](Self::snapshot) で取り直す)。
+    pub fn poll_since(&self, pos: u64) -> Result<(Vec<GroupSums>, u64), Truncated> {
+        let (gs, version) = self.inner.poll_since(&self.eng, pos)?;
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let out = gs
+            .into_iter()
+            .map(|(v, a)| {
+                let now = (a.count, self.sum_of(a));
+                if a.count == 0 {
+                    last.remove(&v);
+                } else {
+                    last.insert(v, now);
+                }
+                (self.value(v), now.0, now.1)
+            })
+            .collect();
+        Ok((out, version))
+    }
+
+    /// 今の全 group と (件数, 合計) と今の版。 ここから [`poll_since`](Self::poll_since) を続けられる (この時点までの差分は
+    /// 渡した扱い = 次の `poll` も空から)。
+    pub fn snapshot(&self) -> (Vec<GroupSums>, u64) {
+        let (gs, version) = self.inner.snapshot(&self.eng);
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        last.clear();
+        let out = gs
+            .into_iter()
+            .map(|(v, a)| {
+                let now = (a.count, self.sum_of(a));
+                if a.count != 0 {
+                    last.insert(v, now);
+                }
+                (self.value(v), now.0, now.1)
+            })
+            .collect();
+        (out, version)
     }
 
     /// group `value` の今の合計 ([`Query::subscribe_sums`] の購読)。
@@ -7027,8 +7130,20 @@ impl<'a> EntityUpdate<'a> {
         }
         // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
         let _row = eng.write_row(self.eid);
+        let name = self.table.pk.map(|i| &self.table.cols[i]);
         for (col, v) in &self.values {
-            tie_value(eng, self.eid, col.get()?, v)?;
+            let cd = col.get()?;
+            // #581: 名前を今と同じ値で書くのは書かない (名前の版数 = その名前になった時刻を保つ)
+            if let Some(nc) = name
+                && cd.name == nc.name
+                && !matches!(v, Value::Null)
+                && let Ok(raw) = value_to_raw_for_query(eng, cd, v)
+                && raw != u64::MAX
+                && eng.get_by_id(self.eid, cd.himo_id) == Some(raw)
+            {
+                continue;
+            }
+            tie_value(eng, self.eid, cd, v)?;
         }
         Ok(())
     }
