@@ -89,6 +89,14 @@ struct ChangeCursor {
     /// #560: 溜めの上限を越えて外した listener (通知係が `on_detached` を呼ぶまで置く) と、 渡せなかった最初の record の HLC。
     detached: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
     lost_from: Option<enchudb_oplog::Hlc>,
+    /// 記録 (`changefeed.seg`) の無い時に渡した record の数 (process の中だけの番号、 `on_changes_at` に渡す)。
+    seq: u64,
+    /// 記録がある時: 記録に写し終えた WAL の offset。
+    log_wal: u64,
+    /// 記録がある時の listener ごとの位置 (次に渡す記録の番号)。
+    readers: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, u64)>,
+    /// 記録が位置を越えて捨てたので外した listener と、 渡せなかった最初の record の HLC (通知係が `on_detached` を呼ぶ)。
+    log_detached: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, enchudb_oplog::Hlc)>,
 }
 
 /// #560: 溜めの既定の上限 (byte)。 `Engine::set_change_backlog_limit` で変える。
@@ -421,7 +429,7 @@ fn tables_path_for(path: &str) -> std::path::PathBuf {
 ///
 /// 並びの索引の宣言 (`orders`、 [`Engine::declare_order`]) は `DIA1` block として一番後ろに足す (`PKS1` / `EXT1` を
 /// 知っている古いバイナリは、 それを読んでから知らない magic の所で止まる)。
-fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16]) -> Vec<u8> {
+fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16], answers: &[AnswerDecl]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -512,13 +520,50 @@ fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16]) ->
             out.extend_from_slice(&u32::from(*h).to_le_bytes());
         }
     }
+    // 宣言された答え ([`Engine::declare_answer`])。 MRK1 の後ろ。 宣言が無ければ書かない。
+    //   ans_magic: "ANS1" (4)
+    //   ans_count: u32
+    //   [(name_len: u32, name (UTF-8), 形 (`AnswerSpec::encode`: 種類 u8 + 中身))] × ans_count
+    if !answers.is_empty() {
+        out.extend_from_slice(b"ANS1");
+        out.extend_from_slice(&(answers.len() as u32).to_le_bytes());
+        for (name, spec) in answers {
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            spec.encode(&mut out);
+        }
+    }
     out
 }
 
 /// 並びの索引の宣言 1 つ: (via の紐, key の紐, 目盛り)。
 type OrderDecl = (u16, u16, Vec<u64>);
-/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐)。
-type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>);
+/// 宣言された答え 1 つ: (名前, 形)。
+type AnswerDecl = (String, crate::live::AnswerSpec);
+/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐, 宣言された答え)。
+type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>, Vec<AnswerDecl>);
+
+/// `ANS1` block の中身 (magic の後ろ) を読む: (宣言, 読んだ byte 数)。 途中で切れている / 名前が UTF-8 でない / 形が
+/// 読めない (`AnswerSpec::decode`) なら None。
+fn deserialize_answers(buf: &[u8]) -> Option<(Vec<AnswerDecl>, usize)> {
+    let mut off = 0usize;
+    let u32_at = |off: &mut usize| -> Option<u32> {
+        let v = u32::from_le_bytes(buf.get(*off..*off + 4)?.try_into().ok()?);
+        *off += 4;
+        Some(v)
+    };
+    let count = u32_at(&mut off)? as usize;
+    // 1 件は最低 10 byte (name_len + 名前 1 byte + 種類 + 条件の数)
+    let mut out = Vec::with_capacity(count.min(buf.len() / 10));
+    for _ in 0..count {
+        let n = u32_at(&mut off)? as usize;
+        let name = std::str::from_utf8(buf.get(off..off.checked_add(n)?)?).ok()?.to_string();
+        off += n;
+        let spec = crate::live::AnswerSpec::decode(buf, &mut off)?;
+        out.push((name, spec));
+    }
+    Some((out, off))
+}
 
 /// `MRK1` block の中身 (magic の後ろ) を読む: (位置の印を持つ紐の番号, 読んだ byte 数)。 途中で切れている / 番号が紐の id に
 /// 入らないなら None。
@@ -632,6 +677,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
     // 末尾の optional block 群 (順不同、 未知の magic で打ち切り)
     let mut orders = Vec::new();
     let mut marks: Vec<u16> = Vec::new();
+    let mut answers: Vec<AnswerDecl> = Vec::new();
     while off + 8 <= buf.len() {
         let magic = &buf[off..off + 4];
         if magic == b"PKS1" {
@@ -707,11 +753,23 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
                     break;
                 }
             }
+        } else if magic == b"ANS1" {
+            // 宣言された答え。 答えは列から作り直せる派生のデータなので、 壊れていたら宣言なしとして読む (sidecar 全体は有効)
+            match deserialize_answers(&buf[off + 4..]) {
+                Some((decls, used)) => {
+                    answers = decls;
+                    off += 4 + used;
+                }
+                None => {
+                    eprintln!("warning: tables sidecar: broken answer declarations (ANS1), ignored");
+                    break;
+                }
+            }
         } else {
             break;
         }
     }
-    Ok((tables, orders, marks))
+    Ok((tables, orders, marks, answers))
 }
 
 /// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。 `orders` は並びの索引の宣言 (`DIA1`)。
@@ -721,8 +779,9 @@ fn persist_tables_to_sidecar(
     tables: &[TableDef],
     orders: &[OrderDecl],
     marks: &[u16],
+    answers: &[AnswerDecl],
 ) -> io::Result<()> {
-    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders, marks))
+    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders, marks, answers))
         .map(|_| ())
 }
 
@@ -1011,6 +1070,9 @@ fn pktombs_path_for(path: &str) -> std::path::PathBuf {
 
 /// `Engine::pk_himo_bits` が覆う himo の数 (これ以上の himo は表をなめて引く)。
 const PK_HIMO_BITS: usize = 2048;
+
+/// 名前で束ねた slot の目印の語の数 (`Engine::bound_filter`、 64 語 = 4096 本)。
+const BOUND_FILTER_WORDS: usize = 64;
 
 /// 主キーの前の名前の sidecar path (`pkformer`、 中身は `pk_former.rs`)。 不在 = 改名なし。
 #[cfg(not(target_arch = "wasm32"))]
@@ -4249,6 +4311,13 @@ pub fn is_engine_internal_table(name: &str) -> bool {
 /// 明示指定推奨、 embedded scale (10k-1M) では default で足りる。
 pub const DEFAULT_TABLE_RESERVED: u32 = 1_000_000;
 
+/// 宣言された答え 1 つ ([`Engine::declare_answer`]): 名前、 形、 engine が持つ購読。
+struct AnswerEntry {
+    name: String,
+    spec: crate::live::AnswerSpec,
+    handle: crate::live::AnswerHandle,
+}
+
 pub struct Engine {
     /// #59: 「想定内だが続行不能」 な事象の種別ごとの発生回数。 panic の代替。
     faults: std::sync::Arc<[std::sync::atomic::AtomicU64; FaultKind::COUNT]>,
@@ -4370,6 +4439,8 @@ pub struct Engine {
     /// live query (クエリ購読) の route。 Column 書き込みが `live_set` / `live_remove`
     /// 経由で通知する (`crate::live` module doc)。
     live: std::sync::Arc<crate::live::LiveRegistry>,
+    /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
+    answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
     row_locks: crate::row_lock::RowLocks,
     /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しが中身を指す列を msync する間だけ
@@ -4415,6 +4486,9 @@ pub struct Engine {
     pk_former_empty: std::sync::atomic::AtomicBool,
     /// `pk_former` を最後に書き出した後に変えたか (`pkformer` を変わった時だけ書く)。
     pk_former_dirty: std::sync::atomic::AtomicBool,
+    /// 名前で束ねた slot の目印 (slot の下位 bit で選ぶ 4096 本、 `is_bound_slot`)。 書き込みの道で 「束ねた行か」 を lock を取らずに
+    /// 落とす (立っていない slot は束ねていない。 立っていても束ねていないことはある)。 下ろさない
+    bound_filter: Box<[std::sync::atomic::AtomicU64]>,
     /// 主キーを覚える表 (`pk_tombs_on` と同じ: `_` で始まらない) の主キーの himo の bit (himo 0..PK_HIMO_BITS)。 書き込みの道で
     /// 「この列は主キーか」 を表をなめずに引く (なめると書き込み 1 回が 22 → 27 ns)。 `refresh_pk_tombs_flag` で引き直す
     pk_himo_bits: [std::sync::atomic::AtomicU64; PK_HIMO_BITS / 64],
@@ -4459,6 +4533,8 @@ pub struct Engine {
     change_listeners_detached: std::sync::atomic::AtomicU64,
     /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。
     change_deliver_lock: parking_lot::Mutex<()>,
+    /// changefeed の記録 (`changefeed.seg`、 `enable_change_log` で作る / 在れば開く時に開く)。 在る時は listener に記録から渡す。
+    change_log: std::sync::OnceLock<crate::change_log::ChangeLog>,
     /// 通知係の thread。 WAL 付きの並行の形で listener が居る時だけ起こす。 Drop で止めて join する。
     notifier_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 通知係を起こす係 (通知係を起こす時に作る)。
@@ -4915,6 +4991,7 @@ impl Engine {
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -4928,6 +5005,7 @@ impl Engine {
             pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
             pk_former_empty: std::sync::atomic::AtomicBool::new(true),
             pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            bound_filter: (0..BOUND_FILTER_WORDS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
@@ -4947,10 +5025,15 @@ impl Engine {
                 bytes: 0,
                 detached: Vec::new(),
                 lost_from: None,
+                seq: 0,
+                log_wal: enchudb_oplog::oplog::HEADER_SIZE as u64,
+                readers: Vec::new(),
+                log_detached: Vec::new(),
             }),
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
             change_deliver_lock: parking_lot::Mutex::new(()),
+            change_log: std::sync::OnceLock::new(),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
             notifier_pending: std::sync::atomic::AtomicBool::new(false),
@@ -5286,13 +5369,16 @@ impl Engine {
         // から再合成できるので、 sidecar 破損で全 DB が unreadable になる失敗
         // モードを避ける。
         match load_tables_from_sidecar(path) {
-            Ok(Some((persisted, orders, marks))) => {
+            Ok(Some((persisted, orders, marks, answers))) => {
                 eng.adopt_persisted_tables(persisted);
                 // 並びの索引の宣言を戻す (table 定義の後: ref の先の表の eid の始まりを使う)。 作るのは最初に読む時
                 // (WAL の replay や Leaf の修理の後)。 作る前の書き込みは何もしないので、 replay は遅くならない
                 eng.restore_orders(orders);
                 // 位置の印の宣言も (表は最初に読む時に取る)
                 eng.restore_marks(marks);
+                // 宣言された答え: 購読の route をここで張る (WAL の再生より前 = 再生で書かれる行も購読が追う)。 種 (表の走査)
+                // は最初の poll が作るので、 開くのも再生も遅くならない
+                eng.restore_answers(answers);
             }
             Ok(None) => {} // 不在: 新規 DB or v4 legacy
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -5391,6 +5477,9 @@ impl Engine {
             Ok(Some(former)) => {
                 if !former.is_empty() {
                     eng.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+                }
+                for slot in former.bound_slots() {
+                    eng.mark_bound_slot(slot);
                 }
                 *eng.pk_former.write().unwrap() = former;
             }
@@ -6163,6 +6252,7 @@ impl Engine {
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -6176,6 +6266,7 @@ impl Engine {
             pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
             pk_former_empty: std::sync::atomic::AtomicBool::new(true),
             pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            bound_filter: (0..BOUND_FILTER_WORDS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
@@ -6195,10 +6286,15 @@ impl Engine {
                 bytes: 0,
                 detached: Vec::new(),
                 lost_from: None,
+                seq: 0,
+                log_wal: enchudb_oplog::oplog::HEADER_SIZE as u64,
+                readers: Vec::new(),
+                log_detached: Vec::new(),
             }),
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
             change_deliver_lock: parking_lot::Mutex::new(()),
+            change_log: std::sync::OnceLock::new(),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
             notifier_pending: std::sync::atomic::AtomicBool::new(false),
@@ -6678,12 +6774,7 @@ impl Engine {
         // 作った table も同じ扱いになる = 「WAL / commit の耐久性は使うが peer には
         // 配らない」 local-only table として使える。 判定は名前だけなので sidecar の
         // format 変更は無く、 reopen を跨いでそのまま効く。
-        let local_only_ranges: Vec<(u32, u32)> = self
-            .tables
-            .iter()
-            .filter(|t| t.is_reserved())
-            .flat_map(|t| t.extents())
-            .collect();
+        let local_only_ranges = self.local_only_ranges();
         let is_internal_eid = |eid: u64| -> bool {
             let local = enchudb_oplog::eid_local(eid);
             local_only_ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
@@ -8986,7 +9077,7 @@ impl Engine {
         // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw())?;
+        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw())?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
         // #178: 別名も同じ trigger で
@@ -9151,7 +9242,7 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw()) {
+                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw()) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
@@ -9600,6 +9691,40 @@ impl Engine {
         }
         let to = enchudb_oplog::make_eid(self_peer, d);
         let mut moved = 0;
+        // #581: 畳む 2 つの行の identity と作成を、 残す行に束ねた identity として覚える (畳む前の cell の版数で)
+        if self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed) {
+            let (dn, sn) = (self.native_identity(d), self.native_identity(s));
+            let (db, sb) = (self.born_of(d, dn), self.born_of(s, sn));
+            // 束ねた identity ごとのカード: 束ねていない行は今の cell を元の identity のカードにする
+            let (d_cards, s_cards) = {
+                let f = self.pk_former.read().unwrap();
+                let snap = |l: u32| if f.bound_of(l).is_empty() { self.cards_of_cells(l) } else { Vec::new() };
+                (snap(d), snap(s))
+            };
+            let mut f = self.pk_former.write().unwrap();
+            if f.bound_of(d).is_empty() {
+                f.add_bound(d, dn, db);
+                for (h, card, t) in d_cards {
+                    f.note_card(d, dn, h, card, t);
+                }
+            }
+            let from: Vec<_> = if f.bound_of(s).is_empty() { vec![(sn, sb)] } else { f.bound_of(s).to_vec() };
+            for (id, c) in from {
+                f.add_bound(d, id, c);
+            }
+            let moved_cards = f.drop_cards(s);
+            f.put_cards(d, moved_cards);
+            // 畳む行の前の名前は残す行の前の名前 (同じデッキ。 slot と一緒に捨てると、 その名前で改名の前に作られた行を束ねない)
+            f.move_names(s, d);
+            for (h, card, t) in s_cards {
+                f.note_card(d, sn, h, card, t);
+            }
+            f.set_bound(s, Vec::new());
+            drop(f);
+            self.mark_bound_slot(d);
+            self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
         // 1. 同じ entity の削除の版数: その版数より古い dst の cell を落とし、 版数を dst にも載せる。 生きた src に版数が載るのは、
         //    前の版の DB の生き残り (削除より新しい cell が残った行) と、 途中で切れた削除の跡なので、 削除優先の 「行ごと消す」 は
         //    当てない (当てると dst ごと消え、 次の段で src の cell も入らない)
@@ -10946,7 +11071,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        let renamed_from = self.pk_rename_from(local, himo_id, value);
+        let renamed_from = self.pk_rename_from(local, himo_id, value).map(|old| (old, self.version_of(local, himo_id)));
         // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
         // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
         if !self.live_set(himo_id as usize, local, value) {
@@ -10954,8 +11079,8 @@ impl Engine {
             return false;
         }
         self.store_cell_hlc(local, himo_id, hlc);
-        if let Some(old) = renamed_from {
-            self.note_pk_former(local, himo_id, old);
+        if let Some((old, old_hlc)) = renamed_from {
+            self.note_pk_former(local, himo_id, old, old_hlc);
         }
         true
     }
@@ -10971,23 +11096,159 @@ impl Engine {
         self.himos.get(himo_id as usize)?.get_value(local).filter(|&old| old != value)
     }
 
-    /// 行 `local` の主キーが `old` から変わった: `old` を前の名前として覚える (`pk_former.rs`)。
+    /// 行 `local` の主キーが `old` (版数 `old_hlc`) から変わった: `old` を前の名前として覚え、 名前の年表を作る (`seed_timeline`)。
+    /// 改名した書き込み自身は、 当てた後に宛名の identity 付きで載る (`note_name_write` / `note_local_name`)。
     #[cold]
-    fn note_pk_former(&self, local: u32, himo: u16, old: u64) {
+    fn note_pk_former(&self, local: u32, himo: u16, old: u64, old_hlc: enchudb_oplog::Hlc) {
         use std::sync::atomic::Ordering;
         let changed = self.with_pk_key(himo, PkValue::Local(old), |k| self.pk_former.write().unwrap().insert(himo, k, local));
-        if changed == Some(true) {
+        let seeded = self.seed_timeline(local, himo, old, old_hlc);
+        if changed == Some(true) || seeded {
             self.pk_former_empty.store(false, Ordering::Release);
             self.pk_former_dirty.store(true, Ordering::Release);
         }
     }
 
-    /// 前に主キー `value` だった生きた行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 今その名前の行が無い時に引く。
-    pub fn former_pk_holder(&self, himo: u16, value: PkValue<'_>) -> Option<enchudb_oplog::EntityId> {
+    /// 行 `local` に名前の年表が無ければ作る: 束ねた identity の名前のカードを載せる (束ねていない行は、 書き込みの宛名の identity
+    /// の名前 `value` (版数 `hlc`))。 作ったら true。
+    fn seed_timeline(&self, local: u32, himo: u16, value: u64, hlc: enchudb_oplog::Hlc) -> bool {
+        let published = self.native_identity(local);
+        let cards: Vec<((u32, u32), u64, enchudb_oplog::Hlc)> = {
+            let f = self.pk_former.read().unwrap();
+            if f.has_timeline(local) {
+                return false;
+            }
+            f.bound_of(local)
+                .iter()
+                .filter_map(|&(id, _)| match f.card_of(local, id, himo) {
+                    Some((crate::pk_former::Card::Value(v), t)) => Some((id, *v, t)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let seed = if cards.is_empty() { vec![(published, value, hlc)] } else { cards };
+        for (id, v, t) in seed {
+            self.with_pk_key(himo, PkValue::Local(v), |k| self.pk_former.write().unwrap().note_name(local, id, himo, k, t));
+        }
+        true
+    }
+
+    /// 行 `local` の名前の年表に、 identity `id` 宛ての名前 `value` への版数 `hlc` の書き込みを載せる (当てた後に、 LWW で負けた
+    /// 書き込みも)。
+    ///
+    /// 今の名前でない名前 (LWW で負けた改名・前の名前で束ねた identity の作成・改名より後に届いた作成) は、 その行がその名前だった
+    /// 間があることを示す: 年表が無ければ作り (今の名前とその版数から)、 前の名前として覚え (後から届く、 その間に作られた行を
+    /// 束ねる)、 その間にその名前で作られた別の生きた行を畳む (先に届いていた行。 書き込みを順に受けた peer では、 改名の時に今の
+    /// 名前で畳んでいる)。 今の名前と同じ名前の書き込みは、 年表のある行にだけ載せる。
+    fn note_name_of(&self, local: u32, id: (u32, u32), himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
+        use std::sync::atomic::Ordering;
+        let current = self.himos.get(himo as usize).and_then(|h| h.get_value(local));
+        let differs = current.is_some_and(|c| c != value) && self.entities.is_live(local);
+        let has = !self.pk_former_empty.load(Ordering::Acquire) && self.pk_former.read().unwrap().has_timeline(local);
+        if !has && !differs {
+            return;
+        }
+        let mut changed = false;
+        if !has && let Some(c) = current {
+            changed |= self.seed_timeline(local, himo, c, self.version_of(local, himo));
+        }
+        let noted = self.with_pk_key(himo, PkValue::Local(value), |k| {
+            let mut f = self.pk_former.write().unwrap();
+            let mut noted = f.note_name(local, id, himo, k, hlc);
+            if differs && f.slot_of(himo, k).is_none_or(|s| s == local || !self.entities.is_live(s)) {
+                noted |= f.insert(himo, k, local);
+            }
+            noted
+        });
+        if changed || noted == Some(true) {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+        if differs {
+            self.fold_rows_named_while_held(local, himo, value);
+            self.fold_former_holder(local, himo, value, hlc);
+        }
+    }
+
+    /// 改名の時刻: 名前の年表の上で行 `local` が名前 `value` だったことのある時刻以前に、 その名前を書かれた別の生きた行 (今もその
+    /// 名前 = 同じ時刻に同じ名前を持った) を `local` と 1 つに畳む
+    /// (同じデッキ)。 畳むのは翻訳した行 (`fold_rows_with_same_pk` と同じ。 自分が作った行どうしは畳めない、 #612)。 戻り値は
+    /// 畳んだ行の数。
+    fn fold_rows_named_while_held(&self, local: u32, himo: u16, value: u64) -> usize {
+        let self_peer = self.peer_id();
+        let mut keep = enchudb_oplog::make_eid(self_peer, local);
+        let mut folded = 0;
+        for other in self.query_by_id64(&[(himo, value)]) {
+            let l = enchudb_oplog::eid_local(other);
+            if l == enchudb_oplog::eid_local(keep) {
+                continue;
+            }
+            let at = self.version_of(l, himo);
+            let held = self
+                .with_pk_key(himo, PkValue::Local(value), |k| {
+                    self.pk_former.read().unwrap().held_since(enchudb_oplog::eid_local(keep), himo, k, at)
+                })
+                .flatten();
+            if held != Some(true) {
+                continue;
+            }
+            let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
+            let (src, dst) = if translated(other) {
+                (other, keep)
+            } else if translated(keep) {
+                (keep, other)
+            } else {
+                continue;
+            };
+            if self.merge_entity_into(src, dst).is_ok() {
+                folded += 1;
+                keep = dst;
+            }
+        }
+        folded
+    }
+
+    /// sync の当て: 行 `local_eid` の主キーの列 `himo` に、 foreign entity `foreign_eid` 宛ての名前 `value` の書き込み (版数 `hlc`)
+    /// を当てた後 (LWW で負けても)。 改名した行なら名前の年表に載せる (その時刻の名前を届く順によらず決める)。 主キーでない列・
+    /// 改名していない行は何もしない。
+    pub fn note_name_write(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo: u16,
+        value: u64,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        if self.is_remembered_pk_himo(himo) {
+            let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+            self.note_name_of(enchudb_oplog::eid_local(local_eid), id, himo, value, hlc);
+        }
+    }
+
+    /// 自分の名前の書き込みを、 改名した行 `local` の名前の年表に載せる (宛名は書き込みの宛名の identity)。
+    fn note_local_name(&self, local: u32, himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
+        if self.is_remembered_pk_himo(himo) {
+            self.note_name_of(local, self.native_identity(local), himo, value, hlc);
+        }
+    }
+
+    /// 前に主キー `value` だった生きた行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 時刻 `created` に作られた行の
+    /// 束ね先として引く。 名前の年表の上で、 その時刻以後にその名前だったことのある行だけ (同じ時刻に同じ名前 = 同じデッキ。 改名の
+    /// 後にその名前で作った行は新しいデッキ。 削除優先と同じく時刻で決める)。 年表の無い行 (前の版の file) は時刻によらず返す。
+    pub fn former_pk_holder(
+        &self,
+        himo: u16,
+        value: PkValue<'_>,
+        created: enchudb_oplog::Hlc,
+    ) -> Option<enchudb_oplog::EntityId> {
         if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        let slot = self.with_pk_key(himo, value, |k| self.pk_former.read().unwrap().slot_of(himo, k))??;
+        let slot = self.with_pk_key(himo, value, |k| {
+            let f = self.pk_former.read().unwrap();
+            let slot = f.slot_of(himo, k)?;
+            f.held_since(slot, himo, k, created).unwrap_or(true).then_some(slot)
+        })??;
         let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         // 削除優先: 消えた行には束ねない (消えた行に束ねると、 後から足した行まで死ぬ)
         self.entities.is_live(slot).then(|| enchudb_oplog::make_eid(self_peer, slot))
@@ -11044,7 +11305,32 @@ impl Engine {
                 keep = dst;
             }
         }
+        // 改名の時刻: 改名した時にその名前だった行 (今は別の名前。 改名を先に受けた peer では、 その時の今の名前で畳んでいる)
+        if dies_at.is_none() {
+            let at = self.version_of(enchudb_oplog::eid_local(keep), himo);
+            folded += self.fold_former_holder(enchudb_oplog::eid_local(keep), himo, value, at);
+        }
         folded
+    }
+
+    /// 改名の時刻: 名前 `value` を時刻 `t` に書かれた行 `local` を、 その時刻にその名前だった (今は別の名前の) 行と 1 つに畳む
+    /// (同じデッキ)。 畳むのは翻訳した行 (自分が作った行どうしは畳めない、 #612)。 戻り値は畳んだ行の数。
+    fn fold_former_holder(&self, local: u32, himo: u16, value: u64, t: enchudb_oplog::Hlc) -> usize {
+        let Some(holder) = self.former_pk_holder(himo, PkValue::Local(value), t) else { return 0 };
+        let self_peer = self.peer_id();
+        let here = enchudb_oplog::make_eid(self_peer, local);
+        if enchudb_oplog::eid_local(holder) == local {
+            return 0;
+        }
+        let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
+        let (src, dst) = if translated(here) {
+            (here, holder)
+        } else if translated(holder) {
+            (holder, here)
+        } else {
+            return 0;
+        };
+        usize::from(self.merge_entity_into(src, dst).is_ok())
     }
 
     /// `set_cell` の untie 版 — cell を空にして版数を進める。 untie も
@@ -11376,7 +11662,11 @@ impl Engine {
             return 0;
         }
         let tomb = self.tombstone_version_of(local);
-        self.note_pk_former(local, himo, value);
+        let changed = self.with_pk_key(himo, PkValue::Local(value), |k| self.pk_former.write().unwrap().insert(himo, k, local));
+        if changed == Some(true) {
+            self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
         {
             let mut g = self.pk_tombs.write().unwrap();
             self.drain_pk_pending(&mut g);
@@ -11398,6 +11688,23 @@ impl Engine {
             }
         }
         removed
+    }
+
+    /// 削除優先 (#551) と改名の時刻: 消した行 `local` の前の名前を今持つ別の行のうち、 `tomb` より前にその名前になった行も消す。
+    /// 改名の後に前の名前で作られた行 (前の名前で束ねない = 別のデッキ) も、 前のデッキの削除より前に作られていれば一緒に消える:
+    /// 改名より先に削除を受けた peer は、 改名を知らずにその名前の行を消している (後から改名を知っても生き返らせない)。 前の名前の
+    /// 無い行は何もしない。
+    fn remove_rows_holding_former_names(&self, local: u32, tomb: enchudb_oplog::Hlc) -> usize {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return 0;
+        }
+        let names: Vec<(u16, Box<[u8]>)> =
+            self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))).collect();
+        names
+            .into_iter()
+            .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
+            .map(|(h, v)| self.remove_rows_named(local, h, v, tomb))
+            .sum()
     }
 
     /// 削除優先 (#551): 消えた行 `local` の名前 (消えた時の名前と前の名前) について [`Self::remove_rows_named`]。
@@ -12463,6 +12770,10 @@ impl Engine {
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
+        // #581: 名前で束ねた identity のうち、 削除より後に作られたものを切り離してから消す
+        if self.split_later_identities(local, hlc) {
+            return true;
+        }
         let raised = self.slot_is_dead(local) && hlc > self.tombstone_version_of(local);
         // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
@@ -12475,10 +12786,430 @@ impl Engine {
         // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)
         if raised {
             self.remove_rows_holding_names_of(local, hlc);
+        } else {
+            self.remove_rows_holding_former_names(local, hlc);
         }
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
+    }
+
+    /// #581: 名前で束ねる直前に (`Syncer` の束ね)、 束ね先の行 `existing` と、 束ねる foreign entity `foreign_eid` (作成 = その
+    /// 最初の名前の書き込みの版数 `created`) を覚える。 束ね先の行の元の identity は最初に束ねる時に覚える (自分の行は自分、
+    /// 翻訳した行は逆写像。 作成はその時の cell の版数の最小で近似する)。 名前の記録を持たない DB では何もしない。
+    pub fn note_bound_identity(
+        &self,
+        existing: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        created: enchudb_oplog::Hlc,
+    ) {
+        use std::sync::atomic::Ordering;
+        if !self.pk_tombs_on.load(Ordering::Relaxed) {
+            return;
+        }
+        let local = enchudb_oplog::eid_local(existing);
+        let native = self.native_identity(local);
+        let born = self.born_of(local, native);
+        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        // 最初に束ねる時は、 今の cell を元の identity のカードとして写す (束ねた後の cell は LWW で混ざる)
+        let first = self.pk_former.read().unwrap().bound_of(local).is_empty();
+        let native_cards = if first { self.cards_of_cells(local) } else { Vec::new() };
+        let mut f = self.pk_former.write().unwrap();
+        let mut changed = false;
+        if f.bound_of(local).is_empty() {
+            changed |= f.add_bound(local, native, born);
+            for (h, card, t) in native_cards {
+                f.note_card(local, native, h, card, t);
+            }
+        }
+        changed |= f.add_bound(local, id, created);
+        drop(f);
+        self.mark_bound_slot(local);
+        if changed {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// #581: 行 `local` の元の identity (自分の行は (自分の peer, local)、 翻訳した行は逆写像)。
+    fn native_identity(&self, local: u32) -> (u32, u32) {
+        self.eid_translator.reverse(local).unwrap_or((self.peer_id(), local))
+    }
+
+    /// 行 `local` の identity `id` の作成: 名前の年表があれば、 その identity の最初の名前の書き込み (改名した行は、 名前を含む全部の
+    /// cell が作成より後に書き換わっていることがある)。 無ければ cell の版数の最小。
+    fn born_of(&self, local: u32, id: (u32, u32)) -> enchudb_oplog::Hlc {
+        use std::sync::atomic::Ordering;
+        if !self.pk_former_empty.load(Ordering::Acquire)
+            && let Some(t) = self.pk_former.read().unwrap().first_name_write(local, id)
+        {
+            return t;
+        }
+        self.min_cell_version(local)
+    }
+
+    /// #581: 行 `local` の cell の版数の最小 (版数の無い cell は見ない)。 行の作成の近似 (名前のカードを最初に書く、 #548)。
+    fn min_cell_version(&self, local: u32) -> enchudb_oplog::Hlc {
+        (0..self.himos.len())
+            .filter(|&h| self.himos[h].get_value(local).is_some())
+            .map(|h| self.version_of(local, h as u16))
+            .filter(|&v| v != enchudb_oplog::Hlc::ZERO)
+            .min()
+            .unwrap_or(enchudb_oplog::Hlc::ZERO)
+    }
+
+    /// 行 `local` に名前で束ねた slot の目印を立てる (`is_bound_slot`)。
+    fn mark_bound_slot(&self, local: u32) {
+        let bit = local as usize % (BOUND_FILTER_WORDS * 64);
+        self.bound_filter[bit / 64].fetch_or(1 << (bit % 64), std::sync::atomic::Ordering::Release);
+    }
+
+    /// 行 `local` は名前で束ねた slot か (束ねた identity ごとのカードを積む行)。 束ねたことの無い DB は atomic 1 回、 目印の
+    /// 立っていない slot は 2 回。
+    fn is_bound_slot(&self, local: u32) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.pk_former_empty.load(Ordering::Acquire) {
+            return false;
+        }
+        let bit = local as usize % (BOUND_FILTER_WORDS * 64);
+        if self.bound_filter[bit / 64].load(Ordering::Acquire) & (1 << (bit % 64)) == 0 {
+            return false;
+        }
+        !self.pk_former.read().unwrap().bound_of(local).is_empty()
+    }
+
+    /// 行 `local` の今の cell をカードにする (最初に束ねる時に、 元の identity のカードとして写す)。 外した cell (値が無く
+    /// 版数がある) は `Gone`。
+    fn cards_of_cells(&self, local: u32) -> Vec<(u16, crate::pk_former::Card, enchudb_oplog::Hlc)> {
+        use crate::pk_former::Card;
+        let self_peer = self.peer_id();
+        let mut out = Vec::new();
+        for hid in 0..self.himos.len() {
+            let h = hid as u16;
+            let ver = self.version_of(local, h);
+            let card = match self.himos[hid].get_value(local) {
+                Some(_) if self.leaf_for(hid).is_some() => {
+                    match self.get_text_owned(enchudb_oplog::make_eid(self_peer, local), &self.himo_names[hid]) {
+                        Some(b) => Card::Bytes(b.into()),
+                        None => continue,
+                    }
+                }
+                Some(v) => Card::Value(v),
+                None if ver != enchudb_oplog::Hlc::ZERO => Card::Gone,
+                None => continue,
+            };
+            out.push((h, card, ver));
+        }
+        out
+    }
+
+    /// 束ねた slot `local` への書き込みを、 宛名の identity `id` のカードとして積む (束ねていない slot は何もしない)。
+    fn note_card(
+        &self,
+        local: u32,
+        id: (u32, u32),
+        himo: u16,
+        card: impl FnOnce() -> crate::pk_former::Card,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        if self.is_bound_slot(local) && self.pk_former.write().unwrap().note_card(local, id, himo, card(), hlc) {
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// 自分の書き込みを、 束ねた slot `local` の元の identity のカードとして積む。
+    fn note_local_card(
+        &self,
+        local: u32,
+        himo: u16,
+        card: impl FnOnce() -> crate::pk_former::Card,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        if self.is_bound_slot(local) {
+            self.note_card(local, self.native_identity(local), himo, card, hlc);
+        }
+    }
+
+    /// sync の当て: 行 `local_eid` に foreign entity `foreign_eid` 宛ての書き込み (値、 `None` = 外した) を受けた。 名前で束ねた
+    /// 行なら、 束ねた identity ごとのカードに積む (改名の時刻で切り離す時に、 その identity の値を戻すため。
+    /// [`Engine::split_for_rename`])。 LWW で負けた書き込みも積む (その identity の値ではある)。 束ねていない行は何もしない。
+    pub fn note_bound_write(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo: u16,
+        value: Option<u64>,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        use crate::pk_former::Card;
+        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        self.note_card(enchudb_oplog::eid_local(local_eid), id, himo, || value.map_or(Card::Gone, Card::Value), hlc);
+    }
+
+    /// [`Engine::note_bound_write`] の Leaf 版 (中身を積む)。
+    pub fn note_bound_leaf(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo: u16,
+        bytes: &[u8],
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        self.note_card(enchudb_oplog::eid_local(local_eid), id, himo, || crate::pk_former::Card::Bytes(bytes.into()), hlc);
+    }
+
+    /// 改名の時刻 (削除優先と同じく時刻で決める): 名前で束ねた行 `local_eid` に、 foreign entity `target` の名前のカードを `value` に
+    /// 書き換える書き込みが時刻 `t` に届いた。 束ねた identity のうち `t` より後に作られたもの (改名の後に前の名前で作られた行。
+    /// 改名を先に受けた peer では別のデッキ) を、 改名より前の identity から切り離す。 それぞれの identity の値は束ねた
+    /// identity ごとのカードから戻す (束ねた行の cell は LWW で混ざっている)。
+    ///
+    /// - 行に残るのは、 自分の行なら自分の identity の側 (自分の peer の番号は slot に固定で、 写像で移せない)、 翻訳した行なら
+    ///   書き込みの宛名 (逆写像、 束ねると最後に束ねた identity になる) の側。 他方を新しい slot に移す (写像を付け替え、 宛名を
+    ///   移す側の先頭にして逆写像も移す)
+    /// - 行に残る側の cell は、 その側のカードの値と版数に戻す (他方の新しい値で上書きされていた cell も戻る)
+    /// - 移す側は新しい slot に、 名前のカードを先にして当てる
+    ///
+    /// 切り離したら `target` の今居る行の eid (呼び手はそこに名前のカードを当てる)、 切り離さなければ None。 改名でない (`target`
+    /// の名前のカードが無い / 同じ値 / この書き込みより新しい) 時と、 束ねていない行は何もしない。
+    pub fn split_for_rename(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        target: enchudb_oplog::EntityId,
+        himo: u16,
+        value: u64,
+        t: enchudb_oplog::Hlc,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use crate::pk_former::{Card, newest_per_himo};
+        use std::sync::atomic::Ordering;
+        let local = enchudb_oplog::eid_local(local_eid);
+        if !self.is_bound_slot(local) || !self.entities.is_live(local) {
+            return None;
+        }
+        let target_id = (enchudb_oplog::eid_peer(target), enchudb_oplog::eid_local(target));
+        let list = {
+            let f = self.pk_former.read().unwrap();
+            let renamed = matches!(f.card_of(local, target_id, himo), Some((Card::Value(v), h)) if *v != value && h < t);
+            if !renamed {
+                return None;
+            }
+            f.bound_of(local).to_vec()
+        };
+        let (later, earlier): (Vec<_>, Vec<_>) = list.into_iter().partition(|&(_, c)| c > t);
+        if later.is_empty() || earlier.is_empty() {
+            return None;
+        }
+        let self_peer = self.peer_id();
+        let own = (self_peer, local);
+        let published = self.native_identity(local);
+        let pinned = if later.iter().chain(&earlier).any(|&(id, _)| id == own) { own } else { published };
+        let (mut stay, mut go) = if later.iter().any(|&(id, _)| id == pinned) { (later, earlier) } else { (earlier, later) };
+        // 残る側は固定の identity を、 移す側は今の宛名を先頭に (宛名が移す側なら、 最初の付け替えで逆写像も移る)
+        stay.sort_by_key(|&(id, _)| id != pinned);
+        go.sort_by_key(|&(id, _)| id != published);
+        let moved = self.alloc_translated_local(himo)?;
+        let (stay_ids, go_ids): (Vec<_>, Vec<_>) = (stay.iter().map(|b| b.0).collect(), go.iter().map(|b| b.0).collect());
+        let (stay_cards, go_cards) = {
+            let mut f = self.pk_former.write().unwrap();
+            let go_names = f.take_names(local, &go_ids);
+            f.put_names(moved, go_names);
+            f.move_names_by_timeline(local, moved);
+            let go_cards = f.take_cards(local, &go_ids);
+            let stay_cards = f.take_cards(local, &stay_ids);
+            let stay_now = newest_per_himo(&stay_cards);
+            let go_now = newest_per_himo(&go_cards);
+            if stay.len() > 1 {
+                f.put_cards(local, stay_cards);
+            }
+            if go.len() > 1 {
+                f.put_cards(moved, go_cards);
+            }
+            f.set_bound(local, if stay.len() > 1 { stay } else { Vec::new() });
+            f.set_bound(moved, if go.len() > 1 { go } else { Vec::new() });
+            (stay_now, go_now)
+        };
+        if go_ids.len() > 1 {
+            self.mark_bound_slot(moved);
+        }
+        self.pk_former_dirty.store(true, Ordering::Release);
+        // 移す側: 写像を新しい slot へ (自分の peer の identity は行の持ち主だけで、 残る側に居る)
+        let mut first = true;
+        for &(peer, fl) in &go_ids {
+            if peer == self_peer {
+                continue;
+            }
+            if std::mem::take(&mut first) {
+                self.eid_translator.insert(peer, fl, moved);
+            } else {
+                self.eid_translator.alias(peer, fl, moved);
+            }
+        }
+        // 残る側: cell をその側のカードに戻す (値と版数ごと。 カードの無い列は空にする)
+        {
+            let _row = self.row_locks.write(local);
+            for hid in 0..self.himos.len() {
+                let h = hid as u16;
+                let want = stay_cards.iter().find(|c| c.0 == h);
+                let has_value = self.himos[hid].get_value(local).is_some();
+                if want.is_none() && !has_value && self.version_of(local, h) == enchudb_oplog::Hlc::ZERO {
+                    continue;
+                }
+                self.remove_cell_freeing_leaf(local, hid);
+                self.reset_cell_version(local, h);
+            }
+        }
+        let here = enchudb_oplog::make_eid(self_peer, local);
+        let there = enchudb_oplog::make_eid(self_peer, moved);
+        self.apply_cards(here, himo, &stay_cards);
+        self.apply_cards(there, himo, &go_cards);
+        Some(if go_ids.contains(&target_id) { there } else { here })
+    }
+
+    /// カードを行 `eid` に当てる (名前の列 `pk` を先に。 版数ごと LWW で当てる)。
+    fn apply_cards(&self, eid: enchudb_oplog::EntityId, pk: u16, cards: &[(u16, crate::pk_former::Card, enchudb_oplog::Hlc)]) {
+        use crate::pk_former::Card;
+        let mut order: Vec<_> = cards.iter().collect();
+        order.sort_by_key(|c| c.0 != pk);
+        for (h, card, hlc) in order {
+            match card {
+                Card::Value(v) => {
+                    self.remote_tie_apply_result(eid, *h, *v, *hlc);
+                }
+                Card::Bytes(b) => {
+                    self.remote_tieleaf_apply(eid, *h, b, *hlc);
+                }
+                Card::Gone => {
+                    self.remote_untie_apply(eid, *h, *hlc);
+                }
+            }
+        }
+    }
+
+    /// cell `(local, himo)` の版数を 「不明」 に戻す (`store_cell_hlc` は ZERO を書かない)。 呼び手は行の lock を握っている。
+    fn reset_cell_version(&self, local: u32, himo: u16) {
+        if local >= self.max_entities() {
+            return;
+        }
+        if !self.has_cell_version() {
+            self.hlc_store.remove(self.version_key(local), himo);
+            return;
+        }
+        if let Some(col) = self.ver_col(himo)
+            && col.count() > local
+        {
+            col.clear(local);
+        }
+    }
+
+    /// #581: 行 `local` を版数 `t` で消す前に、 名前で束ねた identity のうち `t` より後に作られたもの (削除の後に同じ名前で
+    /// 作られた行 = 削除を先に受けた peer では別のデッキ) を切り離す。 切り離して消したら true (呼び手は消さない)、 束ねた
+    /// identity が無い / 全部 `t` 以前なら false (呼び手が普通に消す)。
+    ///
+    /// - 元の identity が後: 行は残る。 早い identity を消えた slot に付け替え (その宛ての書き込みは捨てる)、 `t` 以前の cell
+    ///   (早い identity の書き込み) を落とし、 名前の削除を覚える
+    /// - 元の identity が早い: 後の identity を新しい slot に移し (`t` より新しい cell を写す)、 行を消す
+    ///
+    /// `t` より新しい cell のうち、 削除を知らない peer が消えた identity 宛てに書いた分は、 後の identity の書き込みと分けられない
+    /// (cell は書いた宛名を持たない) ので、 後の identity の側に残る。
+    fn split_later_identities(&self, local: u32, t: enchudb_oplog::Hlc) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.pk_former_empty.load(Ordering::Acquire) || !self.entities.is_live(local) {
+            return false;
+        }
+        let list = self.pk_former.read().unwrap().bound_of(local).to_vec();
+        let Some(&(native, _)) = list.first() else { return false };
+        let (later, earlier): (Vec<_>, Vec<_>) = list.into_iter().partition(|&(_, c)| c > t);
+        if later.is_empty() {
+            return false;
+        }
+        let Some(pk) = self.pk_himo_of_slot(local) else { return false };
+        let self_peer = self.peer_id();
+        if later.iter().any(|&(id, _)| id == native) {
+            // 元の行は残る: 早い identity を消えた slot に付け替える
+            for &((peer, fl), _) in &earlier {
+                if peer == self_peer && fl == local {
+                    continue;
+                }
+                if let Some(dead) = self.alloc_translated_local(pk) {
+                    self.set_tombstone_local(dead, t);
+                    self.live_free(dead);
+                    self.eid_translator.insert(peer, fl, dead);
+                }
+            }
+            let name = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
+            {
+                let _row = self.row_locks.write(local);
+                for hid in 0..self.himos.len() {
+                    if self.himos[hid].get_value(local).is_some() && self.version_of(local, hid as u16) <= t {
+                        self.remove_cell_freeing_leaf(local, hid);
+                    }
+                }
+            }
+            if let Some(v) = name {
+                let mut g = self.pk_tombs.write().unwrap();
+                self.drain_pk_pending(&mut g);
+                self.with_pk_key(pk, PkValue::Local(v), |k| self.note_pk_locked(&mut g, pk, k, crate::pk_tombs::NO_SLOT, t));
+            }
+            {
+                let mut f = self.pk_former.write().unwrap();
+                let earlier_ids: Vec<_> = earlier.iter().map(|b| b.0).collect();
+                f.take_cards(local, &earlier_ids);
+                if later.len() <= 1 {
+                    f.drop_cards(local);
+                }
+                f.set_bound(local, if later.len() > 1 { later } else { Vec::new() });
+            }
+        } else {
+            // 元の行は消える: 後の identity を新しい slot に移す
+            let Some(moved) = self.alloc_translated_local(pk) else { return false };
+            self.copy_cells_newer_than(local, moved, t);
+            for (i, &((peer, fl), _)) in later.iter().enumerate() {
+                if i == 0 {
+                    self.eid_translator.insert(peer, fl, moved);
+                } else {
+                    self.eid_translator.alias(peer, fl, moved);
+                }
+            }
+            {
+                let mut f = self.pk_former.write().unwrap();
+                let later_ids: Vec<_> = later.iter().map(|b| b.0).collect();
+                let cards = f.take_cards(local, &later_ids);
+                if later.len() > 1 {
+                    f.put_cards(moved, cards);
+                }
+                f.set_bound(local, earlier);
+                f.set_bound(moved, if later.len() > 1 { later } else { Vec::new() });
+            }
+            self.mark_bound_slot(moved);
+            self.apply_delete_local(local, t);
+        }
+        self.pk_former_dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// #581: 行 `from` の cell のうち版数が `t` より新しいものを行 `to` に写す (`merge_entity_into` の 2 段目と同じ当て方)。
+    fn copy_cells_newer_than(&self, from: u32, to: u32, t: enchudb_oplog::Hlc) {
+        let self_peer = self.peer_id();
+        let to_eid = enchudb_oplog::make_eid(self_peer, to);
+        for hid in 0..self.himos.len() {
+            let h = hid as u16;
+            let ver = self.version_of(from, h);
+            if ver <= t {
+                continue;
+            }
+            match self.himos[hid].get_value(from) {
+                Some(_) if self.leaf_for(hid).is_some() => {
+                    let src = enchudb_oplog::make_eid(self_peer, from);
+                    if let Some(bytes) = self.get_text_owned(src, &self.himo_names[hid]) {
+                        self.remote_tieleaf_apply(to_eid, h, &bytes, ver);
+                    }
+                }
+                Some(v) => {
+                    self.remote_tie_apply_result(to_eid, h, v, ver);
+                }
+                None => {}
+            }
+        }
     }
 
     /// #490: リモート peer から届いた Delete を、 翻訳する前の eid (author の世界番号) のまま当てる。
@@ -13094,6 +13825,7 @@ impl Engine {
                 return Err(TieRejected::OlderThanCell);
             }
             if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Bytes(bytes.into()), hlc);
             return Ok(());
         }
         // Tag は dedupe、Leaf は常に新規 id。
@@ -13152,6 +13884,8 @@ impl Engine {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
+        self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(vid as u64), hlc);
+        self.note_local_name(eid, himo_id, vid as u64, hlc);
         Ok(())
     }
 
@@ -13282,6 +14016,7 @@ impl Engine {
                 return;
             }
             if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Bytes(value.into()), hlc);
             return;
         }
         let vid = match self.value_types[hid] {
@@ -13340,7 +14075,10 @@ impl Engine {
         };
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
         drop(row);
-        if !written {
+        if written {
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(vid as u64), hlc);
+            self.note_local_name(eid, himo_id, vid as u64, hlc);
+        } else {
             self.warn_local_write_rejected(eid, himo_id, hlc);
         }
         self.vocab_unpin(hid, vid);
@@ -13416,6 +14154,8 @@ impl Engine {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
+        self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(value), hlc);
+        self.note_local_name(eid, himo_id, value, hlc);
         Ok(())
     }
 
@@ -13463,6 +14203,7 @@ impl Engine {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
+        self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(target_eid as u64), hlc);
         Ok(())
     }
 
@@ -13517,7 +14258,9 @@ impl Engine {
         };
         let cleared = self.clear_cell_in_freeing_leaf(row.as_ref(), eid, himo_id, hlc);
         drop(row);
-        if !cleared {
+        if cleared {
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Gone, hlc);
+        } else {
             self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
@@ -13543,7 +14286,9 @@ impl Engine {
         };
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc);
         drop(row);
-        if !applied {
+        if applied {
+            self.remove_rows_holding_former_names(eid, hlc);
+        } else {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
         }
     }
@@ -13687,6 +14432,18 @@ impl Engine {
         &self,
         listener: std::sync::Arc<dyn crate::changefeed::ChangeListener>,
     ) {
+        // 記録がある時は、 今の記録の終わりから (付けた時に書き出し待ちだった record は、 書き出された後に渡る)
+        if let Some(log) = self.change_log.get() {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(wal) = self.oplog.as_ref() {
+                let _ = self.pump_change_log(wal, log, &mut c, false);
+            }
+            c.readers.push((listener.clone(), log.range().1));
+            self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
+            drop(c);
+            self.ensure_notifier();
+            return;
+        }
         let was_empty = {
             let mut guard = self.change_listeners.write().unwrap();
             let was_empty = guard.is_empty();
@@ -13706,6 +14463,282 @@ impl Engine {
     /// 登録済み listener 数(テスト/監視用)。
     pub fn change_listener_count(&self) -> usize {
         self.change_listeners.read().unwrap().len()
+    }
+
+    /// changefeed の記録 (`{dir}/changefeed.seg`) を作る。 以後 (開き直しても) listener に渡す record を番号付きで残し、
+    /// [`Self::add_change_listener_from`] で番号の続きから受け直せる (番号は [`crate::changefeed::ChangeListener::on_changes_at`]
+    /// で渡る)。 `cap` は記録の大きさ (byte、 下限 1 MiB、 既に在る記録は作った時の大きさ)。 満杯なら古い方から捨てる。
+    /// 記録が在る間は、 listener に渡していない record をメモリに溜めない (溜めの上限 `set_change_backlog_limit` も使わない)。
+    ///
+    /// 作った時から記録する (それより前に閉じた record は入らない)。 listener を付ける前に呼ぶこと (付いていると
+    /// `InvalidInput`)。 WAL 付きの並行の engine (`open_concurrent_with_oplog` など) だけ。 既に在れば何もしない。
+    /// 記録の 1/4 より大きい record は番号だけ使って中身を残さない (その番号を読む listener は外れ、 受け直しは
+    /// [`crate::change_log::Truncated`])。 記録を知らない binary で開いて書いた間の record は記録に入らない。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_change_log(&self, cap: usize) -> io::Result<()> {
+        if self.change_log.get().is_some() {
+            return Ok(());
+        }
+        let Some(wal) = self.oplog.as_ref() else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "changefeed の記録は WAL 付きの並行の engine だけ"));
+        };
+        let Backing::Segments(set) = &self.backing else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "changefeed の記録は directory の DB だけ"));
+        };
+        if self.is_readonly() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "readonly"));
+        }
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "enable_change_log は listener を付ける前に呼ぶ"));
+        }
+        let existed = set.dir().join(crate::change_log::FILE).exists();
+        let log = crate::change_log::ChangeLog::open(set.dir(), cap, true, false)?;
+        c.log_wal = if existed {
+            Self::change_log_resume_offset(wal, &log)
+        } else {
+            // 今から: 閉じた group の後ろから写す (閉じていない group は閉じた時に入る)
+            wal.scan_for_change_log(enchudb_oplog::oplog::HEADER_SIZE as u64, u64::MAX, false).1
+        };
+        // 畳んだ印を新しい周より先に届ける (続きの位置を探す時に、 前の周と新しい周を取り違えない)
+        wal.set_sync_on_reset(true);
+        let _ = self.change_log.set(log);
+        Ok(())
+    }
+
+    /// changefeed の記録に残っている番号の範囲 `(最古, 次)`。 記録が無ければ None。 listener に渡した番号はこの範囲で受け直せる。
+    pub fn change_log_range(&self) -> Option<(u64, u64)> {
+        let log = self.change_log.get()?;
+        if let Some(wal) = self.oplog.as_ref() {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = self.pump_change_log(wal, log, &mut c, false);
+        }
+        Some(log.range())
+    }
+
+    /// changefeed の記録の `pos` 番から listener を付ける (前に受けた最後の番号 + 1 を渡すと、 落ちる前の続きから受け直す)。
+    /// `pos` が記録に無ければ `Err(Truncated { from })` (`from` = 今残っている最古の番号。 記録の先の番号 / 記録の無い engine も
+    /// Truncated)。 その時は今の状態から読み直し、 [`Self::add_change_listener`] で付け直す。
+    pub fn add_change_listener_from(
+        &self,
+        listener: std::sync::Arc<dyn crate::changefeed::ChangeListener>,
+        pos: u64,
+    ) -> Result<(), crate::change_log::Truncated> {
+        let Some(log) = self.change_log.get() else {
+            let c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            return Err(crate::change_log::Truncated { from: c.seq });
+        };
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(wal) = self.oplog.as_ref() {
+            let _ = self.pump_change_log(wal, log, &mut c, false);
+        }
+        let (first, next) = log.range();
+        if pos < first || pos > next {
+            return Err(crate::change_log::Truncated { from: if pos < first { first } else { next } });
+        }
+        c.readers.push((listener.clone(), pos));
+        self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
+        drop(c);
+        self.ensure_notifier();
+        self.notify_listeners();
+        Ok(())
+    }
+
+    /// 記録を開く (在る時だけ)。 WAL を開いて再生した後・consumer を起こす前に呼ぶ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_change_log(&self) {
+        let Some(wal) = self.oplog.as_ref() else { return };
+        let Backing::Segments(set) = &self.backing else { return };
+        if self.is_readonly() || !set.dir().join(crate::change_log::FILE).exists() {
+            return;
+        }
+        match crate::change_log::ChangeLog::open(set.dir(), 0, false, false) {
+            Ok(log) => {
+                let start = Self::change_log_resume_offset(wal, &log);
+                self.change_emit.lock().unwrap_or_else(|p| p.into_inner()).log_wal = start;
+                wal.set_sync_on_reset(true);
+                let _ = self.change_log.set(log);
+            }
+            Err(e) => eprintln!(
+                "[enchudb] warning: could not open {} ({e}) — the changefeed runs without its record",
+                crate::change_log::FILE
+            ),
+        }
+    }
+
+    /// 記録の続きの WAL の位置: 最後に記録した record を WAL の中で探し、 その直後。 見つからなければ WAL の頭 (記録した後に
+    /// 畳んだ = WAL の record は全部その後。 畳む前に全部を写して書き出すので抜けない)。 「見つからない = 畳んだ後」 は、 畳んだ
+    /// 印を新しい周より先に書き出すので成り立つ (`OpLog::set_sync_on_reset`。 書き出さないと、 前の周の header のまま新しい周の
+    /// page だけが届いた像で前の周を途中までしか読めず、 記録した record を頭から写し直した)。
+    fn change_log_resume_offset(wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog) -> u64 {
+        let start = enchudb_oplog::oplog::HEADER_SIZE as u64;
+        let Some((hlc, id)) = log.last_written() else { return start };
+        let (recs, _) = wal.scan_for_change_log(start, u64::MAX, true);
+        recs.iter()
+            .find(|(r, _)| r.hlc == hlc && crate::change_log::fnv1a64(&r.signed_bytes) == id)
+            .map_or(start, |(_, end)| *end)
+    }
+
+    /// WAL の record を記録に写す (呼び手が `change_emit` を持つ)。 `with_tail` が false なら書き出し済み (checkpoint まで) に
+    /// Commit で閉じた group だけ (落ちたら消える record に番号を振らない: 振ると開き直した後に番号がずれる)。 true なら閉じて
+    /// いない末尾も含めて全部 (畳む直前、 全部書き出してある)。 記録が listener の位置を越えて捨てたら、 その listener を外す
+    /// (通知係が `on_detached` を呼ぶ)。 書き出しに失敗したら Err (写せた所までは進める)。 戻り値は写した数。
+    /// local-only の表 (`_` で始まる表、 `define_reserved_table`) の slot の範囲。 sync の bridge が配らず、 changefeed も渡さない。
+    fn local_only_ranges(&self) -> Vec<(u32, u32)> {
+        self.tables.iter().filter(|t| t.is_reserved()).flat_map(|t| t.extents()).collect()
+    }
+
+    /// changefeed に渡す record だけ残す: local-only の表の書き込みを外す (peer に配らない表は listener にも渡さない。 listener の
+    /// 中で local-only の表に位置を書くと、 その書き込みがまた配られて止まらない)。 local-only の表が無い DB は何も外さない。
+    /// Commit は WAL を読む所で group の区切りになるだけで渡らないので、 外した書き込みだけの group も何も渡らない。
+    fn keep_for_changefeed<T>(&self, recs: Vec<T>, op: impl Fn(&T) -> &enchudb_oplog::oplog::DecodedOp) -> Vec<T> {
+        use enchudb_oplog::oplog::DecodedOp;
+        let ranges = self.local_only_ranges();
+        if ranges.is_empty() {
+            return recs;
+        }
+        let local_only = |eid: u64| {
+            let local = enchudb_oplog::eid_local(eid);
+            ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
+        };
+        recs.into_iter()
+            .filter(|r| match op(r) {
+                DecodedOp::Tie { eid, .. }
+                | DecodedOp::Untie { eid, .. }
+                | DecodedOp::Delete { eid }
+                | DecodedOp::Content { eid, .. }
+                | DecodedOp::TieNamed { eid, .. }
+                | DecodedOp::TieLeaf { eid, .. }
+                | DecodedOp::TieRef { eid, .. } => !local_only(*eid),
+                DecodedOp::Commit | DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } => true,
+            })
+            .collect()
+    }
+
+    fn pump_change_log(
+        &self,
+        wal: &enchudb_oplog::oplog::OpLog,
+        log: &crate::change_log::ChangeLog,
+        c: &mut ChangeCursor,
+        with_tail: bool,
+    ) -> io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        let (recs, end) = wal.scan_for_change_log(c.log_wal, wal.checkpoint(), with_tail);
+        let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
+        if recs.is_empty() {
+            c.log_wal = c.log_wal.max(end);
+            return Ok(0);
+        }
+        let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
+        let batch: Vec<crate::change_log::NewEntry> = recs
+            .into_iter()
+            .map(|(r, _)| {
+                let wal_id = crate::change_log::fnv1a64(&r.signed_bytes);
+                let w = crate::transport::WireRecord::from(r);
+                crate::change_log::NewEntry { hlc: w.hlc, wal_id, bytes: w.encode() }
+            })
+            .collect();
+        let watch: Vec<u64> = c.readers.iter().map(|(_, p)| *p).collect();
+        let before = log.range().1;
+        let mut lost = Vec::new();
+        let res = log.append(&batch, &watch, &mut lost);
+        let done = (log.range().1 - before) as usize;
+        c.log_wal = if done == ends.len() {
+            end
+        } else if done > 0 {
+            ends[done - 1]
+        } else {
+            c.log_wal
+        };
+        // 捨てた位置で読んでいた listener を外す
+        let first = log.range().0;
+        if c.readers.iter().any(|(_, p)| *p < first) {
+            let mut gone = Vec::new();
+            c.readers.retain(|(l, p)| {
+                if *p >= first {
+                    return true;
+                }
+                let from = lost.iter().find(|(no, _)| no == p).map_or(enchudb_oplog::Hlc::ZERO, |(_, h)| *h);
+                gone.push((l.clone(), from));
+                false
+            });
+            self.change_listeners
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|l| !gone.iter().any(|(g, _)| std::sync::Arc::ptr_eq(g, l)));
+            self.change_listeners_detached.fetch_add(gone.len() as u64, Ordering::Relaxed);
+            eprintln!(
+                "[enchudb] warning: {} change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)",
+                gone.len()
+            );
+            c.log_detached.extend(gone);
+            self.notify_listeners();
+        }
+        res.map(|()| done)
+    }
+
+    /// 記録がある時の配信: 記録に写してから、 listener ごとに位置から読んで渡す。 位置は渡す前に進める (畳む側の写しが、
+    /// 渡した分を 「まだ読んでいない」 と見て外さないように)。
+    fn deliver_from_log(&self, wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog) {
+        /// 1 回に 1 listener へ渡す量の目安。
+        const CHUNK: usize = 4 << 20;
+        let gone = {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = self.pump_change_log(wal, log, &mut c, false) {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
+                }
+            }
+            std::mem::take(&mut c.log_detached)
+        };
+        for (l, from) in gone {
+            l.on_detached(from);
+        }
+        loop {
+            let mut work = Vec::new();
+            let mut broken = Vec::new();
+            {
+                let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                for (l, pos) in c.readers.iter_mut() {
+                    match log.read(*pos, CHUNK) {
+                        Ok(es) if !es.is_empty() => {
+                            work.push((l.clone(), *pos, es));
+                            *pos = work.last().unwrap().2.last().unwrap().no + 1;
+                        }
+                        Ok(_) => {}
+                        Err(_) => broken.push(l.clone()),
+                    }
+                }
+                if !broken.is_empty() {
+                    c.readers.retain(|(l, _)| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
+                    self.change_listeners
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .retain(|l| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
+                    self.change_listeners_detached.fetch_add(broken.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            for l in broken {
+                l.on_detached(enchudb_oplog::Hlc::ZERO);
+            }
+            if work.is_empty() {
+                return;
+            }
+            for (l, first, es) in work {
+                let recs: Vec<crate::transport::WireRecord> = es
+                    .iter()
+                    .filter_map(|e| match crate::transport::WireRecord::decode(&e.bytes) {
+                        Ok((r, _)) => Some(r),
+                        Err(err) => {
+                            eprintln!("[enchudb] warning: changefeed.seg entry {} does not decode ({err:?}) — skipped", e.no);
+                            None
+                        }
+                    })
+                    .collect();
+                l.on_changes_at(first, &recs);
+            }
+        }
     }
 
     // ──── blob store (大容量バイナリ: 画像/動画/モデル等) ────
@@ -16075,6 +17108,163 @@ impl Engine {
         }
     }
 
+    // ─────────────────────────── 宣言された答え ───────────────────────────
+
+    /// 答え (購読) に名前を付けて宣言する: 形 ([`AnswerSpec`](crate::live::AnswerSpec) = 条件・group・並び) を
+    /// `{db}/tables` (`ANS1`) に保存し、 開き直すと engine が開く時 (WAL の再生の前) に自分で購読を張る。 アプリは
+    /// [`answer`](Self::answer) で名前から購読を取るだけで、 条件を書き直さない。
+    ///
+    /// - 開く時の登録は route を張るだけ。 種 (最初の答え = 表を読む) は最初の poll が作る (`.order()` の索引と同じ: 開くのは
+    ///   遅くならない)。 今宣言した購読も同じ (登録と barrier まで、 走査は最初の poll)
+    /// - 返す handle は engine が持つ購読の clone (poll の状態は 1 つ = 同じ差分はどれか 1 つの clone にだけ届く)。 engine が
+    ///   閉じるまで生きる (アプリの handle を落としても購読は残る)
+    /// - 同じ名前に同じ形をもう一度宣言するのは何もしない (同じ購読を返す)。 違う形なら置き換える (前の購読は、 それを持つ
+    ///   handle が全部落ちた時に外れる)。 外すのは [`drop_answer`](Self::drop_answer)
+    /// - 形の検査は [`subscribe`](Self::subscribe) / [`subscribe_counts`](Self::subscribe_counts) /
+    ///   [`subscribe_top`](Self::subscribe_top) と同じ (`InvalidInput`)。 名前は 1〜255 byte、 NUL なし
+    /// - 宣言を知らない古い binary で開いても壊れない (読まないだけ。 その binary が table 定義を書き直すと宣言は消える)。
+    ///   memory-only の DB と readonly で開いた process は保存しない (その process の中だけ)
+    pub fn declare_answer(&self, name: &str, spec: crate::live::AnswerSpec) -> io::Result<crate::live::AnswerHandle> {
+        if name.is_empty() || name.len() > 255 || name.bytes().any(|b| b == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("declare_answer: bad name {name:?} (1..=255 bytes, no NUL)"),
+            ));
+        }
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(a) = answers.iter().find(|a| a.name == name)
+            && a.spec == spec
+        {
+            return Ok(a.handle.clone());
+        }
+        let handle = self.register_answer(&spec)?;
+        match answers.iter_mut().find(|a| a.name == name) {
+            Some(a) => {
+                a.spec = spec;
+                a.handle = handle.clone();
+            }
+            None => answers.push(AnswerEntry { name: name.to_string(), spec, handle: handle.clone() }),
+        }
+        drop(answers);
+        if !self.is_readonly() {
+            self.try_persist_tables();
+        }
+        Ok(handle)
+    }
+
+    /// 宣言された答えの購読を名前で取る (無ければ None)。 返すのは engine が持つ購読の clone
+    /// ([`declare_answer`](Self::declare_answer))。
+    pub fn answer(&self, name: &str) -> Option<crate::live::AnswerHandle> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|a| a.name == name).map(|a| a.handle.clone())
+    }
+
+    /// 宣言された答えの形を名前で取る (無ければ None)。
+    pub fn answer_spec(&self, name: &str) -> Option<crate::live::AnswerSpec> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|a| a.name == name).map(|a| a.spec.clone())
+    }
+
+    /// 宣言された答えを外す。 外したら true、 無ければ false。 宣言は保存からも消える。 購読そのものは、 それを持つ handle が
+    /// 全部落ちた時に外れる。
+    pub fn drop_answer(&self, name: &str) -> bool {
+        let removed = {
+            let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+            let n = answers.len();
+            answers.retain(|a| a.name != name);
+            answers.len() != n
+        };
+        if removed && !self.is_readonly() {
+            self.try_persist_tables();
+        }
+        removed
+    }
+
+    /// 今の宣言 (名前, 形)。 宣言した順。
+    pub fn answer_declarations(&self) -> Vec<(String, crate::live::AnswerSpec)> {
+        self.answer_decls_raw()
+    }
+
+    /// `{db}/tables` に書く宣言 (名前, 形)。
+    fn answer_decls_raw(&self) -> Vec<AnswerDecl> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|a| (a.name.clone(), a.spec.clone())).collect()
+    }
+
+    /// 開く時: `{db}/tables` の宣言を戻す (route を張るだけ、 種は最初の poll)。 紐が無い / 型が合わないなど張れない宣言は
+    /// 警告して捨てる (答えは列から作り直せる派生のデータ)。 同じ名前が 2 つあれば先のを取る。
+    fn restore_answers(&self, decls: Vec<AnswerDecl>) {
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        for (name, spec) in decls {
+            if answers.iter().any(|a| a.name == name) {
+                eprintln!("warning: dropped a duplicate stored answer declaration '{name}'");
+                continue;
+            }
+            match self.register_answer(&spec) {
+                Ok(handle) => answers.push(AnswerEntry { name, spec, handle }),
+                Err(e) => eprintln!("warning: dropped a stored answer declaration '{name}': {e}"),
+            }
+        }
+    }
+
+    /// 宣言の形で購読を登録する: 検査 → route に載せる → 条件の紐の barrier。 種 (初期候補の走査) は最初の poll が作る
+    /// (`subscribe*` は登録の時に作る)。 ref の逆引きの索引も温めない (最初に読む時に組む)。
+    fn register_answer(&self, spec: &crate::live::AnswerSpec) -> io::Result<crate::live::AnswerHandle> {
+        use crate::live::{AnswerHandle, AnswerSpec};
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
+        let preds = spec.preds().to_vec();
+        self.validate_live_preds(&preds)?;
+        let mut branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
+        let keys: usize = branches.iter().map(|b| crate::live::key_count(b)).fold(0, usize::saturating_add);
+        if keys > crate::live::MAX_KEYS {
+            return Err(bad("In / Or expand to too many keys"));
+        }
+        let check_path = |path: &[u16], himo: u16, what: &str| -> io::Result<()> {
+            if himo as usize >= self.himos.len() || path.iter().any(|&h| h as usize >= self.himos.len()) {
+                return Err(bad(&format!("unknown {what} himo")));
+            }
+            if path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
+                return Err(bad(&format!("{what} path himo is not a Ref himo")));
+            }
+            Ok(())
+        };
+        let handle = match spec {
+            AnswerSpec::Set { .. } => {
+                let q = if branches.len() == 1 {
+                    self.live.register(branches.pop().unwrap_or_default(), false)
+                } else {
+                    self.live.register_any(branches, false)
+                };
+                AnswerHandle::Query(std::sync::Arc::new(q))
+            }
+            AnswerSpec::Counts { group_path, group_himo, sum_himo, .. } => {
+                check_path(group_path, *group_himo, "group")?;
+                if let Some(s) = sum_himo
+                    && !matches!(self.value_type_at(*s as usize), Some(ValueType::Number | ValueType::Number64))
+                {
+                    return Err(bad("sum himo is not a Number / Number64 himo"));
+                }
+                let q = self
+                    .live
+                    .register_counts(branches, (group_path.clone(), *group_himo), *sum_himo)
+                    .map_err(|m| bad(&m))?;
+                AnswerHandle::Counts(std::sync::Arc::new(q))
+            }
+            AnswerSpec::Top { order_path, order_himo, desc, limit, .. } => {
+                if *limit == 0 {
+                    return Err(bad("limit must be at least 1"));
+                }
+                check_path(order_path, *order_himo, "order")?;
+                let q = self
+                    .live
+                    .register_top(branches, (order_path.clone(), *order_himo, *desc), *limit as usize)
+                    .map_err(|m| bad(&m))?;
+                AnswerHandle::Query(std::sync::Arc::new(q))
+            }
+        };
+        for h in handle.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        Ok(handle)
+    }
+
     /// 宣言を確かめて並びの索引を作る (中身は空、 作るのは [`order_ready`](Self::order_ready))。
     fn new_order_index(&self, via_id: usize, key_id: usize, ticks: &[u64]) -> Result<crate::order_index::OrderIndex, String> {
         let (Some(via), Some(key)) = (self.himos.get(via_id), self.himos.get(key_id)) else {
@@ -17358,6 +18548,11 @@ impl Engine {
                 l.on_detached(from);
             }
         }
+        // 記録がある時は記録から、 listener ごとの位置で渡す
+        if let Some(log) = self.change_log.get() {
+            self.deliver_from_log(wal, log);
+            return;
+        }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
         // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
         let listeners = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
@@ -17371,36 +18566,54 @@ impl Engine {
             let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
             let mut batch = std::mem::take(&mut c.committed);
             if committed_end > c.offset {
+                let recs = self.keep_for_changefeed(recs, |r| &r.op);
                 // 畳んだ時に閉じていなかった末尾は、 この Commit で閉じた group の頭
                 batch.append(&mut c.open_tail);
                 batch.extend(recs.into_iter().map(crate::transport::WireRecord::from));
                 c.offset = committed_end;
             }
             c.bytes = c.open_tail.iter().map(change_record_bytes).sum();
-            batch
+            let first = c.seq;
+            c.seq += batch.len() as u64;
+            (first, batch)
         };
+        let (first, batch) = batch;
         if batch.is_empty() {
             return;
         }
         for listener in &listeners {
-            listener.on_changes(&batch);
+            listener.on_changes_at(first, &batch);
         }
     }
 
     /// changefeed: ring を畳む直前 (`append_lock` の下、 呼び手が `change_emit` を持って) に、 cursor から先の record を溜めに
     /// 移す。 Commit で閉じた分は `committed` に (前に閉じていなかった末尾を頭に付けて)、 閉じていない末尾は `open_tail` に
     /// 足す。 cursor は読み終えた終端に進める (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。
-    /// listener が居なければ何もしない。 戻り値は移した record の数。
+    /// listener が居なければ何もしない。 戻り値は移した record の数 (None = 畳まない: 記録に写せなかった)。
+    ///
+    /// 記録 (`changefeed.seg`) がある時は、 溜めの代わりに、 閉じていない末尾も含めて全部を記録に写す (畳む前は全部書き出してある)。
     ///
     /// #560: 移すと溜めが上限 (`change_backlog_limit`) を越えるなら、 移さずに溜めごと捨て、 listener を全部外す (止まった・遅すぎる
     /// listener のために書き手を止めない・メモリを使い切らない。 前は上限が無く、 止まった listener の間は畳むたびに ring の
     /// 全部を `append_lock` の下で写して溜め続けた)。 外した listener には通知係が `on_detached` で知らせる。
-    fn spill_changes_for_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor) -> usize {
+    fn spill_changes_for_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor) -> Option<usize> {
         use std::sync::atomic::Ordering;
+        if let Some(log) = self.change_log.get() {
+            return match self.pump_change_log(wal, log, c, true) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    self.record_fault(FaultKind::DiskSpace, "changefeed.seg に写せない — WAL を畳まない");
+                    eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — the WAL is not folded");
+                    None
+                }
+            };
+        }
         if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
-            return 0;
+            return Some(0);
         }
         let (recs, committed_end, tail, end) = wal.iter_from_with_tail(c.offset);
+        let recs = self.keep_for_changefeed(recs, |r| &r.op);
+        let tail = self.keep_for_changefeed(tail, |r| &r.op);
         let moved = recs.len() + tail.len();
         let recs: Vec<crate::transport::WireRecord> = recs.into_iter().map(crate::transport::WireRecord::from).collect();
         let tail: Vec<crate::transport::WireRecord> = tail.into_iter().map(crate::transport::WireRecord::from).collect();
@@ -17424,7 +18637,7 @@ impl Engine {
                 self.change_backlog_limit.load(Ordering::Relaxed),
             );
             self.notify_listeners();
-            return 0;
+            return Some(0);
         }
         if committed_end > c.offset {
             let open = std::mem::take(&mut c.open_tail);
@@ -17434,7 +18647,7 @@ impl Engine {
         c.open_tail.extend(tail);
         c.bytes += add;
         c.offset = end;
-        moved
+        Some(moved)
     }
 
     /// changefeed: 畳んだ後の後始末 (呼び手が `change_emit` を持ったまま)。 畳めたら cursor を ring の頭に戻し、 溜めに移した
@@ -17443,6 +18656,7 @@ impl Engine {
     fn after_fold_changes(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, folded: bool, moved: usize) {
         if folded {
             c.offset = enchudb_oplog::oplog::HEADER_SIZE as u64;
+            c.log_wal = enchudb_oplog::oplog::HEADER_SIZE as u64;
         }
         if folded && !c.open_tail.is_empty() {
             let _ = self.append_commit_marker(wal);
@@ -17459,10 +18673,8 @@ impl Engine {
         let mut moved = 0;
         let folded = self.wal_fold_safe()
             && wal.try_reset_if(|| {
-                self.wal_fold_safe_locked() && {
-                    moved = self.spill_changes_for_fold(wal, &mut c);
-                    true
-                }
+                self.wal_fold_safe_locked()
+                    && self.spill_changes_for_fold(wal, &mut c).map(|m| moved = m).is_some()
             });
         if folded {
             self.reset_sync_ops_offset();
@@ -17483,6 +18695,11 @@ impl Engine {
     /// 書き込みは止まらないが、 渡すまでメモリに持つ)。
     pub fn change_backlog_len(&self) -> usize {
         let c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(log) = self.change_log.get() {
+            // 記録がある時: 記録の中で、 いちばん遅れた listener がまだ受けていない数
+            let next = log.range().1;
+            return c.readers.iter().map(|(_, p)| next.saturating_sub(*p)).max().unwrap_or(0) as usize;
+        }
         c.committed.len() + c.open_tail.len()
     }
 
@@ -17568,6 +18785,9 @@ impl Engine {
         if oplog.is_none() {
             return Arc::new(eng);
         }
+        // changefeed の記録は consumer が畳む前に WAL の続きの位置を合わせる
+        #[cfg(not(target_arch = "wasm32"))]
+        eng.attach_change_log();
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(crate::consumer_waker::ConsumerWaker::default());
         eng.consumer_waker = Some(waker.clone());
@@ -17942,10 +19162,9 @@ impl Engine {
                         ok
                     },
                     || {
-                        direct && self.wal_fold_safe_locked() && {
-                            moved = self.spill_changes_for_fold(wal, &mut c);
-                            true
-                        }
+                        direct
+                            && self.wal_fold_safe_locked()
+                            && self.spill_changes_for_fold(wal, &mut c).map(|m| moved = m).is_some()
                     },
                 );
                 if folded {
@@ -18334,7 +19553,7 @@ impl Engine {
         // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
         // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
         if !self.tables.is_empty() {
-            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw()))?;
+            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw()))?;
         }
         let eidmap_entries = self.eidmap_entries_with_tombstones();
         if !eidmap_entries.is_empty() {
@@ -23507,15 +24726,15 @@ mod order_decl_sidecar_tests {
         let eng = engine(&path);
         assert!(eng.table_eid_extents("u").unwrap().len() >= 2, "前提: EXT1 を書く");
         assert!(eng.tables.iter().any(|t| t.pk_himo.is_some()), "前提: PKS1 を書く");
-        let without = serialize_tables(&eng.tables, &[], &[]);
+        let without = serialize_tables(&eng.tables, &[], &[], &[]);
         assert!(!without.windows(4).any(|w| w == b"DIA1"), "宣言が無ければ DIA1 を書かない");
         eng.declare_order("u.company", "u.age", &[30, 65]).unwrap();
         let decls = eng.order_decls_raw();
         assert_eq!(decls.len(), 1);
-        let with = serialize_tables(&eng.tables, &decls, &[]);
+        let with = serialize_tables(&eng.tables, &decls, &[], &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"DIA1", "DIA1 は一番後ろに足す");
-        let (t0, o0, _) = deserialize_tables(&without).unwrap();
-        let (t1, o1, _) = deserialize_tables(&with).unwrap();
+        let (t0, o0, _, _) = deserialize_tables(&without).unwrap();
+        let (t1, o1, _, _) = deserialize_tables(&with).unwrap();
         assert!(o0.is_empty());
         assert_eq!(o1, decls);
         assert_eq!(shape(&t0), shape(&eng.tables), "前提: 読み戻した形が元と同じ");
@@ -23523,12 +24742,12 @@ mod order_decl_sidecar_tests {
         // 古い binary の読み方 = DIA1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         old[without.len()..without.len() + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2, _) = deserialize_tables(&old).unwrap();
+        let (t2, o2, _, _) = deserialize_tables(&old).unwrap();
         assert!(o2.is_empty());
         assert_eq!(shape(&t2), shape(&t0), "古い binary に見える table / PK / extent が変わった");
         // 途中で切れた DIA1 は宣言なし (table は有効)
         for cut in [1, 4, 9, 12] {
-            let (t3, o3, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            let (t3, o3, _, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
             assert!(o3.is_empty(), "cut {cut}");
             assert_eq!(shape(&t3), shape(&t0), "cut {cut}");
         }
@@ -23604,20 +24823,20 @@ mod marks_decl_sidecar_tests {
         let eng = engine(&path);
         let (via, age) = (eng.himo_id("u.company").unwrap() as u16, eng.himo_id("u.age").unwrap() as u16);
         let orders = vec![(via, age, vec![30u64, 65])];
-        let without = serialize_tables(&eng.tables, &orders, &[]);
+        let without = serialize_tables(&eng.tables, &orders, &[], &[]);
         assert!(!without.windows(4).any(|w| w == b"MRK1"), "宣言が無ければ MRK1 を書かない");
-        let with = serialize_tables(&eng.tables, &orders, &[age]);
+        let with = serialize_tables(&eng.tables, &orders, &[age], &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"MRK1", "MRK1 は DIA1 の後ろに足す");
-        let (t, o, m) = deserialize_tables(&with).unwrap();
+        let (t, o, m, _) = deserialize_tables(&with).unwrap();
         assert_eq!((t.len(), o, m), (eng.tables.len(), orders.clone(), vec![age]));
         // 古い binary の読み方 = MRK1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         let at = without.len();
         old[at..at + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2, m2) = deserialize_tables(&old).unwrap();
+        let (t2, o2, m2, _) = deserialize_tables(&old).unwrap();
         assert_eq!((t2.len(), o2, m2), (eng.tables.len(), orders.clone(), vec![]));
         // 途中で切れた MRK1 は宣言なし (table と並びは有効)
-        let (t3, o3, m3) = deserialize_tables(&with[..with.len() - 2]).unwrap();
+        let (t3, o3, m3, _) = deserialize_tables(&with[..with.len() - 2]).unwrap();
         assert_eq!((t3.len(), o3, m3), (eng.tables.len(), orders, vec![]));
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
@@ -23644,13 +24863,190 @@ mod marks_decl_sidecar_tests {
         assert!(!eng.declare_marks("u.age").unwrap(), "組む前の宣言は次に組む時から (今は効いていない)");
         assert!(!eng.declare_marks("u.age").unwrap(), "2 度目は何もしない");
         eng.persist_tables().unwrap();
-        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, m, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert_eq!(m, vec![eng.himo_id("u.age").unwrap() as u16], "宣言は sidecar に書く");
         assert!(eng.drop_marks("u.age").unwrap());
         assert!(!eng.drop_marks("u.age").unwrap());
         eng.persist_tables().unwrap();
-        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, m, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert!(m.is_empty(), "外すと sidecar からも消える");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// 宣言された答え (`ANS1`、 `Engine::declare_answer`) の読み書き: MRK1 の後ろに足す、 宣言が無ければ書かない、 古い binary の
+/// 読み方 (知らない magic で止まる) で table / 並び / 印の宣言は同じに読める、 壊れた ANS1 は宣言なしとして読む、 開く時に
+/// 張れない宣言 (紐が無い / 型が合わない) は捨てる、 宣言すると保存され外すと消える、 同じ形は同じ購読、 違う形は置き換え。
+#[cfg(test)]
+mod answer_decl_sidecar_tests {
+    use super::*;
+    use crate::live::{AnswerHandle, AnswerSpec, LivePred};
+
+    fn tmp(name: &str) -> String {
+        let path = format!("/tmp/enchu_answer_decl_{name}_{}.db", std::process::id());
+        let _ = crate::db_files::remove_db(&path);
+        path
+    }
+
+    fn engine(path: &str) -> Engine {
+        let mut eng = Engine::create_growable_opts(
+            path,
+            GrowableOptions {
+                max_entities: 64,
+                max_himos: 16,
+                vocab_data_size: 64 * 1024,
+                content_data_size: Some(64 * 1024),
+                reserve_entities: Some(128),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        eng.define_table("c", 4).unwrap();
+        eng.define_himo_in("c", "city", ValueType::Tag, 0).unwrap();
+        eng.define_table("u", 4).unwrap();
+        eng.define_himo_in("u", "id", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "memo", ValueType::Leaf, 0).unwrap();
+        eng.define_ref_in("u", "company", "c").unwrap();
+        let id = eng.himo_id("u.id").unwrap() as u16;
+        eng.set_table_pk("u", id).unwrap();
+        eng
+    }
+
+    fn h(eng: &Engine, name: &str) -> u16 {
+        eng.himo_id(name).unwrap() as u16
+    }
+
+    fn specs(eng: &Engine) -> Vec<(String, AnswerSpec)> {
+        let (age, company, city) = (h(eng, "u.age"), h(eng, "u.company"), h(eng, "c.city"));
+        vec![
+            ("adults".into(), AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 31, hi: u64::MAX }] }),
+            (
+                "by_city".into(),
+                AnswerSpec::Counts { preds: vec![LivePred::Present { himo_id: age }], group_path: vec![company], group_himo: city, sum_himo: Some(age) },
+            ),
+            (
+                "oldest".into(),
+                AnswerSpec::Top { preds: vec![LivePred::Via { path: vec![company], pred: Box::new(LivePred::EqText { himo_id: city, text: "東京".into() }) }], order_path: vec![], order_himo: age, desc: true, limit: 3 },
+            ),
+        ]
+    }
+
+    #[test]
+    fn ans1_is_appended_after_mrk1_and_round_trips() {
+        let path = tmp("append");
+        let eng = engine(&path);
+        let (via, age) = (h(&eng, "u.company"), h(&eng, "u.age"));
+        let orders = vec![(via, age, vec![30u64, 65])];
+        let answers = specs(&eng);
+        let without = serialize_tables(&eng.tables, &orders, &[age], &[]);
+        assert!(!without.windows(4).any(|w| w == b"ANS1"), "宣言が無ければ ANS1 を書かない");
+        let with = serialize_tables(&eng.tables, &orders, &[age], &answers);
+        assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"ANS1", "ANS1 は MRK1 の後ろに足す");
+        let (t, o, m, a) = deserialize_tables(&with).unwrap();
+        assert_eq!((t.len(), o, m, a), (eng.tables.len(), orders.clone(), vec![age], answers.clone()));
+        // 古い binary の読み方 = ANS1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
+        let mut old = with.clone();
+        let at = without.len();
+        old[at..at + 4].copy_from_slice(b"ZZZ9");
+        let (t2, o2, m2, a2) = deserialize_tables(&old).unwrap();
+        assert_eq!((t2.len(), o2, m2, a2), (eng.tables.len(), orders.clone(), vec![age], vec![]));
+        // 途中で切れた ANS1 は宣言なし (table / 並び / 印は有効)
+        for cut in [1usize, 7, 20, with.len() - at - 5] {
+            let (t3, o3, m3, a3) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            assert_eq!((t3.len(), o3, m3, a3), (eng.tables.len(), orders.clone(), vec![age], vec![]), "cut {cut}");
+        }
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn restore_keeps_only_declarations_it_can_register() {
+        let path = tmp("restore");
+        let eng = engine(&path);
+        let (age, memo, company) = (h(&eng, "u.age"), h(&eng, "u.memo"), h(&eng, "u.company"));
+        let mut decls = specs(&eng);
+        decls.push(("no_such_himo".into(), AnswerSpec::Set { preds: vec![LivePred::Present { himo_id: 999 }] }));
+        decls.push(("path_not_ref".into(), AnswerSpec::Counts { preds: vec![LivePred::Present { himo_id: age }], group_path: vec![age], group_himo: age, sum_himo: None }));
+        decls.push(("sum_is_leaf".into(), AnswerSpec::Counts { preds: vec![LivePred::Present { himo_id: age }], group_path: vec![], group_himo: company, sum_himo: Some(memo) }));
+        decls.push(("limit_zero".into(), AnswerSpec::Top { preds: vec![LivePred::Present { himo_id: age }], order_path: vec![], order_himo: age, desc: false, limit: 0 }));
+        decls.push(("adults".into(), AnswerSpec::Set { preds: vec![LivePred::Present { himo_id: age }] }));
+        eng.restore_answers(decls);
+        let names: Vec<String> = eng.answer_declarations().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["adults", "by_city", "oldest"], "張れない宣言と重複は捨てる");
+        assert_eq!(eng.answer_spec("adults"), Some(specs(&eng)[0].1.clone()), "同じ名前は先の宣言");
+        assert!(matches!(eng.answer("by_city"), Some(AnswerHandle::Counts(_))));
+        assert!(matches!(eng.answer("oldest"), Some(AnswerHandle::Query(_))));
+        assert!(eng.answer("no_such_himo").is_none());
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn declare_persists_same_shape_is_noop_different_shape_replaces_and_drop_removes() {
+        let path = tmp("persist");
+        let eng = engine(&path);
+        let age = h(&eng, "u.age");
+        assert!(eng.declare_answer("", AnswerSpec::Set { preds: vec![LivePred::Present { himo_id: age }] }).is_err(), "空の名前");
+        assert!(eng.declare_answer("x", AnswerSpec::Set { preds: vec![] }).is_err(), "条件なし");
+        let first = AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 31, hi: u64::MAX }] };
+        let a = eng.declare_answer("adults", first.clone()).unwrap();
+        let b = eng.declare_answer("adults", first.clone()).unwrap();
+        assert_eq!(a.id(), b.id(), "同じ形は同じ購読");
+        assert_eq!(eng.answer("adults").map(|x| x.id()), Some(a.id()));
+        eng.persist_tables().unwrap();
+        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert_eq!(stored, vec![("adults".to_string(), first)], "宣言は sidecar に書く");
+        let second = AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 65, hi: u64::MAX }] };
+        let c = eng.declare_answer("adults", second.clone()).unwrap();
+        assert_ne!(c.id(), a.id(), "違う形は置き換え");
+        assert_eq!(eng.answer_spec("adults"), Some(second.clone()));
+        eng.persist_tables().unwrap();
+        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert_eq!(stored, vec![("adults".to_string(), second)]);
+        assert!(eng.drop_answer("adults"));
+        assert!(!eng.drop_answer("adults"));
+        assert!(eng.answer("adults").is_none());
+        eng.persist_tables().unwrap();
+        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert!(stored.is_empty(), "外すと sidecar からも消える");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    /// 開き直すと宣言が戻り、 最初の poll が種を作る (登録の時には表を読まない)。 閉じる前に書いた分も、 開いてから
+    /// poll までに書いた分も答えに入る。
+    #[test]
+    fn reopen_restores_and_first_poll_seeds() {
+        let path = tmp("reopen");
+        let mut eng = engine(&path);
+        let age = h(&eng, "u.age");
+        let before: Vec<u64> = (0..6)
+            .map(|i| {
+                let e = eng.entity_in("u").unwrap();
+                eng.tie(e, "u.age", 20 + i * 10);
+                e
+            })
+            .collect();
+        eng.declare_answer("adults", AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 31, hi: u64::MAX }] }).unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+        let mut eng = Engine::open_standalone(&path).unwrap();
+        let Some(AnswerHandle::Query(q)) = eng.answer("adults") else { panic!("宣言が戻っていない") };
+        let late = eng.entity_in("u").unwrap();
+        eng.tie(late, "u.age", 80);
+        let d = q.poll(&eng);
+        let mut want: Vec<u64> = before.iter().copied().filter(|&e| eng.get(e, "u.age").unwrap() > 30).collect();
+        want.push(late);
+        want.sort_unstable();
+        let mut got = d.added.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "閉じる前の行と開いてから書いた行が最初の poll に入る");
+        assert!(d.removed.is_empty());
+        eng.tie(before[0], "u.age", 99);
+        let d = q.poll(&eng);
+        assert_eq!((d.added, d.removed), (vec![before[0]], vec![]), "宣言された購読に差分が届く");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
     }
