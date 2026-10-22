@@ -1071,6 +1071,9 @@ fn pktombs_path_for(path: &str) -> std::path::PathBuf {
 /// `Engine::pk_himo_bits` が覆う himo の数 (これ以上の himo は表をなめて引く)。
 const PK_HIMO_BITS: usize = 2048;
 
+/// 名前で束ねた slot の目印の語の数 (`Engine::bound_filter`、 64 語 = 4096 本)。
+const BOUND_FILTER_WORDS: usize = 64;
+
 /// 主キーの前の名前の sidecar path (`pkformer`、 中身は `pk_former.rs`)。 不在 = 改名なし。
 #[cfg(not(target_arch = "wasm32"))]
 fn pkformer_path_for(path: &str) -> std::path::PathBuf {
@@ -4483,6 +4486,9 @@ pub struct Engine {
     pk_former_empty: std::sync::atomic::AtomicBool,
     /// `pk_former` を最後に書き出した後に変えたか (`pkformer` を変わった時だけ書く)。
     pk_former_dirty: std::sync::atomic::AtomicBool,
+    /// 名前で束ねた slot の目印 (slot の下位 bit で選ぶ 4096 本、 `is_bound_slot`)。 書き込みの道で 「束ねた行か」 を lock を取らずに
+    /// 落とす (立っていない slot は束ねていない。 立っていても束ねていないことはある)。 下ろさない
+    bound_filter: Box<[std::sync::atomic::AtomicU64]>,
     /// 主キーを覚える表 (`pk_tombs_on` と同じ: `_` で始まらない) の主キーの himo の bit (himo 0..PK_HIMO_BITS)。 書き込みの道で
     /// 「この列は主キーか」 を表をなめずに引く (なめると書き込み 1 回が 22 → 27 ns)。 `refresh_pk_tombs_flag` で引き直す
     pk_himo_bits: [std::sync::atomic::AtomicU64; PK_HIMO_BITS / 64],
@@ -4999,6 +5005,7 @@ impl Engine {
             pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
             pk_former_empty: std::sync::atomic::AtomicBool::new(true),
             pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            bound_filter: (0..BOUND_FILTER_WORDS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
@@ -5470,6 +5477,9 @@ impl Engine {
             Ok(Some(former)) => {
                 if !former.is_empty() {
                     eng.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+                }
+                for slot in former.bound_slots() {
+                    eng.mark_bound_slot(slot);
                 }
                 *eng.pk_former.write().unwrap() = former;
             }
@@ -6256,6 +6266,7 @@ impl Engine {
             pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
             pk_former_empty: std::sync::atomic::AtomicBool::new(true),
             pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            bound_filter: (0..BOUND_FILTER_WORDS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
@@ -9687,18 +9698,35 @@ impl Engine {
         let mut moved = 0;
         // #581: 畳む 2 つの行の identity と作成を、 残す行に束ねた identity として覚える (畳む前の cell の版数で)
         if self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed) {
-            let (dn, db) = (self.native_identity(d), self.min_cell_version(d));
-            let (sn, sb) = (self.native_identity(s), self.min_cell_version(s));
+            let (dn, sn) = (self.native_identity(d), self.native_identity(s));
+            let (db, sb) = (self.born_of(d, dn), self.born_of(s, sn));
+            // 束ねた identity ごとのカード: 束ねていない行は今の cell を元の identity のカードにする
+            let (d_cards, s_cards) = {
+                let f = self.pk_former.read().unwrap();
+                let snap = |l: u32| if f.bound_of(l).is_empty() { self.cards_of_cells(l) } else { Vec::new() };
+                (snap(d), snap(s))
+            };
             let mut f = self.pk_former.write().unwrap();
             if f.bound_of(d).is_empty() {
                 f.add_bound(d, dn, db);
+                for (h, card, t) in d_cards {
+                    f.note_card(d, dn, h, card, t);
+                }
             }
             let from: Vec<_> = if f.bound_of(s).is_empty() { vec![(sn, sb)] } else { f.bound_of(s).to_vec() };
             for (id, c) in from {
                 f.add_bound(d, id, c);
             }
+            let moved_cards = f.drop_cards(s);
+            f.put_cards(d, moved_cards);
+            // 畳む行の前の名前は残す行の前の名前 (同じデッキ。 slot と一緒に捨てると、 その名前で改名の前に作られた行を束ねない)
+            f.move_names(s, d);
+            for (h, card, t) in s_cards {
+                f.note_card(d, sn, h, card, t);
+            }
             f.set_bound(s, Vec::new());
             drop(f);
+            self.mark_bound_slot(d);
             self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
             self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -11048,7 +11076,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        let renamed_from = self.pk_rename_from(local, himo_id, value);
+        let renamed_from = self.pk_rename_from(local, himo_id, value).map(|old| (old, self.version_of(local, himo_id)));
         // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
         // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
         if !self.live_set(himo_id as usize, local, value) {
@@ -11056,8 +11084,8 @@ impl Engine {
             return false;
         }
         self.store_cell_hlc(local, himo_id, hlc);
-        if let Some(old) = renamed_from {
-            self.note_pk_former(local, himo_id, old);
+        if let Some((old, old_hlc)) = renamed_from {
+            self.note_pk_former(local, himo_id, old, old_hlc);
         }
         true
     }
@@ -11073,23 +11101,159 @@ impl Engine {
         self.himos.get(himo_id as usize)?.get_value(local).filter(|&old| old != value)
     }
 
-    /// 行 `local` の主キーが `old` から変わった: `old` を前の名前として覚える (`pk_former.rs`)。
+    /// 行 `local` の主キーが `old` (版数 `old_hlc`) から変わった: `old` を前の名前として覚え、 名前の年表を作る (`seed_timeline`)。
+    /// 改名した書き込み自身は、 当てた後に宛名の identity 付きで載る (`note_name_write` / `note_local_name`)。
     #[cold]
-    fn note_pk_former(&self, local: u32, himo: u16, old: u64) {
+    fn note_pk_former(&self, local: u32, himo: u16, old: u64, old_hlc: enchudb_oplog::Hlc) {
         use std::sync::atomic::Ordering;
         let changed = self.with_pk_key(himo, PkValue::Local(old), |k| self.pk_former.write().unwrap().insert(himo, k, local));
-        if changed == Some(true) {
+        let seeded = self.seed_timeline(local, himo, old, old_hlc);
+        if changed == Some(true) || seeded {
             self.pk_former_empty.store(false, Ordering::Release);
             self.pk_former_dirty.store(true, Ordering::Release);
         }
     }
 
-    /// 前に主キー `value` だった生きた行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 今その名前の行が無い時に引く。
-    pub fn former_pk_holder(&self, himo: u16, value: PkValue<'_>) -> Option<enchudb_oplog::EntityId> {
+    /// 行 `local` に名前の年表が無ければ作る: 束ねた identity の名前のカードを載せる (束ねていない行は、 書き込みの宛名の identity
+    /// の名前 `value` (版数 `hlc`))。 作ったら true。
+    fn seed_timeline(&self, local: u32, himo: u16, value: u64, hlc: enchudb_oplog::Hlc) -> bool {
+        let published = self.native_identity(local);
+        let cards: Vec<((u32, u32), u64, enchudb_oplog::Hlc)> = {
+            let f = self.pk_former.read().unwrap();
+            if f.has_timeline(local) {
+                return false;
+            }
+            f.bound_of(local)
+                .iter()
+                .filter_map(|&(id, _)| match f.card_of(local, id, himo) {
+                    Some((crate::pk_former::Card::Value(v), t)) => Some((id, *v, t)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let seed = if cards.is_empty() { vec![(published, value, hlc)] } else { cards };
+        for (id, v, t) in seed {
+            self.with_pk_key(himo, PkValue::Local(v), |k| self.pk_former.write().unwrap().note_name(local, id, himo, k, t));
+        }
+        true
+    }
+
+    /// 行 `local` の名前の年表に、 identity `id` 宛ての名前 `value` への版数 `hlc` の書き込みを載せる (当てた後に、 LWW で負けた
+    /// 書き込みも)。
+    ///
+    /// 今の名前でない名前 (LWW で負けた改名・前の名前で束ねた identity の作成・改名より後に届いた作成) は、 その行がその名前だった
+    /// 間があることを示す: 年表が無ければ作り (今の名前とその版数から)、 前の名前として覚え (後から届く、 その間に作られた行を
+    /// 束ねる)、 その間にその名前で作られた別の生きた行を畳む (先に届いていた行。 書き込みを順に受けた peer では、 改名の時に今の
+    /// 名前で畳んでいる)。 今の名前と同じ名前の書き込みは、 年表のある行にだけ載せる。
+    fn note_name_of(&self, local: u32, id: (u32, u32), himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
+        use std::sync::atomic::Ordering;
+        let current = self.himos.get(himo as usize).and_then(|h| h.get_value(local));
+        let differs = current.is_some_and(|c| c != value) && self.entities.is_live(local);
+        let has = !self.pk_former_empty.load(Ordering::Acquire) && self.pk_former.read().unwrap().has_timeline(local);
+        if !has && !differs {
+            return;
+        }
+        let mut changed = false;
+        if !has && let Some(c) = current {
+            changed |= self.seed_timeline(local, himo, c, self.version_of(local, himo));
+        }
+        let noted = self.with_pk_key(himo, PkValue::Local(value), |k| {
+            let mut f = self.pk_former.write().unwrap();
+            let mut noted = f.note_name(local, id, himo, k, hlc);
+            if differs && f.slot_of(himo, k).is_none_or(|s| s == local || !self.entities.is_live(s)) {
+                noted |= f.insert(himo, k, local);
+            }
+            noted
+        });
+        if changed || noted == Some(true) {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+        if differs {
+            self.fold_rows_named_while_held(local, himo, value);
+            self.fold_former_holder(local, himo, value, hlc);
+        }
+    }
+
+    /// 改名の時刻: 名前の年表の上で行 `local` が名前 `value` だったことのある時刻以前に、 その名前を書かれた別の生きた行 (今もその
+    /// 名前 = 同じ時刻に同じ名前を持った) を `local` と 1 つに畳む
+    /// (同じデッキ)。 畳むのは翻訳した行 (`fold_rows_with_same_pk` と同じ。 自分が作った行どうしは畳めない、 #612)。 戻り値は
+    /// 畳んだ行の数。
+    fn fold_rows_named_while_held(&self, local: u32, himo: u16, value: u64) -> usize {
+        let self_peer = self.peer_id();
+        let mut keep = enchudb_oplog::make_eid(self_peer, local);
+        let mut folded = 0;
+        for other in self.query_by_id64(&[(himo, value)]) {
+            let l = enchudb_oplog::eid_local(other);
+            if l == enchudb_oplog::eid_local(keep) {
+                continue;
+            }
+            let at = self.version_of(l, himo);
+            let held = self
+                .with_pk_key(himo, PkValue::Local(value), |k| {
+                    self.pk_former.read().unwrap().held_since(enchudb_oplog::eid_local(keep), himo, k, at)
+                })
+                .flatten();
+            if held != Some(true) {
+                continue;
+            }
+            let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
+            let (src, dst) = if translated(other) {
+                (other, keep)
+            } else if translated(keep) {
+                (keep, other)
+            } else {
+                continue;
+            };
+            if self.merge_entity_into(src, dst).is_ok() {
+                folded += 1;
+                keep = dst;
+            }
+        }
+        folded
+    }
+
+    /// sync の当て: 行 `local_eid` の主キーの列 `himo` に、 foreign entity `foreign_eid` 宛ての名前 `value` の書き込み (版数 `hlc`)
+    /// を当てた後 (LWW で負けても)。 改名した行なら名前の年表に載せる (その時刻の名前を届く順によらず決める)。 主キーでない列・
+    /// 改名していない行は何もしない。
+    pub fn note_name_write(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo: u16,
+        value: u64,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        if self.is_remembered_pk_himo(himo) {
+            let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+            self.note_name_of(enchudb_oplog::eid_local(local_eid), id, himo, value, hlc);
+        }
+    }
+
+    /// 自分の名前の書き込みを、 改名した行 `local` の名前の年表に載せる (宛名は書き込みの宛名の identity)。
+    fn note_local_name(&self, local: u32, himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
+        if self.is_remembered_pk_himo(himo) {
+            self.note_name_of(local, self.native_identity(local), himo, value, hlc);
+        }
+    }
+
+    /// 前に主キー `value` だった生きた行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 時刻 `created` に作られた行の
+    /// 束ね先として引く。 名前の年表の上で、 その時刻以後にその名前だったことのある行だけ (同じ時刻に同じ名前 = 同じデッキ。 改名の
+    /// 後にその名前で作った行は新しいデッキ。 削除優先と同じく時刻で決める)。 年表の無い行 (前の版の file) は時刻によらず返す。
+    pub fn former_pk_holder(
+        &self,
+        himo: u16,
+        value: PkValue<'_>,
+        created: enchudb_oplog::Hlc,
+    ) -> Option<enchudb_oplog::EntityId> {
         if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        let slot = self.with_pk_key(himo, value, |k| self.pk_former.read().unwrap().slot_of(himo, k))??;
+        let slot = self.with_pk_key(himo, value, |k| {
+            let f = self.pk_former.read().unwrap();
+            let slot = f.slot_of(himo, k)?;
+            f.held_since(slot, himo, k, created).unwrap_or(true).then_some(slot)
+        })??;
         let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         // 削除優先: 消えた行には束ねない (消えた行に束ねると、 後から足した行まで死ぬ)
         self.entities.is_live(slot).then(|| enchudb_oplog::make_eid(self_peer, slot))
@@ -11146,7 +11310,32 @@ impl Engine {
                 keep = dst;
             }
         }
+        // 改名の時刻: 改名した時にその名前だった行 (今は別の名前。 改名を先に受けた peer では、 その時の今の名前で畳んでいる)
+        if dies_at.is_none() {
+            let at = self.version_of(enchudb_oplog::eid_local(keep), himo);
+            folded += self.fold_former_holder(enchudb_oplog::eid_local(keep), himo, value, at);
+        }
         folded
+    }
+
+    /// 改名の時刻: 名前 `value` を時刻 `t` に書かれた行 `local` を、 その時刻にその名前だった (今は別の名前の) 行と 1 つに畳む
+    /// (同じデッキ)。 畳むのは翻訳した行 (自分が作った行どうしは畳めない、 #612)。 戻り値は畳んだ行の数。
+    fn fold_former_holder(&self, local: u32, himo: u16, value: u64, t: enchudb_oplog::Hlc) -> usize {
+        let Some(holder) = self.former_pk_holder(himo, PkValue::Local(value), t) else { return 0 };
+        let self_peer = self.peer_id();
+        let here = enchudb_oplog::make_eid(self_peer, local);
+        if enchudb_oplog::eid_local(holder) == local {
+            return 0;
+        }
+        let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
+        let (src, dst) = if translated(here) {
+            (here, holder)
+        } else if translated(holder) {
+            (holder, here)
+        } else {
+            return 0;
+        };
+        usize::from(self.merge_entity_into(src, dst).is_ok())
     }
 
     /// `set_cell` の untie 版 — cell を空にして版数を進める。 untie も
@@ -11478,7 +11667,11 @@ impl Engine {
             return 0;
         }
         let tomb = self.tombstone_version_of(local);
-        self.note_pk_former(local, himo, value);
+        let changed = self.with_pk_key(himo, PkValue::Local(value), |k| self.pk_former.write().unwrap().insert(himo, k, local));
+        if changed == Some(true) {
+            self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
         {
             let mut g = self.pk_tombs.write().unwrap();
             self.drain_pk_pending(&mut g);
@@ -11500,6 +11693,23 @@ impl Engine {
             }
         }
         removed
+    }
+
+    /// 削除優先 (#551) と改名の時刻: 消した行 `local` の前の名前を今持つ別の行のうち、 `tomb` より前にその名前になった行も消す。
+    /// 改名の後に前の名前で作られた行 (前の名前で束ねない = 別のデッキ) も、 前のデッキの削除より前に作られていれば一緒に消える:
+    /// 改名より先に削除を受けた peer は、 改名を知らずにその名前の行を消している (後から改名を知っても生き返らせない)。 前の名前の
+    /// 無い行は何もしない。
+    fn remove_rows_holding_former_names(&self, local: u32, tomb: enchudb_oplog::Hlc) -> usize {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return 0;
+        }
+        let names: Vec<(u16, Box<[u8]>)> =
+            self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))).collect();
+        names
+            .into_iter()
+            .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
+            .map(|(h, v)| self.remove_rows_named(local, h, v, tomb))
+            .sum()
     }
 
     /// 削除優先 (#551): 消えた行 `local` の名前 (消えた時の名前と前の名前) について [`Self::remove_rows_named`]。
@@ -12581,6 +12791,8 @@ impl Engine {
         // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)
         if raised {
             self.remove_rows_holding_names_of(local, hlc);
+        } else {
+            self.remove_rows_holding_former_names(local, hlc);
         }
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
@@ -12602,15 +12814,22 @@ impl Engine {
         }
         let local = enchudb_oplog::eid_local(existing);
         let native = self.native_identity(local);
-        let born = self.min_cell_version(local);
+        let born = self.born_of(local, native);
         let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        // 最初に束ねる時は、 今の cell を元の identity のカードとして写す (束ねた後の cell は LWW で混ざる)
+        let first = self.pk_former.read().unwrap().bound_of(local).is_empty();
+        let native_cards = if first { self.cards_of_cells(local) } else { Vec::new() };
         let mut f = self.pk_former.write().unwrap();
         let mut changed = false;
         if f.bound_of(local).is_empty() {
             changed |= f.add_bound(local, native, born);
+            for (h, card, t) in native_cards {
+                f.note_card(local, native, h, card, t);
+            }
         }
         changed |= f.add_bound(local, id, created);
         drop(f);
+        self.mark_bound_slot(local);
         if changed {
             self.pk_former_empty.store(false, Ordering::Release);
             self.pk_former_dirty.store(true, Ordering::Release);
@@ -12622,6 +12841,18 @@ impl Engine {
         self.eid_translator.reverse(local).unwrap_or((self.peer_id(), local))
     }
 
+    /// 行 `local` の identity `id` の作成: 名前の年表があれば、 その identity の最初の名前の書き込み (改名した行は、 名前を含む全部の
+    /// cell が作成より後に書き換わっていることがある)。 無ければ cell の版数の最小。
+    fn born_of(&self, local: u32, id: (u32, u32)) -> enchudb_oplog::Hlc {
+        use std::sync::atomic::Ordering;
+        if !self.pk_former_empty.load(Ordering::Acquire)
+            && let Some(t) = self.pk_former.read().unwrap().first_name_write(local, id)
+        {
+            return t;
+        }
+        self.min_cell_version(local)
+    }
+
     /// #581: 行 `local` の cell の版数の最小 (版数の無い cell は見ない)。 行の作成の近似 (名前のカードを最初に書く、 #548)。
     fn min_cell_version(&self, local: u32) -> enchudb_oplog::Hlc {
         (0..self.himos.len())
@@ -12630,6 +12861,249 @@ impl Engine {
             .filter(|&v| v != enchudb_oplog::Hlc::ZERO)
             .min()
             .unwrap_or(enchudb_oplog::Hlc::ZERO)
+    }
+
+    /// 行 `local` に名前で束ねた slot の目印を立てる (`is_bound_slot`)。
+    fn mark_bound_slot(&self, local: u32) {
+        let bit = local as usize % (BOUND_FILTER_WORDS * 64);
+        self.bound_filter[bit / 64].fetch_or(1 << (bit % 64), std::sync::atomic::Ordering::Release);
+    }
+
+    /// 行 `local` は名前で束ねた slot か (束ねた identity ごとのカードを積む行)。 束ねたことの無い DB は atomic 1 回、 目印の
+    /// 立っていない slot は 2 回。
+    fn is_bound_slot(&self, local: u32) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.pk_former_empty.load(Ordering::Acquire) {
+            return false;
+        }
+        let bit = local as usize % (BOUND_FILTER_WORDS * 64);
+        if self.bound_filter[bit / 64].load(Ordering::Acquire) & (1 << (bit % 64)) == 0 {
+            return false;
+        }
+        !self.pk_former.read().unwrap().bound_of(local).is_empty()
+    }
+
+    /// 行 `local` の今の cell をカードにする (最初に束ねる時に、 元の identity のカードとして写す)。 外した cell (値が無く
+    /// 版数がある) は `Gone`。
+    fn cards_of_cells(&self, local: u32) -> Vec<(u16, crate::pk_former::Card, enchudb_oplog::Hlc)> {
+        use crate::pk_former::Card;
+        let self_peer = self.peer_id();
+        let mut out = Vec::new();
+        for hid in 0..self.himos.len() {
+            let h = hid as u16;
+            let ver = self.version_of(local, h);
+            let card = match self.himos[hid].get_value(local) {
+                Some(_) if self.leaf_for(hid).is_some() => {
+                    match self.get_text_owned(enchudb_oplog::make_eid(self_peer, local), &self.himo_names[hid]) {
+                        Some(b) => Card::Bytes(b.into()),
+                        None => continue,
+                    }
+                }
+                Some(v) => Card::Value(v),
+                None if ver != enchudb_oplog::Hlc::ZERO => Card::Gone,
+                None => continue,
+            };
+            out.push((h, card, ver));
+        }
+        out
+    }
+
+    /// 束ねた slot `local` への書き込みを、 宛名の identity `id` のカードとして積む (束ねていない slot は何もしない)。
+    fn note_card(
+        &self,
+        local: u32,
+        id: (u32, u32),
+        himo: u16,
+        card: impl FnOnce() -> crate::pk_former::Card,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        if self.is_bound_slot(local) && self.pk_former.write().unwrap().note_card(local, id, himo, card(), hlc) {
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// 自分の書き込みを、 束ねた slot `local` の元の identity のカードとして積む。
+    fn note_local_card(
+        &self,
+        local: u32,
+        himo: u16,
+        card: impl FnOnce() -> crate::pk_former::Card,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        if self.is_bound_slot(local) {
+            self.note_card(local, self.native_identity(local), himo, card, hlc);
+        }
+    }
+
+    /// sync の当て: 行 `local_eid` に foreign entity `foreign_eid` 宛ての書き込み (値、 `None` = 外した) を受けた。 名前で束ねた
+    /// 行なら、 束ねた identity ごとのカードに積む (改名の時刻で切り離す時に、 その identity の値を戻すため。
+    /// [`Engine::split_for_rename`])。 LWW で負けた書き込みも積む (その identity の値ではある)。 束ねていない行は何もしない。
+    pub fn note_bound_write(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo: u16,
+        value: Option<u64>,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        use crate::pk_former::Card;
+        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        self.note_card(enchudb_oplog::eid_local(local_eid), id, himo, || value.map_or(Card::Gone, Card::Value), hlc);
+    }
+
+    /// [`Engine::note_bound_write`] の Leaf 版 (中身を積む)。
+    pub fn note_bound_leaf(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo: u16,
+        bytes: &[u8],
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        self.note_card(enchudb_oplog::eid_local(local_eid), id, himo, || crate::pk_former::Card::Bytes(bytes.into()), hlc);
+    }
+
+    /// 改名の時刻 (削除優先と同じく時刻で決める): 名前で束ねた行 `local_eid` に、 foreign entity `target` の名前のカードを `value` に
+    /// 書き換える書き込みが時刻 `t` に届いた。 束ねた identity のうち `t` より後に作られたもの (改名の後に前の名前で作られた行。
+    /// 改名を先に受けた peer では別のデッキ) を、 改名より前の identity から切り離す。 それぞれの identity の値は束ねた
+    /// identity ごとのカードから戻す (束ねた行の cell は LWW で混ざっている)。
+    ///
+    /// - 行に残るのは、 自分の行なら自分の identity の側 (自分の peer の番号は slot に固定で、 写像で移せない)、 翻訳した行なら
+    ///   書き込みの宛名 (逆写像、 束ねると最後に束ねた identity になる) の側。 他方を新しい slot に移す (写像を付け替え、 宛名を
+    ///   移す側の先頭にして逆写像も移す)
+    /// - 行に残る側の cell は、 その側のカードの値と版数に戻す (他方の新しい値で上書きされていた cell も戻る)
+    /// - 移す側は新しい slot に、 名前のカードを先にして当てる
+    ///
+    /// 切り離したら `target` の今居る行の eid (呼び手はそこに名前のカードを当てる)、 切り離さなければ None。 改名でない (`target`
+    /// の名前のカードが無い / 同じ値 / この書き込みより新しい) 時と、 束ねていない行は何もしない。
+    pub fn split_for_rename(
+        &self,
+        local_eid: enchudb_oplog::EntityId,
+        target: enchudb_oplog::EntityId,
+        himo: u16,
+        value: u64,
+        t: enchudb_oplog::Hlc,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use crate::pk_former::{Card, newest_per_himo};
+        use std::sync::atomic::Ordering;
+        let local = enchudb_oplog::eid_local(local_eid);
+        if !self.is_bound_slot(local) || !self.entities.is_live(local) {
+            return None;
+        }
+        let target_id = (enchudb_oplog::eid_peer(target), enchudb_oplog::eid_local(target));
+        let list = {
+            let f = self.pk_former.read().unwrap();
+            let renamed = matches!(f.card_of(local, target_id, himo), Some((Card::Value(v), h)) if *v != value && h < t);
+            if !renamed {
+                return None;
+            }
+            f.bound_of(local).to_vec()
+        };
+        let (later, earlier): (Vec<_>, Vec<_>) = list.into_iter().partition(|&(_, c)| c > t);
+        if later.is_empty() || earlier.is_empty() {
+            return None;
+        }
+        let self_peer = self.peer_id();
+        let own = (self_peer, local);
+        let published = self.native_identity(local);
+        let pinned = if later.iter().chain(&earlier).any(|&(id, _)| id == own) { own } else { published };
+        let (mut stay, mut go) = if later.iter().any(|&(id, _)| id == pinned) { (later, earlier) } else { (earlier, later) };
+        // 残る側は固定の identity を、 移す側は今の宛名を先頭に (宛名が移す側なら、 最初の付け替えで逆写像も移る)
+        stay.sort_by_key(|&(id, _)| id != pinned);
+        go.sort_by_key(|&(id, _)| id != published);
+        let moved = self.alloc_translated_local(himo)?;
+        let (stay_ids, go_ids): (Vec<_>, Vec<_>) = (stay.iter().map(|b| b.0).collect(), go.iter().map(|b| b.0).collect());
+        let (stay_cards, go_cards) = {
+            let mut f = self.pk_former.write().unwrap();
+            let go_names = f.take_names(local, &go_ids);
+            f.put_names(moved, go_names);
+            f.move_names_by_timeline(local, moved);
+            let go_cards = f.take_cards(local, &go_ids);
+            let stay_cards = f.take_cards(local, &stay_ids);
+            let stay_now = newest_per_himo(&stay_cards);
+            let go_now = newest_per_himo(&go_cards);
+            if stay.len() > 1 {
+                f.put_cards(local, stay_cards);
+            }
+            if go.len() > 1 {
+                f.put_cards(moved, go_cards);
+            }
+            f.set_bound(local, if stay.len() > 1 { stay } else { Vec::new() });
+            f.set_bound(moved, if go.len() > 1 { go } else { Vec::new() });
+            (stay_now, go_now)
+        };
+        if go_ids.len() > 1 {
+            self.mark_bound_slot(moved);
+        }
+        self.pk_former_dirty.store(true, Ordering::Release);
+        // 移す側: 写像を新しい slot へ (自分の peer の identity は行の持ち主だけで、 残る側に居る)
+        let mut first = true;
+        for &(peer, fl) in &go_ids {
+            if peer == self_peer {
+                continue;
+            }
+            if std::mem::take(&mut first) {
+                self.eid_translator.insert(peer, fl, moved);
+            } else {
+                self.eid_translator.alias(peer, fl, moved);
+            }
+        }
+        // 残る側: cell をその側のカードに戻す (値と版数ごと。 カードの無い列は空にする)
+        {
+            let _row = self.row_locks.write(local);
+            for hid in 0..self.himos.len() {
+                let h = hid as u16;
+                let want = stay_cards.iter().find(|c| c.0 == h);
+                let has_value = self.himos[hid].get_value(local).is_some();
+                if want.is_none() && !has_value && self.version_of(local, h) == enchudb_oplog::Hlc::ZERO {
+                    continue;
+                }
+                self.remove_cell_freeing_leaf(local, hid);
+                self.reset_cell_version(local, h);
+            }
+        }
+        let here = enchudb_oplog::make_eid(self_peer, local);
+        let there = enchudb_oplog::make_eid(self_peer, moved);
+        self.apply_cards(here, himo, &stay_cards);
+        self.apply_cards(there, himo, &go_cards);
+        Some(if go_ids.contains(&target_id) { there } else { here })
+    }
+
+    /// カードを行 `eid` に当てる (名前の列 `pk` を先に。 版数ごと LWW で当てる)。
+    fn apply_cards(&self, eid: enchudb_oplog::EntityId, pk: u16, cards: &[(u16, crate::pk_former::Card, enchudb_oplog::Hlc)]) {
+        use crate::pk_former::Card;
+        let mut order: Vec<_> = cards.iter().collect();
+        order.sort_by_key(|c| c.0 != pk);
+        for (h, card, hlc) in order {
+            match card {
+                Card::Value(v) => {
+                    self.remote_tie_apply_result(eid, *h, *v, *hlc);
+                }
+                Card::Bytes(b) => {
+                    self.remote_tieleaf_apply(eid, *h, b, *hlc);
+                }
+                Card::Gone => {
+                    self.remote_untie_apply(eid, *h, *hlc);
+                }
+            }
+        }
+    }
+
+    /// cell `(local, himo)` の版数を 「不明」 に戻す (`store_cell_hlc` は ZERO を書かない)。 呼び手は行の lock を握っている。
+    fn reset_cell_version(&self, local: u32, himo: u16) {
+        if local >= self.max_entities() {
+            return;
+        }
+        if !self.has_cell_version() {
+            self.hlc_store.remove(self.version_key(local), himo);
+            return;
+        }
+        if let Some(col) = self.ver_col(himo)
+            && col.count() > local
+        {
+            col.clear(local);
+        }
     }
 
     /// #581: 行 `local` を版数 `t` で消す前に、 名前で束ねた identity のうち `t` より後に作られたもの (削除の後に同じ名前で
@@ -12681,7 +13155,15 @@ impl Engine {
                 self.drain_pk_pending(&mut g);
                 self.with_pk_key(pk, PkValue::Local(v), |k| self.note_pk_locked(&mut g, pk, k, crate::pk_tombs::NO_SLOT, t));
             }
-            self.pk_former.write().unwrap().set_bound(local, if later.len() > 1 { later } else { Vec::new() });
+            {
+                let mut f = self.pk_former.write().unwrap();
+                let earlier_ids: Vec<_> = earlier.iter().map(|b| b.0).collect();
+                f.take_cards(local, &earlier_ids);
+                if later.len() <= 1 {
+                    f.drop_cards(local);
+                }
+                f.set_bound(local, if later.len() > 1 { later } else { Vec::new() });
+            }
         } else {
             // 元の行は消える: 後の identity を新しい slot に移す
             let Some(moved) = self.alloc_translated_local(pk) else { return false };
@@ -12695,9 +13177,15 @@ impl Engine {
             }
             {
                 let mut f = self.pk_former.write().unwrap();
+                let later_ids: Vec<_> = later.iter().map(|b| b.0).collect();
+                let cards = f.take_cards(local, &later_ids);
+                if later.len() > 1 {
+                    f.put_cards(moved, cards);
+                }
                 f.set_bound(local, earlier);
                 f.set_bound(moved, if later.len() > 1 { later } else { Vec::new() });
             }
+            self.mark_bound_slot(moved);
             self.apply_delete_local(local, t);
         }
         self.pk_former_dirty.store(true, Ordering::Release);
@@ -13342,6 +13830,7 @@ impl Engine {
                 return Err(TieRejected::OlderThanCell);
             }
             if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Bytes(bytes.into()), hlc);
             return Ok(());
         }
         // Tag は dedupe、Leaf は常に新規 id。
@@ -13400,6 +13889,8 @@ impl Engine {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
+        self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(vid as u64), hlc);
+        self.note_local_name(eid, himo_id, vid as u64, hlc);
         Ok(())
     }
 
@@ -13530,6 +14021,7 @@ impl Engine {
                 return;
             }
             if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Bytes(value.into()), hlc);
             return;
         }
         let vid = match self.value_types[hid] {
@@ -13588,7 +14080,10 @@ impl Engine {
         };
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
         drop(row);
-        if !written {
+        if written {
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(vid as u64), hlc);
+            self.note_local_name(eid, himo_id, vid as u64, hlc);
+        } else {
             self.warn_local_write_rejected(eid, himo_id, hlc);
         }
         self.vocab_unpin(hid, vid);
@@ -13664,6 +14159,8 @@ impl Engine {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
+        self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(value), hlc);
+        self.note_local_name(eid, himo_id, value, hlc);
         Ok(())
     }
 
@@ -13711,6 +14208,7 @@ impl Engine {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
+        self.note_local_card(eid, himo_id, || crate::pk_former::Card::Value(target_eid as u64), hlc);
         Ok(())
     }
 
@@ -13765,7 +14263,9 @@ impl Engine {
         };
         let cleared = self.clear_cell_in_freeing_leaf(row.as_ref(), eid, himo_id, hlc);
         drop(row);
-        if !cleared {
+        if cleared {
+            self.note_local_card(eid, himo_id, || crate::pk_former::Card::Gone, hlc);
+        } else {
             self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
@@ -13791,7 +14291,9 @@ impl Engine {
         };
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc);
         drop(row);
-        if !applied {
+        if applied {
+            self.remove_rows_holding_former_names(eid, hlc);
+        } else {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
         }
     }

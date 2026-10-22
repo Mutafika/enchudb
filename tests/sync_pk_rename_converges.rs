@@ -283,20 +283,22 @@ fn rename_back_with_an_unaware_create() {
     });
 }
 
-/// 前の名前は開き直しても残る (`pkformer`)。 受け手 R が改名を受けてから開き直し、 その後で改名を知らない B の z を受ける。
-/// 開き直さない受け手と同じ答え (B の z を改名した行に束ねる)。
+/// 前の名前と、 行がその名前を離れた時刻は開き直しても残る (`pkformer`)。 受け手 R が改名を受けてから開き直し、 その後で
+/// 改名を知らない B の z (改名の前に作った = 改名した行と同じデッキ) と C の z (改名の後に作った = 新しいデッキ) を受ける。
+/// 開き直さない受け手と同じ答え。 前の名前を忘れると B の z が別の行になり、 離れた時刻を忘れると C の z も改名した行に束ねる。
 #[test]
 fn former_names_survive_a_reopen() {
     let dir = Dir::new("reopen");
     let tr = Arc::new(InMemoryTransport::new());
-    for id in [1, 2, 10, 11] {
+    for id in [1, 2, 3, 10, 11] {
         tr.register_peer(id);
     }
-    let (a, b) = (make(&dir, 1, &tr), make(&dir, 2, &tr));
+    let (a, b, c) = (make(&dir, 1, &tr), make(&dir, 2, &tr), make(&dir, 3, &tr));
     let (r, plain) = (make(&dir, 10, &tr), make(&dir, 11, &tr));
     a.upsert("z", "a");
-    a.rename("z", "y");
     b.upsert("z", "b");
+    a.rename("z", "y");
+    c.upsert("z", "c");
     r.pull(1);
     plain.pull(1);
     let path = dir.db(10);
@@ -305,10 +307,69 @@ fn former_names_survive_a_reopen() {
     db.engine().set_peer_id(10);
     let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
     let r = Peer { db, sync, first_row: std::sync::OnceLock::new() };
-    r.pull(2);
-    plain.pull(2);
-    assert_eq!(plain.rows(), vec![(Some(Value::Text("z".into())), Some(Value::Text("b".into())))], "前提: B の z を改名した行に束ねる");
-    assert_eq!(r.rows(), plain.rows(), "開き直した受け手が前の名前を忘れた");
+    for from in [2, 3] {
+        r.pull(from);
+        plain.pull(from);
+    }
+    let text = |s: &str| Some(Value::Text(s.into()));
+    assert_eq!(
+        plain.rows(),
+        vec![(text("y"), text("b")), (text("z"), text("c"))],
+        "前提: B の z は改名した行に束ね、 C の z は新しいデッキ"
+    );
+    assert_eq!(r.rows(), plain.rows(), "開き直した受け手が前の名前か、 名前を離れた時刻を忘れた");
+}
+
+/// 束ねた identity ごとのカードは開き直しても残る (`pkformer`)。 record を手で組んで当てる: 改名の後に作られた C の行 (名前 1) に、
+/// 改名の前に作られた A の行 (名前 1) を今の名前で束ねて開き直す。 その後で A の改名 (1 → 2) が届くと、 A の行をカードの値
+/// (score 10) で切り離す。 カードを失うと切り離せず、 改名は C の名前の書き込みより古いので負けて 1 行のまま。
+#[test]
+fn bound_cards_survive_a_reopen() {
+    use enchudb_oplog::make_eid;
+    use enchudb_oplog::oplog::DecodedOp;
+    let dir = Dir::new("cards-reopen");
+    let path = dir.db(10);
+    let tr = Arc::new(InMemoryTransport::new());
+    tr.register_peer(10);
+    let rec = |author: u32, wall: u64, op: DecodedOp| enchudb::transport::WireRecord {
+        hlc: Hlc { wall, logical: 0, peer: author },
+        author_peer: author,
+        op,
+        signature: [0; 64],
+        pubkey_fp: [0; 8],
+        signed_bytes: Vec::new(),
+    };
+    let (row_a, row_c) = (make_eid(1, 5), make_eid(3, 9));
+    let rows = |db: &Database| {
+        db.engine().rebuild();
+        let t = db.get_table(T).unwrap();
+        let mut v: Vec<_> = t.all().find().unwrap().into_iter().map(|e| (t.entity(e).get("key"), t.entity(e).get("score"))).collect();
+        v.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        v
+    };
+    let key = {
+        let mut b = Database::create_with_capacity(&path, 4096).unwrap();
+        b.table(T).number("key").number("score").primary_key("key").build().unwrap();
+        b.enable_sync().unwrap();
+        let db = b.finish_with_oplog(OPLOG).unwrap();
+        db.engine().set_peer_id(10);
+        let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+        let key = db.engine().himo_id("t.key").unwrap() as u16;
+        let score = db.engine().himo_id("t.score").unwrap() as u16;
+        let tie = |eid, himo_id, value| DecodedOp::Tie { eid, himo_id, value };
+        sync.apply_records(&[rec(3, 300, tie(row_c, key, 1)), rec(3, 301, tie(row_c, score, 30))]);
+        sync.apply_records(&[rec(1, 100, tie(row_a, key, 1)), rec(1, 101, tie(row_a, score, 10))]);
+        let n = |v: i64| Some(Value::Number(v));
+        assert_eq!(rows(&db), vec![(n(1), n(30))], "前提: A の行を C の行に今の名前で束ねる");
+        db.engine().oplog_sync().unwrap();
+        key
+    };
+    let db = Database::open_with_oplog(&path, OPLOG).unwrap();
+    db.engine().set_peer_id(10);
+    let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+    sync.apply_records(&[rec(1, 200, DecodedOp::Tie { eid: row_a, himo_id: key, value: 2 })]);
+    let n = |v: i64| Some(Value::Number(v));
+    assert_eq!(rows(&db), vec![(n(1), n(30)), (n(2), n(10))], "開き直した受け手が束ねた identity のカードを失った");
 }
 
 /// 消えた行の slot を別の行に使い回したら、 その行の前の名前は外す (外さないと、 改名を知らない peer の古い名前の行が、

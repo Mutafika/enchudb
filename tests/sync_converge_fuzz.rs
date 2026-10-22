@@ -5,8 +5,9 @@
 //! 名前の列 (`key`) で束ねる表 (#141)。 改名 (#569)・削除優先 (#577)・消した名前 (#582 / #588) の組み合わせを、 人が形を思い付く代わりに
 //! 機械に探させる (#547 / #551 / #545 / #581 は全部人が見つけた)。 答えには名前の無い塊 (title だけの entity) も入れる。
 //!
-//! 既知の割れ (改名した本人が前の名前で作り直す形、 ユーザに確認中) があるので、 普段の試験からは外す (改名を出さずに回すなら
-//! `ENCHU_FUZZ_NO_RENAME=1`):
+//! 改名を混ぜるとまだ割れる形があるので、 普段の試験からは外す。 残っているのは、 改名の時刻の決まり (改名より後に前の名前で作った
+//! 行は新しいデッキ) を入れる前から割れていた形: #612 (相手の改名で自分の行 2 つが同じ名前になる) と #614 (削除の後の改名を、 作成より
+//! 先に受ける)。 改名を出さずに回すなら `ENCHU_FUZZ_NO_RENAME=1`:
 //!
 //! ```text
 //! ENCHU_FUZZ_CASES=200 cargo test --release --test sync_converge_fuzz -- --ignored --nocapture
@@ -266,7 +267,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: cases(), max_shrink_iters: 2000, ..ProptestConfig::default() })]
 
     #[test]
-    #[ignore = "既知の割れ (改名の作り直し) があるので手で回す"]
+    #[ignore = "既知の割れ (#612 / #614) があるので手で回す"]
     fn every_order_converges(steps in proptest::collection::vec(step_strategy(), 1..10)) {
         if let Err(msg) = run(&steps) {
             prop_assert!(false, "手順 {steps:?}\n{msg}");
@@ -330,4 +331,226 @@ fn a_name_that_arrives_after_its_row_still_meets_the_delete() {
         Step::Delete { by: 2, key: 1 },
     ];
     assert_eq!(run(&steps), Ok(vec![]));
+}
+
+/// 縮めた形 (改名の時刻 1): A が改名した後に、 前の名前で作り直す。 作り直した行は改名の後に作られた = 新しいデッキ。 改名を先に
+/// 受けた受け手も、 前の名前で改名した行に束ねない (前は束ねて、 A だけ 2 行になった)。
+#[test]
+fn a_row_made_with_the_former_name_after_the_rename_is_a_new_deck() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Rename { by: 0, from: 1, to: 0 },
+        Step::Upsert { by: 0, key: 1, title: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t0")), (text("k1"), text("t1"))]));
+}
+
+/// 縮めた形 (改名の時刻 2): B が改名の前に同じ名前で作った行は、 改名した行と同じデッキ。 改名の後に A が前の名前で作り直した行
+/// (新しいデッキ) を先に受けていても、 B の行はそちらに束ねない (今の名前より、 その時刻にその名前だった行を先に引く)。
+#[test]
+fn a_row_made_with_the_former_name_before_the_rename_joins_the_renamed_deck() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Upsert { by: 1, key: 1, title: 1 },
+        Step::Rename { by: 0, from: 1, to: 0 },
+        Step::Upsert { by: 0, key: 1, title: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t1")), (text("k1"), text("t2"))]));
+}
+
+/// 縮めた形 (改名の時刻 3): C が改名の後に前の名前で作った行を先に受け、 改名した行 (改名の前) をそれに今の名前で束ねた受け手に、
+/// 後から改名が届く。 改名より後に作られた C の行を切り離す (それぞれの title も戻す: 束ねた行の title は C の方が新しかった)。
+#[test]
+fn a_row_made_after_the_rename_splits_off_when_the_rename_arrives_late() {
+    let steps = [
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+        Step::Upsert { by: 2, key: 1, title: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t1")), (text("k2"), text("t0"))]));
+}
+
+/// 改名の時刻 4: 切り離す時、 束ねていた間の自分の書き込みは、 その書き込みの宛名の identity の側に残る。 A は B の k1 を受けた
+/// 後に (改名を知らずに) C の k1 (改名の後に作られた) を受けて束ね、 束ねた行の title を書く。 束ねた行への書き込みの宛名は最後に
+/// 束ねた identity (C の行) なので、 他の peer でも C の行に当たる。 その後で B の改名が届くと、 A の title は C の行に、 B の行は
+/// B の title に戻る (束ねた行の cell は混ざっているので、 identity ごとのカードから戻す)。
+#[test]
+fn a_split_keeps_the_writes_made_while_bound() {
+    let steps = [
+        Step::Upsert { by: 1, key: 1, title: 1 },
+        Step::Pull { by: 0, from: 1 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Pull { by: 0, from: 2 },
+        Step::Retitle { by: 0, key: 1, title: 2 },
+        Step::Pull { by: 0, from: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t2")), (text("k2"), text("t1"))]));
+}
+
+/// 改名の時刻 4 の続き: 切り離した後も、 行の slot の持ち主 (C の行) は自分の slot に残る。 C は改名の後に k1 を作り、 B の k1 と
+/// 改名を受けて切り離した後に、 自分の k1 の title を書く (自分の行の番号で書くので、 他の peer でも C の行に当たる)。
+#[test]
+fn the_slot_owner_stays_in_its_slot_after_a_split() {
+    let steps = [
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+        Step::Upsert { by: 2, key: 1, title: 1 },
+        Step::Pull { by: 2, from: 1 },
+        Step::Retitle { by: 2, key: 1, title: 3 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t3")), (text("k2"), text("t0"))]));
+}
+
+/// 改名と削除 (今の形、 前の名前の行も消える): A が k0 を k1 に改名し、 改名の後に C が作った k0 (新しいデッキ) を受けてから、
+/// 自分で k1 を消す。 消す前に作られた C の k0 も一緒に消える (削除を先に受けた peer は、 改名を知らずに k0 の行を消している)。
+#[test]
+fn deleting_a_renamed_row_also_deletes_rows_holding_its_former_name() {
+    let steps = [
+        Step::Upsert { by: 0, key: 0, title: 0 },
+        Step::Rename { by: 0, from: 0, to: 1 },
+        Step::Upsert { by: 2, key: 0, title: 1 },
+        Step::Pull { by: 0, from: 2 },
+        Step::Delete { by: 0, key: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![]));
+}
+
+/// 縮めた形 (改名の時刻 5): A が k2 を k0 に改名し、 B の k0 と 1 つに畳む。 畳んだ行の前の名前 k2 も残す行に移す (前は slot と
+/// 一緒に捨て、 改名の前に作られた C の k2 が別の行になった)。
+#[test]
+fn a_row_folded_by_a_rename_keeps_its_former_names() {
+    let steps = [
+        Step::Upsert { by: 1, key: 0, title: 0 },
+        Step::Upsert { by: 2, key: 2, title: 1 },
+        Step::Upsert { by: 0, key: 2, title: 2 },
+        Step::Rename { by: 0, from: 2, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t2"))]));
+}
+
+/// 縮めた形 (改名の時刻 6): 同じデッキの 2 つの identity を、 2 人が別々の名前に改名する (C は k1 → k2、 その後で B は k1 → k0)。
+/// A が 2 つの改名の間に k1 で作った行は、 その時刻のデッキの名前が k2 なので新しいデッキ。 B の改名を先に受けた受け手でも、
+/// C の改名 (LWW で負ける) を名前の年表に載せて、 k1 を離れた時刻を C の改名にする (前は B の改名で k1 を離れたと見て束ねた)。
+#[test]
+fn concurrent_renames_decide_the_former_name_by_the_earlier_rename() {
+    let steps = [
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Upsert { by: 1, key: 1, title: 1 },
+        Step::Rename { by: 2, from: 1, to: 2 },
+        Step::Upsert { by: 0, key: 1, title: 2 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t1")), (text("k1"), text("t2"))]));
+}
+
+/// 縮めた形 (改名の時刻 7): 上の形で、 A が 2 つの改名の間に作るのが改名の先の名前 k2 (C の改名の後、 B の改名の前)。 その時刻の
+/// デッキの名前は k2 なので、 A の行は同じデッキ。 B の改名を先に受けた受け手では C の改名が LWW で負けるが、 名前の年表に載せて
+/// k2 を前の名前として覚え、 先に届いていた A の行も畳む。
+#[test]
+fn a_row_made_with_the_name_of_a_losing_rename_joins_the_deck() {
+    let steps = [
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Upsert { by: 1, key: 1, title: 1 },
+        Step::Rename { by: 2, from: 1, to: 2 },
+        Step::Upsert { by: 0, key: 2, title: 2 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t2"))]));
+}
+
+/// 縮めた形 (改名の時刻 8): B が自分の行の title を書き換えてから改名する (名前も title も作成より後の版数になる)。 B の行に C の行を
+/// 束ねる時、 B の行の作成を cell の版数の最小で近似すると C の改名より後に見え、 C の改名で B の行を切り離した。 名前の年表の
+/// 最初の書き込み (改名の前の名前の版数) を作成にする。
+#[test]
+fn a_rewritten_row_keeps_its_creation_time_when_bound() {
+    let steps = [
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Rename { by: 2, from: 1, to: 2 },
+        Step::Retitle { by: 1, key: 1, title: 1 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t1"))]));
+}
+
+/// 縮めた形 (改名の時刻 9): C が A の k1 を受けて k0 に改名する。 C から先に受ける受け手は、 A の行の作成より先に改名を受け、
+/// 別の行として払い出す。 後から届いた A の作成 (k1、 改名より古い) は LWW で負けるが、 その行が改名の前に k1 だったことを
+/// 示す: 名前の年表を作って k1 を前の名前にし、 その間に k1 で作られた B の行も畳む。
+#[test]
+fn a_create_arriving_after_its_rename_reveals_the_former_name() {
+    let steps = [
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Upsert { by: 0, key: 1, title: 1 },
+        Step::Pull { by: 2, from: 0 },
+        Step::Rename { by: 2, from: 1, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t1"))]));
+}
+
+/// #613 の形 (束ねた後の自分の改名が、 束ねた相手の identity 宛てで出る): A が自分の k2 に C の k2 を束ねてから改名する。 C の行の
+/// 作成より先に改名を受けた受け手も、 後から届いた作成で前の名前を知り、 A の行を畳む。
+#[test]
+fn a_rename_addressed_to_a_bound_identity_still_converges() {
+    let steps = [
+        Step::Upsert { by: 2, key: 2, title: 0 },
+        Step::Upsert { by: 0, key: 2, title: 1 },
+        Step::Pull { by: 0, from: 2 },
+        Step::Rename { by: 0, from: 2, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t1"))]));
+}
+
+/// 縮めた形 (改名の時刻 10): B が自分の k1 を k0 に改名した時、 A の行はまだ k0 だった (A は後で k2 に改名する)。 B の行は A の行と
+/// 同じデッキ。 A の改名を先に受けた受け手は、 B の改名を当てた時に k0 の行が今は無いが、 その時刻に k0 だった A の行と畳む。
+#[test]
+fn a_rename_into_a_name_another_row_held_then_joins_that_row() {
+    let steps = [
+        Step::Upsert { by: 0, key: 0, title: 0 },
+        Step::Upsert { by: 1, key: 1, title: 1 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+        Step::Rename { by: 0, from: 0, to: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k2"), text("t1"))]));
+}
+
+/// 縮めた形 (改名の時刻 11): B が k2 を、 C の行が持つ k0 に改名し (C の行と同じデッキ)、 さらに k1 に改名する。 B の 2 つの改名を
+/// 先に受けた受け手は、 C の行の作成の時刻には B の行がまだ k2 だが、 その後 C の行と同じ時刻に k0 だった (前の版は時刻を見ずに
+/// 前の名前で束ねたので割れなかった)。
+#[test]
+fn a_row_holding_a_name_another_row_took_later_joins_it() {
+    let steps = [
+        Step::Upsert { by: 1, key: 2, title: 0 },
+        Step::Upsert { by: 2, key: 0, title: 1 },
+        Step::Rename { by: 1, from: 2, to: 0 },
+        Step::Rename { by: 1, from: 0, to: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t1"))]));
+}
+
+/// 改名の時刻 12: A が自分で改名した後に、 B が改名の後に前の名前で作った行を A が受ける。 A の名前の年表に自分の改名が載って
+/// いないと、 A だけ B の行を自分の行に束ねる。
+#[test]
+fn the_renamer_does_not_bind_a_later_row_with_its_former_name() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Rename { by: 0, from: 1, to: 0 },
+        Step::Upsert { by: 1, key: 1, title: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t0")), (text("k1"), text("t1"))]));
+}
+
+/// 改名の時刻 13: C が k1 を k2 に改名した時、 A の行が k2 だった (A は後で k0 に改名する)。 C の改名は B の後の改名で負けるが、
+/// その時刻に k2 だった A の行と同じデッキ。 B と A の改名を先に受けた受け手では、 負けた C の改名を年表に載せる時に A の行と畳む。
+#[test]
+fn a_losing_rename_joins_the_row_that_held_its_name_then() {
+    let steps = [
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Upsert { by: 1, key: 1, title: 1 },
+        Step::Upsert { by: 0, key: 2, title: 2 },
+        Step::Rename { by: 2, from: 1, to: 2 },
+        Step::Rename { by: 0, from: 2, to: 0 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t2"))]));
 }
