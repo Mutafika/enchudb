@@ -570,6 +570,7 @@ Tables with a primary key treat rows with the same key as one row: a row another
 
 - **Delete wins.** Writes addressed to a deleted row are dropped, even when they are newer than the delete (a peer that edits the row without having seen the delete loses the edit). Rows other peers created with the same key before the delete are the same row and go with it, including rows that arrive after the delete (#513, #577; the deleted keys are kept in `pktombs`). A row added with the same key after the delete is a new row and lives.
 - **Renames keep the row.** Writing a new key is a rename: the old key still names the same row, so a row another peer created with the old key without knowing about the rename joins it. Whether it joins is decided by time, like deletes: a row created with the old key before the rename joins the renamed row, one created after the rename is a new row (#569, #617).
+- **Two own rows renamed into one key fold.** When another peer's rename gives two rows this peer created the same key, they are folded into one row like any two rows with the same key. An eid of the folded row that the app still holds keeps working: reads and writes through it reach the kept row, and so do records other peers address to it. The folded row's slot is never reused (#612).
 
 #### What a differential pull does *not* promise
 
