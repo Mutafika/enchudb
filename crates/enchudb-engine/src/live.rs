@@ -6363,6 +6363,442 @@ impl std::fmt::Debug for TouchedLiveQuery {
     }
 }
 
+// ─────────────────────────── 宣言された答え ───────────────────────────
+
+/// 宣言された答えの形 ([`Engine::declare_answer`](crate::engine::Engine::declare_answer))。 条件は engine の形
+/// ([`LivePred`]、 紐は番号) で持ち、 `{db}/tables` の `ANS1` block に保存して開き直すと戻る。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnswerSpec {
+    /// 条件に当てはまる entity の集合 ([`Engine::subscribe`](crate::engine::Engine::subscribe) と同じ)。
+    Set { preds: Vec<LivePred> },
+    /// ref の道 `group_path` をたどった先の紐 `group_himo` の値ごとの件数と、 根の紐 `sum_himo` の和
+    /// ([`Engine::subscribe_counts`](crate::engine::Engine::subscribe_counts) /
+    /// [`subscribe_sums`](crate::engine::Engine::subscribe_sums) と同じ)。
+    Counts { preds: Vec<LivePred>, group_path: Vec<u16>, group_himo: u16, sum_himo: Option<u16> },
+    /// ref の道 `order_path` をたどった先の紐 `order_himo` の値で並べた先頭 `limit` 件
+    /// ([`Engine::subscribe_top`](crate::engine::Engine::subscribe_top) と同じ)。
+    Top { preds: Vec<LivePred>, order_path: Vec<u16>, order_himo: u16, desc: bool, limit: u32 },
+}
+
+/// 宣言された答えの購読。 engine が持ち (開いている間ずっと生きる)、 [`Engine::answer`](crate::engine::Engine::answer) は
+/// 同じ購読を指す clone を返す (poll の状態は 1 つ = 同じ差分はどれか 1 つの clone にだけ届く)。
+#[derive(Clone)]
+pub enum AnswerHandle {
+    /// `Set` / `Top` の購読。
+    Query(Arc<LiveQuery>),
+    /// `Counts` の購読。
+    Counts(Arc<LiveCounts>),
+}
+
+impl AnswerHandle {
+    /// 条件に出てくる全ての紐 (engine の barrier 用)。
+    pub(crate) fn himos(&self) -> Vec<u16> {
+        match self {
+            AnswerHandle::Query(q) => q.himos(),
+            AnswerHandle::Counts(c) => c.himos(),
+        }
+    }
+
+    /// 購読の id ([`LiveQuery::id`] / [`LiveCounts::id`])。
+    pub fn id(&self) -> u64 {
+        match self {
+            AnswerHandle::Query(q) => q.id(),
+            AnswerHandle::Counts(c) => c.id(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AnswerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnswerHandle::Query(q) => f.debug_tuple("Query").field(q).finish(),
+            AnswerHandle::Counts(c) => f.debug_tuple("Counts").field(c).finish(),
+        }
+    }
+}
+
+/// `ANS1` の byte 列を読む小さな読み手 (範囲を越えたら None)。
+struct AnsReader<'a> {
+    buf: &'a [u8],
+    off: usize,
+}
+
+impl<'a> AnsReader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.buf.get(self.off..self.off.checked_add(n)?)?;
+        self.off += n;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn i128(&mut self) -> Option<i128> {
+        Some(i128::from_le_bytes(self.take(16)?.try_into().ok()?))
+    }
+    fn flag(&mut self) -> Option<bool> {
+        match self.u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+    fn opt_u16(&mut self) -> Option<Option<u16>> {
+        Some(if self.flag()? { Some(self.u16()?) } else { None })
+    }
+    /// 残りの byte 数 (壊れた count で大きく確保しないための上限)。
+    fn left(&self) -> usize {
+        self.buf.len().saturating_sub(self.off)
+    }
+    fn path(&mut self) -> Option<Vec<u16>> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(self.left() / 2));
+        for _ in 0..n {
+            out.push(self.u16()?);
+        }
+        Some(out)
+    }
+}
+
+/// 入れ子 (`Via` / `Not` / `Exists` / `Or`) の深さの上限 (壊れた入力で stack を使い切らない)。
+const ANS_MAX_DEPTH: usize = 64;
+
+fn encode_u16s(out: &mut Vec<u8>, p: &[u16]) {
+    out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+    for &h in p {
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+}
+
+fn encode_preds(out: &mut Vec<u8>, preds: &[LivePred]) {
+    out.extend_from_slice(&(preds.len() as u32).to_le_bytes());
+    for p in preds {
+        p.encode(out);
+    }
+}
+
+fn decode_preds(r: &mut AnsReader<'_>, depth: usize) -> Option<Vec<LivePred>> {
+    let n = r.u32()? as usize;
+    // 1 件は最低 3 byte (tag + 紐)
+    let mut out = Vec::with_capacity(n.min(r.left() / 3));
+    for _ in 0..n {
+        out.push(LivePred::decode(r, depth)?);
+    }
+    Some(out)
+}
+
+impl LivePred {
+    /// `ANS1` の形: tag 1 byte + 中身 (数は little endian、 紐は u16、 値は u64、 文字は長さ u32 + UTF-8)。
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            LivePred::Eq { himo_id, value } => {
+                out.push(0);
+                out.extend_from_slice(&himo_id.to_le_bytes());
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            LivePred::EqText { himo_id, text } => {
+                out.push(1);
+                out.extend_from_slice(&himo_id.to_le_bytes());
+                out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+            }
+            LivePred::Range { himo_id, lo, hi } => {
+                out.push(2);
+                out.extend_from_slice(&himo_id.to_le_bytes());
+                out.extend_from_slice(&lo.to_le_bytes());
+                out.extend_from_slice(&hi.to_le_bytes());
+            }
+            LivePred::In { himo_id, values } => {
+                out.push(3);
+                out.extend_from_slice(&himo_id.to_le_bytes());
+                out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                for v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            LivePred::Present { himo_id } => {
+                out.push(4);
+                out.extend_from_slice(&himo_id.to_le_bytes());
+            }
+            LivePred::Via { path, pred } => {
+                out.push(5);
+                encode_u16s(out, path);
+                pred.encode(out);
+            }
+            LivePred::Not(p) => {
+                out.push(6);
+                p.encode(out);
+            }
+            LivePred::Exists { via, preds } => {
+                out.push(7);
+                out.extend_from_slice(&via.to_le_bytes());
+                encode_preds(out, preds);
+            }
+            LivePred::ExistsEq { mine, theirs, preds } => {
+                out.push(8);
+                out.extend_from_slice(&mine.to_le_bytes());
+                out.extend_from_slice(&theirs.to_le_bytes());
+                encode_preds(out, preds);
+            }
+            LivePred::CountAtLeast { via, mine, min, preds } => {
+                out.push(9);
+                out.extend_from_slice(&via.to_le_bytes());
+                encode_opt_u16(out, *mine);
+                out.extend_from_slice(&min.to_le_bytes());
+                encode_preds(out, preds);
+            }
+            LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds } => {
+                out.push(10);
+                out.extend_from_slice(&via.to_le_bytes());
+                encode_opt_u16(out, *mine);
+                out.extend_from_slice(&sum_himo.to_le_bytes());
+                out.extend_from_slice(&min.to_le_bytes());
+                out.push(*signed as u8);
+                encode_preds(out, preds);
+            }
+            LivePred::Or(branches) => {
+                out.push(11);
+                out.extend_from_slice(&(branches.len() as u32).to_le_bytes());
+                for b in branches {
+                    encode_preds(out, b);
+                }
+            }
+        }
+    }
+
+    /// [`encode`](Self::encode) の逆。 途中で切れている / 知らない tag / 深すぎる入れ子なら None。
+    fn decode(r: &mut AnsReader<'_>, depth: usize) -> Option<Self> {
+        if depth > ANS_MAX_DEPTH {
+            return None;
+        }
+        Some(match r.u8()? {
+            0 => LivePred::Eq { himo_id: r.u16()?, value: r.u64()? },
+            1 => {
+                let himo_id = r.u16()?;
+                let n = r.u32()? as usize;
+                let text = std::str::from_utf8(r.take(n)?).ok()?.to_string();
+                LivePred::EqText { himo_id, text }
+            }
+            2 => LivePred::Range { himo_id: r.u16()?, lo: r.u64()?, hi: r.u64()? },
+            3 => {
+                let himo_id = r.u16()?;
+                let n = r.u32()? as usize;
+                let mut values = Vec::with_capacity(n.min(r.left() / 8));
+                for _ in 0..n {
+                    values.push(r.u64()?);
+                }
+                LivePred::In { himo_id, values }
+            }
+            4 => LivePred::Present { himo_id: r.u16()? },
+            5 => {
+                let path = r.path()?;
+                LivePred::Via { path, pred: Box::new(LivePred::decode(r, depth + 1)?) }
+            }
+            6 => LivePred::Not(Box::new(LivePred::decode(r, depth + 1)?)),
+            7 => {
+                let via = r.u16()?;
+                LivePred::Exists { via, preds: decode_preds(r, depth + 1)? }
+            }
+            8 => {
+                let mine = r.u16()?;
+                let theirs = r.u16()?;
+                LivePred::ExistsEq { mine, theirs, preds: decode_preds(r, depth + 1)? }
+            }
+            9 => {
+                let via = r.u16()?;
+                let mine = r.opt_u16()?;
+                let min = r.u64()?;
+                LivePred::CountAtLeast { via, mine, min, preds: decode_preds(r, depth + 1)? }
+            }
+            10 => {
+                let via = r.u16()?;
+                let mine = r.opt_u16()?;
+                let sum_himo = r.u16()?;
+                let min = r.i128()?;
+                let signed = r.flag()?;
+                LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds: decode_preds(r, depth + 1)? }
+            }
+            11 => {
+                let n = r.u32()? as usize;
+                let mut branches = Vec::with_capacity(n.min(r.left() / 4));
+                for _ in 0..n {
+                    branches.push(decode_preds(r, depth + 1)?);
+                }
+                LivePred::Or(branches)
+            }
+            _ => return None,
+        })
+    }
+}
+
+fn encode_opt_u16(out: &mut Vec<u8>, v: Option<u16>) {
+    match v {
+        Some(h) => {
+            out.push(1);
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+impl AnswerSpec {
+    /// 条件 (根への AND)。
+    pub fn preds(&self) -> &[LivePred] {
+        match self {
+            AnswerSpec::Set { preds } | AnswerSpec::Counts { preds, .. } | AnswerSpec::Top { preds, .. } => preds,
+        }
+    }
+
+    /// `ANS1` の 1 件分の形 (名前は呼び手が書く): 種類 1 byte + 中身。
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            AnswerSpec::Set { preds } => {
+                out.push(0);
+                encode_preds(out, preds);
+            }
+            AnswerSpec::Counts { preds, group_path, group_himo, sum_himo } => {
+                out.push(1);
+                encode_u16s(out, group_path);
+                out.extend_from_slice(&group_himo.to_le_bytes());
+                encode_opt_u16(out, *sum_himo);
+                encode_preds(out, preds);
+            }
+            AnswerSpec::Top { preds, order_path, order_himo, desc, limit } => {
+                out.push(2);
+                encode_u16s(out, order_path);
+                out.extend_from_slice(&order_himo.to_le_bytes());
+                out.push(*desc as u8);
+                out.extend_from_slice(&limit.to_le_bytes());
+                encode_preds(out, preds);
+            }
+        }
+    }
+
+    /// `buf[*off..]` から 1 件読み、 `off` を進める。 途中で切れている / 知らない種類なら None (`off` は進めない)。
+    pub(crate) fn decode(buf: &[u8], off: &mut usize) -> Option<Self> {
+        let mut r = AnsReader { buf, off: *off };
+        let spec = match r.u8()? {
+            0 => AnswerSpec::Set { preds: decode_preds(&mut r, 0)? },
+            1 => {
+                let group_path = r.path()?;
+                let group_himo = r.u16()?;
+                let sum_himo = r.opt_u16()?;
+                AnswerSpec::Counts { preds: decode_preds(&mut r, 0)?, group_path, group_himo, sum_himo }
+            }
+            2 => {
+                let order_path = r.path()?;
+                let order_himo = r.u16()?;
+                let desc = r.flag()?;
+                let limit = r.u32()?;
+                AnswerSpec::Top { preds: decode_preds(&mut r, 0)?, order_path, order_himo, desc, limit }
+            }
+            _ => return None,
+        };
+        *off = r.off;
+        Some(spec)
+    }
+}
+
+/// 宣言された答えの形 (`ANS1`) の読み書き: 全部の種類の条件が元に戻る、 どこで切れても None (panic しない)、 知らない
+/// 種類 / tag は None、 深すぎる入れ子は None。
+#[cfg(test)]
+mod answer_spec_tests {
+    use super::*;
+
+    fn every_pred() -> Vec<LivePred> {
+        vec![
+            LivePred::Eq { himo_id: 1, value: 30 },
+            LivePred::EqText { himo_id: 2, text: "東京".into() },
+            LivePred::Range { himo_id: 3, lo: 10, hi: u64::MAX - 1 },
+            LivePred::In { himo_id: 4, values: vec![1, 2, 3] },
+            LivePred::Present { himo_id: 5 },
+            LivePred::Via { path: vec![6, 7], pred: Box::new(LivePred::Not(Box::new(LivePred::EqText { himo_id: 8, text: String::new() }))) },
+            LivePred::Exists { via: 9, preds: vec![LivePred::Eq { himo_id: 10, value: 1 }] },
+            LivePred::ExistsEq { mine: 11, theirs: 12, preds: vec![LivePred::Present { himo_id: 13 }] },
+            LivePred::CountAtLeast { via: 14, mine: None, min: 50, preds: vec![LivePred::Range { himo_id: 15, lo: 31, hi: u64::MAX }] },
+            LivePred::CountAtLeast { via: 14, mine: Some(16), min: 3, preds: vec![LivePred::Present { himo_id: 15 }] },
+            LivePred::SumAtLeast { via: 17, mine: Some(18), sum_himo: 19, min: -(1i128 << 70), signed: true, preds: vec![LivePred::Present { himo_id: 20 }] },
+            LivePred::Or(vec![vec![LivePred::Eq { himo_id: 21, value: 1 }], vec![LivePred::Eq { himo_id: 21, value: 2 }, LivePred::Present { himo_id: 22 }]]),
+        ]
+    }
+
+    fn specs() -> Vec<AnswerSpec> {
+        vec![
+            AnswerSpec::Set { preds: every_pred() },
+            AnswerSpec::Counts { preds: vec![LivePred::Present { himo_id: 1 }], group_path: vec![2, 3], group_himo: 4, sum_himo: None },
+            AnswerSpec::Counts { preds: every_pred(), group_path: vec![], group_himo: 4, sum_himo: Some(5) },
+            AnswerSpec::Top { preds: vec![LivePred::Eq { himo_id: 1, value: 0 }], order_path: vec![9], order_himo: 6, desc: true, limit: 10 },
+            AnswerSpec::Top { preds: every_pred(), order_path: vec![], order_himo: 6, desc: false, limit: u32::MAX },
+        ]
+    }
+
+    #[test]
+    fn round_trips_every_variant() {
+        for spec in specs() {
+            let mut bytes = vec![0xAA, 0xBB]; // 前に何かあっても (off から読む)
+            spec.encode(&mut bytes);
+            bytes.extend_from_slice(&[0xCC]); // 後ろに何かあっても (読んだ所で止まる)
+            let mut off = 2;
+            let back = AnswerSpec::decode(&bytes, &mut off).expect("decode");
+            assert_eq!(back, spec);
+            assert_eq!(off, bytes.len() - 1, "読んだ byte 数");
+        }
+    }
+
+    #[test]
+    fn any_truncation_is_none_without_panic() {
+        for spec in specs() {
+            let mut bytes = Vec::new();
+            spec.encode(&mut bytes);
+            for cut in 0..bytes.len() {
+                let mut off = 0;
+                assert!(AnswerSpec::decode(&bytes[..cut], &mut off).is_none(), "{cut} byte で切れた入力が読めてしまう");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_kind_or_tag_is_none() {
+        let mut off = 0;
+        assert!(AnswerSpec::decode(&[7, 0, 0, 0, 0], &mut off).is_none(), "知らない種類");
+        // Set に知らない tag の条件
+        let mut bytes = vec![0, 1, 0, 0, 0, 200, 1, 0];
+        bytes.extend_from_slice(&[0; 16]);
+        assert!(AnswerSpec::decode(&bytes, &mut off).is_none(), "知らない tag");
+        // 真偽の byte が 0 / 1 以外
+        let mut bytes = Vec::new();
+        AnswerSpec::Top { preds: vec![LivePred::Present { himo_id: 1 }], order_path: vec![], order_himo: 2, desc: true, limit: 1 }.encode(&mut bytes);
+        bytes[1 + 4 + 2] = 2; // 種類 + 道の数 + 紐 の次が desc
+        assert!(AnswerSpec::decode(&bytes, &mut off).is_none(), "壊れた真偽");
+    }
+
+    #[test]
+    fn nesting_deeper_than_the_limit_is_none() {
+        let mut p = LivePred::Present { himo_id: 1 };
+        for _ in 0..ANS_MAX_DEPTH {
+            p = LivePred::Not(Box::new(p));
+        }
+        let ok = AnswerSpec::Set { preds: vec![p.clone()] };
+        let mut bytes = Vec::new();
+        ok.encode(&mut bytes);
+        let mut off = 0;
+        assert_eq!(AnswerSpec::decode(&bytes, &mut off), Some(ok), "上限ちょうどは読める");
+        let too_deep = AnswerSpec::Set { preds: vec![LivePred::Not(Box::new(p))] };
+        let mut bytes = Vec::new();
+        too_deep.encode(&mut bytes);
+        let mut off = 0;
+        assert!(AnswerSpec::decode(&bytes, &mut off).is_none(), "上限を越えた入れ子は None");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
