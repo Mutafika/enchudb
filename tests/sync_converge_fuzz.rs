@@ -5,13 +5,14 @@
 //! 名前の列 (`key`) で束ねる表 (#141)。 改名 (#569)・削除優先 (#577)・消した名前 (#582 / #588) の組み合わせを、 人が形を思い付く代わりに
 //! 機械に探させる (#547 / #551 / #545 / #581 は全部人が見つけた)。 答えには名前の無い塊 (title だけの entity) も入れる。
 //!
-//! 改名を混ぜるとまだ割れる形があるので、 普段の試験からは外す。 残っているのは、 改名の時刻の決まり (改名より後に前の名前で作った
-//! 行は新しいデッキ) を入れる前から割れていた形: #612 (相手の改名で自分の行 2 つが同じ名前になる)。 改名を出さずに回すなら
-//! `ENCHU_FUZZ_NO_RENAME=1`:
+//! 普段の試験 (CI) は乱数の種を固定して 32 回回す (毎回同じ手順。 揺れで落ちない)。 新しい形を探す時は `ENCHU_FUZZ_CASES` で回数を
+//! 渡すと、 毎回違う種で回す (`ENCHU_FUZZ_SEED` で種を決めて繰り返せる)。 改名を出さずに回すなら `ENCHU_FUZZ_NO_RENAME=1`:
 //!
 //! ```text
-//! ENCHU_FUZZ_CASES=200 cargo test --release --test sync_converge_fuzz -- --ignored --nocapture
+//! ENCHU_FUZZ_CASES=1000 cargo test --release --test sync_converge_fuzz every_order -- --nocapture
 //! ```
+//!
+//! #612 (自分の行どうしを畳む) が入って、 改名を混ぜて 1,000 回ずつ回しても割れなくなった (2026-10-22)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -263,11 +264,20 @@ fn cases() -> u32 {
     std::env::var("ENCHU_FUZZ_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
 }
 
+/// 種: `ENCHU_FUZZ_SEED` があればそれ、 回数を渡した (手で探す) なら毎回違う種、 どちらも無ければ (CI) 固定。
+fn seed() -> proptest::test_runner::RngSeed {
+    use proptest::test_runner::RngSeed;
+    match std::env::var("ENCHU_FUZZ_SEED").ok().and_then(|v| v.parse().ok()) {
+        Some(n) => RngSeed::Fixed(n),
+        None if std::env::var("ENCHU_FUZZ_CASES").is_ok() => RngSeed::Random,
+        None => RngSeed::Fixed(612),
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: cases(), max_shrink_iters: 2000, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(), rng_seed: seed(), max_shrink_iters: 2000, ..ProptestConfig::default() })]
 
     #[test]
-    #[ignore = "既知の割れ (#612) があるので手で回す"]
     fn every_order_converges(steps in proptest::collection::vec(step_strategy(), 1..10)) {
         if let Err(msg) = run(&steps) {
             prop_assert!(false, "手順 {steps:?}\n{msg}");
@@ -659,4 +669,65 @@ fn an_identity_renamed_by_another_identity_of_its_deck_stays_with_the_deck() {
         Step::Rename { by: 2, from: 0, to: 1 },
     ];
     assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t2")), (text("k2"), text("t0"))]));
+}
+
+/// #612: C が自分で作った 2 行 (k1 と k0) のうち、 k1 を B が k0 に改名する (B は C の k0 を知らない)。 2 行は同じ名前 = 同じデッキ。
+/// 他の peer は 2 行を 1 つに畳む。 C も自分の 2 行を 1 つに畳む (畳まれた行の eid は残す行に転送する)。
+#[test]
+fn a_peer_folds_its_own_rows_renamed_into_one_name() {
+    let steps = [
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Pull { by: 1, from: 2 },
+        Step::Upsert { by: 2, key: 0, title: 0 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t0"))]));
+}
+
+/// #612 の別の形: 上の後に、 B (自分の 2 行を持つ側) がデッキを改名する。 畳んでいないと、 改名は 2 行の片方にしか当たらない。
+#[test]
+fn a_rename_after_folding_own_rows_renames_the_whole_deck() {
+    let steps = [
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Pull { by: 2, from: 1 },
+        Step::Upsert { by: 1, key: 0, title: 0 },
+        Step::Rename { by: 2, from: 1, to: 0 },
+        Step::Rename { by: 1, from: 0, to: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k2"), text("t0"))]));
+}
+
+/// #612 の続き (年表で畳む): C の k1 を B が k0 に改名し、 その後 C が (改名を知らずに) k0 を作る。 A は B の改名を受けてデッキを k2 に
+/// 改名する。 C は A の改名を先に受けるので、 B の改名は LWW で負けるが、 C の行が k0 だった間に C の k0 が作られた = 同じデッキ。
+/// 負けた改名を年表に載せる時に、 C の自分の 2 行を畳む。
+#[test]
+fn a_losing_rename_folds_own_rows_made_while_it_held_the_name() {
+    let steps = [
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Pull { by: 1, from: 2 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+        Step::Upsert { by: 2, key: 0, title: 0 },
+        Step::Pull { by: 0, from: 1 },
+        Step::Rename { by: 0, from: 0, to: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k2"), text("t0"))]));
+}
+
+/// #612 の続き (切り離し): C の k1 を B が k0 に改名し、 A がさらに k5 に改名する。 その後 C が (どちらも知らずに) k0 を作る (デッキが
+/// k0 を離れた後 = 新しいデッキ)。 C は B の改名を先に受けて自分の 2 行を畳み、 A の改名を受けて切り離す。 切り離す C の k0 は
+/// 元の slot に戻す (新しい slot に移すと、 その後の C の書き込みが知らない世界番号宛てに出る)。
+#[test]
+fn a_split_puts_a_folded_own_row_back_in_its_slot() {
+    let steps = [
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Pull { by: 1, from: 2 },
+        Step::Rename { by: 1, from: 1, to: 0 },
+        Step::Pull { by: 0, from: 1 },
+        Step::Rename { by: 0, from: 0, to: 5 },
+        Step::Upsert { by: 2, key: 0, title: 1 },
+        Step::Pull { by: 2, from: 1 },
+        Step::Pull { by: 2, from: 0 },
+        Step::Retitle { by: 2, key: 0, title: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t2")), (text("k5"), text("t0"))]));
 }

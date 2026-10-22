@@ -4512,6 +4512,9 @@ pub struct Engine {
     pk_former: std::sync::RwLock<crate::pk_former::PkFormer>,
     /// `pk_former` が空か (常態で lock を取らない)。 空でなくなったら戻さない。
     pk_former_empty: std::sync::atomic::AtomicBool,
+    /// #612: 畳んだ自分の行の別名 (自分の peer の世界番号 → 残す行、 翻訳の別名の表に置く) があるか。 無ければ eid を受け取る入口は
+    /// 別名を引かない (atomic 1 回)。 立てたら開き直すまで下ろさない
+    own_alias_on: std::sync::atomic::AtomicBool,
     /// `pk_former` を最後に書き出した後に変えたか (`pkformer` を変わった時だけ書く)。
     pk_former_dirty: std::sync::atomic::AtomicBool,
     /// 名前で束ねた slot の目印 (slot の下位 bit で選ぶ 4096 本、 `is_bound_slot`)。 書き込みの道で 「束ねた行か」 を lock を取らずに
@@ -5035,6 +5038,7 @@ impl Engine {
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
             pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
             pk_former_empty: std::sync::atomic::AtomicBool::new(true),
+            own_alias_on: std::sync::atomic::AtomicBool::new(false),
             pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
             bound_filter: (0..BOUND_FILTER_WORDS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             pk_himo_bits: Default::default(),
@@ -5494,8 +5498,13 @@ impl Engine {
         // (別名宛ての record が新しい行として払い出される = 畳む前と同じ)
         match load_eidalias_from_sidecar(path) {
             Ok(Some(entries)) => {
+                let self_peer = eng.peer_id();
                 for (peer, foreign_local, local) in entries {
                     eng.eid_translator.alias(peer, foreign_local, local);
+                    // #612: 畳んだ自分の行の別名
+                    if peer == self_peer {
+                        eng.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
             }
             Ok(None) => {}
@@ -6298,6 +6307,7 @@ impl Engine {
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
             pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
             pk_former_empty: std::sync::atomic::AtomicBool::new(true),
+            own_alias_on: std::sync::atomic::AtomicBool::new(false),
             pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
             bound_filter: (0..BOUND_FILTER_WORDS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             pk_himo_bits: Default::default(),
@@ -9043,7 +9053,8 @@ impl Engine {
                 if local >= allocated {
                     break 'outer;
                 }
-                if !self.entities.is_live(global) {
+                // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
+                if !self.entities.is_live(global) && !self.is_folded_own_slot(global) {
                     fl.push(local);
                 }
                 local += 1;
@@ -9684,8 +9695,8 @@ impl Engine {
         }
     }
 
-    /// #178: 同じ entity を指す 2 つの local 行のうち、 翻訳した行 `src` (相手の世界番号の写し) を `dst` に畳む。 戻り値は
-    /// `dst` に当たった cell の数 (値と外し)。
+    /// #178: 同じ entity を指す 2 つの local 行のうち、 翻訳した行 `src` (相手の世界番号の写し) を `dst` に畳む (#612: `src` と `dst` が
+    /// どちらも自分の行でもよい)。 戻り値は `dst` に当たった cell の数 (値と外し)。
     ///
     /// 2 台が同じ自然キーの行を別々に作ってから束ねると、 束ねる前に出て行った書き込みが相手で別の行として払い出され、 同じ
     /// entity が 2 行になる (#178)。 その 2 行を 1 つにする:
@@ -9695,12 +9706,13 @@ impl Engine {
     ///    ある) は外しとして当てる。 Leaf は中身を写す。 版数の無い cell は dst に値が無い時だけ入る (版数の無い書き込みを LWW は
     ///    いつも通すので、 そのまま当てると dst の新しい値を消す)
     /// 3. src を指していた世界番号 (逆写像と別名) を全部 dst の別名にする: 以後その世界番号宛ての record は dst に当たる。 dst に
-    ///    書いた record の宛名は dst の世界番号のまま ([`crate::eid_translator::EidTranslator::alias`])
+    ///    書いた record の宛名は dst の世界番号のまま ([`crate::eid_translator::EidTranslator::alias`])。 #612: 自分の行の src は、
+    ///    自分の peer の世界番号 (自分の peer, src) も dst の別名にする (受けた record も、 アプリが持つ src の eid も dst に転送)
     /// 4. src の行を落とし、 版数も消して slot を空ける。 削除の印は残さない (同じ entity は dst で生きている。 主キーの削除の
-    ///    記録も残さない)
+    ///    記録も残さない)。 自分の行の slot は使い回さない (別名が slot を指す世界番号そのもの)
     ///
-    /// oplog には何も積まない (相手には 「同じ entity」 の知らせで伝える、 #178)。 src は翻訳した行に限る: 自分が産んだ行は、
-    /// その世界番号宛ての record がこの先も届くのに転送先を持たないので畳めない。 自分の行 / 同じ行 / 生きていない行は Err。
+    /// oplog には何も積まない (相手には 「同じ entity」 の知らせで伝える、 #178)。 自分の行を翻訳した行に畳むのは Err (その行に
+    /// 書いた record の宛名が相手の世界番号になる。 逆に畳む)。 同じ行 / 生きていない行も Err。
     /// 畳んでいる間に src に届いた record (写像を引いた後で当てる前) は失われうる (sync の当てを止めてから呼ぶこと)。
     pub fn merge_entity_into(
         &self,
@@ -9716,8 +9728,11 @@ impl Engine {
         if !self.entities.is_live(s) || !self.entities.is_live(d) {
             return Err(format!("merge_entity_into: row {} is not live", if self.entities.is_live(s) { d } else { s }));
         }
-        if self.eid_translator.reverse(s).is_none() {
-            return Err(format!("merge_entity_into: src {s} is not a translated row (rows this peer created cannot be merged away)"));
+        // #612: 自分の行は、 残す行も自分の行の時だけ畳める (畳んだ行の世界番号を残す行の別名にして転送する)。 翻訳した行に
+        // 自分の行を畳むと、 その行に書いた record の宛名が相手の世界番号になる (逆にする: 翻訳した行を自分の行に畳む)
+        let own_src = self.eid_translator.reverse(s).is_none();
+        if own_src && self.eid_translator.reverse(d).is_some() {
+            return Err(format!("merge_entity_into: src {s} is this peer's row but dst {d} is a translated row (merge the other way)"));
         }
         let (ts, td) = (self.table_name_of_local(s), self.table_name_of_local(d));
         if ts != td {
@@ -9791,6 +9806,12 @@ impl Engine {
         // 3. 世界番号を dst へ (以後 src の世界番号宛ての record は dst に当たる)
         for (peer, foreign_local) in self.eid_translator.remove_local(s) {
             self.eid_translator.alias(peer, foreign_local, d);
+        }
+        // #612: 自分の行の世界番号 (自分の peer, s) も dst の別名に。 アプリが持つ s の eid も dst に転送する (`forward_eid`)。
+        // slot s は使い回さない (`is_folded_own_slot`)
+        if own_src {
+            self.eid_translator.alias(self_peer, s, d);
+            self.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
         }
         // 4. src を落として slot を空ける (版数 0 = cell を全部落とす。 削除の印・主キーの記録は残さない)
         self.remove_entity_body(s, enchudb_oplog::Hlc::ZERO);
@@ -10075,6 +10096,7 @@ impl Engine {
     /// update/delete が未割当 slot へ phantom write するのを防ぐ existence check 用。
     /// 範囲外 eid は false。
     pub fn is_live(&self, eid: enchudb_oplog::EntityId) -> bool {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.entities.is_live(enchudb_oplog::eid_local(eid))
     }
     pub fn next_eid(&self) -> enchudb_oplog::EntityId {
@@ -11207,8 +11229,7 @@ impl Engine {
 
     /// 改名の時刻: 名前の年表の上で行 `local` が名前 `value` だったことのある時刻以前に、 その名前を書かれた別の生きた行 (今もその
     /// 名前 = 同じ時刻に同じ名前を持った) を `local` と 1 つに畳む
-    /// (同じデッキ)。 畳むのは翻訳した行 (`fold_rows_with_same_pk` と同じ。 自分が作った行どうしは畳めない、 #612)。 戻り値は
-    /// 畳んだ行の数。
+    /// (同じデッキ)。 畳み方は `fold_rows_with_same_pk` と同じ (翻訳した行を畳む、 #612: 自分の行どうしも)。 戻り値は畳んだ行の数。
     fn fold_rows_named_while_held(&self, local: u32, himo: u16, value: u64) -> usize {
         let self_peer = self.peer_id();
         let mut keep = enchudb_oplog::make_eid(self_peer, local);
@@ -11227,14 +11248,9 @@ impl Engine {
             if held != Some(true) {
                 continue;
             }
+            // 翻訳した行を畳む (自分の行は残す)。 どちらも自分の行なら other を畳む (#612、 other の eid は keep に転送する)
             let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
-            let (src, dst) = if translated(other) {
-                (other, keep)
-            } else if translated(keep) {
-                (keep, other)
-            } else {
-                continue;
-            };
+            let (src, dst) = if translated(keep) && !translated(other) { (keep, other) } else { (other, keep) };
             if self.merge_entity_into(src, dst).is_ok() {
                 folded += 1;
                 keep = dst;
@@ -11319,7 +11335,7 @@ impl Engine {
     }
 
     /// sync の当て: 行 `eid` の主キーが `value` になった時、 同じ主キーの別の生きた行を 1 つに畳む (主キーが同じなら同じ行)。
-    /// 畳むのは翻訳した行 (自分が産んだ行は畳めない、 `merge_entity_into`)。 戻り値は畳んだ行の数。
+    /// 自分の行と翻訳した行なら翻訳した行を畳む (#612: 自分の行どうしも畳む、 `merge_entity_into`)。 戻り値は畳んだ行の数。
     ///
     /// `dies_at`: 行 `eid` がこの後 (同じ batch で) 消える時刻。 その削除より後に主キーを書かれた行 (消したのを見て足し直した行) は
     /// 畳まない (畳むと一緒に消える。 削除優先、 2026-10-21)。
@@ -11341,14 +11357,9 @@ impl Engine {
             {
                 continue;
             }
+            // 翻訳した行を畳む (自分の行は残す)。 どちらも自分の行なら other を畳む (#612、 other の eid は keep に転送する)
             let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
-            let (src, dst) = if translated(other) {
-                (other, keep)
-            } else if translated(keep) {
-                (keep, other)
-            } else {
-                continue;
-            };
+            let (src, dst) = if translated(keep) && !translated(other) { (keep, other) } else { (other, keep) };
             if self.merge_entity_into(src, dst).is_ok() {
                 folded += 1;
                 keep = dst;
@@ -11363,7 +11374,7 @@ impl Engine {
     }
 
     /// 改名の時刻: 名前 `value` を時刻 `t` に書かれた行 `local` を、 その時刻にその名前だった (今は別の名前の) 行と 1 つに畳む
-    /// (同じデッキ)。 畳むのは翻訳した行 (自分が作った行どうしは畳めない、 #612)。 戻り値は畳んだ行の数。
+    /// (同じデッキ)。 自分の行と翻訳した行なら翻訳した行を畳む (#612: 自分の行どうしも畳む)。 戻り値は畳んだ行の数。
     fn fold_former_holder(&self, local: u32, himo: u16, value: u64, t: enchudb_oplog::Hlc) -> usize {
         let Some(holder) = self.former_pk_holder(himo, PkValue::Local(value), t) else { return 0 };
         let self_peer = self.peer_id();
@@ -11371,14 +11382,9 @@ impl Engine {
         if enchudb_oplog::eid_local(holder) == local {
             return 0;
         }
+        // 翻訳した行を畳む (自分の行は残す)。 どちらも自分の行なら here を畳む (#612、 here の eid は holder に転送する)
         let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
-        let (src, dst) = if translated(here) {
-            (here, holder)
-        } else if translated(holder) {
-            (holder, here)
-        } else {
-            return 0;
-        };
+        let (src, dst) = if translated(holder) && !translated(here) { (holder, here) } else { (here, holder) };
         usize::from(self.merge_entity_into(src, dst).is_ok())
     }
 
@@ -11506,11 +11512,27 @@ impl Engine {
     ///
     /// #178: slot を指す別名 (同じ entity の 2 つ目の世界番号) も外し、 同じ削除版数を退避する (同じ entity なので)。
     fn evict_translation_for_reuse(&self, local: u32) {
-        let keys = self.eid_translator.remove_local(local);
+        let mut keys = self.eid_translator.remove_local(local);
         if keys.is_empty() {
             return;
         }
         let tomb = self.tombstone_version_of(local);
+        // #612: 畳んだ自分の行 (自分の peer の世界番号) は、 その slot を自分自身の別名にして予約したまま (使い回さない) 削除の
+        // 版数を載せる (その世界番号宛ての record を捨てる。 外すだけだと、 届いた record がその slot に名前の無い行を作る)
+        let self_peer = self.peer_id();
+        keys.retain(|&(peer, s)| {
+            if peer != self_peer {
+                return true;
+            }
+            self.eid_translator.alias(peer, s, s);
+            if tomb != enchudb_oplog::Hlc::ZERO {
+                self.set_tombstone_local(s, tomb);
+            }
+            false
+        });
+        if keys.is_empty() {
+            return;
+        }
         if tomb == enchudb_oplog::Hlc::ZERO {
             // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い。
             return;
@@ -12266,6 +12288,80 @@ impl Engine {
         &self.eid_translator
     }
 
+    /// #612: 畳んだ自分の行 (別名) を残す行へ。 自分の行どうしを畳んだことの無い DB は何もしない (atomic 1 回)。
+    ///
+    /// 印は Relaxed で読む: 別名そのものは translator の lock の下で読む。 畳んだ後の読み書き (畳んだことを知った後の呼び出し) は、
+    /// 畳んだ側との間に lock などの同期があるので、 Relaxed でも印は立って見える。
+    #[inline]
+    fn forward_local(&self, local: u32) -> u32 {
+        if !self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed) {
+            return local;
+        }
+        self.forward_local_slow(local)
+    }
+
+    #[cold]
+    fn forward_local_slow(&self, mut local: u32) -> u32 {
+        let self_peer = self.peer_id();
+        // 畳んだ先がさらに畳まれていれば辿る (別名は畳むたびに残す行へ張り替えるので、 普通は 1 段)
+        for _ in 0..64 {
+            match self.eid_translator.get(self_peer, local) {
+                Some(to) if to != local => local = to,
+                _ => break,
+            }
+        }
+        local
+    }
+
+    /// #612: アプリが持つ eid (自分の peer の世界番号) を、 畳んだ自分の行なら残す行の eid に (転送)。 それ以外はそのまま。
+    #[inline]
+    pub fn forward_eid(&self, eid: enchudb_oplog::EntityId) -> enchudb_oplog::EntityId {
+        if !self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed)
+            || enchudb_oplog::eid_peer(eid) != self.peer_id()
+        {
+            return eid;
+        }
+        enchudb_oplog::make_eid(enchudb_oplog::eid_peer(eid), self.forward_local_slow(enchudb_oplog::eid_local(eid)))
+    }
+
+    /// #612: slot `local` は畳んだ自分の行 (別名を持つ、 使い回さない) か。 残した行の slot が使い回された後は、 自分自身を指す別名で
+    /// 予約したまま (`evict_translation_for_reuse`)。
+    fn is_folded_own_slot(&self, local: u32) -> bool {
+        self.own_alias_on.load(std::sync::atomic::Ordering::Acquire) && self.eid_translator.get(self.peer_id(), local).is_some()
+    }
+
+    /// #612: 行 `here` から切り離す identity `ids` の中に畳んだ自分の行 (自分の peer, x) が居れば、 その slot x を生き返らせて返す
+    /// (別名を外す)。 自分の行の世界番号は slot に固定なので、 切り離す先は新しい slot でなく元の slot。
+    fn revive_folded_own(&self, ids: &[(enchudb_oplog::PeerId, u32)], here: u32) -> Option<u32> {
+        let self_peer = self.peer_id();
+        let &(_, x) =
+            ids.iter().find(|&&(p, l)| p == self_peer && l != here && self.eid_translator.get(p, l) == Some(here))?;
+        self.eid_translator.unalias(self_peer, x);
+        self.entities.ensure_live(x);
+        Some(x)
+    }
+
+    /// #612: 切り離した identity `ids` を slot `moved` に付け替える。 `moved` が自分の行 (生き返らせた slot) なら、 全部を別名に
+    /// する (逆写像を張ると、 その行に書いた record の宛名が相手の世界番号になる)。 新しい slot なら最初の相手の identity を逆写像
+    /// (宛名)、 残りを別名に。 自分の peer の identity は自分の slot 以外なら別名。
+    fn point_identities_to(&self, ids: &[(enchudb_oplog::PeerId, u32)], moved: u32, moved_is_own: bool) {
+        let self_peer = self.peer_id();
+        let mut first = !moved_is_own;
+        for &(peer, fl) in ids {
+            if peer == self_peer {
+                if fl != moved {
+                    self.eid_translator.alias(peer, fl, moved);
+                }
+                continue;
+            }
+            if std::mem::take(&mut first) {
+                self.eid_translator.insert(peer, fl, moved);
+            } else {
+                self.eid_translator.alias(peer, fl, moved);
+            }
+        }
+    }
+
     /// #9: 受信 op の foreign eid を「自分の eid 空間の local eid」に翻訳する。
     /// 初見の `(owner, foreign_local)` には `himo_id` が属する closed table 内に
     /// fresh な local entity を払い出す (= local entity と同じ allocator なので衝突しない)。
@@ -12286,7 +12382,7 @@ impl Engine {
         let self_peer = self.peer_id.load(Ordering::Acquire);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         if owner == self_peer {
-            return Some(foreign_eid); // identity: 自分が産んだ entity
+            return Some(self.forward_eid(foreign_eid)); // identity: 自分が産んだ entity (#612: 畳んだ行は残す行へ)
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
@@ -12318,7 +12414,7 @@ impl Engine {
         let self_peer = self.peer_id.load(Ordering::Acquire);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         if owner == self_peer {
-            return Some(foreign_eid);
+            return Some(self.forward_eid(foreign_eid));
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         self.eid_translator
@@ -12368,7 +12464,7 @@ impl Engine {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
         if author_peer == self_peer {
-            return Some(foreign_value); // identity: 自分が author
+            return Some(self.forward_local(foreign_value)); // identity: 自分が author (#612: 畳んだ行は残す行へ)
         }
         // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
         // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
@@ -13056,7 +13152,15 @@ impl Engine {
         // 残る側は固定の identity を、 移す側は今の宛名を先頭に (宛名が移す側なら、 最初の付け替えで逆写像も移る)
         stay.sort_by_key(|&(id, _)| id != pinned);
         go.sort_by_key(|&(id, _)| id != published);
-        let moved = self.alloc_translated_local(himo)?;
+        // #612: 移す側に畳んだ自分の行が居れば、 その元の slot に戻す (自分の identity を先頭 = 行の元の identity に)
+        let go_all: Vec<_> = go.iter().map(|b| b.0).collect();
+        let (moved, moved_is_own) = match self.revive_folded_own(&go_all, local) {
+            Some(x) => {
+                go.sort_by_key(|&(id, _)| id != (self_peer, x));
+                (x, true)
+            }
+            None => (self.alloc_translated_local(himo)?, false),
+        };
         let (stay_ids, go_ids): (Vec<_>, Vec<_>) = (stay.iter().map(|b| b.0).collect(), go.iter().map(|b| b.0).collect());
         let (stay_cards, go_cards) = {
             let mut f = self.pk_former.write().unwrap();
@@ -13081,18 +13185,8 @@ impl Engine {
             self.mark_bound_slot(moved);
         }
         self.pk_former_dirty.store(true, Ordering::Release);
-        // 移す側: 写像を新しい slot へ (自分の peer の identity は行の持ち主だけで、 残る側に居る)
-        let mut first = true;
-        for &(peer, fl) in &go_ids {
-            if peer == self_peer {
-                continue;
-            }
-            if std::mem::take(&mut first) {
-                self.eid_translator.insert(peer, fl, moved);
-            } else {
-                self.eid_translator.alias(peer, fl, moved);
-            }
-        }
+        // 移す側: 写像を移す先の slot へ (行の持ち主の自分の identity は残る側に居る)
+        self.point_identities_to(&go_ids, moved, moved_is_own);
         // 残る側: cell をその側のカードに戻す (値と版数ごと。 カードの無い列は空にする)
         {
             let _row = self.row_locks.write(local);
@@ -13179,6 +13273,14 @@ impl Engine {
                 if peer == self_peer && fl == local {
                     continue;
                 }
+                // #612: 畳んだ自分の行は、 元の slot を消えた slot にする (別名を外して削除の版数を載せる)
+                if peer == self_peer {
+                    if self.is_folded_own_slot(fl) {
+                        self.eid_translator.unalias(peer, fl);
+                        self.set_tombstone_local(fl, t);
+                    }
+                    continue;
+                }
                 if let Some(dead) = self.alloc_translated_local(pk) {
                     self.set_tombstone_local(dead, t);
                     self.live_free(dead);
@@ -13209,19 +13311,24 @@ impl Engine {
                 f.set_bound(local, if later.len() > 1 { later } else { Vec::new() });
             }
         } else {
-            // 元の行は消える: 後の identity を新しい slot に移す
-            let Some(moved) = self.alloc_translated_local(pk) else { return false };
-            self.copy_cells_newer_than(local, moved, t);
-            for (i, &((peer, fl), _)) in later.iter().enumerate() {
-                if i == 0 {
-                    self.eid_translator.insert(peer, fl, moved);
-                } else {
-                    self.eid_translator.alias(peer, fl, moved);
+            // 元の行は消える: 後の identity を新しい slot に移す (#612: 畳んだ自分の行が居れば、 その元の slot に戻す)
+            let mut later = later;
+            let later_all: Vec<_> = later.iter().map(|b| b.0).collect();
+            let (moved, moved_is_own) = match self.revive_folded_own(&later_all, local) {
+                Some(x) => {
+                    later.sort_by_key(|&(id, _)| id != (self_peer, x));
+                    (x, true)
                 }
-            }
+                None => match self.alloc_translated_local(pk) {
+                    Some(m) => (m, false),
+                    None => return false,
+                },
+            };
+            self.copy_cells_newer_than(local, moved, t);
+            let later_ids: Vec<_> = later.iter().map(|b| b.0).collect();
+            self.point_identities_to(&later_ids, moved, moved_is_own);
             {
                 let mut f = self.pk_former.write().unwrap();
-                let later_ids: Vec<_> = later.iter().map(|b| b.0).collect();
                 let cards = f.take_cards(local, &later_ids);
                 if later.len() > 1 {
                     f.put_cards(moved, cards);
@@ -13648,6 +13755,8 @@ impl Engine {
     }
 
     pub fn tie_text(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: &str) {
+
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let hid = self.ensure_himo(himo, ValueType::Tag, 0);
         self.tie_text_by_id(eid, hid as u16, value);
@@ -13664,6 +13773,7 @@ impl Engine {
     /// 実測では 72M tie のフルリビルドに対して合計 0.115 % で、 **性能のために乗り換える
     /// 必要は無い**。 これがあるのは `&self` 系と API を揃えるため。
     pub fn tie_text_by_id(&mut self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -13715,6 +13825,8 @@ impl Engine {
     }
 
     pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
+
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         // 幅は himo を定義する前に確かめる (拒否された write で himo が生えない)。 新しく生える himo は
         // Number (u32)
@@ -13729,6 +13841,7 @@ impl Engine {
     /// #264: `tie` の himo_id 直指定版 (build phase = `&mut self`)。
     /// 契約は [`Engine::tie_text_by_id`] と同じ (検証を保つ / himo は定義しない)。
     pub fn tie_by_id(&mut self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -13748,6 +13861,10 @@ impl Engine {
     }
 
     pub fn tie_ref(&mut self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
+
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
+
+        let target_eid = self.forward_eid(target_eid);
         self.check_writable();
         // sentinel は himo を定義する前に弾く (拒否された write で himo が生えない)。
         let target_local = enchudb_oplog::eid_local(target_eid);
@@ -13810,6 +13927,7 @@ impl Engine {
     /// 定義済みの紐に文字列を張る。&selfで呼べる（Arc共有のまま書き込み可）。
     /// 紐が未定義ならpanic。define_himo を先に呼ぶこと。
     pub fn tie_text_to(&self, eid: enchudb_oplog::EntityId, himo: &str, value: &str) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_text_to_by_id(eid, hid, value);
@@ -13818,11 +13936,13 @@ impl Engine {
     /// `tie_text_to` の himo_id 直指定版。 hot path 用 (per-call の string lookup を消す)。
     /// 起動時に `himo_id(&str)` で解決して u16 を cache しておく。
     pub fn tie_text_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let _ = self.try_tie_text_to_by_id(eid, himo_id, value);
     }
 
     /// `tie_text_to_by_id` の結果付き版 (#316)。 書かなかった時は理由を返す (oplog にも積まない)。
     pub fn try_tie_text_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) -> Result<(), TieRejected> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -14023,6 +14143,7 @@ impl Engine {
     /// insert (Leaf なら dedupe なし) し、 himo に紐付ける。 `_sync_ops.payload`
     /// (= oplog record の生 wire bytes) 等、 UTF-8 制約を持たない data を書く用。
     pub fn tie_bytes_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &[u8]) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -14135,6 +14256,7 @@ impl Engine {
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
     pub fn tie_to(&self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_to_by_id(eid, hid, value);
@@ -14142,11 +14264,13 @@ impl Engine {
 
     /// `tie_to` の himo_id 直指定版。 hot path 用 (string lookup を避ける)。
     pub fn tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let _ = self.try_tie_to_by_id(eid, himo_id, value);
     }
 
     /// `tie_to_by_id` の結果付き版 (#316)。 書かなかった時は理由を返す (oplog にも積まない)。
     pub fn try_tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) -> Result<(), TieRejected> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -14210,6 +14334,8 @@ impl Engine {
 
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
     pub fn tie_ref_to(&self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
+        let target_eid = self.forward_eid(target_eid);
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_ref_to_by_id(eid, hid, target_eid);
@@ -14217,11 +14343,15 @@ impl Engine {
 
     /// `tie_ref_to` の himo_id 直指定版。 hot path 用。
     pub fn tie_ref_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, target_eid: enchudb_oplog::EntityId) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
+        let target_eid = self.forward_eid(target_eid);
         let _ = self.try_tie_ref_to_by_id(eid, himo_id, target_eid);
     }
 
     /// `tie_ref_to_by_id` の結果付き版 (#316)。 書かなかった時は理由を返す (oplog にも積まない)。
     pub fn try_tie_ref_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, target_eid: enchudb_oplog::EntityId) -> Result<(), TieRejected> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
+        let target_eid = self.forward_eid(target_eid);
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let target_eid = enchudb_oplog::eid_local(target_eid);
@@ -14265,6 +14395,7 @@ impl Engine {
     /// 同じ行 (や同じ stripe に当たる行) を書こうとすると互いに待つ)。 `tie_*` 1 回だけなら握らなくても
     /// その cell の書き込みは重ならない。
     pub fn write_row(&self, eid: enchudb_oplog::EntityId) -> crate::row_lock::RowWrite<'_> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.row_locks.write(enchudb_oplog::eid_local(eid))
     }
 
@@ -14273,12 +14404,15 @@ impl Engine {
     /// `f` は副作用を持たないこと。 `get*` を 1 つずつ呼ぶと、 間に入った書き込みで同時には無かった
     /// 列の組を掴みうる。
     pub fn read_row<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnMut() -> R) -> R {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.row_locks.read(enchudb_oplog::eid_local(eid), f)
     }
 
     // ──── untie ────
 
     pub fn untie(&self, eid: enchudb_oplog::EntityId, himo: &str) {
+
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         if let Some(hid) = self.himo_id(himo) {
             self.untie_by_id(eid, hid as u16);
         }
@@ -14288,6 +14422,7 @@ impl Engine {
     /// panic、 release では silently no-op (string 版が未定義 himo を no-op 扱いするのと
     /// 整合)。
     pub fn untie_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -14317,6 +14452,8 @@ impl Engine {
     // ──── delete ────
 
     pub fn delete(&self, eid: enchudb_oplog::EntityId) {
+
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         // #534: 消すには全部の列の古い値を読む (索引と Leaf の領域の片付け)。 開けない列があれば何も積まずに断る (途中まで
@@ -14427,6 +14564,7 @@ impl Engine {
     /// が構造ごと退役する。 旧 content region は**凍結アーカイブ**:
     /// `get_content` の fallback でのみ読み、 書き込みは一切しない。
     pub fn content(&self, eid: enchudb_oplog::EntityId, key: &str, data: &[u8]) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let hid = self.ensure_content_himo(local, key);
@@ -14436,6 +14574,7 @@ impl Engine {
     /// content を**借用で**読む。 書き手が同時に動かない時だけ使える — 他の thread / 他の process が
     /// 書いているなら [`Engine::get_content_owned`] (#107、 debug build は [`Engine::get_text`] と同じ条件で止める)。
     pub fn get_content(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<&[u8]> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let local = enchudb_oplog::eid_local(eid);
         // 新経路 (`_c_{key}` Leaf himo) 優先
         if let Some(hid) = self.content_himo_id(local, key) {
@@ -14456,6 +14595,7 @@ impl Engine {
     /// 旧 content region (pre-0.9) は 0.9.0 以降 **凍結アーカイブで書き込みゼロ** なので
     /// copy のみ (verify 不要)。
     pub fn get_content_owned(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<Vec<u8>> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let local = enchudb_oplog::eid_local(eid);
         if let Some(hid) = self.content_himo_id(local, key) {
             // cell が設定されていれば新経路の結果をそのまま返す。 `text_owned_by_id` の
@@ -14839,6 +14979,7 @@ impl Engine {
     /// 借用の読みが始まった後に別の thread が Leaf を書いた engine)。 release build は何もしない。
     /// 同じ借用を返す [`Engine::get_content`] / [`Engine::get_entity`] も同じ扱い。
     pub fn get_text(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<&[u8]> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
         // Tag は vocab、 routed-Leaf (#88) は LeafStore、 reserved Leaf は vocab。
@@ -14863,6 +15004,7 @@ impl Engine {
     /// 借用を返す [`get_text`] は writer 稼働中の Leaf に対しては aliasing UB になる
     /// ため、 並行 read する consumer は本 API を使う。
     pub fn get_text_owned(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<Vec<u8>> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
         self.text_owned_by_id(hid, eid)
@@ -14971,6 +15113,7 @@ impl Engine {
 
     /// entity の紐の値。 列の幅によらず u64 (u32 の列の値もそのまま広げて返す)。
     pub fn get(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<u64> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
         self.himos[hid].get_value(eid)
@@ -14979,6 +15122,7 @@ impl Engine {
     /// `get` の bindings 版。 schema 等で `himo_id` を起動時に pre-resolve した hot path 用。
     /// 名前 lookup (= himo_names の線形検索) が無くなるので point lookup が最速。
     pub fn get_by_id(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u64> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         self.himos.get(hid as usize)?.get_value(eid)
     }
@@ -16689,12 +16833,14 @@ impl Engine {
 
     /// 日付を epoch 日数として tie
     pub fn tie_date(&mut self, eid: enchudb_oplog::EntityId, himo: &str, year: u32, month: u32, day: u32) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.tie(eid, himo, Self::date_to_days(year, month, day));
     }
 
     /// epoch 日数から (year, month, day) を返す。 値が無い時と、 64 bit 列の値が日付でない
     /// (u32 を超える日数 = 約 1,170 万年より先、 年が u32 に入らない) 時は None
     pub fn get_date(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<(u32, u32, u32)> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.get(eid, himo).and_then(|d| u32::try_from(d).ok()).map(Self::days_to_date)
     }
 
@@ -16736,6 +16882,8 @@ impl Engine {
     }
 
     pub fn himos_of(&self, eid: enchudb_oplog::EntityId) -> Vec<&str> {
+
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         self.himos.iter().enumerate()
             .filter(|(_, ds)| ds.get_value(eid).is_some())
@@ -16747,6 +16895,7 @@ impl Engine {
     /// text は**借用**で返る。 書き手が同時に動かない時だけ使える — 他の thread / 他の process が
     /// 書いているなら [`Engine::get_entity_owned`] (#107、 debug build は [`Engine::get_text`] と同じ条件で止める)。
     pub fn get_entity(&self, eid: enchudb_oplog::EntityId) -> Vec<(&str, EntityValue<'_>)> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         let mut fields = Vec::with_capacity(self.himos.len());
         for (i, hs) in self.himos.iter().enumerate() {
@@ -16769,6 +16918,7 @@ impl Engine {
     /// 列ごとに読むので、 列をまたいだ 1 つの版ではない (揃った組が要るなら [`Engine::read_row`] の中で)。
     /// 読んでいる間に外れた列は入らない。
     pub fn get_entity_owned(&self, eid: enchudb_oplog::EntityId) -> Vec<(&str, EntityValueOwned)> {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         let mut fields = Vec::with_capacity(self.himos.len());
         for (i, hs) in self.himos.iter().enumerate() {
@@ -20016,6 +20166,7 @@ impl Engine {
     /// 0.33 までは write queue に積んで裏の consumer thread が後から当てていた (返った後の読みは `flush_writes` で待つ)。
     /// 書き込みの道を 1 本にするため、 その場で書く形に変えた。 名前は互換のために残す (新しいコードは `tie_to` を使う)。
     pub fn tie_async(&self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_async_by_id(eid, hid, value);
@@ -20024,6 +20175,7 @@ impl Engine {
     /// `tie_async` の himo_id 直指定版 (`tie_to_by_id` と同じ道)。 entity が紐の table の範囲の外、 または Ref の行き先が
     /// 行き先の table の範囲の外なら panic する (今まで通り。 `tie_to_by_id` は確かめない)。
     pub fn tie_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         // #59: 列の幅に入らない値 (sentinel 含む) は拒否 + 計上
@@ -20045,6 +20197,7 @@ impl Engine {
     /// 呼んだ thread がその場で書く text 版 (`tie_text_to` と同じ道。 `tie_async` の doc を参照)。 Tag は辞書に入れ、 WAL には
     /// `Vocab` → `Tie` の順に載せる (受け手で `(author_peer, vid)` → 受け手の vid の対応が先に張られる)。
     pub fn tie_text_async(&self, eid: enchudb_oplog::EntityId, himo: &str, value: &str) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_text_async_by_id(eid, hid, value);
@@ -20052,12 +20205,14 @@ impl Engine {
 
     /// `tie_text_async` の himo_id 直指定版。 text 本体は vocab 経由なので value はそのまま。
     pub fn tie_text_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.tie_bytes_async_by_id(eid, himo_id, value.as_bytes());
     }
 
     /// `tie_text_async_by_id` の bytes 版 (0.9.0: content 互換層も使う)。 `tie_bytes_to_by_id` と同じ道。 entity が紐の table の
     /// 範囲の外なら panic する (今まで通り)。
     pub fn tie_bytes_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &[u8]) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -20072,6 +20227,8 @@ impl Engine {
     /// WAL / 本体に運ぶ。 target_eid は u64 [peer|local] だが、 WAL は value: u32 しか運べないため peer_id 部は捨てる。 すなわち
     /// 受け手では 「author_peer と同じ peer 上の entity」 を指す ref として組み直される (cross-peer ref は未対応)。
     pub fn tie_ref_async(&self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
+        let target_eid = self.forward_eid(target_eid);
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_ref_async_by_id(eid, hid, target_eid);
@@ -20080,6 +20237,8 @@ impl Engine {
     /// `tie_ref_async` の himo_id 直指定版 (`tie_ref_to_by_id` と同じ道)。 entity が紐の table の範囲の外、 または行き先が行き先の
     /// table の範囲の外なら panic する (今まで通り)。
     pub fn tie_ref_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, target_eid: enchudb_oplog::EntityId) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
+        let target_eid = self.forward_eid(target_eid);
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let target_local = enchudb_oplog::eid_local(target_eid);
@@ -20101,17 +20260,20 @@ impl Engine {
 
     /// 呼んだ thread がその場で外す (`untie` と同じ道。 `tie_async` の doc を参照)。
     pub fn untie_async(&self, eid: enchudb_oplog::EntityId, himo: &str) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let hid = match self.himo_id(himo) { Some(x) => x as u16, None => return };
         self.untie_async_by_id(eid, hid);
     }
 
     /// `untie_async` の himo_id 直指定版 (`untie_by_id` と同じ道)。
     pub fn untie_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.untie_by_id(eid, himo_id);
     }
 
     /// 呼んだ thread がその場で消す (`delete` と同じ道。 `tie_async` の doc を参照)。
     pub fn delete_async(&self, eid: enchudb_oplog::EntityId) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.delete(eid);
     }
 
@@ -20121,6 +20283,7 @@ impl Engine {
     /// 0.9.0: 保存先を `_c_{key}` Leaf himo に変更 (`content` の doc 参照)。
     /// WAL には `Op::Content` ではなく通常の `Op::Vocab` + `Op::Tie` が乗る。
     pub fn content_async(&self, eid: enchudb_oplog::EntityId, key: &str, data: &[u8]) {
+        let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let hid = self.ensure_content_himo(local, key);
