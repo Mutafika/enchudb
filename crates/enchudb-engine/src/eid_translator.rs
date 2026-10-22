@@ -166,6 +166,21 @@ impl EidTranslator {
         }
     }
 
+    /// #612: 別名 `(author_peer, foreign_local)` を外す (畳んだ自分の行を元の slot に戻す時)。 逆写像の key は外さない。 外したら true。
+    pub fn unalias(&self, author_peer: PeerId, foreign_local: u32) -> bool {
+        let key = (author_peer, foreign_local);
+        let mut fwd = self.inner.write().unwrap();
+        let rev = self.translated_locals.read().unwrap();
+        let mut al = self.aliases.write().unwrap();
+        let Some(&old) = fwd.get(&key) else { return false };
+        if rev.get(&old) == Some(&key) {
+            return false;
+        }
+        fwd.remove(&key);
+        drop_alias(&mut al, old, key);
+        true
+    }
+
     /// #178: `local` を指す別名 (別名でなく逆写像の key は含まない)。
     pub fn aliases_of(&self, local: u32) -> Vec<Key> {
         self.aliases.read().unwrap().get(&local).cloned().unwrap_or_default()
