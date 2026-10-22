@@ -89,7 +89,7 @@ pub struct Truncated {
 
 impl std::fmt::Display for Truncated {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "changefeed position is no longer kept (oldest kept: {})", self.from)
+        write!(f, "position is no longer kept (oldest kept: {})", self.from)
     }
 }
 
