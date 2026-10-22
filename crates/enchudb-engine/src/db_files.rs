@@ -17,6 +17,9 @@ pub const OPLOG: &str = "oplog";
 pub const TABLES: &str = "tables";
 /// #9: eid 翻訳テーブル + foreign tombstone。
 pub const EIDMAP: &str = "eidmap";
+/// #560: `eidmap` の後に変わった分の追記 (`crate::eidmap_log`)。 header が今の `eidmap` と合う時だけ読む。 読まない旧 binary は
+/// `eidmap` だけを読む (きれいに閉じた後は追記が空なので全部ある)。
+pub const EIDMAP_LOG: &str = "eidmap.log";
 /// peer ごとの text vid 写像。
 pub const VOCABMAP: &str = "vocabmap";
 /// #513: 消した主キーの記録 (`crate::pk_tombs`)。
@@ -43,13 +46,16 @@ pub const LEAFFREE: &str = "leaf.free";
 pub const CREATING: &str = "creating";
 
 /// segment 以外に DB directory へ置かれ得る file 名の一覧 (migrate / copy 用)。
-pub const ALL: [&str; 12] = [OPLOG, TABLES, EIDMAP, EIDALIAS, VOCABMAP, PKTOMBS, PKFORMER, CRC, LOCK, SCHEMA, LEAFFREE, SEGMENTS];
+pub const ALL: [&str; 13] =
+    [OPLOG, TABLES, EIDMAP, EIDMAP_LOG, EIDALIAS, VOCABMAP, PKTOMBS, PKFORMER, CRC, LOCK, SCHEMA, LEAFFREE, SEGMENTS];
 
 /// HTTP bootstrap (`/bootstrap/{name}`) で本体と別に配る sidecar。 `.eidmap` 無しの
 /// restore は再 sync で重複 entity / tombstone 喪失、 `.vocabmap` 無しは受信済み `Vocab`
 /// の写像喪失を起こす (#78-H9)。 `pktombs` 無しは、 それまでに消した主キーの行が、 後から届いた同じ主キーの
 /// 古い行に当たらない (#513。 旧 server は 404 を返し、 受け手は無しで続ける)。 `eidalias` 無しは、 畳んだ行の世界番号宛ての
 /// record が新しい行として払い出される (#178)。 `pkformer` 無しは、 改名を知らない peer の古い名前の行が改名した行に束ならない。
+/// `eidmap` は `eidmap.log` を当てた形で配る (`Engine::eidmap_for_bootstrap`、 #560)。 log は配らない (古い受け手は取りに来ない、
+/// 別々に読むと間にまとめ直しが入って合わなくなる)。
 pub const BOOTSTRAP: [&str; 6] = [EIDMAP, EIDALIAS, TABLES, VOCABMAP, PKTOMBS, PKFORMER];
 
 /// `{db_dir}/{name}`。

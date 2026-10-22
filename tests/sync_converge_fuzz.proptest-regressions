@@ -15,3 +15,4 @@ cc 0a409ecc81e0169c849b34f74af25d63034d827260130a4e0f75491764fad3bd # shrinks to
 cc b1441eef06395038f3f71679ac865baabd541e0abad79d78d80a37bb37211e5e # shrinks to steps = [Upsert { by: 2, key: 2, title: 0 }, Upsert { by: 0, key: 2, title: 0 }, Pull { by: 0, from: 2 }, Rename { by: 0, from: 2, to: 0 }]
 cc 481bbfbcface29d4fd0e7cf1573657d80142a9e9fe17764bda74c88a73a2ff34 # shrinks to steps = [Upsert { by: 1, key: 1, title: 0 }, Upsert { by: 0, key: 0, title: 0 }, Rename { by: 1, from: 1, to: 2 }, Rename { by: 0, from: 0, to: 1 }]
 cc 694de82eaa234f3ddd942c19d52691d5ac0cd927d21bac652d3c50a3e26b8d37 # shrinks to steps = [Upsert { by: 1, key: 1, title: 0 }, Pull { by: 2, from: 1 }, Upsert { by: 1, key: 0, title: 0 }, Rename { by: 2, from: 1, to: 0 }, Rename { by: 1, from: 0, to: 2 }]
+cc 0fa55c3f44ee976bfe19d561e7d05baf2ab9bc0a7e4ae53d2aa5289b316ba982 # shrinks to steps = [Upsert { by: 2, key: 0, title: 0 }, Pull { by: 0, from: 2 }, Delete { by: 2, key: 0 }]

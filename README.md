@@ -373,6 +373,8 @@ belongs to the DB lives inside it — `mv`, `rm -r` and `cp -r` move the whole t
   oplog                     WAL (when enabled)
   tables                    table definitions (+ PK / extent blocks)
   eidmap, vocabmap          foreign-eid / vocab translation (only when syncing)
+  eidmap.log                eidmap changes since its last rewrite, appended (folded into
+                            eidmap on a clean close; relay bootstrap serves them folded)
   pktombs                   deleted primary keys, appended (syncing DBs that deleted a PK row)
   crc                       region CRC (only when seal_integrity is used)
   schema                    enchudb-schema's table schema

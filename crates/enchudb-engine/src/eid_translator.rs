@@ -73,6 +73,9 @@ pub struct EidTranslator {
     /// 確保の atomicity は写像の lock ではなくこの lock が担保する。 保持順は必ず
     /// `alloc_lock` → (`inner` | `translated_locals`) で、 逆向きに取る経路は無い。
     alloc_lock: std::sync::Mutex<()>,
+    /// #560: `.eidmap` の中身 (逆写像の組) が変わった key。 engine が書き出しの時に取り出し、 その key の今の中身だけを
+    /// `eidmap.log` に追記する。 変えた後に積む (先に積むと、 取り出した書き出しが古い中身を書き、 後の変更に印が無い)
+    dirty: std::sync::Mutex<Vec<Key>>,
 }
 
 impl Default for EidTranslator {
@@ -89,7 +92,40 @@ impl EidTranslator {
             aliases: RwLock::new(HashMap::new()),
             authors: RwLock::new(std::collections::BTreeSet::new()),
             alloc_lock: std::sync::Mutex::new(()),
+            dirty: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// #560: key の `.eidmap` の中身が変わった印 (engine の削除の版数の変化もここに積む)。
+    pub fn mark_dirty(&self, key: Key) {
+        self.dirty.lock().unwrap_or_else(|p| p.into_inner()).push(key);
+    }
+
+    /// #560: 印の付いた key を取り出す (重ねて積まれた key は 1 つに)。
+    pub fn take_dirty(&self) -> Vec<Key> {
+        let mut v = std::mem::take(&mut *self.dirty.lock().unwrap_or_else(|p| p.into_inner()));
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// #560: 書き出しに失敗した key を印に戻す。
+    pub fn restore_dirty(&self, keys: Vec<Key>) {
+        self.dirty.lock().unwrap_or_else(|p| p.into_inner()).extend(keys);
+    }
+
+    /// #560: 印を全部捨てる (開く時、 `.eidmap` から読んだ中身は disk と同じ)。
+    pub fn clear_dirty(&self) {
+        self.dirty.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// #560: key の `.eidmap` の写像の面 (`snapshot` に入る = 前向きの写像があり、 その local の別名でない) の local。 無ければ None。
+    pub fn mapped_local(&self, author_peer: PeerId, foreign_local: u32) -> Option<u32> {
+        let key = (author_peer, foreign_local);
+        let fwd = self.inner.read().unwrap();
+        let local = *fwd.get(&key)?;
+        let al = self.aliases.read().unwrap();
+        al.get(&local).is_none_or(|keys| !keys.contains(&key)).then_some(local)
     }
 
     /// 既存の写像を引く。 未登録なら None。
@@ -113,9 +149,9 @@ impl EidTranslator {
     /// 変わる場合は stale な逆写像 entry を掃除する。
     pub fn insert(&self, author_peer: PeerId, foreign_local: u32, local: u32) {
         let key = (author_peer, foreign_local);
-        let mut guard = self.inner.write().unwrap();
-        let old = guard.insert(key, local);
-        drop(guard);
+        // lock の順は `inner` → `translated_locals` → `aliases` (`alias` と同じ)
+        let mut fwd = self.inner.write().unwrap();
+        let old = fwd.insert(key, local);
         let mut rev = self.translated_locals.write().unwrap();
         if let Some(old_local) = old {
             // #178: 前の local の逆写像がこの key の時だけ外す (key がその local の別名だった時、 その local の逆写像は別の key)
@@ -123,13 +159,29 @@ impl EidTranslator {
                 rev.remove(&old_local);
             }
         }
-        rev.insert(local, key);
-        drop(rev);
+        let displaced = rev.insert(local, key).filter(|&k| k != key);
+        let mut al = self.aliases.write().unwrap();
         // #178: 別名だった key なら別名から外す (この local の逆写像になった / 他の local の別名だった)
         if let Some(old_local) = old {
-            let mut al = self.aliases.write().unwrap();
             drop_alias(&mut al, old_local, key);
             drop_alias(&mut al, local, key);
+        }
+        // #560: この local の前の逆写像の key が、 まだこの local を指していれば別名にする (宛名ではないが、 その世界番号宛ての
+        // record はこの local に当たる)。 前は前向きの写像だけが残り、 別名にも載らなかったので、 slot を使い回す時に外れず
+        // (`remove_local`)、 `.eidmap` では逆写像と同じ扱いの 2 つ目の key になっていた
+        if let Some(prev) = displaced
+            && fwd.get(&prev) == Some(&local)
+        {
+            let v = al.entry(local).or_default();
+            if !v.contains(&prev) {
+                v.push(prev);
+            }
+        }
+        drop((fwd, rev, al));
+        // #560: この key と、 この local の前の逆写像の key の中身が変わった
+        self.mark_dirty(key);
+        if let Some(prev) = displaced {
+            self.mark_dirty(prev);
         }
         // #226: author 索引。 lock は単独で取る (`inner` / `translated_locals` と
         // 同時には保持しないので、 既存の順序制約に影響しない)。
@@ -161,12 +213,15 @@ impl EidTranslator {
             }
         }
         drop((fwd, rev, al));
+        // #560: 逆写像だった key が別名になったかもしれない
+        self.mark_dirty(key);
         if !self.authors.read().unwrap().contains(&author_peer) {
             self.authors.write().unwrap().insert(author_peer);
         }
     }
 
     /// #612: 別名 `(author_peer, foreign_local)` を外す (畳んだ自分の行を元の slot に戻す時)。 逆写像の key は外さない。 外したら true。
+    /// 印 (#560) は付けない: 別名は `.eidmap` に入らないので、 外しても `.eidmap` の中身は変わらない。
     pub fn unalias(&self, author_peer: PeerId, foreign_local: u32) -> bool {
         let key = (author_peer, foreign_local);
         let mut fwd = self.inner.write().unwrap();
@@ -178,6 +233,7 @@ impl EidTranslator {
         }
         fwd.remove(&key);
         drop_alias(&mut al, old, key);
+        drop((fwd, rev, al));
         true
     }
 
@@ -292,6 +348,11 @@ impl EidTranslator {
                     out.push(key);
                 }
             }
+        }
+        drop(fwd);
+        // #560: 外した key の中身が変わった
+        for &key in &out {
+            self.mark_dirty(key);
         }
         out
     }
@@ -451,5 +512,62 @@ mod tests {
         let mut called = false;
         assert_eq!(t.if_unmapped(1, 42, || called = true), Err(7));
         assert!(!called, "写像があるのに呼んだ");
+    }
+
+    /// #560: 逆写像を別の key に張り替えた (`insert`) 時、 前の key がまだその local を指していれば別名になり、 slot を使い回す時
+    /// (`remove_local`) に一緒に外れる。 前は前向きの写像だけが残り、 使い回した slot の新しい住人にその世界番号宛ての record が
+    /// 入った (`.eidmap` の書き出しを disk と突き合わせて見つけた)。
+    #[test]
+    fn a_displaced_reverse_key_goes_with_the_slot() {
+        let t = EidTranslator::new();
+        t.insert(1, 10, 5);
+        t.insert(2, 20, 5);
+        assert_eq!(t.reverse(5), Some((2, 20)));
+        assert_eq!(t.get(1, 10), Some(5), "前提: 前の key もまだ同じ行に当たる");
+        let mut gone = t.remove_local(5);
+        gone.sort_unstable();
+        assert_eq!(gone, vec![(1, 10), (2, 20)], "slot を手放す時に前の key を外さない");
+        assert_eq!(t.get(1, 10), None, "前の key が使い回す slot を指したまま");
+    }
+
+    /// #560: `.eidmap` の写像の面 (`snapshot`) が変わった key には、 変えた操作の後に必ず印がある (印の付け忘れは、 落ちた後に
+    /// 開くとその写像を失う)。 4 つの書き換え (`insert` / `alias` / `unalias` / `remove_local`) を小さな key と slot の空間で
+    /// 乱数で並べ、 操作ごとに見る。
+    #[test]
+    fn every_change_to_the_eidmap_face_is_marked() {
+        let face = |t: &EidTranslator| -> HashMap<Key, u32> { t.snapshot().into_iter().map(|(p, f, l)| ((p, f), l)).collect() };
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n) as u32
+        };
+        for _ in 0..200 {
+            let t = EidTranslator::new();
+            for _ in 0..60 {
+                let before = face(&t);
+                let (peer, fl, local) = (1 + next(2), next(5), next(6));
+                let op = next(4);
+                match op {
+                    0 => t.insert(peer, fl, local),
+                    1 => t.alias(peer, fl, local),
+                    2 => {
+                        t.unalias(peer, fl);
+                    }
+                    _ => {
+                        let _ = t.remove_local(local);
+                    }
+                }
+                let after = face(&t);
+                let marked = t.take_dirty();
+                let mut changed: Vec<Key> = before.keys().chain(after.keys()).copied().filter(|k| before.get(k) != after.get(k)).collect();
+                changed.sort_unstable();
+                changed.dedup();
+                for k in changed {
+                    assert!(marked.contains(&k), "op {op} ({peer}, {fl}, {local}) で {k:?} の写像の面が {:?} → {:?} に変わったのに印が無い", before.get(&k), after.get(&k));
+                }
+            }
+        }
     }
 }
