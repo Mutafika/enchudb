@@ -4452,6 +4452,8 @@ pub struct Engine {
     consumer_thread: std::sync::OnceLock<std::thread::ThreadId>,
     /// #388: 満杯に近づいて consumer が書き出し + 畳みをした回数 (観測用)。
     wal_room_folds: std::sync::atomic::AtomicU64,
+    /// WAL の空きを待つ書き手が、 待ちの上限 (`WAL_ROOM_WAIT`) まで待って空かなかった回数 (観測用)。
+    wal_room_wait_timeouts: std::sync::atomic::AtomicU64,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
     /// #388: consumer が書き出し + 畳みを試して、 畳めない状態だった回数 (待ち手は、 待ち始めた後にこれが 1 回あれば諦める)。
@@ -5013,6 +5015,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
+            wal_room_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
             wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
@@ -6275,6 +6278,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
+            wal_room_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
             wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
@@ -19415,7 +19419,11 @@ impl Engine {
             }
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
-        wal.free_bytes() >= size
+        let room = wal.free_bytes() >= size;
+        if !room {
+            self.wal_room_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        room
     }
 
     /// #391: consumer thread が起きた (loop を回った) 回数。 何も書いていない間は増えない
@@ -19433,6 +19441,13 @@ impl Engine {
     /// #388: WAL が満杯の時に consumer が畳んで空いた回数 (書き手は待たされたが、 何も落ちていない)。
     pub fn wal_room_folds(&self) -> u64 {
         self.wal_room_folds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// WAL の空きを待つ書き手が、 待ちの上限 (5 秒) まで待っても空かなかった回数。 畳めない状態がすぐ分かった時 (sync の bridge が
+    /// 配り終えていない等) は待たずに諦めるので数えない。 0 でなければ、 空きを作る係が待っている書き手を待つ形 (#511 の 4) か、
+    /// 書き出しが 5 秒以上止まった。
+    pub fn wal_room_wait_timeouts(&self) -> u64 {
+        self.wal_room_wait_timeouts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// #440: bridge が写した `_sync_ops` の行と payload をまだ書き出していなければ、 本体を書き出す。 oplog を畳む前に呼ぶ
