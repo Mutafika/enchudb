@@ -251,12 +251,20 @@ fn the_floor_is_raised_once_when_the_full_episode_ends() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     w.join().unwrap();
     assert!(eng.wal_dropped_records() > 0, "前提: 満杯で落ちた record がある (無ければ floor は上がらない)");
-    // 数えた後に落ちがあれば、 その episode の終わり (= floor を上げる周) は数えた後に来る。 数えた後に落ちていなければ、 最後の
-    // episode は数える前に終わって上げ済みでありうる (遅い machine で書き手が止まった周、 #604)
+    // 数えた後に落ちがあれば、 その episode の終わり (= floor を上げる周) は数えた後に来る
     if eng.wal_dropped_records() > dropped_during {
         wait_floor_bump(&eng, during);
     }
+    // 書き手が止まった後に、 最後の episode を終わらせる: floor を上げるのは、 新しく落ちない bridge の周が
+    // `WAL_DROP_EPISODE_QUIET_MS` (100 ms) 続いた時。 数える前に最後の落ちがあっても、 その episode の終わりは数えた後の周に
+    // 来うる (前はここで待たずに数え、 その後に上がって落ちた、 #606 の CI)。 1 秒 bridge を回してから数える
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < quiet_until {
+        eng.transfer_oplog_to_sync_ops();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let after = eng.wal_drop_floor_bumps();
+    assert!(after > 0, "落ちた record があるのに floor を 1 度も上げない");
     std::thread::sleep(std::time::Duration::from_millis(300));
     eng.transfer_oplog_to_sync_ops();
     assert_eq!(eng.wal_drop_floor_bumps(), after, "落ちなくなった後にも上げた");
