@@ -19,11 +19,22 @@ struct Recorder {
     calls: AtomicUsize,
     delay: Duration,
     gate: AtomicBool,
+    /// `on_detached` で受け取った HLC (#560)
+    detached: Mutex<Option<enchudb_oplog::Hlc>>,
+    /// `on_changes` に入ったか (門で止まっている間も立つ)
+    entered: AtomicBool,
 }
 
 impl Recorder {
     fn new(delay: Duration, open: bool) -> Arc<Self> {
-        Arc::new(Self { seen: Mutex::new(Vec::new()), calls: AtomicUsize::new(0), delay, gate: AtomicBool::new(open) })
+        Arc::new(Self {
+            seen: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            delay,
+            gate: AtomicBool::new(open),
+            detached: Mutex::new(None),
+            entered: AtomicBool::new(false),
+        })
     }
     fn len(&self) -> usize {
         self.seen.lock().unwrap().len()
@@ -32,6 +43,7 @@ impl Recorder {
 
 impl ChangeListener for Recorder {
     fn on_changes(&self, recs: &[WireRecord]) {
+        self.entered.store(true, Ordering::Release);
         // 止める受け手: test が門を開けるまで (最大 30 秒) 返らない
         let until = Instant::now() + Duration::from_secs(30);
         while !self.gate.load(Ordering::Acquire) && Instant::now() < until {
@@ -45,6 +57,10 @@ impl ChangeListener for Recorder {
                 s.push(value);
             }
         }
+    }
+
+    fn on_detached(&self, lost_from: enchudb_oplog::Hlc) {
+        *self.detached.lock().unwrap() = Some(lost_from);
     }
 }
 
@@ -147,4 +163,88 @@ fn stalled_listener_does_not_stall_writers() {
     if let Some(m) = first_mismatch(&got, N) {
         panic!("受け手に順に 1 回ずつ届いていない: {m} ({seen})");
     }
+}
+
+/// #560: 止まった受け手の溜めが上限を越えたら、 溜めを捨てて受け手を外す (書き手は止めない、 記録も落とさない)。 受け手が戻ると
+/// `on_detached` で、 渡せなかった最初の記録の HLC を受け取る。 外した後は溜めない。 前は上限が無く、 止まった受け手の間は畳むたびに
+/// ring の全部を写して溜め続けた。
+#[test]
+fn stalled_listener_is_detached_when_the_backlog_overflows() {
+    let (p, eng) = engine("overflow", 256 << 10);
+    // 1 回の畳みで移す分 (WAL 256 KiB 分の record、 溜めでは 1 つ約 2.5 倍) より大きく、 2 回分より小さい = 溜まって越える
+    eng.set_change_backlog_limit(1 << 20);
+    let rec = Recorder::new(Duration::ZERO, false);
+    eng.add_change_listener(rec.clone());
+    const N: u64 = 50_000;
+    let (folds, took) = write_in_order(&eng, N);
+    let dropped = eng.wal_dropped_records();
+    let (detached, listeners, backlog) = (eng.change_listeners_detached(), eng.change_listener_count(), eng.change_backlog_len());
+    rec.gate.store(true, Ordering::Release);
+    let until = Instant::now() + Duration::from_secs(30);
+    while rec.detached.lock().unwrap().is_none() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let lost_from = *rec.detached.lock().unwrap();
+    let seen = rec.len();
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+    let what = format!("畳んだ {folds} 回、 書くのに {took:?}、 落ちた記録 {dropped}、 外した {detached}、 受け手 {listeners}、 溜め {backlog}");
+    assert!(folds >= 5, "前提: 書いている間に 5 回以上畳む ({what})");
+    assert_eq!(detached, 1, "溜めが上限を越えても受け手を外さない ({what})");
+    assert_eq!(listeners, 0, "外した受け手が残っている ({what})");
+    assert_eq!(backlog, 0, "外した後も溜めている ({what})");
+    assert_eq!(dropped, 0, "記録が落ちた ({what})");
+    assert!(took < Duration::from_secs(3), "書き手が止まっている受け手を待った ({what})");
+    assert!(lost_from.is_some(), "受け手が on_detached を受け取らない ({what})");
+    assert!((seen as u64) < N, "外した受け手に全部届いた ({what}、 届いた {seen})");
+}
+
+/// #560 の対照: すぐ受け取る受け手は、 上限が WAL の 2 倍でも、 何度畳んでも外されない (溜めの大きさは配った分だけ減る)。
+#[test]
+fn prompt_listener_is_not_detached_under_a_small_limit() {
+    let (p, eng) = engine("prompt", 256 << 10);
+    eng.set_change_backlog_limit(512 << 10);
+    let rec = Recorder::new(Duration::ZERO, true);
+    eng.add_change_listener(rec.clone());
+    const N: u64 = 200_000;
+    let (folds, _) = write_in_order(&eng, N);
+    eng.oplog_sync().unwrap();
+    let got = wait_for(&rec, N as usize, Duration::from_secs(60));
+    let detached = eng.change_listeners_detached();
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+    assert!(folds >= 20, "前提: 書いている間に 20 回以上畳む (畳んだ {folds} 回)");
+    assert_eq!(detached, 0, "すぐ受け取る受け手を外した (畳んだ {folds} 回)");
+    if let Some(m) = first_mismatch(&got, N) {
+        panic!("受け手に順に 1 回ずつ届いていない: {m}");
+    }
+}
+
+/// #560: 通知係が止まった受け手に配っている最中でも、 `oplog_sync()` は永久には待たない (上限 5 秒で配らずに返る。 残りは
+/// 通知係が配る)。 前は受け手が返るまで待った (受け手が永久に止まれば `oplog_sync()` も永久)。
+#[test]
+fn oplog_sync_does_not_wait_forever_behind_a_stuck_listener() {
+    let (p, eng) = engine("stuck-sync", 1 << 20);
+    let rec = Recorder::new(Duration::ZERO, false);
+    eng.add_change_listener(rec.clone());
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    eng.tie_to_by_id(a, ts, 1u64);
+    eng.oplog_commit();
+    // 通知係が配り始めて受け手の門で止まるのを待つ (consumer の周期で配る)
+    let until = Instant::now() + Duration::from_secs(10);
+    while !rec.entered.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(rec.entered.load(Ordering::Acquire), "前提: 通知係が受け手に配り始めた");
+    eng.tie_to_by_id(a, ts, 2u64);
+    let started = Instant::now();
+    eng.oplog_sync().unwrap();
+    let took = started.elapsed();
+    rec.gate.store(true, Ordering::Release);
+    let got = wait_for(&rec, 2, Duration::from_secs(30));
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+    assert!(took < Duration::from_secs(10), "oplog_sync が止まった受け手を {took:?} 待った");
+    assert_eq!(got, vec![1, 2], "受け手が戻った後に残りが届かない");
 }

@@ -72,14 +72,14 @@ fn writes_dropped_right_before_close_reach_the_peer() {
     let mut dropped = Vec::new();
     {
         let _no_fold = eng_a.transfer_lock_for_fold();
-        // 閉じた group で WAL を埋め、 残りを 100 B (Tie 128 B も Commit 112 B も入らない) にする。 TieLeaf の record は
+        // 閉じた group で WAL を埋め、 残りを 100 B (Tie 136 B も Commit 120 B も入らない) にする。 TieLeaf の record は
         // 文字列の長さ + c B
         let e0 = eng_a.entity_in("notes").unwrap();
         let h0 = wal.head();
         eng_a.tie_text_to(e0, "notes.body", "x");
         let c = wal.head() - h0 - 1;
         eng_a.oplog_commit();
-        let pad = wal.free_bytes() - 112 - 100 - c;
+        let pad = wal.free_bytes() - wal.record_size_of(0) as u64 - 100 - c;
         let e1 = eng_a.entity_in("notes").unwrap();
         eng_a.tie_text_to(e1, "notes.body", &"p".repeat(pad as usize));
         eng_a.oplog_commit();

@@ -18,7 +18,8 @@ async-blob = ["dep:async-trait", "dep:tokio"]
 [lints.rust]
 # loom model test (tests/loom_append_publish.rs) は `--cfg loom` で有効化する。
 # check-cfg に登録して unexpected_cfgs 警告を抑止。
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+# 行の lock (row_lock.rs) を loom の atomic で組むのは enchudb だけの `--cfg enchu_loom` (tests/loom_row_lock.rs、 #563)。
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(enchu_loom)'] }
 
 [dependencies]
 enchudb-oplog = { path = "../enchudb-oplog" }
@@ -55,6 +56,11 @@ windows-sys = { version = "0.59", features = [
 # std::time panics on wasm32-unknown-unknown ("time not implemented"); web-time
 # shims Instant/SystemTime for the browser.
 web-time = "1"
+
+# `--cfg enchu_loom` の時だけ、 行の lock (`row_lock.rs`) を loom の atomic で組む (tests/loom_row_lock.rs、 #563)。 普段の build には入らない。
+# `--cfg loom` にしないのは、 利用者が自分の loom 試験で付けた時に enchudb の lock まで loom になって model の外で panic するため
+[target.'cfg(enchu_loom)'.dependencies]
+loom = "0.7"
 
 [dev-dependencies]
 # model-based property test (engine op 列 vs 参照 oracle、#95 の stale/verify 網羅)
