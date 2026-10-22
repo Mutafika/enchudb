@@ -227,6 +227,9 @@ fn a_dropped_relayed_record_raises_its_authors_floor_to_its_own_hlc() {
 fn the_floor_is_raised_once_when_the_full_episode_ends() {
     let pa = tmp_path("episode");
     let eng = make_engine(&pa, 1, 64 * 1024);
+    // #388 から満杯の書き手は consumer が畳むのを待つので、 速い machine では 1 件も落ちず floor も上がらない (#604)。 待ち手を
+    // 外して、 満杯で落ちる経路にする (畳むのは consumer の周のまま)
+    eng.oplog().unwrap().set_room_waiter(None);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let w = {
         let (eng, stop) = (eng.clone(), stop.clone());
@@ -243,11 +246,16 @@ fn the_floor_is_raised_once_when_the_full_episode_ends() {
     };
     // 1.5 秒 (consumer の 15 周) 書き続ける。 bridge は consumer の周だけ
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    let during = eng.wal_drop_floor_bumps();
+    let (during, dropped_during) = (eng.wal_drop_floor_bumps(), eng.wal_dropped_records());
     assert!(during < 5, "満杯の間に floor を {during} 回上げた");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     w.join().unwrap();
-    wait_floor_bump(&eng, during);
+    assert!(eng.wal_dropped_records() > 0, "前提: 満杯で落ちた record がある (無ければ floor は上がらない)");
+    // 数えた後に落ちがあれば、 その episode の終わり (= floor を上げる周) は数えた後に来る。 数えた後に落ちていなければ、 最後の
+    // episode は数える前に終わって上げ済みでありうる (遅い machine で書き手が止まった周、 #604)
+    if eng.wal_dropped_records() > dropped_during {
+        wait_floor_bump(&eng, during);
+    }
     let after = eng.wal_drop_floor_bumps();
     std::thread::sleep(std::time::Duration::from_millis(300));
     eng.transfer_oplog_to_sync_ops();

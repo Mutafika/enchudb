@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 41e056141d05742a8637823c5b9b18bf2c7ed11af00335807c758f36bc69417b # shrinks to steps = [Upsert { by: 0, key: 1, title: 0 }, Rename { by: 0, from: 1, to: 0 }, Upsert { by: 0, key: 1, title: 0 }]
+cc 722890a5fce0c9682f560ee2b35c23742019b2180766ce84ddcc057524d270af # shrinks to steps = [Upsert { by: 1, key: 2, title: 0 }, Pull { by: 2, from: 1 }, Delete { by: 1, key: 2 }, Upsert { by: 0, key: 2, title: 0 }]
+cc 1a166dc5b09f6ce1d263f526a415aa902f46c44c0e27cfdedbdce996757acd5f # shrinks to steps = [Upsert { by: 1, key: 2, title: 0 }, Upsert { by: 0, key: 2, title: 0 }, Delete { by: 0, key: 2 }, Upsert { by: 1, key: 2, title: 0 }]
+cc 13385c71a12822c1615fca1622d535be288f65c04c25ea7e607861750379acd2 # shrinks to steps = [Upsert { by: 0, key: 1, title: 0 }, Pull { by: 1, from: 0 }, Upsert { by: 2, key: 1, title: 0 }, Retitle { by: 1, key: 1, title: 0 }, Delete { by: 2, key: 1 }]
+cc 21ddca5ec04a5cfc23fee3d746237e2751be3d6f42d3ba055035afc040fb0540 # shrinks to steps = [Upsert { by: 1, key: 1, title: 0 }, Rename { by: 1, from: 1, to: 2 }, Upsert { by: 2, key: 1, title: 0 }]
+cc dfa9876130a900a01e4e627ba34ddce7ed8b433cfc6864620571106a98c6c8d5 # shrinks to steps = [Upsert { by: 1, key: 0, title: 0 }, Upsert { by: 2, key: 2, title: 0 }, Upsert { by: 0, key: 2, title: 0 }, Rename { by: 0, from: 2, to: 0 }]
+cc e8610d51cf52b26c0380beeceb71e4994e5cdae4f58125ca6d9fa6d50cd85bc7 # shrinks to steps = [Upsert { by: 2, key: 1, title: 0 }, Pull { by: 1, from: 2 }, Upsert { by: 2, key: 0, title: 0 }, Rename { by: 1, from: 1, to: 0 }]
+cc 0a409ecc81e0169c849b34f74af25d63034d827260130a4e0f75491764fad3bd # shrinks to steps = [Upsert { by: 2, key: 1, title: 0 }, Upsert { by: 1, key: 1, title: 0 }, Rename { by: 2, from: 1, to: 2 }, Upsert { by: 0, key: 1, title: 0 }, Rename { by: 1, from: 1, to: 0 }]
+cc b1441eef06395038f3f71679ac865baabd541e0abad79d78d80a37bb37211e5e # shrinks to steps = [Upsert { by: 2, key: 2, title: 0 }, Upsert { by: 0, key: 2, title: 0 }, Pull { by: 0, from: 2 }, Rename { by: 0, from: 2, to: 0 }]

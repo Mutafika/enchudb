@@ -2177,6 +2177,11 @@ impl<'a> RowBuilder<'a> {
         // #548: 名前のカードを最初に書く。 sync で書き込みが分かれて届いても、 受け手は名前より先に他のカードを受けない
         let mut resolved: Vec<_> = resolved.collect();
         if let Some(nc) = name_col {
+            // #581: upsert が名前で当たった行には名前のカードを書き直さない (引いた値と同じ。 書き直すと名前の版数が上がり、 その
+            // 名前になった時刻 = 行の作成が分からなくなる。 sync は束ねた行の切り離しを作成の時刻で決める)
+            if target_eid.is_some() {
+                resolved.retain(|(c, _)| c.name != nc.name);
+            }
             resolved.sort_by_key(|(c, _)| c.name != nc.name);
         }
 
@@ -7027,8 +7032,20 @@ impl<'a> EntityUpdate<'a> {
         }
         // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
         let _row = eng.write_row(self.eid);
+        let name = self.table.pk.map(|i| &self.table.cols[i]);
         for (col, v) in &self.values {
-            tie_value(eng, self.eid, col.get()?, v)?;
+            let cd = col.get()?;
+            // #581: 名前を今と同じ値で書くのは書かない (名前の版数 = その名前になった時刻を保つ)
+            if let Some(nc) = name
+                && cd.name == nc.name
+                && !matches!(v, Value::Null)
+                && let Ok(raw) = value_to_raw_for_query(eng, cd, v)
+                && raw != u64::MAX
+                && eng.get_by_id(self.eid, cd.himo_id) == Some(raw)
+            {
+                continue;
+            }
+            tie_value(eng, self.eid, cd, v)?;
         }
         Ok(())
     }
