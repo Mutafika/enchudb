@@ -104,7 +104,7 @@ pub mod blob_store;
 pub mod sparse_copy;
 
 pub use engine::{DbState, Engine, EntityValue, EntityValueOwned, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, PkValue, RemoteApply, TieRejected, VocabUsage};
-pub use live::{Agg, GroupedLiveQuery, KeyedDelta, LiveCounts, LiveGroup, LiveDelta, LiveKeyed, LivePred, LiveQuery, TouchedDelta, TouchedLiveQuery, MAX_BRANCHES, MAX_KEYS};
+pub use live::{Agg, AnswerHandle, AnswerSpec, GroupedLiveQuery, KeyedDelta, LiveCounts, LiveGroup, LiveDelta, LiveKeyed, LivePred, LiveQuery, TouchedDelta, TouchedLiveQuery, MAX_BRANCHES, MAX_KEYS};
 pub use sparse_copy::copy_sparse;
 /// 番号で受け直す流れ (changefeed の記録・宣言された答え) の 「その位置はもう無い」。
 pub use change_log::Truncated;
