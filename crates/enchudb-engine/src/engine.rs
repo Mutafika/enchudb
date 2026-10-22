@@ -911,6 +911,18 @@ const WAL_DROP_FLOOR_MAX_DELAY_MS: u64 = 5_000;
 /// consumer を起こして bridge を回すと、 落ちと落ちの間に毎回 「終わった」 になり floor を上げ続けた。
 const WAL_DROP_EPISODE_QUIET_MS: u64 = 100;
 
+/// #451 (段階 1): 配り済みの印の候補 = 切れ目 (`Engine::take_durable_cut`)。 置く時 (`Engine::end_durable_cut`) に S を決める。
+struct DurableCut {
+    hlc: enchudb_oplog::Hlc,
+    /// 切れ目の前に読んだ `next_sync_lsn - 1` (S の下限: ここまでの行は切れ目より前)
+    lsn_at_cut: u32,
+    /// oplog の (周, 切れ目の時の終わり): 開く時の header の走査はここから
+    wal: (u32, u64),
+    /// 切れ目の時の、 自分の落ちた record を覚えた回数 (`OpLog::dropped_gen`)。 置く時に変わっていれば置かない (切れ目の後の Commit が
+    /// 満杯で畳みを起こし、 切れ目以下の閉じていない record を孤児 (#450) として落とした時: 時計では分からない)
+    dropped_gen: u64,
+}
+
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
@@ -2048,6 +2060,102 @@ mod consumer_sleep_hook {
 
     pub(super) fn call(wal: &OpLog) {
         HOOK.call(wal);
+    }
+}
+
+/// #451 (段階 1) の test: bridge が落ちた write の floor を本体に書く直前の割り込み点 (持ち越しに残ったまま書いていることを見る)。
+#[cfg(test)]
+mod floor_write_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// #451 (段階 1): 落ちた write の floor を本体に書いている間、 切れ目は候補を出さない (持ち越しから取り出してから書くと、 その間の
+/// 切れ目が floor の無い落ちた write を印で覆う = 隣のレビューで見つかった穴)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod durable_cut_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn the_cut_waits_while_a_floor_is_being_written() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-floorcut-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_cell_version(&path, 65_536).unwrap();
+        eng.define_table("notes", 1_000).unwrap();
+        eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("notes", "body", ValueType::Leaf, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 64 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let wal = eng.oplog().unwrap().clone();
+        wal.set_room_waiter(None);
+        let e0 = eng.entity_in("notes").unwrap();
+        eng.tie_to(e0, "notes.note", 100);
+        eng.oplog_sync().unwrap();
+        {
+            let _no_fold = eng.transfer_lock_for_fold();
+            let e1 = eng.entity_in("notes").unwrap();
+            let h0 = wal.head();
+            eng.tie_text_to(e1, "notes.body", "x");
+            let c = wal.head() - h0 - 1;
+            eng.oplog_commit();
+            let commit = wal.record_size_of(0) as u64;
+            let pad = wal.free_bytes() - commit - (commit + 60) - c;
+            let e2 = eng.entity_in("notes").unwrap();
+            eng.tie_text_to(e2, "notes.body", &"p".repeat(pad as usize));
+            eng.oplog_commit();
+            assert_eq!(wal.free_bytes(), commit + 60, "前提: Commit は入るが Tie は入らない残り");
+            let head = wal.head();
+            let e = eng.entity_in("notes").unwrap();
+            eng.tie_to(e, "notes.note", 1);
+            assert_eq!(wal.head(), head, "前提: WAL に載らない");
+        }
+        // 持ち越しへ (静かになるまで floor は上げない)
+        eng.transfer_oplog_to_sync_ops();
+        assert!(eng.take_durable_cut(&wal).is_none(), "持ち越し中は候補なし");
+        // floor を書く直前の割り込み点で切れ目を取る → 候補なし (持ち越しに残っている)。 割り込み点は consumer の bridge が踏むことも
+        // あるので (静かになった後の周期)、 結果は flag で受けて test の thread で確かめる
+        let seen = Arc::new(AtomicBool::new(false));
+        let violated = Arc::new(AtomicBool::new(false));
+        let (eng2, seen2, violated2) = (eng.clone(), seen.clone(), violated.clone());
+        floor_write_hook::set(&wal, move |wal| {
+            // 候補が出たら (穴) flag だけ立てる (ここは bridge の transfer_lock の中なので、 end_durable_cut は呼ばない = 自分を待つ)
+            if eng2.take_durable_cut(wal).is_some() {
+                violated2.store(true, Ordering::Release);
+            }
+            seen2.store(true, Ordering::Release);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(WAL_DROP_EPISODE_QUIET_MS + 20));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !seen.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "前提: 静かになった後の bridge が floor を書く");
+            eng.transfer_oplog_to_sync_ops();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!violated.load(Ordering::Acquire), "floor を本体に書いている間に切れ目が候補を出した");
+        assert_eq!(eng.wal_drop_floor_bumps(), 1);
+        // 書き終えた後は候補が出る (floor は次の本体の書き出しで届く = 切れ目の後の書き出し)
+        let cut = eng.take_durable_cut(&wal).expect("floor を書いた後は候補が出る");
+        eng.end_durable_cut(&wal, cut, false);
+        drop((wal, eng));
+        let _ = enchudb_engine_remove(&path);
+    }
+
+    fn enchudb_engine_remove(path: &str) -> std::io::Result<()> {
+        crate::db_files::remove_db(path)
     }
 }
 
@@ -4618,6 +4726,14 @@ pub struct Engine {
     wal_drop_floor_bumps: std::sync::atomic::AtomicU64,
     /// #451: 開く時に、 本体にあって oplog / `_sync_ops` に無かった自分の write を作り直した cell / 削除の数。
     unlogged_writes_relogged: std::sync::atomic::AtomicU64,
+    /// #451 (段階 1): 配り済みの印を置いた回数 (観測用)。
+    durable_mark_publishes: std::sync::atomic::AtomicU64,
+    /// #451 (段階 1): 置いた印がまだ ring の書き出しに乗っていない (consumer が、 書くものの無い周期に ring だけ書き出す)。
+    durable_mark_flush_pending: std::sync::atomic::AtomicBool,
+    /// #451 (段階 1): 置く前の切れ目 (C, 切れ目より後の自分の record の最初の行の手前の lsn)。 bridge が自分の record (HLC > C) の行を
+    /// 作る時に埋める = 印の S はその行の手前まで (`durable_cuts_open` は空でない時だけ bridge が lock を取るための数)。
+    durable_cuts: std::sync::Mutex<Vec<(enchudb_oplog::Hlc, Option<u32>)>>,
+    durable_cuts_open: std::sync::atomic::AtomicUsize,
     /// #57: まだ floor に入れていない、 WAL に載らなかった record (author, 落ちた HLC の max) と、
     /// 最初に落ちた時刻 / 最後に落ちたのを見た時刻 (unix ms)。 満杯の episode が終わったら (最後に落ちてから
     /// `WAL_DROP_EPISODE_QUIET_MS` 落ちなかったら) まとめて floor に入れる。
@@ -5089,6 +5205,10 @@ impl Engine {
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
+            durable_mark_publishes: std::sync::atomic::AtomicU64::new(0),
+            durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
+            durable_cuts: std::sync::Mutex::new(Vec::new()),
+            durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
             wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
@@ -6358,6 +6478,10 @@ impl Engine {
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
+            durable_mark_publishes: std::sync::atomic::AtomicU64::new(0),
+            durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
+            durable_cuts: std::sync::Mutex::new(Vec::new()),
+            durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
             wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
@@ -6584,6 +6708,10 @@ impl Engine {
                 if v > max_lsn { max_lsn = v; }
             });
         }
+        // #451 (段階 1): 行を全部回収した後 (ack で消えた) でも、 印の S 以下の lsn は出さない (印は 「lsn ≤ S の行は切れ目より前」 を言う)
+        if let Some(m) = self.durable_mark() {
+            max_lsn = max_lsn.max(m.lsn);
+        }
         if max_lsn > 0 {
             // 既に進んでいる場合は後退させない (enable → open の二重呼び等)
             let cur = self.next_sync_lsn.load(Ordering::Acquire);
@@ -6683,9 +6811,11 @@ impl Engine {
         // 閉じる時 (consumer の最後の bridge) は待たずに上げる (#449)。 落ちたことはメモリにしか無いので、
         // 待つと閉じた後に floor が残らず、 落ちた write は本体にあるのに相手に永久に届かない。
         let closing = self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire));
-        let fresh = wal.take_dropped();
         let due = {
+            // #451 (段階 1): WAL が覚えた落ちた record を持ち越しへ移すのは持ち越しの lock の下で (切れ目 (`take_durable_cut`) は
+            // この lock を持って両方を見るので、 移す途中の record を見逃さない)
             let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = wal.take_dropped();
             let had_fresh = !fresh.is_empty();
             for (a, h) in fresh {
                 match p.0.iter_mut().find(|(x, _)| *x == a) {
@@ -6703,8 +6833,11 @@ impl Engine {
                 }
                 let quiet = now_ms.saturating_sub(*last) >= WAL_DROP_EPISODE_QUIET_MS;
                 if closing || quiet || now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
-                    p.1 = None;
-                    Some(std::mem::take(&mut p.0))
+                    // #451 (段階 1): 持ち越しから取り出さずに写す。 floor を本体に書き終えてから (下) 持ち越しの lock の下で消す:
+                    // 書いている間も持ち越しに残っているので、 切れ目 (`take_durable_cut`) はその間も候補を出さない (取り出してから
+                    // 書くと、 その間の切れ目が floor の無い落ちた write を印で覆い、 印が ring の書き出しで先に届くと相手に永久に届かない)。
+                    // 記録できなかった時は持ち越しに残ったまま (次の周にまた上げる)
+                    Some(p.0.clone())
                 } else {
                     None
                 }
@@ -6715,16 +6848,15 @@ impl Engine {
             let me = self.peer_id();
             let floors: Vec<(u32, enchudb_oplog::Hlc)> =
                 dropped.iter().map(|&(a, h)| (a, if a == me { now.max(h) } else { h })).collect();
+            #[cfg(test)]
+            floor_write_hook::call(wal);
             if self.record_reclaimed_floors(&floors) {
                 self.wal_drop_floor_bumps.fetch_add(1, Ordering::Relaxed);
-            } else {
-                // 記録できなかった分は次の周に持ち越す (捨てると穴を知らせる手段が無くなる)
                 let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
-                for (a, h) in dropped {
-                    match p.0.iter_mut().find(|(x, _)| *x == a) {
-                        Some((_, m)) => *m = (*m).max(h),
-                        None => p.0.push((a, h)),
-                    }
+                // 書いた分だけ消す (書いている間に同じ author がまた落ちて HLC が進んだ分は残す = 次の周にまた上げる)
+                p.0.retain(|e| !dropped.contains(e));
+                if p.0.is_empty() {
+                    p.1 = None;
                 }
             }
         }
@@ -6983,6 +7115,10 @@ impl Engine {
             };
             count += 1;
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
+            // #451 (段階 1): 置く前の切れ目より後の自分の record の行 = その切れ目の印 S はこの行の手前まで
+            if rec.author_peer == self_peer && self.durable_cuts_open.load(Ordering::Acquire) > 0 {
+                self.note_row_after_cut(rec.hlc, lsn);
+            }
             if trace {
                 eprintln!(
                     "[bridge]   row lsn={lsn} eid={row_eid} op={:?}",
@@ -7216,6 +7352,12 @@ impl Engine {
         *ON.get_or_init(|| std::env::var("ENCHU_TRACE_BRIDGE").is_ok_and(|v| v != "0"))
     }
 
+    /// `ENCHU_TRACE_OPEN=1` で、 開く時の段ごとの時間を stderr に出す (OPEN_TIME_PLAN、 #451 の照合など)。
+    pub fn trace_open_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("ENCHU_TRACE_OPEN").is_ok_and(|v| v != "0"))
+    }
+
     /// `try_reset_if` の述語として `append_lock` 保持下で呼ばれる `wal_fold_safe`。 true なら呼び手はそのまま畳む。
     ///
     /// 判定内容は `wal_fold_safe` と同一。 違いは 2 つ:
@@ -7374,6 +7516,151 @@ impl Engine {
     pub fn unlogged_writes_relogged(&self) -> u64 {
         self.unlogged_writes_relogged.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// #451 (段階 1): 配り済みの印を置いた回数 (観測用)。
+    pub fn durable_mark_publishes(&self) -> u64 {
+        self.durable_mark_publishes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #451 (段階 1): 配り済みの印 (payload の ring の header)。 ring を持たない DB (packed / wasm / sync の表なし) と、 0.35 以前の
+    /// binary が作った ring は `None`。 ring をまだ開いていなければ file から読むだけ (位置合わせで行をなめない)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn durable_mark(&self) -> Option<crate::sync_payload_ring::DurableMark> {
+        if let Some(r) = self.sync_payload_ring.get() {
+            return r.durable_mark();
+        }
+        let Backing::Segments(set) = &self.backing else { return None };
+        crate::sync_payload_ring::PayloadRing::read_durable_mark(set.dir())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn durable_mark(&self) -> Option<crate::sync_payload_ring::DurableMark> {
+        None
+    }
+
+    /// #451 (段階 1): 配り済みの印の候補 (C, S) を切れ目で取る。 **Commit を打つ前に呼ぶ** (印が覆う record は全部、 その Commit で
+    /// 閉じた group に入り、 畳む時の孤児 (#450) にならない)。 候補を置けるのは、 この後に始めた oplog の fsync と本体の書き出しが
+    /// 返り、 Commit が打てた後 ([`Self::publish_durable_mark`])。
+    ///
+    /// - C = 時計の今 (`OpLog::durable_cut_for`、 append_lock の下)。 HLC ≤ C の自分の record は全部 ring に書き終えている
+    /// - S = 切れ目より前に読んだ `next_sync_lsn` - 1。 lsn ≤ S の行は切れ目より前に作った行 = 切れ目より前に載った record (HLC ≤ C)
+    ///   から作った行 (行を作るのは record を読んだ後)
+    /// - 落ちた write (#57 / #450) の floor がまだ無い間 (WAL が覚えている / 持ち越し中) は `None` (前の印のまま。 印は一度正しければ
+    ///   ずっと正しい)。 外すと、 落ちた write (本体にだけある) を印が覆い、 開く時に floor が上がらず相手に永久に届かない
+    /// - 切れ目は置くまで `durable_cuts` に登録しておき、 その間に bridge が作った行のうち自分の record で HLC > C のものの最初の行を
+    ///   覚える (S はその手前まで伸ばせる = 切れ目の後の bridge が切れ目以下の record の行を作っても印に入る)。 置かなくても
+    ///   [`Self::end_durable_cut`] で外すこと
+    fn take_durable_cut(&self, wal: &enchudb_oplog::oplog::OpLog) -> Option<DurableCut> {
+        use std::sync::atomic::Ordering;
+        if !self.sync_tables_on() {
+            return None;
+        }
+        let me = self.peer_id();
+        let pending = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.0.iter().any(|(a, _)| *a == me) {
+            return None;
+        }
+        // 登録 (`durable_cuts`) は時計を覗く前に: 覗いてから登録するまでに bridge が作った自分の record (> C) の行を見逃すと、
+        // S がその行を越えて、 畳んだ後に落ちると作り直して二重に配る。 lock を持ったまま覗く (bridge の行の記録は待つ、 一瞬)
+        let mut cuts = self.durable_cuts.lock().unwrap_or_else(|e| e.into_inner());
+        self.durable_cuts_open.store(cuts.len() + 1, Ordering::Release);
+        let lsn = self.next_sync_lsn.load(Ordering::Acquire).saturating_sub(1);
+        let point = wal.durable_cut_for(me);
+        drop(pending);
+        if point.dropped_pending {
+            self.durable_cuts_open.store(cuts.len(), Ordering::Release);
+            return None;
+        }
+        cuts.push((point.hlc, None));
+        Some(DurableCut {
+            hlc: point.hlc,
+            lsn_at_cut: lsn,
+            wal: (point.lap, point.offset),
+            dropped_gen: point.dropped_gen,
+        })
+    }
+
+    /// #451 (段階 1): bridge が自分の record の行を作った。 置く前の切れ目のうち、 この record が切れ目より後 (HLC > C) で、 まだ
+    /// 最初の行を覚えていないものに、 この行の手前 (lsn - 1) を覚える (bridge の `transfer_lock` の下から、 lsn の順に呼ばれる)。
+    fn note_row_after_cut(&self, hlc: enchudb_oplog::Hlc, lsn: u32) {
+        let mut cuts = self.durable_cuts.lock().unwrap_or_else(|e| e.into_inner());
+        for (c, first) in cuts.iter_mut() {
+            if first.is_none() && hlc > *c {
+                *first = Some(lsn.saturating_sub(1));
+            }
+        }
+    }
+
+    /// #451 (段階 1): 切れ目を閉じる。 `publish` なら印として置く (呼ぶのは bridge の後 = 切れ目の後に始めた fsync と本体の書き出しが
+    /// 返り、 Commit が打てた後)。 S = 切れ目の後に bridge が作った自分の record (HLC > C) の最初の行の手前、 無ければ今までの行
+    /// 全部 (`transfer_lock` の下で読む = bridge と直列、 この後に増える行は次の切れ目のもの)。
+    fn end_durable_cut(&self, wal: &enchudb_oplog::oplog::OpLog, cut: DurableCut, publish: bool) {
+        use std::sync::atomic::Ordering;
+        // 切れ目の後に自分の落ちた record が増えていれば置かない (切れ目の後の Commit が満杯で畳みを起こすと、 切れ目以下の閉じて
+        // いない record が孤児 (#450) として落ちる = 時計では切れ目より前。 普通に落ちた record は切れ目より後なので置いても
+        // よいが、 区別せずに次の書き出しに回す)
+        let publish = publish && wal.dropped_gen() == cut.dropped_gen;
+        let _bridge = self.transfer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let first_after = {
+            let mut cuts = self.durable_cuts.lock().unwrap_or_else(|e| e.into_inner());
+            let found = cuts.iter().position(|(c, _)| *c == cut.hlc).map(|i| cuts.remove(i).1);
+            self.durable_cuts_open.store(cuts.len(), Ordering::Release);
+            found.flatten()
+        };
+        if !publish {
+            return;
+        }
+        let lsn = first_after
+            .unwrap_or_else(|| self.next_sync_lsn.load(Ordering::Acquire).saturating_sub(1))
+            .max(cut.lsn_at_cut);
+        self.publish_durable_mark(crate::sync_payload_ring::DurableMark {
+            hlc: cut.hlc,
+            lsn,
+            wal_lap: cut.wal.0,
+            wal_off: cut.wal.1,
+        });
+    }
+
+    /// #451 (段階 1): 候補を印として置く。 disk に届くのは次の ring の書き出し (`body_msync`、 または書くものの無い周期の
+    /// [`Self::flush_durable_mark_if_pending`])。 呼ぶのは bridge の後 (ring は最初の bridge が作る)。 ring を作れなかった DB は置かない。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn publish_durable_mark(&self, m: crate::sync_payload_ring::DurableMark) {
+        use std::sync::atomic::Ordering;
+        let Some(ring) = self.sync_payload_ring.get() else { return };
+        if ring.set_durable_mark(m) {
+            self.durable_mark_publishes.fetch_add(1, Ordering::Relaxed);
+            self.durable_mark_flush_pending.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn publish_durable_mark(&self, _m: crate::sync_payload_ring::DurableMark) {}
+
+    /// #451 (段階 1): ring を書き出す (本体の書き出しと同じ契機)。 置いた印もここで届くので 「まだ届いていない」 印を下ろす
+    /// (書き出しの前に下ろす: 書き出しの間に置いた印は次の書き出しを待つ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn flush_payload_ring(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let Some(ring) = self.sync_payload_ring.get() else { return Ok(()) };
+        let pending = self.durable_mark_flush_pending.swap(false, Ordering::AcqRel);
+        let r = ring.flush();
+        if r.is_err() && pending {
+            self.durable_mark_flush_pending.store(true, Ordering::Release);
+        }
+        r
+    }
+
+    /// #451 (段階 1): 置いた印がまだ書き出されていなければ、 ring だけ書き出す (consumer の、 書くものの無い周期から。 暇になった後に
+    /// kill されても印が残る)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn flush_durable_mark_if_pending(&self) {
+        if self.durable_mark_flush_pending.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.flush_payload_ring();
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn flush_durable_mark_if_pending(&self) {}
 
     /// Commit marker の append が失敗した回数（観測用）。 平常時は 0。
     ///
@@ -18344,6 +18631,10 @@ impl Engine {
         use enchudb_oplog::oplog::Op;
         // きれいに閉じたかは紐名の辞書の clean flag で見る (辞書 (vocab) の flag は、 一度も語を入れていない DB では
         // 読めない — 空の辞書は header を書いていないので 「まっさら」 と読む)。 sync する DB は紐を必ず持つ
+        // #451 (段階 1): この process の record は印の W より後に採番する (時計が戻っていても印に覆われない)。 きれいに閉じた後も
+        if let Some(m) = self.durable_mark() {
+            wal.observe_hlc(m.hlc);
+        }
         if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() {
             return false;
         }
@@ -18355,11 +18646,45 @@ impl Engine {
             return false;
         }
         let me = self.peer_id();
-        // 配る経路が知っている自分の HLC
-        let mut known: std::collections::HashSet<Hlc> =
-            wal.records_with_tail().into_iter().filter(|r| r.author_peer == me).map(|r| r.hlc).collect();
+        let trace = Self::trace_open_enabled();
+        let t0 = std::time::Instant::now();
+        // #451 (段階 1): 配り済みの印 (W, S)。 HLC ≤ W の自分の write は record が disk にあり、 lsn ≤ S の行は HLC ≤ W の record から
+        // 作った行なので、 HLC > W の cell と lsn > S の行だけ見る。 印が無ければ (0.35 以前の binary が作った ring / 一度も
+        // 置いていない / ring を持てない DB) 全部
+        let mark = self.durable_mark();
+        let (w, s) = mark.map(|m| (m.hlc, m.lsn)).unwrap_or((Hlc::ZERO, 0));
+        // 配る経路が知っている自分の HLC (印より後のものだけ)。 record は組まず header の並びだけ読み、 印の位置 (同じ周なら切れ目の時の
+        // 終わり) から読む (100 万 record の WAL が畳まれずに残っていると、 record を組む走査は 340 ms、 先頭からの header の走査でも
+        // page を全部読む)
+        let mut known: std::collections::HashSet<Hlc> = std::collections::HashSet::new();
+        wal.visit_record_headers_with_tail(mark.map(|m| (m.wal_lap, m.wal_off)), |author, hlc| {
+            if author == me && hlc > w {
+                known.insert(hlc);
+            }
+        });
+        let t_ring = t0.elapsed();
+        let mut rows_read = 0usize;
         if let Some(cols) = self.sync_payload_cols() {
-            for row in self.entities_with_himo(cols.lsn) {
+            // lsn の列を 1 回なめて lsn > S の行だけ取り出し (開く時の走査、 書き手と並走しない)、 author が自分の行だけ payload を読む
+            let peer_hid = self.himo_id("_sync_ops.peer_id").map(|h| h as u16);
+            let mut rows: Vec<u32> = Vec::new();
+            if let Some(hs) = self.himos.get(cols.lsn as usize)
+                && hs.ensure_loaded().is_ok()
+            {
+                hs.for_each_set_cell(|local, lsn| {
+                    if lsn > s as u64 {
+                        rows.push(local);
+                    }
+                });
+            }
+            for local in rows {
+                let row = enchudb_oplog::make_eid(me, local);
+                if let Some(ph) = peer_hid
+                    && self.get_by_id32(row, ph).is_some_and(|a| a != me)
+                {
+                    continue;
+                }
+                rows_read += 1;
                 if let Some((author, hlc)) = self
                     .sync_op_payload(row, &cols)
                     .and_then(|p| enchudb_oplog::oplog::sync_ops_payload_author_hlc(&p))
@@ -18369,6 +18694,7 @@ impl Engine {
                 }
             }
         }
+        let t_rows = t0.elapsed();
         let floor = self
             .read_reclaimed_floor_entries()
             .unwrap_or_default()
@@ -18377,9 +18703,10 @@ impl Engine {
             .map(|(_, h)| h)
             .max()
             .unwrap_or(Hlc::ZERO);
-        // 相手の cursor (自分の author) はこれを越えない
-        let reached = known.iter().copied().max().unwrap_or(Hlc::ZERO).max(floor);
-        let unlogged = |h: Hlc| h != Hlc::ZERO && h.peer == me && h > floor && !known.contains(&h);
+        // 相手の cursor (自分の author) はこれを越えない (印の W は配った record 以上)
+        let reached = known.iter().copied().max().unwrap_or(Hlc::ZERO).max(floor).max(w);
+        let lower = floor.max(w);
+        let unlogged = |h: Hlc| h != Hlc::ZERO && h.peer == me && h > lower && !known.contains(&h);
         let mut cells: Vec<(Hlc, u32, usize)> = Vec::new();
         for hid in 0..self.himos.len() {
             if self.himo_is_in_reserved_table(hid) {
@@ -18401,6 +18728,17 @@ impl Engine {
                     deletes.push((h, local));
                 }
             }
+        }
+        if trace {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "[trace] relog: mark {mark:?}, oplog {:.2} ms, rows (lsn > S, mine: {rows_read}) {:.2} ms, cells {:.2} ms, candidates {} cells + {} deletes",
+                ms(t_ring),
+                ms(t_rows - t_ring),
+                ms(t0.elapsed() - t_rows),
+                cells.len(),
+                deletes.len()
+            );
         }
         if cells.is_empty() && deletes.is_empty() {
             return false;
@@ -19187,6 +19525,8 @@ impl Engine {
                     if let Some(wal) = oplog_for_thread.as_ref() {
                         if last_fsync.elapsed() >= fsync_interval {
                             if wal.head() > wal.checkpoint() {
+                                // #451 (段階 1): 配り済みの印の候補は Commit を打つ前に切る (印が覆う record は閉じた group に入る)
+                                let cut = engine.take_durable_cut(wal);
                                 let committed = engine.append_commit_marker(wal).is_ok();
                                 // #77-H3: checkpoint の上限は「今回の fsync/msync に
                                 // 含まれることが確定した位置」= Commit append 直後の
@@ -19225,9 +19565,17 @@ impl Engine {
                                 if engine.sync_tables_enabled() {
                                     engine.transfer_oplog_to_sync_ops();
                                 }
+                                // #451 (段階 1): 切れ目より前の record は書き出した (fsync + msync が返り、 Commit で閉じた) ので印を置く。
+                                // bridge の後 = payload の ring (印の置き場) が生えた後 (最初の書き出しでも置ける)
+                                if let Some(c) = cut {
+                                    engine.end_durable_cut(wal, c, committed && synced);
+                                }
 
                                 // changefeed: durable 化した record を listener に渡すよう通知係に頼む
                                 engine.notify_listeners();
+                            } else {
+                                // #451 (段階 1): 書くものの無い周期に、 置いた印を ring だけ書き出す (暇になった後に kill されても印が残る)
+                                engine.flush_durable_mark_if_pending();
                             }
                             // ring buffer reset を試みる。head == checkpoint の
                             // ときだけ head/checkpoint を HEADER_SIZE に戻す。
@@ -19647,9 +19995,7 @@ impl Engine {
                 let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
                 // ring の payload も本体と同じ契機で、 それを指す `_sync_ops` の行より先に書き出す (#440: 行だけ届いて
                 // payload が無いと dead row になる)
-                if let Some(ring) = self.sync_payload_ring.get() {
-                    ring.flush()?;
-                }
+                self.flush_payload_ring()?;
                 self.write_out_body(false)?;
                 if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
                     leaf.durable_end(t);
@@ -19729,6 +20075,8 @@ impl Engine {
             // push された record は commit されないまま = `_sync_ops` に出て来ない。
             // それを `Ok(())` で返すのが 「oplog_sync() は成功したのに配布されない」
             // の正体だったので、 呼び出し側に伝える (死区間を除く。 下の `commit_res?`)。
+            // #451 (段階 1): 配り済みの印の候補は Commit を打つ前に切る
+            let cut = self.take_durable_cut(wal);
             let commit_res = self.append_commit_marker(wal);
             // 満杯で打てなかったか (= その瞬間の `append_dead`) は失敗の種類で決める。 Commit は
             // 最小の record (`commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
@@ -19738,10 +20086,15 @@ impl Engine {
             // snapshot (msync 後の再読は未同期 record まで checkpoint してしまう)
             let durable_head = wal.head();
             let durable_lsn = wal.next_lsn().saturating_sub(1);
-            wal.fsync()?;
             // #550: 消した主キーの記録は WAL の後・本体より先に
-            self.persist_name_records()?;
-            self.body_msync()?;
+            let written = wal.fsync().and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
+            if let Err(e) = written {
+                // #451 (段階 1): 書き出せなかったので印は置かない (切れ目の登録だけ外す)
+                if let Some(c) = cut {
+                    self.end_durable_cut(wal, c, false);
+                }
+                return Err(e);
+            }
             // #268: Commit 失敗時に checkpoint を進めない理由は consumer tick と同じ。
             if commit_res.is_ok() || wal.append_dead() {
                 wal.advance_checkpoint(durable_head);
@@ -19760,6 +20113,10 @@ impl Engine {
                     );
                 }
                 self.transfer_oplog_to_sync_ops();
+            }
+            // #451 (段階 1): 切れ目より前の record は書き出した (Commit で閉じた) ので印を置く (bridge の後 = ring が生えた後)
+            if let Some(c) = cut {
+                self.end_durable_cut(wal, c, commit_res.is_ok());
             }
             // changefeed: durable 化したので listener へ即時 push
             // (consumer の 100ms tick を待たず caller スレッドで発火。 通知係が配っている最中なら、 それを待ってから配る)
@@ -20368,10 +20725,7 @@ impl Engine {
         let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
         // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める。 ring は行より先に
         let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ring) = self.sync_payload_ring.get() {
-            ring.flush()?;
-        }
+        self.flush_payload_ring()?;
         self.write_out_body(true)?;
         if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
             leaf.durable_end(t);

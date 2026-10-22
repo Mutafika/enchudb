@@ -98,6 +98,21 @@ const OFF_LAP: usize = 28;
 pub const LAP_TRAILER: usize = 8;
 const LAP_SALT: u32 = 0xC3A5_5A3C;
 
+/// #451 (段階 1): 切れ目 ([`OpLog::durable_cut_for`])。
+#[derive(Clone, Copy, Debug)]
+pub struct DurableCutPoint {
+    /// 時計の今 (author の record で HLC ≤ hlc のものは全部 ring に書き終えている)
+    pub hlc: Hlc,
+    /// author の落ちた record (#57) がまだ覚えられたままか (= floor がまだ無い)
+    pub dropped_pending: bool,
+    /// author の落ちた record を覚えた回数 ([`OpLog::dropped_gen`])。 置く時に変わっていれば、 切れ目の後に落ちた record がある
+    /// (畳む時の孤児 (#450) は古い HLC を持つので、 時計では分からない)
+    pub dropped_gen: u64,
+    /// ring の周と、 切れ目の時の終わり (この周でこれより前の record は全部切れ目より前)
+    pub lap: u32,
+    pub offset: u64,
+}
+
 /// 周の印を書く。
 #[inline]
 fn write_lap_trailer(t: &mut [u8], lap: u32) {
@@ -832,6 +847,8 @@ pub struct OpLog {
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
     dropped: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
+    /// #451 (段階 1): 自分 (`peer_id`) の落ちた record を覚えた回数 (`dropped` の lock の下で上げる)。
+    dropped_gen: std::sync::atomic::AtomicU64,
     /// #178: scan が読み飛ばした record の累計 (知らない版が書いた [`op_type::SKIPPABLE`] の op。 同じ record を読み直すと
     /// また数える)。 [`OpLog::skipped_ops`]。
     skipped_ops: AtomicU64,
@@ -1022,6 +1039,7 @@ impl OpLog {
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
+            dropped_gen: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -1129,6 +1147,7 @@ impl OpLog {
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
+            dropped_gen: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -1328,13 +1347,18 @@ impl OpLog {
         }
         // #57: 自分の write の束 (Commit しか無い束は record を運ばない)。 HLC は事前採番の max
         if r.is_err() {
-            let carried = records.iter().enumerate().filter(|(_, x)| !matches!(x.as_op(), Op::Commit));
-            let max = match hlcs {
-                Some(h) => carried.map(|(i, _)| h[i]).max(),
-                None => carried.map(|_| ()).next().map(|_| self.next_hlc()),
-            };
-            if let Some(h) = max {
-                self.note_dropped(self.peer_id(), h);
+            let mut carried = records.iter().enumerate().filter(|(_, x)| !matches!(x.as_op(), Op::Commit));
+            match hlcs {
+                Some(h) => {
+                    if let Some(max) = carried.map(|(i, _)| h[i]).max() {
+                        self.note_dropped(self.peer_id(), max);
+                    }
+                }
+                None => {
+                    if carried.next().is_some() {
+                        self.note_dropped_minting(self.peer_id(), None);
+                    }
+                }
             }
         }
         r
@@ -1611,8 +1635,8 @@ impl OpLog {
             if e.kind() == io::ErrorKind::OutOfMemory && self.larger_than_ring(record_size as u64 + reserve) {
                 return (io::Error::new(io::ErrorKind::InvalidInput, "oplog: the record is larger than the WAL"), Hlc::ZERO);
             }
-            let hlc = relay.map(|h| h.hlc).or(hlc_override).unwrap_or_else(|| self.next_hlc());
-            self.note_dropped(relay.map(|h| h.author).unwrap_or_else(|| self.peer_id()), hlc);
+            let author = relay.map(|h| h.author).unwrap_or_else(|| self.peer_id());
+            let hlc = self.note_dropped_minting(author, relay.map(|h| h.hlc).or(hlc_override));
             (e, hlc)
         })
     }
@@ -1937,10 +1961,53 @@ impl OpLog {
     }
 
     fn note_dropped(&self, author: PeerId, hlc: Hlc) {
+        self.note_dropped_minting(author, Some(hlc));
+    }
+
+    /// #451 (段階 1): 落ちた record を、 `dropped` の lock を持ったまま採番して覚える (`hlc` が無ければここで採番)。
+    /// 切れ目 ([`OpLog::durable_cut_for`]) は同じ lock の下で時計を覗くので、 切れ目に見えなかった落ちた record の HLC は
+    /// 切れ目より大きい (lock の外で採番してから覚えると、 採番と覚えるの間に切れ目が入って、 切れ目以下の HLC の落ちた
+    /// record を切れ目が見逃す)
+    fn note_dropped_minting(&self, author: PeerId, hlc: Option<Hlc>) -> Hlc {
         let mut g = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        let hlc = hlc.unwrap_or_else(|| self.next_hlc());
         match g.iter_mut().find(|(a, _)| *a == author) {
             Some((_, h)) => *h = (*h).max(hlc),
             None => g.push((author, hlc)),
+        }
+        if author == self.peer_id() {
+            self.dropped_gen.fetch_add(1, Ordering::Release);
+        }
+        hlc
+    }
+
+    /// #451 (段階 1): 自分の落ちた record を覚えた回数 (切れ目と置く時で比べる)。
+    pub fn dropped_gen(&self) -> u64 {
+        self.dropped_gen.load(Ordering::Acquire)
+    }
+
+    /// #451 (段階 1、 配り済みの印): 切れ目。 `append_lock` と `dropped` の lock を持って時計を覗き、
+    /// `(c, author の落ちた record が覚えられたままか)` を返す。
+    ///
+    /// - `author` の record で HLC ≤ c のものは、 返った時点で全部 ring に書き終えている (採番は append の中で `append_lock`
+    ///   の下。 事前採番の record (`append_at_hlc` / `append_many_with_hlcs`) は開く時の作り直しだけで、 切れ目と並走しない)
+    ///   ので、 この後に始めた fsync に入る。 この後に採番する record は全部 c より大きい
+    /// - 落ちた record (#57) は `dropped` の lock の下で採番して覚える ([`OpLog::note_dropped_minting`]) ので、 2 つ目が false
+    ///   なら author の落ちた record に HLC ≤ c のものは無い (後から落ちるものは c より大きい)。 畳む時の孤児の group (#450) は
+    ///   閉じていない group の record = 呼び手が切れ目の後に打つ Commit より前に載った record は入らない (呼び手は Commit の前に切る)
+    /// - 3 つ目・4 つ目 = ring の周と、 切れ目の時の終わり (append_lock の下なので書きかけは無い): この周でこれより前の record は
+    ///   全部切れ目より前に載った = `author` のものは HLC ≤ c。 開く時の header の走査 ([`OpLog::visit_record_headers_with_tail`])
+    ///   はここから読めばよい (周が違えば畳んだ後 = 先頭から)
+    pub fn durable_cut_for(&self, author: PeerId) -> DurableCutPoint {
+        let _in_proc = self.append_lock.lock();
+        let dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        let st = *self.hlc_state.lock();
+        DurableCutPoint {
+            hlc: Hlc { wall: st.0, logical: st.1, peer: author },
+            dropped_pending: dropped.iter().any(|(a, _)| *a == author),
+            dropped_gen: self.dropped_gen.load(Ordering::Acquire),
+            lap: self.lap.load(Ordering::Acquire),
+            offset: self.head.load(Ordering::Acquire),
         }
     }
 
@@ -1957,6 +2024,75 @@ impl OpLog {
     pub fn records_with_tail(&self) -> Vec<Record> {
         let s = self.scan_from_offset(HEADER_SIZE as u64);
         s.out.into_iter().chain(s.tail).map(|(r, _)| r).collect()
+    }
+
+    /// #451 (段階 1): [`OpLog::records_with_tail`] と同じ範囲 (Commit で閉じた group と閉じていない末尾) の record の (author, HLC) を、
+    /// header だけ読んで渡す (payload を組まない・写さない。 開く時の照合は HLC だけ要る: 100 万 record で 340 ms → header の並びを
+    /// 読むだけ)。 record ごとに CRC と周の印を確かめ、 `records_with_tail` と同じ所で止まる。 渡す op は `records_with_tail` と少し
+    /// 違う (安全側): Commit も渡し、 読み飛ばしてよい op (#178、 ALIAS) は渡さない。
+    ///
+    /// `from` = 読み始める位置 (周, offset) ([`OpLog::durable_cut_for`] の 3 つ目・4 つ目 = 配り済みの印の位置)。 周が今の周と同じで
+    /// offset が ring の中ならそこから (それより前の record は印より前)、 周が違う (畳んだ) / 周なし (v2) / 範囲外なら先頭から。
+    pub fn visit_record_headers_with_tail(&self, from: Option<(u32, u64)>, mut f: impl FnMut(PeerId, Hlc)) {
+        let (trailer, lap) = (self.trailer.load(Ordering::Acquire), self.lap.load(Ordering::Acquire));
+        let head = self.written.load(Ordering::Acquire);
+        let mmap = self.mmap_slice();
+        let mut offset = match from {
+            Some((l, off)) if l != 0 && l == lap && off >= HEADER_SIZE as u64 && off <= head => off,
+            _ => HEADER_SIZE as u64,
+        };
+        while offset < head {
+            let rec_end = (offset as usize) + REC_HEADER_SIZE;
+            if rec_end > mmap.len() {
+                break;
+            }
+            let header = &mmap[offset as usize..rec_end];
+            if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC {
+                break;
+            }
+            let version = header[OFF_VERSION];
+            if !known_version(version) {
+                break;
+            }
+            let op_byte = header[OFF_OP];
+            let payload_len = u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()) as usize;
+            let payload_end = rec_end + payload_len;
+            if payload_end > mmap.len() {
+                break;
+            }
+            let next_off = payload_end + trailer;
+            if trailer != 0 {
+                if next_off > mmap.len() {
+                    break;
+                }
+                let t = &mmap[payload_end..next_off];
+                let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
+                let check = u32::from_le_bytes(t[4..8].try_into().unwrap());
+                if check != rec_lap ^ LAP_SALT || rec_lap != lap {
+                    break;
+                }
+            }
+            let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
+            if stored_crc != record_crc(version, &header[CRC_FIELDS], &mmap[rec_end..payload_end]) {
+                break;
+            }
+            let known_op = matches!(
+                op_byte,
+                op_type::TIE | op_type::UNTIE | op_type::DELETE | op_type::CONTENT | op_type::COMMIT | op_type::VOCAB
+                    | op_type::TIE_NAMED | op_type::TIE_LEAF | op_type::TIE_REF | op_type::TIE64 | op_type::TIE_NAMED64
+            );
+            if known_op {
+                let hlc = Hlc {
+                    wall: u64::from_le_bytes(header[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap()),
+                    logical: u32::from_le_bytes(header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].try_into().unwrap()),
+                    peer: u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap()),
+                };
+                f(u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap()), hlc);
+            } else if !op_type::skippable(op_byte) {
+                break;
+            }
+            offset = next_off as u64;
+        }
     }
 
     /// #450: `start_offset` から先の、 Commit で閉じられていない record (閉じの Commit が満杯で入らなかった孤児の group) を、
@@ -2427,6 +2563,7 @@ impl OpLog {
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
+            dropped_gen: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -2621,6 +2758,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// #451 (段階 1): 切れ目は、 その前に載った record の HLC 以上で、 その後に採番する HLC より小さい。 満杯で落ちた record は
+    /// 切れ目に見え (`dropped` の lock の下で採番して覚える)、 取り出した落ちた record の HLC は切れ目以下
+    #[test]
+    fn durable_cut_bounds_the_records_and_sees_dropped_ones() {
+        let p = tmp("durable_cut");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        wal.set_peer_id(7);
+        let (_, h1) = wal.append_with_hlc(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        let cut = wal.durable_cut_for(7);
+        let (c, lap, off) = (cut.hlc, cut.lap, cut.offset);
+        assert!(h1 <= c, "切れ目は前の record 以上: {h1:?} {c:?}");
+        assert!(!cut.dropped_pending);
+        assert_eq!(cut.dropped_gen, 0);
+        assert_eq!((lap, off), (wal.lap(), wal.head()), "切れ目の位置 = この周の終わり");
+        let (_, h2) = wal.append_with_hlc(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
+        assert!(h2 > c, "切れ目の後の record は切れ目より大きい: {c:?} {h2:?}");
+        let mut after = Vec::new();
+        wal.visit_record_headers_with_tail(Some((lap, off)), |_, h| after.push(h));
+        assert_eq!(after, vec![h2], "切れ目の位置から読むと切れ目の後の record だけ");
+        // 満杯にして落とす (空きの待ち手なし = その場で落ちる)
+        let mut fell = 0;
+        for i in 0..2000u32 {
+            if wal.append(Op::Tie { eid: 3, himo_id: 0, value: i as u64 }).is_err() {
+                fell += 1;
+                if fell == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(fell, 3, "前提: 満杯で落ちる");
+        let cut2 = wal.durable_cut_for(7);
+        let c2 = cut2.hlc;
+        assert!(cut2.dropped_pending, "落ちた record は切れ目に見える");
+        assert_eq!(cut2.dropped_gen, 3, "自分の落ちた record を覚えた回数");
+        assert!(!wal.durable_cut_for(8).dropped_pending, "他の author の落ちた record では無い");
+        let d = wal.take_dropped();
+        assert!(d.iter().all(|(a, h)| *a == 7 && *h <= c2), "落ちた record の HLC は切れ目以下: {d:?} {c2:?}");
+        assert!(!wal.durable_cut_for(7).dropped_pending, "取り出した後は見えない");
+        assert_eq!(wal.durable_cut_for(7).dropped_gen, 3, "取り出しても回数は戻らない (置く時に切れ目と比べる)");
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #451 (段階 1): header だけ読む走査は `records_with_tail` と同じ (author, HLC) の並びを返し (閉じた group + 閉じていない末尾)、
+    /// CRC の合わない record に当たればそこで止まる (前の record までは返す)
+    #[test]
+    fn header_scan_matches_the_record_scan_and_stops_at_a_bad_crc_after_the_checkpoint() {
+        let p = tmp("header_scan");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        wal.set_peer_id(3);
+        for i in 0..20u64 {
+            wal.append(Op::Tie { eid: i, himo_id: 0, value: i }).unwrap();
+            if i % 5 == 4 {
+                wal.append(Op::Commit).unwrap();
+            }
+        }
+        let cp = wal.head();
+        wal.advance_checkpoint(cp);
+        // 閉じていない末尾
+        let (off_tail, _) = (wal.head(), wal.append(Op::Tie { eid: 100, himo_id: 0, value: 100 }).unwrap());
+        wal.append(Op::Tie { eid: 101, himo_id: 0, value: 101 }).unwrap();
+        let expect: Vec<(PeerId, Hlc)> = wal.records_with_tail().iter().map(|r| (r.author_peer, r.hlc)).collect();
+        let mut got = Vec::new();
+        wal.visit_record_headers_with_tail(None, |a, h| got.push((a, h)));
+        assert_eq!(got.len(), 22 + 4, "Commit も数える (Tie 22 + Commit 4)");
+        let mut from_tail = Vec::new();
+        wal.visit_record_headers_with_tail(Some((wal.lap(), off_tail)), |a, h| from_tail.push((a, h)));
+        assert_eq!(from_tail, got[24..].to_vec(), "位置を渡せばそこから");
+        let mut other_lap = Vec::new();
+        wal.visit_record_headers_with_tail(Some((wal.lap() + 1, off_tail)), |a, h| other_lap.push((a, h)));
+        assert_eq!(other_lap, got, "周が違えば先頭から");
+        let mut no_lap = Vec::new();
+        wal.visit_record_headers_with_tail(Some((0, off_tail)), |a, h| no_lap.push((a, h)));
+        assert_eq!(no_lap, got, "周なし (v2) は先頭から");
+        let ties: Vec<(PeerId, Hlc)> = got.iter().copied().filter(|e| expect.contains(e)).collect();
+        assert_eq!(ties, expect, "Tie の (author, HLC) は record の走査と同じ並び");
+        // record の payload を壊す (CRC が合わない) → そこで止まる
+        let mmap = wal.mmap_mut_slice();
+        mmap[off_tail as usize + REC_HEADER_SIZE] ^= 0xFF;
+        let mut got2 = Vec::new();
+        wal.visit_record_headers_with_tail(None, |a, h| got2.push((a, h)));
+        assert_eq!(got2.len(), 24, "壊れた record の手前まで");
+        assert_eq!(wal.records_with_tail().len(), 20, "record の走査も同じ所で止まる (Commit は数えない)");
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

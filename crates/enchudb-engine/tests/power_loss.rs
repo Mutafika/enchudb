@@ -1331,3 +1331,387 @@ fn local_writes_after_power_loss_are_not_older_than_cells() {
     assert!(r.is_ok(), "汚れた終了の後のローカルの書き込みが cell の版数より古いと弾かれた: {r:?}");
     assert_eq!(got, Some(6));
 }
+
+// ── #451 段階 1 (OPEN_TIME_PLAN): 配り済みの印 ──────────────────────────────────────────────────────────────
+
+/// consumer の oplog の書き出しを、 写した直後 (= disk に届く前) で止める。 戻り値の drop で放す (hook も外す)。
+/// `with_stalled_sync` の consumer 側だけ (oplog_sync の thread は走らせない)。
+///
+/// Commit を 1 つ積んで consumer を周期の書き出し (写した直後、 lock を持たない所) に来させ、 止まったのを見てから返す (止まる前に
+/// 始まった周期は無い = 返った後に印を置くのは呼び手だけ)。 「次に写した所で止まる」 形にしないこと: 埋まった WAL を見て起きた
+/// consumer は空き作り (#388、 `make_wal_room_inner`) に入り、 transfer の lock を持ったまま書き出す = その写しで止まると、 試験の
+/// `oplog_sync` の bridge (同じ lock を待つ) と互いに待つ。 Linux の CI で踏んだ (試験の `oplog_sync` の Commit で起きた consumer が、
+/// 試験 thread の fsync と本体の書き出しの間に lock を取った。 Mac は書き出しが速く、 bridge が先に済んで consumer は lock を取れない)。
+fn hold_consumer(eng: &Arc<Engine>) -> ConsumerHeld {
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let hold = std::sync::Mutex::new(Some((parked_tx, release_rx)));
+    crashsim::set_after_copy_hook(Some(Arc::new(move |what| {
+        if what == Copied::Oplog && std::thread::current().name() == Some("enchudb-consumer") {
+            let taken = hold.lock().unwrap().take();
+            if let Some((parked, release)) = taken {
+                let _ = parked.send(());
+                let _ = release.recv();
+            }
+        }
+    })));
+    // 書き出すものを渡す (head > checkpoint で周期の書き出しに入る)
+    eng.oplog_commit();
+    parked_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("前提: consumer が周期の oplog の書き出し (写した直後) で止まる");
+    ConsumerHeld(Some(release_tx))
+}
+
+/// #451 (段階 1): 配り済みの印が disk にあっても、 印の後に書いた write が本体にだけ届いた像では作り直す (印は、 印より前の
+/// write だけを飛ばす)。 像には印 (切れ目 = 止めた `oplog_sync` の Commit の前 = 最初の 2 つの write の後) が入り、 その後の
+/// 5 つの write は oplog に無い。
+#[test]
+fn writes_after_a_durable_mark_are_still_relogged_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for attempt in 0..5 {
+        let root = scratch(&format!("mark_after{attempt}"));
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        crashsim::start();
+        let eng = notes_engine(&live.join("db"), OPLOG_CAP);
+        let [a, b, c, d, e] = [(); 5].map(|_| eng.entity_in("notes").unwrap());
+        eng.tie_to(a, "notes.note", 1);
+        eng.tie_to(e, "notes.note", 5);
+        eng.oplog_sync().unwrap();
+        eng.oplog_sync().unwrap();
+        let mark0 = eng.durable_mark().expect("前提: 2 回目の書き出しで印が置かれる");
+        let held = with_stalled_sync(&eng, || {
+            // 書く間に consumer が目を覚まして Commit を打つと、 止めた sync の bridge がこの write を行にし、 下の本体の書き出しで
+            // 届く (= 作り直さなくてよい形になる)。 その Commit を 1 回だけ失敗させて、 5 つとも閉じていない group に残す
+            eng.oplog().unwrap().fail_next_commits(1);
+            eng.tie_to(b, "notes.note", 22);
+            eng.tie_text_to(c, "notes.tag", "fresh-word");
+            eng.tie_text_to(d, "notes.body", "leaf body");
+            eng.untie(a, "notes.note");
+            eng.delete(e);
+        });
+        // 止めた側の本体の書き出しは済んでいる。 止めた sync が置いた印 (切れ目は書く前) も ring の書き出しで届かせる
+        eng.body_msync().unwrap();
+        let img = root.join("img");
+        let captured = crashsim::capture(&live, &img, Mode::Lost);
+        crashsim::stop();
+        drop(held);
+        let hid = |n: &str| eng.himo_id(n).unwrap() as u16;
+        let (note, tag, body) = (hid("notes.note"), hid("notes.tag"), hid("notes.body"));
+        let before = [eng.cell_hlc(b, note), eng.cell_hlc(c, tag), eng.cell_hlc(d, body), eng.cell_hlc(a, note)];
+        let deleted_at = eng.tombstone_hlc(e);
+        drop(eng);
+        captured.unwrap();
+        let db = img.join("db");
+        let in_oplog = OpLog::open(&db.join("oplog"))
+            .unwrap()
+            .records_with_tail()
+            .iter()
+            .filter(|r| before.contains(&r.hlc) || r.hlc == deleted_at)
+            .count();
+        if in_oplog > 0 {
+            eprintln!("[mark_after] 撮り直す ({attempt} 回目): consumer の書き出しが先に oplog を届かせた");
+            let _ = std::fs::remove_dir_all(&root);
+            continue;
+        }
+        // 像の印: 止めた sync の切れ目 = 最初の 2 つの write より後、 5 つの write より前
+        let img_mark = PayloadRing::read_durable_mark(&db).expect("像に印が無い (ring の書き出しで届くはず)");
+        assert!(img_mark.hlc >= mark0.hlc, "印は進む: {img_mark:?} (前 {mark0:?})");
+        assert!(
+            before.iter().all(|h| *h > img_mark.hlc) && deleted_at > img_mark.hlc,
+            "前提: 5 つの write は印より後 {img_mark:?} {before:?} {deleted_at:?}"
+        );
+        let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert_eq!(eng.get(b, "notes.note"), Some(22), "前提: 本体に届いている");
+        assert_eq!(eng.unlogged_writes_relogged(), 5, "印の後の write を作り直していない (印が覆った)");
+        assert_eq!(floor_of(&eng, 1), None, "作り直せたので floor は上げない");
+        let recs = distributed(&eng);
+        let local = |x: u64, y: &u64| eid_local(x) == eid_local(*y);
+        assert!(
+            recs.iter().any(|r| matches!(&r.op, DecodedOp::Tie { eid, himo_id, value } if local(b, eid) && *himo_id == note && *value == 22)),
+            "作り直した値が配る分に無い"
+        );
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    panic!("5 回とも consumer の書き出しが先に oplog を届かせ、 前提を作れなかった");
+}
+
+/// #451 (段階 1): WAL が満杯で落ちた write (#57) の floor がまだ無い間は、 配り済みの印を進めない。 consumer の書き出しを止めて
+/// (consumer の bridge が先に落ちた record を持ち越さない = 切れ目は WAL が覚えている落ちた record を見る形)、 落とした直後に
+/// `oplog_sync` を走らせる (その bridge が持ち越す、 floor はまだ上げない) → 印は前のまま。 本体と ring を書き出してから電源断の像を
+/// 撮り、 開いた時に落ちた write が floor に覆われるか作り直されること (印が覆うと、 開く時に見ず相手に永久に届かない)。
+#[test]
+fn a_mark_never_covers_a_dropped_write_before_its_floor_is_on_disk() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("mark_dropped");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let eng = notes_engine(&live.join("db"), 64 * 1024);
+    let note = eng.himo_id("notes.note").unwrap() as u16;
+    let wal = eng.oplog().unwrap().clone();
+    // 満杯の書き手を待たせない (#388)
+    wal.set_room_waiter(None);
+    // 印を 1 つ置いておく
+    let e0 = eng.entity_in("notes").unwrap();
+    eng.tie_to(e0, "notes.note", 100);
+    eng.oplog_sync().unwrap();
+    // consumer を周期の oplog の書き出し (写した直後) で止めておく = その bridge は走らず、 埋まった WAL の空き作りにも入らない。
+    // 印を読むのは止めた後: 止める前に始まった周期 (切れ目は落とす前) が、 読んだ後に印を置くことがある (遅い disk で踏んだ)
+    let held = hold_consumer(&eng);
+    let before = eng.durable_mark().expect("前提: 印が置かれている");
+    let mut dropped = Vec::new();
+    {
+        let _no_fold = eng.transfer_lock_for_fold();
+        // 閉じた group で WAL を埋め、 残りを 「Commit は入るが Tie (+ Commit の分の空き) は入らない」 大きさにする
+        let e1 = eng.entity_in("notes").unwrap();
+        let h0 = wal.head();
+        eng.tie_text_to(e1, "notes.body", "x");
+        let c = wal.head() - h0 - 1;
+        eng.oplog_commit();
+        let commit = wal.record_size_of(0) as u64;
+        let pad = wal.free_bytes() - commit - (commit + 60) - c;
+        let e2 = eng.entity_in("notes").unwrap();
+        eng.tie_text_to(e2, "notes.body", &"p".repeat(pad as usize));
+        eng.oplog_commit();
+        assert_eq!(wal.free_bytes(), commit + 60, "前提: Commit は入るが Tie は入らない残り");
+        for i in 0..5u32 {
+            let head = wal.head();
+            let e = eng.entity_in("notes").unwrap();
+            eng.tie_to(e, "notes.note", i);
+            assert_eq!(wal.head(), head, "前提: WAL に載らない");
+            dropped.push(eng.cell_hlc(e, note));
+        }
+    }
+    // 落とした直後の書き出し = 印を置く機会。 切れ目は WAL が覚えている落ちた record を見て候補を出さない。 bridge は落ちた record を
+    // 持ち越すが floor はまだ上げない (静かになってから)
+    eng.oplog_sync().unwrap();
+    assert_eq!(eng.durable_mark(), Some(before), "落ちた write の floor が無いうちは印を進めない");
+    // 置いた印があれば ring の書き出しで届く
+    eng.body_msync().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(held);
+    drop((wal, eng));
+    captured.unwrap();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), 64 * 1024).unwrap();
+    let max_dropped = dropped.iter().copied().max().unwrap();
+    let floor = floor_of(&eng, 1);
+    let relogged = eng.unlogged_writes_relogged();
+    assert!(
+        floor.is_some_and(|f| f >= max_dropped) || relogged == 5,
+        "落ちた write {max_dropped:?} が floor {floor:?} に覆われず、 作り直し ({relogged}) もされない (印が覆った)"
+    );
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #451 (段階 1): 印より後の `_sync_ops` の行は開く時に読む。 印 (W, S) が disk にある像で、 W より後の write が oplog には
+/// 無く (consumer の書き出しを止める)、 行 (lsn > S) にだけある → 作り直さない (旧 #451 と同じ答え。 行を見なければ重ねて配る)。
+/// 像は consumer の書き出しを止めて手で bridge した形 (本物では record が届いてから行ができる) で、 開く側の約束だけを見る。
+#[test]
+fn a_write_known_only_from_a_row_after_the_mark_is_not_relogged() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("mark_row");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let eng = notes_engine(&live.join("db"), OPLOG_CAP);
+    let note = eng.himo_id("notes.note").unwrap() as u16;
+    let a = eng.entity_in("notes").unwrap();
+    eng.tie_to(a, "notes.note", 1);
+    // consumer を先に止める: 止める前に始まった周期が、 印を読んだ後に別の印を置くと像の印が前提と違う (遅い disk で踏む形)
+    let held = hold_consumer(&eng);
+    eng.oplog_sync().unwrap();
+    eng.oplog_sync().unwrap();
+    let mark = eng.durable_mark().expect("前提: 印");
+    // 印を届かせる
+    eng.body_msync().unwrap();
+    let x = eng.entity_in("notes").unwrap();
+    eng.tie_to(x, "notes.note", 7);
+    let hx = eng.cell_hlc(x, note);
+    assert!(hx > mark.hlc, "前提: x は印より後");
+    eng.oplog_commit();
+    assert!(eng.transfer_oplog_to_sync_ops() > 0, "前提: x の record を行に写す");
+    // 行 (と payload) を届かせる。 oplog は fsync しない (consumer は止めている)
+    eng.body_msync().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(held);
+    drop(eng);
+    captured.unwrap();
+    let db = img.join("db");
+    let in_oplog = OpLog::open(&db.join("oplog")).unwrap().records_with_tail().iter().filter(|r| r.hlc == hx).count();
+    assert_eq!(in_oplog, 0, "前提: x の record は像の oplog に無い");
+    assert_eq!(PayloadRing::read_durable_mark(&db), Some(mark), "前提: 像の印");
+    let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.get(x, "notes.note"), Some(7), "前提: 本体に届いている");
+    assert_eq!(eng.unlogged_writes_relogged(), 0, "行にある write を作り直した (印より後の行を見ていない)");
+    assert_eq!(floor_of(&eng, 1), None);
+    let recs = distributed(&eng);
+    let ties = recs
+        .iter()
+        .filter(|r| matches!(&r.op, DecodedOp::Tie { eid, himo_id, value } if eid_local(*eid) == eid_local(x) && *himo_id == note && *value == 7))
+        .count();
+    assert_eq!(ties, 1, "x の Tie は配る分に 1 つ (重ねて配らない)");
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #451 (段階 1): 置いた印は、 書くものの無い周期に consumer が ring だけ書き出す (書き終えて暇になった後に kill されても印が残る)。
+#[test]
+fn the_mark_reaches_disk_while_idle() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("mark_idle");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let eng = notes_engine(&live.join("db"), OPLOG_CAP);
+    let a = eng.entity_in("notes").unwrap();
+    eng.tie_to(a, "notes.note", 1);
+    eng.oplog_sync().unwrap();
+    eng.oplog_sync().unwrap();
+    let m = eng.durable_mark().expect("前提: 印");
+    // 置いただけ (ring の書き出しは次の周期)。 暇な周期を待つ (sync の DB の consumer は 1 秒ごとに起きる)
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    // 読んだ後に、 読む前に始まった consumer の周期が (後の切れ目で) 印を進めていてもよい: 届くのは最後に置いた印 = m 以上
+    let on_disk = PayloadRing::read_durable_mark(&img.join("db"));
+    assert!(on_disk.is_some_and(|d| (d.hlc, d.lsn) >= (m.hlc, m.lsn)), "暇な周期に印が届いていない: {on_disk:?} (置いた印 {m:?})");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #451 (段階 1): 印は、 切れ目の後に始めた oplog の fsync (と本体の書き出し) が返ってから置く。 fsync を写した直後で止め
+/// (record はまだ disk に無い)、 その間に本体と ring を書き出して像を撮る: 像に印があっても、 止めた fsync に入るはずだった
+/// write (切れ目より前) は覆わない (書き出しの前に置くと、 印が disk に届いた後に電源が落ちた時、 覆われた write が
+/// oplog に無いのに開く時に見ない = 相手に永久に届かない)。
+#[test]
+fn a_mark_is_not_on_disk_before_the_records_it_covers() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for attempt in 0..5 {
+        let root = scratch(&format!("mark_before{attempt}"));
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        crashsim::start();
+        let eng = notes_engine(&live.join("db"), OPLOG_CAP);
+        let note = eng.himo_id("notes.note").unwrap() as u16;
+        let a = eng.entity_in("notes").unwrap();
+        eng.tie_to(a, "notes.note", 1);
+        eng.oplog_sync().unwrap();
+        eng.oplog_sync().unwrap();
+        let mark0 = eng.durable_mark().expect("前提: 印");
+        // 止める fsync に入る write (切れ目より前)
+        let f = eng.entity_in("notes").unwrap();
+        eng.tie_to(f, "notes.note", 6);
+        let hf = eng.cell_hlc(f, note);
+        let img = root.join("img");
+        let mut captured = None;
+        let held = with_stalled_sync(&eng, || {
+            // fsync が返る前に、 本体と ring (置いた印があれば) を書き出して像を撮る (consumer の Commit は 1 回失敗させる = 上と同じ)
+            eng.oplog().unwrap().fail_next_commits(1);
+            eng.body_msync().unwrap();
+            captured = Some(crashsim::capture(&live, &img, Mode::Lost));
+        });
+        crashsim::stop();
+        drop(held);
+        drop(eng);
+        captured.unwrap().unwrap();
+        let db = img.join("db");
+        let in_oplog = OpLog::open(&db.join("oplog")).unwrap().records_with_tail().iter().filter(|r| r.hlc == hf).count();
+        if in_oplog > 0 {
+            eprintln!("[mark_before] 撮り直す ({attempt} 回目): consumer の書き出しが先に oplog を届かせた");
+            let _ = std::fs::remove_dir_all(&root);
+            continue;
+        }
+        let img_mark = PayloadRing::read_durable_mark(&db);
+        assert!(
+            img_mark.is_some_and(|m| m.hlc < hf),
+            "像の印 {img_mark:?} が、 oplog に届いていない write {hf:?} を覆う (書き出しが返る前に置いた)。 前の印 {mark0:?}"
+        );
+        let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert_eq!(eng.get(f, "notes.note"), Some(6), "前提: 本体に届いている");
+        assert_eq!(eng.unlogged_writes_relogged(), 1, "oplog に無い write を作り直していない");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    panic!("5 回とも consumer の書き出しが先に oplog を届かせ、 前提を作れなかった");
+}
+
+/// #451 (段階 1): 印は oplog の位置 (その周の、 切れ目の時の終わり) も持ち、 開く時の header の走査はそこから (それより前の自分の
+/// record は全部切れ目以下)。 切れ目の後に載って oplog にだけある (行には無い) record はそこから先で見つかる → 作り直さない。
+/// 止めた `oplog_sync` (切れ目の後、 fsync の途中) の間に x を書き、 その後に oplog だけ書き出す (bridge はしない)。
+#[test]
+fn a_write_known_only_from_the_wal_after_the_mark_is_not_relogged() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("mark_wal");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let eng = notes_engine(&live.join("db"), OPLOG_CAP);
+    let note = eng.himo_id("notes.note").unwrap() as u16;
+    let a = eng.entity_in("notes").unwrap();
+    eng.tie_to(a, "notes.note", 1);
+    eng.oplog_sync().unwrap();
+    let x = eng.entity_in("notes").unwrap();
+    let held = with_stalled_sync(&eng, || {
+        // 止めた sync の切れ目の後 (Commit の後) に載る = 閉じていない group、 その sync の bridge は行にしない (consumer が目を覚まして
+        // 打つ Commit は 1 回失敗させる: 通ると x が行になり、 下の本体の書き出しで届く)
+        eng.oplog().unwrap().fail_next_commits(1);
+        eng.tie_to(x, "notes.note", 7);
+    });
+    let hx = eng.cell_hlc(x, note);
+    // x の record を届かせ (bridge はしない)、 止めた sync が置いた印 (位置は x の手前) と本体も届かせる
+    eng.oplog().unwrap().fsync().unwrap();
+    eng.body_msync().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(held);
+    drop(eng);
+    captured.unwrap();
+    let db = img.join("db");
+    let in_oplog = OpLog::open(&db.join("oplog")).unwrap().records_with_tail().iter().filter(|r| r.hlc == hx).count();
+    assert_eq!(in_oplog, 1, "前提: x の record は像の oplog にある");
+    let mark = PayloadRing::read_durable_mark(&db).expect("前提: 像に印");
+    assert!(mark.hlc < hx, "前提: 印の切れ目は x より前: {mark:?} {hx:?}");
+    let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.get(x, "notes.note"), Some(7), "前提: 本体に届いている");
+    assert_eq!(eng.unlogged_writes_relogged(), 0, "oplog にある write を作り直した (印の位置から先を読んでいない)");
+    assert_eq!(floor_of(&eng, 1), None);
+    let recs = distributed(&eng);
+    let ties = recs
+        .iter()
+        .filter(|r| matches!(&r.op, DecodedOp::Tie { eid, himo_id, value } if eid_local(*eid) == eid_local(x) && *himo_id == note && *value == 7))
+        .count();
+    assert_eq!(ties, 1, "x の Tie は配る分に 1 つ (重ねて配らない)");
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+}
