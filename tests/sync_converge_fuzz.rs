@@ -6,8 +6,8 @@
 //! 機械に探させる (#547 / #551 / #545 / #581 は全部人が見つけた)。 答えには名前の無い塊 (title だけの entity) も入れる。
 //!
 //! 改名を混ぜるとまだ割れる形があるので、 普段の試験からは外す。 残っているのは、 改名の時刻の決まり (改名より後に前の名前で作った
-//! 行は新しいデッキ) を入れる前から割れていた形: #612 (相手の改名で自分の行 2 つが同じ名前になる) と #620 (改名で離れた名前に、 後から
-//! 別の行が改名で入る)。 改名を出さずに回すなら `ENCHU_FUZZ_NO_RENAME=1`:
+//! 行は新しいデッキ) を入れる前から割れていた形: #612 (相手の改名で自分の行 2 つが同じ名前になる)。 改名を出さずに回すなら
+//! `ENCHU_FUZZ_NO_RENAME=1`:
 //!
 //! ```text
 //! ENCHU_FUZZ_CASES=200 cargo test --release --test sync_converge_fuzz -- --ignored --nocapture
@@ -267,7 +267,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: cases(), max_shrink_iters: 2000, ..ProptestConfig::default() })]
 
     #[test]
-    #[ignore = "既知の割れ (#612 / #620) があるので手で回す"]
+    #[ignore = "既知の割れ (#612) があるので手で回す"]
     fn every_order_converges(steps in proptest::collection::vec(step_strategy(), 1..10)) {
         if let Err(msg) = run(&steps) {
             prop_assert!(false, "手順 {steps:?}\n{msg}");
@@ -599,6 +599,38 @@ fn a_late_create_after_the_delete_keeps_the_row() {
     assert_eq!(run(&steps), Ok(vec![(text("k2"), text("t1"))]));
 }
 
+/// 改名の時刻 14: B が k1 を k2 に改名した後に、 A が (B の行を知らずに) k0 を k1 に改名する。 A の行が k1 になった時、 B の行はもう
+/// k2 なので、 2 つの行は同じ時刻に同じ名前だったことがない = 別のデッキ。
+#[test]
+fn a_rename_into_a_name_another_row_already_left_is_a_new_deck() {
+    let steps = [
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Upsert { by: 0, key: 0, title: 0 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+        Step::Rename { by: 0, from: 0, to: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t0")), (text("k2"), text("t0"))]));
+}
+
+/// 改名の時刻 15 (#620 の続き): A の k0 と C の k0 は同じデッキ (C が A の行を束ねる)。 B が k1 を k2 に改名した後に、 C がデッキを
+/// k0 から k1 に改名する。 デッキは B の改名の後に k1 になったので、 B の行とは別のデッキ。 束ねていた A の identity は、 自分宛ての
+/// k1 への書き込みが無くても、 C の改名で k1 を持ち始めた (改名はデッキの全部の identity に当たる)。 B の行の作成 (A の行の作成より
+/// 後) は、 A の identity が k1 を持ち始めた時刻ではない。 最後の A の title の書き換え (A の identity 宛て) は、 A の identity と同じ
+/// デッキ (k1) に当たる。
+#[test]
+fn a_deck_renamed_into_a_name_another_row_already_left_stays_together() {
+    let steps = [
+        Step::Upsert { by: 0, key: 0, title: 1 },
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Upsert { by: 2, key: 0, title: 1 },
+        Step::Pull { by: 2, from: 0 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+        Step::Rename { by: 2, from: 0, to: 1 },
+        Step::Retitle { by: 0, key: 0, title: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t2")), (text("k2"), text("t0"))]));
+}
+
 /// 削除優先 (#614 で払い出しの道を書き換えたので): C が A の削除を知らずに k1 を作り (削除より前 = 同じデッキ)、 削除の後に title を
 /// 書き換える。 C の行を削除の後に受けた受け手は、 死んだ slot を払い出して、 削除の後の書き換えも捨てる。
 #[test]
@@ -612,3 +644,19 @@ fn a_write_after_the_delete_to_a_row_made_before_it_is_dropped() {
     assert_eq!(run(&steps), Ok(vec![]));
 }
 
+/// 改名の時刻 16 (#620 の続き): 上の形で、 C の改名 (A の identity 宛て、 束ねた後の書き込みの宛名) で k1 を持ち始めた C の identity。
+/// C の identity は B の行より前に作られ、 B の改名の後に (A の identity 宛ての改名で) k1 になった。 B の行の作成は、 C の identity が
+/// k1 を持ち始めた時刻ではない (C の title が残るのは A と C のデッキ)。
+#[test]
+fn an_identity_renamed_by_another_identity_of_its_deck_stays_with_the_deck() {
+    let steps = [
+        Step::Upsert { by: 0, key: 0, title: 1 },
+        Step::Upsert { by: 2, key: 0, title: 1 },
+        Step::Upsert { by: 1, key: 1, title: 0 },
+        Step::Retitle { by: 2, key: 0, title: 2 },
+        Step::Pull { by: 2, from: 0 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+        Step::Rename { by: 2, from: 0, to: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t2")), (text("k2"), text("t0"))]));
+}
