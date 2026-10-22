@@ -202,8 +202,10 @@ fn unversioned_src_cells_only_fill_empty_dst_cells() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// 断る形: 自分の行を翻訳した行に (#612: 自分の行どうしは畳める、 `tests/sync_own_rows_fold.rs`)、 同じ行に、 別の表の行に、
+/// 生きていない行に。
 #[test]
-fn merge_refuses_own_same_dead_and_cross_table_rows() {
+fn merge_refuses_own_into_translated_same_dead_and_cross_table_rows() {
     let path = tmp_path("refuse");
     let eng = make_db(&path);
     let own = eng.entity_in("files").unwrap();
@@ -216,15 +218,16 @@ fn merge_refuses_own_same_dead_and_cross_table_rows() {
     let src = translated_row(&eng, make_eid(OTHER_PEER, 82));
     assert!(eng.remote_tie_apply(src, hid(&eng, "files.size"), 4, Hlc { wall: 10, logical: 0, peer: OTHER_PEER }));
 
-    assert!(eng.merge_entity_into(own, own2).is_err(), "自分の行を畳んだ");
+    assert!(eng.merge_entity_into(own, src).is_err(), "自分の行を翻訳した行に畳んだ (その行に書いた record の宛名が相手の世界番号になる)");
     assert!(eng.merge_entity_into(src, src).is_err(), "同じ行に畳んだ");
     assert!(eng.merge_entity_into(src, x).is_err(), "別の表の行に畳んだ");
     let dead = eng.entity_in("files").unwrap();
     eng.delete(dead);
     eng.flush_writes();
     assert!(eng.merge_entity_into(src, dead).is_err(), "生きていない行に畳んだ");
-    // 断った後も src はそのまま
+    // 断った後も src / own はそのまま
     assert_eq!(eng.get(src, "files.size"), Some(4));
+    assert_eq!(eng.get(own, "files.size"), Some(1));
     assert_eq!(eng.get(own2, "files.size"), Some(2));
     drop(eng);
     let _ = std::fs::remove_dir_all(&path);
