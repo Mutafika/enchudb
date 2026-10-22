@@ -9685,6 +9685,23 @@ impl Engine {
         }
         let to = enchudb_oplog::make_eid(self_peer, d);
         let mut moved = 0;
+        // #581: 畳む 2 つの行の identity と作成を、 残す行に束ねた identity として覚える (畳む前の cell の版数で)
+        if self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed) {
+            let (dn, db) = (self.native_identity(d), self.min_cell_version(d));
+            let (sn, sb) = (self.native_identity(s), self.min_cell_version(s));
+            let mut f = self.pk_former.write().unwrap();
+            if f.bound_of(d).is_empty() {
+                f.add_bound(d, dn, db);
+            }
+            let from: Vec<_> = if f.bound_of(s).is_empty() { vec![(sn, sb)] } else { f.bound_of(s).to_vec() };
+            for (id, c) in from {
+                f.add_bound(d, id, c);
+            }
+            f.set_bound(s, Vec::new());
+            drop(f);
+            self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
         // 1. 同じ entity の削除の版数: その版数より古い dst の cell を落とし、 版数を dst にも載せる。 生きた src に版数が載るのは、
         //    前の版の DB の生き残り (削除より新しい cell が残った行) と、 途中で切れた削除の跡なので、 削除優先の 「行ごと消す」 は
         //    当てない (当てると dst ごと消え、 次の段で src の cell も入らない)
@@ -12548,6 +12565,10 @@ impl Engine {
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
+        // #581: 名前で束ねた identity のうち、 削除より後に作られたものを切り離してから消す
+        if self.split_later_identities(local, hlc) {
+            return true;
+        }
         let raised = self.slot_is_dead(local) && hlc > self.tombstone_version_of(local);
         // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
@@ -12564,6 +12585,148 @@ impl Engine {
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
+    }
+
+    /// #581: 名前で束ねる直前に (`Syncer` の束ね)、 束ね先の行 `existing` と、 束ねる foreign entity `foreign_eid` (作成 = その
+    /// 最初の名前の書き込みの版数 `created`) を覚える。 束ね先の行の元の identity は最初に束ねる時に覚える (自分の行は自分、
+    /// 翻訳した行は逆写像。 作成はその時の cell の版数の最小で近似する)。 名前の記録を持たない DB では何もしない。
+    pub fn note_bound_identity(
+        &self,
+        existing: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        created: enchudb_oplog::Hlc,
+    ) {
+        use std::sync::atomic::Ordering;
+        if !self.pk_tombs_on.load(Ordering::Relaxed) {
+            return;
+        }
+        let local = enchudb_oplog::eid_local(existing);
+        let native = self.native_identity(local);
+        let born = self.min_cell_version(local);
+        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        let mut f = self.pk_former.write().unwrap();
+        let mut changed = false;
+        if f.bound_of(local).is_empty() {
+            changed |= f.add_bound(local, native, born);
+        }
+        changed |= f.add_bound(local, id, created);
+        drop(f);
+        if changed {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// #581: 行 `local` の元の identity (自分の行は (自分の peer, local)、 翻訳した行は逆写像)。
+    fn native_identity(&self, local: u32) -> (u32, u32) {
+        self.eid_translator.reverse(local).unwrap_or((self.peer_id(), local))
+    }
+
+    /// #581: 行 `local` の cell の版数の最小 (版数の無い cell は見ない)。 行の作成の近似 (名前のカードを最初に書く、 #548)。
+    fn min_cell_version(&self, local: u32) -> enchudb_oplog::Hlc {
+        (0..self.himos.len())
+            .filter(|&h| self.himos[h].get_value(local).is_some())
+            .map(|h| self.version_of(local, h as u16))
+            .filter(|&v| v != enchudb_oplog::Hlc::ZERO)
+            .min()
+            .unwrap_or(enchudb_oplog::Hlc::ZERO)
+    }
+
+    /// #581: 行 `local` を版数 `t` で消す前に、 名前で束ねた identity のうち `t` より後に作られたもの (削除の後に同じ名前で
+    /// 作られた行 = 削除を先に受けた peer では別のデッキ) を切り離す。 切り離して消したら true (呼び手は消さない)、 束ねた
+    /// identity が無い / 全部 `t` 以前なら false (呼び手が普通に消す)。
+    ///
+    /// - 元の identity が後: 行は残る。 早い identity を消えた slot に付け替え (その宛ての書き込みは捨てる)、 `t` 以前の cell
+    ///   (早い identity の書き込み) を落とし、 名前の削除を覚える
+    /// - 元の identity が早い: 後の identity を新しい slot に移し (`t` より新しい cell を写す)、 行を消す
+    ///
+    /// `t` より新しい cell のうち、 削除を知らない peer が消えた identity 宛てに書いた分は、 後の identity の書き込みと分けられない
+    /// (cell は書いた宛名を持たない) ので、 後の identity の側に残る。
+    fn split_later_identities(&self, local: u32, t: enchudb_oplog::Hlc) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.pk_former_empty.load(Ordering::Acquire) || !self.entities.is_live(local) {
+            return false;
+        }
+        let list = self.pk_former.read().unwrap().bound_of(local).to_vec();
+        let Some(&(native, _)) = list.first() else { return false };
+        let (later, earlier): (Vec<_>, Vec<_>) = list.into_iter().partition(|&(_, c)| c > t);
+        if later.is_empty() {
+            return false;
+        }
+        let Some(pk) = self.pk_himo_of_slot(local) else { return false };
+        let self_peer = self.peer_id();
+        if later.iter().any(|&(id, _)| id == native) {
+            // 元の行は残る: 早い identity を消えた slot に付け替える
+            for &((peer, fl), _) in &earlier {
+                if peer == self_peer && fl == local {
+                    continue;
+                }
+                if let Some(dead) = self.alloc_translated_local(pk) {
+                    self.set_tombstone_local(dead, t);
+                    self.live_free(dead);
+                    self.eid_translator.insert(peer, fl, dead);
+                }
+            }
+            let name = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
+            {
+                let _row = self.row_locks.write(local);
+                for hid in 0..self.himos.len() {
+                    if self.himos[hid].get_value(local).is_some() && self.version_of(local, hid as u16) <= t {
+                        self.remove_cell_freeing_leaf(local, hid);
+                    }
+                }
+            }
+            if let Some(v) = name {
+                let mut g = self.pk_tombs.write().unwrap();
+                self.drain_pk_pending(&mut g);
+                self.with_pk_key(pk, PkValue::Local(v), |k| self.note_pk_locked(&mut g, pk, k, crate::pk_tombs::NO_SLOT, t));
+            }
+            self.pk_former.write().unwrap().set_bound(local, if later.len() > 1 { later } else { Vec::new() });
+        } else {
+            // 元の行は消える: 後の identity を新しい slot に移す
+            let Some(moved) = self.alloc_translated_local(pk) else { return false };
+            self.copy_cells_newer_than(local, moved, t);
+            for (i, &((peer, fl), _)) in later.iter().enumerate() {
+                if i == 0 {
+                    self.eid_translator.insert(peer, fl, moved);
+                } else {
+                    self.eid_translator.alias(peer, fl, moved);
+                }
+            }
+            {
+                let mut f = self.pk_former.write().unwrap();
+                f.set_bound(local, earlier);
+                f.set_bound(moved, if later.len() > 1 { later } else { Vec::new() });
+            }
+            self.apply_delete_local(local, t);
+        }
+        self.pk_former_dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// #581: 行 `from` の cell のうち版数が `t` より新しいものを行 `to` に写す (`merge_entity_into` の 2 段目と同じ当て方)。
+    fn copy_cells_newer_than(&self, from: u32, to: u32, t: enchudb_oplog::Hlc) {
+        let self_peer = self.peer_id();
+        let to_eid = enchudb_oplog::make_eid(self_peer, to);
+        for hid in 0..self.himos.len() {
+            let h = hid as u16;
+            let ver = self.version_of(from, h);
+            if ver <= t {
+                continue;
+            }
+            match self.himos[hid].get_value(from) {
+                Some(_) if self.leaf_for(hid).is_some() => {
+                    let src = enchudb_oplog::make_eid(self_peer, from);
+                    if let Some(bytes) = self.get_text_owned(src, &self.himo_names[hid]) {
+                        self.remote_tieleaf_apply(to_eid, h, &bytes, ver);
+                    }
+                }
+                Some(v) => {
+                    self.remote_tie_apply_result(to_eid, h, v, ver);
+                }
+                None => {}
+            }
+        }
     }
 
     /// #490: リモート peer から届いた Delete を、 翻訳する前の eid (author の世界番号) のまま当てる。

@@ -1415,6 +1415,8 @@ impl Syncer {
         };
         // #513: 束ねた行にも、 その主キーの行を消した削除を当てる (削除の後に作り直された行に束ねる時、 削除より古い
         // 書き込みを残さない)
+        // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)
+        self.engine.note_bound_identity(existing, *eid, rec.hlc);
         let bound = self.engine.bind_remote_eid_by_pk(rec.author_peer, *eid, existing, *himo_id, local_value);
         own.then_some(bound)
     }
@@ -1612,7 +1614,18 @@ impl Syncer {
                 let r = ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc));
                 // 主キーが変わって (改名)、 同じ主キーの別の行があれば 1 つに畳む (主キーが同じなら同じ行、 PK_IDENTITY_PLAN 11-1)
                 if r == ApplyResult::Applied && self.engine.is_pk_himo(*himo_id) {
-                    self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value, dying.get(eid).copied());
+                    // 削除優先 (総当たりで見つけた形): その名前がこの書き込みより後に消されていれば、 この行もその削除で消える
+                    // (その名前で作られた / 改名した時点で、 消されたデッキの一員)。 名前の書き込みより先に他の列が別の配りで
+                    // 届いて slot を払い出していると、 束ねの時の確かめ (`bind_by_primary_key`) を通らないので、 ここで見る。
+                    // 消える行は畳まない (畳むと、 削除の後に作られた同じ名前の行まで巻き込む)
+                    match self.engine.name_deleted_at(*himo_id, PkValue::Local(value)) {
+                        Some(t) if t > rec.hlc => {
+                            self.engine.remote_delete_apply(local_eid, t);
+                        }
+                        _ => {
+                            self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value, dying.get(eid).copied());
+                        }
+                    }
                 }
                 // 削除優先 (#551): 消えた行への改名は捨てるが、 その名前も消した名前 (改名を先に受けた peer と同じ名前の集まり)
                 if r == ApplyResult::SkippedOlder && self.engine.is_pk_himo(*himo_id) {
