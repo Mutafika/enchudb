@@ -381,9 +381,9 @@ fn a_row_made_after_the_rename_splits_off_when_the_rename_arrives_late() {
 }
 
 /// 改名の時刻 4: 切り離す時、 束ねていた間の自分の書き込みは、 その書き込みの宛名の identity の側に残る。 A は B の k1 を受けた
-/// 後に (改名を知らずに) C の k1 (改名の後に作られた) を受けて束ね、 束ねた行の title を書く。 束ねた行への書き込みの宛名は最後に
-/// 束ねた identity (C の行) なので、 他の peer でも C の行に当たる。 その後で B の改名が届くと、 A の title は C の行に、 B の行は
-/// B の title に戻る (束ねた行の cell は混ざっているので、 identity ごとのカードから戻す)。
+/// 後に (改名を知らずに) C の k1 (改名の後に作られた) を受けて束ね、 束ねた行の title を書く。 束ねた行への書き込みの宛名は行の元の
+/// identity (B の行、 #613: 束ねても宛名は替えない) なので、 他の peer でも B の行に当たる。 その後で B の改名が届くと、 A の title は
+/// B の行 (k2) に、 C の行は C の title に戻る (束ねた行の cell は混ざっているので、 identity ごとのカードから戻す)。
 #[test]
 fn a_split_keeps_the_writes_made_while_bound() {
     let steps = [
@@ -395,7 +395,7 @@ fn a_split_keeps_the_writes_made_while_bound() {
         Step::Retitle { by: 0, key: 1, title: 2 },
         Step::Pull { by: 0, from: 1 },
     ];
-    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t2")), (text("k2"), text("t1"))]));
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t0")), (text("k2"), text("t2"))]));
 }
 
 /// 改名の時刻 4 の続き: 切り離した後も、 行の slot の持ち主 (C の行) は自分の slot に残る。 C は改名の後に k1 を作り、 B の k1 と
