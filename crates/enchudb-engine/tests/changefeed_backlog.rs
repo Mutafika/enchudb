@@ -199,11 +199,15 @@ fn stalled_listener_is_detached_when_the_backlog_overflows() {
     assert!((seen as u64) < N, "外した受け手に全部届いた ({what}、 届いた {seen})");
 }
 
-/// #560 の対照: すぐ受け取る受け手は、 上限が WAL の 2 倍でも、 何度畳んでも外されない (溜めの大きさは配った分だけ減る)。
+/// #560 の対照: すぐ受け取る受け手は、 上限が小さくても、 何度畳んでも外されない (溜めの大きさは配った分だけ減る)。
+///
+/// 上限は 8 MiB (既定の 64 MiB の 1/8、 溜めでは畳み 13 回分ほど)。 配った分を溜めから引かなければ、 200,000 件 (溜めでは約 68 MiB)
+/// の途中で越えて外れる。 前は 512 KiB (畳み 1 回分より小さい) で、 通知係が畳みの間に 1 度も起きないと越えた (混んだ CI の runner
+/// で畳み 109 回のうち 1 回。 手元で 12 本並べると master で 48 回中 1 回)。 通知係は畳むたびに起こされるが、 いつ動くかは OS 次第。
 #[test]
 fn prompt_listener_is_not_detached_under_a_small_limit() {
     let (p, eng) = engine("prompt", 256 << 10);
-    eng.set_change_backlog_limit(512 << 10);
+    eng.set_change_backlog_limit(8 << 20);
     let rec = Recorder::new(Duration::ZERO, true);
     eng.add_change_listener(rec.clone());
     const N: u64 = 200_000;

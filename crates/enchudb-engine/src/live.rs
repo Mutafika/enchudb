@@ -240,6 +240,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::change_log::Truncated;
 use enchudb_oplog::EntityId;
 
 /// live query の条件 1 個。 全部 **根の entity についての AND** として組み合わさる。
@@ -2249,6 +2250,8 @@ struct Member {
     pins: Vec<u32>,
     /// 見直しの節を持つ family の member ([`TouchedLiveQuery`]) なら、 最後の poll 以降に根の紐が書かれた根の entity。
     touched: Option<Marks>,
+    /// 渡した差分の記録 (版付き。 [`LiveQuery::poll_since`])。 `drain` のたびに積む (on の時だけ)。
+    log: DeltaLog<LiveDelta>,
 }
 
 /// 上位 k 件の購読の境界。 鍵の順序 (`RootKey::order`、 (並びの値, eid) の昇順。 降順の購読は
@@ -2317,10 +2320,13 @@ struct KeyedState {
 struct GroupState {
     changed: Marks<u64>,
     reported: std::collections::BTreeMap<u64, Agg>,
+    /// 渡した差分の記録 (動いた group の値、 版付き。 [`LiveCounts::poll_since`])。
+    log: DeltaLog<Vec<u64>>,
 }
 
 impl GroupState {
     /// 動いた group の今の集計 (最後に渡したものと違うものだけ、 値の昇順。 件数 0 = group が消えた)。
+    /// 渡した差分は記録にも残す (`log` が on の時)。
     fn drain(&mut self, groups: &std::collections::BTreeMap<u64, Agg>) -> Vec<(u64, Agg)> {
         let mut out = Vec::new();
         for v in self.changed.take() {
@@ -2335,6 +2341,7 @@ impl GroupState {
                 }
             }
         }
+        self.log.record_groups(&out);
         out
     }
 }
@@ -2367,11 +2374,13 @@ impl Member {
         }
     }
 
-    /// changed を消費して差分を返し、 報告済みの集合を進める。 `root` = 根の答え。
+    /// changed を消費して差分を返し、 報告済みの集合を進める。 `root` = 根の答え。 渡した差分は記録にも残す (`log` が on の時)。
     fn drain(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: u32) -> LiveDelta {
         self.queued = false;
         let probe = Member::probe(&self.root_keys, self.range, self.topk.map(|t| (t, self.order_desc)));
-        drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(e, root(e)), peer)
+        let d = drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(e, root(e)), peer);
+        self.log.record_delta(&d);
+        d
     }
 
     /// 鍵付きの購読: changed を消費して `(eid, 鍵)` の差分を返す。 `root` = 根の答え (値 = 鍵)。 `left` に居る eid
@@ -3864,6 +3873,7 @@ impl Family {
             group: 0,
             pins: Vec::new(),
             touched: self.notice.then(Marks::default),
+            log: DeltaLog::off(),
         };
         let slot = match s.members.iter().position(Option::is_none) {
             Some(i) => {
@@ -5163,6 +5173,8 @@ struct UnionState {
     changed: Marks,
     /// `LiveRegistry::ready_unions` に載っているか。
     queued: bool,
+    /// 渡した差分の記録 (版付き。 [`LiveQuery::poll_since`])。
+    log: DeltaLog<LiveDelta>,
 }
 
 impl UnionState {
@@ -5174,6 +5186,7 @@ impl UnionState {
             left: Marks::default(),
             changed: Marks::default(),
             queued: false,
+            log: DeltaLog::off(),
         }
     }
 
@@ -5219,7 +5232,9 @@ impl UnionState {
     fn drain(&mut self, peer: u32) -> LiveDelta {
         self.queued = false;
         let branches = &self.branches;
-        drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| branches.iter().any(|b| b.get(e)), peer)
+        let d = drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| branches.iter().any(|b| b.get(e)), peer);
+        self.log.record_delta(&d);
+        d
     }
 
     /// どれかの枝に居る entity (昇順)。
@@ -5317,6 +5332,96 @@ impl LiveQuery {
     pub fn poll(&self, eng: &crate::engine::Engine) -> LiveDelta {
         self.check_engine(eng);
         self.poll_with(eng)
+    }
+
+    /// `pos` (前に受け取った版) から今までの差分と、 今の版。 `pos` が今の版なら空。
+    ///
+    /// [`Truncated`] = `pos` から先を組めない: 記録が始まる前の版 (開き直した後に前の process の版を渡した時も)、 記録の大きさ
+    /// ([`crate::engine::Engine::set_answer_log_limit`]) を越えて捨てた、 今の版より先。 その時は [`snapshot`](Self::snapshot) で今の
+    /// 全体と版を取り直す (`from` は組める最古の版 / 今の版)。
+    ///
+    /// - 宣言された答え ([`crate::engine::Engine::declare_answer`]) は登録時から記録し、 他の購読は最初の `poll_since` / `snapshot`
+    ///   から (その前に `poll` で渡した差分は組めない)
+    /// - 版は差分を 1 つ記録するたびに +1 (空の poll は進めない)。 開き直すと前の process より大きい始まりから = 版は process を
+    ///   跨いで単調 (前の版を渡せば `Truncated`)
+    /// - `poll` / 束 ([`LiveGroup`]) の poll で渡した差分も記録に残る = どの道で受けても `pos` からの差分は同じ
+    /// - 差分は entity ごとに最初と最後の出入りで決める: 入って出た entity は出ない、 出て入り直した entity は removed と added の
+    ///   両方 (別物として入り直した)、 他は最後の出入り。 removed → added の順に積めば `pos` の時点の集合から今の集合になる
+    pub fn poll_since(&self, eng: &crate::engine::Engine, pos: u64) -> Result<(LiveDelta, u64), Truncated> {
+        self.check_engine(eng);
+        let cap = eng.answer_log_limit();
+        let peer = self.registry.peer.load(Ordering::Acquire);
+        match &self.kind {
+            Kind::One { family, slot } => {
+                let mut guard = family.settled.lock();
+                family.settle(eng, &mut guard);
+                let Settled { recs, vals, members, opart, order_view, .. } = &mut *guard;
+                let Some(m) = members[*slot].as_mut() else { return Ok((LiveDelta::default(), 0)) };
+                m.log.enable(cap);
+                let _ = m.drain(|e| view_at(recs, vals, opart, *order_view, e), peer);
+                m.log.since(pos)
+            }
+            Kind::Any(u) => {
+                let mut st = u.settle(eng);
+                st.log.enable(cap);
+                let _ = st.drain(peer);
+                st.log.since(pos)
+            }
+        }
+    }
+
+    /// 今の結果全体 (eid 昇順) と今の版。 ここから [`poll_since`](Self::poll_since) を続けられる (この時点までの差分は渡した
+    /// 扱い = 次の `poll` も空から)。 [`Truncated`] の後の取り直しに。
+    pub fn snapshot(&self, eng: &crate::engine::Engine) -> (Vec<EntityId>, u64) {
+        self.check_engine(eng);
+        let cap = eng.answer_log_limit();
+        let peer = self.registry.peer.load(Ordering::Acquire);
+        match &self.kind {
+            Kind::One { family, slot } => {
+                let mut s = family.settled.lock();
+                family.settle(eng, &mut s);
+                let version = {
+                    let Settled { recs, vals, members, opart, order_view, .. } = &mut *s;
+                    let Some(m) = members[*slot].as_mut() else { return (Vec::new(), 0) };
+                    m.log.enable(cap);
+                    let _ = m.drain(|e| view_at(recs, vals, opart, *order_view, e), peer);
+                    m.log.version
+                };
+                let Some(m) = s.members[*slot].as_ref() else { return (Vec::new(), version) };
+                let out = if m.topk.is_some() {
+                    let mut out: Vec<EntityId> = Self::ranked_in(&s, m).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+                    out.sort_unstable();
+                    out
+                } else {
+                    s.recs[0]
+                        .with_keys(&m.root_keys)
+                        .into_iter()
+                        .filter(|&e| m.has(e, s.root(e)))
+                        .map(|e| enchudb_oplog::make_eid(peer, e))
+                        .collect()
+                };
+                (out, version)
+            }
+            Kind::Any(u) => {
+                let mut st = u.settle(eng);
+                st.log.enable(cap);
+                let _ = st.drain(peer);
+                let out = st.members().into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+                (out, st.log.version)
+            }
+        }
+    }
+
+    /// 差分の記録を今から始める (宣言された答えの登録時に engine が呼ぶ。 既に始めていれば何もしない)。
+    pub(crate) fn enable_log(&self, cap: usize) {
+        match &self.kind {
+            Kind::One { family, slot } => {
+                if let Some(m) = family.settled.lock().members[*slot].as_mut() {
+                    m.log.enable(cap);
+                }
+            }
+            Kind::Any(u) => u.state.lock().log.enable(cap),
+        }
     }
 
     pub(crate) fn poll_with(&self, r: &impl CellReader) -> LiveDelta {
@@ -5701,6 +5806,39 @@ impl LiveCounts {
     pub fn poll_sums(&self, eng: &crate::engine::Engine) -> Vec<(u64, Agg)> {
         self.check_engine(eng);
         self.poll_with(eng)
+    }
+
+    /// `pos` (前に受け取った版) から今までに件数か合計が動いた group と今の集計 (値の昇順、 件数 0 = 消えた)、 今の版。
+    /// [`Truncated`] と記録の決まりは [`LiveQuery::poll_since`] と同じ。 記録に残すのは動いた group の値だけで、 集計は今の値で
+    /// 返す (動いて戻った group も届く = 値で上書きすれば今の集計)。
+    pub fn poll_since(&self, eng: &crate::engine::Engine, pos: u64) -> Result<(Vec<(u64, Agg)>, u64), Truncated> {
+        self.check_engine(eng);
+        let cap = eng.answer_log_limit();
+        self.with(eng, |g, groups, _| {
+            g.log.enable(cap);
+            let _ = g.drain(groups);
+            let (vs, version) = g.log.groups_since(pos)?;
+            Ok((vs.into_iter().map(|v| (v, groups.get(&v).copied().unwrap_or_default())).collect(), version))
+        })
+    }
+
+    /// 今の全 group と件数・合計 (値の昇順) と今の版 (ここから [`poll_since`](Self::poll_since) を続けられる、 この時点までの
+    /// 差分は渡した扱い)。 [`Truncated`] の後の取り直しに。
+    pub fn snapshot(&self, eng: &crate::engine::Engine) -> (Vec<(u64, Agg)>, u64) {
+        self.check_engine(eng);
+        let cap = eng.answer_log_limit();
+        self.with(eng, |g, groups, _| {
+            g.log.enable(cap);
+            let _ = g.drain(groups);
+            (groups.iter().map(|(&v, &c)| (v, c)).collect(), g.log.version)
+        })
+    }
+
+    /// 差分の記録を今から始める (宣言された答えの登録時に engine が呼ぶ。 既に始めていれば何もしない)。
+    pub(crate) fn enable_log(&self, cap: usize) {
+        if let Some(g) = self.family.settled.lock().members[self.slot].as_mut().and_then(|m| m.grp.as_mut()) {
+            g.log.enable(cap);
+        }
     }
 
     pub(crate) fn poll_with(&self, r: &impl CellReader) -> Vec<(u64, Agg)> {
@@ -6414,6 +6552,265 @@ impl std::fmt::Debug for AnswerHandle {
             AnswerHandle::Query(q) => f.debug_tuple("Query").field(q).finish(),
             AnswerHandle::Counts(c) => f.debug_tuple("Counts").field(c).finish(),
         }
+    }
+}
+
+// ─────────────────────── 差分の位置 (版付きの記録、 poll_since) ───────────────────────
+
+/// 版の始まり: 今の時刻 (µs) を 12 bit 上げた値。 記録を始める (開き直す) たびに新しい始まりになるので、 前の process の版は
+/// この process の版の範囲に入らない (`poll_since` は [`Truncated`] で答える)。 同じ µs に 2 回始める / 1 µs に 4096 回より多く
+/// 差分を記録することは無い。
+fn version_base() -> u64 {
+    let us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    us << 12
+}
+
+/// poll ごとに渡した差分を版付きで残す記録 ([`LiveQuery::poll_since`] / [`LiveCounts::poll_since`])。 `T` は 1 回の差分
+/// (集合は [`LiveDelta`]、 集計は動いた group の値)。
+///
+/// - 版は差分を 1 つ記録するたびに +1 (空の差分は記録しない)。 始まりは [`version_base`] (開き直すと前より大きい)
+/// - `from` = ここから先の差分を組める最古の版 (記録の先頭の 1 つ前)。 大きさが `cap` を越えたら古い方から捨てて `from` を
+///   進める (いちばん新しい 1 つは残す = 続けて poll する呼び手の差分は必ず組める)
+/// - on でない記録は何もしない (宣言された答えは登録時に、 他の購読は最初の `poll_since` / `snapshot` で on になる)
+struct DeltaLog<T> {
+    on: bool,
+    version: u64,
+    from: u64,
+    /// (版, 大きさ (byte、 概算), 差分)。 版の昇順。
+    entries: std::collections::VecDeque<(u64, usize, T)>,
+    bytes: usize,
+    cap: usize,
+}
+
+impl<T> Default for DeltaLog<T> {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl<T> DeltaLog<T> {
+    const fn off() -> Self {
+        DeltaLog { on: false, version: 0, from: 0, entries: std::collections::VecDeque::new(), bytes: 0, cap: 0 }
+    }
+
+    /// 記録を始める (既に始めていれば何もしない)。
+    fn enable(&mut self, cap: usize) {
+        if !self.on {
+            self.on = true;
+            self.cap = cap;
+            self.version = version_base();
+            self.from = self.version;
+        }
+    }
+
+    /// 差分を 1 つ記録する (空の差分は呼ばない)。
+    fn record(&mut self, size: usize, delta: T) {
+        if !self.on {
+            return;
+        }
+        self.version += 1;
+        self.entries.push_back((self.version, size, delta));
+        self.bytes += size;
+        while self.bytes > self.cap && self.entries.len() > 1 {
+            if let Some((v, s, _)) = self.entries.pop_front() {
+                self.bytes -= s;
+                self.from = v;
+            }
+        }
+    }
+
+    /// `pos` から先の差分を組めるか。 組めなければ [`Truncated`] (`from` = 組める最古の版。 `pos` が今の版より先なら今の版)。
+    fn check(&self, pos: u64) -> Result<(), Truncated> {
+        if pos < self.from {
+            Err(Truncated { from: self.from })
+        } else if pos > self.version {
+            Err(Truncated { from: self.version })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `pos` より後の記録 (版の昇順)。
+    fn after(&self, pos: u64) -> impl Iterator<Item = &T> {
+        let start = self.entries.partition_point(|(v, _, _)| *v <= pos);
+        self.entries.range(start..).map(|(_, _, d)| d)
+    }
+}
+
+impl DeltaLog<LiveDelta> {
+    fn record_delta(&mut self, d: &LiveDelta) {
+        if self.on && !d.is_empty() {
+            self.record((d.added.len() + d.removed.len()) * std::mem::size_of::<EntityId>(), d.clone());
+        }
+    }
+
+    /// `pos` から今までの差分を 1 つに組む (eid 昇順)。 entity ごとに最初と最後の出入りで決める: 入って出た = 何もなし、
+    /// 出て入った = removed と added の両方 (別物として入り直した)、 他は最後の出入り。
+    fn since(&self, pos: u64) -> Result<(LiveDelta, u64), Truncated> {
+        self.check(pos)?;
+        let mut it = self.after(pos);
+        let Some(first) = it.next() else { return Ok((LiveDelta::default(), self.version)) };
+        let Some(second) = it.next() else { return Ok((first.clone(), self.version)) };
+        // (eid, 順番, 入った) を eid の順に並べ、 entity ごとに最初と最後を見る (removed → added の順が 1 回の差分の中の順)
+        let mut ops: Vec<(EntityId, usize, bool)> = Vec::new();
+        let mut seq = 0usize;
+        for d in [first, second].into_iter().chain(it) {
+            for &e in &d.removed {
+                ops.push((e, seq, false));
+                seq += 1;
+            }
+            for &e in &d.added {
+                ops.push((e, seq, true));
+                seq += 1;
+            }
+        }
+        ops.sort_unstable();
+        let mut out = LiveDelta::default();
+        let mut i = 0;
+        while i < ops.len() {
+            let e = ops[i].0;
+            let mut j = i + 1;
+            while j < ops.len() && ops[j].0 == e {
+                j += 1;
+            }
+            match (ops[i].2, ops[j - 1].2) {
+                (true, true) => out.added.push(e),
+                (false, false) => out.removed.push(e),
+                (true, false) => {}
+                (false, true) => {
+                    out.removed.push(e);
+                    out.added.push(e);
+                }
+            }
+            i = j;
+        }
+        Ok((out, self.version))
+    }
+}
+
+impl DeltaLog<Vec<u64>> {
+    fn record_groups(&mut self, out: &[(u64, Agg)]) {
+        if self.on && !out.is_empty() {
+            self.record(out.len() * std::mem::size_of::<u64>(), out.iter().map(|(v, _)| *v).collect());
+        }
+    }
+
+    /// `pos` から今までに動いた group の値 (昇順、 重複なし) と今の版。
+    fn groups_since(&self, pos: u64) -> Result<(Vec<u64>, u64), Truncated> {
+        self.check(pos)?;
+        let mut vs: Vec<u64> = self.after(pos).flat_map(|g| g.iter().copied()).collect();
+        vs.sort_unstable();
+        vs.dedup();
+        Ok((vs, self.version))
+    }
+}
+
+#[cfg(test)]
+mod delta_log_tests {
+    use super::*;
+
+    fn d(removed: &[u64], added: &[u64]) -> LiveDelta {
+        LiveDelta { added: added.to_vec(), removed: removed.to_vec() }
+    }
+
+    fn log(cap: usize) -> DeltaLog<LiveDelta> {
+        let mut l = DeltaLog::off();
+        l.enable(cap);
+        l
+    }
+
+    /// 記録する前の版は空、 1 つなら差分そのもの、 2 つ以上は entity ごとに最初と最後の出入りで組む。
+    #[test]
+    fn composes_first_and_last_moves_per_entity() {
+        let mut l = log(1 << 20);
+        let v0 = l.version;
+        assert_eq!(l.since(v0), Ok((LiveDelta::default(), v0)));
+        l.record_delta(&d(&[], &[1, 2, 3]));
+        let v1 = l.version;
+        assert_eq!(v1, v0 + 1);
+        assert_eq!(l.since(v0), Ok((d(&[], &[1, 2, 3]), v1)));
+        // 2: 入って出た (何もなし)、 3: 出て入った (両方)、 1: 居続ける、 4: 入った、 5: 出た
+        l.record_delta(&d(&[2, 3], &[4, 5]));
+        l.record_delta(&d(&[5], &[3]));
+        let v3 = l.version;
+        assert_eq!(v3, v1 + 2);
+        assert_eq!(l.since(v0), Ok((d(&[], &[1, 3, 4]), v3)));
+        assert_eq!(l.since(v1), Ok((d(&[2, 3], &[3, 4]), v3)));
+        assert_eq!(l.since(v3 - 1), Ok((d(&[5], &[3]), v3)));
+        assert_eq!(l.since(v3), Ok((LiveDelta::default(), v3)));
+        // 同じ差分の中の removed + added (別物として入り直した) も両方のまま
+        l.record_delta(&d(&[4], &[4]));
+        assert_eq!(l.since(v3), Ok((d(&[4], &[4]), v3 + 1)));
+        // 4 は v1 の時点では居なかった = 出て入り直しても added だけ
+        assert_eq!(l.since(v1), Ok((d(&[2, 3], &[3, 4]), v3 + 1)));
+    }
+
+    /// 空の差分は版を進めず記録しない。 off の記録は何もしない。
+    #[test]
+    fn empty_deltas_and_off_logs_record_nothing() {
+        let mut l = log(1 << 20);
+        let v0 = l.version;
+        l.record_delta(&LiveDelta::default());
+        assert_eq!(l.version, v0);
+        assert!(l.entries.is_empty());
+        let mut off: DeltaLog<LiveDelta> = DeltaLog::off();
+        off.record_delta(&d(&[], &[1]));
+        assert_eq!((off.version, off.entries.len()), (0, 0));
+        // enable は 1 回だけ (2 回目は版も cap も変えない)
+        let cap = l.cap;
+        l.enable(1);
+        assert_eq!((l.version, l.cap), (v0, cap));
+    }
+
+    /// 上限を越えたら古い方から捨てて from を進める (いちばん新しい 1 つは残す)。 捨てた版と先の版は Truncated。
+    #[test]
+    fn evicts_oldest_past_cap_and_reports_truncated() {
+        // 1 件 8 byte: 上限 20 byte = 2 件まで
+        let mut l = log(20);
+        let v0 = l.version;
+        l.record_delta(&d(&[], &[1]));
+        l.record_delta(&d(&[], &[2]));
+        assert_eq!(l.since(v0), Ok((d(&[], &[1, 2]), v0 + 2)));
+        l.record_delta(&d(&[], &[3]));
+        assert_eq!(l.from, v0 + 1);
+        assert_eq!(l.since(v0), Err(Truncated { from: v0 + 1 }));
+        assert_eq!(l.since(v0 + 1), Ok((d(&[], &[2, 3]), v0 + 3)));
+        assert_eq!(l.since(v0 + 4), Err(Truncated { from: v0 + 3 }));
+        // 上限より大きい 1 つは残る (その前は全部捨てる)
+        l.record_delta(&d(&[], &[4, 5, 6, 7]));
+        assert_eq!(l.entries.len(), 1);
+        assert_eq!(l.from, v0 + 3);
+        assert_eq!(l.since(v0 + 3), Ok((d(&[], &[4, 5, 6, 7]), v0 + 4)));
+        assert_eq!(l.since(v0 + 2), Err(Truncated { from: v0 + 3 }));
+    }
+
+    /// 集計の記録は動いた group の値の和集合 (昇順、 重複なし)。
+    #[test]
+    fn groups_since_unions_changed_values() {
+        let mut l: DeltaLog<Vec<u64>> = DeltaLog::off();
+        l.enable(1 << 20);
+        let v0 = l.version;
+        let a = Agg { count: 1, sum: 0, summed: 0 };
+        l.record_groups(&[(5, a), (2, a)]);
+        l.record_groups(&[]);
+        l.record_groups(&[(2, a), (9, a)]);
+        assert_eq!(l.version, v0 + 2);
+        assert_eq!(l.groups_since(v0), Ok((vec![2, 5, 9], v0 + 2)));
+        assert_eq!(l.groups_since(v0 + 1), Ok((vec![2, 9], v0 + 2)));
+        assert_eq!(l.groups_since(v0 + 2), Ok((vec![], v0 + 2)));
+        assert_eq!(l.groups_since(v0.wrapping_sub(1)), Err(Truncated { from: v0 }));
+    }
+
+    /// 版の始まりは時刻から = 後で始めた記録の始まりは前より大きい。
+    #[test]
+    fn later_logs_start_at_larger_versions() {
+        let a = log(1);
+        std::thread::sleep(std::time::Duration::from_micros(5));
+        let b = log(1);
+        assert!(b.version > a.version, "{} <= {}", b.version, a.version);
     }
 }
 
