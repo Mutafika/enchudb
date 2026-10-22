@@ -260,19 +260,6 @@ struct PkPending {
     hlc: enchudb_oplog::Hlc,
 }
 
-/// #513: 覚えた主キーの bit の表の大きさ (bit、 2 の冪)。 64 KiB。
-const PK_BLOOM_BITS: usize = 1 << 19;
-
-/// #513: 主キーの bit の表の番地 (FNV-1a 64)。
-fn pk_bloom_index(himo: u16, key: &[u8]) -> usize {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in himo.to_le_bytes().iter().chain(key) {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    (h as usize) & (PK_BLOOM_BITS - 1)
-}
-
 /// #513: 主キーで束ねる時の主キーの値 ([`Engine::reserve_remote_eid_for_pk`])。 受け手の辞書にある値・数などは local な
 /// 値 (`Local`)、 受け手の辞書に無い文字列 (届いた `Vocab` の bytes) は `Text`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4686,9 +4673,9 @@ pub struct Engine {
     pk_pending: parking_lot::Mutex<Vec<PkPending>>,
     /// #513: `pk_pending` に積んだ分があるかもしれない (無いのに立っていることはある)。
     pk_pending_nonempty: std::sync::atomic::AtomicBool,
-    /// #513: 覚えた主キーの bit の表 (主キーの hash に 1 bit)。 bit が無ければ、 その主キーは覚えていない。 受け手が新しい行
-    /// ごとに引く時に、 lock を取らずに弾く。 初めて覚えた時に作る。
-    pk_bloom: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    /// #513: 覚えた主キーの bit の表 (`pk_tombs.rs` の `PkBloom`)。 bit が無ければ、 その主キーは覚えていない。 受け手が新しい行
+    /// ごとに引く時に、 lock を取らずに弾く。 初めて覚えた時に作り、 主キーが増えたら大きく作り直す (#560)。
+    pk_bloom: crate::pk_tombs::PkBloom,
     /// 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
     /// 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
@@ -5211,7 +5198,7 @@ impl Engine {
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
-            pk_bloom: std::sync::OnceLock::new(),
+            pk_bloom: crate::pk_tombs::PkBloom::default(),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -5715,9 +5702,7 @@ impl Engine {
                 if !loaded.is_empty() {
                     eng.pk_tombs_empty.store(false, Ordering::Release);
                 }
-                for (himo, key) in loaded.keys() {
-                    eng.pk_bloom_set(himo, key);
-                }
+                eng.pk_bloom.fit(&loaded);
                 *eng.pk_tombs.write().unwrap() = loaded;
                 if torn {
                     eprintln!("warning: pktombs sidecar ends with a torn record (dropped; rewritten on the next persist)");
@@ -6489,7 +6474,7 @@ impl Engine {
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
-            pk_bloom: std::sync::OnceLock::new(),
+            pk_bloom: crate::pk_tombs::PkBloom::default(),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -12293,24 +12278,8 @@ impl Engine {
         if g.note(himo, key, slot, hlc) {
             self.pk_tombs_dirty.store(true, Ordering::Release);
         }
-        self.pk_bloom_set(himo, key);
+        self.pk_bloom.add(g, himo, key);
         self.pk_tombs_empty.store(false, Ordering::Release);
-    }
-
-    /// #513: 主キーの bit の表に立てる。
-    fn pk_bloom_set(&self, himo: u16, key: &[u8]) {
-        let words = self
-            .pk_bloom
-            .get_or_init(|| (0..PK_BLOOM_BITS / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
-        let i = pk_bloom_index(himo, key);
-        words[i / 64].fetch_or(1 << (i % 64), std::sync::atomic::Ordering::Release);
-    }
-
-    /// #513: 主キーを覚えているかもしれない (false なら覚えていない)。
-    fn pk_bloom_maybe(&self, himo: u16, key: &[u8]) -> bool {
-        let Some(words) = self.pk_bloom.get() else { return false };
-        let i = pk_bloom_index(himo, key);
-        words[i / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (i % 64)) != 0
     }
 
     /// #513: 主キー `(himo, value)` の行を消した削除の版数 (覚えていれば)。
@@ -12321,7 +12290,7 @@ impl Engine {
         }
         self.flush_pk_pending();
         self.with_pk_key(himo, value, |key| {
-            if !self.pk_bloom_maybe(himo, key) {
+            if !self.pk_bloom.maybe(himo, key) {
                 return None;
             }
             self.pk_tombs.read().unwrap().tomb_of(himo, key)
