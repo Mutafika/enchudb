@@ -165,6 +165,27 @@ impl PkFormer {
         self.timeline.get(&slot)?.iter().filter(|w| w.1 == himo && &w.2[..] == key).map(|w| w.3).min()
     }
 
+    /// #620: 行 `slot` の identity `id` (作成 `created`) が名前 `(himo, key)` を持ち始めた時刻。 その identity 宛てにその名前への書き込み
+    /// があれば最初のもの (その名前で作られた / その名前に改名した)。 無ければ、 作成より後に行の別の identity がその名前に改名した
+    /// 最初の時刻 (改名は同じデッキの全部の identity に当たる)。 どちらも無ければ作成。
+    pub(crate) fn entered(
+        &self,
+        slot: u32,
+        id: (u32, u32),
+        created: enchudb_oplog::Hlc,
+        himo: u16,
+        key: &[u8],
+    ) -> enchudb_oplog::Hlc {
+        let Some(v) = self.timeline.get(&slot) else { return created };
+        let named = |w: &&NameWrite| w.1 == himo && &w.2[..] == key;
+        if let Some(t) = v.iter().filter(named).filter(|w| w.0 == id).map(|w| w.3).min() {
+            return t;
+        }
+        // 別の名前からの改名 (その identity の前の書き込みが別の名前)
+        let renamed_into = |w: &&NameWrite| v.iter().any(|e| e.0 == w.0 && e.1 == himo && e.3 < w.3 && &e.2[..] != key);
+        v.iter().filter(named).filter(|w| w.3 >= created).filter(renamed_into).map(|w| w.3).min().unwrap_or(created)
+    }
+
     /// 行 `slot` の名前の年表で、 identity `id` 宛ての最初の書き込みの版数 (その identity の作成)。
     pub(crate) fn first_name_write(&self, slot: u32, id: (u32, u32)) -> Option<enchudb_oplog::Hlc> {
         self.timeline.get(&slot)?.iter().filter(|w| w.0 == id).map(|w| w.3).min()

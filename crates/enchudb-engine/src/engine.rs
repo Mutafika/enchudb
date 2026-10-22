@@ -13002,15 +13002,15 @@ impl Engine {
             return None;
         }
         let target_id = (enchudb_oplog::eid_peer(target), enchudb_oplog::eid_local(target));
-        let list = {
-            let f = self.pk_former.read().unwrap();
-            let renamed = matches!(f.card_of(local, target_id, himo), Some((Card::Value(v), h)) if *v != value && h < t);
-            if !renamed {
-                return None;
-            }
-            f.bound_of(local).to_vec()
+        let old = match self.pk_former.read().unwrap().card_of(local, target_id, himo) {
+            Some((Card::Value(v), h)) if *v != value && h < t => *v,
+            _ => return None,
         };
-        let (later, earlier): (Vec<_>, Vec<_>) = list.into_iter().partition(|&(_, c)| c > t);
+        // 改名より後に前の名前を持ち始めた identity (改名の後に前の名前で作られた、 #620: 改名の後に前の名前に改名した) は別のデッキ
+        let (later, earlier): (Vec<_>, Vec<_>) = self.with_pk_key(himo, PkValue::Local(old), |k| {
+            let f = self.pk_former.read().unwrap();
+            f.bound_of(local).iter().copied().partition(|&(id, c)| f.entered(local, id, c, himo, k) > t)
+        })?;
         if later.is_empty() || earlier.is_empty() {
             return None;
         }
