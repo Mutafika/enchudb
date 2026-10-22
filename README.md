@@ -299,7 +299,9 @@ stream across restarts, call `enable_change_log(cap)` once: records then go to
 listener those numbers. Store the next number with your own commit, and after a restart call
 `add_change_listener_from(listener, next)` to continue where you stopped. If the log has
 already dropped that number, the call returns `Truncated { from }`; re-read the current state
-instead.
+instead. Writes to local-only tables (names starting with `_`, `define_reserved_table`, such as
+`_cursors`) are not handed to listeners, just as they are not sent to peers, so a listener can store
+its position in one of them without receiving its own writes back.
 
 Starting the ring over leaves the previous lap's records in the file until they are overwritten. Every record therefore
 carries the lap it was written in (an 8-byte mark after the payload, oplog file format 3), and recovery stops at the first
