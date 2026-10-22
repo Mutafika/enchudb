@@ -6763,12 +6763,7 @@ impl Engine {
         // 作った table も同じ扱いになる = 「WAL / commit の耐久性は使うが peer には
         // 配らない」 local-only table として使える。 判定は名前だけなので sidecar の
         // format 変更は無く、 reopen を跨いでそのまま効く。
-        let local_only_ranges: Vec<(u32, u32)> = self
-            .tables
-            .iter()
-            .filter(|t| t.is_reserved())
-            .flat_map(|t| t.extents())
-            .collect();
+        let local_only_ranges = self.local_only_ranges();
         let is_internal_eid = |eid: u64| -> bool {
             let local = enchudb_oplog::eid_local(eid);
             local_only_ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
@@ -13923,6 +13918,38 @@ impl Engine {
     /// Commit で閉じた group だけ (落ちたら消える record に番号を振らない: 振ると開き直した後に番号がずれる)。 true なら閉じて
     /// いない末尾も含めて全部 (畳む直前、 全部書き出してある)。 記録が listener の位置を越えて捨てたら、 その listener を外す
     /// (通知係が `on_detached` を呼ぶ)。 書き出しに失敗したら Err (写せた所までは進める)。 戻り値は写した数。
+    /// local-only の表 (`_` で始まる表、 `define_reserved_table`) の slot の範囲。 sync の bridge が配らず、 changefeed も渡さない。
+    fn local_only_ranges(&self) -> Vec<(u32, u32)> {
+        self.tables.iter().filter(|t| t.is_reserved()).flat_map(|t| t.extents()).collect()
+    }
+
+    /// changefeed に渡す record だけ残す: local-only の表の書き込みを外す (peer に配らない表は listener にも渡さない。 listener の
+    /// 中で local-only の表に位置を書くと、 その書き込みがまた配られて止まらない)。 local-only の表が無い DB は何も外さない。
+    /// Commit は WAL を読む所で group の区切りになるだけで渡らないので、 外した書き込みだけの group も何も渡らない。
+    fn keep_for_changefeed<T>(&self, recs: Vec<T>, op: impl Fn(&T) -> &enchudb_oplog::oplog::DecodedOp) -> Vec<T> {
+        use enchudb_oplog::oplog::DecodedOp;
+        let ranges = self.local_only_ranges();
+        if ranges.is_empty() {
+            return recs;
+        }
+        let local_only = |eid: u64| {
+            let local = enchudb_oplog::eid_local(eid);
+            ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
+        };
+        recs.into_iter()
+            .filter(|r| match op(r) {
+                DecodedOp::Tie { eid, .. }
+                | DecodedOp::Untie { eid, .. }
+                | DecodedOp::Delete { eid }
+                | DecodedOp::Content { eid, .. }
+                | DecodedOp::TieNamed { eid, .. }
+                | DecodedOp::TieLeaf { eid, .. }
+                | DecodedOp::TieRef { eid, .. } => !local_only(*eid),
+                DecodedOp::Commit | DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } => true,
+            })
+            .collect()
+    }
+
     fn pump_change_log(
         &self,
         wal: &enchudb_oplog::oplog::OpLog,
@@ -13932,6 +13959,7 @@ impl Engine {
     ) -> io::Result<usize> {
         use std::sync::atomic::Ordering;
         let (recs, end) = wal.scan_for_change_log(c.log_wal, wal.checkpoint(), with_tail);
+        let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
         if recs.is_empty() {
             c.log_wal = c.log_wal.max(end);
             return Ok(0);
@@ -17873,6 +17901,7 @@ impl Engine {
             let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
             let mut batch = std::mem::take(&mut c.committed);
             if committed_end > c.offset {
+                let recs = self.keep_for_changefeed(recs, |r| &r.op);
                 // 畳んだ時に閉じていなかった末尾は、 この Commit で閉じた group の頭
                 batch.append(&mut c.open_tail);
                 batch.extend(recs.into_iter().map(crate::transport::WireRecord::from));
@@ -17918,6 +17947,8 @@ impl Engine {
             return Some(0);
         }
         let (recs, committed_end, tail, end) = wal.iter_from_with_tail(c.offset);
+        let recs = self.keep_for_changefeed(recs, |r| &r.op);
+        let tail = self.keep_for_changefeed(tail, |r| &r.op);
         let moved = recs.len() + tail.len();
         let recs: Vec<crate::transport::WireRecord> = recs.into_iter().map(crate::transport::WireRecord::from).collect();
         let tail: Vec<crate::transport::WireRecord> = tail.into_iter().map(crate::transport::WireRecord::from).collect();
