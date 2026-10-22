@@ -1382,11 +1382,15 @@ impl Syncer {
                 }
             }
         };
-        // 索引は書く時に並べるので、 同じ batch で前に当てた record も引ける。 今その名前の行が無ければ、 前にその名前だった行
-        // (改名した行) に束ねる (PK_IDENTITY_PLAN 11-1: 改名を知らずに古い名前で作った行を、 届く順によらず同じ行にする)
-        let existing = self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next()
-            .or_else(|| self.engine.former_pk_holder(*himo_id, PkValue::Local(local_value)));
+        // 索引は書く時に並べるので、 同じ batch で前に当てた record も引ける。 名前の持ち主は時刻で決める: 改名より前に作られた
+        // 行は、 前にその名前だった行 (改名した行) に束ねる (PK_IDENTITY_PLAN 11-1: 改名を知らずに古い名前で作った行を、 届く順に
+        // よらず同じ行にする)。 改名より後に作られた行は、 今その名前の行に束ねる (無ければ新しいデッキ)。 改名の後にその名前で
+        // 作られた行が先に届いていても、 改名より前に作られた行はそちらに束ねない
         let created = rec.hlc;
+        let existing = self
+            .engine
+            .former_pk_holder(*himo_id, PkValue::Local(local_value), created)
+            .or_else(|| self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next());
         let reserve = || {
             self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Local(local_value), created).filter(|_| own)
         };
@@ -1608,10 +1612,21 @@ impl Syncer {
                         None => return ApplyResult::DroppedVocab,
                     }
                 };
+                // 改名の時刻: 名前で束ねた行の名前を書き換える時、 改名より後に作られた identity (改名を先に受けた peer では
+                // 別のデッキ) を切り離してから当てる
+                let local_eid = if self.engine.is_pk_himo(*himo_id) {
+                    self.engine.split_for_rename(local_eid, *eid, *himo_id, value, rec.hlc).unwrap_or(local_eid)
+                } else {
+                    local_eid
+                };
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
                 let r = ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc));
+                // 当てた後に (LWW で負けても) 束ねた identity のカードと名前の年表に積む (最初の改名は、 当てる前のカードから
+                // 年表を作る)
+                self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value), rec.hlc);
+                self.engine.note_name_write(local_eid, *eid, *himo_id, value, rec.hlc);
                 // 主キーが変わって (改名)、 同じ主キーの別の行があれば 1 つに畳む (主キーが同じなら同じ行、 PK_IDENTITY_PLAN 11-1)
                 if r == ApplyResult::Applied && self.engine.is_pk_himo(*himo_id) {
                     // 削除優先 (総当たりで見つけた形): その名前がこの書き込みより後に消されていれば、 この行もその削除で消える
@@ -1652,6 +1667,7 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::Dropped,
                 };
+                self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value as u64), rec.hlc);
                 ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc))
             }
             DecodedOp::Untie { eid, himo_id } => {
@@ -1661,6 +1677,7 @@ impl Syncer {
                     None => return ApplyResult::Dropped,
                 };
                 // #9: 写像ができたので退避中の Content を drain。
+                self.engine.note_bound_write(local_eid, *eid, *himo_id, None, rec.hlc);
                 ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc))
             }
             DecodedOp::Delete { eid } => {
@@ -1693,6 +1710,7 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::DroppedVocab,
                 };
+                self.engine.note_bound_write(local_eid, *eid, local_hid, Some(value), rec.hlc);
                 ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, local_hid, value, rec.hlc))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
@@ -1706,6 +1724,7 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
+                self.engine.note_bound_leaf(local_eid, *eid, local_hid, bytes, rec.hlc);
                 ApplyResult::from(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc))
             }
             DecodedOp::Content { eid, key, data } => {
