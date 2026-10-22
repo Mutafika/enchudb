@@ -6,8 +6,8 @@
 //! 機械に探させる (#547 / #551 / #545 / #581 は全部人が見つけた)。 答えには名前の無い塊 (title だけの entity) も入れる。
 //!
 //! 改名を混ぜるとまだ割れる形があるので、 普段の試験からは外す。 残っているのは、 改名の時刻の決まり (改名より後に前の名前で作った
-//! 行は新しいデッキ) を入れる前から割れていた形: #612 (相手の改名で自分の行 2 つが同じ名前になる) と #614 (削除の後の改名を、 作成より
-//! 先に受ける)。 改名を出さずに回すなら `ENCHU_FUZZ_NO_RENAME=1`:
+//! 行は新しいデッキ) を入れる前から割れていた形: #612 (相手の改名で自分の行 2 つが同じ名前になる) と #620 (改名で離れた名前に、 後から
+//! 別の行が改名で入る)。 改名を出さずに回すなら `ENCHU_FUZZ_NO_RENAME=1`:
 //!
 //! ```text
 //! ENCHU_FUZZ_CASES=200 cargo test --release --test sync_converge_fuzz -- --ignored --nocapture
@@ -267,7 +267,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: cases(), max_shrink_iters: 2000, ..ProptestConfig::default() })]
 
     #[test]
-    #[ignore = "既知の割れ (#612 / #614) があるので手で回す"]
+    #[ignore = "既知の割れ (#612 / #620) があるので手で回す"]
     fn every_order_converges(steps in proptest::collection::vec(step_strategy(), 1..10)) {
         if let Err(msg) = run(&steps) {
             prop_assert!(false, "手順 {steps:?}\n{msg}");
@@ -554,3 +554,61 @@ fn a_losing_rename_joins_the_row_that_held_its_name_then() {
     ];
     assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t2"))]));
 }
+
+/// #614: A が k1 を作って消す。 B は C の k2 を受け、 A の削除を知らずに k1 に改名する (削除より後)。 C の行は削除の後に k1 に
+/// なった行なので生き、 title も C が作った時のまま。 改名を C の行の作成より先に受けた受け手は、 k1 を消した削除の版数を払い出す
+/// slot に載せ、 後から届いた C の作成と title (削除より古い) を捨てていた。
+#[test]
+fn a_rename_after_the_delete_keeps_the_writes_made_before_it() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Upsert { by: 2, key: 2, title: 0 },
+        Step::Pull { by: 1, from: 2 },
+        Step::Delete { by: 0, key: 1 },
+        Step::Rename { by: 1, from: 2, to: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k1"), text("t0"))]));
+}
+
+/// #614 の続き: A が k1 を作って消す。 C は A の削除を知らずに k1 を作り (削除より前 = A の行と同じデッキ)、 B は C の k1 を受けて
+/// 削除の後に k2 に改名する。 C の行は消えたデッキの一員なので、 削除の後の改名も捨てる。 B の改名を C の作成より先に受けた受け手は、
+/// 最初に見た名前の書き込み (k2) で生きた slot を払い出す。 後から届いた C の作成 (削除より前に k1、 LWW で負ける) で消す。
+#[test]
+fn a_late_create_shows_the_row_was_in_the_deleted_deck() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Upsert { by: 2, key: 1, title: 1 },
+        Step::Pull { by: 1, from: 2 },
+        Step::Delete { by: 0, key: 1 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![]));
+}
+
+/// #614 の続き (上の形の裏): A が k1 を消した後に、 C が (削除を知らずに) k1 を作る (削除の後 = 新しいデッキ)。 B は C の k1 を受けて
+/// k2 に改名する。 B の改名を先に受けた受け手に後から届く C の作成 (k1、 LWW で負ける) は削除より後なので、 C の行を消さない。
+#[test]
+fn a_late_create_after_the_delete_keeps_the_row() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Delete { by: 0, key: 1 },
+        Step::Upsert { by: 2, key: 1, title: 1 },
+        Step::Pull { by: 1, from: 2 },
+        Step::Rename { by: 1, from: 1, to: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k2"), text("t1"))]));
+}
+
+/// 削除優先 (#614 で払い出しの道を書き換えたので): C が A の削除を知らずに k1 を作り (削除より前 = 同じデッキ)、 削除の後に title を
+/// 書き換える。 C の行を削除の後に受けた受け手は、 死んだ slot を払い出して、 削除の後の書き換えも捨てる。
+#[test]
+fn a_write_after_the_delete_to_a_row_made_before_it_is_dropped() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Upsert { by: 2, key: 1, title: 1 },
+        Step::Delete { by: 0, key: 1 },
+        Step::Retitle { by: 2, key: 1, title: 2 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![]));
+}
+
