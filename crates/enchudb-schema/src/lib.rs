@@ -267,11 +267,41 @@ struct TableInner {
     /// pk の `cols` index。 PK 未指定なら None。
     pk: Option<usize>,
     relations: Vec<RelationInner>,
-    /// #60: PK upsert の lookup→allocate を直列化する per-table lock。
-    /// 並行 mode で 2 thread が同一 PK を upsert したとき、 両方が「PK 不在」を
-    /// 観測 → 両方 entity_in で別 eid を払い出す TOCTOU で重複行ができるのを防ぐ。
-    /// per-table なので別 table の upsert は並行のまま。
-    upsert_lock: std::sync::Mutex<()>,
+    /// #60 / #601: 名前 (主キー) の確かめと書き込みを並べる lock。 並行 mode で 2 thread が同じ名前を書いた時、 両方が
+    /// 「その名前の行は無い」 を見て両方とも新しい行を作る TOCTOU を防ぐ (upsert も insert も名前の書き換えも)。 名前の値で
+    /// 選ぶ (同じ名前は同じ lock、 違う名前の書き込みはほとんど並行のまま)。 前は表ごとに 1 本で upsert だけが取った。
+    name_locks: NameLocks,
+}
+
+/// #601: 名前の値ごとの lock の数。
+const NAME_LOCKS: usize = 64;
+
+/// #601: 名前の値で選ぶ lock の並び。 値は辞書の番号でなく値そのもの (文字なら bytes) で選ぶ: 新しい文字は書く途中で番号が
+/// 付くので、 番号で選ぶと同じ名前の 2 本が別の lock を取りうる。
+#[derive(Debug)]
+struct NameLocks(Box<[std::sync::Mutex<()>]>);
+
+impl NameLocks {
+    fn new() -> Self {
+        NameLocks((0..NAME_LOCKS).map(|_| std::sync::Mutex::new(())).collect())
+    }
+
+    fn lock(&self, v: &Value) -> std::sync::MutexGuard<'_, ()> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        match v {
+            Value::Text(s) => eat(s.as_bytes()),
+            Value::Number(n) => eat(&n.to_le_bytes()),
+            Value::Ref(e) => eat(&e.to_le_bytes()),
+            _ => {}
+        }
+        self.0[(h % NAME_LOCKS as u64) as usize].lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl TableInner {
@@ -306,7 +336,7 @@ impl<'a> ColRef<'a> {
 
 /// #73: `TableInner` は `Arc` 共有の immutable snapshot なので、 schema 変更
 /// (column 追加 / PK 補完) は copy-on-write で新 Arc に差し替える。 name /
-/// table_vid は `src` から引き継ぎ、 upsert_lock は新規 (= lock 状態は引き継が
+/// table_vid は `src` から引き継ぎ、 name_locks は新規 (= lock 状態は引き継が
 /// ない、 migration は書き込み静止時に行う前提)。
 fn rebuild_table_inner(
     src: &TableInner,
@@ -320,7 +350,7 @@ fn rebuild_table_inner(
         cols,
         pk,
         relations,
-        upsert_lock: std::sync::Mutex::new(()),
+        name_locks: NameLocks::new(),
     })
 }
 
@@ -1160,7 +1190,7 @@ impl Database {
                 cols,
                 pk,
                 relations,
-                upsert_lock: std::sync::Mutex::new(()),
+                name_locks: NameLocks::new(),
             }));
         }
         Ok(())
@@ -1727,7 +1757,7 @@ impl<'a> TableBuilder<'a> {
             cols,
             pk: pk_idx,
             relations: relations.into_iter().map(|(from_col, to_table)| RelationInner { from_col, to_table }).collect(),
-            upsert_lock: std::sync::Mutex::new(()),
+            name_locks: NameLocks::new(),
         });
         // engine に table が残っていた (schema の blob だけ古い) 時は、 engine が戻した並びもここで宣言に合わせる
         sync_orders(&db.eng, &inner, &orders)?;
@@ -2105,36 +2135,28 @@ impl<'a> RowBuilder<'a> {
         }
         let resolved = self.values.iter().filter_map(|(c, v)| c.get().ok().map(|c| (c, v)));
 
-        // 2. upsert なら PK 一致 row を探す
+        // 2. その名前の行を探す。 upsert なら当たった行に書き、 insert なら断る (#601: 名前が同じなら同じデッキ。 前の insert は
+        //    同じ名前の 2 つ目の行を作った)
         //
-        // #60: lookup→allocate を per-table lock で直列化して TOCTOU を防ぐ。
-        // PK upsert のときだけ取得 (= PK 無し / 非 upsert は lock 不要で並行のまま)。
-        // poison しても () の中身は無いので into_inner で回復する。
-        // guard は commit 末尾まで保持 = PK tie が次 upserter から見えてから解放。
-        let _upsert_guard = if self.replace_on_pk && self.table.pk.is_some() {
-            Some(self.table.upsert_lock.lock().unwrap_or_else(|e| e.into_inner()))
-        } else {
-            None
-        };
-
+        // #60 / #601: 確かめと書き込みを名前ごとの lock で並べて TOCTOU を防ぐ。 guard は commit の末尾まで持つ = 名前のカードが
+        // 次の書き手から見えてから離す。 名前の無い表 / 名前を書かない行は lock 不要で並行のまま。
+        let pk_col = self.table.pk.map(|i| &self.table.cols[i]);
+        let pk_value = pk_col
+            .and_then(|pc| resolved.clone().find(|(c, _)| c.name == pc.name).map(|(_, v)| v))
+            .filter(|v| !matches!(v, Value::Null));
+        let _name_guard = pk_value.map(|v| self.table.name_locks.lock(v));
         let mut target_eid: Option<EntityId> = None;
-        if self.replace_on_pk {
-            if let Some(pk_idx) = self.table.pk {
-                let pk_col = &self.table.cols[pk_idx];
-                let pk_value = resolved.clone()
-                    .find(|(c, _)| c.name == pk_col.name)
-                    .map(|(_, v)| v);
-                if let Some(pk_v) = pk_value {
-                    let pk_raw = value_to_raw_for_query(eng, pk_col, pk_v)?;
-                    if pk_raw != u64::MAX {
-                        eng.rebuild();
-                        // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
-                        // 他テーブルと衝突しない → marker cond は不要。
-                        let found = eng.query_by_id64(&[
-                            (pk_col.himo_id, pk_raw),
-                        ]);
-                        target_eid = found.into_iter().next();
-                    }
+        if let (Some(pk_col), Some(pk_v)) = (pk_col, pk_value) {
+            let pk_raw = value_to_raw_for_query(eng, pk_col, pk_v)?;
+            if pk_raw != u64::MAX {
+                eng.rebuild();
+                // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
+                // 他テーブルと衝突しない → marker cond は不要。
+                let found = eng.query_by_id64(&[(pk_col.himo_id, pk_raw)]).into_iter().next();
+                if self.replace_on_pk {
+                    target_eid = found;
+                } else if found.is_some() {
+                    return Err(SchemaError::DuplicatePk);
                 }
             }
         }
@@ -2155,6 +2177,11 @@ impl<'a> RowBuilder<'a> {
         // #548: 名前のカードを最初に書く。 sync で書き込みが分かれて届いても、 受け手は名前より先に他のカードを受けない
         let mut resolved: Vec<_> = resolved.collect();
         if let Some(nc) = name_col {
+            // #581: upsert が名前で当たった行には名前のカードを書き直さない (引いた値と同じ。 書き直すと名前の版数が上がり、 その
+            // 名前になった時刻 = 行の作成が分からなくなる。 sync は束ねた行の切り離しを作成の時刻で決める)
+            if target_eid.is_some() {
+                resolved.retain(|(c, _)| c.name != nc.name);
+            }
             resolved.sort_by_key(|(c, _)| c.name != nc.name);
         }
 
@@ -6985,10 +7012,40 @@ impl<'a> EntityUpdate<'a> {
     }
     pub fn commit(self) -> Result<(), SchemaError> {
         let eng = self.db.engine();
+        // #601: 名前を書き換えるなら、 別の生きた行が既にその名前なら断る (名前が同じなら同じデッキ)。 確かめと書き込みは名前の
+        // lock で並べる (insert / upsert と同じ lock)
+        let pk = self.table.pk.map(|i| &self.table.cols[i]).and_then(|pc| {
+            self.values.iter().rev().find(|(c, _)| matches!(c, ColRef::Known(k) if k.name == pc.name)).map(|(_, v)| (pc, v))
+        });
+        let _name_guard = pk.map(|(_, v)| self.table.name_locks.lock(v));
+        if let Some((pc, v)) = pk
+            && !matches!(v, Value::Null)
+        {
+            let raw = value_to_raw_for_query(eng, pc, v)?;
+            if raw != u64::MAX {
+                eng.rebuild();
+                let me = enchudb_oplog::eid_local(self.eid);
+                if eng.query_by_id64(&[(pc.himo_id, raw)]).into_iter().any(|e| enchudb_oplog::eid_local(e) != me) {
+                    return Err(SchemaError::DuplicatePk);
+                }
+            }
+        }
         // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
         let _row = eng.write_row(self.eid);
+        let name = self.table.pk.map(|i| &self.table.cols[i]);
         for (col, v) in &self.values {
-            tie_value(eng, self.eid, col.get()?, v)?;
+            let cd = col.get()?;
+            // #581: 名前を今と同じ値で書くのは書かない (名前の版数 = その名前になった時刻を保つ)
+            if let Some(nc) = name
+                && cd.name == nc.name
+                && !matches!(v, Value::Null)
+                && let Ok(raw) = value_to_raw_for_query(eng, cd, v)
+                && raw != u64::MAX
+                && eng.get_by_id(self.eid, cd.himo_id) == Some(raw)
+            {
+                continue;
+            }
+            tie_value(eng, self.eid, cd, v)?;
         }
         Ok(())
     }
@@ -7419,7 +7476,7 @@ mod tests {
     }
 
     /// #60: 並行 mode で同一 PK を複数 thread が同時 upsert しても重複行が
-    /// できないこと。 fix (per-table upsert_lock) 無効化時は TOCTOU で複数行が
+    /// できないこと。 fix (名前ごとの lock、 前は per-table upsert_lock) 無効化時は TOCTOU で複数行が
     /// できて fail する。
     #[test]
     fn concurrent_upsert_same_pk_does_not_duplicate() {
