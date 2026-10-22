@@ -22010,6 +22010,9 @@ mod tests {
         eng.tie_async_by_id(e, hid, 9);
         eng.oplog_sync().unwrap();
 
+        // #523: bridge の lock を持ったまま追い越しを作って判定する。 consumer は 100 ms ごとに bridge を回すので、 lock の外で
+        // store すると、 判定の前に bridge が cursor を head に書き戻し 「追いつき済み」 になる (lib の試験を並べて回すと 8 回に 1 回)
+        let _bridge = eng.transfer_lock_for_fold();
         let head = eng.oplog.as_ref().unwrap().head();
         eng.sync_ops_offset
             .store(head + 4096, std::sync::atomic::Ordering::Release);
@@ -22024,6 +22027,7 @@ mod tests {
             "追い越しを検出したら ring 先頭へ巻き戻すこと"
         );
         assert!(eng.sync_ops_cursor_repairs() >= 1, "修復が観測できること");
+        drop(_bridge);
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
             let _ = std::fs::remove_file(format!("{path}{suffix}"));
