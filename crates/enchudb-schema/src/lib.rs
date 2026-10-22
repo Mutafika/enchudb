@@ -61,7 +61,7 @@
 //! 時に自動で復元、 himo_id も再 resolve される。 `Drop` で flush が呼ばれるので
 //! 手動 flush は不要 (明示的に呼びたい場合は `db.engine_mut().flush()`)。
 
-use enchudb_engine::{Engine, ValueType};
+use enchudb_engine::{AnswerHandle, AnswerSpec, Engine, ValueType};
 /// #118: growable layout の全 knob を露出する options 型を re-export
 /// (`enchudb_schema::GrowableOptions` / `LeafScale` で使えるように)。
 pub use enchudb_engine::engine::TableEidUsage;
@@ -267,11 +267,41 @@ struct TableInner {
     /// pk の `cols` index。 PK 未指定なら None。
     pk: Option<usize>,
     relations: Vec<RelationInner>,
-    /// #60: PK upsert の lookup→allocate を直列化する per-table lock。
-    /// 並行 mode で 2 thread が同一 PK を upsert したとき、 両方が「PK 不在」を
-    /// 観測 → 両方 entity_in で別 eid を払い出す TOCTOU で重複行ができるのを防ぐ。
-    /// per-table なので別 table の upsert は並行のまま。
-    upsert_lock: std::sync::Mutex<()>,
+    /// #60 / #601: 名前 (主キー) の確かめと書き込みを並べる lock。 並行 mode で 2 thread が同じ名前を書いた時、 両方が
+    /// 「その名前の行は無い」 を見て両方とも新しい行を作る TOCTOU を防ぐ (upsert も insert も名前の書き換えも)。 名前の値で
+    /// 選ぶ (同じ名前は同じ lock、 違う名前の書き込みはほとんど並行のまま)。 前は表ごとに 1 本で upsert だけが取った。
+    name_locks: NameLocks,
+}
+
+/// #601: 名前の値ごとの lock の数。
+const NAME_LOCKS: usize = 64;
+
+/// #601: 名前の値で選ぶ lock の並び。 値は辞書の番号でなく値そのもの (文字なら bytes) で選ぶ: 新しい文字は書く途中で番号が
+/// 付くので、 番号で選ぶと同じ名前の 2 本が別の lock を取りうる。
+#[derive(Debug)]
+struct NameLocks(Box<[std::sync::Mutex<()>]>);
+
+impl NameLocks {
+    fn new() -> Self {
+        NameLocks((0..NAME_LOCKS).map(|_| std::sync::Mutex::new(())).collect())
+    }
+
+    fn lock(&self, v: &Value) -> std::sync::MutexGuard<'_, ()> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        match v {
+            Value::Text(s) => eat(s.as_bytes()),
+            Value::Number(n) => eat(&n.to_le_bytes()),
+            Value::Ref(e) => eat(&e.to_le_bytes()),
+            _ => {}
+        }
+        self.0[(h % NAME_LOCKS as u64) as usize].lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl TableInner {
@@ -306,7 +336,7 @@ impl<'a> ColRef<'a> {
 
 /// #73: `TableInner` は `Arc` 共有の immutable snapshot なので、 schema 変更
 /// (column 追加 / PK 補完) は copy-on-write で新 Arc に差し替える。 name /
-/// table_vid は `src` から引き継ぎ、 upsert_lock は新規 (= lock 状態は引き継が
+/// table_vid は `src` から引き継ぎ、 name_locks は新規 (= lock 状態は引き継が
 /// ない、 migration は書き込み静止時に行う前提)。
 fn rebuild_table_inner(
     src: &TableInner,
@@ -320,7 +350,7 @@ fn rebuild_table_inner(
         cols,
         pk,
         relations,
-        upsert_lock: std::sync::Mutex::new(()),
+        name_locks: NameLocks::new(),
     })
 }
 
@@ -652,6 +682,58 @@ impl Database {
     /// ある時向け)。 束に入れていない購読 (同じ `Database` を使う他の部品が持つもの) の差分は取り出さない。
     pub fn live_group(&self) -> LiveGroup {
         LiveGroup { inner: self.eng.live_group(), eng: self.eng.clone() }
+    }
+
+    /// 宣言された答え ([`Query::answer`] / [`Query::answer_counts`] / [`Query::answer_sums`]) を名前で取る (無ければ None)。
+    /// 開き直した後も取れる (宣言は `{db}/tables` に保存され、 engine が開く時に購読を張り直す = アプリは条件を書き直さない)。
+    /// 返すのは engine が持つ購読を指す handle で、 poll の状態は 1 つ (同じ名前で 2 回取って両方 poll すると、 差分は
+    /// どちらか一方にだけ届く)。 最初の poll が種を作る (登録時点の全件 / 全 group が added)。
+    pub fn answer(&self, name: &str) -> Option<Answer> {
+        let handle = self.eng.answer(name)?;
+        let spec = self.eng.answer_spec(name)?;
+        Some(self.wrap_answer(handle, &spec))
+    }
+
+    /// 宣言された答えの名前 (宣言した順)。
+    pub fn answers(&self) -> Vec<String> {
+        self.eng.answer_declarations().into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// 宣言された答えを外す (宣言は保存からも消える)。 外したら true、 無ければ false。 購読そのものは、 それを持つ handle が
+    /// 全部落ちた時に外れる。
+    pub fn drop_answer(&self, name: &str) -> bool {
+        self.eng.drop_answer(name)
+    }
+
+    /// engine の handle を schema の購読に (group / 合計の列の型は table の定義から、 無ければ engine の紐の型から)。
+    fn wrap_answer(&self, handle: AnswerHandle, spec: &AnswerSpec) -> Answer {
+        let eng = self.eng.clone();
+        match handle {
+            AnswerHandle::Query(inner) => Answer::Query(LiveQuery { inner, eng }),
+            AnswerHandle::Counts(inner) => {
+                let (group, sum) = match spec {
+                    AnswerSpec::Counts { group_himo, sum_himo, .. } => (*group_himo, *sum_himo),
+                    _ => (0, None),
+                };
+                let ty = self.column_type_of(group).unwrap_or(ColumnType::Number);
+                let sum_big = sum.and_then(|h| self.column_type_of(h)) == Some(ColumnType::BigInt);
+                Answer::Counts(LiveCounts { inner, eng, ty, sum_big, last: Default::default() })
+            }
+        }
+    }
+
+    /// 紐の番号から列の型 (table の定義を先に、 無ければ engine の紐の型から)。
+    fn column_type_of(&self, himo: u16) -> Option<ColumnType> {
+        if let Some(c) = self.tables.iter().flat_map(|t| t.cols.iter()).find(|c| c.himo_id == himo) {
+            return Some(c.ty);
+        }
+        Some(match self.eng.value_type_at(himo as usize)? {
+            ValueType::Number => ColumnType::Number,
+            ValueType::Number64 => ColumnType::BigInt,
+            ValueType::Tag => ColumnType::Tag,
+            ValueType::Leaf => ColumnType::Leaf,
+            ValueType::Ref => ColumnType::Ref,
+        })
     }
 
     /// build phase 用、 `Arc<Engine>` が他に共有されていない (count = 1) 時のみ
@@ -1108,7 +1190,7 @@ impl Database {
                 cols,
                 pk,
                 relations,
-                upsert_lock: std::sync::Mutex::new(()),
+                name_locks: NameLocks::new(),
             }));
         }
         Ok(())
@@ -1675,7 +1757,7 @@ impl<'a> TableBuilder<'a> {
             cols,
             pk: pk_idx,
             relations: relations.into_iter().map(|(from_col, to_table)| RelationInner { from_col, to_table }).collect(),
-            upsert_lock: std::sync::Mutex::new(()),
+            name_locks: NameLocks::new(),
         });
         // engine に table が残っていた (schema の blob だけ古い) 時は、 engine が戻した並びもここで宣言に合わせる
         sync_orders(&db.eng, &inner, &orders)?;
@@ -2053,36 +2135,28 @@ impl<'a> RowBuilder<'a> {
         }
         let resolved = self.values.iter().filter_map(|(c, v)| c.get().ok().map(|c| (c, v)));
 
-        // 2. upsert なら PK 一致 row を探す
+        // 2. その名前の行を探す。 upsert なら当たった行に書き、 insert なら断る (#601: 名前が同じなら同じデッキ。 前の insert は
+        //    同じ名前の 2 つ目の行を作った)
         //
-        // #60: lookup→allocate を per-table lock で直列化して TOCTOU を防ぐ。
-        // PK upsert のときだけ取得 (= PK 無し / 非 upsert は lock 不要で並行のまま)。
-        // poison しても () の中身は無いので into_inner で回復する。
-        // guard は commit 末尾まで保持 = PK tie が次 upserter から見えてから解放。
-        let _upsert_guard = if self.replace_on_pk && self.table.pk.is_some() {
-            Some(self.table.upsert_lock.lock().unwrap_or_else(|e| e.into_inner()))
-        } else {
-            None
-        };
-
+        // #60 / #601: 確かめと書き込みを名前ごとの lock で並べて TOCTOU を防ぐ。 guard は commit の末尾まで持つ = 名前のカードが
+        // 次の書き手から見えてから離す。 名前の無い表 / 名前を書かない行は lock 不要で並行のまま。
+        let pk_col = self.table.pk.map(|i| &self.table.cols[i]);
+        let pk_value = pk_col
+            .and_then(|pc| resolved.clone().find(|(c, _)| c.name == pc.name).map(|(_, v)| v))
+            .filter(|v| !matches!(v, Value::Null));
+        let _name_guard = pk_value.map(|v| self.table.name_locks.lock(v));
         let mut target_eid: Option<EntityId> = None;
-        if self.replace_on_pk {
-            if let Some(pk_idx) = self.table.pk {
-                let pk_col = &self.table.cols[pk_idx];
-                let pk_value = resolved.clone()
-                    .find(|(c, _)| c.name == pk_col.name)
-                    .map(|(_, v)| v);
-                if let Some(pk_v) = pk_value {
-                    let pk_raw = value_to_raw_for_query(eng, pk_col, pk_v)?;
-                    if pk_raw != u64::MAX {
-                        eng.rebuild();
-                        // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
-                        // 他テーブルと衝突しない → marker cond は不要。
-                        let found = eng.query_by_id64(&[
-                            (pk_col.himo_id, pk_raw),
-                        ]);
-                        target_eid = found.into_iter().next();
-                    }
+        if let (Some(pk_col), Some(pk_v)) = (pk_col, pk_value) {
+            let pk_raw = value_to_raw_for_query(eng, pk_col, pk_v)?;
+            if pk_raw != u64::MAX {
+                eng.rebuild();
+                // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
+                // 他テーブルと衝突しない → marker cond は不要。
+                let found = eng.query_by_id64(&[(pk_col.himo_id, pk_raw)]).into_iter().next();
+                if self.replace_on_pk {
+                    target_eid = found;
+                } else if found.is_some() {
+                    return Err(SchemaError::DuplicatePk);
                 }
             }
         }
@@ -2148,7 +2222,8 @@ impl<'a> RowBuilder<'a> {
 /// engine を `Arc` で抱えているので `Database` を借用しない — struct に入れて持ち回れ、
 /// 別 thread から poll してよい。
 pub struct LiveQuery {
-    inner: enchudb_engine::LiveQuery,
+    /// engine の購読。 宣言された答え ([`Database::answer`]) は engine が持つ購読を指す (clone)。
+    inner: Arc<enchudb_engine::LiveQuery>,
     eng: Arc<Engine>,
 }
 
@@ -2211,7 +2286,8 @@ impl std::fmt::Debug for LiveQuery {
 /// [`Query::subscribe_counts`] の戻り値。 group の値ごとの件数を購読する。 drop で購読解除、
 /// `Database` を借用しない。
 pub struct LiveCounts {
-    inner: enchudb_engine::LiveCounts,
+    /// engine の購読。 宣言された答え ([`Database::answer`]) は engine が持つ購読を指す (clone)。
+    inner: Arc<enchudb_engine::LiveCounts>,
     eng: Arc<Engine>,
     ty: ColumnType,
     /// 合計の列が BigInt (engine の合計を元の値に戻す)。
@@ -2389,6 +2465,32 @@ impl std::fmt::Debug for LiveHaving {
 
 /// 購読の束 ([`Database::live_group`])。 束を drop しても購読はそのまま (差分は各購読の `poll` で受け取れ、
 /// 他の束に入れ直してもよい)。
+/// [`Database::answer`] の戻り値: 宣言された答えの購読 (形は宣言した時のもの)。
+pub enum Answer {
+    /// 集合 / 上位 k 件 ([`Query::answer`])。
+    Query(LiveQuery),
+    /// group ごとの件数 / 合計 ([`Query::answer_counts`] / [`Query::answer_sums`])。
+    Counts(LiveCounts),
+}
+
+impl Answer {
+    /// 集合 / 上位 k 件の購読なら取り出す。
+    pub fn into_query(self) -> Option<LiveQuery> {
+        match self {
+            Answer::Query(q) => Some(q),
+            Answer::Counts(_) => None,
+        }
+    }
+
+    /// 件数 / 合計の購読なら取り出す。
+    pub fn into_counts(self) -> Option<LiveCounts> {
+        match self {
+            Answer::Counts(c) => Some(c),
+            Answer::Query(_) => None,
+        }
+    }
+}
+
 pub struct LiveGroup {
     inner: enchudb_engine::LiveGroup,
     eng: Arc<Engine>,
@@ -2704,7 +2806,7 @@ impl<'a> JoinQuery<'a> {
                 }
                 .map_err(io)?;
                 let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner, eng, ty: cd.ty, sum_big, last: Default::default() })))
+                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big, last: Default::default() })))
             }
             JoinOn::Range(..) => Err(bad("join subscribe_counts: not supported for join_range yet".into())),
             JoinOn::Eq(my, _) => {
@@ -2731,7 +2833,7 @@ impl<'a> JoinQuery<'a> {
                     }
                     .map_err(io)?;
                     let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                    Ok(LiveCounts { inner, eng: eng.clone(), ty, sum_big, last: Default::default() })
+                    Ok(LiveCounts { inner: Arc::new(inner), eng: eng.clone(), ty, sum_big, last: Default::default() })
                 };
                 let lsum = side.as_ref().filter(|s| !s.0).map(|s| &s.1);
                 let rsum = side.as_ref().filter(|s| s.0).map(|s| &s.1);
@@ -6328,7 +6430,7 @@ impl<'a> Query<'a> {
             }
             _ => eng.subscribe(preds).map_err(|e| SchemaError::Io(e.to_string()))?,
         };
-        Ok(LiveQuery { inner, eng })
+        Ok(LiveQuery { inner: Arc::new(inner), eng })
     }
 
     /// ref をたどる条件 (`where_eq("company.city", "Tokyo")`) を **ref の先の row (group) 単位**
@@ -6475,7 +6577,89 @@ impl<'a> Query<'a> {
             None => eng.subscribe_counts(preds, path, cd.himo_id),
         }
         .map_err(|e| SchemaError::BadValue(e.to_string()))?;
-        Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+        Ok(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+    }
+
+    /// この query の答えに名前を付けて **宣言する**: 集合 (`order_by(..).limit(k)` なら先頭 k 件) の購読を engine が持ち、 形は
+    /// DB (`{db}/tables`) に保存されて、 開き直すと engine が開く時に (WAL の再生の前に) 購読を張り直す。 以後は
+    /// [`Database::answer`] で名前から取るだけ (条件を書き直さない)。
+    ///
+    /// ```ignore
+    /// let adults = users.where_gt("age", 30i64).answer("adults")?;   // 宣言 + 今すぐ使える購読
+    /// // 開き直した後
+    /// let adults = db.answer("adults").and_then(Answer::into_query).unwrap();
+    /// adults.poll();   // 最初の poll が種を作る (全件 added)、 以後は差分
+    /// ```
+    ///
+    /// - 返す購読は [`subscribe`](Self::subscribe) と同じ API。 engine が持つ購読を指すので、 落としても購読は残る
+    ///   (poll の状態は 1 つ)。 種 (表の走査) は最初の poll が作る (開くのは遅くならない)
+    /// - 同じ名前に同じ形をもう一度宣言するのは何もしない (同じ購読)。 違う形なら置き換える。 外すのは
+    ///   [`Database::drop_answer`]
+    /// - 形の決まり (`limit` には `order_by` が要る、 など) は `subscribe` と同じ。 readonly で開いた DB の宣言は保存しない
+    pub fn answer(self, name: &str) -> Result<LiveQuery, SchemaError> {
+        let order = self.order_col()?;
+        let limit = self.limit;
+        if limit.is_some() && order.is_none() {
+            return Err(SchemaError::BadValue("answer: limit needs order_by".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue("answer: where_eq on an unknown column or with a mismatched value type".into())
+        })?;
+        let spec = match (order, limit) {
+            (Some((order_path, order_himo, desc)), Some(k)) => AnswerSpec::Top {
+                preds,
+                order_path,
+                order_himo,
+                desc,
+                limit: u32::try_from(k).map_err(|_| SchemaError::BadValue("answer: limit is too large".into()))?,
+            },
+            _ => AnswerSpec::Set { preds },
+        };
+        match eng.declare_answer(name, spec).map_err(|e| SchemaError::BadValue(e.to_string()))? {
+            AnswerHandle::Query(inner) => Ok(LiveQuery { inner, eng }),
+            AnswerHandle::Counts(_) => Err(SchemaError::Internal("answer: engine returned a counts subscription".into())),
+        }
+    }
+
+    /// [`subscribe_counts`](Self::subscribe_counts) の宣言版 (決まりは [`answer`](Self::answer) と同じ)。
+    pub fn answer_counts(self, name: &str, col: &str) -> Result<LiveCounts, SchemaError> {
+        self.answer_agg(name, col, None)
+    }
+
+    /// [`subscribe_sums`](Self::subscribe_sums) の宣言版 (決まりは [`answer`](Self::answer) と同じ)。
+    pub fn answer_sums(self, name: &str, col: &str, sum_col: &str) -> Result<LiveCounts, SchemaError> {
+        let cd = self
+            .table
+            .col(sum_col)
+            .filter(|c| matches!(c.ty, ColumnType::Number | ColumnType::BigInt))
+            .ok_or_else(|| SchemaError::BadValue(format!("answer_sums: {sum_col} is not a Number / BigInt column of this table")))?;
+        let big = cd.ty == ColumnType::BigInt;
+        let h = cd.himo_id;
+        self.answer_agg(name, col, Some((h, big)))
+    }
+
+    fn answer_agg(self, name: &str, col: &str, sum: Option<(u16, bool)>) -> Result<LiveCounts, SchemaError> {
+        if self.limit.is_some() {
+            return Err(SchemaError::BadValue("answer_counts: limit is not supported".into()));
+        }
+        let (group_path, cd) = self
+            .resolve_col(col)
+            .ok_or_else(|| SchemaError::BadValue(format!("answer_counts: unknown column {col}")))?;
+        if cd.ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue("answer_counts: cannot group by a Leaf column".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue("answer: where_eq on an unknown column or with a mismatched value type".into())
+        })?;
+        let spec = AnswerSpec::Counts { preds, group_path, group_himo: cd.himo_id, sum_himo: sum.map(|s| s.0) };
+        match eng.declare_answer(name, spec).map_err(|e| SchemaError::BadValue(e.to_string()))? {
+            AnswerHandle::Counts(inner) => {
+                Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+            }
+            AnswerHandle::Query(_) => Err(SchemaError::Internal("answer_counts: engine returned a set subscription".into())),
+        }
     }
 
     /// ablation / 計測用: engine の `subscribe_expand_always` で購読する (結果は `subscribe`
@@ -6492,7 +6676,7 @@ impl<'a> Query<'a> {
             )
         })?;
         let inner = eng.subscribe_expand_always(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
-        Ok(LiveQuery { inner, eng })
+        Ok(LiveQuery { inner: Arc::new(inner), eng })
     }
 
     /// 条件を engine の `LivePred` に写す。 `None` = 常に 0 件になる条件 (未知の列 / 型不一致の
@@ -6828,6 +7012,24 @@ impl<'a> EntityUpdate<'a> {
     }
     pub fn commit(self) -> Result<(), SchemaError> {
         let eng = self.db.engine();
+        // #601: 名前を書き換えるなら、 別の生きた行が既にその名前なら断る (名前が同じなら同じデッキ)。 確かめと書き込みは名前の
+        // lock で並べる (insert / upsert と同じ lock)
+        let pk = self.table.pk.map(|i| &self.table.cols[i]).and_then(|pc| {
+            self.values.iter().rev().find(|(c, _)| matches!(c, ColRef::Known(k) if k.name == pc.name)).map(|(_, v)| (pc, v))
+        });
+        let _name_guard = pk.map(|(_, v)| self.table.name_locks.lock(v));
+        if let Some((pc, v)) = pk
+            && !matches!(v, Value::Null)
+        {
+            let raw = value_to_raw_for_query(eng, pc, v)?;
+            if raw != u64::MAX {
+                eng.rebuild();
+                let me = enchudb_oplog::eid_local(self.eid);
+                if eng.query_by_id64(&[(pc.himo_id, raw)]).into_iter().any(|e| enchudb_oplog::eid_local(e) != me) {
+                    return Err(SchemaError::DuplicatePk);
+                }
+            }
+        }
         // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
         let _row = eng.write_row(self.eid);
         let name = self.table.pk.map(|i| &self.table.cols[i]);
@@ -7274,7 +7476,7 @@ mod tests {
     }
 
     /// #60: 並行 mode で同一 PK を複数 thread が同時 upsert しても重複行が
-    /// できないこと。 fix (per-table upsert_lock) 無効化時は TOCTOU で複数行が
+    /// できないこと。 fix (名前ごとの lock、 前は per-table upsert_lock) 無効化時は TOCTOU で複数行が
     /// できて fail する。
     #[test]
     fn concurrent_upsert_same_pk_does_not_duplicate() {

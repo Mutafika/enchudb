@@ -107,6 +107,30 @@ tokyo.count();                     // current size, same as find()?.len()
 
 The engine-level API is `Engine::subscribe(Vec<LivePred>)`.
 
+### Declared answers (named subscriptions that survive a reopen)
+
+A subscription lives in memory. If the app always wants the same answer ("adults", "orders per city", "top 10 by score"), declare it once under a name. The shape is stored in the DB (`{db}/tables`), and every later open re-registers the subscription before the oplog is replayed, so the app only asks for it by name:
+
+```rust
+// first run: declare (returns a subscription you can use right away)
+let adults = users.all().where_gt("age", 30i64).answer("adults")?;
+let per_city = users.all().answer_counts("per_city", "company.city")?;
+let spent = orders.where_eq("status", "paid").answer_sums("spent", "customer.region", "amount")?;
+let top = users.all().order_by_desc("score").limit(10).answer("top")?;
+
+// every later run: take it by name
+let db = Database::open("/tmp/app.db")?;
+let adults = db.answer("adults").and_then(Answer::into_query).unwrap();
+let first = adults.poll();      // the whole current result as `added`, then only differences
+db.answers();                   // ["adults", "per_city", "spent", "top"]
+db.drop_answer("spent");        // forget it (the declaration is removed from the DB too)
+```
+
+- The first `poll()` after an open builds the answer (it reads the table, like a fresh `subscribe()` would); the open itself does not get slower, declared or not.
+- The handle points at a subscription the engine owns: dropping your handle does not unsubscribe, and taking the same name twice gives two handles on one poll state (a difference is delivered to one of them).
+- Declaring the same name with the same shape again does nothing; a different shape replaces it.
+- An older binary that does not know the declarations opens the DB normally (it just does not register them, and if it rewrites the table definitions they are gone).
+
 ### Engine layer (for graph ops / custom dispatch)
 
 ```rust
@@ -229,10 +253,26 @@ once it has been flushed: by the background flush (every 100 ms) or by `oplog_sy
 The oplog is a ring. When it fills up, the background thread pauses appends, flushes, and starts
 the ring over. Writers that append in the meantime wait instead of losing their records, so a
 single writer that never pauses no longer overflows it (#388); `Engine::wal_room_folds()` counts
-these pauses. A DB that syncs to peers (or has change listeners) cannot restart the ring until
-those records have been handed on. If that is stuck, writes still land in the DB, but their
-records drop out of the stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch
-up by bootstrap.
+these pauses. A DB that syncs to peers cannot restart the ring until those records have been
+handed on. If that is stuck, writes still land in the DB, but their records drop out of the
+stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch up by bootstrap.
+
+Change listeners (`add_change_listener`) do not hold the ring. Records they have not received
+yet move to an in-memory backlog when the ring restarts; past its cap (64 MiB,
+`set_change_backlog_limit`) the listeners are detached and told so (`on_detached`). To keep the
+stream across restarts, call `enable_change_log(cap)` once: records then go to
+`changefeed.seg` with numbers that never repeat. `on_changes_at(first, records)` tells a
+listener those numbers. Store the next number with your own commit, and after a restart call
+`add_change_listener_from(listener, next)` to continue where you stopped. If the log has
+already dropped that number, the call returns `Truncated { from }`; re-read the current state
+instead.
+
+Starting the ring over leaves the previous lap's records in the file until they are overwritten. Every record therefore
+carries the lap it was written in (an 8-byte mark after the payload, oplog file format 3), and recovery stops at the first
+record whose lap is not the current one. Without it, a power loss right after a restart of the ring could present the old
+records as the continuation of the new ones when the OS had written the header page before the data pages (#608).
+A format-3 oplog cannot be opened by 0.35 and earlier; to go back, close the DB cleanly and delete `{db}/oplog`
+(after a clean close everything in it is already applied).
 
 ### RAG (`enchudb-rag`)
 
