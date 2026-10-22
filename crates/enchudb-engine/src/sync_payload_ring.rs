@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::region::Region;
 use crate::segment_map::SegmentMap;
+use enchudb_oplog::Hlc;
 
 /// DB の directory の中の file 名。 `*.seg` なので複製 (`db_files::is_segment_entry`) にそのまま載る。
 pub const FILE: &str = "sync.payload.seg";
@@ -49,6 +50,67 @@ const MAX_CAP: usize = 1 << 30;
 /// 1 行あたりの payload の目安 (署名 72 B + header + 値)。 これより大きい record が続くと行の枠より先に ring が
 /// 埋まるが、 その時は bridge が待つだけ (行の枠が埋まった時と同じ backpressure)。
 const BYTES_PER_ROW: usize = 256;
+
+/// #451 (段階 1): 配り済みの印の置き場 = header の 16..56 (`[tag "DMK1"][wall u64][logical u32][peer u32][lsn u32][wal lap u32]
+/// [wal offset u64][check u32]`、 LE、 check は tag から wal offset までの FNV-1a 32)。 0.35 以前の binary は header の 12 B より後ろを読まず、 ring を作る時は 0 で
+/// 作る = 印が無い (開く時は全部の照合、 安全側)。 file の version は上げない
+const MARK_AT: usize = 16;
+const MARK_TAG: [u8; 4] = *b"DMK1";
+const MARK_LEN: usize = 40;
+
+/// #451 (段階 1、 OPEN_TIME_PLAN の段階 1): 配り済みの印。 印が disk にある時、 **自分 (`hlc.peer`) の write で HLC ≤ `hlc` の
+/// ものは全部、 record が disk にある** (oplog、 畳んだ後なら `_sync_ops` の行、 または floor)。 lsn ≤ `lsn` の `_sync_ops` の行は
+/// HLC ≤ `hlc` の record から作った行。 開く時 (`Engine::relog_unlogged_writes`) は HLC > `hlc` の cell と lsn > `lsn` の行だけを
+/// 見る。 置くのは consumer / `oplog_sync` が、 Commit の前に切った切れ目の候補を、 fsync と本体の書き出しが返った後に
+/// (`Engine::take_durable_cut` / `publish_durable_mark`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableMark {
+    pub hlc: Hlc,
+    pub lsn: u32,
+    /// oplog の周と、 切れ目の時の終わり (`OpLog::durable_cut_for`): この周でこれより前の record は印より前なので、 開く時の header の
+    /// 走査はここから (周が違えば先頭から)
+    pub wal_lap: u32,
+    pub wal_off: u64,
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut h = 0x811c_9dc5u32;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+fn encode_mark(m: DurableMark) -> [u8; MARK_LEN] {
+    let mut b = [0u8; MARK_LEN];
+    b[..4].copy_from_slice(&MARK_TAG);
+    b[4..12].copy_from_slice(&m.hlc.wall.to_le_bytes());
+    b[12..16].copy_from_slice(&m.hlc.logical.to_le_bytes());
+    b[16..20].copy_from_slice(&m.hlc.peer.to_le_bytes());
+    b[20..24].copy_from_slice(&m.lsn.to_le_bytes());
+    b[24..28].copy_from_slice(&m.wal_lap.to_le_bytes());
+    b[28..36].copy_from_slice(&m.wal_off.to_le_bytes());
+    let check = fnv1a32(&b[..36]);
+    b[36..40].copy_from_slice(&check.to_le_bytes());
+    b
+}
+
+fn decode_mark(b: &[u8]) -> Option<DurableMark> {
+    if b.len() != MARK_LEN || b[..4] != MARK_TAG || fnv1a32(&b[..36]) != u32::from_le_bytes(b[36..40].try_into().ok()?) {
+        return None;
+    }
+    Some(DurableMark {
+        hlc: Hlc {
+            wall: u64::from_le_bytes(b[4..12].try_into().ok()?),
+            logical: u32::from_le_bytes(b[12..16].try_into().ok()?),
+            peer: u32::from_le_bytes(b[16..20].try_into().ok()?),
+        },
+        lsn: u32::from_le_bytes(b[20..24].try_into().ok()?),
+        wal_lap: u32::from_le_bytes(b[24..28].try_into().ok()?),
+        wal_off: u64::from_le_bytes(b[28..36].try_into().ok()?),
+    })
+}
 
 /// `_sync_ops` の行数の上限から ring の大きさを決める。
 pub fn capacity_for(rows: u32) -> usize {
@@ -249,6 +311,35 @@ impl PayloadRing {
     pub fn flush(&self) -> io::Result<()> {
         self._map.flush_dirty()
     }
+
+    /// 配り済みの印 (#451 段階 1)。 無い (0.35 以前の binary が作った ring / 一度も置いていない) か壊れていれば `None`。
+    pub fn durable_mark(&self) -> Option<DurableMark> {
+        let _c = self.cursor.lock().unwrap();
+        decode_mark(&self.region.slice()[MARK_AT..MARK_AT + MARK_LEN])
+    }
+
+    /// 印を置く。 進める時だけ (今の印より前の候補は置かない = 印は一度正しければずっと正しい)。 置いたら true。 disk に届くのは
+    /// 次の [`PayloadRing::flush`] (本体の書き出しと同じ契機)。
+    pub fn set_durable_mark(&self, m: DurableMark) -> bool {
+        let _c = self.cursor.lock().unwrap();
+        if decode_mark(&self.region.slice()[MARK_AT..MARK_AT + MARK_LEN]).is_some_and(|cur| (m.hlc, m.lsn) <= (cur.hlc, cur.lsn)) {
+            return false;
+        }
+        self.region.write_at(MARK_AT, &encode_mark(m));
+        self.region.mark_dirty(MARK_AT, MARK_LEN);
+        true
+    }
+
+    /// ring を開かずに印だけ読む (開く時に使う: ring を開くと位置合わせで `_sync_ops` の行を全部なめる)。 file が無い /
+    /// 読めない / 印が無いなら `None`。
+    pub fn read_durable_mark(dir: &Path) -> Option<DurableMark> {
+        let mut h = [0u8; HEADER];
+        std::io::Read::read_exact(&mut std::fs::File::open(dir.join(FILE)).ok()?, &mut h).ok()?;
+        if h[..4] != MAGIC {
+            return None;
+        }
+        decode_mark(&h[MARK_AT..MARK_AT + MARK_LEN])
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +406,34 @@ mod tests {
         assert!(!dir.join(format!("{FILE}.tmp")).exists(), "一時 file が残った");
         let ring = PayloadRing::open_or_create(&dir, 1 << 20, true).unwrap();
         assert_eq!(ring.read(h, 1).unwrap(), b"0123456789");
+    }
+
+    /// #451 (段階 1): 印の往復。 作ったばかりの ring (header の残りは 0 = 0.35 以前の binary が作った形) に印は無い、 前の印は
+    /// 置かない、 開き直しても残る (ring を開かずに読む道も同じ)、 check の合わない印は無いのと同じ
+    #[test]
+    fn durable_mark_round_trips_and_rejects_older_marks_and_garbage() {
+        let d = tempdir("mark");
+        let ring = PayloadRing::open_or_create(&d, 64 * 1024, false).unwrap();
+        assert_eq!(ring.durable_mark(), None, "作ったばかりの ring に印は無い");
+        assert_eq!(PayloadRing::read_durable_mark(&d), None);
+        let m1 = DurableMark { hlc: Hlc { wall: 10, logical: 2, peer: 1 }, lsn: 5, wal_lap: 3, wal_off: 4096 };
+        assert!(ring.set_durable_mark(m1));
+        assert_eq!(ring.durable_mark(), Some(m1));
+        let older = DurableMark { hlc: Hlc { wall: 10, logical: 1, peer: 1 }, lsn: 9, wal_lap: 3, wal_off: 8192 };
+        assert!(!ring.set_durable_mark(older), "前の印は置かない");
+        assert!(!ring.set_durable_mark(m1), "同じ印は置き直さない");
+        assert_eq!(ring.durable_mark(), Some(m1));
+        let more_rows = DurableMark { lsn: 6, wal_off: 8192, ..m1 };
+        assert!(ring.set_durable_mark(more_rows), "同じ HLC でも行が進めば置く");
+        ring.flush().unwrap();
+        drop(ring);
+        assert_eq!(PayloadRing::read_durable_mark(&d), Some(more_rows), "ring を開かずに読める");
+        let ring = PayloadRing::open_or_create(&d, 64 * 1024, false).unwrap();
+        assert_eq!(ring.durable_mark(), Some(more_rows), "開き直しても残る");
+        ring.region.write_at(MARK_AT + 8, &[0xFF]);
+        assert_eq!(ring.durable_mark(), None, "check の合わない印は無いのと同じ");
+        assert!(ring.set_durable_mark(older), "壊れた印の上には置ける");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
