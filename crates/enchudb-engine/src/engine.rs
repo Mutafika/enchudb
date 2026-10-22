@@ -9845,14 +9845,16 @@ impl Engine {
             .eid_translator
             .reverse(target_local)
             .map_or(enchudb_oplog::make_eid(self_peer, target_local), |(p, l)| enchudb_oplog::make_eid(p, l));
-        let mut bound_now = false;
-        let local = self
+        // #613: 前向きの写像だけを張る (別名、 `EidTranslator::alias`)。 行の逆写像 (この行に書いた record の宛名) は行の元の
+        // identity のまま。 前は束ねた identity に替えていたので、 束ねた後の書き込みが、 その identity の作成を受けていない受け手で
+        // 別の行になった。 元の identity の作成は同じ書き手の流れの前にあるので、 受け手は必ず先に受けている
+        let (local, bound_now) = match self
             .eid_translator
-            .get_or_insert_with(author_peer, foreign_local, || {
-                bound_now = true;
-                Some(target_local)
-            })
-            .unwrap_or(target_local);
+            .if_unmapped(author_peer, foreign_local, || self.eid_translator.alias(author_peer, foreign_local, target_local))
+        {
+            Ok(()) => (target_local, true),
+            Err(existing) => (existing, false),
+        };
         // #178: **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま
         // bridge されている (宛名の付け替えは bridge 時に `reverse()` を引くため)。
         // 相手側はそれを別 entity として払い出すので PK 無しの重複行が生える。
@@ -13110,8 +13112,8 @@ impl Engine {
     /// identity ごとのカードから戻す (束ねた行の cell は LWW で混ざっている)。
     ///
     /// - 行に残るのは、 自分の行なら自分の identity の側 (自分の peer の番号は slot に固定で、 写像で移せない)、 翻訳した行なら
-    ///   書き込みの宛名 (逆写像、 束ねると最後に束ねた identity になる) の側。 他方を新しい slot に移す (写像を付け替え、 宛名を
-    ///   移す側の先頭にして逆写像も移す)
+    ///   書き込みの宛名 (逆写像 = 行の元の identity、 #613: 束ねても替えない) の側。 他方を新しい slot に移す (写像を付け替え、
+    ///   移す側の先頭の相手の identity を新しい slot の逆写像にする)
     /// - 行に残る側の cell は、 その側のカードの値と版数に戻す (他方の新しい値で上書きされていた cell も戻る)
     /// - 移す側は新しい slot に、 名前のカードを先にして当てる
     ///
@@ -13149,9 +13151,8 @@ impl Engine {
         let published = self.native_identity(local);
         let pinned = if later.iter().chain(&earlier).any(|&(id, _)| id == own) { own } else { published };
         let (mut stay, mut go) = if later.iter().any(|&(id, _)| id == pinned) { (later, earlier) } else { (earlier, later) };
-        // 残る側は固定の identity を、 移す側は今の宛名を先頭に (宛名が移す側なら、 最初の付け替えで逆写像も移る)
+        // 残る側は固定の identity を先頭に (宛名 = 元の identity は固定の側に居るので、 移す側には居ない)
         stay.sort_by_key(|&(id, _)| id != pinned);
-        go.sort_by_key(|&(id, _)| id != published);
         // #612: 移す側に畳んだ自分の行が居れば、 その元の slot に戻す (自分の identity を先頭 = 行の元の identity に)
         let go_all: Vec<_> = go.iter().map(|b| b.0).collect();
         let (moved, moved_is_own) = match self.revive_folded_own(&go_all, local) {
