@@ -9859,10 +9859,10 @@ impl Engine {
 
     /// #513: 主キー `pk_value` の生きた行が無い時 (`Syncer` が主キーで束ねる先を引いて、 無かった時)。
     ///
-    /// その主キーの行を消した削除 (`pk_tombs.rs`) か、 この foreign entity 宛ての、 作成より先に届いた削除 (#490) を
-    /// 覚えていれば、 entity に払い出す slot に、 その版数 (大きい方) を載せる。 削除より古い書き込みは弾かれ、 新しい
-    /// 書き込みは当たる。 作成より先の削除は、 この slot (主キー `pk_value` の行) の削除として主キーの記録にも載せる
-    /// (作成を先に受けた peer では、 削除がこの主キーの行に当たって記録に載るので、 届く順で答えを変えない)。
+    /// その主キーの行を消した削除 (`pk_tombs.rs`) のうち `created` より後のものか、 この foreign entity 宛ての、 作成より先に
+    /// 届いた削除 (#490) を覚えていれば、 entity に払い出す slot に、 その版数 (大きい方) を載せる。 作成より先の削除は、 この
+    /// slot (主キー `pk_value` の行) の削除として主キーの記録にも載せる (作成を先に受けた peer では、 削除がこの主キーの行に
+    /// 当たって記録に載るので、 届く順で答えを変えない)。
     ///
     /// 2 つの記録が両方とも空 (常態) か、 自分が産んだ entity の時は何もせず `None` (通常の払い出しに任せる)。 どちらかが
     /// 空でなければ、 載せる版数が無くても払い出しをここで済ませ、 その local eid を返す (通常の道 `resolve_remote_eid` と
@@ -9870,7 +9870,8 @@ impl Engine {
     ///
     /// 削除優先 (2026-10-21): 作成より先に届いた削除がある entity と、 その主キーの削除より前に作られた entity (`created` =
     /// 作成の主キーの書き込みの版数) は死んでいる。 払い出した slot は生かさない (その entity 宛ての書き込みは捨てる)。 削除の後に
-    /// 作られた entity (消したのを見て足し直した行) は生きる。
+    /// 作られた entity (消したのを見て足し直した行) は生き、 その名前の削除を slot に載せない (#614: 削除の後に別の名前から改名で
+    /// その名前になった行の、 改名より前の書き込みを捨てていた)。
     pub fn reserve_remote_eid_for_pk(
         &self,
         foreign_eid: enchudb_oplog::EntityId,
@@ -9891,7 +9892,9 @@ impl Engine {
             return None;
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        let by_pk = self.pk_tombstone_of(pk_himo, pk_value);
+        // #614: その名前を削除の後に持った entity (最初に見た名前の書き込みが削除より後。 削除の後に作った行、 別の名前から改名した
+        // 行) は消えたデッキの一員でない。 その名前の削除を slot に載せると、 改名より前の (削除より古い) 書き込みを捨てる
+        let by_pk = self.pk_tombstone_of(pk_himo, pk_value).filter(|&t| t > created);
         let local = self.eid_translator.get_or_insert_with(owner, foreign_local, || {
             let local = self.alloc_translated_local(pk_himo)?;
             let early = self.foreign_tombstone_of(owner, foreign_local);
@@ -9900,8 +9903,6 @@ impl Engine {
                 let mut g = self.pk_tombs.write().unwrap();
                 self.drain_pk_pending(&mut g);
                 self.with_pk_key(pk_himo, pk_value, |key| self.note_pk_locked(&mut g, pk_himo, key, local, tomb));
-            }
-            if early.is_some() || by_pk.is_some_and(|t| t > created) {
                 self.live_free(local);
             }
             Some(local)
@@ -11267,6 +11268,20 @@ impl Engine {
             return None;
         }
         self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid))
+    }
+
+    /// #614: 行 `eid` が主キー `value` を持ち始めた時刻 (削除優先の 「削除の後に足し直した行か」 の確かめに使う)。 改名した行は名前の
+    /// 年表の、 その名前への最初の書き込み (その名前で作られた / その名前に改名した時刻。 後で別の名前に改名していても、 名前の
+    /// cell の版数はその改名の版数で、 名前を持ち始めた時刻ではない)。 年表の無い行は名前の cell の版数。
+    pub fn name_held_from(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> enchudb_oplog::Hlc {
+        let local = enchudb_oplog::eid_local(eid);
+        if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(Some(t)) =
+                self.with_pk_key(himo, PkValue::Local(value), |k| self.pk_former.read().unwrap().first_held(local, himo, k))
+        {
+            return t;
+        }
+        self.cell_hlc(eid, himo)
     }
 
     /// 削除優先: 主キー `value` の行を消した削除の版数 (#513、 `pk_tombs.rs`)。

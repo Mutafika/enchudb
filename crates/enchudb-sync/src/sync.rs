@@ -1402,7 +1402,8 @@ impl Syncer {
             .deleted_before_create(*eid)
             .or_else(|| self.engine.name_deleted_at(*himo_id, PkValue::Local(local_value)).filter(|&t| t > created));
         if let (Some(l), Some(t)) = (existing, dead_at.or_else(|| dying.get(eid).copied())) {
-            if self.engine.cell_hlc(l, *himo_id) > t {
+            // #614: 改名した行は、 その名前を持ち始めた時刻で見る (名前の cell の版数は、 後の改名の版数)
+            if self.engine.name_held_from(l, *himo_id, local_value) > t {
                 // 足し直した行: 束ねない。 消えた entity は死んだ slot、 この batch で消える entity は普通の払い出し (後の削除で消える)
                 return if dead_at.is_some() { reserve() } else { None };
             }
@@ -1645,6 +1646,15 @@ impl Syncer {
                 // 削除優先 (#551): 消えた行への改名は捨てるが、 その名前も消した名前 (改名を先に受けた peer と同じ名前の集まり)
                 if r == ApplyResult::SkippedOlder && self.engine.is_pk_himo(*himo_id) {
                     self.engine.name_given_to_dead_row(local_eid, *himo_id, value);
+                    // #614: 生きた行への、 今の名前より古い名前の書き込み (後の改名を先に受けた)。 その名前がこの書き込みより後に
+                    // 消されていれば、 この行はその時刻にその名前だった = 消されたデッキの一員 (当たった名前の書き込みと同じ確かめ。
+                    // 書き込みを順に受けた peer では、 作成を当てた時か束ねた時に消している)
+                    if let Some(t) = self.engine.name_deleted_at(*himo_id, PkValue::Local(value))
+                        && t > rec.hlc
+                        && self.engine.is_live(local_eid)
+                    {
+                        self.engine.remote_delete_apply(local_eid, t);
+                    }
                 }
                 r
             }

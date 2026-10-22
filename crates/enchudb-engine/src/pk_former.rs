@@ -159,6 +159,12 @@ impl PkFormer {
         }))
     }
 
+    /// #614: 行 `slot` の名前の年表で、 名前 `(himo, key)` への最初の書き込みの版数 (その名前で作られた / その名前に改名した時刻。
+    /// LWW で負けた書き込みも)。 年表の無い行と、 年表にその名前の無い行は None。
+    pub(crate) fn first_held(&self, slot: u32, himo: u16, key: &[u8]) -> Option<enchudb_oplog::Hlc> {
+        self.timeline.get(&slot)?.iter().filter(|w| w.1 == himo && &w.2[..] == key).map(|w| w.3).min()
+    }
+
     /// 行 `slot` の名前の年表で、 identity `id` 宛ての最初の書き込みの版数 (その identity の作成)。
     pub(crate) fn first_name_write(&self, slot: u32, id: (u32, u32)) -> Option<enchudb_oplog::Hlc> {
         self.timeline.get(&slot)?.iter().filter(|w| w.0 == id).map(|w| w.3).min()
