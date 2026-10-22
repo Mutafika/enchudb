@@ -976,30 +976,62 @@ fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<EidmapEntry>, String> {
     Ok(entries)
 }
 
-/// #9: eidmap を sidecar に atomic 書き換え (fsync 込み)。 entries 空なら何もしない
-/// (= sync してない DB に空ファイルを作らない)。
+/// #560: `eidmap` の bytes と、 その続きの `eidmap.log` の record (log が無い / 合わなければ None、 (record, 切れていたか)) を読む。
+/// 不在なら Ok(None)。 log を先に読む: まとめ直しは `eidmap` → 空の log の順に置き換えるので、 log の後に読んだ `eidmap` が合わ
+/// なければ、 その `eidmap` は log より新しい = 全部を持つ (別の process の書き手と並ぶ読み手 (readonly で開く / relay の bootstrap)
+/// でも、 log にだけある写像を落とさない)。 逆の順だと、 2 つを読む間にまとめ直しが入れば古い `eidmap` だけが残る。
 #[cfg(not(target_arch = "wasm32"))]
-fn persist_eidmap_to_sidecar(db_path: &str, entries: &[EidmapEntry]) -> io::Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    crate::db_files::write_atomic_if_changed(&eidmap_path_for(db_path), &serialize_eidmap(entries))
-        .map(|_| ())
+#[allow(clippy::type_complexity)]
+fn read_eidmap_sidecars(db_path: &str) -> io::Result<Option<(Vec<u8>, Option<(Vec<crate::eidmap_log::Entry>, bool)>)>> {
+    enchudb_oplog::io_point("sidecar.read_eidmap")?;
+    let log = match std::fs::read(crate::db_files::path_for(db_path, crate::db_files::EIDMAP_LOG)) {
+        Ok(log) => Some(log),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    #[cfg(test)]
+    eidmap_read_hook::between_reads();
+    let buf = match std::fs::read(eidmap_path_for(db_path)) {
+        Ok(buf) => buf,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let records = log.and_then(|log| crate::eidmap_log::read(&log, &buf));
+    Ok(Some((buf, records)))
 }
 
-/// #9: eidmap sidecar を読む。 不在なら Ok(None)。
-#[cfg(not(target_arch = "wasm32"))]
-fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>>> {
-    let sidecar = eidmap_path_for(db_path);
-    enchudb_oplog::io_point("sidecar.read_eidmap")?;
-    match std::fs::read(&sidecar) {
-        Ok(buf) => match deserialize_eidmap(&buf) {
-            Ok(entries) => Ok(Some(entries)),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+/// 試験用: `read_eidmap_sidecars` の 2 つの読みの間で走らせる処理 (読む間にまとめ直しが入った形を必ず作る)。
+#[cfg(test)]
+mod eidmap_read_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+    pub(super) fn between_reads() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
+/// #9: eidmap sidecar を読む。 不在なら Ok(None)。 #560: 続きの `eidmap.log` があれば当て、 log の様子も返す (log が無い / 合わない /
+/// 切れていれば、 次の書き出しでまとめ直す)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<(Vec<EidmapEntry>, crate::eidmap_log::LogState)>> {
+    let Some((buf, log)) = read_eidmap_sidecars(db_path)? else {
+        return Ok(None);
+    };
+    let entries = deserialize_eidmap(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(match log {
+        Some((records, torn)) => {
+            let state = crate::eidmap_log::LogState { records: records.len() as u64, ok: !torn };
+            (crate::eidmap_log::merge(entries, &records), state)
+        }
+        None => (entries, crate::eidmap_log::LogState::default()),
+    }))
 }
 
 /// #178: 翻訳の別名の sidecar path (`eidalias`)。 不在 = 別名なし。
@@ -2357,6 +2389,20 @@ impl Engine {
             kinds.push(SegmentKind::Tomb);
         }
         kinds
+    }
+
+    /// #560: relay の bootstrap (`/bootstrap/eidmap`) が配る `eidmap` (`eidmap.log` を当てた形)。 不在なら Ok(None)。 受け手は log を
+    /// 取りに来ない (古い受け手は log を知らない。 別々に読むと、 間にまとめ直しが入って合わなくなる) ので、 送る側で 1 つの `eidmap`
+    /// にする。 開いている DB の横で読んでよい (`read_eidmap_sidecars`)。 中身が読めない `eidmap` はそのまま返す (受け手が開く時に
+    /// 警告して空で続ける、 前と同じ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn eidmap_for_bootstrap(db_path: &str) -> io::Result<Option<Vec<u8>>> {
+        Ok(read_eidmap_sidecars(db_path)?.map(|(buf, log)| match (log, deserialize_eidmap(&buf)) {
+            (Some((records, _)), Ok(entries)) if !records.is_empty() => {
+                serialize_eidmap(&crate::eidmap_log::merge(entries, &records))
+            }
+            _ => buf,
+        }))
     }
 
     /// v10: DB directory を **packed 1 ファイル** (= 旧 v9 の 1 ファイル layout と byte 互換、
@@ -4697,6 +4743,10 @@ pub struct Engine {
     /// state の snapshot (serialize) から rename までを丸ごとこの lock 下に置く —
     /// serialize も lock 内なので「後から取った方が必ず新しい状態を書く」が成立する。
     sidecar_persist_lock: std::sync::Mutex<()>,
+    /// #560: `eidmap.log` の様子 (`sidecar_persist_lock` の下で読み書き)。
+    eidmap_log: std::sync::Mutex<crate::eidmap_log::LogState>,
+    /// #560: 次の書き出しで `eidmap` をまとめ直す (きれいに閉じる時。 読まない旧 binary も `eidmap` だけで全部ある)。
+    eidmap_compact: std::sync::atomic::AtomicBool,
     /// writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
     /// flock(LOCK_EX)、 Engine drop で fd close = lock release。 readonly では None。
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
@@ -5111,6 +5161,8 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             sidecar_persist_lock: std::sync::Mutex::new(()),
+            eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
+            eidmap_compact: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
             immutable: None,
             backing,
@@ -5458,7 +5510,8 @@ impl Engine {
         // 空の translator で続行 (additive、 後方互換)。 破損は警告のみで空続行 (= 再
         // sync で mapping は張り直せる)。
         match load_eidmap_from_sidecar(path) {
-            Ok(Some(entries)) => {
+            Ok(Some((entries, log))) => {
+                *eng.eidmap_log.lock().unwrap_or_else(|p| p.into_inner()) = log;
                 for (peer, foreign_local, local, tomb) in entries {
                     // #166: 写像を持たない削除記録 (slot を手放した identity)。
                     // 写像も slot も復元せず、 退避表にだけ載せる。 次にこの
@@ -5513,6 +5566,8 @@ impl Engine {
             }
             Err(e) => return Err(eng.abandon_open("eidalias", e)),
         }
+        // #560: 読み込みで付いた印は捨てる (`eidmap` + log から読んだ中身は disk と同じ)
+        eng.eid_translator.clear_dirty();
         // 主キーの前の名前。 壊れていたら警告して無しで続ける (今の名前でだけ束ねる = 前の版の動き)
         match load_pkformer_from_sidecar(path) {
             Ok(Some(former)) => {
@@ -6380,6 +6435,8 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             sidecar_persist_lock: std::sync::Mutex::new(()),
+            eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
+            eidmap_compact: std::sync::atomic::AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
             _writer_lock: None, // caller (open_internal) が後から差し替える
             #[cfg(not(target_arch = "wasm32"))]
@@ -9123,8 +9180,8 @@ impl Engine {
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw())?;
-        // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
-        persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
+        // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。 #560: 変わった分だけ追記
+        self.persist_eidmap()?;
         // #178: 別名も同じ trigger で
         persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot())?;
         // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
@@ -9206,6 +9263,88 @@ impl Engine {
         self.persist_name_records()?;
         self.body_msync()?;
         self.persist_tables()
+    }
+
+    /// #560: `.eidmap` を書き出す。 印の付いた key (`EidTranslator::take_dirty`) の今の中身だけを `eidmap.log` に追記する。 log が
+    /// 生きている記録の 2 倍を越えた / 信用できない / きれいに閉じる時は、 まとめ直す (`eidmap` を書き直して log を空にする)。 失敗
+    /// したら印を戻し、 次はまとめ直す。 呼び手は `sidecar_persist_lock` を握っている (書き出しを 1 本に並べる)。 写像が無く `eidmap`
+    /// も無い DB (sync してない) には file を作らない。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_eidmap(&self) -> io::Result<()> {
+        use crate::eidmap_log::{MAPPING_GONE, NO_LOCAL_SLOT as ORPHAN, REWRITE_SLACK, push_record};
+        use std::sync::atomic::Ordering;
+        let keys = self.eid_translator.take_dirty();
+        let mut log = self.eidmap_log.lock().unwrap_or_else(|p| p.into_inner());
+        let compact = self.eidmap_compact.swap(false, Ordering::AcqRel);
+        let live = self.eid_translator.len() as u64 + self.foreign_tombs.read().unwrap().len() as u64;
+        let fail = |log: &mut crate::eidmap_log::LogState, keys: Vec<(enchudb_oplog::PeerId, u32)>| {
+            log.ok = false;
+            self.eid_translator.restore_dirty(keys);
+        };
+        if compact || !log.ok || log.records + keys.len() as u64 > 2 * live + REWRITE_SLACK {
+            let entries = self.eidmap_entries_with_tombstones();
+            let eidmap = eidmap_path_for(&self.path);
+            if entries.is_empty() && !eidmap.exists() {
+                return Ok(());
+            }
+            let bytes = serialize_eidmap(&entries);
+            let log_path = crate::db_files::path_for(&self.path, crate::db_files::EIDMAP_LOG);
+            let r = crate::db_files::write_atomic_if_changed(&eidmap, &bytes)
+                .and_then(|_| crate::db_files::write_atomic_if_changed(&log_path, &crate::eidmap_log::header(&bytes)));
+            return match r {
+                Ok(_) => {
+                    *log = crate::eidmap_log::LogState { records: 0, ok: true };
+                    Ok(())
+                }
+                Err(e) => {
+                    fail(&mut log, keys);
+                    Err(e)
+                }
+            };
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // 印の key ごとに 2 つの面 (写像の面は今の逆写像の組と削除の版数か、 無ければ外す。 退避した削除があれば足す)
+        let mut buf = Vec::with_capacity(keys.len() * 2 * crate::eidmap_log::RECORD_LEN);
+        let mut records = 0u64;
+        for &(peer, fl) in &keys {
+            let mapped = self.eid_translator.mapped_local(peer, fl).map(|l| (l, self.tombstone_version_of(l)));
+            let (local, tomb) = mapped.unwrap_or((MAPPING_GONE, enchudb_oplog::Hlc::ZERO));
+            push_record(&mut buf, (peer, fl, local, tomb));
+            records += 1;
+            if let Some(t) = self.foreign_tombstone_of(peer, fl).filter(|t| *t != enchudb_oplog::Hlc::ZERO) {
+                push_record(&mut buf, (peer, fl, ORPHAN, t));
+                records += 1;
+            }
+        }
+        let log_path = crate::db_files::path_for(&self.path, crate::db_files::EIDMAP_LOG);
+        match crate::db_files::append_synced(&log_path, &buf) {
+            Ok(()) => {
+                log.records += records;
+                Ok(())
+            }
+            Err(e) => {
+                fail(&mut log, keys);
+                Err(e)
+            }
+        }
+    }
+
+    /// #560: 書き出した `eidmap` + `eidmap.log` を読み直した中身が、 memory の中身 (`eidmap_entries_with_tombstones`) と同じか。
+    /// 印の付け忘れ (変えたのに log に載らない) を試験で拾う。 違えば (disk にだけある, memory にだけある) を返す。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn eidmap_disk_diff(&self) -> io::Result<Option<(Vec<String>, Vec<String>)>> {
+        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let disk: std::collections::BTreeSet<EidmapEntry> =
+            load_eidmap_from_sidecar(&self.path)?.map(|(e, _)| e).unwrap_or_default().into_iter().collect();
+        let mem: std::collections::BTreeSet<EidmapEntry> = self.eidmap_entries_with_tombstones().into_iter().collect();
+        if disk == mem {
+            return Ok(None);
+        }
+        let show = |e: &EidmapEntry| format!("{:?}", e);
+        Ok(Some((disk.difference(&mem).map(show).collect(), mem.difference(&disk).map(show).collect())))
     }
 
     /// `.vocabmap` を dirty のときだけ書く。 写像は単調増加なので「増えたか」で足りる。
@@ -9297,9 +9436,7 @@ impl Engine {
                 }
                 // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
                 // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
-                if let Err(e) =
-                    persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
-                {
+                if let Err(e) = self.persist_eidmap() {
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // #178: 別名も
@@ -11541,14 +11678,19 @@ impl Engine {
         }
         self.move_names_to_identities(local, &keys);
         let mut g = self.foreign_tombs.write().unwrap();
-        for key in keys {
+        for &key in &keys {
             let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
             if *e < tomb {
                 *e = tomb; // monotone-max (同 identity が複数回 slot を回った場合)
             }
         }
+        drop(g);
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // #560: 退避した削除の面が変わった (写像の面は `remove_local` が印を付けた)
+        for key in keys {
+            self.eid_translator.mark_dirty(key);
+        }
     }
 
     /// #545: 消えた行の slot `local` を使い回す前に、 その行の名前 (消えた時の名前と前の名前) を、 slot に写っていた identity に移す。
@@ -11638,8 +11780,11 @@ impl Engine {
             return false;
         }
         *e = tomb;
+        drop(g);
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // #560: 退避した削除の面が変わった
+        self.eid_translator.mark_dirty((peer, foreign_local));
         true
     }
 
@@ -12282,7 +12427,18 @@ impl Engine {
                 self.hlc_store.try_set(self.version_key(local), u16::MAX, hlc);
             }
         }
+        self.mark_eidmap_slot(local);
         true
+    }
+
+    /// #560: slot `local` が翻訳した行なら、 その key の `.eidmap` の中身 (削除の版数) が変わった印を付ける (変えた後に呼ぶ)。
+    fn mark_eidmap_slot(&self, local: u32) {
+        if self.eid_translator.is_empty() {
+            return;
+        }
+        if let Some(key) = self.eid_translator.reverse(local) {
+            self.eid_translator.mark_dirty(key);
+        }
     }
 
     /// #9: foreign eid 翻訳テーブルへの参照。
@@ -20409,6 +20565,8 @@ impl Engine {
         }
         self.flush_writes();
         self.commit();
+        // #560: graceful close も `eidmap` をまとめ直す
+        self.eidmap_compact.store(true, std::sync::atomic::Ordering::Release);
         self.try_persist_tables();
         for ds in &self.himos {
             ds.sync();
@@ -20602,6 +20760,8 @@ impl Drop for Engine {
             && !self.abandoned.load(Ordering::Acquire)
         {
             self.commit();
+            // #560: 閉じる時は `eidmap` をまとめ直す (読まない旧 binary も `eidmap` だけで全部ある)
+            self.eidmap_compact.store(true, Ordering::Release);
             self.try_persist_tables();
             for ds in &self.himos {
                 ds.sync();
@@ -25402,5 +25562,57 @@ mod answer_decl_sidecar_tests {
         assert_eq!((d.added, d.removed), (vec![before[0]], vec![]), "宣言された購読に差分が届く");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// #560: `eidmap.log` を `eidmap` と読み合わせる道。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod eidmap_log_read_tests {
+    use super::*;
+    use enchudb_oplog::{Hlc, make_eid};
+
+    /// bootstrap が log と `eidmap` を読む間にまとめ直しが入っても、 log にだけあった写像を落とさない (log を先に読むので、 後に
+    /// 読んだ `eidmap` は log より新しい = 全部を持つ。 `eidmap` を先に読むと、 まとめ直す前の `eidmap` と空の log になり、 前の
+    /// `eidmap` だけを配る)。
+    #[test]
+    fn a_compaction_between_the_reads_keeps_the_log() {
+        let path = format!("/tmp/enchu_eidmap_straddle_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        {
+            let mut eng = Engine::create_with_cell_version(&path, 4096).unwrap();
+            eng.define_table("t", 1000).unwrap();
+            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+            eng.set_peer_id(2);
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 4 << 20).unwrap();
+        let h = eng.himo_id("t.v").unwrap() as u16;
+        let receive = |i: u32| {
+            let local = eng.resolve_remote_eid(make_eid(1, i), h).unwrap();
+            assert!(eng.remote_tie_apply(local, h, i + 100, Hlc { wall: 1_000 + i as u64, logical: 0, peer: 1 }));
+        };
+        receive(0);
+        eng.persist_sync_state().unwrap();
+        for i in 1..4 {
+            receive(i);
+        }
+        eng.persist_sync_state().unwrap();
+        let log_len = std::fs::metadata(crate::db_files::path_for(&path, crate::db_files::EIDMAP_LOG)).unwrap().len();
+        assert!(log_len > crate::eidmap_log::HEADER_LEN as u64, "前提: 写像 1..4 は log にだけある");
+        let expect: std::collections::BTreeSet<_> = eng.eidmap_entries_with_tombstones().into_iter().collect();
+
+        let other = eng.clone();
+        eidmap_read_hook::set(move || {
+            other.eidmap_compact.store(true, std::sync::atomic::Ordering::Release);
+            other.persist_sync_state().unwrap();
+        });
+        let served = Engine::eidmap_for_bootstrap(&path).unwrap().unwrap();
+        let log_len = std::fs::metadata(crate::db_files::path_for(&path, crate::db_files::EIDMAP_LOG)).unwrap().len();
+        assert_eq!(log_len, crate::eidmap_log::HEADER_LEN as u64, "前提: 読む間にまとめ直した");
+        let got: std::collections::BTreeSet<_> = deserialize_eidmap(&served).unwrap().into_iter().collect();
+        assert_eq!(got, expect, "読む間のまとめ直しで log にだけあった写像を落とした");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

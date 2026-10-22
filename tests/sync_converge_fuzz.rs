@@ -126,9 +126,16 @@ impl Peer {
         self.publish();
     }
 
-    /// engine の不変量の違反 (`verify_invariants`、 書き手を止めてから)。 主キーの重複は警告 (#601 が入るまで)。
+    /// engine の不変量の違反 (`verify_invariants`、 書き手を止めてから)。 主キーの重複は警告 (#601 が入るまで)。 #560: 書き出した
+    /// `eidmap` + `eidmap.log` を読み直した中身が memory の中身と同じか (変えたのに log に載せない所を拾う)。
     fn violations(&self) -> Vec<String> {
-        self.db.engine().verify_invariants().violations
+        let eng = self.db.engine();
+        let mut out = eng.verify_invariants().violations;
+        eng.persist_tables().unwrap();
+        if let Some((disk, mem)) = eng.eidmap_disk_diff().unwrap() {
+            out.push(format!("eidmap: disk にだけ {disk:?} / memory にだけ {mem:?}"));
+        }
+        out
     }
 
     /// 表の行 (key, title)。 名前の無い塊 (title だけの entity) も入れる。
