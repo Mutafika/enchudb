@@ -14,6 +14,11 @@
 //!   たびに [`Acl::add_writer`] で再投入する必要がある。**
 //! - 効果があるのは同一プロセス内で `is_writer()` を確認する経路
 //!   (sync の op 受信チェック等) のみ。
+//! - **ACL だけでは peer 番号を名乗るだけで通る。** 判定する `author_peer` は送り手が
+//!   自分で書く値で、ACL の判定は署名の確認と結び付いていない。ACL を効かせるなら、
+//!   受け取る側で `Syncer::set_require_signature(true)` (既定はオフ) と相手の公開鍵の
+//!   登録 (`Engine::pubkeys().force_register`)、送る側で鍵の設定 (`Keypair::load_or_create`
+//!   → `Engine::set_keypair`。Engine を開いても鍵は作られず、署名欄はゼロのまま) が要る。
 //!
 //! 永続化された ACL (紐データとして WAL に乗り、peer 間で分散されるもの) は
 //! 将来の作業であり、現時点では存在しない。
