@@ -111,6 +111,8 @@ pub struct DurableCutPoint {
     /// ring の周と、 切れ目の時の終わり (この周でこれより前の record は全部切れ目より前)
     pub lap: u32,
     pub offset: u64,
+    /// 切れ目の時の、 自分の中身のある record を積んだ回数 ([`OpLog::quiet_since`])
+    pub own_data: u64,
 }
 
 /// 周の印を書く。
@@ -849,6 +851,8 @@ pub struct OpLog {
     dropped: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
     /// #451 (段階 1): 自分 (`peer_id`) の落ちた record を覚えた回数 (`dropped` の lock の下で上げる)。
     dropped_gen: std::sync::atomic::AtomicU64,
+    /// 自分の、 中身のある record (Commit を除く、 中継を除く) を積んだ回数。 append の直列化の内側で進める (`quiet_since`)
+    own_data: std::sync::atomic::AtomicU64,
     /// #178: scan が読み飛ばした record の累計 (知らない版が書いた [`op_type::SKIPPABLE`] の op。 同じ record を読み直すと
     /// また数える)。 [`OpLog::skipped_ops`]。
     skipped_ops: AtomicU64,
@@ -1040,6 +1044,7 @@ impl OpLog {
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
+            own_data: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -1148,6 +1153,7 @@ impl OpLog {
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
+            own_data: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -1402,6 +1408,9 @@ impl OpLog {
                 None => self.next_hlc(),
             };
             let author_peer = hlc.peer;
+            if !matches!(op, Op::Commit) {
+                self.own_data.fetch_add(1, Ordering::AcqRel);
+            }
 
             let op_byte = op.op_byte();
             let payload_offset = offset as usize + REC_HEADER_SIZE;
@@ -1707,6 +1716,9 @@ impl OpLog {
             None => {
                 let h = hlc_override.unwrap_or_else(|| self.next_hlc());
                 let a = h.peer;
+                if !matches!(op, Op::Commit) {
+                    self.own_data.fetch_add(1, Ordering::AcqRel);
+                }
                 (h, a)
             }
         };
@@ -2008,7 +2020,20 @@ impl OpLog {
             dropped_gen: self.dropped_gen.load(Ordering::Acquire),
             lap: self.lap.load(Ordering::Acquire),
             offset: self.head.load(Ordering::Acquire),
+            own_data: self.own_data.load(Ordering::Acquire),
         }
+    }
+
+    /// ホストの形 (`HOST_PLAN.md`): 切れ目 ([`OpLog::durable_cut_for`] の `own_data`) の後に自分の中身のある record (Commit と中継を
+    /// 除く) を積んでいなければ、 時計を今まで進めてその HLC を返す (以後の採番はこれより後なので、 HLC がこれ以下の `author` の
+    /// 中身のある record は切れ目より前に積んだ物だけ)。 積んでいれば `None`。 採番は append の直列化の内側なので、 見る間に積まれる
+    /// ことはない
+    pub fn quiet_since(&self, own_data: u64, author: PeerId) -> Option<Hlc> {
+        let _in_proc = self.append_lock.lock();
+        if self.own_data.load(Ordering::Acquire) != own_data {
+            return None;
+        }
+        Some(Hlc { peer: author, ..self.next_hlc() })
     }
 
     /// #57: 前回から append に失敗して WAL に載らなかった record を、 author ごとに落ちた HLC の max で
@@ -2564,6 +2589,7 @@ impl OpLog {
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
+            own_data: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -2758,6 +2784,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// ホストの形: 切れ目の後に Commit と中継しか積んでいなければ 「中身のある自分の record は積んでいない」 (時計を今まで進め、
+    /// 以後の採番はそれより後)。 中身のある自分の record を積んだら、 次の切れ目までは言わない。
+    #[test]
+    fn quiet_since_ignores_commits_and_relays_but_not_own_data() {
+        let p = tmp("quiet_since");
+        let wal = OpLog::create(&p, 1 << 20).unwrap();
+        wal.set_peer_id(7);
+        let cut = wal.durable_cut_for(7);
+        wal.append(Op::Commit).unwrap();
+        let other = Hlc { wall: 5, logical: 0, peer: 9 };
+        let hdr = RelayedHeader { hlc: other, author: 9, signature: [0; 64], pubkey_fp: [0; 8] };
+        wal.append_relayed(Op::Tie { eid: 1, himo_id: 0, value: 1 }, hdr).unwrap();
+        let q = wal.quiet_since(cut.own_data, 7).expect("Commit と中継だけなら中身は積んでいない");
+        assert_eq!(q.peer, 7);
+        let (_, next) = wal.append_with_hlc(Op::Tie { eid: 2, himo_id: 0, value: 1 }).unwrap();
+        assert!(next > q, "後の採番が言った時刻より後でない: {next:?} {q:?}");
+        assert!(wal.quiet_since(cut.own_data, 7).is_none(), "中身のある自分の record を積んだ後に言った");
+        let (_, _) = wal.append_with_hlc(Op::Commit).unwrap();
+        let cut2 = wal.durable_cut_for(7);
+        assert!(wal.quiet_since(cut2.own_data, 7).is_some(), "次の切れ目からはまた言える");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// #451 (段階 1): 切れ目は、 その前に載った record の HLC 以上で、 その後に採番する HLC より小さい。 満杯で落ちた record は

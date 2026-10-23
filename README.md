@@ -599,8 +599,10 @@ if out.history_truncated {
 
 - The host acknowledges what it applied, so each client's `_sync_ops` is reclaimed as soon as the host has its records (a client that stays away does not hold the others back). A client's pull acknowledges the host's stream, so the host's `_sync_ops` is reclaimed too.
 - A client whose cursor is below the host's reclaimed floor is told so (`history_truncated`) and catches up from the host's state.
-- Old clients (`HttpTransport`, `/publish` and `/pull`) can talk to a host; their acks don't reach it, so their part of the host's `_sync_ops` is not reclaimed.
-- Not yet: the host reads its whole `_sync_ops` for every pull, and a client that has pulled once and then stays away keeps the host's `_sync_ops` from being reclaimed.
+- **Deleted-row bookkeeping is forgotten once everyone is past it.** Each client tells the host how far it has published its own writes and how far it has received the host's stream. The host hands out the line every active client has passed, and the host and the clients drop the deleted keys (`pktombs`) and the deletes of rows they no longer map that are older than it. A host started without a `cursor_path` hands out no line (after a restart it would not know whom to wait for), so nothing is forgotten under it.
+- **A client that stays away for 30 days** (`HttpHost::set_silence_limit`) stops counting, both for the line and for the host's `_sync_ops` reclaim. When it comes back it catches up from the host's state. If it then publishes records older than the line that the host never got, the host refuses them and `HttpHostTransport::rebase_required()` turns true: rebuild the local DB from the host, then redo those writes (taking them could bring a deleted row back). A client syncing for the first time is never refused: its offline writes are taken even when they are older than the line.
+- Old clients (`HttpTransport`, `/publish` and `/pull`) can talk to a host; their acks don't reach it, so their part of the host's `_sync_ops` is not reclaimed, and while one is active the line does not move.
+- Not yet: the host reads its whole `_sync_ops` for every pull.
 
 `HttpRelay` is the earlier board: it keeps records in memory per publisher and does not carry acks, floors or state, so over it no `_sync_ops` is ever reclaimed and a truncated client is never told.
 

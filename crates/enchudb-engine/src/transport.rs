@@ -634,6 +634,24 @@ pub trait Transport: Send + Sync {
         }
     }
 
+    /// ホストの形 (`HOST_PLAN.md`): `peer` (自分) の書き込みのうち HLC が `through` 以下のものは全部 `_sync_ops` に載っている
+    /// ([`crate::engine::Engine::sync_published_through`])。 `Syncer::publish_since` が record を集める**前**に呼ぶ (集めた record が
+    /// `through` 以下の自分の record を全部含むように)。 ホストはこの publish を全部当てた時、 `peer` の配り終えの線を進める。
+    /// default は何もしない
+    fn note_published_through(&self, _peer: PeerId, _through: Hlc) {}
+
+    /// [`Transport::note_published_through`] を使うか (使わない transport のために、 `Syncer` は線を求めない = 時計も進めない)。
+    fn uses_published_through(&self) -> bool {
+        false
+    }
+
+    /// ホストの形: `from` (ホスト) が配った、 削除の記録を忘れてよい線 (全部の書き手が線より前の record をホストに出し終え、 全部の
+    /// 受け手がそれを受け終えた)。 `Syncer::pull_once` が当て終えた後に読み、 線より前の削除の記録を捨てて、 線を時計に入れる。
+    /// default は `None` (忘れない)
+    fn forget_horizon(&self, _from: PeerId) -> Option<Hlc> {
+        None
+    }
+
     /// #140: `author` の live state を取得する。 None = この transport は
     /// state 配布を運べない、 または author が provider 未登録。
     ///

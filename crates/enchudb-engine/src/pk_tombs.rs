@@ -257,6 +257,29 @@ impl PkTombs {
         true
     }
 
+    /// 削除の版数が `h` より前の主キーを忘れる (その主キーの slot の記録も)。 忘れた主キーの数。 file は次の書き出しでまとめ直す。
+    /// 呼び手は `h` より前の削除がもう要らないことを確かめた (ホストが配る忘れてよい線、 `HOST_PLAN.md`)。
+    pub(crate) fn forget_before(&mut self, h: Hlc) -> usize {
+        let gone = self.keys.iter().filter(|k| k.hlc() < h).count();
+        if gone == 0 {
+            return 0;
+        }
+        let old = std::mem::take(self);
+        let mut new_id = vec![EMPTY; old.keys.len()];
+        for (id, k) in old.keys.iter().enumerate() {
+            if k.hlc() >= h {
+                new_id[id] = self.push_key(k.himo, old.bytes(k), k.hlc());
+            }
+        }
+        for (&slot, &id) in &old.by_slot {
+            if new_id[id as usize] != EMPTY {
+                self.by_slot.insert(slot, new_id[id as usize]);
+            }
+        }
+        // `in_file = None` (既定) = 次の書き出しでまとめ直す
+        gone
+    }
+
     /// 書き出す分を取り出す (呼び手は書いた結果を [`PkTombs::persisted`] / [`PkTombs::persist_failed`] で返す)。 file を
     /// 信用できない時と、 record が増えすぎた時はまとめ直す。 書くものが無ければ `None`。
     pub(crate) fn take_for_persist(&mut self) -> Option<Persist> {
@@ -772,6 +795,33 @@ mod tests {
         assert!(!fresh.fit(&back), "足りていれば作り直さない");
         assert_eq!(fresh.bits(), bloom.bits());
         assert!((0..n).all(|i| fresh.maybe(3, &(i * 2).to_le_bytes())));
+    }
+
+    #[test]
+    fn deletes_before_the_line_are_forgotten() {
+        let mut p = PkTombs::default();
+        let mut file = Vec::new();
+        let key = |i: u32| -> Vec<u8> {
+            // 長い鍵と短い鍵を混ぜる (arena の置き直し)
+            if i % 2 == 0 { i.to_le_bytes().to_vec() } else { format!("name-{i:06}").into_bytes() }
+        };
+        for i in 0..100u32 {
+            p.note(3, &key(i), i, hlc(i as u64));
+        }
+        write(&mut file, &mut p);
+        assert_eq!(p.forget_before(hlc(60)), 60);
+        assert_eq!(p.forget_before(hlc(60)), 0, "二度目は何もしない");
+        assert_eq!(p.key_count(), 40);
+        for i in 0..100u32 {
+            let want = (i >= 60).then(|| hlc(i as u64));
+            assert_eq!(p.tomb_of(3, &key(i)), want, "{i}");
+            assert_eq!(p.key_of_slot(i).map(|(h, k)| (h, k.to_vec())), want.map(|_| (3, key(i))), "slot {i}");
+        }
+        // 書き出しは忘れた後の中身でまとめ直す
+        assert_eq!(write(&mut file, &mut p), Some("rewrite"));
+        let (back, _) = PkTombs::load(&file).unwrap();
+        assert!(same(&back, &p));
+        assert_eq!(back.key_count(), 40);
     }
 
     #[test]

@@ -1001,6 +1001,17 @@ impl Syncer {
             self.transport.record_pull_ack_multi(from, self_peer, &cursors);
         }
 
+        // ホストの形: 全部の書き手が出し終え、 全部の受け手が受け終えた線より前の削除の記録は、 もう誰も要らない (`HOST_PLAN.md`)。
+        // 線は時計にも入れる (以後の自分の書き込みは線より後 = ホストが 「線より前の新しい record」 として断らない)
+        if let Some(line) = self.transport.forget_horizon(from) {
+            if let Some(wal) = self.engine.oplog_arc() {
+                wal.observe_hlc(line);
+            }
+            if self.engine.forget_deletes_before(line) > 0 {
+                let _ = self.engine.persist_sync_state();
+            }
+        }
+
         // #226: relay が新しい author を取り込んだら、 その author の state 配布元
         // としても名乗る (`serve_state` で opt-in 済みなら)。
         self.refresh_state_providers();
@@ -1163,6 +1174,7 @@ impl Syncer {
         if peers.is_empty() {
             // backward compat: known_peers 未実装 transport (HTTP/WS push 等) は
             // 旧 broadcast 経路。 filter は無視される。
+            self.note_published_through();
             let filtered = self.collect_records_since(since);
             // #57: 集めた後にも広告する (engine の bridge は WAL に載らなかった record のために
             // floor を上げてから後続を転写する。 集める前の広告だけだと、 その後続を古い floor と
@@ -1180,6 +1192,16 @@ impl Syncer {
             total += self.publish_since_for_peer(p, since);
         }
         total
+    }
+
+    /// ホストの形: 自分の書き込みがどこまで `_sync_ops` に載っているか ([`Engine::sync_published_through`]) を、 record を集める**前**に
+    /// transport に伝える (集めた record がその時刻以下の自分の record を全部含む)。 使わない transport には何もしない
+    fn note_published_through(&self) {
+        if self.transport.uses_published_through()
+            && let Some(t) = self.engine.sync_published_through()
+        {
+            self.transport.note_published_through(self.engine.peer_id(), t);
+        }
     }
 
     /// #140: 自分の `_sync_ops` が reclaim 済みなら、 配れる履歴の下限を transport に広告する。
@@ -1257,6 +1279,7 @@ impl Syncer {
     /// 関心ある record か」 を判定してから送る。
     pub fn publish_since_for_peer(&self, target_peer: PeerId, since: Hlc) -> usize {
         let self_peer = self.engine.peer_id();
+        self.note_published_through();
         let filter = self.subscription_filter.read().unwrap().clone();
         // #219: 落とした record は **puller の cursor が飛び越える** (cursor は
         // 受け取った record の author 別 max HLC で進む) ので、 差分 pull では
