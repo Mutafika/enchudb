@@ -260,19 +260,6 @@ struct PkPending {
     hlc: enchudb_oplog::Hlc,
 }
 
-/// #513: 覚えた主キーの bit の表の大きさ (bit、 2 の冪)。 64 KiB。
-const PK_BLOOM_BITS: usize = 1 << 19;
-
-/// #513: 主キーの bit の表の番地 (FNV-1a 64)。
-fn pk_bloom_index(himo: u16, key: &[u8]) -> usize {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in himo.to_le_bytes().iter().chain(key) {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    (h as usize) & (PK_BLOOM_BITS - 1)
-}
-
 /// #513: 主キーで束ねる時の主キーの値 ([`Engine::reserve_remote_eid_for_pk`])。 受け手の辞書にある値・数などは local な
 /// 値 (`Local`)、 受け手の辞書に無い文字列 (届いた `Vocab` の bytes) は `Text`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4686,9 +4673,9 @@ pub struct Engine {
     pk_pending: parking_lot::Mutex<Vec<PkPending>>,
     /// #513: `pk_pending` に積んだ分があるかもしれない (無いのに立っていることはある)。
     pk_pending_nonempty: std::sync::atomic::AtomicBool,
-    /// #513: 覚えた主キーの bit の表 (主キーの hash に 1 bit)。 bit が無ければ、 その主キーは覚えていない。 受け手が新しい行
-    /// ごとに引く時に、 lock を取らずに弾く。 初めて覚えた時に作る。
-    pk_bloom: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    /// #513: 覚えた主キーの bit の表 (`pk_tombs.rs` の `PkBloom`)。 bit が無ければ、 その主キーは覚えていない。 受け手が新しい行
+    /// ごとに引く時に、 lock を取らずに弾く。 初めて覚えた時に作り、 主キーが増えたら大きく作り直す (#560)。
+    pk_bloom: crate::pk_tombs::PkBloom,
     /// 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
     /// 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
@@ -5211,7 +5198,7 @@ impl Engine {
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
-            pk_bloom: std::sync::OnceLock::new(),
+            pk_bloom: crate::pk_tombs::PkBloom::default(),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -5715,9 +5702,7 @@ impl Engine {
                 if !loaded.is_empty() {
                     eng.pk_tombs_empty.store(false, Ordering::Release);
                 }
-                for (himo, key) in loaded.keys() {
-                    eng.pk_bloom_set(himo, key);
-                }
+                eng.pk_bloom.fit(&loaded);
                 *eng.pk_tombs.write().unwrap() = loaded;
                 if torn {
                     eprintln!("warning: pktombs sidecar ends with a torn record (dropped; rewritten on the next persist)");
@@ -6489,7 +6474,7 @@ impl Engine {
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
-            pk_bloom: std::sync::OnceLock::new(),
+            pk_bloom: crate::pk_tombs::PkBloom::default(),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -8161,7 +8146,7 @@ impl Engine {
     /// `EntitySet` 側は Engine の table に触らないので逆転しない。
     ///
     /// **コストの注記 (未実測)**: この形で critical section は「Vec への push」から
-    /// 「`delete` 全体 (oplog append + column write + tombstone)」に広がる。 その間
+    /// 「削除全体 (column write + tombstone、 WAL には積まない #561)」に広がる。 その間
     /// `entity_in("_sync_ops")` は待つので、 reclaim sweep 中は bridge の row 払い出しが
     /// row 単位で purge と競合する。 row ごとに解放されるので sweep 全体を止める形では
     /// ないが、 影響は測っていない — fanout で bridge throughput を見るときの観測点。
@@ -8185,17 +8170,18 @@ impl Engine {
             .map(|t| (t.local_of(enchudb_oplog::eid_local(eid)), t.free_locals.clone(), t.free_locals_nonempty.clone()));
         match meta {
             Some((Some(local), free_list, nonempty)) => {
-                // WAL に積む (満杯なら空きを待つ) のは、 `free_locals` と行の lock を握る前に済ませる。 空きを作る書き出し係は
-                // bridge で `entity_in("_sync_ops")` の `free_locals` を取り、 `_sync_ops` の行を書く。 握ったまま待つと互いに
-                // 待ち、 書き出し係は畳めず、 こちらは待ちの上限 (`WAL_ROOM_WAIT`) まで止まって record を落とす (reclaim は行ごとに
-                // 繰り返すので長く止まる)。 この行に書くのは purge だけ (`sync_ops_purge_lock` と `expected_lsn` で 1 つに絞って
-                // ある) なので、 積んでから行を握っても WAL の順と当てる順はずれない。 当てて free list に戻すまでは、 前と同じく
-                // `free_locals` を握ったまま (上の doc)。 #511
+                // WAL には積まない (#561)。 `_sync_ops` の行は WAL の record から bridge が作る本体だけの書き込みで (行を書く Tie も
+                // 積まない、 `himo_is_in_engine_internal_table`)、 消すのも同じ。 前は Delete を積んでいて:
+                // - sync の DB の WAL の量がほぼ倍だった (自分の record 1 つに行 1 つ、 落ち着くと行 1 つに purge の Delete 128 B)
+                // - 満杯で落ちると、 配らない record なのに自分の floor を上げ、 相手全員を bootstrap に回した (#57 の道)
+                // - 再生が、 slot を使い回した後の新しい行を消した (bridge が ring から作り直すので失いはしない)
+                // - 満杯なら空きを待つので、 `free_locals` を握る前に積む順が要った (#511)
+                // 落ちて purge が本体に届かなければ行が戻るが、 ack 済みなので reclaim がまた消す。 版数は時計から採る (途中で切れた
+                // purge は開く時の sweep が仕上げる。 #451 の作り直しは内部の表の削除を見ない)。 当てて free list に戻すまでは
+                // `free_locals` を握ったまま (上の doc)
                 self.check_writable();
                 let row_local = enchudb_oplog::eid_local(eid);
-                let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) }) else {
-                    return false;
-                };
+                let hlc = self.oplog.as_ref().map_or(enchudb_oplog::Hlc::ZERO, |wal| wal.mint_hlc());
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
                 let applied = self.apply_delete_in(row.as_ref(), row_local, hlc);
@@ -12293,24 +12279,8 @@ impl Engine {
         if g.note(himo, key, slot, hlc) {
             self.pk_tombs_dirty.store(true, Ordering::Release);
         }
-        self.pk_bloom_set(himo, key);
+        self.pk_bloom.add(g, himo, key);
         self.pk_tombs_empty.store(false, Ordering::Release);
-    }
-
-    /// #513: 主キーの bit の表に立てる。
-    fn pk_bloom_set(&self, himo: u16, key: &[u8]) {
-        let words = self
-            .pk_bloom
-            .get_or_init(|| (0..PK_BLOOM_BITS / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
-        let i = pk_bloom_index(himo, key);
-        words[i / 64].fetch_or(1 << (i % 64), std::sync::atomic::Ordering::Release);
-    }
-
-    /// #513: 主キーを覚えているかもしれない (false なら覚えていない)。
-    fn pk_bloom_maybe(&self, himo: u16, key: &[u8]) -> bool {
-        let Some(words) = self.pk_bloom.get() else { return false };
-        let i = pk_bloom_index(himo, key);
-        words[i / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (i % 64)) != 0
     }
 
     /// #513: 主キー `(himo, value)` の行を消した削除の版数 (覚えていれば)。
@@ -12321,7 +12291,7 @@ impl Engine {
         }
         self.flush_pk_pending();
         self.with_pk_key(himo, value, |key| {
-            if !self.pk_bloom_maybe(himo, key) {
+            if !self.pk_bloom.maybe(himo, key) {
                 return None;
             }
             self.pk_tombs.read().unwrap().tomb_of(himo, key)
@@ -14581,6 +14551,11 @@ impl Engine {
                 .unwrap_or(false),
             None => false,
         }
+    }
+
+    /// slot `local` が engine 自身の内部 table (`_sync_ops` / `_sync_peers`) の行か。
+    fn slot_is_in_engine_internal_table(&self, local: u32) -> bool {
+        self.tables.iter().any(|t| is_engine_internal_table(&t.name) && t.contains(local))
     }
 
     /// 0.7.0: `tie_text_to_by_id` の binary 版。 任意 byte slice を vocab に
@@ -18881,7 +18856,10 @@ impl Engine {
         if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
             for local in 0..n {
                 let h = self.tombstone_hlc_local(local);
-                if unlogged(h) {
+                // engine 内部の表 (`_sync_ops` / `_sync_peers`) の行は配らない。 `_sync_ops` の purge は WAL に積まない (#561) ので、
+                // 見ると落ちた後に開くたびに 「載らなかった自分の削除」 に数え、 配った版数より古いので floor を上げて相手全員を
+                // bootstrap に回す
+                if unlogged(h) && !self.slot_is_in_engine_internal_table(local) {
                     deletes.push((h, local));
                 }
             }
