@@ -202,7 +202,16 @@ impl Drop for HttpRelay {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Result<()> {
+/// 読んだ HTTP request (method / path の route と query / body)。
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) route: String,
+    pub(crate) query: String,
+    pub(crate) body: Vec<u8>,
+}
+
+/// accept した stream から request を 1 つ読む。 相手が閉じた / header が大きすぎる (413 を返した) なら `None`。
+pub(crate) fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
     // listener は accept 検出のため non-blocking（start_inner）だが、 BSD/macOS と
     // Windows では accept した socket がそれを継承する。 そのままだと送信バッファ超の
     // 応答で write_all が WouldBlock 即死 → Content-Length より短い body で切断される
@@ -210,7 +219,6 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let storage = state.storage.clone();
 
     // Request line + headers を \r\n\r\n まで読む
     let mut buf = Vec::with_capacity(1024);
@@ -218,14 +226,15 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
     let headers_end;
     loop {
         let n = stream.read(&mut tmp)?;
-        if n == 0 { return Ok(()); } // client closed
+        if n == 0 { return Ok(None); } // client closed
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_header_end(&buf) {
             headers_end = pos;
             break;
         }
         if buf.len() > 16 * 1024 {
-            return send_response(&mut stream, 413, b"headers too large");
+            send_response(stream, 413, b"headers too large")?;
+            return Ok(None);
         }
     }
 
@@ -234,7 +243,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
     let mut lines = header_str.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split(' ');
-    let method = parts.next().unwrap_or("");
+    let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("");
 
     // Content-Length を header から取得
@@ -263,11 +272,17 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
         body.extend_from_slice(&chunk);
     }
 
-    // path を splits: "/pull?from=1&wall=..." または "/rooms/<id>/pull?..."
     let (route, query) = match path.split_once('?') {
-        Some((r, q)) => (r, q),
-        None => (path, ""),
+        Some((r, q)) => (r.to_string(), q.to_string()),
+        None => (path.to_string(), String::new()),
     };
+    Ok(Some(Request { method, route, query, body }))
+}
+
+fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Result<()> {
+    let storage = state.storage.clone();
+    let Some(req) = read_request(&mut stream)? else { return Ok(()) };
+    let (method, route, query, body) = (req.method.as_str(), req.route.as_str(), req.query.as_str(), req.body);
 
     // #78-H9: bootstrap sidecar 配信 (.eidmap = 翻訳写像 + tombstone、 .tables、
     // .vocabmap = text の vid 写像)。
@@ -437,7 +452,7 @@ fn parse_route(route: &str) -> Option<(String, &'static str)> {
     Some((room_id.to_string(), op))
 }
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
@@ -533,7 +548,7 @@ fn decode_sparse_stream<R: Read>(
     Ok(())
 }
 
-fn parse_query(q: &str) -> HashMap<String, String> {
+pub(crate) fn parse_query(q: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
     for kv in q.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
@@ -543,7 +558,7 @@ fn parse_query(q: &str) -> HashMap<String, String> {
     m
 }
 
-fn send_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
+pub(crate) fn send_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
     send_response_with_body(stream, status, body)
 }
 
@@ -775,7 +790,7 @@ impl HttpTransport {
         Ok(Hlc { wall, logical, peer })
     }
 
-    fn request(&self, method: &str, path: &str, body: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+    pub(crate) fn request(&self, method: &str, path: &str, body: &[u8]) -> io::Result<(u16, Vec<u8>)> {
         let mut stream = self.connect()?;
         let (host, _) = self.host_port()?;
         let req_head = format!(

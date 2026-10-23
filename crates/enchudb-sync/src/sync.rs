@@ -115,6 +115,8 @@ pub struct Syncer {
         std::sync::Mutex<std::collections::HashMap<PeerId, std::collections::HashMap<PeerId, Hlc>>>,
     /// #219: filter が落とした record の累計 (観測用)。 `AllRecords` なら常に 0。
     suppressed_records: std::sync::atomic::AtomicU64,
+    /// ホスト (全員が経由する DB の peer) として動くか ([`Syncer::set_host`])。
+    host: std::sync::atomic::AtomicBool,
     // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
     // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
 }
@@ -317,6 +319,7 @@ impl Syncer {
             served_authors: std::sync::Mutex::new(None),
             suppressed_since: std::sync::Mutex::new(std::collections::HashMap::new()),
             suppressed_records: std::sync::atomic::AtomicU64::new(0),
+            host: std::sync::atomic::AtomicBool::new(false),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
         //
@@ -339,6 +342,32 @@ impl Syncer {
             syncer.hydrate_hlc_store(&engine);
         }
         Ok(syncer)
+    }
+
+    /// ホスト (全員が経由する、 DB を持つ peer) として動く。 ホストは受けた record を自分の DB と ring に持つ (record の置き場の
+    /// 権威) ので、 client への ack を下流の消化で丸めない (#227 の丸めは、 中継が権威でない時の安全策)。 丸めると、 止まった
+    /// client が 1 台いるだけで全員の `_sync_ops` の回収が止まる。 ホストの口 (`enchudb-transport` の `HttpHost`) が立てる
+    pub fn set_host(&self, on: bool) {
+        self.host.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// [`Syncer::set_host`] で立てたか。
+    pub fn is_host(&self) -> bool {
+        self.host.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 受けた ack を取り込んで回収を回し (`absorb_pull_acks`)、 floor を transport に広告する。 `publish_since` の頭と同じ
+    /// (record を集めて配る部分を除いた) 拍。 record を自分から配らないホストが、 ack を受けるたびに呼ぶ
+    pub fn reclaim_beat(&self) -> usize {
+        let n = self.absorb_pull_acks();
+        self.advertise_history_floor();
+        n
+    }
+
+    /// `link` から受けた author ごとの cursor (`last_pulled[link]`)。
+    pub fn cursors_of(&self, link: PeerId) -> Vec<(PeerId, Hlc)> {
+        let guard = self.last_pulled.lock().unwrap();
+        guard.get(&link).map(|m| m.iter().map(|(a, h)| (*a, *h)).collect()).unwrap_or_default()
     }
 
     /// `last_pulled` の永続化先を設定し、 既存ファイルから cursor をロードする。
@@ -1007,7 +1036,7 @@ impl Syncer {
     /// - 「pull はしたが 1 件も消化していない下流」は `_sync_peers` に現れないので
     ///   丸めが効かない (#227 に記録)。 受け皿は floor + bootstrap (#140/#226)
     fn cap_ack_by_downstream(&self, cursors: Vec<(PeerId, Hlc)>) -> Vec<(PeerId, Hlc)> {
-        if !self.engine.gossip_remote_apply() {
+        if !self.engine.gossip_remote_apply() || self.is_host() {
             return cursors;
         }
         let Some(delivered) = self.engine.sync_delivered_cursors() else {

@@ -21,7 +21,7 @@ On top of it you can stack **schema / SQL / FFI / full-text search / RAG / P2P s
 | [`enchudb-engine`](./crates/enchudb-engine) | Core storage engine. Column + LockFreeCylinder + oplog | always |
 | [`enchudb-schema`](./crates/enchudb-schema) | **Native API.** Virtual 2D tables + himo_id pre-resolution + persisted schema | always |
 | [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer, ShardRouter, SubscriptionFilter | always |
-| [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | direct dep |
+| [`enchudb-transport`](./crates/enchudb-transport) | HTTP host (the DB peer every client syncs through) / HTTP relay / WebSocket push hub | direct dep |
 | [`enchudb-textsearch`](./crates/enchudb-textsearch) | Text-search policy on top of ngram. Candidate doc ids + `.contains()` verification for exact substring matching | direct dep |
 | [`enchudb-ngram`](./crates/enchudb-ngram) | bigram inverted-index primitive (posting → intersect → candidate doc ids), mmap-persisted | direct dep |
 | [`enchudb-rag`](./crates/enchudb-rag) | RAG store. Metadata filter first + brute-force cosine, no ANN | direct dep |
@@ -573,6 +573,36 @@ Tables with a primary key treat rows with the same key as one row: a row another
 - **Delete wins.** Writes addressed to a deleted row are dropped, even when they are newer than the delete (a peer that edits the row without having seen the delete loses the edit). Rows other peers created with the same key before the delete are the same row and go with it, including rows that arrive after the delete (#513, #577; the deleted keys are kept in `pktombs`). A row added with the same key after the delete is a new row and lives.
 - **Renames keep the row.** Writing a new key is a rename: the old key still names the same row, so a row another peer created with the old key without knowing about the rename joins it. Whether it joins is decided by time, like deletes: a row created with the old key before the rename joins the renamed row, one created after the rename is a new row (#569, #617).
 - **Two own rows renamed into one key fold.** When another peer's rename gives two rows this peer created the same key, they are folded into one row like any two rows with the same key. An eid of the folded row that the app still holds keeps working: reads and writes through it reach the kept row, and so do records other peers address to it. The folded row's slot is never reused (#612).
+
+#### Sync through a host
+
+The default setup is a **host**: a peer with its own DB that every client publishes to and pulls from. The host applies each client's records to its DB and relays them in its own `_sync_ops`, so the host's DB is where every record lives (it survives a restart). Peers can still pull from each other directly (`HttpRelay`, `InMemoryTransport`, WebSocket).
+
+```rust
+use enchudb_transport::host::{HttpHost, HttpHostTransport};
+
+// the host (a sync DB with a non-zero peer id)
+let host = HttpHost::start("0.0.0.0:8080", host_engine, Some("host.cursors".into()))?;
+
+// a client
+let t = Arc::new(HttpHostTransport::connect("http://host:8080".into(), engine.peer_id())?);
+let s = Syncer::new(engine.clone(), t.clone());
+s.serve_state(); // lets the host ask for this client's state when it is missing some of its records
+s.publish_since(Hlc::ZERO);
+let out = s.pull_once(t.host_id());
+if out.history_truncated {
+    for a in out.truncated_authors {
+        s.bootstrap_pull_via(t.host_id(), a); // the host serves the author's state
+    }
+}
+```
+
+- The host acknowledges what it applied, so each client's `_sync_ops` is reclaimed as soon as the host has its records (a client that stays away does not hold the others back). A client's pull acknowledges the host's stream, so the host's `_sync_ops` is reclaimed too.
+- A client whose cursor is below the host's reclaimed floor is told so (`history_truncated`) and catches up from the host's state.
+- Old clients (`HttpTransport`, `/publish` and `/pull`) can talk to a host; their acks don't reach it, so their part of the host's `_sync_ops` is not reclaimed.
+- Not yet: the host reads its whole `_sync_ops` for every pull, and a client that has pulled once and then stays away keeps the host's `_sync_ops` from being reclaimed.
+
+`HttpRelay` is the earlier board: it keeps records in memory per publisher and does not carry acks, floors or state, so over it no `_sync_ops` is ever reclaimed and a truncated client is never told.
 
 #### What a differential pull does *not* promise
 
