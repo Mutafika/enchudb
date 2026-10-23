@@ -19578,6 +19578,12 @@ impl Engine {
             // `Arc<OpLog>` など)。 record ごとの flock で追記するので、 持っている側が閉じるまで書き込みは待つ
             eprintln!("[enchudb] warning: could not hold the WAL lock for the session ({e}); appends will wait for the other holder");
         }
+        // #631: WAL の peer id は engine の peer id (header から戻した値 / WAL を付ける前に `set_peer_id` した値) に合わせる。
+        // `set_peer_id` だけが WAL に渡していたので、 開き直して呼び直さない / 付ける前に呼ぶと、 自分の record が書き手 0 で
+        // 載り、 `Syncer` が配らなかった (その session の書き込みが相手に黙って届かない)
+        if let Some(wal) = oplog.as_ref() {
+            wal.set_peer_id(eng.peer_id());
+        }
         eng.oplog = oplog.clone();
         if oplog.is_none() {
             return Arc::new(eng);
