@@ -4763,9 +4763,9 @@ pub struct Engine {
     unlogged_writes_relogged: std::sync::atomic::AtomicU64,
     /// #451 (段階 1): 配り済みの印を置いた回数 (観測用)。
     durable_mark_publishes: std::sync::atomic::AtomicU64,
-    /// 最後に置いた配り済みの印の切れ目の時の、 自分の中身のある record を積んだ回数 (`sync_published_through`)。 この process で
-    /// まだ置いていなければ `u64::MAX` (前の process の印の後に何を積んだか分からない)
-    mark_own_data: std::sync::atomic::AtomicU64,
+    /// 最後に置いた配り済みの印の切れ目の時の、 (自分の中身のある record を積んだ回数, 自分の落ちた record を覚えた回数)
+    /// (`sync_published_through`)。 この process でまだ置いていなければ `None` (前の process の印の後に何を積んだか分からない)
+    mark_own_data: std::sync::Mutex<Option<(u64, u64)>>,
     /// #451 (段階 1): 置いた印がまだ ring の書き出しに乗っていない (consumer が、 書くものの無い周期に ring だけ書き出す)。
     durable_mark_flush_pending: std::sync::atomic::AtomicBool,
     /// #451 (段階 1): 置く前の切れ目 (C, 切れ目より後の自分の record の最初の行の手前の lsn)。 bridge が自分の record (HLC > C) の行を
@@ -5248,7 +5248,7 @@ impl Engine {
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
             durable_mark_publishes: std::sync::atomic::AtomicU64::new(0),
-            mark_own_data: std::sync::atomic::AtomicU64::new(u64::MAX),
+            mark_own_data: std::sync::Mutex::new(None),
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
@@ -6525,7 +6525,7 @@ impl Engine {
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
             durable_mark_publishes: std::sync::atomic::AtomicU64::new(0),
-            mark_own_data: std::sync::atomic::AtomicU64::new(u64::MAX),
+            mark_own_data: std::sync::Mutex::new(None),
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
@@ -7589,14 +7589,19 @@ impl Engine {
 
     /// ホストの形 (`HOST_PLAN.md`): HLC がこれ以下の自分の書き込みは全部 `_sync_ops` に載っている時刻。 配り済みの印の切れ目の後に
     /// 自分の中身のある record (Commit を除く) を積んでいなければ時計の今 (時計をそこまで進めるので、 以後の書き込みはこれより後)、
-    /// 積んでいれば印の時刻。 印の無い DB (まだ一度も書き出していない / ring を持たない) は `None`。 書き込みの無い client と、
+    /// 積んでいれば印の時刻。 印の無い DB は、 WAL に自分の中身のある record が無ければ (書いたことの無い client) 時計の今、 あれば
+    /// `None` (印ができるまで待つ)。 書き込みの無い client と、
     /// 自分では書かないホストの線が止まらないように (書き出しは切れ目の後に必ず Commit を積むので、 「何も積んでいない」 では見ない)
     pub fn sync_published_through(&self) -> Option<enchudb_oplog::Hlc> {
-        let mark = self.durable_mark()?;
         let wal = self.oplog.as_ref()?;
+        let Some(mark) = self.durable_mark() else {
+            // 印が無い = 自分の record を `_sync_ops` に載せたことが無い (最初に載せる時に payload の ring を作る)。 WAL にも自分の
+            // 中身のある record が無ければ、 書いたことの無い client
+            return wal.quiet_without_mark(self.peer_id());
+        };
         // 印の切れ目の後に自分の中身のある record を積んでいなければ今 (この process で印を置く前は分からないので印の時刻)
-        let at_cut = self.mark_own_data.load(std::sync::atomic::Ordering::Acquire);
-        let quiet = (at_cut != u64::MAX).then(|| wal.quiet_since(at_cut, self.peer_id())).flatten();
+        let at_cut = *self.mark_own_data.lock().unwrap_or_else(|p| p.into_inner());
+        let quiet = at_cut.and_then(|(own_data, dropped_gen)| wal.quiet_since(own_data, dropped_gen, self.peer_id()));
         Some(quiet.map_or(mark.hlc, |now| now.max(mark.hlc)))
     }
 
@@ -7682,7 +7687,7 @@ impl Engine {
             wal_lap: cut.wal.0,
             wal_off: cut.wal.1,
         }) {
-            self.mark_own_data.store(cut.own_data, Ordering::Release);
+            *self.mark_own_data.lock().unwrap_or_else(|p| p.into_inner()) = Some((cut.own_data, cut.dropped_gen));
         }
     }
 

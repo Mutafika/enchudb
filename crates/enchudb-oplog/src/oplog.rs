@@ -853,6 +853,9 @@ pub struct OpLog {
     dropped_gen: std::sync::atomic::AtomicU64,
     /// 自分の、 中身のある record (Commit を除く、 中継を除く) を積んだ回数。 append の直列化の内側で進める (`quiet_since`)
     own_data: std::sync::atomic::AtomicU64,
+    /// `quiet_without_mark` が WAL を読んで自分の中身のある record が無かった author + 1 (0 = まだ読んでいない)。 前の process が
+    /// 残した record は増えず、 この process の分は `own_data` / `dropped_gen` で見るので、 一度無ければ読み直さない
+    quiet_scanned: std::sync::atomic::AtomicU64,
     /// #178: scan が読み飛ばした record の累計 (知らない版が書いた [`op_type::SKIPPABLE`] の op。 同じ record を読み直すと
     /// また数える)。 [`OpLog::skipped_ops`]。
     skipped_ops: AtomicU64,
@@ -1045,6 +1048,7 @@ impl OpLog {
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
             own_data: std::sync::atomic::AtomicU64::new(0),
+            quiet_scanned: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -1154,6 +1158,7 @@ impl OpLog {
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
             own_data: std::sync::atomic::AtomicU64::new(0),
+            quiet_scanned: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -2026,12 +2031,36 @@ impl OpLog {
 
     /// ホストの形 (`HOST_PLAN.md`): 切れ目 ([`OpLog::durable_cut_for`] の `own_data`) の後に自分の中身のある record (Commit と中継を
     /// 除く) を積んでいなければ、 時計を今まで進めてその HLC を返す (以後の採番はこれより後なので、 HLC がこれ以下の `author` の
-    /// 中身のある record は切れ目より前に積んだ物だけ)。 積んでいれば `None`。 採番は append の直列化の内側なので、 見る間に積まれる
+    /// 中身のある record は切れ目より前に積んだ物だけ)。 積んでいれば `None`。 満杯で落ちた自分の record (`_sync_ops` に無い) を
+    /// 切れ目の後に覚えていても `None` (`dropped_gen`、 印もその間は進まない)。 採番は append の直列化の内側なので、 見る間に積まれる
     /// ことはない
-    pub fn quiet_since(&self, own_data: u64, author: PeerId) -> Option<Hlc> {
+    pub fn quiet_since(&self, own_data: u64, dropped_gen: u64, author: PeerId) -> Option<Hlc> {
         let _in_proc = self.append_lock.lock();
-        if self.own_data.load(Ordering::Acquire) != own_data {
+        // 落ちた record は `dropped` の lock の下で採番して覚える (`note_dropped_minting`、 append_lock の外): 同じ lock を持って
+        // 回数を比べ、 持ったまま今を採番する = この後に落ちる record の HLC は今より後
+        let _dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        if self.own_data.load(Ordering::Acquire) != own_data || self.dropped_gen.load(Ordering::Acquire) != dropped_gen {
             return None;
+        }
+        Some(Hlc { peer: author, ..self.next_hlc() })
+    }
+
+    /// ホストの形: 印の無い (自分の record を `_sync_ops` に載せたことの無い) DB が、 WAL にも自分の中身のある record (Commit を除く)
+    /// を持たず、 落ちた record も覚えていなければ、 時計を今まで進めてその HLC を返す (書いたことの無い client = 読むだけの client が
+    /// 配り終えの線を止めないように)。 WAL を頭から読むのは、 その author で最初に無かった時まで (読むだけの client は印ができない)
+    pub fn quiet_without_mark(&self, author: PeerId) -> Option<Hlc> {
+        let _in_proc = self.append_lock.lock();
+        let dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        if self.own_data.load(Ordering::Acquire) != 0 || self.dropped_gen.load(Ordering::Acquire) != 0 || !dropped.is_empty() {
+            return None;
+        }
+        let scanned = author as u64 + 1;
+        if self.quiet_scanned.load(Ordering::Acquire) != scanned {
+            let s = self.scan_from_offset(HEADER_SIZE as u64);
+            if s.out.iter().chain(s.tail.iter()).any(|(r, _)| r.author_peer == author && !matches!(r.op, DecodedOp::Commit)) {
+                return None;
+            }
+            self.quiet_scanned.store(scanned, Ordering::Release);
         }
         Some(Hlc { peer: author, ..self.next_hlc() })
     }
@@ -2590,6 +2619,7 @@ impl OpLog {
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
             own_data: std::sync::atomic::AtomicU64::new(0),
+            quiet_scanned: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             lap: std::sync::atomic::AtomicU32::new(lap0),
             trailer: std::sync::atomic::AtomicUsize::new(trailer0),
@@ -2798,14 +2828,72 @@ mod tests {
         let other = Hlc { wall: 5, logical: 0, peer: 9 };
         let hdr = RelayedHeader { hlc: other, author: 9, signature: [0; 64], pubkey_fp: [0; 8] };
         wal.append_relayed(Op::Tie { eid: 1, himo_id: 0, value: 1 }, hdr).unwrap();
-        let q = wal.quiet_since(cut.own_data, 7).expect("Commit と中継だけなら中身は積んでいない");
+        let q = wal.quiet_since(cut.own_data, cut.dropped_gen, 7).expect("Commit と中継だけなら中身は積んでいない");
         assert_eq!(q.peer, 7);
         let (_, next) = wal.append_with_hlc(Op::Tie { eid: 2, himo_id: 0, value: 1 }).unwrap();
         assert!(next > q, "後の採番が言った時刻より後でない: {next:?} {q:?}");
-        assert!(wal.quiet_since(cut.own_data, 7).is_none(), "中身のある自分の record を積んだ後に言った");
+        assert!(wal.quiet_since(cut.own_data, cut.dropped_gen, 7).is_none(), "中身のある自分の record を積んだ後に言った");
         let (_, _) = wal.append_with_hlc(Op::Commit).unwrap();
         let cut2 = wal.durable_cut_for(7);
-        assert!(wal.quiet_since(cut2.own_data, 7).is_some(), "次の切れ目からはまた言える");
+        assert!(wal.quiet_since(cut2.own_data, cut2.dropped_gen, 7).is_some(), "次の切れ目からはまた言える");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 印の無い DB: WAL に Commit と中継しか無ければ 「今」 を言い (読むだけの client)、 この process で中身のある自分の record を
+    /// 積んだら言わない。 前の process が積んだ自分の record が WAL に残っていても言わない (開き直すと `own_data` は 0 から)。
+    #[test]
+    fn quiet_without_mark_sees_own_records_of_this_and_earlier_processes() {
+        let p = tmp("quiet_without_mark");
+        {
+            let wal = OpLog::create(&p, 1 << 20).unwrap();
+            wal.set_peer_id(7);
+            wal.append(Op::Commit).unwrap();
+            let hdr = RelayedHeader { hlc: Hlc { wall: 5, logical: 0, peer: 9 }, author: 9, signature: [0; 64], pubkey_fp: [0; 8] };
+            wal.append_relayed(Op::Tie { eid: 1, himo_id: 0, value: 1 }, hdr).unwrap();
+            let q = wal.quiet_without_mark(7).expect("Commit と中継だけなら読むだけの client");
+            assert_eq!(q.peer, 7);
+            assert!(wal.quiet_without_mark(7).is_some(), "2 回目 (読み直さない) も言う");
+            assert!(wal.quiet_without_mark(9).is_none(), "7 で読んだ結果を 9 に使った (9 の record が WAL にある)");
+            let (_, next) = wal.append_with_hlc(Op::Tie { eid: 2, himo_id: 0, value: 1 }).unwrap();
+            assert!(next > q, "後の採番が言った時刻より後でない: {next:?} {q:?}");
+            assert!(wal.quiet_without_mark(7).is_none(), "中身のある自分の record を積んだ後に言った");
+            wal.append(Op::Commit).unwrap();
+        }
+        let wal = OpLog::open(&p).unwrap();
+        wal.set_peer_id(7);
+        assert!(wal.quiet_without_mark(7).is_none(), "前の process の自分の record が WAL に残っているのに言った");
+        assert!(wal.quiet_without_mark(9).is_none(), "9 の record が WAL にあるのに 9 として言った");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 満杯で落ちた自分の record は `own_data` に数えない (alloc が通った後に数える) が、 切れ目 (= 置いた印) の後に落ちていれば
+    /// `quiet_since` は 「今」 を言わない (落ちた record は `_sync_ops` に無い)。 floor を書いて次の印を置いた後はまた言える
+    /// (enchudb-76 のレビューで見つけた)
+    #[test]
+    fn quiet_since_does_not_see_a_dropped_record() {
+        let p = tmp("quiet_since_dropped");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        wal.set_peer_id(7);
+        let mut fell = false;
+        for i in 0..4000u32 {
+            if wal.append(Op::Tie { eid: 3, himo_id: 0, value: i as u64 }).is_err() {
+                fell = true;
+                break;
+            }
+        }
+        assert!(fell, "前提: 満杯で落ちる");
+        let _ = wal.take_dropped();                 // engine が持ち越しへ移して floor を書いた所
+        let cut = wal.durable_cut_for(7);           // = 置いた印の切れ目
+        assert!(!cut.dropped_pending);
+        let (_, h) = wal.append_or_dropped(Op::Tie { eid: 4, himo_id: 0, value: 1 }).expect_err("前提: 満杯のまま落ちる");
+        assert!(h > cut.hlc, "落ちた record の HLC は切れ目より後: {h:?} {:?}", cut.hlc);
+        assert_ne!(wal.dropped_gen(), cut.dropped_gen, "落ちた record は覚えた回数には見える");
+        let q = wal.quiet_since(cut.own_data, cut.dropped_gen, 7);
+        assert!(q.is_none(), "落ちた record (HLC {h:?}、 _sync_ops に無い) を越えて今を言った: {q:?}");
+        let _ = wal.take_dropped();
+        let cut2 = wal.durable_cut_for(7);
+        let q2 = wal.quiet_since(cut2.own_data, cut2.dropped_gen, 7).expect("floor を書いて次の印を置いた後はまた言える");
+        assert!(q2 > h);
         let _ = std::fs::remove_file(&p);
     }
 

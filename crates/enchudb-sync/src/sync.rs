@@ -856,6 +856,17 @@ impl Syncer {
         }
 
         let fetched = self.transport.pull_as_multi(self_peer, from, &since);
+        // ホストの形: 全部の書き手が出し終え、 全部の受け手が受け終えた線より前の削除の記録は、 もう誰も要らない (`HOST_PLAN.md`)。
+        // **この返事を当てる前に**忘れる: 返事にはホストが線で忘れた後に受けた record (線より前の作成) が入りうる。 忘れずに当てると、
+        // 忘れた後に当てたホストと答えが割れる。 線は時計にも入れる (以後の自分の書き込みは線より後)
+        if let Some(line) = self.transport.forget_horizon(from) {
+            if let Some(wal) = self.engine.oplog_arc() {
+                wal.observe_hlc(line);
+            }
+            if self.engine.forget_deletes_before(line) > 0 {
+                let _ = self.engine.persist_sync_state();
+            }
+        }
         // #216: default 実装 transport (全量 fetch fallback) 向けの受信側 filter。
         // per-author filter 済み transport (InMemory) では素通り。
         let cursor_of = |author: PeerId| {
@@ -999,17 +1010,6 @@ impl Syncer {
         let cursors = self.cap_ack_by_downstream(cursors);
         if !cursors.is_empty() {
             self.transport.record_pull_ack_multi(from, self_peer, &cursors);
-        }
-
-        // ホストの形: 全部の書き手が出し終え、 全部の受け手が受け終えた線より前の削除の記録は、 もう誰も要らない (`HOST_PLAN.md`)。
-        // 線は時計にも入れる (以後の自分の書き込みは線より後 = ホストが 「線より前の新しい record」 として断らない)
-        if let Some(line) = self.transport.forget_horizon(from) {
-            if let Some(wal) = self.engine.oplog_arc() {
-                wal.observe_hlc(line);
-            }
-            if self.engine.forget_deletes_before(line) > 0 {
-                let _ = self.engine.persist_sync_state();
-            }
         }
 
         // #226: relay が新しい author を取り込んだら、 その author の state 配布元

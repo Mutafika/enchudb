@@ -646,7 +646,8 @@ pub trait Transport: Send + Sync {
     }
 
     /// ホストの形: `from` (ホスト) が配った、 削除の記録を忘れてよい線 (全部の書き手が線より前の record をホストに出し終え、 全部の
-    /// 受け手がそれを受け終えた)。 `Syncer::pull_once` が当て終えた後に読み、 線より前の削除の記録を捨てて、 線を時計に入れる。
+    /// 受け手がそれを受け終えた)。 `Syncer::pull_once` が返事を当てる前に読み、 線より前の削除の記録を捨てて、 線を時計に入れる
+    /// (返事には、 ホストが線で忘れた後に受けた線より前の作成が入りうる)。
     /// default は `None` (忘れない)
     fn forget_horizon(&self, _from: PeerId) -> Option<Hlc> {
         None
