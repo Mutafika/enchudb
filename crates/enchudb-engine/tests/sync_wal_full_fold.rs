@@ -16,6 +16,7 @@
 //! 4. 1 を直すと、 相手の ack を取り込んで `_sync_ops` を畳む reclaim が固まる形が出た。 purge は `_sync_ops` の
 //!    `free_locals` を握ったまま行を消し (WAL に積む)、 満杯なら空きを待つ。 空きを作る係は bridge で同じ `free_locals` を
 //!    取りに行くので互いを待つ (purge は待ちの上限 5 秒で諦め、 次の行で同じことを繰り返す)。 → WAL に積んでから握る
+//!    (後に #561 で purge は WAL に積まなくなり、 待ちそのものが無くなった)
 //!
 //! #552: 書き手が多いと、 consumer は畳めているのに待つ書き手が諦めて落とした (sync の表によらず、 8 本で数件、 64 KiB に
 //! 64 本で 2 千件ほど。 どの書き手も待ちは数 ms で、 上限の 5 秒に遠かった)。
@@ -193,8 +194,8 @@ fn reclaiming_writer_drops_few_records() {
 
 /// 書き手 8 本 (書き手 0 が reclaim) を新しい DB で何回もくり返し、 WAL が満杯でも reclaim が止まらない (`round` が見る)。
 ///
-/// falsify: 直し 4 (purge は WAL に積んでから `free_locals` を握る) を外すと、 purge が待ちの上限まで空きを待って落ちる
-/// (`wal_room_wait_timeouts` が数える)。
+/// falsify: 直し 4 (purge は WAL に積んでから `free_locals` を握る) を外すと、 purge が待ちの上限まで空きを待って落ちた
+/// (`wal_room_wait_timeouts` が数える)。 #561 で purge は WAL に積まなくなった (この形の待ちは起きない)。
 #[test]
 fn reclaim_does_not_stall_while_the_wal_is_full() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());

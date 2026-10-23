@@ -8146,7 +8146,7 @@ impl Engine {
     /// `EntitySet` 側は Engine の table に触らないので逆転しない。
     ///
     /// **コストの注記 (未実測)**: この形で critical section は「Vec への push」から
-    /// 「`delete` 全体 (oplog append + column write + tombstone)」に広がる。 その間
+    /// 「削除全体 (column write + tombstone、 WAL には積まない #561)」に広がる。 その間
     /// `entity_in("_sync_ops")` は待つので、 reclaim sweep 中は bridge の row 払い出しが
     /// row 単位で purge と競合する。 row ごとに解放されるので sweep 全体を止める形では
     /// ないが、 影響は測っていない — fanout で bridge throughput を見るときの観測点。
@@ -8170,17 +8170,18 @@ impl Engine {
             .map(|t| (t.local_of(enchudb_oplog::eid_local(eid)), t.free_locals.clone(), t.free_locals_nonempty.clone()));
         match meta {
             Some((Some(local), free_list, nonempty)) => {
-                // WAL に積む (満杯なら空きを待つ) のは、 `free_locals` と行の lock を握る前に済ませる。 空きを作る書き出し係は
-                // bridge で `entity_in("_sync_ops")` の `free_locals` を取り、 `_sync_ops` の行を書く。 握ったまま待つと互いに
-                // 待ち、 書き出し係は畳めず、 こちらは待ちの上限 (`WAL_ROOM_WAIT`) まで止まって record を落とす (reclaim は行ごとに
-                // 繰り返すので長く止まる)。 この行に書くのは purge だけ (`sync_ops_purge_lock` と `expected_lsn` で 1 つに絞って
-                // ある) なので、 積んでから行を握っても WAL の順と当てる順はずれない。 当てて free list に戻すまでは、 前と同じく
-                // `free_locals` を握ったまま (上の doc)。 #511
+                // WAL には積まない (#561)。 `_sync_ops` の行は WAL の record から bridge が作る本体だけの書き込みで (行を書く Tie も
+                // 積まない、 `himo_is_in_engine_internal_table`)、 消すのも同じ。 前は Delete を積んでいて:
+                // - sync の DB の WAL の量がほぼ倍だった (自分の record 1 つに行 1 つ、 落ち着くと行 1 つに purge の Delete 128 B)
+                // - 満杯で落ちると、 配らない record なのに自分の floor を上げ、 相手全員を bootstrap に回した (#57 の道)
+                // - 再生が、 slot を使い回した後の新しい行を消した (bridge が ring から作り直すので失いはしない)
+                // - 満杯なら空きを待つので、 `free_locals` を握る前に積む順が要った (#511)
+                // 落ちて purge が本体に届かなければ行が戻るが、 ack 済みなので reclaim がまた消す。 版数は時計から採る (途中で切れた
+                // purge は開く時の sweep が仕上げる。 #451 の作り直しは内部の表の削除を見ない)。 当てて free list に戻すまでは
+                // `free_locals` を握ったまま (上の doc)
                 self.check_writable();
                 let row_local = enchudb_oplog::eid_local(eid);
-                let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) }) else {
-                    return false;
-                };
+                let hlc = self.oplog.as_ref().map_or(enchudb_oplog::Hlc::ZERO, |wal| wal.mint_hlc());
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
                 let applied = self.apply_delete_in(row.as_ref(), row_local, hlc);
@@ -14552,6 +14553,11 @@ impl Engine {
         }
     }
 
+    /// slot `local` が engine 自身の内部 table (`_sync_ops` / `_sync_peers`) の行か。
+    fn slot_is_in_engine_internal_table(&self, local: u32) -> bool {
+        self.tables.iter().any(|t| is_engine_internal_table(&t.name) && t.contains(local))
+    }
+
     /// 0.7.0: `tie_text_to_by_id` の binary 版。 任意 byte slice を vocab に
     /// insert (Leaf なら dedupe なし) し、 himo に紐付ける。 `_sync_ops.payload`
     /// (= oplog record の生 wire bytes) 等、 UTF-8 制約を持たない data を書く用。
@@ -18850,7 +18856,10 @@ impl Engine {
         if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
             for local in 0..n {
                 let h = self.tombstone_hlc_local(local);
-                if unlogged(h) {
+                // engine 内部の表 (`_sync_ops` / `_sync_peers`) の行は配らない。 `_sync_ops` の purge は WAL に積まない (#561) ので、
+                // 見ると落ちた後に開くたびに 「載らなかった自分の削除」 に数え、 配った版数より古いので floor を上げて相手全員を
+                // bootstrap に回す
+                if unlogged(h) && !self.slot_is_in_engine_internal_table(local) {
                     deletes.push((h, local));
                 }
             }
