@@ -3,6 +3,553 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.36.0 — 2026-10-24
+
+minor。 oplog (WAL) の file が v3 になり、 0.35 以前の binary では開けない (#609)。 本体の segment の形は 0.35.0 と同じで、 DB directory
+に file が増える (`eidmap.log`・`eidalias`・`pkformer`・`leaf.free`、 宣言した DB だけ `changefeed.seg`)。 wire の batch の形は同じで、
+知らない op を読み飛ばしてよい印 (#525) と、 設定した時だけ流れる `Op::Alias` (#531) が増えた。 sync の当て方の決まりを変えた:
+消した行宛ての書き込みは削除より新しくても捨てる (削除優先、 #577)、 改名の前の名前も同じ行で、 改名の前後は時刻で決める (#569、 #617)、
+相手の改名で同じ名前になった自分の行どうしも畳む (#625)。 書き手 3 台の乱数の手順を、 受ける順を全部変えて回す総当たりで、 改名を混ぜて
+1,000 回とも peer の答えが揃う (#606、 #625)。 schema の insert は、 名前 (主キー) の無い行と、 既にある名前の行を断る (#575、 #603)。 WAL
+を畳んだ直後の電源断で書き出しの返った値が前の値に戻る穴 (#608) と、 畳めているのに WAL の空きを待つ書き手が諦めて record を落とす穴
+(#552、 0.35.0 の既知の残り) を塞ぎ、 WAL に載らない書き込みは断って本体に当てない (#595)。 sync の DB を暇な時に kill した後の open が
+888 → 70 ms (10 万行 × 10 列、 cold、 #623)。 宣言された答え・差分の位置・changefeed の記録 (#607、 #615、 #610) と、 sync のホスト
+(#634、 #635) を足した。
+
+**上げる時の注意**:
+
+- oplog (WAL) の file が v3 になる (新しく作る oplog は初めから、 0.35 の v2 の file は最初に畳んだ時から)。 0.35 以前の binary
+  では開けない (`WAL version 3 unsupported`)。 下げるには、 きれいに閉じてから `{db}/oplog` を消す
+  (閉じた時点で中身は全部本体に当たっている。 sync の DB は配り終えてから)。 WAL は 4 GiB 未満 (`create_concurrent_with_oplog` などの
+  capacity。 越えると断る)。 record が周の印の 8 B 大きい (数の Tie 128 → 136 B、 Commit 112 → 120 B) ので、 同じ大きさの WAL に入る
+  record は 6〜7% 少なく、 その分だけ畳む回数が増える (sync の DB は #632 で purge の Delete が WAL に載らなくなり、 全体の量は減る)。
+  record の大きさは `OwnedOp::record_size()` / `OpLog::record_size_of()` が印込みで返す (#609)
+- `eidmap.log` (sync の DB、 #629): `eidmap` の後に変わった写像と削除の版数の追記 (1 record 32 B)。 きれいに閉じると `eidmap`
+  にまとめ直して空になるので、 0.35 で開いても全部ある。 落ちた後 (log に record が残っている) に 0.35 で開くと、 log
+  の分の写像と削除を読まない (再 sync で行が重複しうる)。 下げるなら、 0.36 で一度開いてきれいに閉じてから。 0.35 の relay が 0.36
+  の書いている DB を配ると、 log を当てない `eidmap` を配る。 0.36 の `/bootstrap/eidmap` は log を当てた形を配り、 log 自身は配らない
+- `eidalias` (#529、 #625): 同じ entity の 2 つ目の世界番号 (畳んだ行の世界番号の行き先)。 行を畳んだ DB にだけでき、
+  別名が無くなると消える。 0.35 は読まない (畳んだ行の世界番号宛ての record を新しい行として払い出す)。 0.35 の relay は
+  `/bootstrap/eidalias` に 404 を返し、 受け手は無しで続ける
+- `pkformer` (#569、 #588、 #606、 #617): 名前の改名の記録 (前の名前・名前の年表・束ねた identity のカード。 file の版 4、 1〜3 も読む)。
+  sync の DB で名前を書き換えた時・名前で束ねた時などにでき、 書き出す時と閉じる時に書く。 0.35 は読まない (今の名前でだけ束ねる = 0.35
+  の動き)
+- `leaf.free` (#598): きれいに閉じた時の Leaf の空き一覧。 紐名の辞書の clean flag の新しい値 (`CLEAN_LEAF` = 4) が立っている時だけ使い、
+  それ以外 (kill・電源断・途中の flush の後) は今まで通り列から作り直す。 0.35 の binary はこの値を知らないので、
+  汚れた終了の後と同じく紐名の索引を作り直し (sync の DB では #451 の照合も走る)、 閉じる時に前の値 (`CLEAN_GEN`) を書く (= 0.35
+  が書いた後の `leaf.free` は 0.36 が信じない)。 bootstrap には入れない。 0.36 できれいに閉じて `{db}/oplog` を消した sync の DB を 0.35
+  で開いて相手と配り合っても、 #451 の照合は何も作り直さず、 答えも相手が受ける record の数も 0.36 のまま開いた時と同じ
+  (作成・書き換え・削除を配り合った DB で確かめた)
+- `changefeed.seg` (#610): `Engine::enable_change_log(cap)` を呼んだ DB だけ。 0.35 で開いて書いた間の record は記録に入らない
+  (開き直した後、 WAL に残っていない分が抜ける)。 snapshot には載り、 relay の bootstrap (`pack_dir`) には載らない
+- `db_files::ALL` に `EIDMAP_LOG`・`EIDALIAS`・`PKFORMER`・`LEAFFREE`、 `BOOTSTRAP` に `EIDALIAS`・`PKFORMER` が入った。 0.35 の複製
+  (`is_copyable_entry`) は `eidmap.log`・`eidalias`・`pkformer`・`leaf.free` を運ばない
+- `{db}/tables` の後ろに block が 2 つ増える: 位置の印の宣言 `MRK1` (#578) と宣言された答え `ANS1` (#607)。 宣言した DB だけで、
+  宣言の無い DB は 1 byte も変わらない。 0.35 の binary は読まずに開け、 table 定義を書き直すと宣言は消える
+- `sync.payload.seg` の header の空き (16..56) に配り済みの印を置く (file の版は上げない、 #623)。 0.35 の binary は読まない
+  (汚れた終了の後に全部を照合する = 前と同じ)。 0.35 が ring を作り直すと印は消える
+- `_cursors` (#615) は `prepare_cursors` を呼んだ DB にだけ生える local-only の表 (`{db}/tables` の普通の表の定義、 file の形は変えない)。
+  ホストは client ごとの状態と削除を忘れてよい線を `<cursor_path>.clients` に置く (#635)
+- schema の insert で、 その名前の生きた行が既にあれば `Err(SchemaError::DuplicatePk)` (何も書かない。 SQL の INSERT が UNIQUE
+  で失敗するのと同じ)。 名前の書き換え (`EntityUpdate::commit`) で、 別の生きた行が既にその名前なら `DuplicatePk` (同じ commit
+  の他の列も書かない)。 upsert は今まで通りその行に当たる (#603)
+- 名前の列のある表で、 名前を書かずに新しい行を作る (insert / 当たる行の無い upsert / 名前に Null) と `Err(SchemaError::BadValue)`
+  (何も書かず、 eid も払い出さない)。 行を書く時は `.set()` の順によらず名前のカードを最初に書く (WAL の最初の Tie が名前) (#575)
+- upsert が名前で当たった行と、 名前を同じ値で書く update は、 名前のカードを書かない (名前の版数 = その名前になった時刻が変わらない)
+  (#606)
+- 新しく作る表の名前の列が Leaf なら `build()` が `BadValue` (表は残らない)。 既にある表は今まで通り開ける (#576)
+- WAL に載らない書き込みは断って本体に当てない: WAL より大きい 1 件はどの DB でも、 sync の表の無い DB は満杯の WAL を畳めない時
+  (書き出しの失敗) も。 `try_tie_*` は `Err(TieRejected::Fault(FaultKind::WalSpace))`、 schema の `commit()` は `WriteRejected`、
+  戻り値の無い `untie` / `delete` / `tie_bytes_to_by_id` は fault を数えて何も変えない。 0.35.0 までは Ok を返して本体にだけ書いた。 sync
+  の表のある DB の満杯は今まで通り落として、 相手に取り直させる (#57) (#595)
+- 列の segment (`himo/NNNN.seg`) を開いた後に初めて触る I/O が失敗すると、 書き込み (tie / untie / delete) は何も変えずに断る
+  (`FaultKind::SegmentIo`。 結果を返す API は `Err`、 schema は `WriteRejected`)。 読みは今まで通り panic する (lock を離してから)。
+  開く途中で Leaf の列を読めなければ open が `Err` (#543)
+- 開く時に sidecar (tables / eidmap / eidalias / pktombs / vocabmap) の読み込みが I/O エラー (無い file と壊れた中身は今まで通り) なら、
+  open が `Err` で、 何も書かずに閉じる。 0.35.0 までは無いものとして開き、 次の保存で正しい file を空の中身で上書きした。
+  一時的な読みのエラーでも開けない (開き直せば読める) (#542)
+- 紐名の辞書に名前を入れられない列の定義は `Err` (0.35.0 は成功を返し、 開き直すと列を名前で引けなかった)。 `tie` などの
+  「無ければ列を作る」 道では、 その時 panic する (#541)
+- 0.35.0 と 0.36.0 の peer は relay 越しに配り合える (作成・書き換え・削除の基本の形で、 relay
+  をどちらの版にしても同じ答えになることを確かめた)。 ただし削除優先 (#577) や改名の時刻 (#617) など当て方が変わった所は、
+  入れ違いの順によって版ごとに答えが違いうるので、 全 peer をそろえて上げるのがよい。 変わった当て方: 消した行 (eid)
+  宛ての書き込みは削除より新しくても捨て、 削除より前に作られた同じ名前の行も一緒に消える (#577)。 改名の前の名前も同じ行で、
+  改名より前に前の名前で作った行は改名した行、 後に作った行は新しい行 (#569、 #617)。 相手の改名で同じ名前になった自分の行どうしも 1
+  つに畳み、 畳まれた行の eid での読み書きは残す行に届く (転送。 その slot は使い回さない) (#625)。 名前で束ねても、 行に書いた record
+  の宛名は行の元の identity のまま (#628)
+- sync の既定の形をホスト (DB を持つ peer、 `enchudb_transport::HttpHost` と client の `HttpHostTransport`) にした (#634)。 `HttpRelay` /
+  `HttpTransport` は残る。 前の client (`HttpTransport`) もホストと送り合えるが、 その client の ack はホストに届かず (その client
+  の分のホストの `_sync_ops` は回収されない)、 その client が来ている間は削除を忘れてよい線も進まない (#635)
+- `Op::Alias` (「2 つの世界番号は同じ entity」 の知らせ、 #531) は `Engine::set_emit_alias(true)` の時だけ書く (既定は書かない)。 0.35
+  以前の peer はこの op で止まる (wire は batch ごと Err で、 HTTP の client は同じ batch を取り直し続ける。 oplog の scan は打ち切り)
+  ので、 全部の peer を 0.36 にしてから有効にする。 0.36 は、 知らない op でも上の bit (`op_type::SKIPPABLE` = `0x80`) の立った物はその
+  record だけ読み飛ばして数える (`OpLog::skipped_ops()`、 `transport::skipped_records()`) (#525)
+- 署名を求める受け手 (`Syncer::set_require_signature(true)`) は、 署名した bytes から読んだ HLC・author・op が wire の欄と違う record を
+  `rejected_signature` で弾く (cursor を止める) (#570)
+- WAL を付ける前に `set_peer_id` を呼んだ DB と、 peer id を決めて開き直した DB の WAL の record は、 engine の peer id で載る (0.35.0
+  は書き手 0 で載った)。 既に書き手 0 で WAL / `_sync_ops` に載った record はそのまま (#633)
+- change listener に渡していない record の溜めに上限 (既定 64 MiB、 `Engine::set_change_backlog_limit`)。 越えたら溜めを捨てて listener
+  を全部外し、 `ChangeListener::on_detached(lost_from)` を呼ぶ (書き手は止めない)。 外れた listener に渡らなかった record は WAL
+  から畳まれていて、 `audit` でも取り直せないことがある (今の状態から読み直して付け直す)。 `changefeed.seg` のある DB
+  はメモリの溜めを使わない (#597、 #610)
+- `oplog_sync()` は、 通知係が止まった listener に配っているのを 5 秒まで待ち、 越えたら配らずに返る (警告 1 回。 残りは通知係が配る)
+  (#599)。 engine の Drop は、 5 秒の間に 1 度も返らない listener を待たずに返る (残りは listener が戻った後に通知係が配る。
+  `changefeed.seg` があれば記録に残る)。 返り続ける listener (遅いだけ) は今まで通り配り終えるまで待つ (#638)
+- `_` で始まる local-only の表の書き込みは change listener に渡さない (配り・畳む時の溜め・`changefeed.seg` のどれにも) (#616)
+- `ChangeListener` に `on_changes_at(first, records)` / `on_detached(lost_from)` が増え (既定の実装付き)、 `on_changes` にも既定
+  (何もしない) が付いた。 今の実装はそのまま動く (#597、 #610)
+- `changefeed.seg` を使う DB は、 WAL を畳むたびに header の page を 1 回 fsync する (`OpLog::set_sync_on_reset`)。 記録の 1/4 より大きい
+  record は番号だけを使って中身を残さず、 その番号を読む listener は外れる (#610)
+- `OpLog::lock_session` は WAL の flock を待たずに試し、 取れなければ `ErrorKind::WouldBlock` (engine は警告を出し、 record ごとに flock
+  を取る) (#592)
+- peer を設定した DB の `Ravn::follow` (query 言語の follow も) は peer の頭の付いた eid を返す (#584)。 `enchudb-cli` の stats は、 0.34
+  から常に 0 の `queue_len` / `pushed` / `applied` を出さない (`EngineStats` の欄は残る) (#586)
+- 名前のある表で、 名前で一度も引かない (insert しかしない) 表の delete は遅くなる: insert のたびに名前を確かめる (#603)
+  ので名前の索引が必ず組まれ、 delete はその bucket に古い印を付ける。 dbq (100 万行、 WAL なし) の delete 1 行は 636 ns
+  (名前を確かめない形は 385 ns)。 名前で引く・upsert する表は 0.35.0 でも索引を組んでいて同じ手間を払っていた (#645)。 名前のある表の
+  insert は 0.35.0 より速い (dbq の 1 行 309〜318 → 285 ns) (#521、 #645)
+- メモリ: 値がみな違う列 (名前など) の索引の bucket は 1 個あたり 76.7 → 92.7 B (読み直しの数え (#520) と位置の印の pointer (#578)。 #641
+  の測り)
+- 位置の印を宣言した列の書き換えは 1 列あたり +20〜40 ns (#578)。 改名を覚える sync の DB で、 名前の列の書き込みは +1.5〜2 ns (#569)。
+  engine の `get_by_id` は +0.5 ns (畳んだ行の転送の確かめ、 #625)
+- enum に variant が増えた (`#[non_exhaustive]` でないので、 全部を並べる `match` は直す): `FaultKind::SegmentIo` (#543) /
+  `FaultKind::WalSpace` (#595)、 `Op::Alias` / `DecodedOp::Alias` (#531)、 `ScanStop::BadLap` / `ScanStop::StaleLap` (#609)
+- 形の変わった公開の関数: `column::Column::load_or_unwritten` と `himo_store::HimoStore::load` は `Result` を返す (#528)、
+  `Engine::reserve_remote_eid_for_pk` は作成の版数 `created` を受ける (#577)、 `EidTranslator::remove_local` は `Vec<Key>` を返す (#529)、
+  `leaf_store::LeafStore::rebuild_free_list` は `Vec<u32>` を受ける (#594)。 `Transport` trait に既定の実装付きの `note_published_through`
+  / `uses_published_through` / `forget_horizon` が増えた (#635)
+- 公開 API が増えた: `op_type::SKIPPABLE` / `op_type::skippable`、 `OpLog::skipped_ops`、 `transport::skipped_records` (#525)、
+  `Engine::merge_entity_into`、 `EidTranslator::alias` / `unalias` / `aliases_of` / `alias_snapshot` / `mapped_local`、
+  `db_files::EIDALIAS` (#529)、 `Engine::set_emit_alias` / `apply_alias`、 `op_type::ALIAS` (#531)、 `SegmentSet::try_segment` /
+  `try_region` (#543)、 `Engine::former_pk_holder` / `fold_rows_with_same_pk`、 `db_files::PKFORMER` (#569)、 `oplog::decode_signed_bytes`
+  (#570)、 `Engine::deleted_before_create` / `name_deleted_at` (#577)、 `Engine::declare_marks` / `drop_marks` / `marks_declarations`、
+  schema の `TableBuilder::marks` (#578)、 `Engine::name_given_to_dead_row` (#582)、 `Engine::set_change_backlog_limit` /
+  `change_listeners_detached`、 `DEFAULT_CHANGE_BACKLOG_LIMIT`、 `ChangeListener::on_detached` (#597)、 `Engine::leaf_free_bytes` /
+  `leaf_free_list_from_file`、 `LeafStore::free_list_bytes` / `install_free_list` / `free_list_from_file`、 `db_files::LEAFFREE` (#598)、
+  `Engine::verify_invariants`、 `Invariants`、 `LeafStore::holes_snapshot` / `bounds_words` (#602)、 `Engine::note_bound_identity`
+  (#606)、 engine の `AnswerSpec` / `AnswerHandle`、 `Engine::declare_answer` / `answer` / `answer_spec` / `drop_answer` /
+  `answer_declarations`、 schema の `Query::answer` / `answer_counts` / `answer_sums`、 `Database::answer` / `answers` / `drop_answer`、
+  `Answer` (#607)、 `OpLog::lap` / `file_version` / `record_size_of`、 `oplog::LAP_TRAILER` / `OPLOG_FILE_VERSION_V2` (#609)、
+  `Engine::enable_change_log` / `change_log_range` / `add_change_listener_from`、 `ChangeListener::on_changes_at`、 `change_log` module、
+  `Truncated`、 `OpLog::scan_for_change_log` / `set_sync_on_reset` (#610)、 engine と schema の `LiveQuery::poll_since` /
+  `snapshot`・`LiveCounts::poll_since` / `snapshot`、 `Engine::prepare_cursors` / `cursors_ready` / `cursor_get` / `cursor_set` /
+  `answer_log_limit` / `set_answer_log_limit`、 `Cursor`、 `CURSOR_ANSWER` / `CURSOR_CHANGEFEED` / `CURSORS_TABLE` /
+  `DEFAULT_ANSWER_LOG_LIMIT`、 schema の `Database::prepare_cursors` / `cursors_ready` / `cursor_get` / `cursor_set`、 `GroupSums`
+  (#615)、 `Engine::note_name_write` / `note_bound_write` / `note_bound_leaf` / `split_for_rename` (#617)、
+  `Engine::wal_room_wait_timeouts` (#618)、 `Engine::name_held_from` (#621)、 `Engine::durable_mark` / `durable_mark_publishes`、
+  `OpLog::durable_cut_for` / `dropped_gen` / `visit_record_headers_with_tail`、 `DurableCutPoint`、 `sync_payload_ring::DurableMark`
+  (#623)、 `Engine::forward_eid` (#625)、 `Engine::eidmap_for_bootstrap` / `eidmap_disk_diff`、 `db_files::EIDMAP_LOG` (#629)、
+  `Syncer::set_host` / `is_host` / `reclaim_beat` / `cursors_of`、 `enchudb_transport::HttpHost` / `HttpHostTransport` (#634)、
+  `Engine::forget_deletes_before` / `forget_sync_peer` / `sync_published_through`、 `OpLog::quiet_since` / `quiet_without_mark`、
+  `HttpHost::set_silence_limit` / `forget_line`、 `HttpHostTransport::rebase_required` (#635)、 test 用の `enchudb_oplog::io_point` と
+  `fault` module (feature `crashsim` の時だけ働く、 #538)
+
+### Changed — schema: 名前の無い行と、 既にある名前の行を作らない (#548、 #575、 #551、 #576、 #601、 #603)
+
+0.35.0 では、 名前 (表で名前と決めた列) を書かずに行を作れた。 その行は表の全部を引く時 (`all()` / `count()` / `recent()`) に出ず、
+他の列で引く・数える時 (`where_*`、 `Table::min` / `max`) に出た (`where_range(x).count() > all().count()` が起きた)。 同じ名前の insert
+や別の行の名前への改名で、 名前が同じ生きた行が 1 つの DB に 2 つ以上できた (`SchemaError::DuplicatePk` は定義だけで、 返す所が無かった)。
+Leaf の列を名前にした表も作れ、 upsert が毎回新しい行を作り、 sync で束ねず、 消した名前を覚えなかった。
+
+名前の列を持つ表に名前を書かずに新しい行を作ると `BadValue` で、 行を書く時は `.set()` の順によらず名前のカードを最初に書く (sync
+で分かれて届いても、 受け手は名前より先に他のカードを受けない) (#575)。 insert の名前が既にあれば `DuplicatePk`、
+別の行の名前への書き換えも `DuplicatePk`。 確かめと書き込みは名前の値 (文字なら bytes) で選ぶ 64 本の lock で並べる (0.35.0 は表ごとに 1
+本で upsert だけが取り、 違う名前の upsert も並び、 insert は並ばなかった)。 並んだ書き手 8 本 (insert 4 本 + upsert 4 本) が同じ 64
+個の名前を書いても、 名前ごとに 1 行 (#603)。 名前の列が Leaf の新しい表は `build()` で `BadValue` (#576)。 値段は ↓ の 「schema
+の書き込み」 と上げる時の注意の delete。
+
+### Fixed — WAL を畳んだ直後の電源断で前の周の record を再生し、 書き出しの返った値が前の値に戻った (#608、 #609)
+
+WAL (ring) を畳むと head / checkpoint を頭に戻すだけで、 前の周の record は file に残る。 OS が header の page (header +
+新しい周の最初の数 record) を data の page より先に書き出した所で電源が落ちると、 前の周の record が CRC
+の合う続きとして読めることがあり、 開く時の再生が前の周の古い値を当て直した (`oplog_sync` の返った値が前に戻る)。 oplog の file を v3
+にし、 header に ring の周 (畳むたびに +1)、 record ごとに payload の後ろに周の印 8 B (`[lap][lap ^ salt]`、 署名 / CRC の外) を置く。
+scan (再生・bridge・changefeed・audit) は header の周と違う record で止まる (`ScanStop::StaleLap`)。 畳む時は周を head / checkpoint
+より先に書く。 v2 の file は印なしで読め、 最初に畳む時に v3 になる (version → capacity → 周の順に書く)。 電源断の像の試験で、 直す前は 60
+枚中 2 枚落ち、 直した後は 5 回とも 0 枚。
+
+### Fixed — WAL に載らない書き込みが Ok を返し、 本体にだけ書かれた (#553、 #554、 #595)
+
+WAL より大きい 1 件は、 空の ring にも入らないのに空きを上限の 5 秒まで待ち (consumer を約 2 万回起こした)、 落ちた record
+として覚えて本体にだけ書いた (sync の相手には取り直させた)。 sync の表の無い DB で WAL を畳めない時 (書き出しの失敗) も、
+載らない書き込みを本体にだけ書いた。 どちらも断って本体に当てない (`FaultKind::WalSpace`。 Leaf の slot は返し、 辞書の押さえは外す)。 Tag
+の新しい語は Vocab と Tie の 2 件で、 Vocab が載らなければ Tie も積まない。 WAL より大きい 1 件は待たずに断り、 落ちた record に数えない。
+64 KiB の WAL に 100 KiB の文字を書くと、 sync の表の有無によらず 1 秒以内に断る。
+
+### Fixed — 畳めているのに、 WAL の空きを待つ書き手が諦めて record を落とした (#552、 #565、 #571、 #572)
+
+0.35.0 の既知の残り 「書き手を 4・8 本にして WAL の満杯をくり返すと、 sync の表の有無によらず落ちる回がある」 の正体。 空きを待つ書き手は
+consumer が 2 回試したら諦め、 その数に畳んだ試しも入れていた (= consumer は畳めたが、
+空きを他の書き手に食われた時に飢えた書き手を落とした)。 append は待ち手が空けた後に 1 回しか書き直さず、
+その前に他の書き手が空きを埋めるとその場で落とした (#565)。 満杯で載らなかった後、 待ち手に頼む前に畳まれて空いていた時も、
+満杯でない失敗と読んで諦めた (#572)。 数えるのは畳めない状態だった試しだけにし、 3 つの append (`append` / `append_many` /
+`append_relayed_verbatim`) は載るか待ち手が諦めるまで書き直す。 諦めるのは今まで通り、 畳めない状態 (bridge の backpressure / 書き出しの
+I/O 失敗)・閉じる時・上限 (5 秒) の時。
+
+sync の表の無い DB で WAL 64 KiB に書き手 32 本 / 64 本、 各 4 回で落ち 0 (直しを戻すと書き手 32 本の 1 回目で 15〜32 件)。 debug で 6
+本同時に回すと、 直す前は 18 回中 2 回で 1 件落ち、 直した後は 60 回中 0 回 (#572)。 sync の DB の同じ形の試験の許容 (各回 1000 件未満) も
+0 にした。
+
+### Changed — sync: 消した行宛ての書き込みは、 削除より新しくても捨てる (削除優先) (#547、 #577、 #549、 #583)
+
+0.35.0 までは 「後に書いた方が勝つ」 で、 削除を知らずに書いた、 削除より新しい cell が残り、 名前の消えた塊になった (#514 の生き残り)。
+例 (買い物リスト、 スマホ 2 台): 10:00 に母が 「牛乳」 を消し、 10:05 に電波の無い父が (消えたのを知らずに) 牛乳を ×2 に書き換えると、
+つながった後も牛乳は消えたまま。 削除は行の cell を版数によらず全部消して行を死なせ、 受け取った書き込み (Tie・TieLeaf・content)
+は消えた行に当てない (自分の書き込みと WAL の再生は今まで通り版数で決める)。 名前の削除より前に作られた同じ名前の行は一緒に消え、
+削除の後に足した行 (新しい eid) は残る。 作成より先に削除を受けた entity に払い出す slot は生かさない (0.35.0 の既知の残りの、 cell の無い
+slot が live で残って表の枠を食う形も起きない、 #549)。
+
+書き手 3 台・受け手が pull する順 6 通り・書き手どうしの pull し合いの 9 つの答えが、 7 つの形
+(削除を知らない書き換え・削除を見てからの足し直し・作成より先の削除・2 人が別々に足し直す・Leaf の書き換えなど) のどれでも決めた答えになる
+(直す前は 3 つの形で名前の無い塊が残った)。
+
+### Fixed — sync: 消した名前が削除の時の今の名前だけで、 改名や slot の使い回しの後に答えが割れた (#551、 #582、 #588、 #606、 #621)
+
+消した名前の記録 (`pktombs`) は、 削除を当てた時に行が持っていた今の名前だけだった。 改名を当てた peer と当てていない peer
+で消した名前が違い、 その後に届く同じ名前の行の生き死にが届く順で割れた。 消した名前を 「消した行が持った名前の全部」 にする:
+行を消す時に前の名前も覚え、 消えた行への改名が届いたらその名前も消した名前にして、 削除より前にその名前になった行を一緒に消す。 2
+人が別々に同じ行を消した時も、 後の削除で同じように消す (#582)。 消えた行の slot を使い回す時は、 その行の名前を identity (作った peer
+とその番号) に移し、 後から届いた写像の無い削除でもその名前を消す (#545、 #588)。 名前で束ねた identity とその作成の時刻を覚え、
+削除の後に作られた identity は、 束ねた後に届いた削除で巻き込まずに切り離す (#581、 #606)。
+削除の後に改名でその名前になった行は削除の時にその名前でなかったので、 改名より前の書き込みを捨てない (#614、 #621)。
+名前のカードが他の列より遅れて届いた時も、 その名前の削除を確かめる (#606)。
+
+収束の総当たり `tests/sync_converge_fuzz.rs` を足した (#606): 書き手 3 台の乱数の手順 (upsert / 改名 / 削除 / 書き換え / pull) を、
+受ける順 6 通りと pull し合いの全部で回し、 全部の peer の答えと `verify_invariants()` を比べ、 割れたら手順を縮めて出す。
+見つけた割れを縮めた手順はそのまま試験に残した。 CI では種を固定して 32 回 (手で回す時は `ENCHU_FUZZ_CASES` / `ENCHU_FUZZ_SEED`) (#625)。
+
+### Changed — sync: 改名の前の名前も同じ行、 改名の前後は時刻で決める (#569、 #617、 #620、 #622、 #613、 #628)
+
+名前が同じなら同じ行 (#141 / #513)。 受け手は行を受けた時の今の名前で同じ名前の行を引いていたので、 名前を書き換える (改名、 東京 →
+新東京) と届く順で答えが割れた (書き手 3 台・受け手 6 通りの順・pull し合いの 9 つの答えで、 7 つの形のうち 3 つ)。 前の名前を覚え
+(`pkformer`)、 今その名前の行が無ければ前にその名前だった行に束ね、 名前の Tie を当てた後に同じ名前の別の行があれば 1 つに畳む (#569)。
+改名した行は名前の年表 (名前のカードへの書き込みを identity・値・版数ごと、 LWW で負けた書き込みも) を持ち、
+改名より前に前の名前で作った行は改名した行、 後に作った行は新しい行にする (改名した本人が前の名前で作り直すと、 本人では 2 行・他の peer
+では 1 行になっていた) (#617)。 改名で離れた名前に後から改名で入った行は、 前の持ち主と同じ時刻に同じ名前だったことがないので切り離す
+(#620、 #622)。 名前で束ねても、 行に書いた record の宛名 (逆写像) は行の元の identity のまま (前は束ねた相手の identity に替え、 その
+identity の作成を受けていない受け手で別の行になった)。 このため、 束ねていた間の書き込みは、 後で改名の時刻で切り離した時に行の元の
+identity の側に残る (前は最後に束ねた identity の側) (#613、 #628)。
+
+改名を覚える sync の DB で、 名前の列の書き込み (同じ値の書き直し) は 20.6〜22.4 → 22.4〜24.4 ns (前の値を読む分)、 名前でない列は
+0.95〜1.03 倍 (10 万行、 WAL なし、 交互に 8 回) (#569)。
+
+### Fixed — 相手の改名で同じ名前になった自分の行どうしが、 自分の peer でだけ 2 行のまま残った (#612、 #625)
+
+他の peer はその 2 行を 1 つに畳むが、 `merge_entity_into` が翻訳した行しか畳めなかった (自分の行は、 その世界番号宛ての record
+がこの先も届くのに転送先を持たない)。 自分の行どうしも畳み、 畳んだ行の世界番号を残す行の別名にする (`eidalias` に保存)。
+相手が畳まれた行宛てに書いた record・削除・ref の値は残す行に届き、 engine の eid を受け取る公開の関数 (tie / untie / delete / get /
+get_text / content / read_row / write_row / is_live / `*_async` など 45 個) と ref の target も入口で別名を引く (アプリが持つ畳まれた行の
+eid での読み書きも残す行に届く)。 畳んだ行の slot は使い回さない。 自分の行どうしを畳んだことのない DB は atomic の読み 1 回で素通りする。
+
+改名を混ぜた総当たりが何も飛ばさずに 1,000 回通り、 総当たりを普段の試験に戻した。 各 100 万回 (交互に 3 回ずつ): engine の `get_by_id`
+1.7〜1.8 → 2.2〜2.3 ns、 `tie_to_by_id` 20.8〜21.3 → 21.0〜21.8 ns、 schema の `entity(e).set` 46.4〜46.5 → 44.6〜45.4 ns、
+`entity(e).get` 6.7〜7.2 → 7.0〜8.0 ns。
+
+### Fixed — 2 台が同じ名前の行を別々に作ると、 同じ名前の行が 2 つ残った (#178、 #525、 #529、 #531、 #546、 #567)
+
+束ねる前に出て行った書き込みが相手で別の行として払い出され、 同じ名前の行が 2 つになった (束ねた側は数えるだけだった、
+`bind_over_local_writes`)。 同じ entity の 2 行を畳む `Engine::merge_entity_into(src, dst)` を足し (src の cell を版数ごと LWW で dst
+に当て、 src の世界番号を dst の別名にする。 別名は新しい file `eidalias` に置く) (#529)、 名前の Tie が届いた時に同じ名前の行を畳む
+(#569)。 名前の無い record しか届かない世界番号のために、 束ねた側が 「この 2 つの世界番号は同じ entity」 を配る `Op::Alias` を足した
+(`Engine::set_emit_alias(true)` の時だけ書く) (#531)。 その前段として、 op の上の bit (`0x80`) を 「知らない版は読み飛ばしてよい」
+印にし、 wire と oplog の scan がその record だけ飛ばす (#525。 0.35.0 は知らない op で、 wire は batch ごと Err になり HTTP の client
+は同じ batch を取り直し続けて黙って止まり、 oplog の scan は後ろの record を全部捨てた)。 知らせが作成より先に届いても、
+先に届いた削除を当てる (#546、 #567)。
+
+### Fixed — 名前を後に set した行を、 受け手が名前で束ねなかった (#544、 #566)
+
+`upsert().set("title", ..).set("key", ..)` のように名前を後に set すると、 行の最初の record が名前でない Tie になり、
+受け手はそれで新しい slot を払い出して、 後から来た名前の Tie を束ねなかった (#509 の退行)。 2 台が同じ名前の行をこの形で作ると受け手に 2
+行残り、 0.35.0 の 「削除は、 その名前の行の、 削除より古い書き込みを、 どの author のものでも消す」 も黙って効かなかった。 batch
+を当てる前に entity ごとの最初の名前の Tie を引いておき、 写像の無い entity の最初の record を当てる前にそれで束ねる (使うのは ACL
+と署名を通る名前の Tie だけ)。 schema の書き込みは #575 から名前を最初に書く。
+
+### Fixed — 署名を求める受け手が、 署名を確かめた bytes と違う中身を当てた (#568、 #570)
+
+`Syncer::set_require_signature(true)` でも、 受け手は署名を `signed_bytes` で確かめ、 当てるのは wire の別の欄 (op / HLC / author)
+だった。 署名を持つ peer の record を 1 つ手に入れれば、 その peer を名乗って任意の op (任意の行・列・値・Delete) を当てられ、 relay
+は当てた中身と違う `signed_bytes` を次の peer に流した。 `signed_bytes` から HLC・author・op を読み (`oplog::decode_signed_bytes`)、 wire
+の欄と違えば署名の失敗 (`rejected_signature`、 cursor を止める) として弾く。 正しい流れでは必ず一致する。 署名を見ない設定 (既定)
+は変えない。
+
+### Fixed — WAL を付ける前に peer id を決めた DB と、 開き直した DB で、 自分の書き込みが書き手 0 で配られた (#631、 #633)
+
+engine の peer id は DB の header に残り、 開き直すと engine は戻すが、 WAL に渡すのは `set_peer_id` (WAL が付いている時) と #451
+の作り直しだけだった。 `create*` → `set_peer_id` → `concurrentize_with_oplog` (schema の build phase → `finish_with_oplog`) の形と、 peer
+id を決めた DB を開き直して `set_peer_id` を呼び直さない形で、 record が書き手 0 で WAL に載り、 書き手 1
+で作った行の書き換えが相手で別の新しい行に割れた。 WAL を engine に付ける所で engine の peer id を渡す。
+
+### Added — ホスト: DB を持つ peer の HTTP の口を sync の既定の形に (#634)
+
+0.35.0 の HTTP は、 record を memory に預かる掲示板 (`HttpRelay`) と、 `pull` / `publish` だけの client (`HttpTransport`) だった。 ack /
+floor / state / 書き手ごとの cursor を運ばないので、 HTTP で同期すると `_sync_ops` が回収されず、 抜けの検出 (#140) と取り直しも起きず、
+掲示板を再起動すると record が全部消えた。 ホスト (`enchudb_transport::HttpHost` = 中継の印を立てた `Engine` + HTTP の口) と、
+ホストと話す client の transport (`HttpHostTransport`) を足し、 sync の既定の形にした。 全 client がホストに送り、 ホストから受け、 record
+の置き場はホストの DB だけ (再起動を越える)。 `POST /v2/publish?peer=c` は c の record を `pull_once(c)` と同じ道で当てて中継し、 WAL
+を書き出してから ack を返す。 `POST /v2/pull?to=c` は書き手ごとの cursor より後のホストの `_sync_ops` (c 自身の record を除く) と floor
+を返し、 cursor が ack を兼ねる。 ほかに `/v2/ack`・`/v2/floor`・`GET /v2/floors`・`/v2/state`、 前の `GET /pull` / `POST /publish`
+も受ける。 ホストは client への ack を下流の消化で丸めない (`Syncer::set_host`。 丸めると止まった client が 1
+台いるだけで全員の回収が止まる)。
+
+### Added — ホストが削除を忘れてよい線を配る (#560、 #635)
+
+消した名前の記録 (`pktombs`) と、 写像を外した後の相手の行の削除の記録 (`foreign_tombs`) は、 消した数だけ増え続けた (0.35.0
+の既知の残り)。 忘れてよいのは 「全部の書き手が削除より前の自分の書き込みを出し終え、 全部の受け手がそれを受け終えた」 時だけで、
+中心の無い形では決められない。 ホストがその線を配る: client は publish に 「HLC がここまでの自分の書き込みは全部 `_sync_ops`
+に載っている」 時刻 (`Engine::sync_published_through`) を付け、 前の返事を全部当てた時だけ次の pull に受け終えた線を付ける。
+ホストは数える client ごとの小さい方を取り、 自分の ring に残る record を越えない線 (下がらない) を pull の返事に載せる。 ホストと client
+はその線より前の削除の記録を捨てる (`Engine::forget_deletes_before`。 client は返事を当てる前に忘れる)。
+
+一度も publish していない client は線を止める (まだ出していないオフラインの行を持ちうる。 送る record が無くても publish は線を言う)。 30
+日 (`HttpHost::set_silence_limit`) 黙った client は、 線とホストの `_sync_ops` の回収から外す (`Engine::forget_sync_peer`)。 戻ってきたら
+pull はできるが、 自分の record のある publish は全部 `STALE` で断る (`HttpHostTransport::rebase_required()`。
+留守の間に消えた行を持ったままなので、 新しい peer id の DB にホストから取り直してから書き直す)。 初めて来た client は断らない。 client
+ごとの状態と線は `<cursor_path>.clients` に置き、 `cursor_path` の無いホストは線を配らない (忘れない)。
+
+### Changed — change listener の溜めと待ちに上限 (#560、 #597、 #599、 #636、 #638)
+
+0.35.0 では、 止まった・遅すぎる listener の間、 WAL を畳むたびに ring の残りを `append_lock` の下で写して溜めに積み、
+溜めは無制限に増えた (256 MB の WAL なら畳み 1 回で最大 256 MB 分、 その間書き手は止まる)。 `oplog_sync()` は通知係の配りを待つので
+listener と一緒に止まり (2 秒止まる listener で 3.8 秒)、 engine の Drop は通知係を join するので永久に返らなかった。
+
+溜めに上限を置き (既定 64 MiB)、 越えたら溜めを捨てて listener を全部外し、 `on_detached(lost_from)` (渡せなかった最初の record の HLC)
+を呼ぶ。 溜めは全 listener で 1 本なので、 1 本の遅い listener で全部が外れる (#597)。 `oplog_sync()` は 5 秒まで待って、
+越えたら配らずに返る (#599)。 Drop のために、 通知係と engine が分け合うもの (配る鍵・門・起こす係・印) を engine の外 (`ChangeNotifier`)
+に移し、 通知係は engine に触る所 (配る分を取り出す所) だけを門の下で行う。 Drop は 5 秒の間に 1 度も返らない listener を待たずに、
+門を持ったまま残りを取り出して先へ進み、 通知係は listener が戻った後に engine に触らずに残りを配って終わる (`changefeed.seg`
+がある時は残りは記録に残る)。 listener の中で engine の最後の参照を落とすと、 Drop が通知係の thread の上で自分を join して panic
+していたのも直した。 ASan の下で changefeed の試験 19 本が通り、 通知係が門を見ずに engine に触る変異は `heap-use-after-free` で落ちる
+(#638)。
+
+### Fixed — I/O エラーで、 書き出しの返った table が消えた・開けなくなった・panic した (#533〜#537、 #539〜#543)
+
+決まった書き込みの流れの全部の I/O の点で、 I/O エラー・process の死・電源断を起こして開き直す試験 (fault matrix、 #538) が 5
+つを見つけた。
+
+- 開く時に sidecar の読み込みが `EIO` だと無いものとして開き、 次の保存で正しい file を上書きした (書き出しの返った table が消えた)。 open
+  を `Err` にし、 開くのをやめた engine は何も書かずに閉じる (#533、 #542)
+- 列の segment を初めて開く I/O が失敗すると、 lock を持ったまま panic して lock を毒し、 consumer の thread も panic した。
+  書き込みは断り (`untie` / `delete` は WAL に積む前に断り、 delete は途中まで消さない)、 読みは lock を離してから panic する (#534、
+  #543)
+- 伸ばす mmap が失敗すると file だけ伸び、 その後に封緘した `.crc` が開く時に合わなかった。 file の長さを戻す (別の process の readonly
+  の読み手が、 伸ばしてから戻すまでの間に伸びた所まで mmap していると、 戻した後にそこを読めば SIGBUS になりうる。
+  伸びた所は誰も書いていないので普通の読みは触らない) (#535、 #540)
+- `.crc` をその場で上書きしていたので、 書く途中のエラー / 落ちた後に開けなかった。 tmp に書いて書き出してから rename する (#536、 #539)
+- 列の定義が紐名の辞書に名前を入れられなくても成功を返し、 開き直すと列を名前で引けなかった。 定義を失敗させる (#537、 #541)
+
+継続 fuzzing (#527) の `packed_open` が 60 秒で、 壊れた packed DB (`Engine::from_bytes`、 relay の bootstrap / wasm の入口)
+が開けてしまい読みで panic する形を見つけた (header の CRC が覆わない欄が壊れて列の region がずれ、 列の header
+の値の幅を確かめていなかった)。 列の header (値の幅・cell の位置・件数) を開く時に確かめて `column header corrupt` の `Err` にする。
+directory の DB は列を最初に触る時に同じ検査で、 何が壊れているかを言う panic にした (#526、 #528)。
+
+### Fixed — 消した名前と前の名前の記録が、 `oplog_sync()` の返った後の電源断で消えた (#550、 #585)
+
+消した名前の記録 (`pktombs`) と前の名前 (`pkformer`) は、 consumer の周期 (checkpoint を進めた後) か flush / Drop でしか書いていなかった。
+`oplog_sync` が返った後の周期 1 つ分 (最大 100 ms) の電源断で記録を失い、 本体に届いた削除は名前の cell が消えているので、
+再生でも再配送でも名前を引き直せなかった (0.35.0 の既知の残り)。 WAL を書き出した後・本体を書き出す前に書く (`oplog_sync`、 consumer と
+WAL の空け作りの書き出し、 受けた削除の後、 開く時の再生の後)。 電源断の像の試験は、 直す前は 5 回とも落ち、 直した後は 5 回とも通る。
+
+### Fixed — consumer が寝ると決めた直後に書かれた record が、 次の書き込みまで書き出されなかった (#555、 #564)
+
+consumer は 「WAL は空」 と見てから寝る印を立てて park する。 その間に書き手が append すると、 書き手は consumer
+が起きていると見て起こさず、 record は次の append / 閉じる時 / `oplog_sync()` まで fsync も配信もされなかった (sync の表の無い DB は #500
+で 1 秒の見回りが無いので、 listener は burst の最後を受け取らないまま)。 空と見た時だけ、 印を立てた後に WAL の head をもう一度見る。
+
+### Fixed — 汚れた終了の後、 時計が戻っていると、 sync の表の無い DB のローカルの書き込みが弾かれた (#557、 #587)
+
+開く時の HLC の種は WAL に残った record だけで、 畳んだ直後 (WAL が空) に汚れた終了をして壁時計が戻っていると、
+開いた後のローカルの書き込みが前に書いた cell より古い版数を採り、 `OlderThanCell` (schema は `WriteRejected`) で弾かれた (record は WAL
+に載った後)。 sync の表の無い v9 の DB (cell の版数あり) も、 汚れた終了の後に開く時は cell と tombstone の版数の最大で時計を進める。
+
+### Performance — 開く時間 (#594、 #596、 #598、 #600、 #623)
+
+writer で開くたびに走る仕事を減らした。 測りの道具 `examples/open_time.rs` (#594) と `examples/answer_time.rs` (#607) を入れた (子 process
+に書かせて止め、 APFS の clone を新しい process で開く。 clone は page cache が別なので cold、 warm は写しを全部読んでから)。
+
+- Leaf の空き一覧の作り直しを 1 pass に (HashSet をやめて sort + dedup、 slot ごとに header を 1 回読む): 100 万行 × 3 列 (Leaf 1 列) の
+  warm の open 53.8 / 54.6 → 21.5 / 21.7 ms、 × 10 列 (Leaf 3 列) 139.9 / 140.3 → 56.9 / 56.9 ms (#594)
+- きれいに閉じた時に Leaf の空き一覧を `leaf.free` に残し、 次の open は検証して入れるだけ (合わなければ作り直す): 100 万行 × 10 列 cold
+  352 / 353 → 32.5 / 32.8 ms、 warm 48.3 / 50.4 → 6.4 / 6.6 ms。 kill の後は今まで通り作り直す (#598)
+- 途中で切れた delete の掃除を tombstone の列の線形な走査に: 100 万 entity (削除 2 万) 4.0 → 1.3 ms (#596)
+- sync の DB の `next_sync_lsn` の復元を列の 1 回の走査に: 配る分 100 万行 3.3 → 0.7 ms (#600)
+- 配り済みの印: 汚れた終了の後の sync の DB は、 開くたびに 「本体にあって oplog / `_sync_ops` に無い自分の write」 を作り直す照合 (#451)
+  をしていた。 書き出しのたびに、 HLC が W 以下の自分の write は全部 record が disk にある印 (W と `_sync_ops` の lsn S) を
+  `sync.payload.seg` の header に置き、 開く時は印より後の cell と行だけを見る (oplog は header だけを印の位置から)。 暇な時に kill した後
+  (スマホの background の kill) の open: 10 万行 × 3 列 cold 147 → 27 ms・warm 51 → 6.5 ms、 × 10 列 cold 888 → 70 ms・warm 440 → 13 ms。
+  書いている最中の kill は × 10 列 cold 365.7 / 367.4 → 310.9 / 313.5 ms。 きれいに閉じた後と sync の無い DB は変わらない。 落ちた write
+  (#57 / #450) の floor がまだ無い間は印を進めない (#623)
+
+### Added — 宣言された答え: 名前を付けた購読の形を DB に残し、 開き直すと engine が張り直す (#607)
+
+購読 (集合 / group の件数・合計 / 上位 k 件) に名前を付けて宣言すると (schema の `Query::answer(name)` / `answer_counts(name, col)` /
+`answer_sums(name, col, sum_col)`。 返るのは `subscribe*` と同じ購読)、 形 (条件・group・並び) を `{db}/tables` の `ANS1` block に残し、
+開き直すと engine が開く時 (WAL の再生の前) に購読を張り直す。 アプリは `Database::answer(name)` (`Answer::Query` / `Answer::Counts`)
+で取るだけで、 条件を書き直さない。 開く時に張るのは route だけで、 種 (表の走査) は最初の poll が作るので、
+開く時間は宣言の有無で変わらない (4 つ宣言した DB の open は宣言なしと同じ、 warm 0.7 ms・cold 2 ms ほど)。 最初の poll までの時間は、
+開いてから `subscribe*` で張るのと同じ。 handle は engine が持つ購読の clone で、 落としても購読は残り、 同じ名前を 2 回取ると poll
+の状態は 1 つ。 同じ名前に同じ形は何もせず、 違う形は置き換える。 readonly で開いた process の宣言は保存しない。 閉じずに落ちた後も、 WAL
+の再生で戻った行が答えに入る。
+
+### Added — 差分の位置: `poll_since(版)` / `snapshot` と、 名前付きの位置を置く local-only の表 `_cursors` (#615)
+
+購読が渡した差分に版を付け (差分を記録するたびに +1、 始まりは時刻 (µs) << 12)、 `LiveQuery::poll_since(pos)` は版 pos
+からの差分と今の版を返す (入って出た row は出ない、 出て入った row は removed と added の両方)。 `LiveCounts::poll_since` は動いた group
+と今の (件数, 合計)。 続けられなければ `Err(Truncated { from })` で、 `snapshot()` で全体から取り直す。 「ここまで処理した」 版は、
+`Database::prepare_cursors()` (build phase で 1 回) で作る local-only の表 `_cursors` に `cursor_set(name, Cursor { kind, pos, hlc })`
+で置き、 開き直した後に `cursor_get(name)` で読む (WAL に載り、 peer には配らない)。 処理の書き込みの後に位置を置けば、 再生された DB
+に位置だけが在って処理が無いことは無い (逆は在りうる = もう一度処理する、 at-least-once)。 記録は 1 購読 16 MiB まで
+(`set_answer_log_limit`。 越えたら古い方から捨てて `from` を進める)。 宣言された答えは宣言時 (開く時) から、 `subscribe` の購読は最初の
+`poll_since` / `snapshot` から記録する。 記録する購読の最初の poll は差分の clone が 1 つ増える (100 万行の集合の種 = 737k 行で +0.2〜1.2
+ms、 ≈2%)。 `Truncated` は changefeed の記録 (#610) と共用。
+
+### Added — changefeed の記録 `changefeed.seg`: 番号付きで残し、 開き直した後も続きから受け直す (#610、 #616)
+
+0.35.0 では、 落ちた consumer が処理した所の続きから受け直す手が `audit(from_hlc)` だけで、 畳んだ record はそこにも出なかった。
+`Engine::enable_change_log(cap)` を一度呼ぶと、 listener に渡す record を `{db}/changefeed.seg` に番号付きで残し (以後は開くたびに使う)、
+番号は `ChangeListener::on_changes_at(first, records)` で渡る (既定は `on_changes` を呼ぶ)。 アプリは処理と一緒に 「次の番号」
+を置いておき (`_cursors` の `CURSOR_CHANGEFEED`)、 開き直した後に `add_change_listener_from(listener, 次の番号)`
+で落ちる前の続きから受け直す。 記録が捨てた番号は `Err(Truncated { from })`。 写すのは書き出した record (checkpoint までに閉じた group)
+だけなので、 落ちても同じ record に同じ番号が付く。 listener が居ない間に畳んだ record も残る。 呼ばない DB には file を作らず、
+動きも今のまま。
+
+local-only の表 (`_` で始まる表) の書き込みは listener に渡さない (配り・畳む時の溜め・記録の全部、 #616)。 0.35.0
+は全部を渡していたので、 listener の中で位置を local-only の表に書くと、 その書き込みが次の配りでまた届き、
+書き手が止まっても配りが止まらなかった。
+
+### Added — 位置の印: 書き換えの多い列ごとの宣言 `.marks(col)` (#578、 #640、 #641)
+
+書き換え・削除で出ていった entity の古い entry は、 bucket を読むたびに Column と照らしていた。 `TableBuilder::marks(col)` (engine は
+`declare_marks`) で宣言した列は、 書き手が置いた位置を entity ごとに覚え (匿名 mmap の位置の表、 1 件 4 B)、 書き換え・消しの時に古い
+entry へ印を立てる。 印のそろった bucket の読みは、 印の立った entry を飛ばして写すだけ (Column で確かめない・往復の重複落としも無い)。
+100 万行の 10% を書き換えた後、 範囲 0.1% の find 0.25 倍、 等値 + 範囲 0.54 倍、 範囲 + 等値 0.62 倍、 上位 10 件 0.83〜0.87 倍。
+宣言した列の書き換えは 1 列あたり +20〜40 ns (位置の表を引いて bit を立てる)。 宣言は `{db}/tables` の `MRK1` block に残り、
+開き直すと戻る。 build のたびに書いた印がその表の印の全部 (書かなければ外れる、 handle だけの build は変えない)。 円柱を組む前 (起動時の
+build) に宣言すること (組んだ後の宣言は開き直してから効く)。 Leaf の列は断る。
+
+宣言の無い列は前と同じ道を通る。 0.36 を切る前の測りで、 宣言の無い列の bucket も印の置き場を持っていたのを外した (値がみな違う列 20
+万行の bucket 1 個あたり 116.7 → 92.7 B、 0.35.0 は 76.7 B。 社員の表 100 万行の RSS 395 / 399 → 361 / 373 MB、 #578 の前は 363 MB)
+(#640、 #641)。
+
+### Performance — sync の記録: `.eidmap` の追記・消した名前の記録の大きさ・purge の WAL (#560、 #629、 #630、 #561、 #632)
+
+pull で何か当てるたびの書き出しが `.eidmap` を毎回全部組み直していた (新しい行を 1 件受けただけでも写像の数に比例)。 変わった key
+の今の中身だけを `eidmap.log` に追記し (1 record 32 B、 FNV-1a 32 付き)、 record が生きている記録の 2 倍 + 1024 を越えた時・log
+が信用できない時・きれいに閉じる時にまとめ直す。 新しい行を 1 件受けた pull の後の書き出しは、 写像 1 万 9 → 8.9 ms、 10 万 12 → 8.9 ms、
+100 万 40 → 9.1 ms (残りは他の sidecar と本体の書き出し)。 ついでに、 逆写像を別の key に張り替えた時に前の key の前向きの写像が残り、
+slot を使い回した後にその世界番号宛ての record が新しい住人に入った穴 (0.35.0 にもある) を直した (#629)。
+
+消した名前の記録は 1 つ 32 B (8 byte 以下の名前はその中、 長い名前だけ別の置き場) にし、 名前 → 番号を開番地の表に、 受け手が lock
+を取らずに弾く bit の表を名前 1 つに 16 bit 以上を保って作り直す形にした (file の形は同じ)。 数の名前 100 万で 1 つあたり 147 → 75 B (slot
+を外した後 42 B)、 文字の名前 (~11 B) 147 → 94 B、 引く (当たり) 98 → 64 ns、 bit の表の素通り 10 万鍵 17.4 → 1.0 %・100 万鍵 85.2 → 1.5 %
+(#630)。
+
+`_sync_ops` の行を消す purge だけが `Op::Delete` を WAL に積んでいた (行を書く Tie は積まない)。 落ち着いた sync の DB では自分の record 1
+つにつき後から Delete 128 B が載り (3 列の upsert 528 B に 512 B、 +97 %)、 WAL が満杯で Delete が落ちると自分の floor を上げて相手全員を
+bootstrap に回した。 purge は WAL に積まず、 削除の版数は WAL の時計から採る。 汚れた終了の後の照合 (#451) は engine 内部の表の slot
+の削除を見ない (#632)。 同じ purge の、 引けない行を `delete()` に落とす道 (内部の行は WAL の空きを待たない約束を破る唯一の道) も外した
+(#592)。
+
+### Performance — schema の書き込み (#521、 #644、 #645)
+
+書き込みの builder は `set(col, val)` のたびに列の名前を `String` に写して積み、 commit で引き直していた (1 行 5 列の insert
+で確保と解放が 9 回ずつ)。 set の時に列を引いて、 列への参照と値だけを積む。 dbq (100 万行、 1 行 1 commit、 6 seed) の insert_row 309.0 →
+190.9 ns (1.62 倍)、 insert_bulk 305.2 → 189.1 ns で、 SQLite の 1 transaction の insert (in-memory 196.0 ns、 file・同期なし 229.4 ns)
+より速い。 列の名前の大文字小文字・知らない列の `UnknownColumn` などの振る舞いは変えていない (#521)。
+
+名前の確かめ (#603) と名前のカードを最初に書く並び (#575) で、 名前のある表の insert は 1 行 381〜389 ns になっていた (0.35.0 は 309〜318
+ns、 #644)。 値がみな違う名前の bucket を初めから 4 件分で作り (空の backing を作ってすぐ捨てていた)、 並びは Vec を作らず名前の列 →
+残りの列の 2 回なめる形にした。 dbq (3 回の中央値) の insert 1 行 (WAL なし) 389 → 285 ns、 まとめ 382 → 276 ns、 WAL あり 760 → 650 ns
+(名前を確かめない形は 290 / 276 / 671 ns)、 1 行の heap の確保 8.03 → 6.01 回 (0.35.0 は 5.00 回)。 delete 1 行は 631 → 636 ns
+で変わらない (↑ 上げる時の注意) (#645)。 #521 の数は別の日の測り。
+
+### Performance — 索引の読み (#520、 #522、 #524、 #558、 #574)
+
+古い entry の印のある bucket は、 次に書かれるまで読みのたびに全部を Column と照らし続けた (1 割の行を書き換えた後の範囲 10% の find が
+static の 19 倍)。 書き手が触らないまま照らすのが 2 回目 (1024 件より短い bucket は 3 回目) 以降なら、
+読み手がその値の鍵を待たずに取れた時に詰め直してから写すだけで読む。 dbq (100 万行) の churn の後の範囲 10% の find 391.7 → 25.3 µs (15.5
+倍、 static の 20 µs に並ぶ)。 上位 k 件・最小 / 最大と sparse の run は詰め直さない (#520)。
+
+値の順の読み (上位 k 件・最小 / 最大) の確保と二分探索を減らした: bigint の ts の churn の後の上位 10 件 755 → 431 ns (1.75 倍、 SQLite
+in-memory 492 ns)、 最大 234 → 132 ns (1.78 倍、 SQLite 197 ns)、 age (dense の bucket) の上位 10 件 1.4〜1.5 倍 (#522)。
+書き換えの多い列の bucket の詰め直し (512 件以上の整列を基数 sort に、 照らしを分岐なしに、 照らした列をそのまま backing に) と書き手の印
+(epoch の pin を 1 回に、 印の列の容量を残す) を軽くした: live の noop-flip の 100 件まとめ 1.22〜1.25 倍、 1 件ずつ (F=10) 1.32 倍、
+churn の後の [読む 読む 書く] 1.32 倍 (#524)。
+
+bucket の 「頭の昇順の長さ」 を書き手が push ごとに保つのをやめ、 範囲の読みが読む時に探す (#481 の後は範囲の読みしか使っていなかった)。
+書き手 1 本の insert 156.5 → 132.8 ns (0.85 倍)、 書き手 4 本は揺れの中。 0.33.0 の節の 「上位 10 件 363 ns、 最小 100 ns (#479)」
+は当時の経路の記録 (#558、 #574)。
+
+### Performance — live の購読 (#518、 #519、 #532、 #642、 #643)
+
+記録の無い親 (登録の後に一度も評価していない会社) の書き換えで、 答えが変わらないのに配下を全員評価し直していた。 「評価でこの entity
+を真と読んだ」 印を節ごとに持ち、 印が無ければ引かない。 会社への 1 回目の書き込み + poll: 社員 1 万人 49584 → 167 ns、 live の bench の
+noop-flip F=1000 1 件ずつ 4.92 → 0.17 µs (#518)。
+
+束ねた family の poll を軽くした (鍵の表を u64 の二分探索で引く、 印の buffer の使い回し、 短い並びを heap に置かない、 評価と当てを 2
+段に、 差分の整列を (id, 添字) で): 購読 1 万本・100 件まとめ 0.770 → 0.482 µs (1.60 倍、 DD 0.592 µs) (#519)。 2
+段にした時に評価の置き場に根の全員分を一度に置き、 最初の poll と大きい書き込みの後の RSS の峰を上げていた (社員 100 万人の行の購読で 58 →
+80 MB) ので、 1024 人ずつに区切った: 80.7 → 58.7 MB、 書き手 8 本 125.4 → 86.1 MB (常に持つ heap は同じ) (#642、 #643)。
+
+3 つ以上の table の組 (`LiveMultiJoin`) の段ごとの置き場を、 1 本の木から 2 本の鎖 (同じ前の段の組を持つ兄弟 / 同じ row) にした: user 100
+万 × 会社 1 万 × 店 2000 の 1 万件まとめ 123〜137k → 268〜272k ops/s (DBSP 8 worker のいちばん良かった回 184k の 1.46〜1.48 倍。 0.35.0 は
+0.85 倍で負け)、 100 件まとめ 65〜76k → 143〜158k、 1 件ずつ 73〜75k → 142〜149k。 長く回した形 (300 万 op を 10 秒で打ち切り) は
+108〜111k → 192〜198k (DBSP 8 worker 160〜177k) (#532)。
+
+### Added — 不変量の検査 `Engine::verify_invariants` (#602)
+
+`verify_invariants() -> Invariants { violations, warnings }` (O(DB の大きさ)、 書き手と並走しない所で呼ぶ): Leaf の cell の slot
+が全部読める・空きの一覧が範囲の中で重ならない・空きの中に live の slot が無い、 途中で切れた delete が無い、 Tag の cell
+の語が辞書にある、 EntitySet の生きている数と bitmap が合う。 表ごとの名前の重複は警告。 収束の総当たり・電源断の像の検証・調査に使う。
+
+### その他
+
+- `Ravn::follow` が、 peer を設定した DB で頭なしの eid を返していた (`reverse_follow` と食い違い、 `bfs` は輪で戻った始点を別の entity
+  と見て再訪した)。 `make_eid(peer_id, v)` で返す。 `Engine::get` の Ref の値と `Engine::pull` は doc 通り頭なしのまま (#556、 #584)
+- `OpLog::lock_session` は `append_lock` を持ったまま待つ flock を取っていたので、 同じ process で同じ WAL を開いた前の `OpLog`
+  が残っていると開き直しが永久に止まった。 待たずに試す (#561、 #592)
+- `enchudb-cli` の stats は、 0.34 から常に 0 の `queue_len` / `pushed` / `applied` を出さない (#562、 #586)
+
+### Tests・CI・文書
+
+- 継続 fuzzing (`fuzz/`、 cargo-fuzz + AddressSanitizer、 外から届く bytes を読む 5 つの入口を毎日 10 分) と coverage の地図 (master
+  ごと、 gate はしない。 最初の地図は行 89.47%) (#98、 #527、 #530)
+- I/O の点ごとの故障の試験 (fault injection と crash matrix、 `tests/fault_matrix.rs`、 feature `crashsim`) (#98、 #538)
+- loom で `row_lock.rs` の code そのものを走らせる (#563、 #591)。 同じ cell の書き手の WAL の順と当てる順を割り込み点で確かめる (#563、
+  #590)。 WAL の割り込み点の置き場を WAL ごとに (#579、 #580)。 作成より先に削除を受けた行の slot が生きたまま残らない (#549、 #583)
+- 揺れていた試験: #604 / #605、 #611、 #618 (`Engine::wal_room_wait_timeouts()` を足し、 reclaim
+  の時間でなく空きの待ちが上限に達した回数で見る)、 #619、 #523 / #626、 #637 / #639
+- 文書: cli の stats・`crash_writer`・changefeed の module doc (#562、 #586)、 `order_by` の同じ値の中の順と page の境目 (#559、 #589)、
+  `append_bucket` の並行契約の comment (#562、 #593)、 README の同期の節 (削除優先・改名の時刻・自分の行の畳み、 #624、 #627)
+
+### 既知の残り
+
+- WAL 付きで書き手の thread を増やしても速くならない (0.35.0 と同じ、 #506)
+- 名前のある表で、 名前で一度も引かない表の delete は、 名前を確かめない形より遅い (636 ns と 385 ns、 #645)
+- engine を直に使う書き手 (名前でない列を先に tie する、 名前の列を untie する) は名前の無い行を作れる (#575)。 名前の Tie が、 entity
+  の最初の record より後の別の batch で届くと、 受け手は名前で束ねない (#566)
+- `Op::Alias` を受けた時に 2 つの世界番号のどちらにも行が無い peer は何もしない。 その後に 2 つの世界番号の record が別々に届くと 2
+  行になりうる (#531)
+- live-state の bootstrap (state record で行を運ぶ形) は前の名前を運ばない (HTTP の bootstrap の sidecar は運ぶ)。 `merge_entity_into`
+  で畳む間に src に当たる他の書き込みは失われうる (sync の当ての中で呼ぶので、 当ては止まっている) (#569)
+- 改名の後に前の名前で作った行も、 前の行の削除より前に作られていれば一緒に消える (改名より先に削除を受けた peer に合わせる)。
+  名前の年表と束ねた identity のカードは書き出す時と閉じる時に `pkformer` に書くので、 落ちた後に残るのは書き出した所まで。 語を回収する
+  DB では、 年表の Tag の値が古い番号になりうる (#617)
+- 削除を知らない書き手が、 削除より後に消えた identity 宛てに書いた cell は、 残る identity の側に残る (#606)
+- 畳まれた自分の行を指す ref の cell は書き換えない: 読みは転送で残す行に届くが、 `where_ref(col, 残す行)` の逆引きには出ない (#625)
+- ホストは pull のたびに `_sync_ops` を全部読む (100 万行で重い)。 ホスト 1 つ = DB 1 つ (#634)。 ホストを通さない形 (peer
+  直・`HttpRelay`) では削除の記録 (`pktombs` / `foreign_tombs`) は減らず、 線を知らない古い client がホストに来ている間も線は進まない
+  (#635)
+- 宣言された答えの状態はメモリだけなので、 開き直した後の `poll_since` は必ず `Truncated` (状態を region に置く形はまだ) (#607、 #615)
+- 列の segment を初めて開く失敗は、 汚れた終わり方の後に開く途中で走る所 (索引の組み直し・oplog
+  に載っていない書き込みの作り直し・途中で切れた delete の仕上げ) と、 sync で届いた Delete を当てる道では今まで通り panic する (#543)
+- 故障の試験が点を置いていない I/O: sync の payload の ring、 辞書の参照数、 pack / unpack / migrate / snapshot、 BlobStore、
+  `Path::exists()` が飲み込む stat のエラー (#538)。 header の CRC は `[0..64)` しか覆わない (後ろの欄の破損は列の header の検査で止まる、
+  #528)
+- OS が msync の前に本体の page を先に書いた所で落ちた時は、 消した名前の記録を書く順では防げない (#419 と同じ扱い、 #585)
+- 3 つ以上の table の組の購読は、 長く回すと出力の組の `Vec` の確保と解放が約 3 割 (公開 API の形
+  `TupleDelta { added: Vec<Vec<EntityId>> }` の差、 #532)。 live の noop-flip の 100 件まとめは DD の 0.65〜0.68 倍 (#524)
+- `order_by` の同じ値の中の順は決めない。 決めた順 (値, eid) で並べる・keyset で page を切る手段は無い (#589)
+
 ## 0.35.0 — 2026-10-19
 
 minor。 on-disk 形式 (segment・`.eidmap`・WAL の record) と wire 形式は 0.34.0 と同じ (開き直しも sync もそのまま)。 sync の表を持つ DB で
