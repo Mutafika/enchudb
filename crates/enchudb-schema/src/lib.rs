@@ -2176,7 +2176,7 @@ impl<'a> RowBuilder<'a> {
         // 次の書き手から見えてから離す。 名前の無い表 / 名前を書かない行は lock 不要で並行のまま。
         let pk_col = self.table.pk.map(|i| &self.table.cols[i]);
         let pk_value = pk_col
-            .and_then(|pc| resolved.clone().find(|(c, _)| c.name == pc.name).map(|(_, v)| v))
+            .and_then(|pc| resolved.clone().find(|(c, _)| c.himo_id == pc.himo_id).map(|(_, v)| v))
             .filter(|v| !matches!(v, Value::Null));
         let _name_guard = pk_value.map(|v| self.table.name_locks.lock(v));
         let mut target_eid: Option<EntityId> = None;
@@ -2198,26 +2198,23 @@ impl<'a> RowBuilder<'a> {
         // #548: 名前 (表で名前と決めた列) の無い行は作らない。 デッキは名前でしかできないので、 名前の無いカードの塊は表の
         // どこにも現れてはいけない (前は作れてしまい、 表の全部を引く時は出ず、 他の列で引く・数える時は出た)。 upsert で
         // 当たった既にある行は名前を持っている
-        let name_col = self.table.pk.map(|i| &self.table.cols[i]);
         if target_eid.is_none()
-            && let Some(nc) = name_col
-            && !resolved.clone().any(|(c, v)| c.name == nc.name && !matches!(v, Value::Null))
+            && let Some(nc) = pk_col
+            && !resolved.clone().any(|(c, v)| c.himo_id == nc.himo_id && !matches!(v, Value::Null))
         {
             return Err(SchemaError::BadValue(format!(
                 "table '{}': a new row needs a value for its name column '{}' (rows without it are not rows)",
                 self.table.name, nc.name
             )));
         }
-        // #548: 名前のカードを最初に書く。 sync で書き込みが分かれて届いても、 受け手は名前より先に他のカードを受けない
-        let mut resolved: Vec<_> = resolved.collect();
-        if let Some(nc) = name_col {
-            // #581: upsert が名前で当たった行には名前のカードを書き直さない (引いた値と同じ。 書き直すと名前の版数が上がり、 その
-            // 名前になった時刻 = 行の作成が分からなくなる。 sync は束ねた行の切り離しを作成の時刻で決める)
-            if target_eid.is_some() {
-                resolved.retain(|(c, _)| c.name != nc.name);
-            }
-            resolved.sort_by_key(|(c, _)| c.name != nc.name);
-        }
+        // #548: 名前のカードを最初に書く。 sync で書き込みが分かれて届いても、 受け手は名前より先に他のカードを受けない。 名前の
+        // 列 → 残りの列の順に 2 回なめる (並べ直す Vec を insert のたびに作らない)。
+        // #581: upsert が名前で当たった行には名前のカードを書き直さない (引いた値と同じ。 書き直すと名前の版数が上がり、 その
+        // 名前になった時刻 = 行の作成が分からなくなる。 sync は束ねた行の切り離しを作成の時刻で決める)
+        let name_hid = pk_col.map(|nc| nc.himo_id);
+        let is_name = move |c: &&ColumnInner| Some(c.himo_id) == name_hid;
+        let names = resolved.clone().filter(move |(c, _)| target_eid.is_none() && is_name(c));
+        let resolved = names.chain(resolved.filter(move |(c, _)| !is_name(c)));
 
         let eid = match target_eid {
             Some(e) => e,

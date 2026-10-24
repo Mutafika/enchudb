@@ -901,7 +901,8 @@ impl LockFreeCylinder {
     /// 要素 `slot` (配列 `k`) の bucket に足す (空なら、 ここで初めて bucket を作る、 #358)。
     #[inline]
     fn push_slot(&self, k: usize, slot: &Slot, eid: u32, guard: &Guard) {
-        let (b, created) = slot.get_or_create(self.marks_on());
+        // 作るなら初めから 1 回目に伸ばす大きさで (空の backing を作ってすぐ捨てない。 値がみな違う列は値ごとに作る)
+        let (b, created) = slot.get_or_create_with(crate::append_bucket::INITIAL_CAP, self.marks_on());
         if created {
             self.used[k].fetch_add(1, Ordering::Relaxed);
         }
