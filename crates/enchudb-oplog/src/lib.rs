@@ -32,6 +32,7 @@
 
 pub mod keys;
 pub mod oplog;
+mod wal_lock;
 
 /// 電源断の模擬 (テスト専用、 feature `crashsim`)。 書き出しの済んだ page を控え、 page cache ごと
 /// 失った姿の像を作る。
