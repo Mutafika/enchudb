@@ -173,7 +173,9 @@ fn a_silent_client_stops_holding_the_line_and_is_refused_when_it_returns() {
     let (hp, p1, p2, p3) = (tmp("silent-host"), tmp("silent-c1"), tmp("silent-c2"), tmp("silent-c3"));
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(format!("{hp}.cursors").into())).unwrap();
-    host.set_silence_limit(Duration::from_millis(300));
+    // 黙らせる前は上限を長くしておく (短いと、 負荷の下では黙らせない client の往復の間も上限を越え、 他の client が来た時に
+    // 外される。 外された client は戻った client になって二度と数えないので、 線が止まる、 #637)
+    host.set_silence_limit(Duration::from_secs(600));
     let url = format!("http://{}", host.addr());
     let (c1, c2, c3) = (client(db(&p1, 1), &url), client(db(&p2, 2), &url), client(db(&p3, 3), &url));
     c1.write(1, 10);
@@ -182,7 +184,12 @@ fn a_silent_client_stops_holding_the_line_and_is_refused_when_it_returns() {
     // c2 は書いて出さずに黙る
     let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     c2.write(5, 50);
-    std::thread::sleep(Duration::from_millis(400));
+    // c2 / c3 を黙らせる: c1 が来た直後に上限を縮め、 上限より長く待つ。 縮める時にもその場で黙った client を外すので、 上限は
+    // c1 が来てから縮めるまでの間より十分長く。 この後に来るのは c1 だけで、 ホストは来た client の時刻を新しくしてから外す
+    // client を決めるので、 c1 は外れない
+    c1.sync();
+    host.set_silence_limit(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(1500));
     c1.delete(1);
     for k in 10..30 {
         c1.write(k, k);
