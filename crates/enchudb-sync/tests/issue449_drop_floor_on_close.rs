@@ -12,6 +12,7 @@ use enchudb_engine::ValueType;
 use enchudb_oplog::{Hlc, PeerId};
 use enchudb_sync::Syncer;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -40,6 +41,22 @@ fn make_engine(path: &str, peer: PeerId, oplog_capacity: usize) -> Arc<Engine> {
 
 fn has_note(eng: &Engine, i: u32) -> bool {
     !eng.pull_raw("notes.note", i).is_empty()
+}
+
+/// 畳む lock (`transfer_oplog_to_sync_ops` も取る) を持って呼ぶ。 裏の consumer は 100 ms ごとの書き出しで Commit を 1 つ打ってから
+/// bridge でこの lock を取りに行って止まる。 準備の途中に入ると残りが Commit 1 つ分ずれる (#648: record の大きさを head の差で
+/// 測る間なら残りが 220 B、 埋め草の直前なら埋め草が閉じの Commit の分の空きを残せずに落ちる、 準備の後なら Commit が入らない
+/// 残りになる)。 ここで Commit を 1 つ打って consumer に書き出させ、 consumer の Commit が入るのを待つ = その後は lock を離すまで
+/// consumer は WAL に書かない。 lock を取った時に consumer がもう lock の前に居る (書き出しを終えていた / 畳みに来ていた) なら
+/// Commit は来ないので、 5 秒で見切る。
+fn let_the_consumer_commit_and_wait_on_the_lock(eng: &Engine) {
+    let wal = eng.oplog().unwrap();
+    eng.oplog_commit();
+    let ours = wal.head();
+    let end = Instant::now() + Duration::from_secs(5);
+    while wal.head() == ours && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -72,6 +89,7 @@ fn writes_dropped_right_before_close_reach_the_peer() {
     let mut dropped = Vec::new();
     {
         let _no_fold = eng_a.transfer_lock_for_fold();
+        let_the_consumer_commit_and_wait_on_the_lock(&eng_a);
         // 閉じた group で WAL を埋め、 残りを 100 B (Tie 136 B も Commit 120 B も入らない) にする。 TieLeaf の record は
         // 文字列の長さ + c B
         let e0 = eng_a.entity_in("notes").unwrap();
