@@ -2488,6 +2488,9 @@ fn root_at(recs: &[KeyStore], vals: &[ValWords], e: u32) -> Option<Ans> {
     recs[0].key(e).map(|id| (id, vals[0].get(e).saturating_sub(1)))
 }
 
+/// settle の根の評価を置く数 (`Settled::nows` の大きさの上限)。 この数ずつ評価してから当てる。
+const SETTLE_CHUNK: usize = 1024;
+
 /// poll 側だけが触る状態 (評価 lock の下)。
 struct Settled {
     /// 節ごとの記録 (添字 0 = 根の現在の鍵)。
@@ -2523,6 +2526,7 @@ struct Settled {
     /// 次の settle は答えが変わらなくても展開する (`fresh` の初回の報告のため)。
     force: bool,
     /// settle の根の loop の、 評価した答えの置き場 (poll のたびに確保し直さない。 1 件ずつ poll すると確保と解放が効く)。
+    /// [`SETTLE_CHUNK`] 人ずつ使うので、 それより大きくならない。
     nows: Vec<(u32, Option<Ans>)>,
     /// 合計する列のある集計の family: 根ごとに、 今数えている合計の値 + 1 (0 = 値が無い、 `Family::sum`)。
     summand: ValWords,
@@ -4500,33 +4504,35 @@ impl Family {
                 }
                 // 印の付いた根 (ref や根の条件の紐が書かれた) は全部読み直し、 上の近道より後に
                 // 当てる (逆引きの後に ref が書き換わった根は、 こちらの今の Column の答えが勝つ)。
-                // 先に全員を評価してから当てる: 根の評価は根の記録・鍵・member を読まないので、 当てる順は変わらない。 1 人ずつ
+                // 先に評価してから当てる: 根の評価は根の記録・鍵・member を読まないので、 当てる順は変わらない。 1 人ずつ
                 // 評価と当てを交互にすると、 どちらも heap の別々の所を読みに行く待ちが 1 人ずつ直列に並ぶ (分けると各 loop が
-                // 短くなり、 次の人の読みが前の人の待ちに重なる)
+                // 短くなり、 次の人の読みが前の人の待ちに重なる)。 評価の置き場は [`SETTLE_CHUNK`] 人ずつ (根の全員を置くと、
+                // 登録の後の最初の poll や大きい書き込みの後に、 置き場が根の数だけ一時に膨らむ。 100 万人の行の購読で heap の峰
+                // +9 MB・RSS の峰 +22 MB だった)
                 if list.is_empty() {
                     continue;
                 }
                 let mut nows = std::mem::take(&mut s.nows);
-                nows.extend(list.into_iter().map(|e| (e, self.eval(r, s, 0, e))));
-                for &(e, now) in &nows {
-                    match (self.partial.or(self.order_part), mode) {
-                        (Some(c1), _) => {
-                            let g = now.map_or(0, |a| a.1);
-                            let t = now.and_then(|_| r.cell(self.nodes[c1].via, e));
-                            let now = now.and_then(|a| Some((a.0, t?)));
-                            match mode {
-                                RootMode::Ordered(desc) => s.apply_root_order_part(e, now, g, desc),
-                                _ => s.apply_root_partial(e, now, g, summand(e)),
+                for chunk in list.chunks(SETTLE_CHUNK) {
+                    nows.clear();
+                    nows.extend(chunk.iter().map(|&e| (e, self.eval(r, s, 0, e))));
+                    for &(e, now) in &nows {
+                        match (self.partial.or(self.order_part), mode) {
+                            (Some(c1), _) => {
+                                let g = now.map_or(0, |a| a.1);
+                                let t = now.and_then(|_| r.cell(self.nodes[c1].via, e));
+                                let now = now.and_then(|a| Some((a.0, t?)));
+                                match mode {
+                                    RootMode::Ordered(desc) => s.apply_root_order_part(e, now, g, desc),
+                                    _ => s.apply_root_partial(e, now, g, summand(e)),
+                                }
                             }
+                            (None, _) => s.apply_root_cached(e, now, summand(e), mode, &mut cache, &fresh),
                         }
-                        (None, _) => s.apply_root_cached(e, now, summand(e), mode, &mut cache, &fresh),
                     }
                 }
-                // 大きい置き場 (印の多い poll の後) は手放す
-                if nows.capacity() <= 1024 {
-                    nows.clear();
-                    s.nows = nows;
-                }
+                nows.clear();
+                s.nows = nows;
                 continue;
             }
             let (parent, via, path) = (self.nodes[n].parent, self.nodes[n].via, self.on_path[n]);
