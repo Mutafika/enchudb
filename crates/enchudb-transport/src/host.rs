@@ -23,7 +23,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -38,7 +38,10 @@ use crate::http::{HttpTransport, parse_query, read_request, send_response};
 // 中身の形
 // ─────────────────────────────────────────────────────────────
 
-/// 書き手ごとの位置 (cursor / ack / floor) の列: `[数 u32]([peer u32][wall u64][logical u32][hlc peer u32])*`。
+/// 書き手ごとの位置 (cursor / ack / floor) の列。
+type Cursors = Vec<(PeerId, Hlc)>;
+
+/// 書き手ごとの位置の列の形: `[数 u32]([peer u32][wall u64][logical u32][hlc peer u32])*`。
 fn encode_cursors(list: &[(PeerId, Hlc)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + list.len() * 20);
     out.extend_from_slice(&(list.len() as u32).to_le_bytes());
@@ -57,6 +60,13 @@ fn decode_cursors(buf: &[u8]) -> Option<Vec<(PeerId, Hlc)>> {
     }
     let (chunks, _) = body.as_chunks::<20>();
     Some(chunks.iter().map(|c| (u32::from_le_bytes(c[..4].try_into().unwrap()), get_hlc(&c[4..]))).collect())
+}
+
+/// 位置の列を頭から読み、 列と残りを返す。
+fn decode_cursors_prefix(buf: &[u8]) -> Option<(Cursors, &[u8])> {
+    let n = u32::from_le_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let end = 4usize.checked_add(n.checked_mul(20)?)?;
+    Some((decode_cursors(buf.get(..end)?)?, &buf[end..]))
 }
 
 fn put_hlc(out: &mut Vec<u8>, h: Hlc) {
@@ -108,6 +118,50 @@ fn decode_state(buf: &[u8]) -> Option<StateBatch> {
 
 /// publish の返事の印: ホストが c の state を求めている (c の floor にホストの cursor が届かない)。
 const NEED_STATE: u8 = 1;
+/// publish の返事の印: 黙ったので外した後に戻ってきた client の record なので受けなかった。 c は新しい peer id の DB にホストから
+/// 取り直してから書き直す (留守の間に消えた行を持ったままなので、 受けると忘れた削除を越えて消えた行が生き返りうる)。
+const STALE: u8 = 2;
+
+/// 黙った client を線と回収の数から外すまでの既定 (30 日)。
+const DEFAULT_SILENCE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// HLC を `w.l.p` に (query の値)。
+fn hlc_param(h: Hlc) -> String {
+    format!("{}.{}.{}", h.wall, h.logical, h.peer)
+}
+
+fn parse_hlc(s: &str) -> Option<Hlc> {
+    let mut it = s.split('.');
+    let h = Hlc { wall: it.next()?.parse().ok()?, logical: it.next()?.parse().ok()?, peer: it.next()?.parse().ok()? };
+    it.next().is_none().then_some(h)
+}
+
+/// ホストが client ごとに覚えること (削除を忘れてよい線のため、 `HOST_PLAN.md` の段 2)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClientState {
+    /// 最後に来た時刻 (ms)。
+    last_seen_ms: u64,
+    /// この client の配り終えの線 (HLC がこれ以下の自分の record は全部ホストに出した)。 一度も言っていない client は F を止める
+    /// (まだ出していない自分の record が、 線を越えた後に届きうる)。
+    through: Option<Hlc>,
+    /// この client の受け終えの線 (ホストが配った配り終えの線のうち、 全部受けたと言った物)。
+    caught_up: Hlc,
+    /// 黙ったので外した (線と `_sync_peers` から)。
+    dropped: bool,
+    /// 外した後に戻ってきた。 record のある publish を全部断る (留守の間に消えた行を持ったままなので、 線より後の書き込みでも
+    /// 消えた行を生き返らせうる)。 新しい peer id の DB で作り直すこと
+    returned: bool,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self { last_seen_ms: 0, through: None, caught_up: Hlc::ZERO, dropped: false, returned: false }
+    }
+}
 
 /// 書き手ごとの位置の列を、 書き手ごとに大きい方へ足す。
 fn merge_max(into: &mut Vec<(PeerId, Hlc)>, add: &[(PeerId, Hlc)]) {
@@ -193,6 +247,110 @@ struct HostInner {
     loopback: Arc<Loopback>,
     /// client ごとの publish を 1 本ずつに並べる (同じ client の record を当てる順を保つ)。
     client_locks: Mutex<HashMap<PeerId, Arc<Mutex<()>>>>,
+    /// client ごとの状態と、 削除を忘れてよい線 (F、 下がらない)。
+    lines: Mutex<Lines>,
+    /// client の状態の置き場 (`cursor_path` の横)。 無ければ線を出さない (開き直した後に誰を待つか分からないので、 忘れない側)。
+    lines_path: Option<PathBuf>,
+    /// client の record を当てる間 (read) と、 F を進めてホストが忘れる間 (write) を分ける。 忘れる前に当てた record と、 忘れた
+    /// 後に当てた record で答えが変わる (忘れた削除より前の作成) ので、 F を配る前に忘れ終え、 その間は当てない。 client は返事の
+    /// F で忘れてから当てる (`Syncer::pull_once`)
+    gate: RwLock<()>,
+}
+
+struct Lines {
+    clients: HashMap<PeerId, ClientState>,
+    forget: Hlc,
+    silence: Option<Duration>,
+    /// 最後に書き出した中身 (変わった時だけ書く)。
+    saved: Option<(HashMap<PeerId, ClientState>, Hlc)>,
+}
+
+impl Default for Lines {
+    fn default() -> Self {
+        Self { clients: HashMap::new(), forget: Hlc::ZERO, silence: None, saved: None }
+    }
+}
+
+impl Lines {
+    fn silence(&self) -> Duration {
+        self.silence.unwrap_or(DEFAULT_SILENCE)
+    }
+
+    /// 線に数える client (黙っていない、 外した後に戻ったのでもない)。
+    fn counted(&self, c: &ClientState, now: u64) -> bool {
+        !c.dropped && !c.returned && now.saturating_sub(c.last_seen_ms) < self.silence().as_millis() as u64
+    }
+
+    /// F の候補 (今の F より上の時だけ): 数える client ごとの min(受け終えの線, 配り終えの線) の最小。 線を一度も言っていない
+    /// client は 0。 受け終えの線は、 その client が線を言う前に計算した P (その client の record を待っていない) でもありうる
+    /// ので、 配り終えの線でも丸める = F より前の、 数える client の record は全部ホストに当たっている。
+    fn forget_candidate(&self, now: u64) -> Option<Hlc> {
+        self.clients
+            .values()
+            .filter(|c| self.counted(c, now))
+            .map(|c| c.through.map_or(Hlc::ZERO, |t| c.caught_up.min(t)))
+            .min()
+            .filter(|f| *f > self.forget)
+    }
+
+    /// 書き出す中身。
+    fn encode(&self) -> String {
+        let mut out = format!("F {}\n", hlc_param(self.forget));
+        let mut ids: Vec<_> = self.clients.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let c = &self.clients[&id];
+            out.push_str(&format!(
+                "C {id} {} {} {} {} {}\n",
+                c.last_seen_ms,
+                c.through.map_or("-".into(), hlc_param),
+                hlc_param(c.caught_up),
+                c.dropped as u8,
+                c.returned as u8
+            ));
+        }
+        out
+    }
+
+    fn decode(text: &str) -> Lines {
+        let mut l = Lines::default();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f.as_slice() {
+                ["F", h] => l.forget = parse_hlc(h).unwrap_or(Hlc::ZERO),
+                ["C", id, seen, through, caught, dropped, returned] => {
+                    let (Ok(id), Ok(seen)) = (id.parse::<PeerId>(), seen.parse::<u64>()) else { continue };
+                    l.clients.insert(
+                        id,
+                        ClientState {
+                            last_seen_ms: seen,
+                            through: parse_hlc(through),
+                            caught_up: parse_hlc(caught).unwrap_or(Hlc::ZERO),
+                            dropped: *dropped == "1",
+                            returned: *returned == "1",
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+        l
+    }
+
+    /// 前に書いた中身から、 書き直すほど変わったか (last_seen だけの変化は 1 時間まで書かない)。
+    fn changed(&self) -> bool {
+        let Some((clients, forget)) = &self.saved else { return true };
+        if *forget != self.forget || clients.len() != self.clients.len() {
+            return true;
+        }
+        self.clients.iter().any(|(id, c)| match clients.get(id) {
+            None => true,
+            Some(o) => {
+                let quiet = ClientState { last_seen_ms: o.last_seen_ms, ..*c };
+                quiet != *o || c.last_seen_ms.saturating_sub(o.last_seen_ms) > 3_600_000
+            }
+        })
+    }
 }
 
 impl HostInner {
@@ -200,18 +358,39 @@ impl HostInner {
         self.client_locks.lock().unwrap().entry(c).or_default().clone()
     }
 
-    /// client `from` の record を当てる。 戻り値は (c の state が要るか, c への ack)。
-    fn accept(&self, from: PeerId, records: Vec<WireRecord>) -> (bool, Vec<(PeerId, Hlc)>) {
+    /// client `from` の record を当てる。 `through` は from の配り終えの線 (この batch を全部当てたら進める)。 戻り値は (返事の印,
+    /// from への ack)。
+    fn accept(&self, from: PeerId, records: Vec<WireRecord>, through: Option<Hlc>) -> (u8, Vec<(PeerId, Hlc)>) {
         let lock = self.client_lock(from);
         let _serial = lock.lock().unwrap();
-        self.loopback.inbox.lock().unwrap().insert(from, records);
-        let out = self.syncer.pull_once(from);
-        self.loopback.inbox.lock().unwrap().remove(&from);
-        // 中継として WAL に載せた record を書き出してから ack を返す (ack で client は自分の ring から消すので、 その後にホストが
-        // 落ちて中継の record を失うと、 他の client に届く道が無くなる)
-        if out.applied > 0 {
-            let _ = self.engine.oplog_sync();
+        let seen = |s: &Self| s.syncer.cursors_of(from).into_iter().find(|(a, _)| *a == from).map_or(Hlc::ZERO, |(_, h)| h);
+        let returning = self.lines_path.is_some()
+            && self.lines.lock().unwrap().clients.get(&from).is_some_and(|c| c.dropped || c.returned);
+        let mine = records.iter().any(|r| r.author_peer == from);
+        if returning && mine {
+            self.touch(from, |_| {});
+            return (STALE, self.syncer.cursors_of(from));
         }
+        let top = records.iter().filter(|r| r.author_peer == from).map(|r| r.hlc).max();
+        let (out, all_in) = {
+            let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
+            self.loopback.inbox.lock().unwrap().insert(from, records);
+            let out = self.syncer.pull_once(from);
+            self.loopback.inbox.lock().unwrap().remove(&from);
+            // 全部当てた (from の cursor が batch の最大に届いた) 時だけ、 配り終えの線を進める
+            let all_in = top.is_none_or(|t| seen(self) >= t) && !out.history_truncated;
+            // 中継として WAL に載せた record を書き出してから ack を返す (ack で client は自分の ring から消すので、 その後にホストが
+            // 落ちて中継の record を失うと、 他の client に届く道が無くなる)
+            if out.applied > 0 {
+                let _ = self.engine.oplog_sync();
+            }
+            (out, all_in)
+        };
+        self.touch(from, |c| {
+            if all_in && !c.returned && let Some(t) = through {
+                c.through = Some(c.through.map_or(t, |cur| cur.max(t)));
+            }
+        });
         let ack = self
             .loopback
             .acks_for_clients
@@ -219,7 +398,93 @@ impl HostInner {
             .unwrap()
             .remove(&from)
             .unwrap_or_else(|| self.syncer.cursors_of(from));
-        (out.history_truncated, ack)
+        (if out.history_truncated { NEED_STATE } else { 0 }, ack)
+    }
+
+    /// client `c` が来た: last_seen を今にして `f` を当て、 線を計算し直す。 外した client が来たら、 戻ったとして断る側に回す。
+    fn touch(&self, c: PeerId, f: impl FnOnce(&mut ClientState)) {
+        let now = now_ms();
+        {
+            let mut l = self.lines.lock().unwrap();
+            let st = l.clients.entry(c).or_default();
+            st.last_seen_ms = now;
+            if st.dropped {
+                st.dropped = false;
+                st.returned = true;
+            }
+            f(st);
+        }
+        self.recompute(now);
+    }
+
+    /// 配り終えの線 P: ホスト自身の書き込みと、 数える client のうち線を言ったものの最小。
+    fn publish_line(&self) -> Hlc {
+        let mut p = self.engine.sync_published_through().unwrap_or(Hlc::ZERO);
+        let now = now_ms();
+        let l = self.lines.lock().unwrap();
+        for c in l.clients.values().filter(|c| l.counted(c, now)) {
+            if let Some(t) = c.through {
+                p = p.min(t);
+            }
+        }
+        p
+    }
+
+    /// ホストの `_sync_ops` に残っている record の HLC の最小 (残っていなければ None)。 F はこれを越えない: 残っている record は
+    /// まだ個別に配りうるので、 その削除をホストが忘れた後に誰かが当てると、 名前で束ねた行の答えが割れる。
+    fn ring_min(&self) -> Option<Hlc> {
+        self.engine
+            .pending_sync_ops(0)
+            .iter()
+            .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
+            .map(|r| r.hlc)
+            .min()
+    }
+
+    /// 黙った client を外し、 忘れてよい線 F を進め、 進んだらホストの削除の記録を捨てる。 F = min([`Lines::forget_candidate`]、
+    /// ホストの ring に残る record) で下がらない (pull しかしない client は F を止める)。 置き場が無ければ何もしない。
+    fn recompute(&self, now: u64) {
+        let Some(path) = &self.lines_path else { return };
+        let mut drop_peers = Vec::new();
+        let candidate = {
+            let mut l = self.lines.lock().unwrap();
+            let limit = l.silence().as_millis() as u64;
+            for (id, c) in l.clients.iter_mut() {
+                if !c.dropped && !c.returned && now.saturating_sub(c.last_seen_ms) >= limit {
+                    c.dropped = true;
+                    drop_peers.push(*id);
+                }
+            }
+            l.forget_candidate(now)
+        };
+        for p in drop_peers {
+            self.engine.forget_sync_peer(p);
+        }
+        if let Some(candidate) = candidate {
+            // 当てる間を止めて (write)、 ring の最小で丸め、 忘れ終えてから F を置く
+            let _gate = self.gate.write().unwrap_or_else(|p| p.into_inner());
+            let f = self.ring_min().map_or(candidate, |m| candidate.min(m));
+            let current = self.lines.lock().unwrap().forget;
+            if f > current {
+                if self.engine.forget_deletes_before(f) > 0 {
+                    let _ = self.engine.persist_sync_state();
+                }
+                self.lines.lock().unwrap().forget = f;
+            }
+        }
+        let text = {
+            let mut l = self.lines.lock().unwrap();
+            l.changed().then(|| {
+                l.saved = Some((l.clients.clone(), l.forget));
+                l.encode()
+            })
+        };
+        if let Some(text) = text {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
     }
 
     /// client `to` に配る record: ホストの `_sync_ops` のうち、 書き手ごとの cursor より後 (to 自身の record は除く)。
@@ -255,6 +520,7 @@ impl HostInner {
             merge_max(&mut cursors, &[own]);
         }
         merge_max(self.loopback.acks_from_clients.lock().unwrap().entry(by).or_default(), &cursors);
+        // 回収は ring が半分埋まってから (`absorb_pull_acks`)。 F は ring に残る record を越えないので、 削除の記録を忘れるのも回収の後
         self.syncer.reclaim_beat();
     }
 }
@@ -270,7 +536,8 @@ pub struct HttpHost {
 impl HttpHost {
     /// `engine` (sync の表があり、 peer id が 0 でない、 WAL 付きの DB) をホストにして `bind_addr` で listen する。 ホストは中継の
     /// 印 (`set_gossip_remote_apply`) を立てる。 `cursor_path` は client ごとの受けた位置の置き場 (無ければ memory だけで、
-    /// 開き直すと client の record を当て直す。 当て直しは冪等)。
+    /// 開き直すと client の record を当て直す。 当て直しは冪等)。 その横 (`<cursor_path>.clients`) に client ごとの線を置き、
+    /// 削除を忘れてよい線を配る (`cursor_path` が無ければ線を配らない = 誰も削除の記録を忘れない)。
     pub fn start(bind_addr: &str, engine: Arc<Engine>, cursor_path: Option<PathBuf>) -> io::Result<Self> {
         let host = engine.peer_id();
         if host == 0 {
@@ -280,12 +547,31 @@ impl HttpHost {
         let loopback = Arc::new(Loopback { host, ..Loopback::default() });
         let mut syncer = Syncer::try_new(engine.clone(), loopback.clone())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let lines_path = cursor_path.as_ref().map(|p| {
+            let mut s = p.clone().into_os_string();
+            s.push(".clients");
+            PathBuf::from(s)
+        });
+        let mut lines = lines_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| Lines::decode(&t))
+            .unwrap_or_default();
+        lines.saved = Some((lines.clients.clone(), lines.forget));
         if let Some(p) = cursor_path {
             syncer = syncer.with_cursor_path(p);
         }
         syncer.set_host(true);
         syncer.serve_state();
-        let inner = Arc::new(HostInner { engine, syncer, loopback, client_locks: Mutex::new(HashMap::new()) });
+        let inner = Arc::new(HostInner {
+            engine,
+            syncer,
+            loopback,
+            client_locks: Mutex::new(HashMap::new()),
+            lines: Mutex::new(lines),
+            lines_path,
+            gate: RwLock::new(()),
+        });
 
         let listener = TcpListener::bind(bind_addr)?;
         let addr = listener.local_addr()?;
@@ -322,6 +608,18 @@ impl HttpHost {
     pub fn syncer(&self) -> &Syncer {
         &self.inner.syncer
     }
+
+    /// 黙った client を線と回収の数から外すまでの長さ (既定 30 日)。 外した client が戻って自分の record を出すと、 ホストは受けずに
+    /// `STALE` を返す (client は新しい peer id の DB に取り直してから書き直す)。
+    pub fn set_silence_limit(&self, limit: Duration) {
+        self.inner.lines.lock().unwrap().silence = Some(limit);
+        self.inner.recompute(now_ms());
+    }
+
+    /// 削除を忘れてよい線 (配っている物、 観測・試験用)。 線を配らないホストは ZERO。
+    pub fn forget_line(&self) -> Hlc {
+        self.inner.lines.lock().unwrap().forget
+    }
 }
 
 impl Drop for HttpHost {
@@ -342,21 +640,33 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
         ("POST", "/v2/publish") | ("POST", "/publish") => {
             let Some(from) = peer_param("peer") else { return send_response(&mut stream, 400, b"peer") };
             let Ok(records) = decode_batch(&req.body) else { return send_response(&mut stream, 400, b"batch") };
-            let (need_state, ack) = host.accept(from, records);
+            let through = q.get("through").and_then(|s| parse_hlc(s));
+            let (flags, ack) = host.accept(from, records, through);
             if req.route == "/publish" {
                 return send_response(&mut stream, 200, b"");
             }
-            let mut out = vec![if need_state { NEED_STATE } else { 0 }];
+            let mut out = vec![flags];
             out.extend_from_slice(&encode_cursors(&ack));
             send_response(&mut stream, 200, &out)
         }
         ("POST", "/v2/pull") => {
             let Some(to) = peer_param("to") else { return send_response(&mut stream, 400, b"to") };
             let Some(since) = decode_cursors(&req.body) else { return send_response(&mut stream, 400, b"cursors") };
-            // record を読んでから floor を読む (間に回収が入ると floor が上がる側 = 穴を見逃さない)
+            // 前の返事を全部当てた client は、 その返事の配り終えの線まで受け終えた
+            let seen_line = q.get("seen").and_then(|s| parse_hlc(s));
+            host.touch(to, |c| {
+                if let Some(h) = seen_line {
+                    c.caught_up = c.caught_up.max(h);
+                }
+            });
+            // 配り終えの線を record より先に読む (線より前の record は今ホストにある = この後に読む record に入る)。 floor は record の
+            // 後 (間に回収が入ると floor が上がる側 = 穴を見逃さない)
+            let publish_line = host.publish_line();
             let records = host.records_for(to, &since);
             let mut out = encode_framed(&records);
             out.extend_from_slice(&encode_cursors(&host.floors_for(to)));
+            put_hlc(&mut out, publish_line);
+            put_hlc(&mut out, host.lines.lock().unwrap().forget);
             // pull の cursor は ack も兼ねる (`Syncer::pull_once` は当てて書き出した後にしか cursor を進めない、 #149)。 自分の record
             // しか無い client は何も受けないので `record_pull_ack_multi` を呼ばない — ここで受けないと、 その client の record の行が
             // ホストの ring から回収されない
@@ -377,6 +687,7 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
         ("POST", "/v2/ack") => {
             let Some(by) = peer_param("peer") else { return send_response(&mut stream, 400, b"peer") };
             let Some(cursors) = decode_cursors(&req.body) else { return send_response(&mut stream, 400, b"cursors") };
+            host.touch(by, |_| {});
             host.ack_from(by, cursors);
             send_response(&mut stream, 200, b"")
         }
@@ -433,6 +744,15 @@ pub struct HttpHostTransport {
     floors: Mutex<Option<Vec<(PeerId, Hlc)>>>,
     /// 自分の state の配布元 (`serve_state` が登録する)。 ホストが求めた時に送る。
     own_state: Mutex<HashMap<PeerId, StateProvider>>,
+    /// `Syncer` が record を集める前に伝えた自分の配り終えの線 (次の publish に付ける) と、 最後に送った線。
+    through: Mutex<(Option<Hlc>, Option<Hlc>)>,
+    /// 前の pull の返事: (配り終えの線, 書き手ごとの record の最大, floor で止めた書き手があったか)。 次の要求で、 全部当てていれば
+    /// 線を 「受け終えた」 と返す。
+    prev_answer: Mutex<Option<(Hlc, Cursors, bool)>>,
+    /// ホストが配った、 削除を忘れてよい線。
+    forget: Mutex<Hlc>,
+    /// ホストが `STALE` を返した (取り直してから書き直す)。
+    rebase: AtomicBool,
 }
 
 impl HttpHostTransport {
@@ -452,7 +772,17 @@ impl HttpHostTransport {
             acked: Mutex::new(Vec::new()),
             floors: Mutex::new(None),
             own_state: Mutex::new(HashMap::new()),
+            through: Mutex::new((None, None)),
+            prev_answer: Mutex::new(None),
+            forget: Mutex::new(Hlc::ZERO),
+            rebase: AtomicBool::new(false),
         })
+    }
+
+    /// ホストがこの client の record を受けなかった (黙ったので外された後に戻ってきた)。 新しい peer id の DB にホストから取り直して
+    /// から書き直すこと (この peer id の record はもう受けない)。 受けると、 忘れた削除を越えて消えた行が生き返りうる。
+    pub fn rebase_required(&self) -> bool {
+        self.rebase.load(Ordering::Acquire)
     }
 
     /// ホストの peer id (`pull_once` に渡す)。
@@ -489,19 +819,46 @@ impl Transport for HttpHostTransport {
             let done = |a: PeerId| acked.iter().find(|(p, _)| *p == a).map_or(Hlc::ZERO, |(_, h)| *h);
             records.into_iter().filter(|r| r.hlc > done(r.author_peer)).collect()
         };
-        if records.is_empty() {
+        // 送る record が無くても、 配り終えの線が進んだら言う (書き込みの無い client が線を止めない)
+        let (through, sent) = *self.through.lock().unwrap();
+        if records.is_empty() && (from != self.me || through.is_none() || through == sent) {
             return;
         }
-        let Ok((200, body)) = self.http.request("POST", &format!("/v2/publish?peer={from}"), &encode_batch(&records))
-        else {
-            return;
-        };
+        let mut path = format!("/v2/publish?peer={from}");
+        if from == self.me
+            && let Some(t) = through
+        {
+            path.push_str(&format!("&through={}", hlc_param(t)));
+        }
+        let Ok((200, body)) = self.http.request("POST", &path, &encode_batch(&records)) else { return };
         let (Some(&flags), Some(ack)) = (body.first(), body.get(1..).and_then(decode_cursors)) else { return };
+        if flags & STALE != 0 {
+            self.rebase.store(true, Ordering::Release);
+            return;
+        }
+        if from == self.me {
+            self.through.lock().unwrap().1 = through;
+        }
         merge_max(&mut self.acked.lock().unwrap(), &ack);
         merge_max(self.pending_acks.lock().unwrap().entry(from).or_default(), &ack);
         if flags & NEED_STATE != 0 {
             self.push_state(from);
         }
+    }
+
+    fn uses_published_through(&self) -> bool {
+        true
+    }
+
+    fn note_published_through(&self, peer: PeerId, through: Hlc) {
+        if peer == self.me {
+            self.through.lock().unwrap().0 = Some(through);
+        }
+    }
+
+    fn forget_horizon(&self, from: PeerId) -> Option<Hlc> {
+        let f = *self.forget.lock().unwrap();
+        (from == self.host && f > Hlc::ZERO).then_some(f)
     }
 
     fn known_peers(&self) -> Vec<PeerId> {
@@ -512,11 +869,29 @@ impl Transport for HttpHostTransport {
         if from != self.host {
             return Vec::new();
         }
-        let Ok((200, body)) = self.http.request("POST", &format!("/v2/pull?to={to}"), &encode_cursors(since)) else {
+        // 前の返事を全部当てた (cursor が返事の record に届いた、 floor で止めた書き手が無い) なら、 その返事の配り終えの線まで
+        // 受け終えたと言う
+        let cur = |a: PeerId| since.iter().find(|(p, _)| *p == a).map_or(Hlc::ZERO, |(_, h)| *h);
+        let seen = self
+            .prev_answer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(_, tops, held)| !held && tops.iter().all(|(a, t)| cur(*a) >= *t))
+            .map(|(p, _, _)| *p);
+        let mut path = format!("/v2/pull?to={to}");
+        if let Some(p) = seen {
+            path.push_str(&format!("&seen={}", hlc_param(p)));
+        }
+        let Ok((200, body)) = self.http.request("POST", &path, &encode_cursors(since)) else {
             return Vec::new();
         };
         let Some((records, rest)) = decode_framed(&body) else { return Vec::new() };
-        let Some(floors) = decode_cursors(rest) else { return Vec::new() };
+        let Some((floors, rest)) = decode_cursors_prefix(rest) else { return Vec::new() };
+        let (publish_line, forget) = match rest.len() {
+            32 => (get_hlc(&rest[..16]), get_hlc(&rest[16..])),
+            _ => (Hlc::ZERO, Hlc::ZERO),
+        };
         // 返事の floor は record を読んだ後の物。 cursor が floor に届かない書き手は、 この返事の record も途中から始まりうる
         // (間に回収が入った) ので渡さない — cursor は進まず、 次の `pull_once` の前の判定が floor で抜けを知らせる
         let baseline = floors.iter().find(|(a, _)| *a == u32::MAX).map_or(Hlc::ZERO, |(_, h)| *h);
@@ -525,7 +900,17 @@ impl Transport for HttpHostTransport {
             let f = floors.iter().find(|(p, _)| *p == a).map_or(Hlc::ZERO, |(_, h)| *h);
             cur < f.max(baseline)
         };
-        let records = records.into_iter().filter(|r| !short(r.author_peer)).collect();
+        let held = records.iter().any(|r| short(r.author_peer));
+        let records: Vec<WireRecord> = records.into_iter().filter(|r| !short(r.author_peer)).collect();
+        let mut tops: Vec<(PeerId, Hlc)> = Vec::new();
+        for r in &records {
+            merge_max(&mut tops, &[(r.author_peer, r.hlc)]);
+        }
+        *self.prev_answer.lock().unwrap() = Some((publish_line, tops, held));
+        {
+            let mut f = self.forget.lock().unwrap();
+            *f = (*f).max(forget);
+        }
         *self.floors.lock().unwrap() = Some(floors);
         records
     }
@@ -620,6 +1005,31 @@ mod tests {
         server.join().unwrap();
         assert_eq!(got.iter().map(|r| r.author_peer).collect::<Vec<_>>(), vec![6], "floor に届かない書き手の record を渡した");
         assert_eq!(t.history_floor_multi(7), Some(vec![(5, h(9))]), "floor を覚えない");
+    }
+
+    /// F は数える client の配り終えの線を越えない: 線を言う前に計算された P を受け終えた client (時計が遅れていて、 配り終えの線が
+    /// P より下) が居ても、 F はその client の配り終えの線まで。 線を一度も言っていない client と、 外した / 戻った client も見る。
+    #[test]
+    fn the_forget_line_does_not_pass_a_clients_published_line() {
+        let h = |w| Hlc { wall: w, logical: 0, peer: 0 };
+        let now = 1_000;
+        let client = |through: Option<u64>, caught: u64| ClientState {
+            last_seen_ms: now,
+            through: through.map(h),
+            caught_up: h(caught),
+            ..ClientState::default()
+        };
+        let mut l = Lines::default();
+        l.clients.insert(1, client(Some(90), 80));
+        l.clients.insert(2, client(Some(50), 80)); // P=80 を受け終えたが、 自分の record は 50 までしか出していない
+        assert_eq!(l.forget_candidate(now), Some(h(50)), "client 2 のまだ出していない record を越えた");
+        l.clients.insert(3, client(None, 80));
+        assert_eq!(l.forget_candidate(now), None, "線を言っていない client が居るのに進んだ");
+        l.clients.get_mut(&3).unwrap().returned = true;
+        l.clients.insert(4, ClientState { dropped: true, ..client(None, 0) });
+        assert_eq!(l.forget_candidate(now), Some(h(50)), "外した / 戻った client が F を止めた");
+        l.forget = h(50);
+        assert_eq!(l.forget_candidate(now), None, "F が下がらずに同じ値を言い直した");
     }
 
     #[test]

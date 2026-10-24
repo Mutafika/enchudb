@@ -908,6 +908,8 @@ struct DurableCut {
     /// 切れ目の時の、 自分の落ちた record を覚えた回数 (`OpLog::dropped_gen`)。 置く時に変わっていれば置かない (切れ目の後の Commit が
     /// 満杯で畳みを起こし、 切れ目以下の閉じていない record を孤児 (#450) として落とした時: 時計では分からない)
     dropped_gen: u64,
+    /// 切れ目の時の、 自分の中身のある record を積んだ回数 (`OpLog::quiet_since`、 ホストの形の配り終えの線)
+    own_data: u64,
 }
 
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
@@ -4761,6 +4763,9 @@ pub struct Engine {
     unlogged_writes_relogged: std::sync::atomic::AtomicU64,
     /// #451 (段階 1): 配り済みの印を置いた回数 (観測用)。
     durable_mark_publishes: std::sync::atomic::AtomicU64,
+    /// 最後に置いた配り済みの印の切れ目の時の、 (自分の中身のある record を積んだ回数, 自分の落ちた record を覚えた回数)
+    /// (`sync_published_through`)。 この process でまだ置いていなければ `None` (前の process の印の後に何を積んだか分からない)
+    mark_own_data: std::sync::Mutex<Option<(u64, u64)>>,
     /// #451 (段階 1): 置いた印がまだ ring の書き出しに乗っていない (consumer が、 書くものの無い周期に ring だけ書き出す)。
     durable_mark_flush_pending: std::sync::atomic::AtomicBool,
     /// #451 (段階 1): 置く前の切れ目 (C, 切れ目より後の自分の record の最初の行の手前の lsn)。 bridge が自分の record (HLC > C) の行を
@@ -5243,6 +5248,7 @@ impl Engine {
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
             durable_mark_publishes: std::sync::atomic::AtomicU64::new(0),
+            mark_own_data: std::sync::Mutex::new(None),
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
@@ -6519,6 +6525,7 @@ impl Engine {
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
             durable_mark_publishes: std::sync::atomic::AtomicU64::new(0),
+            mark_own_data: std::sync::Mutex::new(None),
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
@@ -7580,6 +7587,24 @@ impl Engine {
         None
     }
 
+    /// ホストの形 (`HOST_PLAN.md`): HLC がこれ以下の自分の書き込みは全部 `_sync_ops` に載っている時刻。 配り済みの印の切れ目の後に
+    /// 自分の中身のある record (Commit を除く) を積んでいなければ時計の今 (時計をそこまで進めるので、 以後の書き込みはこれより後)、
+    /// 積んでいれば印の時刻。 印の無い DB は、 WAL に自分の中身のある record が無ければ (書いたことの無い client) 時計の今、 あれば
+    /// `None` (印ができるまで待つ)。 書き込みの無い client と、
+    /// 自分では書かないホストの線が止まらないように (書き出しは切れ目の後に必ず Commit を積むので、 「何も積んでいない」 では見ない)
+    pub fn sync_published_through(&self) -> Option<enchudb_oplog::Hlc> {
+        let wal = self.oplog.as_ref()?;
+        let Some(mark) = self.durable_mark() else {
+            // 印が無い = 自分の record を `_sync_ops` に載せたことが無い (最初に載せる時に payload の ring を作る)。 WAL にも自分の
+            // 中身のある record が無ければ、 書いたことの無い client
+            return wal.quiet_without_mark(self.peer_id());
+        };
+        // 印の切れ目の後に自分の中身のある record を積んでいなければ今 (この process で印を置く前は分からないので印の時刻)
+        let at_cut = *self.mark_own_data.lock().unwrap_or_else(|p| p.into_inner());
+        let quiet = at_cut.and_then(|(own_data, dropped_gen)| wal.quiet_since(own_data, dropped_gen, self.peer_id()));
+        Some(quiet.map_or(mark.hlc, |now| now.max(mark.hlc)))
+    }
+
     /// #451 (段階 1): 配り済みの印の候補 (C, S) を切れ目で取る。 **Commit を打つ前に呼ぶ** (印が覆う record は全部、 その Commit で
     /// 閉じた group に入り、 畳む時の孤児 (#450) にならない)。 候補を置けるのは、 この後に始めた oplog の fsync と本体の書き出しが
     /// 返り、 Commit が打てた後 ([`Self::publish_durable_mark`])。
@@ -7619,6 +7644,7 @@ impl Engine {
             lsn_at_cut: lsn,
             wal: (point.lap, point.offset),
             dropped_gen: point.dropped_gen,
+            own_data: point.own_data,
         })
     }
 
@@ -7655,28 +7681,34 @@ impl Engine {
         let lsn = first_after
             .unwrap_or_else(|| self.next_sync_lsn.load(Ordering::Acquire).saturating_sub(1))
             .max(cut.lsn_at_cut);
-        self.publish_durable_mark(crate::sync_payload_ring::DurableMark {
+        if self.publish_durable_mark(crate::sync_payload_ring::DurableMark {
             hlc: cut.hlc,
             lsn,
             wal_lap: cut.wal.0,
             wal_off: cut.wal.1,
-        });
+        }) {
+            *self.mark_own_data.lock().unwrap_or_else(|p| p.into_inner()) = Some((cut.own_data, cut.dropped_gen));
+        }
     }
 
     /// #451 (段階 1): 候補を印として置く。 disk に届くのは次の ring の書き出し (`body_msync`、 または書くものの無い周期の
     /// [`Self::flush_durable_mark_if_pending`])。 呼ぶのは bridge の後 (ring は最初の bridge が作る)。 ring を作れなかった DB は置かない。
     #[cfg(not(target_arch = "wasm32"))]
-    fn publish_durable_mark(&self, m: crate::sync_payload_ring::DurableMark) {
+    fn publish_durable_mark(&self, m: crate::sync_payload_ring::DurableMark) -> bool {
         use std::sync::atomic::Ordering;
-        let Some(ring) = self.sync_payload_ring.get() else { return };
+        let Some(ring) = self.sync_payload_ring.get() else { return false };
         if ring.set_durable_mark(m) {
             self.durable_mark_publishes.fetch_add(1, Ordering::Relaxed);
             self.durable_mark_flush_pending.store(true, Ordering::Release);
+            return true;
         }
+        false
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn publish_durable_mark(&self, _m: crate::sync_payload_ring::DurableMark) {}
+    fn publish_durable_mark(&self, _m: crate::sync_payload_ring::DurableMark) -> bool {
+        false
+    }
 
     /// #451 (段階 1): ring を書き出す (本体の書き出しと同じ契機)。 置いた印もここで届くので 「まだ届いていない」 印を下ろす
     /// (書き出しの前に下ろす: 書き出しの間に置いた印は次の書き出しを待つ)。
@@ -7879,6 +7911,25 @@ impl Engine {
             .unwrap_or(0);
         self.tie_to_by_id(row_eid, last_seen_hid, (now_ms / 65536) as u32);
         Ok(())
+    }
+
+    /// `peer` を `_sync_ops` の回収の数から外す (`_sync_peers` の行の消化の位置を外す)。 外したら `true`。 次にその peer の ack が
+    /// 来たら数に戻る。 ホストが黙った client を外す時に呼ぶ (止まった client が全員の回収を止めないように。 戻ってきた client は
+    /// floor で抜けを知って取り直す)
+    pub fn forget_sync_peer(&self, peer: enchudb_oplog::PeerId) -> bool {
+        let (Some(peer_id_hid), Some(consumed_lsn_hid)) =
+            (self.himo_id("_sync_peers.peer_id"), self.himo_id("_sync_peers.consumed_lsn"))
+        else {
+            return false;
+        };
+        let mut gone = false;
+        for row in self.query_by_id(&[(peer_id_hid as u16, peer)]) {
+            if self.get_by_id32(row, consumed_lsn_hid as u16).is_some() {
+                self.untie_by_id(row, consumed_lsn_hid as u16);
+                gone = true;
+            }
+        }
+        gone
     }
 
     /// #149: pull cursor (HLC) に基づく ack。 relay/gateway 経路には明示 ack が
@@ -12309,6 +12360,38 @@ impl Engine {
         if g.forget_slot(local) {
             self.pk_tombs_dirty.store(true, Ordering::Release);
         }
+    }
+
+    /// 削除の版数が `h` より前の、 削除の記録を忘れる: 消した主キー (`pk_tombs`) と、 写像を外した後の相手の行の削除 (`foreign_tombs`)。
+    /// 忘れた数 (0 でなければ `persist_sync_state` で書き直す)。 行の slot に残った削除の版数 (`slot_is_dead`) は触らない。
+    ///
+    /// 呼んでよいのは、 `h` より前の書き込みがもう届かないと分かった時だけ: 全部の書き手が `h` より前の自分の書き込みを出し終え、
+    /// 全部の受け手がそれを受け終えた (ホストが配る忘れてよい線、 `HOST_PLAN.md`)。 早く忘れると、 後から届いた削除より前の作成で
+    /// 消した行が生き返る
+    pub fn forget_deletes_before(&self, h: enchudb_oplog::Hlc) -> usize {
+        use std::sync::atomic::Ordering;
+        let mut gone = 0;
+        if !self.pk_tombs_empty.load(Ordering::Acquire) || self.pk_pending_nonempty.load(Ordering::Acquire) {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            let n = g.forget_before(h);
+            if n > 0 {
+                self.pk_tombs_dirty.store(true, Ordering::Release);
+                gone += n;
+            }
+        }
+        if !self.foreign_tombs_empty.load(Ordering::Acquire) {
+            let mut g = self.foreign_tombs.write().unwrap();
+            let before = g.len();
+            g.retain(|_, t| *t >= h);
+            let n = before - g.len();
+            if n > 0 {
+                // `eidmap.log` の退避の記録は消せないので、 次の書き出しで `eidmap` をまとめ直す
+                self.eidmap_compact.store(true, Ordering::Release);
+                gone += n;
+            }
+        }
+        gone
     }
 
     /// #513: 覚えている、 消した主キーの数 (観測・test 用)。
