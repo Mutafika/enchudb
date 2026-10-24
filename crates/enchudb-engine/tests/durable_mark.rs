@@ -151,8 +151,10 @@ fn a_reopen_does_not_hand_out_lsns_at_or_below_the_mark() {
     };
     assert!(m.lsn < 1000);
     {
+        // 閉じるまでに印がもう 1 歩進むことがある (consumer の周期の書き出し / 閉じる時の書き出し、 #649) ので、 ring の今の印から作る
         let ring = PayloadRing::open_or_create(&db, 16 << 20, false).unwrap();
-        assert!(ring.set_durable_mark(DurableMark { lsn: 1000, ..m }));
+        let now = ring.durable_mark().expect("前提: 印");
+        assert!(ring.set_durable_mark(DurableMark { lsn: 1000, ..now }));
         ring.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
