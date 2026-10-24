@@ -38,6 +38,20 @@ fn floor_of(eng: &Engine, author: u32) -> Option<Hlc> {
     eng.sync_reclaimed_floors().unwrap_or_default().into_iter().find(|(a, _)| *a == author).map(|(_, h)| h)
 }
 
+/// 畳む lock (`transfer_oplog_to_sync_ops` も取る) を持って呼ぶ。 裏の consumer は 100 ms ごとの書き出しで Commit を 1 つ打ってから
+/// bridge でこの lock を取りに行って止まる。 WAL を埋める準備の途中に入ると残りが Commit 1 つ分ずれる (#648) ので、 ここで Commit を
+/// 1 つ打って consumer に書き出させ、 consumer の Commit が入るのを待つ = その後は lock を離すまで consumer は WAL に書かない。 lock を
+/// 取った時に consumer がもう lock の前に居る (書き出しを終えていた / 畳みに来ていた) なら Commit は来ないので、 5 秒で見切る。
+fn let_the_consumer_commit_and_wait_on_the_lock(eng: &Engine) {
+    let wal = eng.oplog().unwrap();
+    eng.oplog_commit();
+    let ours = wal.head();
+    let end = Instant::now() + Duration::from_secs(5);
+    while wal.head() == ours && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// 印は書き出し (`oplog_sync`) のたびに進み、 切れ目 (Commit の前) より後に書いた write は覆わない。 置くのは bridge の後なので、
 /// 最初の書き出し (ring はその bridge が作る) でも置ける。
 #[test]
@@ -91,6 +105,7 @@ fn dropped_writes_hold_the_mark_until_their_floor_is_recorded() {
     let mut dropped = Vec::new();
     {
         let _no_fold = eng.transfer_lock_for_fold();
+        let_the_consumer_commit_and_wait_on_the_lock(&eng);
         let e1 = eng.entity_in("notes").unwrap();
         let h0 = wal.head();
         eng.tie_text_to(e1, "notes.body", "x");
@@ -151,8 +166,10 @@ fn a_reopen_does_not_hand_out_lsns_at_or_below_the_mark() {
     };
     assert!(m.lsn < 1000);
     {
+        // 閉じるまでに印がもう 1 歩進むことがある (consumer の周期の書き出し / 閉じる時の書き出し、 #649) ので、 ring の今の印から作る
         let ring = PayloadRing::open_or_create(&db, 16 << 20, false).unwrap();
-        assert!(ring.set_durable_mark(DurableMark { lsn: 1000, ..m }));
+        let now = ring.durable_mark().expect("前提: 印");
+        assert!(ring.set_durable_mark(DurableMark { lsn: 1000, ..now }));
         ring.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
