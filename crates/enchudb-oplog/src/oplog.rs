@@ -81,6 +81,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use memmap2::MmapMut;
 
+use crate::wal_lock::WalGuard;
 use crate::{Hlc, PeerId};
 
 const FILE_MAGIC: &[u8; 4] = b"EWAL";
@@ -822,16 +823,19 @@ pub struct OpLog {
     /// 従来通り flock が担う。
     ///
     /// std の `Mutex` は macOS では pthread の mutex で、 書き手を並べると取り合うたびに、 待つのも起こすのも system call
-    /// だった (書き手 8 本の sample で、 書き手の時間の 5〜9 割、 #506)。 parking_lot の `Mutex` は少し回って待ってから寝て、 外す時は寝ている待ち手が
-    /// 居る時だけ起こす。
-    append_lock: parking_lot::Mutex<()>,
+    /// だった (書き手 8 本の sample で、 書き手の時間の 5〜9 割、 #506)。 parking_lot の `Mutex` と同じ手順 (少し回って待ってから寝て、
+    /// 外す時は寝ている待ち手が居る時だけ起こす) で、 try_lock が CAS 1 回の lock ([`crate::wal_lock`]、 まとめ書きの入口が使う)。
+    append_lock: crate::wal_lock::WalLock,
     /// [`OpLog::lock_session`] で、 開いている間ずっと flock を持っている。 立っている間の append は record ごとに
     /// flock を取らない (取ると外す時に、 開いている間の lock ごと外れる: flock は開いた file ごとの lock で数えない)。
     /// `append_lock` の下で立て、 append も `append_lock` の下で見る。
     session_locked: std::sync::atomic::AtomicBool,
     /// append 中の writer 数 (観測用)。 満杯で空きを待つ writer も数に入る。 畳むのとの直列化は `append_lock` で、
-    /// この数は畳む条件に使わない (`try_reset_if`)。
+    /// この数は畳む条件に使わない (`try_reset_if`)。 まとめ書きの置き場のある thread の分は `pending_shards` に数える。
     pending_writes: std::sync::atomic::AtomicU32,
+    /// `pending_writes` の、 置き場のある thread の分 (置き場の番号ごと、 その thread だけが足し引きする line)。 #506: 1 つの数を
+    /// 書き手 8 本が append のたびに 2 回足し引きすると、 その line の取り合いでまとめ書きの 8 本が 5.5 → 3.4 M/s に落ちた。
+    pending_shards: Box<[PendingShard]>,
     /// auto reset を許可するか。default false。
     /// true にすると consumer が head==checkpoint の tick で ring buffer を空に戻し
     /// 長期運用で WAL 容量を食い切らない動きになるが、audit/iter_committed/publish_since
@@ -869,6 +873,13 @@ pub struct OpLog {
     room_waiter: std::sync::RwLock<Option<RoomWaiter>>,
     /// #391: append が載った後に呼ぶ (engine が consumer を起こす — 書き出しの tick を回すため)。
     append_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// #506 まとめ書き: `append_lock` を取れなかった書き手が頼みを置く場所 (書き手の thread ごとに 1 つ、 [`combine_slot_index`])。
+    /// lock を持つ書き手が全部を見て積む ([`OpLog::serve_slots`])。
+    combine_slots: Box<[CombineSlot]>,
+    /// 頼みを置いたことのある置き場の番号の最大 + 1 と、 頼みが置かれているかもしれない印 ([`CombineHint`])。
+    combine: CombineHint,
+    /// 置き場の頼みとして積んだ record の数。 `append_lock` の下でだけ進める ([`OpLog::combined_appends`])。
+    combined: AtomicU64,
 }
 
 /// #388: [`OpLog::set_room_waiter`] の待ち手。 引数は載せたい byte 数、 戻り値は空いたか。 append_lock を持たずに呼ぶ。
@@ -884,6 +895,114 @@ thread_local! {
     static FAULT_INJECT_APPEND_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// test 用: この thread が record ごとの flock を実際に取った回数 ([`OpLog::lock_session`] の test)。
     static FLOCK_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// test 用: この thread が lock を持って置き場の頼みを積む時、 次の 1 つを積む前に panic する (#506)。
+    static FAULT_INJECT_SERVE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #506 まとめ書き: 頼みの置き場の数。 置き場は書き手の thread ごとに決まる ([`combine_slot_index`]) ので、 番号がこれを越えた
+/// thread は頼まずに lock を待って自分で積む。
+const COMBINE_SLOTS: usize = 64;
+const SLOT_EMPTY: u32 = 0;
+const SLOT_PENDING: u32 = 1;
+const SLOT_DONE: u32 = 2;
+/// 1 回 lock を持つ間に置き場を見回る回数の上限 (積む書き手が自分の書き込みに戻れるように)。
+const APPEND_SERVE_ROUNDS: usize = 2;
+/// 頼みを置いた書き手が、 積まれるのを回って待つ回数 (この間 64 回ごとに、 lock が空いていれば取りに行く)。 越えたら lock を寝て
+/// 待ち、 取れたら置かれた頼み (自分の分を含む) を積む。
+const APPEND_REQ_SPINS: u32 = 1 << 12;
+
+/// まとめ書きの頼み 1 つの置き場 (cache line 1 本 = 128 B)。 頼む書き手が中身を書いて `state` を PENDING にし、 lock を持つ書き手が
+/// 積んで結果を置いて DONE にし、 頼んだ書き手が結果を取って EMPTY に戻す。 頼みと結果が同じ line なので、 頼み 1 つで core を渡る
+/// line は行きと帰りの 1 本ずつ。 置き場の持ち主は 1 つの thread だけ (番号は同時に生きている thread の間で重ならない) なので、
+/// 頼む側に取り合いは無い (10-17 の試作は頼みを 1 本の list の先頭に CAS で積み、 そこを全員が取り合った)。
+#[repr(C, align(128))]
+struct CombineSlot {
+    state: std::sync::atomic::AtomicU32,
+    req: std::cell::UnsafeCell<std::mem::MaybeUninit<SlotReq<'static>>>,
+    result: std::cell::UnsafeCell<Option<io::Result<(u64, Hlc)>>>,
+}
+
+const _: () = assert!(std::mem::size_of::<CombineSlot>() == 128);
+
+impl CombineSlot {
+    fn new_slots() -> Box<[CombineSlot]> {
+        (0..COMBINE_SLOTS)
+            .map(|_| CombineSlot {
+                state: std::sync::atomic::AtomicU32::new(SLOT_EMPTY),
+                req: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+                result: std::cell::UnsafeCell::new(None),
+            })
+            .collect()
+    }
+}
+
+/// まとめ書きの置き場を見るかの手がかり (cache line 1 本、 書かれるのはまれ)。
+#[repr(align(128))]
+struct CombineHint {
+    /// 頼みを置いたことのある置き場の番号の最大 + 1 (lock を持つ書き手はここまで見る)。 置く書き手が上げるだけで下げない。
+    hw: std::sync::atomic::AtomicU32,
+    /// 頼みが置かれているかもしれない。 頼んだ書き手が (倒れていれば) 立て、 見回って何も無かった持ち手が倒す。 倒れている間、 lock を
+    /// 持つ書き手は置き場を読まない: 一度でも頼みが置かれた後に毎回 `hw` 個の置き場を見ると、 書き手 1 本の append が遅くなった (#506、
+    /// 書き手 1 本でも裏の consumer と lock がぶつかれば頼む)。 倒すのと立てるのが入れ違って頼みが印なしで残っても、 頼んだ書き手は
+    /// 回って待つ間に自分で lock を取って積む (止まらない)。
+    wanted: std::sync::atomic::AtomicBool,
+}
+
+/// 1 record の頼み (`append_lock` の下で積む中身)。 置き場には `'static` として置く: 頼んだ書き手は DONE を見るまで戻らない。
+struct SlotReq<'a> {
+    op: Op<'a>,
+    payload_size: usize,
+    /// group を閉じる record か (= 閉じの Commit の分の空きを残さなくてよい、 `alloc`)
+    closes_group: bool,
+    /// 中継の header (大きい) と事前採番の HLC は、 頼んだ書き手の stack を指す
+    relay: Option<&'a RelayedHeader>,
+    hlc_override: Option<&'a Hlc>,
+}
+
+/// `pending_writes` の thread ごとの分 (cache line 1 本)。
+#[repr(align(128))]
+struct PendingShard(std::sync::atomic::AtomicU32);
+
+/// lock を持つ書き手が置き場の頼みを積む間の印。 積む途中で panic したら、 その頼みを失敗で返す (頼んだ書き手が待ち続けないように)。
+struct ServeGuard<'a>(&'a CombineSlot);
+
+impl ServeGuard<'_> {
+    fn finish(self, out: io::Result<(u64, Hlc)>) {
+        let slot = self.0;
+        std::mem::forget(self);
+        // SAFETY: PENDING の置き場の結果は、 lock を持つ書き手 1 本だけが書く (頼んだ書き手は DONE を見るまで読まない)
+        unsafe { *slot.result.get() = Some(out) };
+        // Release: 頼んだ書き手が結果を見る。 この後は置き場に触らない
+        slot.state.store(SLOT_DONE, Ordering::Release);
+    }
+}
+
+impl Drop for ServeGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `finish` と同じ
+        unsafe { *self.0.result.get() = Some(Err(io::Error::other("WAL append panicked in the writer that appended this record"))) };
+        self.0.state.store(SLOT_DONE, Ordering::Release);
+    }
+}
+
+/// #506: この thread の、 まとめ書きの置き場の番号。 thread が終わると番号を返し、 後に始まった thread が使い回す (同時に生きている
+/// thread の間で番号は重ならない = 置き場の持ち主は 1 つ)。 thread の終わりの片付けの最中 (thread-local がもう無い) は None。
+#[cfg(not(target_arch = "wasm32"))]
+fn combine_slot_index() -> Option<usize> {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static FREE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    struct Index(u32);
+    impl Drop for Index {
+        fn drop(&mut self) {
+            FREE.lock().unwrap_or_else(|e| e.into_inner()).push(self.0);
+        }
+    }
+    thread_local! {
+        static MINE: Index = Index(
+            FREE.lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap_or_else(|| NEXT.fetch_add(1, Ordering::Relaxed)),
+        );
+    }
+    MINE.try_with(|i| i.0 as usize).ok()
 }
 
 /// `pending_writes` を RAII で減算するガード。
@@ -907,8 +1026,15 @@ impl Drop for PendingGuard<'_> {
 impl OpLog {
     /// `pending_writes` を `n` 増やし、 drop 時に同量減らす RAII ガードを返す。
     fn pending_guard(&self, n: u32) -> PendingGuard<'_> {
-        self.pending_writes.fetch_add(n, Ordering::AcqRel);
-        PendingGuard { counter: &self.pending_writes, n }
+        #[cfg(not(target_arch = "wasm32"))]
+        let counter = match combine_slot_index().filter(|&i| i < COMBINE_SLOTS) {
+            Some(i) => &self.pending_shards[i].0,
+            None => &self.pending_writes,
+        };
+        #[cfg(target_arch = "wasm32")]
+        let counter = &self.pending_writes;
+        counter.fetch_add(n, Ordering::AcqRel);
+        PendingGuard { counter, n }
     }
 
     /// oplog 容量到達時の `OutOfMemory` エラーを生成する。
@@ -1036,9 +1162,13 @@ impl OpLog {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             signing: std::sync::atomic::AtomicBool::new(false),
-            append_lock: parking_lot::Mutex::new(()),
+            append_lock: crate::wal_lock::WalLock::new(()),
+            combine_slots: CombineSlot::new_slots(),
+            combine: CombineHint { hw: std::sync::atomic::AtomicU32::new(0), wanted: std::sync::atomic::AtomicBool::new(false) },
+            combined: AtomicU64::new(0),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
+            pending_shards: (0..COMBINE_SLOTS).map(|_| PendingShard(std::sync::atomic::AtomicU32::new(0))).collect(),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
@@ -1146,9 +1276,13 @@ impl OpLog {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             signing: std::sync::atomic::AtomicBool::new(false),
-            append_lock: parking_lot::Mutex::new(()),
+            append_lock: crate::wal_lock::WalLock::new(()),
+            combine_slots: CombineSlot::new_slots(),
+            combine: CombineHint { hw: std::sync::atomic::AtomicU32::new(0), wanted: std::sync::atomic::AtomicBool::new(false) },
+            combined: AtomicU64::new(0),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
+            pending_shards: (0..COMBINE_SLOTS).map(|_| PendingShard(std::sync::atomic::AtomicU32::new(0))).collect(),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
@@ -1629,11 +1763,11 @@ impl OpLog {
         hlc_override: Option<Hlc>,
     ) -> Result<(u64, Hlc), (io::Error, Hlc)> {
         let is_commit = matches!(op, Op::Commit);
-        let mut r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override, is_commit);
+        let mut r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit);
         let reserve = if is_commit { 0 } else { self.commit_room.load(Ordering::Relaxed) };
         // 空いた後に他の書き手が先に埋めたら、 また待つ (#552: 前は 1 回しか書き直さず、 畳めているのに落とした)
         while r.as_ref().is_err_and(|e| self.wait_for_room(e, record_size as u64 + reserve)) {
-            r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override, is_commit);
+            r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit);
         }
         if r.is_ok() {
             self.appended();
@@ -1666,13 +1800,15 @@ impl OpLog {
         self.append_inner_noting(op, payload_size, record_size, None, None)
     }
 
+    /// op と中継の header は参照で受ける (#506: 値で受けると、 取り合いの道に参照を渡すだけで、 呼び手が append のたびに写しを
+    /// 作って渡すようになり、 書き手 1 本の append が 36 → 42 ns に遅くなった)。
     fn append_inner_raw(
         &self,
-        op: Op<'_>,
+        op: &Op<'_>,
         payload_size: usize,
         // lock の外の見積もり (空きの待ちに使う)。 本当の大きさは lock の下で決める (#608)
         _record_size_hint: usize,
-        relay: Option<RelayedHeader>,
+        relay: Option<&RelayedHeader>,
         hlc_override: Option<Hlc>,
         // group を閉じる record か (= 閉じの Commit の分の空きを残さなくてよい、 `alloc`)
         closes_group: bool,
@@ -1698,7 +1834,171 @@ impl OpLog {
         // #75: 同一プロセス内は append_lock、 プロセス間は flock で直列化。
         // flock は open file description 単位なので、 同じ File を共有する
         // スレッド間では排他にならない — append_lock が必須。
-        let _in_proc = self.append_lock.lock();
+        //
+        // lock を取れた時は自分の分を積み、 置き場の頼みも積んでから離す。 取れない時はまとめ書き (#506、 `lock_or_request`): 頼みを
+        // 置いて待ち、 他の書き手が積めばその結果を返す。 自分で lock を取れたら頼みを下げて、 ここから自分で積む。
+        //
+        // 頼み (`SlotReq`) は取り合った時だけ作る (1 本の道で頼みを struct に詰めて参照で渡すと 36 → 49 ns)
+        let _in_proc = match self.append_lock.try_lock() {
+            Some(g) => g,
+            None => match self.lock_or_request(op, payload_size, closes_group, relay, hlc_override) {
+                Ok(g) => g,
+                Err(appended) => return appended,
+            },
+        };
+        let r = self.append_locked(op, payload_size, closes_group, relay, hlc_override);
+        self.serve_slots();
+        r
+    }
+
+    /// `append_lock` を取れなかった書き手 (まとめ書き、 #506): 頼みを自分の置き場に置き、 lock を持つ書き手に積んでもらう。 積まれたら
+    /// その結果を `Err` で、 待つ間に自分で lock を取れたら頼みを下げて lock を `Ok` で返す (呼び手が自分で積み、 置き場の頼みも積む)。
+    /// 置き場の無い thread (番号が `COMBINE_SLOTS` 以上 / thread の終わりの片付けの最中) は lock を待つ。
+    ///
+    /// 書き手 8 本が record ごとに lock を受け渡すと、 受け渡し 1 回 (lock と WAL の状態が core を渡る) が積む仕事より重く、 合計は
+    /// 1 本の 0.35 倍だった (M4 Max、 書き手ごとに 110 ns の仕事を挟んだ append)。 lock の種類 (MCS の queue lock も) でも、 lock の
+    /// 中で書く line を減らしても、 受け渡しが record ごとである限り変わらない (`WAL_MULTI_WRITER_PLAN.md`)。 持つ書き手がまとめて
+    /// 積めば、 受け渡しは束ごとで、 頼み 1 つの手間は置き場の line の行き帰りだけになる。 積む順 = LSN・HLC の順はそのまま (lock を
+    /// 持つ書き手が積んだ順に振る)。 同じ cell の書き手は行の lock を持ったまま頼むので、 WAL の順と当てる順もそろったまま (#503)。
+    #[cold]
+    #[inline(never)]
+    fn lock_or_request<'a>(
+        &'a self,
+        op: &Op<'_>,
+        payload_size: usize,
+        closes_group: bool,
+        relay: Option<&RelayedHeader>,
+        hlc_override: Option<Hlc>,
+    ) -> Result<WalGuard<'a>, io::Result<(u64, Hlc)>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(i) = combine_slot_index().filter(|&i| i < COMBINE_SLOTS) {
+            return self.append_by_request(
+                i,
+                SlotReq { op: op.clone(), payload_size, closes_group, relay, hlc_override: hlc_override.as_ref() },
+            );
+        }
+        let _ = (op, payload_size, closes_group, relay, hlc_override);
+        Ok(self.append_lock.lock())
+    }
+
+    /// まとめ書き: 頼みを置き場 `i` (この thread の) に置き、 lock を持つ書き手に積んでもらう ([`OpLog::lock_or_request`])。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn append_by_request(&self, i: usize, req: SlotReq<'_>) -> Result<WalGuard<'_>, io::Result<(u64, Hlc)>> {
+        let slot = &self.combine_slots[i];
+        debug_assert_eq!(slot.state.load(Ordering::Relaxed), SLOT_EMPTY);
+        // SAFETY: 置き場の持ち主はこの thread だけで、 EMPTY の間は誰も読まない。 頼みの借用は、 DONE を見るか頼みを下げるまで
+        // この関数から戻らないので 'static に延ばしてよい (積む書き手は DONE の後に触らない)
+        unsafe { (*slot.req.get()).write(std::mem::transmute::<SlotReq<'_>, SlotReq<'static>>(req)) };
+        if i as u32 >= self.combine.hw.load(Ordering::Relaxed) {
+            self.combine.hw.fetch_max(i as u32 + 1, Ordering::Relaxed);
+        }
+        // Release: 積む書き手が頼みの中身を見る
+        slot.state.store(SLOT_PENDING, Ordering::Release);
+        // 印は倒れている時だけ書く (取り合いの続く間は立ったままなので、 頼むたびに line を書かない)。 Release: 印を見た持ち手は
+        // 上の PENDING も見る
+        if !self.combine.wanted.load(Ordering::Relaxed) {
+            self.combine.wanted.store(true, Ordering::Release);
+        }
+        // 積まれた結果を取って置き場を空に戻す。 Acquire: 積んだ書き手が書いた結果を見る
+        let take = || {
+            (slot.state.load(Ordering::Acquire) == SLOT_DONE).then(|| {
+                // SAFETY: DONE の後は、 積んだ書き手は置き場に触らない
+                let r = unsafe { (*slot.result.get()).take() }.expect("まとめ書きの結果が無い");
+                slot.state.store(SLOT_EMPTY, Ordering::Relaxed);
+                r
+            })
+        };
+        let mut spins = 0u32;
+        loop {
+            if let Some(r) = take() {
+                return Err(r);
+            }
+            let lock = if spins < APPEND_REQ_SPINS {
+                spins += 1;
+                if spins.is_multiple_of(64) && !self.append_lock.is_locked() {
+                    self.append_lock.try_lock()
+                } else {
+                    std::hint::spin_loop();
+                    None
+                }
+            } else {
+                Some(self.append_lock.lock())
+            };
+            if let Some(g) = lock {
+                // lock を持った: 前の持ち手が積んでいれば結果を返す (持っている間に他の頼みも積む)。 まだなら頼みを下げて、 呼び手が
+                // 自分で積む (lock を持つのは自分だけなので、 PENDING のままの置き場を読む書き手はいない)
+                if let Some(r) = take() {
+                    self.serve_slots();
+                    return Err(r);
+                }
+                slot.state.store(SLOT_EMPTY, Ordering::Relaxed);
+                return Ok(g);
+            }
+        }
+    }
+
+    /// `append_lock` を持って呼ぶ。 置き場の頼みを積んで結果を返す。 頼みが置かれている印が倒れていれば (書き手 1 本) 1 回読むだけ。
+    #[inline(always)]
+    fn serve_slots(&self) {
+        if self.combine.wanted.load(Ordering::Acquire) {
+            self.serve_slots_from((self.combine.hw.load(Ordering::Relaxed) as usize).min(COMBINE_SLOTS));
+        }
+    }
+
+    /// `serve_slots` の本体: 置き場 `0..n` を見る。 先に全部の置き場の印を読んでから積む (印の読みが重なる)。
+    #[inline(never)]
+    fn serve_slots_from(&self, n: usize) {
+        for _ in 0..APPEND_SERVE_ROUNDS {
+            let mut pending = 0u64;
+            for (i, s) in self.combine_slots[..n].iter().enumerate() {
+                if s.state.load(Ordering::Relaxed) == SLOT_PENDING {
+                    pending |= 1 << i;
+                }
+            }
+            if pending == 0 {
+                // 見回って何も無かった: 印を倒す (この後に置かれた頼みは、 置いた書き手が印を立て直す)
+                self.combine.wanted.store(false, Ordering::Relaxed);
+                return;
+            }
+            // Acquire: PENDING を読んだ置き場の頼みの中身 (頼んだ書き手の Release の前に書いた) を見る
+            std::sync::atomic::fence(Ordering::Acquire);
+            while pending != 0 {
+                let i = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
+                let slot = &self.combine_slots[i];
+                let guard = ServeGuard(slot);
+                #[cfg(test)]
+                FAULT_INJECT_SERVE_PANIC.with(|c| {
+                    if c.replace(false) {
+                        panic!("fault-injected panic while appending a request (#506 test)");
+                    }
+                });
+                // SAFETY: PENDING の頼みは、 DONE にするまで頼んだ書き手が書き換えない (その書き手は DONE を見るまで戻らない)
+                let req = unsafe { (*slot.req.get()).assume_init_ref() };
+                let out = self.append_locked(&req.op, req.payload_size, req.closes_group, req.relay, req.hlc_override.copied());
+                self.combined.store(self.combined.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                guard.finish(out);
+            }
+        }
+    }
+
+    /// #506: lock を持つ書き手が、 他の書き手が置き場に置いた頼みとして積んだ record の数 (観測用。 頼んだ書き手が待つ間に自分で lock を
+    /// 取った時は頼みを下げて自分で積むので数えない)。
+    pub fn combined_appends(&self) -> u64 {
+        self.combined.load(Ordering::Relaxed)
+    }
+
+    /// `append_lock` を持って呼ぶ。 1 record を積む。 呼び元 (1 本の道・置き場の頼み・置き場の無い thread) ごとに中へ入れる:
+    /// 外の関数のままだと 1 本の append が 38 → 48 ns に遅くなった (#506)。
+    #[inline(always)]
+    fn append_locked(
+        &self,
+        op: &Op<'_>,
+        payload_size: usize,
+        closes_group: bool,
+        relay: Option<&RelayedHeader>,
+        hlc_override: Option<Hlc>,
+    ) -> io::Result<(u64, Hlc)> {
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -1716,7 +2016,7 @@ impl OpLog {
         self.next_lsn.store(lsn + 1, Ordering::Release);
         // relay 経路では受信 HLC/author/署名をそのまま乗せる (gossip 用)。
         // 通常経路では next_hlc + 自鍵で署名。
-        let (hlc, author_peer) = match &relay {
+        let (hlc, author_peer) = match relay {
             Some(o) => (o.hlc, o.author),
             None => {
                 let h = hlc_override.unwrap_or_else(|| self.next_hlc());
@@ -1914,9 +2214,9 @@ impl OpLog {
         self.capacity
     }
 
-    /// pending_writes を返す(テスト/観測用)。
+    /// pending_writes を返す(テスト/観測用)。 thread ごとの分を足す。
     pub fn pending_writes(&self) -> u32 {
-        self.pending_writes.load(Ordering::Acquire)
+        self.pending_shards.iter().fold(self.pending_writes.load(Ordering::Acquire), |n, s| n + s.0.load(Ordering::Acquire))
     }
 
     /// これ以上**いかなる record も** append できない満杯か。
@@ -2607,9 +2907,13 @@ impl OpLog {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             signing: std::sync::atomic::AtomicBool::new(false),
-            append_lock: parking_lot::Mutex::new(()),
+            append_lock: crate::wal_lock::WalLock::new(()),
+            combine_slots: CombineSlot::new_slots(),
+            combine: CombineHint { hw: std::sync::atomic::AtomicU32::new(0), wanted: std::sync::atomic::AtomicBool::new(false) },
+            combined: AtomicU64::new(0),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
+            pending_shards: (0..COMBINE_SLOTS).map(|_| PendingShard(std::sync::atomic::AtomicU32::new(0))).collect(),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
@@ -4301,5 +4605,170 @@ mod tests {
         };
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         assert!(!p.exists(), "file を作る前に断る");
+    }
+    /// #506: 置き場の印が PENDING の数 (試験用)。
+    fn pending_slots(wal: &OpLog) -> usize {
+        wal.combine_slots.iter().filter(|s| s.state.load(Ordering::Acquire) == SLOT_PENDING).count()
+    }
+
+    fn wait_pending(wal: &OpLog, n: usize) {
+        let t0 = std::time::Instant::now();
+        while pending_slots(wal) < n {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(60), "頼みが置き場に置かれない ({} / {n})", pending_slots(wal));
+            std::thread::yield_now();
+        }
+    }
+
+    /// #506 まとめ書き: lock を持つ書き手は、 lock を待つ書き手が置き場に置いた頼みを積み、 それぞれに自分の record の (LSN, HLC) を
+    /// 返す。 頼みの中身 (借用した bytes、 事前採番の HLC、 中継の header) も、 積む書き手が頼んだ書き手の stack から読む。
+    #[test]
+    fn holder_appends_requests_left_in_slots() {
+        let p = tmp("combine_slots");
+        let wal = OpLog::create(&p, 4 << 20).unwrap();
+        wal.set_peer_id(1);
+        let data = vec![7u8; 300];
+        let pre = Hlc { wall: 1, logical: 5, peer: 1 };
+        let relay = RelayedHeader { hlc: Hlc { wall: 2, logical: 0, peer: 9 }, author: 9, signature: [3; 64], pubkey_fp: [4; 8] };
+        let (wal, data) = (&wal, &data);
+        let got: Vec<(u64, Hlc)> = std::thread::scope(|s| {
+            let held = wal.append_lock.lock();
+            let hs = vec![
+                s.spawn(move || wal.append_with_hlc(Op::Tie { eid: 1, himo_id: 2, value: 3 })),
+                s.spawn(move || wal.append_with_hlc(Op::Content { eid: 2, key: "k", data })),
+                s.spawn(move || wal.append_at_hlc(Op::Delete { eid: 3 }, pre).map(|l| (l, pre))),
+                s.spawn(move || wal.append_relayed(Op::Untie { eid: 4, himo_id: 5 }, relay).map(|l| (l, relay.hlc))),
+            ];
+            wait_pending(wal, 4);
+            wal.serve_slots();
+            assert_eq!(pending_slots(wal), 0, "lock を持つ書き手が、 置かれた頼みを全部積む");
+            assert_eq!(wal.combined_appends(), 4);
+            drop(held);
+            hs.into_iter().map(|h| h.join().unwrap().unwrap()).collect()
+        });
+        wal.append(Op::Commit).unwrap();
+        let recs: Vec<Record> = wal.iter_committed().into_iter().filter(|r| !matches!(r.op, DecodedOp::Commit)).collect();
+        assert_eq!(recs.len(), 4);
+        for w in recs.windows(2) {
+            assert!(w[0].lsn < w[1].lsn, "WAL の順に LSN が増える");
+        }
+        let rec = |i: usize| recs.iter().find(|r| r.lsn == got[i].0).unwrap_or_else(|| panic!("書き手 {i} の LSN の record が無い"));
+        for (i, want) in [
+            DecodedOp::Tie { eid: 1, himo_id: 2, value: 3 },
+            DecodedOp::Content { eid: 2, key: "k".into(), data: vec![7; 300] },
+            DecodedOp::Delete { eid: 3 },
+            DecodedOp::Untie { eid: 4, himo_id: 5 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(rec(i).op, want, "書き手 {i} が受け取った LSN の record が、 その書き手の op");
+            assert_eq!(rec(i).hlc, got[i].1, "書き手 {i} が受け取った HLC が、 その record の HLC");
+        }
+        assert_eq!(rec(2).hlc, pre, "事前採番の HLC が載る");
+        assert_eq!((rec(3).author_peer, rec(3).signature, rec(3).pubkey_fp), (9, [3; 64], [4; 8]), "中継の header が載る");
+        assert_eq!(rec(0).author_peer, 1);
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #506: 置き場の頼みを積む途中で panic したら、 その頼みだけが失敗で返る (頼んだ書き手が待ち続けない)。 残りの頼みは置き場に
+    /// 残り、 次に lock を持つ書き手が積む。 panic した頼みの record は WAL に無い。
+    #[test]
+    fn panic_while_appending_a_request_fails_only_that_request() {
+        let p = tmp("combine_panic");
+        let wal = OpLog::create(&p, 4 << 20).unwrap();
+        let wal = &wal;
+        let out: Vec<io::Result<u64>> = std::thread::scope(|s| {
+            let held = wal.append_lock.lock();
+            let hs: Vec<_> = (0..3u64).map(|i| s.spawn(move || wal.append(Op::Tie { eid: i, himo_id: 0, value: i }))).collect();
+            wait_pending(wal, 3);
+            FAULT_INJECT_SERVE_PANIC.with(|c| c.set(true));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wal.serve_slots()));
+            assert!(r.is_err(), "fault が効いていない");
+            assert_eq!(pending_slots(wal), 2, "panic で積めなかった残りの頼みは置き場に残る");
+            wal.serve_slots();
+            drop(held);
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let errs: Vec<_> = out.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(errs.len(), 1, "panic した頼みだけが失敗で返る: {out:?}");
+        assert!(errs[0].to_string().contains("panicked"), "{}", errs[0]);
+        wal.append(Op::Commit).unwrap();
+        assert_eq!(wal.iter_committed().iter().filter(|r| !matches!(r.op, DecodedOp::Commit)).count(), 2);
+        assert_eq!(wal.pending_writes(), 0);
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #506: 置き場の番号は同時に生きている thread の間で重ならず (置き場の持ち主は 1 つ)、 終わった thread の番号は後の thread が
+    /// 使い回す (1 本ずつ 200 本作っても番号が増え続けない)。
+    #[test]
+    fn slot_index_is_unique_among_live_threads_and_reused() {
+        let b = std::sync::Barrier::new(8);
+        let live: Vec<usize> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        let i = combine_slot_index().unwrap();
+                        b.wait();
+                        assert_eq!(combine_slot_index(), Some(i), "番号は thread の間ずっと同じ");
+                        i
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut sorted = live.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 8, "同時に生きている thread の番号が重なった: {live:?}");
+        let seq: Vec<usize> = (0..200).map(|_| std::thread::spawn(|| combine_slot_index().unwrap()).join().unwrap()).collect();
+        assert!(seq.iter().all(|&i| i < 128), "終わった thread の番号が使い回されていない: max {}", seq.iter().max().unwrap());
+    }
+
+    /// まとめ書き: 書き手 8 本が同時に積む時、 各書き手が受け取った (LSN, HLC) は、 その LSN の record に載った自分の値と HLC。
+    /// record は WAL の順に LSN・HLC とも増える (lock を持つ書き手が、 頼みの record を順に積む)。 append 中の writer の数は 0 に戻る。
+    #[test]
+    fn concurrent_appends_get_back_their_own_record() {
+        use std::sync::Arc;
+        let p = tmp("combine_results");
+        let wal = Arc::new(OpLog::create(&p, 64 * 1024 * 1024).unwrap());
+        const THREADS: u64 = 8;
+        const PER: u64 = 20_000;
+        let hs: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let w = wal.clone();
+                std::thread::spawn(move || {
+                    (0..PER)
+                        .map(|i| {
+                            let eid = t * 1_000_000 + i;
+                            let (lsn, hlc) = w.append_with_hlc(Op::Tie { eid, himo_id: 0, value: i }).unwrap();
+                            (lsn, hlc, eid)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let got: Vec<_> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        assert_eq!(wal.pending_writes(), 0);
+        wal.append(Op::Commit).unwrap();
+        let recs = wal.iter_committed();
+        let recs: Vec<_> = recs.iter().filter(|r| !matches!(r.op, DecodedOp::Commit)).collect();
+        assert_eq!(recs.len(), (THREADS * PER) as usize);
+        for w in recs.windows(2) {
+            assert!(w[0].lsn < w[1].lsn && w[0].hlc < w[1].hlc, "WAL の順と LSN / HLC の順が違う");
+        }
+        let by_lsn: std::collections::HashMap<u64, (Hlc, u64)> = recs
+            .iter()
+            .map(|r| match r.op {
+                DecodedOp::Tie { eid, .. } => (r.lsn, (r.hlc, eid)),
+                ref other => panic!("unexpected op: {other:?}"),
+            })
+            .collect();
+        for (lsn, hlc, eid) in got {
+            assert_eq!(by_lsn.get(&lsn), Some(&(hlc, eid)), "書き手が受け取った LSN {lsn} の record が、 その書き手の値と HLC でない");
+        }
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
     }
 }

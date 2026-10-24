@@ -13,6 +13,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 parking_lot = "0.12"
+# WAL に積む lock (`src/wal_lock.rs`、 #506): parking_lot の Mutex と同じ手順で、 try_lock を CAS 1 回にした lock
+lock_api = "0.4"
+parking_lot_core = "0.9"
 
 [features]
 # 電源断の模擬 (テスト専用)。 書き出し (msync / sync_all) の済んだ page を控える hook を入れる。
