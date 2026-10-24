@@ -449,7 +449,7 @@ impl OrderIndex {
             }
         }
         if want != 0 {
-            let (bk, _) = self.slot_make(want - 1).get_or_create();
+            let (bk, _) = self.slot_make(want - 1).get_or_create(false);
             bk.push_in(e, &guard);
             bk.live_inc();
         }
