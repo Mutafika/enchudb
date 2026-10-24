@@ -293,8 +293,10 @@ stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch up by bo
 
 Change listeners (`add_change_listener`) do not hold the ring. Records they have not received
 yet move to an in-memory backlog when the ring restarts; past its cap (64 MiB,
-`set_change_backlog_limit`) the listeners are detached and told so (`on_detached`). To keep the
-stream across restarts, call `enable_change_log(cap)` once: records then go to
+`set_change_backlog_limit`) the listeners are detached and told so (`on_detached`). Dropping the
+engine waits until the listeners have taken what is left, but not for a listener that has stopped
+returning: after 5 seconds without a return it closes anyway, and the rest is handed over when that
+listener comes back (#636). To keep the stream across restarts, call `enable_change_log(cap)` once: records then go to
 `changefeed.seg` with numbers that never repeat. `on_changes_at(first, records)` tells a
 listener those numbers. Store the next number with your own commit, and after a restart call
 `add_change_listener_from(listener, next)` to continue where you stopped. If the log has
