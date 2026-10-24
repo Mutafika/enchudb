@@ -252,3 +252,129 @@ fn oplog_sync_does_not_wait_forever_behind_a_stuck_listener() {
     assert!(took < Duration::from_secs(10), "oplog_sync が止まった受け手を {took:?} 待った");
     assert_eq!(got, vec![1, 2], "受け手が戻った後に残りが届かない");
 }
+
+/// #636: 通知係が止まった受け手に配っている最中でも、 Drop は永久には待たない (受け手が 5 秒の間 1 度も返らなければ先へ進む)。
+/// 閉じ終えているので同じ DB を開き直せ、 受け手が戻ると、 閉じる前に書いた残りが順に届く (戻った通知係は閉じた engine に
+/// 触らず、 Drop が取り出しておいた残りを配る)。 前は Drop が通知係を join するまで返らなかった (受け手が永久に止まれば Drop も)。
+#[test]
+fn drop_does_not_wait_forever_behind_a_stuck_listener() {
+    let (p, eng) = engine("stuck-drop", 1 << 20);
+    let rec = Recorder::new(Duration::ZERO, false);
+    eng.add_change_listener(rec.clone());
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    eng.tie_to_by_id(a, ts, 1u64);
+    eng.oplog_commit();
+    // 通知係が配り始めて受け手の門で止まるのを待つ (consumer の周期で配る)
+    let until = Instant::now() + Duration::from_secs(10);
+    while !rec.entered.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(rec.entered.load(Ordering::Acquire), "前提: 通知係が受け手に配り始めた");
+    eng.tie_to_by_id(a, ts, 2u64);
+    eng.oplog_commit();
+    let started = Instant::now();
+    drop(eng);
+    let took = started.elapsed();
+    let stuck_at_close = rec.calls.load(Ordering::Relaxed) == 0;
+    let reopened = Engine::open_concurrent_with_oplog(&p, 1 << 20).map(drop);
+    rec.gate.store(true, Ordering::Release);
+    let got = wait_for(&rec, 2, Duration::from_secs(30));
+    let _ = db_files::remove_db(&p);
+    assert!(took < Duration::from_secs(15), "Drop が止まった受け手を {took:?} 待った");
+    assert!(stuck_at_close, "前提: 閉じた時に受け手はまだ止まっている");
+    assert!(reopened.is_ok(), "閉じた後に開き直せない: {:?}", reopened.err());
+    assert_eq!(got, vec![1, 2], "受け手が戻った後に残りが届かない");
+}
+
+/// #636: 返り続ける受け手 (遅いだけ) は、 Drop が配り終えるまで待つ。 待つのをやめるのは 5 秒の間 1 度も返らない時だけ
+/// (受け手 3 つ × 2.5 秒 = 7.5 秒かかる最後の配りでも、 閉じ終えた時には全員に届いている)。
+#[test]
+fn drop_waits_for_slow_listeners_that_keep_returning() {
+    let (p, eng) = engine("slow-drop", 1 << 20);
+    let recs: Vec<Arc<Recorder>> = (0..3).map(|_| Recorder::new(Duration::from_millis(2500), true)).collect();
+    for r in &recs {
+        eng.add_change_listener(r.clone());
+    }
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    eng.tie_to_by_id(a, ts, 1u64);
+    eng.oplog_commit();
+    let started = Instant::now();
+    drop(eng);
+    let took = started.elapsed();
+    let got: Vec<Vec<u64>> = recs.iter().map(|r| r.seen.lock().unwrap().clone()).collect();
+    let _ = db_files::remove_db(&p);
+    assert_eq!(got, vec![vec![1]; 3], "Drop が遅い受け手を待たずに閉じた ({took:?})");
+}
+
+/// #636: すぐ返る受け手なら、 Drop は待たずに閉じる (通知係が終わったことを門で知らせる。 知らせないと、 Drop は通知係が
+/// 止まっていると見るまで 5 秒以上待つ)。 受け手が panic して通知係が死んでも同じ。
+#[test]
+fn drop_returns_at_once_with_a_prompt_or_panicking_listener() {
+    struct Panics;
+    impl ChangeListener for Panics {
+        fn on_changes(&self, _: &[WireRecord]) {
+            panic!("受け手の panic (試験)");
+        }
+    }
+    for panics in [false, true] {
+        let (p, eng) = engine(if panics { "panic-drop" } else { "prompt-drop" }, 1 << 20);
+        let rec = Recorder::new(Duration::ZERO, true);
+        if panics {
+            eng.add_change_listener(Arc::new(Panics));
+        } else {
+            eng.add_change_listener(rec.clone());
+        }
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let a = eng.entity().unwrap();
+        eng.tie_to_by_id(a, ts, 1u64);
+        eng.oplog_commit();
+        let started = Instant::now();
+        drop(eng);
+        let took = started.elapsed();
+        let _ = db_files::remove_db(&p);
+        assert!(took < Duration::from_secs(3), "panic する受け手 = {panics}: Drop に {took:?} かかった");
+        if !panics {
+            assert_eq!(rec.seen.lock().unwrap().clone(), vec![1], "閉じる前に書いた record が届いていない");
+        }
+    }
+}
+
+/// #636: listener が engine の最後の参照を落とすと、 Drop は通知係の thread の上で走る。 その時は通知係を待たずに閉じる
+/// (前は通知係が自分を join して panic した。 待つ形のままだと、 通知係は listener が返るまで進まないので 5 秒以上止まる)。
+#[test]
+fn a_listener_may_drop_the_last_reference_to_the_engine() {
+    struct Holder {
+        eng: Mutex<Option<Arc<Engine>>>,
+        took: Mutex<Option<Duration>>,
+    }
+    impl ChangeListener for Holder {
+        fn on_changes(&self, _: &[WireRecord]) {
+            let eng = self.eng.lock().unwrap().take();
+            if let Some(eng) = eng {
+                let started = Instant::now();
+                drop(eng);
+                *self.took.lock().unwrap() = Some(started.elapsed());
+            }
+        }
+    }
+    let (p, eng) = engine("self-drop", 1 << 20);
+    let h = Arc::new(Holder { eng: Mutex::new(None), took: Mutex::new(None) });
+    eng.add_change_listener(h.clone());
+    *h.eng.lock().unwrap() = Some(eng.clone());
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    eng.tie_to_by_id(a, ts, 1u64);
+    eng.oplog_commit();
+    drop(eng);
+    let until = Instant::now() + Duration::from_secs(30);
+    while h.took.lock().unwrap().is_none() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let took = *h.took.lock().unwrap();
+    let reopened = Engine::open_concurrent_with_oplog(&p, 1 << 20).map(drop);
+    let _ = db_files::remove_db(&p);
+    assert!(took.is_some_and(|t| t < Duration::from_secs(3)), "listener の中の Drop: {took:?} (None = 返らなかった / panic)");
+    assert!(reopened.is_ok(), "閉じた後に開き直せない: {:?}", reopened.err());
+}

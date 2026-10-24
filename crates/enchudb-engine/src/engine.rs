@@ -111,6 +111,192 @@ fn change_record_bytes(r: &crate::transport::WireRecord) -> usize {
     std::mem::size_of::<crate::transport::WireRecord>() + r.signed_bytes.len()
 }
 
+/// changefeed の通知係 (`enchudb-notifier`) と engine が分け合うもの (#636)。 通知係は engine を生のポインタで指すので、
+/// engine に触るのは門 (`gate`) が [`NotifierGate::Alive`] の間に門を持っている時だけ。 listener の callback は門の外で呼ぶ。
+///
+/// Drop は通知係が残りを配り終えるのを待つ。 listener が [`LISTENER_WAIT`] の間に 1 度も返らなければ、 門を持ったまま残りを
+/// 取り出して門を [`NotifierGate::Gone`] にし、 先へ進む (engine はその後に消える)。 通知係は listener が戻った後に門を見て、
+/// engine に触らずに取り出された残りを配って終わる。 前は Drop が通知係を join するまで待ったので、 永久に止まる listener なら
+/// Drop も返らなかった (待つのを途中でやめると、 戻った通知係が消えた engine に触る)。
+#[derive(Default)]
+struct ChangeNotifier {
+    /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。 callback の間も持つので
+    /// engine の外に置く。
+    deliver_lock: parking_lot::Mutex<()>,
+    gate: parking_lot::Mutex<NotifierGate>,
+    /// 門が `Exited` になった (通知係が終わった) ことを Drop に知らせる。
+    exited: parking_lot::Condvar,
+    /// listener の callback が返った回数と、 通知係が門を通った回数。 Drop はこれが動かない間を 「止まっている」 と見る。
+    progress: std::sync::atomic::AtomicU64,
+    /// 通知係を起こす係 (通知係の thread が起きた時に自分を登録する)。
+    waker: crate::consumer_waker::ConsumerWaker,
+    /// 通知係への 「配るものがあるかもしれない」 印 (consumer の書き出しの後と、 溜めに移した後に立てる)。
+    pending: std::sync::atomic::AtomicBool,
+    /// 通知係を止める印 (Drop)。
+    stop: std::sync::atomic::AtomicBool,
+}
+
+/// 通知係の門 (#636、 [`ChangeNotifier`])。
+#[derive(Default)]
+enum NotifierGate {
+    /// engine が生きている。 通知係は門を持てば engine に触ってよい
+    #[default]
+    Alive,
+    /// 通知係が終わった
+    Exited,
+    /// Drop が待つのをやめた (engine はもう無い)。 中は Drop が取り出した残り (通知係が配る)
+    Gone(Option<ChangeBatch>),
+}
+
+/// 配信の中で engine に触る所 (#636)。 `oplog_sync` を呼んだ thread は engine を借りている (`&Engine`)。 通知係は生のポインタで
+/// 指しているので、 門の下でだけ触る ([`NotifierEngine`])。 None = engine はもう無い。
+trait ChangeSource {
+    fn with<R>(&self, f: impl FnOnce(&Engine) -> R) -> Option<R>;
+}
+
+impl ChangeSource for Engine {
+    fn with<R>(&self, f: impl FnOnce(&Engine) -> R) -> Option<R> {
+        Some(f(self))
+    }
+}
+
+/// 通知係が持つ engine の指し先 (#636)。
+struct NotifierEngine {
+    /// engine の住所 (`pinned` = `Arc` の中で動かない)
+    engine: usize,
+    notifier: std::sync::Arc<ChangeNotifier>,
+}
+
+impl ChangeSource for NotifierEngine {
+    fn with<R>(&self, f: impl FnOnce(&Engine) -> R) -> Option<R> {
+        let gate = self.notifier.gate.lock();
+        if !matches!(*gate, NotifierGate::Alive) {
+            return None;
+        }
+        self.notifier.progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: 門が Alive の間は engine が生きている。 Drop は門を持って Gone にしてから先へ進むので、 ここで門を持っている
+        // 間は Drop が待つ
+        Some(f(unsafe { &*(self.engine as *const Engine) }))
+    }
+}
+
+/// 配信 1 回分の、 engine から取り出したもの (#636: listener は engine の外で呼ぶ)。
+#[derive(Default)]
+struct ChangeBatch {
+    /// 外した listener と、 渡せなかった最初の record の HLC (`on_detached` で知らせる)
+    detached: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, enchudb_oplog::Hlc)>,
+    /// 渡す相手 (取り出した時の listener)
+    listeners: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+    /// `records[0]` の番号
+    first: u64,
+    records: Vec<crate::transport::WireRecord>,
+}
+
+impl ChangeBatch {
+    fn run(self, progress: &std::sync::atomic::AtomicU64) {
+        use std::sync::atomic::Ordering;
+        for (l, from) in self.detached {
+            l.on_detached(from);
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.records.is_empty() {
+            return;
+        }
+        for l in &self.listeners {
+            l.on_changes_at(self.first, &self.records);
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 記録 (`changefeed.seg`) がある時の配信 1 回分 (#636): listener ごとに位置から読んだ entry と、 読めずに外した listener。
+#[derive(Default)]
+struct LogWork {
+    reads: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, u64, Vec<crate::change_log::Entry>)>,
+    broken: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+}
+
+impl ChangeNotifier {
+    /// changefeed: 溜め (畳んだ ring から移した分) と、 cursor から先の Commit で閉じた record を取り出して全 listener に渡し、
+    /// cursor を進める。
+    ///
+    /// 配信は `deliver_lock` で 1 本ずつ (#337)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路: 戻った
+    /// 時点で自分の commit を配り終えている、 という約束のため。 先に取り出した配信は、 lock を返す前に配り終えている)。
+    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
+    /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
+    /// 待たない)。
+    ///
+    /// #560: 待つのは [`LISTENER_WAIT`] まで。 配っている listener がそれより長く返らなければ、 配らずに返る (残りは通知係が
+    /// 配る)。 前は止まった listener の後ろで `oplog_sync()` が永久に待った。
+    ///
+    /// #636: engine に触るのは取り出す所 (`src.with`) だけ。 false = engine はもう無い (通知係が門で見た)。
+    fn deliver(&self, src: &impl ChangeSource, wait: bool) -> bool {
+        use std::sync::atomic::Ordering;
+        thread_local! {
+            /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
+            static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if EMITTING.with(|e| e.get()) {
+            return true;
+        }
+        let deliver = if wait { self.deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.deliver_lock.try_lock() };
+        let Some(_deliver) = deliver else {
+            if wait {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[enchudb] warning: a change listener has not returned for {LISTENER_WAIT:?} — oplog_sync() returns \
+                         without delivering its commit (the notifier delivers it later)"
+                    );
+                }
+            }
+            return true;
+        };
+        struct Emitting;
+        impl Drop for Emitting {
+            fn drop(&mut self) {
+                EMITTING.with(|e| e.set(false));
+            }
+        }
+        EMITTING.with(|e| e.set(true));
+        let _emitting = Emitting;
+        let (batch, log) = match src.with(Engine::take_changes) {
+            None => return false,
+            Some(None) => return true,
+            Some(Some(x)) => x,
+        };
+        batch.run(&self.progress);
+        if !log {
+            return true;
+        }
+        // 記録がある時は、 listener ごとの位置から読んで渡す
+        loop {
+            let Some(work) = src.with(Engine::take_log_work) else { return false };
+            for l in work.broken {
+                l.on_detached(enchudb_oplog::Hlc::ZERO);
+                self.progress.fetch_add(1, Ordering::Relaxed);
+            }
+            if work.reads.is_empty() {
+                return true;
+            }
+            for (l, first, es) in work.reads {
+                let recs: Vec<crate::transport::WireRecord> = es
+                    .iter()
+                    .filter_map(|e| match crate::transport::WireRecord::decode(&e.bytes) {
+                        Ok((r, _)) => Some(r),
+                        Err(err) => {
+                            eprintln!("[enchudb] warning: changefeed.seg entry {} does not decode ({err:?}) — skipped", e.no);
+                            None
+                        }
+                    })
+                    .collect();
+                l.on_changes_at(first, &recs);
+                self.progress.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// [`Engine::verify_invariants`] の答え。 `violations` が空なら不変量は全部成り立つ。 `warnings` は 「今の code では
 /// まだ約束していないが、 約束するつもりの形」 (主キーの重複、 #601 が直るまで)
 #[derive(Debug, Default, Clone)]
@@ -3285,7 +3471,8 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// 配り終えるまで畳めない時など)。
 #[cfg(not(target_arch = "wasm32"))]
 const WAL_ROOM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// #560: `oplog_sync()` が、 配っている最中の listener (通知係が呼んでいる) を待つ上限。
+/// #560: `oplog_sync()` が、 配っている最中の listener (通知係が呼んでいる) を待つ上限。 #636: Drop が、 返らない listener を待つ
+/// 上限 (listener が返るたびに数え直す)。
 const LISTENER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// sync の DB で満杯の時に、 閉じの Commit を打ち直して畳み直す回数の上限 (`make_wal_room_inner`)。
@@ -4707,18 +4894,13 @@ pub struct Engine {
     answer_log_limit: std::sync::atomic::AtomicUsize,
     /// #560: 溜めの上限を越えて外した listener の数 (累計)。
     change_listeners_detached: std::sync::atomic::AtomicU64,
-    /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。
-    change_deliver_lock: parking_lot::Mutex<()>,
     /// changefeed の記録 (`changefeed.seg`、 `enable_change_log` で作る / 在れば開く時に開く)。 在る時は listener に記録から渡す。
     change_log: std::sync::OnceLock<crate::change_log::ChangeLog>,
-    /// 通知係の thread。 WAL 付きの並行の形で listener が居る時だけ起こす。 Drop で止めて join する。
+    /// 通知係の thread。 WAL 付きの並行の形で listener が居る時だけ起こす。 Drop で止めて join する (listener が止まって
+    /// 返らなければ待つのをやめる、 #636)。
     notifier_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// 通知係を起こす係 (通知係を起こす時に作る)。
-    notifier_waker: std::sync::OnceLock<std::sync::Arc<crate::consumer_waker::ConsumerWaker>>,
-    /// 通知係への 「配るものがあるかもしれない」 印 (consumer の書き出しの後と、 溜めに移した後に立てる)。
-    notifier_pending: std::sync::atomic::AtomicBool,
-    /// 通知係を止める印 (Drop)。
-    notifier_stop: std::sync::atomic::AtomicBool,
+    /// 通知係と分け合うもの (配る鍵・門・起こす係・印、 #636)。 通知係の thread は engine が消えた後も持つ。
+    notifier: std::sync::Arc<ChangeNotifier>,
     /// 並行の形で `Arc` に入った (住所が動かない)。 通知係の thread がこの engine を指してよい。
     pinned: std::sync::atomic::AtomicBool,
     /// 0.7.0 Phase 4: 既に `_sync_ops` table に転送済みの WAL offset。
@@ -5226,12 +5408,9 @@ impl Engine {
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
             answer_log_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_ANSWER_LOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
-            change_deliver_lock: parking_lot::Mutex::new(()),
             change_log: std::sync::OnceLock::new(),
             notifier_handle: std::sync::Mutex::new(None),
-            notifier_waker: std::sync::OnceLock::new(),
-            notifier_pending: std::sync::atomic::AtomicBool::new(false),
-            notifier_stop: std::sync::atomic::AtomicBool::new(false),
+            notifier: Default::default(),
             pinned: std::sync::atomic::AtomicBool::new(false),
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
@@ -6503,12 +6682,9 @@ impl Engine {
             change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
             answer_log_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_ANSWER_LOG_LIMIT),
             change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
-            change_deliver_lock: parking_lot::Mutex::new(()),
             change_log: std::sync::OnceLock::new(),
             notifier_handle: std::sync::Mutex::new(None),
-            notifier_waker: std::sync::OnceLock::new(),
-            notifier_pending: std::sync::atomic::AtomicBool::new(false),
-            notifier_stop: std::sync::atomic::AtomicBool::new(false),
+            notifier: Default::default(),
             pinned: std::sync::atomic::AtomicBool::new(false),
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
@@ -15368,68 +15544,36 @@ impl Engine {
         res.map(|()| done)
     }
 
-    /// 記録がある時の配信: 記録に写してから、 listener ごとに位置から読んで渡す。 位置は渡す前に進める (畳む側の写しが、
-    /// 渡した分を 「まだ読んでいない」 と見て外さないように)。
-    fn deliver_from_log(&self, wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog) {
+    /// changefeed: 記録がある時の配信 1 回分を取り出す (#636: listener は呼び手が engine の外で呼ぶ)。 listener ごとに位置から
+    /// 読み、 位置は渡す前に進める (畳む側の写しが、 渡した分を 「まだ読んでいない」 と見て外さないように)。 読めない listener
+    /// は外す。
+    fn take_log_work(&self) -> LogWork {
         /// 1 回に 1 listener へ渡す量の目安。
         const CHUNK: usize = 4 << 20;
-        let gone = {
-            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = self.pump_change_log(wal, log, &mut c, false) {
-                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
+        let mut work = LogWork::default();
+        let Some(log) = self.change_log.get() else { return work };
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        for (l, pos) in c.readers.iter_mut() {
+            match log.read(*pos, CHUNK) {
+                Ok(es) if !es.is_empty() => {
+                    let next = es.last().unwrap().no + 1;
+                    work.reads.push((l.clone(), *pos, es));
+                    *pos = next;
                 }
-            }
-            std::mem::take(&mut c.log_detached)
-        };
-        for (l, from) in gone {
-            l.on_detached(from);
-        }
-        loop {
-            let mut work = Vec::new();
-            let mut broken = Vec::new();
-            {
-                let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-                for (l, pos) in c.readers.iter_mut() {
-                    match log.read(*pos, CHUNK) {
-                        Ok(es) if !es.is_empty() => {
-                            work.push((l.clone(), *pos, es));
-                            *pos = work.last().unwrap().2.last().unwrap().no + 1;
-                        }
-                        Ok(_) => {}
-                        Err(_) => broken.push(l.clone()),
-                    }
-                }
-                if !broken.is_empty() {
-                    c.readers.retain(|(l, _)| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
-                    self.change_listeners
-                        .write()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .retain(|l| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
-                    self.change_listeners_detached.fetch_add(broken.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            for l in broken {
-                l.on_detached(enchudb_oplog::Hlc::ZERO);
-            }
-            if work.is_empty() {
-                return;
-            }
-            for (l, first, es) in work {
-                let recs: Vec<crate::transport::WireRecord> = es
-                    .iter()
-                    .filter_map(|e| match crate::transport::WireRecord::decode(&e.bytes) {
-                        Ok((r, _)) => Some(r),
-                        Err(err) => {
-                            eprintln!("[enchudb] warning: changefeed.seg entry {} does not decode ({err:?}) — skipped", e.no);
-                            None
-                        }
-                    })
-                    .collect();
-                l.on_changes_at(first, &recs);
+                Ok(_) => {}
+                Err(_) => work.broken.push(l.clone()),
             }
         }
+        if !work.broken.is_empty() {
+            let broken = &work.broken;
+            c.readers.retain(|(l, _)| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
+            self.change_listeners
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|l| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
+            self.change_listeners_detached.fetch_add(broken.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        work
     }
 
     // ──── blob store (大容量バイナリ: 画像/動画/モデル等) ────
@@ -19377,93 +19521,62 @@ impl Engine {
         Self::spawn_consumer_with_oplog(eng, None)
     }
 
-    /// changefeed: 溜め (畳んだ ring から移した分) と、 cursor から先の Commit で閉じた record を取り出して全 listener に渡し、
-    /// cursor を進める。
-    ///
-    /// 配信は `change_deliver_lock` で 1 本ずつ (#337)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路: 戻った
-    /// 時点で自分の commit を配り終えている、 という約束のため。 先に取り出した配信は、 lock を返す前に配り終えている)。
-    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
-    /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
-    /// 待たない)。
-    ///
-    /// #560: 待つのは [`LISTENER_WAIT`] まで。 配っている listener がそれより長く返らなければ、 配らずに返る (残りは通知係が
-    /// 配る)。 前は止まった listener の後ろで `oplog_sync()` が永久に待った。
+    /// changefeed: 配る分を取り出して全 listener に渡す ([`ChangeNotifier::deliver`]、 呼んだ thread が配る)。
     fn deliver_changes(&self, wait: bool) {
-        thread_local! {
-            /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
-            static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        self.notifier.deliver(self, wait);
+    }
+
+    /// changefeed: 配る分を取り出す (#636: listener は呼び手が engine の外で呼ぶ)。 溜めの上限を越えて外した listener の知らせと、
+    /// 記録の無い時は溜めと cursor から先の Commit で閉じた record (cursor を進める)。 記録がある時は、 記録に写して、 記録が
+    /// 位置を越えて捨てたので外した listener の知らせだけ (true を添える = 続きは [`Self::take_log_work`] で listener ごとに読む)。
+    /// None = WAL が無い。
+    fn take_changes(&self) -> Option<(ChangeBatch, bool)> {
+        let wal = self.oplog.as_ref()?;
+        let mut out = ChangeBatch::default();
+        // #560: 溜めの上限を越えて外した listener に知らせる
+        {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            let detached = std::mem::take(&mut c.detached);
+            if let Some(from) = c.lost_from.take() {
+                out.detached = detached.into_iter().map(|l| (l, from)).collect();
+            }
         }
-        if EMITTING.with(|e| e.get()) {
-            return;
-        }
-        let Some(wal) = self.oplog.as_ref() else { return };
-        let deliver = if wait { self.change_deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.change_deliver_lock.try_lock() };
-        let Some(_deliver) = deliver else {
-            if wait {
+        // 記録がある時は記録に写す (渡すのは listener ごとの位置から)
+        if let Some(log) = self.change_log.get() {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = self.pump_change_log(wal, log, &mut c, false) {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!(
-                        "[enchudb] warning: a change listener has not returned for {LISTENER_WAIT:?} — oplog_sync() returns \
-                         without delivering its commit (the notifier delivers it later)"
-                    );
+                    eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
                 }
             }
-            return;
-        };
-        struct Emitting;
-        impl Drop for Emitting {
-            fn drop(&mut self) {
-                EMITTING.with(|e| e.set(false));
-            }
-        }
-        EMITTING.with(|e| e.set(true));
-        let _emitting = Emitting;
-        // #560: 溜めの上限を越えて外した listener に知らせる (lock の外で呼ぶ)
-        let (detached, lost_from) = {
-            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            (std::mem::take(&mut c.detached), c.lost_from.take())
-        };
-        if let Some(from) = lost_from {
-            for l in &detached {
-                l.on_detached(from);
-            }
-        }
-        // 記録がある時は記録から、 listener ごとの位置で渡す
-        if let Some(log) = self.change_log.get() {
-            self.deliver_from_log(wal, log);
-            return;
+            out.detached.extend(std::mem::take(&mut c.log_detached));
+            return Some((out, true));
         }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
         // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
         let listeners = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
         if listeners.is_empty() {
-            return;
+            return Some((out, false));
         }
-        let batch = {
-            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
-            // 恒久 skip (listener への通知漏れ) を起こしていた。
-            let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
-            let mut batch = std::mem::take(&mut c.committed);
-            if committed_end > c.offset {
-                let recs = self.keep_for_changefeed(recs, |r| &r.op);
-                // 畳んだ時に閉じていなかった末尾は、 この Commit で閉じた group の頭
-                batch.append(&mut c.open_tail);
-                batch.extend(recs.into_iter().map(crate::transport::WireRecord::from));
-                c.offset = committed_end;
-            }
-            c.bytes = c.open_tail.iter().map(change_record_bytes).sum();
-            let first = c.seq;
-            c.seq += batch.len() as u64;
-            (first, batch)
-        };
-        let (first, batch) = batch;
-        if batch.is_empty() {
-            return;
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
+        // 恒久 skip (listener への通知漏れ) を起こしていた。
+        let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
+        let mut batch = std::mem::take(&mut c.committed);
+        if committed_end > c.offset {
+            let recs = self.keep_for_changefeed(recs, |r| &r.op);
+            // 畳んだ時に閉じていなかった末尾は、 この Commit で閉じた group の頭
+            batch.append(&mut c.open_tail);
+            batch.extend(recs.into_iter().map(crate::transport::WireRecord::from));
+            c.offset = committed_end;
         }
-        for listener in &listeners {
-            listener.on_changes_at(first, &batch);
-        }
+        c.bytes = c.open_tail.iter().map(change_record_bytes).sum();
+        out.first = c.seq;
+        c.seq += batch.len() as u64;
+        out.records = batch;
+        out.listeners = listeners;
+        Some((out, false))
     }
 
     /// changefeed: ring を畳む直前 (`append_lock` の下、 呼び手が `change_emit` を持って) に、 cursor から先の record を溜めに
@@ -19565,10 +19678,8 @@ impl Engine {
 
     /// changefeed: 通知係に配るよう頼む (通知係が居なければ何もしない。 その時は `oplog_sync` が配る)。
     fn notify_listeners(&self) {
-        self.notifier_pending.store(true, std::sync::atomic::Ordering::Release);
-        if let Some(w) = self.notifier_waker.get() {
-            w.wake();
-        }
+        self.notifier.pending.store(true, std::sync::atomic::Ordering::Release);
+        self.notifier.waker.wake();
     }
 
     /// changefeed: 溜めにある、 まだ listener に渡していない record の数 (観測用)。 listener が遅いと増える (WAL は畳めるので
@@ -19596,14 +19707,15 @@ impl Engine {
 
     /// changefeed: 通知係の thread を起こす (まだ居なければ)。 listener の callback を WAL の書き出し係 (consumer) から外す:
     /// consumer が callback を呼ぶと、 遅い・止まった listener の間は畳めず、 WAL が満杯になって書き手が待たされ、 落ちた。
-    /// WAL 付きの並行の形 (`Arc` に入って住所が動かない) で、 listener が居る時だけ。 Drop が止めて join する。
+    /// WAL 付きの並行の形 (`Arc` に入って住所が動かない) で、 listener が居る時だけ。 Drop が止めて join する (listener が
+    /// 止まって返らなければ待つのをやめる、 #636)。
     fn ensure_notifier(&self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             use std::sync::atomic::Ordering;
             if self.oplog.is_none()
                 || !self.pinned.load(Ordering::Acquire)
-                || self.notifier_stop.load(Ordering::Acquire)
+                || self.notifier.stop.load(Ordering::Acquire)
                 || self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty()
             {
                 return;
@@ -19612,22 +19724,45 @@ impl Engine {
             if handle.is_some() {
                 return;
             }
-            let waker = self.notifier_waker.get_or_init(Default::default).clone();
-            let engine_addr = self as *const Engine as usize;
+            let notifier = self.notifier.clone();
+            let src = NotifierEngine { engine: self as *const Engine as usize, notifier: notifier.clone() };
             let spawned = std::thread::Builder::new().name("enchudb-notifier".into()).spawn(move || {
-                // SAFETY: Drop が通知係を止めて join するまで engine は生きている (`pinned` = `Arc` の中で動かない)
-                let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
-                waker.register_current();
-                loop {
-                    let stop = engine.notifier_stop.load(Ordering::Acquire);
-                    engine.notifier_pending.store(false, Ordering::Release);
-                    engine.deliver_changes(true);
-                    if stop {
-                        return;
+                /// 抜ける時 (listener の panic も) に門を Exited にして Drop に知らせる (Drop が待つのをやめた後なら何もしない)。
+                struct Exit<'a>(&'a ChangeNotifier);
+                impl Drop for Exit<'_> {
+                    fn drop(&mut self) {
+                        let mut gate = self.0.gate.lock();
+                        if matches!(*gate, NotifierGate::Alive) {
+                            *gate = NotifierGate::Exited;
+                            self.0.exited.notify_all();
+                        }
                     }
-                    waker.sleep(None, || {
-                        !engine.notifier_pending.load(Ordering::Acquire) && !engine.notifier_stop.load(Ordering::Acquire)
-                    });
+                }
+                let n = &*notifier;
+                let _exit = Exit(n);
+                n.waker.register_current();
+                loop {
+                    let stop = n.stop.load(Ordering::Acquire);
+                    n.pending.store(false, Ordering::Release);
+                    // false = Drop が待つのをやめた (engine はもう無い)
+                    if !n.deliver(&src, true) || stop {
+                        break;
+                    }
+                    n.waker.sleep(None, || !n.pending.load(Ordering::Acquire) && !n.stop.load(Ordering::Acquire));
+                }
+                // Drop が待つのをやめていれば、 Drop が取り出した残りを配って終わる (engine には触らない)
+                let rest = {
+                    let mut gate = n.gate.lock();
+                    if let NotifierGate::Gone(rest) = &mut *gate {
+                        rest.take()
+                    } else {
+                        *gate = NotifierGate::Exited;
+                        n.exited.notify_all();
+                        None
+                    }
+                };
+                if let Some(rest) = rest {
+                    rest.run(&n.progress);
                 }
             });
             match spawned {
@@ -19635,6 +19770,45 @@ impl Engine {
                 // thread を起こせなければ今までどおり (consumer の書き出しの後に配るのは `oplog_sync` だけになる)
                 Err(e) => eprintln!("[enchudb] warning: could not spawn the change notifier thread ({e}) — listeners get records only from oplog_sync()"),
             }
+        }
+    }
+
+    /// Drop: 通知係 (thread `notifier`) が残りを配って終わるのを待つ (#636)。 listener が [`LISTENER_WAIT`] の間に 1 度も返らなければ、
+    /// 門を持ったまま残りを取り出して門を Gone にし (通知係は listener が戻った後に、 engine に触らずにそれを配る)、 false を返す
+    /// (join しない)。 返り続ける listener (遅いだけ) は配り終えるまで待つ。
+    ///
+    /// 通知係の thread の上で閉じている (listener が engine の最後の参照を落とした) 時は待たない: 通知係はこの呼び出しが返るまで
+    /// 進まない (前は通知係が自分を join して panic した)。
+    fn wait_for_notifier(&self, notifier: std::thread::ThreadId) -> bool {
+        use std::sync::atomic::Ordering;
+        let n = &self.notifier;
+        let here = std::thread::current().id() == notifier;
+        let mut gate = n.gate.lock();
+        let mut seen = n.progress.load(Ordering::Relaxed);
+        loop {
+            if matches!(*gate, NotifierGate::Exited) {
+                return true;
+            }
+            if !here {
+                let timed_out = n.exited.wait_for(&mut gate, LISTENER_WAIT).timed_out();
+                if matches!(*gate, NotifierGate::Exited) {
+                    return true;
+                }
+                if !timed_out {
+                    continue;
+                }
+                let now = n.progress.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    continue;
+                }
+                eprintln!(
+                    "[enchudb] warning: a change listener has not returned for {LISTENER_WAIT:?} — the engine closes without \
+                     waiting for it (the notifier delivers the rest when it returns)"
+                );
+            }
+            *gate = NotifierGate::Gone(self.take_changes().map(|(rest, _)| rest));
+            return false;
         }
     }
 
@@ -21162,12 +21336,14 @@ impl Drop for Engine {
                 let _ = handle.join();
             }
         }
-        // 通知係は、 consumer の最後の書き出しの後に残りを配って (溜めに移した分も) exit する
-        self.notifier_stop.store(true, Ordering::Release);
-        if let Some(w) = self.notifier_waker.get() {
-            w.wake();
-        }
-        if let Some(handle) = self.notifier_handle.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        // 通知係は、 consumer の最後の書き出しの後に残りを配って (溜めに移した分も) exit する。 listener が止まって返らなければ
+        // 待つのをやめ、 残りは通知係に渡す (#636)
+        self.notifier.stop.store(true, Ordering::Release);
+        self.notifier.waker.wake();
+        let handle = self.notifier_handle.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(handle) = handle
+            && self.wait_for_notifier(handle.thread().id())
+        {
             let _ = handle.join();
         }
         // #101: graceful close で clean flag を永続化 → 次 open は rebuild_index skip。

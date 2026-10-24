@@ -12,17 +12,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 受け取った record の番号と、 Tie なら値を順に控える。 `gate` が立つまで最初の呼び出しで止まる。
+/// 受け取った record の番号と、 Tie なら値を順に控える。 `gate` が立つまで最初の呼び出しで止まる。 1 回の呼び出しごとに
+/// `delay` 寝る。
 struct Recorder {
     /// (番号, Tie の値)
     seen: Mutex<Vec<(u64, Option<u64>)>>,
     gate: AtomicBool,
     detached: Mutex<Option<enchudb_oplog::Hlc>>,
+    /// `on_changes_at` に入ったか (門で止まっている間も立つ)
+    entered: AtomicBool,
+    delay: Duration,
 }
 
 impl Recorder {
     fn new(open: bool) -> Arc<Self> {
-        Arc::new(Self { seen: Mutex::new(Vec::new()), gate: AtomicBool::new(open), detached: Mutex::new(None) })
+        Arc::new(Self {
+            seen: Mutex::new(Vec::new()),
+            gate: AtomicBool::new(open),
+            detached: Mutex::new(None),
+            entered: AtomicBool::new(false),
+            delay: Duration::ZERO,
+        })
+    }
+    /// 門は開いていて、 1 回の呼び出しごとに `delay` 寝る受け手。
+    fn slow(delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            seen: Mutex::new(Vec::new()),
+            gate: AtomicBool::new(true),
+            detached: Mutex::new(None),
+            entered: AtomicBool::new(false),
+            delay,
+        })
     }
     fn values(&self) -> Vec<u64> {
         self.seen.lock().unwrap().iter().filter_map(|(_, v)| *v).collect()
@@ -35,10 +55,12 @@ impl Recorder {
 
 impl ChangeListener for Recorder {
     fn on_changes_at(&self, first: u64, recs: &[WireRecord]) {
+        self.entered.store(true, Ordering::Release);
         let until = Instant::now() + Duration::from_secs(30);
         while !self.gate.load(Ordering::Acquire) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(1));
         }
+        std::thread::sleep(self.delay);
         let mut s = self.seen.lock().unwrap();
         for (k, r) in recs.iter().enumerate() {
             let v = match r.op {
@@ -304,3 +326,63 @@ fn enable_after_a_listener_is_refused_and_resume_without_a_log_is_truncated() {
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
 }
 
+
+/// #636: 記録がある時も、 通知係が止まった listener に配っている最中に Drop は先へ進む (5 秒の間 1 度も返らなければ)。 渡せなかった
+/// record は記録に残り、 開き直した後に番号の続きから受け直せる (止まった listener が戻っても、 閉じた engine の記録には触らない)。
+#[test]
+fn drop_does_not_wait_forever_behind_a_stuck_listener_and_the_rest_stays_in_the_record() {
+    let p = path("stuck-drop");
+    let eng = create(&p, 1 << 20);
+    eng.enable_change_log(4 << 20).unwrap();
+    let stuck = Recorder::new(false);
+    eng.add_change_listener(stuck.clone());
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    eng.tie_to_by_id(a, ts, 1u64);
+    eng.oplog_commit();
+    let until = Instant::now() + Duration::from_secs(10);
+    while !stuck.entered.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(stuck.entered.load(Ordering::Acquire), "前提: 通知係が listener に配り始めた");
+    eng.tie_to_by_id(a, ts, 2u64);
+    eng.oplog_commit();
+    let started = Instant::now();
+    drop(eng);
+    let took = started.elapsed();
+    let eng = Engine::open_concurrent_with_oplog(&p, 1 << 20).unwrap();
+    let rec = Recorder::new(true);
+    eng.add_change_listener_from(rec.clone(), 0).unwrap();
+    eng.oplog_sync().unwrap();
+    let got = wait_for(&rec, 2);
+    let stuck_meanwhile = stuck.values().is_empty();
+    stuck.gate.store(true, Ordering::Release);
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+    assert!(took < Duration::from_secs(15), "Drop が止まった listener を {took:?} 待った");
+    assert!(stuck_meanwhile, "前提: 開き直して受け直す間、 前の listener は止まったまま");
+    assert_eq!(got, vec![1, 2], "閉じる前に書いた record が記録に残っていない");
+}
+
+/// #636: 記録がある時も、 返り続ける listener (遅いだけ) は Drop が配り終えるまで待つ (listener 3 つ × 2.5 秒 = 7.5 秒かかる最後の
+/// 配りでも、 閉じ終えた時には全員に届いている)。 待つのをやめるのは 5 秒の間 1 度も返らない時だけ。
+#[test]
+fn drop_waits_for_slow_listeners_with_the_record() {
+    let p = path("slow-drop");
+    let eng = create(&p, 1 << 20);
+    eng.enable_change_log(4 << 20).unwrap();
+    let recs: Vec<Arc<Recorder>> = (0..3).map(|_| Recorder::slow(Duration::from_millis(2500))).collect();
+    for r in &recs {
+        eng.add_change_listener(r.clone());
+    }
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    eng.tie_to_by_id(a, ts, 1u64);
+    eng.oplog_commit();
+    let started = Instant::now();
+    drop(eng);
+    let took = started.elapsed();
+    let got: Vec<Vec<u64>> = recs.iter().map(|r| r.values()).collect();
+    let _ = db_files::remove_db(&p);
+    assert_eq!(got, vec![vec![1]; 3], "Drop が遅い listener を待たずに閉じた ({took:?})");
+}
