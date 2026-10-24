@@ -1557,6 +1557,37 @@ mod tests {
         }
     }
 
+    /// 位置の印は、 bucket の backing を伸ばしても (古い印を写す) 詰め直しても (組み直した backing も印を持つ) 効いたまま。 伸ばした
+    /// backing が印を落とすと、 「印は全部そろっている」 のまま出ていった entity を写す (答えが変わる)。 詰め直した backing が印を
+    /// 持たないと、 読みが Column で確かめる道に戻る (答えは同じ、 速さだけ)。
+    #[test]
+    fn marks_survive_growing_and_compacting_the_bucket() {
+        let hs = make_store(64);
+        assert!(!hs.declare_marks(true));
+        for e in 0..4 {
+            assert!(hs.set(e, 1));
+        }
+        let _ = hs.pull(1u32); // 索引を組む (値 1 の bucket は 4 件分)
+        assert!(hs.marks_live());
+        assert!(hs.set(0, 2)); // 位置 0 に古い印
+        for e in 4..12 {
+            assert!(hs.set(e, 1)); // backing を 4 → 8 → 16 に伸ばす
+        }
+        let (mut raw, needs, stale) = hs.cyl.read_to_vec_marked(1);
+        raw.sort_unstable();
+        assert!(stale, "前提: 古い entry がある");
+        assert!(!needs, "伸ばした後も印はそろっている");
+        assert_eq!(raw, (1..12).collect::<Vec<u32>>(), "伸ばした backing が古い印を落とした");
+        hs.compact_now(); // 詰め直す (読み直しの詰め直しと同じ組み直し)
+        assert!(!hs.cyl.bucket_needs_verify(1), "前提: 詰め直した");
+        assert!(hs.set(1, 2));
+        let (mut raw, needs, stale) = hs.cyl.read_to_vec_marked(1);
+        raw.sort_unstable();
+        assert!(stale, "前提: 古い entry がある");
+        assert!(!needs, "詰め直した backing が印を持たない (読みが Column で確かめる道に戻った)");
+        assert_eq!(raw, (2..12).collect::<Vec<u32>>());
+    }
+
     /// `walk_values` の値ごとの [`BucketIter`] が、 bucket を写さずに置いてある順・重複なし・Column で確かめた live だけを
     /// 出す: 組んだ後に足した entry、 出ていった古い entry、 同じ値に戻った entity の重複 (往復) を混ぜて、 全部の cell を読んだ
     /// 答えと顔ぶれで比べる (同じ値の中の順は問わない)。 途中で止めた時 (先頭 k 件) も、 k 件ちょうど・重複なし・その値の live。

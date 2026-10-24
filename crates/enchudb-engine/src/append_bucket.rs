@@ -42,6 +42,14 @@ const INITIAL_CAP: usize = 4;
 struct Buf {
     data: Box<[UnsafeCell<u32>]>,
     len: AtomicUsize,
+    /// 古い印 (#578)。 印を持つ bucket (位置の印を宣言した列) の、 中身のある backing だけが持つ。 宣言の無い列の bucket は
+    /// 持たない (backing の大きさを印の前と同じにする。 前は全部の backing が持ち、 値がみな違う列 (bucket が行の数だけある)
+    /// で bucket 1 個に 30 B ほど増えた)。 無ければ 「印は全部ではない」 (読みは Column で確かめる)。
+    marks: Option<Box<Marks>>,
+}
+
+/// backing の古い印 (#578)。
+struct Marks {
     /// `data[i]` の entity がこの値を出ていったら bit `i` を立てる (書き手が置いた位置を覚えていて、 書き換え・消しの時に
     /// 立てる)。 読み手は bit の立っていない entry を写すだけ (Column を読まない)。
     stale: Box<[AtomicU64]>,
@@ -57,14 +65,15 @@ struct Buf {
 unsafe impl Sync for Buf {}
 
 impl Buf {
-    fn with_cap(cap: usize) -> Self {
-        Self::from_vec(Vec::new(), cap)
+    fn with_cap(cap: usize, marked: bool) -> Self {
+        Self::from_vec(Vec::new(), cap, marked)
     }
 
     /// `v` を頭に置いた容量 `cap` (`v.len()` 以上) の backing。 `v` は昇順であること (詰め直しの出力。 読み手は昇順を前提に
     /// しないが、 詰め直した直後の bucket が eid の順で読めることを `compact_sorts_by_eid` が確かめる)。
-    /// 空きは 0 で埋める (`vec![0; cap]` は確保の時に 0 の page をもらうだけ)。 古い印は無し、 印は全部そろっている (true)。
-    fn from_vec(v: Vec<u32>, cap: usize) -> Self {
+    /// 空きは 0 で埋める (`vec![0; cap]` は確保の時に 0 の page をもらうだけ)。 `marked` (印を持つ bucket) なら、 古い印は無し・
+    /// 印は全部そろっている (true) の印を付ける (中身の無い backing には付けない)。
+    fn from_vec(v: Vec<u32>, cap: usize, marked: bool) -> Self {
         debug_assert!(v.len() <= cap && v.is_sorted());
         let len = v.len();
         let data: Box<[u32]> = if len == 0 {
@@ -76,12 +85,10 @@ impl Buf {
         };
         // SAFETY: UnsafeCell<u32> は u32 と同じ表現 (repr(transparent))。 長さはそのまま移る
         let data = unsafe { Box::from_raw(Box::into_raw(data) as *mut [UnsafeCell<u32>]) };
-        Self {
-            data,
-            len: AtomicUsize::new(len),
-            stale: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
-            exact: AtomicBool::new(true),
-        }
+        let marks = (marked && cap > 0).then(|| {
+            Box::new(Marks { stale: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(), exact: AtomicBool::new(true) })
+        });
+        Self { data, len: AtomicUsize::new(len), marks }
     }
     #[inline]
     fn cap(&self) -> usize {
@@ -108,6 +115,8 @@ pub struct AppendBucket {
     verified: AtomicU64,
     /// 間に書き込みの無い照らしを繰り返した回数 (1 回目の読みの後の読み直しの数)。
     rereads: AtomicU32,
+    /// 古い印を持つか (位置の印を宣言した列の bucket、 #578)。 作る時に決まる。
+    marked: bool,
 }
 
 // SAFETY: 書き手は値の鍵で 1 本 / 多 reader。 全アクセスは atomic len + epoch で同期される。
@@ -239,24 +248,20 @@ fn sort_eids(v: &mut Vec<u32>) {
 impl AppendBucket {
     /// 空の bucket（初回 push まで heap 確保しない）。
     pub fn new() -> Self {
-        Self {
-            backing: Atomic::new(Buf::with_cap(0)),
-            live: AtomicU32::new(0),
-            removed: AtomicBool::new(false),
-            verified: AtomicU64::new(u64::MAX),
-            rereads: AtomicU32::new(0),
-        }
+        Self::with_capacity(0, false)
     }
 
     /// `cap` 件分の backing を先に確保した空の bucket。 入る件数が分かっている時 (索引をまとめて組む時、 #394)
-    /// に使う — 倍々で伸ばすと、 伸ばすたびの古い backing が epoch を過ぎるまで残る。
-    pub fn with_capacity(cap: usize) -> Self {
+    /// に使う — 倍々で伸ばすと、 伸ばすたびの古い backing が epoch を過ぎるまで残る。 `marked` = 古い印を持つ (位置の印を
+    /// 宣言した列、 #578)。
+    pub fn with_capacity(cap: usize, marked: bool) -> Self {
         Self {
-            backing: Atomic::new(Buf::with_cap(cap)),
+            backing: Atomic::new(Buf::with_cap(cap, marked)),
             live: AtomicU32::new(0),
             removed: AtomicBool::new(false),
             verified: AtomicU64::new(u64::MAX),
             rereads: AtomicU32::new(0),
+            marked,
         }
     }
 
@@ -349,7 +354,7 @@ impl AppendBucket {
             b.len.store(l + 1, Ordering::Release);
         } else {
             let ncap = (b.cap() * 2).max(INITIAL_CAP);
-            let nb = Buf::with_cap(ncap);
+            let nb = Buf::with_cap(ncap, self.marked);
             // 既存 published 要素をコピー（[0..l] は不変なので安全に読める）
             let src = unsafe { b.published(l) };
             for (i, &v) in src.iter().enumerate() {
@@ -360,11 +365,14 @@ impl AppendBucket {
             unsafe {
                 *nb.data[l].get() = eid;
             }
-            // 古い印も写す (印を立てるのはこの bucket の書き手 1 本 = 自分なので、 写す間に増えない)
-            for (w, x) in b.stale.iter().enumerate() {
-                nb.stale[w].store(x.load(Ordering::Relaxed), Ordering::Relaxed);
+            // 古い印も写す (印を立てるのはこの bucket の書き手 1 本 = 自分なので、 写す間に増えない)。 中身の無かった backing
+            // (印を持たない) からは写すものが無い
+            if let (Some(om), Some(nm)) = (b.marks.as_deref(), nb.marks.as_deref()) {
+                for (w, x) in om.stale.iter().enumerate() {
+                    nm.stale[w].store(x.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                nm.exact.store(om.exact.load(Ordering::Relaxed), Ordering::Relaxed);
             }
-            nb.exact.store(b.exact.load(Ordering::Relaxed), Ordering::Relaxed);
             nb.len.store(l + 1, Ordering::Relaxed); // まだ誰も見ていない
             self.backing.store(Owned::new(nb), Ordering::Release);
             // 旧 backing は全 reader が epoch を通過してから解放
@@ -413,7 +421,7 @@ impl AppendBucket {
         }
 
         // 昇順の列をそのまま backing にする (まだ誰も見ていない。 古い印は無し、 印はそろっている)
-        let nb = Buf::from_vec(kept, live.next_power_of_two().max(INITIAL_CAP));
+        let nb = Buf::from_vec(kept, live.next_power_of_two().max(INITIAL_CAP), self.marked);
         self.backing.store(Owned::new(nb), Ordering::Release);
         // SAFETY: 旧 backing は全 reader が epoch を通過してから解放。
         unsafe {
@@ -430,6 +438,8 @@ impl AppendBucket {
     /// `eid` が無ければ印せないので、 この bucket の印は不完全になる (読みは Column で確かめる)。
     pub fn mark_stale(&self, at: Option<(usize, u32)>, guard: &Guard) {
         let b = unsafe { self.backing.load(Ordering::Acquire, guard).deref() };
+        // 印を持たない backing (宣言の前に作った bucket / 中身の無い backing) は、 印が全部でないと読みが見る (Column で確かめる)
+        let Some(m) = b.marks.as_deref() else { return };
         match at {
             // 位置の表は書き手が足す時と組み直す時に書くので、 その位置には eid がある (中身は読まない: 古い bucket の中身は
             // 乱れた位置への読みになる)
@@ -437,10 +447,10 @@ impl AppendBucket {
                 debug_assert_eq!(unsafe { *b.data[p].get() }, eid, "位置の表が bucket と合わない");
                 let _ = eid;
                 // 印を立てるのはこの bucket の書き手 1 本 (値の鍵の下) なので、 atomic の RMW でなく読んでから書く
-                let w = &b.stale[p / 64];
+                let w = &m.stale[p / 64];
                 w.store(w.load(Ordering::Relaxed) | (1u64 << (p % 64)), Ordering::Release);
             }
-            _ => b.exact.store(false, Ordering::Release),
+            _ => m.exact.store(false, Ordering::Release),
         }
     }
 
@@ -450,13 +460,17 @@ impl AppendBucket {
         // SAFETY: backing は常に非 null。
         let b = unsafe { p1.deref() };
         let n = b.len.load(Ordering::Acquire);
-        // len の後に読む: 印の付かない古い entry の後に足した分が [0..n] に見えるなら、 その前に下げた flag も見える
-        let exact = b.exact.load(Ordering::Acquire);
+        // len の後に読む: 印の付かない古い entry の後に足した分が [0..n] に見えるなら、 その前に下げた flag も見える。 印を
+        // 持たない backing は 「印は全部ではない」
+        let (marks, exact): (&'g [AtomicU64], bool) = match b.marks.as_deref() {
+            Some(m) => (&m.stale, m.exact.load(Ordering::Acquire)),
+            None => (&[], false),
+        };
         // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
         let s = unsafe { b.published(n) };
         let f = self.removed.load(Ordering::Acquire);
         let p2 = self.backing.load(Ordering::Acquire, guard);
-        (s, &b.stale, f || p2 != p1, exact)
+        (s, marks, f || p2 != p1, exact)
     }
 
     /// 外部 guard 下で published slice を borrow（query 単位 pin 用、 zero-copy）。
