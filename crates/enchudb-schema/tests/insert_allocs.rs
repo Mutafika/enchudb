@@ -57,7 +57,6 @@ fn inserting_a_named_row_allocates_little() {
     }
     let per_row = (ALLOCS.load(Ordering::Relaxed) - before) as f64 / n as f64;
     eprintln!("allocations per insert: {per_row:.2}");
-    drop(t);
     drop(db);
     let _ = std::fs::remove_dir_all(&path);
     // v0.35.0 は 5.00 回 (主キーの索引を組まない)、 この直しの前の master は 8.03 回、 直した後 6.01 回 (主キーの値ごとの bucket の分が
