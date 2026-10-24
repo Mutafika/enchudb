@@ -151,19 +151,20 @@ impl Slot {
         unsafe { p.as_ref() }
     }
 
-    /// bucket (空なら作って置く) と、 今作ったか。 **その値の書き手だけ** — `HimoStore` の値の鍵の下で同時に 1 本。
+    /// bucket (空なら作って置く) と、 今作ったか。 **その値の書き手だけ** — `HimoStore` の値の鍵の下で同時に 1 本。 `marked` =
+    /// 作る bucket に古い印を持たせる (位置の印を使う列、 #578)。
     #[inline]
-    pub(crate) fn get_or_create(&self) -> (&AppendBucket, bool) {
-        self.get_or_create_with(0)
+    pub(crate) fn get_or_create(&self, marked: bool) -> (&AppendBucket, bool) {
+        self.get_or_create_with(0, marked)
     }
 
     /// `get_or_create` の、 作る時に `cap` 件分を先に確保する版 (索引をまとめて組む時、 #394)。
     #[inline]
-    fn get_or_create_with(&self, cap: usize) -> (&AppendBucket, bool) {
+    fn get_or_create_with(&self, cap: usize, marked: bool) -> (&AppendBucket, bool) {
         if let Some(b) = self.get() {
             return (b, false);
         }
-        let p = Arc::into_raw(Arc::new(AppendBucket::with_capacity(cap))) as *mut AppendBucket;
+        let p = Arc::into_raw(Arc::new(AppendBucket::with_capacity(cap, marked))) as *mut AppendBucket;
         self.0.store(p, Ordering::Release);
         // SAFETY: 今置いた pointer (参照はこの Slot が持つ)。
         (unsafe { &*p }, true)
@@ -901,7 +902,7 @@ impl LockFreeCylinder {
     #[inline]
     fn push_slot(&self, k: usize, slot: &Slot, eid: u32, guard: &Guard) {
         // 作るなら初めから 1 回目に伸ばす大きさで (空の backing を作ってすぐ捨てない。 値がみな違う列は値ごとに作る)
-        let (b, created) = slot.get_or_create_with(crate::append_bucket::INITIAL_CAP);
+        let (b, created) = slot.get_or_create_with(crate::append_bucket::INITIAL_CAP, self.marks_on());
         if created {
             self.used[k].fetch_add(1, Ordering::Relaxed);
         }
@@ -1008,7 +1009,7 @@ impl LockFreeCylinder {
                 continue;
             }
             let (_, j) = self.dense_slot(v).expect("配列 k の窓の値");
-            let (b, created) = nv[j].get_or_create();
+            let (b, created) = nv[j].get_or_create(self.marks_on());
             if created {
                 self.used[k].fetch_add(1, Ordering::Relaxed);
                 self.unique_count.fetch_add(1, Ordering::Relaxed);
@@ -1089,7 +1090,7 @@ impl LockFreeCylinder {
         for (eid, v) in entries() {
             match self.dense_slot(v) {
                 Some((k, i)) if i < lens[k] => {
-                    let (b, created) = arrs[k][i].get_or_create_with(counts[k][i] as usize);
+                    let (b, created) = arrs[k][i].get_or_create_with(counts[k][i] as usize, self.marks_on());
                     if created {
                         self.used[k].fetch_add(1, Ordering::Relaxed);
                     }
@@ -1492,8 +1493,8 @@ mod tests {
         let early = s.clone();
         assert!(early.get().is_none(), "空の写しは空");
 
-        let p = s.get_or_create().0 as *const AppendBucket;
-        let (again, created) = s.get_or_create();
+        let p = s.get_or_create(false).0 as *const AppendBucket;
+        let (again, created) = s.get_or_create(false);
         assert_eq!(again as *const AppendBucket, p, "2 度目は同じ bucket");
         assert!(!created, "2 度目は作らない");
         assert!(early.get().is_none(), "写した後に置いた bucket は、 先に取った写しからは見えない");
