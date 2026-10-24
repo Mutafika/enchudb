@@ -36,7 +36,8 @@ use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-const INITIAL_CAP: usize = 4;
+/// 空の bucket に初めて足す時の backing の大きさ。
+pub(crate) const INITIAL_CAP: usize = 4;
 
 /// 単一の連続 backing。 `data[0..len]` が publish 済み（不変）、 `data[len..cap]` は spare。
 struct Buf {
