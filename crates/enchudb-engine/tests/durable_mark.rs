@@ -141,8 +141,16 @@ fn dropped_writes_hold_the_mark_until_their_floor_is_recorded() {
         assert!(Instant::now() < deadline, "前提: 落ちた write の floor が 10 秒で上がらない");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // consumer は floor を上げた周の続きで書き出してから WAL を畳む。 畳まれる前に書くと e3 も WAL に載らずに落ちて、 その floor が
+    // 無いので印は止まったまま (#652)。 畳まれるのも待つ
+    while wal.free_bytes() < wal.capacity() / 2 {
+        assert!(Instant::now() < deadline, "前提: floor が上がった後、 WAL が畳まれない (head {})", wal.head());
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let e3 = eng.entity_in("notes").unwrap();
+    let head = wal.head();
     eng.tie_to(e3, "notes.note", 7);
+    assert!(wal.head() > head, "前提: e3 は WAL に載る");
     eng.oplog_sync().unwrap();
     let after = eng.durable_mark().unwrap();
     assert!(after.hlc >= max_dropped, "floor が上がった後の書き出しで印は進む: {after:?} {max_dropped:?}");
