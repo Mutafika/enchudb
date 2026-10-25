@@ -3,6 +3,83 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.36.1 — 2026-10-25
+
+patch。 on-disk 形式・wire 形式は 0.36.0 と同じ (WAL の record の形も、 積む順 = LSN・HLC の順も変わらない)。 API は観測用の
+`OpLog::combined_appends()` が増えただけ。 oplog (WAL) のある DB で書き手を並べた時の書き込みが速くなった: 書き手 8 本の合計が
+0.36.0 の 2.6〜2.8 倍 (#647)。 書き手 1 本は変わらない。
+
+**上げる時の注意**:
+
+- 0.36.0 との間は、 上げても下げても何もしなくてよい (file も wire も同じ)
+- `enchudb-oplog` が `lock_api` 0.4 と `parking_lot_core` 0.9 を直接使う (どちらも `parking_lot` の下で前から入っていた crate で、
+  `Cargo.lock` に増える crate は無い)
+- 書き手 8 本の合計は、 まだ書き手 1 本の 0.7〜0.9 倍 (log は 1 本の順のまま)。 書く量がいちばん大事なら、 WAL のある DB は今も
+  1 本で書くのが速い (README の 「Concurrency」 の段落も直した)
+
+### Performance — WAL のある DB で書き手を並べると、 record ごとに lock を受け渡していた (#506、 #647)
+
+WAL の record は 1 本の log に `append_lock` の下で 1 件ずつ積む。 書き手 8 本が列の書き込みを挟みながら積むと、 record ごとに lock が
+別の core へ渡り、 その受け渡し (1 回 ≈ 275 ns、 M4 Max) が積む仕事 (35 ns) より重かった。 書き手 8 本の合計は 1 本の 0.2〜0.4 倍だった。
+
+lock を取れなかった書き手は、 自分の置き場 (thread ごとに 1 つ、 128 B の line 1 本、 64 個) に頼みを書いて待つ。 lock を持つ書き手は
+自分の分を積んだ後に置き場を見回り、 置かれた頼みをまとめて積んで結果を返す (flat combining、 1 回 lock を持つ間に 2 周まで)。 lock の
+受け渡しが record ごとでなく束ごとになる。 積む順は持つ書き手が積んだ順で、 同じ cell の書き手は行の lock を持ったまま頼むので、 WAL の
+順と本体に当てる順もそろったまま (#503)。 頼んだ書き手は、 待つ間に lock が空けば頼みを下げて自分で積み、 長く待てば lock を寝て待つ。
+置き場の無い thread (同時に 64 本を超えた分) は今まで通り lock を待つ。 積む途中で panic したら、 その頼みだけを失敗で返す (残りは
+次の持ち手が積む)。 頼みの置かれていない間 (書き手 1 本) は置き場を見ない。
+
+ほかに: `append_lock` を、 try_lock が CAS 1 回の lock にした (手順は parking_lot の Mutex と同じ、 `parking_lot_core` の上)。 観測用の
+「書きかけの append の数」 を書き手ごとの line に分けた (1 つの数を全員が足し引きすると、 まとめ書きの 8 本が 5.5 → 3.4 M/s)。 WAL に
+積む内側の関数が op を値で受けていて、 呼び手が append のたびに写しを作っていたのを、 参照で受ける形にした (書き手 1 本の append
+36 → 34.5 ns、 oplog だけの bench)。
+
+dbw / dbc (enchu の system だけを写した書き込みの bench)、 0.36.0 と交互に 6 通りの並びで 1 回ずつ、 負荷 < 12、 答え合わせの崩れ 0・
+WAL 落ち 0。 「揺れ」 は 0.36.0 をもう 1 本並べた時の比:
+
+| 種類 | 内容 | 0.36.0 (M/s) | 0.36.1 / 0.36.0 | 揺れ |
+|---|---|---|---|---|
+| W1o | schema の update、 WAL あり、 書き手 1 本 | 5.55 | 1.025 | 1.007 |
+| W8o | 同じ、 8 本 | 1.76 | **2.768** | 1.003 |
+| E1o | engine 直、 WAL あり、 1 本 | 6.77 | 1.023 | 0.988 |
+| E8o | 同じ、 8 本 | 1.90 | **2.558** | 1.010 |
+| R1o | engine 直、 100 万行に乱数の順、 1 本 | 6.47 | 1.024 | 0.989 |
+| R8o | 同じ、 8 本 | 1.80 | **2.700** | 1.001 |
+| E1 | engine 直、 WAL なし、 1 本 | 18.2 | 0.983 | 0.943 |
+| E8 | 同じ、 8 本 | 83.7 | 1.002 | 1.006 |
+| cell8o | 8 本が同じ cell に、 WAL あり | 6.87 | 0.986 | 1.009 |
+| sync1 | sync の表あり、 1 本 | 12.0 | 0.992 | 1.001 |
+
+E1 と cell8o は最初の測りで 0.902 / 0.967 と線 (0.98) を外れたので、 決めてあった通り 1 回を 3 倍に長くして測り直した数 (E1 は WAL を
+使わない道で、 版によらず回ごとに 12〜19 M/s と揺れた)。 oplog だけの bench (append の間に書き手ごとの仕事 113 / 266 ns を挟む) の
+8 本は 2.31 / 1.72 → 6.02 / 5.62 M/s、 1 本は 0.98〜1.02 倍。
+
+0.36.0 を切る前と同じ版の比べ (nq / w1 / relw、 どれも WAL を使わない道、 0.36.0 と交互、 電源、 負荷 < 12、 答え合わせの崩れ 0):
+書き込みは nq の insert 1.00 倍・update 0.99 倍、 w1 (書き手 1 / 8 本 × 購読 3 種) 0.99〜1.13 倍、 relw 1.00 倍 (RSS 423 → 384 MB)。
+nq の読み 32 種類は中央値 0.99 倍で、 最初の 3 seed では 9 種類が 0.95 倍を切った。 読みのコードは 2 版で同じなので、 seed を 6 つ足し、
+同じ 2 版を関数の揃え方だけ変えて組んだ組 (`-C llvm-args=-align-all-functions=6`) も並べた: 0.95 倍を切る種類は、 ふつうに組んだ組で 4、
+揃え方を変えた組で 5 で、 顔ぶれが入れ替わる (`top_scd` 0.91〜0.93 → 0.98〜0.99、 `static/c_in` 0.90 → 1.06、 `churn/f_rng01` 1.03 → 0.85)。
+同じ source の 0.36.0 どうしでも揃え方だけで 1 割前後動くので、 置き場所の揺れと見ている。
+
+### Tests
+
+- oplog の単体: lock を持つ書き手が、 lock を待つ書き手 4 本の頼み (Tie / 借用した bytes の Content / 事前採番の HLC / 中継の header)
+  を積み、 各書き手が自分の record の (LSN, HLC) を受け取る (`holder_appends_requests_left_in_slots`)。 積む途中の panic はその頼みだけを
+  失敗で返し、 残りは次の持ち手が積む (`panic_while_appending_a_request_fails_only_that_request`)。 置き場の番号は同時に生きている thread
+  の間で重ならず、 終わった thread の番号を使い回す (`slot_index_is_unique_among_live_threads_and_reused`)。 8 本 × 2 万回で各書き手が
+  自分の record を受け取り、 WAL の順に LSN・HLC が増える (`concurrent_appends_get_back_their_own_record`)
+- `wal_lock` の単体: 8 本 × 5 万回の排他 (持ったまま止まって他を寝かせる、 `lock_excludes_and_wakes_sleepers`)、 try_lock は持たれて
+  いれば取らず、 寝ている書き手だけの時は取る (`try_lock_takes_a_free_lock_even_with_sleepers`)
+- oplog `tests/combine_many_threads.rs`: 置き場 (64) より多い 72 本が同時に積む (番号 64 以上の thread は lock を待つ道)
+- engine `tests/loom_wal_combine_slots.rs` (CI の loom の段に足した): 置き場の受け渡し (使い回しを含む) に race が無く、 どの頼みも
+  1 回だけ積まれる。 頼みとして積まれた並びを辿ったことも見る。 対照 4 本 (結果より先に DONE / Relaxed の PENDING / fence なし /
+  積まれたかを見ずに頼みを下げる) は全部落ちる。 変異 (oplog の試験) は 15 本中 14 本を検出、 残った 1 本 (寝る前に寝る印を立てない) は
+  寝ずに回り直すだけ (遅くなるが誤らない)
+- 並べて回すと落ちた試験の前提を直した (どれも試験だけ、 master でも落ちていた): `issue449_drop_floor_on_close` と `durable_mark` の
+  落ちた write の試験は、 WAL を埋める前に consumer の周期の Commit が割り込むと残りの見積りが外れていた (#648、 #650)。 `durable_mark`
+  の開き直しの試験は、 閉じる時の書き出しで印がもう 1 歩進むのを見ていなかった (#649、 #651)。 `durable_mark` の落ちた write の試験は、
+  floor が上がった後、 consumer が WAL を畳む前に次の write を書くと、 それも WAL に載らずに落ちていた (#652、 #653)
+
 ## 0.36.0 — 2026-10-24
 
 minor。 oplog (WAL) の file が v3 になり、 0.35 以前の binary では開けない (#609)。 本体の segment の形は 0.35.0 と同じで、 DB directory
