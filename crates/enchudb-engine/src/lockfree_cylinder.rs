@@ -526,7 +526,8 @@ impl LockFreeCylinder {
                         None => b.mark_stale(None, guard),
                     }
                 }
-                b.note_stale().map(|prev| (b.len_in(guard), prev - 1))
+                // len は書き手の写し (backing を読まない、 #603 の後の delete)
+                b.note_stale().map(|prev| (b.writer_len(), prev - 1))
             }
             Some(None) => {
                 debug_assert!(false, "note_stale: 未確保 bucket (value={value})");

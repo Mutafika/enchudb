@@ -118,6 +118,11 @@ pub struct AppendBucket {
     rereads: AtomicU32,
     /// 古い印を持つか (位置の印を宣言した列の bucket、 #578)。 作る時に決まる。
     marked: bool,
+    /// backing の len の写し (u32 に入らない長さは u32::MAX)。 書き手が書き換え・消しの後に詰め直すかを決めるためだけに使う
+    /// ([`writer_len`](Self::writer_len))。 動かすのも読むのも bucket の書き手 1 本 (値の鍵の下)、 読み手は使わない。 backing を
+    /// 読まずに済む: 値がみな違う列 (主キー、 bucket が行の数だけある) の delete は、 backing の 1 回の外れが 1 行 280 ns だった
+    /// (#603 の後、 100 万行)。 頭の空きに入るので bucket の大きさは変わらない。
+    wlen: AtomicU32,
 }
 
 // SAFETY: 書き手は値の鍵で 1 本 / 多 reader。 全アクセスは atomic len + epoch で同期される。
@@ -263,6 +268,7 @@ impl AppendBucket {
             verified: AtomicU64::new(u64::MAX),
             rereads: AtomicU32::new(0),
             marked,
+            wlen: AtomicU32::new(0),
         }
     }
 
@@ -353,6 +359,7 @@ impl AppendBucket {
                 *b.data[l].get() = eid;
             }
             b.len.store(l + 1, Ordering::Release);
+            self.set_writer_len(l + 1);
         } else {
             let ncap = (b.cap() * 2).max(INITIAL_CAP);
             let nb = Buf::with_cap(ncap, self.marked);
@@ -376,6 +383,7 @@ impl AppendBucket {
             }
             nb.len.store(l + 1, Ordering::Relaxed); // まだ誰も見ていない
             self.backing.store(Owned::new(nb), Ordering::Release);
+            self.set_writer_len(l + 1);
             // 旧 backing は全 reader が epoch を通過してから解放
             unsafe {
                 guard.defer_destroy(cur);
@@ -429,6 +437,7 @@ impl AppendBucket {
             guard.defer_destroy(cur);
         }
         self.live.store(live as u32, Ordering::Relaxed);
+        self.set_writer_len(live);
         self.verified.store(u64::MAX, Ordering::Relaxed);
         self.rereads.store(0, Ordering::Relaxed);
         self.removed.store(false, Ordering::Release); // swap 後 — 順序契約はメソッド doc 参照
@@ -557,6 +566,18 @@ impl AppendBucket {
         unsafe { cur.deref() }.len.load(Ordering::Acquire)
     }
 
+    /// 書き手が最後に置いた len (backing を読まない)。 **bucket の書き手 1 本だけ** (値の鍵の下) — 書き手は自分の書いた len を
+    /// 見るので [`len_in`](Self::len_in) と同じ数 (u32 に入らない長さは u32::MAX)。 読み手は `len_in` を使う。
+    #[inline]
+    pub fn writer_len(&self) -> usize {
+        self.wlen.load(Ordering::Relaxed) as usize
+    }
+
+    #[inline]
+    fn set_writer_len(&self, len: usize) {
+        self.wlen.store(u32::try_from(len).unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -619,6 +640,32 @@ mod tests {
         }
         assert_eq!(b.len(), n as usize);
         assert_eq!(b.read_to_vec(), (0..n).collect::<Vec<_>>());
+    }
+
+    /// 書き手の len の写し (`writer_len`) は、 足す (空きに置く / 伸ばす)・詰め直すのどの後も backing の len と同じ。 古い印を
+    /// 付けても動かない。 写しは頭の空きに入る (bucket の大きさは写しの前と同じ 32 B)。
+    #[test]
+    fn writer_len_follows_len() {
+        assert_eq!(std::mem::size_of::<AppendBucket>(), 32);
+        let b = AppendBucket::new();
+        let guard = epoch::pin();
+        assert_eq!(b.writer_len(), 0);
+        // INITIAL_CAP から倍々に伸ばす所 (伸ばす道) と、 空きに置く所 (その場の道) を両方踏む
+        for i in 0..200u32 {
+            b.push_in(i, &guard);
+            b.live_inc();
+            assert_eq!(b.writer_len(), b.len_in(&guard), "push {i} の後");
+        }
+        for _ in 0..150 {
+            b.note_stale();
+        }
+        assert_eq!(b.writer_len(), 200, "古い印では len は動かない");
+        let live = b.compact_in(&guard, |e| e >= 150);
+        assert_eq!(live, 50);
+        assert_eq!(b.writer_len(), b.len_in(&guard), "詰め直しの後");
+        assert_eq!(b.writer_len(), 50);
+        b.push_in(500, &guard);
+        assert_eq!(b.writer_len(), 51, "詰め直した後に足す");
     }
 
     #[test]
