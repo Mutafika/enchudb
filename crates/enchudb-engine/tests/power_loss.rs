@@ -1201,6 +1201,246 @@ fn write_during_write_out(stop_at: Phase, himo: &'static str) {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// #656: 書き出しの済んだ語を指す Tag の cell は、 その列の門が閉じていても待たずに書ける (先に届いても語はディスクに
+/// ある)。 新しい語を指す cell は門で待つ。 門を閉じた所で書き出しを止め、 その間に両方を書かせて、 書き出しの後の
+/// 電源断の像でどの cell も前の値か中身ごと届いた値。 旧: 1 つの門を中身を指す列の全部の msync の間閉じていて、 済んだ語を
+/// 書く書き手も待った。
+#[test]
+fn a_cell_of_a_written_out_word_does_not_wait_at_the_gate() {
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("durable_word");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 100).unwrap();
+    eng.define_himo_in("t", "tg", ValueType::Tag, 0).unwrap();
+    let [e0, e1, e2, e3] = std::array::from_fn(|_| eng.entity_in("t").unwrap());
+    eng.tie_text(e0, "t.tg", "old");
+    eng.tie_text(e1, "t.tg", "shared");
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Arc::new(eng);
+    // 新しい語を書いて列に印を立てる (書き出しはこの列の門を閉じて、 中身をもう一度書き出す)
+    eng.tie_text_to(e2, "t.tg", "a-word-written-before-the-write-out");
+
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (paused_tx, go_rx) = (Mutex::new(paused_tx), Mutex::new(go_rx));
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::GateClosed {
+            paused_tx.lock().unwrap().send(()).unwrap();
+            go_rx.lock().unwrap().recv_timeout(Duration::from_secs(10)).expect("書き出しを進める合図が来ない");
+        }
+    })));
+    let syncer = {
+        let eng = eng.clone();
+        std::thread::spawn(move || eng.body_msync().unwrap())
+    };
+    paused_rx.recv_timeout(Duration::from_secs(10)).expect("書き出しが門を閉じた所で止まらない");
+    let waits = eng.publish_gate_waits();
+    let durable = {
+        let eng = eng.clone();
+        std::thread::spawn(move || eng.tie_text_to(e0, "t.tg", "shared"))
+    };
+    let fresh = {
+        let eng = eng.clone();
+        std::thread::spawn(move || eng.tie_text_to(e3, "t.tg", "a-word-written-while-the-gate-is-closed"))
+    };
+    let end = Instant::now() + Duration::from_secs(5);
+    while !durable.is_finished() {
+        assert!(Instant::now() < end, "書き出しの済んだ語を書く書き手が門で待った");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    durable.join().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!fresh.is_finished(), "新しい語を書く書き手が閉じた門を通った");
+    assert_eq!(eng.publish_gate_waits(), waits + 1, "門で待った書き手を数えていない");
+    go_tx.send(()).unwrap();
+    syncer.join().unwrap();
+    fresh.join().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    write_out_hook::set(None);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    let opened = Engine::open_standalone(img.join("db").to_str().unwrap()).unwrap();
+    let text = |e| opened.get_text_owned(e, "t.tg").map(|b| String::from_utf8_lossy(&b).into_owned());
+    let got = [text(e0), text(e1), text(e2), text(e3)];
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&root);
+    let ok = |g: &Option<String>, allowed: &[Option<&str>]| allowed.contains(&g.as_deref());
+    assert!(
+        ok(&got[0], &[Some("old"), Some("shared")])
+            && ok(&got[1], &[Some("shared")])
+            && ok(&got[2], &[Some("a-word-written-before-the-write-out")])
+            && ok(&got[3], &[None, Some("a-word-written-while-the-gate-is-closed")]),
+        "cell が中身より先に届いた / 書き出しの返った値が消えた: {got:?}"
+    );
+}
+
+/// #656: 印の無い列 (前に書き出してから新しい語を指す cell が無い列) は 1 本ずつ門を閉じて書き出す。 その間に新しい語を
+/// 書く書き手は、 その列なら待ち、 別の列なら待たない。 列を書き出す所で止めて両方に書かせ、 書き出しの後の像でどの cell も
+/// 前の値か中身ごと届いた値。
+#[test]
+fn a_writer_waits_only_while_its_own_column_is_written_out() {
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("own_column");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 100).unwrap();
+    eng.define_himo_in("t", "tg", ValueType::Tag, 0).unwrap();
+    eng.define_himo_in("t", "other", ValueType::Tag, 0).unwrap();
+    let tg = eng.himo_id("t.tg").expect("t.tg") as u16;
+    // 書き手は別の行に書く (同じ行の書き手は行の lock で並ぶ)
+    let [e0, e1, e2] = std::array::from_fn(|_| eng.entity_in("t").unwrap());
+    eng.tie_text(e0, "t.tg", "old");
+    eng.tie_text(e0, "t.other", "old");
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Arc::new(eng);
+    // 書き出しの前に書いた cell (列は書いた範囲を持つので、 1 本ずつの列の書き出しが msync する)
+    eng.tie_text_to(e0, "t.tg", "old");
+
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (paused_tx, go_rx) = (Mutex::new(paused_tx), Mutex::new(go_rx));
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::Column(tg) {
+            paused_tx.lock().unwrap().send(()).unwrap();
+            go_rx.lock().unwrap().recv_timeout(Duration::from_secs(10)).expect("書き出しを進める合図が来ない");
+        }
+    })));
+    let syncer = {
+        let eng = eng.clone();
+        std::thread::spawn(move || eng.body_msync().unwrap())
+    };
+    paused_rx.recv_timeout(Duration::from_secs(10)).expect("書き出しが列の門を閉じた所で止まらない");
+    let same = {
+        let eng = eng.clone();
+        std::thread::spawn(move || eng.tie_text_to(e1, "t.tg", "a-new-word-in-the-closed-column"))
+    };
+    let other = {
+        let eng = eng.clone();
+        std::thread::spawn(move || eng.tie_text_to(e2, "t.other", "a-new-word-in-an-open-column"))
+    };
+    let end = Instant::now() + Duration::from_secs(5);
+    while !other.is_finished() {
+        assert!(Instant::now() < end, "閉じていない列に書く書き手が待った");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    other.join().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!same.is_finished(), "書き出している列に新しい語を書く書き手が門を通った");
+    go_tx.send(()).unwrap();
+    syncer.join().unwrap();
+    same.join().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    write_out_hook::set(None);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    let opened = Engine::open_standalone(img.join("db").to_str().unwrap()).unwrap();
+    let text = |e, h| opened.get_text_owned(e, h).map(|b| String::from_utf8_lossy(&b).into_owned());
+    let got = [text(e0, "t.tg"), text(e1, "t.tg"), text(e2, "t.other")];
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        got[0].as_deref() == Some("old")
+            && matches!(got[1].as_deref(), None | Some("a-new-word-in-the-closed-column"))
+            && matches!(got[2].as_deref(), None | Some("a-new-word-in-an-open-column")),
+        "cell が中身より先に届いた / 書き出しの返った値が消えた: {got:?}"
+    );
+}
+
+/// #656: 前の session が書き出さずに終わった (process が落ちた) 語は、 page cache にあってもディスクに無い。 開いた後に
+/// その語を指す cell を書いても、 最初の書き出しが辞書の全域を書き出すので、 cell だけが届くことは無い (書き出しの済んだ語の
+/// 境目は、 その後でないと進めない)。 前の session は子 process で書いて、 書き出さずに exit する。
+#[test]
+fn words_left_unwritten_by_a_crashed_session_reach_disk_before_cells() {
+    if std::env::var(VERIFY_ENV).is_ok() || std::env::var(UNWRITTEN_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("unwritten_words");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let (e1, e2) = {
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.define_himo_in("t", "tg", ValueType::Tag, 0).unwrap();
+        let e0 = eng.entity_in("t").unwrap();
+        eng.tie_text(e0, "t.tg", "flushed");
+        let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        (e1, e2)
+    };
+    // 子: 開いて新しい語を書き、 書き出さずに終わる (page cache には残る、 この process の控えには無い)
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["write_words_and_die_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env(UNWRITTEN_ENV, &db)
+        .env(ACKED_ENV, e1.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn child");
+    assert!(out.status.success(), "子が落ちた: {}", String::from_utf8_lossy(&out.stderr));
+    let mut eng = Engine::open_standalone(db.to_str().unwrap()).unwrap();
+    assert_eq!(eng.get_text_owned(e1, "t.tg").as_deref(), Some(&b"left-unwritten"[..]), "前提: 子の書いた語が page cache にある");
+    // 既にある語を指す cell (辞書には書かない)
+    eng.tie_text(e2, "t.tg", "left-unwritten");
+    eng.body_msync().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    let opened = Engine::open_standalone(img.join("db").to_str().unwrap()).unwrap();
+    let got = [e1, e2].map(|e| opened.get_text_owned(e, "t.tg").map(|b| String::from_utf8_lossy(&b).into_owned()));
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&root);
+    for g in &got {
+        assert!(
+            matches!(g.as_deref(), None | Some("left-unwritten")),
+            "辞書に語の無い cell が届いた (開いてから最初の書き出しが辞書の全域を書き出していない): {got:?}"
+        );
+    }
+}
+
+const UNWRITTEN_ENV: &str = "ENCHU_POWER_LOSS_UNWRITTEN";
+
+/// 子: `words_left_unwritten_by_a_crashed_session_reach_disk_before_cells` の前の session。
+#[test]
+fn write_words_and_die_child() {
+    let Ok(db) = std::env::var(UNWRITTEN_ENV) else { return };
+    let e1: u64 = std::env::var(ACKED_ENV).unwrap().parse().unwrap();
+    let mut eng = Engine::open_standalone(&db).unwrap();
+    eng.tie_text(e1, "t.tg", "left-unwritten");
+    // 書き出さずに終わる (Drop の flush を通さない)
+    std::process::exit(0);
+}
+
 /// #431: oplog の fsync の後・本体の書き出しの前に電源が落ちても、 新しい語を書いた Tag の cell は開き直した後に
 /// その語を読む (再生が自分の Vocab を当てる)。 oplog だけを fsync して像を撮る (consumer の周期の書き出しが先に
 /// 辞書を書き出していたら撮り直す)。 旧実装: `Some("")` (cell は語の番号を指すが、 辞書に語が無い)。

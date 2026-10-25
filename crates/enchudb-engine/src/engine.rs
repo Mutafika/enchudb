@@ -1770,6 +1770,8 @@ pub mod write_out_hook {
         GateClosed,
         /// 中身を指す列を書き出して門を開いた後 (残りを書き出す前)
         Opened,
+        /// #656: 残りの中身を指す列 (紐の番号) の門を閉じた後 (その列を書き出す前)。 列ごとに呼ぶ
+        Column(u16),
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
@@ -4801,9 +4803,12 @@ pub struct Engine {
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
     row_locks: crate::row_lock::RowLocks,
-    /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しが中身を指す列を msync する間だけ
+    /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しがその列を msync する間だけ
     /// 待たせる (`write_out_body`、 `crate::publish_gate`)。
     publish_gate: crate::publish_gate::PublishGate,
+    /// #656: 開いてから中身 (辞書 / Leaf) の全域を 1 度書き出したか。 前の session が書き出さずに残した page には印が無いので、
+    /// それまでは辞書の境目 (`Vocabulary::durable_mark`) を進められない
+    content_settled: std::sync::atomic::AtomicBool,
     /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// request18: `sync_tables_enabled()` の cache。 本体は `has_reserved_table`
@@ -5368,6 +5373,7 @@ impl Engine {
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
+            content_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -6642,6 +6648,7 @@ impl Engine {
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
+            content_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -11463,9 +11470,10 @@ impl Engine {
             self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
             return false;
         }
-        let ok = if self.points_to_content(hid) {
-            // #419: 中身を指す cell は門の中で書く (書き出しが中身を指す列を msync する間は待つ。 中身はこの前に書いてある)
-            let _pass = self.publish_gate.enter(local);
+        let ok = if self.points_to_content(hid) && !self.content_is_durable(hid, value) {
+            // #419: 中身を指す cell は門の中で書く (書き出しがこの列を msync する間は待つ。 中身はこの前に書いてある)。
+            // #656: 書き出しの済んだ語を指す cell は門を通らない (先に届いても中身はディスクにある)
+            let _pass = self.publish_gate.enter(hid as u16, local);
             self.himos[hid].set(local, value)
         } else {
             self.himos[hid].set(local, value)
@@ -11497,6 +11505,13 @@ impl Engine {
     #[inline]
     fn points_to_content(&self, hid: usize) -> bool {
         matches!(self.value_types.get(hid), Some(ValueType::Tag | ValueType::Leaf))
+    }
+
+    /// #656: 中身を指す cell の値 `value` の中身が、 もうディスクにあるか (書き出しの済んだ辞書の語)。 Leaf の slot は
+    /// 書くたびに新しい中身なので false。
+    #[inline]
+    fn content_is_durable(&self, hid: usize, value: u64) -> bool {
+        self.uses_vocab(hid) && u32::try_from(value).is_ok_and(|v| self.vocab.is_durable(v))
     }
 
     /// 紐の値が辞書の番号か (Tag / LeafStore に回していない Leaf)。
@@ -20422,39 +20437,104 @@ impl Engine {
     /// そこで次の順にする:
     ///
     /// 1. 中身の segment (Leaf の slot / 辞書)。 その後、 書き出している間に書かれた分をあと 2 回追いかける (門を
-    ///    閉じている間の 3 を短くする)
-    /// 2. 門を閉じる (`PublishGate::close`): 中身を指す cell を書いている書き手が出るのを待ち、 開くまで書かせない
-    /// 3. 中身の segment をもう一度 (書いた範囲だけ)
-    /// 4. 中身を指す列 (Tag / Leaf)、 門を開く
-    /// 5. 残り (header / entity / 中身を指さない列 …)
+    ///    閉じている間の 2 を短くする)。 辞書は書き出す前に境目を取り、 書き出せたら境目を進める (`Vocabulary::durable_mark`、
+    ///    境目より前の語を指す cell は門を通らない = 先に届いてもよい)
+    /// 2. 門を通って cell を書いた列 (印のある列) の門をまとめて閉じる (`PublishGate::close`: 中に居る書き手が出るのを
+    ///    待ち、 開くまで書かせない) → 中身のうち cell が読む分 (辞書の data と offsets / Leaf の slot) をもう一度 (書いた範囲
+    ///    だけ) → その列を書き出す → 開く。 閉じている間の書き出しは segment を並べて msync する (`SegmentSet::flush_parallel`)
+    /// 3. 残りの中身を指す列を 1 本ずつ: 門を閉じる → (閉じる前に門を通った書き手が居れば) 中身をもう一度 → 列 → 開く
+    /// 4. 残り (header / entity / 中身を指さない列 …)
     ///
-    /// 4 で届く cell は 2 より前に書かれたもので、 書き手は中身を書いてから門に入るので、 その中身は 3 までに届いている。
-    /// 書き手が待つのは 3 と 4 の間だけ。
+    /// 2 / 3 で届く cell は門を閉じる前に書かれたもので、 書き手は中身を書いてから門に入る (入ると列に印を立てる) ので、
+    /// その中身は列の前の中身の書き出しで届いている。 書き手が待つのは自分の列の門が閉じている間だけ (#656: 前は 1 つの門を
+    /// 中身を指す列の全部の msync の間閉じていて、 Tag 列が 16 本の表の書き手は書き出しのたびに 16 回の msync を待った)。
     #[cfg(not(target_arch = "wasm32"))]
     fn write_out_body(&self, all: bool) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
         let Backing::Segments(set) = &self.backing else { return Ok(()) };
         let points = |k: SegmentKind| matches!(k, SegmentKind::Himo(h) if self.points_to_content(h as usize));
         let content = |k: SegmentKind| {
             matches!(k, SegmentKind::LeafData | SegmentKind::VocabData | SegmentKind::VocabOffsets | SegmentKind::VocabIndex)
         };
-        set.flush_where(all, content)?;
+        let write_content = |all: bool| -> io::Result<()> {
+            let end = self.vocab.durable_mark();
+            set.flush_where(all, content)?;
+            self.vocab.set_durable(end);
+            Ok(())
+        };
+        // 門を閉じている間に書き出し直す中身は、 cell を読むのに要る分だけ (辞書の data と offsets / Leaf の slot)。 辞書の
+        // 索引は要らない: 書き出しの後に語を足すと clean の印 (data の頭の page) が倒れ、 電源断の後に開くと data から作り直す
+        let read_by_cells = |k: SegmentKind| matches!(k, SegmentKind::LeafData | SegmentKind::VocabData | SegmentKind::VocabOffsets);
+        let rewrite_content = || -> io::Result<()> {
+            let end = self.vocab.durable_mark();
+            set.flush_parallel(false, read_by_cells)?;
+            self.vocab.set_durable(end);
+            Ok(())
+        };
+        // 開いてから最初の書き出しは中身の全域 (前の session が書き出さずに残した page には印が無い。 書き出しの済んだ語の
+        // 境目は、 その page も届いた後でないと進められない)
+        let settled = self.content_settled.load(Ordering::Acquire);
+        write_content(all || !settled)?;
+        if !settled {
+            self.content_settled.store(true, Ordering::Release);
+        }
         for _ in 0..2 {
-            set.flush_where(false, content)?;
+            write_content(false)?;
         }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeGate);
+        let (fresh, rest): (Vec<_>, Vec<_>) = set
+            .all()
+            .into_iter()
+            .filter(|(k, _)| points(*k))
+            .partition(|(k, _)| matches!(k, SegmentKind::Himo(h) if self.publish_gate.written(*h as u16)));
+        let column = |k: SegmentKind| match k {
+            SegmentKind::Himo(h) => h as u16,
+            _ => unreachable!("中身を指す列は紐の segment"),
+        };
         {
-            let _closed = self.publish_gate.close();
+            let _closed = self.publish_gate.close(fresh.iter().map(|(k, _)| column(*k)));
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::Closed);
-            set.flush_where(false, content)?;
+            let mut entered = false;
+            for (k, _) in &fresh {
+                entered |= self.publish_gate.take_written(column(*k));
+            }
+            if entered {
+                rewrite_content()?;
+            }
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::GateClosed);
-            set.flush_where(all, points)?;
+            let fresh: Vec<_> = fresh.into_iter().filter(|(_, seg)| all || seg.has_dirty()).collect();
+            SegmentSet::flush_segments(&fresh, all)?;
         }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::Opened);
+        for (k, seg) in &rest {
+            // 書いた範囲の無い列は msync しない = 閉じなくてよい (同じ組の列の書き手を止めない)
+            if !all && !seg.has_dirty() {
+                continue;
+            }
+            let _closed = self.publish_gate.close([column(*k)]);
+            if self.publish_gate.take_written(column(*k)) {
+                rewrite_content()?;
+            }
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::Column(column(*k)));
+            SegmentSet::flush_segment(*k, seg, all)?;
+        }
         set.flush_where(all, |k| !content(k) && !points(k))
+    }
+
+    /// #656: 書き手が書き出しの門で待った回数 (Tag / Leaf の cell を書こうとして、 その列の門が閉じていた)。 当たっているかを
+    /// 見分けるため (待ちの長さは [`Self::publish_gate_closed_ns`])。
+    pub fn publish_gate_waits(&self) -> u64 {
+        self.publish_gate.waits()
+    }
+
+    /// #656: 書き出しが門を閉じていた時間の合計 (ns)。 閉じている間、 その列に新しい語 / Leaf の値を書く書き手は待つ。
+    pub fn publish_gate_closed_ns(&self) -> u64 {
+        self.publish_gate.closed_ns()
     }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。

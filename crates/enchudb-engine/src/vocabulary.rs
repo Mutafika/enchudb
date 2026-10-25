@@ -178,6 +178,9 @@ thread_local! {
     static TABLE_SPACE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// test 用: 表を作り直すために今の表をなめた回数 (`Vocabulary::rebuild_table`)。
     static TABLE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// test 用の割り込み点 (#656): insert が data に語を書いた直後 (offsets を書く前) に 1 回だけ走らせる処理。 書き出しの
+    /// 境目 (`durable_mark`) が、 書き終えていない語を待つかを見るため。
+    static AFTER_DATA_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 読み手が表を読んだ直後の割り込み点 (test 以外では何もしない)。
@@ -194,6 +197,15 @@ fn hook_after_table_read() {
 fn hook_after_precheck() {
     #[cfg(test)]
     if let Some(f) = AFTER_PRECHECK.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
+/// insert が data に語を書いた直後 (offsets を書く前) の割り込み点 (test 以外では何もしない)。
+#[inline(always)]
+fn hook_after_data_write() {
+    #[cfg(test)]
+    if let Some(f) = AFTER_DATA_WRITE.with(|h| h.borrow_mut().take()) {
         f();
     }
 }
@@ -312,6 +324,69 @@ pub struct Vocabulary {
     /// #381: 今の表の中の、 語が入れ替わって死んだ entry の数 (回収で場所を別の語に渡すたびに 1)。 表の埋まりに
     /// 数え、 増えたら表を作り直して落とす。
     stale_entries: AtomicU32,
+    /// #656: 書き出しの済んだ語の境目 (`is_durable`)。
+    durable: Durable,
+}
+
+/// #656: 書き出しの済んだ語の境目。 data のこの位置より前に置いた語は、 data も offsets もディスクにある
+/// ([`Vocabulary::is_durable`])。 そういう語を指す cell は先にディスクに届いてもよいので、 書き出しの門
+/// (`crate::publish_gate`) を通らずに書ける。
+///
+/// 境目は書き出しの前に取る ([`Vocabulary::durable_mark`]): data の終わりを読み、 版を 1 つ進め、 前の版で語を置いて
+/// いる書き手 ([`Vocabulary::alloc_entry`]) が出るのを待つ。 書き手は版と書き手の数を 1 語 (`state`) で読み書きする
+/// (今の版に 1 を足す CAS)。 版を進める RMW より前に入った書き手は前の版に数えられて待たれ、 後に入った書き手は
+/// 進める RMW と同期するので、 その後に取る data の場所は、 進める前に読んだ終わりより先 = 境目に入らない。 書き出しが
+/// 返ってから境目を進める ([`Vocabulary::set_durable`])。 (版と数を別の atomic に置くと SeqCst の全順序に頼る形になり、
+/// loom で確かめられない。 `tests/loom_publish_gate_durable.rs`)
+#[derive(Default)]
+struct Durable {
+    /// 書き出しの済んだ data の終わり (0 = まだ何も届けていない)
+    end: AtomicU32,
+    /// 最上位 bit = 今の版の偶奇。 下位 32 bit = 偶の版で語を置いている書き手の数、 その上の 31 bit = 奇の版の数
+    state: AtomicU64,
+    /// 境目を取る側を 1 本にする (2 本が版を進め合うと、 待っている版に新しい書き手が入り続けうる)
+    marking: std::sync::Mutex<()>,
+}
+
+const DURABLE_ODD: u64 = 1 << 63;
+
+/// 版 `odd` の書き手 1 本分。
+#[inline]
+fn durable_one(odd: bool) -> u64 {
+    if odd { 1 << 32 } else { 1 }
+}
+
+/// 版 `odd` の書き手の数。
+#[inline]
+fn durable_count(state: u64, odd: bool) -> u64 {
+    if odd { (state & !DURABLE_ODD) >> 32 } else { state & u32::MAX as u64 }
+}
+
+/// 語を置く間持つ ([`Durable`])。 drop で出る。
+struct Writing<'a> {
+    state: &'a AtomicU64,
+    odd: bool,
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        // Release: 境目を取る側の Acquire の読みと対 (書いた data と offsets、 付けた印が見える)
+        self.state.fetch_sub(durable_one(self.odd), Ordering::Release);
+    }
+}
+
+impl Durable {
+    fn begin_write(&self) -> Writing<'_> {
+        let mut s = self.state.load(Ordering::Relaxed);
+        loop {
+            let odd = s & DURABLE_ODD != 0;
+            // Acquire: 版を進めた RMW の後に入ったなら、 それと同期する (進める前に読まれた終わりより先の場所を取る)
+            match self.state.compare_exchange_weak(s, s + durable_one(odd), Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return Writing { state: &self.state, odd },
+                Err(now) => s = now,
+            }
+        }
+    }
 }
 
 unsafe impl Sync for Vocabulary {}
@@ -372,6 +447,7 @@ impl Vocabulary {
             refs_clean_on_load: false,
             leaf_free_on_load: false,
             stale_entries: AtomicU32::new(0),
+            durable: Durable::default(),
         }
     }
 
@@ -430,6 +506,7 @@ impl Vocabulary {
             refs_clean_on_load: usable && !is_fresh && clean_flag == CLEAN_REFS,
             leaf_free_on_load: usable && !is_fresh && clean_flag == CLEAN_LEAF,
             stale_entries: AtomicU32::new(0),
+            durable: Durable::default(),
         };
         if usable {
             return Ok(v);
@@ -938,6 +1015,50 @@ impl Vocabulary {
         }
     }
 
+    /// #656: 書き出しの前に呼ぶ。 今の data の終わりを返す。 返った時、 その位置より前に語を置いた書き手は data と
+    /// offsets を書いて印を付け終えている (続く書き出しに入る)。 書き出しが成功したら [`Self::set_durable`] に渡す。
+    pub fn durable_mark(&self) -> u32 {
+        let d = &self.durable;
+        let _one = d.marking.lock().unwrap_or_else(|p| p.into_inner());
+        // 終わりを読んでから版を進める: 終わりより前の場所を取った書き手は、 場所を取る前に前の版に入っている
+        let end = self.data_end.load(Ordering::Acquire);
+        let odd = d.state.fetch_xor(DURABLE_ODD, Ordering::AcqRel) & DURABLE_ODD != 0;
+        let mut spins = 0u32;
+        while durable_count(d.state.load(Ordering::Acquire), odd) != 0 {
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+            spins = spins.saturating_add(1);
+        }
+        end
+    }
+
+    /// #656: [`Self::durable_mark`] の後の書き出しが成功した: `end` より前に置いた語はディスクにある。
+    pub fn set_durable(&self, end: u32) {
+        self.durable.end.fetch_max(end, Ordering::Release);
+    }
+
+    /// #656: 番号 `vid` の語が、 書き出しの済んだ語か (data も offsets もディスクにある)。 世代の合わない番号・範囲外は
+    /// false。 その語を指す cell は、 書き出しの門を通らずに書いてよい。
+    #[inline]
+    pub fn is_durable(&self, vid: u32) -> bool {
+        let end = self.durable.end.load(Ordering::Acquire);
+        let slot = vid_slot(vid);
+        if end == 0 || slot >= self.offsets_cap || slot >= self.count.load(Ordering::Acquire) {
+            return false;
+        }
+        let e = self.offsets.as_atomic_u64(slot as usize * 8).load(Ordering::Acquire);
+        let (offset, len_gen) = (e as u32, (e >> 32) as u32);
+        let len = len_gen & LEN_MASK;
+        // 位置が header より前 = まだ書いていない場所。 空の語 (len 0) は位置が境目より前の時だけ (境目ちょうどは後に置いた語)
+        len_gen >> VID_GEN_SHIFT == vid_gen(vid)
+            && offset >= HEADER as u32
+            && offset < end
+            && offset as u64 + len as u64 <= end as u64
+    }
+
     #[inline]
     pub fn get(&self, vid: u32) -> &[u8] {
         self.get_checked(vid).unwrap_or(&[])
@@ -1082,6 +1203,13 @@ impl Vocabulary {
     /// 番号を取り、 data と offsets に `value` を書く (索引にはまだ入れない)。 回収した場所があれば使い回す (#381)。
     /// `pinned` なら返す番号の参照を 1 つ持った状態で返す。
     fn alloc_entry(&self, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
+        // #656: data の場所を取ってから data と offsets に印を付けるまで (`durable_mark` はこれを待つ)
+        let _writing = self.durable.begin_write();
+        self.alloc_entry_in(value, pinned)
+    }
+
+    /// `alloc_entry` の本体。
+    fn alloc_entry_in(&self, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
         // #381: 回収した場所があれば、 新しい番号より先に使い回す
         if let Some(slot) = self.claim() {
             return self.fill_claimed(slot, value, pinned);
@@ -1141,6 +1269,7 @@ impl Vocabulary {
             return Err(VocabFail::Space);
         }
         self.data.write_at(offset as usize, value);
+        hook_after_data_write();
         self.data.write_at(0, &MAGIC);
         let new_count = id + 1;
         let new_end = offset + len;
@@ -1938,6 +2067,71 @@ mod tests {
             assert_eq!(w.lookup(b"beta"), Some(b), "readonly {readonly}");
             assert_eq!(w.lookup(b"alpha"), None, "readonly {readonly}");
         }
+    }
+
+    /// #656: 書き出しの済んだ語は、 境目を取る前に置いた語だけ。 境目の後に置いた語 (空の語も)・回収で場所を使い回した
+    /// 新しい語・世代の合わない番号は済んでいない。
+    #[test]
+    fn durable_words_are_the_words_before_the_mark() {
+        let (_r, v) = reclaiming(64);
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.finish_refs();
+        assert!(!v.is_durable(a), "書き出す前に済んだことになった");
+        let end = v.durable_mark();
+        // 空の語は境目ちょうどの位置に置く (data を足していないので)
+        let empty = v.try_get_or_insert_pinned(b"").unwrap();
+        let b = v.try_get_or_insert_pinned(b"beta").unwrap();
+        v.set_durable(end);
+        assert!(v.is_durable(a));
+        assert!(!v.is_durable(b), "境目の後に置いた語が済んだことになった");
+        assert!(!v.is_durable(empty), "境目の後に置いた空の語が済んだことになった");
+        assert!(!v.is_durable(make_vid(1, vid_slot(a))), "世代の合わない番号");
+        assert!(!v.is_durable(make_vid(0, 63)), "まだ置いていない場所");
+        v.set_durable(v.durable_mark());
+        assert!(v.is_durable(b) && v.is_durable(a));
+        // 回収した場所に置いた新しい語は、 次の境目まで済んでいない (場所は前の語のまま古い)
+        v.release(a);
+        let c = v.try_get_or_insert_pinned(b"gamma").unwrap();
+        assert_eq!(vid_slot(c), vid_slot(a), "前提: 空いた場所を使い回す");
+        assert!(!v.is_durable(c), "使い回した場所の新しい語が済んだことになった");
+        assert!(!v.is_durable(a), "回収した語の番号");
+        v.set_durable(v.durable_mark());
+        assert!(v.is_durable(c));
+    }
+
+    /// #656: 境目を取る側は、 data の場所を取って offsets をまだ書いていない insert を待つ (待たないと、 書き出しが
+    /// offsets を書く前の page を書いて 「済んだ」 とし、 その語を指す cell が門を通らずに先に届く)。
+    #[test]
+    fn durable_mark_waits_for_a_word_being_written() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let r = make_regions(1024, 1024, 64 * 1024);
+        let w: &'static Vocabulary = Box::leak(Box::new(r.vocab_init(1024, 1024)));
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            AFTER_DATA_WRITE.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    inside_tx.send(()).unwrap();
+                    go_rx.recv_timeout(Duration::from_secs(10)).expect("insert を進める合図が来ない");
+                }))
+            });
+            w.try_get_or_insert(b"written-slowly").unwrap()
+        });
+        inside_rx.recv_timeout(Duration::from_secs(10)).expect("insert が data を書いた所で止まらない");
+        let marked: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let marker = std::thread::spawn(move || {
+            let end = w.durable_mark();
+            marked.store(true, Ordering::SeqCst);
+            end
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!marked.load(Ordering::SeqCst), "offsets を書いていない insert を待たずに境目を取った");
+        go_tx.send(()).unwrap();
+        let vid = writer.join().unwrap();
+        w.set_durable(marker.join().unwrap());
+        assert!(w.is_durable(vid), "待った insert の語が境目に入らない");
     }
 
     /// #381: 回収が無効なら今までどおり (押さえる・返すは何もしない、 使い回さない)。
