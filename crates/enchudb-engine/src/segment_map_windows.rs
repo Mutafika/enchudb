@@ -309,6 +309,11 @@ impl SegmentMap {
         self.dirty_hi.fetch_max(hi, Ordering::Release);
     }
 
+    /// `mark_dirty` の印が付いているか (unix 版と同じ)。
+    pub fn has_dirty(&self) -> bool {
+        self.dirty_hi.load(Ordering::Acquire) > self.dirty_lo.load(Ordering::Acquire)
+    }
+
     pub fn flush_dirty(&self) -> io::Result<()> {
         let lo = self.dirty_lo.swap(usize::MAX, Ordering::AcqRel);
         let hi = self.dirty_hi.swap(0, Ordering::AcqRel);

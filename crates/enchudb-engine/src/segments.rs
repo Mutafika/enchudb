@@ -503,16 +503,47 @@ impl SegmentSet {
     /// 段に分ける時に使う (#419: 中身 → 中身を指す列)。 `mark_dirty` を通さない store (EntitySet / header) は常に全域。
     pub fn flush_where(&self, all: bool, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
         for (k, s) in self.all() {
-            if !pick(k) {
-                continue;
-            }
-            match k {
-                SegmentKind::Header | SegmentKind::Entities => s.flush_all()?,
-                _ if all => s.flush_all()?,
-                _ => s.flush_dirty()?,
+            if pick(k) {
+                Self::flush_segment(k, &s, all)?;
             }
         }
         Ok(())
+    }
+
+    /// `pick` が選んだ segment を並べて msync する (#656: 書き出しの門を閉じている間を短くする。 遅いディスクでは msync 1 回の
+    /// 待ちが ms 単位で、 1 本ずつ書くと閉じている間が segment の数だけ伸びる)。 書くものの無い segment は飛ばし、 2 つ
+    /// 以上の時だけ thread を立てる。 印を通さない store (header / entity) は選ばないこと (印が無いので飛ばす)。
+    pub fn flush_parallel(&self, all: bool, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
+        let busy: Vec<(SegmentKind, Arc<SegmentMap>)> =
+            self.all().into_iter().filter(|(k, s)| pick(*k) && (all || s.has_dirty())).collect();
+        Self::flush_segments(&busy, all)
+    }
+
+    /// `segs` を並べて msync する (`flush_parallel` の本体)。 1 つなら呼んだ thread で書く。
+    pub fn flush_segments(segs: &[(SegmentKind, Arc<SegmentMap>)], all: bool) -> io::Result<()> {
+        match segs {
+            [] => Ok(()),
+            [(k, s)] => Self::flush_segment(*k, s, all),
+            [(k, s), rest @ ..] => std::thread::scope(|scope| {
+                let others: Vec<_> =
+                    rest.iter().map(|(k, s)| scope.spawn(move || Self::flush_segment(*k, s, all))).collect();
+                let mut res = Self::flush_segment(*k, s, all);
+                for h in others {
+                    let r = h.join().unwrap_or_else(|_| Err(io::Error::other("segment の書き出しの thread が panic した")));
+                    res = res.and(r);
+                }
+                res
+            }),
+        }
+    }
+
+    /// segment を 1 つ msync する (`flush_where` の 1 つ分。 #656: 中身を指す列を 1 本ずつ書き出す)。
+    pub fn flush_segment(kind: SegmentKind, s: &SegmentMap, all: bool) -> io::Result<()> {
+        match kind {
+            SegmentKind::Header | SegmentKind::Entities => s.flush_all(),
+            _ if all => s.flush_all(),
+            _ => s.flush_dirty(),
+        }
     }
 
     pub fn flush_kind(&self, kind: SegmentKind, off: usize, len: usize) -> io::Result<()> {

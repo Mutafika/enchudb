@@ -933,6 +933,12 @@ impl SegmentMap {
         }
     }
 
+    /// `mark_dirty` の印が付いているか (#656: 書き出しを並べる時に、 書くものの無い segment に thread を立てない)。
+    pub fn has_dirty(&self) -> bool {
+        let d = self.dirty.load(Ordering::Acquire);
+        d & DIRTY_LAST_MASK >= d >> 32
+    }
+
     /// 直近 `mark_dirty` の範囲だけ msync して reset。
     ///
     /// 返った時、 呼ぶ前に印を付けた page は全部書き出してある (同時に走る別の flush が取り出していても、
