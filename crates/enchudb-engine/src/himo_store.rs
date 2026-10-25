@@ -2377,6 +2377,33 @@ mod tests {
         assert_eq!(got, vec![1, 2, 3]);
     }
 
+    /// 消しで古い entry が半分に届いた bucket を 1 回詰め直し、 その後の消しは (古い entry がまた半分に届くまで) 詰め直さない。
+    /// 詰め直すかは書き手の len の写し (`AppendBucket::writer_len`) で決めるので、 写しが詰め直した後の長さに戻らないと、
+    /// 詰め直した後の消しのたびに詰め直す (組み直しの手間が消しのたびに乗る)。
+    #[test]
+    fn removes_compact_once_per_half() {
+        const N: u32 = 2 * COMPACT_MIN_LEN as u32;
+        let hs = make_store(256);
+        for e in 0..N {
+            assert!(hs.set(e, 0));
+        }
+        assert_eq!(hs.pull(0).len(), N as usize);
+        assert!(hs.cylinder_built());
+        for e in 0..N / 2 - 1 {
+            hs.remove(e);
+        }
+        assert_eq!(hs.cyl.slice_len(0), N as usize, "古い entry が半分に届く前は詰め直さない");
+        hs.remove(N / 2 - 1);
+        assert_eq!(hs.cyl.slice_len(0), N as usize / 2, "半分に届いた消しで詰め直す");
+        for e in N / 2..N / 2 + 10 {
+            hs.remove(e);
+        }
+        assert_eq!(hs.cyl.slice_len(0), N as usize / 2, "詰め直した後の消し 10 本では詰め直さない");
+        let mut got = hs.pull(0);
+        got.sort_unstable();
+        assert_eq!(got, (N / 2 + 10..N).collect::<Vec<_>>());
+    }
+
     /// 組んだ紐の詰め直しは、 他の値の書き手が並んで列を書いている間に、 照合 (`keep`) で列を読む。 列全体の `&[u8]` を
     /// 作る読み (`stored_at`) だと、 並んだ書き手の atomic store と data race になるので、 照合は atomic に読む
     /// (`stored_sync`)。 **Miri の上でだけ意味がある test**: 詰め直しの直前で書き手を止め (割り込み点)、 その間に別の値の
