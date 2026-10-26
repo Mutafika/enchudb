@@ -153,7 +153,14 @@ fn leaf_columns_cannot_be_balls() {
 /// release で 20 回中 20 回落ちる (変異なしは 20 回中 0 回。 6 回目の形 2026-10-26、 8 回目の形 (宣言の前の値 + 控え) 2026-10-27 も同じ)。
 #[test]
 fn concurrent_writers_leave_history_in_the_ledgers() {
-    concurrent_run("conc", &[0, 1, 2, 3, 4, 5]);
+    concurrent_run("conc", &[0, 1, 2, 3, 4, 5], false);
+}
+
+/// 上と同じを WAL 付き (concurrent + oplog) で回す: 球の時刻は書き込みの WAL の HLC (名簿の鍵より前に決まる)。 同じ値に書く書き手の
+/// HLC の順と鍵の順がずれた時は球の時刻を上げ、 WAL の時計もそこまで進める (柵でそろえた時の 「今」 の答えが後から変わらない)。
+#[test]
+fn concurrent_writers_with_wal_hlc_times() {
+    concurrent_run("walhlc", &[3, 9, 1 << 24, (1 << 24) + 64, 0, 1], true);
 }
 
 /// 上と同じを、 値の種類が多い列の値 (2^20 以上: 円柱では sparse = write_lock の道、 帳面は値ごとに分けない列 1 本) と、
@@ -161,10 +168,10 @@ fn concurrent_writers_leave_history_in_the_ledgers() {
 /// 下位 bit が同じ (帳面の同じ列に落ちる)。
 #[test]
 fn concurrent_writers_on_wide_values() {
-    concurrent_run("wide", &[3, 9, 1 << 24, (1 << 24) + 64, (1 << 24) + 128, (1 << 30) + 1]);
+    concurrent_run("wide", &[3, 9, 1 << 24, (1 << 24) + 64, (1 << 24) + 128, (1 << 30) + 1], false);
 }
 
-fn concurrent_run(name: &str, vals: &[u64]) {
+fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     const TH: usize = 4;
     const PER: usize = 16;
     let n_vals = vals.len() as u64;
@@ -172,19 +179,26 @@ fn concurrent_run(name: &str, vals: &[u64]) {
     cleanup(&path);
     let mut db = Database::create(&path).unwrap();
     db.table("t").number("id").number("a").primary_key("id").build().unwrap();
-    let t = db.get_table("t").unwrap();
+    if wal {
+        db.enable_sync().unwrap(); // cell の版数 (書き込みの HLC) を持たせて、 球の時刻と突き合わせる
+    }
     // 3 行に 1 行は宣言の前に値を入れておく (球の 「前から」 の面と、 帳面の頭のデッキになる)
     let mut eids = Vec::new();
     let mut seeded = vec![None::<u64>; TH * PER];
-    for i in 0..TH * PER {
-        let mut row = t.insert().set("id", i as i64);
-        if i % 3 == 0 {
-            let v = vals[i % vals.len()];
-            row = row.set("a", v as i64);
-            seeded[i] = Some(v);
+    {
+        let t = db.get_table("t").unwrap();
+        for i in 0..TH * PER {
+            let mut row = t.insert().set("id", i as i64);
+            if i % 3 == 0 {
+                let v = vals[i % vals.len()];
+                row = row.set("a", v as i64);
+                seeded[i] = Some(v);
+            }
+            eids.push(row.commit().unwrap());
         }
-        eids.push(row.commit().unwrap());
     }
+    let db: std::sync::Arc<Database> = if wal { db.finish_with_oplog(64 << 20).unwrap() } else { std::sync::Arc::new(db) };
+    let t = db.get_table("t").unwrap();
     let eng = db.arc_engine();
     eng.ball_set_snap_min(16); // 控えを作る書き手と、 帳面に足す書き手が重なる
     assert!(eng.declare_ball("t.a").unwrap());
@@ -193,10 +207,12 @@ fn concurrent_run(name: &str, vals: &[u64]) {
     let bar = std::sync::Barrier::new(TH + 1);
     let diffs = std::sync::atomic::AtomicU64::new(0);
     let log = std::sync::Mutex::new(vec![None::<u64>; TH * PER]);
+    // 値を変えた最後の書き込みの HLC (WAL 付きの時、 書いた直後に cell の版数から読む)
+    let changed_at = std::sync::Mutex::new(vec![enchudb_oplog::Hlc::ZERO; TH * PER]);
     let mut checks: Vec<(u64, Vec<Option<u64>>)> = Vec::new();
     std::thread::scope(|s| {
         for th in 0..TH {
-            let (eng, bar, log, eids, diffs) = (&eng, &bar, &log, &eids, &diffs);
+            let (eng, bar, log, eids, diffs, changed_at) = (&eng, &bar, &log, &eids, &diffs, &changed_at);
             let vals = vals;
             let mut mine = seeded[th * PER..(th + 1) * PER].to_vec();
             s.spawn(move || {
@@ -218,6 +234,9 @@ fn concurrent_run(name: &str, vals: &[u64]) {
                         };
                         if mine[k] != new {
                             diffs.fetch_add(u64::from(mine[k].is_some()) + u64::from(new.is_some()), std::sync::atomic::Ordering::Relaxed);
+                            if wal {
+                                changed_at.lock().unwrap()[th * PER + k] = eng.cell_hlc(e, ha);
+                            }
                         }
                         mine[k] = new;
                     }
@@ -251,9 +270,39 @@ fn concurrent_run(name: &str, vals: &[u64]) {
         let want: Vec<u64> = (0..TH * PER).filter(|&i| seeded[i] == Some(v)).map(|i| eids[i]).collect();
         assert_eq!(eng.ball_pull_at("t.a", v, 0), want, "時刻 0 v={v}");
     }
-    // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (最後の 20 回の時刻を全部)
+    // 時刻の元: WAL 付きは HLC (wall ms << 23 = 2^40 より大きい)、 無ければ数え口
+    assert_eq!(eng.ball_now() > 1 << 40, wal, "時刻の元が違う: {}", eng.ball_now());
+    if wal {
+        // 球の最後の時刻 (書き換え / 外すとも) は、 値を変えた最後の書き込みの WAL の HLC 以上 (上げた時だけ大きい)。
+        // 同じ値の書き直しは球を回さないので、 cell の今の版数でなく書き手が控えた HLC と比べる
+        let changed_at = changed_at.into_inner().unwrap();
+        let mut checked = 0;
+        for (i, &e) in eids.iter().enumerate() {
+            let h = changed_at[i];
+            if h == enchudb_oplog::Hlc::ZERO {
+                continue;
+            }
+            let last = eng.ball_faces(e, "t.a").last().map(|f| if f.to == u64::MAX { f.from } else { f.to }).unwrap();
+            assert!(last >= h.wall << 23 | h.logical as u64, "e={e} 球の最後 {last} < HLC {h:?}");
+            checked += 1;
+        }
+        assert!(checked > TH * PER / 2, "版数を持つ cell が少ない: {checked}");
+    }
+    // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (最後の 20 回の、 球の面の時刻の境目とその 1 つ前を全部)
     let from = checks[checks.len().saturating_sub(21)].0;
-    for tm in from..=eng.ball_now() {
+    let mut times = std::collections::BTreeSet::new();
+    for &e in &eids {
+        for f in eng.ball_faces(e, "t.a") {
+            for x in [f.from, f.to] {
+                if x >= from && x != u64::MAX {
+                    times.insert(x);
+                    times.insert(x - 1);
+                }
+            }
+        }
+    }
+    assert!(times.len() > 100, "途中の時刻が少ない: {}", times.len());
+    for tm in times {
         for &v in vals {
             let faces: Vec<u64> = eids.iter().copied().filter(|&e| eng.ball_value_at(e, "t.a", tm) == Some(v)).collect();
             assert_eq!(eng.ball_pull_at("t.a", v, tm), faces, "t={tm} v={v}");

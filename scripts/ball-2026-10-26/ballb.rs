@@ -3,7 +3,8 @@
 //! `tie_to_by_id` で書き手 <threads> 本、 Barrier でそろえて全員が終わるまでの ns / 1 回)。 feature `ball` の版は
 //! BALL=1 で a / b / w を球にする (表を作った直後、 行の無い時)。
 //!
-//! usage: ballb w <threads> <seed>    (DB は BALL_DIR の下、 終わったら消す。 BALL_TOTAL 既定 96 万、 BALL_CYCLES 既定 3)
+//! usage: ballb w <threads> <seed>    (DB は BALL_DIR の下、 終わったら消す。 BALL_TOTAL 既定 96 万、 BALL_CYCLES 既定 3、
+//!                                     BALL_WAL=1 で WAL 付き (BALL_WAL_CAP 既定 2 GiB)、 9 回目で足した)
 //!        ballb r <seed>              (feature ball のみ。 読みの段)
 //!
 //! r: 表 t (id、 a = Number 0..99) に BALL_TOTAL 行、 a を球にしてから、 1 回につき 10% の行の a を書き換えるのを BALL_ROUNDS 回
@@ -83,8 +84,13 @@ fn mode_w(threads: usize, seed: u64) {
     let cycles = env_usize("BALL_CYCLES", 3);
     let per = total / threads;
     let ball = ball_on();
-    let mut db = Database::create(&path).unwrap();
-    db.table("t").number("id").number("a").number("b").bigint("w").primary_key("id").with_capacity(total as u32 + 1000).build().unwrap();
+    // BALL_WAL=1: WAL (oplog) 付きの concurrent に移してから書く (9 回目で足した。 球の時刻を WAL の HLC にした版を測るため)
+    let wal = std::env::var("BALL_WAL").is_ok_and(|v| v == "1");
+    let db: Arc<Database> = {
+        let mut db = Database::create(&path).unwrap();
+        db.table("t").number("id").number("a").number("b").bigint("w").primary_key("id").with_capacity(total as u32 + 1000).build().unwrap();
+        if wal { db.finish_with_oplog(env_usize("BALL_WAL_CAP", 2 << 30)).unwrap() } else { Arc::new(db) }
+    };
     let t = db.get_table("t").unwrap();
     let eng: Arc<Engine> = db.arc_engine();
     let h = |c: &str| eng.himo_id(c).unwrap() as u16;
@@ -115,7 +121,7 @@ fn mode_w(threads: usize, seed: u64) {
         });
         let ns = t0.elapsed().as_nanos() as f64;
         println!(
-            "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"{stage}\",\"threads\":{threads},\"seed\":{seed},\"cycle\":{cycle},\"total\":{total},\"ns\":{:.1}}}",
+            "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"wal\":{wal},\"kind\":\"{stage}\",\"threads\":{threads},\"seed\":{seed},\"cycle\":{cycle},\"total\":{total},\"ns\":{:.1}}}",
             ns / (ops_per_thread * threads) as f64 * threads as f64
         );
     };
@@ -178,7 +184,7 @@ fn mode_w(threads: usize, seed: u64) {
     #[cfg(not(feature = "ball"))]
     let diffs = 0u64;
     println!(
-        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{diffs},\"rss_peak_kb\":{}}}",
+        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"wal\":{wal},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{diffs},\"rss_peak_kb\":{}}}",
         rss_peak_kb()
     );
 }

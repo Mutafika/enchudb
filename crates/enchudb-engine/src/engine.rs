@@ -11648,10 +11648,36 @@ impl Engine {
             if let Some(ts) = ts {
                 b.turn(local, Some(value), ts);
             }
+            self.ball_observe_raised();
             b.build_snaps(snaps);
             return ok;
         }
         self.himos[hid].set(local, value)
+    }
+
+    /// 球 (試作): HLC `hlc` の書き込みとして `f` で名簿に書く (球の時刻 = この HLC。 球の紐が無ければ `f` だけ)。
+    #[inline]
+    fn with_ball_time<R>(&self, hlc: enchudb_oplog::Hlc, f: impl FnOnce() -> R) -> R {
+        if !self.balls.any() {
+            return f();
+        }
+        crate::ball::set_write_time(crate::ball::pack_hlc(hlc.wall, hlc.logical));
+        let r = f();
+        crate::ball::set_write_time(0);
+        r
+    }
+
+    /// 球 (試作): 帳面と球の時刻の順を保つために時刻を上げたら (同じ値か同じ球に先に書いた書き手の後にした)、 行の lock の中で
+    /// WAL の時計をそこまで進める (この後に払い出す HLC を上げた時刻より後にする = 「今」 より後の書き込みが過去に見えない)。
+    /// 球の名簿に書く道は全部 `himo_set` / `himo_remove` を通るので、 そこで呼ぶ (HLC を渡さない道の書き込みも)。
+    fn ball_observe_raised(&self) {
+        let raised = crate::ball::take_raised();
+        if raised != 0
+            && let Some(w) = self.oplog.as_ref()
+        {
+            let (wall, logical) = crate::ball::unpack_hlc(raised);
+            w.observe_hlc(enchudb_oplog::Hlc { wall, logical, peer: self.peer_id() });
+        }
     }
 
     /// `himo_set` の外す版。
@@ -11670,6 +11696,7 @@ impl Engine {
             if let Some(ts) = ts {
                 b.turn(local, None, ts);
             }
+            self.ball_observe_raised();
             b.build_snaps(snaps);
             return;
         }
@@ -11837,7 +11864,8 @@ impl Engine {
         let renamed_from = self.pk_rename_from(local, himo_id, value).map(|old| (old, self.version_of(local, himo_id)));
         // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
         // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
-        if !self.live_set(himo_id as usize, local, value) {
+        // 球 (試作): この書き込みの HLC を球の時刻にする
+        if !self.with_ball_time(hlc, || self.live_set(himo_id as usize, local, value)) {
             self.record_fault(FaultKind::DiskSpace, "列を伸ばすディスクの空きが無い — cell も版数も書かない");
             return false;
         }
@@ -12117,7 +12145,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.live_remove(himo_id as usize, local);
+        self.with_ball_time(hlc, || self.live_remove(himo_id as usize, local));
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -12142,7 +12170,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.remove_cell_freeing_leaf(local, himo_id as usize);
+        self.with_ball_time(hlc, || self.remove_cell_freeing_leaf(local, himo_id as usize));
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -12958,7 +12986,7 @@ impl Engine {
                 survivor = true;
                 continue;
             }
-            self.remove_cell_freeing_leaf(local, hid);
+            self.with_ball_time(hlc, || self.remove_cell_freeing_leaf(local, hid));
         }
         if !survivor {
             self.live_free(local);

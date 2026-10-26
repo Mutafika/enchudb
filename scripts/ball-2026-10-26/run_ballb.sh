@@ -7,6 +7,7 @@
 # (A3) 球の値段: on / base と on - base (ns) を段ごとに出す (合否なし、 位置の印の +40 ns/列 と並べてユーザに見せる)
 # (2 回目) lclk_on = 時刻だけ書き手ごとの数え口にした測り専用の版 (時刻の順は壊れる)。 共有の時刻の値段 = on - lclk_on
 # (A4) 回の始まりの空きが 2 GiB 未満、 負荷 > 8 の回は判定から外す (印を付けて残す)
+# (9 回目) BALL_WAL=1 を付けて回すと WAL 付き (bench の BALL_WAL)。 基準は BALL_PLAN.md の 9 回目
 S=$(cd "$(dirname "$0")" && pwd)
 RES=${RES:-$S/results_ballb.jsonl}
 SEEDS=${SEEDS:-"41 42 43 44 45 46"}
@@ -28,6 +29,7 @@ for seed in $SEEDS; do
         v5_on) B=$S/ballb-proto-v5.bin; export BALL=1 ;;
         v6_on) B=$S/ballb-proto-v6.bin; export BALL=1 ;;
         v7b_on) B=$S/ballb-proto-v7b.bin; export BALL=1 ;;
+        v8w_on) B=$S/ballb-proto-v8w.bin; export BALL=1 ;;
       esac
       quiet; l=$(load1); f=$(freeg); t0=$(date +%s)
       "$B" w $th $seed | sed "s/^{/{\"v\":\"$v\",\"load\":$l,\"free_g\":$f,/" >> "$RES"
