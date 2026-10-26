@@ -18013,6 +18013,11 @@ impl Engine {
         crate::append_bucket::spin_misses()
     }
 
+    /// 球にした紐の円柱の詰め直し (外れたカードを履歴の段へ移した) の回数 (試作の診断、 process 全体)。
+    pub fn ball_spin_compactions(&self) -> usize {
+        crate::append_bucket::spin_compactions()
+    }
+
     /// 球にした紐の円柱で、 値 `value` のデッキのカードが向きの時刻を持つか (試作の診断)。
     pub fn ball_value_in_deck(&self, himo: &str, value: u64) -> bool {
         self.himo_id(himo).is_some_and(|id| self.balls.get(id as u16).is_some() && self.himos[id].spun_in_array(value))
