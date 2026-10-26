@@ -80,8 +80,8 @@
  {
   "name": "bit の表: 入った / 出たを逆に当てる",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        if into {\n            bits[i >> 6] &= !m;",
-  "replace": "        if !into {\n            bits[i >> 6] &= !m;"
+  "find": "((into as u64).wrapping_sub(1) & m)",
+  "replace": "((!into as u64).wrapping_sub(1) & m)"
  },
  {
   "name": "bit の表: 今のデッキを立てない",
@@ -250,5 +250,35 @@
   "file": "crates/enchudb-engine/src/ball.rs",
   "find": "                *b.into[k >> 6].get_mut() |= 1 << (k & 63);",
   "replace": "                let _ = k;"
+ },
+ {
+  "name": "bit の表: 当てる前の bit を消さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "*w = (*w & !m) | (",
+  "replace": "*w = *w | ("
+ },
+ {
+  "name": "表の読み: 5 個以上立った語の残りを書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        if c > 4 {\n            for s in &mut spare[4..c] {",
+  "replace": "        if c > 64 {\n            for s in &mut spare[4..c] {"
+ },
+ {
+  "name": "表の読み: 立っていた数でなく 4 個までしか進めない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "unsafe { out.set_len(out.len() + c) };",
+  "replace": "unsafe { out.set_len(out.len() + c.min(4)) };"
+ },
+ {
+  "name": "表の読み: 語の始まりの eid を 64 倍しない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "let base = lo as u64 + ((w as u64) << 6);",
+  "replace": "let base = lo as u64 + (w as u64);"
+ },
+ {
+  "name": "表の読み: 最初の 4 個で書いた bit を消さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            y &= y.wrapping_sub(1);\n        }\n        if c > 4 {",
+  "replace": "            y &= y;\n        }\n        if c > 4 {"
  }
 ]

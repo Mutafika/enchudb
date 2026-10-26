@@ -6,13 +6,14 @@
 //! usage: ballb w <threads> <seed>    (DB は BALL_DIR の下、 終わったら消す。 BALL_TOTAL 既定 96 万、 BALL_CYCLES 既定 3)
 //!        ballb r <seed>              (feature ball のみ。 読みの段)
 //!
-//! r: 表 t (id、 a = Number 0..99) に BALL_TOTAL 行、 a を球にしてから、 1 回につき 10% の行の a を書き換えるのを 10 回。
-//!    回の終わりの時刻を控え、 5 回目の終わり (t5) と今について:
+//! r: 表 t (id、 a = Number 0..99) に BALL_TOTAL 行、 a を球にしてから、 1 回につき 10% の行の a を書き換えるのを BALL_ROUNDS 回
+//!    (既定 10、 7 回目で足した)。 回の終わりの時刻を控え、 1 回目の終わり (t1)、 5 回目の終わり (t5) と今について:
 //!    - pull_now   : pull_raw("t.a", v) の 1 本の ns (v = 0..99 を回す)
 //!    - pull_at_t5 : ball_pull_at("t.a", v, t5)
 //!    - pull_at_now: ball_pull_at("t.a", v, 今)
 //!    - get_now    : get(e, "t.a")、 value_at_t5 : ball_value_at(e, "t.a", t5) (e は乱数)
-//!    答え合わせ: 全部の v で ball_pull_at(v, 今) = pull_raw(v) (並べて)、 t5 の答えは手元の写し (5 回目の後の a) と比べる。
+//!    - pull_at_t1 : ball_pull_at("t.a", v, t1) (最後に測る、 7 回目で足した)
+//!    答え合わせ: 全部の v で ball_pull_at(v, 今) = pull_raw(v) (並べて)、 t5 / t1 の答えは手元の写し (5 回目 / 1 回目の後の a) と比べる。
 //!    面の数と取った byte、 RSS の峰も出す。
 //! 出力: 1 行 1 JSON (stdout)。
 
@@ -205,14 +206,19 @@ fn mode_r(seed: u64) {
         eids.push(e);
     }
     eng.declare_ball("t.a").unwrap();
-    let mut t5 = 0;
-    let mut at5 = Vec::new();
-    for round in 1..=10 {
+    let rounds = env_usize("BALL_ROUNDS", 10);
+    let (mut t1, mut t5) = (0, 0);
+    let (mut at1, mut at5) = (Vec::new(), Vec::new());
+    for round in 1..=rounds {
         for _ in 0..total / 10 {
             let i = (r.next() % total as u64) as usize;
             let a = (r.next() % 100) as u32;
             eng.tie_to_by_id(eids[i], ha, a);
             cur[i] = a;
+        }
+        if round == 1 {
+            t1 = eng.ball_now();
+            at1 = cur.clone();
         }
         if round == 5 {
             t5 = eng.ball_now();
@@ -227,6 +233,8 @@ fn mode_r(seed: u64) {
         assert_eq!(eng.ball_pull_at("t.a", v, now), p, "今の v={v}");
         let want: Vec<u64> = (0..total).filter(|&i| at5[i] as u64 == v).map(|i| eids[i]).collect();
         assert_eq!(eng.ball_pull_at("t.a", v, t5), want, "t5 の v={v}");
+        let want: Vec<u64> = (0..total).filter(|&i| at1[i] as u64 == v).map(|i| eids[i]).collect();
+        assert_eq!(eng.ball_pull_at("t.a", v, t1), want, "t1 の v={v}");
     }
     let time = |name: &str, n: usize, f: &dyn Fn(usize) -> usize| {
         let mut xs: Vec<f64> = (0..5)
@@ -249,9 +257,10 @@ fn mode_r(seed: u64) {
     let picks: Vec<u64> = (0..100_000).map(|k| eids[(Rng(k as u64 * 0x9E37 + seed | 1).next() % total as u64) as usize]).collect();
     time("get_now", 100_000, &|k| eng.get(picks[k], "t.a").unwrap_or(0) as usize);
     time("value_at_t5", 100_000, &|k| eng.ball_value_at(picks[k], "t.a", t5).unwrap_or(0) as usize);
+    time("pull_at_t1", 200, &|k| eng.ball_pull_at("t.a", (k % 100) as u64, t1).len());
     let (faces, bytes) = eng.ball_stats("t.a").unwrap();
     println!(
-        "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{},\"rss_peak_kb\":{}}}",
+        "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"rounds\":{rounds},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{},\"rss_peak_kb\":{}}}",
         eng.ball_diff_count("t.a").unwrap(),
         rss_peak_kb()
     );

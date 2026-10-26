@@ -666,22 +666,41 @@ fn roll_back_on(bits: &mut [u64], now: &[u32], after: Tail<'_>, lo: u32) -> Vec<
         let i = (e - lo) as usize;
         bits[i >> 6] |= 1 << (i & 63);
     }
+    // 入った → 落とす、 出た → 立てる、 を枝なしで (入った / 出たは揃わずに並ぶので、 枝にすると読み違いが続く: 差分 9.4k で
+    // 30 µs、 枝なし 6 µs。 値 1 つを繰り返し読む時だけ枝の予測が覚えて 10 µs)
     after.for_each_rev(|e, into| {
         let i = (e - lo) as usize;
         let m = 1u64 << (i & 63);
-        if into {
-            bits[i >> 6] &= !m;
-        } else {
-            bits[i >> 6] |= m;
-        }
+        let w = &mut bits[i >> 6];
+        *w = (*w & !m) | ((into as u64).wrapping_sub(1) & m);
     });
-    let mut out = Vec::with_capacity(now.len() + after.len() / 2);
+    collect_bits(bits, lo, now.len() + after.len() / 2)
+}
+
+/// 表の立った bit の eid を昇順に。 語ごとに 4 個を枝なしで書き (空いた bit の分は捨てる場所に書く)、 立っていた数だけ進める。
+/// 語ごとに立った数だけ回すと、 回る数が語ごとに揺れて読み違いが続く (語 15k で 64 µs、 これで 18 µs)。
+fn collect_bits(bits: &[u64], lo: u32, hint: usize) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(hint + 64);
     for (w, &x) in bits.iter().enumerate() {
-        let mut x = x;
-        while x != 0 {
-            out.push((lo as u64 + ((w as u64) << 6) + x.trailing_zeros() as u64) as u32);
-            x &= x - 1;
+        if out.capacity() - out.len() < 64 {
+            out.reserve(64);
         }
+        let base = lo as u64 + ((w as u64) << 6);
+        let c = x.count_ones() as usize;
+        let spare = &mut out.spare_capacity_mut()[..64];
+        let mut y = x;
+        for s in &mut spare[..4] {
+            s.write((base + y.trailing_zeros() as u64) as u32);
+            y &= y.wrapping_sub(1);
+        }
+        if c > 4 {
+            for s in &mut spare[4..c] {
+                s.write((base + y.trailing_zeros() as u64) as u32);
+                y &= y - 1;
+            }
+        }
+        // SAFETY: [len..len + c] は今書いた (c ≤ 64 ≤ 空き)
+        unsafe { out.set_len(out.len() + c) };
     }
     out
 }
@@ -982,17 +1001,19 @@ mod tests {
             r ^= r << 17;
             r
         };
-        for case in 0..60 {
+        // Miri は小さく (bit の表の読み出しの unsafe を通すため。 表の道は 1024 未満でも直に呼ぶ)
+        let (cases, big) = if cfg!(miri) { (6, 200) } else { (60, 3000) };
+        for case in 0..cases {
             let spread: u64 = [64, 5000, 1 << 31][case % 3];
             let base = (next() % (u32::MAX as u64 - spread)) as u32;
-            let n = 50 + (next() % 3000) as usize;
+            let n = 50 + (next() % big) as usize;
             let mut cur: BTreeMap<u32, bool> = BTreeMap::new();
             for _ in 0..n {
                 cur.insert(base + (next() % spread) as u32, true);
             }
             let start = cur.clone();
             let mut after = Vec::new();
-            for t in 1..=(next() % 4000) {
+            for t in 1..=(next() % (big as u64 * 4 / 3)) {
                 let e = if next() % 2 == 0 && !cur.is_empty() {
                     *cur.keys().nth((next() % cur.len() as u64) as usize).unwrap()
                 } else {
