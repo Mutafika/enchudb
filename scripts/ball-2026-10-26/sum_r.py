@@ -7,7 +7,8 @@ for r in rows:
     if r["kind"]=="ok": d[(r["v"],"rss_mb")].append(r["rss_peak_kb"]/1024); d[(r["v"],"bytes_mb")].append(r["ball_bytes"]/2**20)
     else: d[(r["v"],r["kind"])].append(r["ns"])
 print("loads", sorted({r["load"] for r in rows}))
-for k in ["pull_now","pull_at_now","pull_at_t5","pull_at_t1","get_now","value_at_t5","rss_mb","bytes_mb"]:
+kinds=[r["kind"] for r in rows if r["kind"]!="ok"]
+for k in list(dict.fromkeys(kinds))+["rss_mb","bytes_mb"]:
     line=f"{k:12}"
     for v in vs:
         a=d.get((v,k))

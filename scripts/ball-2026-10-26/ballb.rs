@@ -6,6 +6,7 @@
 //! usage: ballb w <threads> <seed>    (DB は BALL_DIR の下、 終わったら消す。 BALL_TOTAL 既定 96 万、 BALL_CYCLES 既定 3、
 //!                                     BALL_WAL=1 で WAL 付き (BALL_WAL_CAP 既定 2 GiB)、 9 回目で足した)
 //!        ballb r <seed>              (feature ball のみ。 読みの段)
+//!        ballb h <seed>              (feature ball のみ。 熱い行の読み、 10 回目)
 //!
 //! r: 表 t (id、 a = Number 0..99) に BALL_TOTAL 行、 a を球にしてから、 1 回につき 10% の行の a を書き換えるのを BALL_ROUNDS 回
 //!    (既定 10、 7 回目で足した)。 回の終わりの時刻を控え、 1 回目の終わり (t1)、 5 回目の終わり (t5) と今について:
@@ -16,6 +17,12 @@
 //!    - pull_at_t1 : ball_pull_at("t.a", v, t1) (最後に測る、 7 回目で足した)
 //!    答え合わせ: 全部の v で ball_pull_at(v, 今) = pull_raw(v) (並べて)、 t5 / t1 の答えは手元の写し (5 回目 / 1 回目の後の a) と比べる。
 //!    面の数と取った byte、 RSS の峰も出す。
+//! h: 熱い行 (10 回目で足した)。 表 t に BALL_TOTAL 行 (a = 0..99) を入れて a を球にした後、 そのうち BALL_HOT 行 (既定 1000) だけを
+//!    書き換える (1 行あたり BALL_HOT_WRITES 回、 既定 2000。 行は毎回乱数で選ぶので 1 行の面は散らばる。 1 割は外す)。 書くたびに時刻を控え:
+//!    - value_at_hot_all   : 熱い行の、 履歴全体から一様に選んだ t
+//!    - value_at_hot_recent: 熱い行の、 最後の 1% の書き込みの間の t
+//!    - value_at_cold      : 書き換えていない行 (面は前からの 1 つ) の一様な t
+//!    答え合わせ: 測る組 (行, t) を全部、 手元の (時刻, 値) の列の二分探索と比べる。
 //! 出力: 1 行 1 JSON (stdout)。
 
 use enchudb::schema::Database;
@@ -272,12 +279,110 @@ fn mode_r(seed: u64) {
     );
 }
 
+#[cfg(feature = "ball")]
+fn mode_h(seed: u64) {
+    let path = db_path("h");
+    let _c = Cleanup(path.clone());
+    let total = env_usize("BALL_TOTAL", 960_000);
+    let hot = env_usize("BALL_HOT", 1000);
+    let writes = env_usize("BALL_HOT_WRITES", 2000);
+    let mut db = Database::create(&path).unwrap();
+    db.table("t").number("id").number("a").primary_key("id").with_capacity(total as u32 + 1000).build().unwrap();
+    let eng: Arc<Engine> = db.arc_engine();
+    let (hid, ha) = (eng.himo_id("t.id").unwrap() as u16, eng.himo_id("t.a").unwrap() as u16);
+    let mut r = Rng(seed | 1);
+    let mut eids = Vec::with_capacity(total);
+    let mut first = Vec::with_capacity(total);
+    for i in 0..total {
+        let e = eng.entity_in("t").unwrap();
+        let a = (r.next() % 100) as u32;
+        eng.tie_to_by_id(e, hid, i as u32);
+        eng.tie_to_by_id(e, ha, a);
+        eids.push(e);
+        first.push(a);
+    }
+    eng.declare_ball("t.a").unwrap();
+    // 熱い行は表に散らす。 行ごとの (時刻, 値) の列 (宣言の前からの値は時刻 0)
+    let stride = total / hot;
+    let hot_ix: Vec<usize> = (0..hot).map(|k| k * stride).collect();
+    let mut hist: Vec<Vec<(u64, Option<u32>)>> = hot_ix.iter().map(|&i| vec![(0, Some(first[i]))]).collect();
+    let n = hot * writes;
+    let mut recent_from = 0;
+    for w in 0..n {
+        let h = (r.next() % hot as u64) as usize;
+        let e = eids[hot_ix[h]];
+        let cur = hist[h].last().unwrap().1;
+        // 値を必ず変える (同じ値の書き直しは球を回さない)
+        let new = match (r.next() % 10, cur) {
+            (0, Some(_)) => None,
+            (_, c) => {
+                let v = (r.next() % 100) as u32;
+                Some(if Some(v) == c { (v + 1) % 100 } else { v })
+            }
+        };
+        match new {
+            Some(v) => eng.tie_to_by_id(e, ha, v),
+            None => eng.untie_by_id(e, ha),
+        }
+        let tm = eng.ball_now();
+        hist[h].push((tm, new));
+        if w == n - n / 100 {
+            recent_from = tm;
+        }
+    }
+    let end = eng.ball_now();
+    let q = 100_000usize;
+    let mut qr = Rng(seed.wrapping_mul(0x9E37) | 1);
+    let mut pick = |lo: u64| -> Vec<(usize, u64)> { (0..q).map(|_| ((qr.next() % hot as u64) as usize, lo + qr.next() % (end - lo + 1))).collect() };
+    let all = pick(0);
+    let recent = pick(recent_from);
+    // 書き換えていない行: 熱い行は stride (偶数) の倍数番なので、 奇数番
+    assert!(stride % 2 == 0);
+    let cold: Vec<(usize, u64)> = (0..q).map(|_| ((qr.next() % total as u64) as usize | 1, qr.next() % (end + 1))).collect();
+    // 答え合わせ (熱い行は手元の列、 書き換えていない行は前からの値)
+    for set in [&all, &recent] {
+        for &(h, t) in set.iter() {
+            let k = hist[h].partition_point(|x| x.0 <= t) - 1;
+            assert_eq!(eng.ball_value_at(eids[hot_ix[h]], "t.a", t), hist[h][k].1.map(u64::from), "h={h} t={t}");
+        }
+    }
+    for &(i, t) in &cold {
+        assert_eq!(eng.ball_value_at(eids[i], "t.a", t), Some(first[i] as u64), "i={i} t={t}");
+    }
+    let time = |name: &str, f: &dyn Fn(usize) -> usize| {
+        let mut xs: Vec<f64> = (0..5)
+            .map(|_| {
+                let t0 = Instant::now();
+                let mut acc = 0usize;
+                for k in 0..q {
+                    acc += f(k);
+                }
+                black_box(acc);
+                t0.elapsed().as_nanos() as f64 / q as f64
+            })
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        println!("{{\"mode\":\"h\",\"kind\":\"{name}\",\"seed\":{seed},\"hot\":{hot},\"writes\":{writes},\"ns\":{:.1}}}", xs[2]);
+    };
+    let he: Vec<u64> = hot_ix.iter().map(|&i| eids[i]).collect();
+    time("value_at_hot_all", &|k| eng.ball_value_at(he[all[k].0], "t.a", all[k].1).unwrap_or(0) as usize);
+    time("value_at_hot_recent", &|k| eng.ball_value_at(he[recent[k].0], "t.a", recent[k].1).unwrap_or(0) as usize);
+    time("value_at_cold", &|k| eng.ball_value_at(eids[cold[k].0], "t.a", cold[k].1).unwrap_or(0) as usize);
+    let (faces, bytes) = eng.ball_stats("t.a").unwrap();
+    println!(
+        "{{\"mode\":\"h\",\"kind\":\"ok\",\"seed\":{seed},\"hot\":{hot},\"writes\":{writes},\"faces\":{faces},\"ball_bytes\":{bytes},\"rss_peak_kb\":{}}}",
+        rss_peak_kb()
+    );
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a[1].as_str() {
         "w" => mode_w(a[2].parse().unwrap(), a[3].parse().unwrap()),
         #[cfg(feature = "ball")]
         "r" => mode_r(a[2].parse().unwrap()),
+        #[cfg(feature = "ball")]
+        "h" => mode_h(a[2].parse().unwrap()),
         m => panic!("unknown mode {m}"),
     }
 }

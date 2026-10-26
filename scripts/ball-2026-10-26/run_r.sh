@@ -6,6 +6,7 @@
 # (R3) pull_at_now / pull_now / value_at_t5 は前の版の ±20% に収まる (bit の表は差分の少ない読みでは使わない)
 # (R4) 負荷 > 8 の回は判定から外す (印を付けて残す)
 # 7 回目 (差分を細くする) の基準は BALL_PLAN.md の 7 回目 (VERSIONS="v6 cur"): t5 は 6 回目の 0.7 倍以下、 他は ±20%、 RSS は 6 回目以下
+# 10 回目: MODE=h で熱い行の段 (ballb h)。 基準は BALL_PLAN.md の 10 回目
 S=$(cd "$(dirname "$0")" && pwd)
 RES=${RES:-$S/results_ballb_r.jsonl}
 : > "$RES"
@@ -19,6 +20,6 @@ for seed in ${SEEDS:-41 42 43}; do for v in ${VERSIONS:-v5 cur}; do
     *) B=$S/ballb-proto-$v.bin ;;
   esac
   quiet; l=$(load1)
-  BALL=1 "$B" r $seed | sed "s/^{/{\"v\":\"$v\",\"load\":$l,/" >> "$RES"
+  BALL=1 "$B" ${MODE:-r} $seed | sed "s/^{/{\"v\":\"$v\",\"load\":$l,/" >> "$RES"
   echo "$v seed=$seed load=$l"
 done; done

@@ -30,6 +30,7 @@ for seed in $SEEDS; do
         v6_on) B=$S/ballb-proto-v6.bin; export BALL=1 ;;
         v7b_on) B=$S/ballb-proto-v7b.bin; export BALL=1 ;;
         v8w_on) B=$S/ballb-proto-v8w.bin; export BALL=1 ;;
+        v*_on) B=$S/ballb-proto-${v%_on}.bin; export BALL=1 ;;
       esac
       quiet; l=$(load1); f=$(freeg); t0=$(date +%s)
       "$B" w $th $seed | sed "s/^{/{\"v\":\"$v\",\"load\":$l,\"free_g\":$f,/" >> "$RES"

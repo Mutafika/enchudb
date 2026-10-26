@@ -35,6 +35,11 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   8 回目を同じ bench で組み直した `v8w_on` と交互。 `*_v9a.jsonl` は HLC を thread-local で渡していた最初の版 (宣言の無い列の書き直しが
   +2 ns 重く線を越えた)。 base (cb827e4) は scratchpad に worktree で作り直して組んだ。 変異は `ball_mut_v9.json` (84 本、 全部落ちる)、
   並行の変異の検出率は `rate9.py` (`rate9.log` = 直した後、 `rate9a.log` = 最初の版)
+- 10 回目 (球の面に skew binary の飛び糸、 時点 t の値を O(log n) 歩): `results_ballb_h_v10.jsonl` (熱い行、 `ballb h` = `MODE=h run_r.sh`、
+  1000 行 × 書き換え 2000 回) / `results_ballb_r50_v10.jsonl` (`BALL_ROUNDS=50`) / `results_ballb_v10.jsonl` (書き込み、 base / `v9h_on` / `v10_on`)。
+  比べる 9 回目は `h` の段を足した同じ bench で組み直した `v9h` (削除の HLC を直した後の db53420)。 要約は `sum_r.py <file> v9h,v10`
+  (段の名前は file から取る)。 変異は `ball_mut_v10.json` (93 本、 ball.rs の 75 本は単体、 他の 18 本は schema の試験で全部落ちる。
+  幅の計算の 2 本は並行の試験では書き手の panic で Barrier が止まり時間切れ、 飛び糸の試験だけなら 2〜3 秒で落ちる)
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
