@@ -1,7 +1,7 @@
 #!/bin/sh
 # 列ごとの球の値段: base / a・b だけ球 (ab) / w だけ球 (w)、 書き手 1 / 4 本 × seed 41〜43 (96 万行、 cycle 3)
 S=$(cd "$(dirname "$0")" && pwd)
-RES=$S/results_ballb_cols.jsonl
+RES=${RES:-$S/results_ballb_cols.jsonl}
 : > "$RES"
 export BALL_DIR=$S/balldb
 load1() { sysctl -n vm.loadavg | awk '{print $2}'; }

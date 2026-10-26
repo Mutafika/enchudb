@@ -88,15 +88,15 @@ fn mode_w(threads: usize, seed: u64) {
     let eng: Arc<Engine> = db.arc_engine();
     let h = |c: &str| eng.himo_id(c).unwrap() as u16;
     let (hid, ha, hb, hw) = (h("t.id"), h("t.a"), h("t.b"), h("t.w"));
+    // 球にする (宣言が円柱を組む。 組んだ後の紐は宣言できないので索引を作る前に)。 BALL_COLS: 球にする列 (既定は 3 本とも)
+    if ball {
+        let cols = std::env::var("BALL_COLS").unwrap_or_else(|_| "t.a,t.b,t.w".into());
+        declare(&eng, &cols.split(',').collect::<Vec<_>>());
+    }
     // 索引を作る (組んだ後の書き手 = 値の鍵の道、 acb の prebuild=1)
     let _ = t.where_eq("a", 1i64).count().unwrap();
     let _ = t.where_eq("b", 1i64).count().unwrap();
     let _ = eng.count_value_by_id(hw, 1);
-    if ball {
-        // BALL_COLS: 球にする列 (既定は 3 本とも)。 列ごとの値段を分ける時に
-        let cols = std::env::var("BALL_COLS").unwrap_or_else(|_| "t.a,t.b,t.w".into());
-        declare(&eng, &cols.split(',').collect::<Vec<_>>());
-    }
     let tag = build_tag();
     let bl = u8::from(ball);
     let run = |stage: &str, cycle: usize, ops_per_thread: usize, f: &(dyn Fn(usize) + Sync)| {
@@ -172,8 +172,12 @@ fn mode_w(threads: usize, seed: u64) {
     let bytes: usize = ["t.a", "t.b", "t.w"].iter().filter_map(|h| eng.ball_stats(h)).map(|s| s.1).sum();
     #[cfg(not(feature = "ball"))]
     let bytes = 0usize;
+    #[cfg(feature = "ball")]
+    let misses = eng.ball_spin_misses();
+    #[cfg(not(feature = "ball"))]
+    let misses = 0usize;
     println!(
-        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"rss_peak_kb\":{}}}",
+        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{misses},\"rss_peak_kb\":{}}}",
         rss_peak_kb()
     );
 }
@@ -188,7 +192,7 @@ fn mode_r(seed: u64) {
     let t = db.get_table("t").unwrap();
     let eng: Arc<Engine> = db.arc_engine();
     let (hid, ha) = (eng.himo_id("t.id").unwrap() as u16, eng.himo_id("t.a").unwrap() as u16);
-    let _ = t.where_eq("a", 1i64).count().unwrap();
+    // a の円柱は組まない (球の宣言が、 入れた後の列から組む)
     let mut r = Rng(seed | 1);
     let mut cur: Vec<u32> = Vec::with_capacity(total);
     let mut eids = Vec::with_capacity(total);
@@ -246,7 +250,12 @@ fn mode_r(seed: u64) {
     time("get_now", 100_000, &|k| eng.get(picks[k], "t.a").unwrap_or(0) as usize);
     time("value_at_t5", 100_000, &|k| eng.ball_value_at(picks[k], "t.a", t5).unwrap_or(0) as usize);
     let (faces, bytes) = eng.ball_stats("t.a").unwrap();
-    println!("{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"faces\":{faces},\"ball_bytes\":{bytes},\"rss_peak_kb\":{}}}", rss_peak_kb());
+    assert!((0..100u64).all(|v| eng.ball_value_in_deck("t.a", v)), "a の値は全部カードが時刻を持つ");
+    println!(
+        "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{},\"rss_peak_kb\":{}}}",
+        eng.ball_spin_misses(),
+        rss_peak_kb()
+    );
 }
 
 fn main() {

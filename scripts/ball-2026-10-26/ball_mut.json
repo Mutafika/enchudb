@@ -32,25 +32,25 @@
  {
   "name": "前からの面を時刻 1 から",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "self.push_face(i, eid, NONE, v, 0);",
-  "replace": "self.push_face(i, eid, NONE, v, 1);"
+  "find": "self.push_face(i, eid, NONE, v, 0, in_deck);",
+  "replace": "self.push_face(i, eid, NONE, v, 1, in_deck);"
  },
  {
   "name": "書き換えの時刻が今と同じ",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;",
-  "replace": "let ts = clock.fetch_add(1, Ordering::Relaxed);"
+  "find": "self.clock.fetch_add(1, Ordering::Relaxed) + 1",
+  "replace": "self.clock.fetch_add(1, Ordering::Relaxed)"
  },
  {
   "name": "untie / delete を球に伝えない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            self.balls.on_remove(hid as u16, local);\n",
+  "find": "            self.balls.on_remove(hid as u16, local, ts);\n",
   "replace": ""
  },
  {
   "name": "書き換えを球に伝えない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "                self.balls.on_set(hid as u16, local, value);\n",
+  "find": "                self.balls.on_set(hid as u16, local, value, ts, self.himos[hid].spun_in_array(value));\n",
   "replace": ""
  },
  {
@@ -64,5 +64,47 @@
   "file": "crates/enchudb-engine/src/ball.rs",
   "find": "self.wide_of(v).get(&v).copied().unwrap_or(0)",
   "replace": "self.wide_of(v + 1).get(&v).copied().unwrap_or(0)"
+ },
+ {
+  "name": "カードに外れた時刻を書かない",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "                    sp.to[p].store(ts, Ordering::Release);\n",
+  "replace": ""
+ },
+ {
+  "name": "カードに上を向いた時刻を書かない (前からに見える)",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "                sp.from[l].store(ts, Ordering::Relaxed);\n                sp.to[l].store(SPIN_OPEN, Ordering::Relaxed);\n",
+  "replace": "                sp.to[l].store(SPIN_OPEN, Ordering::Relaxed);\n"
+ },
+ {
+  "name": "伸ばした backing に時刻を写さない",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "                        ns.to[i].store(os.to[i].load(Ordering::Relaxed), Ordering::Relaxed);\n",
+  "replace": ""
+ },
+ {
+  "name": "カードの読みが外れた時刻を見ない",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "if sp.from[i].load(Ordering::Relaxed) <= t && sp.to[i].load(Ordering::Acquire) > t {",
+  "replace": "if sp.from[i].load(Ordering::Relaxed) <= t {"
+ },
+ {
+  "name": "球の列も詰め直す (外れたカードを捨てる)",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "        if self.spun {\n            return self.live() as usize;\n        }\n",
+  "replace": ""
+ },
+ {
+  "name": "外す時に時刻を渡さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.himos[hid].remove_at(local, ball_ts);",
+  "replace": "        self.himos[hid].remove_at(local, None);"
+ },
+ {
+  "name": "書き換えの古いカードに時刻を渡さない",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "                let stale = old.and_then(|o| cyl.note_stale_of_in_at(o, eid, ts, &guard).map(|s| (o, s)));",
+  "replace": "                let stale = old.and_then(|o| cyl.note_stale_of_in_at(o, eid, None, &guard).map(|s| (o, s)));"
  }
 ]

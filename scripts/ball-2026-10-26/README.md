@@ -9,6 +9,9 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
 - `run_cols.sh`: 球にする列を分けた版 (a・b だけ / w だけ、 seed 41〜43)
 - 結果: `results_ballb_v1.jsonl` (直す前: 面の場所を 1 つの数え口で取る、 u32 の値は全部配列) / `results_ballb_v2.jsonl` (直した後) /
   `results_ballb_cols.jsonl` / `results_ballb_r.jsonl` (読み、 seed 41〜43)
-- `ball_mut.json`: 変異 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
+- 3 回目 (履歴をデッキのカードのスピン = 向きの時刻に残す): `results_ballb_v3.jsonl` / `results_ballb_cols_v3.jsonl` /
+  `results_ballb_r_v3.jsonl`。 `ballb.rs` は 3 回目の形 (宣言を索引を組む前に、 読みの段は円柱を先に組まない、 時刻を書けなかった
+  カードの数を出す)
+- `ball_mut.json`: 変異 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
