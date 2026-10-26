@@ -4799,6 +4799,8 @@ pub struct Engine {
     /// live query (クエリ購読) の route。 Column 書き込みが `live_set` / `live_remove`
     /// 経由で通知する (`crate::live` module doc)。
     live: std::sync::Arc<crate::live::LiveRegistry>,
+    /// 球 (試作、 `crate::ball`): 宣言した紐の値の履歴。 宣言が無ければ書き手は atomic 1 回で素通り。
+    balls: crate::ball::Balls,
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -5370,6 +5372,7 @@ impl Engine {
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            balls: crate::ball::Balls::new(),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -6645,6 +6648,7 @@ impl Engine {
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            balls: crate::ball::Balls::new(),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -11481,6 +11485,9 @@ impl Engine {
         if ok {
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
             self.order_note(hid as u16, local);
+            if self.balls.any() {
+                self.balls.on_set(hid as u16, local, value);
+            }
             self.live.touch(hid as u16, local);
         }
         if changed {
@@ -11634,6 +11641,9 @@ impl Engine {
         };
         self.himos[hid].remove(local);
         self.order_note(hid as u16, local);
+        if self.balls.any() {
+            self.balls.on_remove(hid as u16, local);
+        }
         self.live.touch(hid as u16, local);
         if let Some(o) = old {
             self.vocab.release(o);
@@ -17944,6 +17954,48 @@ impl Engine {
         h.declare_marks(false);
         self.try_persist_tables();
         Ok(true)
+    }
+
+    /// 球にする (試作、 `crate::ball`): 紐 `himo` の値を書き換えるたびに前の値を面として残す。 今ある値は 「前から」
+    /// (時刻 0) の面になる。 書き手の居ない時に呼ぶこと。 宣言はメモリの上だけ (保存しない、 開き直すと消える)。
+    /// 新しく宣言したら true。 Leaf の紐は不可 (値が中身の場所で、 書き換えると前の中身は消える)。
+    pub fn declare_ball(&self, himo: &str) -> Result<bool, String> {
+        let id = self.himo_id(himo).ok_or_else(|| format!("declare_ball: unknown himo '{himo}'"))?;
+        let h = self.himos.get(id).ok_or_else(|| format!("declare_ball: himo {id} out of range"))?;
+        if h.value_type == ValueType::Leaf {
+            return Err(format!("declare_ball: '{himo}' is a Leaf himo"));
+        }
+        Ok(self.balls.declare(id as u16, |f| h.for_each_set_cell(|e, v| f(e, v))))
+    }
+
+    /// 球の今の時刻 (試作)。 この後の書き換えは、 これより大きい時刻になる。
+    pub fn ball_now(&self) -> u64 {
+        self.balls.now()
+    }
+
+    /// 時点 `t` の値 (試作)。 球にしていない紐は None。
+    pub fn ball_value_at(&self, eid: enchudb_oplog::EntityId, himo: &str, t: u64) -> Option<u64> {
+        self.balls.get(self.himo_id(himo)? as u16)?.value_at(enchudb_oplog::eid_local(eid), t)
+    }
+
+    /// 球の面を古い順に (試作)。
+    pub fn ball_faces(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<crate::ball::FaceView> {
+        self.himo_id(himo)
+            .and_then(|id| self.balls.get(id as u16))
+            .map_or_else(Vec::new, |b| b.faces_of(enchudb_oplog::eid_local(eid)))
+    }
+
+    /// 時点 `t` に `value` が上を向いていた entity (試作、 eid の昇順)。 Tag の紐は `vocab_id` で番号にしてから。
+    pub fn ball_pull_at(&self, himo: &str, value: u64, t: u64) -> Vec<enchudb_oplog::EntityId> {
+        let Some(b) = self.himo_id(himo).and_then(|id| self.balls.get(id as u16)) else { return Vec::new() };
+        let peer = self.peer_id();
+        b.pull_at(value, t).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+    }
+
+    /// 球の面の数と取った byte (試作)。
+    pub fn ball_stats(&self, himo: &str) -> Option<(u64, usize)> {
+        let b = self.balls.get(self.himo_id(himo)? as u16)?;
+        Some((b.face_count(), b.bytes()))
     }
 
     /// 位置の印を宣言した紐の名前 (紐の番号の順)。

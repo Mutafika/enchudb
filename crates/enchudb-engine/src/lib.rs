@@ -42,6 +42,8 @@ pub(crate) mod append_vec;
 pub(crate) mod append_bucket;
 pub(crate) mod lockfree_cylinder;
 pub(crate) mod order_index;
+/// 球 (試作): 値の履歴。
+pub mod ball;
 /// dense 配列を伸ばした回数 (診断用、 request23)。 `segment_map::grow_stats` と同じ位置づけ。
 pub use lockfree_cylinder::dense_grow_count;
 pub(crate) mod region;
@@ -108,6 +110,7 @@ pub mod sparse_copy;
 pub use engine::{DbState, Engine, EntityValue, EntityValueOwned, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, PkValue, RemoteApply, TieRejected, VocabUsage, Cursor, CURSOR_ANSWER, CURSOR_CHANGEFEED, CURSORS_TABLE, DEFAULT_ANSWER_LOG_LIMIT};
 pub use live::{Agg, AnswerHandle, AnswerSpec, GroupedLiveQuery, KeyedDelta, LiveCounts, LiveGroup, LiveDelta, LiveKeyed, LivePred, LiveQuery, TouchedDelta, TouchedLiveQuery, MAX_BRANCHES, MAX_KEYS};
 pub use sparse_copy::copy_sparse;
+pub use ball::FaceView;
 /// 番号で受け直す流れ (changefeed の記録・宣言された答え) の 「その位置はもう無い」。
 pub use change_log::Truncated;
 #[cfg(not(target_arch = "wasm32"))]
