@@ -222,6 +222,40 @@ fn raised_times_move_the_wal_clock() {
     }
 }
 
+/// 行の削除 (delete) も、 球の面を削除の WAL の HLC で閉じる: e0 が値 5 に入った後に e1 が値 6 に入り、 その後で e0 を消す。
+/// e1 が入った時点では e0 はまだ値 5 のデッキに居る。 削除の道で HLC を渡し忘れると、 面は e0 の最後の時刻 + 1 で閉じ、
+/// e1 の時点の答えから e0 が抜ける (並行の試験は行を消さないので、 ここでしか見えない)。
+#[test]
+fn deletes_close_faces_at_their_wal_time() {
+    let path = tmp_path("delete_hlc");
+    cleanup(&path);
+    let mut db = Database::create(&path).unwrap();
+    db.table("t").number("id").number("a").primary_key("id").build().unwrap();
+    let mut eids = Vec::new();
+    {
+        let t = db.get_table("t").unwrap();
+        for i in 0..2i64 {
+            eids.push(t.insert().set("id", i).commit().unwrap());
+        }
+    }
+    let db = db.finish_with_oplog(16 << 20).unwrap();
+    let eng = db.arc_engine();
+    assert!(eng.declare_ball("t.a").unwrap());
+    let ha = eng.himo_id("t.a").unwrap() as u16;
+    eng.tie_to_by_id(eids[0], ha, 5u32);
+    eng.tie_to_by_id(eids[1], ha, 6u32);
+    let t1 = eng.ball_faces(eids[1], "t.a")[0].from;
+    db.get_table("t").unwrap().entity(eids[0]).delete().unwrap();
+    let faces = eng.ball_faces(eids[0], "t.a");
+    assert_eq!(faces.len(), 1);
+    assert!(faces[0].to > t1, "削除の時刻 {} が、 その前の書き込みの時刻 {t1} 以前", faces[0].to);
+    assert_eq!(eng.ball_pull_at("t.a", 5, t1), vec![eids[0]], "e1 が入った時点では e0 はまだ値 5");
+    assert_eq!(eng.ball_pull_at("t.a", 5, faces[0].to), Vec::<u64>::new());
+    drop(eng);
+    drop(db);
+    cleanup(&path);
+}
+
 fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     const TH: usize = 4;
     const PER: usize = 16;

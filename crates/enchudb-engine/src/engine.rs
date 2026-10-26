@@ -10462,7 +10462,7 @@ impl Engine {
             self.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
         }
         // 4. src を落として slot を空ける (版数 0 = cell を全部落とす。 削除の印・主キーの記録は残さない)
-        self.remove_entity_body(s, enchudb_oplog::Hlc::ZERO);
+        self.remove_entity_body(s, enchudb_oplog::Hlc::ZERO, enchudb_oplog::Hlc::ZERO);
         self.clear_cell_versions(s);
         Ok(moved)
     }
@@ -12703,7 +12703,7 @@ impl Engine {
         // 削除優先 (ユーザの決め、 2026-10-21): 削除より新しい cell も消し、 行を死なせる (消した行の eid 宛ての書き込みは、 削除より
         // 新しくても捨てる。 受け取った書き込みは `slot_is_dead` で弾く)。 前は削除より新しい cell を残し (#514)、 名前の無い塊が
         // 生きた (#547)
-        self.remove_entity_body(local, enchudb_oplog::Hlc::ZERO);
+        self.remove_entity_body(local, enchudb_oplog::Hlc::ZERO, hlc);
         true
     }
 
@@ -12937,7 +12937,7 @@ impl Engine {
             if repair {
                 // #513: 切れた削除が主キーの cell を消す前だったなら、 ここで覚える (覚えた後に切れていれば同じ版数で no-op)
                 self.remember_pk_tombstone(local, tomb);
-                self.remove_entity_body(local, tomb);
+                self.remove_entity_body(local, tomb, tomb);
             }
             repaired += 1;
         }
@@ -12963,14 +12963,18 @@ impl Engine {
     ///
     /// 行を握って消す (#349): 他の cell の書き手と同じく、 `read_row` に消している途中の行を見せない。
     /// `apply_delete_local` から来た時は入れ子で素通り。
-    fn remove_entity_body(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+    ///
+    /// 残す境目 (`keep_newer_than`、 上の 「削除より新しい」 の削除の版数) と、 消した時刻 (`hlc`、 球の面を閉じる時刻) は別に渡す:
+    /// 削除優先の道は境目を `ZERO` にして全部消すが、 球には削除の HLC を渡す (`ZERO` を渡すと、 削除の時刻が球の最後の時刻 + 1 に
+    /// なり、 その間の時点の答えから消えた行が先に抜ける)。
+    fn remove_entity_body(&self, local: u32, keep_newer_than: enchudb_oplog::Hlc, hlc: enchudb_oplog::Hlc) {
         let _row = self.row_locks.write(local);
         let mut survivor = false;
         for hid in 0..self.himos.len() {
             if self.himos[hid].get_value(local).is_none() {
                 continue;
             }
-            if hlc != enchudb_oplog::Hlc::ZERO && self.version_of(local, hid as u16) > hlc {
+            if keep_newer_than != enchudb_oplog::Hlc::ZERO && self.version_of(local, hid as u16) > keep_newer_than {
                 survivor = true;
                 continue;
             }
