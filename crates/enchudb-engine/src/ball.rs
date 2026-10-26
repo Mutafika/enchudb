@@ -482,7 +482,8 @@ impl Ball {
         out
     }
 
-    /// 時点 `t` に値 `v` の面を上にしていた球 (eid の昇順)。 `now` は今のデッキ (この呼び出しの**前に**読んだもの、 並びは問わない)。
+    /// 時点 `t` に値 `v` の面を上にしていた球 (eid の昇順)。 `now` は今のデッキ (この呼び出しの**前に**読んだもの、 並びは問わない、
+    /// 重なりは無いこと = `HimoStore::pull` の返り値)。
     /// 今のデッキから、 帳面の t より後の差分を逆に戻す。
     pub fn pull_at(&self, v: u64, t: u64, now: Vec<u32>) -> Vec<u32> {
         if v >= LOG_DENSE {
@@ -528,7 +529,7 @@ impl Ball {
     }
 }
 
-/// 今のデッキ `now` (並びは問わない、 重なってもよい) に、 t より後の差分 `after` (時刻の順) を新しい方から逆に当てた、
+/// 今のデッキ `now` (並びは問わない、 重なりは無い) に、 t より後の差分 `after` (時刻の順) を新しい方から逆に当てた、
 /// 時点 t のデッキ (eid の昇順)。 差分が多く eid が狭く集まっていれば bit の表で、 そうでなければ並べて合わせる。
 fn roll_back(now: Vec<u32>, after: &[Diff]) -> Vec<u32> {
     match bits_window(&now, after) {
@@ -588,9 +589,9 @@ fn roll_back_on(bits: &mut [u64], now: &[u32], after: &[Diff], lo: u32) -> Vec<u
 /// 今のデッキと、 球ごとの t より後の最初の差分 (入った = t には居なかった、 出た = 居た) を eid の順に並べて合わせる。
 fn roll_back_merge(mut now: Vec<u32>, after: &[Diff]) -> Vec<u32> {
     // 名簿の読みはほぼ並んでいる (詰め直した bucket + 後ろに足した分) ので比較 sort (並んだ所を一気に通る)。 基数 sort は
-    // 並びによらず桁の数だけ写すので、 今を指した読みが 5 → 22 µs になった
+    // 並びによらず桁の数だけ写すので、 今を指した読みが 5 → 22 µs になった。 重なりは無い約束 (落とす走査 1 回で +2.8 µs)
     now.sort_unstable();
-    now.dedup();
+    debug_assert!(now.windows(2).all(|w| w[0] < w[1]), "ball: 今のデッキに重なり");
     if after.is_empty() {
         return now;
     }
@@ -870,8 +871,8 @@ mod tests {
     }
 
     /// 戻し方 2 通り (bit の表 / 並べて合わせる) を、 手で決めた答え (球ごとの t より後の最初の差分、 無ければ今) と比べる。
-    /// 差分は手元の写しから作るので、 入った / 出たは球ごとに交互、 今のデッキは差分の後の写し。 eid の狭い / 広い散らばり、
-    /// 今のデッキの重なりも混ぜる。
+    /// 差分は手元の写しから作るので、 入った / 出たは球ごとに交互、 今のデッキは差分の後の写し (並びを崩して渡す)。 eid の狭い /
+    /// 広い散らばりを混ぜる。
     #[test]
     fn both_roll_backs_agree_with_the_first_diff_after_t() {
         let mut r = 0x9E37_79B9_7F4A_7C15u64;
@@ -902,11 +903,12 @@ mod tests {
                 after.push(Diff { t, eid: e, into: !inside as u32 });
             }
             let mut now: Vec<u32> = cur.iter().filter(|x| *x.1).map(|x| *x.0).collect();
-            if case % 4 == 0 {
-                let dup: Vec<u32> = now.iter().step_by(3).copied().collect();
-                now.extend(dup); // 名簿の読みが重なっても
+            if case % 2 == 0 {
+                now.reverse();
+            } else {
+                let k = now.len() / 3;
+                now.rotate_left(k);
             }
-            now.reverse();
             // 時点 t = cut 番目の差分の時刻: t より後の差分だけを渡し、 答えは写しに頭から cut 個当てたもの
             for cut in [0, after.len() / 3, after.len() / 2, after.len()] {
                 let tail = &after[cut..];

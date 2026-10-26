@@ -68,14 +68,8 @@
  {
   "name": "並べて合わせる道: 今のデッキを並べない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "    now.sort_unstable();\n    now.dedup();",
-  "replace": "    now.dedup();"
- },
- {
-  "name": "並べて合わせる道: 今のデッキの重なりを落とさない",
-  "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "    now.sort_unstable();\n    now.dedup();",
-  "replace": "    now.sort_unstable();"
+  "find": "    now.sort_unstable();\n    debug_assert!",
+  "replace": "    debug_assert!"
  },
  {
   "name": "bit の表: 差分を古い方から当てる",
