@@ -22,9 +22,11 @@
 //!
 //! ## 並行
 //! 書き手は engine の行の lock の下 (`live_set` / `live_remove`) で呼ぶ = 同じ entity の書き手は 1 本。 面の場所は
-//! `next` の fetch_add で取り、 中身を書いてから球の頭 (`heads`) を Release で出す。 デッキの頭は CAS で付け替える
+//! 書き手 (thread) ごとに `BLOCK` 個ずつ `next` の fetch_add でまとめて取り (書き手が 1 つの数え口を取り合わない)、 中身を
+//! 書いてから球の頭 (`heads`) を Release で出す。 デッキの頭は CAS で付け替える
 //! (前の頭を `prev_v` に書いてから CAS、 読み手は頭を Acquire で読んで糸をたどる)。 読み手は lock を取らない。
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -38,6 +40,20 @@ const CHUNK_BITS: u32 = 16;
 const CHUNK: usize = 1 << CHUNK_BITS;
 /// u32 の添字を覆う塊の数。
 const CHUNKS: usize = 1 << (32 - CHUNK_BITS);
+/// デッキの頭を配列に置く値の上限 (2^20、 円柱の dense と同じ)。 上は `WIDE` 本に分けた表 (値の範囲に散る列で、 値 1 つの
+/// ために塊を取らない)。
+const DECK_DENSE: u64 = 1 << 20;
+const WIDE: usize = 64;
+/// 書き手ごとに面の場所をまとめて取る数。
+const BLOCK: u64 = 64;
+
+/// 球に付ける通し番号 (書き手ごとの面の場所の塊がどの球の物かを見分ける。 番地は使い回されるので使わない)。
+static BALL_IDS: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// この thread が取った面の場所の塊: (球の番号, 次, 終わり)。 球 8 つまで。 追い出した塊の残りは使わない場所になる。
+    static BLOCKS: Cell<[(u64, u32, u32); 8]> = const { Cell::new([(0, 0, 0); 8]) };
+}
 
 /// u32 の添字で引く、 塊ごとに初めて触った時に取る配列。 読み手は取らない (無い塊は空として読む)。
 struct Chunked<T> {
@@ -45,13 +61,14 @@ struct Chunked<T> {
 }
 
 impl<T: Default> Chunked<T> {
-    fn new() -> Self {
-        Self { chunks: (0..CHUNKS).map(|_| OnceLock::new()).collect() }
+    /// 添字 `n` 未満を覆う。
+    fn new(n: u64) -> Self {
+        Self { chunks: (0..n.div_ceil(CHUNK as u64)).map(|_| OnceLock::new()).collect() }
     }
 
     #[inline]
     fn get(&self, i: u32) -> Option<&T> {
-        let c = self.chunks[(i >> CHUNK_BITS) as usize].get()?;
+        let c = self.chunks.get((i >> CHUNK_BITS) as usize)?.get()?;
         Some(&c[i as usize & (CHUNK - 1)])
     }
 
@@ -89,20 +106,33 @@ pub struct FaceView {
 
 /// 紐 1 本の球の全部 (entity ごとの球 + 値ごとのデッキの頭)。
 pub(crate) struct Ball {
+    id: u64,
     faces: Chunked<Face>,
-    /// 出した面の数 (= 次の面の場所)。
-    next: AtomicU32,
+    /// 書き手に渡した面の場所の数 (書き手ごとの塊の、 まだ使っていない分を含む)。
+    next: AtomicU64,
     /// entity → 今の面 + 1 (0 = 球が無い)。
     heads: Chunked<AtomicU32>,
-    /// 値 (u32 に入る) → その値の最後の面 + 1。
+    /// 値 (`DECK_DENSE` 未満) → その値の最後の面 + 1。
     decks: Chunked<AtomicU32>,
-    /// u32 に入らない値のデッキの頭 (Number64 の列)。 試作なので lock で守る。
-    wide: Mutex<BTreeMap<u64, u32>>,
+    /// `DECK_DENSE` 以上の値のデッキの頭。 値の下位 bit で `WIDE` 本に分ける。 試作なので lock で守る。
+    wide: Box<[Mutex<BTreeMap<u64, u32>>]>,
 }
 
 impl Ball {
     fn new() -> Self {
-        Self { faces: Chunked::new(), next: AtomicU32::new(0), heads: Chunked::new(), decks: Chunked::new(), wide: Mutex::new(BTreeMap::new()) }
+        Self {
+            id: BALL_IDS.fetch_add(1, Ordering::Relaxed),
+            faces: Chunked::new(1 << 32),
+            next: AtomicU64::new(0),
+            heads: Chunked::new(1 << 32),
+            decks: Chunked::new(DECK_DENSE),
+            wide: (0..WIDE).map(|_| Mutex::new(BTreeMap::new())).collect(),
+        }
+    }
+
+    #[inline]
+    fn wide_of(&self, v: u64) -> std::sync::MutexGuard<'_, BTreeMap<u64, u32>> {
+        self.wide[v as usize % WIDE].lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[inline]
@@ -118,8 +148,8 @@ impl Ball {
         f.value.store(v, Ordering::Relaxed);
         f.from.store(from, Ordering::Relaxed);
         f.to.store(OPEN, Ordering::Relaxed);
-        if let Ok(v32) = u32::try_from(v) {
-            let head = self.decks.get_or_alloc(v32);
+        if v < DECK_DENSE {
+            let head = self.decks.get_or_alloc(v as u32);
             let mut old = head.load(Ordering::Acquire);
             loop {
                 f.prev_v.store(old.wrapping_sub(1), Ordering::Relaxed);
@@ -129,16 +159,38 @@ impl Ball {
                 }
             }
         } else {
-            let mut w = self.wide.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = self.wide_of(v);
             let old = w.insert(v, i + 1).unwrap_or(0);
             f.prev_v.store(old.wrapping_sub(1), Ordering::Release);
         }
     }
 
+    /// 面の場所を 1 つ。 この thread の塊から渡し、 尽きたら `BLOCK` 個まとめて取る。 NONE は糸の終わりに使うので、
+    /// 場所を使い切ったら記録をやめる (試作)。
     fn alloc(&self) -> Option<u32> {
-        let i = self.next.fetch_add(1, Ordering::Relaxed);
-        // NONE は糸の終わりに使う。 使い切ったら記録をやめる (試作)
-        (i < NONE - 1).then_some(i)
+        BLOCKS.with(|c| {
+            let mut b = c.get();
+            let k = match b.iter().position(|e| e.0 == self.id) {
+                Some(k) => k,
+                None => {
+                    b.rotate_right(1);
+                    b[0] = (self.id, 0, 0);
+                    0
+                }
+            };
+            if b[k].1 == b[k].2 {
+                let start = self.next.fetch_add(BLOCK, Ordering::Relaxed);
+                if start + BLOCK >= NONE as u64 {
+                    return None;
+                }
+                b[k].1 = start as u32;
+                b[k].2 = (start + BLOCK) as u32;
+            }
+            let i = b[k].1;
+            b[k].1 += 1;
+            c.set(b);
+            Some(i)
+        })
     }
 
     /// 球を回す: `new` を上に向ける (None = 今の面を閉じるだけ)。 行の lock の下で呼ぶ。
@@ -208,9 +260,10 @@ impl Ball {
 
     /// 時点 `t` に値 `v` が上を向いていた entity (eid の昇順)。 同じ球の面は時刻が重ならないので、 1 つの eid は 1 回だけ出る。
     pub fn pull_at(&self, v: u64, t: u64) -> Vec<u32> {
-        let head = match u32::try_from(v) {
-            Ok(v32) => self.decks.get(v32).map_or(0, |h| h.load(Ordering::Acquire)),
-            Err(_) => self.wide.lock().unwrap_or_else(|e| e.into_inner()).get(&v).copied().unwrap_or(0),
+        let head = if v < DECK_DENSE {
+            self.decks.get(v as u32).map_or(0, |h| h.load(Ordering::Acquire))
+        } else {
+            self.wide_of(v).get(&v).copied().unwrap_or(0)
         };
         let mut out = Vec::new();
         let Some(mut i) = head.checked_sub(1) else { return out };
@@ -228,9 +281,9 @@ impl Ball {
         out
     }
 
-    /// 出した面の数。
+    /// 書き手に渡した面の場所の数 (書き手ごとの塊の、 まだ使っていない分 = 高々 `BLOCK` × 書き手の数を含む)。
     pub fn face_count(&self) -> u64 {
-        self.next.load(Ordering::Relaxed).min(NONE - 1) as u64
+        self.next.load(Ordering::Relaxed).min(NONE as u64)
     }
 
     /// 取った塊の大きさ (byte、 塊の表は除く)。
