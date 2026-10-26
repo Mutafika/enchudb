@@ -11474,17 +11474,13 @@ impl Engine {
             self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
             return false;
         }
-        // 球にした紐 (試作): 名簿 (円柱) を書き換える前に、 デッキの差分の帳面と球の面に記す (`crate::ball` の順序)
-        if self.balls.any() {
-            self.balls.record(hid as u16, local, self.himos[hid].get_value(local), Some(value));
-        }
         let ok = if self.points_to_content(hid) && !self.content_is_durable(hid, value) {
             // #419: 中身を指す cell は門の中で書く (書き出しがこの列を msync する間は待つ。 中身はこの前に書いてある)。
             // #656: 書き出しの済んだ語を指す cell は門を通らない (先に届いても中身はディスクにある)
             let _pass = self.publish_gate.enter(hid as u16, local);
-            self.himos[hid].set(local, value)
+            self.himo_set(hid, local, value)
         } else {
-            self.himos[hid].set(local, value)
+            self.himo_set(hid, local, value)
         };
         if ok {
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
@@ -11632,6 +11628,36 @@ impl Engine {
         true
     }
 
+    /// 名簿 (円柱) と列に書く (`live_set` の中、 行の lock の下)。 球にした紐 (試作、 `crate::ball` の順序) は、 名簿の鍵の中で
+    /// 名簿を書き換える前に帳面に書き足し、 鍵を離した後で球を回す。
+    #[inline]
+    fn himo_set(&self, hid: usize, local: u32, value: u64) -> bool {
+        if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
+            debug_assert!(self.himos[hid].cylinder_built(), "球の紐の円柱は宣言の時に組んである");
+            let mut ts = None;
+            let ok = self.himos[hid].set_noting(local, value, |old, g| ts = b.note(local, old, Some(value), self.balls.clock(), g));
+            if let Some(ts) = ts {
+                b.turn(local, Some(value), ts);
+            }
+            return ok;
+        }
+        self.himos[hid].set(local, value)
+    }
+
+    /// `himo_set` の外す版。
+    #[inline]
+    fn himo_remove(&self, hid: usize, local: u32) {
+        if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
+            let mut ts = None;
+            self.himos[hid].remove_noting(local, |old, g| ts = b.note(local, old, None, self.balls.clock(), g));
+            if let Some(ts) = ts {
+                b.turn(local, None, ts);
+            }
+            return;
+        }
+        self.himos[hid].remove(local)
+    }
+
     /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
     #[inline]
     fn live_remove(&self, hid: usize, local: u32) {
@@ -11640,10 +11666,7 @@ impl Engine {
         } else {
             None
         };
-        if self.balls.any() {
-            self.balls.record(hid as u16, local, self.himos[hid].get_value(local), None);
-        }
-        self.himos[hid].remove(local);
+        self.himo_remove(hid, local);
         self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);
         if let Some(o) = old {
@@ -17958,8 +17981,8 @@ impl Engine {
     }
 
     /// 球にする (試作、 `crate::ball`): 紐 `himo` の値を書き換えるたびに、 球の面 (entity ごとの前の値) とデッキの差分の帳面
-    /// (値ごとの 「時刻 t に入った / 出た」) に記す。 名簿 (円柱) は master のまま。 今ある値は 「前から」 (時刻 0)。 書き手の
-    /// 居ない時に呼ぶこと。 宣言はメモリの上だけ (保存しない、 開き直すと消える)。 新しく宣言したら true。 Leaf の紐は不可
+    /// (値ごとの 「時刻 t に入った / 出た」) に記す。 名簿 (円柱) は master のまま (まだ組んでいなければ今組む)。 今ある値は
+    /// 「前から」 (時刻 0)。 書き手の居ない時に呼ぶこと。 宣言はメモリの上だけ (保存しない、 開き直すと消える)。 新しく宣言したら true。 Leaf の紐は不可
     /// (値が中身の場所で、 書き換えると前の中身は消える)。
     pub fn declare_ball(&self, himo: &str) -> Result<bool, String> {
         let id = self.himo_id(himo).ok_or_else(|| format!("declare_ball: unknown himo '{himo}'"))?;
@@ -17967,6 +17990,8 @@ impl Engine {
         if h.value_type == ValueType::Leaf {
             return Err(format!("declare_ball: '{himo}' is a Leaf himo"));
         }
+        // 帳面の書き手は名簿の鍵で並ぶ (組んでいない紐の書き手は鍵を取らない)
+        h.build_cylinder();
         Ok(self.balls.declare(id as u16, |f| h.for_each_set_cell(|e, v| f(e, v))))
     }
 

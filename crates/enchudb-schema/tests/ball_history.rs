@@ -152,10 +152,22 @@ fn leaf_columns_cannot_be_balls() {
 /// 時刻を帳面の鍵の外で取る変異は release で 20 回中 20 回落ちる (変異なしは 20 回中 0 回、 2026-10-26)。
 #[test]
 fn concurrent_writers_leave_history_in_the_ledgers() {
+    concurrent_run("conc", &[0, 1, 2, 3, 4, 5]);
+}
+
+/// 上と同じを、 値の種類が多い列の値 (2^20 以上: 円柱では sparse = write_lock の道、 帳面は値ごとに分けない列 1 本) と、
+/// 配列の中の小さい値を混ぜて回す (小さい値 ↔ 大きい値の書き換えは、 write_lock と値の鍵を両方取る道)。 大きい値のうち 3 つは
+/// 下位 bit が同じ (帳面の同じ列に落ちる)。
+#[test]
+fn concurrent_writers_on_wide_values() {
+    concurrent_run("wide", &[3, 9, 1 << 24, (1 << 24) + 64, (1 << 24) + 128, (1 << 30) + 1]);
+}
+
+fn concurrent_run(name: &str, vals: &[u64]) {
     const TH: usize = 4;
     const PER: usize = 16;
-    const VALS: u64 = 6;
-    let path = tmp_path("conc");
+    let n_vals = vals.len() as u64;
+    let path = tmp_path(name);
     cleanup(&path);
     let mut db = Database::create(&path).unwrap();
     db.table("t").number("id").number("a").primary_key("id").build().unwrap();
@@ -175,6 +187,7 @@ fn concurrent_writers_leave_history_in_the_ledgers() {
     std::thread::scope(|s| {
         for th in 0..TH {
             let (eng, bar, log, eids, diffs) = (&eng, &bar, &log, &eids, &diffs);
+            let vals = vals;
             s.spawn(move || {
                 let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ th as u64);
                 let mut mine = vec![None::<u64>; PER];
@@ -182,12 +195,13 @@ fn concurrent_writers_leave_history_in_the_ledgers() {
                     for _ in 0..30 {
                         let k = r.below(PER as u64) as usize;
                         let e = eids[th * PER + k];
-                        let new = match r.below(VALS + 1) {
-                            VALS => {
+                        let new = match r.below(n_vals + 1) {
+                            k if k == n_vals => {
                                 eng.untie_by_id(e, ha);
                                 None
                             }
-                            v => {
+                            k => {
+                                let v = vals[k as usize];
                                 eng.tie_to_by_id(e, ha, v as u32);
                                 Some(v)
                             }
@@ -210,7 +224,7 @@ fn concurrent_writers_leave_history_in_the_ledgers() {
         }
     });
     for (k, (tm, want)) in checks.iter().enumerate() {
-        for v in 0..VALS {
+        for &v in vals {
             let deck: Vec<u64> = (0..TH * PER).filter(|&i| want[i] == Some(v)).map(|i| eids[i]).collect();
             assert_eq!(eng.ball_pull_at("t.a", v, *tm), deck, "回 {k} t={tm} v={v}");
         }
@@ -221,14 +235,14 @@ fn concurrent_writers_leave_history_in_the_ledgers() {
     // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (最後の 20 回の時刻を全部)
     let from = checks[checks.len().saturating_sub(21)].0;
     for tm in from..=eng.ball_now() {
-        for v in 0..VALS {
+        for &v in vals {
             let faces: Vec<u64> = eids.iter().copied().filter(|&e| eng.ball_value_at(e, "t.a", tm) == Some(v)).collect();
             assert_eq!(eng.ball_pull_at("t.a", v, tm), faces, "t={tm} v={v}");
         }
     }
     // 今の読み (名簿) も合う
     let last = &checks.last().unwrap().1;
-    for v in 0..VALS {
+    for &v in vals {
         let mut cur = eng.pull_raw("t.a", v as u32);
         cur.sort_unstable();
         let want: Vec<u64> = (0..TH * PER).filter(|&i| last[i] == Some(v)).map(|i| eids[i]).collect();

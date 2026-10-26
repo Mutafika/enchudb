@@ -1,0 +1,182 @@
+[
+ {
+  "name": "外した面を閉じない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            f.to.store(ts, Ordering::Release);",
+  "replace": "            let _ = f;"
+ },
+ {
+  "name": "球の読みが外れた時刻を見ない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "return (f.to.load(Ordering::Acquire) > t).then(|| f.value.load(Ordering::Relaxed));",
+  "replace": "return Some(f.value.load(Ordering::Relaxed));"
+ },
+ {
+  "name": "前からの面を時刻 1 から",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.push_face(i, eid, NONE, v, 0);",
+  "replace": "self.push_face(i, eid, NONE, v, 1);"
+ },
+ {
+  "name": "時刻を進めない (書き換えの時刻が今と同じ)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;",
+  "replace": "let ts = clock.fetch_add(0, Ordering::Relaxed) + 1;"
+ },
+ {
+  "name": "塊の中の場所を進めない (同じ場所を 2 度渡す)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            b[k].1 += 1;",
+  "replace": "            b[k].1 += 0;"
+ },
+ {
+  "name": "帳面に 出た を書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.log_push(o, Diff { t: ts, eid, into: 0 }, guard);",
+  "replace": "let _ = o;"
+ },
+ {
+  "name": "帳面に 入った を書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.log_push(n, Diff { t: ts, eid, into: 1 }, guard);",
+  "replace": "let _ = n;"
+ },
+ {
+  "name": "帳面の二分探索で t ちょうどの差分も後ろに数える",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "d.partition_point(|x| x.t <= t)",
+  "replace": "d.partition_point(|x| x.t < t)"
+ },
+ {
+  "name": "伸ばした帳面に前の差分を写さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            unsafe { *data[i].get() = *b.data[i].get() };",
+  "replace": "            let _ = i;"
+ },
+ {
+  "name": "並べて合わせる道: 最初の差分でなく最後の差分で決める",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "first.sort_unstable_by_key(|&(e, i, _)| (e, i));",
+  "replace": "first.sort_unstable_by_key(|&(e, i, _)| (e, u32::MAX - i));"
+ },
+ {
+  "name": "並べて合わせる道: 入った / 出たを逆に当てる",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "(x.eid, i as u32, x.into == 1)",
+  "replace": "(x.eid, i as u32, x.into == 0)"
+ },
+ {
+  "name": "並べて合わせる道: 今のデッキを並べない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "    sort_eids(&mut now);\n    now.dedup();",
+  "replace": "    now.dedup();"
+ },
+ {
+  "name": "並べて合わせる道: 今のデッキの重なりを落とさない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "    sort_eids(&mut now);\n    now.dedup();",
+  "replace": "    sort_eids(&mut now);"
+ },
+ {
+  "name": "bit の表: 差分を古い方から当てる",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "    for d in after.iter().rev() {",
+  "replace": "    for d in after.iter() {"
+ },
+ {
+  "name": "bit の表: 入った / 出たを逆に当てる",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        if d.into == 1 {",
+  "replace": "        if d.into == 0 {"
+ },
+ {
+  "name": "bit の表: 今のデッキを立てない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        bits[i >> 6] |= 1 << (i & 63);",
+  "replace": "        let _ = i;"
+ },
+ {
+  "name": "bit の表: 最後の語を取らない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "    let words = ((hi - lo) as usize >> 6) + 1;\n    (words <=",
+  "replace": "    let words = ((hi - lo) as usize >> 6).max(1);\n    (words <="
+ },
+ {
+  "name": "大きい値: 糸を前の差分につながない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "link: *head << 1 | d.into",
+  "replace": "link: d.into"
+ },
+ {
+  "name": "大きい値: t ちょうどの差分も後ろに数える",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            if d.t <= t {",
+  "replace": "            if d.t < t {"
+ },
+ {
+  "name": "大きい値: 時刻の順に並べ直さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            at = d.link >> 1;\n        }\n        out.reverse();",
+  "replace": "            at = d.link >> 1;\n        }"
+ },
+ {
+  "name": "名簿の鍵の外で帳面に書く (書き換えの速い道)",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "                let _held = locks.lock_pair(old, Some(value));\n                hook::at(\"inside_value_locks\");\n                note(old, &guard);",
+  "replace": "                note(old, &guard);\n                let _held = locks.lock_pair(old, Some(value));\n                hook::at(\"inside_value_locks\");"
+ },
+ {
+  "name": "名簿の鍵の外で帳面に書く (外す速い道)",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "                let _held = self.vlocks().lock_pair(Some(o), None);\n                note(Some(o), &guard);",
+  "replace": "                note(Some(o), &guard);\n                let _held = self.vlocks().lock_pair(Some(o), None);"
+ },
+ {
+  "name": "sparse の道で新しい値の鍵を取らない",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "let _held = (!grow).then(|| locks.lock_pair(old_in, new_in.then_some(value)));",
+  "replace": "let _held = (!grow).then(|| locks.lock_pair(old_in, None));"
+ },
+ {
+  "name": "書き換えの速い道で帳面に書かない",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "                note(old, &guard);\n                // 値更新",
+  "replace": "                // 値更新"
+ },
+ {
+  "name": "書き換えの sparse の道で帳面に書かない",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "\n        note(old, &guard);\n        let stale",
+  "replace": "\n        let stale"
+ },
+ {
+  "name": "外す速い道で帳面に書かない",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "                note(Some(o), &guard);\n                let stale",
+  "replace": "                let stale"
+ },
+ {
+  "name": "外す sparse の道で帳面に書かない",
+  "file": "crates/enchudb-engine/src/himo_store.rs",
+  "find": "\n        note(Some(o), &guard);\n        let stale",
+  "replace": "\n        let stale"
+ },
+ {
+  "name": "書き換えで球を回さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                b.turn(local, Some(value), ts);",
+  "replace": "                let _ = ts;"
+ },
+ {
+  "name": "外した球の面を閉じない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                b.turn(local, None, ts);",
+  "replace": "                let _ = ts;"
+ },
+ {
+  "name": "宣言で円柱を組まない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        h.build_cylinder();\n        Ok(self.balls.declare",
+  "replace": "        Ok(self.balls.declare"
+ }
+]

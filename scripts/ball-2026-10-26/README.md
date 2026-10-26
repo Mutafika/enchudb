@@ -17,6 +17,9 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
 - 5 回目 (名簿は master のまま、 履歴は球の面とデッキの差分の帳面): `results_ballb_v5.jsonl` / `results_ballb_cols_v5.jsonl` /
   `results_ballb_r_v5.jsonl`。 どれも 4 回目の binary (`v4_on` / `v4ab` / `v4w` / `"v":"v4"`) と交互に回した。 変異は `ball_mut_v5.json`
   (17 本、 全部どちらかで落ちる。 時刻を帳面の鍵の外で取る変異は回の途中の時刻の突き合わせで 20/20)。 `ballb.rs` は 5 回目の形
+- 6 回目 (帳面を名簿の鍵の中で書く、 時点 t を bit の表で戻す、 大きい値は列 1 本に糸): `results_ballb_v6.jsonl` /
+  `results_ballb_cols_v6.jsonl` / `results_ballb_r_v6.jsonl`。 5 回目の binary (`v5_on` / `v5ab` / `v5w` / `run_r.sh` の `v5`) と
+  交互に回した。 読みの段は `run_r.sh` (基準は script の頭)。 変異は `ball_mut_v6.json`
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。

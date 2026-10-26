@@ -214,7 +214,7 @@ const RADIX_MIN: usize = 512;
 /// eid の列を昇順にする。 長い列は基数 sort: 最小値からの差を 11 bit 以下の同じ幅の桁に分け、 下の桁から安定に振り分ける
 /// (桁の数は差の bit 数で決まる。 eid は表の中で近い所に集まるので、 2 桁で済むことが多い)。 比較 sort は列が長いほど
 /// 1 件の段数 (log n) が増え、 書き換えの多い列の詰め直しで整列が書き手の時間の 15% を占めていた。
-fn sort_eids(v: &mut Vec<u32>) {
+pub(crate) fn sort_eids(v: &mut Vec<u32>) {
     if v.len() < RADIX_MIN {
         v.sort_unstable();
         return;

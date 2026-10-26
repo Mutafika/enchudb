@@ -749,6 +749,14 @@ impl HimoStore {
     /// commit を伸ばせない = ディスク満杯。 未 commit page に書くと SIGBUS になるので
     /// 書かずに諦める)。 戻り値を無視しても従来どおり動く。
     pub fn set(&self, eid: u32, value: u64) -> bool {
+        self.set_noting(eid, value, |_, _| {})
+    }
+
+    /// `set` と同じ。 円柱を組んだ紐で値が変わる時、 名簿 (円柱) の鍵 (古い値と新しい値の、 値の鍵か write_lock) を持ったまま、
+    /// 名簿と列を書き換える**前に** `note(古い値, guard)` を呼ぶ (球の試作、 `crate::ball`: 帳面の書き手を名簿の書き手と同じ鍵で
+    /// 並べる)。 円柱を組んでいない紐・同じ値の書き直し・書けなかった時は呼ばない。
+    #[inline]
+    pub(crate) fn set_noting(&self, eid: u32, value: u64, note: impl FnOnce(Option<u64>, &Guard)) -> bool {
         // 幅に入らない値は書かない (呼び側 = engine の tie 系が先に弾いて fault に積む)
         if value > self.value_type.max_value() {
             debug_assert!(false, "HimoStore::set: value {value} exceeds {:?}", self.value_type);
@@ -756,7 +764,7 @@ impl HimoStore {
         }
         // cylinder を組んだ紐は値ごとの鍵で書く (`set_indexed`)。 flag は組む側が鍵を作った後に Release で立てる
         if self.cyl_built.load(Ordering::Acquire) {
-            return self.set_indexed(eid, value);
+            return self.set_indexed(eid, value, note);
         }
         // cylinder を組んでいなければ、 write_lock を取らずに門の中で Column だけを書く (`WriteGate`)
         if let Some(_pass) = self.gate.try_enter() {
@@ -768,7 +776,7 @@ impl HimoStore {
         let w = self.write_lock.lock();
         if self.cyl_live(&w).is_some() {
             drop(w);
-            return self.set_indexed(eid, value);
+            return self.set_indexed(eid, value, note);
         }
         self.store_unindexed(eid, value)
     }
@@ -778,7 +786,8 @@ impl HimoStore {
     /// なら、 write_lock (sparse と配列の差し替えの書き手は 1 本) も取る。 伸ばすなら全部の鍵も取る。
     ///
     /// 同じ cell の書き手は engine の行の lock で並ぶので、 古い値はこの間動かない。
-    fn set_indexed(&self, eid: u32, value: u64) -> bool {
+    #[inline]
+    fn set_indexed(&self, eid: u32, value: u64, note: impl FnOnce(Option<u64>, &Guard)) -> bool {
         let col = self.col();
         // 位置の表の行を先に cache に載せる (Column の古い値の読みと並んで待つ。 値は鍵を取った後に読み直す)
         self.cyl.prefetch_slot(eid);
@@ -797,6 +806,7 @@ impl HimoStore {
             if cyl.in_array(value, &guard) && old.is_none_or(|o| cyl.in_array(o, &guard)) {
                 let _held = locks.lock_pair(old, Some(value));
                 hook::at("inside_value_locks");
+                note(old, &guard);
                 // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
                 // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
                 let stale = old.and_then(|o| cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s)));
@@ -823,6 +833,7 @@ impl HimoStore {
         // 伸ばすなら全部の鍵 (配列を写す間に他の書き手が bucket を置くと消える)、 伸ばさないなら配列の中の側の値の鍵
         let _all = grow.then(|| locks.lock_all());
         let _held = (!grow).then(|| locks.lock_pair(old_in, new_in.then_some(value)));
+        note(old, &guard);
         let stale = old.and_then(|o| cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s)));
         store_at(col, eid, value + 1);
         if old.is_none() {
@@ -906,11 +917,17 @@ impl HimoStore {
     }
 
     pub fn remove(&self, eid: u32) {
+        self.remove_noting(eid, |_, _| {})
+    }
+
+    /// `remove` と同じ。 円柱を組んだ紐で値を外す時、 名簿の鍵を持ったまま外す前に `note(古い値, guard)` を呼ぶ (`set_noting`)。
+    #[inline]
+    pub(crate) fn remove_noting(&self, eid: u32, note: impl FnOnce(Option<u64>, &Guard)) {
         let col = self.col();
         if eid < col.count() {
             // cylinder を組んだ紐は値の鍵で消す (`set` と同じ)
             if self.cyl_built.load(Ordering::Acquire) {
-                return self.remove_indexed(eid);
+                return self.remove_indexed(eid, note);
             }
             // cylinder を組んでいなければ門の中で消すだけ (`set` と同じ)
             if let Some(_pass) = self.gate.try_enter() {
@@ -923,7 +940,7 @@ impl HimoStore {
             let w = self.write_lock.lock();
             if self.cyl_live(&w).is_some() {
                 drop(w);
-                return self.remove_indexed(eid);
+                return self.remove_indexed(eid, note);
             }
             if value_at(col, eid).is_some() {
                 col.clear(eid);
@@ -934,7 +951,8 @@ impl HimoStore {
 
     /// cylinder を組んだ紐の削除 (`set_indexed` と同じ鍵の取り方): 古い値が配列の中ならその値の鍵、 sparse なら
     /// write_lock。 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）。 flag → Column の順 (set と同じ)。
-    fn remove_indexed(&self, eid: u32) {
+    #[inline]
+    fn remove_indexed(&self, eid: u32, note: impl FnOnce(Option<u64>, &Guard)) {
         let col = self.col();
         let Some(o) = value_at(col, eid) else {
             return;
@@ -944,6 +962,7 @@ impl HimoStore {
             let guard = epoch::pin();
             if cyl.in_array(o, &guard) {
                 let _held = self.vlocks().lock_pair(Some(o), None);
+                note(Some(o), &guard);
                 let stale = cyl.note_stale_of_in(o, eid, &guard);
                 cyl.forget_slot(eid);
                 col.clear(eid);
@@ -959,6 +978,7 @@ impl HimoStore {
         let _w = self.write_lock.lock();
         let guard = epoch::pin();
         let _held = cyl.in_array(o, &guard).then(|| self.vlocks().lock_pair(Some(o), None));
+        note(Some(o), &guard);
         let stale = cyl.note_stale_of_in(o, eid, &guard);
         cyl.forget_slot(eid);
         col.clear(eid);
@@ -1442,6 +1462,12 @@ impl HimoStore {
     /// (#270)。 観測用 (#255 / #270 の gate)。
     pub fn cylinder_built(&self) -> bool {
         self.cyl_built.load(Ordering::Acquire)
+    }
+
+    /// cylinder を今組む (組んであれば何もしない)。 球の宣言 (試作) が、 帳面の書き手を名簿の鍵に並べるために使う
+    /// (組んだ紐の書き手は必ず値の鍵か write_lock を取る。 組んだ印は戻らない)。
+    pub(crate) fn build_cylinder(&self) {
+        self.ensure_cylinder_built();
     }
 
     /// 総件数 (live 基準、churn があっても正確 — request12)。
