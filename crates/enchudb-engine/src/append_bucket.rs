@@ -34,7 +34,6 @@
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::UnsafeCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// 空の bucket に初めて足す時の backing の大きさ。
@@ -50,74 +49,6 @@ struct Buf {
     marks: Option<Box<Marks>>,
 }
 
-/// まだ上を向いているカードの `to`。
-pub(crate) const SPIN_OPEN: u64 = u64::MAX;
-
-/// 球にした列のカードの向きの時刻 (試作)。 `from[i]` = `data[i]` の entity がこの値を上に向けた時刻 (0 = 宣言の前から)、
-/// `to[i]` = 外れた時刻 (`SPIN_OPEN` = まだ上)。 時点 t にこの値だった entity = `from <= t < to` のカード。 `from` は出す前に
-/// 1 回、 `to` は外れる時に 1 回、 どちらもこの bucket の書き手 1 本 (値の鍵の下) が書く。
-///
-/// 詰め直しは外れたカード (印の立った entry) を捨てずに履歴の段 `past` へ移す。 段は外れた時刻の順に並べた run の列で、
-/// backing ごとに持つ (詰め直しも伸長も新しい backing に前の段を写して足すだけ、 run は `Arc` で共有して書き換えない)。 読み手は
-/// 控えた backing の中のカードと段を読むので、 詰め直しの前後のどちらを控えても同じカードを 1 回ずつ見る。
-struct Spins {
-    from: Box<[AtomicU64]>,
-    to: Box<[AtomicU64]>,
-    past: Vec<Arc<[Card]>>,
-}
-
-impl Spins {
-    fn new(cap: usize) -> Self {
-        Self {
-            from: (0..cap).map(|_| AtomicU64::new(0)).collect(),
-            to: (0..cap).map(|_| AtomicU64::new(SPIN_OPEN)).collect(),
-            past: Vec::new(),
-        }
-    }
-}
-
-/// 履歴の段のカード 1 枚 (外れたカード)。 run の中は `to` の昇順。
-#[derive(Clone, Copy)]
-struct Card {
-    to: u64,
-    from: u64,
-    eid: u32,
-}
-
-/// 外れた時刻の順の run 2 本を 1 本に混ぜる。
-fn merge_by_to(a: &[Card], b: &[Card]) -> Arc<[Card]> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        if a[i].to <= b[j].to {
-            out.push(a[i]);
-            i += 1;
-        } else {
-            out.push(b[j]);
-            j += 1;
-        }
-    }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
-    out.into()
-}
-
-/// 球にした列で、 外れたカードの位置が分からず外れた時刻を書けなかった回数 (試作の診断。 0 のはず)。
-static SPIN_MISSES: AtomicUsize = AtomicUsize::new(0);
-
-/// 球の列の詰め直し (外れたカードを履歴の段へ移した) の回数 (試作の診断)。
-static SPIN_COMPACTS: AtomicUsize = AtomicUsize::new(0);
-
-/// [`SPIN_COMPACTS`] の今の値。
-pub fn spin_compactions() -> usize {
-    SPIN_COMPACTS.load(Ordering::Relaxed)
-}
-
-/// [`SPIN_MISSES`] の今の値。
-pub fn spin_misses() -> usize {
-    SPIN_MISSES.load(Ordering::Relaxed)
-}
-
 /// backing の古い印 (#578)。
 struct Marks {
     /// `data[i]` の entity がこの値を出ていったら bit `i` を立てる (書き手が置いた位置を覚えていて、 書き換え・消しの時に
@@ -127,9 +58,6 @@ struct Marks {
     /// 足した分の見える読み手には下がったのも見える)。 組み直した backing は true。 bucket ごとでなく backing ごとに持つ (読み手は
     /// 控えた backing の flag を読む: 組み直しの前の backing を控えた読み手が、 組み直した後の true を見ないように)。
     exact: AtomicBool,
-    /// 向きの時刻 (球、 試作 `crate::ball`): 球にした列の bucket だけが持つ (印の置き場の中に置く = 宣言の無い列の backing は
-    /// 大きくならない)。
-    spins: Option<Spins>,
 }
 
 // SAFETY: published 範囲 [0..len] は書き換わらない。 writer は spare slot [len] のみ書く。
@@ -138,15 +66,15 @@ struct Marks {
 unsafe impl Sync for Buf {}
 
 impl Buf {
-    fn with_cap(cap: usize, marked: bool, spun: bool) -> Self {
-        Self::from_vec(Vec::new(), cap, marked, spun)
+    fn with_cap(cap: usize, marked: bool) -> Self {
+        Self::from_vec(Vec::new(), cap, marked)
     }
 
     /// `v` を頭に置いた容量 `cap` (`v.len()` 以上) の backing。 `v` は昇順であること (詰め直しの出力。 読み手は昇順を前提に
     /// しないが、 詰め直した直後の bucket が eid の順で読めることを `compact_sorts_by_eid` が確かめる)。
     /// 空きは 0 で埋める (`vec![0; cap]` は確保の時に 0 の page をもらうだけ)。 `marked` (印を持つ bucket) なら、 古い印は無し・
     /// 印は全部そろっている (true) の印を付ける (中身の無い backing には付けない)。
-    fn from_vec(v: Vec<u32>, cap: usize, marked: bool, spun: bool) -> Self {
+    fn from_vec(v: Vec<u32>, cap: usize, marked: bool) -> Self {
         debug_assert!(v.len() <= cap && v.is_sorted());
         let len = v.len();
         let data: Box<[u32]> = if len == 0 {
@@ -159,44 +87,9 @@ impl Buf {
         // SAFETY: UnsafeCell<u32> は u32 と同じ表現 (repr(transparent))。 長さはそのまま移る
         let data = unsafe { Box::from_raw(Box::into_raw(data) as *mut [UnsafeCell<u32>]) };
         let marks = (marked && cap > 0).then(|| {
-            Box::new(Marks {
-                stale: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
-                exact: AtomicBool::new(true),
-                spins: spun.then(|| Spins::new(cap)),
-            })
+            Box::new(Marks { stale: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(), exact: AtomicBool::new(true) })
         });
-        // 球の列の backing は空で作る (詰め直さないので、 中身のある列からは作らない)。 球の列は印も持つ
-        debug_assert!(!spun || (len == 0 && marked));
         Self { data, len: AtomicUsize::new(len), marks }
-    }
-
-    /// 向きの時刻 (球の列の、 中身のある backing だけ)。
-    #[inline]
-    fn spins(&self) -> Option<&Spins> {
-        self.marks.as_deref()?.spins.as_ref()
-    }
-
-    #[inline]
-    fn spins_mut(&mut self) -> Option<&mut Spins> {
-        self.marks.as_deref_mut()?.spins.as_mut()
-    }
-
-    /// 球の列の詰め直しの backing: 上を向いているカード `live` ((eid, 上を向いた時刻)、 eid の昇順) を頭に、 履歴の段 `past`。
-    fn spun_from(live: &[(u32, u64)], cap: usize, past: Vec<Arc<[Card]>>) -> Self {
-        let mut b = Self::with_cap(cap, true, true);
-        let sp = b.spins_mut().expect("球の列の backing は向きの時刻を持つ");
-        sp.past = past;
-        for (i, &(_, f)) in live.iter().enumerate() {
-            sp.from[i].store(f, Ordering::Relaxed);
-        }
-        for (i, &(e, _)) in live.iter().enumerate() {
-            // SAFETY: まだ誰も見ていない backing の容量の中
-            unsafe {
-                *b.data[i].get() = e;
-            }
-        }
-        b.len.store(live.len(), Ordering::Relaxed);
-        b
     }
     #[inline]
     fn cap(&self) -> usize {
@@ -225,8 +118,6 @@ pub struct AppendBucket {
     rereads: AtomicU32,
     /// 古い印を持つか (位置の印を宣言した列の bucket、 #578)。 作る時に決まる。
     marked: bool,
-    /// 向きの時刻を持つか (球にした列の bucket、 試作)。 持つ bucket は印も持ち、 詰め直さない (外れたカードが履歴)。
-    spun: bool,
     /// backing の len の写し (u32 に入らない長さは u32::MAX)。 書き手が書き換え・消しの後に詰め直すかを決めるためだけに使う
     /// ([`writer_len`](Self::writer_len))。 動かすのも読むのも bucket の書き手 1 本 (値の鍵の下)、 読み手は使わない。 backing を
     /// 読まずに済む: 値がみな違う列 (主キー、 bucket が行の数だけある) の delete は、 backing の 1 回の外れが 1 行 280 ns だった
@@ -370,23 +261,13 @@ impl AppendBucket {
     /// に使う — 倍々で伸ばすと、 伸ばすたびの古い backing が epoch を過ぎるまで残る。 `marked` = 古い印を持つ (位置の印を
     /// 宣言した列、 #578)。
     pub fn with_capacity(cap: usize, marked: bool) -> Self {
-        Self::with_capacity_kind(cap, marked, false)
-    }
-
-    /// 球にした列の bucket (試作): 印と向きの時刻を持ち、 詰め直さない。
-    pub fn with_capacity_spun(cap: usize) -> Self {
-        Self::with_capacity_kind(cap, true, true)
-    }
-
-    fn with_capacity_kind(cap: usize, marked: bool, spun: bool) -> Self {
         Self {
-            backing: Atomic::new(Buf::with_cap(cap, marked, spun)),
+            backing: Atomic::new(Buf::with_cap(cap, marked)),
             live: AtomicU32::new(0),
             removed: AtomicBool::new(false),
             verified: AtomicU64::new(u64::MAX),
             rereads: AtomicU32::new(0),
             marked,
-            spun,
             wlen: AtomicU32::new(0),
         }
     }
@@ -468,12 +349,6 @@ impl AppendBucket {
     /// pin の重複を避ける（#95: insert 経路の pin 3 回 → 1 回）。
     /// 戻り値は push 前の published len（0 なら「空 bucket への初 push」= unique 判定用）。
     pub fn push_in(&self, eid: u32, guard: &Guard) -> usize {
-        self.push_in_at(eid, 0, guard)
-    }
-
-    /// [`push_in`](Self::push_in) の、 球の列のカードに上を向いた時刻 `ts` を書く版 (0 = 宣言の前から)。 時刻は len を出す前に
-    /// 書く (時点を指した読みが、 時刻の無いカードを 「前から」 と読まないように)。 球でない bucket では `ts` を使わない。
-    pub fn push_in_at(&self, eid: u32, ts: u64, guard: &Guard) -> usize {
         let cur = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null（new/push で維持）。
         let b = unsafe { cur.deref() };
@@ -483,19 +358,11 @@ impl AppendBucket {
             unsafe {
                 *b.data[l].get() = eid;
             }
-            if let Some(sp) = b.spins() {
-                sp.from[l].store(ts, Ordering::Relaxed);
-                sp.to[l].store(SPIN_OPEN, Ordering::Relaxed);
-            }
             b.len.store(l + 1, Ordering::Release);
             self.set_writer_len(l + 1);
         } else {
             let ncap = (b.cap() * 2).max(INITIAL_CAP);
-            let mut nb = Buf::with_cap(ncap, self.marked, self.spun);
-            // 履歴の段も写す (run は共有)
-            if let (Some(os), Some(ns)) = (b.spins(), nb.spins_mut()) {
-                ns.past = os.past.clone();
-            }
+            let nb = Buf::with_cap(ncap, self.marked);
             // 既存 published 要素をコピー（[0..l] は不変なので安全に読める）
             let src = unsafe { b.published(l) };
             for (i, &v) in src.iter().enumerate() {
@@ -513,16 +380,6 @@ impl AppendBucket {
                     nm.stale[w].store(x.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
                 nm.exact.store(om.exact.load(Ordering::Relaxed), Ordering::Relaxed);
-            }
-            // 向きの時刻も写す (外れた時刻を書くのもこの bucket の書き手 1 本)。 中身の無かった backing は持たない
-            if let Some(ns) = nb.spins() {
-                if let Some(os) = b.spins() {
-                    for i in 0..l {
-                        ns.from[i].store(os.from[i].load(Ordering::Relaxed), Ordering::Relaxed);
-                        ns.to[i].store(os.to[i].load(Ordering::Relaxed), Ordering::Relaxed);
-                    }
-                }
-                ns.from[l].store(ts, Ordering::Relaxed);
             }
             nb.len.store(l + 1, Ordering::Relaxed); // まだ誰も見ていない
             self.backing.store(Owned::new(nb), Ordering::Release);
@@ -552,10 +409,6 @@ impl AppendBucket {
     /// [`compact_in`](Self::compact_in) の、 残した entry の新しい位置を `placed(eid, 位置)` で知らせる版 (書き手が位置の表を
     /// 書き直す)。
     pub fn compact_in_placed(&self, guard: &Guard, mut keep: impl FnMut(u32) -> bool, mut placed: impl FnMut(u32, usize)) -> usize {
-        // 球の列は外れたカード (印の立った entry) を捨てずに履歴の段へ移す
-        if self.spun {
-            return self.compact_spun(guard, placed);
-        }
         let cur = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null。
         let b = unsafe { cur.deref() };
@@ -577,7 +430,7 @@ impl AppendBucket {
         }
 
         // 昇順の列をそのまま backing にする (まだ誰も見ていない。 古い印は無し、 印はそろっている)
-        let nb = Buf::from_vec(kept, live.next_power_of_two().max(INITIAL_CAP), self.marked, false);
+        let nb = Buf::from_vec(kept, live.next_power_of_two().max(INITIAL_CAP), self.marked);
         self.backing.store(Owned::new(nb), Ordering::Release);
         // SAFETY: 旧 backing は全 reader が epoch を通過してから解放。
         unsafe {
@@ -591,73 +444,10 @@ impl AppendBucket {
         live
     }
 
-    /// 球の列の詰め直し: 上を向いているカード (印の無い entry) は上を向いた時刻ごと eid の順に並べ直し、 外れたカード (印の立った
-    /// entry) は外れた時刻の順の run にして履歴の段の後ろに足す。 後ろの 2 本は、 前の方が後ろの 2 倍以下なら混ぜる (段の本数は
-    /// カードの数の log)。 印が全部でない (位置の分からない外れがあった) backing は詰め直さない (印の無い古いカードを上を向いて
-    /// いると取り違えるので)。 値の鍵を持つ 1 thread。
-    fn compact_spun(&self, guard: &Guard, mut placed: impl FnMut(u32, usize)) -> usize {
-        let cur = self.backing.load(Ordering::Acquire, guard);
-        // SAFETY: backing は常に非 null。
-        let b = unsafe { cur.deref() };
-        let (Some(m), Some(sp)) = (b.marks.as_deref(), b.spins()) else { return self.live() as usize };
-        if !m.exact.load(Ordering::Relaxed) {
-            return self.live() as usize;
-        }
-        let l = b.len.load(Ordering::Relaxed);
-        // SAFETY: [0..l] は publish 済み = 不変。
-        let src = unsafe { b.published(l) };
-        let mut live: Vec<(u32, u64)> = Vec::with_capacity(self.live() as usize);
-        let mut closed: Vec<Card> = Vec::with_capacity(l.saturating_sub(self.live() as usize));
-        for (i, &e) in src.iter().enumerate() {
-            let from = sp.from[i].load(Ordering::Relaxed);
-            if (m.stale[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 == 1 {
-                closed.push(Card { to: sp.to[i].load(Ordering::Relaxed), from, eid: e });
-            } else {
-                live.push((e, from));
-            }
-        }
-        debug_assert_eq!(live.len(), self.live() as usize, "印の無いカードの数 = live");
-        live.sort_unstable_by_key(|&(e, _)| e);
-        closed.sort_unstable_by_key(|c| c.to);
-        let mut past = sp.past.clone();
-        if !closed.is_empty() {
-            past.push(closed.into());
-            while past.len() >= 2 && past[past.len() - 2].len() <= 2 * past[past.len() - 1].len() {
-                let (y, x) = (past.pop().expect("2 本ある"), past.pop().expect("2 本ある"));
-                past.push(merge_by_to(&x, &y));
-            }
-        }
-        for (i, &(e, _)) in live.iter().enumerate() {
-            placed(e, i);
-        }
-        let n = live.len();
-        let nb = Buf::spun_from(&live, n.next_power_of_two().max(INITIAL_CAP), past);
-        self.backing.store(Owned::new(nb), Ordering::Release);
-        // SAFETY: 旧 backing は全 reader が epoch を通過してから解放。
-        unsafe {
-            guard.defer_destroy(cur);
-        }
-        self.live.store(n as u32, Ordering::Relaxed);
-        self.set_writer_len(n);
-        self.verified.store(u64::MAX, Ordering::Relaxed);
-        self.rereads.store(0, Ordering::Relaxed);
-        self.removed.store(false, Ordering::Release);
-        SPIN_COMPACTS.fetch_add(1, Ordering::Relaxed);
-        n
-    }
-
     /// 位置 `p` の entry (`eid` のはず) を古いと印す (この bucket の書き手 1 本で)。 位置を知らない (`None`) か、 そこに
     /// `eid` が無ければ印せないので、 この bucket の印は不完全になる (読みは Column で確かめる)。
     pub fn mark_stale(&self, at: Option<(usize, u32)>, guard: &Guard) {
-        self.mark_stale_at(at, None, guard)
-    }
-
-    /// [`mark_stale`](Self::mark_stale) の、 球の列のカードに外れた時刻 `ts` も書く版。
-    pub fn mark_stale_at(&self, at: Option<(usize, u32)>, ts: Option<u64>, guard: &Guard) {
         let b = unsafe { self.backing.load(Ordering::Acquire, guard).deref() };
-        if self.spun && !matches!(at, Some((p, _)) if p < b.len.load(Ordering::Relaxed)) {
-            SPIN_MISSES.fetch_add(1, Ordering::Relaxed);
-        }
         // 印を持たない backing (宣言の前に作った bucket / 中身の無い backing) は、 印が全部でないと読みが見る (Column で確かめる)
         let Some(m) = b.marks.as_deref() else { return };
         match at {
@@ -666,46 +456,12 @@ impl AppendBucket {
             Some((p, eid)) if p < b.len.load(Ordering::Relaxed) => {
                 debug_assert_eq!(unsafe { *b.data[p].get() }, eid, "位置の表が bucket と合わない");
                 let _ = eid;
-                if let (Some(ts), Some(sp)) = (ts, b.spins()) {
-                    sp.to[p].store(ts, Ordering::Release);
-                }
                 // 印を立てるのはこの bucket の書き手 1 本 (値の鍵の下) なので、 atomic の RMW でなく読んでから書く
                 let w = &m.stale[p / 64];
                 w.store(w.load(Ordering::Relaxed) | (1u64 << (p % 64)), Ordering::Release);
             }
             _ => m.exact.store(false, Ordering::Release),
         }
-    }
-
-    /// 時点 `t` に上を向いていたカードの entity を `out` に足す (球の列、 試作)。 球でない bucket は何もせず false。
-    /// backing のカード (上を向いているカードと、 前の詰め直しの後に外れたカード) をなめ、 履歴の段は外れた時刻で二分探索して
-    /// t より後に外れたカードだけを見る。 時点 `t` までの書き込みが
-    /// 返った後なら答えは揺れない (今に近い `t` は、 並んで書いている途中のカードが前の向きに見えうる)。
-    pub fn read_spun_at(&self, t: u64, guard: &Guard, out: &mut Vec<u32>) -> bool {
-        if !self.spun {
-            return false;
-        }
-        let b = unsafe { self.backing.load(Ordering::Acquire, guard).deref() };
-        let n = b.len.load(Ordering::Acquire);
-        let Some(sp) = b.spins() else { return true };
-        // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
-        let s = unsafe { b.published(n) };
-        for i in 0..n {
-            if sp.from[i].load(Ordering::Relaxed) <= t && sp.to[i].load(Ordering::Acquire) > t {
-                out.push(s[i]);
-            }
-        }
-        // 履歴の段: 外れた時刻が t より後のカード (run の後ろ側) のうち、 t までに上を向いたもの
-        for run in &sp.past {
-            let k = run.partition_point(|c| c.to <= t);
-            out.extend(run[k..].iter().filter(|c| c.from <= t).map(|c| c.eid));
-        }
-        true
-    }
-
-    /// 向きの時刻を持つ bucket か。
-    pub fn is_spun(&self) -> bool {
-        self.spun
     }
 
     /// [`snapshot_in`](Self::snapshot_in) に、 古い印の列と 「印が全部か」 を足した版。
@@ -1147,60 +903,5 @@ mod tests {
         assert_eq!(b.len(), n as usize);
         let v = b.read_to_vec();
         assert_eq!(v, (0..n).collect::<Vec<_>>());
-    }
-
-    /// 球の列の bucket (試作): 外れたカードを詰め直しで履歴の段に移し、 時点 t の読みが手元の写し (eid, 上を向いた時刻,
-    /// 外れた時刻) と合う。 2 回目の詰め直しでは、 前の run より早い時刻に外れたカード (時刻を採ってから値の鍵を取るまでに
-    /// 別の書き手の詰め直しが入った形) を混ぜ、 run を混ぜる時の並べ直しを通す。
-    #[test]
-    fn spun_bucket_moves_closed_cards_to_the_past() {
-        let b = AppendBucket::with_capacity_spun(0);
-        let guard = epoch::pin();
-        let mut pos = std::collections::BTreeMap::<u32, usize>::new();
-        // 写し: (eid, from, to)
-        let mut log: Vec<(u32, u64, u64)> = Vec::new();
-        let push = |b: &AppendBucket, pos: &mut std::collections::BTreeMap<u32, usize>, log: &mut Vec<(u32, u64, u64)>, e: u32, from: u64| {
-            let p = b.push_in_at(e, from, &guard);
-            b.live_inc();
-            pos.insert(e, p);
-            log.push((e, from, SPIN_OPEN));
-        };
-        let close = |b: &AppendBucket, pos: &std::collections::BTreeMap<u32, usize>, log: &mut Vec<(u32, u64, u64)>, e: u32, to: u64| {
-            b.mark_stale_at(Some((pos[&e], e)), Some(to), &guard);
-            b.note_stale();
-            let k = log.iter().rposition(|&(x, _, t)| x == e && t == SPIN_OPEN).unwrap();
-            log[k].2 = to;
-        };
-        for e in 0..80u32 {
-            push(&b, &mut pos, &mut log, e, 1 + e as u64);
-        }
-        for e in 0..50u32 {
-            close(&b, &pos, &mut log, e, 200 + e as u64);
-        }
-        b.compact_in_placed(&guard, |_| true, |e, i| {
-            pos.insert(e, i);
-        });
-        for e in 0..50u32 {
-            push(&b, &mut pos, &mut log, e, 300 + e as u64);
-        }
-        // 置き場の順と逆の時刻で外す (詰め直しが外れた時刻で並べ直すのを通す)
-        for e in 50..80u32 {
-            close(&b, &pos, &mut log, e, 179 - (e - 50) as u64);
-        }
-        for e in 0..20u32 {
-            close(&b, &pos, &mut log, e, 400 + e as u64);
-        }
-        b.compact_in_placed(&guard, |_| true, |e, i| {
-            pos.insert(e, i);
-        });
-        assert_eq!(b.live(), 30);
-        for t in [0u64, 1, 40, 80, 149, 150, 165, 179, 180, 199, 200, 225, 260, 300, 330, 399, 400, 410, 420, 1000] {
-            let mut got = Vec::new();
-            assert!(b.read_spun_at(t, &guard, &mut got));
-            got.sort_unstable();
-            let mut want: Vec<u32> = log.iter().filter(|&&(_, f, to)| f <= t && t < to).map(|&(e, _, _)| e).collect();
-            want.sort_unstable();
-            assert_eq!(got, want, "t={t}");
-        }
     }
 }

@@ -11474,22 +11474,21 @@ impl Engine {
             self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
             return false;
         }
-        // 球にした紐 (試作): 時刻を 1 回取り、 円柱のカードと球の面に同じ時刻を書く
-        let ball_ts = if self.balls.any() { self.balls.get(hid as u16).map(|_| self.balls.tick()) } else { None };
+        // 球にした紐 (試作): 名簿 (円柱) を書き換える前に、 デッキの差分の帳面と球の面に記す (`crate::ball` の順序)
+        if self.balls.any() {
+            self.balls.record(hid as u16, local, self.himos[hid].get_value(local), Some(value));
+        }
         let ok = if self.points_to_content(hid) && !self.content_is_durable(hid, value) {
             // #419: 中身を指す cell は門の中で書く (書き出しがこの列を msync する間は待つ。 中身はこの前に書いてある)。
             // #656: 書き出しの済んだ語を指す cell は門を通らない (先に届いても中身はディスクにある)
             let _pass = self.publish_gate.enter(hid as u16, local);
-            self.himos[hid].set_at(local, value, ball_ts)
+            self.himos[hid].set(local, value)
         } else {
-            self.himos[hid].set_at(local, value, ball_ts)
+            self.himos[hid].set(local, value)
         };
         if ok {
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
             self.order_note(hid as u16, local);
-            if let Some(ts) = ball_ts {
-                self.balls.on_set(hid as u16, local, value, ts, self.himos[hid].spun_in_array(value));
-            }
             self.live.touch(hid as u16, local);
         }
         if changed {
@@ -11641,12 +11640,11 @@ impl Engine {
         } else {
             None
         };
-        let ball_ts = if self.balls.any() { self.balls.get(hid as u16).map(|_| self.balls.tick()) } else { None };
-        self.himos[hid].remove_at(local, ball_ts);
-        self.order_note(hid as u16, local);
-        if let Some(ts) = ball_ts {
-            self.balls.on_remove(hid as u16, local, ts);
+        if self.balls.any() {
+            self.balls.record(hid as u16, local, self.himos[hid].get_value(local), None);
         }
+        self.himos[hid].remove(local);
+        self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);
         if let Some(o) = old {
             self.vocab.release(o);
@@ -17959,22 +17957,17 @@ impl Engine {
         Ok(true)
     }
 
-    /// 球にする (試作、 `crate::ball`): 紐 `himo` の値を書き換えるたびに前の値を残す。 円柱をここで組み、 そのカードに
-    /// 上を向いた時刻と外れた時刻を持たせて詰め直さない (履歴はデッキのカードのスピンに残る)。 今ある値は 「前から」
-    /// (時刻 0)。 円柱をもう組んだ紐は不可 (開き直して最初に読む前に宣言する)。 書き手の居ない時に呼ぶこと。 宣言は
-    /// メモリの上だけ (保存しない、 開き直すと消える)。 新しく宣言したら true。 Leaf の紐は不可 (値が中身の場所で、
-    /// 書き換えると前の中身は消える)。
+    /// 球にする (試作、 `crate::ball`): 紐 `himo` の値を書き換えるたびに、 球の面 (entity ごとの前の値) とデッキの差分の帳面
+    /// (値ごとの 「時刻 t に入った / 出た」) に記す。 名簿 (円柱) は master のまま。 今ある値は 「前から」 (時刻 0)。 書き手の
+    /// 居ない時に呼ぶこと。 宣言はメモリの上だけ (保存しない、 開き直すと消える)。 新しく宣言したら true。 Leaf の紐は不可
+    /// (値が中身の場所で、 書き換えると前の中身は消える)。
     pub fn declare_ball(&self, himo: &str) -> Result<bool, String> {
         let id = self.himo_id(himo).ok_or_else(|| format!("declare_ball: unknown himo '{himo}'"))?;
         let h = self.himos.get(id).ok_or_else(|| format!("declare_ball: himo {id} out of range"))?;
         if h.value_type == ValueType::Leaf {
             return Err(format!("declare_ball: '{himo}' is a Leaf himo"));
         }
-        if self.balls.get(id as u16).is_some() {
-            return Ok(false);
-        }
-        h.declare_spun().map_err(|e| format!("declare_ball: '{himo}': {e}"))?;
-        Ok(self.balls.declare(id as u16, |f| h.for_each_set_cell(|e, v| f(e, v, h.spun_in_array(v)))))
+        Ok(self.balls.declare(id as u16, |f| h.for_each_set_cell(|e, v| f(e, v))))
     }
 
     /// 球の今の時刻 (試作)。 この後の書き換えは、 これより大きい時刻になる。
@@ -17994,39 +17987,25 @@ impl Engine {
             .map_or_else(Vec::new, |b| b.faces_of(enchudb_oplog::eid_local(eid)))
     }
 
-    /// 時点 `t` に `value` が上を向いていた entity (試作、 eid の昇順)。 Tag の紐は `vocab_id` で番号にしてから。
-    /// 円柱の配列の中の値はデッキのカードの向きの時刻から、 外の値は球の面のデッキの糸から引く。
+    /// 時点 `t` に `value` の面を上にしていた entity (試作、 eid の昇順)。 Tag の紐は `vocab_id` で番号にしてから。
+    /// 今のデッキ (名簿) を先に読み、 デッキの差分の帳面の t より後の分を逆に戻す。
     pub fn ball_pull_at(&self, himo: &str, value: u64, t: u64) -> Vec<enchudb_oplog::EntityId> {
         let Some(id) = self.himo_id(himo) else { return Vec::new() };
         let Some(b) = self.balls.get(id as u16) else { return Vec::new() };
-        let mut local = match self.himos[id].pull_at(value, t) {
-            Some(v) => v,
-            None => b.pull_at(value, t),
-        };
-        local.sort_unstable();
+        let now = self.himos[id].pull(value);
         let peer = self.peer_id();
-        local.into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
-    }
-
-    /// 球にした紐で、 外れたカードの位置が分からず外れた時刻を書けなかった回数 (試作の診断、 process 全体。 0 のはず)。
-    pub fn ball_spin_misses(&self) -> usize {
-        crate::append_bucket::spin_misses()
-    }
-
-    /// 球にした紐の円柱の詰め直し (外れたカードを履歴の段へ移した) の回数 (試作の診断、 process 全体)。
-    pub fn ball_spin_compactions(&self) -> usize {
-        crate::append_bucket::spin_compactions()
-    }
-
-    /// 球にした紐の円柱で、 値 `value` のデッキのカードが向きの時刻を持つか (試作の診断)。
-    pub fn ball_value_in_deck(&self, himo: &str, value: u64) -> bool {
-        self.himo_id(himo).is_some_and(|id| self.balls.get(id as u16).is_some() && self.himos[id].spun_in_array(value))
+        b.pull_at(value, t, now).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
     /// 球の面の数と取った byte (試作)。
     pub fn ball_stats(&self, himo: &str) -> Option<(u64, usize)> {
         let b = self.balls.get(self.himo_id(himo)? as u16)?;
         Some((b.face_count(), b.bytes()))
+    }
+
+    /// デッキの差分の帳面の差分の数 (試作)。
+    pub fn ball_diff_count(&self, himo: &str) -> Option<u64> {
+        Some(self.balls.get(self.himo_id(himo)? as u16)?.diff_count())
     }
 
     /// 位置の印を宣言した紐の名前 (紐の番号の順)。

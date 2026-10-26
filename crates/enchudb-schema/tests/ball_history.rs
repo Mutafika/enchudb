@@ -1,4 +1,4 @@
-//! 球 (試作、 `enchudb_engine::ball`、 履歴はデッキのカードのスピン = 向きの時刻に残す): schema の書き込み (insert / upsert / untie / delete) を回ごとに重ね、 回の終わりの時刻を
+//! 球 (試作、 `enchudb_engine::ball`、 履歴は球の面とデッキの差分の帳面に残す): schema の書き込み (insert / upsert / untie / delete) を回ごとに重ね、 回の終わりの時刻を
 //! 外から控える。 全部の回の時刻で、 デッキの答え (`ball_pull_at`) と球の答え (`ball_value_at`) を手元の写しと比べる。
 //! 最後の時刻の答えは今の読み (`where_eq(..).find()`) とも比べる。 schema の表はこの回数では消した eid を使い回さない
 //! (使い回しは engine の `ball::tests::wide_values_and_reused_eids` が見る)。
@@ -53,6 +53,10 @@ fn as_of_answers_match_a_log_of_schema_writes() {
     assert!(!eng.declare_ball("users.city").unwrap(), "2 回目は何もしない");
     let mut checks: Vec<(u64, Rows)> = vec![(eng.ball_now(), rows.clone())];
     let mut r = Rng(0x2545_F491_4F6C_DD1D);
+    // 値が変わった書き込みの差分の数 (古い値があれば 出た 1、 新しい値があれば 入った 1) を手元で数える
+    let (mut city_d, mut age_d) = (0u64, 0u64);
+    let diffs = |old: Option<&str>, new: Option<&str>| if old == new { 0 } else { u64::from(old.is_some()) + u64::from(new.is_some()) };
+    let diffs_n = |old: Option<i64>, new: Option<i64>| if old == new { 0 } else { u64::from(old.is_some()) + u64::from(new.is_some()) };
     for _round in 0..60 {
         for _ in 0..40 {
             let live: Vec<u64> = rows.keys().copied().collect();
@@ -61,19 +65,24 @@ fn as_of_answers_match_a_log_of_schema_writes() {
                 0..=3 => {
                     let c = CITIES[r.below(4) as usize];
                     users.upsert().set("id", ids[&e]).set("city", c).commit().unwrap();
+                    city_d += diffs(rows[&e].0, Some(c));
                     rows.get_mut(&e).unwrap().0 = Some(c);
                 }
                 4..=5 => {
                     let a = r.below(50) as i64;
                     users.upsert().set("id", ids[&e]).set("age", a).commit().unwrap();
+                    age_d += diffs_n(rows[&e].1, Some(a));
                     rows.get_mut(&e).unwrap().1 = Some(a);
                 }
                 6 => {
                     eng.untie(e, "users.city");
+                    city_d += diffs(rows[&e].0, None);
                     rows.get_mut(&e).unwrap().0 = None;
                 }
                 7 => {
                     users.entity(e).delete().unwrap();
+                    city_d += diffs(rows[&e].0, None);
+                    age_d += diffs_n(rows[&e].1, None);
                     rows.remove(&e);
                     ids.remove(&e);
                 }
@@ -81,6 +90,8 @@ fn as_of_answers_match_a_log_of_schema_writes() {
                     let (c, a) = (CITIES[r.below(4) as usize], r.below(50) as i64);
                     let e = users.insert().set("id", next_id).set("city", c).set("age", a).commit().unwrap();
                     assert!(!rows.contains_key(&e));
+                    city_d += 1;
+                    age_d += 1;
                     rows.insert(e, (Some(c), Some(a)));
                     ids.insert(e, next_id);
                     next_id += 1;
@@ -113,12 +124,9 @@ fn as_of_answers_match_a_log_of_schema_writes() {
         cur.sort_unstable();
         assert_eq!(eng.ball_pull_at("users.city", eng.vocab_id(c).unwrap() as u64, now), cur, "今の {c}");
     }
-    // 書いた値は全部、 デッキのカードが時刻を持つ値 (円柱の配列の中) で、 外れた時刻は全部書けた
-    for c in CITIES {
-        assert!(eng.ball_value_in_deck("users.city", eng.vocab_id(c).unwrap() as u64), "{c}");
-    }
-    assert!(eng.ball_value_in_deck("users.age", 49));
-    assert_eq!(eng.ball_spin_misses(), 0);
+    // 値の変わった書き込み (書き換え・外す・消す・足す) は全部、 デッキの差分の帳面に届いた
+    assert_eq!(eng.ball_diff_count("users.city"), Some(city_d));
+    assert_eq!(eng.ball_diff_count("users.age"), Some(age_d));
     let (faces, _bytes) = eng.ball_stats("users.city").unwrap();
     assert!(faces > 200, "書き換えの面が積まれている ({faces})");
     drop(users);
@@ -140,10 +148,9 @@ fn leaf_columns_cannot_be_balls() {
 
 /// 書き手 4 本が自分の row 16 個の a (値 0..6) を書いたり外したりする (engine の `tie_to_by_id` / `untie_by_id`)。 回ごとに
 /// Barrier でそろえ、 そろった時刻と書き手の写しを控える。 全部の回の時刻で、 デッキのカードの答えと球の答えを写しと比べる
-/// (同じ値のカードに書き手が並んで足す・外れた時刻を書く・bucket を伸ばして写す、 を並べて通す)。 書き換えの値の鍵を
-/// 外す変異は release で 20 回中 20 回落ちる (変異なしは 20 回中 0 回、 2026-10-26)。
+/// (同じ値の帳面に書き手が並んで書き足す・帳面を伸ばして写す、 を並べて通す)。
 #[test]
-fn concurrent_writers_leave_history_in_the_cards() {
+fn concurrent_writers_leave_history_in_the_ledgers() {
     const TH: usize = 4;
     const PER: usize = 16;
     const VALS: u64 = 6;
@@ -161,11 +168,12 @@ fn concurrent_writers_leave_history_in_the_cards() {
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let rounds = 200;
     let bar = std::sync::Barrier::new(TH + 1);
+    let diffs = std::sync::atomic::AtomicU64::new(0);
     let log = std::sync::Mutex::new(vec![None::<u64>; TH * PER]);
     let mut checks: Vec<(u64, Vec<Option<u64>>)> = Vec::new();
     std::thread::scope(|s| {
         for th in 0..TH {
-            let (eng, bar, log, eids) = (&eng, &bar, &log, &eids);
+            let (eng, bar, log, eids, diffs) = (&eng, &bar, &log, &eids, &diffs);
             s.spawn(move || {
                 let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ th as u64);
                 let mut mine = vec![None::<u64>; PER];
@@ -173,16 +181,20 @@ fn concurrent_writers_leave_history_in_the_cards() {
                     for _ in 0..30 {
                         let k = r.below(PER as u64) as usize;
                         let e = eids[th * PER + k];
-                        match r.below(VALS + 1) {
+                        let new = match r.below(VALS + 1) {
                             VALS => {
                                 eng.untie_by_id(e, ha);
-                                mine[k] = None;
+                                None
                             }
                             v => {
                                 eng.tie_to_by_id(e, ha, v as u32);
-                                mine[k] = Some(v);
+                                Some(v)
                             }
+                        };
+                        if mine[k] != new {
+                            diffs.fetch_add(u64::from(mine[k].is_some()) + u64::from(new.is_some()), std::sync::atomic::Ordering::Relaxed);
                         }
+                        mine[k] = new;
                     }
                     log.lock().unwrap()[th * PER..(th + 1) * PER].copy_from_slice(&mine);
                     bar.wait();
@@ -196,9 +208,6 @@ fn concurrent_writers_leave_history_in_the_cards() {
             bar.wait();
         }
     });
-    for v in 0..VALS {
-        assert!(eng.ball_value_in_deck("t.a", v));
-    }
     for (k, (tm, want)) in checks.iter().enumerate() {
         for v in 0..VALS {
             let deck: Vec<u64> = (0..TH * PER).filter(|&i| want[i] == Some(v)).map(|i| eids[i]).collect();
@@ -208,7 +217,7 @@ fn concurrent_writers_leave_history_in_the_cards() {
             assert_eq!(eng.ball_value_at(eids[i], "t.a", *tm), want[i], "回 {k} e={}", eids[i]);
         }
     }
-    // 今の読み (印で外れたカードを飛ばす) も合う
+    // 今の読み (名簿) も合う
     let last = &checks.last().unwrap().1;
     for v in 0..VALS {
         let mut cur = eng.pull_raw("t.a", v as u32);
@@ -216,7 +225,7 @@ fn concurrent_writers_leave_history_in_the_cards() {
         let want: Vec<u64> = (0..TH * PER).filter(|&i| last[i] == Some(v)).map(|i| eids[i]).collect();
         assert_eq!(cur, want, "今の v={v}");
     }
-    assert_eq!(eng.ball_spin_misses(), 0);
+    assert_eq!(eng.ball_diff_count("t.a"), Some(diffs.into_inner()));
     drop(t);
     drop(db);
     cleanup(&path);
