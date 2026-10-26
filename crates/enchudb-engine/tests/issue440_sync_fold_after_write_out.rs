@@ -30,7 +30,7 @@ fn idle_sync_db_folds_the_oplog_after_writing_out_bridged_rows() {
     assert_eq!(eng.pending_sync_ops(0).len(), 100, "bridge されていない (前提)");
     let wal = eng.oplog().unwrap().clone();
     let deadline = Instant::now() + Duration::from_secs(3);
-    while wal.head() != enchudb_oplog::oplog::HEADER_SIZE as u64 {
+    while !wal.is_empty() {
         assert!(Instant::now() < deadline, "書き込みが止んで 3 秒たっても oplog が畳まれない (head {})", wal.head());
         std::thread::sleep(Duration::from_millis(10));
     }

@@ -65,7 +65,7 @@ fn idle_consumer_sleeps() {
         // 書き出し → 畳み (100 ms ごとの tick 2 回分) が済むのを待つ
         if oplog {
             let wal = eng.oplog().unwrap().clone();
-            assert!(wait_until(Duration::from_secs(3), || wal.head() == wal.checkpoint() && wal.head() <= 4096), "畳まれない");
+            assert!(wait_until(Duration::from_secs(3), || wal.head() == wal.checkpoint() && enchudb_oplog::oplog::wal_pos_offset(wal.head()) <= 4096), "畳まれない");
         }
         std::thread::sleep(Duration::from_millis(150));
         let before = eng.consumer_wakeups();

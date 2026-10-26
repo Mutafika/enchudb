@@ -106,6 +106,15 @@ fn dropped_writes_hold_the_mark_until_their_floor_is_recorded() {
     {
         let _no_fold = eng.transfer_lock_for_fold();
         let_the_consumer_commit_and_wait_on_the_lock(&eng);
+        // 2 区画: A を埋めて B へ移る (A は畳めないまま残るので、 空きは B の残りだけ)
+        let filler = eng.entity_in("notes").unwrap();
+        let switched = wal.switches();
+        let mut i = 0u32;
+        while wal.switches() == switched {
+            eng.tie_to(filler, "notes.note", i);
+            eng.oplog_commit();
+            i += 1;
+        }
         let e1 = eng.entity_in("notes").unwrap();
         let h0 = wal.head();
         eng.tie_text_to(e1, "notes.body", "x");
@@ -240,7 +249,9 @@ fn rows_from_records_after_the_cut_are_not_covered_by_its_mark() {
 #[test]
 fn an_orphaned_group_dropped_by_the_commit_after_the_cut_is_not_covered() {
     let root = scratch("orphan");
-    let eng = notes_engine(&root.join("db"), 64 * 1024);
+    // 満杯の死区間 (閉じの Commit も入らない) で consumer が畳む形は 1 区画 (v3) の形の道なので、 2 区画にできない大きさ
+    // (`2 * HALF_ALIGN` 未満)。 2 区画は区画を移る時に閉じの Commit で group を閉じる
+    let eng = notes_engine(&root.join("db"), 24 * 1024);
     let note = eng.himo_id("notes.note").unwrap() as u16;
     let wal = eng.oplog().unwrap().clone();
     wal.keep_commit_room_for_test(false);
