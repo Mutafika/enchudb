@@ -8,10 +8,10 @@ On top of it you can stack **schema / SQL / FFI / full-text search / RAG / P2P s
 
 ## Why
 
-- **Faster lookups than SQLite**: LockFreeCylinder resolves value → eid in ns, and multi-condition AND is just a bucket intersection.
+- **Faster lookups than SQLite**: LockFreeCylinder resolves value → eid in ns, and a multi-condition AND starts from the smallest bucket and checks the other conditions against the columns.
 - **Relations, unlike Rocks / LMDB**: himo + cylinder let you traverse between entities (ref columns + reverse bucket lookup).
 - **Append-only oplog + HLC**: P2P sync (`enchudb-sync`) is built in, including partial sync (`SubscriptionFilter`).
-- **Small memory footprint**: a single mmap file that leans on the OS page cache.
+- **Small memory footprint**: the columns live in mmap-backed segment files (one directory per database) and lean on the OS page cache; only the value → eid buckets are kept on the heap, built from the columns on first use.
 
 ## Workspace
 
