@@ -31,6 +31,10 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   `results_ballb_cols_v8.jsonl` / `results_ballb_v8.jsonl`。 どれも 7 回目の binary (`v7b` / `v7bab` / `v7bw` / `v7b_on`) と交互。
   読みの要約は `sum_r.py <file> v7b,cur`、 書き込みは `sum_w.py <cols> <3 列> v7b`。 変異は `ball_mut_v8.json` (67 本、 ball.rs の
   55 本は単体、 engine の 12 本は schema の試験で全部落ちる)
+- 9 回目 (球の時刻を WAL の HLC に): `results_ballb_v9.jsonl` (WAL なし) / `results_ballb_wal_v9.jsonl` (`BALL_WAL=1`)。 どれも
+  8 回目を同じ bench で組み直した `v8w_on` と交互。 `*_v9a.jsonl` は HLC を thread-local で渡していた最初の版 (宣言の無い列の書き直しが
+  +2 ns 重く線を越えた)。 base (cb827e4) は scratchpad に worktree で作り直して組んだ。 変異は `ball_mut_v9.json` (84 本、 全部落ちる)、
+  並行の変異の検出率は `rate9.py` (`rate9.log` = 直した後、 `rate9a.log` = 最初の版)
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
