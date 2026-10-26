@@ -8,11 +8,16 @@
 //! - 同じデッキ (値) の 1 つ前の面 (`prev_v`) — 「時点 t にこの値だった entity」 ([`Ball::pull_at`]) は、 その値の
 //!   最後の面から糸をたどる (その値に一度でも入った面を全部見る = デッキの履歴の長さに比例)
 //!
+//! 履歴はスピンに残す (2 回目の試作): 円柱の配列に入る値のデッキは、 カードが上を向いた時刻と外れた時刻を持ち
+//! (`AppendBucket` の向きの時刻)、 外れたカードを詰め直しで捨てない。 時点 t のデッキはデッキを連続に読む。 デッキの糸
+//! (`prev_v`) は、 カードに時刻を持たない値 (円柱の配列の外 = sparse) の面だけに張る。 球の糸 (`prev`) は全部の面に張る
+//! (1 つの entity の前の値を引くには、 前にどのデッキに居たかが要る)。
+//!
 //! 同じ値の書き直しは球を回さない (面を足さない)。 外す (untie / delete) は今の面を閉じるだけ (空の面は作らない)。
 //!
 //! ## 試作の範囲
 //! - メモリの上だけ (開き直すと消える)。 宣言も保存しない
-//! - 時刻は engine の中の通し番号 ([`Balls::now`]、 書き換え 1 回ごとに +1)。 HLC ではない。 宣言の前からある値の面は
+//! - 時刻は engine の中の通し番号 ([`Balls::tick`]、 書き換え 1 回ごとに +1、 円柱のカードと同じ時刻)。 HLC ではない。 宣言の前からある値の面は
 //!   `from = 0` (「前から」)
 //! - 宣言 ([`Balls::declare`]) は書き手の居ない時に (宣言と同時の書き込みは面を 2 つ作りうる)
 //! - 球は eid ごと: delete は今の面を閉じるだけで、 同じ eid を使い回した次の entity の面は前の entity の面の続きに付く
@@ -140,15 +145,18 @@ impl Ball {
         self.faces.get(i).expect("ball: 出した面の塊は取ってある")
     }
 
-    /// 値 `v` の面を `i` として出す (中身を書いてからデッキの頭を付け替える)。
-    fn push_face(&self, i: u32, eid: u32, prev: u32, v: u64, from: u64) {
+    /// 値 `v` の面を `i` として出す (中身を書いてからデッキの頭を付け替える)。 `in_deck` = その値のデッキは円柱のカードが
+    /// 時刻を持つ (デッキの糸を張らない)。
+    fn push_face(&self, i: u32, eid: u32, prev: u32, v: u64, from: u64, in_deck: bool) {
         let f = self.faces.get_or_alloc(i);
         f.eid.store(eid, Ordering::Relaxed);
         f.prev.store(prev, Ordering::Relaxed);
         f.value.store(v, Ordering::Relaxed);
         f.from.store(from, Ordering::Relaxed);
         f.to.store(OPEN, Ordering::Relaxed);
-        if v < DECK_DENSE {
+        if in_deck {
+            f.prev_v.store(NONE, Ordering::Relaxed);
+        } else if v < DECK_DENSE {
             let head = self.decks.get_or_alloc(v as u32);
             let mut old = head.load(Ordering::Acquire);
             loop {
@@ -193,8 +201,8 @@ impl Ball {
         })
     }
 
-    /// 球を回す: `new` を上に向ける (None = 今の面を閉じるだけ)。 行の lock の下で呼ぶ。
-    fn turn(&self, eid: u32, new: Option<u64>, clock: &AtomicU64) {
+    /// 球を回す: `new` を上に向ける (None = 今の面を閉じるだけ)、 時刻 `ts`。 行の lock の下で呼ぶ。
+    fn turn(&self, eid: u32, new: Option<u64>, ts: u64, in_deck: bool) {
         let head = self.heads.get_or_alloc(eid);
         let cur = head.load(Ordering::Relaxed);
         let open = (cur != 0).then(|| self.face(cur - 1)).filter(|f| f.to.load(Ordering::Relaxed) == OPEN);
@@ -203,25 +211,24 @@ impl Ball {
             (None, None) => return,
             _ => {}
         }
-        let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(f) = open {
             f.to.store(ts, Ordering::Release);
         }
         if let Some(v) = new {
             let Some(i) = self.alloc() else { return };
-            self.push_face(i, eid, cur.wrapping_sub(1), v, ts);
+            self.push_face(i, eid, cur.wrapping_sub(1), v, ts, in_deck);
             head.store(i + 1, Ordering::Release);
         }
     }
 
     /// 宣言の前からある値を 「前から」 (from = 0) の面にする。
-    fn seed(&self, eid: u32, v: u64) {
+    fn seed(&self, eid: u32, v: u64, in_deck: bool) {
         let head = self.heads.get_or_alloc(eid);
         if head.load(Ordering::Relaxed) != 0 {
             return;
         }
         let Some(i) = self.alloc() else { return };
-        self.push_face(i, eid, NONE, v, 0);
+        self.push_face(i, eid, NONE, v, 0, in_deck);
         head.store(i + 1, Ordering::Release);
     }
 
@@ -259,6 +266,7 @@ impl Ball {
     }
 
     /// 時点 `t` に値 `v` が上を向いていた entity (eid の昇順)。 同じ球の面は時刻が重ならないので、 1 つの eid は 1 回だけ出る。
+    /// デッキの糸を張った値 (円柱のカードが時刻を持たない値) だけ。
     pub fn pull_at(&self, v: u64, t: u64) -> Vec<u32> {
         let head = if v < DECK_DENSE {
             self.decks.get(v as u32).map_or(0, |h| h.load(Ordering::Acquire))
@@ -315,13 +323,19 @@ impl Balls {
         self.clock.load(Ordering::Relaxed)
     }
 
+    /// 書き込み 1 回の時刻を取る (円柱のカードと球の面に同じ時刻を書く)。
+    #[inline]
+    pub fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     #[inline]
     pub fn get(&self, hid: u16) -> Option<&Ball> {
         self.slots.get()?[hid as usize].get().map(|b| &**b)
     }
 
-    /// 紐 `hid` を球にする。 `seed` に今の値 (eid, 値) を全部渡す。 宣言済みなら false。
-    pub fn declare(&self, hid: u16, seed: impl FnOnce(&mut dyn FnMut(u32, u64))) -> bool {
+    /// 紐 `hid` を球にする。 `seed` に今の値 (eid, 値, その値のデッキは円柱のカードが時刻を持つか) を全部渡す。 宣言済みなら false。
+    pub fn declare(&self, hid: u16, seed: impl FnOnce(&mut dyn FnMut(u32, u64, bool))) -> bool {
         let slots = self.slots.get_or_init(|| (0..=u16::MAX as usize).map(|_| OnceLock::new()).collect());
         let mut fresh = false;
         let ball = slots[hid as usize].get_or_init(|| {
@@ -329,25 +343,25 @@ impl Balls {
             Box::new(Ball::new())
         });
         if fresh {
-            seed(&mut |eid, v| ball.seed(eid, v));
+            seed(&mut |eid, v, in_deck| ball.seed(eid, v, in_deck));
             self.any.store(true, Ordering::Release);
         }
         fresh
     }
 
-    /// 値を書いた後 (行の lock の下)。
+    /// 値を書いた後 (行の lock の下)。 `ts` は [`tick`](Self::tick) で取った時刻。
     #[inline]
-    pub fn on_set(&self, hid: u16, eid: u32, v: u64) {
+    pub fn on_set(&self, hid: u16, eid: u32, v: u64, ts: u64, in_deck: bool) {
         if let Some(b) = self.get(hid) {
-            b.turn(eid, Some(v), &self.clock);
+            b.turn(eid, Some(v), ts, in_deck);
         }
     }
 
     /// 値を外した後 (行の lock の下)。
     #[inline]
-    pub fn on_remove(&self, hid: u16, eid: u32) {
+    pub fn on_remove(&self, hid: u16, eid: u32, ts: u64) {
         if let Some(b) = self.get(hid) {
-            b.turn(eid, None, &self.clock);
+            b.turn(eid, None, ts, false);
         }
     }
 
@@ -357,17 +371,28 @@ impl Balls {
 mod tests {
     use super::*;
 
+    /// 書く (デッキの糸を張る値として)。
+    fn set(b: &Balls, hid: u16, eid: u32, v: u64) {
+        let ts = b.tick();
+        b.on_set(hid, eid, v, ts, false);
+    }
+
+    fn rm(b: &Balls, hid: u16, eid: u32) {
+        let ts = b.tick();
+        b.on_remove(hid, eid, ts);
+    }
+
     #[test]
     fn faces_keep_the_old_values() {
         let b = Balls::new();
         assert!(b.declare(3, |_| {}));
-        b.on_set(3, 7, 10);
+        set(&b, 3, 7, 10);
         let t1 = b.now();
-        b.on_set(3, 7, 10); // 同じ値は回さない
-        assert_eq!(b.now(), t1);
-        b.on_set(3, 7, 20);
+        set(&b, 3, 7, 10); // 同じ値は回さない (時刻は進むが面は足さない)
+        assert_eq!(b.get(3).unwrap().faces_of(7).len(), 1);
+        set(&b, 3, 7, 20);
         let t2 = b.now();
-        b.on_remove(3, 7);
+        rm(&b, 3, 7);
         let t3 = b.now();
         let ball = b.get(3).unwrap();
         assert_eq!(ball.value_at(7, 0), None, "書く前");
@@ -387,10 +412,10 @@ mod tests {
     fn seeded_faces_are_from_the_start() {
         let b = Balls::new();
         b.declare(0, |f| {
-            f(1, 5);
-            f(2, 5);
+            f(1, 5, false);
+            f(2, 5, false);
         });
-        b.on_set(0, 1, 6);
+        set(&b, 0, 1, 6);
         let t = b.now();
         let ball = b.get(0).unwrap();
         assert_eq!(ball.pull_at(5, 0), vec![1, 2]);
@@ -403,10 +428,10 @@ mod tests {
         let b = Balls::new();
         b.declare(1, |_| {});
         let big = 1u64 << 40;
-        b.on_set(1, 4, big);
+        set(&b, 1, 4, big);
         let t = b.now();
-        b.on_remove(1, 4); // delete も外すだけ
-        b.on_set(1, 4, 9); // 使い回した eid の次の entity
+        rm(&b, 1, 4); // delete も外すだけ
+        set(&b, 1, 4, 9); // 使い回した eid の次の entity
         let ball = b.get(1).unwrap();
         assert_eq!(ball.pull_at(big, t), vec![4]);
         assert_eq!(ball.value_at(4, t), Some(big), "球の糸もデッキの糸と同じく前の面を答える");
@@ -448,11 +473,11 @@ mod tests {
                             let e = th * PER + (r % PER as u64) as u32;
                             match (r >> 8) % (VALS + 1) {
                                 VALS => {
-                                    b.on_remove(0, e);
+                                    rm(&b, 0, e);
                                     mine[(e - th * PER) as usize] = None;
                                 }
                                 v => {
-                                    b.on_set(0, e, v);
+                                    set(&b, 0, e, v);
                                     mine[(e - th * PER) as usize] = Some(v);
                                 }
                             }

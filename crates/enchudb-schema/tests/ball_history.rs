@@ -1,4 +1,4 @@
-//! 球 (試作、 `enchudb_engine::ball`): schema の書き込み (insert / upsert / untie / delete) を回ごとに重ね、 回の終わりの時刻を
+//! 球 (試作、 `enchudb_engine::ball`、 履歴はデッキのカードのスピン = 向きの時刻に残す): schema の書き込み (insert / upsert / untie / delete) を回ごとに重ね、 回の終わりの時刻を
 //! 外から控える。 全部の回の時刻で、 デッキの答え (`ball_pull_at`) と球の答え (`ball_value_at`) を手元の写しと比べる。
 //! 最後の時刻の答えは今の読み (`where_eq(..).find()`) とも比べる。 schema の表はこの回数では消した eid を使い回さない
 //! (使い回しは engine の `ball::tests::wide_values_and_reused_eids` が見る)。
@@ -113,6 +113,12 @@ fn as_of_answers_match_a_log_of_schema_writes() {
         cur.sort_unstable();
         assert_eq!(eng.ball_pull_at("users.city", eng.vocab_id(c).unwrap() as u64, now), cur, "今の {c}");
     }
+    // 書いた値は全部、 デッキのカードが時刻を持つ値 (円柱の配列の中) で、 外れた時刻は全部書けた
+    for c in CITIES {
+        assert!(eng.ball_value_in_deck("users.city", eng.vocab_id(c).unwrap() as u64), "{c}");
+    }
+    assert!(eng.ball_value_in_deck("users.age", 49));
+    assert_eq!(eng.ball_spin_misses(), 0);
     let (faces, _bytes) = eng.ball_stats("users.city").unwrap();
     assert!(faces > 200, "書き換えの面が積まれている ({faces})");
     drop(users);

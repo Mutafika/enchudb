@@ -155,16 +155,18 @@ impl Slot {
     /// 作る bucket に古い印を持たせる (位置の印を使う列、 #578)。
     #[inline]
     pub(crate) fn get_or_create(&self, marked: bool) -> (&AppendBucket, bool) {
-        self.get_or_create_with(0, marked)
+        self.get_or_create_with(0, marked, false)
     }
 
-    /// `get_or_create` の、 作る時に `cap` 件分を先に確保する版 (索引をまとめて組む時、 #394)。
+    /// `get_or_create` の、 作る時に `cap` 件分を先に確保する版 (索引をまとめて組む時、 #394)。 `spun` = 球にした列の bucket
+    /// (印と向きの時刻を持つ、 試作)。
     #[inline]
-    fn get_or_create_with(&self, cap: usize, marked: bool) -> (&AppendBucket, bool) {
+    fn get_or_create_with(&self, cap: usize, marked: bool, spun: bool) -> (&AppendBucket, bool) {
         if let Some(b) = self.get() {
             return (b, false);
         }
-        let p = Arc::into_raw(Arc::new(AppendBucket::with_capacity(cap, marked))) as *mut AppendBucket;
+        let b = if spun { AppendBucket::with_capacity_spun(cap) } else { AppendBucket::with_capacity(cap, marked) };
+        let p = Arc::into_raw(Arc::new(b)) as *mut AppendBucket;
         self.0.store(p, Ordering::Release);
         // SAFETY: 今置いた pointer (参照はこの Slot が持つ)。
         (unsafe { &*p }, true)
@@ -238,6 +240,8 @@ pub struct LockFreeCylinder {
     slots: std::sync::OnceLock<Option<SlotTable>>,
     /// 位置の印を使うか (表を取れたら true、 [`disable_marks`](Self::disable_marks) で false)。 読み手は印を信用する前に見る。
     marks_on: AtomicBool,
+    /// 球にした列か (試作 `crate::ball`): bucket は向きの時刻を持ち、 詰め直さない。 組む前に [`set_spun`](Self::set_spun)。
+    spun: AtomicBool,
     /// `dense` の 0 番に当たる値 ([`set_low_base`](Self::set_low_base)、 既定 0)。 組んだ後は変わらない。
     low_base: AtomicU64,
     dense: Atomic<DenseArr>,
@@ -296,6 +300,7 @@ impl LockFreeCylinder {
         Self {
             slots: std::sync::OnceLock::new(),
             marks_on: AtomicBool::new(false),
+            spun: AtomicBool::new(false),
             low_base: AtomicU64::new(0),
             dense: Atomic::new(init),
             dense_pos: Atomic::new(Vec::new()),
@@ -450,7 +455,47 @@ impl LockFreeCylinder {
     /// になり、 その bucket の読みは Column で確かめる)。 戻り値は `(bucket の raw len, 減分後の live)` — 呼び出し側 (HimoStore) が
     /// incremental compaction の trigger 判定 (stale 率) に使う (P2)。 書き手が 1 回の書き込みで pin を 1 回にするため guard は外から。
     pub(crate) fn note_stale_of_in(&self, value: u64, eid: u32, guard: &Guard) -> Option<(usize, u32)> {
-        self.note_stale_at(value, Some(eid), guard)
+        self.note_stale_at(value, Some(eid), None, guard)
+    }
+
+    /// [`note_stale_of_in`](Self::note_stale_of_in) の、 球の列のカードに外れた時刻 `ts` も書く版。
+    pub(crate) fn note_stale_of_in_at(&self, value: u64, eid: u32, ts: Option<u64>, guard: &Guard) -> Option<(usize, u32)> {
+        self.note_stale_at(value, Some(eid), ts, guard)
+    }
+
+    /// 球にする (試作): 以後に作る bucket は向きの時刻を持ち、 詰め直さない。 組む前 (`HimoStore` が write_lock の下、
+    /// 読み手の居ない時) に呼ぶ。 0 から上の配列は窓の最後まで伸ばしておく (後から伸ばすと sparse の entry が時刻なしで
+    /// 配列へ移るので、 球の列は伸ばさない。 値の置き場所 = 配列の中か外か、 は組んだ後は変わらない)。
+    pub(crate) fn set_spun(&self) {
+        debug_assert_eq!(self.total(), 0, "set_spun は空の索引に");
+        self.spun.store(true, Ordering::Relaxed);
+        let guard = epoch::pin();
+        let a = self.arr(LOW);
+        // SAFETY: dense は常に非 null。
+        let mut v = unsafe { a.load(Ordering::Acquire, &guard).deref() }.clone();
+        v.resize_with(region_cap(LOW), Slot::empty);
+        let old = a.swap(Owned::new(v), Ordering::AcqRel, &guard);
+        // SAFETY: 旧 array は全 reader が epoch 通過後に解放。
+        unsafe { guard.defer_destroy(old) };
+    }
+
+    /// 球にした列か。
+    #[inline]
+    pub(crate) fn spun(&self) -> bool {
+        self.spun.load(Ordering::Relaxed)
+    }
+
+    /// 時点 `t` に値 `value` が上を向いていた entity (試作)。 値が配列の外 (sparse、 カードに時刻が無い) なら None。
+    /// 並びは書いた順 (eid の順ではない)。
+    pub(crate) fn pull_at(&self, value: u64, t: u64) -> Option<Vec<u32>> {
+        let guard = epoch::pin();
+        let (k, i) = self.dense_slot(value)?;
+        let slot = self.vec_of(k, &guard).get(i)?;
+        let mut out = Vec::new();
+        if let Some(b) = slot.get() {
+            b.read_spun_at(t, &guard, &mut out);
+        }
+        Some(out)
     }
 
     /// 位置の表を列の大きさ `n` で取る (組む前に 1 回。 2 回目からは何もしない。 取れなければ印なしで動く)。
@@ -509,10 +554,10 @@ impl LockFreeCylinder {
     /// 通すのに使う。
     #[cfg(test)]
     pub(crate) fn note_stale(&self, value: u64) -> Option<(usize, u32)> {
-        self.note_stale_at(value, None, &epoch::pin())
+        self.note_stale_at(value, None, None, &epoch::pin())
     }
 
-    fn note_stale_at(&self, value: u64, eid: Option<u32>, guard: &Guard) -> Option<(usize, u32)> {
+    fn note_stale_at(&self, value: u64, eid: Option<u32>, ts: Option<u64>, guard: &Guard) -> Option<(usize, u32)> {
         // 立っていれば書かない (書き手が並ぶと、 同じ値の store でも cache line を取り合う)
         if !self.any_removed.load(Ordering::Relaxed) {
             self.any_removed.store(true, Ordering::Relaxed);
@@ -522,7 +567,7 @@ impl LockFreeCylinder {
                 // 印を使う列なら、 覚えている位置の entry に古い印を立てる (印は removed より先に。 読み手は印を見て飛ばす)
                 if self.marks_on() {
                     match eid {
-                        Some(e) => b.mark_stale(self.slot_get(e).map(|p| (p, e)), guard),
+                        Some(e) => b.mark_stale_at(self.slot_get(e).map(|p| (p, e)), ts, guard),
                         None => b.mark_stale(None, guard),
                     }
                 }
@@ -894,20 +939,26 @@ impl LockFreeCylinder {
     /// (`HimoStore` の値の鍵の下)。 配列を伸ばす書き手は全部の鍵を持つので、 この間に配列は差し替わらない。
     #[inline]
     pub(crate) fn push_in_array(&self, eid: u32, value: u64, guard: &Guard) {
+        self.push_in_array_at(eid, value, 0, guard)
+    }
+
+    /// [`push_in_array`](Self::push_in_array) の、 球の列のカードに上を向いた時刻 `ts` を書く版。
+    #[inline]
+    pub(crate) fn push_in_array_at(&self, eid: u32, value: u64, ts: u64, guard: &Guard) {
         debug_assert!(self.in_array(value, guard), "push_in_array: 配列の外の値 {value}");
         let (k, i) = self.dense_slot(value).expect("push_in_array: 窓の外の値");
-        self.push_slot(k, &self.vec_of(k, guard)[i], eid, guard);
+        self.push_slot(k, &self.vec_of(k, guard)[i], eid, ts, guard);
     }
 
     /// 要素 `slot` (配列 `k`) の bucket に足す (空なら、 ここで初めて bucket を作る、 #358)。
     #[inline]
-    fn push_slot(&self, k: usize, slot: &Slot, eid: u32, guard: &Guard) {
+    fn push_slot(&self, k: usize, slot: &Slot, eid: u32, ts: u64, guard: &Guard) {
         // 作るなら初めから 1 回目に伸ばす大きさで (空の backing を作ってすぐ捨てない。 値がみな違う列は値ごとに作る)
-        let (b, created) = slot.get_or_create_with(crate::append_bucket::INITIAL_CAP, self.marks_on());
+        let (b, created) = slot.get_or_create_with(crate::append_bucket::INITIAL_CAP, self.marks_on(), self.spun());
         if created {
             self.used[k].fetch_add(1, Ordering::Relaxed);
         }
-        let prev_len = b.push_in(eid, guard);
+        let prev_len = b.push_in_at(eid, ts, guard);
         self.slot_set(eid, prev_len);
         let prev_live = b.live_inc();
         self.bump_stats(prev_len == 0, prev_live == 0);
@@ -947,7 +998,7 @@ impl LockFreeCylinder {
         // SAFETY: dense は常に非 null。
         let vec = unsafe { arr.deref() };
         if i < vec.len() {
-            self.push_slot(k, &vec[i], eid, &guard);
+            self.push_slot(k, &vec[i], eid, 0, &guard);
             return;
         }
         // 配列の外: 伸ばすか、 sparse に置くか (#373)
@@ -966,7 +1017,7 @@ impl LockFreeCylinder {
         nv.resize_with(new_len, Slot::empty);
         let waited = self.waiting[k].load(Ordering::Relaxed) > 0;
         let moved = if waited { self.move_from_sparse(k, old_len, new_len, &nv, (value, eid), keep, &guard) } else { 0 };
-        self.push_slot(k, &nv[i], eid, &guard);
+        self.push_slot(k, &nv[i], eid, 0, &guard);
         DENSE_GROWS.fetch_add(1, Ordering::Relaxed);
         dense.store(Owned::new(nv), Ordering::Release);
         // SAFETY: 旧 array は全 reader が epoch 通過後に解放。
@@ -1010,7 +1061,7 @@ impl LockFreeCylinder {
                 continue;
             }
             let (_, j) = self.dense_slot(v).expect("配列 k の窓の値");
-            let (b, created) = nv[j].get_or_create(self.marks_on());
+            let (b, created) = nv[j].get_or_create_with(0, self.marks_on(), self.spun());
             if created {
                 self.used[k].fetch_add(1, Ordering::Relaxed);
                 self.unique_count.fetch_add(1, Ordering::Relaxed);
@@ -1091,7 +1142,7 @@ impl LockFreeCylinder {
         for (eid, v) in entries() {
             match self.dense_slot(v) {
                 Some((k, i)) if i < lens[k] => {
-                    let (b, created) = arrs[k][i].get_or_create_with(counts[k][i] as usize, self.marks_on());
+                    let (b, created) = arrs[k][i].get_or_create_with(counts[k][i] as usize, self.marks_on(), self.spun());
                     if created {
                         self.used[k].fetch_add(1, Ordering::Relaxed);
                     }

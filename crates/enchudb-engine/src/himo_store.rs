@@ -199,6 +199,8 @@ pub struct HimoStore {
     present: PresentCount,
     /// 位置の印を持つと宣言されたか ([`declare_marks`](Self::declare_marks)、 engine の `MRK1`)。 円柱を組む時に見る。
     marks: AtomicBool,
+    /// 球にしたか (試作 `crate::ball`、 [`declare_spun`](Self::declare_spun))。 円柱は宣言の時に組み、 カードは向きの時刻を持つ。
+    spun: AtomicBool,
 }
 
 /// 古い entry のある bucket (値 `value`) の eid の列 `eids` から、 今の値がちょうど `value` の entity を 1 回ずつ `out` に足す。
@@ -526,6 +528,7 @@ impl HimoStore {
             vlocks: OnceLock::new(),
             present: PresentCount::new(true),
             marks: AtomicBool::new(false),
+            spun: AtomicBool::new(false),
         }
     }
 
@@ -549,6 +552,7 @@ impl HimoStore {
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
             marks: AtomicBool::new(false),
+            spun: AtomicBool::new(false),
         })
     }
 
@@ -576,6 +580,7 @@ impl HimoStore {
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
             marks: AtomicBool::new(false),
+            spun: AtomicBool::new(false),
         }
     }
 
@@ -668,6 +673,34 @@ impl HimoStore {
         self.cyl.marks_on()
     }
 
+    /// 球にする (試作 `crate::ball`): 位置の印を付け、 円柱をここで組む (カードは向きの時刻を持ち、 詰め直さない)。 円柱を
+    /// もう組んでいれば Err (組んだカードに時刻が無く、 古い entry も残っているので)。 書き手の居ない時に呼ぶ。
+    pub(crate) fn declare_spun(&self) -> Result<(), &'static str> {
+        if self.cyl_built.load(Ordering::Acquire) {
+            return Err("円柱を組んだ後の紐は球にできない (試作。 開き直して最初に読む前に宣言する)");
+        }
+        self.marks.store(true, Ordering::Relaxed);
+        self.spun.store(true, Ordering::Relaxed);
+        self.ensure_cylinder_built();
+        if !self.cyl.marks_on() {
+            return Err("位置の表を取れなかった");
+        }
+        Ok(())
+    }
+
+    /// 球にした紐で、 値 `value` のカードが時刻を持つか (= 円柱の配列の中)。 組んだ後は変わらない。
+    pub(crate) fn spun_in_array(&self, value: u64) -> bool {
+        self.spun.load(Ordering::Relaxed) && self.cyl_built.load(Ordering::Acquire) && self.cyl.in_array(value, &epoch::pin())
+    }
+
+    /// 時点 `t` に値 `value` のカードが上を向いていた entity (球の紐、 配列の中の値だけ)。
+    pub(crate) fn pull_at(&self, value: u64, t: u64) -> Option<Vec<u32>> {
+        if !self.spun.load(Ordering::Relaxed) || !self.cyl_built.load(Ordering::Acquire) {
+            return None;
+        }
+        self.cyl.pull_at(value, t)
+    }
+
     /// 位置の印が宣言されているか (保存する宣言)。
     pub(crate) fn marks_declared(&self) -> bool {
         self.marks.load(Ordering::Relaxed)
@@ -700,6 +733,10 @@ impl HimoStore {
         // 宣言された列だけ、 位置の表 (entity ごとの bucket の中の位置) を列の大きさで取る (匿名 mmap。 触った所だけが実際のメモリ)
         if self.marks.load(Ordering::Relaxed) {
             self.cyl.init_slots(col.max_entities);
+        }
+        // 球の紐: bucket に向きの時刻を持たせ、 配列を窓の最後まで伸ばしてから組む (組んだカードは 「前から」 = 時刻 0)
+        if self.spun.load(Ordering::Relaxed) {
+            self.cyl.set_spun();
         }
         // 全部を見てからまとめて組む (dense / sparse の振り分けを 1 度で決める、 #373)
         self.cyl.build(|| {
@@ -749,6 +786,12 @@ impl HimoStore {
     /// commit を伸ばせない = ディスク満杯。 未 commit page に書くと SIGBUS になるので
     /// 書かずに諦める)。 戻り値を無視しても従来どおり動く。
     pub fn set(&self, eid: u32, value: u64) -> bool {
+        self.set_at(eid, value, None)
+    }
+
+    /// [`set`](Self::set) の、 球にした紐のカードに時刻 `ts` を書く版 (試作)。 球の紐の円柱は宣言の時に組んであるので、
+    /// 値の鍵の道 (`set_indexed`) を通る。
+    pub fn set_at(&self, eid: u32, value: u64, ts: Option<u64>) -> bool {
         // 幅に入らない値は書かない (呼び側 = engine の tie 系が先に弾いて fault に積む)
         if value > self.value_type.max_value() {
             debug_assert!(false, "HimoStore::set: value {value} exceeds {:?}", self.value_type);
@@ -756,8 +799,9 @@ impl HimoStore {
         }
         // cylinder を組んだ紐は値ごとの鍵で書く (`set_indexed`)。 flag は組む側が鍵を作った後に Release で立てる
         if self.cyl_built.load(Ordering::Acquire) {
-            return self.set_indexed(eid, value);
+            return self.set_indexed(eid, value, ts);
         }
+        debug_assert!(ts.is_none(), "球の紐は宣言の時に円柱を組む");
         // cylinder を組んでいなければ、 write_lock を取らずに門の中で Column だけを書く (`WriteGate`)
         if let Some(_pass) = self.gate.try_enter() {
             hook::at("inside_gate");
@@ -768,7 +812,7 @@ impl HimoStore {
         let w = self.write_lock.lock();
         if self.cyl_live(&w).is_some() {
             drop(w);
-            return self.set_indexed(eid, value);
+            return self.set_indexed(eid, value, ts);
         }
         self.store_unindexed(eid, value)
     }
@@ -778,7 +822,9 @@ impl HimoStore {
     /// なら、 write_lock (sparse と配列の差し替えの書き手は 1 本) も取る。 伸ばすなら全部の鍵も取る。
     ///
     /// 同じ cell の書き手は engine の行の lock で並ぶので、 古い値はこの間動かない。
-    fn set_indexed(&self, eid: u32, value: u64) -> bool {
+    ///
+    /// `ts` = 球の紐のカードの時刻 (新しいカードの上を向いた時刻 = 古いカードの外れた時刻)。 球の紐は配列を伸ばさない。
+    fn set_indexed(&self, eid: u32, value: u64, ts: Option<u64>) -> bool {
         let col = self.col();
         // 位置の表の行を先に cache に載せる (Column の古い値の読みと並んで待つ。 値は鍵を取った後に読み直す)
         self.cyl.prefetch_slot(eid);
@@ -799,14 +845,14 @@ impl HimoStore {
                 hook::at("inside_value_locks");
                 // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
                 // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
-                let stale = old.and_then(|o| cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s)));
+                let stale = old.and_then(|o| cyl.note_stale_of_in_at(o, eid, ts, &guard).map(|s| (o, s)));
                 // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
                 // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
                 store_at(col, eid, value + 1);
                 if old.is_none() {
                     self.present.add(1);
                 }
-                cyl.push_in_array(eid, value, &guard);
+                cyl.push_in_array_at(eid, value, ts.unwrap_or(0), &guard);
                 // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)。 古い値の鍵の下で
                 if let Some((o, (len, live))) = stale {
                     self.maybe_compact(o, len, live, &guard);
@@ -819,17 +865,17 @@ impl HimoStore {
         let guard = epoch::pin();
         let old_in = old.filter(|&o| cyl.in_array(o, &guard));
         let new_in = cyl.in_array(value, &guard);
-        let grow = !new_in && cyl.would_grow(value, &guard);
+        let grow = !new_in && !cyl.spun() && cyl.would_grow(value, &guard);
         // 伸ばすなら全部の鍵 (配列を写す間に他の書き手が bucket を置くと消える)、 伸ばさないなら配列の中の側の値の鍵
         let _all = grow.then(|| locks.lock_all());
         let _held = (!grow).then(|| locks.lock_pair(old_in, new_in.then_some(value)));
-        let stale = old.and_then(|o| cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s)));
+        let stale = old.and_then(|o| cyl.note_stale_of_in_at(o, eid, ts, &guard).map(|s| (o, s)));
         store_at(col, eid, value + 1);
         if old.is_none() {
             self.present.add(1);
         }
         if new_in {
-            cyl.push_in_array(eid, value, &guard);
+            cyl.push_in_array_at(eid, value, ts.unwrap_or(0), &guard);
         } else {
             cyl.insert_with(eid, value, grow, |v, e| stored_sync(col, e) == v + 1);
         }
@@ -906,11 +952,16 @@ impl HimoStore {
     }
 
     pub fn remove(&self, eid: u32) {
+        self.remove_at(eid, None)
+    }
+
+    /// [`remove`](Self::remove) の、 球にした紐のカードに外れた時刻 `ts` を書く版 (試作)。
+    pub fn remove_at(&self, eid: u32, ts: Option<u64>) {
         let col = self.col();
         if eid < col.count() {
             // cylinder を組んだ紐は値の鍵で消す (`set` と同じ)
             if self.cyl_built.load(Ordering::Acquire) {
-                return self.remove_indexed(eid);
+                return self.remove_indexed(eid, ts);
             }
             // cylinder を組んでいなければ門の中で消すだけ (`set` と同じ)
             if let Some(_pass) = self.gate.try_enter() {
@@ -923,7 +974,7 @@ impl HimoStore {
             let w = self.write_lock.lock();
             if self.cyl_live(&w).is_some() {
                 drop(w);
-                return self.remove_indexed(eid);
+                return self.remove_indexed(eid, ts);
             }
             if value_at(col, eid).is_some() {
                 col.clear(eid);
@@ -934,7 +985,7 @@ impl HimoStore {
 
     /// cylinder を組んだ紐の削除 (`set_indexed` と同じ鍵の取り方): 古い値が配列の中ならその値の鍵、 sparse なら
     /// write_lock。 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）。 flag → Column の順 (set と同じ)。
-    fn remove_indexed(&self, eid: u32) {
+    fn remove_indexed(&self, eid: u32, ts: Option<u64>) {
         let col = self.col();
         let Some(o) = value_at(col, eid) else {
             return;
@@ -944,7 +995,7 @@ impl HimoStore {
             let guard = epoch::pin();
             if cyl.in_array(o, &guard) {
                 let _held = self.vlocks().lock_pair(Some(o), None);
-                let stale = cyl.note_stale_of_in(o, eid, &guard);
+                let stale = cyl.note_stale_of_in_at(o, eid, ts, &guard);
                 cyl.forget_slot(eid);
                 col.clear(eid);
                 self.present.add(-1);
@@ -959,7 +1010,7 @@ impl HimoStore {
         let _w = self.write_lock.lock();
         let guard = epoch::pin();
         let _held = cyl.in_array(o, &guard).then(|| self.vlocks().lock_pair(Some(o), None));
-        let stale = cyl.note_stale_of_in(o, eid, &guard);
+        let stale = cyl.note_stale_of_in_at(o, eid, ts, &guard);
         cyl.forget_slot(eid);
         col.clear(eid);
         self.present.add(-1);
