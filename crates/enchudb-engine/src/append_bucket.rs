@@ -1148,4 +1148,59 @@ mod tests {
         let v = b.read_to_vec();
         assert_eq!(v, (0..n).collect::<Vec<_>>());
     }
+
+    /// 球の列の bucket (試作): 外れたカードを詰め直しで履歴の段に移し、 時点 t の読みが手元の写し (eid, 上を向いた時刻,
+    /// 外れた時刻) と合う。 2 回目の詰め直しでは、 前の run より早い時刻に外れたカード (時刻を採ってから値の鍵を取るまでに
+    /// 別の書き手の詰め直しが入った形) を混ぜ、 run を混ぜる時の並べ直しを通す。
+    #[test]
+    fn spun_bucket_moves_closed_cards_to_the_past() {
+        let b = AppendBucket::with_capacity_spun(0);
+        let guard = epoch::pin();
+        let mut pos = std::collections::BTreeMap::<u32, usize>::new();
+        // 写し: (eid, from, to)
+        let mut log: Vec<(u32, u64, u64)> = Vec::new();
+        let push = |b: &AppendBucket, pos: &mut std::collections::BTreeMap<u32, usize>, log: &mut Vec<(u32, u64, u64)>, e: u32, from: u64| {
+            let p = b.push_in_at(e, from, &guard);
+            b.live_inc();
+            pos.insert(e, p);
+            log.push((e, from, SPIN_OPEN));
+        };
+        let close = |b: &AppendBucket, pos: &std::collections::BTreeMap<u32, usize>, log: &mut Vec<(u32, u64, u64)>, e: u32, to: u64| {
+            b.mark_stale_at(Some((pos[&e], e)), Some(to), &guard);
+            b.note_stale();
+            let k = log.iter().rposition(|&(x, _, t)| x == e && t == SPIN_OPEN).unwrap();
+            log[k].2 = to;
+        };
+        for e in 0..80u32 {
+            push(&b, &mut pos, &mut log, e, 1 + e as u64);
+        }
+        for e in 0..50u32 {
+            close(&b, &pos, &mut log, e, 200 + e as u64);
+        }
+        b.compact_in_placed(&guard, |_| true, |e, i| {
+            pos.insert(e, i);
+        });
+        for e in 0..50u32 {
+            push(&b, &mut pos, &mut log, e, 300 + e as u64);
+        }
+        // 置き場の順と逆の時刻で外す (詰め直しが外れた時刻で並べ直すのを通す)
+        for e in 50..80u32 {
+            close(&b, &pos, &mut log, e, 179 - (e - 50) as u64);
+        }
+        for e in 0..20u32 {
+            close(&b, &pos, &mut log, e, 400 + e as u64);
+        }
+        b.compact_in_placed(&guard, |_| true, |e, i| {
+            pos.insert(e, i);
+        });
+        assert_eq!(b.live(), 30);
+        for t in [0u64, 1, 40, 80, 149, 150, 165, 179, 180, 199, 200, 225, 260, 300, 330, 399, 400, 410, 420, 1000] {
+            let mut got = Vec::new();
+            assert!(b.read_spun_at(t, &guard, &mut got));
+            got.sort_unstable();
+            let mut want: Vec<u32> = log.iter().filter(|&&(_, f, to)| f <= t && t < to).map(|&(e, _, _)| e).collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "t={t}");
+        }
+    }
 }
