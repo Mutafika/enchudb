@@ -61,6 +61,8 @@ const LOG_DENSE: u64 = 1 << 20;
 const WIDE: usize = 64;
 /// 書き手ごとに面の場所をまとめて取る数。
 const BLOCK: u64 = 64;
+/// 控えの間隔の下限 (差分の数)。 間隔は max(これ, 前の控えの大きさ) = 控えは 1 差分あたり 4 B 以下。
+const SNAP_MIN: usize = 1024;
 /// 時点 t の読みで、 t より後の差分がこの数以上なら eid の bit の表で戻す (少なければ並べて合わせる方が速い)。
 const BITS_MIN_AFTER: usize = 1024;
 /// bit の表の語の数が (今のデッキ + 差分) のこの倍までなら表を使う (eid が広く散る時は並べて合わせる)。
@@ -162,19 +164,84 @@ impl LogBuf {
     }
 }
 
+/// 控え 1 つ: 帳面の `pos` より前の差分を全部当てたデッキ (eid の昇順)。 位置は帳面の書き手が登録の時に決め、 中身は後で作る
+/// (作り終えるまで `eids` は空)。
+#[derive(Default)]
+struct Snap {
+    pos: AtomicUsize,
+    eids: OnceLock<Box<[u32]>>,
+}
+
+/// 控えの並び (位置の順)。 登録は帳面の書き手 1 本 (名簿の鍵の下)、 読み手は `n` を Acquire で読んで [0..n) を見る。
+/// 塊 c は 2^c 個 (登録した控えの塊は登録の前に取る)。
+struct SnapList {
+    chunks: [OnceLock<Box<[Snap]>>; 32],
+    n: AtomicUsize,
+}
+
+impl SnapList {
+    fn new() -> Self {
+        Self { chunks: std::array::from_fn(|_| OnceLock::new()), n: AtomicUsize::new(0) }
+    }
+
+    /// j 番目の (塊, 塊の中の場所)。
+    fn at(j: usize) -> (usize, usize) {
+        let c = (usize::BITS - 1 - (j + 1).leading_zeros()) as usize;
+        (c, j + 1 - (1 << c))
+    }
+
+    fn get(&self, j: usize) -> &Snap {
+        let (c, o) = Self::at(j);
+        &self.chunks[c].get().expect("ball: 登録した控えの塊は取ってある")[o]
+    }
+
+    /// 位置 `pos` の控えを登録する (中身はまだ)。 帳面の書き手 1 本だけ。
+    fn register(&self, pos: usize) -> usize {
+        let j = self.n.load(Ordering::Relaxed);
+        let (c, o) = Self::at(j);
+        self.chunks[c].get_or_init(|| (0..1usize << c).map(|_| Snap::default()).collect())[o].pos.store(pos, Ordering::Relaxed);
+        self.n.store(j + 1, Ordering::Release);
+        j
+    }
+
+    fn len(&self) -> usize {
+        self.n.load(Ordering::Acquire)
+    }
+}
+
 /// 値 1 つのデッキの差分の帳面。 書き手 1 本 (名簿の鍵の下) / 読み手は lock を取らない (epoch)。 足すのは後ろだけ、 満杯なら
 /// 倍の backing に写して差し替える (古い backing は読み手が抜けてから捨てる)。
+///
+/// 時刻ごとのデッキの控え: 帳面の頭 (位置 0) のデッキは `seed` (宣言の時の値、 無ければ空)。 その後は、 前の控えから差分が
+/// max(控えの間隔の下限, 前の控えの大きさ) 個たまるたびに (大きさは書き手が帳面に足すたびに数える)、 帳面の書き手が位置を登録し、 名簿の鍵を離した後で同じ書き手が
+/// 中身を作る ([`DiffLog::build`]: 作り終えた一番近い前の控えから差分を前向きに当てる。 帳面の [0..位置) は変わらないので鍵は要らない)。
+/// 控えは 1 差分あたり 4 B 以下。
 struct DiffLog {
     buf: Atomic<LogBuf>,
+    seed: Box<[u32]>,
+    /// 最初の控えを登録する時に取る。
+    snaps: OnceLock<Box<SnapList>>,
+    /// 次の控えを登録する帳面の位置 (書き手だけが読み書き)。
+    snap_due: AtomicUsize,
+    /// 帳面の終わりのデッキの大きさ (書き手だけが読み書き。 入った +1 / 出た −1、 控えの間隔に使う)。
+    size: AtomicUsize,
 }
 
 impl DiffLog {
-    fn new() -> Self {
-        Self { buf: Atomic::new(LogBuf::with_cap(0)) }
+    /// `seed` = 帳面の頭のデッキ (eid の昇順、 重なりなし)。 `snap_min` = 控えの間隔の下限。
+    fn new(seed: Box<[u32]>, snap_min: usize) -> Self {
+        let n = seed.len();
+        Self {
+            buf: Atomic::new(LogBuf::with_cap(0)),
+            seed,
+            snaps: OnceLock::new(),
+            snap_due: AtomicUsize::new(snap_min.max(n)),
+            size: AtomicUsize::new(n),
+        }
     }
 
-    /// 後ろに足す。 名簿の鍵を持つ 1 thread だけ。
-    fn push(&self, d: Diff, guard: &Guard) {
+    /// 後ろに足す。 名簿の鍵を持つ 1 thread だけ。 控えを登録したらその番号 (名簿の鍵を離した後で [`DiffLog::build`] に渡す)。
+    fn push(&self, d: Diff, snap_min: usize, guard: &Guard) -> Option<usize> {
         let cur = self.buf.load(Ordering::Acquire, guard);
         // SAFETY: buf は常に非 null。
         let mut b = unsafe { cur.deref() };
@@ -210,6 +277,81 @@ impl DiffLog {
             w.store(w.load(Ordering::Relaxed) | 1 << (l & 63), Ordering::Relaxed);
         }
         b.len.store(l + 1, Ordering::Release);
+        let size = self.size.load(Ordering::Relaxed);
+        debug_assert!(d.into == 1 || size > 0, "ball: 空のデッキから出た");
+        let size = if d.into == 1 { size + 1 } else { size.wrapping_sub(1) };
+        self.size.store(size, Ordering::Relaxed);
+        if l + 1 < self.snap_due.load(Ordering::Relaxed) {
+            return None;
+        }
+        let j = self.snaps.get_or_init(|| Box::new(SnapList::new())).register(l + 1);
+        // 間隔 = max(下限, この控えの大きさ): 控えは 1 差分あたり 4 B 以下
+        self.snap_due.store(l + 1 + snap_min.max(size), Ordering::Relaxed);
+        Some(j)
+    }
+
+    /// 控え `j` の中身を作る (登録した書き手が名簿の鍵を離した後で)。 作り終えた一番近い前の控え (無ければ頭) から差分を前向きに当てる。
+    fn build(&self, j: usize, guard: &Guard) {
+        let list = self.snaps.get().expect("ball: 登録した控えの並びは取ってある");
+        let target = list.get(j).pos.load(Ordering::Relaxed);
+        let (from, base) = (0..j)
+            .rev()
+            .find_map(|i| {
+                let s = list.get(i);
+                s.eids.get().map(|e| (s.pos.load(Ordering::Relaxed), &**e))
+            })
+            .unwrap_or((0, &*self.seed));
+        let out = self.read(guard, |_, eids, into| apply(base, Tail { eids: &eids[from..target], into, skip: from }, false));
+        let _ = list.get(j).eids.set(out.into_boxed_slice());
+    }
+
+    /// 時点 t の読みをどこから当てるか: 控えからなら (t の位置 k, 控えの位置, デッキ)、 今から戻すなら None。 差分の数で一番近い
+    /// もの (同じなら控え)。
+    fn choose(&self, t: u64, guard: &Guard) -> Option<(usize, usize, &[u32])> {
+        let (k, len) = self.read(guard, |ts, _, _| (ts.partition_point(|&x| x <= t), ts.len()));
+        let (pos, base) = self.nearest(k);
+        (pos.abs_diff(k) <= len - k).then_some((k, pos, base))
+    }
+
+    /// 帳面の位置 `k` に一番近い作り終えた控え (頭を含む): (位置, デッキ)。 同じ近さなら前の方。
+    fn nearest(&self, k: usize) -> (usize, &[u32]) {
+        let mut best = (0, &*self.seed);
+        let Some(list) = self.snaps.get() else { return best };
+        let n = list.len();
+        // 位置は登録の順に増える: k 以下の最後と k より後の最初
+        let (mut lo, mut hi) = (0, n);
+        while lo < hi {
+            let m = (lo + hi) / 2;
+            if list.get(m).pos.load(Ordering::Relaxed) <= k {
+                lo = m + 1;
+            } else {
+                hi = m;
+            }
+        }
+        let built = |i: usize| {
+            let s = list.get(i);
+            s.eids.get().map(|e| (s.pos.load(Ordering::Relaxed), &**e))
+        };
+        if let Some(b) = (0..lo).rev().find_map(built) {
+            best = b;
+        }
+        if let Some(a) = (lo..n).find_map(built)
+            && a.0 - k < k - best.0
+        {
+            best = a;
+        }
+        best
+    }
+
+    /// 作り終えた控えの数。
+    fn snap_count(&self) -> usize {
+        self.snaps.get().map_or(0, |l| (0..l.len()).filter(|&j| l.get(j).eids.get().is_some()).count())
+    }
+
+    /// 頭と控えのデッキの byte。
+    fn snap_bytes(&self) -> usize {
+        let list = self.snaps.get().map_or(0, |l| (0..l.len()).map(|j| l.get(j).eids.get().map_or(0, |e| e.len())).sum::<usize>());
+        (self.seed.len() + list) * 4
     }
 
     /// 出した差分を読む: f(時刻, eid, 入った bit)。
@@ -269,6 +411,21 @@ impl Tail<'_> {
             k = start;
         }
     }
+
+    /// 古い方から (eid, 入った) を渡す (bit の語は 64 個に 1 回読む)。
+    #[inline]
+    fn for_each(&self, mut f: impl FnMut(u32, bool)) {
+        let mut k = 0;
+        while k < self.eids.len() {
+            let i = self.skip + k;
+            let w = self.into[i >> 6].load(Ordering::Relaxed);
+            let end = (((i >> 6) + 1) << 6).saturating_sub(self.skip).min(self.eids.len());
+            for j in k..end {
+                f(self.eids[j], w >> ((self.skip + j) & 63) & 1 == 1);
+            }
+            k = end;
+        }
+    }
 }
 
 /// 集めた差分の写し (大きい値の糸から集めた差分、 試験)。
@@ -295,7 +452,12 @@ impl TailBuf {
 
     /// `from` 番目から後。
     fn tail(&self, from: usize) -> Tail<'_> {
-        Tail { eids: &self.eids[from..], into: &self.into, skip: from }
+        self.range(from, self.eids.len())
+    }
+
+    /// [from..to)。
+    fn range(&self, from: usize, to: usize) -> Tail<'_> {
+        Tail { eids: &self.eids[from..to], into: &self.into, skip: from }
     }
 }
 
@@ -371,14 +533,21 @@ struct Slot {
     prev: u32,
 }
 
-/// 大きい値の差分の、 取った場所と列の lock。 `slots` は [古い値 (出た), 新しい値 (入った)]。
+/// 書き換え 1 回の帳面の仕事: 大きい値の差分の、 取った場所と列の lock (`slots` は [古い値 (出た), 新しい値 (入った)])、 と
+/// 登録した控え (値, 番号)。 控えは名簿の鍵を離した後で [`Ball::build_snaps`] に渡す ([`Reserved::take_snaps`])。
 pub(crate) struct Reserved<'a> {
     held: [Option<(usize, MutexGuard<'a, WideStripe>)>; 2],
     slots: [Option<Slot>; 2],
     filled: bool,
+    snaps: [Option<(u32, usize)>; 2],
 }
 
 impl Reserved<'_> {
+    /// 登録した控え (値, 番号)。
+    pub(crate) fn take_snaps(&mut self) -> [Option<(u32, usize)>; 2] {
+        std::mem::take(&mut self.snaps)
+    }
+
     /// `i` (0 = 古い値、 1 = 新しい値) の場所に時刻を書く。
     fn fill(&mut self, i: usize, v: u64, ts: u64) {
         let s = self.slots[i].as_ref().expect("ball: 大きい値の場所は名簿の鍵の前に取ってある");
@@ -413,10 +582,12 @@ pub(crate) struct Ball {
     logs: Chunked<OnceLock<Box<DiffLog>>>,
     /// `LOG_DENSE` 以上の値の差分。 値の下位 bit で `WIDE` 本に分ける (違う値の書き手は名簿の鍵では並ばないので lock で守る)。
     wide: Box<[Mutex<WideStripe>]>,
+    /// 控えの間隔の下限 (差分の数)。
+    snap_min: usize,
 }
 
 impl Ball {
-    fn new() -> Self {
+    fn new(snap_min: usize) -> Self {
         Self {
             id: BALL_IDS.fetch_add(1, Ordering::Relaxed),
             faces: Chunked::new(1 << 32),
@@ -424,6 +595,27 @@ impl Ball {
             heads: Chunked::new(1 << 32),
             logs: Chunked::new(LOG_DENSE),
             wide: (0..WIDE).map(|_| Mutex::new(WideStripe::default())).collect(),
+            snap_min,
+        }
+    }
+
+    /// [`Ball::note`] が登録した控えを作る。 名簿の鍵を離した後で、 登録した書き手が呼ぶ。
+    pub(crate) fn build_snaps(&self, snaps: [Option<(u32, usize)>; 2]) {
+        if snaps == [None, None] {
+            return;
+        }
+        let guard = epoch::pin();
+        for (v, j) in snaps.into_iter().flatten() {
+            self.logs.get(v).and_then(|l| l.get()).expect("ball: 控えを登録した帳面はある").build(j, &guard);
+        }
+    }
+
+    /// 宣言の時のデッキを帳面の頭に置く (`LOG_DENSE` 未満の値、 eid の昇順)。 書き手の居ない時に。
+    fn seed_logs(&self, decks: BTreeMap<u32, Vec<u32>>) {
+        for (v, mut eids) in decks {
+            eids.sort_unstable();
+            debug_assert!(eids.windows(2).all(|w| w[0] < w[1]), "ball: 宣言のデッキに重なり");
+            let _ = self.logs.get_or_alloc(v).set(Box::new(DiffLog::new(eids.into_boxed_slice(), self.snap_min)));
         }
     }
 
@@ -439,7 +631,7 @@ impl Ball {
     /// 書き換え `old` → `new` の大きい値の側の差分の場所を、 **名簿の鍵を取る前に** 取る (時刻は未定)。 返り値は列の lock を
     /// 持ったまま、 [`Ball::note`] が時刻を書き込む。 `note` を呼ばずに落とすと取り消す。 どちらも小さい値なら何も取らない。
     pub(crate) fn reserve(&self, eid: u32, old: Option<u64>, new: Option<u64>) -> Reserved<'_> {
-        let mut r = Reserved { held: [None, None], slots: [None, None], filled: false };
+        let mut r = Reserved { held: [None, None], slots: [None, None], filled: false, snaps: [None, None] };
         let wide = |v: Option<u64>| v.filter(|&v| v >= LOG_DENSE);
         let vs = [wide(old), wide(new)];
         if old == new || vs == [None, None] {
@@ -465,7 +657,8 @@ impl Ball {
 
     /// 書き換え `old` → `new` を帳面に記す。 **名簿の鍵の中、 名簿を書き換える前に** 呼ぶ (`HimoStore::set_noting` の `note`):
     /// 時刻を取り、 古い値の帳面に 「出た」、 新しい値の帳面に 「入った」 を足す (大きい値は `wide` に取った場所に時刻を書く)。
-    /// 返り値は時刻 (同じ値なら何もせず None)。 鍵を離した後、 `wide` を落とし、 行の lock の下で [`Ball::turn`] にこの時刻を渡すこと。
+    /// 返り値は時刻 (同じ値なら何もせず None)。 鍵を離した後、 `wide` から控えを取り出して ([`Reserved::take_snaps`]) 落とし、
+    /// 行の lock の下で [`Ball::turn`] にこの時刻を渡し、 控えを [`Ball::build_snaps`] で作ること。
     pub(crate) fn note(&self, eid: u32, old: Option<u64>, new: Option<u64>, clock: &AtomicU64, guard: &Guard, wide: &mut Reserved<'_>) -> Option<u64> {
         if old == new {
             return None;
@@ -474,7 +667,10 @@ impl Ball {
         for (i, v) in [old, new].into_iter().enumerate() {
             debug_assert_eq!(wide.slots[i].is_some(), v.is_some_and(|v| v >= LOG_DENSE), "ball: 取った場所と書き換えが違う");
             match v {
-                Some(v) if v < LOG_DENSE => self.logs.get_or_alloc(v as u32).get_or_init(|| Box::new(DiffLog::new())).push(Diff { t: ts, eid, into: i as u32 }, guard),
+                Some(v) if v < LOG_DENSE => {
+                    let log = self.logs.get_or_alloc(v as u32).get_or_init(|| Box::new(DiffLog::new(Box::new([]), self.snap_min)));
+                    wide.snaps[i] = log.push(Diff { t: ts, eid, into: i as u32 }, self.snap_min, guard).map(|j| (v as u32, j));
+                }
                 Some(v) => wide.fill(i, v, ts),
                 None => {}
             }
@@ -579,20 +775,63 @@ impl Ball {
         out
     }
 
-    /// 時点 `t` に値 `v` の面を上にしていた球 (eid の昇順)。 `now` は今のデッキ (この呼び出しの**前に**読んだもの、 並びは問わない、
-    /// 重なりは無いこと = `HimoStore::pull` の返り値)。
-    /// 今のデッキから、 帳面の t より後の差分を逆に戻す。
-    pub fn pull_at(&self, v: u64, t: u64, now: Vec<u32>) -> Vec<u32> {
+    /// 時点 `t` に値 `v` の面を上にしていた球 (eid の昇順)。 `now` は今のデッキを名簿から読む (並びは問わない、 重なりは無いこと
+    /// = `HimoStore::pull` の返り値)。 帳面の t の位置 k に、 今 (帳面の終わり) と作り終えた控えのうち差分の数で一番近いものから
+    /// 当てる: 今か k より後の控えからは逆に戻し、 k より前の控え (帳面の頭を含む) からは前向きに進める。 同じ近さなら控え
+    /// (名簿を読まない)。 今から戻す時は名簿を読んでから帳面を読み直す (名簿の変化を見たなら、 その前に書いた差分も見える)。
+    pub fn pull_at(&self, v: u64, t: u64, now: impl FnOnce() -> Vec<u32>) -> Vec<u32> {
         if v >= LOG_DENSE {
+            let now = now();
             let after = self.stripe(v).after(v, t);
-            return roll_back(now, after.tail(0));
+            return from_now(now, after.tail(0));
         }
-        let Some(log) = self.logs.get(v as u32).and_then(|l| l.get()) else { return roll_back(now, TailBuf::new([]).tail(0)) };
+        let Some(log) = self.logs.get(v as u32).and_then(|l| l.get()) else { return from_now(now(), TailBuf::new([]).tail(0)) };
+        let guard = epoch::pin();
+        if let Some((k, pos, base)) = log.choose(t, &guard) {
+            return log.read(&guard, |_, eids, into| {
+                if pos <= k {
+                    apply(base, Tail { eids: &eids[pos..k], into, skip: pos }, false)
+                } else {
+                    apply(base, Tail { eids: &eids[k..pos], into, skip: k }, true)
+                }
+            });
+        }
+        let now = now();
+        log.read(&guard, |ts, eids, into| {
+            let k = ts.partition_point(|&x| x <= t);
+            from_now(now, Tail { eids: &eids[k..], into, skip: k })
+        })
+    }
+
+    /// 時点 `t` の答えを、 今と作り終えた全部の控え (帳面の頭を含む) のそれぞれから作る (試験用: どの道も同じ答えか)。
+    #[cfg(test)]
+    fn pull_at_every(&self, v: u64, t: u64, now: Vec<u32>) -> Vec<(String, Vec<u32>)> {
+        let mut out = vec![("今".to_string(), self.pull_at(v, t, || now.clone()))];
+        let Some(log) = self.logs.get(v as u32).and_then(|l| l.get()) else { return out };
         let guard = epoch::pin();
         log.read(&guard, |ts, eids, into| {
             let k = ts.partition_point(|&x| x <= t);
-            roll_back(now, Tail { eids: &eids[k..], into, skip: k })
-        })
+            let mut bases = vec![(0, &*log.seed)];
+            if let Some(list) = log.snaps.get() {
+                bases.extend((0..list.len()).filter_map(|j| list.get(j).eids.get().map(|e| (list.get(j).pos.load(Ordering::Relaxed), &**e))));
+            }
+            for (pos, base) in bases {
+                let got = if pos <= k {
+                    apply(base, Tail { eids: &eids[pos..k], into, skip: pos }, false)
+                } else {
+                    apply(base, Tail { eids: &eids[k..pos], into, skip: k }, true)
+                };
+                out.push((format!("控え@{pos}"), got));
+            }
+        });
+        out
+    }
+
+    /// 帳面の控えの数 (作り終えた数)。
+    pub fn snap_count(&self) -> usize {
+        let mut n = 0;
+        self.logs.for_each(|l| n += l.get().map_or(0, |l| l.snap_count()));
+        n
     }
 
     /// 書き手に渡した面の場所の数 (書き手ごとの塊の、 まだ使っていない分 = 高々 `BLOCK` × 書き手の数を含む)。
@@ -612,7 +851,7 @@ impl Ball {
     pub fn bytes(&self) -> usize {
         let guard = epoch::pin();
         let mut logs = 0usize;
-        self.logs.for_each(|l| logs += l.get().map_or(0, |l| l.bytes(&guard)));
+        self.logs.for_each(|l| logs += l.get().map_or(0, |l| l.bytes(&guard) + l.snap_bytes()));
         let wide: usize = self
             .wide
             .iter()
@@ -630,51 +869,71 @@ impl Ball {
 }
 
 /// 今のデッキ `now` (並びは問わない、 重なりは無い) に、 t より後の差分 `after` (時刻の順) を新しい方から逆に当てた、
-/// 時点 t のデッキ (eid の昇順)。 差分が多く eid が狭く集まっていれば bit の表で、 そうでなければ並べて合わせる。
-fn roll_back(now: Vec<u32>, after: Tail<'_>) -> Vec<u32> {
-    match bits_window(&now, after) {
-        Some((lo, words)) => roll_back_bits(&now, after, lo, words),
-        None => roll_back_merge(now, after),
+/// 時点 t のデッキ (eid の昇順)。
+fn from_now(mut now: Vec<u32>, after: Tail<'_>) -> Vec<u32> {
+    // 名簿の読みはほぼ並んでいる (詰め直した bucket + 後ろに足した分) ので比較 sort (並んだ所を一気に通る)。 基数 sort は
+    // 並びによらず桁の数だけ写すので、 今を指した読みが 5 → 22 µs になった。 重なりは無い約束 (落とす走査 1 回で +2.8 µs)
+    now.sort_unstable();
+    debug_assert!(now.windows(2).all(|w| w[0] < w[1]), "ball: 今のデッキに重なり");
+    if after.len() == 0 {
+        return now;
+    }
+    apply(&now, after, true)
+}
+
+/// デッキ `base` (eid の昇順、 重なりなし) に差分 `tail` (時刻の順) を当てたデッキ (eid の昇順)。 `back` = base が tail の後の
+/// デッキで、 新しい方から逆に当てる (入った → 抜く、 出た → 足す。 球ごとに最初の差分が決める)。 でなければ base が tail の前の
+/// デッキで、 古い方から当てる (入った → 足す、 出た → 抜く。 球ごとに最後の差分が決める)。 差分の無い球は base のまま。
+/// 差分が多く eid が狭く集まっていれば bit の表で、 そうでなければ並べて合わせる。
+fn apply(base: &[u32], tail: Tail<'_>, back: bool) -> Vec<u32> {
+    match bits_window(base, tail) {
+        Some((lo, words)) => apply_bits(base, tail, lo, words, back),
+        None => apply_merge(base, tail, back),
     }
 }
 
 /// bit の表を使うなら (表の始まりの eid, 語の数)。
-fn bits_window(now: &[u32], after: Tail<'_>) -> Option<(u32, usize)> {
-    if after.len() < BITS_MIN_AFTER {
+fn bits_window(base: &[u32], tail: Tail<'_>) -> Option<(u32, usize)> {
+    if tail.len() < BITS_MIN_AFTER {
         return None;
     }
-    let (lo, hi) = now.iter().chain(after.eids).fold((u32::MAX, 0), |(lo, hi), &e| (lo.min(e), hi.max(e)));
+    let (lo, hi) = base.iter().chain(tail.eids).fold((u32::MAX, 0), |(lo, hi), &e| (lo.min(e), hi.max(e)));
     let words = ((hi - lo) as usize >> 6) + 1;
-    (words <= BITS_MAX_SPREAD * (now.len() + after.len())).then_some((lo, words))
+    (words <= BITS_MAX_SPREAD * (base.len() + tail.len())).then_some((lo, words))
 }
 
-/// eid の bit の表に今のデッキを立て、 差分を新しい方から当てる (入った → 落とす、 出た → 立てる)。 表を頭から読めば昇順。
-fn roll_back_bits(now: &[u32], after: Tail<'_>, lo: u32, words: usize) -> Vec<u32> {
+/// eid の bit の表に base を立て、 差分を当てる。 表を頭から読めば昇順。
+fn apply_bits(base: &[u32], tail: Tail<'_>, lo: u32, words: usize, back: bool) -> Vec<u32> {
     // 表は thread ごとに使い回す (毎回取ると 100 KB を超える表は新しい page を触るたびに page fault)
     BITS.with(|b| {
         let mut bits = b.take();
         bits.clear();
         bits.resize(words, 0);
-        let out = roll_back_on(&mut bits, now, after, lo);
+        let out = apply_on(&mut bits, base, tail, lo, back);
         b.set(bits);
         out
     })
 }
 
-fn roll_back_on(bits: &mut [u64], now: &[u32], after: Tail<'_>, lo: u32) -> Vec<u32> {
-    for &e in now {
+fn apply_on(bits: &mut [u64], base: &[u32], tail: Tail<'_>, lo: u32, back: bool) -> Vec<u32> {
+    for &e in base {
         let i = (e - lo) as usize;
         bits[i >> 6] |= 1 << (i & 63);
     }
-    // 入った → 落とす、 出た → 立てる、 を枝なしで (入った / 出たは揃わずに並ぶので、 枝にすると読み違いが続く: 差分 9.4k で
-    // 30 µs、 枝なし 6 µs。 値 1 つを繰り返し読む時だけ枝の予測が覚えて 10 µs)
-    after.for_each_rev(|e, into| {
+    // 立てる / 落とすを枝なしで (入った / 出たは揃わずに並ぶので、 枝にすると読み違いが続く: 差分 9.4k で 30 µs、 枝なし 6 µs。
+    // 値 1 つを繰り返し読む時だけ枝の予測が覚えて 10 µs)。 逆に当てる時は入った → 落とす、 前向きは入った → 立てる
+    let mut put = |e: u32, into: bool| {
         let i = (e - lo) as usize;
         let m = 1u64 << (i & 63);
         let w = &mut bits[i >> 6];
-        *w = (*w & !m) | ((into as u64).wrapping_sub(1) & m);
-    });
-    collect_bits(bits, lo, now.len() + after.len() / 2)
+        *w = (*w & !m) | (((into != back) as u64).wrapping_neg() & m);
+    };
+    if back {
+        tail.for_each_rev(&mut put);
+    } else {
+        tail.for_each(&mut put);
+    }
+    collect_bits(bits, lo, base.len() + tail.len() / 2)
 }
 
 /// 表の立った bit の eid を昇順に。 語ごとに 4 個を枝なしで書き (空いた bit の分は捨てる場所に書く)、 立っていた数だけ進める。
@@ -705,29 +964,27 @@ fn collect_bits(bits: &[u64], lo: u32, hint: usize) -> Vec<u32> {
     out
 }
 
-/// 今のデッキと、 球ごとの t より後の最初の差分 (入った = t には居なかった、 出た = 居た) を eid の順に並べて合わせる。
-fn roll_back_merge(mut now: Vec<u32>, after: Tail<'_>) -> Vec<u32> {
-    // 名簿の読みはほぼ並んでいる (詰め直した bucket + 後ろに足した分) ので比較 sort (並んだ所を一気に通る)。 基数 sort は
-    // 並びによらず桁の数だけ写すので、 今を指した読みが 5 → 22 µs になった。 重なりは無い約束 (落とす走査 1 回で +2.8 µs)
-    now.sort_unstable();
-    debug_assert!(now.windows(2).all(|w| w[0] < w[1]), "ball: 今のデッキに重なり");
-    if after.len() == 0 {
-        return now;
+/// base と、 球ごとに決める差分 (逆なら最初 = t の直後、 前向きなら最後) を eid の順に並べて合わせる。 決める差分のある球は
+/// その差分で (逆: 入った = 居なかった、 前向き: 入った = 居る)、 無い球は base のまま。
+fn apply_merge(base: &[u32], tail: Tail<'_>, back: bool) -> Vec<u32> {
+    if tail.len() == 0 {
+        return base.to_vec();
     }
-    let mut first: Vec<(u32, u32, bool)> = after.eids.iter().enumerate().map(|(i, &e)| (e, i as u32, after.entered(i))).collect();
-    first.sort_unstable_by_key(|&(e, i, _)| (e, i));
-    first.dedup_by_key(|x| x.0);
-    let mut out = Vec::with_capacity(now.len() + first.len());
+    let mut pick: Vec<(u32, u32, bool)> = tail.eids.iter().enumerate().map(|(i, &e)| (e, i as u32, tail.entered(i) != back)).collect();
+    // 球ごとに決める差分を先頭に: 逆は古い方、 前向きは新しい方
+    pick.sort_unstable_by_key(|&(e, i, _)| (e, if back { i } else { !i }));
+    pick.dedup_by_key(|x| x.0);
+    let mut out = Vec::with_capacity(base.len() + pick.len());
     let mut j = 0;
-    for &e in &now {
-        while j < first.len() && first[j].0 < e {
-            if !first[j].2 {
-                out.push(first[j].0);
+    for &e in base {
+        while j < pick.len() && pick[j].0 < e {
+            if pick[j].2 {
+                out.push(pick[j].0);
             }
             j += 1;
         }
-        if j < first.len() && first[j].0 == e {
-            if !first[j].2 {
+        if j < pick.len() && pick[j].0 == e {
+            if pick[j].2 {
                 out.push(e);
             }
             j += 1;
@@ -735,7 +992,7 @@ fn roll_back_merge(mut now: Vec<u32>, after: Tail<'_>) -> Vec<u32> {
             out.push(e);
         }
     }
-    out.extend(first[j..].iter().filter(|x| !x.2).map(|x| x.0));
+    out.extend(pick[j..].iter().filter(|x| x.2).map(|x| x.0));
     out
 }
 
@@ -743,13 +1000,15 @@ fn roll_back_merge(mut now: Vec<u32>, after: Tail<'_>) -> Vec<u32> {
 pub(crate) struct Balls {
     any: AtomicBool,
     clock: AtomicU64,
+    /// これから宣言する球の控えの間隔の下限 (差分の数)。
+    snap_min: AtomicUsize,
     /// 紐の番号 → 球。 最初の宣言で取る。
     slots: OnceLock<Box<[OnceLock<Box<Ball>>]>>,
 }
 
 impl Balls {
     pub fn new() -> Self {
-        Self { any: AtomicBool::new(false), clock: AtomicU64::new(0), slots: OnceLock::new() }
+        Self { any: AtomicBool::new(false), clock: AtomicU64::new(0), snap_min: AtomicUsize::new(SNAP_MIN), slots: OnceLock::new() }
     }
 
     #[inline]
@@ -773,16 +1032,29 @@ impl Balls {
         self.slots.get()?[hid as usize].get().map(|b| &**b)
     }
 
+    /// これから宣言する球の控えの間隔の下限 (差分の数、 既定 `SNAP_MIN`)。 試験が小さくして控えの道を通す。
+    pub fn set_snap_min(&self, n: usize) {
+        self.snap_min.store(n.max(1), Ordering::Relaxed);
+    }
+
     /// 紐 `hid` を球にする。 `seed` に今の値 (eid, 値) を全部渡す。 宣言済みなら false。 名簿 (円柱) は先に組んでおくこと。
+    /// 今の値は球の 「前から」 の面と、 帳面の頭のデッキ (時刻 0 のデッキ、 `LOG_DENSE` 未満の値) になる。
     pub fn declare(&self, hid: u16, seed: impl FnOnce(&mut dyn FnMut(u32, u64))) -> bool {
         let slots = self.slots.get_or_init(|| (0..=u16::MAX as usize).map(|_| OnceLock::new()).collect());
         let mut fresh = false;
         let ball = slots[hid as usize].get_or_init(|| {
             fresh = true;
-            Box::new(Ball::new())
+            Box::new(Ball::new(self.snap_min.load(Ordering::Relaxed)))
         });
         if fresh {
-            seed(&mut |eid, v| ball.seed(eid, v));
+            let mut decks: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+            seed(&mut |eid, v| {
+                ball.seed(eid, v);
+                if v < LOG_DENSE {
+                    decks.entry(v as u32).or_default().push(eid);
+                }
+            });
+            ball.seed_logs(decks);
             self.any.store(true, Ordering::Release);
         }
         fresh
@@ -809,10 +1081,12 @@ mod tests {
             let held: Vec<_> = ks.iter().map(|&k| self.0[k].lock()).collect();
             let ts = ball.note(eid, old, new, b.clock(), &epoch::pin(), &mut wide);
             drop(held);
+            let snaps = wide.take_snaps();
             drop(wide);
             if let Some(ts) = ts {
                 ball.turn(eid, new, ts);
             }
+            ball.build_snaps(snaps);
             ts
         }
     }
@@ -828,6 +1102,12 @@ mod tests {
         fn new() -> Self {
             Self { b: Balls::new(), locks: Locks::new(16), cur: BTreeMap::new() }
         }
+        /// 控えの間隔の下限を `n` にして (宣言の前に)。
+        fn with_snap_min(n: usize) -> Self {
+            let x = Self::new();
+            x.b.set_snap_min(n);
+            x
+        }
         fn set(&mut self, hid: u16, eid: u32, v: u64) {
             let old = self.cur.insert((hid, eid), v);
             self.locks.record(&self.b, hid, eid, old, Some(v));
@@ -841,7 +1121,7 @@ mod tests {
             self.cur.iter().filter(|&(&(h, _), &x)| h == hid && x == v).map(|(&(_, e), _)| e).collect()
         }
         fn pull_at(&self, hid: u16, v: u64, t: u64) -> Vec<u32> {
-            self.b.get(hid).unwrap().pull_at(v, t, self.now(hid, v))
+            self.b.get(hid).unwrap().pull_at(v, t, || self.now(hid, v))
         }
     }
 
@@ -989,7 +1269,8 @@ mod tests {
         }
     }
 
-    /// 戻し方 2 通り (bit の表 / 並べて合わせる) を、 手で決めた答え (球ごとの t より後の最初の差分、 無ければ今) と比べる。
+    /// 当て方 2 通り (bit の表 / 並べて合わせる) × 向き 2 つ (今から逆に / 始まりから前向きに) を、 手で決めた答え (始まりの写しに
+    /// 頭から cut 個の差分を当てたもの) と比べる。
     /// 差分は手元の写しから作るので、 入った / 出たは球ごとに交互、 今のデッキは差分の後の写し (並びを崩して渡す)。 eid の狭い /
     /// 広い散らばりを混ぜる。
     #[test]
@@ -1041,15 +1322,126 @@ mod tests {
                     mid.insert(d.eid, d.into == 1);
                 }
                 let want: Vec<u32> = mid.iter().filter(|x| *x.1).map(|x| *x.0).collect();
-                assert_eq!(roll_back_merge(now.clone(), tail), want, "merge case {case} cut {cut}");
+                let mut sorted = now.clone();
+                sorted.sort_unstable();
+                assert_eq!(apply_merge(&sorted, tail, true), want, "merge case {case} cut {cut}");
                 let (lo, hi) = now.iter().chain(tail.eids).fold((u32::MAX, 0), |(lo, hi), &e| (lo.min(e), hi.max(e)));
                 if lo <= hi && hi - lo < 1 << 24 {
                     let words = ((hi - lo) as usize >> 6) + 1;
-                    assert_eq!(roll_back_bits(&now, tail, lo, words), want, "bits case {case} cut {cut}");
+                    assert_eq!(apply_bits(&now, tail, lo, words, true), want, "bits case {case} cut {cut}");
                 }
-                assert_eq!(roll_back(now.clone(), tail), want, "roll_back case {case} cut {cut}");
+                assert_eq!(from_now(now.clone(), tail), want, "from_now case {case} cut {cut}");
+                // 前向き: 始まりのデッキから頭の cut 個を当てる (控えから進める道)
+                let start_deck: Vec<u32> = start.iter().filter(|x| *x.1).map(|x| *x.0).collect();
+                let head = buf.range(0, cut);
+                assert_eq!(apply_merge(&start_deck, head, false), want, "merge fwd case {case} cut {cut}");
+                let (lo, hi) = start_deck.iter().chain(head.eids).fold((u32::MAX, 0), |(lo, hi), &e| (lo.min(e), hi.max(e)));
+                if lo <= hi && hi - lo < 1 << 24 {
+                    let words = ((hi - lo) as usize >> 6) + 1;
+                    assert_eq!(apply_bits(&start_deck, head, lo, words, false), want, "bits fwd case {case} cut {cut}");
+                }
+                assert_eq!(apply(&start_deck, head, false), want, "apply fwd case {case} cut {cut}");
+                // 前向きを途中から: cut の時のデッキから [cut..n) を当てると最後のデッキ (入った bit は頭から数える = skip > 0)
+                let end_deck: Vec<u32> = cur.iter().filter(|x| *x.1).map(|x| *x.0).collect();
+                assert_eq!(apply(&want, buf.range(cut, n), false), end_deck, "apply fwd from cut case {case} cut {cut}");
+                assert_eq!(apply_merge(&want, buf.range(cut, n), false), end_deck, "merge fwd from cut case {case} cut {cut}");
             }
         }
+    }
+
+    /// 時刻ごとのデッキの控え: 宣言の時のデッキ (帳面の頭) と、 差分がたまるたびに作る控えの、 どれから当てても (控えの前の
+    /// 時点へは逆に、 後の時点へは前向きに) 手元の写しと同じ答え。 宣言の前の値も、 大きい値も混ぜる。
+    #[test]
+    fn every_snapshot_agrees_with_a_log() {
+        let mut x = T::with_snap_min(8);
+        let vals: [u64; 6] = [0, 1, 2, 3, 7, 1 << 30];
+        for e in 0..20u32 {
+            x.cur.insert((0, e), vals[e as usize % 4]);
+        }
+        let seed: Vec<(u32, u64)> = x.cur.iter().map(|(&(_, e), &v)| (e, v)).collect();
+        x.b.declare(0, |f| seed.iter().for_each(|&(e, v)| f(e, v)));
+        let mut log: Vec<(u64, BTreeMap<u32, u64>)> = vec![(0, x.cur.iter().map(|(&(_, e), &v)| (e, v)).collect())];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..3000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let e = (r % 40) as u32;
+            match (r >> 8) % 8 {
+                6 | 7 => x.rm(0, e),
+                k => x.set(0, e, vals[k as usize]),
+            }
+            log.push((x.b.now(), x.cur.iter().map(|(&(_, e), &v)| (e, v)).collect()));
+        }
+        let ball = x.b.get(0).unwrap();
+        assert!(ball.snap_count() > 50, "控えの道を通っていない: {}", ball.snap_count());
+        for (t, snap) in log.iter().step_by(29) {
+            for &v in &vals {
+                let want: Vec<u32> = snap.iter().filter(|&(_, &x)| x == v).map(|(&e, _)| e).collect();
+                for (way, got) in ball.pull_at_every(v, *t, x.now(0, v)) {
+                    assert_eq!(got, want, "t={t} v={v} {way}");
+                }
+            }
+        }
+    }
+
+    /// 時点 t の読みは、 今と控えのうち差分の数で一番近いところから当てる (同じ近さなら控え)。 答えはどこからでも同じなので、
+    /// 選び方は答えでなく選んだ場所で見る。
+    #[test]
+    fn reads_start_from_the_nearest_snapshot() {
+        let mut x = T::with_snap_min(10);
+        x.b.declare(0, |_| {});
+        // 値 1 の帳面: 入る / 出るを繰り返す (1 回の書き換えで 1 差分)。 控えは 10, 20, ... (デッキは小さいので間隔は 10)
+        let mut ts = vec![0u64];
+        for i in 0..46u32 {
+            if i % 2 == 0 {
+                x.set(0, i / 2, 1);
+            } else {
+                x.rm(0, i / 2);
+            }
+            ts.push(x.b.now());
+        }
+        let ball = x.b.get(0).unwrap();
+        let log = ball.logs.get(1).and_then(|l| l.get()).unwrap();
+        let guard = epoch::pin();
+        let pos: Vec<usize> = (0..log.snaps.get().unwrap().len()).map(|j| log.snaps.get().unwrap().get(j).pos.load(Ordering::Relaxed)).collect();
+        assert_eq!(pos, vec![10, 20, 30, 40]);
+        // 位置 k (= k 個目の差分の時刻) → 選ぶ場所 (None = 今 = 46)。 43 は控え 40 と今が同じ近さ
+        for (k, want) in [(0, Some(0)), (4, Some(0)), (5, Some(0)), (6, Some(10)), (15, Some(10)), (16, Some(20)), (42, Some(40)), (43, Some(40)), (44, None), (46, None)] {
+            assert_eq!(log.choose(ts[k], &guard).map(|c| c.1), want, "k={k}");
+            if let Some((kk, _, _)) = log.choose(ts[k], &guard) {
+                assert_eq!(kk, k);
+            }
+        }
+    }
+
+    /// 控えの間隔は max(下限, 前の控えの大きさ): デッキが大きい値は控えの間を広げる (控えは 1 差分あたり 4 B 以下)。
+    #[test]
+    fn snapshot_interval_follows_the_deck_size() {
+        let mut x = T::with_snap_min(4);
+        for e in 0..30u32 {
+            x.cur.insert((0, e), 1);
+        }
+        x.b.declare(0, |f| (0..30).for_each(|e| f(e, 1)));
+        // 値 1 から 30..40 を出し入れする (デッキは 30〜40)
+        for i in 0..200u32 {
+            let e = 30 + i % 10;
+            if (i / 10) % 2 == 0 {
+                x.set(0, e, 1);
+            } else {
+                x.rm(0, e);
+            }
+        }
+        let log = x.b.get(0).unwrap().logs.get(1).and_then(|l| l.get()).unwrap();
+        let list = log.snaps.get().unwrap();
+        let mut prev = (0, 30);
+        for j in 0..list.len() {
+            let s = list.get(j);
+            let (pos, size) = (s.pos.load(Ordering::Relaxed), s.eids.get().unwrap().len());
+            assert_eq!(pos - prev.0, 4usize.max(prev.1), "控え {j}");
+            prev = (pos, size);
+        }
+        assert!(list.len() >= 4);
     }
 
     /// 書き手 4 本が自分の entity 8 個に、 同じ値の組 (0..5) を書いたり外したりする。 回ごとに Barrier でそろえ、 そろった時刻を
@@ -1062,6 +1454,7 @@ mod tests {
         const PER: u32 = 8;
         const VALS: u64 = 5;
         let b = Balls::new();
+        b.set_snap_min(16); // 控えを作る書き手と、 帳面に足す書き手 / 読み手が重なる
         b.declare(0, |_| {});
         let locks = Locks::new(VALS as usize);
         let rounds = if cfg!(miri) { 4 } else { 300 };
@@ -1106,12 +1499,20 @@ mod tests {
             for v in 0..VALS {
                 let deck: Vec<u32> = (0..TH * PER).filter(|&e| want[e as usize] == Some(v)).collect();
                 let now: Vec<u32> = (0..TH * PER).filter(|&e| last[e as usize] == Some(v)).collect();
-                assert_eq!(ball.pull_at(v, *t, now), deck, "回 {r} t={t} v={v}");
+                // 全部の控えから当てるのは 15 回に 1 回 (控えの数 × 帳面の長さかかる)、 他は選んだところから
+                if r % 15 == 0 {
+                    for (way, got) in ball.pull_at_every(v, *t, now) {
+                        assert_eq!(got, deck, "回 {r} t={t} v={v} {way}");
+                    }
+                } else {
+                    assert_eq!(ball.pull_at(v, *t, || now.clone()), deck, "回 {r} t={t} v={v}");
+                }
             }
             for e in 0..TH * PER {
                 assert_eq!(ball.value_at(e, *t), want[e as usize], "回 {r} t={t} e={e}");
             }
         }
+        assert!(ball.snap_count() > 100, "控えの道を通っていない: {}", ball.snap_count());
         // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (球の面は行ごとに時刻の順。 帳面の並びが時刻の順から
         // 崩れると、 同じ回の中の 2 つの書き込みの間の時刻で食い違う)。 最後の 40 回の時刻を全部
         let end = b.now();
@@ -1120,7 +1521,7 @@ mod tests {
             for v in 0..VALS {
                 let now: Vec<u32> = (0..TH * PER).filter(|&e| last[e as usize] == Some(v)).collect();
                 let faces: Vec<u32> = (0..TH * PER).filter(|&e| ball.value_at(e, t) == Some(v)).collect();
-                assert_eq!(ball.pull_at(v, t, now), faces, "t={t} v={v}");
+                assert_eq!(ball.pull_at(v, t, || now.clone()), faces, "t={t} v={v}");
             }
         }
     }

@@ -173,11 +173,20 @@ fn concurrent_run(name: &str, vals: &[u64]) {
     let mut db = Database::create(&path).unwrap();
     db.table("t").number("id").number("a").primary_key("id").build().unwrap();
     let t = db.get_table("t").unwrap();
+    // 3 行に 1 行は宣言の前に値を入れておく (球の 「前から」 の面と、 帳面の頭のデッキになる)
     let mut eids = Vec::new();
-    for i in 0..(TH * PER) as i64 {
-        eids.push(t.insert().set("id", i).commit().unwrap());
+    let mut seeded = vec![None::<u64>; TH * PER];
+    for i in 0..TH * PER {
+        let mut row = t.insert().set("id", i as i64);
+        if i % 3 == 0 {
+            let v = vals[i % vals.len()];
+            row = row.set("a", v as i64);
+            seeded[i] = Some(v);
+        }
+        eids.push(row.commit().unwrap());
     }
     let eng = db.arc_engine();
+    eng.ball_set_snap_min(16); // 控えを作る書き手と、 帳面に足す書き手が重なる
     assert!(eng.declare_ball("t.a").unwrap());
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let rounds = 200;
@@ -189,9 +198,9 @@ fn concurrent_run(name: &str, vals: &[u64]) {
         for th in 0..TH {
             let (eng, bar, log, eids, diffs) = (&eng, &bar, &log, &eids, &diffs);
             let vals = vals;
+            let mut mine = seeded[th * PER..(th + 1) * PER].to_vec();
             s.spawn(move || {
                 let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ th as u64);
-                let mut mine = vec![None::<u64>; PER];
                 for _ in 0..rounds {
                     for _ in 0..30 {
                         let k = r.below(PER as u64) as usize;
@@ -232,6 +241,12 @@ fn concurrent_run(name: &str, vals: &[u64]) {
         for i in 0..TH * PER {
             assert_eq!(eng.ball_value_at(eids[i], "t.a", *tm), want[i], "回 {k} e={}", eids[i]);
         }
+    }
+    assert!(eng.ball_snap_count("t.a").unwrap() > 50, "控えの道を通っていない: {:?}", eng.ball_snap_count("t.a"));
+    // 宣言の時 (時刻 0) のデッキは、 宣言の前に入れた値
+    for &v in vals {
+        let want: Vec<u64> = (0..TH * PER).filter(|&i| seeded[i] == Some(v)).map(|i| eids[i]).collect();
+        assert_eq!(eng.ball_pull_at("t.a", v, 0), want, "時刻 0 v={v}");
     }
     // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (最後の 20 回の時刻を全部)
     let from = checks[checks.len().saturating_sub(21)].0;

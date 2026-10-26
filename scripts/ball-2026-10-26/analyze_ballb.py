@@ -44,7 +44,7 @@ for th in (1, 4):
     x = [r for r in okr if r["threads"] == th]
     if x:
         print(f"球の面 (書き手 {th} 本): faces {statistics.median(r['faces'] for r in x):.0f}、 取った byte {statistics.median(r['ball_bytes'] for r in x) / 2**20:.1f} MiB")
-for v in ("base", "proto_off", "proto_on", "lclk_on", "v4_on", "v5_on", "v6_on"):
+for v in ("base", "proto_off", "proto_on", "lclk_on", "v4_on", "v5_on", "v6_on", "v7b_on"):
     x = [r["rss_peak_kb"] for r in rows if r["kind"] == "ok" and r["v"] == v]
     if x:
         print(f"RSS の峰 {v}: {statistics.median(x) / 1024:.0f} MiB")

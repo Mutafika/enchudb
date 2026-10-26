@@ -11629,7 +11629,8 @@ impl Engine {
     }
 
     /// 名簿 (円柱) と列に書く (`live_set` の中、 行の lock の下)。 球にした紐 (試作、 `crate::ball` の順序) は、 大きい値の
-    /// 差分の場所を名簿の鍵の前に取り、 名簿の鍵の中で名簿を書き換える前に帳面に書き足し、 鍵を離した後で球を回す。
+    /// 差分の場所を名簿の鍵の前に取り、 名簿の鍵の中で名簿を書き換える前に帳面に書き足し、 鍵を離した後で球を回し、
+    /// 帳面に登録した控え (時刻ごとのデッキ) があれば作る。
     #[inline]
     fn himo_set(&self, hid: usize, local: u32, value: u64) -> bool {
         if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
@@ -11642,10 +11643,12 @@ impl Engine {
                 debug_assert_eq!(old, before);
                 ts = b.note(local, old, Some(value), self.balls.clock(), g, &mut wide)
             });
+            let snaps = wide.take_snaps();
             drop(wide);
             if let Some(ts) = ts {
                 b.turn(local, Some(value), ts);
             }
+            b.build_snaps(snaps);
             return ok;
         }
         self.himos[hid].set(local, value)
@@ -11662,10 +11665,12 @@ impl Engine {
                 debug_assert_eq!(old, before);
                 ts = b.note(local, old, None, self.balls.clock(), g, &mut wide)
             });
+            let snaps = wide.take_snaps();
             drop(wide);
             if let Some(ts) = ts {
                 b.turn(local, None, ts);
             }
+            b.build_snaps(snaps);
             return;
         }
         self.himos[hid].remove(local)
@@ -18026,13 +18031,23 @@ impl Engine {
     }
 
     /// 時点 `t` に `value` の面を上にしていた entity (試作、 eid の昇順)。 Tag の紐は `vocab_id` で番号にしてから。
-    /// 今のデッキ (名簿) を先に読み、 デッキの差分の帳面の t より後の分を逆に戻す。
+    /// デッキの差分の帳面の t の位置に一番近い所 (今のデッキ = 名簿 / 時刻ごとのデッキの控え) から差分を当てる。
     pub fn ball_pull_at(&self, himo: &str, value: u64, t: u64) -> Vec<enchudb_oplog::EntityId> {
         let Some(id) = self.himo_id(himo) else { return Vec::new() };
         let Some(b) = self.balls.get(id as u16) else { return Vec::new() };
-        let now = self.himos[id].pull(value);
         let peer = self.peer_id();
-        b.pull_at(value, t, now).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+        b.pull_at(value, t, || self.himos[id].pull(value)).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+    }
+
+    /// これから宣言する球の、 時刻ごとのデッキの控えの間隔の下限 (差分の数、 既定 1024。 試作、 試験が小さくして控えの道を通す)。
+    #[doc(hidden)]
+    pub fn ball_set_snap_min(&self, n: usize) {
+        self.balls.set_snap_min(n);
+    }
+
+    /// 帳面に登録した控えの数 (試作)。
+    pub fn ball_snap_count(&self, himo: &str) -> Option<usize> {
+        Some(self.balls.get(self.himo_id(himo)? as u16)?.snap_count())
     }
 
     /// 球の面の数と取った byte (試作)。
