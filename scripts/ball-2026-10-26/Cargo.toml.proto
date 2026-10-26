@@ -1,0 +1,16 @@
+[package]
+name = "ballb"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+enchudb = { path = "/Users/kubo/Desktop/mutafika/enchudb-ball" }
+libc = "0.2"
+
+[features]
+ball = []
+
+[profile.release]
+debug = false

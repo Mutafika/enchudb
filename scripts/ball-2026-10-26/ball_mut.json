@@ -1,0 +1,68 @@
+[
+ {
+  "name": "外した面を閉じない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            f.to.store(ts, Ordering::Release);",
+  "replace": "            let _ = f;"
+ },
+ {
+  "name": "デッキの読みが外れた時刻を見ない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "if f.from.load(Ordering::Relaxed) <= t && f.to.load(Ordering::Acquire) > t {",
+  "replace": "if f.from.load(Ordering::Relaxed) <= t {"
+ },
+ {
+  "name": "球の読みが外れた時刻を見ない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "return (f.to.load(Ordering::Acquire) > t).then(|| f.value.load(Ordering::Relaxed));",
+  "replace": "return Some(f.value.load(Ordering::Relaxed));"
+ },
+ {
+  "name": "デッキの頭を CAS でなく store で付け替える",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "match head.compare_exchange_weak(old, i + 1, Ordering::Release, Ordering::Acquire) {\n                    Ok(_) => break,\n                    Err(o) => old = o,\n                }",
+  "replace": "std::thread::yield_now();\n                head.store(i + 1, Ordering::Release);\n                let _ = &mut old;\n                break;"
+ },
+ {
+  "name": "同じ値の書き直しも回す",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            (Some(f), Some(v)) if f.value.load(Ordering::Relaxed) == v => return,\n",
+  "replace": ""
+ },
+ {
+  "name": "前からの面を時刻 1 から",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.push_face(i, eid, NONE, v, 0);",
+  "replace": "self.push_face(i, eid, NONE, v, 1);"
+ },
+ {
+  "name": "書き換えの時刻が今と同じ",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;",
+  "replace": "let ts = clock.fetch_add(1, Ordering::Relaxed);"
+ },
+ {
+  "name": "untie / delete を球に伝えない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            self.balls.on_remove(hid as u16, local);\n",
+  "replace": ""
+ },
+ {
+  "name": "書き換えを球に伝えない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                self.balls.on_set(hid as u16, local, value);\n",
+  "replace": ""
+ },
+ {
+  "name": "塊の中の場所を進めない (同じ場所を 2 度渡す)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            b[k].1 += 1;\n",
+  "replace": ""
+ },
+ {
+  "name": "大きい値のデッキを読みと書きで別の表に",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.wide_of(v).get(&v).copied().unwrap_or(0)",
+  "replace": "self.wide_of(v + 1).get(&v).copied().unwrap_or(0)"
+ }
+]

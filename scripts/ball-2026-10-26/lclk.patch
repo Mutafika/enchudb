@@ -1,0 +1,16 @@
+diff --git a/crates/enchudb-engine/src/ball.rs b/crates/enchudb-engine/src/ball.rs
+index ec7e25d..bfc54c1 100644
+--- a/crates/enchudb-engine/src/ball.rs
++++ b/crates/enchudb-engine/src/ball.rs
+@@ -203,7 +203,10 @@ impl Ball {
+             (None, None) => return,
+             _ => {}
+         }
+-        let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;
++        let _ = clock;
++        // 測り専用 (commit しない): 時刻を書き手ごとの数え口にする (時刻の順は壊れる)。 共有の数え口の値段を切り分ける
++        thread_local!(static LCLK: Cell<u64> = const { Cell::new(0) });
++        let ts = LCLK.with(|c| { let v = c.get() + 1; c.set(v); v });
+         if let Some(f) = open {
+             f.to.store(ts, Ordering::Release);
+         }
