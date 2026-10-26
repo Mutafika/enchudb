@@ -148,7 +148,8 @@ fn leaf_columns_cannot_be_balls() {
 
 /// 書き手 4 本が自分の row 16 個の a (値 0..6) を書いたり外したりする (engine の `tie_to_by_id` / `untie_by_id`)。 回ごとに
 /// Barrier でそろえ、 そろった時刻と書き手の写しを控える。 全部の回の時刻で、 デッキのカードの答えと球の答えを写しと比べる
-/// (同じ値の帳面に書き手が並んで書き足す・帳面を伸ばして写す、 を並べて通す)。
+/// (同じ値の帳面に書き手が並んで書き足す・帳面を伸ばして写す、 を並べて通す)。 回の途中の時刻は、 デッキの答えを球の面と突き合わせる。
+/// 時刻を帳面の鍵の外で取る変異は release で 20 回中 20 回落ちる (変異なしは 20 回中 0 回、 2026-10-26)。
 #[test]
 fn concurrent_writers_leave_history_in_the_ledgers() {
     const TH: usize = 4;
@@ -215,6 +216,14 @@ fn concurrent_writers_leave_history_in_the_ledgers() {
         }
         for i in 0..TH * PER {
             assert_eq!(eng.ball_value_at(eids[i], "t.a", *tm), want[i], "回 {k} e={}", eids[i]);
+        }
+    }
+    // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (最後の 20 回の時刻を全部)
+    let from = checks[checks.len().saturating_sub(21)].0;
+    for tm in from..=eng.ball_now() {
+        for v in 0..VALS {
+            let faces: Vec<u64> = eids.iter().copied().filter(|&e| eng.ball_value_at(e, "t.a", tm) == Some(v)).collect();
+            assert_eq!(eng.ball_pull_at("t.a", v, tm), faces, "t={tm} v={v}");
         }
     }
     // 今の読み (名簿) も合う

@@ -620,7 +620,9 @@ mod tests {
 
     /// 書き手 4 本が自分の entity 8 個に、 同じ値の組 (0..5) を書いたり外したりする。 回ごとに Barrier でそろえ、 そろった時刻を
     /// 外から控える (= その時刻の答えは手元の写しで決まる、 球の付けた時刻を使わない)。 最後に、 全部の回の時刻でデッキの答えと
-    /// 球の答えを写しと比べる (今のデッキは最後の写しから渡す)。
+    /// 球の答えを写しと比べる (今のデッキは最後の写しから渡す)。 回の途中の時刻は、 デッキの答えを球の面と突き合わせる。
+    /// 時刻を帳面の鍵の外で取る変異 (帳面の並びが時刻の順から崩れる) は release で 20 回中 20 回落ちる (変異なしは 20 回中 0 回、
+    /// 2026-10-26)。
     #[test]
     fn concurrent_writers_agree_with_a_log() {
         const TH: u32 = 4;
@@ -674,6 +676,17 @@ mod tests {
             }
             for e in 0..TH * PER {
                 assert_eq!(ball.value_at(e, *t), want[e as usize], "回 {r} t={t} e={e}");
+            }
+        }
+        // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (球の面は行ごとに時刻の順。 帳面の並びが時刻の順から
+        // 崩れると、 同じ回の中の 2 つの書き込みの間の時刻で食い違う)。 最後の 40 回の時刻を全部
+        let end = b.now();
+        let from = checks[checks.len().saturating_sub(41)].0;
+        for t in from..=end {
+            for v in 0..VALS {
+                let now: Vec<u32> = (0..TH * PER).filter(|&e| last[e as usize] == Some(v)).collect();
+                let faces: Vec<u32> = (0..TH * PER).filter(|&e| ball.value_at(e, t) == Some(v)).collect();
+                assert_eq!(ball.pull_at(v, t, now), faces, "t={t} v={v}");
             }
         }
     }
