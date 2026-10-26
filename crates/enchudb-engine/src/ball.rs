@@ -12,16 +12,22 @@
 //!   差分の無い球は今と同じ)。 手間は 「t より後の差分の数」 に比例
 //!   - `LOG_DENSE` 未満の値は値ごとの帳面 (`DiffLog`、 差分を詰めて並べる)
 //!   - それより大きい値 (時刻 / ID の列: 1 つの値の差分が 1〜2 個) は値ごとに帳面を作らず、 値の下位 bit で分けた
-//!     `WIDE` 本の列 (`WideStripe`) に足し、 同じ値の 1 つ前の差分へ糸を張る
+//!     `WIDE` 本の列 (`WideStripe`) に足し、 同じ値の 1 つ前の差分へ糸を張る。 列への書き足し (値 → 糸の頭の表を引く) は
+//!     名簿の鍵の**外**で済ませる: 名簿の鍵を取る前に列の lock を取って場所を取り ([`Ball::reserve`]、 時刻は未定)、
+//!     名簿の鍵の中では時刻を書き込むだけ。 列の lock は名簿を書き換え終わるまで持つ (読み手は列の lock の下で読むので、
+//!     時刻の未定の差分は見えない)。 sparse の値の名簿の鍵は紐 1 本の write_lock なので、 その中で表を引くと書き手が並ぶ
+//!     (書き手 4 本で書き換え 1 回 +950 ns だった)
 //!
 //! 同じ値の書き直しは球を回さない (面も差分も足さない)。 外す (untie / delete) は今の面を閉じ、 「出た」 を書く。
 //!
 //! ## 順序
-//! 帳面の書き手 1 本の約束は、 名簿 (円柱) の書き手の鍵がそのまま守る: engine は行の lock の下で
+//! 値ごとの帳面の書き手 1 本の約束は、 名簿 (円柱) の書き手の鍵がそのまま守る: engine は行の lock の下で
 //! `HimoStore::set_noting` / `remove_noting` を呼び、 HimoStore が古い値と新しい値の名簿の鍵 (値の鍵か write_lock) を
 //! 取った中で、 名簿と列を書き換える**前に** [`Ball::note`] が時刻を取って帳面に書き足す (len を Release)。 鍵を離した後、
 //! 行の lock の下で [`Ball::turn`] が球を回す。 同じ値に触る書き手は、 その値が配列の中ならその値の鍵、 sparse なら write_lock
 //! を必ず持ち、 配列を伸ばす書き手は write_lock と全部の鍵を持つので、 同じ値の帳面の書き手は 1 本ずつ並ぶ (帳面の並び = 時刻の順)。
+//! 大きい値の列は、 同じ値の書き手が列の lock を場所を取ってから時刻を書くまで持つので、 糸の並び = 時刻の順。 鍵の順は
+//! 列の lock (番号の小さい方から) → 名簿の鍵。
 //! 宣言 ([`Balls::declare`]) は円柱を先に組む (組んでいない紐の書き手は鍵を取らない。 組んだ印は戻らない)。
 //!
 //! 読み手は今のデッキを先に読み、 その後で帳面を読む (Acquire)。 読み手が名簿の変化を見たなら、 その前に書いた差分も見える。
@@ -39,9 +45,7 @@ use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-use crate::append_bucket::sort_eids;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// 糸の終わり。
 const NONE: u32 = u32::MAX;
@@ -66,6 +70,8 @@ static BALL_IDS: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     /// この thread が取った面の場所の塊: (球の番号, 次, 終わり)。 球 8 つまで。 追い出した塊の残りは使わない場所になる。
     static BLOCKS: Cell<[(u64, u32, u32); 8]> = const { Cell::new([(0, 0, 0); 8]) };
+    /// 時点 t の読みの bit の表 (使い回す)。
+    static BITS: Cell<Vec<u64>> = const { Cell::new(Vec::new()) };
 }
 
 /// u32 の添字で引く、 塊ごとに初めて触った時に取る配列。 読み手は取らない (無い塊は空として読む)。
@@ -202,6 +208,9 @@ impl Drop for DiffLog {
     }
 }
 
+/// 大きい値の差分の、 時刻の未定の印 (列の lock を持つ書き手の外には見えない)。
+const PENDING: u64 = u64::MAX;
+
 /// 大きい値の差分 1 つ (16 B)。 `link` = 同じ値の 1 つ前の差分の場所 + 1 (0 = 最初) << 1 | 入った。
 #[derive(Clone, Copy)]
 struct WideDiff {
@@ -219,12 +228,25 @@ struct WideStripe {
 }
 
 impl WideStripe {
-    fn push(&mut self, v: u64, d: Diff) {
+    /// 値 `v` の糸の先に足す。 返り値は足す前の糸の頭 (取り消す時に戻す)。
+    fn push(&mut self, v: u64, d: Diff) -> u32 {
         let i = self.diffs.len();
         assert!(i < (1 << 31) - 1, "ball: 大きい値の差分の列が一杯 (試作)");
         let head = self.heads.entry(v).or_insert(0);
-        self.diffs.push(WideDiff { t: d.t, eid: d.eid, link: *head << 1 | d.into });
+        let prev = *head;
+        self.diffs.push(WideDiff { t: d.t, eid: d.eid, link: prev << 1 | d.into });
         *head = i as u32 + 1;
+        prev
+    }
+
+    /// 最後に足した値 `v` の差分を取り消す (`push` の返り値を `prev` に)。
+    fn pop(&mut self, v: u64, prev: u32) {
+        self.diffs.pop();
+        if prev == 0 {
+            self.heads.remove(&v);
+        } else {
+            self.heads.insert(v, prev);
+        }
     }
 
     /// 値 `v` の t より後の差分を時刻の順に。
@@ -241,6 +263,44 @@ impl WideStripe {
         }
         out.reverse();
         out
+    }
+}
+
+/// [`Ball::reserve`] で取った場所 1 つ: (`held` の添字, 列の中の場所, 値, 足す前の糸の頭)。
+struct Slot {
+    held: usize,
+    at: usize,
+    v: u64,
+    prev: u32,
+}
+
+/// 大きい値の差分の、 取った場所と列の lock。 `slots` は [古い値 (出た), 新しい値 (入った)]。
+pub(crate) struct Reserved<'a> {
+    held: [Option<(usize, MutexGuard<'a, WideStripe>)>; 2],
+    slots: [Option<Slot>; 2],
+    filled: bool,
+}
+
+impl Reserved<'_> {
+    /// `i` (0 = 古い値、 1 = 新しい値) の場所に時刻を書く。
+    fn fill(&mut self, i: usize, v: u64, ts: u64) {
+        let s = self.slots[i].as_ref().expect("ball: 大きい値の場所は名簿の鍵の前に取ってある");
+        debug_assert_eq!(s.v, v);
+        self.held[s.held].as_mut().unwrap().1.diffs[s.at].t = ts;
+    }
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        // 書かなかった (同じ値 / 書けなかった): 足した順の逆に取り消す
+        for s in self.slots.iter().rev().flatten() {
+            let g = &mut self.held[s.held].as_mut().unwrap().1;
+            debug_assert_eq!(g.diffs.len(), s.at + 1);
+            g.pop(s.v, s.prev);
+        }
     }
 }
 
@@ -275,33 +335,54 @@ impl Ball {
         self.faces.get(i).expect("ball: 出した面の塊は取ってある")
     }
 
-    fn stripe(&self, v: u64) -> std::sync::MutexGuard<'_, WideStripe> {
+    fn stripe(&self, v: u64) -> MutexGuard<'_, WideStripe> {
         self.wide[v as usize % WIDE].lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 値 `v` の帳面に書き足す (無ければ作る)。 `v` の名簿の鍵の下で。
-    fn log_push(&self, v: u64, d: Diff, guard: &Guard) {
-        if v < LOG_DENSE {
-            self.logs.get_or_alloc(v as u32).get_or_init(|| Box::new(DiffLog::new())).push(d, guard);
-        } else {
-            self.stripe(v).push(v, d);
+    /// 書き換え `old` → `new` の大きい値の側の差分の場所を、 **名簿の鍵を取る前に** 取る (時刻は未定)。 返り値は列の lock を
+    /// 持ったまま、 [`Ball::note`] が時刻を書き込む。 `note` を呼ばずに落とすと取り消す。 どちらも小さい値なら何も取らない。
+    pub(crate) fn reserve(&self, eid: u32, old: Option<u64>, new: Option<u64>) -> Reserved<'_> {
+        let mut r = Reserved { held: [None, None], slots: [None, None], filled: false };
+        let wide = |v: Option<u64>| v.filter(|&v| v >= LOG_DENSE);
+        let vs = [wide(old), wide(new)];
+        if old == new || vs == [None, None] {
+            return r;
         }
+        // 列の lock は番号の小さい方から (同じ列なら 1 つ)
+        let mut ks: Vec<usize> = vs.iter().flatten().map(|&v| v as usize % WIDE).collect();
+        ks.sort_unstable();
+        ks.dedup();
+        for (h, &k) in ks.iter().enumerate() {
+            r.held[h] = Some((k, self.wide[k].lock().unwrap_or_else(|e| e.into_inner())));
+        }
+        for (i, v) in vs.into_iter().enumerate() {
+            let Some(v) = v else { continue };
+            let h = ks.iter().position(|&k| k == v as usize % WIDE).unwrap();
+            let g = &mut r.held[h].as_mut().unwrap().1;
+            let at = g.diffs.len();
+            let prev = g.push(v, Diff { t: PENDING, eid, into: i as u32 });
+            r.slots[i] = Some(Slot { held: h, at, v, prev });
+        }
+        r
     }
 
     /// 書き換え `old` → `new` を帳面に記す。 **名簿の鍵の中、 名簿を書き換える前に** 呼ぶ (`HimoStore::set_noting` の `note`):
-    /// 時刻を取り、 古い値の帳面に 「出た」、 新しい値の帳面に 「入った」 を足す。 返り値は時刻 (同じ値なら何もせず None)。
-    /// 鍵を離した後、 行の lock の下で [`Ball::turn`] にこの時刻を渡すこと。
-    pub(crate) fn note(&self, eid: u32, old: Option<u64>, new: Option<u64>, clock: &AtomicU64, guard: &Guard) -> Option<u64> {
+    /// 時刻を取り、 古い値の帳面に 「出た」、 新しい値の帳面に 「入った」 を足す (大きい値は `wide` に取った場所に時刻を書く)。
+    /// 返り値は時刻 (同じ値なら何もせず None)。 鍵を離した後、 `wide` を落とし、 行の lock の下で [`Ball::turn`] にこの時刻を渡すこと。
+    pub(crate) fn note(&self, eid: u32, old: Option<u64>, new: Option<u64>, clock: &AtomicU64, guard: &Guard, wide: &mut Reserved<'_>) -> Option<u64> {
         if old == new {
             return None;
         }
         let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(o) = old {
-            self.log_push(o, Diff { t: ts, eid, into: 0 }, guard);
+        for (i, v) in [old, new].into_iter().enumerate() {
+            debug_assert_eq!(wide.slots[i].is_some(), v.is_some_and(|v| v >= LOG_DENSE), "ball: 取った場所と書き換えが違う");
+            match v {
+                Some(v) if v < LOG_DENSE => self.logs.get_or_alloc(v as u32).get_or_init(|| Box::new(DiffLog::new())).push(Diff { t: ts, eid, into: i as u32 }, guard),
+                Some(v) => wide.fill(i, v, ts),
+                None => {}
+            }
         }
-        if let Some(n) = new {
-            self.log_push(n, Diff { t: ts, eid, into: 1 }, guard);
-        }
+        wide.filled = true;
         Some(ts)
     }
 
@@ -468,7 +549,18 @@ fn bits_window(now: &[u32], after: &[Diff]) -> Option<(u32, usize)> {
 
 /// eid の bit の表に今のデッキを立て、 差分を新しい方から当てる (入った → 落とす、 出た → 立てる)。 表を頭から読めば昇順。
 fn roll_back_bits(now: &[u32], after: &[Diff], lo: u32, words: usize) -> Vec<u32> {
-    let mut bits = vec![0u64; words];
+    // 表は thread ごとに使い回す (毎回取ると 100 KB を超える表は新しい page を触るたびに page fault)
+    BITS.with(|b| {
+        let mut bits = b.take();
+        bits.clear();
+        bits.resize(words, 0);
+        let out = roll_back_on(&mut bits, now, after, lo);
+        b.set(bits);
+        out
+    })
+}
+
+fn roll_back_on(bits: &mut [u64], now: &[u32], after: &[Diff], lo: u32) -> Vec<u32> {
     for &e in now {
         let i = (e - lo) as usize;
         bits[i >> 6] |= 1 << (i & 63);
@@ -495,7 +587,9 @@ fn roll_back_bits(now: &[u32], after: &[Diff], lo: u32, words: usize) -> Vec<u32
 
 /// 今のデッキと、 球ごとの t より後の最初の差分 (入った = t には居なかった、 出た = 居た) を eid の順に並べて合わせる。
 fn roll_back_merge(mut now: Vec<u32>, after: &[Diff]) -> Vec<u32> {
-    sort_eids(&mut now);
+    // 名簿の読みはほぼ並んでいる (詰め直した bucket + 後ろに足した分) ので比較 sort (並んだ所を一気に通る)。 基数 sort は
+    // 並びによらず桁の数だけ写すので、 今を指した読みが 5 → 22 µs になった
+    now.sort_unstable();
     now.dedup();
     if after.is_empty() {
         return now;
@@ -588,12 +682,14 @@ mod tests {
         }
         fn record(&self, b: &Balls, hid: u16, eid: u32, old: Option<u64>, new: Option<u64>) -> Option<u64> {
             let ball = b.get(hid)?;
+            let mut wide = ball.reserve(eid, old, new);
             let mut ks: Vec<usize> = old.into_iter().chain(new).map(|v| v as usize % self.0.len()).collect();
             ks.sort_unstable();
             ks.dedup();
             let held: Vec<_> = ks.iter().map(|&k| self.0[k].lock()).collect();
-            let ts = ball.note(eid, old, new, b.clock(), &epoch::pin());
+            let ts = ball.note(eid, old, new, b.clock(), &epoch::pin(), &mut wide);
             drop(held);
+            drop(wide);
             if let Some(ts) = ts {
                 ball.turn(eid, new, ts);
             }
@@ -722,6 +818,33 @@ mod tests {
                 assert_eq!(x.pull_at(0, v, *t), want, "t={t} v={v}");
             }
         }
+    }
+
+    /// 大きい値の場所を取って書かなかった (同じ値 / 名簿に書けなかった) 時は取り消す: 差分も糸の頭も残らず、 その後の
+    /// 書き換えの糸は取る前の続きにつながる (古い値と新しい値が同じ列 / 違う列 / 片方だけ大きい値、 の 3 通り)。
+    #[test]
+    fn unused_wide_reservations_are_taken_back() {
+        let mut x = T::new();
+        x.b.declare(0, |_| {});
+        let (a, b, c) = (1u64 << 30, (1u64 << 30) + WIDE as u64, (1u64 << 30) + 1); // a と b は同じ列
+        x.set(0, 1, a);
+        let t1 = x.b.now();
+        for (old, new) in [(Some(a), Some(b)), (Some(a), Some(c)), (Some(a), Some(5)), (Some(a), None), (None, Some(b))] {
+            let r = x.b.get(0).unwrap().reserve(1, old, new);
+            drop(r);
+        }
+        assert_eq!(x.b.get(0).unwrap().diff_count(), 1, "取り消した場所は残らない");
+        x.set(0, 1, b);
+        let t2 = x.b.now();
+        x.set(0, 2, a);
+        x.set(0, 1, a);
+        assert_eq!(x.b.get(0).unwrap().diff_count(), 6);
+        assert_eq!(x.pull_at(0, a, t1), vec![1]);
+        assert_eq!(x.pull_at(0, a, t2), Vec::<u32>::new());
+        assert_eq!(x.pull_at(0, b, t2), vec![1]);
+        assert_eq!(x.pull_at(0, a, x.b.now()), vec![1, 2]);
+        assert_eq!(x.pull_at(0, b, 0), Vec::<u32>::new());
+        assert_eq!(x.pull_at(0, c, 0), Vec::<u32>::new());
     }
 
     /// 1 つの球が何度も出入りする: t より後に最初に入った / 出た、 で t の時の向きが決まる。

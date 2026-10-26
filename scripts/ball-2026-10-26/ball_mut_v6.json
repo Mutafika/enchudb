@@ -32,14 +32,14 @@
  {
   "name": "帳面に 出た を書かない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "self.log_push(o, Diff { t: ts, eid, into: 0 }, guard);",
-  "replace": "let _ = o;"
+  "find": "for (i, v) in [old, new].into_iter().enumerate() {",
+  "replace": "for (i, v) in [None, new].into_iter().enumerate() {"
  },
  {
   "name": "帳面に 入った を書かない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "self.log_push(n, Diff { t: ts, eid, into: 1 }, guard);",
-  "replace": "let _ = n;"
+  "find": "for (i, v) in [old, new].into_iter().enumerate() {",
+  "replace": "for (i, v) in [old, None].into_iter().enumerate() {"
  },
  {
   "name": "帳面の二分探索で t ちょうどの差分も後ろに数える",
@@ -68,14 +68,14 @@
  {
   "name": "並べて合わせる道: 今のデッキを並べない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "    sort_eids(&mut now);\n    now.dedup();",
+  "find": "    now.sort_unstable();\n    now.dedup();",
   "replace": "    now.dedup();"
  },
  {
   "name": "並べて合わせる道: 今のデッキの重なりを落とさない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "    sort_eids(&mut now);\n    now.dedup();",
-  "replace": "    sort_eids(&mut now);"
+  "find": "    now.sort_unstable();\n    now.dedup();",
+  "replace": "    now.sort_unstable();"
  },
  {
   "name": "bit の表: 差分を古い方から当てる",
@@ -104,7 +104,7 @@
  {
   "name": "大きい値: 糸を前の差分につながない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "link: *head << 1 | d.into",
+  "find": "link: prev << 1 | d.into",
   "replace": "link: d.into"
  },
  {
@@ -178,5 +178,29 @@
   "file": "crates/enchudb-engine/src/engine.rs",
   "find": "        h.build_cylinder();\n        Ok(self.balls.declare",
   "replace": "        Ok(self.balls.declare"
+ },
+ {
+  "name": "大きい値: 使わなかった場所を取り消さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        if self.filled {\n            return;",
+  "replace": "        if true {\n            return;"
+ },
+ {
+  "name": "大きい値: 取り消しで糸の頭を戻さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            self.heads.insert(v, prev);",
+  "replace": "            let _ = prev;"
+ },
+ {
+  "name": "大きい値: 取った場所に時刻を書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.held[s.held].as_mut().unwrap().1.diffs[s.at].t = ts;",
+  "replace": "let _ = (s, ts);"
+ },
+ {
+  "name": "値ごとの帳面に書かない (小さい値)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "Some(v) if v < LOG_DENSE => self.logs.get_or_alloc(v as u32).get_or_init(|| Box::new(DiffLog::new())).push(Diff { t: ts, eid, into: i as u32 }, guard),",
+  "replace": "Some(v) if v < LOG_DENSE => {}"
  }
 ]

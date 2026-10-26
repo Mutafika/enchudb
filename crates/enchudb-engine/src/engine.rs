@@ -11628,14 +11628,21 @@ impl Engine {
         true
     }
 
-    /// 名簿 (円柱) と列に書く (`live_set` の中、 行の lock の下)。 球にした紐 (試作、 `crate::ball` の順序) は、 名簿の鍵の中で
-    /// 名簿を書き換える前に帳面に書き足し、 鍵を離した後で球を回す。
+    /// 名簿 (円柱) と列に書く (`live_set` の中、 行の lock の下)。 球にした紐 (試作、 `crate::ball` の順序) は、 大きい値の
+    /// 差分の場所を名簿の鍵の前に取り、 名簿の鍵の中で名簿を書き換える前に帳面に書き足し、 鍵を離した後で球を回す。
     #[inline]
     fn himo_set(&self, hid: usize, local: u32, value: u64) -> bool {
         if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
             debug_assert!(self.himos[hid].cylinder_built(), "球の紐の円柱は宣言の時に組んである");
+            // 大きい値の差分の場所は名簿の鍵の前に (行の lock の下なので古い値は動かない)
+            let before = self.himos[hid].get_value(local);
+            let mut wide = b.reserve(local, before, Some(value));
             let mut ts = None;
-            let ok = self.himos[hid].set_noting(local, value, |old, g| ts = b.note(local, old, Some(value), self.balls.clock(), g));
+            let ok = self.himos[hid].set_noting(local, value, |old, g| {
+                debug_assert_eq!(old, before);
+                ts = b.note(local, old, Some(value), self.balls.clock(), g, &mut wide)
+            });
+            drop(wide);
             if let Some(ts) = ts {
                 b.turn(local, Some(value), ts);
             }
@@ -11648,8 +11655,14 @@ impl Engine {
     #[inline]
     fn himo_remove(&self, hid: usize, local: u32) {
         if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
+            let before = self.himos[hid].get_value(local);
+            let mut wide = b.reserve(local, before, None);
             let mut ts = None;
-            self.himos[hid].remove_noting(local, |old, g| ts = b.note(local, old, None, self.balls.clock(), g));
+            self.himos[hid].remove_noting(local, |old, g| {
+                debug_assert_eq!(old, before);
+                ts = b.note(local, old, None, self.balls.clock(), g, &mut wide)
+            });
+            drop(wide);
             if let Some(ts) = ts {
                 b.turn(local, None, ts);
             }
