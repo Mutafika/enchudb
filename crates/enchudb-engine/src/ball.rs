@@ -4,8 +4,9 @@
 //! 球の集まり (見え方)。 円柱の bucket は、 その球を見つけるための名簿 (master のまま: 回って外れた行は印か Column で飛ばし、
 //! 清書 = 詰め直しで捨てる)。 履歴は 2 か所に書く:
 //!
-//! - **球の面** (`Face`): (eid, 値, 上を向いた時刻 `from`, 外れた時刻 `to`)。 同じ球の 1 つ前の面へ糸 (`prev`) を張る。
-//!   「時点 t の値」 ([`Ball::value_at`]) は今の面から糸をたどる
+//! - **球の面** (`Face`): (値, 上を向いた時刻 `from`, 外れた時刻 `to`)。 同じ球の 1 つ前の面へ糸 (`prev`) と、 もっと前の面へ
+//!   飛び糸 (`jump`) を張る。 「時点 t の値」 ([`Ball::value_at`]) は今の面から飛び糸と糸をたどる (面の数 n に O(log n) 歩、
+//!   [`skip_gap`])
 //! - **デッキの差分の帳面**: 値ごとに 「時刻 t に球 X が入った / 出た」 を書き足す。 時刻は帳面の書き手の鍵の中で取るので、
 //!   値ごとの差分の並びはそのまま時刻の順。 「時点 t にこの値だった球」 ([`Ball::pull_at`]) は、 今のデッキから t より後の差分を
 //!   新しい方から逆に当てて作る (入った → 抜く、 出た → 足す。 最後に当たる = t より後の最初の差分が t の時の向きを決め、
@@ -91,6 +92,20 @@ pub(crate) fn pack_hlc(wall_ms: u64, logical: u32) -> u64 {
 /// [`pack_hlc`] の逆: (wall ms, logical)。
 pub(crate) fn unpack_hlc(t: u64) -> (u64, u32) {
     (t >> 23, (t & ((1 << 23) - 1)) as u32)
+}
+
+/// 深さ `d` (最初の面 = 0) の面の飛び幅: 飛び先は深さ d − 幅。 幅 = d を 2^k − 1 の和に大きい方から分けた時のいちばん小さい項
+/// (skew binary の飛び糸、 Myers 1983 "An applicative random-access stack")。 幅 1 なら飛び先は親、 そうでなければ親の飛び先の飛び先
+/// (書く時に余分に読む面は高々 1 つ、 幅は深さだけで決まるので面に深さを置かない)。 前へたどる時に 「飛び先も t より後なら飛ぶ、
+/// そうでなければ 1 つ戻る」 で、 面の数 n に O(log n) 歩。
+#[inline]
+fn skip_gap(mut d: u32) -> u32 {
+    let mut w = 0;
+    while d > 0 {
+        w = ((1u64 << (63 - (d as u64 + 1).leading_zeros())) - 1) as u32;
+        d -= w;
+    }
+    w
 }
 
 /// 今の書き込みで HLC より上げた時刻 (0 = 上げていない) を取り出す。 上げたら、 書き込みが返る前に (行の lock の中で) WAL の時計を
@@ -188,7 +203,8 @@ impl<T: Default> Chunked<T> {
 /// 球の面 1 つ。 中身は面を出す前に 1 回書き、 後から変わるのは `to` (閉じる時) だけ。
 #[derive(Default)]
 struct Face {
-    eid: AtomicU32,
+    /// 同じ球のもっと前の面 (飛び糸、 [`skip_gap`]。 `NONE` = 最初の面)。
+    jump: AtomicU32,
     /// 同じ球の 1 つ前の面 (`NONE` = 最初の面)。
     prev: AtomicU32,
     value: AtomicU64,
@@ -656,8 +672,8 @@ pub(crate) struct Ball {
     faces: Chunked<Face>,
     /// 書き手に渡した面の場所の数 (書き手ごとの塊の、 まだ使っていない分を含む)。
     next: AtomicU64,
-    /// entity → 今の面 + 1 (0 = 球が無い)。
-    heads: Chunked<AtomicU32>,
+    /// entity → 今の面 + 1 (下位 32 bit、 0 = 球が無い) | 今の面の深さ (上位 32 bit、 最初の面 = 0。 飛び糸を張るのに使う)。
+    heads: Chunked<AtomicU64>,
     /// 値 (`LOG_DENSE` 未満) → 帳面。
     logs: Chunked<OnceLock<Box<DiffLog>>>,
     /// `LOG_DENSE` 以上の値の差分。 値の下位 bit で `WIDE` 本に分ける (違う値の書き手は名簿の鍵では並ばないので lock で守る)。
@@ -809,9 +825,9 @@ impl Ball {
     }
 
     /// 値 `v` の面を `i` として出す。
-    fn push_face(&self, i: u32, eid: u32, prev: u32, v: u64, from: u64) {
+    fn push_face(&self, i: u32, prev: u32, jump: u32, v: u64, from: u64) {
         let f = self.faces.get_or_alloc(i);
-        f.eid.store(eid, Ordering::Relaxed);
+        f.jump.store(jump, Ordering::Relaxed);
         f.prev.store(prev, Ordering::Relaxed);
         f.value.store(v, Ordering::Relaxed);
         f.from.store(from, Ordering::Relaxed);
@@ -821,21 +837,30 @@ impl Ball {
     /// 球を回す: `new` を上に向ける (None = 今の面を閉じるだけ)、 時刻 `ts` ([`Ball::note`] の返り値)。 行の lock の下で呼ぶ。
     pub(crate) fn turn(&self, eid: u32, new: Option<u64>, ts: u64) {
         let head = self.heads.get_or_alloc(eid);
-        let cur = head.load(Ordering::Relaxed);
+        let h = head.load(Ordering::Relaxed);
+        let cur = h as u32;
         if let Some(f) = (cur != 0).then(|| self.face(cur - 1)).filter(|f| f.to.load(Ordering::Relaxed) == OPEN) {
             f.to.store(ts, Ordering::Release);
         }
         if let Some(v) = new {
             let Some(i) = self.alloc() else { return };
-            self.push_face(i, eid, cur.wrapping_sub(1), v, ts);
-            head.store(i + 1, Ordering::Release);
+            if cur == 0 {
+                self.push_face(i, NONE, NONE, v, ts);
+                head.store(i as u64 + 1, Ordering::Release);
+                return;
+            }
+            let (p, d) = (cur - 1, (h >> 32) as u32 + 1);
+            // 幅 1 なら親、 そうでなければ親の飛び先の飛び先 (深さ d − 幅)
+            let jump = if skip_gap(d) == 1 { p } else { self.face(self.face(p).jump.load(Ordering::Relaxed)).jump.load(Ordering::Relaxed) };
+            self.push_face(i, p, jump, v, ts);
+            head.store((d as u64) << 32 | (i as u64 + 1), Ordering::Release);
         }
     }
 
     /// この球の最後の時刻 (今の面の上を向いた時刻、 閉じていれば外れた時刻、 球が無ければ 0)。 行の lock の下で。
     #[inline]
     fn last_time(&self, eid: u32) -> u64 {
-        let Some(cur) = self.heads.get(eid).map(|h| h.load(Ordering::Relaxed)).filter(|&c| c != 0) else { return 0 };
+        let Some(cur) = self.heads.get(eid).map(|h| h.load(Ordering::Relaxed) as u32).filter(|&c| c != 0) else { return 0 };
         let f = self.face(cur - 1);
         match f.to.load(Ordering::Relaxed) {
             OPEN => f.from.load(Ordering::Relaxed),
@@ -850,21 +875,32 @@ impl Ball {
             return;
         }
         let Some(i) = self.alloc() else { return };
-        self.push_face(i, eid, NONE, v, 0);
-        head.store(i + 1, Ordering::Release);
+        self.push_face(i, NONE, NONE, v, 0);
+        head.store(i as u64 + 1, Ordering::Release);
     }
 
-    /// 時点 `t` に上を向いていた値。 今の面から前の面へたどり、 `from <= t` の最初の面が `t` でまだ開いていれば値。
+    /// 時点 `t` に上を向いていた値。 `from <= t` の最初の面 ([`Ball::face_at`]) が `t` でまだ開いていれば値。
     pub fn value_at(&self, eid: u32, t: u64) -> Option<u64> {
-        let mut i = self.heads.get(eid)?.load(Ordering::Acquire).checked_sub(1)?;
+        let f = self.face_at(eid, t).0?;
+        (f.to.load(Ordering::Acquire) > t).then(|| f.value.load(Ordering::Relaxed))
+    }
+
+    /// 今の面から前へ、 `from <= t` の最初の面 (無ければ None)。 返り値の 2 つ目は通った面の数 (試験用)。 面の `from` は糸の向きに
+    /// 減るので、 飛び先の `from` も t より後なら飛んでよい (間の面も全部 t より後)。 そうでなければ 1 つ前へ。
+    #[inline]
+    fn face_at(&self, eid: u32, t: u64) -> (Option<&Face>, u32) {
+        let Some(mut i) = self.heads.get(eid).and_then(|h| (h.load(Ordering::Acquire) as u32).checked_sub(1)) else { return (None, 0) };
+        let mut steps = 0;
         loop {
             let f = self.face(i);
+            steps += 1;
             if f.from.load(Ordering::Relaxed) <= t {
-                return (f.to.load(Ordering::Acquire) > t).then(|| f.value.load(Ordering::Relaxed));
+                return (Some(f), steps);
             }
-            i = f.prev.load(Ordering::Relaxed);
+            let (p, j) = (f.prev.load(Ordering::Relaxed), f.jump.load(Ordering::Relaxed));
+            i = if j != p && self.face(j).from.load(Ordering::Relaxed) > t { j } else { p };
             if i == NONE {
-                return None;
+                return (None, steps);
             }
         }
     }
@@ -872,7 +908,7 @@ impl Ball {
     /// 球の面を古い順に。
     pub fn faces_of(&self, eid: u32) -> Vec<FaceView> {
         let mut out = Vec::new();
-        let Some(mut i) = self.heads.get(eid).and_then(|h| h.load(Ordering::Acquire).checked_sub(1)) else {
+        let Some(mut i) = self.heads.get(eid).and_then(|h| (h.load(Ordering::Acquire) as u32).checked_sub(1)) else {
             return out;
         };
         loop {
@@ -1001,7 +1037,7 @@ impl Ball {
             })
             .sum();
         self.faces.allocated() * CHUNK * std::mem::size_of::<Face>()
-            + self.heads.allocated() * CHUNK * 4
+            + self.heads.allocated() * CHUNK * 8
             + self.logs.allocated() * CHUNK * std::mem::size_of::<OnceLock<Box<DiffLog>>>()
             + logs
             + wide
@@ -1428,6 +1464,57 @@ mod tests {
             let want = if k > 0 && log[k - 1].1 { vec![7] } else { vec![] };
             assert_eq!(x.pull_at(0, 1, t), want, "t={t}");
         }
+    }
+
+    /// 1 つの球に書き換え / 外すを 5000 回 (書き手の道で、 他の球の書き込みを挟んで面を散らす) 当て、 書いた時刻とその前後の全部の
+    /// t で、 飛び糸で探した値 = 手元の (時刻, 値) の列、 かつ通った面の数 ≤ 3⌈log2(面の数 + 1)⌉ (飛び糸を張らない / 親だけでも答えは
+    /// 合うので、 歩数を見る)。 宣言の前からの面 (時刻 0) から始め、 外した後に戻る面と大きい値も混ぜる。
+    #[test]
+    fn jumps_find_the_face_in_log_steps() {
+        let mut x = T::new();
+        x.b.declare(0, |s| s(3, 9));
+        x.cur.insert((0, 3), 9);
+        let mut log: Vec<(u64, Option<u64>)> = vec![(0, Some(9))];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for _ in 0..5000 {
+            let k = next();
+            let last = log.last().unwrap().1;
+            if k % 7 == 0 && last.is_some() {
+                x.rm(0, 3);
+                log.push((x.b.now(), None));
+            } else {
+                let mut v = if k % 11 == 0 { LOG_DENSE + (k >> 8) % 5 } else { (k >> 8) % 40 };
+                if Some(v) == last {
+                    v += 1;
+                }
+                x.set(0, 3, v);
+                log.push((x.b.now(), Some(v)));
+            }
+            if k % 3 == 0 {
+                x.set(0, 100 + (k >> 20) as u32 % 50, (k >> 30) % 5);
+            }
+        }
+        let ball = x.b.get(0).unwrap();
+        let n = ball.faces_of(3).len();
+        let bound = 3 * (n + 1).next_power_of_two().trailing_zeros();
+        let mut worst = 0;
+        for &(tm, _) in &log {
+            for t in [tm.saturating_sub(1), tm, tm + 1] {
+                let want = log[log.partition_point(|&(ts, _)| ts <= t) - 1].1;
+                assert_eq!(ball.value_at(3, t), want, "t={t}");
+                let steps = ball.face_at(3, t).1;
+                assert!(steps <= bound, "t={t}: 面 {n} 個に {steps} 歩 (上限 {bound})");
+                worst = worst.max(steps);
+            }
+        }
+        assert!(n > 4000, "面が少ない: {n}");
+        eprintln!("面 {n} 個、 最大 {worst} 歩 (上限 {bound})");
     }
 
     /// 当て方 2 通り (bit の表 / 並べて合わせる) × 向き 2 つ (今から逆に / 始まりから前向きに) を、 手で決めた答え (始まりの写しに
