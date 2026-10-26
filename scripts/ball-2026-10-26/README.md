@@ -27,6 +27,10 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   `rbprof.rs` は bit の表の戻しを段ごとに測った単独の program (ballb r と同じ形のデータ、 値 100 個を回す / 1 個だけ、 引数 `all` / `hot`):
   時間の大半が枝の読み違いだと分かった測り。 変異は `ball_mut_v7.json` (47 本、 ball.rs の 37 本は単体で全部落ちる)。 `ballb.rs` に
   `BALL_ROUNDS` (履歴の長さ、 既定 10) と 1 回目の時点の読み (`pull_at_t1`) を足した
+- 8 回目 (時刻ごとのデッキの控え): `results_ballb_r_v8.jsonl` (履歴 10 回) / `results_ballb_r50_v8.jsonl` (`BALL_ROUNDS=50`) /
+  `results_ballb_cols_v8.jsonl` / `results_ballb_v8.jsonl`。 どれも 7 回目の binary (`v7b` / `v7bab` / `v7bw` / `v7b_on`) と交互。
+  読みの要約は `sum_r.py <file> v7b,cur`、 書き込みは `sum_w.py <cols> <3 列> v7b`。 変異は `ball_mut_v8.json` (67 本、 ball.rs の
+  55 本は単体、 engine の 12 本は schema の試験で全部落ちる)
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
