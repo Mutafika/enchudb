@@ -18045,9 +18045,9 @@ impl Engine {
         self.balls.set_snap_min(n);
     }
 
-    /// 帳面に登録した控えの数 (試作)。
-    pub fn ball_snap_count(&self, himo: &str) -> Option<usize> {
-        Some(self.balls.get(self.himo_id(himo)? as u16)?.snap_count())
+    /// 帳面の控えの数 (試作): (登録した数, 作り終えた数)。
+    pub fn ball_snap_counts(&self, himo: &str) -> Option<(usize, usize)> {
+        Some(self.balls.get(self.himo_id(himo)? as u16)?.snap_counts())
     }
 
     /// 球の面の数と取った byte (試作)。

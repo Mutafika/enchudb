@@ -242,7 +242,10 @@ fn concurrent_run(name: &str, vals: &[u64]) {
             assert_eq!(eng.ball_value_at(eids[i], "t.a", *tm), want[i], "回 {k} e={}", eids[i]);
         }
     }
-    assert!(eng.ball_snap_count("t.a").unwrap() > 50, "控えの道を通っていない: {:?}", eng.ball_snap_count("t.a"));
+    // 控えは書き換え / 外すの両方の道で作る (登録した書き手が作るので、 書き手が返った後は登録した数 = 作り終えた数)
+    let (registered, built) = eng.ball_snap_counts("t.a").unwrap();
+    assert!(built > 50, "控えの道を通っていない: {built}");
+    assert_eq!(registered, built, "登録した控えは全部作る");
     // 宣言の時 (時刻 0) のデッキは、 宣言の前に入れた値
     for &v in vals {
         let want: Vec<u64> = (0..TH * PER).filter(|&i| seeded[i] == Some(v)).map(|i| eids[i]).collect();

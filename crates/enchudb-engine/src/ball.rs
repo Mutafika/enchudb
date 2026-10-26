@@ -343,9 +343,9 @@ impl DiffLog {
         best
     }
 
-    /// 作り終えた控えの数。
-    fn snap_count(&self) -> usize {
-        self.snaps.get().map_or(0, |l| (0..l.len()).filter(|&j| l.get(j).eids.get().is_some()).count())
+    /// (登録した控えの数, 作り終えた数)。
+    fn snap_counts(&self) -> (usize, usize) {
+        self.snaps.get().map_or((0, 0), |l| (l.len(), (0..l.len()).filter(|&j| l.get(j).eids.get().is_some()).count()))
     }
 
     /// 頭と控えのデッキの byte。
@@ -827,10 +827,13 @@ impl Ball {
         out
     }
 
-    /// 帳面の控えの数 (作り終えた数)。
-    pub fn snap_count(&self) -> usize {
-        let mut n = 0;
-        self.logs.for_each(|l| n += l.get().map_or(0, |l| l.snap_count()));
+    /// 帳面の控えの数: (登録した数, 作り終えた数)。 書き手が返った後は同じ (登録した書き手が鍵を離した後で作る)。
+    pub fn snap_counts(&self) -> (usize, usize) {
+        let mut n = (0, 0);
+        self.logs.for_each(|l| {
+            let (r, b) = l.get().map_or((0, 0), |l| l.snap_counts());
+            n = (n.0 + r, n.1 + b);
+        });
         n
     }
 
@@ -1374,7 +1377,9 @@ mod tests {
             log.push((x.b.now(), x.cur.iter().map(|(&(_, e), &v)| (e, v)).collect()));
         }
         let ball = x.b.get(0).unwrap();
-        assert!(ball.snap_count() > 50, "控えの道を通っていない: {}", ball.snap_count());
+        let (registered, built) = ball.snap_counts();
+        assert!(built > 50, "控えの道を通っていない: {built}");
+        assert_eq!(registered, built, "登録した控えは全部作る");
         for (t, snap) in log.iter().step_by(29) {
             for &v in &vals {
                 let want: Vec<u32> = snap.iter().filter(|&(_, &x)| x == v).map(|(&e, _)| e).collect();
@@ -1512,7 +1517,9 @@ mod tests {
                 assert_eq!(ball.value_at(e, *t), want[e as usize], "回 {r} t={t} e={e}");
             }
         }
-        assert!(ball.snap_count() > 100, "控えの道を通っていない: {}", ball.snap_count());
+        let (registered, built) = ball.snap_counts();
+        assert!(built > 100, "控えの道を通っていない: {built}");
+        assert_eq!(registered, built, "登録した控えは全部作る");
         // 回の途中の時刻も: デッキの帳面の答え = 球の面から集めた答え (球の面は行ごとに時刻の順。 帳面の並びが時刻の順から
         // 崩れると、 同じ回の中の 2 つの書き込みの間の時刻で食い違う)。 最後の 40 回の時刻を全部
         let end = b.now();
