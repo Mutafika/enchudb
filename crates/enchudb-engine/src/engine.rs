@@ -10230,7 +10230,7 @@ impl Engine {
             // 行を握って消す (#349、 `read_row` に消している途中の行を見せない)。
             let _row = self.row_locks.write(local);
             for hid in 0..self.himos.len() {
-                self.remove_cell_freeing_leaf(local, hid);
+                self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO);
             }
             self.live_free(local);
             cleared += 1;
@@ -10431,7 +10431,7 @@ impl Engine {
             self.set_tombstone_local(d, tomb);
             for hid in 0..self.himos.len() {
                 if self.himos[hid].get_value(d).is_some() && self.version_of(d, hid as u16) <= tomb {
-                    self.remove_cell_freeing_leaf(d, hid);
+                    self.remove_cell_freeing_leaf(d, hid, enchudb_oplog::Hlc::ZERO);
                 }
             }
         }
@@ -11465,7 +11465,7 @@ impl Engine {
     /// #381: 回収する辞書の Tag の列なら、 新しい値の参照を取って古い値の参照を返す。 新しい値の番号が古い (回収された)
     /// なら書かずに `StaleValue` を計上して false。
     #[inline]
-    fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>) -> bool {
+    fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>, hlc: enchudb_oplog::Hlc) -> bool {
         let value = value.into();
         let tracked = self.vocab_tracks(hid);
         let old = if tracked { self.himos[hid].get_value32(local) } else { None };
@@ -11478,9 +11478,9 @@ impl Engine {
             // #419: 中身を指す cell は門の中で書く (書き出しがこの列を msync する間は待つ。 中身はこの前に書いてある)。
             // #656: 書き出しの済んだ語を指す cell は門を通らない (先に届いても中身はディスクにある)
             let _pass = self.publish_gate.enter(hid as u16, local);
-            self.himo_set(hid, local, value)
+            self.himo_set(hid, local, value, hlc)
         } else {
-            self.himo_set(hid, local, value)
+            self.himo_set(hid, local, value, hlc)
         };
         if ok {
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
@@ -11629,10 +11629,10 @@ impl Engine {
     }
 
     /// 名簿 (円柱) と列に書く (`live_set` の中、 行の lock の下)。 球にした紐 (試作、 `crate::ball` の順序) は、 大きい値の
-    /// 差分の場所を名簿の鍵の前に取り、 名簿の鍵の中で名簿を書き換える前に帳面に書き足し、 鍵を離した後で球を回し、
-    /// 帳面に登録した控え (時刻ごとのデッキ) があれば作る。
+    /// 差分の場所を名簿の鍵の前に取り、 名簿の鍵の中で名簿を書き換える前に帳面に書き足し (時刻 = この書き込みの HLC `hlc`、
+    /// `ZERO` なら数え口)、 鍵を離した後で球を回し、 帳面に登録した控え (時刻ごとのデッキ) があれば作る。
     #[inline]
-    fn himo_set(&self, hid: usize, local: u32, value: u64) -> bool {
+    fn himo_set(&self, hid: usize, local: u32, value: u64, hlc: enchudb_oplog::Hlc) -> bool {
         if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
             debug_assert!(self.himos[hid].cylinder_built(), "球の紐の円柱は宣言の時に組んである");
             // 大きい値の差分の場所は名簿の鍵の前に (行の lock の下なので古い値は動かない)
@@ -11641,7 +11641,7 @@ impl Engine {
             let mut ts = None;
             let ok = self.himos[hid].set_noting(local, value, |old, g| {
                 debug_assert_eq!(old, before);
-                ts = b.note(local, old, Some(value), self.balls.clock(), g, &mut wide)
+                ts = b.note(local, old, Some(value), self.balls.clock(), crate::ball::pack_hlc(hlc.wall, hlc.logical), g, &mut wide)
             });
             let snaps = wide.take_snaps();
             drop(wide);
@@ -11653,18 +11653,6 @@ impl Engine {
             return ok;
         }
         self.himos[hid].set(local, value)
-    }
-
-    /// 球 (試作): HLC `hlc` の書き込みとして `f` で名簿に書く (球の時刻 = この HLC。 球の紐が無ければ `f` だけ)。
-    #[inline]
-    fn with_ball_time<R>(&self, hlc: enchudb_oplog::Hlc, f: impl FnOnce() -> R) -> R {
-        if !self.balls.any() {
-            return f();
-        }
-        crate::ball::set_write_time(crate::ball::pack_hlc(hlc.wall, hlc.logical));
-        let r = f();
-        crate::ball::set_write_time(0);
-        r
     }
 
     /// 球 (試作): 帳面と球の時刻の順を保つために時刻を上げたら (同じ値か同じ球に先に書いた書き手の後にした)、 行の lock の中で
@@ -11682,14 +11670,14 @@ impl Engine {
 
     /// `himo_set` の外す版。
     #[inline]
-    fn himo_remove(&self, hid: usize, local: u32) {
+    fn himo_remove(&self, hid: usize, local: u32, hlc: enchudb_oplog::Hlc) {
         if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
             let before = self.himos[hid].get_value(local);
             let mut wide = b.reserve(local, before, None);
             let mut ts = None;
             self.himos[hid].remove_noting(local, |old, g| {
                 debug_assert_eq!(old, before);
-                ts = b.note(local, old, None, self.balls.clock(), g, &mut wide)
+                ts = b.note(local, old, None, self.balls.clock(), crate::ball::pack_hlc(hlc.wall, hlc.logical), g, &mut wide)
             });
             let snaps = wide.take_snaps();
             drop(wide);
@@ -11705,13 +11693,13 @@ impl Engine {
 
     /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
     #[inline]
-    fn live_remove(&self, hid: usize, local: u32) {
+    fn live_remove(&self, hid: usize, local: u32, hlc: enchudb_oplog::Hlc) {
         let old = if self.vocab_tracks(hid) {
             self.himos[hid].get_value32(local)
         } else {
             None
         };
-        self.himo_remove(hid, local);
+        self.himo_remove(hid, local, hlc);
         self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);
         if let Some(o) = old {
@@ -11865,7 +11853,7 @@ impl Engine {
         // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
         // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
         // 球 (試作): この書き込みの HLC を球の時刻にする
-        if !self.with_ball_time(hlc, || self.live_set(himo_id as usize, local, value)) {
+        if !self.live_set(himo_id as usize, local, value, hlc) {
             self.record_fault(FaultKind::DiskSpace, "列を伸ばすディスクの空きが無い — cell も版数も書かない");
             return false;
         }
@@ -12145,7 +12133,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.with_ball_time(hlc, || self.live_remove(himo_id as usize, local));
+        self.live_remove(himo_id as usize, local, hlc);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -12170,7 +12158,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.with_ball_time(hlc, || self.remove_cell_freeing_leaf(local, himo_id as usize));
+        self.remove_cell_freeing_leaf(local, himo_id as usize, hlc);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -12986,7 +12974,7 @@ impl Engine {
                 survivor = true;
                 continue;
             }
-            self.with_ball_time(hlc, || self.remove_cell_freeing_leaf(local, hid));
+            self.remove_cell_freeing_leaf(local, hid, hlc);
         }
         if !survivor {
             self.live_free(local);
@@ -13448,9 +13436,9 @@ impl Engine {
     /// #343: **列を消してから**返す。 返してから消すと、 その間に別の行の書き込みが同じ長さの slot を
     /// best-fit で再利用し、 lock 無しの読み手が 「旧 offset → 別の行の値で gen が揃った slot → 列はまだ旧
     /// offset」 と確定して、 別の行の値を返した (#119 の書き換えと同じ順)。
-    fn remove_cell_freeing_leaf(&self, local: u32, hid: usize) {
+    fn remove_cell_freeing_leaf(&self, local: u32, hid: usize, hlc: enchudb_oplog::Hlc) {
         let old = self.take_leaf_cell(local, hid);
-        self.live_remove(hid, local);
+        self.live_remove(hid, local, hlc);
         self.free_leaf_offset(hid, old);
     }
 
@@ -13965,7 +13953,7 @@ impl Engine {
                 if want.is_none() && !has_value && self.version_of(local, h) == enchudb_oplog::Hlc::ZERO {
                     continue;
                 }
-                self.remove_cell_freeing_leaf(local, hid);
+                self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO);
                 self.reset_cell_version(local, h);
             }
         }
@@ -14060,7 +14048,7 @@ impl Engine {
                 let _row = self.row_locks.write(local);
                 for hid in 0..self.himos.len() {
                     if self.himos[hid].get_value(local).is_some() && self.version_of(local, hid as u16) <= t {
-                        self.remove_cell_freeing_leaf(local, hid);
+                        self.remove_cell_freeing_leaf(local, hid, t);
                     }
                 }
             }
@@ -14563,7 +14551,7 @@ impl Engine {
                 );
                 return;
             }
-            self.live_set(hid, eid, off);
+            self.live_set(hid, eid, off, enchudb_oplog::Hlc::ZERO);
             if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
             return;
         }
@@ -14588,7 +14576,7 @@ impl Engine {
                 return;
             }
         };
-        self.live_set(hid, eid, vid);
+        self.live_set(hid, eid, vid, enchudb_oplog::Hlc::ZERO);
         self.vocab_unpin(hid, vid);
     }
 
@@ -14625,7 +14613,7 @@ impl Engine {
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: Ref himo は target_table の eid range を validate (Ref の列は u32)
         self.validate_ref_tie(hid, value as u32);
-        self.live_set(hid, eid, value);
+        self.live_set(hid, eid, value, enchudb_oplog::Hlc::ZERO);
     }
 
     pub fn tie_ref(&mut self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
@@ -14666,7 +14654,7 @@ impl Engine {
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(hid, target_eid);
-        self.live_set(hid, eid, target_eid);
+        self.live_set(hid, eid, target_eid, enchudb_oplog::Hlc::ZERO);
     }
 
     /// #59: sentinel (`u32::MAX`) は cell に入らない。 panic せず write を拒否 + 計上して

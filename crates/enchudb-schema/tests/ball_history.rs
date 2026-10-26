@@ -163,6 +163,12 @@ fn concurrent_writers_with_wal_hlc_times() {
     concurrent_run("walhlc", &[3, 9, 1 << 24, (1 << 24) + 64, 0, 1], true);
 }
 
+/// 上と同じを値 2 つで (外すが 3 回に 1 回、 同じ値に重なる書き手が多い = 外す書き込みの時刻を上げる回が多い)。
+#[test]
+fn concurrent_writers_with_wal_hlc_times_and_many_removes() {
+    concurrent_run("walrm", &[5, 6], true);
+}
+
 /// 上と同じを、 値の種類が多い列の値 (2^20 以上: 円柱では sparse = write_lock の道、 帳面は値ごとに分けない列 1 本) と、
 /// 配列の中の小さい値を混ぜて回す (小さい値 ↔ 大きい値の書き換えは、 write_lock と値の鍵を両方取る道)。 大きい値のうち 3 つは
 /// 下位 bit が同じ (帳面の同じ列に落ちる)。

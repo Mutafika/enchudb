@@ -404,7 +404,7 @@
  {
   "name": "HLC を使わず数え口だけ",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        match WRITE_TIME.with(Cell::get) {\n            0 => (self.counter.fetch_add(1, Ordering::Relaxed) + 1, false),",
+  "find": "        match hlc {\n            0 => (self.counter.fetch_add(1, Ordering::Relaxed) + 1, false),",
   "replace": "        match 0u64 {\n            0 => (self.counter.fetch_add(1, Ordering::Relaxed) + 1, false),"
  },
  {
@@ -476,14 +476,14 @@
  {
   "name": "書き込みで HLC を置かない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "if !self.with_ball_time(hlc, || self.live_set(himo_id as usize, local, value)) {",
-  "replace": "if !self.live_set(himo_id as usize, local, value) {"
+  "find": "        if !self.live_set(himo_id as usize, local, value, hlc) {",
+  "replace": "        if !self.live_set(himo_id as usize, local, value, enchudb_oplog::Hlc::ZERO) {"
  },
  {
   "name": "外すで HLC を置かない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "self.with_ball_time(hlc, || self.remove_cell_freeing_leaf(local, himo_id as usize));",
-  "replace": "self.remove_cell_freeing_leaf(local, himo_id as usize);"
+  "find": "        self.remove_cell_freeing_leaf(local, himo_id as usize, hlc);",
+  "replace": "        self.remove_cell_freeing_leaf(local, himo_id as usize, enchudb_oplog::Hlc::ZERO);"
  },
  {
   "name": "上げた時刻を WAL の時計に渡さない",

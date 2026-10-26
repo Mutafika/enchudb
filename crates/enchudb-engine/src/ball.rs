@@ -76,8 +76,6 @@ thread_local! {
     static BLOCKS: Cell<[(u64, u32, u32); 8]> = const { Cell::new([(0, 0, 0); 8]) };
     /// 時点 t の読みの bit の表 (使い回す)。
     static BITS: Cell<Vec<u64>> = const { Cell::new(Vec::new()) };
-    /// 今の書き込みの WAL の HLC を詰めたもの ([`pack_hlc`]、 0 = 無い)。 engine が名簿に書く前に置き、 書いた後で 0 に戻す。
-    static WRITE_TIME: Cell<u64> = const { Cell::new(0) };
     /// この thread の、 付けた時刻の置き場の番号 (`usize::MAX` = まだ)。
     static CLOCK_SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
     /// 今の書き込みで HLC より上げた時刻 (0 = 上げていない)。 engine が WAL の時計に渡す ([`take_raised`])。
@@ -93,11 +91,6 @@ pub(crate) fn pack_hlc(wall_ms: u64, logical: u32) -> u64 {
 /// [`pack_hlc`] の逆: (wall ms, logical)。
 pub(crate) fn unpack_hlc(t: u64) -> (u64, u32) {
     (t >> 23, (t & ((1 << 23) - 1)) as u32)
-}
-
-/// 今の書き込みの時刻 ([`pack_hlc`]、 0 = 無い)。 名簿に書く間だけ置く。
-pub(crate) fn set_write_time(t: u64) {
-    WRITE_TIME.with(|c| c.set(t));
 }
 
 /// 今の書き込みで HLC より上げた時刻 (0 = 上げていない) を取り出す。 上げたら、 書き込みが返る前に (行の lock の中で) WAL の時計を
@@ -130,10 +123,10 @@ impl Clock {
         Self { counter: AtomicU64::new(0), last: (0..CLOCK_SLOTS).map(|_| Padded::default()).collect() }
     }
 
-    /// 今の書き込みの時刻の元: HLC があればそれ、 無ければ数え口を 1 進めた値。 返り値の 2 つ目は HLC から取ったか。
+    /// 書き込みの時刻の元: HLC (`hlc`、 [`pack_hlc`]) があればそれ、 無ければ (0) 数え口を 1 進めた値。 返り値の 2 つ目は HLC から取ったか。
     #[inline]
-    fn base(&self) -> (u64, bool) {
-        match WRITE_TIME.with(Cell::get) {
+    fn base(&self, hlc: u64) -> (u64, bool) {
+        match hlc {
             0 => (self.counter.fetch_add(1, Ordering::Relaxed) + 1, false),
             h => (h, true),
         }
@@ -745,17 +738,18 @@ impl Ball {
     }
 
     /// 書き換え `old` → `new` を帳面に記す。 **名簿の鍵の中、 名簿を書き換える前に** 呼ぶ (`HimoStore::set_noting` の `note`):
-    /// 時刻を取り、 古い値の帳面に 「出た」、 新しい値の帳面に 「入った」 を足す (大きい値は `wide` に取った場所に時刻を書く)。
+    /// 時刻を取り (`hlc` = この書き込みの WAL の HLC を [`pack_hlc`] で詰めたもの、 0 = 無い)、 古い値の帳面に 「出た」、 新しい値の帳面に 「入った」 を足す (大きい値は `wide` に取った場所に時刻を書く)。
     /// 返り値は時刻 (同じ値なら何もせず None)。 鍵を離した後、 `wide` から控えを取り出して ([`Reserved::take_snaps`]) 落とし、
     /// 行の lock の下で [`Ball::turn`] にこの時刻を渡し、 控えを [`Ball::build_snaps`] で作ること。
-    pub(crate) fn note(&self, eid: u32, old: Option<u64>, new: Option<u64>, clock: &Clock, guard: &Guard, wide: &mut Reserved<'_>) -> Option<u64> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn note(&self, eid: u32, old: Option<u64>, new: Option<u64>, clock: &Clock, hlc: u64, guard: &Guard, wide: &mut Reserved<'_>) -> Option<u64> {
         if old == new {
             return None;
         }
         // 時刻: HLC (無ければ数え口)。 HLC は名簿の鍵より前に決まるので、 同じ値に書く 2 人の HLC の順と鍵の順はずれうる。
         // 古い値と新しい値の名簿の鍵を持っている今、 両方の帳面の最後とこの球の最後の面より後に上げる (帳面の並び = 時刻の順、
         // 球の面も時刻の順)。 上がるのは同時に書いた書き手の間だけで、 その順は鍵を取った順
-        let (base, from_hlc) = clock.base();
+        let (base, from_hlc) = clock.base(hlc);
         let mut floor = self.last_time(eid);
         for (i, v) in [old, new].into_iter().enumerate() {
             match v {
@@ -1226,14 +1220,12 @@ mod tests {
         #[allow(clippy::too_many_arguments)]
         fn record_at(&self, b: &Balls, hid: u16, eid: u32, old: Option<u64>, new: Option<u64>, hlc: u64, wal: Option<&AtomicU64>) -> Option<u64> {
             let ball = b.get(hid)?;
-            set_write_time(hlc);
             let mut wide = ball.reserve(eid, old, new);
             let mut ks: Vec<usize> = old.into_iter().chain(new).map(|v| v as usize % self.0.len()).collect();
             ks.sort_unstable();
             ks.dedup();
             let held: Vec<_> = ks.iter().map(|&k| self.0[k].lock()).collect();
-            let ts = ball.note(eid, old, new, b.clock(), &epoch::pin(), &mut wide);
-            set_write_time(0);
+            let ts = ball.note(eid, old, new, b.clock(), hlc, &epoch::pin(), &mut wide);
             let raised = take_raised();
             if let Some(w) = wal.filter(|_| raised != 0) {
                 w.fetch_max(raised, Ordering::Relaxed);
@@ -1335,6 +1327,9 @@ mod tests {
         assert_eq!(x.pull_at(0, 5, t), vec![2]);
         assert_eq!(x.pull_at(0, 6, 0), Vec::<u32>::new());
         assert_eq!(x.b.get(0).unwrap().value_at(1, t - 1), Some(5));
+        // 宣言の前からの値は時刻 0 (宣言の時) から上を向いている
+        assert_eq!(x.b.get(0).unwrap().value_at(1, 0), Some(5));
+        assert_eq!(x.b.get(0).unwrap().value_at(2, 0), Some(5));
     }
 
     #[test]
@@ -1640,6 +1635,11 @@ mod tests {
         // 大きい値: e4 が HLC 500、 e5 が HLC 400 で同じ値に
         assert_eq!(x.put_at(0, 4, Some(big), 500), 500);
         assert_eq!(x.put_at(0, 5, Some(big), 400), 501, "大きい値の糸の 1 つ前 (500) の後に上げる");
+        // 球だけが知っている時刻: e6 を値 4 に (600)、 外す (610)、 まだ誰も居ない値 5 に古い HLC 605 で。 値 5 の帳面は空なので、
+        // 球の最後の面の外れた時刻 (610) の後に上げる
+        assert_eq!(x.put_at(0, 6, Some(4), 600), 600);
+        assert_eq!(x.put_at(0, 6, None, 610), 610);
+        assert_eq!(x.put_at(0, 6, Some(5), 605), 611, "球の最後の面が外れた時刻 (610) の後に上げる");
         let ball = x.b.get(0).unwrap();
         assert!(ball.ledgers_in_time_order());
         assert_eq!(x.pull_at(0, 1, 200), vec![2]);
@@ -1649,7 +1649,11 @@ mod tests {
         assert_eq!(ball.faces_of(3), vec![FaceView { value: 2, from: 300, to: 301 }]);
         assert_eq!(x.pull_at(0, big, 500), vec![4]);
         assert_eq!(x.pull_at(0, big, 501), vec![4, 5]);
-        assert_eq!(x.b.now(), 501, "今の時刻は付けた時刻の最大");
+        assert_eq!(
+            ball.faces_of(6),
+            vec![FaceView { value: 4, from: 600, to: 610 }, FaceView { value: 5, from: 611, to: OPEN }]
+        );
+        assert_eq!(x.b.now(), 611, "今の時刻は付けた時刻の最大");
     }
 
     /// 書き手 4 本が自分の entity 8 個に、 同じ値の組 (0..5) を書いたり外したりする。 回ごとに Barrier でそろえ、 そろった時刻を
