@@ -41,7 +41,7 @@ fn wait_bridged(eng: &Engine, n: u32) {
         eng.current_sync_lsn() >= n
     });
     wait_until("oplog ring reset to HEADER_SIZE", || {
-        eng.oplog().unwrap().head() == enchudb_oplog::oplog::HEADER_SIZE as u64
+        eng.oplog().unwrap().is_empty()
     });
 }
 
@@ -163,10 +163,8 @@ fn records_after_ring_reset_are_still_synced() {
     wait_bridged(&eng, 3);
 
     // ring が実際に reset したことを確認 (= このテストの前提が成立している)。
-    let head_after_reset = eng.oplog().unwrap().head();
-    assert_eq!(
-        head_after_reset,
-        enchudb_oplog::oplog::HEADER_SIZE as u64,
+    assert!(
+        eng.oplog().unwrap().is_empty(),
         "precondition: oplog ring should have reset to HEADER_SIZE after batch1 drained"
     );
 

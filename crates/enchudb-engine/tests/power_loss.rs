@@ -66,6 +66,11 @@ enum Kind {
     /// 書き手と並んで走る。 書き出しが返った書き込みは、 開き直して bridge し直した後の配る分 (`pending_sync_ops`) に
     /// 全部あること (相手の peer に届く)。 像は `Lost` だけ
     Sync,
+    /// `Oplog` を小さい WAL (0.37 の 2 区画、 1 区画 64 KiB) で: batch 1 つが区画を越え、 書いている間に区画を何十回も切り替えて
+    /// 古い区画を畳む。 どの像でも、 古い区画 → 新しい区画の順に再生して書き出しの返った batch が全部ある
+    OplogHalves,
+    /// `Sync` を小さい WAL (1 区画 128 KiB) で: bridge が区画をまたいで読み、 読み終えた古い区画だけを畳む
+    SyncHalves,
 }
 
 impl Kind {
@@ -76,12 +81,26 @@ impl Kind {
             Kind::Leaf => "leaf",
             Kind::LeafSync => "leaf_sync",
             Kind::Sync => "sync",
+            Kind::OplogHalves => "oplog_halves",
+            Kind::SyncHalves => "sync_halves",
+        }
+    }
+    /// sync する DB か
+    fn sync(self) -> bool {
+        matches!(self, Kind::Sync | Kind::SyncHalves)
+    }
+    /// 書き手の WAL の大きさ
+    fn oplog_cap(self) -> usize {
+        match self {
+            Kind::OplogHalves => 128 * 1024,
+            Kind::SyncHalves => 256 * 1024,
+            _ => OPLOG_CAP,
         }
     }
     /// 書き出しが返る batch の数
     fn batches(self) -> u32 {
         match self {
-            Kind::Flush | Kind::Oplog | Kind::Sync => BATCHES,
+            Kind::Flush | Kind::Oplog | Kind::Sync | Kind::OplogHalves | Kind::SyncHalves => BATCHES,
             Kind::Leaf | Kind::LeafSync => LEAF_BATCHES,
         }
     }
@@ -92,6 +111,8 @@ impl Kind {
             "leaf" => Kind::Leaf,
             "leaf_sync" => Kind::LeafSync,
             "sync" => Kind::Sync,
+            "oplog_halves" => Kind::OplogHalves,
+            "sync_halves" => Kind::SyncHalves,
             _ => panic!("unknown kind {s}"),
         }
     }
@@ -133,8 +154,8 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
                 acked.store(b + 1, Ordering::Release);
             }
         }
-        Kind::Oplog | Kind::Sync => {
-            let mut eng = if kind == Kind::Sync {
+        Kind::Oplog | Kind::Sync | Kind::OplogHalves | Kind::SyncHalves => {
+            let mut eng = if kind.sync() {
                 // `_sync_ops` の枠は残りの eid 空間の半分。 全 batch の record (2.4 万) が ack 無しで入る大きさにする
                 // (入らない分は ack されるまで oplog で待つ)
                 Engine::create_with_cell_version(db, 262_144).unwrap()
@@ -142,16 +163,16 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
                 Engine::create_with_capacity(db, 65_536).unwrap()
             };
             define_schema(&mut eng);
-            if kind == Kind::Sync {
+            if kind.sync() {
                 eng.enable_sync_tables().unwrap();
             }
             eng.flush().unwrap();
             eng.persist_tables().unwrap();
-            let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, kind.oplog_cap()).unwrap();
             // sync: 書き手と並んで oplog_sync を回し続ける thread。 bridge が本体の書き出しや畳む所と重なる (#440 の
             // 「畳む前の書き出し」 と 「畳む」 の間に bridge が入る、 #442 の 「行だけ届いた」 行ができる)
             let done = Arc::new(AtomicBool::new(false));
-            let syncer = (kind == Kind::Sync).then(|| {
+            let syncer = kind.sync().then(|| {
                 let (eng, done) = (eng.clone(), done.clone());
                 std::thread::spawn(move || {
                     while !done.load(Ordering::Relaxed) {
@@ -179,8 +200,11 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
             }
             // WAL に載らずに落ちた record は配る分に無くてよい (floor を上げて相手に取り直させる、 #57)。 ここは落ちない
             // 大きさの oplog で、 書き出しが返った書き込みが全部配る分にあることを見る
-            if kind == Kind::Sync {
+            if kind.sync() {
                 assert_eq!(eng.wal_dropped_records(), 0, "WAL に載らずに落ちた record がある (oplog が小さい)");
+            }
+            if matches!(kind, Kind::OplogHalves | Kind::SyncHalves) {
+                assert!(eng.wal_switches() >= 10, "前提: 書いている間に区画を何度も切り替える ({} 回)", eng.wal_switches());
             }
         }
         Kind::LeafSync => write_leaf_sync(db, acked),
@@ -395,7 +419,9 @@ fn verify_leaf(eng: &Engine, acked: u32) -> String {
 fn verify_image(kind: Kind, db: &str, acked: u32) -> String {
     let opened = match kind {
         Kind::Flush | Kind::Leaf => Engine::open_standalone(db).map(Arc::new),
-        Kind::Oplog | Kind::LeafSync | Kind::Sync => Engine::open_concurrent_with_oplog(db, OPLOG_CAP),
+        Kind::Oplog | Kind::LeafSync | Kind::Sync | Kind::OplogHalves | Kind::SyncHalves => {
+            Engine::open_concurrent_with_oplog(db, kind.oplog_cap())
+        }
     };
     let eng = match opened {
         Ok(e) => e,
@@ -433,7 +459,7 @@ fn verify_image(kind: Kind, db: &str, acked: u32) -> String {
             }
         }
     }
-    if kind == Kind::Sync {
+    if kind.sync() {
         return verify_sync_stream(&eng, acked);
     }
     String::new()
@@ -574,7 +600,7 @@ fn run(kind: Kind) {
         }
         // acked を先に読む: 像の控えはこの時点以降の書き出しを含む (acked は控えた後に進む)
         let a = acked.load(Ordering::Acquire);
-        let mode = if matches!(kind, Kind::Leaf | Kind::LeafSync | Kind::Sync) || n.is_multiple_of(2) {
+        let mode = if matches!(kind, Kind::Leaf | Kind::LeafSync | Kind::Sync | Kind::SyncHalves) || n.is_multiple_of(2) {
             Mode::Lost
         } else {
             Mode::Mixed { seed: n }
@@ -718,6 +744,25 @@ fn power_loss_keeps_sync_records_of_synced_batches() {
         return;
     }
     run(Kind::Sync);
+}
+
+/// 0.37: 2 区画の WAL を何度も切り替え、 古い区画を書き出して畳みながら書く (切り替え・畳み・区画をまたぐ再生の途中の像)。
+#[test]
+fn power_loss_keeps_oplog_synced_batches_across_wal_halves() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    run(Kind::OplogHalves);
+}
+
+/// 0.37: sync する DB で、 bridge が区画をまたいで読み、 読み終えた古い区画だけを畳む途中の像でも、 書き出しが返った書き込みは
+/// 配る分に全部ある。
+#[test]
+fn power_loss_keeps_sync_records_across_wal_halves() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    run(Kind::SyncHalves);
 }
 
 /// crashsim の控えが、 rename で置き換えた sidecar の inode 番号を引き継いだ列の segment に写らない。
@@ -1010,7 +1055,7 @@ fn nothing_is_relogged_when_every_write_on_disk_is_in_the_oplog() {
     // 畳ませる
     let wal = eng.oplog().unwrap().clone();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while wal.head() != enchudb_oplog::oplog::HEADER_SIZE as u64 {
+    while !wal.is_empty() {
         assert!(std::time::Instant::now() < deadline, "前提: 5 秒で oplog を畳まない (head {})", wal.head());
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1055,6 +1100,15 @@ fn writes_dropped_from_a_full_wal_are_covered_by_a_floor_after_power_loss() {
     let img = root.join("img");
     let captured = {
         let _no_fold = eng.transfer_lock_for_fold();
+        // 2 区画: A を埋めて B へ移る (A は畳めないまま残るので、 空きは B の残りだけ)
+        let filler = eng.entity_in("notes").unwrap();
+        let switched = wal.switches();
+        let mut i = 0u32;
+        while wal.switches() == switched {
+            eng.tie_to(filler, "notes.note", i);
+            eng.oplog_commit();
+            i += 1;
+        }
         // 閉じた group で WAL を埋め、 残りを 100 B (Tie 136 B も Commit 120 B も入らない) にする。 TieLeaf の record は
         // 文字列の長さ + c B
         let e0 = eng.entity_in("notes").unwrap();
@@ -1603,6 +1657,59 @@ fn hold_consumer(eng: &Arc<Engine>) -> ConsumerHeld {
     ConsumerHeld(Some(release_tx))
 }
 
+/// 0.37 (#440 の 2 区画): 本体の書き出しが届かせた bridge の位置は、 書き出しを始めた時の位置。 書き出し終えた後 (位置を置く前)
+/// に bridge が写した行は書き出されていないので、 その行の record を含む WAL は畳んでよいと言わない (写した行の数も、 書き出した
+/// 位置も追いつかない)。 もう一度書き出せば言う。 2 区画の形は、 書き手が書き続ける間もこの位置で古い区画を畳む。
+#[test]
+fn rows_bridged_after_the_write_out_do_not_let_the_wal_fold() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("bridged_after_write_out");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let eng = notes_engine(&live.join("db"), 4 << 20);
+    for i in 0..10u32 {
+        let e = eng.entity_in("notes").unwrap();
+        eng.tie_to(e, "notes.note", i);
+    }
+    eng.oplog_sync().unwrap();
+    // consumer を止めておく (周期の書き出しが間に入ると、 写した行が書き出されてしまう)
+    let held = hold_consumer(&eng);
+    // 止める時に consumer が打った Commit も写してから書き出す
+    eng.transfer_oplog_to_sync_ops();
+    eng.body_msync().unwrap();
+    assert!(eng.wal_fold_safe(), "前提: 写した行を書き出した後は畳める");
+    for i in 10..20u32 {
+        let e = eng.entity_in("notes").unwrap();
+        eng.tie_to(e, "notes.note", i);
+    }
+    eng.oplog_commit();
+    // 書き出し終えた後、 位置を置く前に bridge が写す
+    let bridged = Arc::new(AtomicU32::new(0));
+    {
+        let (eng, bridged) = (eng.clone(), bridged.clone());
+        let once = std::sync::Mutex::new(true);
+        write_out_hook::set(Some(Arc::new(move |phase| {
+            if phase == Phase::WrittenOut && std::mem::take(&mut *once.lock().unwrap()) {
+                bridged.store(eng.transfer_oplog_to_sync_ops() as u32, Ordering::Release);
+            }
+        })));
+    }
+    eng.body_msync().unwrap();
+    write_out_hook::set(None);
+    assert!(bridged.load(Ordering::Acquire) > 0, "前提: 書き出しの後に bridge が写した");
+    assert!(!eng.wal_fold_safe(), "書き出しの後に写した行を書き出す前に畳んでよいと言った");
+    eng.body_msync().unwrap();
+    assert!(eng.wal_fold_safe(), "写した行を書き出した後も畳めない");
+    drop(held);
+    crashsim::stop();
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// #451 (段階 1): 配り済みの印が disk にあっても、 印の後に書いた write が本体にだけ届いた像では作り直す (印は、 印より前の
 /// write だけを飛ばす)。 像には印 (切れ目 = 止めた `oplog_sync` の Commit の前 = 最初の 2 つの write の後) が入り、 その後の
 /// 5 つの write は oplog に無い。
@@ -1712,6 +1819,15 @@ fn a_mark_never_covers_a_dropped_write_before_its_floor_is_on_disk() {
     let mut dropped = Vec::new();
     {
         let _no_fold = eng.transfer_lock_for_fold();
+        // 2 区画: A を埋めて B へ移る (A は畳めないまま残るので、 空きは B の残りだけ)
+        let filler = eng.entity_in("notes").unwrap();
+        let switched = wal.switches();
+        let mut i = 0u32;
+        while wal.switches() == switched {
+            eng.tie_to(filler, "notes.note", i);
+            eng.oplog_commit();
+            i += 1;
+        }
         // 閉じた group で WAL を埋め、 残りを 「Commit は入るが Tie (+ Commit の分の空き) は入らない」 大きさにする
         let e1 = eng.entity_in("notes").unwrap();
         let h0 = wal.head();

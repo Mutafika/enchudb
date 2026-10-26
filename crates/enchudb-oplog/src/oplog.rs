@@ -72,6 +72,32 @@
 //! v2 (0.35 以前) の header は capacity が 8B で周が無く、 record に周の印が無い。 v2 の file は読めて、 最初に畳む時に
 //! v3 に変わる (ring が空の時に header を書き換えるだけ)。 v3 の file は 0.35 以前の binary では開けない (`WAL version 3
 //! unsupported`) — 下げるには、 きれいに閉じてから `.oplog` を消す (閉じた時点で中身は全部本体に当たっている)。
+//!
+//! # 2 つの区画 (file v4、 0.37)
+//!
+//! 1 つの区画は頭から書き足して丸ごと巻き戻すしかないので、 書き手が休まず書くと畳める瞬間が来ず、 空きを作るには append を
+//! 止めて全部を書き出すしかなかった (#388 の空き作り。 msync の遅いディスクで書き手が全員 170〜190 ms 止まった)。 v4 は
+//! file を 2 つの区画に分けて交互に使う:
+//!
+//! ```text
+//! [区画 A の header 32B][区画 A の record ...]    0 から half
+//! [区画 B の header 32B][区画 B の record ...]    half から 2 * half (half = capacity / 2 を HALF_ALIGN に切り下げ)
+//! ```
+//!
+//! - 区画の header は v3 と同じ形 (version = 4、 head / checkpoint は区画の頭からの offset、 capacity は区画の大きさ、 lap)
+//! - 書き手は今の区画 (active) に書き足し、 載らなくなったら、 もう一方が空なら開いている group を Commit で閉じてそちらへ
+//!   移る (切り替え)。 移った後の古い区画には誰も書き足さないので、 書き出し (fsync + 本体の msync) を append を止めずに
+//!   済ませて畳める。 書き手が待つのは、 もう一方をまだ畳めていないのに今の区画も埋まった時だけ
+//! - 周 (lap) は 2 つの区画を通して 1 本の数で、 区画を使い始める (畳む / 切り替えで移る) たびに新しい数を置く。 大きい方が
+//!   新しい (`lap_newer`、 0 は v2 の 「周なし」)。 どちらが active かは保存せず、 開く時に header から決める
+//!   (record のある区画のうち周の新しい方、 どちらも空なら周の新しい方)
+//! - 位置 = `(周 << 32) | 区画の中の offset` ([`wal_pos`])。 位置の大小は WAL に積んだ順。 位置の周がどの区画にも無い = その
+//!   区画は畳まれた後 (読み手はもう一方を頭から読む)。 v2 の file (周 0) の位置は offset そのもの
+//! - 1 件の record は 1 区画に収まること (区画より大きい record は断る)
+//!
+//! v3 の file は 1 区画の形のまま読み書きし、 最初に畳む時に v4 になる (B の header を書いて fsync → A の capacity → version の
+//! 順。 どの途中の像も v3 か v4 として開ける)。 2 区画にできない小さい WAL (`2 * HALF_ALIGN` 未満) は v3 の 1 区画の形で作る。
+//! v4 の file は 0.36 以前の binary では開けない — 下げるには、 きれいに閉じてから `{db}/oplog` を消す。
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -85,12 +111,318 @@ use crate::wal_lock::WalGuard;
 use crate::{Hlc, PeerId};
 
 const FILE_MAGIC: &[u8; 4] = b"EWAL";
-/// 書く file の版。 v3 (#608): header の capacity を u32 にして空いた 4 byte に ring の周 (lap) を置き、 record ごとに周の印
-/// ([`LAP_TRAILER`]) を付ける。 v2 (周の印なし) は読めて、 最初に畳む時に v3 に変わる (`advance_lap_locked`)。
-pub const OPLOG_FILE_VERSION: u32 = 3;
-/// 読める旧版 (周の印なし、 capacity は u64)。
+/// 書く file の版。 v4 (0.37): file を 2 つの区画に分けて交互に使う (module doc の 「2 つの区画」)。
+pub const OPLOG_FILE_VERSION: u32 = 4;
+/// 1 区画の版 (#608): header の capacity を u32 にして空いた 4 byte に ring の周 (lap) を置き、 record ごとに周の印
+/// ([`LAP_TRAILER`]) を付ける。 読めて、 最初に畳む時に v4 になる。 2 区画にできない小さい WAL もこの形で作る。
+pub const OPLOG_FILE_VERSION_V3: u32 = 3;
+/// 読める旧版 (周の印なし、 capacity は u64)。 最初に畳む時に v3 → v4 になる。
 pub const OPLOG_FILE_VERSION_V2: u32 = 2;
 pub const HEADER_SIZE: usize = 32;
+/// v4 の区画の大きさの単位 (区画の境を page にそろえる。 Apple Silicon の page は 16 KiB)。 区画がこれより小さくなる WAL は
+/// 1 区画 (v3) の形。
+pub const HALF_ALIGN: u64 = 16 * 1024;
+/// 開いた時、 次に置く周を header の周の最大からこれだけ先にする。 前の process が置いて header が届かずに落ちた周 (その周の
+/// record は page に残りうる) を使い直さない。 書き出し (fsync) の間に置く周は高々 1 つ。
+const LAP_SKIP_ON_OPEN: u32 = 16;
+
+/// WAL の中の位置: `(周 << 32) | 区画の中の offset`。 大小は WAL に積んだ順 (周が 2^32 で回るまで)。 周 0 (v2 の file) は
+/// offset そのもの。 0 と [`HEADER_SIZE`] は 「どの区画よりも前」 (先頭から読む)。
+#[inline]
+pub fn wal_pos(lap: u32, offset: u64) -> u64 {
+    ((lap as u64) << 32) | offset
+}
+
+/// 位置の周。
+#[inline]
+pub fn wal_pos_lap(pos: u64) -> u32 {
+    (pos >> 32) as u32
+}
+
+/// 位置の区画の中の offset。
+#[inline]
+pub fn wal_pos_offset(pos: u64) -> u64 {
+    pos & u32::MAX as u64
+}
+
+/// 周 `a` が `b` より新しいか (2^32 で回る数の比べ)。 0 (v2 の 「周なし」 / まだ使っていない区画) はどの周よりも古い。
+#[inline]
+fn lap_newer(a: u32, b: u32) -> bool {
+    match (a, b) {
+        (0, _) => false,
+        (_, 0) => true,
+        _ => (a.wrapping_sub(b) as i32) > 0,
+    }
+}
+
+/// 次の周 (0 は 「周なし」 の印なので飛ばす)。
+#[inline]
+fn next_lap(l: u32) -> u32 {
+    l.wrapping_add(1).max(1)
+}
+
+/// 1 つの区画 (v3 / v2 の file と小さい WAL は file 全体で 1 区画)。 head / written / checkpoint は区画の頭 (`base`) からの offset。
+/// 位置と大きさは 4 GiB 未満 (WAL は 4 GiB 未満) なので 32 bit (2 区画と採番の欄を 1 本の cache line に置くため、 [`Hot`])。
+struct Half {
+    /// 区画の header の位置 (file の中の byte offset)。 v3 → v4 で B ができる時に置く (`append_lock` の下)
+    base: std::sync::atomic::AtomicU32,
+    /// 区画の大きさ (header 込み)。 0 = 使わない区画 (1 区画の形の B)
+    size: std::sync::atomic::AtomicU32,
+    /// 次に書く位置 (writer が前進)。 header の head にも置く
+    head: AtomicU64,
+    /// #268: **書き終えた** record の終端。 append は head を先に進めてから record を書くので、 head と
+    /// この値の間は書いている最中 = 前の周 (fold 前) の record がまだ残っている。 scan はここまでしか読まない
+    /// (読むと前の周の Commit で group を閉じたつもりになり、 cursor を record の境目でない位置へ進めて
+    /// bridge が開き直すまで止まった)。 append は append_lock の下で書き終えてから Release で置く。
+    written: AtomicU64,
+    /// ここまで本体に書き出した (consumer が前進)
+    checkpoint: AtomicU64,
+    /// #608: この区画の今の周。 record の周の印に書き、 scan はこれと違う record で止まる。 v2 の file は 0
+    lap: std::sync::atomic::AtomicU32,
+}
+
+impl Half {
+    fn new(base: u64, size: u64, head: u64, checkpoint: u64, lap: u32) -> Self {
+        Half {
+            base: std::sync::atomic::AtomicU32::new(base as u32),
+            size: std::sync::atomic::AtomicU32::new(size as u32),
+            head: AtomicU64::new(head),
+            written: AtomicU64::new(head),
+            checkpoint: AtomicU64::new(checkpoint),
+            lap: std::sync::atomic::AtomicU32::new(lap),
+        }
+    }
+
+    #[inline]
+    fn base(&self) -> usize {
+        self.base.load(Ordering::Acquire) as usize
+    }
+
+    #[inline]
+    fn size(&self) -> u64 {
+        self.size.load(Ordering::Acquire) as u64
+    }
+
+    #[inline]
+    fn lap(&self) -> u32 {
+        self.lap.load(Ordering::Acquire)
+    }
+
+    /// record が 1 件も無い (畳んだ後 / まだ使っていない)。
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) <= HEADER_SIZE as u64
+    }
+}
+
+/// append のたびに `append_lock` の持ち手が読み書きする欄 (区画 2 つ、 今の区画の番号、 LSN、 HLC) を 1 本の cache line (Apple
+/// Silicon の 128 B) に置く。 持ち手が別の core に替わるたびに取りに行く line が 1 本で済む (区画の欄と採番の欄が別の line だった
+/// 間、 書き手 8 本の append の合計が 0.36 の 0.80〜0.84 倍だった)。
+#[repr(C, align(128))]
+struct Hot {
+    /// 区画 A / B。 1 区画の形 (v3 / v2 の file、 小さい WAL) は A だけ (B は大きさ 0)
+    halves: [Half; 2],
+    next_lsn: AtomicU64,
+    /// 今書き足している区画の番号 (0 / 1)。 `append_lock` の下で変える
+    active: std::sync::atomic::AtomicUsize,
+    /// 最後に払い出した HLC の (wall(ms), logical)。 logical は wall が進まない時の tiebreaker。
+    /// 2 つを 1 つの lock で読み書きする: 別々の atomic だと、 同じ ms の中では wall の CAS が
+    /// 同じ値への CAS になって必ず成功し、 並行した採番が同じ logical を読んで同じ HLC を払い出す
+    /// (同期経路の `append` と async 経路の `mint_hlc` は別の lock の中から呼ばれる)。
+    hlc_state: parking_lot::Mutex<(u64, u32)>,
+    /// 自分の、 中身のある record (Commit を除く、 中継を除く) を積んだ回数。 append の直列化の内側で進める (`quiet_since`)
+    own_data: AtomicU64,
+}
+
+const _: () = assert!(std::mem::size_of::<Hot>() == 128);
+
+/// `append_lock` だけで 1 本の cache line。 lock を取れなかった書き手はこれを回って読む (`lock_or_request`) ので、 持ち手が append
+/// のたびに書く欄 (`Hot`、 数) と同じ line にあると、 書くたびに待つ書き手の読みとぶつかる (OpLog の欄の並びが変わって同じ line に
+/// 入った間、 書き手 8 本の append の合計が 0.36 の 0.80〜0.84 倍だった)。
+#[repr(align(128))]
+struct LockLine(crate::wal_lock::WalLock);
+
+impl std::ops::Deref for LockLine {
+    type Target = crate::wal_lock::WalLock;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// 区画の header を書く (v3 / v4 の形)。
+fn write_half_header(mmap: &mut [u8], base: usize, version: u32, size: u64, head: u64, checkpoint: u64, lap: u32) {
+    let h = &mut mmap[base..base + HEADER_SIZE];
+    h[0..4].copy_from_slice(FILE_MAGIC);
+    h[4..8].copy_from_slice(&version.to_le_bytes());
+    h[8..16].copy_from_slice(&head.to_le_bytes());
+    h[16..24].copy_from_slice(&checkpoint.to_le_bytes());
+    h[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(size as u32).to_le_bytes());
+    h[OFF_LAP..OFF_LAP + 4].copy_from_slice(&lap.to_le_bytes());
+}
+
+/// capacity の file を 2 区画にした時の区画の大きさ (2 区画にできなければ None)。
+fn half_size_for(capacity: u64) -> Option<u64> {
+    let h = (capacity / 2) / HALF_ALIGN * HALF_ALIGN;
+    (h >= HALF_ALIGN && capacity < u32::MAX as u64).then_some(h)
+}
+
+/// append の場所 (`OpLog::alloc`): 区画、 その header の位置、 区画の中の offset、 周 (`append_lock` の下で読んだ値)。
+struct Slot<'a> {
+    half: &'a Half,
+    base: usize,
+    off: u64,
+    lap: u32,
+}
+
+/// [`OpLog::read_plan`] の 1 区画分: 区画の header の位置、 周、 読み始める offset、 書き終えた終端。
+#[derive(Clone, Copy)]
+struct ReadPart {
+    base: usize,
+    lap: u32,
+    start: u64,
+    end: u64,
+}
+
+/// 作る / 開く時に決める区画と周の形 ([`OpLog::assemble`] に渡す)。
+struct Layout {
+    halves: [Half; 2],
+    active: usize,
+    two: bool,
+    next_lap: u32,
+    trailer: usize,
+}
+
+/// 新しい WAL の header を書いて形を返す。 2 区画にできれば v4 (A を周 1 で使い始め、 B は周 0 = まだ使っていない)、
+/// できなければ v3 の 1 区画。
+fn fresh_layout(mmap: &mut [u8], capacity: u64) -> Layout {
+    let hs = HEADER_SIZE as u64;
+    match half_size_for(capacity) {
+        Some(h) => {
+            write_half_header(mmap, 0, OPLOG_FILE_VERSION, h, hs, hs, 1);
+            write_half_header(mmap, h as usize, OPLOG_FILE_VERSION, h, hs, hs, 0);
+            Layout {
+                halves: [Half::new(0, h, hs, hs, 1), Half::new(h, h, hs, hs, 0)],
+                active: 0,
+                two: true,
+                next_lap: 2,
+                trailer: LAP_TRAILER,
+            }
+        }
+        None => {
+            write_half_header(mmap, 0, OPLOG_FILE_VERSION_V3, capacity, hs, hs, 1);
+            Layout {
+                halves: [Half::new(0, capacity, hs, hs, 1), Half::new(0, 0, hs, hs, 0)],
+                active: 0,
+                two: false,
+                next_lap: 2,
+                trailer: LAP_TRAILER,
+            }
+        }
+    }
+}
+
+/// 開く時に header を読んで形を決める。 v4 の B の header が読めない (v3 → v4 の途中の像で B がまだ無い、 は B を先に書いて
+/// fsync するので起きないが、 壊れた file) なら、 B はまだ使っていない区画として header を書き直す。
+fn read_layout(mmap: &mut [u8]) -> io::Result<Layout> {
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+    if mmap.len() < HEADER_SIZE {
+        return Err(bad("WAL too small".into()));
+    }
+    if &mmap[0..4] != FILE_MAGIC {
+        return Err(bad("bad WAL magic".into()));
+    }
+    let r64 = |m: &[u8], o: usize| u64::from_le_bytes(m[o..o + 8].try_into().unwrap());
+    let r32 = |m: &[u8], o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+    let version = r32(mmap, 4);
+    let file_len = mmap.len() as u64;
+    let hs = HEADER_SIZE as u64;
+    // 0.9.0 (L1): header の capacity / head / checkpoint を実 file 長と突き合わせる。 旧実装は無検証だったため、 truncated
+    // .oplog (crash / 不完全 copy) が正常に open された後、 append の mmap[offset..] で OOB panic した。
+    let in_range = |name: &str, v: u64, capacity: u64| -> io::Result<()> {
+        if v < hs || v > capacity {
+            return Err(bad(format!("WAL header corrupt: {name} = {v} out of range [{hs}, capacity {capacity}]")));
+        }
+        Ok(())
+    };
+    let truncated = |capacity: u64| {
+        bad(format!(
+            "WAL truncated: header capacity {capacity} exceeds file size {file_len} — file was cut short (crash / partial copy?)"
+        ))
+    };
+    match version {
+        OPLOG_FILE_VERSION_V2 | OPLOG_FILE_VERSION_V3 => {
+            let (head, checkpoint) = (r64(mmap, 8), r64(mmap, 16));
+            // v3: capacity は u32 で、 その後ろが周 (#608)。 v2: capacity は u64、 周の印なし (最初に畳む時に v3 へ)
+            let (capacity, lap, trailer) = if version == OPLOG_FILE_VERSION_V3 {
+                (r32(mmap, OFF_CAPACITY) as u64, r32(mmap, OFF_LAP), LAP_TRAILER)
+            } else {
+                (r64(mmap, 24), 0, 0)
+            };
+            if capacity >= u32::MAX as u64 {
+                // 位置 (`wal_pos`) は区画の中の offset を 32 bit に置く
+                return Err(bad(format!(
+                    "a v2 WAL of {capacity} bytes (4 GiB or more) cannot be opened by this version: close the DB cleanly with \
+                     the version that wrote it and delete the oplog file"
+                )));
+            }
+            if capacity > file_len {
+                return Err(truncated(capacity));
+            }
+            in_range("head", head, capacity)?;
+            in_range("checkpoint", checkpoint, capacity)?;
+            Ok(Layout {
+                halves: [Half::new(0, capacity, head, checkpoint, lap), Half::new(0, 0, hs, hs, 0)],
+                active: 0,
+                two: false,
+                next_lap: lap.wrapping_add(LAP_SKIP_ON_OPEN).max(1),
+                trailer,
+            })
+        }
+        OPLOG_FILE_VERSION => {
+            let h = r32(mmap, OFF_CAPACITY) as u64;
+            if h < HALF_ALIGN {
+                return Err(bad(format!("WAL header corrupt: half size {h} is below {HALF_ALIGN}")));
+            }
+            if 2 * h > file_len {
+                return Err(truncated(2 * h));
+            }
+            let (a_head, a_cp, a_lap) = (r64(mmap, 8), r64(mmap, 16), r32(mmap, OFF_LAP));
+            in_range("head", a_head, h)?;
+            in_range("checkpoint", a_cp, h)?;
+            let b = h as usize;
+            let b_ok = &mmap[b..b + 4] == FILE_MAGIC
+                && r32(mmap, b + 4) == OPLOG_FILE_VERSION
+                && r32(mmap, b + OFF_CAPACITY) as u64 == h;
+            let (b_head, b_cp, b_lap) = if b_ok {
+                let (bh, bc) = (r64(mmap, b + 8), r64(mmap, b + 16));
+                in_range("head", bh, h)?;
+                in_range("checkpoint", bc, h)?;
+                (bh, bc, r32(mmap, b + OFF_LAP))
+            } else {
+                write_half_header(mmap, b, OPLOG_FILE_VERSION, h, hs, hs, 0);
+                (hs, hs, 0)
+            };
+            // record のある区画のうち周の新しい方 (どちらも空 / どちらにもあるなら周の新しい方)
+            let active = match (a_head > hs, b_head > hs) {
+                (true, false) => 0,
+                (false, true) => 1,
+                _ => usize::from(lap_newer(b_lap, a_lap)),
+            };
+            let top = if lap_newer(b_lap, a_lap) { b_lap } else { a_lap };
+            Ok(Layout {
+                halves: [Half::new(0, h, a_head, a_cp, a_lap), Half::new(h, h, b_head, b_cp, b_lap)],
+                active,
+                two: true,
+                next_lap: top.wrapping_add(LAP_SKIP_ON_OPEN).max(1),
+                trailer: LAP_TRAILER,
+            })
+        }
+        v => Err(bad(format!(
+            "WAL version {v} unsupported (expected {OPLOG_FILE_VERSION}, {OPLOG_FILE_VERSION_V3} or {OPLOG_FILE_VERSION_V2})"
+        ))),
+    }
+}
 /// v3: header の capacity (u32)。
 const OFF_CAPACITY: usize = 24;
 /// v3: header の lap (ring の周)。
@@ -795,21 +1127,14 @@ pub struct OpLog {
     mmap: MmapMut,
     #[cfg(target_arch = "wasm32")]
     buf: Vec<u8>,
-    capacity: u64,
-    /// writer 側のキャッシュ(atomic CAS で前進)。mmap ヘッダにも反映。
-    head: AtomicU64,
-    /// #268: **書き終えた** record の終端。 append は head を先に進めてから record を書くので、 head と
-    /// この値の間は書いている最中 = 前の周 (fold 前) の record がまだ残っている。 scan はここまでしか読まない
-    /// (読むと前の周の Commit で group を閉じたつもりになり、 cursor を record の境目でない位置へ進めて
-    /// bridge が開き直すまで止まった)。 append は append_lock の下で書き終えてから Release で置く。
-    written: AtomicU64,
-    checkpoint: AtomicU64,
-    next_lsn: AtomicU64,
-    /// 最後に払い出した HLC の (wall(ms), logical)。 logical は wall が進まない時の tiebreaker。
-    /// 2 つを 1 つの lock で読み書きする: 別々の atomic だと、 同じ ms の中では wall の CAS が
-    /// 同じ値への CAS になって必ず成功し、 並行した採番が同じ logical を読んで同じ HLC を払い出す
-    /// (同期経路の `append` と async 経路の `mint_hlc` は別の lock の中から呼ばれる)。
-    hlc_state: parking_lot::Mutex<(u64, u32)>,
+    /// 区画 2 つと採番の欄 (1 本の cache line)
+    hot: Hot,
+    /// 2 区画の形か (v4)。 v3 → v4 で立てる (`append_lock` の下)
+    two: std::sync::atomic::AtomicBool,
+    /// 次に区画に置く周 (畳む / 切り替えで移る時に取る)。 `append_lock` の下で進める
+    next_lap: std::sync::atomic::AtomicU32,
+    /// 区画を切り替えた回数 (観測用、 [`OpLog::switches`])
+    switches: AtomicU64,
     /// この OpLog を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
     /// ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
@@ -825,7 +1150,7 @@ pub struct OpLog {
     /// std の `Mutex` は macOS では pthread の mutex で、 書き手を並べると取り合うたびに、 待つのも起こすのも system call
     /// だった (書き手 8 本の sample で、 書き手の時間の 5〜9 割、 #506)。 parking_lot の `Mutex` と同じ手順 (少し回って待ってから寝て、
     /// 外す時は寝ている待ち手が居る時だけ起こす) で、 try_lock が CAS 1 回の lock ([`crate::wal_lock`]、 まとめ書きの入口が使う)。
-    append_lock: crate::wal_lock::WalLock,
+    append_lock: LockLine,
     /// [`OpLog::lock_session`] で、 開いている間ずっと flock を持っている。 立っている間の append は record ごとに
     /// flock を取らない (取ると外す時に、 開いている間の lock ごと外れる: flock は開いた file ごとの lock で数えない)。
     /// `append_lock` の下で立て、 append も `append_lock` の下で見る。
@@ -855,18 +1180,13 @@ pub struct OpLog {
     dropped: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
     /// #451 (段階 1): 自分 (`peer_id`) の落ちた record を覚えた回数 (`dropped` の lock の下で上げる)。
     dropped_gen: std::sync::atomic::AtomicU64,
-    /// 自分の、 中身のある record (Commit を除く、 中継を除く) を積んだ回数。 append の直列化の内側で進める (`quiet_since`)
-    own_data: std::sync::atomic::AtomicU64,
     /// `quiet_without_mark` が WAL を読んで自分の中身のある record が無かった author + 1 (0 = まだ読んでいない)。 前の process が
     /// 残した record は増えず、 この process の分は `own_data` / `dropped_gen` で見るので、 一度無ければ読み直さない
     quiet_scanned: std::sync::atomic::AtomicU64,
     /// #178: scan が読み飛ばした record の累計 (知らない版が書いた [`op_type::SKIPPABLE`] の op。 同じ record を読み直すと
     /// また数える)。 [`OpLog::skipped_ops`]。
     skipped_ops: AtomicU64,
-    /// #608: ring の周 (畳むたびに +1、 header の `OFF_LAP`)。 record の周の印に書き、 scan はこれと違う record で止まる。
-    /// v2 の file (まだ畳んでいない) は 0。
-    lap: std::sync::atomic::AtomicU32,
-    /// #608: record ごとの周の印の大きさ: v3 の file は [`LAP_TRAILER`]、 v2 (最初に畳むまで) は 0。 `append_lock` の下で変える。
+    /// #608: record ごとの周の印の大きさ: v3 / v4 の file は [`LAP_TRAILER`]、 v2 (最初に畳むまで) は 0。 `append_lock` の下で変える。
     trailer: std::sync::atomic::AtomicUsize,
     /// #388: append が満杯にぶつかった時に呼ぶ待ち手 (engine が consumer に畳ませて、 空くまで待つ)。 true を返したら
     /// 1 回だけ書き直す。 None なら今までどおりすぐ落とす。
@@ -1066,7 +1386,7 @@ impl OpLog {
                         "enchudb oplog: WAL full (capacity={} bytes) — append dropped, \
                          op NOT recorded to stream; advance checkpoint or enable auto_reset \
                          (rate-limited to 1/s)",
-                        self.capacity
+                        self.capacity()
                     );
                 }
             }
@@ -1116,19 +1436,20 @@ impl OpLog {
         false
     }
 
-    /// #553: `size` byte (record と閉じの Commit の分) が空の ring にも入らないか。
+    /// #553: `size` byte (record と閉じの Commit の分) が空の区画にも入らないか (2 区画の形は 1 区画の大きさで見る)。
     fn larger_than_ring(&self, size: u64) -> bool {
-        size > self.capacity.saturating_sub(HEADER_SIZE as u64)
+        size > self.hot.halves[0].size().saturating_sub(HEADER_SIZE as u64)
     }
 
-    /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。
+    /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。 2 区画にできる大きさ (`2 * HALF_ALIGN` 以上) なら v4、 できなければ
+    /// v3 の 1 区画。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &Path, capacity: usize) -> io::Result<Self> {
         crate::io_point("oplog.create")?;
         if capacity as u64 >= u32::MAX as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("oplog capacity {capacity} must be below 4 GiB (the v3 header keeps it in 32 bits)"),
+                format!("oplog capacity {capacity} must be below 4 GiB (the header keeps it in 32 bits)"),
             ));
         }
         let file = OpenOptions::new()
@@ -1141,48 +1462,8 @@ impl OpLog {
         file.set_len(capacity as u64)?;
         crate::io_point("oplog.mmap")?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        // ヘッダ初期化
-        mmap[0..4].copy_from_slice(FILE_MAGIC);
-        mmap[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
-        mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes()); // head
-        mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes()); // checkpoint
-        mmap[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(capacity as u32).to_le_bytes()); // capacity (v3: u32)
-        mmap[OFF_LAP..OFF_LAP + 4].copy_from_slice(&1u32.to_le_bytes()); // lap: 1 周目 (#608)
-        let (lap0, trailer0) = (1u32, LAP_TRAILER);
-
-        let wal = Self {
-            _file: file,
-            mmap,
-            capacity: capacity as u64,
-            head: AtomicU64::new(HEADER_SIZE as u64),
-            written: AtomicU64::new(HEADER_SIZE as u64),
-            checkpoint: AtomicU64::new(HEADER_SIZE as u64),
-            next_lsn: AtomicU64::new(1),
-            hlc_state: parking_lot::Mutex::new((0, 0)),
-            peer_id: std::sync::atomic::AtomicU32::new(0),
-            keypair: std::sync::RwLock::new(None),
-            signing: std::sync::atomic::AtomicBool::new(false),
-            append_lock: crate::wal_lock::WalLock::new(()),
-            combine_slots: CombineSlot::new_slots(),
-            combine: CombineHint { hw: std::sync::atomic::AtomicU32::new(0), wanted: std::sync::atomic::AtomicBool::new(false) },
-            combined: AtomicU64::new(0),
-            session_locked: std::sync::atomic::AtomicBool::new(false),
-            pending_writes: std::sync::atomic::AtomicU32::new(0),
-            pending_shards: (0..COMBINE_SLOTS).map(|_| PendingShard(std::sync::atomic::AtomicU32::new(0))).collect(),
-            auto_reset: std::sync::atomic::AtomicBool::new(false),
-            fail_next_commits: std::sync::atomic::AtomicU32::new(0),
-            commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
-            sync_on_reset: std::sync::atomic::AtomicBool::new(false),
-            room_waiter: std::sync::RwLock::new(None),
-            append_hook: std::sync::OnceLock::new(),
-            dropped: std::sync::Mutex::new(Vec::new()),
-            dropped_gen: std::sync::atomic::AtomicU64::new(0),
-            own_data: std::sync::atomic::AtomicU64::new(0),
-            quiet_scanned: std::sync::atomic::AtomicU64::new(0),
-            skipped_ops: AtomicU64::new(0),
-            lap: std::sync::atomic::AtomicU32::new(lap0),
-            trailer: std::sync::atomic::AtomicUsize::new(trailer0),
-        };
+        let layout = fresh_layout(&mut mmap, capacity as u64);
+        let wal = Self::assemble(file, mmap, layout);
         // #415: header をすぐ書き出す。 書き出さないと、 consumer の最初の fsync (100 ms) より前に落ちた時に header が
         // 0 のまま残り、 `bad WAL magic` で開けない (開く側は 0 のままの header を作り直す: `was_never_written`)
         wal.fsync()?;
@@ -1206,77 +1487,44 @@ impl OpLog {
         Ok(head.iter().all(|&b| b == 0))
     }
 
-    /// 既存 WAL を開く。 v3 (周の印あり) と v2 (周の印なし。 最初に畳む時に v3 になる) を読む。
+    /// 既存 WAL を開く。 v4 (2 区画)、 v3 (1 区画、 周の印あり)、 v2 (周の印なし。 最初に畳む時に v3 → v4 になる) を読む。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &Path) -> io::Result<Self> {
         crate::io_point("oplog.open")?;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        if mmap.len() < HEADER_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL too small"));
-        }
-        if &mmap[0..4] != FILE_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad WAL magic"));
-        }
-        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        if version != OPLOG_FILE_VERSION && version != OPLOG_FILE_VERSION_V2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("WAL version {} unsupported (expected {} or {})", version, OPLOG_FILE_VERSION, OPLOG_FILE_VERSION_V2),
-            ));
-        }
-        let head = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
-        let checkpoint = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
-        // v3: capacity は u32 で、 その後ろが周 (#608)。 v2: capacity は u64、 周の印なし (最初に畳む時に v3 へ)
-        let (capacity, lap0, trailer0) = if version == OPLOG_FILE_VERSION {
-            (
-                u32::from_le_bytes(mmap[OFF_CAPACITY..OFF_CAPACITY + 4].try_into().unwrap()) as u64,
-                u32::from_le_bytes(mmap[OFF_LAP..OFF_LAP + 4].try_into().unwrap()),
-                LAP_TRAILER,
-            )
-        } else {
-            (u64::from_le_bytes(mmap[24..32].try_into().unwrap()), 0, 0)
-        };
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        let layout = read_layout(&mut mmap)?;
+        Ok(Self::assemble(file, mmap, layout))
+    }
 
-        // 0.9.0 (L1): header の capacity / head / checkpoint を実 file 長と突き合わせる。
-        // 旧実装は無検証だったため、 truncated .oplog (crash / 不完全 copy) が
-        // 正常に open された後、 append の mmap[offset..] で OOB panic した。
-        let file_len = mmap.len() as u64;
-        if capacity > file_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "WAL truncated: header capacity {} exceeds file size {} — \
-                     file was cut short (crash / partial copy?)",
-                    capacity, file_len,
-                ),
-            ));
-        }
-        for (name, v) in [("head", head), ("checkpoint", checkpoint)] {
-            if v < HEADER_SIZE as u64 || v > capacity {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "WAL header corrupt: {} = {} out of range [{}, capacity {}]",
-                        name, v, HEADER_SIZE, capacity,
-                    ),
-                ));
-            }
-        }
-
-        Ok(Self {
+    /// 作る / 開く時に決めた形から組み立てる。
+    fn assemble(
+        #[cfg(not(target_arch = "wasm32"))] file: File,
+        #[cfg(not(target_arch = "wasm32"))] mmap: MmapMut,
+        #[cfg(target_arch = "wasm32")] buf: Vec<u8>,
+        l: Layout,
+    ) -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
             _file: file,
+            #[cfg(not(target_arch = "wasm32"))]
             mmap,
-            capacity,
-            head: AtomicU64::new(head),
-            written: AtomicU64::new(head),
-            checkpoint: AtomicU64::new(checkpoint),
-            next_lsn: AtomicU64::new(1),
-            hlc_state: parking_lot::Mutex::new((0, 0)),
+            #[cfg(target_arch = "wasm32")]
+            buf,
+            hot: Hot {
+                halves: l.halves,
+                next_lsn: AtomicU64::new(1),
+                active: std::sync::atomic::AtomicUsize::new(l.active),
+                hlc_state: parking_lot::Mutex::new((0, 0)),
+                own_data: AtomicU64::new(0),
+            },
+            two: std::sync::atomic::AtomicBool::new(l.two),
+            next_lap: std::sync::atomic::AtomicU32::new(l.next_lap),
+            switches: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             signing: std::sync::atomic::AtomicBool::new(false),
-            append_lock: crate::wal_lock::WalLock::new(()),
+            append_lock: LockLine(crate::wal_lock::WalLock::new(())),
             combine_slots: CombineSlot::new_slots(),
             combine: CombineHint { hw: std::sync::atomic::AtomicU32::new(0), wanted: std::sync::atomic::AtomicBool::new(false) },
             combined: AtomicU64::new(0),
@@ -1285,18 +1533,16 @@ impl OpLog {
             pending_shards: (0..COMBINE_SLOTS).map(|_| PendingShard(std::sync::atomic::AtomicU32::new(0))).collect(),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
-            commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
+            commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + l.trailer) as u64),
             sync_on_reset: std::sync::atomic::AtomicBool::new(false),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
-            own_data: std::sync::atomic::AtomicU64::new(0),
             quiet_scanned: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
-            lap: std::sync::atomic::AtomicU32::new(lap0),
-            trailer: std::sync::atomic::AtomicUsize::new(trailer0),
-        })
+            trailer: std::sync::atomic::AtomicUsize::new(l.trailer),
+        }
     }
 
     /// #178: scan が読み飛ばした record の累計 (知らない版が書いた 「読み飛ばしてよい」 op、 [`op_type::SKIPPABLE`])。
@@ -1324,21 +1570,57 @@ impl OpLog {
         self.peer_id.load(Ordering::Acquire)
     }
 
-    /// 現在の head(次の append 位置)。
+    /// 今の head (次の append の位置、 [`wal_pos`])。
     #[inline]
-    pub fn head(&self) -> u64 { self.head.load(Ordering::Acquire) }
+    pub fn head(&self) -> u64 {
+        let h = &self.hot.halves[self.hot.active.load(Ordering::Acquire)];
+        wal_pos(h.lap(), h.head.load(Ordering::Acquire))
+    }
 
-    /// 現在の checkpoint(ここまで本体に反映済み)。
+    /// 今の checkpoint の位置 (ここまで本体に書き出した、 [`wal_pos`])。 古い区画に書き出していない record があればその区画の
+    /// checkpoint、 無ければ今の区画の checkpoint。
+    pub fn checkpoint(&self) -> u64 {
+        let ai = self.hot.active.load(Ordering::Acquire);
+        let (a, o) = (&self.hot.halves[ai], &self.hot.halves[ai ^ 1]);
+        if o.size() > 0 && !o.is_empty() {
+            let cp = o.checkpoint.load(Ordering::Acquire);
+            if cp < o.head.load(Ordering::Acquire) {
+                return wal_pos(o.lap(), cp);
+            }
+        }
+        wal_pos(a.lap(), a.checkpoint.load(Ordering::Acquire))
+    }
+
+    /// #608: 今の区画の周 (畳む / 切り替えで移るたびに新しい数)。 v2 の file (まだ一度も畳んでいない) は 0。
     #[inline]
-    pub fn checkpoint(&self) -> u64 { self.checkpoint.load(Ordering::Acquire) }
+    pub fn lap(&self) -> u32 {
+        self.hot.halves[self.hot.active.load(Ordering::Acquire)].lap()
+    }
 
-    /// #608: ring の周 (畳むたびに +1)。 v2 の file (まだ一度も畳んでいない) は 0。
-    #[inline]
-    pub fn lap(&self) -> u32 { self.lap.load(Ordering::Acquire) }
-
-    /// file の版 (header): 周の印のある v3 か、 周の印の無い v2 (最初に畳む時に v3 になる)。
+    /// file の版 (header): 2 区画の v4、 1 区画の v3、 周の印の無い v2 (最初に畳む時に v3 → v4 になる)。
     pub fn file_version(&self) -> u32 {
-        if self.trailer.load(Ordering::Acquire) == 0 { OPLOG_FILE_VERSION_V2 } else { OPLOG_FILE_VERSION }
+        if self.trailer.load(Ordering::Acquire) == 0 {
+            OPLOG_FILE_VERSION_V2
+        } else if self.two.load(Ordering::Acquire) {
+            OPLOG_FILE_VERSION
+        } else {
+            OPLOG_FILE_VERSION_V3
+        }
+    }
+
+    /// 2 区画の形 (v4) か。
+    pub fn two_halves(&self) -> bool {
+        self.two.load(Ordering::Acquire)
+    }
+
+    /// record が 1 件も無い (どの区画も空)。
+    pub fn is_empty(&self) -> bool {
+        self.hot.halves.iter().all(|h| h.size() == 0 || h.is_empty())
+    }
+
+    /// 区画を切り替えた回数 (観測用)。
+    pub fn switches(&self) -> u64 {
+        self.switches.load(Ordering::Relaxed)
     }
 
     /// 今この WAL に載せた時の 1 record の大きさ (header + payload + 周の印。 v2 の file は印なし)。
@@ -1346,8 +1628,14 @@ impl OpLog {
         REC_HEADER_SIZE + payload_size + self.trailer.load(Ordering::Acquire)
     }
 
-    /// **採番に使う head**。 native では mmap 上の永続値を真実とし、 process-local
-    /// atomic と突き合わせる — 別 process が直前に append していると `self.head` は
+    /// 今書き足している区画 (`append_lock` の下で読む)。
+    #[inline]
+    fn active_half(&self) -> &Half {
+        &self.hot.halves[self.hot.active.load(Ordering::Relaxed)]
+    }
+
+    /// 区画 `h` の **採番に使う head**。 native では mmap 上の永続値を真実とし、 process-local
+    /// atomic と突き合わせる — 別 process が直前に append していると `head` は
     /// 古いため。
     ///
     /// #268: `append_dead` / `free_bytes` (= 「もう書けないか」 の観測) もこの値で
@@ -1355,50 +1643,182 @@ impl OpLog {
     /// 失敗し続けているのに 「まだ余裕がある」 と答える**ことがあり、 その乖離は
     /// `wal_fold_safe` の死区間例外 (= brick の唯一の出口) まで塞いでいた。
     #[inline]
-    fn alloc_head(&self) -> u64 {
+    fn alloc_head(&self, h: &Half) -> u64 {
+        self.alloc_head_at(h, h.base())
+    }
+
+    /// `alloc_head` の、 区画の header の位置 `b` を呼び手が読んだ版 (append の道は 1 回だけ読む)。
+    #[inline]
+    fn alloc_head_at(&self, h: &Half, b: usize) -> u64 {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mm = self.mmap_slice();
-            let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
-            on_disk.max(self.head.load(Ordering::Acquire))
+            let on_disk = u64::from_le_bytes(self.mmap_slice()[b + 8..b + 16].try_into().unwrap());
+            on_disk.max(h.head.load(Ordering::Acquire))
         }
         #[cfg(target_arch = "wasm32")]
         {
-            self.head.load(Ordering::Acquire)
+            let _ = b;
+            h.head.load(Ordering::Acquire)
         }
     }
 
-    /// `size` bytes を予約して開始 offset を返す。 **`append_lock` 保持下で呼ぶこと**。
+    /// 区画 `h` (header は `b`) の header の head と `written` を `end` に (record を書き終えた後、 `append_lock` の下)。
+    #[inline]
+    fn put_head(&self, h: &Half, b: usize, end: u64) {
+        self.mmap_mut_slice()[b + 8..b + 16].copy_from_slice(&end.to_le_bytes());
+        h.written.store(end, Ordering::Release);
+    }
+
+    /// `size` bytes を予約して (区画, 区画の中の開始 offset) を返す。 **`append_lock` 保持下で呼ぶこと**。 今の区画に載らなければ、
+    /// もう一方へ移ってから取る (`switch_locked`)。
     ///
     /// group を閉じない record (`closes_group` = false) は、 閉じの Commit 1 つ分 (`REC_HEADER_SIZE`) の空きを残してしか
-    /// 場所を取らない。 満杯でも、 開いている group を必ず閉じられる (engine はそれを閉じ、 bridge に渡してから畳む)。 前は
-    /// Commit も入らない所まで埋まると開いた group を閉じられず、 sync の DB では畳む時に孤児の group として配りから落として
-    /// いた (#511。 #450 の死区間の例外。 WAL 256 KiB に書き手 1 本で 20 万回書くと、 満杯の後のほぼ全部)。
+    /// 場所を取らない。 満杯でも、 開いている group を必ず閉じられる (engine はそれを閉じ、 bridge に渡してから畳む。 区画を
+    /// 切り替える時もこの空きで閉じる)。 前は Commit も入らない所まで埋まると開いた group を閉じられず、 sync の DB では畳む時に
+    /// 孤児の group として配りから落としていた (#511。 #450 の死区間の例外。 WAL 256 KiB に書き手 1 本で 20 万回書くと、 満杯の
+    /// 後のほぼ全部)。
     ///
     /// head は record 本体を書く **前** に bump される (scan は Commit で閉じた
     /// group しか `out` に載せないので、 書き込み途中の領域が読まれることはない)。
+    ///
+    /// 戻り値は区画の番号 (上位 32 bit) と区画の中の offset (下位、 4 GiB 未満) を 1 語に (`Slot` のような struct を返すと register に
+    /// 載らず、 書き手 1 本の append が 2.5 ns 遅くなった)。 区画は [`OpLog::slot`] で引く。
     #[inline]
     fn alloc(&self, size: u64, closes_group: bool) -> io::Result<u64> {
-        let cur = self.alloc_head();
+        let i = self.hot.active.load(Ordering::Relaxed);
+        match self.alloc_off(&self.hot.halves[i], size, closes_group) {
+            Some(off) => Ok(((i as u64) << 32) | off),
+            None => self.alloc_after_switch(size, closes_group),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_after_switch(&self, size: u64, closes_group: bool) -> io::Result<u64> {
+        // 空の区画にも入らない record では移らない (移ると閉じの Commit だけが古い区画に残り、 次に移れなくなる)
+        let need = size + if closes_group { 0 } else { self.commit_room.load(Ordering::Relaxed) };
+        if !self.larger_than_ring(need) && self.switch_locked() {
+            let i = self.hot.active.load(Ordering::Relaxed);
+            if let Some(off) = self.alloc_off(&self.hot.halves[i], size, closes_group) {
+                return Ok(((i as u64) << 32) | off);
+            }
+        }
+        Err(self.wal_full_err())
+    }
+
+    /// `alloc` の戻り値から場所を引く (`append_lock` の下、 区画の位置と周は Relaxed で読む)。
+    #[inline]
+    fn slot(&self, at: u64) -> Slot<'_> {
+        let half = &self.hot.halves[(at >> 32) as usize];
+        Slot { half, base: half.base.load(Ordering::Relaxed) as usize, off: at & u32::MAX as u64, lap: half.lap.load(Ordering::Relaxed) }
+    }
+
+    /// 区画 `h` に `size` bytes を取れれば offset。 区画の位置・大きさ・周は `append_lock` の下でしか変えないので、 ここ (lock の下)
+    /// では Relaxed で読む。
+    #[inline]
+    fn alloc_off(&self, h: &Half, size: u64, closes_group: bool) -> Option<u64> {
+        let cur = self.alloc_head_at(h, h.base.load(Ordering::Relaxed) as usize);
         let new = cur + size;
         let need = if closes_group { new } else { new + self.commit_room.load(Ordering::Relaxed) };
-        if need > self.capacity {
-            return Err(self.wal_full_err());
+        if need > h.size.load(Ordering::Relaxed) as u64 {
+            return None;
         }
-        self.head.store(new, Ordering::Release);
-        Ok(cur)
+        h.head.store(new, Ordering::Release);
+        Some(cur)
+    }
+
+    /// 区画 `h` に `size` bytes を取れればその場所。 区画の位置・大きさ・周は `append_lock` の下でしか変えないので、 ここ (lock の下)
+    /// では Relaxed で読む (append 1 回に Acquire の読みを足すと、 書き手 1 本の append が 36 → 38.5 ns に遅くなった)。
+    fn alloc_in<'a>(&self, h: &'a Half, size: u64, closes_group: bool) -> Option<Slot<'a>> {
+        let off = self.alloc_off(h, size, closes_group)?;
+        Some(Slot { half: h, base: h.base.load(Ordering::Relaxed) as usize, off, lap: h.lap.load(Ordering::Relaxed) })
+    }
+
+    /// 今の区画が埋まった時、 もう一方が空なら移る (`append_lock` の下)。 開いている group は今の区画に閉じの Commit を置いて
+    /// 閉じる (その分の空きは `alloc` が残している)。 もう一方の周が今の区画より新しくなければ新しい周を置く (畳んだ時に置いて
+    /// あればそのまま)。 移った後の古い区画には誰も書き足さない (書き出して畳むのは engine の consumer)。
+    fn switch_locked(&self) -> bool {
+        if !self.two.load(Ordering::Acquire) {
+            return false;
+        }
+        let ai = self.hot.active.load(Ordering::Relaxed);
+        let (a, o) = (&self.hot.halves[ai], &self.hot.halves[ai ^ 1]);
+        if !o.is_empty() || self.alloc_head(o) > HEADER_SIZE as u64 {
+            return false;
+        }
+        self.close_group_for_switch(a);
+        if !lap_newer(o.lap(), a.lap()) {
+            let lap = self.take_next_lap();
+            let b = o.base();
+            self.mmap_mut_slice()[b + OFF_LAP..b + OFF_LAP + 4].copy_from_slice(&lap.to_le_bytes());
+            o.lap.store(lap, Ordering::Release);
+        }
+        self.hot.active.store(ai ^ 1, Ordering::Release);
+        self.switches.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// 切り替えの前に、 今の区画に Commit を置いて開いている group を閉じる (`append_lock` の下)。 入らなければ (閉じの Commit の
+    /// 分の空きを残さない test の形) 置かない — 読み手は group を区画をまたいで読む。
+    fn close_group_for_switch(&self, h: &Half) {
+        // #268 の test の fault injection (Commit の append が失敗する) は、 この Commit にも効かせる (閉じられない group は区画を
+        // またいで続く)
+        if self.take_commit_fault() {
+            return;
+        }
+        let trailer = self.trailer.load(Ordering::Acquire);
+        let size = (REC_HEADER_SIZE + trailer) as u64;
+        let Some(Slot { base, off, lap, .. }) = self.alloc_in(h, size, true) else { return };
+        let lsn = self.hot.next_lsn.load(Ordering::Relaxed);
+        self.hot.next_lsn.store(lsn + 1, Ordering::Release);
+        let hlc = self.next_hlc();
+        let author = hlc.peer;
+        let op_byte = op_type::COMMIT;
+        let crc = new_record_crc(op_byte, 0, lsn, hlc, author, &[]);
+        let keypair = if self.signing.load(Ordering::Acquire) { self.keypair.read().unwrap().clone() } else { None };
+        let (signature, pubkey_fp) = match keypair {
+            Some(kp) => (kp.sign(&signed_payload(op_byte, 0, lsn, hlc, author, crc, &[])), kp.pubkey_fp()),
+            None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
+        };
+        let at = base + off as usize;
+        let mmap = self.mmap_mut_slice();
+        let header = &mut mmap[at..at + REC_HEADER_SIZE];
+        header[OFF_MAGIC..OFF_MAGIC + 2].copy_from_slice(REC_MAGIC);
+        header[OFF_VERSION] = REC_VERSION;
+        header[OFF_OP] = op_byte;
+        header[OFF_LEN..OFF_LEN + 4].copy_from_slice(&0u32.to_le_bytes());
+        header[OFF_LSN..OFF_LSN + 8].copy_from_slice(&lsn.to_le_bytes());
+        header[OFF_HLC_WALL..OFF_HLC_WALL + 8].copy_from_slice(&hlc.wall.to_le_bytes());
+        header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].copy_from_slice(&hlc.logical.to_le_bytes());
+        header[OFF_HLC_PEER..OFF_HLC_PEER + 4].copy_from_slice(&hlc.peer.to_le_bytes());
+        header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].copy_from_slice(&author.to_le_bytes());
+        header[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        header[OFF_SIGNATURE..OFF_SIGNATURE + 64].copy_from_slice(&signature);
+        header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&pubkey_fp);
+        if trailer != 0 {
+            let t = at + REC_HEADER_SIZE;
+            write_lap_trailer(&mut mmap[t..t + trailer], lap);
+        }
+        self.put_head(h, base, off + size);
+    }
+
+    /// 次に置く周を取る (`append_lock` の下)。
+    fn take_next_lap(&self) -> u32 {
+        let l = self.next_lap.load(Ordering::Relaxed);
+        self.next_lap.store(next_lap(l), Ordering::Relaxed);
+        l
     }
 
     /// 次に発行する LSN。
     #[inline]
-    pub fn next_lsn(&self) -> u64 { self.next_lsn.load(Ordering::Acquire) }
+    pub fn next_lsn(&self) -> u64 { self.hot.next_lsn.load(Ordering::Acquire) }
 
     /// 次の HLC を払い出す。
     /// wall が前回より進んでいれば logical=0 にリセット、同じ/戻っていれば logical+1。
     fn next_hlc(&self) -> Hlc {
         let peer = self.peer_id.load(Ordering::Acquire);
         let now = current_wall_ms();
-        let mut st = self.hlc_state.lock();
+        let mut st = self.hot.hlc_state.lock();
         let (last, logical) = *st;
         *st = if now > last { (now, 0) } else { (last, logical.wrapping_add(1)) };
         Hlc { wall: st.0, logical: st.1, peer }
@@ -1523,23 +1943,24 @@ impl OpLog {
         let _lock = self.flock_exclusive()?;
 
         // #608: 本当の大きさは lock の下で (周の印の有無は畳む時に変わる)
-        let (trailer, lap) = (self.trailer.load(Ordering::Acquire), self.lap.load(Ordering::Acquire));
+        let trailer = self.trailer.load(Ordering::Acquire);
         let sizes: Vec<usize> = records.iter().map(|r| REC_HEADER_SIZE + r.as_op().payload_size() + trailer).collect();
         let total: usize = sizes.iter().sum();
 
-        // 一括 allocate
+        // 一括 allocate (束は 1 つの区画に置く。 周は場所を取った区画の周 = 切り替えた後なら移った先)
         let closes = records.last().is_some_and(|r| matches!(r.as_op(), Op::Commit));
-        let start_offset = self.alloc(total as u64, closes)?;
+        let Slot { half, base, off: start_offset, lap } = self.slot(self.alloc(total as u64, closes)?);
+        let base = base as u64;
 
         let mut lsns = Vec::with_capacity(records.len());
         let keypair = self.keypair.read().unwrap().clone();
-        let mut offset = start_offset;
+        let mut offset = base + start_offset;
         let mmap = self.mmap_mut_slice();
 
         for (i, (rec, &record_size)) in records.iter().zip(sizes.iter()).enumerate() {
             let op = rec.as_op();
             let payload_size = record_size - REC_HEADER_SIZE - trailer;
-            let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
+            let lsn = self.hot.next_lsn.fetch_add(1, Ordering::AcqRel);
             // request17-A3: 事前採番された HLC があればそれを使う (採番し直すと
             // cell の version column と record の HLC がずれる)。
             let hlc = match hlcs {
@@ -1548,7 +1969,7 @@ impl OpLog {
             };
             let author_peer = hlc.peer;
             if !matches!(op, Op::Commit) {
-                self.own_data.fetch_add(1, Ordering::AcqRel);
+                self.hot.own_data.fetch_add(1, Ordering::AcqRel);
             }
 
             let op_byte = op.op_byte();
@@ -1593,9 +2014,8 @@ impl OpLog {
             offset += record_size as u64;
         }
 
-        // ファイルヘッダの head を一括更新 (batch 全体が書き終わったあと)
-        mmap[8..16].copy_from_slice(&(start_offset + total as u64).to_le_bytes());
-        self.written.store(start_offset + total as u64, Ordering::Release);
+        // 区画の header の head を一括更新 (batch 全体が書き終わったあと)
+        self.put_head(half, base as usize, start_offset + total as u64);
 
         Ok(lsns)
     }
@@ -1691,14 +2111,14 @@ impl OpLog {
         let _lock = self.flock_exclusive()?;
 
         // #608: 本当の大きさは lock の下で (周の印の有無は畳む時に変わる)
-        let (trailer, lap) = (self.trailer.load(Ordering::Acquire), self.lap.load(Ordering::Acquire));
+        let trailer = self.trailer.load(Ordering::Acquire);
         let payload_len = sb.len() - SIGNED_PAYLOAD_HEADER_SIZE;
         let record_size = REC_HEADER_SIZE + payload_len + trailer;
         // head 採番は append_inner と同じ規則 (mmap 上の永続値を真実とする)。
-        let offset = self.alloc(record_size as u64, false)?;
+        let Slot { half, base, off: offset, lap } = self.slot(self.alloc(record_size as u64, false)?);
 
         let mmap = self.mmap_mut_slice();
-        let off = offset as usize;
+        let off = base + offset as usize;
         mmap[off..off + SIGNED_PAYLOAD_HEADER_SIZE]
             .copy_from_slice(&sb[0..SIGNED_PAYLOAD_HEADER_SIZE]);
         mmap[off + OFF_SIGNATURE..off + OFF_SIGNATURE + 64].copy_from_slice(signature);
@@ -1709,9 +2129,8 @@ impl OpLog {
             let t = off + REC_HEADER_SIZE + payload_len;
             write_lap_trailer(&mut mmap[t..t + trailer], lap);
         }
-        // ファイルヘッダの head も更新
-        mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
-        self.written.store(offset + record_size as u64, Ordering::Release);
+        // 区画の header の head も更新
+        self.put_head(half, base, offset + record_size as u64);
 
         // ローカル HLC clock を受信 HLC で merge (後退防止)
         let hlc = Hlc {
@@ -1734,7 +2153,7 @@ impl OpLog {
     }
 
     fn merge_external_hlc(&self, recv: Hlc) {
-        let mut st = self.hlc_state.lock();
+        let mut st = self.hot.hlc_state.lock();
         if (recv.wall, recv.logical) > *st {
             *st = (recv.wall, recv.logical);
         }
@@ -1948,6 +2367,8 @@ impl OpLog {
     /// `serve_slots` の本体: 置き場 `0..n` を見る。 先に全部の置き場の印を読んでから積む (印の読みが重なる)。
     #[inline(never)]
     fn serve_slots_from(&self, n: usize) {
+        // 積んだ数は見回りの終わりにまとめて足す (record ごとに書くと、 頼む書き手が読む欄と line を取り合う)
+        let mut served = 0u64;
         for _ in 0..APPEND_SERVE_ROUNDS {
             let mut pending = 0u64;
             for (i, s) in self.combine_slots[..n].iter().enumerate() {
@@ -1958,7 +2379,7 @@ impl OpLog {
             if pending == 0 {
                 // 見回って何も無かった: 印を倒す (この後に置かれた頼みは、 置いた書き手が印を立て直す)
                 self.combine.wanted.store(false, Ordering::Relaxed);
-                return;
+                break;
             }
             // Acquire: PENDING を読んだ置き場の頼みの中身 (頼んだ書き手の Release の前に書いた) を見る
             std::sync::atomic::fence(Ordering::Acquire);
@@ -1976,9 +2397,12 @@ impl OpLog {
                 // SAFETY: PENDING の頼みは、 DONE にするまで頼んだ書き手が書き換えない (その書き手は DONE を見るまで戻らない)
                 let req = unsafe { (*slot.req.get()).assume_init_ref() };
                 let out = self.append_locked(&req.op, req.payload_size, req.closes_group, req.relay, req.hlc_override.copied());
-                self.combined.store(self.combined.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                served += 1;
                 guard.finish(out);
             }
+        }
+        if served > 0 {
+            self.combined.store(self.combined.load(Ordering::Relaxed) + served, Ordering::Relaxed);
         }
     }
 
@@ -2003,17 +2427,18 @@ impl OpLog {
         let _lock = self.flock_exclusive()?;
 
         // #608: 本当の大きさは lock の下で (周の印の有無は畳む時に変わる)。 引数の `record_size` は lock の外の見積もり
-        let (trailer, lap) = (self.trailer.load(Ordering::Acquire), self.lap.load(Ordering::Acquire));
+        let trailer = self.trailer.load(Ordering::Acquire);
         let record_size = REC_HEADER_SIZE + payload_size + trailer;
         // ── head を mmap 上の値から読み直して採番 ──
-        // 別 process が直前に append した場合、 self.head (process-local atomic) は
+        // 別 process が直前に append した場合、 区画の head (process-local atomic) は
         // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。
-        // append_lock + flock の両方を保持しているので単純 store で OK。
-        let offset = self.alloc(record_size as u64, closes_group)?;
+        // append_lock + flock の両方を保持しているので単純 store で OK。 周は場所を取った区画の周 (切り替えた後なら移った先)
+        let Slot { half, base, off: offset, lap } = self.slot(self.alloc(record_size as u64, closes_group)?);
+        let at = base + offset as usize;
 
         // append_lock の下でだけ進める (読み手は lock を取らずに読むので atomic のまま)
-        let lsn = self.next_lsn.load(Ordering::Relaxed);
-        self.next_lsn.store(lsn + 1, Ordering::Release);
+        let lsn = self.hot.next_lsn.load(Ordering::Relaxed);
+        self.hot.next_lsn.store(lsn + 1, Ordering::Release);
         // relay 経路では受信 HLC/author/署名をそのまま乗せる (gossip 用)。
         // 通常経路では next_hlc + 自鍵で署名。
         let (hlc, author_peer) = match relay {
@@ -2022,14 +2447,14 @@ impl OpLog {
                 let h = hlc_override.unwrap_or_else(|| self.next_hlc());
                 let a = h.peer;
                 if !matches!(op, Op::Commit) {
-                    self.own_data.fetch_add(1, Ordering::AcqRel);
+                    self.hot.own_data.fetch_add(1, Ordering::AcqRel);
                 }
                 (h, a)
             }
         };
 
         let op_byte = op.op_byte();
-        let payload_offset = offset as usize + REC_HEADER_SIZE;
+        let payload_offset = at + REC_HEADER_SIZE;
         let mmap = self.mmap_mut_slice();
         op.write_payload(&mut mmap[payload_offset..payload_offset + payload_size]);
         let crc = new_record_crc(
@@ -2056,7 +2481,7 @@ impl OpLog {
             }
         };
 
-        let header = &mut mmap[offset as usize..offset as usize + REC_HEADER_SIZE];
+        let header = &mut mmap[at..at + REC_HEADER_SIZE];
         header[OFF_MAGIC..OFF_MAGIC + 2].copy_from_slice(REC_MAGIC);
         header[OFF_VERSION] = REC_VERSION;
         header[OFF_OP] = op_byte;
@@ -2074,9 +2499,8 @@ impl OpLog {
             write_lap_trailer(&mut mmap[t..t + trailer], lap);
         }
 
-        // ファイルヘッダの head も更新
-        mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
-        self.written.store(offset + record_size as u64, Ordering::Release);
+        // 区画の header の head も更新
+        self.put_head(half, base, offset + record_size as u64);
 
         Ok((lsn, hlc))
     }
@@ -2093,11 +2517,12 @@ impl OpLog {
     /// (head==checkpoint ⇒ body へ msync 済) を満たす領域は crash recovery
     /// にも sync にも不要なので、 無条件に畳んでよい。 `auto_reset` フラグは vestigial。
     pub fn try_reset(&self) -> bool {
-        self.try_reset_if(|| true)
+        self.try_reset_if(|_| true)
     }
 
-    /// `try_reset` の述語つき版。 `fold_safe` は **`append_lock` 保持中に、 fold の
-    /// 直前に**評価される。
+    /// `try_reset` の述語つき版。 畳める区画 (`fold_target_locked`) が 1 つあれば、 `fold_safe(through)` が true の時に畳む。
+    /// `through` は、 読み手 (sync の bridge / changefeed) がそこまで読み終えていればその区画を畳んでよい位置 (その区画の
+    /// head、 [`wal_pos`])。 `fold_safe` は **`append_lock` 保持中に、 fold の直前に**評価される。 1 回に畳むのは 1 区画。
     ///
     /// 呼び出し側が lock の外で 「畳んでよいか」 を判定してから `try_reset` を呼ぶと、
     /// 判定と fold の間に他 thread の append + `advance_checkpoint` が割り込める
@@ -2109,38 +2534,76 @@ impl OpLog {
     /// `fold_safe` は `append_lock` を保持したまま呼ばれるので、 この OpLog の
     /// append 系 API を再入的に呼んではならない (`head` / `checkpoint` /
     /// `pending_writes` の読みと scan 系は lock を取らないので安全)。
-    pub fn try_reset_if(&self, fold_safe: impl FnOnce() -> bool) -> bool {
+    pub fn try_reset_if(&self, fold_safe: impl FnOnce(u64) -> bool) -> bool {
         // #77-M8: append_lock で append と直列化。 旧実装は pending_writes
         // チェックと head CAS の間に窓があり、 その間に進入した append の
         // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
         // append_lock 保持中は append_inner が進入できないため窓が閉じる。
         let _in_proc = self.append_lock.lock();
-        let head = self.head.load(Ordering::Acquire);
-        let cp = self.checkpoint.load(Ordering::Acquire);
-        if head != cp || head <= HEADER_SIZE as u64 { return false; }
         // `pending_writes` は見ない (`checkpoint_and_reset` と同じ)。 全 append は `append_lock` の下で場所を取って
         // 書き終え、 head も進めるので、 ここで数に入っているのは lock を待っている append と、 満杯で空きを待っている
         // append (`wait_for_room`、 record はまだ載っていない) だけ。 前は見ていたので、 空きを待つ書き手がいる間は畳めず、
         // 空きを作れないまま書き手が諦めて record が落ちた (sync の DB で満杯になると、 その後の record がほぼ全部落ちた、 #511)。
+        let Some((i, through)) = self.fold_target_locked() else { return false };
         // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
-        if !fold_safe() { return false; }
-        self.reset_ring_locked(head)
+        if !fold_safe(through) { return false; }
+        self.fold_half_locked(i)
     }
 
-    /// ring を先頭に戻す (`append_lock` を持った呼び手から、 head == checkpoint を確かめた後)。
-    fn reset_ring_locked(&self, head: u64) -> bool {
-        if self.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    /// 今畳める区画があれば、 読み手がそこまで読み終えていればよい位置 (`try_reset_if` が `fold_safe` に渡す値)。 lock を取らない
+    /// 見積もり (呼び手が lock の外で先に確かめる用、 本当の判定は `try_reset_if` の中)。
+    pub fn fold_hint(&self) -> Option<u64> {
+        self.fold_target_locked().map(|(_, through)| through)
+    }
+
+    /// 位置 `pos` ([`wal_pos`]) の周の区画がまだあるか。 無い = その区画は畳まれた後 (畳むと新しい周を置く) で、 その位置から
+    /// 読むと残った区画を頭から読む。
+    pub fn holds(&self, pos: u64) -> bool {
+        let l = wal_pos_lap(pos);
+        self.hot.halves.iter().any(|h| h.size() > 0 && h.lap() == l)
+    }
+
+    /// 畳める区画と、 読み手がそこまで読み終えていればよい位置 (`append_lock` の下)。
+    ///
+    /// - 古い区画 (今書き足していない方) に record があれば、 全部を本体に書き出してある (checkpoint == head) 時にその区画。
+    ///   書き出していなければ何も畳まない (今の区画は古い区画が空になるまで畳まない)
+    /// - 古い区画が空 (1 区画の形も) なら、 今の区画を全部書き出してある時に、 その場で (周を進めて頭から書き直す)
+    fn fold_target_locked(&self) -> Option<(usize, u64)> {
+        let ai = self.hot.active.load(Ordering::Relaxed);
+        if self.two.load(Ordering::Acquire) {
+            let o = &self.hot.halves[ai ^ 1];
+            if !o.is_empty() {
+                let head = o.head.load(Ordering::Acquire);
+                return (o.checkpoint.load(Ordering::Acquire) == head).then(|| (ai ^ 1, wal_pos(o.lap(), head)));
+            }
+        }
+        let a = &self.hot.halves[ai];
+        let head = a.head.load(Ordering::Acquire);
+        (head > HEADER_SIZE as u64 && a.checkpoint.load(Ordering::Acquire) == head).then(|| (ai, wal_pos(a.lap(), head)))
+    }
+
+    /// 区画 `i` を頭に戻す (`append_lock` を持った呼び手から、 その区画の head == checkpoint を確かめた後)。 新しい周を置くので、
+    /// 前の周の record は読まれない。 古い区画を畳んだ後は、 次に切り替えで移る時に周を置き直さない (今の区画より新しい周)。
+    /// 1 区画の形 (v3 / v2) は、 畳んだ後に 2 区画にできれば v4 にする (`split_locked`)。
+    fn fold_half_locked(&self, i: usize) -> bool {
+        let h = &self.hot.halves[i];
+        let head = h.head.load(Ordering::Acquire);
+        if head <= HEADER_SIZE as u64
+            || h.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
             return false;
         }
         let mmap = self.mmap_mut_slice();
         // #608: 周を進める。 header には head / checkpoint より先に書く: header の page の像がどの瞬間に撮られても
         // (周, head, checkpoint) は 「新しい周と 32」 か 「前の周と前の位置」 のどちらか。 「新しい周と前の位置」 は、 前の周の
         // record (全部適用済みで、 本体も書き出してある) を周の違いで読まないだけで、 何も失わない
-        self.advance_lap_locked(mmap);
-        self.written.store(HEADER_SIZE as u64, Ordering::Release);
-        self.checkpoint.store(HEADER_SIZE as u64, Ordering::Release);
-        mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
-        mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        self.advance_lap_locked(mmap, h);
+        h.written.store(HEADER_SIZE as u64, Ordering::Release);
+        h.checkpoint.store(HEADER_SIZE as u64, Ordering::Release);
+        let b = h.base();
+        mmap[b + 8..b + 16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        mmap[b + 16..b + 24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        self.split_locked();
         if self.sync_on_reset.load(Ordering::Acquire) {
             // append_lock の下: 次の record が前の周の page を上書きする前に、 頭に戻した header を届ける
             let _ = self.fsync();
@@ -2156,20 +2619,18 @@ impl OpLog {
         self.sync_on_reset.store(on, Ordering::Release);
     }
 
-    /// #608: ring の周を 1 つ進めて header に書く (`append_lock` の下、 ring が空の時)。 v2 の file はここで v3 になる
-    /// (version → 3、 capacity を u32 に、 周 = 1、 以後の record に周の印)。 書く順は version → capacity → 周: v2 の
+    /// #608: 区画 `h` に新しい周を置いて header に書く (`append_lock` の下、 区画が空の時)。 v2 の file はここで v3 になる
+    /// (version → 3、 capacity を u32 に、 周、 以後の record に周の印)。 書く順は version → capacity → 周: v2 の
     /// 読み方では周の場所が capacity の上位 4 byte なので、 version を先に 3 にしないと、 途中の像を v2 として読んだ時に
-    /// capacity が 4 GiB 増えて開けない。 4 GiB 以上の v2 の file は v3 にできない (周の印なしのまま、 警告)。
-    fn advance_lap_locked(&self, mmap: &mut [u8]) {
+    /// capacity が 4 GiB 増えて開けない (4 GiB 以上の v2 の file は開かない、 `read_layout`)。
+    fn advance_lap_locked(&self, mmap: &mut [u8], h: &Half) {
+        let lap = self.take_next_lap();
+        let b = h.base();
         if self.trailer.load(Ordering::Acquire) == 0 {
-            if self.capacity >= u32::MAX as u64 {
-                eprintln!("enchudb oplog: warning: a v2 WAL of {} bytes cannot take lap marks (#608); keep it below 4 GiB", self.capacity);
-                return;
-            }
-            mmap[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
-            mmap[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(self.capacity as u32).to_le_bytes());
-            mmap[OFF_LAP..OFF_LAP + 4].copy_from_slice(&1u32.to_le_bytes());
-            self.lap.store(1, Ordering::Release);
+            mmap[4..8].copy_from_slice(&OPLOG_FILE_VERSION_V3.to_le_bytes());
+            mmap[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(h.size() as u32).to_le_bytes());
+            mmap[OFF_LAP..OFF_LAP + 4].copy_from_slice(&lap.to_le_bytes());
+            h.lap.store(lap, Ordering::Release);
             self.trailer.store(LAP_TRAILER, Ordering::Release);
             // 閉じの Commit の分の空きも印の分だけ増える (test が 0 にしていればそのまま)
             let _ = self.commit_room.compare_exchange(
@@ -2179,39 +2640,90 @@ impl OpLog {
                 Ordering::Relaxed,
             );
         } else {
-            // 0 は 「周なし (v2)」 の印なので飛ばす (2^32 周で戻る: 一度も書き直されずにそれだけ残る record は無い)
-            let lap = self.lap.load(Ordering::Acquire).wrapping_add(1).max(1);
-            mmap[OFF_LAP..OFF_LAP + 4].copy_from_slice(&lap.to_le_bytes());
-            self.lap.store(lap, Ordering::Release);
+            mmap[b + OFF_LAP..b + OFF_LAP + 4].copy_from_slice(&lap.to_le_bytes());
+            h.lap.store(lap, Ordering::Release);
         }
     }
 
-    /// #388: append を止めたまま (`append_lock` を持ったまま) checkpoint を head まで進め、 そのまま畳めれば畳む。
+    /// v3 の 1 区画を v4 の 2 区画にする (`append_lock` の下、 区画を畳んだ直後 = 空の時)。 B の header を書いて fsync してから、
+    /// A の capacity → version の順に書く: 途中のどの像も、 v3 (capacity が file 全体か半分、 空) か v4 として開ける。 fsync に
+    /// 失敗したら 1 区画のまま (B の header は v3 の区画の中の空き)。
+    fn split_locked(&self) {
+        if self.two.load(Ordering::Acquire) || self.trailer.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let (a, b) = (&self.hot.halves[0], &self.hot.halves[1]);
+        let Some(hs) = half_size_for(a.size()) else { return };
+        if !a.is_empty() {
+            return;
+        }
+        let empty = HEADER_SIZE as u64;
+        let mmap = self.mmap_mut_slice();
+        write_half_header(mmap, hs as usize, OPLOG_FILE_VERSION, hs, empty, empty, 0);
+        if self.fsync().is_err() {
+            return;
+        }
+        mmap[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(hs as u32).to_le_bytes());
+        mmap[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
+        a.size.store(hs as u32, Ordering::Release);
+        b.base.store(hs as u32, Ordering::Release);
+        b.size.store(hs as u32, Ordering::Release);
+        self.two.store(true, Ordering::Release);
+    }
+
+    /// #388: checkpoint を head まで進め、 畳めれば 1 区画畳む。 `sync(head)` は head までの record の効果を本体に書き出す
+    /// (oplog の fsync + 本体の msync) 役で、 false なら何も進めない。 戻り値は (checkpoint を進めたか、 畳んだか)。 `fold_safe`
+    /// は `try_reset_if` と同じ (lock の下で、 checkpoint を進めた後に呼ぶ)。 `sync` / `fold_safe` から この OpLog の append 系を
+    /// 呼んではならない。
     ///
-    /// `sync(head)` は head までの record の効果を本体に書き出す (oplog の fsync + 本体の msync) 役で、 false なら何も
-    /// 進めない。 その間 append は待たされる (= 書き手への back-pressure)。 `try_reset` は書き出してから畳むまでの間に
-    /// 次の record が入ると畳めず、 書き手が休まず書く間は ring が満杯まで埋まっていた。
-    ///
-    /// 戻り値は (checkpoint を進めたか、 畳んだか)。 `fold_safe` は lock の下で、 checkpoint を進めた後に呼ぶ
-    /// (`try_reset_if` と同じ)。 `pending_writes` は見ない — 全 append は `append_lock` の下で場所を取るので、 ここで
-    /// 数に入っているのは lock を待っている (まだ場所を取っていない) append だけ。 `sync` / `fold_safe` から
-    /// この OpLog の append 系を呼んではならない (自分の lock で止まる)。
-    pub fn checkpoint_and_reset(&self, sync: impl FnOnce(u64) -> bool, fold_safe: impl FnOnce() -> bool) -> (bool, bool) {
+    /// - 2 区画の形: 書き出しの間も append を止めない。 古い区画には誰も書き足さないので、 書き出した後に古い区画を畳める
+    ///   (今の区画に書き足した分は次の書き出しに入る)
+    /// - 1 区画の形: append を止めたまま (`append_lock` を持ったまま) 書き出して畳む (= 書き手への back-pressure)。 `try_reset`
+    ///   は書き出してから畳むまでの間に次の record が入ると畳めず、 書き手が休まず書く間は ring が満杯まで埋まっていた。
+    ///   `pending_writes` は見ない — 全 append は `append_lock` の下で場所を取るので、 数に入っているのは lock を待っている
+    ///   (まだ場所を取っていない) append だけ
+    pub fn checkpoint_and_reset(&self, mut sync: impl FnMut(u64) -> bool, mut fold_safe: impl FnMut(u64) -> bool) -> (bool, bool) {
+        if self.two.load(Ordering::Acquire) {
+            // 書き出している間に書き手が今の区画を埋めて移ると、 読んだ head は古い区画の中 = 古い区画の checkpoint がその head に
+            // 届かず畳めない (空きを待つ書き手が 「畳めない」 を見て諦めた)。 移っていたら新しい区画の head まで書き出し直す
+            let mut advanced = false;
+            for _ in 0..3 {
+                let head = self.head();
+                if self.is_empty() || !sync(head) {
+                    return (advanced, false);
+                }
+                self.advance_checkpoint(head);
+                advanced = true;
+                if self.try_reset_if(&mut fold_safe) {
+                    return (true, true);
+                }
+                if wal_pos_lap(head) == self.lap() {
+                    break;
+                }
+            }
+            return (advanced, false);
+        }
         let _in_proc = self.append_lock.lock();
-        let head = self.head.load(Ordering::Acquire);
-        if head <= HEADER_SIZE as u64 || !sync(head) {
+        let head = self.head();
+        if self.is_empty() || !sync(head) {
             return (false, false);
         }
-        self.advance_checkpoint(head);
-        if !fold_safe() {
+        self.advance_checkpoint_locked(head);
+        let Some((i, through)) = self.fold_target_locked() else { return (true, false) };
+        if !fold_safe(through) {
             return (true, false);
         }
-        (true, self.reset_ring_locked(head))
+        (true, self.fold_half_locked(i))
     }
 
-    /// WAL の容量 (byte)。
+    /// WAL の容量 (byte、 2 区画の和)。
     pub fn capacity(&self) -> u64 {
-        self.capacity
+        self.hot.halves.iter().map(Half::size).sum()
+    }
+
+    /// 1 区画の大きさ (1 区画の形は file 全体)。 1 件の record はこれより小さいこと。
+    pub fn half_capacity(&self) -> u64 {
+        self.hot.halves[0].size()
     }
 
     /// pending_writes を返す(テスト/観測用)。 thread ごとの分を足す。
@@ -2219,7 +2731,7 @@ impl OpLog {
         self.pending_shards.iter().fold(self.pending_writes.load(Ordering::Acquire), |n, s| n + s.0.load(Ordering::Acquire))
     }
 
-    /// これ以上**いかなる record も** append できない満杯か。
+    /// これ以上**いかなる record も** append できない満杯か (今の区画に Commit も入らず、 移れる空の区画も無い)。
     ///
     /// 最小の record は payload 0 の Commit（= REC_HEADER_SIZE bytes）なので、
     /// それすら入らない残量なら、 この WAL は畳まれるまで一切前進できない。
@@ -2233,13 +2745,25 @@ impl OpLog {
     /// 「append は全滅しているのに append_dead() は false」 になり、
     /// 出口 (fold の死区間例外) が閉じたまま無音で止まる。
     pub fn append_dead(&self) -> bool {
-        self.alloc_head() + self.record_size_of(0) as u64 > self.capacity
+        let ai = self.hot.active.load(Ordering::Acquire);
+        let a = &self.hot.halves[ai];
+        let full = self.alloc_head(a) + self.record_size_of(0) as u64 > a.size();
+        full && !(self.two.load(Ordering::Acquire) && self.hot.halves[ai ^ 1].is_empty())
     }
 
     /// 残り append 可能バイト数（観測用）。 `append_dead` と対で、 呼び出し側が
-    /// 「WAL がどれだけ逼迫しているか」を可視化するのに使う。
+    /// 「WAL がどれだけ逼迫しているか」を可視化するのに使う。 今の区画の残りと、 移れる空の区画の大きさ。
     pub fn free_bytes(&self) -> u64 {
-        self.capacity.saturating_sub(self.alloc_head())
+        let ai = self.hot.active.load(Ordering::Acquire);
+        let a = &self.hot.halves[ai];
+        let mut free = a.size().saturating_sub(self.alloc_head(a));
+        if self.two.load(Ordering::Acquire) {
+            let o = &self.hot.halves[ai ^ 1];
+            if o.is_empty() {
+                free += o.size().saturating_sub(HEADER_SIZE as u64);
+            }
+        }
+        free
     }
 
     /// auto_reset を切り替え(Syncer attached の engine では false にする)。
@@ -2318,14 +2842,14 @@ impl OpLog {
     pub fn durable_cut_for(&self, author: PeerId) -> DurableCutPoint {
         let _in_proc = self.append_lock.lock();
         let dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
-        let st = *self.hlc_state.lock();
+        let st = *self.hot.hlc_state.lock();
         DurableCutPoint {
             hlc: Hlc { wall: st.0, logical: st.1, peer: author },
             dropped_pending: dropped.iter().any(|(a, _)| *a == author),
             dropped_gen: self.dropped_gen.load(Ordering::Acquire),
-            lap: self.lap.load(Ordering::Acquire),
-            offset: self.head.load(Ordering::Acquire),
-            own_data: self.own_data.load(Ordering::Acquire),
+            lap: self.active_half().lap(),
+            offset: self.active_half().head.load(Ordering::Acquire),
+            own_data: self.hot.own_data.load(Ordering::Acquire),
         }
     }
 
@@ -2339,7 +2863,7 @@ impl OpLog {
         // 落ちた record は `dropped` の lock の下で採番して覚える (`note_dropped_minting`、 append_lock の外): 同じ lock を持って
         // 回数を比べ、 持ったまま今を採番する = この後に落ちる record の HLC は今より後
         let _dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
-        if self.own_data.load(Ordering::Acquire) != own_data || self.dropped_gen.load(Ordering::Acquire) != dropped_gen {
+        if self.hot.own_data.load(Ordering::Acquire) != own_data || self.dropped_gen.load(Ordering::Acquire) != dropped_gen {
             return None;
         }
         Some(Hlc { peer: author, ..self.next_hlc() })
@@ -2351,7 +2875,7 @@ impl OpLog {
     pub fn quiet_without_mark(&self, author: PeerId) -> Option<Hlc> {
         let _in_proc = self.append_lock.lock();
         let dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
-        if self.own_data.load(Ordering::Acquire) != 0 || self.dropped_gen.load(Ordering::Acquire) != 0 || !dropped.is_empty() {
+        if self.hot.own_data.load(Ordering::Acquire) != 0 || self.dropped_gen.load(Ordering::Acquire) != 0 || !dropped.is_empty() {
             return None;
         }
         let scanned = author as u64 + 1;
@@ -2385,68 +2909,132 @@ impl OpLog {
     /// 読むだけ)。 record ごとに CRC と周の印を確かめ、 `records_with_tail` と同じ所で止まる。 渡す op は `records_with_tail` と少し
     /// 違う (安全側): Commit も渡し、 読み飛ばしてよい op (#178、 ALIAS) は渡さない。
     ///
-    /// `from` = 読み始める位置 (周, offset) ([`OpLog::durable_cut_for`] の 3 つ目・4 つ目 = 配り済みの印の位置)。 周が今の周と同じで
-    /// offset が ring の中ならそこから (それより前の record は印より前)、 周が違う (畳んだ) / 周なし (v2) / 範囲外なら先頭から。
+    /// `from` = 読み始める位置 (周, offset) ([`OpLog::durable_cut_for`] の 3 つ目・4 つ目 = 配り済みの印の位置)。 その周の区画は
+    /// offset から (それより前の record は印より前)、 それより新しい周の区画は頭から、 古い周の区画は読まない (全部印より前)。
+    /// 周がどの区画にも無く全部より古い (畳んだ後) / 周なし (v2) / offset が書き終えた終端より先 なら先頭から (`read_plan`)。
     pub fn visit_record_headers_with_tail(&self, from: Option<(u32, u64)>, mut f: impl FnMut(PeerId, Hlc)) {
-        let (trailer, lap) = (self.trailer.load(Ordering::Acquire), self.lap.load(Ordering::Acquire));
-        let head = self.written.load(Ordering::Acquire);
-        let mmap = self.mmap_slice();
-        let mut offset = match from {
-            Some((l, off)) if l != 0 && l == lap && off >= HEADER_SIZE as u64 && off <= head => off,
-            _ => HEADER_SIZE as u64,
+        let trailer = self.trailer.load(Ordering::Acquire);
+        let start = match from {
+            Some((l, off)) if l != 0 => wal_pos(l, off),
+            _ => 0,
         };
-        while offset < head {
-            let rec_end = (offset as usize) + REC_HEADER_SIZE;
-            if rec_end > mmap.len() {
-                break;
-            }
-            let header = &mmap[offset as usize..rec_end];
-            if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC {
-                break;
-            }
-            let version = header[OFF_VERSION];
-            if !known_version(version) {
-                break;
-            }
-            let op_byte = header[OFF_OP];
-            let payload_len = u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()) as usize;
-            let payload_end = rec_end + payload_len;
-            if payload_end > mmap.len() {
-                break;
-            }
-            let next_off = payload_end + trailer;
-            if trailer != 0 {
-                if next_off > mmap.len() {
-                    break;
+        let mmap = self.mmap_slice();
+        for part in self.read_plan(start, true).into_iter().flatten() {
+            let (base, lap) = (part.base, part.lap);
+            let mut offset = part.start;
+            while offset < part.end {
+                let at = base + offset as usize;
+                let rec_end = at + REC_HEADER_SIZE;
+                if rec_end > mmap.len() {
+                    return;
                 }
-                let t = &mmap[payload_end..next_off];
-                let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
-                let check = u32::from_le_bytes(t[4..8].try_into().unwrap());
-                if check != rec_lap ^ LAP_SALT || rec_lap != lap {
-                    break;
+                let header = &mmap[at..rec_end];
+                if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC {
+                    return;
                 }
+                let version = header[OFF_VERSION];
+                if !known_version(version) {
+                    return;
+                }
+                let op_byte = header[OFF_OP];
+                let payload_len = u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()) as usize;
+                let payload_end = rec_end + payload_len;
+                if payload_end > mmap.len() {
+                    return;
+                }
+                let next_off = payload_end + trailer;
+                if trailer != 0 {
+                    if next_off > mmap.len() {
+                        return;
+                    }
+                    let t = &mmap[payload_end..next_off];
+                    let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
+                    let check = u32::from_le_bytes(t[4..8].try_into().unwrap());
+                    if check != rec_lap ^ LAP_SALT || rec_lap != lap {
+                        return;
+                    }
+                }
+                let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
+                if stored_crc != record_crc(version, &header[CRC_FIELDS], &mmap[rec_end..payload_end]) {
+                    return;
+                }
+                let known_op = matches!(
+                    op_byte,
+                    op_type::TIE | op_type::UNTIE | op_type::DELETE | op_type::CONTENT | op_type::COMMIT | op_type::VOCAB
+                        | op_type::TIE_NAMED | op_type::TIE_LEAF | op_type::TIE_REF | op_type::TIE64 | op_type::TIE_NAMED64
+                );
+                if known_op {
+                    let hlc = Hlc {
+                        wall: u64::from_le_bytes(header[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap()),
+                        logical: u32::from_le_bytes(header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].try_into().unwrap()),
+                        peer: u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap()),
+                    };
+                    f(u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap()), hlc);
+                } else if !op_type::skippable(op_byte) {
+                    return;
+                }
+                offset = (next_off - base) as u64;
             }
-            let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
-            if stored_crc != record_crc(version, &header[CRC_FIELDS], &mmap[rec_end..payload_end]) {
-                break;
-            }
-            let known_op = matches!(
-                op_byte,
-                op_type::TIE | op_type::UNTIE | op_type::DELETE | op_type::CONTENT | op_type::COMMIT | op_type::VOCAB
-                    | op_type::TIE_NAMED | op_type::TIE_LEAF | op_type::TIE_REF | op_type::TIE64 | op_type::TIE_NAMED64
-            );
-            if known_op {
-                let hlc = Hlc {
-                    wall: u64::from_le_bytes(header[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap()),
-                    logical: u32::from_le_bytes(header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].try_into().unwrap()),
-                    peer: u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap()),
-                };
-                f(u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap()), hlc);
-            } else if !op_type::skippable(op_byte) {
-                break;
-            }
-            offset = next_off as u64;
         }
+    }
+
+    /// 位置 `from` ([`wal_pos`]) から読む区画の並び (周の古い順)。 `from` の周の区画はその offset から、 それより新しい周の区画は
+    /// 頭から、 古い周の区画は読まない (読み終えている = 読み手の位置はその区画より後)。 `from` がどの区画よりも新しい (どの区画にも
+    /// 同じ周も新しい周も無い = 壊れた位置) なら全部を頭から。 `from` の offset が区画の書き終えた終端より先なら、
+    /// `beyond_from_start` で頭から (false なら何も読まない = cursor の 「失った更新」 は呼び手が見る)。
+    ///
+    /// 周 → 書き終えた終端の順に読む (Acquire)。 畳む側は周を置いてから終端を頭に戻し、 切り替えでは移る先の周を置いてから
+    /// record を書くので、 読んだ組は 「新しい周と古い終端」 になっても逆は無い (前の周の record を新しい周で読んで止まるだけ)。
+    /// 終端は **新しい区画を先に** 読む: 古い区画の終端を先に読むと、 その後に書き手が古い区画に足してから移って新しい区画に
+    /// 書いた時、 古い区画の残りを飛ばして新しい区画を読み、 位置がその先へ進む (changefeed の受け手に区画 1 つ分の record が
+    /// 届かなかった)。 新しい区画の終端を読んでから古い区画の終端を読めば、 新しい区画に record があれば古い区画の終端は最後の
+    /// 値 (切り替えの前に置いた終端 → 移る → 新しい区画の終端、 の順に Release で置く)。
+    fn read_plan(&self, from: u64, beyond_from_start: bool) -> [Option<ReadPart>; 2] {
+        let (fl, foff) = (wal_pos_lap(from), wal_pos_offset(from));
+        let hs = HEADER_SIZE as u64;
+        let lap_of = |h: &Half| (h.size() > 0).then(|| (h.base(), h.lap()));
+        let (a, b) = (lap_of(&self.hot.halves[0]), lap_of(&self.hot.halves[1]));
+        // (古い方, 新しい方) の区画の番号
+        let order: [Option<usize>; 2] = match (a, b) {
+            (Some((_, la)), Some((_, lb))) => {
+                if lap_newer(la, lb) {
+                    [Some(1), Some(0)]
+                } else {
+                    [Some(0), Some(1)]
+                }
+            }
+            (Some(_), None) => [Some(0), None],
+            (None, Some(_)) => [Some(1), None],
+            (None, None) => [None, None],
+        };
+        let laps = [a, b];
+        let part = |i: Option<usize>, end: u64| {
+            i.and_then(|i| laps[i]).map(|(base, lap)| ReadPart { base, lap, start: hs, end })
+        };
+        let newer_end = order[1].map_or(0, |i| self.hot.halves[i].written.load(Ordering::Acquire));
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        read_plan_hook::call();
+        let older_end = order[0].map_or(0, |i| self.hot.halves[i].written.load(Ordering::Acquire));
+        let parts = [part(order[0], older_end), part(order[1], newer_end)];
+        let known = parts.iter().flatten().any(|p| p.lap == fl || lap_newer(p.lap, fl));
+        parts.map(|p| {
+            let mut p = p?;
+            if !known {
+                return Some(p);
+            }
+            if p.lap == fl {
+                p.start = if foff > p.end {
+                    if beyond_from_start { hs } else { foff }
+                } else {
+                    foff.max(hs)
+                };
+                Some(p)
+            } else if lap_newer(p.lap, fl) {
+                Some(p)
+            } else {
+                None
+            }
+        })
     }
 
     /// #450: `start_offset` から先の、 Commit で閉じられていない record (閉じの Commit が満杯で入らなかった孤児の group) を、
@@ -2492,12 +3080,35 @@ impl OpLog {
     /// 読んだ stale head を渡すと checkpoint > head の壊れ状態になり、 head が
     /// その値を再突破するまで背景 fsync / sync 転送が止まっていた。
     pub fn advance_checkpoint(&self, new_checkpoint: u64) {
-        let head = self.head.load(Ordering::Acquire);
-        let target = new_checkpoint.min(head);
-        let cur = self.checkpoint.load(Ordering::Acquire);
-        if target <= cur { return; }
-        self.checkpoint.store(target, Ordering::Release);
-        self.mmap_mut_slice()[16..24].copy_from_slice(&target.to_le_bytes());
+        // 畳む (`append_lock` の下) と並ばないように: 畳む前の head を読んで畳んだ後の区画に書くと checkpoint > head になる
+        let _in_proc = self.append_lock.lock();
+        self.advance_checkpoint_locked(new_checkpoint);
+    }
+
+    /// `advance_checkpoint` の本体 (`append_lock` の下)。 位置の周の区画はその offset まで (head で切る)、 それより古い周の区画は
+    /// head まで (全部その位置より前に積んだ)、 新しい周の区画は進めない。 前にだけ進める。
+    fn advance_checkpoint_locked(&self, new_checkpoint: u64) {
+        let (l, off) = (wal_pos_lap(new_checkpoint), wal_pos_offset(new_checkpoint));
+        let mmap = self.mmap_mut_slice();
+        for h in &self.hot.halves {
+            if h.size() == 0 {
+                continue;
+            }
+            let (hl, head) = (h.lap(), h.head.load(Ordering::Acquire));
+            let target = if hl == l {
+                off.min(head)
+            } else if lap_newer(l, hl) {
+                head
+            } else {
+                continue;
+            };
+            if target <= h.checkpoint.load(Ordering::Acquire) {
+                continue;
+            }
+            h.checkpoint.store(target, Ordering::Release);
+            let b = h.base();
+            mmap[b + 16..b + 24].copy_from_slice(&target.to_le_bytes());
+        }
     }
 
     /// HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
@@ -2616,13 +3227,13 @@ impl OpLog {
 
     /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
     fn recover_inner(&self) -> (Vec<Record>, Vec<Record>) {
-        let start = self.checkpoint.load(Ordering::Acquire);
+        let start = self.checkpoint();
         let s = self.scan_from_offset(start);
         if s.max_lsn > 0 {
-            self.next_lsn.store(s.max_lsn + 1, Ordering::Release);
+            self.hot.next_lsn.store(s.max_lsn + 1, Ordering::Release);
         }
         if s.max_hlc.wall > 0 {
-            *self.hlc_state.lock() = (s.max_hlc.wall, s.max_hlc.logical);
+            *self.hot.hlc_state.lock() = (s.max_hlc.wall, s.max_hlc.logical);
         }
         (strip_offsets(s.out), strip_offsets(s.tail))
     }
@@ -2645,13 +3256,8 @@ impl OpLog {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut commit_ends = Vec::new();
-        let mut offset = start_offset;
         let mut committed_end = start_offset;
-        // #608: 周の印の有無とこの周。 `written` より先に読む (畳む側は周を進めてから written を戻すので、 周が新しくて
-        // written が古い組になりうる = 前の周の record を新しい周で読んで止まるだけで、 逆 (古い周で新しい record) は無い)
-        let (trailer, lap) = (self.trailer.load(Ordering::Acquire), self.lap.load(Ordering::Acquire));
-        // #268: head ではなく書き終えた終端まで (head との間は書いている最中 = 前の周の record が見える)
-        let head = self.written.load(Ordering::Acquire);
+        let trailer = self.trailer.load(Ordering::Acquire);
         let mut max_lsn = 0;
         let mut max_hlc = Hlc::ZERO;
         // #268: 打ち切り理由。 while を抜け切れば「head まで読んだ」。
@@ -2659,123 +3265,148 @@ impl OpLog {
 
         let mmap = self.mmap_slice();
 
-        while offset < head {
-            let rec_end = (offset as usize) + REC_HEADER_SIZE;
-            if rec_end > mmap.len() { stop = ScanStop::OutOfBounds; break; }
-            let header = &mmap[offset as usize..rec_end];
-            if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC {
-                stop = ScanStop::BadMagic;
-                break;
-            }
-            let version = header[OFF_VERSION];
-            if !known_version(version) {
-                stop = ScanStop::BadVersion;
-                break;
-            }
-
-            let op_byte = header[OFF_OP];
-            let payload_len = u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()) as usize;
-            let lsn = u64::from_le_bytes(header[OFF_LSN..OFF_LSN + 8].try_into().unwrap());
-            let hlc_wall = u64::from_le_bytes(header[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap());
-            let hlc_logical = u32::from_le_bytes(header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].try_into().unwrap());
-            let hlc_peer = u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap());
-            let author_peer = u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap());
-            let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
-            let mut signature = [0u8; 64];
-            signature.copy_from_slice(&header[OFF_SIGNATURE..OFF_SIGNATURE + 64]);
-            let mut pubkey_fp = [0u8; 8];
-            pubkey_fp.copy_from_slice(&header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8]);
-            let hlc = Hlc { wall: hlc_wall, logical: hlc_logical, peer: hlc_peer };
-
-            let payload_off = rec_end;
-            let payload_end = payload_off + payload_len;
-            if payload_end > mmap.len() { stop = ScanStop::OutOfBounds; break; }
-
-            // v3 は header の値も覆う (壊れた header のゴミの HLC / author を通さない、 #58)
-            let computed_crc = record_crc(version, &header[CRC_FIELDS], &mmap[payload_off..payload_end]);
-            if stored_crc != computed_crc {
-                stop = ScanStop::BadCrc; // 破損 tail
-                break;
-            }
-            // #608: 周の印。 この周でない record は、 畳んだ後も page に残っている前の周の中身 (header の page だけ先に書き
-            // 出された像では、 新しい周の数件の後ろにそれが続く)。 CRC は合うので印で見分ける
-            let next_off = payload_end + trailer;
-            if trailer != 0 {
-                if next_off > mmap.len() { stop = ScanStop::OutOfBounds; break; }
-                let t = &mmap[payload_end..next_off];
-                let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
-                let check = u32::from_le_bytes(t[4..8].try_into().unwrap());
-                if check != rec_lap ^ LAP_SALT {
-                    stop = ScanStop::BadLap; // 書きかけの印 (torn)
-                    break;
+        // 区画を周の古い順に。 group は区画をまたいで続く (切り替えは閉じの Commit を置くので普段はまたがない)。 区画の途中で
+        // 止まったら (壊れた record / 前の周の record) 後ろの区画も読まない: 後ろの区画の record は全部その後に積んだ物
+        // #608: 区画ごとに周を `written` より先に読む (`read_plan`)。 #268: head ではなく書き終えた終端まで (head との間は書いている
+        // 最中 = 前の周の record が見える)
+        // 最後まで読んだ区画の終わり (閉じていない record が無ければ、 ここまで読み終えた位置を返す)
+        let mut read_end: Option<u64> = None;
+        let hs = HEADER_SIZE as u64;
+        'parts: for part in self.read_plan(start_offset, false).into_iter().flatten() {
+            let (base, lap, head) = (part.base, part.lap, part.end);
+            let mut offset = part.start;
+            while offset < head {
+                let at = base + offset as usize;
+                let rec_end = at + REC_HEADER_SIZE;
+                if rec_end > mmap.len() { stop = ScanStop::OutOfBounds; break 'parts; }
+                let header = &mmap[at..rec_end];
+                if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC {
+                    stop = ScanStop::BadMagic;
+                    break 'parts;
                 }
-                if rec_lap != lap {
-                    stop = ScanStop::StaleLap;
-                    break;
+                let version = header[OFF_VERSION];
+                if !known_version(version) {
+                    stop = ScanStop::BadVersion;
+                    break 'parts;
                 }
-            }
 
-            let payload_slice = &mmap[payload_off..payload_end];
-            let op = decode_op(op_byte, payload_slice);
-            if lsn > max_lsn { max_lsn = lsn; }
-            if hlc > max_hlc { max_hlc = hlc; }
+                let op_byte = header[OFF_OP];
+                let payload_len = u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()) as usize;
+                let lsn = u64::from_le_bytes(header[OFF_LSN..OFF_LSN + 8].try_into().unwrap());
+                let hlc_wall = u64::from_le_bytes(header[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap());
+                let hlc_logical = u32::from_le_bytes(header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].try_into().unwrap());
+                let hlc_peer = u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap());
+                let author_peer = u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap());
+                let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
+                let mut signature = [0u8; 64];
+                signature.copy_from_slice(&header[OFF_SIGNATURE..OFF_SIGNATURE + 64]);
+                let mut pubkey_fp = [0u8; 8];
+                pubkey_fp.copy_from_slice(&header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8]);
+                let hlc = Hlc { wall: hlc_wall, logical: hlc_logical, peer: hlc_peer };
 
-            // 署名はその record の版の bytes に掛かっている。 header の先頭は signed_bytes と同じ並びなので
-            // そのまま切り出す (v2 の record を v3 として組み直さない)
-            let mut signed_bytes = Vec::with_capacity(SIGNED_PAYLOAD_HEADER_SIZE + payload_len);
-            signed_bytes.extend_from_slice(&header[..SIGNED_PAYLOAD_HEADER_SIZE]);
-            signed_bytes.extend_from_slice(payload_slice);
+                let payload_off = rec_end;
+                let payload_end = payload_off + payload_len;
+                if payload_end > mmap.len() { stop = ScanStop::OutOfBounds; break 'parts; }
 
-            match op {
-                Some(DecodedOp::Commit) => {
-                    out.append(&mut batch);
-                    committed_end = next_off as u64;
-                    commit_ends.push(committed_end);
+                // v3 は header の値も覆う (壊れた header のゴミの HLC / author を通さない、 #58)
+                let computed_crc = record_crc(version, &header[CRC_FIELDS], &mmap[payload_off..payload_end]);
+                if stored_crc != computed_crc {
+                    stop = ScanStop::BadCrc; // 破損 tail
+                    break 'parts;
                 }
-                Some(other) => {
-                    batch.push((
-                        Record {
-                            lsn, hlc, author_peer, op: other,
-                            signature, pubkey_fp, signed_bytes,
-                        },
-                        next_off as u64,
-                    ));
-                }
-                // #178: 知らない版が書いた 「読み飛ばしてよい」 op は、 その record だけ飛ばして先を読む (下の打ち切りと違い、
-                // 後ろの record を捨てない)
-                None if op_type::skippable(op_byte) => {
-                    self.skipped_ops.fetch_add(1, Ordering::Relaxed);
-                }
-                None => {
-                    // forward-compat 可視化 (0.9.0 L1): 新しい version が書いた
-                    // 未知 op_type (or 不正 payload) は従来通りここで scan を打ち
-                    // 切るが、 silent だと以降の正常 record 落ちに気付けない。
-                    // changefeed 経路は cursor が進めず毎 tick 再 scan するため、
-                    // 0.8.15 の persist warning と同様に 1 秒 1 回に rate-limit。
-                    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let last = LAST_WARN_MS.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last) >= 1000
-                        && LAST_WARN_MS
-                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        eprintln!(
-                            "enchudb oplog: undecodable op (op_type={}) at offset {} — \
-                             stopping scan; later records in this WAL are ignored \
-                             (written by a newer version?)",
-                            op_byte, offset,
-                        );
+                // #608: 周の印。 この周でない record は、 畳んだ後も page に残っている前の周の中身 (header の page だけ先に書き
+                // 出された像では、 新しい周の数件の後ろにそれが続く)。 CRC は合うので印で見分ける
+                let next_off = payload_end + trailer;
+                if trailer != 0 {
+                    if next_off > mmap.len() { stop = ScanStop::OutOfBounds; break 'parts; }
+                    let t = &mmap[payload_end..next_off];
+                    let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
+                    let check = u32::from_le_bytes(t[4..8].try_into().unwrap());
+                    if check != rec_lap ^ LAP_SALT {
+                        stop = ScanStop::BadLap; // 書きかけの印 (torn)
+                        break 'parts;
                     }
-                    stop = ScanStop::UndecodableOp;
-                    break;
+                    if rec_lap != lap {
+                        stop = ScanStop::StaleLap;
+                        break 'parts;
+                    }
                 }
-            }
 
-            offset = next_off as u64;
+                let payload_slice = &mmap[payload_off..payload_end];
+                let op = decode_op(op_byte, payload_slice);
+                if lsn > max_lsn { max_lsn = lsn; }
+                if hlc > max_hlc { max_hlc = hlc; }
+
+                // 署名はその record の版の bytes に掛かっている。 header の先頭は signed_bytes と同じ並びなので
+                // そのまま切り出す (v2 の record を v3 として組み直さない)
+                let mut signed_bytes = Vec::with_capacity(SIGNED_PAYLOAD_HEADER_SIZE + payload_len);
+                signed_bytes.extend_from_slice(&header[..SIGNED_PAYLOAD_HEADER_SIZE]);
+                signed_bytes.extend_from_slice(payload_slice);
+
+                match op {
+                    Some(DecodedOp::Commit) => {
+                        out.append(&mut batch);
+                        committed_end = wal_pos(lap, (next_off - base) as u64);
+                        commit_ends.push(committed_end);
+                    }
+                    Some(other) => {
+                        batch.push((
+                            Record {
+                                lsn, hlc, author_peer, op: other,
+                                signature, pubkey_fp, signed_bytes,
+                            },
+                            wal_pos(lap, (next_off - base) as u64),
+                        ));
+                    }
+                    // #178: 知らない版が書いた 「読み飛ばしてよい」 op は、 その record だけ飛ばして先を読む (下の打ち切りと違い、
+                    // 後ろの record を捨てない)
+                    None if op_type::skippable(op_byte) => {
+                        self.skipped_ops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        // forward-compat 可視化 (0.9.0 L1): 新しい version が書いた
+                        // 未知 op_type (or 不正 payload) は従来通りここで scan を打ち
+                        // 切るが、 silent だと以降の正常 record 落ちに気付けない。
+                        // changefeed 経路は cursor が進めず毎 tick 再 scan するため、
+                        // 0.8.15 の persist warning と同様に 1 秒 1 回に rate-limit。
+                        static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let last = LAST_WARN_MS.load(Ordering::Relaxed);
+                        if now_ms.saturating_sub(last) >= 1000
+                            && LAST_WARN_MS
+                                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
+                            eprintln!(
+                                "enchudb oplog: undecodable op (op_type={}) at offset {} — \
+                                 stopping scan; later records in this WAL are ignored \
+                                 (written by a newer version?)",
+                                op_byte, offset,
+                            );
+                        }
+                        stop = ScanStop::UndecodableOp;
+                        break 'parts;
+                    }
+                }
+
+                offset = (next_off - base) as u64;
+            }
+            // 空の区画の頭へは、 前に読んだ区画も空の時だけ進める: 新しい区画が空なら古い区画が今書き足している区画 (今の区画が空
+            // なのは、 その場で畳んだ = 周がいちばん新しい時だけ) で、 その頭へ進むと古い区画にこの後足される record を飛ばす
+            if part.end > hs || read_end.is_none_or(|e| wal_pos_offset(e) <= hs) {
+                read_end = Some(wal_pos(lap, offset.max(part.start)));
+            }
+        }
+        // 全部を読み切って閉じていない record も無ければ、 読み終えた位置まで進めてよい (区画を畳んだ後の空の区画 / 読み飛ばした
+        // op の後。 位置を進めないと、 畳んだ区画を指す位置 (= 先頭) のまま `head` より小さく見え、 読み手が追いついたと分からない)
+        if stop == ScanStop::Head
+            && batch.is_empty()
+            && let Some(e) = read_end
+        {
+            committed_end = committed_end.max(e);
         }
 
         // 未 commit batch は `out` には混ぜず、 呼び手が選べるよう別枠で返す。
@@ -2784,17 +3415,19 @@ impl OpLog {
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。
     pub fn reset_to_checkpoint(&self) {
-        let cp = self.checkpoint.load(Ordering::Acquire);
-        self.head.store(cp, Ordering::Release);
-        self.written.store(cp, Ordering::Release);
-        self.mmap_mut_slice()[8..16].copy_from_slice(&cp.to_le_bytes());
+        let _in_proc = self.append_lock.lock();
+        let h = self.active_half();
+        let cp = h.checkpoint.load(Ordering::Acquire);
+        h.head.store(cp, Ordering::Release);
+        self.put_head(h, h.base(), cp);
     }
 
     /// WAL 使用量(bytes)と容量を返す(監視用)。
     pub fn usage(&self) -> (u64, u64) {
-        let head = self.head.load(Ordering::Acquire);
-        let cp = self.checkpoint.load(Ordering::Acquire);
-        (head.saturating_sub(cp), self.capacity)
+        let used = self.hot.halves.iter().filter(|h| h.size() > 0).map(|h| {
+            h.head.load(Ordering::Acquire).saturating_sub(h.checkpoint.load(Ordering::Acquire))
+        });
+        (used.sum(), self.capacity())
     }
 
     // ---- flock (multi-process write 排他) ----
@@ -2889,45 +3522,8 @@ impl OpLog {
     #[cfg(target_arch = "wasm32")]
     pub fn create_in_memory(capacity: usize) -> Self {
         let mut buf = vec![0u8; capacity];
-        buf[0..4].copy_from_slice(FILE_MAGIC);
-        buf[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
-        buf[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
-        buf[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
-        buf[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(capacity as u32).to_le_bytes());
-        buf[OFF_LAP..OFF_LAP + 4].copy_from_slice(&1u32.to_le_bytes());
-        let (lap0, trailer0) = (1u32, LAP_TRAILER);
-        Self {
-            buf,
-            capacity: capacity as u64,
-            head: AtomicU64::new(HEADER_SIZE as u64),
-            written: AtomicU64::new(HEADER_SIZE as u64),
-            checkpoint: AtomicU64::new(HEADER_SIZE as u64),
-            next_lsn: AtomicU64::new(1),
-            hlc_state: parking_lot::Mutex::new((0, 0)),
-            peer_id: std::sync::atomic::AtomicU32::new(0),
-            keypair: std::sync::RwLock::new(None),
-            signing: std::sync::atomic::AtomicBool::new(false),
-            append_lock: crate::wal_lock::WalLock::new(()),
-            combine_slots: CombineSlot::new_slots(),
-            combine: CombineHint { hw: std::sync::atomic::AtomicU32::new(0), wanted: std::sync::atomic::AtomicBool::new(false) },
-            combined: AtomicU64::new(0),
-            session_locked: std::sync::atomic::AtomicBool::new(false),
-            pending_writes: std::sync::atomic::AtomicU32::new(0),
-            pending_shards: (0..COMBINE_SLOTS).map(|_| PendingShard(std::sync::atomic::AtomicU32::new(0))).collect(),
-            auto_reset: std::sync::atomic::AtomicBool::new(false),
-            fail_next_commits: std::sync::atomic::AtomicU32::new(0),
-            commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + trailer0) as u64),
-            sync_on_reset: std::sync::atomic::AtomicBool::new(false),
-            room_waiter: std::sync::RwLock::new(None),
-            append_hook: std::sync::OnceLock::new(),
-            dropped: std::sync::Mutex::new(Vec::new()),
-            dropped_gen: std::sync::atomic::AtomicU64::new(0),
-            own_data: std::sync::atomic::AtomicU64::new(0),
-            quiet_scanned: std::sync::atomic::AtomicU64::new(0),
-            skipped_ops: AtomicU64::new(0),
-            lap: std::sync::atomic::AtomicU32::new(lap0),
-            trailer: std::sync::atomic::AtomicUsize::new(trailer0),
-        }
+        let layout = fresh_layout(&mut buf, capacity as u64);
+        Self::assemble(buf, layout)
     }
 }
 
@@ -3107,6 +3703,23 @@ fn fnv1a(data: &[u8]) -> u32 {
     h
 }
 
+/// test 用: 読み手が新しい区画の終端を読んでから古い区画の終端を読むまでの間に 1 度だけ呼ぶ (この thread の次の読みだけ)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod read_plan_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub(super) fn set(f: Box<dyn FnOnce()>) {
+        HOOK.with(|h| *h.borrow_mut() = Some(f));
+    }
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -3214,7 +3827,7 @@ mod tests {
         assert!(h1 <= c, "切れ目は前の record 以上: {h1:?} {c:?}");
         assert!(!cut.dropped_pending);
         assert_eq!(cut.dropped_gen, 0);
-        assert_eq!((lap, off), (wal.lap(), wal.head()), "切れ目の位置 = この周の終わり");
+        assert_eq!((lap, off), (wal.lap(), wal_pos_offset(wal.head())), "切れ目の位置 = この周の終わり");
         let (_, h2) = wal.append_with_hlc(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
         assert!(h2 > c, "切れ目の後の record は切れ目より大きい: {c:?} {h2:?}");
         let mut after = Vec::new();
@@ -3260,7 +3873,7 @@ mod tests {
         let cp = wal.head();
         wal.advance_checkpoint(cp);
         // 閉じていない末尾
-        let (off_tail, _) = (wal.head(), wal.append(Op::Tie { eid: 100, himo_id: 0, value: 100 }).unwrap());
+        let (off_tail, _) = (wal_pos_offset(wal.head()), wal.append(Op::Tie { eid: 100, himo_id: 0, value: 100 }).unwrap());
         wal.append(Op::Tie { eid: 101, himo_id: 0, value: 101 }).unwrap();
         let expect: Vec<(PeerId, Hlc)> = wal.records_with_tail().iter().map(|r| (r.author_peer, r.hlc)).collect();
         let mut got = Vec::new();
@@ -3777,8 +4390,9 @@ mod tests {
 
         wal.advance_checkpoint(head_before);
         assert!(wal.try_reset(), "should reset when head == checkpoint");
-        assert_eq!(wal.head(), HEADER_SIZE as u64);
-        assert_eq!(wal.checkpoint(), HEADER_SIZE as u64);
+        assert!(wal.is_empty());
+        assert_eq!(wal_pos_offset(wal.head()), HEADER_SIZE as u64);
+        assert_eq!(wal_pos_offset(wal.checkpoint()), HEADER_SIZE as u64);
 
         let lsn = wal.append(Op::Tie { eid: 999, himo_id: 0, value: 99 }).unwrap();
         assert!(lsn > 100);
@@ -3809,8 +4423,9 @@ mod tests {
             wal.try_reset(),
             "ring must reclaim even without set_auto_reset(true)"
         );
-        assert_eq!(wal.head(), HEADER_SIZE as u64);
-        assert_eq!(wal.checkpoint(), HEADER_SIZE as u64);
+        assert!(wal.is_empty());
+        assert_eq!(wal_pos_offset(wal.head()), HEADER_SIZE as u64);
+        assert_eq!(wal_pos_offset(wal.checkpoint()), HEADER_SIZE as u64);
 
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
@@ -4334,13 +4949,13 @@ mod tests {
         let writer = OpLog::create(&p, cap).unwrap();
         // 別 fd (= 別 open file description)。 この時点の in-memory head は HEADER_SIZE。
         let stale = OpLog::open(&p).unwrap();
-        assert_eq!(stale.head(), HEADER_SIZE as u64);
+        assert_eq!(wal_pos_offset(stale.head()), HEADER_SIZE as u64);
 
         while writer.append(Op::Commit).is_ok() {}
         assert!(writer.append_dead(), "満杯にした本人が dead と言っていない");
 
         assert_eq!(
-            stale.head(),
+            wal_pos_offset(stale.head()),
             HEADER_SIZE as u64,
             "前提が崩れている: stale handle の in-memory head が更新されている",
         );
@@ -4394,7 +5009,7 @@ mod tests {
         };
         assert_eq!(full.kind(), io::ErrorKind::OutOfMemory, "前提: 満杯で載らない");
         // 載らなかった後に他の thread が畳んだ
-        wal.checkpoint_and_reset(|_| true, || true);
+        wal.checkpoint_and_reset(|_| true, |_| true);
         assert!(wal.free_bytes() >= size, "前提: 畳んで空いた");
         assert!(wal.wait_for_room(&full, size), "空いているのに書き直さない (満杯でない失敗と読んだ)");
         assert!(!wal.wait_for_room(&io::Error::other("injected"), size), "満杯でない失敗を書き直す");
@@ -4438,7 +5053,7 @@ mod tests {
                 let w = weak.upgrade().unwrap();
                 let n = c.fetch_add(1, Ordering::AcqRel);
                 // engine の consumer と同じく、 書き出して畳む
-                w.checkpoint_and_reset(|_| true, || true);
+                w.checkpoint_and_reset(|_| true, |_| true);
                 let room = w.free_bytes() >= size;
                 if n == 0 {
                     // 空いたと答えた後、 呼び手が書き直す前に他の書き手が空きを埋める
@@ -4475,12 +5090,12 @@ mod tests {
             let t = HEADER_SIZE + REC_HEADER_SIZE + len;
             (u32::from_le_bytes(m[t..t + 4].try_into().unwrap()), u32::from_le_bytes(m[t + 4..t + 8].try_into().unwrap()))
         };
-        assert_eq!(header(&wal), (OPLOG_FILE_VERSION, 64 * 1024, 1));
+        assert_eq!(header(&wal), (OPLOG_FILE_VERSION, 32 * 1024, 1), "2 区画 (A の header の capacity は区画の大きさ)");
         wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
         wal.append(Op::Commit).unwrap();
         assert_eq!(first_trailer(&wal), (1, 1 ^ LAP_SALT), "1 周目の印");
         assert_eq!(wal.record_size_of(16), REC_HEADER_SIZE + 16 + LAP_TRAILER);
-        assert_eq!(wal.head(), (HEADER_SIZE + 2 * REC_HEADER_SIZE + 16 + 2 * LAP_TRAILER) as u64, "印の分だけ進む");
+        assert_eq!(wal.head(), wal_pos(1, (HEADER_SIZE + 2 * REC_HEADER_SIZE + 16 + 2 * LAP_TRAILER) as u64), "印の分だけ進む");
         wal.advance_checkpoint(wal.head());
         assert!(wal.try_reset());
         assert_eq!((wal.lap(), header(&wal).2), (2, 2));
@@ -4516,7 +5131,8 @@ mod tests {
             wal.append(Op::Tie { eid: 1, himo_id: 0, value: i }).unwrap();
         }
         wal.append(Op::Commit).unwrap();
-        let new_head = wal.head();
+        let old_head = wal_pos_offset(old_head);
+        let new_head = wal_pos_offset(wal.head());
         assert_eq!(new_head, (HEADER_SIZE + 5 * (REC_HEADER_SIZE + 16 + LAP_TRAILER) + REC_HEADER_SIZE + LAP_TRAILER) as u64);
         // 前の周の 2 group 目の先頭と new_head がそろっている (= 前提: 印が無ければ続きとして読める)
         {
@@ -4527,7 +5143,7 @@ mod tests {
         wal.fsync().unwrap();
         drop(wal);
         let wal = OpLog::open(&p).unwrap();
-        assert_eq!(wal.head(), old_head);
+        assert_eq!(wal_pos_offset(wal.head()), old_head);
         let (out, _, _, stop) = wal.iter_committed_from_with_diag(HEADER_SIZE as u64);
         let values: Vec<u64> = out
             .iter()
@@ -4557,7 +5173,11 @@ mod tests {
                 m[24..32].copy_from_slice(&cap.to_le_bytes());
             }
             wal.trailer.store(0, Ordering::Release);
-            wal.lap.store(0, Ordering::Release);
+            // 1 区画 (file 全体)、 周なし
+            wal.two.store(false, Ordering::Release);
+            wal.hot.halves[0].size.store(cap as u32, Ordering::Release);
+            wal.hot.halves[1].size.store(0, Ordering::Release);
+            wal.hot.halves[0].lap.store(0, Ordering::Release);
             wal.commit_room.store(REC_HEADER_SIZE as u64, Ordering::Relaxed);
             for i in 0..3u64 {
                 wal.append(Op::Tie { eid: 1, himo_id: 0, value: i }).unwrap();
@@ -4571,15 +5191,16 @@ mod tests {
         assert_eq!(wal.record_size_of(16), REC_HEADER_SIZE + 16, "v2 のうちは印なし");
         let recs = wal.recover_with_tail();
         assert_eq!(recs.len(), 3, "v2 の record が読める");
-        // 畳む → v3
+        // 畳む → v3 → 2 区画にできるので v4 (周は開いた時の周 0 の 16 先)
         wal.advance_checkpoint(wal.head());
         assert!(wal.try_reset());
-        assert_eq!((wal.file_version(), wal.lap()), (OPLOG_FILE_VERSION, 1));
+        let lap = LAP_SKIP_ON_OPEN;
+        assert_eq!((wal.file_version(), wal.lap(), wal.capacity()), (OPLOG_FILE_VERSION, lap, cap));
         {
             let m = wal.mmap_slice();
             assert_eq!(u32::from_le_bytes(m[4..8].try_into().unwrap()), OPLOG_FILE_VERSION);
-            assert_eq!(u32::from_le_bytes(m[OFF_CAPACITY..OFF_CAPACITY + 4].try_into().unwrap()) as u64, cap);
-            assert_eq!(u32::from_le_bytes(m[OFF_LAP..OFF_LAP + 4].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(m[OFF_CAPACITY..OFF_CAPACITY + 4].try_into().unwrap()) as u64, cap / 2);
+            assert_eq!(u32::from_le_bytes(m[OFF_LAP..OFF_LAP + 4].try_into().unwrap()), lap);
         }
         assert_eq!(wal.record_size_of(16), REC_HEADER_SIZE + 16 + LAP_TRAILER, "v3 になったら印つき");
         assert_eq!(wal.commit_room.load(Ordering::Relaxed), (REC_HEADER_SIZE + LAP_TRAILER) as u64);
@@ -4588,7 +5209,7 @@ mod tests {
         wal.fsync().unwrap();
         drop(wal);
         let wal = OpLog::open(&p).unwrap();
-        assert_eq!((wal.file_version(), wal.lap(), wal.capacity()), (OPLOG_FILE_VERSION, 1, cap));
+        assert_eq!((wal.file_version(), wal.lap(), wal.capacity()), (OPLOG_FILE_VERSION, lap, cap));
         let recs = wal.recover_with_tail();
         assert_eq!(recs.len(), 1);
         assert!(matches!(recs[0].op, DecodedOp::Tie { eid: 2, .. }));
@@ -4769,6 +5390,429 @@ mod tests {
             assert_eq!(by_lsn.get(&lsn), Some(&(hlc, eid)), "書き手が受け取った LSN {lsn} の record が、 その書き手の値と HLC でない");
         }
         let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- 2 つの区画 (file v4) ----
+
+    fn tie_values(recs: &[Record]) -> Vec<u64> {
+        recs.iter()
+            .filter_map(|r| match r.op {
+                DecodedOp::Tie { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 1 group (Tie 4 件 + Commit) を書く。
+    fn append_group(wal: &OpLog, v: &mut u64) {
+        for _ in 0..4 {
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: *v }).unwrap();
+            *v += 1;
+        }
+        wal.append(Op::Commit).unwrap();
+    }
+
+    /// 今の区画が埋まると、 開いている group を閉じてもう一方の区画へ移る (周は新しい数)。 2 つの区画を積んだ順に読む。 古い区画
+    /// は全部書き出すまで畳まず、 畳めるのは古い区画 (読み手がその終わりまで読んでいればよい)。 今の区画は古い区画が空になって
+    /// からその場で畳む。
+    #[test]
+    fn halves_switch_when_full_and_scans_keep_the_wal_order() {
+        let p = tmp("halves-switch");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        assert!(wal.two_halves());
+        assert_eq!((wal.file_version(), wal.half_capacity(), wal.capacity()), (OPLOG_FILE_VERSION, 32 * 1024, 64 * 1024));
+        let lap0 = wal.lap();
+        let mut v = 0u64;
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        assert!(lap_newer(wal.lap(), lap0), "移った区画は新しい周");
+        assert_eq!(tie_values(&wal.iter_committed()), (0..v).collect::<Vec<_>>(), "2 つの区画を積んだ順に読む");
+        assert!(!wal.try_reset(), "書き出していない古い区画は畳まない");
+        let old_end = wal_pos(lap0, wal.hot.halves[0].head.load(Ordering::Acquire));
+        assert_eq!(wal.checkpoint(), wal_pos(lap0, HEADER_SIZE as u64), "checkpoint は古い区画の中");
+        wal.advance_checkpoint(wal.head());
+        assert_eq!(wal.checkpoint(), wal.head(), "今の区画の head まで書き出すと古い区画も全部");
+        let mut through = 0;
+        assert!(wal.try_reset_if(|t| {
+            through = t;
+            true
+        }));
+        assert_eq!(through, old_end, "畳んでよい位置 = 古い区画の終わり");
+        assert!(wal.hot.halves[0].is_empty() && !wal.hot.halves[1].is_empty(), "畳んだのは古い区画だけ");
+        let rest = tie_values(&wal.iter_committed());
+        let k = v - rest.len() as u64;
+        assert!(k > 0 && rest == (k..v).collect::<Vec<_>>(), "今の区画の record だけが残る: {rest:?}");
+        // 今の区画はその場で (周を進めて頭から)
+        let lap_b = wal.lap();
+        assert!(wal.try_reset());
+        assert!(wal.is_empty() && lap_newer(wal.lap(), lap_b) && wal.hot.active.load(Ordering::Acquire) == 1);
+        // また埋めると A へ (A の周は今の区画より古いので置き直す)
+        let start = v;
+        while wal.switches() == 1 {
+            append_group(&wal, &mut v);
+        }
+        assert_eq!(wal.hot.active.load(Ordering::Acquire), 0);
+        assert!(lap_newer(wal.hot.halves[0].lap(), wal.hot.halves[1].lap()));
+        assert_eq!(tie_values(&wal.iter_committed()), (start..v).collect::<Vec<_>>());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 両方の区画に record があるまま閉じて開くと、 record のある区画のうち周の新しい方に書き足し、 再生は古い区画から。
+    /// 開いた後に置く周は header の周の最大の [`LAP_SKIP_ON_OPEN`] 先 (前の process が置いて header の届かなかった周を使わない)。
+    #[test]
+    fn reopening_with_both_halves_written_replays_the_older_half_first() {
+        let p = tmp("halves-reopen");
+        let mut v = 0u64;
+        {
+            let wal = OpLog::create(&p, 64 * 1024).unwrap();
+            while wal.switches() == 0 || wal.hot.halves[1].head.load(Ordering::Acquire) < 8 * 1024 {
+                append_group(&wal, &mut v);
+            }
+            wal.fsync().unwrap();
+        }
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!(wal.hot.active.load(Ordering::Acquire), 1, "record のある区画のうち周の新しい方");
+        assert_eq!(tie_values(&wal.recover_with_tail()), (0..v).collect::<Vec<_>>(), "古い区画 → 新しい区画の順に再生");
+        let top = wal.hot.halves[1].lap();
+        append_group(&wal, &mut v);
+        assert_eq!(tie_values(&wal.iter_committed()).last(), Some(&(v - 1)), "今の区画 (B) に書き足す");
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset(), "古い区画 (A) を畳む");
+        assert_eq!(wal.hot.halves[0].lap(), top.wrapping_add(LAP_SKIP_ON_OPEN), "開いた後の周は先へ飛ばす");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 読み手の位置が畳んだ区画を指していたら (その区画は読み終えている)、 もう一方の区画を頭から読む。 位置は WAL に積んだ順。
+    #[test]
+    fn a_cursor_in_a_folded_half_reads_the_other_half_from_its_start() {
+        let p = tmp("halves-cursor");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let mut v = 0u64;
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        let in_b = |w: &OpLog| tie_values(&strip_offsets(w.iter_committed_from_with_offsets(wal_pos(w.hot.halves[1].lap(), HEADER_SIZE as u64)).0));
+        let b_values = in_b(&wal);
+        append_group(&wal, &mut v);
+        let b_values = [b_values, vec![v - 4, v - 3, v - 2, v - 1]].concat();
+        let a_end = wal_pos(wal.hot.halves[0].lap(), wal.hot.halves[0].head.load(Ordering::Acquire));
+        assert!(a_end < wal_pos(wal.hot.halves[1].lap(), HEADER_SIZE as u64), "位置は積んだ順");
+        let (recs, end) = wal.iter_committed_from_with_offsets(a_end);
+        assert_eq!(tie_values(&strip_offsets(recs)), b_values, "A の終わりからは B の頭から");
+        assert_eq!(end, wal.head());
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset_if(|through| a_end >= through), "A を読み終えた読み手なら A を畳める");
+        let (recs, end2) = wal.iter_committed_from_with_offsets(a_end);
+        assert_eq!(tie_values(&strip_offsets(recs)), b_values, "畳んだ区画の位置からも B の頭から (重複も取りこぼしも無い)");
+        assert_eq!(end2, end);
+        assert!(wal.iter_committed_from_with_offsets(end).0.is_empty(), "読み終えた位置からは何も無い");
+        assert_eq!(in_b(&wal), b_values);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// v3 (0.36 の 1 区画) の file は 1 区画のまま読み書きし (区画の半分を越えて書ける)、 最初に畳む時に v4 の 2 区画になる
+    /// (B の header、 A の capacity と version)。 B に前の周の record が残っていても読まない。
+    #[test]
+    fn a_v3_file_becomes_two_halves_at_the_first_fold() {
+        let p = tmp("halves-v3");
+        let cap = 64 * 1024u64;
+        let half = (cap / 2) as usize;
+        let mut v = 0u64;
+        {
+            let wal = OpLog::create(&p, cap as usize).unwrap();
+            {
+                // 0.36 が作った形: 1 区画、 header の capacity は file 全体、 B の header は無い
+                let m = wal.mmap_mut_slice();
+                m[4..8].copy_from_slice(&OPLOG_FILE_VERSION_V3.to_le_bytes());
+                m[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(cap as u32).to_le_bytes());
+                m[half..half + HEADER_SIZE].fill(0);
+            }
+            wal.two.store(false, Ordering::Release);
+            wal.hot.halves[0].size.store(cap as u32, Ordering::Release);
+            wal.hot.halves[1].size.store(0, Ordering::Release);
+            while wal_pos_offset(wal.head()) < 40 * 1024 {
+                append_group(&wal, &mut v);
+            }
+            assert_eq!(wal.switches(), 0);
+            wal.fsync().unwrap();
+        }
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!((wal.file_version(), wal.two_halves(), wal.capacity()), (OPLOG_FILE_VERSION_V3, false, cap));
+        assert_eq!(tie_values(&wal.recover_with_tail()), (0..v).collect::<Vec<_>>(), "区画の半分を越えた record も読める");
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
+        assert_eq!(
+            (wal.file_version(), wal.two_halves(), wal.half_capacity(), wal.capacity()),
+            (OPLOG_FILE_VERSION, true, cap / 2, cap)
+        );
+        {
+            let m = wal.mmap_slice();
+            let r32 = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+            assert_eq!((r32(4), r32(OFF_CAPACITY) as u64), (OPLOG_FILE_VERSION, cap / 2), "A の header");
+            assert_eq!(&m[half..half + 4], FILE_MAGIC, "B の header");
+            assert_eq!((r32(half + 4), r32(half + OFF_CAPACITY) as u64), (OPLOG_FILE_VERSION, cap / 2));
+            assert_eq!(u64::from_le_bytes(m[half + 8..half + 16].try_into().unwrap()), HEADER_SIZE as u64);
+        }
+        // A を埋めて B (前の周の record が残っている) へ移る
+        let start = v;
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        append_group(&wal, &mut v);
+        assert_eq!(tie_values(&wal.iter_committed()), (start..v).collect::<Vec<_>>(), "B に残った前の周の record は読まない");
+        wal.fsync().unwrap();
+        drop(wal);
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!((wal.file_version(), wal.two_halves()), (OPLOG_FILE_VERSION, true));
+        assert_eq!(tie_values(&wal.recover_with_tail()), (start..v).collect::<Vec<_>>());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 2 区画にできない小さい WAL は v3 の 1 区画で作る (今までと同じ形)。
+    #[test]
+    fn a_wal_too_small_for_two_halves_stays_one_v3_half() {
+        let p = tmp("halves-small");
+        let wal = OpLog::create(&p, 16 * 1024).unwrap();
+        assert_eq!((wal.file_version(), wal.two_halves(), wal.capacity()), (OPLOG_FILE_VERSION_V3, false, 16 * 1024));
+        drop(wal);
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!((wal.file_version(), wal.two_halves()), (OPLOG_FILE_VERSION_V3, false));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 1 件の record は 1 区画に収まること: 区画より大きい record は断る (`InvalidInput`、 畳んでも載らない)。
+    #[test]
+    fn a_record_larger_than_a_half_is_refused() {
+        let p = tmp("halves-big");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let big = vec![7u8; 40 * 1024];
+        let e = wal.append(Op::Content { eid: 1, key: "k", data: &big }).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        let fits = vec![7u8; 20 * 1024];
+        wal.append(Op::Content { eid: 1, key: "k", data: &fits }).unwrap();
+        wal.append(Op::Content { eid: 1, key: "k", data: &fits }).unwrap();
+        assert_eq!(wal.switches(), 1, "2 件目は移った区画に");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 書き手が載せられないのは、 今の区画が埋まって、 もう一方をまだ畳めていない時だけ。 古い区画を畳めばまた移れる。
+    #[test]
+    fn appends_fail_only_while_both_halves_are_full() {
+        let p = tmp("halves-full");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let mut v = 0u64;
+        let e = loop {
+            if let Err(e) = wal.append(Op::Tie { eid: 1, himo_id: 0, value: v }) {
+                break e;
+            }
+            v += 1;
+            wal.append(Op::Commit).unwrap();
+        };
+        assert_eq!(e.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(wal.switches(), 1, "1 度移ってから埋まった");
+        while wal.append(Op::Commit).is_ok() {}
+        assert!(wal.append_dead(), "今の区画に Commit も入らず、 移れる空の区画も無い");
+        assert!(wal.free_bytes() < wal.record_size_of(0) as u64);
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset(), "古い区画を畳む");
+        assert!(!wal.append_dead());
+        assert!(wal.free_bytes() >= wal.half_capacity() - HEADER_SIZE as u64);
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: v }).unwrap();
+        assert_eq!(wal.switches(), 2, "畳んだ区画へ移った");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 配り済みの印の位置 (切れ目) からの header の走査は、 区画をまたいで切れ目の後の record を全部読む。 切れ目の区画を畳んだ
+    /// 後は、 残った区画を頭から (全部切れ目の後)。
+    #[test]
+    fn the_header_visit_from_a_durable_cut_crosses_halves() {
+        let p = tmp("halves-cut");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let mut v = 0u64;
+        for _ in 0..10 {
+            append_group(&wal, &mut v);
+        }
+        let mut before = 0;
+        wal.visit_record_headers_with_tail(None, |_, _| before += 1);
+        let cut = wal.durable_cut_for(0);
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        for _ in 0..3 {
+            append_group(&wal, &mut v);
+        }
+        let mut all = Vec::new();
+        wal.visit_record_headers_with_tail(None, |_, h| all.push(h));
+        let mut after = Vec::new();
+        wal.visit_record_headers_with_tail(Some((cut.lap, cut.offset)), |_, h| after.push(h));
+        assert_eq!(after, all[before..].to_vec(), "切れ目の後 = A の残り + B 全部");
+        let in_b = {
+            let mut n = Vec::new();
+            wal.visit_record_headers_with_tail(Some((wal.hot.halves[1].lap(), HEADER_SIZE as u64)), |_, h| n.push(h));
+            n
+        };
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
+        let mut after_fold = Vec::new();
+        wal.visit_record_headers_with_tail(Some((cut.lap, cut.offset)), |_, h| after_fold.push(h));
+        assert_eq!(after_fold, in_b, "切れ目の区画を畳んだ後は B を頭から");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 書き手 4 本 (束ねる道も通る) が小さい WAL に書き続け、 何度も区画を切り替える横で、 読み手が位置から読んで進め、 畳む係が
+    /// 読み手の読み終えた区画を畳む (engine の bridge と consumer の形、 読むのと畳むのは同じ lock の下)。 読み手はどの record も
+    /// 1 回ずつ、 書き手ごとに積んだ順に受け取る。
+    #[test]
+    fn readers_see_every_record_once_while_writers_switch_halves() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        let p = tmp("halves-stress");
+        let wal = Arc::new(OpLog::create(&p, 64 * 1024).unwrap());
+        const W: u64 = 4;
+        const N: u64 = 3000;
+        let cursor = Arc::new(AtomicU64::new(HEADER_SIZE as u64));
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let transfer = Arc::new(Mutex::new(()));
+        let done = Arc::new(AtomicBool::new(false));
+        let read = {
+            let (wal, cursor, seen, transfer) = (wal.clone(), cursor.clone(), seen.clone(), transfer.clone());
+            move || {
+                let _g = transfer.lock().unwrap();
+                let from = cursor.load(Ordering::Acquire);
+                let (recs, end) = wal.iter_committed_from_with_offsets(from);
+                let mut s = seen.lock().unwrap();
+                for (r, _) in recs {
+                    if let DecodedOp::Tie { eid, value, .. } = r.op {
+                        s.push((eid, value));
+                    }
+                }
+                assert!(end >= from, "位置が戻った: {from:#x} → {end:#x}");
+                cursor.store(end, Ordering::Release);
+            }
+        };
+        let consumer = {
+            let (wal, cursor, transfer, done, read) = (wal.clone(), cursor.clone(), transfer.clone(), done.clone(), read.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    read();
+                    wal.advance_checkpoint(wal.head());
+                    let _g = transfer.lock().unwrap();
+                    wal.try_reset_if(|through| cursor.load(Ordering::Acquire) >= through);
+                }
+            })
+        };
+        let writers: Vec<_> = (0..W)
+            .map(|w| {
+                let wal = wal.clone();
+                std::thread::spawn(move || {
+                    let put = |op: Op<'_>| {
+                        while let Err(e) = wal.append(op.clone()) {
+                            assert_eq!(e.kind(), io::ErrorKind::OutOfMemory, "{e}");
+                            std::thread::yield_now();
+                        }
+                    };
+                    for i in 0..N {
+                        put(Op::Tie { eid: w, himo_id: 0, value: i });
+                        if i % 3 == 2 {
+                            put(Op::Commit);
+                        }
+                    }
+                    put(Op::Commit);
+                })
+            })
+            .collect();
+        for t in writers {
+            t.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        consumer.join().unwrap();
+        wal.append(Op::Commit).unwrap();
+        read();
+        assert!(wal.switches() >= 10, "前提: 何度も切り替えた ({})", wal.switches());
+        let seen = seen.lock().unwrap();
+        for w in 0..W {
+            let mine: Vec<u64> = seen.iter().filter(|(e, _)| *e == w).map(|(_, v)| *v).collect();
+            assert_eq!(mine, (0..N).collect::<Vec<_>>(), "書き手 {w} の record が 1 回ずつ積んだ順に届いていない");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 読み手が 2 つの区画の終端を読む間に、 書き手が今の区画に足して移り、 移った先にも書く。 読み手は今の区画の残りを飛ばさない
+    /// (前は区画の番号の順に終端を読み、 今の区画の終端を先に読むと、 その後に足された record を飛ばして移った先を読み、 位置が
+    /// その先へ進んだ: changefeed の受け手に区画 1 つ分が届かなかった)。
+    #[test]
+    fn a_reader_does_not_skip_records_added_while_it_reads_the_half_ends() {
+        let p = tmp("halves-readrace");
+        let wal = std::sync::Arc::new(OpLog::create(&p, 64 * 1024).unwrap());
+        let mut v = 0u64;
+        // B に移って A を畳む (A は空で、 周は B より新しい) → B を少し書いて、 読み手が B の途中まで読む
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
+        assert!(wal.hot.halves[0].is_empty() && lap_newer(wal.hot.halves[0].lap(), wal.hot.halves[1].lap()), "前提: A は空で周が新しい");
+        append_group(&wal, &mut v);
+        let (recs, cursor) = wal.iter_committed_from_with_offsets(HEADER_SIZE as u64);
+        let first = tie_values(&strip_offsets(recs));
+        // 次の読みの、 終端を 2 つ読む間に: B を埋めて A へ移り、 A にも書く
+        let (w, start) = (wal.clone(), v);
+        let written = std::sync::Arc::new(std::sync::Mutex::new(v));
+        let wr = written.clone();
+        read_plan_hook::set(Box::new(move || {
+            let mut v = start;
+            while w.switches() == 1 {
+                append_group(&w, &mut v);
+            }
+            append_group(&w, &mut v);
+            *wr.lock().unwrap() = v;
+        }));
+        let (recs, end) = wal.iter_committed_from_with_offsets(cursor);
+        let got = tie_values(&strip_offsets(recs));
+        let (recs2, _) = wal.iter_committed_from_with_offsets(end);
+        let got2 = tie_values(&strip_offsets(recs2));
+        let all = [first, got, got2].concat();
+        // A にあった分は畳んだので、 残っているのは B の頭から
+        let k = all[0];
+        assert!(k > 0, "前提: A を畳んだ");
+        assert_eq!(all, (k..*written.lock().unwrap()).collect::<Vec<_>>(), "読み手が record を飛ばした / 重ねた");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 書き出し (`checkpoint_and_reset` の sync) の最中に書き手が今の区画を埋めて移っても、 古い区画を畳む (書き出す前に読んだ head は
+    /// 古い区画の中なので、 1 回目は古い区画の checkpoint がその head までしか進まない → 新しい区画の head まで書き出し直す)。 前は
+    /// 畳めずに返り、 空きを待つ書き手が 「畳めない」 を見て書き込みを断った。
+    #[test]
+    fn a_switch_during_the_write_out_still_folds_the_old_half() {
+        let p = tmp("halves-syncrace");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let mut v = 0u64;
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset(), "A を畳む");
+        // B に書く。 書き出しの最中に B を埋めて A へ移る
+        append_group(&wal, &mut v);
+        let mut calls = 0;
+        let (advanced, folded) = wal.checkpoint_and_reset(
+            |_head| {
+                calls += 1;
+                if calls == 1 {
+                    while wal.switches() == 1 {
+                        append_group(&wal, &mut v);
+                    }
+                    append_group(&wal, &mut v);
+                }
+                true
+            },
+            |_| true,
+        );
+        assert_eq!((advanced, folded), (true, true), "書き出しの最中に移っても古い区画 (B) を畳む");
+        assert!(calls >= 2, "移った後の head まで書き出し直した");
+        assert!(wal.hot.halves[1].is_empty() && !wal.hot.halves[0].is_empty());
         let _ = std::fs::remove_file(&p);
     }
 }

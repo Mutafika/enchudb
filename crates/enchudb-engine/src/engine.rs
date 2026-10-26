@@ -316,13 +316,13 @@ impl Invariants {
 pub struct EngineStats {
     pub entity_count: u32,
     pub himo_count: u32,
-    /// WAL の次 append 位置(byte offset)
+    /// WAL の次 append 位置 (0.37: `(周 << 32) | 区画の中の offset`、 `enchudb_oplog::oplog::wal_pos`)
     pub oplog_head: u64,
-    /// 本体へ反映 + fsync 済みの位置
+    /// 本体へ反映 + fsync 済みの位置 (同じ形)
     pub oplog_checkpoint: u64,
     /// WAL ファイル容量(設定値、sparse)
     pub oplog_capacity: u64,
-    /// head - checkpoint。大きいと未 fsync が溜まっている
+    /// 本体へ書き出していない record の byte 数 (2 区画の和)。大きいと未 fsync が溜まっている
     pub oplog_lag_bytes: u64,
     /// 発行済みの最大 LSN
     pub oplog_next_lsn: u64,
@@ -1772,6 +1772,8 @@ pub mod write_out_hook {
         Opened,
         /// #656: 残りの中身を指す列 (紐の番号) の門を閉じた後 (その列を書き出す前)。 列ごとに呼ぶ
         Column(u16),
+        /// 0.37: `body_msync` が本体を書き出し終えた後 (書き出しが届かせた bridge の位置を置く前)
+        WrittenOut,
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
@@ -2020,7 +2022,8 @@ mod wal_room_commit_tests {
             eng.enable_sync_tables().unwrap();
             eng.flush().unwrap();
         }
-        let eng = Engine::open_concurrent_with_oplog(&path, 256 << 10).unwrap();
+        // 1 区画 (v3) の形の空き作りのやり直しを試すので、 2 区画にできない大きさ (`2 * HALF_ALIGN` 未満)
+        let eng = Engine::open_concurrent_with_oplog(&path, 24 << 10).unwrap();
         eng.set_peer_id(1);
         let hid = eng.himo_id("rows.val").unwrap() as u16;
         let rows: Vec<u64> = (0..1_000).map(|_| eng.entity_in("rows").unwrap()).collect();
@@ -2316,6 +2319,15 @@ mod durable_cut_tests {
         eng.oplog_sync().unwrap();
         {
             let _no_fold = eng.transfer_lock_for_fold();
+            // 2 区画: A を埋めて B へ移る (A は畳めないまま残るので、 空きは B の残りだけ)
+            let filler = eng.entity_in("notes").unwrap();
+            let switched = wal.switches();
+            let mut i = 0u32;
+            while wal.switches() == switched {
+                eng.tie_to(filler, "notes.note", i);
+                eng.oplog_commit();
+                i += 1;
+            }
             let e1 = eng.entity_in("notes").unwrap();
             let h0 = wal.head();
             eng.tie_text_to(e1, "notes.body", "x");
@@ -2387,8 +2399,7 @@ mod consumer_sleep_tests {
         let e = eng.entity().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
         let wal = eng.oplog.as_ref().unwrap().clone();
-        let empty = enchudb_oplog::oplog::HEADER_SIZE as u64;
-        let drained = |w: &enchudb_oplog::oplog::OpLog| w.head() == empty && w.checkpoint() == empty;
+        let drained = |w: &enchudb_oplog::oplog::OpLog| w.is_empty();
 
         let (at_window, consumer_waits) = mpsc::channel::<()>();
         let (go, resume) = mpsc::channel::<()>();
@@ -2401,7 +2412,7 @@ mod consumer_sleep_tests {
         eng.tie_to(e, "v", 1u32);
         consumer_waits.recv_timeout(Duration::from_secs(10)).expect("前提: consumer が空の WAL を見て寝る所まで来た");
         eng.tie_to(e, "v", 2u32);
-        assert!(wal.head() > empty, "前提: 割り込み点の間に WAL に書いた");
+        assert!(!wal.is_empty(), "前提: 割り込み点の間に WAL に書いた");
         go.send(()).unwrap();
 
         let end = Instant::now() + Duration::from_secs(3);
@@ -4773,6 +4784,10 @@ pub struct Engine {
     /// #440: 本体の書き出しが届かせた `sync_bridged` (書き出しの始めに読んだ値を、 書き出しが成功したら置く)。 これが
     /// `sync_bridged` に追いつくまで oplog を畳まない。
     sync_bridged_durable: std::sync::atomic::AtomicU64,
+    /// #440 (0.37 の 2 区画): 本体の書き出しが届かせた bridge の位置 (書き出しの始めに読んだ `sync_ops_offset` を、 書き出しが
+    /// 成功したら置く)。 この位置より前の record の行と payload はディスクにある。 古い区画は、 これがその区画の終わりを越えて
+    /// いれば畳める (書き手が今の区画に書き続け、 bridge がそれを写し続ける間、 `sync_bridged` の数は追いつかない)
+    sync_bridged_durable_pos: std::sync::atomic::AtomicU64,
     /// request17 (v9): ローカル write が cell の版数判定で弾かれた warn の一度きり
     /// フラグ。 構造上起きないはずの事象なので、 起きたら無音にしない。
     warned_cell_version_reject: std::sync::atomic::AtomicBool,
@@ -5358,6 +5373,7 @@ impl Engine {
             warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
             sync_bridged: std::sync::atomic::AtomicU64::new(0),
             sync_bridged_durable: std::sync::atomic::AtomicU64::new(0),
+            sync_bridged_durable_pos: std::sync::atomic::AtomicU64::new(0),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
@@ -6633,6 +6649,7 @@ impl Engine {
             warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
             sync_bridged: std::sync::atomic::AtomicU64::new(0),
             sync_bridged_durable: std::sync::atomic::AtomicU64::new(0),
+            sync_bridged_durable_pos: std::sync::atomic::AtomicU64::new(0),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
@@ -7492,7 +7509,16 @@ impl Engine {
     /// reset 後に append された record が `from > head` で transfer 対象から外れ、
     /// `_sync_ops` に bridge されず sync から無言で欠落する。 reset と同じ
     /// consumer thread から、 transfer 完了 (= offset==旧head) で畳んだ直後にのみ呼ぶこと。
+    ///
+    /// 0.37 (WAL の 2 区画): 戻すのは cursor が畳んだ区画を指している時だけ (`OpLog::holds`)。 古い区画だけを畳んだ時に、
+    /// 今の区画を指す cursor を頭に戻すと、 今の区画の record を配り直す。 畳んだ区画を指す cursor は戻さなくても、 そこから
+    /// 読むと残った区画を頭から読む (位置の周がどの区画にも無い)。
     pub fn reset_sync_ops_offset(&self) {
+        if let Some(wal) = self.oplog.as_ref()
+            && wal.holds(self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return;
+        }
         self.sync_ops_offset.store(
             enchudb_oplog::oplog::HEADER_SIZE as u64,
             std::sync::atomic::Ordering::Release,
@@ -7512,16 +7538,25 @@ impl Engine {
     /// 次の record が上書きされ、 次の oplog の fsync がそれを行の書き出しより先に届かせるので、 その間に電源が落ちると
     /// record が oplog にも `_sync_ops` にも無くなる。 畳む側は先に [`Self::write_out_bridged`] を呼ぶ。
     pub fn wal_fold_safe(&self) -> bool {
-        // bridge の判定が先 (cursor の追い越しを見つけたら、 そこで巻き戻す)
-        self.wal_fold_safe_bridge()
-            && self.sync_bridged.load(std::sync::atomic::Ordering::Acquire)
-                <= self.sync_bridged_durable.load(std::sync::atomic::Ordering::Acquire)
+        let through = self.oplog.as_ref().map_or(0, |w| w.head());
+        self.wal_fold_safe_to(through)
+    }
+
+    /// [`Self::wal_fold_safe`] の、 位置 `through` ([`enchudb_oplog::oplog::wal_pos`]) より前を畳んでよいか (2 区画の形で古い
+    /// 区画だけを畳む時は、 その区画の終わり。 `OpLog::try_reset_if` が渡す)。
+    fn wal_fold_safe_to(&self, through: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        // bridge の判定が先 (cursor の追い越しを見つけたら、 そこで巻き戻す)。 #440: 畳む区画の record の行が書き出してあること
+        // (写した行が全部書き出してあるか、 書き出しが届かせた bridge の位置が畳む区画の終わりを越えている)
+        self.wal_fold_safe_bridge(through)
+            && (self.sync_bridged.load(Ordering::Acquire) <= self.sync_bridged_durable.load(Ordering::Acquire)
+                || self.sync_bridged_durable_pos.load(Ordering::Acquire) >= through)
     }
 
     /// [`Self::wal_fold_safe`] のうち、 bridge が読み切ったか。 listener に配っていない record は、 畳む時に溜めへ移す
     /// ([`Self::spill_changes_for_fold`]。 0.34 までは配り終えるまで畳まず (#337)、 遅い listener が WAL を満杯にして書き込みを
     /// 落としていた)。
-    fn wal_fold_safe_bridge(&self) -> bool {
+    fn wal_fold_safe_bridge(&self, through: u64) -> bool {
         let Some(wal) = self.oplog.as_ref() else {
             return true;
         };
@@ -7552,10 +7587,10 @@ impl Engine {
             );
             return false;
         }
-        if offset >= head {
+        if offset >= through {
             return true;
         }
-        // offset < head でも、 WAL が「Commit 1 個すら append できない」満杯
+        // offset < through でも、 WAL が「Commit 1 個すら append できない」満杯
         // （append_dead）で、 かつ bridge が最後の committed group まで読み切って
         // いるなら、 残る tail は「閉じの Commit が満杯で書けなかった孤児 group」。
         // 今後 commit される可能性がゼロ（append が全て失敗する）なので、 recovery
@@ -7601,7 +7636,13 @@ impl Engine {
     ///   入らなかった孤児の group) を、 WAL に載らなかった write (#57) と同じに覚える (#450)。 その write は本体に
     ///   当たっているのに、 畳むと `_sync_ops` にも WAL にも無くなる — 覚えれば bridge がその author の floor を上げる
     pub fn wal_fold_safe_locked(&self) -> bool {
-        let safe = self.wal_fold_safe();
+        let through = self.oplog.as_ref().map_or(0, |w| w.head());
+        self.wal_fold_safe_locked_to(through)
+    }
+
+    /// [`Self::wal_fold_safe_locked`] の、 位置 `through` より前を畳む時 (`OpLog::try_reset_if` の述語)。
+    fn wal_fold_safe_locked_to(&self, through: u64) -> bool {
+        let safe = self.wal_fold_safe_to(through);
         if !safe {
             self.fold_race_saves
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7611,7 +7652,7 @@ impl Engine {
             && let Some(wal) = self.oplog.as_ref()
         {
             let from = self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
-            if from < wal.head() {
+            if from < through {
                 // 畳むと配れなくなる record なので、 WAL に載らなかった record と同じく `wal_dropped_records` にも数える
                 // (前は、 満杯で空きを待つ書き手がいる間は畳めず、 その書き手の append の失敗として数えられていた、 #511)
                 let dropped = wal.note_uncommitted_tail_dropped(from);
@@ -19662,9 +19703,15 @@ impl Engine {
     /// 分があれば通知係を起こす。 閉じていない末尾が残っていれば、 新しい ring に Commit を打ってその group を閉じる (打たない
     /// と、 次に書かれるまで末尾が渡らない。 consumer の tick も head が checkpoint より先にある時しか Commit を打たない)。
     fn after_fold_changes(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, folded: bool, moved: usize) {
+        // 畳んだ区画を指す cursor だけ頭に戻す (`reset_sync_ops_offset` と同じ。 今の区画を指す cursor を戻すと配り直す)
         if folded {
-            c.offset = enchudb_oplog::oplog::HEADER_SIZE as u64;
-            c.log_wal = enchudb_oplog::oplog::HEADER_SIZE as u64;
+            let start = enchudb_oplog::oplog::HEADER_SIZE as u64;
+            if !wal.holds(c.offset) {
+                c.offset = start;
+            }
+            if !wal.holds(c.log_wal) {
+                c.log_wal = start;
+            }
         }
         if folded && !c.open_tail.is_empty() {
             let _ = self.append_commit_marker(wal);
@@ -19679,9 +19726,10 @@ impl Engine {
     fn try_fold_with_changes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         let mut moved = 0;
-        let folded = self.wal_fold_safe()
-            && wal.try_reset_if(|| {
-                self.wal_fold_safe_locked()
+        // 先に lock の外で見積もる (畳める区画が無い / bridge が読み終えていないなら append_lock を取らない)
+        let folded = wal.fold_hint().is_some_and(|through| self.wal_fold_safe_to(through))
+            && wal.try_reset_if(|through| {
+                self.wal_fold_safe_locked_to(through)
                     && self.spill_changes_for_fold(wal, &mut c).map(|m| moved = m).is_some()
             });
         if folded {
@@ -20027,8 +20075,13 @@ impl Engine {
                             engine.write_out_bridged(wal);
                             let fold_guard = engine.transfer_lock_for_fold();
                             // listener に配っていない record は畳む直前に溜めへ移す (配り終えるのを待たない、 #337 の cursor の
-                            // 巻き戻しは配信の取り出しと直列)。 #63: bridge の cursor も巻き戻す
-                            engine.try_fold_with_changes(wal);
+                            // 巻き戻しは配信の取り出しと直列)。 #63: bridge の cursor も巻き戻す。 0.37: 1 回に畳むのは 1 区画
+                            // (古い区画を畳んだ後、 今の区画も書き出し済みならその場で畳む)
+                            for _ in 0..2 {
+                                if !engine.try_fold_with_changes(wal) {
+                                    break;
+                                }
+                            }
                             drop(fold_guard);
                             last_fsync = Instant::now();
                         }
@@ -20084,7 +20137,12 @@ impl Engine {
                             // #440: bridge した行と payload を書き出してから畳む
                             engine.write_out_bridged(wal);
                             let fold_guard = engine.transfer_lock_for_fold();
-                            engine.try_fold_with_changes(wal);
+                            // 0.37: 1 回に畳むのは 1 区画 (閉じる時は畳めるだけ畳む)
+                            for _ in 0..2 {
+                                if !engine.try_fold_with_changes(wal) {
+                                    break;
+                                }
+                            }
                             drop(fold_guard);
                         }
                         return;
@@ -20094,7 +20152,7 @@ impl Engine {
                     // (旧: 1 ms ごとに起きて見回り = 何もしない DB 1 つで 1 秒 500 回)。
                     // 時間で起きるのは、 書き出し (100 ms ごと) や畳みがまだ残っている間だけ
                     let wal_behind = |wal: &enchudb_oplog::oplog::OpLog| {
-                        wal.head() > wal.checkpoint() || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
+                        wal.head() > wal.checkpoint() || !wal.is_empty()
                     };
                     // 空と見た WAL (寝る印を立てた後にもう一度見る)
                     let mut idle_wal = None;
@@ -20200,7 +20258,7 @@ impl Engine {
     fn make_wal_room_inner(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> WalRoom {
         use std::sync::atomic::Ordering;
         self.wal_room_wanted.store(false, Ordering::Release);
-        if wal.head() <= enchudb_oplog::oplog::HEADER_SIZE as u64 {
+        if wal.is_empty() {
             return WalRoom::Transient; // 畳むものが無い (空いている)
         }
         let direct = !self.sync_tables_enabled();
@@ -20246,9 +20304,9 @@ impl Engine {
                         }
                         ok
                     },
-                    || {
+                    |through| {
                         direct
-                            && self.wal_fold_safe_locked()
+                            && self.wal_fold_safe_locked_to(through)
                             && self.spill_changes_for_fold(wal, &mut c).map(|m| moved = m).is_some()
                     },
                 );
@@ -20349,9 +20407,15 @@ impl Engine {
         self.consumer_waker.as_deref()
     }
 
-    /// #388: WAL が満杯の時に consumer が畳んで空いた回数 (書き手は待たされたが、 何も落ちていない)。
+    /// #388: WAL が満杯の時に consumer が畳んで空いた回数 (書き手は待たされたが、 何も落ちていない)。 0.37 の 2 区画の形では、
+    /// 書き出しの間も書き手を止めない (古い区画を書き出して畳む)。
     pub fn wal_room_folds(&self) -> u64 {
         self.wal_room_folds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 0.37: WAL の書き手が今の区画を埋めて、 もう一方の区画へ移った回数 (`OpLog::switches`)。 WAL が無ければ 0。
+    pub fn wal_switches(&self) -> u64 {
+        self.oplog.as_ref().map_or(0, |w| w.switches())
     }
 
     /// WAL の空きを待つ書き手が、 待ちの上限 (5 秒) まで待っても空かなかった回数。 畳めない状態がすぐ分かった時 (sync の bridge が
@@ -20362,14 +20426,15 @@ impl Engine {
     }
 
     /// #440: bridge が写した `_sync_ops` の行と payload をまだ書き出していなければ、 本体を書き出す。 oplog を畳む前に呼ぶ
-    /// (畳むかは [`Self::wal_fold_safe`] が決める。 書き出せなければ畳まない)。 畳めない時 (head が checkpoint より先 =
-    /// 書き出し待ちの record がある) は何もしない — その record の書き出しが行も一緒に書き出す。
+    /// (畳むかは [`Self::wal_fold_safe`] が決める。 書き出せなければ畳まない)。 畳める区画が無い時 (1 区画の形で head が
+    /// checkpoint より先 = 書き出し待ちの record がある) は何もしない — その record の書き出しが行も一緒に書き出す。 0.37 の
+    /// 2 区画の形では、 書き手が今の区画に書き続けていても古い区画は畳めるので、 その区画の行が書き出してあるかを見る。
     fn write_out_bridged(&self, wal: &enchudb_oplog::oplog::OpLog) {
         use std::sync::atomic::Ordering;
-        if wal.head() != wal.checkpoint() {
-            return;
-        }
-        if self.sync_bridged.load(Ordering::Acquire) > self.sync_bridged_durable.load(Ordering::Acquire) {
+        let Some(through) = wal.fold_hint() else { return };
+        if self.sync_bridged.load(Ordering::Acquire) > self.sync_bridged_durable.load(Ordering::Acquire)
+            && self.sync_bridged_durable_pos.load(Ordering::Acquire) < through
+        {
             let _ = self.body_msync();
         }
     }
@@ -20404,16 +20469,21 @@ impl Engine {
             Backing::Segments(set) => {
                 // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
                 let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
-                // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める
+                // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める (bridge は行を書いて
+                // から cursor を進めるので、 読んだ cursor より前の record の行は書き出しに入る)
                 let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
+                let bridged_pos = self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
                 // ring の payload も本体と同じ契機で、 それを指す `_sync_ops` の行より先に書き出す (#440: 行だけ届いて
                 // payload が無いと dead row になる)
                 self.flush_payload_ring()?;
                 self.write_out_body(false)?;
+                #[cfg(feature = "crashsim")]
+                write_out_hook::call(write_out_hook::Phase::WrittenOut);
                 if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
                     leaf.durable_end(t);
                 }
                 self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
+                self.sync_bridged_durable_pos.fetch_max(bridged_pos, std::sync::atomic::Ordering::AcqRel);
                 // 「この時点の segment 長」 を記録する。 次の open で切り詰めを検出できる。
                 set.write_manifest()
             }
@@ -20421,6 +20491,7 @@ impl Engine {
                 // ディスクが無いので、 bridge した行はいつでも畳める (#440)
                 let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
                 self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
+                self.sync_bridged_durable_pos.store(u64::MAX, std::sync::atomic::Ordering::Release);
                 Ok(())
             }
         }
@@ -20768,9 +20839,12 @@ impl Engine {
 
     pub fn stats(&self) -> EngineStats {
         use std::sync::atomic::Ordering;
-        let (oplog_head, oplog_checkpoint, oplog_capacity, oplog_lsn) = match self.oplog.as_ref() {
-            Some(w) => (w.head(), w.checkpoint(), w.usage().1, w.next_lsn().saturating_sub(1)),
-            None => (0, 0, 0, 0),
+        let (oplog_head, oplog_checkpoint, oplog_capacity, oplog_lag, oplog_lsn) = match self.oplog.as_ref() {
+            Some(w) => {
+                let (lag, cap) = w.usage();
+                (w.head(), w.checkpoint(), cap, lag, w.next_lsn().saturating_sub(1))
+            }
+            None => (0, 0, 0, 0, 0),
         };
         let (peer_id, hlc_entries, max_hlc) = (
             self.peer_id.load(Ordering::Acquire),
@@ -20784,7 +20858,7 @@ impl Engine {
             oplog_head,
             oplog_checkpoint,
             oplog_capacity,
-            oplog_lag_bytes: oplog_head.saturating_sub(oplog_checkpoint),
+            oplog_lag_bytes: oplog_lag,
             oplog_next_lsn: oplog_lsn,
             durable_lsn: self.durable_lsn.load(Ordering::Acquire),
             // 0.34 で write queue を外した (欄は互換のために残す)
@@ -21203,12 +21277,14 @@ impl Engine {
         let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
         // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める。 ring は行より先に
         let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
+        let bridged_pos = self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
         self.flush_payload_ring()?;
         self.write_out_body(true)?;
         if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
             leaf.durable_end(t);
         }
         self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
+        self.sync_bridged_durable_pos.fetch_max(bridged_pos, std::sync::atomic::Ordering::AcqRel);
         if refs {
             self.vocab.mark_index_clean_refs();
         } else {
@@ -22614,7 +22690,8 @@ mod tests {
         // transfer の CAS も外れて修理の数が 2 になる、 または巻き戻しの後に裏の transfer が cursor を進め直す (手元の CI で
         // 1 回、 修理の数 2 で落ちた)。 巻き戻しと下の stale store の模擬は lock を取らないので、 握ったままで詰まらない。
         let _fold = eng.transfer_lock_for_fold();
-        eng.reset_sync_ops_offset();
+        // 0.37: `reset_sync_ops_offset` は cursor が畳んだ区画を指す時だけ戻す (ここでは区画を畳んでいない) ので、 巻き戻しを直に置く
+        eng.sync_ops_offset.store(enchudb_oplog::oplog::HEADER_SIZE as u64, std::sync::atomic::Ordering::Release);
         assert_eq!(
             eng.sync_ops_bridge_offset(),
             enchudb_oplog::oplog::HEADER_SIZE as u64,
