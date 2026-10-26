@@ -137,3 +137,87 @@ fn leaf_columns_cannot_be_balls() {
     drop(db);
     cleanup(&path);
 }
+
+/// 書き手 4 本が自分の row 16 個の a (値 0..6) を書いたり外したりする (engine の `tie_to_by_id` / `untie_by_id`)。 回ごとに
+/// Barrier でそろえ、 そろった時刻と書き手の写しを控える。 全部の回の時刻で、 デッキのカードの答えと球の答えを写しと比べる
+/// (同じ値のカードに書き手が並んで足す・外れた時刻を書く・bucket を伸ばして写す、 を並べて通す)。 書き換えの値の鍵を
+/// 外す変異は release で 20 回中 20 回落ちる (変異なしは 20 回中 0 回、 2026-10-26)。
+#[test]
+fn concurrent_writers_leave_history_in_the_cards() {
+    const TH: usize = 4;
+    const PER: usize = 16;
+    const VALS: u64 = 6;
+    let path = tmp_path("conc");
+    cleanup(&path);
+    let mut db = Database::create(&path).unwrap();
+    db.table("t").number("id").number("a").primary_key("id").build().unwrap();
+    let t = db.get_table("t").unwrap();
+    let mut eids = Vec::new();
+    for i in 0..(TH * PER) as i64 {
+        eids.push(t.insert().set("id", i).commit().unwrap());
+    }
+    let eng = db.arc_engine();
+    assert!(eng.declare_ball("t.a").unwrap());
+    let ha = eng.himo_id("t.a").unwrap() as u16;
+    let rounds = 200;
+    let bar = std::sync::Barrier::new(TH + 1);
+    let log = std::sync::Mutex::new(vec![None::<u64>; TH * PER]);
+    let mut checks: Vec<(u64, Vec<Option<u64>>)> = Vec::new();
+    std::thread::scope(|s| {
+        for th in 0..TH {
+            let (eng, bar, log, eids) = (&eng, &bar, &log, &eids);
+            s.spawn(move || {
+                let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ th as u64);
+                let mut mine = vec![None::<u64>; PER];
+                for _ in 0..rounds {
+                    for _ in 0..30 {
+                        let k = r.below(PER as u64) as usize;
+                        let e = eids[th * PER + k];
+                        match r.below(VALS + 1) {
+                            VALS => {
+                                eng.untie_by_id(e, ha);
+                                mine[k] = None;
+                            }
+                            v => {
+                                eng.tie_to_by_id(e, ha, v as u32);
+                                mine[k] = Some(v);
+                            }
+                        }
+                    }
+                    log.lock().unwrap()[th * PER..(th + 1) * PER].copy_from_slice(&mine);
+                    bar.wait();
+                    bar.wait();
+                }
+            });
+        }
+        for _ in 0..rounds {
+            bar.wait();
+            checks.push((eng.ball_now(), log.lock().unwrap().clone()));
+            bar.wait();
+        }
+    });
+    for v in 0..VALS {
+        assert!(eng.ball_value_in_deck("t.a", v));
+    }
+    for (k, (tm, want)) in checks.iter().enumerate() {
+        for v in 0..VALS {
+            let deck: Vec<u64> = (0..TH * PER).filter(|&i| want[i] == Some(v)).map(|i| eids[i]).collect();
+            assert_eq!(eng.ball_pull_at("t.a", v, *tm), deck, "回 {k} t={tm} v={v}");
+        }
+        for i in 0..TH * PER {
+            assert_eq!(eng.ball_value_at(eids[i], "t.a", *tm), want[i], "回 {k} e={}", eids[i]);
+        }
+    }
+    // 今の読み (印で外れたカードを飛ばす) も合う
+    let last = &checks.last().unwrap().1;
+    for v in 0..VALS {
+        let mut cur = eng.pull_raw("t.a", v as u32);
+        cur.sort_unstable();
+        let want: Vec<u64> = (0..TH * PER).filter(|&i| last[i] == Some(v)).map(|i| eids[i]).collect();
+        assert_eq!(cur, want, "今の v={v}");
+    }
+    assert_eq!(eng.ball_spin_misses(), 0);
+    drop(t);
+    drop(db);
+    cleanup(&path);
+}
