@@ -173,15 +173,11 @@ fn mode_w(threads: usize, seed: u64) {
     #[cfg(not(feature = "ball"))]
     let bytes = 0usize;
     #[cfg(feature = "ball")]
-    let misses = eng.ball_spin_misses();
+    let diffs: u64 = ["t.a", "t.b", "t.w"].iter().filter_map(|h| eng.ball_diff_count(h)).sum();
     #[cfg(not(feature = "ball"))]
-    let misses = 0usize;
-    #[cfg(feature = "ball")]
-    let compacts = eng.ball_spin_compactions();
-    #[cfg(not(feature = "ball"))]
-    let compacts = 0usize;
+    let diffs = 0u64;
     println!(
-        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{misses},\"spin_compacts\":{compacts},\"rss_peak_kb\":{}}}",
+        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{diffs},\"rss_peak_kb\":{}}}",
         rss_peak_kb()
     );
 }
@@ -254,11 +250,9 @@ fn mode_r(seed: u64) {
     time("get_now", 100_000, &|k| eng.get(picks[k], "t.a").unwrap_or(0) as usize);
     time("value_at_t5", 100_000, &|k| eng.ball_value_at(picks[k], "t.a", t5).unwrap_or(0) as usize);
     let (faces, bytes) = eng.ball_stats("t.a").unwrap();
-    assert!((0..100u64).all(|v| eng.ball_value_in_deck("t.a", v)), "a の値は全部カードが時刻を持つ");
     println!(
-        "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{},\"spin_compacts\":{},\"rss_peak_kb\":{}}}",
-        eng.ball_spin_misses(),
-        eng.ball_spin_compactions(),
+        "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{},\"rss_peak_kb\":{}}}",
+        eng.ball_diff_count("t.a").unwrap(),
         rss_peak_kb()
     );
 }

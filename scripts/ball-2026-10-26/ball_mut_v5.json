@@ -1,0 +1,104 @@
+[
+ {
+  "name": "外した面を閉じない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            f.to.store(ts, Ordering::Release);",
+  "replace": "            let _ = f;"
+ },
+ {
+  "name": "球の読みが外れた時刻を見ない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "return (f.to.load(Ordering::Acquire) > t).then(|| f.value.load(Ordering::Relaxed));",
+  "replace": "return Some(f.value.load(Ordering::Relaxed));"
+ },
+ {
+  "name": "前からの面を時刻 1 から",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.push_face(i, eid, NONE, v, 0);",
+  "replace": "self.push_face(i, eid, NONE, v, 1);"
+ },
+ {
+  "name": "時刻を進めない (書き換えの時刻が今と同じ)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;",
+  "replace": "let ts = clock.fetch_add(1, Ordering::Relaxed);"
+ },
+ {
+  "name": "塊の中の場所を進めない (同じ場所を 2 度渡す)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            b[k].1 += 1;\n",
+  "replace": ""
+ },
+ {
+  "name": "untie / delete を記さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            self.balls.record(hid as u16, local, self.himos[hid].get_value(local), None);\n",
+  "replace": ""
+ },
+ {
+  "name": "書き換えを記さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            self.balls.record(hid as u16, local, self.himos[hid].get_value(local), Some(value));\n",
+  "replace": ""
+ },
+ {
+  "name": "帳面に 出た を書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            self.log_push(o, Diff { t: ts, eid, into: 0 }, &guard);\n",
+  "replace": ""
+ },
+ {
+  "name": "帳面に 入った を書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            self.log_push(n, Diff { t: ts, eid, into: 1 }, &guard);\n",
+  "replace": ""
+ },
+ {
+  "name": "帳面の二分探索で t ちょうどの差分も後ろに数える",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "d.partition_point(|x| x.t <= t)",
+  "replace": "d.partition_point(|x| x.t < t)"
+ },
+ {
+  "name": "最初の差分でなく最後の差分で決める",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "first.sort_unstable_by_key(|&(e, i, _)| (e, i));",
+  "replace": "first.sort_unstable_by_key(|&(e, i, _)| (e, u32::MAX - i));"
+ },
+ {
+  "name": "入った / 出たを逆に当てる",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "(x.eid, i as u32, x.into == 1)",
+  "replace": "(x.eid, i as u32, x.into == 0)"
+ },
+ {
+  "name": "時刻を帳面の鍵の外で取る",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        let _held: Vec<_> = ks.iter().map(|&k| self.locks[k].lock()).collect();\n        let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;\n",
+  "replace": "        let ts = clock.fetch_add(1, Ordering::Relaxed) + 1;\n        std::thread::yield_now();\n        let _held: Vec<_> = ks.iter().map(|&k| self.locks[k].lock()).collect();\n"
+ },
+ {
+  "name": "帳面の鍵を取らない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        let _held: Vec<_> = ks.iter().map(|&k| self.locks[k].lock()).collect();\n",
+  "replace": "        let _held: Vec<()> = Vec::new();\n"
+ },
+ {
+  "name": "伸ばした帳面に前の差分を写さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            unsafe { *data[i].get() = *b.data[i].get() };\n",
+  "replace": ""
+ },
+ {
+  "name": "大きい値の帳面を読みと書きで別の表に",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "self.wide[v as usize % WIDE].lock().unwrap_or_else(|e| e.into_inner()).get(&v).cloned().map(LogRef::Wide)",
+  "replace": "self.wide[(v as usize + 1) % WIDE].lock().unwrap_or_else(|e| e.into_inner()).get(&v).cloned().map(LogRef::Wide)"
+ },
+ {
+  "name": "同じ値の書き直しも記す",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        if old == new {\n            return None;\n        }\n",
+  "replace": ""
+ }
+]
