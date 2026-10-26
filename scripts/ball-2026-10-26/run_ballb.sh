@@ -26,6 +26,7 @@ for seed in $SEEDS; do
         lclk_on) B=$S/target-ballb-lclk/release/ballb; export BALL=1 ;;
         v4_on) B=$S/ballb-proto-v4.bin; export BALL=1 ;;
         v5_on) B=$S/ballb-proto-v5.bin; export BALL=1 ;;
+        v6_on) B=$S/ballb-proto-v6.bin; export BALL=1 ;;
       esac
       quiet; l=$(load1); f=$(freeg); t0=$(date +%s)
       "$B" w $th $seed | sed "s/^{/{\"v\":\"$v\",\"load\":$l,\"free_g\":$f,/" >> "$RES"

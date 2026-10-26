@@ -15,6 +15,8 @@ for seed in 41 42 43; do for th in 1 4; do for v in ${VERSIONS:-base ab w}; do
     v4w) B=$S/ballb-proto-v4.bin; export BALL=1 BALL_COLS=t.w ;;
     v5ab) B=$S/ballb-proto-v5.bin; export BALL=1 BALL_COLS=t.a,t.b ;;
     v5w) B=$S/ballb-proto-v5.bin; export BALL=1 BALL_COLS=t.w ;;
+    v6ab) B=$S/ballb-proto-v6.bin; export BALL=1 BALL_COLS=t.a,t.b ;;
+    v6w) B=$S/ballb-proto-v6.bin; export BALL=1 BALL_COLS=t.w ;;
   esac
   quiet; l=$(load1)
   "$B" w $th $seed | sed "s/^{/{\"v\":\"$v\",\"load\":$l,/" >> "$RES"

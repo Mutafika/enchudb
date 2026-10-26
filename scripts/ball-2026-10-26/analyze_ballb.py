@@ -21,7 +21,7 @@ stages = ["w_ins", "w_upd", "w_untie", "w_retie"]
 fail = []
 for th in (1, 4):
     print(f"\n書き手 {th} 本 (ns / 1 回、 中央値、 seed × cycle)")
-    print(f"{'段':<8} {'base':>8} {'base2':>8} {'off':>8} {'on':>8} {'off/base':>9} {'線':>6} {'on/base':>8} {'on-base':>8} {'lclk':>8} {'on-lclk':>8} {'v4':>8} {'v4-base':>8} {'v5':>8} {'v5-base':>8}")
+    print(f"{'段':<8} {'base':>8} {'base2':>8} {'off':>8} {'on':>8} {'off/base':>9} {'線':>6} {'on/base':>8} {'on-base':>8} {'lclk':>8} {'on-lclk':>8} {'v4':>8} {'v4-base':>8} {'v5':>8} {'v5-base':>8} {'v6':>8} {'v6-base':>8}")
     for s in stages:
         b, b2, off, on = (med.get((v, th, s)) for v in ("base", "base2", "proto_off", "proto_on"))
         if None in (b, b2, off, on):
@@ -34,7 +34,9 @@ for th in (1, 4):
         v4 = med.get(("v4_on", th, s))
         extra += f" {v4:8.1f} {v4 - b:8.1f}" if v4 is not None else f" {'':>8} {'':>8}"
         v5 = med.get(("v5_on", th, s))
-        extra += f" {v5:8.1f} {v5 - b:8.1f}" if v5 is not None else ""
+        extra += f" {v5:8.1f} {v5 - b:8.1f}" if v5 is not None else f" {'':>8} {'':>8}"
+        v6 = med.get(("v6_on", th, s))
+        extra += f" {v6:8.1f} {v6 - b:8.1f}" if v6 is not None else ""
         print(f"{s:<8} {b:8.1f} {b2:8.1f} {off:8.1f} {on:8.1f} {off / b:9.3f} {line:6.3f} {on / b:8.3f} {on - b:8.1f}{extra}")
 print(f"\n(A2) 宣言なしの値段が線を越えた段: {fail if fail else 'なし'}")
 okr = [r for r in rows if r["kind"] == "ok" and r["v"] == "proto_on"]
@@ -42,7 +44,7 @@ for th in (1, 4):
     x = [r for r in okr if r["threads"] == th]
     if x:
         print(f"球の面 (書き手 {th} 本): faces {statistics.median(r['faces'] for r in x):.0f}、 取った byte {statistics.median(r['ball_bytes'] for r in x) / 2**20:.1f} MiB")
-for v in ("base", "proto_off", "proto_on", "lclk_on", "v4_on", "v5_on"):
+for v in ("base", "proto_off", "proto_on", "lclk_on", "v4_on", "v5_on", "v6_on"):
     x = [r["rss_peak_kb"] for r in rows if r["kind"] == "ok" and r["v"] == v]
     if x:
         print(f"RSS の峰 {v}: {statistics.median(x) / 1024:.0f} MiB")

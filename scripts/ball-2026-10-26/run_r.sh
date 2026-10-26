@@ -5,6 +5,7 @@
 # (R2) pull_at_t5 (真ん中の時点) を前の版と並べる。 見込み: 6 回目は 5 回目 (269 µs) の半分以下
 # (R3) pull_at_now / pull_now / value_at_t5 は前の版の ±20% に収まる (bit の表は差分の少ない読みでは使わない)
 # (R4) 負荷 > 8 の回は判定から外す (印を付けて残す)
+# 7 回目 (差分を細くする) の基準は BALL_PLAN.md の 7 回目 (VERSIONS="v6 cur"): t5 は 6 回目の 0.7 倍以下、 他は ±20%、 RSS は 6 回目以下
 S=$(cd "$(dirname "$0")" && pwd)
 RES=${RES:-$S/results_ballb_r.jsonl}
 : > "$RES"

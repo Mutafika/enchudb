@@ -10,7 +10,9 @@
 //!   値ごとの差分の並びはそのまま時刻の順。 「時点 t にこの値だった球」 ([`Ball::pull_at`]) は、 今のデッキから t より後の差分を
 //!   新しい方から逆に当てて作る (入った → 抜く、 出た → 足す。 最後に当たる = t より後の最初の差分が t の時の向きを決め、
 //!   差分の無い球は今と同じ)。 手間は 「t より後の差分の数」 に比例
-//!   - `LOG_DENSE` 未満の値は値ごとの帳面 (`DiffLog`、 差分を詰めて並べる)
+//!   - `LOG_DENSE` 未満の値は値ごとの帳面 (`DiffLog`)。 差分は時刻 / eid / 入った bit の列 3 本に分けて詰める: 戻す時に
+//!     読むのは eid と bit (1 差分 4 B + 1 bit)、 時刻は t の二分探索だけが読む (1 つの構造体 16 B に並べていた時は、 真ん中の
+//!     時点の読みの大半が cache の外から差分を読む分だった)
 //!   - それより大きい値 (時刻 / ID の列: 1 つの値の差分が 1〜2 個) は値ごとに帳面を作らず、 値の下位 bit で分けた
 //!     `WIDE` 本の列 (`WideStripe`) に足し、 同じ値の 1 つ前の差分へ糸を張る。 列への書き足し (値 → 糸の頭の表を引く) は
 //!     名簿の鍵の**外**で済ませる: 名簿の鍵を取る前に列の lock を取って場所を取り ([`Ball::reserve`]、 時刻は未定)、
@@ -135,15 +137,30 @@ struct Diff {
     into: u32,
 }
 
-/// 帳面の backing。 `data[0..len]` が出した差分 (以後変わらない)。
+/// 帳面の backing。 差分を列 3 本に分けて持つ: 時刻 (時点 t の二分探索だけが読む) / eid / 入った bit (差分 64 個で 1 語、
+/// 出していない bit は 0)。 戻す時に読むのは eid と bit だけ (1 差分 4 B + 1 bit)。 `[0..len]` が出した差分 (以後変わらない)。
 struct LogBuf {
-    data: Box<[UnsafeCell<Diff>]>,
+    t: Box<[UnsafeCell<u64>]>,
+    eid: Box<[UnsafeCell<u32>]>,
+    into: Box<[AtomicU64]>,
     len: AtomicUsize,
 }
 
 // SAFETY: 出した範囲 [0..len] は書き換わらない。 書き手 (名簿の鍵の下で 1 本) は [len] だけに書いてから len を Release で進め、
-// 読み手は len を Acquire で読んで [0..len] だけを読む。
+// 読み手は len を Acquire で読んで [0..len] だけを読む。 入った bit の語は読み手の読む bit と書き手の立てる bit が同じ語に
+// 乗るので atomic (書き手は 1 本、 立てるだけ)。
 unsafe impl Sync for LogBuf {}
+
+impl LogBuf {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            t: (0..cap).map(|_| UnsafeCell::new(0)).collect(),
+            eid: (0..cap).map(|_| UnsafeCell::new(0)).collect(),
+            into: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            len: AtomicUsize::new(0),
+        }
+    }
+}
 
 /// 値 1 つのデッキの差分の帳面。 書き手 1 本 (名簿の鍵の下) / 読み手は lock を取らない (epoch)。 足すのは後ろだけ、 満杯なら
 /// 倍の backing に写して差し替える (古い backing は読み手が抜けてから捨てる)。
@@ -153,51 +170,132 @@ struct DiffLog {
 
 impl DiffLog {
     fn new() -> Self {
-        Self { buf: Atomic::new(LogBuf { data: Box::new([]), len: AtomicUsize::new(0) }) }
+        Self { buf: Atomic::new(LogBuf::with_cap(0)) }
     }
 
     /// 後ろに足す。 名簿の鍵を持つ 1 thread だけ。
     fn push(&self, d: Diff, guard: &Guard) {
         let cur = self.buf.load(Ordering::Acquire, guard);
         // SAFETY: buf は常に非 null。
-        let b = unsafe { cur.deref() };
+        let mut b = unsafe { cur.deref() };
         let l = b.len.load(Ordering::Relaxed);
-        if l < b.data.len() {
-            // SAFETY: [l] はまだ出していない (読み手は読まない)。 書き手は 1 本
-            unsafe { *b.data[l].get() = d };
-            b.len.store(l + 1, Ordering::Release);
-            return;
+        if l == b.t.len() {
+            let n = LogBuf::with_cap((l * 2).max(4));
+            for i in 0..l {
+                // SAFETY: 古い backing の [0..l] は出した範囲で変わらない。 新しい backing はまだ誰も見ていない
+                unsafe {
+                    *n.t[i].get() = *b.t[i].get();
+                    *n.eid[i].get() = *b.eid[i].get();
+                }
+            }
+            for (w, x) in n.into.iter().zip(&b.into[..l.div_ceil(64)]) {
+                w.store(x.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            n.len.store(l, Ordering::Relaxed);
+            let n = Owned::new(n).into_shared(guard);
+            self.buf.store(n, Ordering::Release);
+            // SAFETY: 古い backing は読み手が epoch を抜けてから捨てる。 新しい backing は今 store した (非 null)
+            unsafe {
+                guard.defer_destroy(cur);
+                b = n.deref();
+            }
         }
-        let cap = (b.data.len() * 2).max(4);
-        let data: Box<[UnsafeCell<Diff>]> = (0..cap).map(|_| UnsafeCell::new(Diff::default())).collect();
-        for i in 0..l {
-            // SAFETY: 古い backing の [0..l] は出した範囲で変わらない。 新しい backing はまだ誰も見ていない
-            unsafe { *data[i].get() = *b.data[i].get() };
+        // SAFETY: [l] はまだ出していない (読み手は読まない)。 書き手は 1 本
+        unsafe {
+            *b.t[l].get() = d.t;
+            *b.eid[l].get() = d.eid;
         }
-        // SAFETY: 同上
-        unsafe { *data[l].get() = d };
-        self.buf.store(Owned::new(LogBuf { data, len: AtomicUsize::new(l + 1) }), Ordering::Release);
-        // SAFETY: 古い backing は読み手が epoch を抜けてから捨てる。
-        unsafe { guard.defer_destroy(cur) };
+        if d.into == 1 {
+            let w = &b.into[l >> 6];
+            w.store(w.load(Ordering::Relaxed) | 1 << (l & 63), Ordering::Relaxed);
+        }
+        b.len.store(l + 1, Ordering::Release);
     }
 
-    /// 出した差分を読む。
-    fn read<R>(&self, guard: &Guard, f: impl FnOnce(&[Diff]) -> R) -> R {
+    /// 出した差分を読む: f(時刻, eid, 入った bit)。
+    fn read<R>(&self, guard: &Guard, f: impl FnOnce(&[u64], &[u32], &[AtomicU64]) -> R) -> R {
         // SAFETY: buf は常に非 null、 guard が backing を生かす。
         let b = unsafe { self.buf.load(Ordering::Acquire, guard).deref() };
         let n = b.len.load(Ordering::Acquire);
-        // SAFETY: [0..n] は出した範囲 (変わらない)。 UnsafeCell<Diff> は Diff と同じ表現
-        let s = unsafe { std::slice::from_raw_parts(b.data.as_ptr() as *const Diff, n) };
-        f(s)
+        // SAFETY: [0..n] は出した範囲 (変わらない)。 UnsafeCell<T> は T と同じ表現
+        let (t, eid) = unsafe {
+            (std::slice::from_raw_parts(b.t.as_ptr() as *const u64, n), std::slice::from_raw_parts(b.eid.as_ptr() as *const u32, n))
+        };
+        f(t, eid, &b.into)
     }
 
     fn len(&self, guard: &Guard) -> usize {
-        self.read(guard, |s| s.len())
+        self.read(guard, |t, _, _| t.len())
     }
 
-    fn cap(&self, guard: &Guard) -> usize {
+    /// 取った大きさ (byte)。
+    fn bytes(&self, guard: &Guard) -> usize {
         // SAFETY: buf は常に非 null。
-        unsafe { self.buf.load(Ordering::Acquire, guard).deref() }.data.len()
+        let b = unsafe { self.buf.load(Ordering::Acquire, guard).deref() };
+        b.t.len() * 12 + b.into.len() * 8
+    }
+}
+
+/// 時点 t より後の差分 (時刻の順) の eid と入った bit。 差分 k (`eids[k]`) の bit は `into` の `skip + k` 番目。
+#[derive(Clone, Copy)]
+struct Tail<'a> {
+    eids: &'a [u32],
+    into: &'a [AtomicU64],
+    skip: usize,
+}
+
+impl Tail<'_> {
+    fn len(&self) -> usize {
+        self.eids.len()
+    }
+
+    #[inline]
+    fn entered(&self, k: usize) -> bool {
+        let i = self.skip + k;
+        self.into[i >> 6].load(Ordering::Relaxed) >> (i & 63) & 1 == 1
+    }
+
+    /// 新しい方から (eid, 入った) を渡す (bit の語は 64 個に 1 回読む)。
+    #[inline]
+    fn for_each_rev(&self, mut f: impl FnMut(u32, bool)) {
+        let mut k = self.eids.len();
+        while k > 0 {
+            let i = self.skip + k - 1;
+            let w = self.into[i >> 6].load(Ordering::Relaxed);
+            let start = ((i >> 6) << 6).saturating_sub(self.skip);
+            for j in (start..k).rev() {
+                f(self.eids[j], w >> ((self.skip + j) & 63) & 1 == 1);
+            }
+            k = start;
+        }
+    }
+}
+
+/// 集めた差分の写し (大きい値の糸から集めた差分、 試験)。
+struct TailBuf {
+    eids: Vec<u32>,
+    into: Vec<AtomicU64>,
+}
+
+impl TailBuf {
+    /// 時刻の順の差分から。
+    fn new(ds: impl IntoIterator<Item = (u32, bool)>) -> Self {
+        let mut b = Self { eids: Vec::new(), into: Vec::new() };
+        for (k, (e, into)) in ds.into_iter().enumerate() {
+            b.eids.push(e);
+            if k & 63 == 0 {
+                b.into.push(AtomicU64::new(0));
+            }
+            if into {
+                *b.into[k >> 6].get_mut() |= 1 << (k & 63);
+            }
+        }
+        b
+    }
+
+    /// `from` 番目から後。
+    fn tail(&self, from: usize) -> Tail<'_> {
+        Tail { eids: &self.eids[from..], into: &self.into, skip: from }
     }
 }
 
@@ -250,7 +348,7 @@ impl WideStripe {
     }
 
     /// 値 `v` の t より後の差分を時刻の順に。
-    fn after(&self, v: u64, t: u64) -> Vec<Diff> {
+    fn after(&self, v: u64, t: u64) -> TailBuf {
         let mut out = Vec::new();
         let mut at = self.heads.get(&v).copied().unwrap_or(0);
         while at != 0 {
@@ -258,11 +356,10 @@ impl WideStripe {
             if d.t <= t {
                 break;
             }
-            out.push(Diff { t: d.t, eid: d.eid, into: d.link & 1 });
+            out.push((d.eid, d.link & 1 == 1));
             at = d.link >> 1;
         }
-        out.reverse();
-        out
+        TailBuf::new(out.into_iter().rev())
     }
 }
 
@@ -488,11 +585,14 @@ impl Ball {
     pub fn pull_at(&self, v: u64, t: u64, now: Vec<u32>) -> Vec<u32> {
         if v >= LOG_DENSE {
             let after = self.stripe(v).after(v, t);
-            return roll_back(now, &after);
+            return roll_back(now, after.tail(0));
         }
-        let Some(log) = self.logs.get(v as u32).and_then(|l| l.get()) else { return roll_back(now, &[]) };
+        let Some(log) = self.logs.get(v as u32).and_then(|l| l.get()) else { return roll_back(now, TailBuf::new([]).tail(0)) };
         let guard = epoch::pin();
-        log.read(&guard, |d| roll_back(now, &d[d.partition_point(|x| x.t <= t)..]))
+        log.read(&guard, |ts, eids, into| {
+            let k = ts.partition_point(|&x| x <= t);
+            roll_back(now, Tail { eids: &eids[k..], into, skip: k })
+        })
     }
 
     /// 書き手に渡した面の場所の数 (書き手ごとの塊の、 まだ使っていない分 = 高々 `BLOCK` × 書き手の数を含む)。
@@ -512,7 +612,7 @@ impl Ball {
     pub fn bytes(&self) -> usize {
         let guard = epoch::pin();
         let mut logs = 0usize;
-        self.logs.for_each(|l| logs += l.get().map_or(0, |l| l.cap(&guard)));
+        self.logs.for_each(|l| logs += l.get().map_or(0, |l| l.bytes(&guard)));
         let wide: usize = self
             .wide
             .iter()
@@ -524,14 +624,14 @@ impl Ball {
         self.faces.allocated() * CHUNK * std::mem::size_of::<Face>()
             + self.heads.allocated() * CHUNK * 4
             + self.logs.allocated() * CHUNK * std::mem::size_of::<OnceLock<Box<DiffLog>>>()
-            + logs * std::mem::size_of::<Diff>()
+            + logs
             + wide
     }
 }
 
 /// 今のデッキ `now` (並びは問わない、 重なりは無い) に、 t より後の差分 `after` (時刻の順) を新しい方から逆に当てた、
 /// 時点 t のデッキ (eid の昇順)。 差分が多く eid が狭く集まっていれば bit の表で、 そうでなければ並べて合わせる。
-fn roll_back(now: Vec<u32>, after: &[Diff]) -> Vec<u32> {
+fn roll_back(now: Vec<u32>, after: Tail<'_>) -> Vec<u32> {
     match bits_window(&now, after) {
         Some((lo, words)) => roll_back_bits(&now, after, lo, words),
         None => roll_back_merge(now, after),
@@ -539,17 +639,17 @@ fn roll_back(now: Vec<u32>, after: &[Diff]) -> Vec<u32> {
 }
 
 /// bit の表を使うなら (表の始まりの eid, 語の数)。
-fn bits_window(now: &[u32], after: &[Diff]) -> Option<(u32, usize)> {
+fn bits_window(now: &[u32], after: Tail<'_>) -> Option<(u32, usize)> {
     if after.len() < BITS_MIN_AFTER {
         return None;
     }
-    let (lo, hi) = now.iter().copied().chain(after.iter().map(|d| d.eid)).fold((u32::MAX, 0), |(lo, hi), e| (lo.min(e), hi.max(e)));
+    let (lo, hi) = now.iter().chain(after.eids).fold((u32::MAX, 0), |(lo, hi), &e| (lo.min(e), hi.max(e)));
     let words = ((hi - lo) as usize >> 6) + 1;
     (words <= BITS_MAX_SPREAD * (now.len() + after.len())).then_some((lo, words))
 }
 
 /// eid の bit の表に今のデッキを立て、 差分を新しい方から当てる (入った → 落とす、 出た → 立てる)。 表を頭から読めば昇順。
-fn roll_back_bits(now: &[u32], after: &[Diff], lo: u32, words: usize) -> Vec<u32> {
+fn roll_back_bits(now: &[u32], after: Tail<'_>, lo: u32, words: usize) -> Vec<u32> {
     // 表は thread ごとに使い回す (毎回取ると 100 KB を超える表は新しい page を触るたびに page fault)
     BITS.with(|b| {
         let mut bits = b.take();
@@ -561,20 +661,20 @@ fn roll_back_bits(now: &[u32], after: &[Diff], lo: u32, words: usize) -> Vec<u32
     })
 }
 
-fn roll_back_on(bits: &mut [u64], now: &[u32], after: &[Diff], lo: u32) -> Vec<u32> {
+fn roll_back_on(bits: &mut [u64], now: &[u32], after: Tail<'_>, lo: u32) -> Vec<u32> {
     for &e in now {
         let i = (e - lo) as usize;
         bits[i >> 6] |= 1 << (i & 63);
     }
-    for d in after.iter().rev() {
-        let i = (d.eid - lo) as usize;
+    after.for_each_rev(|e, into| {
+        let i = (e - lo) as usize;
         let m = 1u64 << (i & 63);
-        if d.into == 1 {
+        if into {
             bits[i >> 6] &= !m;
         } else {
             bits[i >> 6] |= m;
         }
-    }
+    });
     let mut out = Vec::with_capacity(now.len() + after.len() / 2);
     for (w, &x) in bits.iter().enumerate() {
         let mut x = x;
@@ -587,15 +687,15 @@ fn roll_back_on(bits: &mut [u64], now: &[u32], after: &[Diff], lo: u32) -> Vec<u
 }
 
 /// 今のデッキと、 球ごとの t より後の最初の差分 (入った = t には居なかった、 出た = 居た) を eid の順に並べて合わせる。
-fn roll_back_merge(mut now: Vec<u32>, after: &[Diff]) -> Vec<u32> {
+fn roll_back_merge(mut now: Vec<u32>, after: Tail<'_>) -> Vec<u32> {
     // 名簿の読みはほぼ並んでいる (詰め直した bucket + 後ろに足した分) ので比較 sort (並んだ所を一気に通る)。 基数 sort は
     // 並びによらず桁の数だけ写すので、 今を指した読みが 5 → 22 µs になった。 重なりは無い約束 (落とす走査 1 回で +2.8 µs)
     now.sort_unstable();
     debug_assert!(now.windows(2).all(|w| w[0] < w[1]), "ball: 今のデッキに重なり");
-    if after.is_empty() {
+    if after.len() == 0 {
         return now;
     }
-    let mut first: Vec<(u32, u32, bool)> = after.iter().enumerate().map(|(i, x)| (x.eid, i as u32, x.into == 1)).collect();
+    let mut first: Vec<(u32, u32, bool)> = after.eids.iter().enumerate().map(|(i, &e)| (e, i as u32, after.entered(i))).collect();
     first.sort_unstable_by_key(|&(e, i, _)| (e, i));
     first.dedup_by_key(|x| x.0);
     let mut out = Vec::with_capacity(now.len() + first.len());
@@ -909,16 +1009,19 @@ mod tests {
                 let k = now.len() / 3;
                 now.rotate_left(k);
             }
-            // 時点 t = cut 番目の差分の時刻: t より後の差分だけを渡し、 答えは写しに頭から cut 個当てたもの
-            for cut in [0, after.len() / 3, after.len() / 2, after.len()] {
-                let tail = &after[cut..];
+            // 時点 t = cut 番目の差分の時刻: t より後の差分だけを渡し (帳面と同じく、 入った bit は頭から数える)、 答えは写しに
+            // 頭から cut 個当てたもの。 cut は bit の語の境目の前後も
+            let buf = TailBuf::new(after.iter().map(|d| (d.eid, d.into == 1)));
+            let n = after.len();
+            for cut in [0, 63.min(n), 64.min(n), 65.min(n), n / 3, n / 2, n] {
+                let tail = buf.tail(cut);
                 let mut mid: BTreeMap<u32, bool> = start.clone();
                 for d in &after[..cut] {
                     mid.insert(d.eid, d.into == 1);
                 }
                 let want: Vec<u32> = mid.iter().filter(|x| *x.1).map(|x| *x.0).collect();
                 assert_eq!(roll_back_merge(now.clone(), tail), want, "merge case {case} cut {cut}");
-                let (lo, hi) = now.iter().copied().chain(tail.iter().map(|d| d.eid)).fold((u32::MAX, 0), |(lo, hi), e| (lo.min(e), hi.max(e)));
+                let (lo, hi) = now.iter().chain(tail.eids).fold((u32::MAX, 0), |(lo, hi), &e| (lo.min(e), hi.max(e)));
                 if lo <= hi && hi - lo < 1 << 24 {
                     let words = ((hi - lo) as usize >> 6) + 1;
                     assert_eq!(roll_back_bits(&now, tail, lo, words), want, "bits case {case} cut {cut}");
