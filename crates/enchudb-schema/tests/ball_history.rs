@@ -215,15 +215,18 @@ fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     let log = std::sync::Mutex::new(vec![None::<u64>; TH * PER]);
     // 値を変えた最後の書き込みの HLC (WAL 付きの時、 書いた直後に cell の版数から読む)
     let changed_at = std::sync::Mutex::new(vec![enchudb_oplog::Hlc::ZERO; TH * PER]);
+    // 回ごとの、 値を変えた書き込みの数
+    let changes = std::sync::Mutex::new(vec![0u64; rounds]);
     let mut checks: Vec<(u64, Vec<Option<u64>>)> = Vec::new();
     std::thread::scope(|s| {
         for th in 0..TH {
-            let (eng, bar, log, eids, diffs, changed_at) = (&eng, &bar, &log, &eids, &diffs, &changed_at);
+            let (eng, bar, log, eids, diffs, changed_at, changes) = (&eng, &bar, &log, &eids, &diffs, &changed_at, &changes);
             let vals = vals;
             let mut mine = seeded[th * PER..(th + 1) * PER].to_vec();
             s.spawn(move || {
                 let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ th as u64);
-                for _ in 0..rounds {
+                for round in 0..rounds {
+                    let mut changed = 0;
                     for _ in 0..30 {
                         let k = r.below(PER as u64) as usize;
                         let e = eids[th * PER + k];
@@ -239,6 +242,7 @@ fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
                             }
                         };
                         if mine[k] != new {
+                            changed += 1;
                             diffs.fetch_add(u64::from(mine[k].is_some()) + u64::from(new.is_some()), std::sync::atomic::Ordering::Relaxed);
                             if wal {
                                 changed_at.lock().unwrap()[th * PER + k] = eng.cell_hlc(e, ha);
@@ -247,6 +251,7 @@ fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
                         mine[k] = new;
                     }
                     log.lock().unwrap()[th * PER..(th + 1) * PER].copy_from_slice(&mine);
+                    changes.lock().unwrap()[round] += changed;
                     bar.wait();
                     bar.wait();
                 }
@@ -275,6 +280,26 @@ fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     for &v in vals {
         let want: Vec<u64> = (0..TH * PER).filter(|&i| seeded[i] == Some(v)).map(|i| eids[i]).collect();
         assert_eq!(eng.ball_pull_at("t.a", v, 0), want, "時刻 0 v={v}");
+    }
+    // 柵でそろえた時刻 now(r) 以下の球の時刻 (値を変えた書き込み 1 回につき 1 つ: 書き換えは前の面を閉じた時刻 = 次の面の上を
+    // 向いた時刻) の数は、 回 r までに値を変えた書き込みの数。 後の回の書き込みが過去の時刻に入ると (上げた時刻を WAL の時計に
+    // 渡さない等)、 デッキの答えに出なくても数が合わない
+    let mut times_of: Vec<Vec<u64>> = eids
+        .iter()
+        .map(|&e| {
+            let mut ts: Vec<u64> = eng.ball_faces(e, "t.a").iter().flat_map(|f| [f.from, f.to]).filter(|&x| x != 0 && x != u64::MAX).collect();
+            ts.sort_unstable();
+            ts.dedup();
+            ts
+        })
+        .collect();
+    times_of.iter_mut().for_each(|t| t.shrink_to_fit());
+    let changes = changes.into_inner().unwrap();
+    let mut done = 0u64;
+    for (r, (tm, _)) in checks.iter().enumerate() {
+        done += changes[r];
+        let seen: u64 = times_of.iter().map(|t| t.partition_point(|&x| x <= *tm) as u64).sum();
+        assert_eq!(seen, done, "回 {r} t={tm}: 柵までの球の時刻の数と、 値を変えた書き込みの数");
     }
     // 時刻の元: WAL 付きは HLC (wall ms << 23 = 2^40 より大きい)、 無ければ数え口
     assert_eq!(eng.ball_now() > 1 << 40, wal, "時刻の元が違う: {}", eng.ball_now());
