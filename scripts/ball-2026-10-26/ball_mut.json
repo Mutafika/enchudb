@@ -90,12 +90,6 @@
   "replace": "if sp.from[i].load(Ordering::Relaxed) <= t {"
  },
  {
-  "name": "球の列も詰め直す (外れたカードを捨てる)",
-  "file": "crates/enchudb-engine/src/append_bucket.rs",
-  "find": "        if self.spun {\n            return self.live() as usize;\n        }\n",
-  "replace": ""
- },
- {
   "name": "外す時に時刻を渡さない",
   "file": "crates/enchudb-engine/src/engine.rs",
   "find": "        self.himos[hid].remove_at(local, ball_ts);",
@@ -106,5 +100,47 @@
   "file": "crates/enchudb-engine/src/himo_store.rs",
   "find": "                let stale = old.and_then(|o| cyl.note_stale_of_in_at(o, eid, ts, &guard).map(|s| (o, s)));",
   "replace": "                let stale = old.and_then(|o| cyl.note_stale_of_in_at(o, eid, None, &guard).map(|s| (o, s)));"
+ },
+ {
+  "name": "詰め直しで外れたカードを捨てる (段に移さない)",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "            past.push(closed.into());\n",
+  "replace": "            let _ = closed;\n"
+ },
+ {
+  "name": "段の読みが上を向いた時刻を見ない",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": ".filter(|c| c.from <= t)",
+  "replace": ".filter(|_| true)"
+ },
+ {
+  "name": "段の二分探索で t ちょうどに外れたカードも上に数える",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "run.partition_point(|c| c.to <= t)",
+  "replace": "run.partition_point(|c| c.to < t)"
+ },
+ {
+  "name": "伸ばした backing に段を写さない",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "                ns.past = os.past.clone();\n",
+  "replace": ""
+ },
+ {
+  "name": "詰め直しで上を向いた時刻を運ばない",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "            sp.from[i].store(f, Ordering::Relaxed);\n",
+  "replace": ""
+ },
+ {
+  "name": "run を混ぜる時に並べない (つなぐだけ)",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "        if a[i].to <= b[j].to {",
+  "replace": "        if true {"
+ },
+ {
+  "name": "外れたカードを外れた時刻で並べない",
+  "file": "crates/enchudb-engine/src/append_bucket.rs",
+  "find": "        closed.sort_unstable_by_key(|c| c.to);\n",
+  "replace": ""
  }
 ]

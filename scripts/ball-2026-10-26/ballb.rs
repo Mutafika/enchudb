@@ -176,8 +176,12 @@ fn mode_w(threads: usize, seed: u64) {
     let misses = eng.ball_spin_misses();
     #[cfg(not(feature = "ball"))]
     let misses = 0usize;
+    #[cfg(feature = "ball")]
+    let compacts = eng.ball_spin_compactions();
+    #[cfg(not(feature = "ball"))]
+    let compacts = 0usize;
     println!(
-        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{misses},\"rss_peak_kb\":{}}}",
+        "{{\"mode\":\"w\",\"build\":\"{tag}\",\"ball\":{bl},\"kind\":\"ok\",\"threads\":{threads},\"seed\":{seed},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{misses},\"spin_compacts\":{compacts},\"rss_peak_kb\":{}}}",
         rss_peak_kb()
     );
 }
@@ -252,8 +256,9 @@ fn mode_r(seed: u64) {
     let (faces, bytes) = eng.ball_stats("t.a").unwrap();
     assert!((0..100u64).all(|v| eng.ball_value_in_deck("t.a", v)), "a の値は全部カードが時刻を持つ");
     println!(
-        "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{},\"rss_peak_kb\":{}}}",
+        "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"faces\":{faces},\"ball_bytes\":{bytes},\"spin_misses\":{},\"spin_compacts\":{},\"rss_peak_kb\":{}}}",
         eng.ball_spin_misses(),
+        eng.ball_spin_compactions(),
         rss_peak_kb()
     );
 }

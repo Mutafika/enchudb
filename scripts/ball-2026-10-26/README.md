@@ -12,6 +12,8 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
 - 3 回目 (履歴をデッキのカードのスピン = 向きの時刻に残す): `results_ballb_v3.jsonl` / `results_ballb_cols_v3.jsonl` /
   `results_ballb_r_v3.jsonl`。 `ballb.rs` は 3 回目の形 (宣言を索引を組む前に、 読みの段は円柱を先に組まない、 時刻を書けなかった
   カードの数を出す)
-- `ball_mut.json`: 変異 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
+- 4 回目 (詰め直しで外れたカードを履歴の段へ移す): `results_ballb_v4.jsonl` / `results_ballb_cols_v4.jsonl` / `results_ballb_r_v4.jsonl`
+  (`ballb.rs` は詰め直しの回数も出す)。 段の道の変異 7 本は `ball_mut_past.json` (engine の `spun_bucket` 単体の試験で全部落ちる)
+- `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
