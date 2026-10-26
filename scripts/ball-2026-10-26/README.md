@@ -22,6 +22,11 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   交互に回した。 読みの段は `run_r.sh` (基準は script の頭)。 変異は `ball_mut_v6.json` (33 本、 全部どちらかで落ちる)、 並行の
   変異の検出率は `rate6.py`。 `*_v6_inlock.jsonl` は大きい値の帳面を write_lock の中で書いていた最初の版 (書き手 4 本で値の種類が
   多い列の書き換えが +947 ns、 場所を鍵の前に取る形に直した)。 `results_ballb_r_v6.jsonl` は重なり落としを外した後の版
+- 7 回目 (帳面を時刻 / eid / 入った bit の列 3 本に分ける + 時点 t の bit の表を枝なしで当てて読む): `results_ballb_v7.jsonl` /
+  `results_ballb_cols_v7.jsonl` / `results_ballb_r_v7.jsonl` (読みは 6 回目 / `v7a` = 細くしただけ / 枝なしの 3 つを交互)。
+  `rbprof.rs` は bit の表の戻しを段ごとに測った単独の program (ballb r と同じ形のデータ、 値 100 個を回す / 1 個だけ、 引数 `all` / `hot`):
+  時間の大半が枝の読み違いだと分かった測り。 変異は `ball_mut_v7.json` (47 本、 ball.rs の 37 本は単体で全部落ちる)。 `ballb.rs` に
+  `BALL_ROUNDS` (履歴の長さ、 既定 10) と 1 回目の時点の読み (`pull_at_t1`) を足した
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
