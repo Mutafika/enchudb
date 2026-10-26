@@ -177,6 +177,51 @@ fn concurrent_writers_on_wide_values() {
     concurrent_run("wide", &[3, 9, 1 << 24, (1 << 24) + 64, (1 << 24) + 128, (1 << 30) + 1], false);
 }
 
+/// 時刻を上げた書き込み (外す / 書き換え) は WAL の時計をそこまで進める: その後に払い出す HLC の書き込みは、 上げた時刻より後に
+/// なる。 上げる場面は HLC を指定して書く口 (sync で届いた書き込みの道) で決めた順に作る: e1 が HLC 200 で値 5 に入った後、
+/// e0 が HLC 150 で値 5 から出る → 値 5 の帳面の最後 (200) の後 = 201 に上がる。 指定する HLC の wall は時計より 1 時間先
+/// (この後に払い出す HLC が上げた時刻を越えるのは、 時計を進めた時だけ)。 並行の試験では上げた書き込みが柵の直前に来た時しか
+/// 見えない (外すの後に渡さない変異で 20 回中 10 回)。
+#[test]
+fn raised_times_move_the_wal_clock() {
+    for remove in [false, true] {
+        let path = tmp_path(if remove { "raised_rm" } else { "raised_set" });
+        cleanup(&path);
+        let mut db = Database::create(&path).unwrap();
+        db.table("t").number("id").number("a").primary_key("id").build().unwrap();
+        let mut eids = Vec::new();
+        {
+            let t = db.get_table("t").unwrap();
+            for i in 0..4i64 {
+                eids.push(t.insert().set("id", i).commit().unwrap());
+            }
+        }
+        let db = db.finish_with_oplog(16 << 20).unwrap();
+        let eng = db.arc_engine();
+        assert!(eng.declare_ball("t.a").unwrap());
+        let ha = eng.himo_id("t.a").unwrap() as u16;
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 3_600_000;
+        let h = |logical| enchudb_oplog::Hlc { wall, logical, peer: 0 };
+        let pack = |logical: u64| wall << 23 | logical;
+        assert!(eng.set_cell(eids[0], ha, 5, h(100)));
+        assert!(eng.set_cell(eids[1], ha, 5, h(200)));
+        if remove {
+            assert!(eng.clear_cell(eids[0], ha, h(150)));
+        } else {
+            assert!(eng.set_cell(eids[0], ha, 6, h(150)));
+        }
+        let faces = eng.ball_faces(eids[0], "t.a");
+        assert_eq!(faces[0].to, pack(201), "remove={remove}: 値 5 の帳面の最後 (200) の後に上がる");
+        // この後の書き込み (WAL の HLC) は上げた時刻より後
+        eng.tie_to_by_id(eids[2], ha, 7u32);
+        let later = eng.ball_faces(eids[2], "t.a")[0].from;
+        assert!(later > pack(201), "remove={remove}: 上げた時刻 {} の後の書き込みが {later}", pack(201));
+        drop(eng);
+        drop(db);
+        cleanup(&path);
+    }
+}
+
 fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     const TH: usize = 4;
     const PER: usize = 16;
