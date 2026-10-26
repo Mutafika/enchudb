@@ -47,8 +47,6 @@ struct Buf {
     /// 持たない (backing の大きさを印の前と同じにする。 前は全部の backing が持ち、 値がみな違う列 (bucket が行の数だけある)
     /// で bucket 1 個に 30 B ほど増えた)。 無ければ 「印は全部ではない」 (読みは Column で確かめる)。
     marks: Option<Box<Marks>>,
-    /// 向きの時刻 (球、 試作 `crate::ball`): 球にした列の bucket の、 中身のある backing だけが持つ。
-    spins: Option<Box<Spins>>,
 }
 
 /// まだ上を向いているカードの `to`。
@@ -85,6 +83,9 @@ struct Marks {
     /// 足した分の見える読み手には下がったのも見える)。 組み直した backing は true。 bucket ごとでなく backing ごとに持つ (読み手は
     /// 控えた backing の flag を読む: 組み直しの前の backing を控えた読み手が、 組み直した後の true を見ないように)。
     exact: AtomicBool,
+    /// 向きの時刻 (球、 試作 `crate::ball`): 球にした列の bucket だけが持つ (印の置き場の中に置く = 宣言の無い列の backing は
+    /// 大きくならない)。
+    spins: Option<Spins>,
 }
 
 // SAFETY: published 範囲 [0..len] は書き換わらない。 writer は spare slot [len] のみ書く。
@@ -114,12 +115,21 @@ impl Buf {
         // SAFETY: UnsafeCell<u32> は u32 と同じ表現 (repr(transparent))。 長さはそのまま移る
         let data = unsafe { Box::from_raw(Box::into_raw(data) as *mut [UnsafeCell<u32>]) };
         let marks = (marked && cap > 0).then(|| {
-            Box::new(Marks { stale: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(), exact: AtomicBool::new(true) })
+            Box::new(Marks {
+                stale: (0..cap.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+                exact: AtomicBool::new(true),
+                spins: spun.then(|| Spins::new(cap)),
+            })
         });
-        // 球の列の backing は空で作る (詰め直さないので、 中身のある列からは作らない)
-        debug_assert!(!spun || len == 0);
-        let spins = (spun && cap > 0).then(|| Box::new(Spins::new(cap)));
-        Self { data, len: AtomicUsize::new(len), marks, spins }
+        // 球の列の backing は空で作る (詰め直さないので、 中身のある列からは作らない)。 球の列は印も持つ
+        debug_assert!(!spun || (len == 0 && marked));
+        Self { data, len: AtomicUsize::new(len), marks }
+    }
+
+    /// 向きの時刻 (球の列の、 中身のある backing だけ)。
+    #[inline]
+    fn spins(&self) -> Option<&Spins> {
+        self.marks.as_deref()?.spins.as_ref()
     }
     #[inline]
     fn cap(&self) -> usize {
@@ -406,7 +416,7 @@ impl AppendBucket {
             unsafe {
                 *b.data[l].get() = eid;
             }
-            if let Some(sp) = b.spins.as_deref() {
+            if let Some(sp) = b.spins() {
                 sp.from[l].store(ts, Ordering::Relaxed);
                 sp.to[l].store(SPIN_OPEN, Ordering::Relaxed);
             }
@@ -434,8 +444,8 @@ impl AppendBucket {
                 nm.exact.store(om.exact.load(Ordering::Relaxed), Ordering::Relaxed);
             }
             // 向きの時刻も写す (外れた時刻を書くのもこの bucket の書き手 1 本)。 中身の無かった backing は持たない
-            if let Some(ns) = nb.spins.as_deref() {
-                if let Some(os) = b.spins.as_deref() {
+            if let Some(ns) = nb.spins() {
+                if let Some(os) = b.spins() {
                     for i in 0..l {
                         ns.from[i].store(os.from[i].load(Ordering::Relaxed), Ordering::Relaxed);
                         ns.to[i].store(os.to[i].load(Ordering::Relaxed), Ordering::Relaxed);
@@ -530,7 +540,7 @@ impl AppendBucket {
             Some((p, eid)) if p < b.len.load(Ordering::Relaxed) => {
                 debug_assert_eq!(unsafe { *b.data[p].get() }, eid, "位置の表が bucket と合わない");
                 let _ = eid;
-                if let (Some(ts), Some(sp)) = (ts, b.spins.as_deref()) {
+                if let (Some(ts), Some(sp)) = (ts, b.spins()) {
                     sp.to[p].store(ts, Ordering::Release);
                 }
                 // 印を立てるのはこの bucket の書き手 1 本 (値の鍵の下) なので、 atomic の RMW でなく読んでから書く
@@ -550,7 +560,7 @@ impl AppendBucket {
         }
         let b = unsafe { self.backing.load(Ordering::Acquire, guard).deref() };
         let n = b.len.load(Ordering::Acquire);
-        let Some(sp) = b.spins.as_deref() else { return true };
+        let Some(sp) = b.spins() else { return true };
         // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
         let s = unsafe { b.published(n) };
         for i in 0..n {
