@@ -1469,9 +1469,11 @@ mod tests {
 
     /// 1 つの球に書き換え / 外すを 5000 回 (書き手の道で、 他の球の書き込みを挟んで面を散らす) 当て、 書いた時刻とその前後の全部の
     /// t で、 飛び糸で探した値 = 手元の (時刻, 値) の列、 かつ通った面の数 ≤ 3⌈log2(面の数 + 1)⌉ (飛び糸を張らない / 親だけでも答えは
-    /// 合うので、 歩数を見る)。 宣言の前からの面 (時刻 0) から始め、 外した後に戻る面と大きい値も混ぜる。
+    /// 合うので、 歩数を見る)。 宣言の前からの面 (時刻 0) から始め、 外した後に戻る面と大きい値も混ぜる。 Miri では 300 回 (5000 回は
+    /// 90 分で終わらない)。
     #[test]
     fn jumps_find_the_face_in_log_steps() {
+        let writes = if cfg!(miri) { 300 } else { 5000 };
         let mut x = T::new();
         x.b.declare(0, |s| s(3, 9));
         x.cur.insert((0, 3), 9);
@@ -1483,7 +1485,7 @@ mod tests {
             r ^= r << 17;
             r
         };
-        for _ in 0..5000 {
+        for _ in 0..writes {
             let k = next();
             let last = log.last().unwrap().1;
             if k % 7 == 0 && last.is_some() {
@@ -1514,7 +1516,7 @@ mod tests {
                 worst = worst.max(steps);
             }
         }
-        assert!(n > 4000, "面が少ない: {n}");
+        assert!(n > writes * 3 / 4, "面が少ない: {n}");
         eprintln!("面 {n} 個、 最大 {worst} 歩 (上限 {bound})");
     }
 
