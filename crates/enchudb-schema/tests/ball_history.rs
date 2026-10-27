@@ -14,6 +14,14 @@ fn cleanup(path: &str) {
     let _ = enchudb_engine::db_files::remove_db(path);
 }
 
+/// 試験が落ちても (panic でも) DB を消す。
+struct Gone(String);
+impl Drop for Gone {
+    fn drop(&mut self) {
+        cleanup(&self.0);
+    }
+}
+
 const CITIES: [&str; 4] = ["Tokyo", "Osaka", "Kyoto", "Fukuoka"];
 
 struct Rng(u64);
@@ -33,6 +41,7 @@ type Rows = BTreeMap<u64, (Option<&'static str>, Option<i64>)>;
 fn as_of_answers_match_a_log_of_schema_writes() {
     let path = tmp_path("asof");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("users").number("id").tag("city").number("age").primary_key("id").build().unwrap();
     let users = db.get_table("users").unwrap();
@@ -138,6 +147,7 @@ fn as_of_answers_match_a_log_of_schema_writes() {
 fn leaf_columns_cannot_be_balls() {
     let path = tmp_path("leaf");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("t").number("id").column("memo", enchudb_schema::ColumnType::Leaf).primary_key("id").build().unwrap();
     assert!(db.engine().declare_ball("t.memo").is_err());
@@ -187,6 +197,7 @@ fn raised_times_move_the_wal_clock() {
     for remove in [false, true] {
         let path = tmp_path(if remove { "raised_rm" } else { "raised_set" });
         cleanup(&path);
+        let _gone = Gone(path.clone());
         let mut db = Database::create(&path).unwrap();
         db.table("t").number("id").number("a").primary_key("id").build().unwrap();
         let mut eids = Vec::new();
@@ -229,6 +240,7 @@ fn raised_times_move_the_wal_clock() {
 fn deletes_close_faces_at_their_wal_time() {
     let path = tmp_path("delete_hlc");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("t").number("id").number("a").primary_key("id").build().unwrap();
     let mut eids = Vec::new();
@@ -262,6 +274,7 @@ fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     let n_vals = vals.len() as u64;
     let path = tmp_path(name);
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("t").number("id").number("a").primary_key("id").build().unwrap();
     if wal {

@@ -24,6 +24,14 @@ fn cleanup(path: &str) {
     let _ = enchudb_engine::db_files::remove_db(path);
 }
 
+/// 試験が落ちても (panic でも) DB を消す。
+struct Gone(String);
+impl Drop for Gone {
+    fn drop(&mut self) {
+        cleanup(&self.0);
+    }
+}
+
 struct Rng(u64);
 impl Rng {
     fn below(&mut self, n: u64) -> u64 {
@@ -156,6 +164,7 @@ fn concurrent_session(
     after: usize,
     pause_ms: u64,
     publish_pause_us: (u64, u64),
+    scan_pause_us: u64,
     seed: u64,
     min_seen: usize,
 ) -> Session {
@@ -163,6 +172,7 @@ fn concurrent_session(
     let eng = db.engine();
     eng.ball_set_build_pause(pause_ms);
     eng.ball_set_publish_pause(publish_pause_us.0, publish_pause_us.1);
+    eng.ball_set_scan_pause(scan_pause_us);
     assert!(eng.ball_rebuild_stats().is_none(), "開くだけでは組まない");
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let bar = Barrier::new(TH + 1);
@@ -274,11 +284,12 @@ fn concurrent_session(
 fn the_first_read_builds_while_writers_write() {
     let path = tmp_path("t2");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut h = create(&path, WAL, 128 << 20);
     let (mut overlapped, mut waits, mut covered) = (0, 0, 0);
     for k in 0..9u64 {
         let pp = [(2000, 0), (0, 2000), (0, 0)][k as usize % 3];
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0x1234 + k, 100);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100);
         overlapped += usize::from(ss.during > 0);
         waits += ss.waits;
         covered += ss.covered;
@@ -301,32 +312,38 @@ fn the_first_read_builds_while_writers_write() {
 fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     let path = tmp_path("t3");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     const SMALL_WAL: usize = 1 << 20;
     let mut h = create(&path, SMALL_WAL, 1 << 20);
     let mut used = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0x77 + k, 2);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2);
         used += usize::from(ss.st.side_ops > 0);
     }
     assert!(used >= 2, "組む間に記録が捨てた所を読んでいない — 試験の前提 ({used}/3)");
     cleanup(&path);
 }
 
-/// (T4) 組む間に consumer が記録に写して WAL を畳む (WAL 1 MiB、 記録 64 MiB = 捨てない、 追いつきの間を試験の口で広げる): 追いつきは
-/// 前に読んだ record を記録から読み直す (HLC で落とす) / 畳んだ後は WAL の前の位置が前の周の物 (周で見る)。 1 回で組めて、 面の数まで合う。
+/// (T4) 組む間に consumer が記録に写して WAL を畳む (WAL 1 MiB、 記録 256 MiB = 捨てない、 追いつきの間を試験の口で広げる): 追いつきは
+/// 前に読んだ record を記録から読み直す (HLC で落とす) / 畳んだ後は WAL の前の位置が前の周の物 (周で見る) / WAL を読む前か読む間に畳むと
+/// 読んだ所は新しい周の途中 (読んだ分は捨てて記録から読み直す)。 面の数まで合う。
 #[test]
 fn a_build_reads_on_while_the_wal_folds() {
     let path = tmp_path("t4");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     const SMALL_WAL: usize = 1 << 20;
-    let mut h = create(&path, SMALL_WAL, 64 << 20);
-    let mut folded = 0;
+    let mut h = create(&path, SMALL_WAL, 256 << 20);
+    let (mut folded, mut refolds) = (0, 0);
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 0x99 + k, 100);
+        // WAL の位置を取った後・読む前に 20 ms 止まる (その間に畳むと、 読む所が新しい周の途中になる)
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 20_000, 0x99 + k, 100);
         assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         folded += usize::from(ss.folds > 0);
+        refolds += usize::from(ss.st.refolds > 0);
     }
     assert!(folded >= 2, "組む間に WAL を畳んでいない — 試験の前提 ({folded}/3)");
+    assert!(refolds >= 2, "WAL を読む間に畳んでいない — 試験の前提 ({refolds}/3)");
     let db = Database::open_with_oplog(&path, SMALL_WAL).unwrap();
     assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
     drop(db);

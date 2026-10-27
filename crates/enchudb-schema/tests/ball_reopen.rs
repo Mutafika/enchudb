@@ -16,6 +16,14 @@ fn cleanup(path: &str) {
     let _ = enchudb_engine::db_files::remove_db(path);
 }
 
+/// 試験が落ちても (panic でも) DB を消す。
+struct Gone(String);
+impl Drop for Gone {
+    fn drop(&mut self) {
+        cleanup(&self.0);
+    }
+}
+
 const CITIES: [&str; 4] = ["Tokyo", "Osaka", "Kyoto", "Fukuoka"];
 const WAL: usize = 8 << 20;
 
@@ -185,6 +193,7 @@ fn declare(db: &Database) -> (bool, bool) {
 fn reopen_reads_the_history_before_close() {
     let path = tmp_path("t1");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut w = World::new(0x2545_F491_4F6C_DD1D);
     let hz0;
     {
@@ -228,6 +237,7 @@ fn reopen_reads_the_history_before_close() {
 fn reopen_after_the_log_dropped_records() {
     let path = tmp_path("t2");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut w = World::new(0x9E37_79B9_7F4A_7C15);
     let hz0;
     {
@@ -260,6 +270,7 @@ fn reopen_after_the_log_dropped_records() {
 fn a_base_the_log_no_longer_covers_starts_over() {
     let path = tmp_path("t4");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut w = World::new(0x1234_5678_9ABC_DEF1);
     {
         let db = create(&path, 1 << 20);
@@ -295,6 +306,7 @@ fn a_base_the_log_no_longer_covers_starts_over() {
 fn writes_that_never_reached_the_log_move_the_horizon_to_now() {
     let path = tmp_path("t5");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut w = World::new(0x0BAD_F00D_1234_5678);
     {
         let db = create(&path, 64 << 20);
@@ -331,6 +343,7 @@ fn writes_that_never_reached_the_log_move_the_horizon_to_now() {
 fn local_only_tables_keep_no_base() {
     let path = tmp_path("local");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("users").number("id").tag("city").number("age").primary_key("id").build().unwrap();
     db.prepare_cursors().unwrap();
@@ -351,6 +364,7 @@ fn local_only_tables_keep_no_base() {
 fn bases_follow_the_log_in_sessions_without_a_declaration() {
     let path = tmp_path("t6");
     cleanup(&path);
+    let _gone = Gone(path.clone());
     let mut w = World::new(0x5DEE_CE66_D1CE_4E5B);
     let hz0;
     {
