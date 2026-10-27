@@ -2,56 +2,68 @@
  {
   "name": "公開中の書き手が待たずに球に書かない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "                PHASE_PUBLISHING => std::thread::yield_now(),",
-  "replace": "                PHASE_PUBLISHING => return None,"
+  "find": "                    std::thread::yield_now()\n                }\n                _ => return None,",
+  "replace": "                    return None\n                }\n                _ => return None,"
  },
  {
-  "name": "公開中の書き手が待たずに球に書く (閾値なし)",
+  "name": "公開中の書き手が待たずに閾値を見ずに球に書く",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "                PHASE_PUBLISHING => std::thread::yield_now(),",
-  "replace": "                PHASE_PUBLISHING => return self.get(hid),"
+  "find": "                    std::thread::yield_now()\n                }\n                _ => return None,",
+  "replace": "                    return self.get(hid)\n                }\n                _ => return None,"
  },
  {
   "name": "閾値を見ずに球に書く",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "                    return (t >= b.threshold.load(Ordering::Relaxed)).then_some(b);",
-  "replace": "                    return Some(b);"
+  "find": "                    if t >= b.threshold.load(Ordering::Relaxed) {",
+  "replace": "                    if true {"
  },
  {
   "name": "閾値より後も書き手が書かない",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "                    return (t >= b.threshold.load(Ordering::Relaxed)).then_some(b);",
-  "replace": "                    return (t < b.threshold.load(Ordering::Relaxed)).then_some(b);"
+  "find": "                    if t >= b.threshold.load(Ordering::Relaxed) {",
+  "replace": "                    if t < b.threshold.load(Ordering::Relaxed) {"
  },
  {
   "name": "最後の残りを当てない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            // (4) H より前の残り\n            if !rp.catch_up(log, wal, &mut pos, Some(h)) {",
-  "replace": "            // (4) H より前の残り\n            if false && !rp.catch_up(log, wal, &mut pos, Some(h)) {"
+  "find": "            if !rp.catch_up(log, wal, &mut pos, Some(h), held.as_deref()) {",
+  "replace": "            if false && !rp.catch_up(log, wal, &mut pos, Some(h), held.as_deref()) {"
  },
  {
   "name": "最後の残りで H 以降も当てる",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            if !rp.catch_up(log, wal, &mut pos, Some(h)) {",
-  "replace": "            if !rp.catch_up(log, wal, &mut pos, None) {"
+  "find": "            if !rp.catch_up(log, wal, &mut pos, Some(h), held.as_deref()) {",
+  "replace": "            if !rp.catch_up(log, wal, &mut pos, None, held.as_deref()) {"
  },
  {
-  "name": "Commit を積んでから公開中を置く",
+  "name": "H を取ってから公開中を置く",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            self.balls.begin_publish(hid);\n            let h = match wal.append_with_hlc(enchudb_oplog::oplog::Op::Commit) {\n                Ok((_, h)) => h,\n                Err(e) => {\n                    self.balls.abort_publish(hid);\n                    return Err(e);\n                }\n            };",
-  "replace": "            let h = match wal.append_with_hlc(enchudb_oplog::oplog::Op::Commit) {\n                Ok((_, h)) => h,\n                Err(e) => {\n                    self.balls.abort_publish(hid);\n                    return Err(e);\n                }\n            };\n            std::thread::sleep(std::time::Duration::from_millis(2));\n            self.balls.begin_publish(hid);"
+  "find": "            self.balls.begin_publish(hid);\n            let pp = self.ball_publish_pause.load(std::sync::atomic::Ordering::Relaxed);\n            if pp > 0 {\n                std::thread::sleep(std::time::Duration::from_micros(pp));\n            }\n            let h = wal.mint_hlc();\n            wal.quiesce();\n",
+  "replace": "            let h = wal.mint_hlc();\n            wal.quiesce();\n            let pp = self.ball_publish_pause.load(std::sync::atomic::Ordering::Relaxed);\n            if pp > 0 {\n                std::thread::sleep(std::time::Duration::from_micros(pp));\n            }\n            self.balls.begin_publish(hid);\n"
+ },
+ {
+  "name": "H より前の書き終えを待たない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            let h = wal.mint_hlc();\n            wal.quiesce();\n",
+  "replace": "            let h = wal.mint_hlc();\n"
  },
  {
   "name": "WAL の残りを読まない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "        let (recs, _) = wal.scan_for_change_log(c.log_wal, u64::MAX, true);\n        for (r, _) in &recs {",
-  "replace": "        let (recs, _) = wal.scan_for_change_log(c.log_wal, u64::MAX, true);\n        for (r, _) in recs.iter().take(0) {"
+  "find": "        self.wal_mark = Some((lap, end.max(start)));\n        for (r, _) in &recs {",
+  "replace": "        self.wal_mark = Some((lap, end.max(start)));\n        for (r, _) in recs.iter().take(0) {"
+ },
+ {
+  "name": "WAL を前の周の位置から読む",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            Some((l, off)) if l == lap && off >= c.log_wal => off,",
+  "replace": "            Some((_, off)) if off >= c.log_wal => off,"
  },
  {
   "name": "記録が捨てても組み直さない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            if truncated {\n                continue; // 記録が捨てた (土台が進んだ): 土台から組み直す\n            }",
-  "replace": "            let _ = truncated;"
+  "find": "            if !rp.read_log(log, &mut pos, None) {\n                continue; // 記録が捨てた (土台が進んだ): 土台から組み直す\n            }",
+  "replace": "            let _ = rp.read_log(log, &mut pos, None);"
  },
  {
   "name": "土台の時点を地平にしない",
@@ -66,7 +78,7 @@
   "replace": "        }\n        log.set_on_discard"
  },
  {
-  "name": "WAL の無い書き込みで印を置かない",
+  "name": "WAL の無い書き込みで印を置かない (書く)",
   "file": "crates/enchudb-engine/src/engine.rs",
   "find": "        if hlc == enchudb_oplog::Hlc::ZERO {\n            self.ball_bases.wal_less_write(hid as u16);\n        }\n        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {\n            debug_assert!",
   "replace": "        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {\n            debug_assert!"
@@ -88,5 +100,11 @@
   "file": "crates/enchudb-engine/src/engine.rs",
   "find": "        if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {",
   "replace": "        if limit.is_some_and(|l| key(hlc) >= key(l)) {"
+ },
+ {
+  "name": "最後の回も記録に写すのを止めない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            let held = (attempt == ATTEMPTS).then(|| self.change_emit.lock().unwrap_or_else(|p| p.into_inner()));",
+  "replace": "            let held = (attempt == ATTEMPTS + 1).then(|| self.change_emit.lock().unwrap_or_else(|p| p.into_inner()));"
  }
 ]
