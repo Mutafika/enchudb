@@ -1,0 +1,20 @@
+[
+ {
+  "name": "記録に写す前に土台を開かない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.ball_bases.ready(log);\n        let (recs, end) = wal.scan_for_change_log",
+  "replace": "        let (recs, end) = wal.scan_for_change_log"
+ },
+ {
+  "name": "宣言の時に土台を開かない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.pump_change_log(wal, log, &mut c, false)?;\n        self.ball_bases.ready(log);\n",
+  "replace": "        self.pump_change_log(wal, log, &mut c, false)?;\n"
+ },
+ {
+  "name": "開いていない土台があっても捨てる",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        if !self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {\n            // 開いていない",
+  "replace": "        if false {\n            // 開いていない"
+ }
+]

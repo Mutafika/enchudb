@@ -88,7 +88,14 @@ impl World {
                     _ => self.insert(db),
                 }
             }
-            self.checks.push((eng.ball_now(), self.rows.clone()));
+            // 球を宣言していない session は球の時刻が進まないので、 WAL の時計から取る (球の時刻と同じ詰め方)
+            let t = if eng.ball_horizon("users.city").is_some() {
+                eng.ball_now()
+            } else {
+                let h = eng.oplog().unwrap().mint_hlc();
+                h.wall << 23 | (h.logical as u64).min((1 << 23) - 1)
+            };
+            self.checks.push((t, self.rows.clone()));
         }
     }
 
@@ -330,6 +337,43 @@ fn local_only_tables_keep_no_base() {
     let ball = std::path::Path::new(&path).join("ball");
     let n = std::fs::read_dir(&ball).unwrap().count();
     assert_eq!(n, 1, "土台は users.age の 1 本だけ");
+    drop(db);
+    cleanup(&path);
+}
+
+/// (T6) 開き直して宣言し直さずに書き続け、 記録が何周も捨てる: 土台は宣言の無い session でも記録の始まりについて行く (開いた後の
+/// 最初に記録へ写す時に土台を開く)。 もう 1 度開き直して宣言すると、 地平以降の控えが答えと同じ。
+#[test]
+fn bases_follow_the_log_in_sessions_without_a_declaration() {
+    let path = tmp_path("t6");
+    cleanup(&path);
+    let mut w = World::new(0x5DEE_CE66_D1CE_4E5B);
+    let hz0;
+    {
+        let db = create(&path, 1 << 20);
+        for _ in 0..200 {
+            w.insert(&db);
+        }
+        declare(&db);
+        hz0 = db.engine().ball_horizon("users.city").unwrap();
+        w.write(&db, 20, 100);
+    }
+    {
+        // 宣言しない session
+        let db = Database::open_with_oplog(&path, WAL).unwrap();
+        w.write(&db, 150, 100);
+        let (first, next) = db.engine().change_log_range().unwrap();
+        assert!(first > next / 2, "記録が捨てていない — 試験の前提 ({first}, {next})");
+        assert_eq!(db.engine().ball_horizon("users.city"), None);
+    }
+    let db = Database::open_with_oplog(&path, WAL).unwrap();
+    declare(&db);
+    let st = db.engine().ball_rebuild_stats().unwrap();
+    assert_eq!(st.fixed, 0, "土台 + 記録 = 今の列: {st:?}");
+    let hz = db.engine().ball_horizon("users.city").unwrap();
+    assert!(hz > hz0);
+    let (seen, old) = w.verify(&db, "宣言の無い session の後");
+    assert!(seen >= 10 && old >= 20, "地平が 2 つ目の session の控えの間にない — 試験の前提 (後 {seen}, 前 {old})");
     drop(db);
     cleanup(&path);
 }
