@@ -755,7 +755,7 @@ mod tests {
             if noting {
                 // 控えは記録に残っている番号の分だけ (捨てた分は取り出した)
                 let r = bases.recent.lock().unwrap();
-                assert!(r.ops.front().is_none_or(|&(no, _)| no >= log.range().0), "捨てた番号の控えが残っている");
+                assert!(r.ops.front().is_none_or(|&(no, _, _)| no >= log.range().0), "捨てた番号の控えが残っている");
                 assert!(r.ops.len() as u64 <= log.range().1 - log.range().0);
             }
             // 開き直しても同じ (header の done は次に捨てる時に追いつくが、 開く時に記録から当て直す)。 開いた後の最初の捨てる時は
