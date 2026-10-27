@@ -394,3 +394,241 @@ impl OnDiscard for BallBases {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change_log::{MIN_CAP, NewEntry};
+    use crate::transport::WireRecord;
+    use std::collections::BTreeMap;
+
+    const HID: u16 = 3;
+    const NAME: &str = "t.x";
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ballbase-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 記録に載る書き込み 1 つ。 `Other` は別の紐、 `Named` は名前で指す同じ紐。
+    #[derive(Clone, Copy, Debug)]
+    enum W {
+        Set(u32, u64),
+        Unset(u32),
+        Del(u32),
+        Other(u32, u64),
+        Named(u32, u64),
+    }
+
+    fn writes(n: usize, seed: u64) -> Vec<W> {
+        let mut x = seed;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        (0..n)
+            .map(|_| {
+                let (k, e, v) = (next() % 20, (next() % 300) as u32, next() % 40);
+                match k {
+                    0..=11 => W::Set(e, v),
+                    12..=13 => W::Unset(e),
+                    14 => W::Del(e),
+                    15..=17 => W::Other(e, v),
+                    _ => W::Named(e, v + (1 << 33)), // 大きい値 (Tie64 の形) も
+                }
+            })
+            .collect()
+    }
+
+    fn hlc(i: u64) -> Hlc {
+        Hlc { wall: 10_000 + i, logical: 0, peer: 0 }
+    }
+
+    fn entry(i: u64, w: W) -> NewEntry {
+        let op = match w {
+            W::Set(e, v) => DecodedOp::Tie { eid: e as u64, himo_id: HID, value: v },
+            W::Unset(e) => DecodedOp::Untie { eid: e as u64, himo_id: HID },
+            W::Del(e) => DecodedOp::Delete { eid: e as u64 },
+            W::Other(e, v) => DecodedOp::Tie { eid: e as u64, himo_id: HID + 1, value: v },
+            W::Named(e, v) => DecodedOp::TieNamed { eid: e as u64, himo_name: NAME.into(), himo_kind: 0, value: v },
+        };
+        // 署名の欄を埋めた大きさ (record 1 件 ≈ 250 B、 1 MiB の記録に約 4000 件)
+        let w = WireRecord { hlc: hlc(i), author_peer: 0, op, signature: [0; 64], pubkey_fp: [0; 8], signed_bytes: vec![0; 100] };
+        NewEntry { hlc: w.hlc, wal_id: i, bytes: w.encode() }
+    }
+
+    /// 書き込み `[0, n)` を当てた列。
+    fn state(ws: &[W], n: u64) -> BTreeMap<u32, u64> {
+        let mut m = BTreeMap::new();
+        for w in &ws[..n as usize] {
+            match *w {
+                W::Set(e, v) | W::Named(e, v) => {
+                    m.insert(e, v);
+                }
+                W::Unset(e) | W::Del(e) => {
+                    m.remove(&e);
+                }
+                W::Other(..) => {}
+            }
+        }
+        m
+    }
+
+    fn cells(bases: &BallBases) -> (u64, Hlc, BTreeMap<u32, u64>) {
+        bases
+            .with(HID, |b| {
+                let mut m = BTreeMap::new();
+                b.for_each(|e, v| {
+                    m.insert(e, v);
+                });
+                (b.done(), b.horizon(), m)
+            })
+            .expect("土台がある")
+    }
+
+    fn setup(dir: &Path) -> (ChangeLog, Arc<BallBases>) {
+        let log = ChangeLog::open(dir, MIN_CAP, true, false).unwrap();
+        let bases = Arc::new(BallBases::new());
+        bases.insert(Base::create(dir, HID, NAME, &[], 0, hlc(0)).unwrap());
+        log.set_on_discard(bases.clone());
+        (log, bases)
+    }
+
+    fn reopen(dir: &Path) -> (ChangeLog, Arc<BallBases>) {
+        let log = ChangeLog::open(dir, MIN_CAP, false, false).unwrap();
+        let bases = Arc::new(BallBases::new());
+        bases.attach(dir, &log, |h| (h == HID).then(|| NAME.to_string()));
+        log.set_on_discard(bases.clone());
+        (log, bases)
+    }
+
+    /// 足す (100 件ずつ)。 `at` から `upto` まで。
+    fn add(log: &ChangeLog, ws: &[W], at: &mut u64, upto: u64) -> io::Result<()> {
+        while *at < upto {
+            let n = (upto - *at).min(100);
+            let batch: Vec<_> = (*at..*at + n).map(|i| entry(i, ws[i as usize])).collect();
+            log.append(&batch, &[], &mut Vec::new())?;
+            *at += n;
+        }
+        Ok(())
+    }
+
+    /// 土台は記録の始まりの時点の列: done = 記録の最古の番号、 cell = その前の書き込みを全部当てた列、 地平 = 番号 done − 1 の HLC。
+    fn assert_at_log_start(log: &ChangeLog, bases: &BallBases, ws: &[W], what: &str) {
+        let (first, _) = log.range();
+        let (done, hz, m) = cells(bases);
+        assert_eq!(done, first, "{what}: 土台は記録の始まりまで");
+        assert_eq!(m, state(ws, done), "{what}: 土台の列 (done = {done})");
+        if done > 0 {
+            assert_eq!(hz, hlc(done - 1), "{what}: 地平");
+        }
+    }
+
+    #[test]
+    fn discards_keep_the_base_at_the_start_of_the_log() {
+        let dir = tempdir("keep");
+        let ws = writes(30_000, 0x2545_F491_4F6C_DD1D);
+        let (log, bases) = setup(&dir);
+        let mut at = 0;
+        for k in 1..=30u64 {
+            add(&log, &ws, &mut at, k * 1000).unwrap();
+            assert_at_log_start(&log, &bases, &ws, &format!("{k} 千件"));
+        }
+        assert!(log.range().0 > 20_000, "記録が何周も捨てていない — 試験の前提 ({:?})", log.range());
+        // 開き直しても同じ (header の done は次に捨てる時に追いつくが、 開く時に記録から当て直す)
+        drop(log);
+        drop(bases);
+        let (log, bases) = reopen(&dir);
+        assert_at_log_start(&log, &bases, &ws, "開き直した後");
+    }
+
+    /// 捨てる途中で落ちた形 (土台の header の後 / cell を半分当てた後 / 土台を書き出して記録の header の前) → 開く時に記録から
+    /// 当て直して、 当てていた終わりの時点の列になる。 続けて足すと、 また記録の始まりの時点の列。
+    #[test]
+    fn crash_points_recover_on_open() {
+        for stop in 1..=3u8 {
+            let dir = tempdir(&format!("crash{stop}"));
+            let ws = writes(20_000, 0x9E37_79B9_7F4A_7C15 ^ stop as u64);
+            let (log, bases) = setup(&dir);
+            let mut at = 0;
+            add(&log, &ws, &mut at, 8_000).unwrap();
+            let (first0, _) = log.range();
+            assert!(first0 > 0, "まだ捨てていない — 試験の前提");
+            match stop {
+                3 => log.stop_after_discard_hook.store(true, std::sync::atomic::Ordering::Relaxed),
+                s => bases.stop.store(s, std::sync::atomic::Ordering::Relaxed),
+            }
+            // 捨てるまで足す (止まった 1 回は Err)
+            let mut failed = false;
+            for _ in 0..20 {
+                let batch: Vec<_> = (at..at + 100).map(|i| entry(i, ws[i as usize])).collect();
+                if log.append(&batch, &[], &mut Vec::new()).is_err() {
+                    failed = true;
+                    break;
+                }
+                at += 100;
+            }
+            assert!(failed, "stop {stop}: 止まっていない");
+            let first_before = log.range().0;
+            drop(log);
+            drop(bases);
+            let (log, bases) = reopen(&dir);
+            let (first, _) = log.range();
+            assert_eq!(first, first_before, "stop {stop}: 記録は捨てる前のまま");
+            let (done, hz, m) = cells(&bases);
+            assert!(done > first, "stop {stop}: 当てていた終わり ({done}) が記録の始まり ({first}) の先でない");
+            assert_eq!(m, state(&ws, done), "stop {stop}: 当て直した列 (done = {done})");
+            assert_eq!(hz, hlc(done - 1), "stop {stop}: 地平");
+            // 続けて足す: 次に捨てる時に記録の始まりに追いつく
+            add(&log, &ws, &mut at, 20_000).unwrap();
+            assert_at_log_start(&log, &bases, &ws, &format!("stop {stop} の後"));
+            drop(log);
+            drop(bases);
+            let (log, bases) = reopen(&dir);
+            assert_at_log_start(&log, &bases, &ws, &format!("stop {stop} の後に開き直した"));
+        }
+    }
+
+    /// 置けない大きさの record (中身を残さない番号) で全部捨てても、 土台は番号を数えて記録の始まりに居る。
+    #[test]
+    fn a_record_too_large_to_keep_is_a_hole() {
+        let dir = tempdir("hole");
+        let ws = writes(3_000, 77);
+        let (log, bases) = setup(&dir);
+        let mut at = 0;
+        add(&log, &ws, &mut at, 2_000).unwrap();
+        let big = NewEntry { hlc: hlc(2_000), wal_id: 2_000, bytes: vec![0; MIN_CAP / 2] };
+        log.append(&[big], &[], &mut Vec::new()).unwrap();
+        assert_eq!(log.range(), (2_001, 2_001));
+        let (done, hz, m) = cells(&bases);
+        assert_eq!((done, hz), (2_001, hlc(2_000)));
+        assert_eq!(m, state(&ws, 2_000));
+    }
+
+    /// 記録が土台に当てずに捨てた (土台を知らない binary で開いた等): 開く時に土台を消す。
+    #[test]
+    fn a_base_behind_the_log_is_dropped() {
+        let dir = tempdir("behind");
+        let ws = writes(10_000, 5);
+        {
+            let (log, bases) = setup(&dir);
+            let mut at = 0;
+            add(&log, &ws, &mut at, 100).unwrap();
+            drop(bases);
+            drop(log);
+        }
+        // 口を付けずに足して捨てさせる
+        let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
+        let mut at = 100;
+        add(&log, &ws, &mut at, 10_000).unwrap();
+        assert!(log.range().0 > 0);
+        let bases = BallBases::new();
+        bases.attach(&dir, &log, |h| (h == HID).then(|| NAME.to_string()));
+        assert!(!bases.has(HID));
+        assert!(!path_of(&dir, HID).exists(), "使えない土台は消す");
+    }
+}
