@@ -44,6 +44,16 @@ struct Hist {
     eids: Vec<u64>,
     cur: Vec<Option<u64>>,
     checks: Vec<(u64, Vec<Option<u64>>)>,
+    /// 宣言の時の地平 (記録が捨てていなければ組み直した後も同じ)。
+    hz0: u64,
+    /// entity ごとの、 宣言からの面の数 (宣言の時の値の面 1 + 値を変えて上を向いた回数)。 地平が宣言のままなら球の面の数と同じ
+    /// (同じ書き込みを 2 度当てると、 同じ値の面 / 戻って進む面が増える)。
+    faces: Vec<usize>,
+}
+
+/// 書き込み 1 つで面が増えるか (値があって前と違う)。
+fn turns(old: Option<u64>, new: Option<u64>) -> bool {
+    new.is_some() && new != old
 }
 
 impl Hist {
@@ -68,6 +78,11 @@ impl Hist {
                 assert_eq!(eng.ball_value_at(e, "t.a", *t).unwrap(), cur[i], "{what}: 回 {k} t={t} e={e}");
             }
         }
+        if hz == self.hz0 {
+            for (i, &e) in self.eids.iter().enumerate() {
+                assert_eq!(eng.ball_faces(e, "t.a").len(), self.faces[i], "{what}: e={e} 面の数");
+            }
+        }
         // 同じ書き込みを組む側と書き手の両方が当てると、 同じ値の面が隙間なく続く (答えは集合として同じなので、 面で見る)。
         // 外して同じ値を書き直した時は前の面が閉じてから次が上を向く (隙間がある)
         for &e in &self.eids {
@@ -82,7 +97,7 @@ impl Hist {
 }
 
 /// 表 t (id, a) に TH × PER 行を入れ、 記録付きで a を球にして、 1 本で何回か書いて控える。
-fn create(path: &str, log_cap: usize) -> Hist {
+fn create(path: &str, wal: usize, log_cap: usize) -> Hist {
     let mut db = Database::create(path).unwrap();
     db.table("t").number("id").number("a").primary_key("id").build().unwrap();
     let mut eids = Vec::new();
@@ -95,11 +110,12 @@ fn create(path: &str, log_cap: usize) -> Hist {
             cur.push(Some(v));
         }
     }
-    let db = db.finish_with_oplog(WAL).unwrap();
+    let db = db.finish_with_oplog(wal).unwrap();
     let eng = db.engine();
     eng.enable_change_log(log_cap).unwrap();
     assert!(eng.declare_ball("t.a").unwrap());
-    let mut h = Hist { eids, cur, checks: Vec::new() };
+    let n = eids.len();
+    let mut h = Hist { eids, cur, checks: Vec::new(), hz0: eng.ball_horizon("t.a").unwrap(), faces: vec![1; n] };
     h.checks.push((eng.ball_now(), h.cur.clone()));
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let mut r = Rng(0x2545_F491_4F6C_DD1D);
@@ -109,6 +125,7 @@ fn create(path: &str, log_cap: usize) -> Hist {
             let v = VALS[r.below(VALS.len() as u64) as usize];
             eng.tie_to_by_id(h.eids[i], ha, v as u32);
             eng.commit();
+            h.faces[i] += usize::from(turns(h.cur[i], Some(v)));
             h.cur[i] = Some(v);
         }
         h.checks.push((eng.ball_now(), h.cur.clone()));
@@ -129,24 +146,26 @@ struct Session {
 #[allow(clippy::too_many_arguments)]
 fn concurrent_session(
     path: &str,
+    wal: usize,
     h: &mut Hist,
     per: usize,
     gap_us: u64,
     build_at: usize,
     after: usize,
     pause_ms: u64,
-    publish_pause_us: u64,
+    publish_pause_us: (u64, u64),
     seed: u64,
     min_seen: usize,
 ) -> Session {
-    let db = Database::open_with_oplog(path, WAL).unwrap();
+    let db = Database::open_with_oplog(path, wal).unwrap();
     let eng = db.engine();
     eng.ball_set_build_pause(pause_ms);
-    eng.ball_set_publish_pause(publish_pause_us);
+    eng.ball_set_publish_pause(publish_pause_us.0, publish_pause_us.1);
     assert!(eng.ball_rebuild_stats().is_none(), "開くだけでは組まない");
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let bar = Barrier::new(TH + 1);
     let shared = Mutex::new(h.cur.clone());
+    let faces = Mutex::new(h.faces.clone());
     let writes = AtomicU64::new(0);
     let round_now = AtomicUsize::new(0);
     let during = AtomicU64::new(0);
@@ -157,8 +176,9 @@ fn concurrent_session(
     let mut checks = Vec::new();
     std::thread::scope(|s| {
         for th in 0..TH {
-            let (bar, shared, writes, go) = (&bar, &shared, &writes, &go);
+            let (bar, shared, writes, go, faces) = (&bar, &shared, &writes, &go, &faces);
             let mut mine: Vec<Option<u64>> = h.cur[th * PER..(th + 1) * PER].to_vec();
+            let mut turned = vec![0usize; PER];
             s.spawn(move || {
                 let mut r = Rng(seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul(th as u64 + 1)));
                 loop {
@@ -166,13 +186,13 @@ fn concurrent_session(
                         let k = r.below(PER as u64) as usize;
                         let e = eids[th * PER + k];
                         let x = r.below(VALS.len() as u64 + 1) as usize;
-                        if x == VALS.len() {
-                            eng.untie_by_id(e, ha);
-                            mine[k] = None;
-                        } else {
-                            eng.tie_to_by_id(e, ha, VALS[x] as u32);
-                            mine[k] = Some(VALS[x]);
+                        let new = (x < VALS.len()).then(|| VALS[x]);
+                        match new {
+                            None => eng.untie_by_id(e, ha),
+                            Some(v) => eng.tie_to_by_id(e, ha, v as u32),
                         }
+                        turned[k] += usize::from(turns(mine[k], new));
+                        mine[k] = new;
                         eng.commit();
                         writes.fetch_add(1, Ordering::Relaxed);
                         if gap_us > 0 {
@@ -185,6 +205,10 @@ fn concurrent_session(
                     if !go.load(Ordering::Acquire) {
                         break;
                     }
+                }
+                let mut f = faces.lock().unwrap();
+                for (k, t) in turned.into_iter().enumerate() {
+                    f[th * PER + k] += t;
                 }
             });
         }
@@ -214,6 +238,7 @@ fn concurrent_session(
         }
     });
     h.cur = shared.into_inner().unwrap();
+    h.faces = faces.into_inner().unwrap();
     let rounds = checks.len();
     h.checks.extend(checks);
     let st = eng.ball_rebuild_stats().expect("組んだ");
@@ -232,43 +257,48 @@ fn concurrent_session(
     Session { during: during.load(Ordering::Relaxed), st, waits, covered }
 }
 
-/// (T2) 書き手 4 本が書き続ける中で最初の読みが組む (書き手は 1 件ごとに 20 µs 空けて、 組む側が追いつける速さに)。 開き直しを 8 回重ねる (前の session の控えも毎回確かめる)。 書き手は組み終えた
-/// 後も書くので、 公開中に待つ書き手と、 組む側が当てた (閾値より前の) 書き込みを組んだ後に書く書き手が出る (前提として数える)。
-/// 公開中の間は数 µs なので、 半分の session は試験の口で広げる (公開中を置いた後・H を取る前と、 書き終えを待った後に 2 ms ずつ)。
+/// (T2) 書き手 4 本が書き続ける中で最初の読みが組む (書き手は 1 件ごとに 20 µs 空けて、 組む側が追いつける速さに)。 開き直しを 9 回重ねる
+/// (前の session の控えも毎回確かめる)。 書き手は組み終えた後も書くので、 公開中に待つ書き手と、 組む側が当てた (閾値より前の)
+/// 書き込みを組んだ後に書く書き手が出る (前提として数える)。 公開中の間は数 µs なので、 試験の口で広げる: H を取る前に 2 ms
+/// (H より前に積んで待つ書き手) / 書き終えを待った後に 2 ms (H 以降に積んで待つ書き手 = 組む側の残りの読みに H 以降の record がある) / なし を回す。
 #[test]
 fn the_first_read_builds_while_writers_write() {
     let path = tmp_path("t2");
     cleanup(&path);
-    let mut h = create(&path, 32 << 20);
+    let mut h = create(&path, WAL, 32 << 20);
     let (mut overlapped, mut waits, mut covered) = (0, 0, 0);
-    for k in 0..8u64 {
-        let ss = concurrent_session(&path, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, if k % 2 == 0 { 2000 } else { 0 }, 0x1234 + k, 100);
+    for k in 0..9u64 {
+        let pp = [(2000, 0), (0, 2000), (0, 0)][k as usize % 3];
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0x1234 + k, 100);
         overlapped += usize::from(ss.during > 0);
         waits += ss.waits;
         covered += ss.covered;
     }
-    assert!(overlapped >= 6, "組むのと書くのが重なっていない — 試験の前提 ({overlapped}/8)");
+    assert!(overlapped >= 7, "組むのと書くのが重なっていない — 試験の前提 ({overlapped}/9)");
     assert!(waits > 0 && covered > 0, "公開の時の約束の場所を踏んでいない — 試験の前提 (待った {waits}, 閾値より前 {covered})");
     // 最後にもう 1 回開き直して、 書かずに全部の控え
     let db = Database::open_with_oplog(&path, WAL).unwrap();
     let (seen, old) = h.verify(&db, "最後に開き直した後");
     assert_eq!(seen + old, h.checks.len());
     assert!(seen >= 100, "地平以降の控え {seen}");
+    assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
     drop(db);
     cleanup(&path);
 }
 
-/// (T3) 組む間に記録が捨てる (記録 1 MiB、 組む間を広げて書き手が何周も書く): 土台から組み直して答えが合う。
+/// (T3) 組む間に記録が捨てる (記録 1 MiB、 WAL 1 MiB、 組む間を広げて書き手が何周も書く): 土台から組み直し、 最後の回は記録に写すのを止めて
+/// 組む (止めずには追いつけない)。 WAL を何度も畳む (追いつきの間に畳むと、 前に読み終えた WAL の位置は前の周の物)。
 #[test]
 fn a_build_restarts_when_the_log_drops_what_it_was_reading() {
     let path = tmp_path("t3");
     cleanup(&path);
-    let mut h = create(&path, 1 << 20);
-    let mut restarted = 0;
+    const SMALL_WAL: usize = 1 << 20;
+    let mut h = create(&path, SMALL_WAL, 1 << 20);
+    let mut last_attempt = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, &mut h, 400, 0, 3, 3, 600, 0, 0x77 + k, 2);
-        restarted += usize::from(ss.st.attempts >= 2);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0x77 + k, 2);
+        last_attempt += usize::from(ss.st.attempts == 4);
     }
-    assert!(restarted >= 1, "組む間に記録が捨てていない — 試験の前提 (組み直した session {restarted}/3)");
+    assert!(last_attempt >= 1, "最後の回 (止めて組む) まで行っていない — 試験の前提 ({last_attempt}/3)");
     cleanup(&path);
 }
