@@ -18378,7 +18378,10 @@ impl Engine {
             // 小さくなるまで繰り返す
             let t_catch = std::time::Instant::now();
             let mut ok = true;
-            for _ in 0..16 {
+            for i in 0..16 {
+                if pause > 0 && attempt < ATTEMPTS && i > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(pause));
+                }
                 let before = rp.records;
                 if !rp.catch_up(log, wal, &mut pos, None, held.as_deref()) {
                     ok = false;
@@ -18462,7 +18465,8 @@ impl Engine {
         self.ball_publish_pause[1].store(after_us, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 試験: 球を組む時、 記録の残りを読んだ後に `ms` 止まる (最後の回 = 記録に写すのを止めて組む回の他。 書き手が並んで書く間を広げる)。
+    /// 試験: 球を組む時、 記録の残りを読んだ後と追いつきの 2 回目から毎回の前に `ms` 止まる (最後の回 = 記録に写すのを止めて組む回の他。
+    /// 書き手が並んで書く間と、 追いつきの間に consumer が写す・畳む間を広げる)。
     #[doc(hidden)]
     pub fn ball_set_build_pause(&self, ms: u64) {
         self.ball_build_pause.store(ms, std::sync::atomic::Ordering::Relaxed);
