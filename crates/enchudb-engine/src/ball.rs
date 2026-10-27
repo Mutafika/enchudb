@@ -180,7 +180,13 @@ impl<T: Default> Chunked<T> {
 
     #[inline]
     fn get(&self, i: u32) -> Option<&T> {
-        let c = self.chunks.get((i >> CHUNK_BITS) as usize)?.get()?;
+        // 並びは `<[_]>::get` で引かない: 並び全体 (OnceLock 65536 個) の参照を作り、 Miri (Tree Borrows) は 1 回ごとに中の
+        // UnsafeCell を全部たどる (1 回 0.3 秒、 添字で引けば 4〜20 ms)。 長さは raw の参照で見る。 release の機械語は同じ
+        let k = (i >> CHUNK_BITS) as usize;
+        if k >= (&raw const *self.chunks).len() {
+            return None;
+        }
+        let c = self.chunks[k].get()?;
         Some(&c[i as usize & (CHUNK - 1)])
     }
 
