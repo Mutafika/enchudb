@@ -32,14 +32,8 @@
  {
   "name": "開く時に当て直さない",
   "file": "crates/enchudb-engine/src/ball_base.rs",
-  "find": "        if h.done < h.end {",
+  "find": "        if h.done.max(first) < h.end {",
   "replace": "        if false {"
- },
- {
-  "name": "当て直しを記録の始まりから読まない",
-  "file": "crates/enchudb-engine/src/ball_base.rs",
-  "find": "let mut pos = h.done.max(first);",
-  "replace": "let mut pos = h.done;"
  },
  {
   "name": "記録より先の終わりを受け入れる",
