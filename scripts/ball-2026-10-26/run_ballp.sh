@@ -13,8 +13,10 @@ mkdir -p "$BALL_DIR"
 R=${RES_R:-$S/results_ballp_r_v11.jsonl}
 ONLY=${ONLY:-rw}
 W=${RES_W:-$S/results_ballp_w_v11.jsonl}
+L=${RES_L:-$S/results_ballp_l_v12.jsonl}
 case $ONLY in *r*) : > "$R" ;; esac
 case $ONLY in *w*) : > "$W" ;; esac
+case $ONLY in *l*) : > "$L" ;; esac
 load1() { sysctl -n vm.loadavg | awk '{print $2}'; }
 freeg() { df -g / | awk 'NR==2 {print $4}'; }
 quiet() { t=0; while [ "$(load1 | awk '{print ($1 < 8) ? 1 : 0}')" != 1 ]; do sleep 5; t=$((t + 5)); [ $t -ge 1800 ] && break; done; }
@@ -37,3 +39,15 @@ done
     done
   done
 done
+# (12 回目) l: 開き直した後、 書き手 1 本が書き続ける中で最初の読みが組む。 基準は BALL_PLAN.md の 12 回目 (P1: 組む間の書き込み 1 回の
+# 最大の待ち ≤ 5 ms、 組み直しは 1 件 ≤ 0.7 µs)
+case $ONLY in *l*)
+for seed in 41 42 43; do
+  for spec in "16 160000" "64 640000"; do
+    set -- $spec
+    quiet; l=$(load1); f=$(freeg)
+    BALL_WAL_MIB=${BALL_WAL_MIB:-64} "$B" l "$1" "$2" "$seed" | sed "s/^{/{\"load\":$l,\"free_g\":$f,/" >> "$L"
+    echo "l log=${1}MiB writes=$2 seed=$seed load=$l"
+  done
+done ;;
+esac
