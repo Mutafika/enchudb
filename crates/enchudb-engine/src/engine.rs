@@ -15620,9 +15620,16 @@ impl Engine {
             return Ok(0);
         }
         let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
+        // 球の土台 (試作): 土台に当たる書き込みを控える (捨てる時に記録を読み直さない)
+        let filter = self.ball_bases.filter();
+        let mut picked = Vec::new();
         let batch: Vec<crate::change_log::NewEntry> = recs
             .into_iter()
-            .map(|(r, _)| {
+            .enumerate()
+            .map(|(k, (r, _))| {
+                if let Some(op) = filter.as_ref().and_then(|f| f.pick(&r.op, r.author_peer)) {
+                    picked.push((k as u64, op));
+                }
                 let wal_id = crate::change_log::fnv1a64(&r.signed_bytes);
                 let w = crate::transport::WireRecord::from(r);
                 crate::change_log::NewEntry { hlc: w.hlc, wal_id, bytes: w.encode() }
@@ -15630,9 +15637,15 @@ impl Engine {
             .collect();
         let watch: Vec<u64> = c.readers.iter().map(|(_, p)| *p).collect();
         let before = log.range().1;
+        if filter.is_some() {
+            self.ball_bases.noted(before, batch.len(), picked);
+        }
         let mut lost = Vec::new();
         let res = log.append(&batch, &watch, &mut lost);
         let done = (log.range().1 - before) as usize;
+        if filter.is_some() {
+            self.ball_bases.appended(log.range().1);
+        }
         c.log_wal = if done == ends.len() {
             end
         } else if done > 0 {

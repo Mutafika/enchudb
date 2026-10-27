@@ -87,20 +87,53 @@ pub(crate) enum BaseOp {
     Delete(u32),
 }
 
-/// 記録の entry を読む: 球の土台に関わる書き込みなら Some。 他の peer の record は扱わない (試作の範囲)。
-pub(crate) fn decode(e: &Entry, self_peer: u32) -> Option<BaseOp> {
-    let (r, _) = crate::transport::WireRecord::decode(&e.bytes).ok()?;
-    if self_peer != 0 && r.author_peer != 0 && r.author_peer != self_peer {
+/// record の書き込みを土台に当てる形にする (土台に関わり得る書き込みなら Some)。 他の peer の record は扱わない (試作の範囲)。
+pub(crate) fn base_op(op: &DecodedOp, author: u32, self_peer: u32) -> Option<BaseOp> {
+    if self_peer != 0 && author != 0 && author != self_peer {
         return None;
     }
     let local = enchudb_oplog::eid_local;
-    match r.op {
-        DecodedOp::Tie { eid, himo_id, value } => Some(BaseOp::Set(himo_id, local(eid), Some(value))),
-        DecodedOp::Untie { eid, himo_id } => Some(BaseOp::Set(himo_id, local(eid), None)),
-        DecodedOp::Delete { eid } => Some(BaseOp::Delete(local(eid))),
-        DecodedOp::TieNamed { eid, himo_name, value, .. } => Some(BaseOp::SetNamed(himo_name, local(eid), value)),
+    match op {
+        DecodedOp::Tie { eid, himo_id, value } => Some(BaseOp::Set(*himo_id, local(*eid), Some(*value))),
+        DecodedOp::Untie { eid, himo_id } => Some(BaseOp::Set(*himo_id, local(*eid), None)),
+        DecodedOp::Delete { eid } => Some(BaseOp::Delete(local(*eid))),
+        DecodedOp::TieNamed { eid, himo_name, value, .. } => Some(BaseOp::SetNamed(himo_name.clone(), local(*eid), *value)),
         _ => None,
     }
+}
+
+/// 記録の entry を読む: 球の土台に関わり得る書き込みなら Some。
+pub(crate) fn decode(e: &Entry, self_peer: u32) -> Option<BaseOp> {
+    let (r, _) = crate::transport::WireRecord::decode(&e.bytes).ok()?;
+    base_op(&r.op, r.author_peer, self_peer)
+}
+
+/// 土台を持つ紐の書き込みだけを選ぶ (記録に写す時、 [`BallBases::filter`])。
+pub(crate) struct Filter {
+    hids: Vec<u16>,
+    names: Vec<String>,
+    peer: u32,
+}
+
+impl Filter {
+    /// 土台のどれかに当たる書き込みなら Some (消すは全部の土台に当たる)。
+    pub(crate) fn pick(&self, op: &DecodedOp, author: u32) -> Option<BaseOp> {
+        match op {
+            DecodedOp::Tie { himo_id, .. } | DecodedOp::Untie { himo_id, .. } if !self.hids.contains(himo_id) => None,
+            DecodedOp::TieNamed { himo_name, .. } if !self.names.iter().any(|n| n == himo_name) => None,
+            _ => base_op(op, author, self.peer),
+        }
+    }
+}
+
+/// 記録に写した、 土台に当たる書き込みの控え (番号の順)。 捨てる時に記録を読み直さずに当てる。 `from` 以上の番号は控えが全部
+/// (控えに無い番号は土台に当たらない)、 それより前は記録から読む (開いた後に初めて写す前の record)。
+#[derive(Default)]
+struct Recent {
+    from: Option<u64>,
+    /// 次に写す番号 (続きでなければ控えを捨てて `from` から始め直す)。
+    next: u64,
+    ops: std::collections::VecDeque<(u64, BaseOp)>,
 }
 
 /// 土台 1 本 (紐 1 本)。
@@ -241,6 +274,7 @@ impl Base {
 pub(crate) struct BallBases {
     self_peer: std::sync::atomic::AtomicU32,
     bases: Mutex<Vec<Base>>,
+    recent: Mutex<Recent>,
     /// 試験: 捨てる時に止める所 (1 = header を書き出した後・cell の前、 2 = cell を半分当てて書き出した後)。
     #[cfg(test)]
     pub(crate) stop: std::sync::atomic::AtomicU8,
@@ -251,6 +285,7 @@ impl BallBases {
         Self {
             self_peer: std::sync::atomic::AtomicU32::new(0),
             bases: Mutex::new(Vec::new()),
+            recent: Mutex::new(Recent::default()),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicU8::new(0),
         }
@@ -336,6 +371,37 @@ impl BallBases {
     pub(crate) fn with<R>(&self, hid: u16, f: impl FnOnce(&Base) -> R) -> Option<R> {
         self.lock().iter().find(|b| b.hid == hid).map(f)
     }
+
+    /// 記録に写す書き込みのうち土台に当たるものを選ぶ物 (土台が無ければ None)。
+    pub(crate) fn filter(&self) -> Option<Filter> {
+        let g = self.lock();
+        (!g.is_empty()).then(|| Filter {
+            hids: g.iter().map(|b| b.hid).collect(),
+            names: g.iter().map(|b| b.name.clone()).collect(),
+            peer: self.self_peer.load(std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    /// 記録に写す前: 番号 `before` から `n` 件を写す。 そのうち土台に当たる書き込み `ops` (`(before からの位置, 書き込み)`) を控える。
+    /// 写す途中で捨てる時 (1 回に写す量が記録より大きい) にも控えから当てるので、 写す前に呼ぶ。
+    pub(crate) fn noted(&self, before: u64, n: usize, ops: Vec<(u64, BaseOp)>) {
+        let mut r = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        if r.from.is_none() || r.next != before {
+            r.ops.clear();
+            r.from = Some(before);
+        }
+        r.ops.extend(ops.into_iter().map(|(k, op)| (before + k, op)));
+        r.next = before + n as u64;
+    }
+
+    /// 記録に写した後: 番号 `upto` から先は写せなかった (控えから外す。 次はその番号から写し直す)。
+    pub(crate) fn appended(&self, upto: u64) {
+        let mut r = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        while r.ops.back().is_some_and(|&(no, _)| no >= upto) {
+            r.ops.pop_back();
+        }
+        r.next = upto;
+    }
 }
 
 impl OnDiscard for BallBases {
@@ -343,19 +409,43 @@ impl OnDiscard for BallBases {
         !self.lock().is_empty()
     }
 
-    fn discard(&self, first: u64, end: u64, end_hlc: Hlc, hole: Option<u64>, entries: &[Entry]) -> io::Result<()> {
+    fn discard(&self, first: u64, end: u64, end_hlc: Hlc, hole: Option<u64>, read: &mut dyn FnMut(u64, u64) -> Vec<Entry>) -> io::Result<()> {
         let peer = self.self_peer.load(std::sync::atomic::Ordering::Relaxed);
-        let ops: Vec<(u64, Option<BaseOp>)> = entries.iter().map(|e| (e.no, decode(e, peer))).collect();
         let mut g = self.lock();
+        // 当てる番号: 土台のうち一番手前の done (記録の始まりより前は無い) から end まで
+        let Some(start) = g.iter().map(|b| b.done).min().map(|d| d.max(first)) else { return Ok(()) };
+        let mut ops: Vec<(u64, BaseOp)> = Vec::new();
+        // 控えより前の番号は記録から読む (開いた後に初めて写す前の record)。 控えの番号のうち end より前は取り出す
+        let mut r = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        if start >= end {
+            // どの土台も作った時より前の番号
+            while r.ops.front().is_some_and(|&(no, _)| no < end) {
+                r.ops.pop_front();
+            }
+            return Ok(());
+        }
+        let split = r.from.map_or(end, |f| f.clamp(start, end));
+        let mut read_ok = true;
+        if start < split {
+            let es = read(start, split);
+            let want = (split - start) - u64::from(hole.is_some_and(|h| (start..split).contains(&h)));
+            read_ok = es.len() as u64 == want;
+            ops.extend(es.iter().filter_map(|e| decode(e, peer).map(|op| (e.no, op))));
+        }
+        while r.ops.front().is_some_and(|&(no, _)| no < end) {
+            let (no, op) = r.ops.pop_front().unwrap();
+            if no >= start {
+                ops.push((no, op));
+            }
+        }
+        drop(r);
         let mut broken = Vec::new();
         for (k, b) in g.iter_mut().enumerate() {
             if end <= b.done {
                 continue; // 作った時より前の番号 (cell に入っている)
             }
-            // [done, end) が全部読めたか (hole は中身の無い番号)
-            let from = b.done.max(first);
-            let have = |no: u64| hole == Some(no) || ops.binary_search_by_key(&no, |(n, _)| *n).is_ok();
-            if b.done < first || !(from..end).all(have) || end_hlc == Hlc::ZERO {
+            // [done, end) が全部そろったか (記録から読む分が読めない entry で切れた / 捨てた所が土台より先 / 最後の HLC が読めない)
+            if b.done < first || (b.done < split && !read_ok) || end_hlc == Hlc::ZERO {
                 broken.push(k);
                 continue;
             }
@@ -366,7 +456,7 @@ impl OnDiscard for BallBases {
             if stop == 1 {
                 return Err(io::Error::other("test: stopped after the base header"));
             }
-            let todo: Vec<&BaseOp> = ops.iter().filter(|(no, _)| *no >= b.done && *no < end).filter_map(|(_, op)| op.as_ref()).collect();
+            let todo: Vec<&BaseOp> = ops.iter().filter(|(no, _)| *no >= b.done && *no < end).map(|(_, op)| op).collect();
             #[cfg(test)]
             if stop == 2 {
                 for op in &todo[..todo.len() / 2] {
@@ -505,12 +595,34 @@ mod tests {
         (log, bases)
     }
 
+    /// 100 件を足す。 `noting` なら engine の写す道と同じく、 土台に当たる書き込みを足す前に控え、 足した後に写せなかった分を外す
+    /// (捨てる時は控えから当てる)。 でなければ控えなし (捨てる時は記録から読む)。
+    fn add_batch(log: &ChangeLog, bases: &BallBases, noting: bool, ws: &[W], at: u64, n: u64) -> io::Result<()> {
+        let batch: Vec<_> = (at..at + n).map(|i| entry(i, ws[i as usize])).collect();
+        let filter = noting.then(|| bases.filter()).flatten();
+        if let Some(f) = &filter {
+            let picked = batch
+                .iter()
+                .enumerate()
+                .filter_map(|(k, e)| {
+                    let (r, _) = WireRecord::decode(&e.bytes).unwrap();
+                    f.pick(&r.op, r.author_peer).map(|op| (k as u64, op))
+                })
+                .collect();
+            bases.noted(log.range().1, batch.len(), picked);
+        }
+        let res = log.append(&batch, &[], &mut Vec::new());
+        if filter.is_some() {
+            bases.appended(log.range().1);
+        }
+        res
+    }
+
     /// 足す (100 件ずつ)。 `at` から `upto` まで。
-    fn add(log: &ChangeLog, ws: &[W], at: &mut u64, upto: u64) -> io::Result<()> {
+    fn add(log: &ChangeLog, bases: &BallBases, noting: bool, ws: &[W], at: &mut u64, upto: u64) -> io::Result<()> {
         while *at < upto {
             let n = (upto - *at).min(100);
-            let batch: Vec<_> = (*at..*at + n).map(|i| entry(i, ws[i as usize])).collect();
-            log.append(&batch, &[], &mut Vec::new())?;
+            add_batch(log, bases, noting, ws, *at, n)?;
             *at += n;
         }
         Ok(())
@@ -527,68 +639,127 @@ mod tests {
         }
     }
 
+    /// 控えあり (engine の写す道) / なし (記録から読む) の両方で。
     #[test]
     fn discards_keep_the_base_at_the_start_of_the_log() {
-        let dir = tempdir("keep");
-        let ws = writes(30_000, 0x2545_F491_4F6C_DD1D);
-        let (log, bases) = setup(&dir);
-        let mut at = 0;
-        for k in 1..=30u64 {
-            add(&log, &ws, &mut at, k * 1000).unwrap();
-            assert_at_log_start(&log, &bases, &ws, &format!("{k} 千件"));
+        for noting in [true, false] {
+            let dir = tempdir(&format!("keep{noting}"));
+            let ws = writes(30_000, 0x2545_F491_4F6C_DD1D);
+            let (log, bases) = setup(&dir);
+            let mut at = 0;
+            for k in 1..=30u64 {
+                add(&log, &bases, noting, &ws, &mut at, k * 1000).unwrap();
+                assert_at_log_start(&log, &bases, &ws, &format!("控え {noting}: {k} 千件"));
+            }
+            assert!(log.range().0 > 20_000, "記録が何周も捨てていない — 試験の前提 ({:?})", log.range());
+            if noting {
+                // 控えは記録に残っている番号の分だけ (捨てた分は取り出した)
+                let r = bases.recent.lock().unwrap();
+                assert!(r.ops.front().is_none_or(|&(no, _)| no >= log.range().0), "捨てた番号の控えが残っている");
+                assert!(r.ops.len() as u64 <= log.range().1 - log.range().0);
+            }
+            // 開き直しても同じ (header の done は次に捨てる時に追いつくが、 開く時に記録から当て直す)。 開いた後の最初の捨てる時は
+            // 控えの前の番号を記録から読む
+            drop(log);
+            drop(bases);
+            let (log, bases) = reopen(&dir);
+            assert_at_log_start(&log, &bases, &ws, &format!("控え {noting}: 開き直した後"));
+            let ws2 = [ws.clone(), writes(10_000, 99)].concat();
+            add(&log, &bases, noting, &ws2, &mut at, 40_000).unwrap();
+            assert_at_log_start(&log, &bases, &ws2, &format!("控え {noting}: 開き直して足した後"));
         }
-        assert!(log.range().0 > 20_000, "記録が何周も捨てていない — 試験の前提 ({:?})", log.range());
-        // 開き直しても同じ (header の done は次に捨てる時に追いつくが、 開く時に記録から当て直す)
-        drop(log);
-        drop(bases);
-        let (log, bases) = reopen(&dir);
-        assert_at_log_start(&log, &bases, &ws, "開き直した後");
     }
 
     /// 捨てる途中で落ちた形 (土台の header の後 / cell を半分当てた後 / 土台を書き出して記録の header の前) → 開く時に記録から
-    /// 当て直して、 当てていた終わりの時点の列になる。 続けて足すと、 また記録の始まりの時点の列。
+    /// 当て直して、 当てていた終わりの時点の列になる。 続けて足すと、 また記録の始まりの時点の列。 控えあり / なしの両方で。
     #[test]
     fn crash_points_recover_on_open() {
-        for stop in 1..=3u8 {
-            let dir = tempdir(&format!("crash{stop}"));
-            let ws = writes(20_000, 0x9E37_79B9_7F4A_7C15 ^ stop as u64);
-            let (log, bases) = setup(&dir);
-            let mut at = 0;
-            add(&log, &ws, &mut at, 8_000).unwrap();
-            let (first0, _) = log.range();
-            assert!(first0 > 0, "まだ捨てていない — 試験の前提");
-            match stop {
-                3 => log.stop_after_discard_hook.store(true, std::sync::atomic::Ordering::Relaxed),
-                s => bases.stop.store(s, std::sync::atomic::Ordering::Relaxed),
-            }
-            // 捨てるまで足す (止まった 1 回は Err)
-            let mut failed = false;
-            for _ in 0..20 {
-                let batch: Vec<_> = (at..at + 100).map(|i| entry(i, ws[i as usize])).collect();
-                if log.append(&batch, &[], &mut Vec::new()).is_err() {
-                    failed = true;
-                    break;
+        for noting in [true, false] {
+            for stop in 1..=3u8 {
+                let what = format!("控え {noting} stop {stop}");
+                let dir = tempdir(&format!("crash{stop}{noting}"));
+                let ws = writes(20_000, 0x9E37_79B9_7F4A_7C15 ^ stop as u64);
+                let (log, bases) = setup(&dir);
+                let mut at = 0;
+                add(&log, &bases, noting, &ws, &mut at, 8_000).unwrap();
+                let (first0, _) = log.range();
+                assert!(first0 > 0, "{what}: まだ捨てていない — 試験の前提");
+                match stop {
+                    3 => log.stop_after_discard_hook.store(true, std::sync::atomic::Ordering::Relaxed),
+                    s => bases.stop.store(s, std::sync::atomic::Ordering::Relaxed),
                 }
-                at += 100;
+                // 捨てるまで足す (止まった 1 回は Err)
+                let mut failed = false;
+                for _ in 0..20 {
+                    if add_batch(&log, &bases, noting, &ws, at, 100).is_err() {
+                        failed = true;
+                        break;
+                    }
+                    at += 100;
+                }
+                assert!(failed, "{what}: 止まっていない");
+                let first_before = log.range().0;
+                drop(log);
+                drop(bases);
+                let (log, bases) = reopen(&dir);
+                let (first, _) = log.range();
+                assert_eq!(first, first_before, "{what}: 記録は捨てる前のまま");
+                let (done, hz, m) = cells(&bases);
+                assert!(done > first, "{what}: 当てていた終わり ({done}) が記録の始まり ({first}) の先でない");
+                assert_eq!(m, state(&ws, done), "{what}: 当て直した列 (done = {done})");
+                assert_eq!(hz, hlc(done - 1), "{what}: 地平");
+                // 続けて足す: 次に捨てる時に記録の始まりに追いつく
+                at = log.range().1;
+                add(&log, &bases, noting, &ws, &mut at, 20_000).unwrap();
+                assert_at_log_start(&log, &bases, &ws, &format!("{what} の後"));
+                drop(log);
+                drop(bases);
+                let (log, bases) = reopen(&dir);
+                assert_at_log_start(&log, &bases, &ws, &format!("{what} の後に開き直した"));
             }
-            assert!(failed, "stop {stop}: 止まっていない");
-            let first_before = log.range().0;
-            drop(log);
-            drop(bases);
-            let (log, bases) = reopen(&dir);
+        }
+    }
+
+    /// 記録の途中で作った土台 (engine の宣言と同じ: 記録の次の番号から): その前の番号を記録が捨てても土台は動かず、 土台の番号を
+    /// 捨て始めてから記録の始まりについて行く。 控えあり / なしの両方で。
+    #[test]
+    fn a_base_made_mid_log_ignores_older_numbers() {
+        for noting in [true, false] {
+            let dir = tempdir(&format!("mid{noting}"));
+            let ws = writes(20_000, 31);
+            let log = ChangeLog::open(&dir, MIN_CAP, true, false).unwrap();
+            let bases = Arc::new(BallBases::new());
+            log.set_on_discard(bases.clone());
+            let mut at = 0;
+            add(&log, &bases, noting, &ws, &mut at, 3_000).unwrap();
+            let cells0: Vec<(u32, u64)> = state(&ws, 3_000).into_iter().collect();
+            bases.insert(Base::create(&dir, HID, NAME, &cells0, 3_000, hlc(2_999)).unwrap());
+            // 記録は 1 MiB に約 4000 件: 3000 より前の番号を捨てる間、 土台は 3000 のまま
+            add(&log, &bases, noting, &ws, &mut at, 6_000).unwrap();
             let (first, _) = log.range();
-            assert_eq!(first, first_before, "stop {stop}: 記録は捨てる前のまま");
+            assert!(first > 0 && first <= 3_000, "試験の前提 (first = {first})");
             let (done, hz, m) = cells(&bases);
-            assert!(done > first, "stop {stop}: 当てていた終わり ({done}) が記録の始まり ({first}) の先でない");
-            assert_eq!(m, state(&ws, done), "stop {stop}: 当て直した列 (done = {done})");
-            assert_eq!(hz, hlc(done - 1), "stop {stop}: 地平");
-            // 続けて足す: 次に捨てる時に記録の始まりに追いつく
-            add(&log, &ws, &mut at, 20_000).unwrap();
-            assert_at_log_start(&log, &bases, &ws, &format!("stop {stop} の後"));
-            drop(log);
-            drop(bases);
-            let (log, bases) = reopen(&dir);
-            assert_at_log_start(&log, &bases, &ws, &format!("stop {stop} の後に開き直した"));
+            assert_eq!((done, hz), (3_000, hlc(2_999)), "控え {noting}");
+            assert_eq!(m, state(&ws, 3_000), "控え {noting}");
+            add(&log, &bases, noting, &ws, &mut at, 20_000).unwrap();
+            assert_at_log_start(&log, &bases, &ws, &format!("控え {noting}: 土台の番号を捨てた後"));
+        }
+    }
+
+    /// 控えが途切れた (控えずに写した番号がある) 後は控えを始め直し、 その番号は記録から読む。
+    #[test]
+    fn a_gap_in_the_notes_restarts_them() {
+        let dir = tempdir("gap");
+        let ws = writes(20_000, 41);
+        let (log, bases) = setup(&dir);
+        let mut at = 0;
+        for k in 0..200u64 {
+            // 10 回に 1 回は控えずに写す
+            add_batch(&log, &bases, k % 10 != 3, &ws, at, 100).unwrap();
+            at += 100;
+            if k % 20 == 19 {
+                assert_at_log_start(&log, &bases, &ws, &format!("{at} 件"));
+            }
         }
     }
 
@@ -599,7 +770,7 @@ mod tests {
         let ws = writes(3_000, 77);
         let (log, bases) = setup(&dir);
         let mut at = 0;
-        add(&log, &ws, &mut at, 2_000).unwrap();
+        add(&log, &bases, true, &ws, &mut at, 2_000).unwrap();
         let big = NewEntry { hlc: hlc(2_000), wal_id: 2_000, bytes: vec![0; MIN_CAP / 2] };
         log.append(&[big], &[], &mut Vec::new()).unwrap();
         assert_eq!(log.range(), (2_001, 2_001));
@@ -616,14 +787,14 @@ mod tests {
         {
             let (log, bases) = setup(&dir);
             let mut at = 0;
-            add(&log, &ws, &mut at, 100).unwrap();
+            add(&log, &bases, true, &ws, &mut at, 100).unwrap();
             drop(bases);
             drop(log);
         }
         // 口を付けずに足して捨てさせる
         let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
         let mut at = 100;
-        add(&log, &ws, &mut at, 10_000).unwrap();
+        add(&log, &BallBases::new(), false, &ws, &mut at, 10_000).unwrap();
         assert!(log.range().0 > 0);
         let bases = BallBases::new();
         bases.attach(&dir, &log, |h| (h == HID).then(|| NAME.to_string()));

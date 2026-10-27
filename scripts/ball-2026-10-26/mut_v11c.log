@@ -1,0 +1,8 @@
+baseline: pass 3 秒 → 1 run の上限 39 秒
+  killed 8s              記録より先の終わりを受け入れる
+  killed 8s              今の列と比べない
+  killed 8s              合わない時に地平を進めない
+  killed 8s              local-only の表にも土台を作る
+  SURVIVED 8s            宣言の時に記録に写さない
+killed 4 / survived 1 / その他 0
+  生き残り: 宣言の時に記録に写さない

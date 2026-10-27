@@ -26,8 +26,8 @@
  {
   "name": "中身を残さない番号を欠けと見る",
   "file": "crates/enchudb-engine/src/ball_base.rs",
-  "find": "let have = |no: u64| hole == Some(no) || ",
-  "replace": "let have = |no: u64| "
+  "find": "            let want = (split - start) - u64::from(hole.is_some_and(|h| (start..split).contains(&h)));",
+  "replace": "            let want = split - start;"
  },
  {
   "name": "開く時に当て直さない",
@@ -62,19 +62,19 @@
  {
   "name": "名前で指す書き込みを読まない",
   "file": "crates/enchudb-engine/src/ball_base.rs",
-  "find": "        DecodedOp::TieNamed { eid, himo_name, value, .. } => Some(BaseOp::SetNamed(himo_name, local(eid), value)),\n",
+  "find": "        DecodedOp::TieNamed { eid, himo_name, value, .. } => Some(BaseOp::SetNamed(himo_name.clone(), local(*eid), *value)),\n",
   "replace": ""
  },
  {
   "name": "消すを読まない",
   "file": "crates/enchudb-engine/src/ball_base.rs",
-  "find": "        DecodedOp::Delete { eid } => Some(BaseOp::Delete(local(eid))),\n",
+  "find": "        DecodedOp::Delete { eid } => Some(BaseOp::Delete(local(*eid))),\n",
   "replace": ""
  },
  {
   "name": "外すを読まない",
   "file": "crates/enchudb-engine/src/ball_base.rs",
-  "find": "        DecodedOp::Untie { eid, himo_id } => Some(BaseOp::Set(himo_id, local(eid), None)),\n",
+  "find": "        DecodedOp::Untie { eid, himo_id } => Some(BaseOp::Set(*himo_id, local(*eid), None)),\n",
   "replace": ""
  },
  {
@@ -90,10 +90,34 @@
   "replace": "            BaseOp::Delete(_) => Ok(()),"
  },
  {
-  "name": "開く時に地平を header から戻さない",
+  "name": "控えの前の番号を記録から読まない",
   "file": "crates/enchudb-engine/src/ball_base.rs",
-  "find": "        b.done = h.end;\n        b.horizon = h.horizon;",
-  "replace": "        b.done = h.end;"
+  "find": "        if start < split {",
+  "replace": "        if false {"
+ },
+ {
+  "name": "控えの続きでない時に始め直さない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        if r.from.is_none() || r.next != before {",
+  "replace": "        if r.from.is_none() {"
+ },
+ {
+  "name": "作った時より前の番号の時に早く返らない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        if start >= end {\n            // どの土台も作った時より前の番号\n            while r.ops.front().is_some_and(|&(no, _)| no < end) {\n                r.ops.pop_front();\n            }\n            return Ok(());\n        }\n",
+  "replace": ""
+ },
+ {
+  "name": "控えに消すを入れない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            _ => base_op(op, author, self.peer),",
+  "replace": "            DecodedOp::Delete { .. } => None,\n            _ => base_op(op, author, self.peer),"
+ },
+ {
+  "name": "控えに名前で指す書き込みを入れない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            DecodedOp::TieNamed { himo_name, .. } if !self.names.iter().any(|n| n == himo_name) => None,",
+  "replace": "            DecodedOp::TieNamed { .. } => None,"
  },
  {
   "name": "捨てる前の口を呼ばない",
@@ -116,13 +140,13 @@
  {
   "name": "口の Err を捨てる",
   "file": "crates/enchudb-engine/src/change_log.rs",
-  "find": "        h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &entries)?;",
-  "replace": "        let _ = h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &entries);"
+  "find": "        h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &mut read)?;",
+  "replace": "        let _ = h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &mut read);"
  },
  {
   "name": "地平の HLC を最後の entry から取らない",
   "file": "crates/enchudb-engine/src/change_log.rs",
-  "find": "            None => entries.last().filter(|e| e.no + 1 == end).map_or(Hlc::ZERO, |e| e.hlc),",
+  "find": "            None => self.read_in(st, end - 1, end, 0).0.first().map_or(Hlc::ZERO, |e| e.hlc),",
   "replace": "            None => Hlc::ZERO,"
  }
 ]

@@ -112,15 +112,15 @@ pub struct Entry {
     pub bytes: Vec<u8>,
 }
 
-/// 捨てる前に呼ぶ口 (試作、 球の土台 `crate::ball_base`)。 記録が古い entry を捨てる header を書く前に、 捨てる entry を渡す。
+/// 捨てる前に呼ぶ口 (試作、 球の土台 `crate::ball_base`)。 記録が古い entry を捨てる header を書く前に呼ぶ。
 pub(crate) trait OnDiscard: Send + Sync {
-    /// 捨てる entry を読んで渡すか (渡す相手が居ない時は読まない)。
+    /// 捨てる時に呼ぶか (呼ぶ相手が居ない時は、 捨てる entry の最後の HLC も読まない)。
     fn wants(&self) -> bool;
-    /// 番号 `[first, end)` を捨てる。 `entries` は読めた entry (番号の順。 読めない entry から先は無い)、 `end_hlc` は番号
-    /// `end − 1` の record の HLC、 `hole` は中身を残さなかった番号 (置けない大きさの record、 [`ChangeLog::max_entry`])。
-    /// 返る前に、 捨てる分を自分の disk の物に書き出しておくこと (記録はこの後で捨てる header を書き出す)。 Err なら捨てない
-    /// (append は Err)。
-    fn discard(&self, first: u64, end: u64, end_hlc: Hlc, hole: Option<u64>, entries: &[Entry]) -> io::Result<()>;
+    /// 番号 `[first, end)` を捨てる。 `end_hlc` は番号 `end − 1` の record の HLC (読めなければ `Hlc::ZERO`)、 `hole` は中身を
+    /// 残さなかった番号 (置けない大きさの record、 [`ChangeLog::max_entry`])。 `read(a, b)` は番号 `[a, b)` の entry を読む
+    /// (番号の順、 読めない entry から先は無い)。 返る前に、 捨てる分を自分の disk の物に書き出しておくこと (記録はこの後で捨てる
+    /// header を書き出す)。 Err なら捨てない (append は Err)。
+    fn discard(&self, first: u64, end: u64, end_hlc: Hlc, hole: Option<u64>, read: &mut dyn FnMut(u64, u64) -> Vec<Entry>) -> io::Result<()>;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -276,17 +276,16 @@ impl ChangeLog {
         let _ = self.on_discard.set(h);
     }
 
-    /// 捨てる header を書く前: 口があれば捨てる entry `[first, end)` を渡す。
+    /// 捨てる header を書く前: 口があれば捨てる番号 `[first, end)` を知らせる (entry は口が要る分だけ読む)。
     fn before_discard(&self, st: &mut State, end: u64, hole: Option<(u64, Hlc)>) -> io::Result<()> {
         let Some(h) = self.on_discard.get().filter(|h| h.wants()) else { return Ok(()) };
         let first = st.c.first;
-        let until = hole.map_or(end, |(no, _)| no);
-        let entries = if first < until { self.read_in(st, first, until, usize::MAX).0 } else { Vec::new() };
         let end_hlc = match hole {
             Some((_, hlc)) => hlc,
-            None => entries.last().filter(|e| e.no + 1 == end).map_or(Hlc::ZERO, |e| e.hlc),
+            None => self.read_in(st, end - 1, end, 0).0.first().map_or(Hlc::ZERO, |e| e.hlc),
         };
-        h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &entries)?;
+        let mut read = |a: u64, b: u64| if a < b { self.read_in(st, a, b, usize::MAX).0 } else { Vec::new() };
+        h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &mut read)?;
         #[cfg(test)]
         if self.stop_after_discard_hook.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(io::Error::other("test: stopped after the discard hook"));
