@@ -30,7 +30,7 @@
 //! # 試作の範囲
 //!
 //! - 自分の書き込みだけ (他の peer の record は番号の写像が要る。 sync の DB の球は土台を持たない)
-//! - local-only の表 (`_` で始まる表) の書き込みは記録に載らない
+//! - local-only の表 (`_` で始まる表) の書き込みは記録に載らないので、 その紐の球は土台を持たない (メモリだけ)
 //! - 置けない大きさで中身を残さなかった record (`hole`) は球の紐の書き込みでない (Tie は小さい) と見なす
 
 use std::io;
@@ -317,7 +317,6 @@ impl BallBases {
             b.write_header(&Header { done: h.end, ..h })?;
         }
         b.done = h.end;
-        b.horizon = h.horizon;
         Ok(())
     }
 

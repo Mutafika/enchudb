@@ -18062,7 +18062,9 @@ impl Engine {
     /// 今の列で土台を作り、 開き直した後の宣言は土台 (地平の時点の列) に記録の残りを前へ当てて組み直す (開き直す前の履歴が読める、
     /// 記録が捨てた所より前は [`crate::ball::TooOld`])。 記録の無い DB の球はメモリの上だけ (開き直すと消える)。 どちらも地平
     /// (メモリだけなら宣言の時刻) より前の時点は答えない。 宣言の時に WAL を書き出す (閉じていない group は閉じる)。 sync の DB は
-    /// 他の peer の record を扱わないので土台を持たない (試作の範囲)。
+    /// 他の peer の record を扱わないので土台を持たない (試作の範囲)。 local-only の表 (`_` で始まる表) の紐も、 書き込みが記録に
+    /// 載らないので土台を持たない。 組み直した球が今の列と合わない (WAL の無い open で書いた等、 記録に載らない書き込みがあった)
+    /// 時は、 合わない entity を今の時刻で回し、 地平を今に進める (その間の答えは信用できない)。
     pub fn declare_ball(&self, himo: &str) -> Result<bool, String> {
         let id = self.himo_id(himo).ok_or_else(|| format!("declare_ball: unknown himo '{himo}'"))?;
         let h = self.himos.get(id).ok_or_else(|| format!("declare_ball: himo {id} out of range"))?;
@@ -18078,6 +18080,7 @@ impl Engine {
         if let (Some(log), Some(wal), Backing::Segments(set)) = (self.change_log.get(), self.oplog.as_ref(), &self.backing)
             && !self.is_readonly()
             && !self.sync_tables_enabled()
+            && !self.tables.iter().any(|t| t.is_reserved() && t.himo_ids.read().unwrap_or_else(|p| p.into_inner()).contains(&(id as u32)))
         {
             return self.declare_ball_kept(id, himo, log, wal, set.dir()).map_err(|e| format!("declare_ball: {e}"));
         }
@@ -18174,7 +18177,7 @@ impl Engine {
             dt_apply += ta.elapsed();
         }
         let dt_log = t_read.elapsed();
-        // 今の列と比べる (記録に載っていない書き込みがあれば、 今の時刻で回す)
+        // 今の列と比べる (記録に載っていない書き込みがあれば、 今の時刻で回して地平を今に)
         let tc = std::time::Instant::now();
         let mut now_vals: Vec<(u32, u64)> = Vec::new();
         h.for_each_set_cell(|e, v| now_vals.push((e, v)));
@@ -18183,13 +18186,19 @@ impl Engine {
         for &(e, v) in &now_vals {
             want[e as usize] = v;
         }
+        let now = pack(wal.mint_hlc());
         for e in 0..want.len() {
             let have = cur.get(e).copied().unwrap_or(NONE);
             if have != want[e] {
-                let t = pack(wal.mint_hlc());
-                set(&mut cur, e as u32, Some(want[e]).filter(|&x| x != NONE), t);
+                set(&mut cur, e as u32, Some(want[e]).filter(|&x| x != NONE), now);
                 fixed += 1;
             }
+        }
+        if fixed > 0 {
+            ball.raise_horizon(self.balls.now());
+            eprintln!(
+                "[enchudb] warning: the history of ball '{himo}' disagrees with the column for {fixed} entities (writes that never reached changefeed.seg) — it answers only from now"
+            );
         }
         let st = BallRebuildStats {
             records: n_rec,

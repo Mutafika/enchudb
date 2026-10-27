@@ -908,6 +908,11 @@ impl Ball {
         self.horizon.load(Ordering::Relaxed)
     }
 
+    /// 地平を `t` まで進める (組み直した履歴が今の列と合わない時: その間の答えは信用できない)。
+    pub(crate) fn raise_horizon(&self, t: u64) {
+        self.horizon.fetch_max(t, Ordering::Relaxed);
+    }
+
     /// 時点 `t` に答えられるか (地平より前は [`TooOld`])。
     pub fn check(&self, t: u64) -> Result<(), TooOld> {
         let h = self.horizon();

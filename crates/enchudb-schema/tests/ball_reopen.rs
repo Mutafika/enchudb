@@ -92,48 +92,68 @@ impl World {
         }
     }
 
-    /// 控えの全部の時刻で答えを比べる。 地平より前は TooOld。 返り値は (比べた控え, TooOld だった控え)。
+    /// 控えの全部の時刻で答えを比べる (紐 2 本とも同じ数になること)。 返り値は (比べた控え, TooOld だった控え)。
     fn verify(&self, db: &Database, what: &str) -> (usize, usize) {
+        let (c, a) = self.verify_each(db, what);
+        assert_eq!(c, a, "{what}: 2 本の紐で地平の前後の控えの数が違う");
+        c
+    }
+
+    /// 控えの全部の時刻で答えを比べる。 地平 (紐ごと) より前は TooOld。 返り値は紐ごと (city, age) の (比べた控え, TooOld だった控え)。
+    fn verify_each(&self, db: &Database, what: &str) -> ((usize, usize), (usize, usize)) {
         let eng = db.engine();
-        // 地平は紐ごと (宣言は 1 本ずつ)。 間に書き込みが無いので、 控えの時刻は 2 本とも同じ側にある
-        let hz = eng.ball_horizon("users.city").unwrap();
+        let hz_c = eng.ball_horizon("users.city").unwrap();
         let hz_a = eng.ball_horizon("users.age").unwrap();
-        assert!(self.checks.iter().all(|(t, _)| (*t < hz) == (*t < hz_a)), "{what}: 地平の間に控え ({hz}, {hz_a})");
         let vids: Vec<u64> = CITIES.iter().map(|c| eng.vocab_id(c).unwrap() as u64).collect();
         let all_eids: Vec<u64> =
             self.checks.iter().flat_map(|(_, rs)| rs.keys().copied()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        let (mut seen, mut old) = (0, 0);
+        let (mut c, mut a) = ((0, 0), (0, 0));
         for (k, (t, rs)) in self.checks.iter().enumerate() {
-            if *t < hz {
-                assert_eq!(eng.ball_pull_at("users.city", vids[0], *t), Err(TooOld { horizon: hz }), "{what}: 回 {k}");
+            if *t < hz_c {
+                assert_eq!(eng.ball_pull_at("users.city", vids[0], *t), Err(TooOld { horizon: hz_c }), "{what}: 回 {k}");
+                assert_eq!(eng.ball_value_at(all_eids[0], "users.city", *t), Err(TooOld { horizon: hz_c }), "{what}: 回 {k}");
+                c.1 += 1;
+            } else {
+                c.0 += 1;
+                for &vid in &vids {
+                    let want: Vec<u64> = rs.iter().filter(|(_, (c, _))| *c == Some(vid)).map(|(&e, _)| e).collect();
+                    assert_eq!(eng.ball_pull_at("users.city", vid, *t).unwrap(), want, "{what}: 回 {k} t={t} city={vid}");
+                }
+                for &e in &all_eids {
+                    let want = rs.get(&e).and_then(|r| r.0);
+                    assert_eq!(eng.ball_value_at(e, "users.city", *t).unwrap(), want, "{what}: 回 {k} e={e}");
+                }
+            }
+            if *t < hz_a {
+                assert_eq!(eng.ball_pull_at("users.age", 0, *t), Err(TooOld { horizon: hz_a }), "{what}: 回 {k}");
                 assert_eq!(eng.ball_value_at(all_eids[0], "users.age", *t), Err(TooOld { horizon: hz_a }), "{what}: 回 {k}");
-                old += 1;
-                continue;
-            }
-            seen += 1;
-            for &vid in &vids {
-                let want: Vec<u64> = rs.iter().filter(|(_, (c, _))| *c == Some(vid)).map(|(&e, _)| e).collect();
-                assert_eq!(eng.ball_pull_at("users.city", vid, *t).unwrap(), want, "{what}: 回 {k} t={t} city={vid}");
-            }
-            for a in [0u64, 7, 49] {
-                let want: Vec<u64> = rs.iter().filter(|(_, (_, ra))| *ra == Some(a)).map(|(&e, _)| e).collect();
-                assert_eq!(eng.ball_pull_at("users.age", a, *t).unwrap(), want, "{what}: 回 {k} t={t} age={a}");
-            }
-            for &e in &all_eids {
-                let (c, a) = rs.get(&e).copied().unwrap_or((None, None));
-                assert_eq!(eng.ball_value_at(e, "users.city", *t).unwrap(), c, "{what}: 回 {k} e={e}");
-                assert_eq!(eng.ball_value_at(e, "users.age", *t).unwrap(), a, "{what}: 回 {k} e={e}");
+                a.1 += 1;
+            } else {
+                a.0 += 1;
+                for v in [0u64, 7, 49] {
+                    let want: Vec<u64> = rs.iter().filter(|(_, (_, ra))| *ra == Some(v)).map(|(&e, _)| e).collect();
+                    assert_eq!(eng.ball_pull_at("users.age", v, *t).unwrap(), want, "{what}: 回 {k} t={t} age={v}");
+                }
+                for &e in &all_eids {
+                    let want = rs.get(&e).and_then(|r| r.1);
+                    assert_eq!(eng.ball_value_at(e, "users.age", *t).unwrap(), want, "{what}: 回 {k} e={e}");
+                }
             }
         }
         // 今の答え = 今の読み
         let users = db.get_table("users").unwrap();
         let now = eng.ball_now();
-        for c in CITIES {
-            let mut cur = users.where_eq("city", c).find().unwrap();
+        for city in CITIES {
+            let mut cur = users.where_eq("city", city).find().unwrap();
             cur.sort_unstable();
-            assert_eq!(eng.ball_pull_at("users.city", eng.vocab_id(c).unwrap() as u64, now).unwrap(), cur, "{what}: 今の {c}");
+            assert_eq!(eng.ball_pull_at("users.city", eng.vocab_id(city).unwrap() as u64, now).unwrap(), cur, "{what}: 今の {city}");
         }
-        (seen, old)
+        for v in [0i64, 7, 49] {
+            let mut cur = users.where_eq("age", v).find().unwrap();
+            cur.sort_unstable();
+            assert_eq!(eng.ball_pull_at("users.age", v as u64, now).unwrap(), cur, "{what}: 今の age {v}");
+        }
+        (c, a)
     }
 }
 
@@ -253,6 +273,61 @@ fn a_base_the_log_no_longer_covers_starts_over() {
     let db = Database::open_with_oplog(&path, WAL).unwrap();
     declare(&db);
     assert_eq!(w2.verify(&db, "作り直して書いて開き直した後"), (10, 0));
+    drop(db);
+    cleanup(&path);
+}
+
+/// (T5) 記録に載らない書き込み (WAL の無い open で書いた) の後: 組み直した球は今の列と合わない entity を今の時刻で回し、 地平を今に
+/// 進める (前の控えは全部 TooOld、 今の答えは今の読み)。
+#[test]
+fn writes_that_never_reached_the_log_move_the_horizon_to_now() {
+    let path = tmp_path("t5");
+    cleanup(&path);
+    let mut w = World::new(0x0BAD_F00D_1234_5678);
+    {
+        let db = create(&path, 64 << 20);
+        for _ in 0..200 {
+            w.insert(&db);
+        }
+        declare(&db);
+        w.write(&db, 10, 40);
+    }
+    {
+        // WAL の無い open で書く (記録に載らない)
+        let db = Database::open(&path).unwrap();
+        let users = db.get_table("users").unwrap();
+        let es: Vec<u64> = w.rows.keys().copied().take(30).collect();
+        for e in es {
+            users.upsert().set("id", w.ids[&e]).set("age", 49i64).commit().unwrap();
+            w.rows.get_mut(&e).unwrap().1 = Some(49);
+        }
+    }
+    let db = Database::open_with_oplog(&path, WAL).unwrap();
+    declare(&db);
+    let st = db.engine().ball_rebuild_stats().unwrap();
+    assert!(st.fixed > 0, "今の列と合わない entity を回していない: {st:?}");
+    // city は記録と列が合う (履歴はそのまま)、 age は合わない (地平が今に)
+    assert_eq!(w.verify_each(&db, "記録に載らない書き込みの後"), ((10, 0), (0, 10)));
+    assert!(db.engine().ball_horizon("users.age").unwrap() > db.engine().ball_horizon("users.city").unwrap());
+    drop(db);
+    cleanup(&path);
+}
+
+/// local-only の表 (`_` で始まる表) の書き込みは記録に載らない: その紐の球は土台を持たない (メモリだけ、 開き直すと宣言は今から)。
+#[test]
+fn local_only_tables_keep_no_base() {
+    let path = tmp_path("local");
+    cleanup(&path);
+    let mut db = Database::create(&path).unwrap();
+    db.table("users").number("id").tag("city").number("age").primary_key("id").build().unwrap();
+    db.prepare_cursors().unwrap();
+    let db = db.finish_with_oplog(WAL).unwrap();
+    db.engine().enable_change_log(1 << 20).unwrap();
+    assert!(db.engine().declare_ball("_cursors.pos").unwrap());
+    assert!(db.engine().declare_ball("users.age").unwrap());
+    let ball = std::path::Path::new(&path).join("ball");
+    let n = std::fs::read_dir(&ball).unwrap().count();
+    assert_eq!(n, 1, "土台は users.age の 1 本だけ");
     drop(db);
     cleanup(&path);
 }

@@ -1,0 +1,32 @@
+[
+ {
+  "name": "記録より先の終わりを受け入れる",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        if h.end > next {",
+  "replace": "        if false {"
+ },
+ {
+  "name": "今の列と比べない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if have != want[e] {",
+  "replace": "            if have != want[e] && false {"
+ },
+ {
+  "name": "合わない時に地平を進めない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            ball.raise_horizon(self.balls.now());",
+  "replace": ""
+ },
+ {
+  "name": "local-only の表にも土台を作る",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            && !self.tables.iter().any(|t| t.is_reserved() && t.himo_ids.read().unwrap_or_else(|p| p.into_inner()).contains(&(id as u32)))\n",
+  "replace": ""
+ },
+ {
+  "name": "宣言の時に記録に写さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.pump_change_log(wal, log, &mut c, false)?;\n        let pack",
+  "replace": "        let pack"
+ }
+]
