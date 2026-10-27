@@ -79,20 +79,101 @@ pub struct TableEidUsage {
 /// 球の組み直し 1 回の数と時間 (試作、 [`Engine::ball_rebuild_stats`])。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BallRebuildStats {
-    /// 記録から読んだ record の数 (土台の後の番号)。
+    /// 記録と WAL から読んだ record の数 (土台の後)。
     pub records: u64,
     /// そのうち球の紐の書き込み (当てた数、 同じ値の書き直しを含む)。
     pub applied: u64,
-    /// 今の列と違って今の時刻で回した entity の数 (記録に載っていない書き込み)。
-    pub fixed: u64,
-    /// 記録を読んで当てた時間 (`apply_ns` を含む)。
+    /// 組んだ回数 (組む間に記録が捨てて読めなくなると土台から組み直す)。
+    pub attempts: u32,
+    /// 記録の残りを書き手と並んで読んで当てた時間 (最後の回)。
     pub log_ns: u64,
-    /// 読んだ record を解いて球に当てた時間。
-    pub apply_ns: u64,
-    /// 今の列と比べた時間。
-    pub check_ns: u64,
-    /// 種を置いてから終わるまで。
+    /// その後に写した分と WAL の残りを当てた時間。
+    pub catch_ns: u64,
+    /// 公開中を置いてから出すまで (この間、 その紐の書き手は球に書く所で待つ)。
+    pub publish_ns: u64,
+    /// 全部。
     pub total_ns: u64,
+}
+
+/// 組む側の手元: 出す前の球と、 eid ごとの今の値 (`NONE` = 値なし)。 record を HLC の順に当てる (`last` より後だけ)。
+struct BallReplay<'a> {
+    eng: &'a Engine,
+    hid: u16,
+    name: &'a str,
+    peer: u32,
+    ball: Box<crate::ball::Ball>,
+    cur: Vec<u64>,
+    /// 当てた最後の record の HLC (記録と WAL の重なりはこれで落とす)。
+    last: enchudb_oplog::Hlc,
+    records: u64,
+    applied: u64,
+}
+
+impl BallReplay<'_> {
+    const NONE: u64 = u64::MAX;
+
+    /// record 1 件 (HLC の順)。 `limit` があれば HLC がそれ以上の record は当てない (書き手が球に書く)。
+    fn op(&mut self, hlc: enchudb_oplog::Hlc, op: &enchudb_oplog::oplog::DecodedOp, author: u32, limit: Option<enchudb_oplog::Hlc>) {
+        use crate::ball_base::BaseOp;
+        let key = |h: enchudb_oplog::Hlc| (h.wall, h.logical);
+        if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {
+            return;
+        }
+        self.last = hlc;
+        self.records += 1;
+        let t = crate::ball::pack_hlc(hlc.wall, hlc.logical);
+        let (e, v) = match crate::ball_base::base_op(op, author, self.peer) {
+            Some(BaseOp::Set(x, e, v)) if x == self.hid => (e, v),
+            Some(BaseOp::SetNamed(n, e, v)) if n == self.name => (e, Some(v)),
+            Some(BaseOp::Delete(e)) => (e, None),
+            _ => return,
+        };
+        self.applied += 1;
+        if self.cur.len() <= e as usize {
+            self.cur.resize(e as usize + 1, Self::NONE);
+        }
+        let old = Some(self.cur[e as usize]).filter(|&x| x != Self::NONE);
+        if old != v {
+            self.ball.replay(self.eng.balls.clock(), e, old, v, t);
+            self.eng.ball_observe_raised();
+            self.cur[e as usize] = v.unwrap_or(Self::NONE);
+        }
+    }
+
+    fn entry(&mut self, e: &crate::change_log::Entry, limit: Option<enchudb_oplog::Hlc>) {
+        if let Ok((r, _)) = crate::transport::WireRecord::decode(&e.bytes) {
+            self.op(r.hlc, &r.op, r.author_peer, limit);
+        }
+    }
+
+    /// 記録の `pos` から先と、 WAL の記録に写していない残りを当てる (`change_emit` の下 = 写す・捨てるを止めて)。 記録が `pos` より先を
+    /// 捨てていたら false (組み直す)。
+    fn catch_up(
+        &mut self,
+        log: &crate::change_log::ChangeLog,
+        wal: &enchudb_oplog::oplog::OpLog,
+        pos: &mut u64,
+        limit: Option<enchudb_oplog::Hlc>,
+    ) -> bool {
+        let c = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            match log.read(*pos, 4 << 20) {
+                Ok(es) if es.is_empty() => break,
+                Ok(es) => {
+                    *pos = es.last().unwrap().no + 1;
+                    for e in &es {
+                        self.entry(e, limit);
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        let (recs, _) = wal.scan_for_change_log(c.log_wal, u64::MAX, true);
+        for (r, _) in &recs {
+            self.op(r.hlc, &r.op, r.author_peer, limit);
+        }
+        true
+    }
 }
 
 struct ChangeCursor {
@@ -4824,6 +4905,8 @@ pub struct Engine {
     ball_bases: std::sync::Arc<crate::ball_base::BallBases>,
     /// 最後の球の組み直しの数と時間 (試作、 測り用)。
     ball_rebuild_stats: std::sync::Mutex<Option<BallRebuildStats>>,
+    /// 球を組む人は 1 人ずつ (`build_ball`)。
+    ball_build: std::sync::Mutex<()>,
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -5398,6 +5481,7 @@ impl Engine {
             balls: crate::ball::Balls::new(),
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
+            ball_build: std::sync::Mutex::new(()),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -5769,6 +5853,10 @@ impl Engine {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
+        // 球の土台 (試作): WAL の無い書き込みを見張る紐 (土台に印を付ける)
+        if !readonly {
+            eng.ball_bases.track(std::path::Path::new(path));
+        }
 
         // 0.8.15 (issue #52): open 前に残骸 `.tables.tmp` を掃除する self-heal。
         // persist 失敗 (ENOSPC 等) で `.tmp` が残ったケースを次回 reopen で確実に
@@ -6676,6 +6764,7 @@ impl Engine {
             balls: crate::ball::Balls::new(),
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
+            ball_build: std::sync::Mutex::new(()),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -11660,7 +11749,10 @@ impl Engine {
     /// `ZERO` なら数え口)、 鍵を離した後で球を回し、 帳面に登録した控え (時刻ごとのデッキ) があれば作る。
     #[inline]
     fn himo_set(&self, hid: usize, local: u32, value: u64, hlc: enchudb_oplog::Hlc) -> bool {
-        if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            self.ball_bases.wal_less_write(hid as u16);
+        }
+        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {
             debug_assert!(self.himos[hid].cylinder_built(), "球の紐の円柱は宣言の時に組んである");
             // 大きい値の差分の場所は名簿の鍵の前に (行の lock の下なので古い値は動かない)
             let before = self.himos[hid].get_value(local);
@@ -11698,7 +11790,10 @@ impl Engine {
     /// `himo_set` の外す版。
     #[inline]
     fn himo_remove(&self, hid: usize, local: u32, hlc: enchudb_oplog::Hlc) {
-        if let Some(b) = self.balls.any().then(|| self.balls.get(hid as u16)).flatten() {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            self.ball_bases.wal_less_write(hid as u16);
+        }
+        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {
             let before = self.himos[hid].get_value(local);
             let mut wide = b.reserve(local, before, None);
             let mut ts = None;
@@ -15492,8 +15587,37 @@ impl Engine {
     /// 照らすのは、 最初に記録へ写す時か宣言の時 (`BallBases::ready`、 開く時間を変えない)。
     fn attach_ball_bases(&self, dir: &std::path::Path, log: &crate::change_log::ChangeLog) {
         self.ball_bases.set_self_peer(self.peer_id());
-        self.ball_bases.attach(dir, |hid| self.himo_name_at(hid as usize).map(str::to_string));
+        let found = self.ball_bases.attach(dir, |hid| self.himo_name_at(hid as usize).map(str::to_string));
+        for (hid, stale) in found {
+            if stale {
+                // WAL の無い書き込みがあった紐: 今の列で作り直す (履歴はここから)
+                self.renew_ball_base(dir, hid, log);
+            }
+            self.balls.mark_pending(hid);
+        }
         log.set_on_discard(self.ball_bases.clone());
+    }
+
+    /// 土台を今の列で作り直す (開く時、 記録が捨て始める前)。 作れなければ土台を消す (球は宣言し直すまで無い)。
+    fn renew_ball_base(&self, dir: &std::path::Path, hid: u16, log: &crate::change_log::ChangeLog) {
+        let res = (|| {
+            let name = self.himo_name_at(hid as usize).ok_or_else(|| io::Error::other("no such himo"))?;
+            let wal = self.oplog.as_ref().ok_or_else(|| io::Error::other("no WAL"))?;
+            let mut cells = Vec::new();
+            self.himos[hid as usize].for_each_set_cell(|e, v| cells.push((e, v)));
+            crate::ball_base::Base::create(dir, hid, name, &cells, log.range().1, wal.mint_hlc())
+        })();
+        match res {
+            Ok(b) => {
+                eprintln!("[enchudb] warning: himo {hid} was written without the WAL — its ball history starts over from now");
+                self.ball_bases.insert(b);
+            }
+            Err(e) => {
+                eprintln!("[enchudb] warning: could not renew the ball base of himo {hid} ({e}) — removed it");
+                let _ = std::fs::remove_file(crate::ball_base::path_of(dir, hid));
+            }
+        }
+        crate::ball_base::clear_stale(dir, hid);
     }
 
     /// changefeed の記録に残っている番号の範囲 `(最古, 次)`。 記録が無ければ None。 listener に渡した番号はこの範囲で受け直せる。
@@ -18071,16 +18195,17 @@ impl Engine {
     }
 
     /// 球にする (試作、 `crate::ball`): 紐 `himo` の値を書き換えるたびに、 球の面 (entity ごとの前の値) とデッキの差分の帳面
-    /// (値ごとの 「時刻 t に入った / 出た」) に記す。 名簿 (円柱) は master のまま (まだ組んでいなければ今組む)。 書き手の居ない時に
-    /// 呼ぶこと。 新しく宣言したら true (この process で宣言済みなら false)。 Leaf の紐は不可 (値が中身の場所で、 書き換えると前の中身は消える)。
+    /// (値ごとの 「時刻 t に入った / 出た」) に記す。 名簿 (円柱) は master のまま (まだ組んでいなければ今組む)。 新しく宣言したら
+    /// true (この process で組んであれば false)。 Leaf の紐は不可 (値が中身の場所で、 書き換えると前の中身は消える)。
     ///
-    /// changefeed の記録 (`enable_change_log`) のある DB は、 球の土台 (`ball/NNNN.seg`、 `crate::ball_base`) を持つ: 初めての宣言は
-    /// 今の列で土台を作り、 開き直した後の宣言は土台 (地平の時点の列) に記録の残りを前へ当てて組み直す (開き直す前の履歴が読める、
-    /// 記録が捨てた所より前は [`crate::ball::TooOld`])。 記録の無い DB の球はメモリの上だけ (開き直すと消える)。 どちらも地平
-    /// (メモリだけなら宣言の時刻) より前の時点は答えない。 宣言の時に WAL を書き出す (閉じていない group は閉じる)。 sync の DB は
-    /// 他の peer の record を扱わないので土台を持たない (試作の範囲)。 local-only の表 (`_` で始まる表) の紐も、 書き込みが記録に
-    /// 載らないので土台を持たない。 組み直した球が今の列と合わない (WAL の無い open で書いた等、 記録に載らない書き込みがあった)
-    /// 時は、 合わない entity を今の時刻で回し、 地平を今に進める (その間の答えは信用できない)。
+    /// changefeed の記録 (`enable_change_log`) のある DB は、 球の土台 (`ball/NNNN.seg`、 `crate::ball_base`) を持つ = 宣言を保存する:
+    /// 初めての宣言は今の列で土台を作る (書き手の居ない時に呼ぶこと)。 開き直した後は宣言し直さなくてよい: 最初に昔を読む時
+    /// (`ball_value_at` / `ball_pull_at` / `ball_horizon` …) に、 土台 (地平の時点の列) + 記録の残り + WAL の残り から書き手を止めずに組む
+    /// ([`Self::build_ball`]、 開き直した後のこの宣言も同じ)。 記録が捨てた所より前は [`crate::ball::TooOld`]。 記録の無い DB の球は
+    /// メモリの上だけ (開き直すと消える、 宣言は書き手の居ない時に)。 どちらも地平 (メモリだけなら宣言の時刻) より前の時点は答えない。
+    /// sync の DB は他の peer の record を扱わないので土台を持たない (試作の範囲)。 local-only の表 (`_` で始まる表) の紐も、 書き込みが記録に
+    /// 載らないので土台を持たない。 WAL の無い書き込み (WAL なしで開いて書いた) をした紐の土台は、 次に記録付きで開いた時に今の列で
+    /// 作り直す (履歴はそこから、 `crate::ball_base` の `stale`)。
     pub fn declare_ball(&self, himo: &str) -> Result<bool, String> {
         let id = self.himo_id(himo).ok_or_else(|| format!("declare_ball: unknown himo '{himo}'"))?;
         let h = self.himos.get(id).ok_or_else(|| format!("declare_ball: himo {id} out of range"))?;
@@ -18098,6 +18223,15 @@ impl Engine {
             && !self.sync_tables_enabled()
             && !self.tables.iter().any(|t| t.is_reserved() && t.himo_ids.read().unwrap_or_else(|p| p.into_inner()).contains(&(id as u32)))
         {
+            let hid = id as u16;
+            if self.balls.is_pending(hid) || self.ball_bases.has(hid) {
+                match self.build_ball(hid) {
+                    Ok(()) => return Ok(true),
+                    // 土台が使えなかった: 今の列で作る (下)
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("declare_ball: {e}")),
+                }
+            }
             return self.declare_ball_kept(id, himo, log, wal, set.dir()).map_err(|e| format!("declare_ball: {e}"));
         }
         let horizon = match self.oplog.as_ref() {
@@ -18110,7 +18244,7 @@ impl Engine {
         Ok(self.balls.declare(id as u16, horizon, |f| h.for_each_set_cell(|e, v| f(e, v))))
     }
 
-    /// `declare_ball` の土台を持つ道: 土台が無ければ今の列で作り、 在れば土台から組み直す。
+    /// `declare_ball` の初めての宣言 (土台が無い): 今の列で土台を作って球にする (書き手の居ない時に)。
     #[cfg(not(target_arch = "wasm32"))]
     fn declare_ball_kept(
         &self,
@@ -18120,114 +18254,139 @@ impl Engine {
         wal: &enchudb_oplog::oplog::OpLog,
         dir: &std::path::Path,
     ) -> io::Result<bool> {
-        use crate::ball_base::BaseOp;
         let hid = id as u16;
         let h = &self.himos[id];
-        // 書いた record を全部記録に写す (土台と記録の境目を今にする。 写す時に、 開いた後に控えた土台を開いて記録と照らす)。
-        // 写す・捨てる (土台に当てる) のは `change_emit` の下なので、 組み終えるまで持つ
+        // 書いた record を全部記録に写す (土台と記録の境目を今にする)。 写す・捨てる (土台に当てる) のは `change_emit` の下
         self.oplog_sync()?;
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         self.pump_change_log(wal, log, &mut c, false)?;
-        let pack = |t: enchudb_oplog::Hlc| crate::ball::pack_hlc(t.wall, t.logical);
-        if !self.ball_bases.has(hid) {
-            let at = wal.mint_hlc();
-            let mut cells = Vec::new();
-            h.for_each_set_cell(|e, v| cells.push((e, v)));
-            let base = crate::ball_base::Base::create(dir, hid, himo, &cells, log.range().1, at)?;
-            self.ball_bases.insert(base);
-            return Ok(self.balls.declare(hid, pack(at), |f| cells.iter().for_each(|&(e, v)| f(e, v))));
+        let at = wal.mint_hlc();
+        let mut cells = Vec::new();
+        h.for_each_set_cell(|e, v| cells.push((e, v)));
+        let base = crate::ball_base::Base::create(dir, hid, himo, &cells, log.range().1, at)?;
+        self.ball_bases.insert(base);
+        drop(c);
+        Ok(self.balls.declare(hid, crate::ball::pack_hlc(at.wall, at.logical), |f| cells.iter().for_each(|&(e, v)| f(e, v))))
+    }
+
+    /// 土台のある球を組む (書き手を止めずに、 [`crate::ball::Balls`] の約束): 土台 (地平の時点の列) を種に、 記録の残り [done, ..) を
+    /// 前へ当て、 WAL の残り (記録に写していない分) を当て、 公開中を置いて WAL に Commit を積み (その HLC が閾値 H)、 H より前の
+    /// 残りを当ててから球を出す。 組む間に記録が捨てて読めなくなったら土台から組み直す。 組んであれば何もしない。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn build_ball(&self, hid: u16) -> io::Result<()> {
+        let _one = self.ball_build.lock().unwrap_or_else(|p| p.into_inner());
+        if self.balls.get(hid).is_some() {
+            return Ok(());
         }
-        // 種 = 土台 (地平の時点の列)。 今の値を eid ごとに持ち回る (u64::MAX = 値なし)
-        const NONE: u64 = u64::MAX;
-        let (horizon, done, mut cur) = self
-            .ball_bases
-            .with(hid, |b| {
-                let mut cur: Vec<u64> = Vec::new();
+        let (Some(log), Some(wal)) = (self.change_log.get(), self.oplog.as_ref()) else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "a kept ball needs changefeed.seg and the WAL"));
+        };
+        let name = self.himo_name_at(hid as usize).map(str::to_string).ok_or_else(|| io::Error::other("no such himo"))?;
+        // 書き手が球に書く前に名簿の鍵で並ぶように (`declare_ball` と同じ)
+        self.himos[hid as usize].build_cylinder();
+        let t0 = std::time::Instant::now();
+        let peer = self.peer_id();
+        for attempt in 1..=8u32 {
+            // 開いた後に控えた土台を開いて記録と照らす (写す・捨てると並ばないように change_emit の下で)
+            {
+                let _c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                self.ball_bases.ready(log);
+            }
+            let mut cur: Vec<u64> = Vec::new();
+            let Some((horizon, done)) = self.ball_bases.with(hid, |b| {
                 b.for_each(|e, v| {
                     if cur.len() <= e as usize {
-                        cur.resize(e as usize + 1, NONE);
+                        cur.resize(e as usize + 1, BallReplay::NONE);
                     }
                     cur[e as usize] = v;
                 });
-                (b.horizon(), b.done(), cur)
-            })
-            .expect("has");
-        let t0 = std::time::Instant::now();
-        let fresh = self.balls.declare(hid, pack(horizon), |f| {
-            cur.iter().enumerate().filter(|&(_, &v)| v != NONE).for_each(|(e, &v)| f(e as u32, v))
-        });
-        let ball = self.balls.get(hid).expect("declared");
-        let clock = self.balls.clock();
-        let set = |cur: &mut Vec<u64>, e: u32, v: Option<u64>, t: u64| {
-            if cur.len() <= e as usize {
-                cur.resize(e as usize + 1, NONE);
-            }
-            let old = Some(cur[e as usize]).filter(|&x| x != NONE);
-            if old != v {
-                ball.replay(clock, e, old, v, t);
-                self.ball_observe_raised();
-                cur[e as usize] = v.unwrap_or(NONE);
-            }
-        };
-        // 記録の残り (土台の後の番号) を前へ当てる
-        let peer = self.peer_id();
-        let (mut pos, mut n_rec, mut n_hit) = (done, 0u64, 0u64);
-        let t_read = std::time::Instant::now();
-        let mut dt_apply = std::time::Duration::ZERO;
-        loop {
-            let es = log.read(pos, 4 << 20).map_err(|t| io::Error::new(io::ErrorKind::InvalidData, t.to_string()))?;
-            let Some(last) = es.last() else { break };
-            pos = last.no + 1;
-            let ta = std::time::Instant::now();
-            for e in &es {
-                n_rec += 1;
-                let t = pack(e.hlc);
-                match crate::ball_base::decode(e, peer) {
-                    Some(BaseOp::Set(x, e, v)) if x == hid => set(&mut cur, e, v, t),
-                    Some(BaseOp::SetNamed(n, e, v)) if n == himo => set(&mut cur, e, Some(v), t),
-                    Some(BaseOp::Delete(e)) => set(&mut cur, e, None, t),
-                    _ => continue,
+                (b.horizon(), b.done())
+            }) else {
+                // 土台が使えなかった (`ready` が消した): 球にしていない紐に戻す (宣言すれば今の列で作り直す)
+                self.balls.unmark_pending(hid);
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("no ball base for '{name}'")));
+            };
+            let ball = self.balls.make(crate::ball::pack_hlc(horizon.wall, horizon.logical), |f| {
+                cur.iter().enumerate().filter(|&(_, &v)| v != BallReplay::NONE).for_each(|(e, &v)| f(e as u32, v))
+            });
+            let mut rp = BallReplay { eng: self, hid, name: &name, peer, ball, cur, last: horizon, records: 0, applied: 0 };
+            // (1) 記録の残りを書き手と並んで読む
+            let t_log = std::time::Instant::now();
+            let mut pos = done;
+            let mut truncated = false;
+            loop {
+                match log.read(pos, 4 << 20) {
+                    Ok(es) if es.is_empty() => break,
+                    Ok(es) => {
+                        pos = es.last().unwrap().no + 1;
+                        for e in &es {
+                            rp.entry(e, None);
+                        }
+                    }
+                    Err(_) => {
+                        truncated = true;
+                        break;
+                    }
                 }
-                n_hit += 1;
             }
-            dt_apply += ta.elapsed();
-        }
-        let dt_log = t_read.elapsed();
-        // 今の列と比べる (記録に載っていない書き込みがあれば、 今の時刻で回して地平を今に)
-        let tc = std::time::Instant::now();
-        let mut now_vals: Vec<(u32, u64)> = Vec::new();
-        h.for_each_set_cell(|e, v| now_vals.push((e, v)));
-        let mut fixed = 0u64;
-        let mut want = vec![NONE; cur.len().max(now_vals.last().map_or(0, |&(e, _)| e as usize + 1))];
-        for &(e, v) in &now_vals {
-            want[e as usize] = v;
-        }
-        let now = pack(wal.mint_hlc());
-        for e in 0..want.len() {
-            let have = cur.get(e).copied().unwrap_or(NONE);
-            if have != want[e] {
-                set(&mut cur, e as u32, Some(want[e]).filter(|&x| x != NONE), now);
-                fixed += 1;
+            if truncated {
+                continue; // 記録が捨てた (土台が進んだ): 土台から組み直す
             }
+            let log_ns = t_log.elapsed().as_nanos() as u64;
+            // (2) 記録の残り (読んでいる間に写した分) と WAL の残り
+            let t_catch = std::time::Instant::now();
+            if !rp.catch_up(log, wal, &mut pos, None) {
+                continue;
+            }
+            let catch_ns = t_catch.elapsed().as_nanos() as u64;
+            // (3) 公開中を置いて Commit を積む: その HLC より前の書き込みは組む側、 以降は書き手が球に書く
+            let t_pub = std::time::Instant::now();
+            self.balls.begin_publish(hid);
+            let h = match wal.append_with_hlc(enchudb_oplog::oplog::Op::Commit) {
+                Ok((_, h)) => h,
+                Err(e) => {
+                    self.balls.abort_publish(hid);
+                    return Err(e);
+                }
+            };
+            // (4) H より前の残り
+            if !rp.catch_up(log, wal, &mut pos, Some(h)) {
+                self.balls.abort_publish(hid);
+                continue;
+            }
+            // (5) 出す
+            let (records, applied) = (rp.records, rp.applied);
+            self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
+            let st = BallRebuildStats {
+                records,
+                applied,
+                attempts: attempt,
+                log_ns,
+                catch_ns,
+                publish_ns: t_pub.elapsed().as_nanos() as u64,
+                total_ns: t0.elapsed().as_nanos() as u64,
+            };
+            *self.ball_rebuild_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(st);
+            return Ok(());
         }
-        if fixed > 0 {
-            ball.raise_horizon(self.balls.now());
-            eprintln!(
-                "[enchudb] warning: the history of ball '{himo}' disagrees with the column for {fixed} entities (writes that never reached changefeed.seg) — it answers only from now"
-            );
+        Err(io::Error::other(format!("could not catch up with changefeed.seg while building the ball of '{name}'")))
+    }
+
+    /// 読みの入口: 組んだ球。 土台があって組んでいなければ今組む (書き手を止めずに)。 球にしていない紐は None。
+    fn ball_read(&self, hid: u16) -> Option<&crate::ball::Ball> {
+        if let Some(b) = self.balls.get(hid) {
+            return Some(b);
         }
-        let st = BallRebuildStats {
-            records: n_rec,
-            applied: n_hit,
-            fixed,
-            log_ns: dt_log.as_nanos() as u64,
-            apply_ns: dt_apply.as_nanos() as u64,
-            check_ns: tc.elapsed().as_nanos() as u64,
-            total_ns: t0.elapsed().as_nanos() as u64,
-        };
-        *self.ball_rebuild_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(st);
-        drop(c);
-        Ok(fresh)
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.balls.is_pending(hid) {
+            match self.build_ball(hid) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {} // 土台が使えなかった (`ready` が知らせた)
+                Err(e) => eprintln!("[enchudb] warning: could not build the ball of himo {hid} ({e})"),
+            }
+            return self.balls.get(hid);
+        }
+        None
     }
 
     /// 最後の組み直しの数と時間 (試作、 測り用)。
@@ -18241,14 +18400,14 @@ impl Engine {
         self.balls.now()
     }
 
-    /// 球の地平 (試作): これより前の時点は答えない。 球にしていない紐は None。
+    /// 球の地平 (試作): これより前の時点は答えない。 球にしていない紐は None (土台があって組んでいなければ組む)。
     pub fn ball_horizon(&self, himo: &str) -> Option<u64> {
-        Some(self.balls.get(self.himo_id(himo)? as u16)?.horizon())
+        Some(self.ball_read(self.himo_id(himo)? as u16)?.horizon())
     }
 
     /// 時点 `t` の値 (試作)。 球にしていない紐は Ok(None)。 地平より前は `TooOld`。
     pub fn ball_value_at(&self, eid: enchudb_oplog::EntityId, himo: &str, t: u64) -> Result<Option<u64>, crate::ball::TooOld> {
-        let Some(b) = self.himo_id(himo).and_then(|id| self.balls.get(id as u16)) else { return Ok(None) };
+        let Some(b) = self.himo_id(himo).and_then(|id| self.ball_read(id as u16)) else { return Ok(None) };
         b.check(t)?;
         Ok(b.value_at(enchudb_oplog::eid_local(eid), t))
     }
@@ -18256,7 +18415,7 @@ impl Engine {
     /// 球の面を古い順に (試作)。
     pub fn ball_faces(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<crate::ball::FaceView> {
         self.himo_id(himo)
-            .and_then(|id| self.balls.get(id as u16))
+            .and_then(|id| self.ball_read(id as u16))
             .map_or_else(Vec::new, |b| b.faces_of(enchudb_oplog::eid_local(eid)))
     }
 
@@ -18265,7 +18424,7 @@ impl Engine {
     /// 地平より前は `TooOld`、 球にしていない紐は空。
     pub fn ball_pull_at(&self, himo: &str, value: u64, t: u64) -> Result<Vec<enchudb_oplog::EntityId>, crate::ball::TooOld> {
         let Some(id) = self.himo_id(himo) else { return Ok(Vec::new()) };
-        let Some(b) = self.balls.get(id as u16) else { return Ok(Vec::new()) };
+        let Some(b) = self.ball_read(id as u16) else { return Ok(Vec::new()) };
         b.check(t)?;
         let peer = self.peer_id();
         Ok(b.pull_at(value, t, || self.himos[id].pull(value)).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect())
@@ -18279,18 +18438,18 @@ impl Engine {
 
     /// 帳面の控えの数 (試作): (登録した数, 作り終えた数)。
     pub fn ball_snap_counts(&self, himo: &str) -> Option<(usize, usize)> {
-        Some(self.balls.get(self.himo_id(himo)? as u16)?.snap_counts())
+        Some(self.ball_read(self.himo_id(himo)? as u16)?.snap_counts())
     }
 
     /// 球の面の数と取った byte (試作)。
     pub fn ball_stats(&self, himo: &str) -> Option<(u64, usize)> {
-        let b = self.balls.get(self.himo_id(himo)? as u16)?;
+        let b = self.ball_read(self.himo_id(himo)? as u16)?;
         Some((b.face_count(), b.bytes()))
     }
 
     /// デッキの差分の帳面の差分の数 (試作)。
     pub fn ball_diff_count(&self, himo: &str) -> Option<u64> {
-        Some(self.balls.get(self.himo_id(himo)? as u16)?.diff_count())
+        Some(self.ball_read(self.himo_id(himo)? as u16)?.diff_count())
     }
 
     /// 位置の印を宣言した紐の名前 (紐の番号の順)。

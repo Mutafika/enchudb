@@ -51,7 +51,7 @@
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// 糸の終わり。
@@ -706,12 +706,15 @@ pub(crate) struct Ball {
     snap_min: usize,
     /// 地平: これより前の時点は答えない (宣言の時刻、 組み直した球は土台の時点)。 宣言の前からある値の面は `from = 0` のまま。
     horizon: AtomicU64,
+    /// 書き手が球に書く時刻の下限 (書き手を止めずに組んだ球: これより前の書き込みは組む側が当てた。 宣言した球は 0)。
+    threshold: AtomicU64,
 }
 
 impl Ball {
     fn new(snap_min: usize) -> Self {
         Self {
             horizon: AtomicU64::new(0),
+            threshold: AtomicU64::new(0),
             id: BALL_IDS.fetch_add(1, Ordering::Relaxed),
             faces: Chunked::new(1 << 32),
             next: AtomicU64::new(0),
@@ -909,11 +912,6 @@ impl Ball {
     /// 地平 (これより前の時点の答えは無い)。
     pub fn horizon(&self) -> u64 {
         self.horizon.load(Ordering::Relaxed)
-    }
-
-    /// 地平を `t` まで進める (組み直した履歴が今の列と合わない時: その間の答えは信用できない)。
-    pub(crate) fn raise_horizon(&self, t: u64) {
-        self.horizon.fetch_max(t, Ordering::Relaxed);
     }
 
     /// 時点 `t` に答えられるか (地平より前は [`TooOld`])。
@@ -1229,7 +1227,24 @@ fn apply_merge(base: &[u32], tail: Tail<'_>, back: bool) -> Vec<u32> {
     out
 }
 
-/// engine 1 つの球の全部。 宣言が 1 つも無ければ書き手は `any` の load 1 回で素通り。
+/// 紐ごとの球の状態 ([`Balls::for_write`])。
+const PHASE_NONE: u8 = 0;
+/// 土台があり、 まだ組んでいない (開き直した後、 最初に昔を読む時に組む)。
+const PHASE_PENDING: u8 = 1;
+/// 組む側が閾値を決めている最中 (書き手は組み終えるまで待つ)。
+const PHASE_PUBLISHING: u8 = 2;
+/// 組んだ (書き手は自分の時刻が閾値以上なら球に書く)。
+const PHASE_READY: u8 = 3;
+
+/// engine 1 つの球の全部。 球が 1 つも無ければ書き手は `any` の load 1 回で素通り。
+///
+/// ## 書き手を止めずに組む ([`Balls::begin_publish`] / [`Balls::publish`])
+///
+/// 書き手は WAL に積んだ後で [`Balls::for_write`] を呼び、 状態が組んでいない (前) なら球に書かない、 公開中なら組み終えるまで待つ、
+/// 組んだなら自分の時刻が閾値 H 以上の時だけ球に書く。 組む側は公開中を置いてから WAL に Commit を積み、 その HLC を H にし、
+/// H より前の書き込みを全部当ててから球を出す。 書き手が前の状態を読んだなら、 その書き込みは Commit より先に WAL に積んだ (H より前)
+/// = 組む側が当てる。 公開中 / 組んだを読んだ書き手は H と比べる。 H より前は組む側、 H 以降は書き手 = 重ならず漏れない
+/// (WAL の append の lock が、 書き手の 「積む → 読む」 と組む側の 「置く → 積む」 を並べる)。
 pub(crate) struct Balls {
     any: AtomicBool,
     clock: Clock,
@@ -1237,16 +1252,24 @@ pub(crate) struct Balls {
     snap_min: AtomicUsize,
     /// 紐の番号 → 球。 最初の宣言で取る。
     slots: OnceLock<Box<[OnceLock<Box<Ball>>]>>,
+    /// 紐の番号 → 状態 (`PHASE_NONE` / `PHASE_PENDING` / `PHASE_PUBLISHING` / `PHASE_READY`)。 最初に使う時に取る。
+    phases: OnceLock<Box<[AtomicU8]>>,
 }
 
 impl Balls {
     pub fn new() -> Self {
-        Self { any: AtomicBool::new(false), clock: Clock::new(), snap_min: AtomicUsize::new(SNAP_MIN), slots: OnceLock::new() }
+        Self {
+            any: AtomicBool::new(false),
+            clock: Clock::new(),
+            snap_min: AtomicUsize::new(SNAP_MIN),
+            slots: OnceLock::new(),
+            phases: OnceLock::new(),
+        }
     }
 
     #[inline]
     pub fn any(&self) -> bool {
-        self.any.load(Ordering::Acquire)
+        self.any.load(Ordering::SeqCst)
     }
 
     /// 今の時刻 (記した書き換えの時刻の最大)。 この後の書き換えは、 これより大きい時刻になる。
@@ -1265,38 +1288,99 @@ impl Balls {
         self.slots.get()?[hid as usize].get().map(|b| &**b)
     }
 
+    fn phases(&self) -> &[AtomicU8] {
+        self.phases.get_or_init(|| (0..=u16::MAX as usize).map(|_| AtomicU8::new(PHASE_NONE)).collect())
+    }
+
+    #[inline]
+    fn phase(&self, hid: u16) -> u8 {
+        self.phases.get().map_or(PHASE_NONE, |p| p[hid as usize].load(Ordering::SeqCst))
+    }
+
+    /// 書き手 (WAL に積んだ後、 名簿の鍵の前): この書き込み (時刻 `t` = HLC を [`pack_hlc`] で詰めたもの、 WAL の無い書き込みは 0) を
+    /// 球に書くか。 組んでいる最中 (公開中) は組み終えるまで待つ。
+    #[inline]
+    pub fn for_write(&self, hid: u16, t: u64) -> Option<&Ball> {
+        loop {
+            match self.phase(hid) {
+                PHASE_READY => {
+                    let b = self.get(hid)?;
+                    return (t >= b.threshold.load(Ordering::Relaxed)).then_some(b);
+                }
+                PHASE_PUBLISHING => std::thread::yield_now(),
+                _ => return None,
+            }
+        }
+    }
+
+    /// 紐 `hid` は土台があって、 まだ組んでいない (開いた時に土台の番号から)。
+    pub fn mark_pending(&self, hid: u16) {
+        let _ = self.phases()[hid as usize].compare_exchange(PHASE_NONE, PHASE_PENDING, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// 組んでいない球をやめる (土台が使えなかった)。
+    pub fn unmark_pending(&self, hid: u16) {
+        let _ = self.phases()[hid as usize].compare_exchange(PHASE_PENDING, PHASE_NONE, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// まだ組んでいない球か。
+    pub fn is_pending(&self, hid: u16) -> bool {
+        self.phase(hid) == PHASE_PENDING
+    }
+
+    /// 組む側: 公開中を置く (この後で WAL に Commit を積み、 その HLC を閾値にする)。
+    pub fn begin_publish(&self, hid: u16) {
+        self.phases()[hid as usize].store(PHASE_PUBLISHING, Ordering::SeqCst);
+        self.any.store(true, Ordering::SeqCst);
+    }
+
+    /// 組む側: やめて組んでいないに戻す (待っていた書き手は球に書かない = 次に組む時に当てる)。
+    pub fn abort_publish(&self, hid: u16) {
+        self.phases()[hid as usize].store(PHASE_PENDING, Ordering::SeqCst);
+    }
+
+    /// 組む側: 閾値 `threshold` (この時刻より前の書き込みは当て終えた) で球を出す。
+    pub fn publish(&self, hid: u16, ball: Box<Ball>, threshold: u64) {
+        ball.threshold.store(threshold, Ordering::Relaxed);
+        let horizon = ball.horizon();
+        let slots = self.slots.get_or_init(|| (0..=u16::MAX as usize).map(|_| OnceLock::new()).collect());
+        let _ = slots[hid as usize].set(ball);
+        if horizon != 0 {
+            self.clock.publish(horizon);
+        }
+        self.phases()[hid as usize].store(PHASE_READY, Ordering::SeqCst);
+        self.any.store(true, Ordering::SeqCst);
+    }
+
+    /// 組む側: 出す前の手元の球を作る (地平 `horizon` の時点の値 `seed` を種に。 この後で [`Ball::replay`] で当てる)。
+    pub fn make(&self, horizon: u64, seed: impl FnOnce(&mut dyn FnMut(u32, u64))) -> Box<Ball> {
+        let ball = Box::new(Ball::new(self.snap_min.load(Ordering::Relaxed)));
+        ball.horizon.store(horizon, Ordering::Relaxed);
+        let mut decks: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        seed(&mut |eid, v| {
+            ball.seed(eid, v);
+            if v < LOG_DENSE {
+                decks.entry(v as u32).or_default().push(eid);
+            }
+        });
+        ball.seed_logs(decks);
+        ball
+    }
+
     /// これから宣言する球の控えの間隔の下限 (差分の数、 既定 `SNAP_MIN`)。 試験が小さくして控えの道を通す。
     pub fn set_snap_min(&self, n: usize) {
         self.snap_min.store(n.max(1), Ordering::Relaxed);
     }
 
-    /// 紐 `hid` を球にする。 `seed` に地平 `horizon` の時点の値 (eid, 値) を全部渡す。 宣言済みなら false。 名簿 (円柱) は先に組んでおくこと。
-    /// 種の値は球の 「前から」 の面と、 帳面の頭のデッキ (時刻 0 のデッキ、 `LOG_DENSE` 未満の値) になる。 地平より後の書き換えは、
-    /// 宣言の後で [`Ball::replay`] で当てる (組み直し)。
+    /// 紐 `hid` を球にする (書き手の居ない時に。 今からの書き込みは全部球に書く = 閾値 0)。 `seed` に地平 `horizon` の時点の値
+    /// (eid, 値) を全部渡す。 宣言済み (組んだ / 組んでいる) なら false。 名簿 (円柱) は先に組んでおくこと。
     pub fn declare(&self, hid: u16, horizon: u64, seed: impl FnOnce(&mut dyn FnMut(u32, u64))) -> bool {
-        let slots = self.slots.get_or_init(|| (0..=u16::MAX as usize).map(|_| OnceLock::new()).collect());
-        let mut fresh = false;
-        let ball = slots[hid as usize].get_or_init(|| {
-            fresh = true;
-            Box::new(Ball::new(self.snap_min.load(Ordering::Relaxed)))
-        });
-        if fresh {
-            ball.horizon.store(horizon, Ordering::Relaxed);
-            // 今の時刻を地平より前にしない (宣言の直後の 「今」 の読みが地平より前にならない)
-            if horizon != 0 {
-                self.clock.publish(horizon);
-            }
-            let mut decks: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-            seed(&mut |eid, v| {
-                ball.seed(eid, v);
-                if v < LOG_DENSE {
-                    decks.entry(v as u32).or_default().push(eid);
-                }
-            });
-            ball.seed_logs(decks);
-            self.any.store(true, Ordering::Release);
+        if self.get(hid).is_some() || self.phase(hid) == PHASE_PUBLISHING {
+            return false;
         }
-        fresh
+        let ball = self.make(horizon, seed);
+        self.publish(hid, ball, 0);
+        true
     }
 }
 

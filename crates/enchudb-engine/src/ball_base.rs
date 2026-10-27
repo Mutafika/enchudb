@@ -68,6 +68,16 @@ pub fn path_of(dir: &Path, hid: u16) -> PathBuf {
     dir.join(DIR).join(format!("{hid:04}.seg"))
 }
 
+/// WAL の無い書き込みがあった印 (次に記録付きで開いた時に土台を今の列で作り直す)。
+fn stale_path(dir: &Path, hid: u16) -> PathBuf {
+    dir.join(DIR).join(format!("{hid:04}.stale"))
+}
+
+/// 作り直した後に印を消す。
+pub(crate) fn clear_stale(dir: &Path, hid: u16) {
+    let _ = std::fs::remove_file(stale_path(dir, hid));
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Header {
     hid: u16,
@@ -134,6 +144,15 @@ struct Recent {
     /// 次に写す番号 (続きでなければ控えを捨てて `from` から始め直す)。
     next: u64,
     ops: std::collections::VecDeque<(u64, BaseOp)>,
+}
+
+/// `{dir}/ball/` の土台: (紐の番号, 印があるか)、 番号の順。
+fn list(dir: &Path) -> Vec<(u16, bool)> {
+    let Ok(rd) = std::fs::read_dir(dir.join(DIR)) else { return Vec::new() };
+    let mut found: Vec<u16> =
+        rd.flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".seg")?.parse::<u16>().ok()).collect();
+    found.sort_unstable();
+    found.into_iter().map(|hid| (hid, stale_path(dir, hid).exists())).collect()
 }
 
 /// 土台 1 本 (紐 1 本)。
@@ -276,6 +295,8 @@ pub(crate) struct BallBases {
     bases: Mutex<Vec<Base>>,
     /// 開く時に控えた、 まだ開いていない土台 (directory, 紐の番号, 名前)。 [`Self::ready`] が開く。
     pending: Mutex<Vec<(PathBuf, u16, Option<String>)>>,
+    /// WAL の無い書き込みを見張る紐 (開いた時に `ball/` にあった土台、 [`Self::track`])。 書かれたら印を置いて外す。
+    tracked: std::sync::OnceLock<(PathBuf, Box<[std::sync::atomic::AtomicBool]>)>,
     recent: Mutex<Recent>,
     /// 試験: 捨てる時に止める所 (1 = header を書き出した後・cell の前、 2 = cell を半分当てて書き出した後)。
     #[cfg(test)]
@@ -288,6 +309,7 @@ impl BallBases {
             self_peer: std::sync::atomic::AtomicU32::new(0),
             bases: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
+            tracked: std::sync::OnceLock::new(),
             recent: Mutex::new(Recent::default()),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicU8::new(0),
@@ -302,15 +324,39 @@ impl BallBases {
         self.self_peer.store(p, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 開く時: `{dir}/ball/` にある土台の番号だけを控える (開く時間を変えない。 開いて記録と照らすのは [`Self::ready`])。
-    /// `name_of` は紐の番号 → 名前 (無い紐の土台は `ready` で消す)。
-    pub(crate) fn attach(&self, dir: &Path, name_of: impl Fn(u16) -> Option<String>) {
-        let Ok(rd) = std::fs::read_dir(dir.join(DIR)) else { return };
-        let mut found: Vec<u16> =
-            rd.flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".seg")?.parse::<u16>().ok()).collect();
-        found.sort_unstable();
+    /// 開く時 (書く engine): `{dir}/ball/` にある土台の紐を見張る。 WAL の無い書き込み ([`Self::wal_less_write`]) は記録に載らない
+    /// ので、 その紐の土台に印を置く。
+    pub(crate) fn track(&self, dir: &Path) {
+        let found = list(dir);
+        if found.is_empty() {
+            return;
+        }
+        let bits: Box<[std::sync::atomic::AtomicBool]> = (0..=u16::MAX as usize).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        for (hid, _) in found {
+            bits[hid as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = self.tracked.set((dir.to_path_buf(), bits));
+    }
+
+    /// WAL の無い書き込み (HLC = ZERO) を紐 `hid` に書いた: 土台があれば印を置く (1 回だけ)。
+    #[inline]
+    pub(crate) fn wal_less_write(&self, hid: u16) {
+        if let Some((dir, bits)) = self.tracked.get()
+            && bits[hid as usize].swap(false, std::sync::atomic::Ordering::Relaxed)
+            && let Err(e) = std::fs::write(stale_path(dir, hid), b"")
+        {
+            eprintln!("[enchudb] warning: could not mark the ball base of himo {hid} stale ({e})");
+        }
+    }
+
+    /// 開く時 (記録を開いた時): `{dir}/ball/` にある土台の番号だけを控える (開く時間を変えない。 開いて記録と照らすのは [`Self::ready`])。
+    /// 返り値は (紐の番号, 印があるか)。 印のある土台は控えない (呼び手が今の列で作り直す)。 `name_of` は紐の番号 → 名前 (無い紐の
+    /// 土台は `ready` で消す)。
+    pub(crate) fn attach(&self, dir: &Path, name_of: impl Fn(u16) -> Option<String>) -> Vec<(u16, bool)> {
+        let found = list(dir);
         let mut p = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        p.extend(found.into_iter().map(|hid| (dir.to_path_buf(), hid, name_of(hid))));
+        p.extend(found.iter().filter(|&&(_, stale)| !stale).map(|&(hid, _)| (dir.to_path_buf(), hid, name_of(hid))));
+        found
     }
 
     /// 控えた土台を開き、 記録と照らして使えるものを持つ。 落ちて当てている途中の土台は記録から当て直す。 使えない土台は消す。
@@ -605,7 +651,7 @@ mod tests {
     fn reopen(dir: &Path) -> (ChangeLog, Arc<BallBases>) {
         let log = ChangeLog::open(dir, MIN_CAP, false, false).unwrap();
         let bases = Arc::new(BallBases::new());
-        bases.attach(dir, |h| (h == HID).then(|| NAME.to_string()));
+        let _ = bases.attach(dir, |h| (h == HID).then(|| NAME.to_string()));
         log.set_on_discard(bases.clone());
         bases.ready(&log);
         (log, bases)
@@ -815,7 +861,7 @@ mod tests {
         add(&log, &BallBases::new(), false, &ws, &mut at, 10_000).unwrap();
         assert!(log.range().0 > 0);
         let bases = BallBases::new();
-        bases.attach(&dir, |h| (h == HID).then(|| NAME.to_string()));
+        let _ = bases.attach(&dir, |h| (h == HID).then(|| NAME.to_string()));
         assert!(path_of(&dir, HID).exists(), "開く時は控えるだけ");
         bases.ready(&log);
         assert!(!bases.has(HID));

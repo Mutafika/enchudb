@@ -39,11 +39,13 @@ struct World {
     next_id: i64,
     r: Rng,
     checks: Vec<(u64, Rows)>,
+    /// 控えの時刻を WAL の時計から取る (球を組んでいない session は球の時刻が進まない。 球を読むと組んでしまうので読まない)。
+    wal_clock: bool,
 }
 
 impl World {
     fn new(seed: u64) -> Self {
-        Self { rows: BTreeMap::new(), ids: BTreeMap::new(), next_id: 0, r: Rng(seed), checks: Vec::new() }
+        Self { rows: BTreeMap::new(), ids: BTreeMap::new(), next_id: 0, r: Rng(seed), checks: Vec::new(), wal_clock: false }
     }
 
     fn insert(&mut self, db: &Database) {
@@ -88,12 +90,12 @@ impl World {
                     _ => self.insert(db),
                 }
             }
-            // 球を宣言していない session は球の時刻が進まないので、 WAL の時計から取る (球の時刻と同じ詰め方)
-            let t = if eng.ball_horizon("users.city").is_some() {
-                eng.ball_now()
-            } else {
+            // 球を組んでいない session は球の時刻が進まないので、 WAL の時計から取る (球の時刻と同じ詰め方)
+            let t = if self.wal_clock {
                 let h = eng.oplog().unwrap().mint_hlc();
                 h.wall << 23 | (h.logical as u64).min((1 << 23) - 1)
+            } else {
+                eng.ball_now()
             };
             self.checks.push((t, self.rows.clone()));
         }
@@ -198,13 +200,12 @@ fn reopen_reads_the_history_before_close() {
     }
     {
         let db = Database::open_with_oplog(&path, WAL).unwrap();
-        // 宣言し直すまでは球が無い (メモリの上の物)
-        assert_eq!(db.engine().ball_horizon("users.city"), None);
-        assert_eq!(declare(&db), (true, true), "この process では初めての宣言");
+        // 宣言し直さない: 最初の読みが土台 + 記録から組む
+        assert!(db.engine().ball_rebuild_stats().is_none(), "開くだけでは組まない");
+        assert_eq!(db.engine().ball_horizon("users.city"), Some(hz0), "捨てていないので地平は最初の宣言");
         let st = db.engine().ball_rebuild_stats().unwrap();
         assert!(st.records > 1000, "記録から読んだ: {st:?}");
-        assert_eq!(st.fixed, 0, "記録に載っていない書き込みは無い: {st:?}");
-        assert_eq!(db.engine().ball_horizon("users.city"), Some(hz0), "捨てていないので地平は最初の宣言");
+        assert_eq!(st.attempts, 1, "{st:?}");
         assert_eq!(w.verify(&db, "開き直した後"), (40, 0));
         // 開き直した後に書く
         w.write(&db, 20, 40);
@@ -212,7 +213,9 @@ fn reopen_reads_the_history_before_close() {
     }
     {
         let db = Database::open_with_oplog(&path, WAL).unwrap();
+        // 開き直した後の宣言も組む (宣言しなくても同じ)。 組んだ後の宣言は何もしない
         assert_eq!(declare(&db), (true, true));
+        assert_eq!(declare(&db), (false, false));
         assert_eq!(db.engine().ball_horizon("users.city"), Some(hz0));
         assert_eq!(w.verify(&db, "2 回目に開き直した後"), (60, 0));
     }
@@ -276,7 +279,7 @@ fn a_base_the_log_no_longer_covers_starts_over() {
     assert!(db.engine().ball_rebuild_stats().is_none(), "組み直していない (今から)");
     assert_eq!(w.verify(&db, "作り直した後"), (0, 10));
     // 今からの履歴は残る
-    let mut w2 = World { rows: w.rows.clone(), ids: w.ids.clone(), next_id: w.next_id, r: Rng(77), checks: Vec::new() };
+    let mut w2 = World { rows: w.rows.clone(), ids: w.ids.clone(), next_id: w.next_id, r: Rng(77), checks: Vec::new(), wal_clock: false };
     w2.write(&db, 10, 40);
     drop(db);
     let db = Database::open_with_oplog(&path, WAL).unwrap();
@@ -311,10 +314,11 @@ fn writes_that_never_reached_the_log_move_the_horizon_to_now() {
             w.rows.get_mut(&e).unwrap().1 = Some(49);
         }
     }
+    let ball = std::path::Path::new(&path).join("ball");
+    let stale = |p: &std::path::Path| std::fs::read_dir(p).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".stale")).count();
+    assert_eq!(stale(&ball), 1, "WAL の無い書き込みをした紐 (age) の土台に印");
     let db = Database::open_with_oplog(&path, WAL).unwrap();
-    declare(&db);
-    let st = db.engine().ball_rebuild_stats().unwrap();
-    assert!(st.fixed > 0, "今の列と合わない entity を回していない: {st:?}");
+    assert_eq!(stale(&ball), 0, "開く時に今の列で作り直して印を消す");
     // city は記録と列が合う (履歴はそのまま)、 age は合わない (地平が今に)
     assert_eq!(w.verify_each(&db, "記録に載らない書き込みの後"), ((10, 0), (0, 10)));
     assert!(db.engine().ball_horizon("users.age").unwrap() > db.engine().ball_horizon("users.city").unwrap());
@@ -359,17 +363,17 @@ fn bases_follow_the_log_in_sessions_without_a_declaration() {
         w.write(&db, 20, 100);
     }
     {
-        // 宣言しない session
+        // 宣言しない (球を読まない) session
         let db = Database::open_with_oplog(&path, WAL).unwrap();
+        w.wal_clock = true;
         w.write(&db, 150, 100);
+        w.wal_clock = false;
         let (first, next) = db.engine().change_log_range().unwrap();
         assert!(first > next / 2, "記録が捨てていない — 試験の前提 ({first}, {next})");
-        assert_eq!(db.engine().ball_horizon("users.city"), None);
+        assert!(db.engine().ball_rebuild_stats().is_none(), "球を読まない session では組まない");
     }
     let db = Database::open_with_oplog(&path, WAL).unwrap();
     declare(&db);
-    let st = db.engine().ball_rebuild_stats().unwrap();
-    assert_eq!(st.fixed, 0, "土台 + 記録 = 今の列: {st:?}");
     let hz = db.engine().ball_horizon("users.city").unwrap();
     assert!(hz > hz0);
     let (seen, old) = w.verify(&db, "宣言の無い session の後");
