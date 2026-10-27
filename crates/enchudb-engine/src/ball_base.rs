@@ -143,7 +143,7 @@ struct Recent {
     from: Option<u64>,
     /// 次に写す番号 (続きでなければ控えを捨てて `from` から始め直す)。
     next: u64,
-    ops: std::collections::VecDeque<(u64, BaseOp)>,
+    ops: std::collections::VecDeque<(u64, Hlc, BaseOp)>,
 }
 
 /// `{dir}/ball/` の土台: (紐の番号, 印があるか)、 番号の順。
@@ -298,6 +298,8 @@ pub(crate) struct BallBases {
     /// WAL の無い書き込みを見張る紐 (開いた時に `ball/` にあった土台、 [`Self::track`])。 書かれたら印を置いて外す。
     tracked: std::sync::OnceLock<(PathBuf, Box<[std::sync::atomic::AtomicBool]>)>,
     recent: Mutex<Recent>,
+    /// 組む間に捨てた分の控え (`start_side` 〜 `end_side`、 番号, HLC, 書き込み)。 捨てる口が土台に当てる前に足す。
+    side: Mutex<Option<Vec<(u64, Hlc, BaseOp)>>>,
     /// 試験: 捨てる時に止める所 (1 = header を書き出した後・cell の前、 2 = cell を半分当てて書き出した後)。
     #[cfg(test)]
     pub(crate) stop: std::sync::atomic::AtomicU8,
@@ -311,6 +313,7 @@ impl BallBases {
             pending: Mutex::new(Vec::new()),
             tracked: std::sync::OnceLock::new(),
             recent: Mutex::new(Recent::default()),
+            side: Mutex::new(None),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicU8::new(0),
         }
@@ -441,23 +444,54 @@ impl BallBases {
 
     /// 記録に写す前: 番号 `before` から `n` 件を写す。 そのうち土台に当たる書き込み `ops` (`(before からの位置, 書き込み)`) を控える。
     /// 写す途中で捨てる時 (1 回に写す量が記録より大きい) にも控えから当てるので、 写す前に呼ぶ。
-    pub(crate) fn noted(&self, before: u64, n: usize, ops: Vec<(u64, BaseOp)>) {
+    pub(crate) fn noted(&self, before: u64, n: usize, ops: Vec<(u64, Hlc, BaseOp)>) {
         let mut r = self.recent.lock().unwrap_or_else(|p| p.into_inner());
         if r.from.is_none() || r.next != before {
             r.ops.clear();
             r.from = Some(before);
         }
-        r.ops.extend(ops.into_iter().map(|(k, op)| (before + k, op)));
+        r.ops.extend(ops.into_iter().map(|(k, h, op)| (before + k, h, op)));
         r.next = before + n as u64;
     }
 
     /// 記録に写した後: 番号 `upto` から先は写せなかった (控えから外す。 次はその番号から写し直す)。
     pub(crate) fn appended(&self, upto: u64) {
         let mut r = self.recent.lock().unwrap_or_else(|p| p.into_inner());
-        while r.ops.back().is_some_and(|&(no, _)| no >= upto) {
+        while r.ops.back().is_some_and(|&(no, _, _)| no >= upto) {
             r.ops.pop_back();
         }
         r.next = upto;
+    }
+
+    /// 組む側 (engine の `build_ball`): 紐 `hid` の土台 (地平, done, cell) を読み、 同じ lock の下で 「組む間に捨てた分の控え」 を始める
+    /// (この後に記録が捨てる番号の、 土台に当たる書き込みを HLC 付きで控える = 組む側が読む前に捨てられても読める)。 土台が無ければ None。
+    pub(crate) fn start_side(&self, hid: u16, mut cell: impl FnMut(u32, u64)) -> Option<(Hlc, u64)> {
+        let g = self.lock();
+        let b = g.iter().find(|b| b.hid == hid)?;
+        b.for_each(&mut cell);
+        *self.side.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+        Some((b.horizon, b.done))
+    }
+
+    /// 組む間に捨てた分の控えを取り出す (番号の順)。 `from` より前の番号は落とす。
+    pub(crate) fn take_side(&self, from: u64) -> Vec<(u64, Hlc, BaseOp)> {
+        let mut g = self.side.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(v) = g.as_mut() else { return Vec::new() };
+        let mut out = std::mem::take(v);
+        out.retain(|(no, _, _)| *no >= from);
+        out
+    }
+
+    /// 組む間に捨てた分の控えのうち、 `from` より前の番号を落とす (組む側が読み終えた分)。
+    pub(crate) fn prune_side(&self, from: u64) {
+        if let Some(v) = self.side.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            v.retain(|(no, _, _)| *no >= from);
+        }
+    }
+
+    /// 組み終えた: 控えをやめる。
+    pub(crate) fn end_side(&self) {
+        *self.side.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
@@ -475,12 +509,12 @@ impl OnDiscard for BallBases {
         let mut g = self.lock();
         // 当てる番号: 土台のうち一番手前の done (記録の始まりより前は無い) から end まで
         let Some(start) = g.iter().map(|b| b.done).min().map(|d| d.max(first)) else { return Ok(()) };
-        let mut ops: Vec<(u64, BaseOp)> = Vec::new();
+        let mut ops: Vec<(u64, Hlc, BaseOp)> = Vec::new();
         // 控えより前の番号は記録から読む (開いた後に初めて写す前の record)。 控えの番号のうち end より前は取り出す
         let mut r = self.recent.lock().unwrap_or_else(|p| p.into_inner());
         if start >= end {
             // どの土台も作った時より前の番号
-            while r.ops.front().is_some_and(|&(no, _)| no < end) {
+            while r.ops.front().is_some_and(|&(no, _, _)| no < end) {
                 r.ops.pop_front();
             }
             return Ok(());
@@ -491,15 +525,19 @@ impl OnDiscard for BallBases {
             let es = read(start, split);
             let want = (split - start) - u64::from(hole.is_some_and(|h| (start..split).contains(&h)));
             read_ok = es.len() as u64 == want;
-            ops.extend(es.iter().filter_map(|e| decode(e, peer).map(|op| (e.no, op))));
+            ops.extend(es.iter().filter_map(|e| decode(e, peer).map(|op| (e.no, e.hlc, op))));
         }
-        while r.ops.front().is_some_and(|&(no, _)| no < end) {
-            let (no, op) = r.ops.pop_front().unwrap();
+        while r.ops.front().is_some_and(|&(no, _, _)| no < end) {
+            let (no, h, op) = r.ops.pop_front().unwrap();
             if no >= start {
-                ops.push((no, op));
+                ops.push((no, h, op));
             }
         }
         drop(r);
+        // 組んでいる球があれば、 捨てる分を渡す (記録が捨てる header を書く前 = 組む側が読めなくなる前)
+        if let Some(side) = self.side.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            side.extend(ops.iter().cloned());
+        }
         let mut broken = Vec::new();
         for (k, b) in g.iter_mut().enumerate() {
             if end <= b.done {
@@ -517,7 +555,7 @@ impl OnDiscard for BallBases {
             if stop == 1 {
                 return Err(io::Error::other("test: stopped after the base header"));
             }
-            let todo: Vec<&BaseOp> = ops.iter().filter(|(no, _)| *no >= b.done && *no < end).map(|(_, op)| op).collect();
+            let todo: Vec<&BaseOp> = ops.iter().filter(|(no, _, _)| *no >= b.done && *no < end).map(|(_, _, op)| op).collect();
             #[cfg(test)]
             if stop == 2 {
                 for op in &todo[..todo.len() / 2] {
@@ -668,7 +706,7 @@ mod tests {
                 .enumerate()
                 .filter_map(|(k, e)| {
                     let (r, _) = WireRecord::decode(&e.bytes).unwrap();
-                    f.pick(&r.op, r.author_peer).map(|op| (k as u64, op))
+                    f.pick(&r.op, r.author_peer).map(|op| (k as u64, r.hlc, op))
                 })
                 .collect();
             bases.noted(log.range().1, batch.len(), picked);

@@ -205,7 +205,7 @@ fn reopen_reads_the_history_before_close() {
         assert_eq!(db.engine().ball_horizon("users.city"), Some(hz0), "捨てていないので地平は最初の宣言");
         let st = db.engine().ball_rebuild_stats().unwrap();
         assert!(st.records > 1000, "記録から読んだ: {st:?}");
-        assert_eq!(st.attempts, 1, "{st:?}");
+        assert_eq!(st.side_ops, 0, "記録は捨てていない: {st:?}");
         assert_eq!(w.verify(&db, "開き直した後"), (40, 0));
         // 開き直した後に書く
         w.write(&db, 20, 40);

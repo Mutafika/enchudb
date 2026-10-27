@@ -295,20 +295,20 @@ fn the_first_read_builds_while_writers_write() {
     cleanup(&path);
 }
 
-/// (T3) 組む間に記録が捨てる (記録 1 MiB、 WAL 1 MiB、 組む間を広げて書き手が何周も書く): 土台から組み直し、 最後の回は記録に写すのを止めて
-/// 組む (止めずには追いつけない)。 WAL を何度も畳む (追いつきの間に畳むと、 前に読み終えた WAL の位置は前の周の物)。
+/// (T3) 組む間に記録が捨てる (記録 1 MiB、 WAL 1 MiB、 追いつきの間を広げて書き手が何周も書く): 組む側が読む前に捨てた所は、 捨てる口が
+/// 土台に当てる前に渡した控えから当てる (組み直さない)。 WAL も何度も畳む。
 #[test]
-fn a_build_restarts_when_the_log_drops_what_it_was_reading() {
+fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     let path = tmp_path("t3");
     cleanup(&path);
     const SMALL_WAL: usize = 1 << 20;
     let mut h = create(&path, SMALL_WAL, 1 << 20);
-    let mut last_attempt = 0;
+    let mut used = 0;
     for k in 0..3u64 {
         let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0x77 + k, 2);
-        last_attempt += usize::from(ss.st.attempts == 4);
+        used += usize::from(ss.st.side_ops > 0);
     }
-    assert!(last_attempt >= 1, "最後の回 (止めて組む) まで行っていない — 試験の前提 ({last_attempt}/3)");
+    assert!(used >= 2, "組む間に記録が捨てた所を読んでいない — 試験の前提 ({used}/3)");
     cleanup(&path);
 }
 
@@ -323,7 +323,7 @@ fn a_build_reads_on_while_the_wal_folds() {
     let mut folded = 0;
     for k in 0..3u64 {
         let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 0x99 + k, 100);
-        assert_eq!(ss.st.attempts, 1, "記録が捨てた — 試験の前提");
+        assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         folded += usize::from(ss.folds > 0);
     }
     assert!(folded >= 2, "組む間に WAL を畳んでいない — 試験の前提 ({folded}/3)");
