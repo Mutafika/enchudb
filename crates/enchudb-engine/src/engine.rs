@@ -4907,6 +4907,8 @@ pub struct Engine {
     ball_rebuild_stats: std::sync::Mutex<Option<BallRebuildStats>>,
     /// 球を組む人は 1 人ずつ (`build_ball`)。
     ball_build: std::sync::Mutex<()>,
+    /// 試験: 組む時、 1 回目の記録の残りを読んだ後に止まる時間 (ms、 書き手が並んで書く間を広げる)。
+    ball_build_pause: std::sync::atomic::AtomicU64,
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -5482,6 +5484,7 @@ impl Engine {
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
+            ball_build_pause: std::sync::atomic::AtomicU64::new(0),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -6765,6 +6768,7 @@ impl Engine {
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
+            ball_build_pause: std::sync::atomic::AtomicU64::new(0),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -18333,6 +18337,10 @@ impl Engine {
                 continue; // 記録が捨てた (土台が進んだ): 土台から組み直す
             }
             let log_ns = t_log.elapsed().as_nanos() as u64;
+            let pause = self.ball_build_pause.load(std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 && attempt == 1 {
+                std::thread::sleep(std::time::Duration::from_millis(pause));
+            }
             // (2) 記録の残り (読んでいる間に写した分) と WAL の残り
             let t_catch = std::time::Instant::now();
             if !rp.catch_up(log, wal, &mut pos, None) {
@@ -18387,6 +18395,12 @@ impl Engine {
             return self.balls.get(hid);
         }
         None
+    }
+
+    /// 試験: 球を組む時、 1 回目の記録の残りを読んだ後に `ms` 止まる (書き手が並んで書く間を広げる)。
+    #[doc(hidden)]
+    pub fn ball_set_build_pause(&self, ms: u64) {
+        self.ball_build_pause.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 最後の組み直しの数と時間 (試作、 測り用)。
