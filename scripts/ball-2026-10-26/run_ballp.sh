@@ -3,20 +3,24 @@
 # (P1) 組み直しの時間: 記録の record 1 件あたり ≤ 1 µs。 段ごと (読む / 当てる / 今と比べる) に出す
 # (P2) 記録が捨て続ける時、 土台あり / なし で WAL 付きの書き手 1 本の書き換えの時間の差 ≤ 5% (記録 1 MiB。 16 MiB も並べて出す、
 #      16 MiB は回す前の基準に無い: 1 MiB の初回が +26% だった後に足した)
-# (P3) 開く時間: 土台があっても変わらない (2 回目の土台あり vs 土台を消した後、 どちらも温まった後)
+# (P3) 開く時間: 土台があっても変わらない (2 回目の土台あり vs 土台を消した後、 どちらも温まった後)。 r は土台なしを毎回最後に
+#      開くので順の効きが乗る → `ballp o <MiB> 20` で 土台あり / なし (ball/ を別の名前に動かす) を交互に 20 回ずつ (results_ballp_o_v11.jsonl)
 # 負荷 > 8 の回は待つ (30 分で諦めて印を付けて回す)。 binary は $B (scratchpad の ballp crate を release で組んだ物)
 S=$(cd "$(dirname "$0")" && pwd)
 B=${B:-$S/ballp-v11.bin}
 export BALL_DIR=$S/balldb
 mkdir -p "$BALL_DIR"
 R=${RES_R:-$S/results_ballp_r_v11.jsonl}
+ONLY=${ONLY:-rw}
 W=${RES_W:-$S/results_ballp_w_v11.jsonl}
-: > "$R"
-: > "$W"
+case $ONLY in *r*) : > "$R" ;; esac
+case $ONLY in *w*) : > "$W" ;; esac
 load1() { sysctl -n vm.loadavg | awk '{print $2}'; }
 freeg() { df -g / | awk 'NR==2 {print $4}'; }
 quiet() { t=0; while [ "$(load1 | awk '{print ($1 < 8) ? 1 : 0}')" != 1 ]; do sleep 5; t=$((t + 5)); [ $t -ge 1800 ] && break; done; }
-for seed in 41 42 43; do
+case $ONLY in *r*) ;; *) SKIP_R=1 ;; esac
+case $ONLY in *w*) ;; *) SKIP_W=1 ;; esac
+[ -z "$SKIP_R" ] && for seed in 41 42 43; do
   for spec in "16 160000" "64 640000" "256 2600000"; do
     set -- $spec
     quiet; l=$(load1); f=$(freeg)
@@ -24,7 +28,7 @@ for seed in 41 42 43; do
     echo "r log=${1}MiB writes=$2 seed=$seed load=$l"
   done
 done
-for seed in 41 42 43 44 45 46; do
+[ -z "$SKIP_W" ] && for seed in 41 42 43 44 45 46; do
   for m in 1 16; do
     for v in base nobase; do
       quiet; l=$(load1); f=$(freeg)

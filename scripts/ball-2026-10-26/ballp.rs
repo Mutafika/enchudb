@@ -59,6 +59,7 @@ fn main() {
     match args[1].as_str() {
         "r" => rebuild(args[2].parse().unwrap(), args[3].parse().unwrap(), args[4].parse().unwrap(), rows),
         "w" => writes(args[2] == "base", args[3].parse().unwrap(), args[4].parse().unwrap(), rows),
+        "o" => opens(args[2].parse().unwrap(), args[3].parse().unwrap(), rows),
         m => panic!("mode {m}"),
     }
 }
@@ -182,5 +183,51 @@ fn writes(base: bool, n: usize, seed: u64, rows: usize) {
         write_ns as f64 / n as f64,
         range.0,
         range.1
+    );
+}
+
+/// o <記録 MiB> <回数>: 開く時間を 土台あり / なし (ball/ を別の名前に動かす) で交互に (P3、 回す順の効きを除く)。
+fn opens(log_mib: usize, k: usize, rows: usize) {
+    let path = db_path("o");
+    let _c = Cleanup(path.clone());
+    {
+        let db = build(&path, rows).finish_with_oplog(WAL).unwrap();
+        let eng = db.engine();
+        eng.enable_change_log(log_mib << 20).unwrap();
+        assert!(eng.declare_ball("t.a").unwrap());
+        let t = db.get_table("t").unwrap();
+        let mut r = Rng(7);
+        for _ in 0..(log_mib * 6000) {
+            t.upsert().set("id", (r.next() % rows as u64) as i64).set("a", (r.next() % 100) as i64).commit().unwrap();
+        }
+    }
+    let ball = std::path::Path::new(&path).join("ball");
+    let moved = std::path::Path::new(&path).join("ball.x");
+    let open = |p: &str| {
+        let t0 = Instant::now();
+        let db = Database::open_with_oplog(p, WAL).unwrap();
+        let ns = t0.elapsed().as_nanos() as u64;
+        drop(db);
+        ns
+    };
+    open(&path); // 温める
+    let (mut with, mut without) = (Vec::new(), Vec::new());
+    for i in 0..k {
+        // 順を回ごとに入れ替える
+        for j in 0..2 {
+            if (i + j) % 2 == 0 {
+                with.push(open(&path));
+            } else {
+                std::fs::rename(&ball, &moved).unwrap();
+                without.push(open(&path));
+                std::fs::rename(&moved, &ball).unwrap();
+            }
+        }
+    }
+    with.sort_unstable();
+    without.sort_unstable();
+    println!(
+        "{{\"mode\":\"o\",\"log_mib\":{log_mib},\"k\":{k},\"open_base_med_ns\":{},\"open_nobase_med_ns\":{},\"open_base\":{:?},\"open_nobase\":{:?}}}",
+        with[k / 2], without[k / 2], with, without
     );
 }

@@ -45,9 +45,11 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   (0.33 秒 / 4〜20 ms / 0.1 秒 / 0.1 ms)、 `miri_dir_asm.rs` は直した `Chunked::get` と前の形の release の asm を比べる
   (どちらも依存なしの crate の `src/lib.rs`)
 - 11 回目 (球の土台 `ball/NNNN.seg`、 changefeed の記録から開き直した後に組み直す): `ballp.rs` (組み直し・開く時間 `r` /
-  記録が捨て続ける時の書き込み `w`、 crate は `Cargo.toml.ballp`)、 `run_ballp.sh`、 結果 `results_ballp_r_v11.jsonl` /
-  `results_ballp_w_v11.jsonl`。 変異は `ball_mut_v11a.json` (土台と記録の捨てる前の口 21 本、 engine の `ball_base` 単体) /
-  `ball_mut_v11b.json` (組み直しと読み 17 本、 schema の `ball_reopen` + `ball_history`)、 結果は `mut_v11a.log` / `mut_v11b.log`
+  記録が捨て続ける時の書き込み `w` / 土台あり・なしを交互に開く `o`、 crate は `Cargo.toml.ballp`)、 `run_ballp.sh`、 要約 `sum_p.py`、
+  結果 `results_ballp_r_v11.jsonl` / `results_ballp_w_v11.jsonl` / `results_ballp_o_v11.jsonl` (`*_v11pre.jsonl` は捨てる時に記録を
+  読み直していた形)。 変異は `ball_mut_v11a.json` (土台と記録の捨てる前の口 21 本、 engine の `ball_base` 単体) /
+  `ball_mut_v11b.json` (組み直しと読み 17 本、 schema の `ball_reopen` + `ball_history`) / `ball_mut_v11c.json` (追い直し 5 本) /
+  `ball_mut_v11d.json` (開くのを遅らせた所 2 本)、 結果は `mut_v11a〜d.log`
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
