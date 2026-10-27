@@ -50,6 +50,9 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   読み直していた形)。 変異は `ball_mut_v11a.json` (土台と記録の捨てる前の口 21 本、 engine の `ball_base` 単体) /
   `ball_mut_v11b.json` (組み直しと読み 17 本、 schema の `ball_reopen` + `ball_history`) / `ball_mut_v11c.json` (追い直し 5 本) /
   `ball_mut_v11d.json` (開くのを遅らせた所 2 本)、 結果は `mut_v11a〜d.log`
+- 12 回目 (宣言を保存 = 土台の file、 最初の読みが書き手を止めずに組む): `ballp.rs` に `l` (書き手 1 本が書き続ける中で組む、 書き込み 1 回ごとの時間) を足した。
+  結果 `results_ballp_l_v12.jsonl` (`sum_l.py`) / `results_ballp_o_v12.jsonl` (開く時間) / `results_ballb_v12.jsonl` と `results_ballb_wal_v12.jsonl`
+  (11 回目の binary と交互、 `sum_w12.py`)。 変異は `ball_mut_v12.json` (19 本、 schema の `ball_lazy` + `ball_reopen` + `ball_history`)、 結果 `mut_v12.log`
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。

@@ -8,6 +8,8 @@
 //!    控えた時刻 (地平より後のもの) のデッキ = 手元の写し
 //! w <base|nobase> <書き込み数> <seed>: 記録が捨て続ける時の書き手 1 本の書き換え (P2)。 base = 記録を作ってから宣言 (土台あり)、
 //!    nobase = 宣言してから記録を作る (メモリだけの球、 記録が捨てても何も当てない)。 記録 1 MiB、 WAL 8 MiB
+//! l <記録 MiB> <書き込み数> <seed>: (12 回目) 開き直した後、 書き手 1 本が書き続ける中で最初の読みが球を組む。 書き込み 1 回ごとの
+//!    時間を取り、 組む間 / 外の最大・p99 と、 組んだ時の段ごとの時間 (`ball_rebuild_stats`: 公開中の間 = 書き手が待ちうる間) を出す (P1)
 //! 出力: 1 行 1 JSON (stdout)。
 
 use enchudb::schema::Database;
@@ -41,6 +43,11 @@ impl Drop for Cleanup {
 
 const WAL: usize = 8 << 20;
 
+/// WAL の大きさ (`BALL_WAL_MIB`、 既定 8 MiB)。
+fn wal_cap() -> usize {
+    env_usize("BALL_WAL_MIB", 8) << 20
+}
+
 fn build(path: &str, rows: usize) -> Database {
     let mut db = Database::create(path).unwrap();
     db.table("t").number("id").number("a").primary_key("id").build().unwrap();
@@ -60,6 +67,7 @@ fn main() {
         "r" => rebuild(args[2].parse().unwrap(), args[3].parse().unwrap(), args[4].parse().unwrap(), rows),
         "w" => writes(args[2] == "base", args[3].parse().unwrap(), args[4].parse().unwrap(), rows),
         "o" => opens(args[2].parse().unwrap(), args[3].parse().unwrap(), rows),
+        "l" => lazy(args[2].parse().unwrap(), args[3].parse().unwrap(), args[4].parse().unwrap(), rows),
         m => panic!("mode {m}"),
     }
 }
@@ -136,13 +144,13 @@ fn rebuild(log_mib: usize, n: usize, seed: u64, rows: usize) {
     let (db, open_nobase_ns) = open(&path);
     drop(db);
     println!(
-        "{{\"mode\":\"r\",\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"first\":{first},\"next\":{next},\"declare_first_ns\":{declare_first_ns},\"open_base_ns\":{open_base_ns},\"open_base2_ns\":{open_base2_ns},\"open_nobase_ns\":{open_nobase_ns},\"declare_ns\":{declare_ns},\"records\":{},\"applied\":{},\"fixed\":{},\"log_ns\":{},\"apply_ns\":{},\"check_ns\":{},\"total_ns\":{},\"ns_per_record\":{:.1},\"checks_after_horizon\":{seen},\"checks\":{}}}",
+        "{{\"mode\":\"r\",\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"first\":{first},\"next\":{next},\"declare_first_ns\":{declare_first_ns},\"open_base_ns\":{open_base_ns},\"open_base2_ns\":{open_base2_ns},\"open_nobase_ns\":{open_nobase_ns},\"declare_ns\":{declare_ns},\"records\":{},\"applied\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"total_ns\":{},\"ns_per_record\":{:.1},\"checks_after_horizon\":{seen},\"checks\":{}}}",
         st.records,
         st.applied,
-        st.fixed,
+        st.side_ops,
         st.log_ns,
-        st.apply_ns,
-        st.check_ns,
+        st.catch_ns,
+        st.publish_ns,
         st.total_ns,
         declare_ns as f64 / st.records.max(1) as f64,
         checks.len()
@@ -229,5 +237,70 @@ fn opens(log_mib: usize, k: usize, rows: usize) {
     println!(
         "{{\"mode\":\"o\",\"log_mib\":{log_mib},\"k\":{k},\"open_base_med_ns\":{},\"open_nobase_med_ns\":{},\"open_base\":{:?},\"open_nobase\":{:?}}}",
         with[k / 2], without[k / 2], with, without
+    );
+}
+
+fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
+    let path = db_path("l");
+    let _c = Cleanup(path.clone());
+    let mut r = Rng(seed | 1);
+    {
+        let db = build(&path, rows).finish_with_oplog(wal_cap()).unwrap();
+        let eng = db.engine();
+        eng.enable_change_log(log_mib << 20).unwrap();
+        assert!(eng.declare_ball("t.a").unwrap());
+        let t = db.get_table("t").unwrap();
+        for _ in 0..n {
+            t.upsert().set("id", (r.next() % rows as u64) as i64).set("a", (r.next() % 100) as i64).commit().unwrap();
+        }
+    }
+    let db = Database::open_with_oplog(&path, wal_cap()).unwrap();
+    let eng = db.engine();
+    let records = eng.change_log_range().map_or(0, |(f, x)| x - f);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let origin = Instant::now();
+    let (lats, b0, b1) = std::thread::scope(|s| {
+        let w = s.spawn(|| {
+            let t = db.get_table("t").unwrap();
+            let mut r = Rng(seed ^ 0xABCD);
+            let mut lats: Vec<(u64, u64)> = Vec::with_capacity(4 << 20);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let (i, v) = ((r.next() % rows as u64) as i64, (r.next() % 100) as i64);
+                let t0 = Instant::now();
+                t.upsert().set("id", i).set("a", v).commit().unwrap();
+                lats.push(((t0 - origin).as_nanos() as u64, t0.elapsed().as_nanos() as u64));
+            }
+            lats
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let b0 = origin.elapsed().as_nanos() as u64;
+        let _ = eng.ball_horizon("t.a");
+        let b1 = origin.elapsed().as_nanos() as u64;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        (w.join().unwrap(), b0, b1)
+    });
+    let st = eng.ball_rebuild_stats().expect("組んだ");
+    // 答え合わせ: 今のデッキ
+    let now = eng.ball_now();
+    for v in 0..100u64 {
+        let mut want = eng.pull_raw("t.a", v);
+        want.sort_unstable();
+        assert_eq!(eng.ball_pull_at("t.a", v, now).unwrap(), want, "今の v={v}");
+    }
+    let stat = |xs: &mut Vec<u64>| {
+        xs.sort_unstable();
+        if xs.is_empty() {
+            return (0, 0, 0);
+        }
+        (xs.len() as u64, xs[xs.len() * 99 / 100], *xs.last().unwrap())
+    };
+    let mut inside: Vec<u64> = lats.iter().filter(|&&(at, l)| at + l >= b0 && at <= b1).map(|&(_, l)| l).collect();
+    let mut outside: Vec<u64> = lats.iter().filter(|&&(at, l)| !(at + l >= b0 && at <= b1)).map(|&(_, l)| l).collect();
+    let (ni, p99i, maxi) = stat(&mut inside);
+    let (no, p99o, maxo) = stat(&mut outside);
+    println!(
+        "{{\"mode\":\"l\",\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":{},\"read_records\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"publish_parts_ns\":{:?},\"in_n\":{ni},\"in_p99_ns\":{p99i},\"in_max_ns\":{maxi},\"out_n\":{no},\"out_p99_ns\":{p99o},\"out_max_ns\":{maxo}}}",
+        wal_cap() >> 20, b1 - b0, st.records, st.side_ops, st.log_ns, st.catch_ns, st.publish_ns, st.publish_parts_ns
     );
 }
