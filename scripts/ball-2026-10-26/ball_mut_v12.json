@@ -1,0 +1,92 @@
+[
+ {
+  "name": "公開中の書き手が待たずに球に書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                PHASE_PUBLISHING => std::thread::yield_now(),",
+  "replace": "                PHASE_PUBLISHING => return None,"
+ },
+ {
+  "name": "公開中の書き手が待たずに球に書く (閾値なし)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                PHASE_PUBLISHING => std::thread::yield_now(),",
+  "replace": "                PHASE_PUBLISHING => return self.get(hid),"
+ },
+ {
+  "name": "閾値を見ずに球に書く",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                    return (t >= b.threshold.load(Ordering::Relaxed)).then_some(b);",
+  "replace": "                    return Some(b);"
+ },
+ {
+  "name": "閾値より後も書き手が書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                    return (t >= b.threshold.load(Ordering::Relaxed)).then_some(b);",
+  "replace": "                    return (t < b.threshold.load(Ordering::Relaxed)).then_some(b);"
+ },
+ {
+  "name": "最後の残りを当てない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            // (4) H より前の残り\n            if !rp.catch_up(log, wal, &mut pos, Some(h)) {",
+  "replace": "            // (4) H より前の残り\n            if false && !rp.catch_up(log, wal, &mut pos, Some(h)) {"
+ },
+ {
+  "name": "最後の残りで H 以降も当てる",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if !rp.catch_up(log, wal, &mut pos, Some(h)) {",
+  "replace": "            if !rp.catch_up(log, wal, &mut pos, None) {"
+ },
+ {
+  "name": "Commit を積んでから公開中を置く",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            self.balls.begin_publish(hid);\n            let h = match wal.append_with_hlc(enchudb_oplog::oplog::Op::Commit) {\n                Ok((_, h)) => h,\n                Err(e) => {\n                    self.balls.abort_publish(hid);\n                    return Err(e);\n                }\n            };",
+  "replace": "            let h = match wal.append_with_hlc(enchudb_oplog::oplog::Op::Commit) {\n                Ok((_, h)) => h,\n                Err(e) => {\n                    self.balls.abort_publish(hid);\n                    return Err(e);\n                }\n            };\n            std::thread::sleep(std::time::Duration::from_millis(2));\n            self.balls.begin_publish(hid);"
+ },
+ {
+  "name": "WAL の残りを読まない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        let (recs, _) = wal.scan_for_change_log(c.log_wal, u64::MAX, true);\n        for (r, _) in &recs {",
+  "replace": "        let (recs, _) = wal.scan_for_change_log(c.log_wal, u64::MAX, true);\n        for (r, _) in recs.iter().take(0) {"
+ },
+ {
+  "name": "記録が捨てても組み直さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if truncated {\n                continue; // 記録が捨てた (土台が進んだ): 土台から組み直す\n            }",
+  "replace": "            let _ = truncated;"
+ },
+ {
+  "name": "土台の時点を地平にしない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            let ball = self.balls.make(crate::ball::pack_hlc(horizon.wall, horizon.logical), |f| {",
+  "replace": "            let ball = self.balls.make(0, |f| {"
+ },
+ {
+  "name": "開く時に組んでいない球にしない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            self.balls.mark_pending(hid);\n        }\n        log.set_on_discard",
+  "replace": "        }\n        log.set_on_discard"
+ },
+ {
+  "name": "WAL の無い書き込みで印を置かない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if hlc == enchudb_oplog::Hlc::ZERO {\n            self.ball_bases.wal_less_write(hid as u16);\n        }\n        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {\n            debug_assert!",
+  "replace": "        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {\n            debug_assert!"
+ },
+ {
+  "name": "印のある土台を作り直さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if stale {\n                // WAL の無い書き込みがあった紐: 今の列で作り直す (履歴はここから)\n                self.renew_ball_base(dir, hid, log);\n            }",
+  "replace": "            let _ = stale;"
+ },
+ {
+  "name": "組めない土台の球を戻さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        let _ = self.phases()[hid as usize].compare_exchange(PHASE_PENDING, PHASE_NONE, Ordering::SeqCst, Ordering::SeqCst);",
+  "replace": "        let _ = hid;"
+ },
+ {
+  "name": "記録と WAL の重なりを落とさない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {",
+  "replace": "        if limit.is_some_and(|l| key(hlc) >= key(l)) {"
+ }
+]
