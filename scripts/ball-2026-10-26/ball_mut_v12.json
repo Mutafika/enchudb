@@ -50,8 +50,8 @@
  {
   "name": "WAL の残りを読まない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            let (recs, end) = wal.scan_for_change_log(start, u64::MAX, true);\n            for (r, _) in &recs {",
-  "replace": "            let (recs, end) = wal.scan_for_change_log(start, u64::MAX, true);\n            for (r, _) in recs.iter().take(0) {"
+  "find": "            for (r, _) in &recs {\n                self.op(r.hlc, &r.op, r.author_peer, limit);\n            }\n            self.wal_mark = Some((lap, end.max(start)));",
+  "replace": "            for (r, _) in recs.iter().take(0) {\n                self.op(r.hlc, &r.op, r.author_peer, limit);\n            }\n            self.wal_mark = Some((lap, end.max(start)));"
  },
  {
   "name": "WAL を前の周の位置から読む",
@@ -62,8 +62,8 @@
  {
   "name": "読む間に畳んでも周を見ない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            if wal.lap() == lap {\n                self.wal_mark = Some((lap, end.max(start)));",
-  "replace": "            if true {\n                self.wal_mark = Some((lap, end.max(start)));"
+  "find": "            if wal.lap() != lap {\n                // 読む前か読む間に畳んだ",
+  "replace": "            if false {\n                // 読む前か読む間に畳んだ"
  },
  {
   "name": "捨てる口が組む側に控えを渡さない",
