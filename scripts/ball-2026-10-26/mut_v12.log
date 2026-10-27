@@ -1,22 +1,22 @@
-baseline: pass 46 秒 → 1 run の上限 167 秒
-  killed 19s             公開中の書き手が待たずに球に書かない
-  killed 19s             公開中の書き手が待たずに閾値を見ずに球に書く
+baseline: pass 36 秒 → 1 run の上限 139 秒
+  killed 21s             公開中の書き手が待たずに球に書かない
+  killed 21s             公開中の書き手が待たずに閾値を見ずに球に書く
   killed 40s             閾値を見ずに球に書く
   killed 4s              閾値より後も書き手が書かない
-  killed 19s             最後の残りを当てない
-  killed 19s             最後の残りで H 以降も当てる
-  killed 39s             H を取ってから公開中を置く
-  killed 40s             H より前の書き終えを待たない
-  killed 19s             WAL の残りを読まない
-  killed 28s             WAL を前の周の位置から読む
-  SURVIVED 43s           読む間に畳んでも周を見ない
-  killed 25s             捨てる口が組む側に控えを渡さない
-  killed 26s             控えを組む前に始めない
-  killed 23s             読めない所を控えから当てない
-  killed 23s             土台の時点を地平にしない
-  killed 12s             開く時に組んでいない球にしない
-  killed 46s             WAL の無い書き込みで印を置かない (書く)
-  killed 45s             印のある土台を作り直さない
+  killed 42s             最後の残りを当てない
+  killed 30s             最後の残りで H 以降も当てる
+  killed 41s             H を取ってから公開中を置く
+  SURVIVED 45s           H より前の書き終えを待たない
+  killed 43s             WAL の残りを読まない
+  killed 18s             WAL を前の周の位置から読む
+  killed 43s             読む間に畳んでも周を見ない
+  killed 44s             捨てる口が組む側に控えを渡さない
+  killed 45s             控えを組む前に始めない
+  killed 42s             読めない所を控えから当てない
+  killed 43s             土台の時点を地平にしない
+  killed 11s             開く時に組んでいない球にしない
+  killed 49s             WAL の無い書き込みで印を置かない (書く)
+  killed 51s             印のある土台を作り直さない
   killed 20s             記録と WAL の重なりを落とさない
 killed 18 / survived 1 / その他 0
-  生き残り: 読む間に畳んでも周を見ない
+  生き残り: H より前の書き終えを待たない
