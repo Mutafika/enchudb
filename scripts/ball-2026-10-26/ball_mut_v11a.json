@@ -1,0 +1,128 @@
+[
+ {
+  "name": "捨てる前に土台の header を書かない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            b.write_header(&Header { hid: b.hid, done: b.done, end, horizon: end_hlc })?;",
+  "replace": "            let _ = end_hlc;"
+ },
+ {
+  "name": "捨てる時に cell を当てない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            for op in todo {\n                b.apply(op)?;\n            }",
+  "replace": "            let _ = todo;"
+ },
+ {
+  "name": "当て終えた終わりを進めない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            b.done = end;\n            b.horizon = end_hlc;",
+  "replace": "            b.horizon = end_hlc;"
+ },
+ {
+  "name": "地平を進めない (捨てる時)",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            b.done = end;\n            b.horizon = end_hlc;",
+  "replace": "            b.done = end;"
+ },
+ {
+  "name": "中身を残さない番号を欠けと見る",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "let have = |no: u64| hole == Some(no) || ",
+  "replace": "let have = |no: u64| "
+ },
+ {
+  "name": "開く時に当て直さない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        if h.done < h.end {",
+  "replace": "        if false {"
+ },
+ {
+  "name": "当て直しを記録の始まりから読まない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "let mut pos = h.done.max(first);",
+  "replace": "let mut pos = h.done;"
+ },
+ {
+  "name": "記録より先の終わりを受け入れる",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        if h.end > next {",
+  "replace": "        if false {"
+ },
+ {
+  "name": "当てずに捨てた土台を受け入れる",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        if first > h.end {",
+  "replace": "        if false {"
+ },
+ {
+  "name": "cell を値 + 1 にしない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "let stored = v.map_or(0, |v| v + 1);",
+  "replace": "let stored = v.unwrap_or(0);"
+ },
+ {
+  "name": "名前で指す書き込みを読まない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        DecodedOp::TieNamed { eid, himo_name, value, .. } => Some(BaseOp::SetNamed(himo_name, local(eid), value)),\n",
+  "replace": ""
+ },
+ {
+  "name": "消すを読まない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        DecodedOp::Delete { eid } => Some(BaseOp::Delete(local(eid))),\n",
+  "replace": ""
+ },
+ {
+  "name": "外すを読まない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        DecodedOp::Untie { eid, himo_id } => Some(BaseOp::Set(himo_id, local(eid), None)),\n",
+  "replace": ""
+ },
+ {
+  "name": "別の紐の書き込みも当てる",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            BaseOp::Set(h, e, v) if *h == self.hid => self.put(*e, *v),",
+  "replace": "            BaseOp::Set(_, e, v) => self.put(*e, *v),"
+ },
+ {
+  "name": "消すを当てない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            BaseOp::Delete(e) => self.put(*e, None),",
+  "replace": "            BaseOp::Delete(_) => Ok(()),"
+ },
+ {
+  "name": "開く時に地平を header から戻さない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        b.done = h.end;\n        b.horizon = h.horizon;",
+  "replace": "        b.done = h.end;"
+ },
+ {
+  "name": "捨てる前の口を呼ばない",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "            self.before_discard(st, sim.first.min(old_next), None)?;\n",
+  "replace": ""
+ },
+ {
+  "name": "捨てる header の後で口を呼ぶ",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "            self.before_discard(st, sim.first.min(old_next), None)?;\n            // header が捨てた場所を指さないようにしてから上書きする。 古い entry が全部消えたら空の記録\n            let mut mid = st.c;\n            if sim.first >= old_next {\n                mid.first = old_next;\n                mid.tail = mid.head;\n            } else {\n                mid.first = sim.first;\n                mid.tail = sim.tail;\n            }\n            write_header(&self.region, &mid);\n            self.region.mark_dirty(0, HEADER);\n            self.map.flush_dirty()?;\n",
+  "replace": "            // header が捨てた場所を指さないようにしてから上書きする。 古い entry が全部消えたら空の記録\n            let mut mid = st.c;\n            if sim.first >= old_next {\n                mid.first = old_next;\n                mid.tail = mid.head;\n            } else {\n                mid.first = sim.first;\n                mid.tail = sim.tail;\n            }\n            write_header(&self.region, &mid);\n            self.region.mark_dirty(0, HEADER);\n            self.map.flush_dirty()?;\n            self.before_discard(st, sim.first.min(old_next), None)?;\n"
+ },
+ {
+  "name": "置けない record の前に口を呼ばない",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "        self.before_discard(st, limit + 1, Some((limit, rec.hlc)))?;\n",
+  "replace": ""
+ },
+ {
+  "name": "口の Err を捨てる",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "        h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &entries)?;",
+  "replace": "        let _ = h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &entries);"
+ },
+ {
+  "name": "地平の HLC を最後の entry から取らない",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "            None => entries.last().filter(|e| e.no + 1 == end).map_or(Hlc::ZERO, |e| e.hlc),",
+  "replace": "            None => Hlc::ZERO,"
+ }
+]

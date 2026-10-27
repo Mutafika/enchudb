@@ -1,0 +1,104 @@
+[
+ {
+  "name": "開く時に土台を持たない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                self.attach_ball_bases(set.dir(), &log);\n                let _ = self.change_log.set(log);",
+  "replace": "                let _ = self.change_log.set(log);"
+ },
+ {
+  "name": "記録を作る時に土台を照らさない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.attach_ball_bases(set.dir(), &log);\n        let _ = self.change_log.set(log);\n        Ok(())",
+  "replace": "        let _ = self.change_log.set(log);\n        Ok(())"
+ },
+ {
+  "name": "記録に捨てる前の口を付けない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        log.set_on_discard(self.ball_bases.clone());",
+  "replace": ""
+ },
+ {
+  "name": "土台を作らない (メモリだけ)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            && !self.sync_tables_enabled()\n        {\n            return self.declare_ball_kept",
+  "replace": "            && false\n        {\n            return self.declare_ball_kept"
+ },
+ {
+  "name": "組み直しの地平を今にする",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        let fresh = self.balls.declare(hid, pack(horizon), |f| {",
+  "replace": "        let fresh = self.balls.declare(hid, pack(wal.mint_hlc()), |f| {"
+ },
+ {
+  "name": "記録の残りを当てない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        let (mut pos, mut n_rec, mut n_hit) = (done, 0u64, 0u64);",
+  "replace": "        let (mut pos, mut n_rec, mut n_hit) = (log.range().1, 0u64, 0u64);"
+ },
+ {
+  "name": "記録の時刻で当てない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                let t = pack(e.hlc);",
+  "replace": "                let t = { let _ = e.hlc; 0 };"
+ },
+ {
+  "name": "消すを当てない (組み直し)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                    Some(BaseOp::Delete(e)) => set(&mut cur, e, None, t),\n",
+  "replace": ""
+ },
+ {
+  "name": "今の列と比べない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if have != want[e] {",
+  "replace": "            if have != want[e] && false {"
+ },
+ {
+  "name": "宣言の時に WAL を書き出さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.oplog_sync()?;\n        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());\n        self.pump_change_log(wal, log, &mut c, false)?;\n        let pack",
+  "replace": "        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());\n        self.pump_change_log(wal, log, &mut c, false)?;\n        let pack"
+ },
+ {
+  "name": "宣言の時に記録に写さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.pump_change_log(wal, log, &mut c, false)?;\n        let pack",
+  "replace": "        let pack"
+ },
+ {
+  "name": "地平より前も答える (value_at)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        b.check(t)?;\n        Ok(b.value_at(",
+  "replace": "        Ok(b.value_at("
+ },
+ {
+  "name": "地平より前も答える (pull_at)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        b.check(t)?;\n        let peer = self.peer_id();\n        Ok(b.pull_at(",
+  "replace": "        let peer = self.peer_id();\n        Ok(b.pull_at("
+ },
+ {
+  "name": "宣言で今の時刻を地平まで進めない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            if horizon != 0 {\n                self.clock.publish(horizon);\n            }",
+  "replace": ""
+ },
+ {
+  "name": "地平の境目を含めない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        if t < h { Err(TooOld { horizon: h }) } else { Ok(()) }",
+  "replace": "        if t <= h { Err(TooOld { horizon: h }) } else { Ok(()) }"
+ },
+ {
+  "name": "地平を置かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            ball.horizon.store(horizon, Ordering::Relaxed);",
+  "replace": ""
+ },
+ {
+  "name": "当てる時に球を回さない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        if let Some(ts) = ts {\n            self.turn(eid, new, ts);\n        }\n        self.build_snaps(snaps);\n        ts\n    }",
+  "replace": "        self.build_snaps(snaps);\n        ts\n    }"
+ }
+]
