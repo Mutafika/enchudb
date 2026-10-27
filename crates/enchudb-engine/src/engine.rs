@@ -18123,12 +18123,11 @@ impl Engine {
         use crate::ball_base::BaseOp;
         let hid = id as u16;
         let h = &self.himos[id];
-        // 書いた record を全部記録に写す (土台と記録の境目を今にする)。 写す・捨てる (土台に当てる) のは `change_emit` の下なので、
-        // 組み終えるまで持つ
+        // 書いた record を全部記録に写す (土台と記録の境目を今にする。 写す時に、 開いた後に控えた土台を開いて記録と照らす)。
+        // 写す・捨てる (土台に当てる) のは `change_emit` の下なので、 組み終えるまで持つ
         self.oplog_sync()?;
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         self.pump_change_log(wal, log, &mut c, false)?;
-        self.ball_bases.ready(log);
         let pack = |t: enchudb_oplog::Hlc| crate::ball::pack_hlc(t.wall, t.logical);
         if !self.ball_bases.has(hid) {
             let at = wal.mint_hlc();
