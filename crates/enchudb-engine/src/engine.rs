@@ -91,6 +91,8 @@ pub struct BallRebuildStats {
     pub catch_ns: u64,
     /// 公開中を置いてから出すまで (この間、 その紐の書き手は球に書く所で待つ)。
     pub publish_ns: u64,
+    /// その内訳: H より前の append の書き終えを待つ / 記録を lock の外で読む / `change_emit` を待つ / lock の下で記録と WAL を読む。
+    pub publish_parts_ns: [u64; 4],
     /// 全部。
     pub total_ns: u64,
 }
@@ -105,6 +107,10 @@ struct BallReplay<'a> {
     cur: Vec<u64>,
     /// 当てた最後の record の HLC (記録と WAL の重なりはこれで落とす)。
     last: enchudb_oplog::Hlc,
+    /// WAL を読み終えた所 (周, 位置)。 次はここから読む (周が変わった = 畳んだ後は、 記録に写した所から)。
+    wal_mark: Option<(u32, u64)>,
+    /// 最後の `catch_up` の内訳 (記録を lock の外で読む / lock を待つ / lock の下で読む)。
+    parts: [u64; 3],
     records: u64,
     applied: u64,
 }
@@ -146,19 +152,11 @@ impl BallReplay<'_> {
         }
     }
 
-    /// 記録の `pos` から先と、 WAL の記録に写していない残りを当てる (`change_emit` の下 = 写す・捨てるを止めて)。 記録が `pos` より先を
-    /// 捨てていたら false (組み直す)。
-    fn catch_up(
-        &mut self,
-        log: &crate::change_log::ChangeLog,
-        wal: &enchudb_oplog::oplog::OpLog,
-        pos: &mut u64,
-        limit: Option<enchudb_oplog::Hlc>,
-    ) -> bool {
-        let c = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+    /// 記録の `pos` から先を読む (捨てて読めなくなったら false)。
+    fn read_log(&mut self, log: &crate::change_log::ChangeLog, pos: &mut u64, limit: Option<enchudb_oplog::Hlc>) -> bool {
         loop {
             match log.read(*pos, 4 << 20) {
-                Ok(es) if es.is_empty() => break,
+                Ok(es) if es.is_empty() => return true,
                 Ok(es) => {
                     *pos = es.last().unwrap().no + 1;
                     for e in &es {
@@ -168,10 +166,50 @@ impl BallReplay<'_> {
                 Err(_) => return false,
             }
         }
-        let (recs, _) = wal.scan_for_change_log(c.log_wal, u64::MAX, true);
+    }
+
+    /// 記録の `pos` から先と、 WAL の記録に写していない残りを当てる。 記録は先に lock の外で読み (写すのを止めない)、 その後
+    /// `change_emit` の下 (写す・畳むを止めて) で、 その間に写した分と WAL の残りを読む。 `held` は呼び手が持っている
+    /// `change_emit` (組めない時の最後の回)。 記録が `pos` より先を捨てていたら false (組み直す)。
+    fn catch_up(
+        &mut self,
+        log: &crate::change_log::ChangeLog,
+        wal: &enchudb_oplog::oplog::OpLog,
+        pos: &mut u64,
+        limit: Option<enchudb_oplog::Hlc>,
+        held: Option<&ChangeCursor>,
+    ) -> bool {
+        let t0 = std::time::Instant::now();
+        if held.is_none() && !self.read_log(log, pos, limit) {
+            return false;
+        }
+        let t1 = std::time::Instant::now();
+        let guard;
+        let c = match held {
+            Some(c) => c,
+            None => {
+                guard = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                &*guard
+            }
+        };
+        let t2 = std::time::Instant::now();
+        self.parts = [(t1 - t0).as_nanos() as u64, (t2 - t1).as_nanos() as u64, 0];
+        if !self.read_log(log, pos, limit) {
+            return false;
+        }
+        // 畳むのは change_emit の下 (`spill_changes_for_fold`) なので、 持っている間は WAL の位置が動かない。 前に読み終えた所が
+        // 同じ周なら、 そこから読む (読み直さない)
+        let lap = wal.lap();
+        let start = match self.wal_mark {
+            Some((l, off)) if l == lap && off >= c.log_wal => off,
+            _ => c.log_wal,
+        };
+        let (recs, end) = wal.scan_for_change_log(start, u64::MAX, true);
+        self.wal_mark = Some((lap, end.max(start)));
         for (r, _) in &recs {
             self.op(r.hlc, &r.op, r.author_peer, limit);
         }
+        self.parts[2] = t2.elapsed().as_nanos() as u64;
         true
     }
 }
@@ -4909,6 +4947,8 @@ pub struct Engine {
     ball_build: std::sync::Mutex<()>,
     /// 試験: 組む時、 1 回目の記録の残りを読んだ後に止まる時間 (ms、 書き手が並んで書く間を広げる)。
     ball_build_pause: std::sync::atomic::AtomicU64,
+    /// 試験: 公開中を置いた後・H を取る前と、 書き終えを待った後・残りを読む前に止まる時間 (µs、 公開の約束の場所を広げる)。
+    ball_publish_pause: std::sync::atomic::AtomicU64,
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -5485,6 +5525,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
+            ball_publish_pause: std::sync::atomic::AtomicU64::new(0),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -6769,6 +6810,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
+            ball_publish_pause: std::sync::atomic::AtomicU64::new(0),
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -18290,11 +18332,18 @@ impl Engine {
         self.himos[hid as usize].build_cylinder();
         let t0 = std::time::Instant::now();
         let peer = self.peer_id();
-        for attempt in 1..=8u32 {
+        const ATTEMPTS: u32 = 4;
+        for attempt in 1..=ATTEMPTS {
+            // 最後の回は記録に写す・捨てるを止めたまま組む (書き手が速く記録が小さいと、 止めずには追いつけない。 その間に WAL が満杯に
+            // なれば書き手は待つ)
+            let held = (attempt == ATTEMPTS).then(|| self.change_emit.lock().unwrap_or_else(|p| p.into_inner()));
             // 開いた後に控えた土台を開いて記録と照らす (写す・捨てると並ばないように change_emit の下で)
-            {
-                let _c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-                self.ball_bases.ready(log);
+            match &held {
+                Some(_) => self.ball_bases.ready(log),
+                None => {
+                    let _c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                    self.ball_bases.ready(log);
+                }
             }
             let mut cur: Vec<u64> = Vec::new();
             let Some((horizon, done)) = self.ball_bases.with(hid, |b| {
@@ -18313,27 +18362,11 @@ impl Engine {
             let ball = self.balls.make(crate::ball::pack_hlc(horizon.wall, horizon.logical), |f| {
                 cur.iter().enumerate().filter(|&(_, &v)| v != BallReplay::NONE).for_each(|(e, &v)| f(e as u32, v))
             });
-            let mut rp = BallReplay { eng: self, hid, name: &name, peer, ball, cur, last: horizon, records: 0, applied: 0 };
+            let mut rp = BallReplay { eng: self, hid, name: &name, peer, ball, cur, last: horizon, wal_mark: None, parts: [0; 3], records: 0, applied: 0 };
             // (1) 記録の残りを書き手と並んで読む
             let t_log = std::time::Instant::now();
             let mut pos = done;
-            let mut truncated = false;
-            loop {
-                match log.read(pos, 4 << 20) {
-                    Ok(es) if es.is_empty() => break,
-                    Ok(es) => {
-                        pos = es.last().unwrap().no + 1;
-                        for e in &es {
-                            rp.entry(e, None);
-                        }
-                    }
-                    Err(_) => {
-                        truncated = true;
-                        break;
-                    }
-                }
-            }
-            if truncated {
+            if !rp.read_log(log, &mut pos, None) {
                 continue; // 記録が捨てた (土台が進んだ): 土台から組み直す
             }
             let log_ns = t_log.elapsed().as_nanos() as u64;
@@ -18341,29 +18374,46 @@ impl Engine {
             if pause > 0 && attempt == 1 {
                 std::thread::sleep(std::time::Duration::from_millis(pause));
             }
-            // (2) 記録の残り (読んでいる間に写した分) と WAL の残り
+            // (2) 記録の残り (読んでいる間に写した分) と WAL の残り。 公開中 (書き手が待つ間) を短くするため、 1 回に当てる数が
+            // 小さくなるまで繰り返す
             let t_catch = std::time::Instant::now();
-            if !rp.catch_up(log, wal, &mut pos, None) {
+            let mut ok = true;
+            for _ in 0..16 {
+                let before = rp.records;
+                if !rp.catch_up(log, wal, &mut pos, None, held.as_deref()) {
+                    ok = false;
+                    break;
+                }
+                if rp.records - before < 1024 {
+                    break;
+                }
+            }
+            if !ok {
                 continue;
             }
             let catch_ns = t_catch.elapsed().as_nanos() as u64;
-            // (3) 公開中を置いて Commit を積む: その HLC より前の書き込みは組む側、 以降は書き手が球に書く
+            // (3) 公開中を置いて WAL の時計から H を取る: H より前の書き込みは組む側、 以降は書き手が球に書く。 H より前に採番した
+            // append が書き終えるのを待つ (`quiesce`、 WAL の空きは待たない = change_emit を持っていてもよい)
             let t_pub = std::time::Instant::now();
             self.balls.begin_publish(hid);
-            let h = match wal.append_with_hlc(enchudb_oplog::oplog::Op::Commit) {
-                Ok((_, h)) => h,
-                Err(e) => {
-                    self.balls.abort_publish(hid);
-                    return Err(e);
-                }
-            };
+            let pp = self.ball_publish_pause.load(std::sync::atomic::Ordering::Relaxed);
+            if pp > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(pp));
+            }
+            let h = wal.mint_hlc();
+            wal.quiesce();
+            let quiesce_ns = t_pub.elapsed().as_nanos() as u64;
+            if pp > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(pp));
+            }
             // (4) H より前の残り
-            if !rp.catch_up(log, wal, &mut pos, Some(h)) {
+            if !rp.catch_up(log, wal, &mut pos, Some(h), held.as_deref()) {
                 self.balls.abort_publish(hid);
                 continue;
             }
+            drop(held);
             // (5) 出す
-            let (records, applied) = (rp.records, rp.applied);
+            let (records, applied, parts) = (rp.records, rp.applied, rp.parts);
             self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
             let st = BallRebuildStats {
                 records,
@@ -18372,6 +18422,7 @@ impl Engine {
                 log_ns,
                 catch_ns,
                 publish_ns: t_pub.elapsed().as_nanos() as u64,
+                publish_parts_ns: [quiesce_ns, parts[0], parts[1], parts[2]],
                 total_ns: t0.elapsed().as_nanos() as u64,
             };
             *self.ball_rebuild_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(st);
@@ -18395,6 +18446,18 @@ impl Engine {
             return self.balls.get(hid);
         }
         None
+    }
+
+    /// 試験: (公開中で待った書き手, 組んだ後に閾値より前で球に書かなかった書き手) の数 (組む時の約束の場所を踏んだか)。
+    #[doc(hidden)]
+    pub fn ball_publish_counts(&self) -> (u64, u64) {
+        self.balls.publish_counts()
+    }
+
+    /// 試験: 球を組む時、 公開中を置いた後・H を取る前と、 書き終えを待った後・残りを読む前に `us` µs 止まる (公開の約束の場所を広げる)。
+    #[doc(hidden)]
+    pub fn ball_set_publish_pause(&self, us: u64) {
+        self.ball_publish_pause.store(us, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 試験: 球を組む時、 1 回目の記録の残りを読んだ後に `ms` 止まる (書き手が並んで書く間を広げる)。

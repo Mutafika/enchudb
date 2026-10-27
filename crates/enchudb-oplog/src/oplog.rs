@@ -1417,6 +1417,13 @@ impl OpLog {
         self.next_hlc()
     }
 
+    /// 今 積んでいる最中の append が終わるのを待つ (append の lock を 1 回取って放す)。 返った後、 この呼び出しより前に採番した
+    /// record は全部 WAL に書き終えてある (採番と書くのは lock の中で 1 続き。 頼み手の頼みは lock の持ち手が持っている間に積む)。
+    /// 空きの待ちは lock の外なので、 満杯でも待たない (試作: engine の球を書き手を止めずに組む時の境目)。
+    pub fn quiesce(&self) {
+        drop(self.append_lock.lock());
+    }
+
     /// op を append。新しいレコードの LSN を返す。
     ///
     /// writer は append 中 `pending_writes` を +1、 完了時 -1 (観測用。 畳むのとの直列化は `append_lock`)。

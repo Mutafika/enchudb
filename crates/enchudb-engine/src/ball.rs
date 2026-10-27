@@ -1254,6 +1254,9 @@ pub(crate) struct Balls {
     slots: OnceLock<Box<[OnceLock<Box<Ball>>]>>,
     /// 紐の番号 → 状態 (`PHASE_NONE` / `PHASE_PENDING` / `PHASE_PUBLISHING` / `PHASE_READY`)。 最初に使う時に取る。
     phases: OnceLock<Box<[AtomicU8]>>,
+    /// 数 (試験が場所を踏んだかを見る): 公開中で待った書き手 / 組んだ後に閾値より前で球に書かなかった書き手。
+    waits: AtomicU64,
+    covered: AtomicU64,
 }
 
 impl Balls {
@@ -1264,6 +1267,8 @@ impl Balls {
             snap_min: AtomicUsize::new(SNAP_MIN),
             slots: OnceLock::new(),
             phases: OnceLock::new(),
+            waits: AtomicU64::new(0),
+            covered: AtomicU64::new(0),
         }
     }
 
@@ -1301,16 +1306,32 @@ impl Balls {
     /// 球に書くか。 組んでいる最中 (公開中) は組み終えるまで待つ。
     #[inline]
     pub fn for_write(&self, hid: u16, t: u64) -> Option<&Ball> {
+        let mut waited = false;
         loop {
             match self.phase(hid) {
                 PHASE_READY => {
                     let b = self.get(hid)?;
-                    return (t >= b.threshold.load(Ordering::Relaxed)).then_some(b);
+                    if t >= b.threshold.load(Ordering::Relaxed) {
+                        return Some(b);
+                    }
+                    self.covered.fetch_add(1, Ordering::Relaxed);
+                    return None;
                 }
-                PHASE_PUBLISHING => std::thread::yield_now(),
+                PHASE_PUBLISHING => {
+                    if !waited {
+                        waited = true;
+                        self.waits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::yield_now()
+                }
                 _ => return None,
             }
         }
+    }
+
+    /// (公開中で待った書き手, 組んだ後に閾値より前で球に書かなかった書き手) の数 (試験用)。
+    pub fn publish_counts(&self) -> (u64, u64) {
+        (self.waits.load(Ordering::Relaxed), self.covered.load(Ordering::Relaxed))
     }
 
     /// 紐 `hid` は土台があって、 まだ組んでいない (開いた時に土台の番号から)。

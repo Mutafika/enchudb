@@ -13,7 +13,8 @@ use std::sync::{Barrier, Mutex};
 const TH: usize = 4;
 const PER: usize = 250;
 const VALS: [u64; 6] = [3, 5, 8, 13, 21, 2_000_000];
-const WAL: usize = 8 << 20;
+/// WAL は大きめ (畳む間は append が止まり、 公開の約束の場所を書き手が踏めない: この base の WAL は 1 区画)
+const WAL: usize = 64 << 20;
 
 fn tmp_path(name: &str) -> String {
     format!("/tmp/enchudb-ball-lazy-{}-{}", name, std::process::id())
@@ -115,21 +116,33 @@ fn create(path: &str, log_cap: usize) -> Hist {
     h
 }
 
-/// 開き直して、 書き手 TH 本が `rounds` 回 × `per` 件ずつ書く間に、 回 `build_at` の後で別の thread が最初の読みを呼んで球を組む。
-/// 返り値は (組む間に書いた数 (試験の前提: 組むのと書くのが重なった), 組んだ時の数)。
+/// 組んだ時の数: (組む間に書いた数, 組んだ時の段ごとの数, 公開中で待った書き手, 閾値より前で球に書かなかった書き手)。
+struct Session {
+    during: u64,
+    st: enchudb_engine::engine::BallRebuildStats,
+    waits: u64,
+    covered: u64,
+}
+
+/// 開き直して、 書き手 TH 本が 1 回 `per` 件ずつ書き続ける間に、 回 `build_at` の後で別の thread が最初の読みを呼んで球を組む。
+/// 書き手は組み終えた後も `after` 回書く (公開の時に書き手が居るように)。
+#[allow(clippy::too_many_arguments)]
 fn concurrent_session(
     path: &str,
     h: &mut Hist,
-    rounds: usize,
     per: usize,
+    gap_us: u64,
     build_at: usize,
+    after: usize,
     pause_ms: u64,
+    publish_pause_us: u64,
     seed: u64,
     min_seen: usize,
-) -> (u64, enchudb_engine::engine::BallRebuildStats) {
+) -> Session {
     let db = Database::open_with_oplog(path, WAL).unwrap();
     let eng = db.engine();
     eng.ball_set_build_pause(pause_ms);
+    eng.ball_set_publish_pause(publish_pause_us);
     assert!(eng.ball_rebuild_stats().is_none(), "開くだけでは組まない");
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let bar = Barrier::new(TH + 1);
@@ -137,15 +150,18 @@ fn concurrent_session(
     let writes = AtomicU64::new(0);
     let round_now = AtomicUsize::new(0);
     let during = AtomicU64::new(0);
+    // 組み終えた回 + 1 (0 = まだ)
+    let built_at = AtomicUsize::new(0);
+    let go = std::sync::atomic::AtomicBool::new(true);
     let eids = &h.eids;
     let mut checks = Vec::new();
     std::thread::scope(|s| {
         for th in 0..TH {
-            let (bar, shared, writes) = (&bar, &shared, &writes);
+            let (bar, shared, writes, go) = (&bar, &shared, &writes, &go);
             let mut mine: Vec<Option<u64>> = h.cur[th * PER..(th + 1) * PER].to_vec();
             s.spawn(move || {
                 let mut r = Rng(seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul(th as u64 + 1)));
-                for _ in 0..rounds {
+                loop {
                     for _ in 0..per {
                         let k = r.below(PER as u64) as usize;
                         let e = eids[th * PER + k];
@@ -159,14 +175,20 @@ fn concurrent_session(
                         }
                         eng.commit();
                         writes.fetch_add(1, Ordering::Relaxed);
+                        if gap_us > 0 {
+                            std::thread::sleep(std::time::Duration::from_micros(gap_us));
+                        }
                     }
                     shared.lock().unwrap()[th * PER..(th + 1) * PER].copy_from_slice(&mine);
                     bar.wait();
                     bar.wait();
+                    if !go.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             });
         }
-        let (round_now, writes, during) = (&round_now, &writes, &during);
+        let (round_now, writes, during, built_at) = (&round_now, &writes, &during, &built_at);
         s.spawn(move || {
             while round_now.load(Ordering::Acquire) < build_at {
                 std::thread::yield_now();
@@ -175,20 +197,30 @@ fn concurrent_session(
             // 最初の読み: 組む (答えは見ない)
             let _ = eng.ball_value_at(eids[0], "t.a", 0);
             during.store(writes.load(Ordering::Relaxed) - before, Ordering::Relaxed);
+            built_at.store(round_now.load(Ordering::Acquire) + 1, Ordering::Release);
         });
-        for round in 0..rounds {
+        for round in 0..100_000 {
             bar.wait();
             checks.push((wal_now(&db), shared.lock().unwrap().clone()));
             round_now.store(round + 1, Ordering::Release);
+            let b = built_at.load(Ordering::Acquire);
+            if b != 0 && round + 1 >= b + after {
+                go.store(false, Ordering::Release);
+            }
             bar.wait();
+            if !go.load(Ordering::Acquire) {
+                break;
+            }
         }
     });
     h.cur = shared.into_inner().unwrap();
+    let rounds = checks.len();
     h.checks.extend(checks);
     let st = eng.ball_rebuild_stats().expect("組んだ");
-    eprintln!("組む: {st:?}、 組む間の書き込み {}", during.load(Ordering::Relaxed));
+    let (waits, covered) = eng.ball_publish_counts();
+    eprintln!("組む: {st:?}、 組む間の書き込み {}、 回 {rounds}、 公開中で待った {waits}、 閾値より前 {covered}", during.load(Ordering::Relaxed));
     let (seen, _) = h.verify(&db, "書き手と並んで組んだ後");
-    // 記録が捨てない大きさなら全部の控えが地平以降。 捨てる時 (T3) は最後の数回だけ
+    // 地平以降の控え: 書き手が速いと記録が捨てて地平がこの session の中に入る (T3 は最後の数回だけ)
     assert!(seen >= rounds.min(min_seen), "地平以降の控え {seen}");
     // 組んだ後は書き手が球に書く (今の答え = 今の列)
     let now = eng.ball_now().max(wal_now(&db));
@@ -197,25 +229,31 @@ fn concurrent_session(
         want.sort_unstable();
         assert_eq!(eng.ball_pull_at("t.a", v, now).unwrap(), want, "今の v={v}");
     }
-    (during.load(Ordering::Relaxed), st)
+    Session { during: during.load(Ordering::Relaxed), st, waits, covered }
 }
 
-/// (T2) 書き手 4 本が書き続ける中で最初の読みが組む。 開き直しを 8 回重ねる (前の session の控えも毎回確かめる)。
+/// (T2) 書き手 4 本が書き続ける中で最初の読みが組む (書き手は 1 件ごとに 20 µs 空けて、 組む側が追いつける速さに)。 開き直しを 8 回重ねる (前の session の控えも毎回確かめる)。 書き手は組み終えた
+/// 後も書くので、 公開中に待つ書き手と、 組む側が当てた (閾値より前の) 書き込みを組んだ後に書く書き手が出る (前提として数える)。
+/// 公開中の間は数 µs なので、 半分の session は試験の口で広げる (公開中を置いた後・H を取る前と、 書き終えを待った後に 2 ms ずつ)。
 #[test]
 fn the_first_read_builds_while_writers_write() {
     let path = tmp_path("t2");
     cleanup(&path);
-    let mut h = create(&path, 16 << 20);
-    let mut overlapped = 0;
+    let mut h = create(&path, 32 << 20);
+    let (mut overlapped, mut waits, mut covered) = (0, 0, 0);
     for k in 0..8u64 {
-        let (during, _) = concurrent_session(&path, &mut h, 30, 30, 5 + k as usize % 7, 30, 0x1234 + k, usize::MAX);
-        overlapped += usize::from(during > 0);
+        let ss = concurrent_session(&path, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, if k % 2 == 0 { 2000 } else { 0 }, 0x1234 + k, 100);
+        overlapped += usize::from(ss.during > 0);
+        waits += ss.waits;
+        covered += ss.covered;
     }
     assert!(overlapped >= 6, "組むのと書くのが重なっていない — 試験の前提 ({overlapped}/8)");
+    assert!(waits > 0 && covered > 0, "公開の時の約束の場所を踏んでいない — 試験の前提 (待った {waits}, 閾値より前 {covered})");
     // 最後にもう 1 回開き直して、 書かずに全部の控え
     let db = Database::open_with_oplog(&path, WAL).unwrap();
     let (seen, old) = h.verify(&db, "最後に開き直した後");
-    assert_eq!((seen, old), (h.checks.len(), 0));
+    assert_eq!(seen + old, h.checks.len());
+    assert!(seen >= 100, "地平以降の控え {seen}");
     drop(db);
     cleanup(&path);
 }
@@ -228,8 +266,8 @@ fn a_build_restarts_when_the_log_drops_what_it_was_reading() {
     let mut h = create(&path, 1 << 20);
     let mut restarted = 0;
     for k in 0..3u64 {
-        let (_, st) = concurrent_session(&path, &mut h, 20, 400, 3, 300, 0x77 + k, 2);
-        restarted += usize::from(st.attempts >= 2);
+        let ss = concurrent_session(&path, &mut h, 400, 0, 3, 3, 600, 0, 0x77 + k, 2);
+        restarted += usize::from(ss.st.attempts >= 2);
     }
     assert!(restarted >= 1, "組む間に記録が捨てていない — 試験の前提 (組み直した session {restarted}/3)");
     cleanup(&path);
