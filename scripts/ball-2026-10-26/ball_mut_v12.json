@@ -38,8 +38,8 @@
  {
   "name": "H を取ってから公開中を置く",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            self.balls.begin_publish(hid);\n            let pp = self.ball_publish_pause.load(std::sync::atomic::Ordering::Relaxed);\n            if pp > 0 {\n                std::thread::sleep(std::time::Duration::from_micros(pp));\n            }\n            let h = wal.mint_hlc();\n            wal.quiesce();\n",
-  "replace": "            let h = wal.mint_hlc();\n            wal.quiesce();\n            let pp = self.ball_publish_pause.load(std::sync::atomic::Ordering::Relaxed);\n            if pp > 0 {\n                std::thread::sleep(std::time::Duration::from_micros(pp));\n            }\n            self.balls.begin_publish(hid);\n"
+  "find": "            self.balls.begin_publish(hid);\n            let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n            if pp[0] > 0 {\n                std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n            }\n            let h = wal.mint_hlc();\n            wal.quiesce();\n",
+  "replace": "            let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n            let h = wal.mint_hlc();\n            wal.quiesce();\n            if pp[0] > 0 {\n                std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n            }\n            self.balls.begin_publish(hid);\n"
  },
  {
   "name": "H より前の書き終えを待たない",
@@ -58,12 +58,6 @@
   "file": "crates/enchudb-engine/src/engine.rs",
   "find": "            Some((l, off)) if l == lap && off >= c.log_wal => off,",
   "replace": "            Some((_, off)) if off >= c.log_wal => off,"
- },
- {
-  "name": "記録が捨てても組み直さない",
-  "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            if !rp.read_log(log, &mut pos, None) {\n                continue; // 記録が捨てた (土台が進んだ): 土台から組み直す\n            }",
-  "replace": "            let _ = rp.read_log(log, &mut pos, None);"
  },
  {
   "name": "土台の時点を地平にしない",
@@ -88,12 +82,6 @@
   "file": "crates/enchudb-engine/src/engine.rs",
   "find": "            if stale {\n                // WAL の無い書き込みがあった紐: 今の列で作り直す (履歴はここから)\n                self.renew_ball_base(dir, hid, log);\n            }",
   "replace": "            let _ = stale;"
- },
- {
-  "name": "組めない土台の球を戻さない",
-  "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        let _ = self.phases()[hid as usize].compare_exchange(PHASE_PENDING, PHASE_NONE, Ordering::SeqCst, Ordering::SeqCst);",
-  "replace": "        let _ = hid;"
  },
  {
   "name": "記録と WAL の重なりを落とさない",
