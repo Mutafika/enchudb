@@ -243,11 +243,11 @@ fn mode_r(seed: u64) {
     for v in 0..100u64 {
         let mut p = eng.pull_raw("t.a", v as u32);
         p.sort_unstable();
-        assert_eq!(eng.ball_pull_at("t.a", v, now), p, "今の v={v}");
+        assert_eq!(eng.ball_pull_at("t.a", v, now).unwrap(), p, "今の v={v}");
         let want: Vec<u64> = (0..total).filter(|&i| at5[i] as u64 == v).map(|i| eids[i]).collect();
-        assert_eq!(eng.ball_pull_at("t.a", v, t5), want, "t5 の v={v}");
+        assert_eq!(eng.ball_pull_at("t.a", v, t5).unwrap(), want, "t5 の v={v}");
         let want: Vec<u64> = (0..total).filter(|&i| at1[i] as u64 == v).map(|i| eids[i]).collect();
-        assert_eq!(eng.ball_pull_at("t.a", v, t1), want, "t1 の v={v}");
+        assert_eq!(eng.ball_pull_at("t.a", v, t1).unwrap(), want, "t1 の v={v}");
     }
     let time = |name: &str, n: usize, f: &dyn Fn(usize) -> usize| {
         let mut xs: Vec<f64> = (0..5)
@@ -265,12 +265,12 @@ fn mode_r(seed: u64) {
         println!("{{\"mode\":\"r\",\"kind\":\"{name}\",\"seed\":{seed},\"total\":{total},\"ns\":{:.1}}}", xs[2]);
     };
     time("pull_now", 200, &|k| eng.pull_raw("t.a", (k % 100) as u32).len());
-    time("pull_at_now", 200, &|k| eng.ball_pull_at("t.a", (k % 100) as u64, now).len());
-    time("pull_at_t5", 200, &|k| eng.ball_pull_at("t.a", (k % 100) as u64, t5).len());
+    time("pull_at_now", 200, &|k| eng.ball_pull_at("t.a", (k % 100) as u64, now).unwrap().len());
+    time("pull_at_t5", 200, &|k| eng.ball_pull_at("t.a", (k % 100) as u64, t5).unwrap().len());
     let picks: Vec<u64> = (0..100_000).map(|k| eids[(Rng(k as u64 * 0x9E37 + seed | 1).next() % total as u64) as usize]).collect();
     time("get_now", 100_000, &|k| eng.get(picks[k], "t.a").unwrap_or(0) as usize);
-    time("value_at_t5", 100_000, &|k| eng.ball_value_at(picks[k], "t.a", t5).unwrap_or(0) as usize);
-    time("pull_at_t1", 200, &|k| eng.ball_pull_at("t.a", (k % 100) as u64, t1).len());
+    time("value_at_t5", 100_000, &|k| eng.ball_value_at(picks[k], "t.a", t5).unwrap().unwrap_or(0) as usize);
+    time("pull_at_t1", 200, &|k| eng.ball_pull_at("t.a", (k % 100) as u64, t1).unwrap().len());
     let (faces, bytes) = eng.ball_stats("t.a").unwrap();
     println!(
         "{{\"mode\":\"r\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"rounds\":{rounds},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{},\"rss_peak_kb\":{}}}",
@@ -343,11 +343,11 @@ fn mode_h(seed: u64) {
     for set in [&all, &recent] {
         for &(h, t) in set.iter() {
             let k = hist[h].partition_point(|x| x.0 <= t) - 1;
-            assert_eq!(eng.ball_value_at(eids[hot_ix[h]], "t.a", t), hist[h][k].1.map(u64::from), "h={h} t={t}");
+            assert_eq!(eng.ball_value_at(eids[hot_ix[h]], "t.a", t).unwrap(), hist[h][k].1.map(u64::from), "h={h} t={t}");
         }
     }
     for &(i, t) in &cold {
-        assert_eq!(eng.ball_value_at(eids[i], "t.a", t), Some(first[i] as u64), "i={i} t={t}");
+        assert_eq!(eng.ball_value_at(eids[i], "t.a", t).unwrap(), Some(first[i] as u64), "i={i} t={t}");
     }
     let time = |name: &str, f: &dyn Fn(usize) -> usize| {
         let mut xs: Vec<f64> = (0..5)
@@ -365,9 +365,9 @@ fn mode_h(seed: u64) {
         println!("{{\"mode\":\"h\",\"kind\":\"{name}\",\"seed\":{seed},\"hot\":{hot},\"writes\":{writes},\"ns\":{:.1}}}", xs[2]);
     };
     let he: Vec<u64> = hot_ix.iter().map(|&i| eids[i]).collect();
-    time("value_at_hot_all", &|k| eng.ball_value_at(he[all[k].0], "t.a", all[k].1).unwrap_or(0) as usize);
-    time("value_at_hot_recent", &|k| eng.ball_value_at(he[recent[k].0], "t.a", recent[k].1).unwrap_or(0) as usize);
-    time("value_at_cold", &|k| eng.ball_value_at(eids[cold[k].0], "t.a", cold[k].1).unwrap_or(0) as usize);
+    time("value_at_hot_all", &|k| eng.ball_value_at(he[all[k].0], "t.a", all[k].1).unwrap().unwrap_or(0) as usize);
+    time("value_at_hot_recent", &|k| eng.ball_value_at(he[recent[k].0], "t.a", recent[k].1).unwrap().unwrap_or(0) as usize);
+    time("value_at_cold", &|k| eng.ball_value_at(eids[cold[k].0], "t.a", cold[k].1).unwrap().unwrap_or(0) as usize);
     let (faces, bytes) = eng.ball_stats("t.a").unwrap();
     println!(
         "{{\"mode\":\"h\",\"kind\":\"ok\",\"seed\":{seed},\"hot\":{hot},\"writes\":{writes},\"faces\":{faces},\"ball_bytes\":{bytes},\"rss_peak_kb\":{}}}",

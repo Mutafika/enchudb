@@ -109,6 +109,20 @@ fn skip_gap(mut d: u32) -> u32 {
     w
 }
 
+/// 時点が球の地平より前 (宣言の前 / 記録が捨てた所より前): その時点の値はもう分からない。 `horizon` 以降なら答える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooOld {
+    pub horizon: u64,
+}
+
+impl std::fmt::Display for TooOld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the ball keeps no history before {}", self.horizon)
+    }
+}
+
+impl std::error::Error for TooOld {}
+
 /// 今の書き込みで HLC より上げた時刻 (0 = 上げていない) を取り出す。 上げたら、 書き込みが返る前に (行の lock の中で) WAL の時計を
 /// そこまで進めること: でないと、 この後に払い出す HLC が上げた時刻以下になり、 「今」 より後の書き込みが過去の時点に見える
 /// (過去の答えが後から変わる)。
@@ -687,11 +701,14 @@ pub(crate) struct Ball {
     wide: Box<[Mutex<WideStripe>]>,
     /// 控えの間隔の下限 (差分の数)。
     snap_min: usize,
+    /// 地平: これより前の時点は答えない (宣言の時刻、 組み直した球は土台の時点)。 宣言の前からある値の面は `from = 0` のまま。
+    horizon: AtomicU64,
 }
 
 impl Ball {
     fn new(snap_min: usize) -> Self {
         Self {
+            horizon: AtomicU64::new(0),
             id: BALL_IDS.fetch_add(1, Ordering::Relaxed),
             faces: Chunked::new(1 << 32),
             next: AtomicU64::new(0),
@@ -884,6 +901,31 @@ impl Ball {
         let Some(i) = self.alloc() else { return };
         self.push_face(i, NONE, NONE, v, 0);
         head.store(i as u64 + 1, Ordering::Release);
+    }
+
+    /// 地平 (これより前の時点の答えは無い)。
+    pub fn horizon(&self) -> u64 {
+        self.horizon.load(Ordering::Relaxed)
+    }
+
+    /// 時点 `t` に答えられるか (地平より前は [`TooOld`])。
+    pub fn check(&self, t: u64) -> Result<(), TooOld> {
+        let h = self.horizon();
+        if t < h { Err(TooOld { horizon: h }) } else { Ok(()) }
+    }
+
+    /// 書き換え 1 つを当てる (組み直し: 書き手の居ない時に、 記録の順に)。 書き手の道 (`note` → `turn` → 控え) と同じ。
+    /// 時刻は `hlc` ([`pack_hlc`]、 0 = 数え口)、 帳面と球の順を保つ分だけ上げる (上げたら [`take_raised`] が返す)。
+    pub(crate) fn replay(&self, clock: &Clock, eid: u32, old: Option<u64>, new: Option<u64>, hlc: u64) -> Option<u64> {
+        let mut wide = self.reserve(eid, old, new);
+        let ts = self.note(eid, old, new, clock, hlc, &epoch::pin(), &mut wide);
+        let snaps = wide.take_snaps();
+        drop(wide);
+        if let Some(ts) = ts {
+            self.turn(eid, new, ts);
+        }
+        self.build_snaps(snaps);
+        ts
     }
 
     /// 時点 `t` に上を向いていた値。 `from <= t` の最初の面 ([`Ball::face_at`]) が `t` でまだ開いていれば値。
@@ -1220,9 +1262,10 @@ impl Balls {
         self.snap_min.store(n.max(1), Ordering::Relaxed);
     }
 
-    /// 紐 `hid` を球にする。 `seed` に今の値 (eid, 値) を全部渡す。 宣言済みなら false。 名簿 (円柱) は先に組んでおくこと。
-    /// 今の値は球の 「前から」 の面と、 帳面の頭のデッキ (時刻 0 のデッキ、 `LOG_DENSE` 未満の値) になる。
-    pub fn declare(&self, hid: u16, seed: impl FnOnce(&mut dyn FnMut(u32, u64))) -> bool {
+    /// 紐 `hid` を球にする。 `seed` に地平 `horizon` の時点の値 (eid, 値) を全部渡す。 宣言済みなら false。 名簿 (円柱) は先に組んでおくこと。
+    /// 種の値は球の 「前から」 の面と、 帳面の頭のデッキ (時刻 0 のデッキ、 `LOG_DENSE` 未満の値) になる。 地平より後の書き換えは、
+    /// 宣言の後で [`Ball::replay`] で当てる (組み直し)。
+    pub fn declare(&self, hid: u16, horizon: u64, seed: impl FnOnce(&mut dyn FnMut(u32, u64))) -> bool {
         let slots = self.slots.get_or_init(|| (0..=u16::MAX as usize).map(|_| OnceLock::new()).collect());
         let mut fresh = false;
         let ball = slots[hid as usize].get_or_init(|| {
@@ -1230,6 +1273,11 @@ impl Balls {
             Box::new(Ball::new(self.snap_min.load(Ordering::Relaxed)))
         });
         if fresh {
+            ball.horizon.store(horizon, Ordering::Relaxed);
+            // 今の時刻を地平より前にしない (宣言の直後の 「今」 の読みが地平より前にならない)
+            if horizon != 0 {
+                self.clock.publish(horizon);
+            }
             let mut decks: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
             seed(&mut |eid, v| {
                 ball.seed(eid, v);
@@ -1329,7 +1377,7 @@ mod tests {
     #[test]
     fn faces_and_diffs_keep_the_old_values() {
         let mut x = T::new();
-        assert!(x.b.declare(3, |_| {}));
+        assert!(x.b.declare(3, 0, |_| {}));
         x.set(3, 7, 10);
         let t1 = x.b.now();
         x.set(3, 7, 10); // 同じ値は回さない (時刻も進まない)
@@ -1360,7 +1408,7 @@ mod tests {
         let mut x = T::new();
         x.cur.insert((0, 1), 5);
         x.cur.insert((0, 2), 5);
-        x.b.declare(0, |f| {
+        x.b.declare(0, 0, |f| {
             f(1, 5);
             f(2, 5);
         });
@@ -1378,7 +1426,7 @@ mod tests {
     #[test]
     fn wide_values_and_reused_eids() {
         let mut x = T::new();
-        x.b.declare(1, |_| {});
+        x.b.declare(1, 0, |_| {});
         let big = 1u64 << 40;
         x.set(1, 4, big);
         let t = x.b.now();
@@ -1400,7 +1448,7 @@ mod tests {
     #[test]
     fn wide_values_sharing_a_stripe_keep_their_own_threads() {
         let mut x = T::new();
-        x.b.declare(0, |_| {});
+        x.b.declare(0, 0, |_| {});
         let vals: Vec<u64> = (0..4).map(|k| (1u64 << 30) + k * WIDE as u64).collect(); // 全部同じ列
         let mut log: Vec<(u64, BTreeMap<u32, u64>)> = vec![(0, BTreeMap::new())];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
@@ -1429,7 +1477,7 @@ mod tests {
     #[test]
     fn unused_wide_reservations_are_taken_back() {
         let mut x = T::new();
-        x.b.declare(0, |_| {});
+        x.b.declare(0, 0, |_| {});
         let (a, b, c) = (1u64 << 30, (1u64 << 30) + WIDE as u64, (1u64 << 30) + 1); // a と b は同じ列
         x.set(0, 1, a);
         let t1 = x.b.now();
@@ -1455,7 +1503,7 @@ mod tests {
     #[test]
     fn many_round_trips_of_one_ball() {
         let mut x = T::new();
-        x.b.declare(0, |_| {});
+        x.b.declare(0, 0, |_| {});
         let mut log: Vec<(u64, bool)> = Vec::new(); // (時刻, 7 が値 1 か)
         for i in 0..50u64 {
             let v = if i % 3 == 0 { 1 } else { 2 };
@@ -1481,7 +1529,7 @@ mod tests {
     fn jumps_find_the_face_in_log_steps() {
         let writes = if cfg!(miri) { 60 } else { 5000 };
         let mut x = T::new();
-        x.b.declare(0, |s| s(3, 9));
+        x.b.declare(0, 0, |s| s(3, 9));
         x.cur.insert((0, 3), 9);
         let mut log: Vec<(u64, Option<u64>)> = vec![(0, Some(9))];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
@@ -1616,7 +1664,7 @@ mod tests {
             x.cur.insert((0, e), vals[e as usize % 4]);
         }
         let seed: Vec<(u32, u64)> = x.cur.iter().map(|(&(_, e), &v)| (e, v)).collect();
-        x.b.declare(0, |f| seed.iter().for_each(|&(e, v)| f(e, v)));
+        x.b.declare(0, 0, |f| seed.iter().for_each(|&(e, v)| f(e, v)));
         let mut log: Vec<(u64, BTreeMap<u32, u64>)> = vec![(0, x.cur.iter().map(|(&(_, e), &v)| (e, v)).collect())];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
         for _ in 0..3000 {
@@ -1649,7 +1697,7 @@ mod tests {
     #[test]
     fn reads_start_from_the_nearest_snapshot() {
         let mut x = T::with_snap_min(10);
-        x.b.declare(0, |_| {});
+        x.b.declare(0, 0, |_| {});
         // 値 1 の帳面: 入る / 出るを繰り返す (1 回の書き換えで 1 差分)。 控えは 10, 20, ... (デッキは小さいので間隔は 10)
         let mut ts = vec![0u64];
         for i in 0..46u32 {
@@ -1681,7 +1729,7 @@ mod tests {
         for e in 0..30u32 {
             x.cur.insert((0, e), 1);
         }
-        x.b.declare(0, |f| (0..30).for_each(|e| f(e, 1)));
+        x.b.declare(0, 0, |f| (0..30).for_each(|e| f(e, 1)));
         // 値 1 から 30..40 を出し入れする (デッキは 30〜40)
         for i in 0..200u32 {
             let e = 30 + i % 10;
@@ -1720,7 +1768,7 @@ mod tests {
     #[test]
     fn hlc_times_are_raised_to_keep_ledgers_and_balls_in_order() {
         let mut x = T::new();
-        x.b.declare(0, |_| {});
+        x.b.declare(0, 0, |_| {});
         let big = 1u64 << 30;
         // 値 1: e2 が HLC 200 で先に鍵を取り、 e1 (HLC 100) が後
         assert_eq!(x.put_at(0, 2, Some(1), 200), 200, "上げない時は HLC のまま");
@@ -1774,7 +1822,7 @@ mod tests {
         const VALS: u64 = 5;
         let b = Balls::new();
         b.set_snap_min(16); // 控えを作る書き手と、 帳面に足す書き手 / 読み手が重なる
-        b.declare(0, |_| {});
+        b.declare(0, 0, |_| {});
         let locks = Locks::new(VALS as usize);
         let wal = AtomicU64::new(0);
         let rounds = if cfg!(miri) { 4 } else { 300 };

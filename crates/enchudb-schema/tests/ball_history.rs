@@ -105,16 +105,16 @@ fn as_of_answers_match_a_log_of_schema_writes() {
         for c in CITIES {
             let vid = eng.vocab_id(c).unwrap() as u64;
             let want: Vec<u64> = rs.iter().filter(|(_, (rc, _))| *rc == Some(c)).map(|(&e, _)| e).collect();
-            assert_eq!(eng.ball_pull_at("users.city", vid, *t), want, "回 {k} t={t} city={c}");
+            assert_eq!(eng.ball_pull_at("users.city", vid, *t).unwrap(), want, "回 {k} t={t} city={c}");
         }
         for a in [0i64, 7, 49] {
             let want: Vec<u64> = rs.iter().filter(|(_, (_, ra))| *ra == Some(a)).map(|(&e, _)| e).collect();
-            assert_eq!(eng.ball_pull_at("users.age", a as u64, *t), want, "回 {k} t={t} age={a}");
+            assert_eq!(eng.ball_pull_at("users.age", a as u64, *t).unwrap(), want, "回 {k} t={t} age={a}");
         }
         for &e in &all_eids {
             let (c, a) = rs.get(&e).copied().unwrap_or((None, None));
-            assert_eq!(eng.ball_value_at(e, "users.city", *t), c.map(|c| eng.vocab_id(c).unwrap() as u64), "回 {k} e={e}");
-            assert_eq!(eng.ball_value_at(e, "users.age", *t), a.map(|a| a as u64), "回 {k} e={e}");
+            assert_eq!(eng.ball_value_at(e, "users.city", *t).unwrap(), c.map(|c| eng.vocab_id(c).unwrap() as u64), "回 {k} e={e}");
+            assert_eq!(eng.ball_value_at(e, "users.age", *t).unwrap(), a.map(|a| a as u64), "回 {k} e={e}");
         }
     }
     // 今の時刻の答え = 今の読み
@@ -122,7 +122,7 @@ fn as_of_answers_match_a_log_of_schema_writes() {
     for c in CITIES {
         let mut cur = users.where_eq("city", c).find().unwrap();
         cur.sort_unstable();
-        assert_eq!(eng.ball_pull_at("users.city", eng.vocab_id(c).unwrap() as u64, now), cur, "今の {c}");
+        assert_eq!(eng.ball_pull_at("users.city", eng.vocab_id(c).unwrap() as u64, now).unwrap(), cur, "今の {c}");
     }
     // 値の変わった書き込み (書き換え・外す・消す・足す) は全部、 デッキの差分の帳面に届いた
     assert_eq!(eng.ball_diff_count("users.city"), Some(city_d));
@@ -249,8 +249,8 @@ fn deletes_close_faces_at_their_wal_time() {
     let faces = eng.ball_faces(eids[0], "t.a");
     assert_eq!(faces.len(), 1);
     assert!(faces[0].to > t1, "削除の時刻 {} が、 その前の書き込みの時刻 {t1} 以前", faces[0].to);
-    assert_eq!(eng.ball_pull_at("t.a", 5, t1), vec![eids[0]], "e1 が入った時点では e0 はまだ値 5");
-    assert_eq!(eng.ball_pull_at("t.a", 5, faces[0].to), Vec::<u64>::new());
+    assert_eq!(eng.ball_pull_at("t.a", 5, t1).unwrap(), vec![eids[0]], "e1 が入った時点では e0 はまだ値 5");
+    assert_eq!(eng.ball_pull_at("t.a", 5, faces[0].to).unwrap(), Vec::<u64>::new());
     drop(eng);
     drop(db);
     cleanup(&path);
@@ -345,20 +345,29 @@ fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     for (k, (tm, want)) in checks.iter().enumerate() {
         for &v in vals {
             let deck: Vec<u64> = (0..TH * PER).filter(|&i| want[i] == Some(v)).map(|i| eids[i]).collect();
-            assert_eq!(eng.ball_pull_at("t.a", v, *tm), deck, "回 {k} t={tm} v={v}");
+            assert_eq!(eng.ball_pull_at("t.a", v, *tm).unwrap(), deck, "回 {k} t={tm} v={v}");
         }
         for i in 0..TH * PER {
-            assert_eq!(eng.ball_value_at(eids[i], "t.a", *tm), want[i], "回 {k} e={}", eids[i]);
+            assert_eq!(eng.ball_value_at(eids[i], "t.a", *tm).unwrap(), want[i], "回 {k} e={}", eids[i]);
         }
     }
     // 控えは書き換え / 外すの両方の道で作る (登録した書き手が作るので、 書き手が返った後は登録した数 = 作り終えた数)
     let (registered, built) = eng.ball_snap_counts("t.a").unwrap();
     assert!(built > 50, "控えの道を通っていない: {built}");
     assert_eq!(registered, built, "登録した控えは全部作る");
-    // 宣言の時 (時刻 0) のデッキは、 宣言の前に入れた値
+    // 宣言の時 (地平) のデッキは、 宣言の前に入れた値。 地平より前は答えない
+    let hz = eng.ball_horizon("t.a").unwrap();
     for &v in vals {
         let want: Vec<u64> = (0..TH * PER).filter(|&i| seeded[i] == Some(v)).map(|i| eids[i]).collect();
-        assert_eq!(eng.ball_pull_at("t.a", v, 0), want, "時刻 0 v={v}");
+        assert_eq!(eng.ball_pull_at("t.a", v, hz).unwrap(), want, "地平 v={v}");
+        if let Some(before) = hz.checked_sub(1) {
+            assert_eq!(eng.ball_pull_at("t.a", v, before), Err(enchudb_engine::ball::TooOld { horizon: hz }));
+        }
+    }
+    // WAL 付きの宣言の地平は宣言の HLC、 WAL の無い宣言は数え口 (宣言の前に書いていなければ 0)
+    assert_eq!(hz > 0, wal, "地平 {hz}");
+    if wal {
+        assert_eq!(eng.ball_value_at(eids[0], "t.a", hz - 1), Err(enchudb_engine::ball::TooOld { horizon: hz }));
     }
     // 柵でそろえた時刻 now(r) 以下の球の時刻 (値を変えた書き込み 1 回につき 1 つ: 書き換えは前の面を閉じた時刻 = 次の面の上を
     // 向いた時刻) の数は、 回 r までに値を変えた書き込みの数。 後の回の書き込みが過去の時刻に入ると (上げた時刻を WAL の時計に
@@ -414,8 +423,8 @@ fn concurrent_run(name: &str, vals: &[u64], wal: bool) {
     assert!(times.len() > 100, "途中の時刻が少ない: {}", times.len());
     for tm in times {
         for &v in vals {
-            let faces: Vec<u64> = eids.iter().copied().filter(|&e| eng.ball_value_at(e, "t.a", tm) == Some(v)).collect();
-            assert_eq!(eng.ball_pull_at("t.a", v, tm), faces, "t={tm} v={v}");
+            let faces: Vec<u64> = eids.iter().copied().filter(|&e| eng.ball_value_at(e, "t.a", tm).unwrap() == Some(v)).collect();
+            assert_eq!(eng.ball_pull_at("t.a", v, tm).unwrap(), faces, "t={tm} v={v}");
         }
     }
     // 今の読み (名簿) も合う

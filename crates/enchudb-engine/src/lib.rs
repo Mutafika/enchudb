@@ -60,6 +60,8 @@ pub mod segments;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sync_payload_ring;
 pub mod change_log;
+/// 球の土台 (試作): 開き直した後に球を組み直す種。
+pub(crate) mod ball_base;
 pub mod db_files;
 pub mod column;
 pub mod vocabulary;

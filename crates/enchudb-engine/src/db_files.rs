@@ -78,10 +78,10 @@ pub fn legacy_path_for(db_file: &str, name: &str) -> PathBuf {
     PathBuf::from(format!("{db_file}.{name}"))
 }
 
-/// directory entry が DB 本体 (segment file か `himo/` / `ver/`) か。
+/// directory entry が DB 本体 (segment file か `himo/` / `ver/` / 球の土台 `ball/`) か。
 pub fn is_segment_entry(name: &OsStr) -> bool {
     let s = name.to_string_lossy();
-    s.ends_with(".seg") || s == "himo" || s == "ver"
+    s.ends_with(".seg") || s == "himo" || s == "ver" || s == crate::ball_base::DIR
 }
 
 /// #437: create が DB directory に置き得る名前か (segment / sidecar / `lock` / 作成中の印 / sidecar を書き換える

@@ -112,6 +112,17 @@ pub struct Entry {
     pub bytes: Vec<u8>,
 }
 
+/// 捨てる前に呼ぶ口 (試作、 球の土台 `crate::ball_base`)。 記録が古い entry を捨てる header を書く前に、 捨てる entry を渡す。
+pub(crate) trait OnDiscard: Send + Sync {
+    /// 捨てる entry を読んで渡すか (渡す相手が居ない時は読まない)。
+    fn wants(&self) -> bool;
+    /// 番号 `[first, end)` を捨てる。 `entries` は読めた entry (番号の順。 読めない entry から先は無い)、 `end_hlc` は番号
+    /// `end − 1` の record の HLC、 `hole` は中身を残さなかった番号 (置けない大きさの record、 [`ChangeLog::max_entry`])。
+    /// 返る前に、 捨てる分を自分の disk の物に書き出しておくこと (記録はこの後で捨てる header を書き出す)。 Err なら捨てない
+    /// (append は Err)。
+    fn discard(&self, first: u64, end: u64, end_hlc: Hlc, hole: Option<u64>, entries: &[Entry]) -> io::Result<()>;
+}
+
 #[derive(Clone, Copy, Default)]
 struct Cursor {
     /// 最古の entry の data 内の位置 (空なら head と同じ)。
@@ -136,9 +147,14 @@ pub struct ChangeLog {
     region: Region,
     cap: usize,
     st: Mutex<State>,
+    /// 捨てる前に呼ぶ口 ([`OnDiscard`])。
+    on_discard: std::sync::OnceLock<Arc<dyn OnDiscard>>,
     /// 試験: entry を書き出した後・新しい header の前で止める (落ちた形)。
     #[cfg(test)]
     stop_before_header: std::sync::atomic::AtomicBool,
+    /// 試験: 捨てる前の口が返った後・捨てる header の前で止める (落ちた形)。
+    #[cfg(test)]
+    pub(crate) stop_after_discard_hook: std::sync::atomic::AtomicBool,
 }
 
 impl ChangeLog {
@@ -165,8 +181,11 @@ impl ChangeLog {
             region,
             cap,
             st: Mutex::new(State { c: Cursor::default(), marks: VecDeque::new(), marked: true }),
+            on_discard: std::sync::OnceLock::new(),
             #[cfg(test)]
             stop_before_header: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            stop_after_discard_hook: std::sync::atomic::AtomicBool::new(false),
         };
         log.restore(&h);
         Ok(log)
@@ -252,6 +271,29 @@ impl ChangeLog {
         self.cap / 4 - ENTRY_HEADER
     }
 
+    /// 捨てる前に呼ぶ口を付ける (1 回だけ。 2 回目は何もしない)。
+    pub(crate) fn set_on_discard(&self, h: Arc<dyn OnDiscard>) {
+        let _ = self.on_discard.set(h);
+    }
+
+    /// 捨てる header を書く前: 口があれば捨てる entry `[first, end)` を渡す。
+    fn before_discard(&self, st: &mut State, end: u64, hole: Option<(u64, Hlc)>) -> io::Result<()> {
+        let Some(h) = self.on_discard.get().filter(|h| h.wants()) else { return Ok(()) };
+        let first = st.c.first;
+        let until = hole.map_or(end, |(no, _)| no);
+        let entries = if first < until { self.read_in(st, first, until, usize::MAX).0 } else { Vec::new() };
+        let end_hlc = match hole {
+            Some((_, hlc)) => hlc,
+            None => entries.last().filter(|e| e.no + 1 == end).map_or(Hlc::ZERO, |e| e.hlc),
+        };
+        h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &entries)?;
+        #[cfg(test)]
+        if self.stop_after_discard_hook.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::other("test: stopped after the discard hook"));
+        }
+        Ok(())
+    }
+
     /// record を番号の順に足す。 置く場所が無ければ古い entry から捨てる。 `watch` の番号のうち捨てたものは、 その entry の HLC を
     /// `lost` に積む (呼び手は、 その位置で読んでいた読み手を外して `lost_from` に渡す)。 [`Self::max_entry`] を越える record は
     /// 番号を使うだけで残さず、 その前の entry も全部捨てる (読み手はその番号で [`Truncated`] になる)。 途中で書き出しに失敗したら
@@ -286,6 +328,7 @@ impl ChangeLog {
     fn skip_one(&self, st: &mut State, rec: &NewEntry, watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
         let mut sim = st.c;
         let limit = sim.next;
+        self.before_discard(st, limit + 1, Some((limit, rec.hlc)))?;
         while sim.first < limit {
             self.drop_oldest(&mut sim, limit, watch, lost);
         }
@@ -325,6 +368,7 @@ impl ChangeLog {
             sim.next += 1;
         }
         if sim.first != st.c.first {
+            self.before_discard(st, sim.first.min(old_next), None)?;
             // header が捨てた場所を指さないようにしてから上書きする。 古い entry が全部消えたら空の記録
             let mut mid = st.c;
             if sim.first >= old_next {
@@ -385,16 +429,25 @@ impl ChangeLog {
         if pos < first || pos > next {
             return Err(Truncated { from: if pos < first { first } else { next } });
         }
-        let mut out = Vec::new();
         if pos == next {
-            return Ok(out);
+            return Ok(Vec::new());
         }
-        let Some(mut at) = self.locate(&mut st, pos) else {
-            return Err(Truncated { from: first });
+        match self.read_in(&mut st, pos, next, max_bytes) {
+            (out, true) => Ok(out),
+            (_, false) => Err(Truncated { from: first }),
+        }
+    }
+
+    /// `pos` から `until` の手前まで、 最大 `max_bytes` (少なくとも 1 件) 読む。 2 つ目は読めない entry に当たらなかったか
+    /// (当たったら、 そこまでの entry を返す)。 `pos` は `[first, next)` の中。
+    fn read_in(&self, st: &mut State, pos: u64, until: u64, max_bytes: usize) -> (Vec<Entry>, bool) {
+        let mut out = Vec::new();
+        let Some(mut at) = self.locate(st, pos) else {
+            return (out, false);
         };
         let mut bytes = 0;
         let mut no = pos;
-        while no < next {
+        while no < until {
             at = self.wrap_at(at);
             match self.entry_at(at) {
                 Some(e) if e.no == no => {
@@ -404,14 +457,14 @@ impl ChangeLog {
                     out.push(Entry { no, hlc: e.hlc, bytes: b });
                     at = (at + entry_size(e.len)) % self.cap;
                 }
-                _ => return Err(Truncated { from: first }),
+                _ => return (out, false),
             }
             no += 1;
             if bytes >= max_bytes {
                 break;
             }
         }
-        Ok(out)
+        (out, true)
     }
 
     /// 書いた範囲を disk へ (足すたびに書き出しているので、 普段は何もしない)。
