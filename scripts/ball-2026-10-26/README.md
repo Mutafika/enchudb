@@ -39,7 +39,11 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   1000 行 × 書き換え 2000 回) / `results_ballb_r50_v10.jsonl` (`BALL_ROUNDS=50`) / `results_ballb_v10.jsonl` (書き込み、 base / `v9h_on` / `v10_on`)。
   比べる 9 回目は `h` の段を足した同じ bench で組み直した `v9h` (削除の HLC を直した後の db53420)。 要約は `sum_r.py <file> v9h,v10`
   (段の名前は file から取る)。 変異は `ball_mut_v10.json` (93 本、 ball.rs の 75 本は単体、 他の 18 本は schema の試験で全部落ちる。
-  幅の計算の 2 本は並行の試験では書き手の panic で Barrier が止まり時間切れ、 飛び糸の試験だけなら 2〜3 秒で落ちる)
+  幅の計算の 2 本は並行の試験では書き手の panic で Barrier が止まり時間切れ、 飛び糸の試験だけなら 2〜3 秒で落ちる)。
+  宣言の無い列の書き込みは `results_ballb_off_v10.jsonl` (`run_ballb.sh` の `v9h_off` / `v10_off` = BALL=0、 base と交互)。
+  `miri_dir_probe.rs` は Miri (Tree Borrows) で OnceLock 65536 個の並びを `<[_]>::get` / 添字 / `len` / raw の `len` で引く値段
+  (0.33 秒 / 4〜20 ms / 0.1 秒 / 0.1 ms)、 `miri_dir_asm.rs` は直した `Chunked::get` と前の形の release の asm を比べる
+  (どちらも依存なしの crate の `src/lib.rs`)
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。

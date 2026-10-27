@@ -1,0 +1,12 @@
+miri_v10f.log:test ball::tests::both_roll_backs_agree_with_the_first_diff_after_t ... ok
+miri_v10f.log:test ball::tests::faces_and_diffs_keep_the_old_values ... warning: integer-to-pointer cast
+miri_v10f.log:ok
+miri_v10f.log:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 537 filtered out; finished in 1229.67s
+miri_v10e.log:test ball::tests::jumps_find_the_face_in_log_steps ... warning: integer-to-pointer cast
+miri_v10e.log:面 58 個、 最大 14 歩 (上限 18)
+miri_v10e.log:ok
+miri_v10e.log:test ball::tests::many_round_trips_of_one_ball ... ok
+miri_v10e.log:test ball::tests::seeded_faces_are_from_the_start ... ok
+miri_v10e.log:test ball::tests::wide_values_and_reused_eids ... ok
+miri_v10e.log:test ball::tests::wide_values_sharing_a_stripe_keep_their_own_threads ... ok
+miri_v10e.log:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 534 filtered out; finished in 1369.88s

@@ -1,0 +1,1994 @@
+   Compiling libc v0.2.184
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling either v1.15.0
+   Compiling zerocopy v0.8.48
+   Compiling serde_core v1.0.228
+   Compiling bytes v1.11.1
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.0
+   Compiling libm v0.2.16
+   Compiling digest v0.10.7
+   Compiling num-traits v0.2.19
+   Compiling log v0.4.29
+   Compiling zmij v1.0.21
+   Compiling httparse v1.10.1
+   Compiling pkg-config v0.3.33
+   Compiling curve25519-dalek v4.1.3
+   Compiling rayon v1.12.0
+   Compiling futures-task v0.3.34
+   Compiling http v1.4.0
+   Compiling jobserver v0.1.34
+   Compiling thiserror v1.0.69
+   Compiling futures-io v0.3.34
+   Compiling slab v0.4.12
+   Compiling stable_deref_trait v1.2.1
+   Compiling serde_json v1.0.149
+   Compiling serde v1.0.228
+   Compiling cc v1.2.60
+   Compiling core-foundation-sys v0.8.7
+   Compiling crc32fast v1.5.0
+   Compiling base64 v0.22.1
+   Compiling tracing-core v0.1.36
+   Compiling adler2 v2.0.1
+   Compiling hashbrown v0.17.0
+   Compiling futures-core v0.3.34
+   Compiling byteorder v1.5.0
+   Compiling bitflags v2.11.1
+   Compiling memmap2 v0.9.10
+   Compiling parking_lot_core v0.9.12
+   Compiling getrandom v0.2.17
+   Compiling cpufeatures v0.2.17
+   Compiling iana-time-zone v0.1.65
+   Compiling getrandom v0.3.4
+   Compiling socket2 v0.6.3
+   Compiling mio v1.2.0
+   Compiling ring v0.17.14
+   Compiling smallvec v1.15.1
+   Compiling litemap v0.8.2
+   Compiling syn v2.0.117
+   Compiling num-integer v0.1.46
+   Compiling futures-sink v0.3.34
+   Compiling writeable v0.6.3
+   Compiling rand_core v0.6.4
+   Compiling sha2 v0.10.9
+   Compiling parking_lot v0.12.5
+   Compiling chrono v0.4.44
+   Compiling sha1 v0.10.6
+   Compiling ahash v0.8.12
+   Compiling icu_normalizer_data v2.2.0
+   Compiling tokio v1.52.1
+   Compiling data-encoding v2.10.0
+   Compiling utf-8 v0.7.6
+   Compiling icu_properties_data v2.2.0
+   Compiling num-bigint v0.4.6
+   Compiling utf8_iter v1.0.4
+   Compiling zeroize v1.8.2
+   Compiling ed25519-dalek v2.2.0
+   Compiling arrow-schema v58.3.0
+   Compiling errno v0.3.14
+   Compiling http-body v1.0.1
+   Compiling synstructure v0.13.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling serde_derive v1.0.228
+   Compiling thiserror-impl v1.0.69
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling untrusted v0.9.0
+   Compiling rustls-pki-types v1.14.0
+   Compiling percent-encoding v2.3.2
+   Compiling enchudb-oplog v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-oplog)
+   Compiling futures-util v0.3.34
+   Compiling num-complex v0.4.6
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling tower-service v0.3.3
+   Compiling siphasher v1.0.3
+   Compiling rustls v0.23.38
+   Compiling try-lock v0.2.5
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-oplog/src/oplog.rs:2466:14
+     |
+2466 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+2466 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+2466 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+   Compiling enchudb-engine v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-engine)
+   Compiling futures-channel v0.3.34
+   Compiling atomic-waker v1.1.2
+warning: `enchudb-oplog` (lib) generated 1 warning (run `cargo fix --lib -p enchudb-oplog` to apply 1 suggestion)
+   Compiling simd-adler32 v0.3.9
+   Compiling zerofrom v0.1.7
+   Compiling vcpkg v0.2.15
+   Compiling lexical-util v1.0.7
+   Compiling phf_shared v0.11.3
+   Compiling want v0.3.1
+   Compiling rand v0.8.6
+   Compiling rustls-webpki v0.103.13
+   Compiling ryu v1.0.23
+   Compiling rustix v1.1.4
+   Compiling form_urlencoded v1.2.2
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1250:40
+     |
+1250 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1250 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1250 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1304:40
+     |
+1304 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1304 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1304 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+   Compiling sync_wrapper v1.0.2
+   Compiling tracing v0.1.44
+   Compiling hyper v1.9.0
+   Compiling phf_generator v0.11.3
+   Compiling rustix v0.38.44
+   Compiling tower-layer v0.3.3
+   Compiling ipnet v2.12.0
+   Compiling enchudb-sync v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-sync)
+   Compiling enchudb-schema v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-schema)
+   Compiling miniz_oxide v0.8.9
+   Compiling phf_macros v0.11.3
+   Compiling webpki-roots v1.0.7
+   Compiling tower v0.5.3
+   Compiling hyper-util v0.1.20
+   Compiling aho-corasick v1.1.4
+   Compiling equivalent v1.0.2
+   Compiling zlib-rs v0.6.3
+   Compiling enchudb v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball)
+   Compiling bumpalo v3.20.2
+   Compiling ppv-lite86 v0.2.21
+   Compiling half v2.7.1
+   Compiling iri-string v0.7.12
+   Compiling regex-automata v0.4.14
+   Compiling zopfli v0.8.3
+   Compiling rand_chacha v0.3.1
+   Compiling arrow-buffer v58.3.0
+warning: `enchudb-engine` (lib) generated 2 warnings (run `cargo fix --lib -p enchudb-engine` to apply 2 suggestions)
+   Compiling flate2 v1.1.9
+   Compiling indexmap v2.14.0
+   Compiling phf v0.11.3
+   Compiling tower-http v0.6.8
+   Compiling lexical-write-integer v1.0.6
+   Compiling lexical-parse-integer v1.0.6
+   Compiling http-body-util v0.1.3
+   Compiling filetime v0.2.29
+   Compiling arrow-data v58.3.0
+   Compiling zip v6.0.0
+   Compiling lexical-write-float v1.0.6
+   Compiling regex v1.12.3
+   Compiling tungstenite v0.24.0
+   Compiling lexical-parse-float v1.0.6
+   Compiling rand_core v0.9.5
+   Compiling foldhash v0.1.5
+   Compiling arrow-array v58.3.0
+   Compiling unicode-segmentation v1.13.2
+   Compiling unicode-width v0.2.2
+   Compiling getrandom v0.4.2
+   Compiling enchudb-transport v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-transport)
+   Compiling hashbrown v0.15.5
+   Compiling lexical-core v1.0.6
+   Compiling libsqlite3-sys v0.34.0
+   Compiling atoi v2.0.0
+   Compiling clap_lex v1.1.0
+   Compiling arrow-select v58.3.0
+   Compiling cast v0.3.0
+   Compiling heck v0.5.0
+   Compiling ciborium-io v0.2.2
+   Compiling anstyle v1.0.14
+   Compiling rust_decimal v1.42.0
+   Compiling tempfile v3.27.0
+   Compiling hashlink v0.10.0
+   Compiling bincode v1.3.3
+   Compiling arrow-ord v58.3.0
+   Compiling ciborium-ll v0.2.2
+   Compiling clap_builder v4.6.0
+   Compiling strum_macros v0.27.2
+   Compiling arrow-string v58.3.0
+   Compiling arrow-arith v58.3.0
+   Compiling arrow-row v58.3.0
+   Compiling wait-timeout v0.2.1
+   Compiling tokio-rustls v0.26.4
+   Compiling itertools v0.10.5
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling arrayvec v0.7.6
+   Compiling same-file v1.0.6
+   Compiling heed-traits v0.20.0
+   Compiling hyper-rustls v0.27.9
+   Compiling fallible-iterator v0.3.0
+   Compiling rusty-fork v0.3.1
+   Compiling strum v0.27.2
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling yoke v0.8.2
+   Compiling clap v4.6.1
+   Compiling heed-types v0.20.1
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling rand_chacha v0.9.0
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.4
+   Compiling page_size v0.6.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling is-terminal v0.4.17
+   Compiling xattr v1.6.1
+   Compiling crossterm v0.28.1
+   Compiling synchronoise v1.0.1
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling enchudb-ngram v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-ngram)
+   Compiling proptest v1.11.0
+   Compiling syn v3.0.6
+   Compiling tinyvec_macros v0.1.1
+   Compiling tar v0.4.46
+   Compiling comfy-table v7.1.4
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling criterion v0.5.1
+   Compiling thiserror v2.0.18
+   Compiling zstd-safe v7.3.0
+   Compiling tinyvec v1.11.0
+   Compiling arrow-cast v58.3.0
+   Compiling enchudb-connect v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-connect)
+   Compiling futures-macro v0.3.34
+   Compiling thiserror-impl v2.0.18
+   Compiling doxygen-rs v0.4.2
+   Compiling crc32c v0.6.8
+   Compiling unicode-normalization v0.1.25
+   Compiling unicode-bidi v0.3.18
+   Compiling arrow v58.3.0
+   Compiling snap v1.1.2
+   Compiling lmdb-master-sys v0.2.6
+   Compiling unicode-properties v0.1.4
+   Compiling enchudb-rag v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-rag)
+   Compiling tokio-macros v2.7.0
+   Compiling rusqlite v0.36.0
+   Compiling tracing-attributes v0.1.31
+   Compiling stringprep v0.1.5
+   Compiling hmac v0.12.1
+   Compiling pbkdf2 v0.12.2
+   Compiling sqlparser v0.52.0
+   Compiling integer-encoding v4.1.0
+   Compiling enchudb-textsearch v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-textsearch)
+warning: field `selectivity_pct` is never read
+   --> crates/enchudb-rag/examples/rag_compare.rs:127:5
+    |
+125 | struct FilterPattern {
+    |        ------------- field in this struct
+126 |     name: &'static str,
+127 |     selectivity_pct: u32, // 期待選択率
+    |     ^^^^^^^^^^^^^^^
+    |
+    = note: `FilterPattern` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `enchudb-rag` (example "rag_compare") generated 1 warning
+   Compiling enchudb-sql v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-sql)
+   Compiling enchudb-ffi v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-ffi)
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling lz4 v1.28.1
+   Compiling futures-executor v0.3.34
+   Compiling enchudb-cli v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-cli)
+   Compiling futures v0.3.34
+   Compiling heed v0.20.5
+warning: `enchudb-oplog` (lib test) generated 1 warning (1 duplicate)
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_collections v2.2.0
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_provider v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling rsasl v2.3.1
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling zstd v0.13.3
+   Compiling url v2.5.8
+   Compiling rskafka v0.6.0
+   Compiling reqwest v0.12.28
+   Compiling enchudb-kafka v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-kafka)
+   Compiling libduckdb-sys v1.10503.1
+   Compiling duckdb v1.10503.1
+warning: variable does not need to be mutable
+   --> tests/two_peer_sync.rs:297:9
+    |
+297 |     let mut eng = Engine::open_standalone(&path).unwrap();
+    |         ----^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/growable_rss_repro.rs:26:23
+   |
+26 |                 libc::mach_task_self(),
+   |                       ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/growable_rss_repro.rs:59:23
+   |
+59 |                 libc::mach_task_self(),
+   |                       ^^^^^^^^^^^^^^
+
+warning: `enchudb` (example "growable_rss_repro") generated 2 warnings
+warning: `enchudb` (test "two_peer_sync") generated 1 warning (run `cargo fix --test "two_peer_sync" -p enchudb` to apply 1 suggestion)
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/workload_segmented_rss.rs:38:23
+   |
+38 |                 libc::mach_task_self(),
+   |                       ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `i`
+   --> examples/workload_segmented_rss.rs:145:10
+    |
+145 |     for (i, (table_name, himos)) in tbls.iter().enumerate() {
+    |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `enchudb` (example "workload_segmented_rss") generated 2 warnings (run `cargo fix --example "workload_segmented_rss" -p enchudb` to apply 1 suggestion)
+warning: variable does not need to be mutable
+  --> tests/content_store_cross_process.rs:28:13
+   |
+28 |         let mut eng = Engine::create_standalone(&path).unwrap();
+   |             ----^^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> tests/content_store_cross_process.rs:37:13
+   |
+37 |         let mut eng = Engine::open_standalone(&path).unwrap();
+   |             ----^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> tests/content_store_cross_process.rs:62:13
+   |
+62 |         let mut eng = Engine::open_standalone(&path).ok()
+   |             ----^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: `enchudb` (test "content_store_cross_process") generated 3 warnings (run `cargo fix --test "content_store_cross_process" -p enchudb` to apply 3 suggestions)
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/reopen_eager_rebuild_bench.rs:30:19
+   |
+30 |             libc::mach_task_self(),
+   |                   ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: `enchudb` (example "reopen_eager_rebuild_bench") generated 1 warning
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/workload_sparse_rss.rs:32:23
+   |
+32 |                 libc::mach_task_self(),
+   |                       ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: method `row_of_any` is never used
+   --> tests/sync_delete_wins.rs:113:8
+    |
+ 70 | impl Peer {
+    | --------- method in this implementation
+...
+113 |     fn row_of_any(&self) -> u64 {
+    |        ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `enchudb` (example "workload_sparse_rss") generated 1 warning
+warning: `enchudb` (test "sync_delete_wins") generated 1 warning
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/workload_rss_1m.rs:42:23
+   |
+42 |                 libc::mach_task_self(),
+   |                       ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/workload_rss_1m.rs:75:23
+   |
+75 |                 libc::mach_task_self(),
+   |                       ^^^^^^^^^^^^^^
+
+warning: `enchudb` (example "workload_rss_1m") generated 2 warnings
+warning: variable does not need to be mutable
+  --> tests/content_leaf_compat.rs:49:9
+   |
+49 |     let mut eng = Engine::create_standalone(&path).expect("create");
+   |         ----^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> tests/content_leaf_compat.rs:75:9
+   |
+75 |     let mut eng = Engine::create_standalone(&path).expect("create");
+   |         ----^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: use of deprecated function `libc::mach_task_self`: Use the `mach2` crate instead
+  --> examples/lockfree_engine_bench.rs:31:23
+   |
+31 |                 libc::mach_task_self(),
+   |                       ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: `enchudb` (test "content_leaf_compat") generated 2 warnings (run `cargo fix --test "content_leaf_compat" -p enchudb` to apply 2 suggestions)
+warning: `enchudb` (example "lockfree_engine_bench") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 01s
+     Running unittests src/lib.rs (target/debug/deps/enchudb-4cc0b07c164ab9d0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/agentic_engram.rs (target/debug/deps/agentic_engram-4aa3bf2c72434778)
+
+running 4 tests
+test graph_traversal_depth_limit ... ok
+test recall_decisions_by_person_and_topic ... ok
+test recall_sessions_touching_file ... ok
+test exec_dsl_alice_nextjs_decisions ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/api_coverage.rs (target/debug/deps/api_coverage-795c70a7ad269955)
+
+running 6 tests
+test create_concurrent_without_wal_accepts_tie_async ... ok
+test create_with_options_respects_capacity_hint ... ok
+test create_full_with_cyl_all_options ... ok
+test tie_text_to_on_shared_arc ... ok
+test get_entity_returns_all_himos ... ok
+test open_concurrent_replica_rejects_writes_and_syncs_via_remote ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/bigint_sync.rs (target/debug/deps/bigint_sync-6c26d90299f43776)
+
+running 2 tests
+test bigint_primary_keys_bind_across_peers ... ok
+test bigint_syncs_whole_values ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s
+
+     Running tests/blob_store_extended.rs (target/debug/deps/blob_store_extended-2952984d784b6429)
+
+running 4 tests
+test put_into_readonly_root_returns_io_error ... ok
+test truncated_blob_file_returns_hash_mismatch ... ok
+test concurrent_mixed_reader_writer_workload ... ok
+test delete_during_get_race_does_not_panic ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.17s
+
+     Running tests/byzantine.rs (target/debug/deps/byzantine-dfc24b2de317512a)
+
+running 5 tests
+test future_hlc_attack_dominates_lww_known_limitation ... ok
+test stuck_peer_does_not_block_sync_from_others ... ok
+test keypair_rotation_rejected_under_tofu ... ok
+test replay_of_signed_op_is_idempotent ... ok
+test mixed_batch_signed_kept_unsigned_dropped ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+     Running tests/change_listener.rs (target/debug/deps/change_listener-3aa0b79c14bcad1b)
+
+running 5 tests
+test listener_does_not_fire_on_engine_without_oplog ... ok
+test listener_added_after_first_commit_only_sees_subsequent ... ok
+test multiple_listeners_all_fire ... ok
+test single_listener_receives_after_wal_sync ... ok
+test records_are_hlc_ascending ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/concurrent_stress.rs (target/debug/deps/concurrent_stress-bb6d261676561f67)
+
+running 10 tests
+test flush_writes_drains_fully ... ok
+test unbounded_queue_handles_burst ... ok
+test read_after_flush_sees_writes ... ok
+test drop_with_pending_writes ... ok
+test panic_in_reader_doesnt_corrupt ... ok
+test multiple_async_writers ... ok
+test long_running_query_during_writes ... ok
+test drop_while_reading ... ok
+test reader_sees_consistent_snapshot ... ok
+test parallel_readers_during_writes ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+
+     Running tests/content_leaf_compat.rs (target/debug/deps/content_leaf_compat-5275da68bec6de38)
+
+running 4 tests
+test delete_clears_content ... ok
+test content_roundtrip_and_reopen ... ok
+test content_async_survives_wal_recovery ... ok
+test colliding_keys_are_independent ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/content_store_cross_process.rs (target/debug/deps/content_store_cross_process-872fa6d8c1fcb40d)
+
+running 2 tests
+test drop_without_sync_persists_data_end ... ok
+test many_short_lived_writes_do_not_corrupt ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/crash_recovery.rs (target/debug/deps/crash_recovery-347e3b990ef05182)
+
+running 2 tests
+test signed_wal_records_survive_reopen ... ignored, oplog ring は session をまたぐ audit log ではない — graceful shutdown で checkpoint が head に追いつき、次 open の try_reset で ring が畳まれるため audit() が空になる
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-oplog/src/oplog.rs:2466:14
+     |
+2466 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+2466 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+2466 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: `enchudb-oplog` (lib) generated 1 warning (run `cargo fix --lib -p enchudb-oplog` to apply 1 suggestion)
+   Compiling enchudb-engine v0.36.2 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-engine)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1250:40
+     |
+1250 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1250 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1250 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1304:40
+     |
+1304 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1304 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1304 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+warning: `enchudb-engine` (lib) generated 2 warnings (run `cargo fix --lib -p enchudb-engine` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.69s
+test sigkill_during_signed_loop_preserves_synced_and_signatures ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.77s
+
+     Running tests/crdt_and_chaos.rs (target/debug/deps/crdt_and_chaos-49384b3eacb56707)
+
+running 28 tests
+test common::chaos_sim::tests::byzantine_peer_injects_corrupted_lww_damages_other ... ok
+test common::chaos_sim::tests::crashed_peer_drops_all_traffic ... ok
+test common::chaos_sim::tests::delayed_delivery_preserves_convergence ... ok
+test common::chaos_sim::tests::healthy_3_peer_converge ... ok
+test common::chaos_sim::tests::one_way_partition_allows_reverse_direction ... ok
+test common::chaos_sim::tests::lww_vs_crdt_under_partition_data_loss_comparison ... ok
+test common::chaos_sim::tests::out_of_order_delivery_preserves_crdt_convergence ... ok
+test common::chaos_sim::tests::peer_crash_loses_state_then_rejoins_with_sync ... ok
+test common::chaos_sim::tests::partition_heal_converges ... ok
+test common::chaos_sim::tests::per_pair_delay_overrides_global ... ok
+test common::crdt::tests::gcounter_concurrent_inc_no_loss ... ok
+test common::crdt::tests::gcounter_duplicate_merge_idempotent ... ok
+test common::crdt::tests::gset_concurrent_add_no_loss ... ok
+test common::crdt::tests::lww_concurrent_write_loses_data ... ok
+test common::crdt::tests::orset_add_remove_locally ... ok
+test common::crdt::tests::orset_add_wins_over_concurrent_remove ... ok
+test common::crdt::tests::orset_concurrent_add_survives ... ok
+test common::crdt::tests::orset_convergent_both_directions ... ok
+test common::crdt::tests::orset_partition_heal_with_concurrent_ops ... ok
+test common::crdt::tests::orset_same_scenario_preserves_both ... ok
+test common::crdt::tests::pncounter_concurrent_inc_dec ... ok
+test common::chaos_sim::tests::large_n_convergence_time ... ok
+test common::chaos_sim::tests::majority_minority_split_scenario ... ok
+test common::chaos_sim::tests::byzantine_peer_on_orset_cannot_suppress_others ... ok
+test common::chaos_sim::tests::high_drop_rate_still_converges_with_retry ... ok
+test common::chaos_sim::tests::gcounter_under_chaos_converges ... ok
+test common::chaos_sim::tests::byzantine_during_partition_does_not_corrupt_honest_majority ... ok
+test common::chaos_sim::tests::hundred_peer_convergence_time ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/durability_destruction.rs (target/debug/deps/durability_destruction-17e91bc9e9f517b5)
+
+running 12 tests
+test byte_flip_header_magic_detected ... ok
+test byte_flip_header_metadata_detected_by_crc ... ok
+test truncate_db_to_half_fails_to_open ... ok
+test truncate_wal_to_header_loses_uncommitted ... ok
+test concurrent_writers_with_sync_no_data_loss ... ok
+test byte_flip_wal_tail_truncated_silently ... ok
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-oplog/src/oplog.rs:2466:14
+     |
+2466 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+2466 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+2466 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: `enchudb-oplog` (lib) generated 1 warning (run `cargo fix --lib -p enchudb-oplog` to apply 1 suggestion)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1250:40
+     |
+1250 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1250 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1250 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1304:40
+     |
+1304 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1304 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1304 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+warning: `enchudb-engine` (lib) generated 2 warnings (run `cargo fix --lib -p enchudb-engine` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+test body_bit_flip_detected ... ok
+test process_normal_exit_persists_all_writes ... ok
+test process_abort_mid_write_preserves_first_half ... ok
+test process_no_commit_recovers_via_auto_commit ... ok
+test process_sigkill_during_loop_no_corruption ... ok
+test fuzz_random_byte_flip_no_silent_corruption ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.37s
+
+     Running tests/ec_site.rs (target/debug/deps/ec_site-6471ec28421fdae3)
+
+running 15 tests
+test concurrent_order_creation ... ok
+test user_orders ... ok
+test order_items ... ok
+test color_filter ... ok
+test referential_check ... ok
+test category_price_search ... ok
+test product_reviews ... ok
+test category_search ... ok
+test high_rating_products ... ok
+test orders_by_status ... ok
+test count_consistency ... ok
+test monthly_orders ... ok
+test user_order_products ... ok
+test view_persistence ... ok
+test ec_persistence ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/edge_cases.rs (target/debug/deps/edge_cases-a434aaf13356d1c5)
+
+running 21 tests
+test empty_db_query ... ok
+test double_delete ... ok
+test max_values_boundary ... ok
+test delete_unknown_entity ... ok
+test empty_db_persistence ... ok
+test test_dynamic_bucket_expansion ... ok
+test test_unique_count_basic ... ok
+test ref_self_reference ... ok
+test max_value_is_rejected_without_panicking ... ok
+test test_himo_cardinality_api ... ok
+test delete_then_recreate_entity ... ok
+test concurrentize_with_empty ... ok
+test file_version_mismatch ... ok
+test concurrentize_basic_lifecycle ... ok
+test persist_then_modify ... ok
+test test_unique_count_with_replace ... ok
+test tie_large_value_expands_buckets ... ok
+test untie_all_himos_from_entity ... ok
+test max_himos_limit - should panic ... ok
+test zero_value_tie ... ok
+test value_then_text_same_himo - should panic ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/fuzz_like_parsing.rs (target/debug/deps/fuzz_like_parsing-d00db689adb60943)
+
+running 5 tests
+test wire_record_encode_then_decode_roundtrip ... ok
+test oplog_iter_committed_on_random_body_does_not_panic ... ok
+test wire_record_decode_does_not_panic ... ok
+test decode_batch_does_not_panic ... ok
+test decode_batch_with_count_prefix ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.36s
+
+     Running tests/http_transport.rs (target/debug/deps/http_transport-66185f5791c4917e)
+
+running 5 tests
+test incremental_pull_advances_cursor ... ok
+test origin_publishes_replica_pulls_over_http ... ok
+test multiple_replicas_sync_from_same_origin ... ok
+test bootstrap_serves_64_bit_columns ... ok
+test fresh_replica_bootstraps_then_syncs ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.63s
+
+     Running tests/issue140_history_truncation.rs (target/debug/deps/issue140_history_truncation-7f04ea431e40fab2)
+
+running 1 test
+test full_pull_after_reclaim_must_not_silently_lose_history ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/issue141_pk_dedupe.rs (target/debug/deps/issue141_pk_dedupe-c69ac2b58889521c)
+
+running 4 tests
+test pk_survives_reopen_via_tables_sidecar ... ok
+test table_without_pk_still_allocates_separate_entities ... ok
+test different_pk_with_colliding_vid_numbers_stay_separate ... ok
+test same_pk_created_independently_converges_to_one_entity ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/issue80_writer_lock.rs (target/debug/deps/issue80_writer_lock-e067fe704f2466c9)
+
+running 4 tests
+test readonly_open_coexists_with_writer ... ok
+test second_writer_open_fails_fast_in_same_process ... ok
+test second_concurrent_oplog_open_fails_fast_in_same_process ... ok
+test different_paths_do_not_interfere ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/large_scale.rs (target/debug/deps/large_scale-eac8182efb968c6d)
+
+running 3 tests
+test high_cardinality_100k_unique_values ... ignored
+test one_million_flush_reopen_cycle ... ignored
+test ten_million_insert_and_lookup ... ignored
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/oplog_integration.rs (target/debug/deps/oplog_integration-b26b72c77e08cecc)
+
+running 9 tests
+test header_crc_detects_corruption ... ok
+test oplog_file_is_created ... ok
+test concurrent_writes_with_oplog ... ok
+test stats_snapshot ... ok
+test uncommitted_writes_discarded_on_recovery ... ok
+test create_open_with_wal_roundtrip ... ok
+test auto_commit_on_shutdown ... ok
+test recover_after_drop_without_flush ... ok
+test content_async_roundtrip ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/oplog_mmap_race.rs (target/debug/deps/oplog_mmap_race-b1a5541646fd0f4d)
+
+running 2 tests
+test mmap_ahead_of_wal_silent_sync_loss ... ignored
+test oplog_sync_closes_race_window ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/peer_sim_convergence.rs (target/debug/deps/peer_sim_convergence-2af6397d12da0a5a)
+
+running 37 tests
+test common::chaos_sim::tests::byzantine_peer_injects_corrupted_lww_damages_other ... ok
+test common::chaos_sim::tests::healthy_3_peer_converge ... ok
+test common::chaos_sim::tests::delayed_delivery_preserves_convergence ... ok
+test common::chaos_sim::tests::crashed_peer_drops_all_traffic ... ok
+test common::chaos_sim::tests::lww_vs_crdt_under_partition_data_loss_comparison ... ok
+test common::chaos_sim::tests::one_way_partition_allows_reverse_direction ... ok
+test common::chaos_sim::tests::out_of_order_delivery_preserves_crdt_convergence ... ok
+test common::chaos_sim::tests::per_pair_delay_overrides_global ... ok
+test common::crdt::tests::gcounter_concurrent_inc_no_loss ... ok
+test common::crdt::tests::gcounter_duplicate_merge_idempotent ... ok
+test common::chaos_sim::tests::partition_heal_converges ... ok
+test common::crdt::tests::lww_concurrent_write_loses_data ... ok
+test common::crdt::tests::gset_concurrent_add_no_loss ... ok
+test common::crdt::tests::orset_add_remove_locally ... ok
+test common::crdt::tests::orset_add_wins_over_concurrent_remove ... ok
+test common::crdt::tests::orset_concurrent_add_survives ... ok
+test common::chaos_sim::tests::peer_crash_loses_state_then_rejoins_with_sync ... ok
+test common::crdt::tests::orset_convergent_both_directions ... ok
+test common::crdt::tests::orset_same_scenario_preserves_both ... ok
+test common::crdt::tests::orset_partition_heal_with_concurrent_ops ... ok
+test common::crdt::tests::pncounter_concurrent_inc_dec ... ok
+test common::chaos_sim::tests::large_n_convergence_time ... ok
+test common::chaos_sim::tests::byzantine_peer_on_orset_cannot_suppress_others ... ok
+test common::chaos_sim::tests::majority_minority_split_scenario ... ok
+test common::chaos_sim::tests::high_drop_rate_still_converges_with_retry ... ok
+test common::chaos_sim::tests::gcounter_under_chaos_converges ... ok
+test common::chaos_sim::tests::byzantine_during_partition_does_not_corrupt_honest_majority ... ok
+test common::chaos_sim::tests::hundred_peer_convergence_time ... ok
+test lww_skip_and_unresolved_drop_are_counted_separately ... ok
+test consumed_vocab_mapping_survives_restart ... ok
+test text_converges_when_vocab_and_tie_arrive_together ... ok
+test cursor_is_held_when_state_cannot_be_persisted ... ok
+test cursor_never_outlives_the_state_it_consumed ... ok
+test text_converges_across_peer_restart ... ok
+test delete_applies_after_receiver_restart ... ok
+test snapshot_export_carries_the_vocab_mapping ... ok
+test eid_mapping_is_durable_without_clean_shutdown ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+
+     Running tests/phase_e_f.rs (target/debug/deps/phase_e_f-2f27d11a9af9933e)
+
+running 7 tests
+test audit_on_engine_without_wal_returns_empty ... ok
+test audit_filter_by_hlc_range ... ok
+test audit_returns_wal_records ... ok
+test stats_includes_hlc_info ... ok
+test audit_filter_by_author_excludes_others ... ok
+test snapshot_export_plain_engine_roundtrip ... ok
+test snapshot_export_with_wal_includes_wal_file ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/property_based.rs (target/debug/deps/property_based-5d7d363f43610f55)
+
+running 5 tests
+test untie_removes_from_pull ... ok
+test delete_removes_from_all_himos ... ok
+test query_matches_intersection ... ok
+test tie_get_roundtrip ... ok
+test pull_raw_matches_shadow ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.76s
+
+     Running tests/ravn_integration.rs (target/debug/deps/ravn_integration-88f5ca271e9eb154)
+
+running 9 tests
+test exec_errors ... ok
+test exec_empty_result ... ok
+test exec_count ... ok
+test exec_get ... ok
+test sns_timeline ... ok
+test chained_pipes ... ok
+test select_with_text ... ok
+test exec_follow_pipe ... ok
+test ec_path_navigation ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/replica_mode.rs (target/debug/deps/replica_mode-91562a692c9e266b)
+
+running 6 tests
+test replica_syncs_from_origin_via_syncer ... ignored, replica mode + #9 foreign-eid 翻訳が非互換 (translation は eid 確保 = 書き込み)
+test set_replica_mode_toggle ... ok
+test replica_rejects_content ... ok
+test replica_rejects_entity_and_delete ... ok
+test replica_allows_remote_apply_and_read ... ok
+test replica_rejects_tie ... ok
+
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/scenarios.rs (target/debug/deps/scenarios-8597c36e5869b9a8)
+
+running 23 tests
+test date_conversion_roundtrip ... ok
+test aggregates ... ok
+test pull_range_basic ... ok
+test aggregates_with_missing_values ... ok
+test group_sum_basic ... ok
+test query_pair_empty_cell_fallback ... ok
+test date_with_sum ... ok
+test group_sum_with_query ... ok
+test delete_parent_dangling_refs ... ok
+test move_entity_between_parents ... ok
+test repeated_tie_untie ... ok
+test cascade_delete_effect ... ok
+test region_hierarchy_navigation ... ok
+test delete_reuse_id ... ok
+test mixed_workload ... ok
+test sum_basic ... ok
+test sum_skips_missing_values ... ok
+test tie_date_and_range ... ok
+test reverse_lookup_children ... ok
+test tenant_isolation_query ... ok
+test text_and_value_mixed ... ok
+test many_himos ... ok
+test bulk_tie_consistency ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+
+     Running tests/shard_routing.rs (target/debug/deps/shard_routing-7c139bf7a7a40289)
+
+running 6 tests
+test hash_router_deterministic_across_peers ... ok
+test explicit_router_falls_back_for_unknown_himo ... ok
+test is_mine_filter ... ok
+test two_condition_query_crosses_shards ... ok
+test replicated_entity_matches_across_shards_via_sync ... ok
+test single_condition_routes_to_owner_peer ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/snapshot_restore_sync.rs (target/debug/deps/snapshot_restore_sync-0cb5a3580b9999b2)
+
+running 2 tests
+test snapshot_restore_recovers_signed_wal_state ... ignored, oplog ring は session をまたぐ audit log ではない — graceful shutdown で checkpoint が head に追いつき、次 open の try_reset で ring が畳まれるため audit() が空になる
+test restored_replica_syncs_incremental_from_origin_after_snapshot ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/stress.rs (target/debug/deps/stress-b79a9194b5055496)
+
+running 6 tests
+test heavy_1m_writes ... ignored, heavy stress — run with --ignored
+test random_ops_fuzz_30s ... ignored, heavy stress — run with --ignored
+test parallel_10_writers ... ok
+test sustained_10k_writes_and_reopen ... ok
+test content_heavy_load ... ok
+test repeated_drop_recover_cycles ... ok
+
+test result: ok. 4 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/sync_bound_writes_address.rs (target/debug/deps/sync_bound_writes_address-2cd4674e4aa0145a)
+
+running 2 tests
+test writes_after_a_bind_reach_a_receiver_that_never_sees_the_bound_peer ... ok
+test writes_after_binding_into_a_translated_row_keep_its_original_address ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/sync_converge_fuzz.rs (target/debug/deps/sync_converge_fuzz-920a203081ec180f)
+
+running 32 tests
+test a_rename_addressed_to_a_bound_identity_still_converges ... ok
+test a_rewritten_row_keeps_its_creation_time_when_bound ... ok
+test a_rename_after_folding_own_rows_renames_the_whole_deck ... ok
+test a_row_holding_a_name_another_row_took_later_joins_it ... ok
+test a_peer_folds_its_own_rows_renamed_into_one_name ... ok
+test a_rename_into_a_name_another_row_already_left_is_a_new_deck ... ok
+test a_rename_into_a_name_another_row_held_then_joins_that_row ... ok
+test a_rename_after_the_delete_keeps_the_writes_made_before_it ... ok
+test a_late_create_after_the_delete_keeps_the_row ... ok
+test a_create_arriving_after_its_rename_reveals_the_former_name ... ok
+test a_name_that_arrives_after_its_row_still_meets_the_delete ... ok
+test a_row_folded_by_a_rename_keeps_its_former_names ... ok
+test a_losing_rename_folds_own_rows_made_while_it_held_the_name ... ok
+test a_late_create_shows_the_row_was_in_the_deleted_deck ... ok
+test a_deck_renamed_into_a_name_another_row_already_left_stays_together ... ok
+test a_losing_rename_joins_the_row_that_held_its_name_then ... ok
+test a_row_made_with_the_former_name_after_the_rename_is_a_new_deck ... ok
+test a_row_made_after_a_relayed_delete_survives_in_every_order ... ok
+test a_row_made_after_the_rename_splits_off_when_the_rename_arrives_late ... ok
+test a_row_made_after_the_delete_survives_in_every_order ... ok
+test a_row_made_with_the_former_name_before_the_rename_joins_the_renamed_deck ... ok
+test a_write_after_the_delete_to_a_row_made_before_it_is_dropped ... ok
+test a_split_keeps_the_writes_made_while_bound ... ok
+test an_upsert_after_an_unseen_delete_does_not_revive_the_row ... ok
+test a_split_puts_a_folded_own_row_back_in_its_slot ... ok
+test the_renamer_does_not_bind_a_later_row_with_its_former_name ... ok
+test the_slot_owner_stays_in_its_slot_after_a_split ... ok
+test a_row_made_with_the_name_of_a_losing_rename_joins_the_deck ... ok
+test deleting_a_renamed_row_also_deletes_rows_holding_its_former_name ... ok
+test an_identity_renamed_by_another_identity_of_its_deck_stays_with_the_deck ... ok
+test concurrent_renames_decide_the_former_name_by_the_earlier_rename ... ok
+test every_order_converges ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.45s
+
+     Running tests/sync_delete_before_create.rs (target/debug/deps/sync_delete_before_create-d975950cac1d7a35)
+
+running 7 tests
+test an_early_delete_leaves_no_live_slot ... ok
+test early_delete_survives_restart ... ok
+test delete_before_create_does_not_revive_the_row ... ok
+test receiver_with_the_same_primary_key_ends_the_same_in_either_order ... ok
+test alias_before_the_create_keeps_the_early_delete ... ok
+test newer_write_after_the_delete_lands_the_same_in_any_order ... ok
+test concurrent_early_delete_and_create_never_revive ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.15s
+
+     Running tests/sync_delete_wins.rs (target/debug/deps/sync_delete_wins-ce2313daff9e1026)
+
+running 14 tests
+test a_later_delete_finds_the_name_the_row_died_with ... ok
+test names_moved_on_slot_reuse_survive_a_reopen ... ok
+test an_unaware_leaf_edit_to_a_deleted_row_is_dropped ... ok
+test a_bound_row_made_after_the_delete_keeps_none_of_the_deleted_cells ... ok
+test a_folded_row_made_after_the_delete_survives_it ... ok
+test an_unaware_edit_to_a_deleted_row_is_dropped ... ok
+test an_unaware_edit_after_an_early_delete_is_dropped ... ok
+test a_row_added_again_after_seeing_the_delete_lives ... ok
+test an_unaware_edit_to_a_same_name_row_is_dropped_too ... ok
+test a_same_name_row_made_before_the_delete_goes_with_it ... ok
+test a_same_name_row_between_two_deletes_goes_with_the_later ... ok
+test two_rows_added_again_after_the_delete_live_as_one ... ok
+test a_later_delete_after_slot_reuse_still_raises_the_name ... ok
+test a_later_delete_after_slot_reuse_raises_the_former_name_too ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.55s
+
+     Running tests/sync_own_rows_fold.rs (target/debug/deps/sync_own_rows_fold-f1c035a66db6cd34)
+
+running 6 tests
+test a_folded_own_row_eid_forwards_reads_and_writes ... ok
+test records_to_a_folded_own_row_land_in_the_kept_row_after_a_reopen ... ok
+test a_ref_to_a_folded_own_row_points_at_the_kept_row ... ok
+test a_folded_own_slot_is_not_reused_when_the_table_is_full ... ok
+test a_folded_own_slot_stays_reserved_after_the_kept_slot_is_reused ... ok
+test a_delete_addressed_to_a_folded_own_row_deletes_the_deck ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+
+     Running tests/sync_pk_delete_converges.rs (target/debug/deps/sync_pk_delete_converges-ae593714651b3f5b)
+
+running 8 tests
+test sync_enabled_before_the_table_also_remembers ... ok
+test a_delete_older_than_the_other_authors_row_keeps_it ... ok
+test the_deleted_key_survives_a_restart ... ok
+test a_write_newer_than_the_delete_is_dropped ... ok
+test delete_of_a_primary_key_reaches_the_other_authors_row ... ok
+test a_row_made_again_after_the_delete_drops_the_older_writes ... ok
+test an_early_delete_also_covers_the_same_key_from_another_author ... ok
+test two_deletes_of_one_key_agree_in_either_order ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+
+     Running tests/sync_pk_key_set_last.rs (target/debug/deps/sync_pk_key_set_last-44443055b742afe9)
+
+running 5 tests
+test a_key_that_fails_the_signature_check_does_not_bind ... ok
+test a_leaf_column_set_before_the_key_is_bound_too ... ok
+test recreating_a_key_set_last_in_one_batch_converges_with_the_author ... ok
+test delete_of_a_key_set_last_reaches_the_other_authors_row ... ok
+test rows_with_the_key_set_last_are_bound_by_the_key ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+
+     Running tests/sync_pk_recreate_in_one_batch.rs (target/debug/deps/sync_pk_recreate_in_one_batch-d02a35db7aecf2c9)
+
+running 1 test
+test recreating_a_primary_key_in_one_batch_converges_with_the_author ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+     Running tests/sync_pk_rename_converges.rs (target/debug/deps/sync_pk_rename_converges-5f9c8d3425e0bf14)
+
+running 15 tests
+test bound_cards_survive_a_reopen ... ok
+test a_reused_slot_drops_its_former_names ... ok
+test former_names_survive_a_reopen ... ok
+test unaware_write_after_rename ... ok
+test concurrent_renames ... ok
+test same_name_from_two_authors ... ok
+test rename_back_with_an_unaware_create ... ok
+test unaware_create_after_rename ... ok
+test rename_into_an_existing_name ... ok
+test a_late_rename_to_a_deleted_row_spares_a_row_added_after_the_delete ... ok
+test delete_by_new_name_kills_the_former_name ... ok
+test a_second_delete_raises_a_name_learned_after_the_first ... ok
+test rename_then_delete_with_unaware_writers ... ok
+test unaware_delete_after_rename_kills_the_new_name ... ok
+test unaware_delete_after_rename_kills_the_former_name ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.76s
+
+     Running tests/text_sync.rs (target/debug/deps/text_sync-8be5f7d561639b16)
+
+running 6 tests
+test commit_also_writes_wal_marker_under_v33 ... ok
+test single_text_tie_propagates_to_peer_b ... ok
+test multiple_text_values_preserve_distinct_vids ... ok
+test tie_ref_async_propagates_between_peers ... ok
+test peer_a_and_b_share_text_even_if_each_coined_local_vid_first ... ok
+test repeated_same_text_is_deduped_on_receiver ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+     Running tests/two_peer_sync.rs (target/debug/deps/two_peer_sync-66e8d3e80ec75766)
+
+running 14 tests
+test peer_id_persists_across_reopen ... ok
+test unsigned_rejected_when_require_signature ... ok
+test acl_blocks_non_writer_peer ... ok
+test acl_empty_is_permissive ... ok
+test delete_remote_removes_all_himos ... ok
+test lww_concurrent_write_to_same_cell ... ok
+test peer_a_writes_peer_b_reads_via_pull ... ok
+test tampered_signature_rejected ... ok
+test wrong_peer_pubkey_rejected ... ok
+test e2e_multiple_writes_published_and_pulled ... ok
+test hlc_tie_broken_by_peer_id ... ok
+test bidirectional_sync_no_conflict ... ok
+test e2e_write_publish_pull ... ok
+test signed_wal_verifies_between_peers ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.11s
+
+     Running unittests src/main.rs (target/debug/deps/enchu-77c5b35961bbf17a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli_smoke.rs (target/debug/deps/cli_smoke-4759106f9b8d2512)
+
+running 3 tests
+test create_and_basic_repl_flow ... ok
+test readonly_entity_and_dump_read_leaf_columns ... ok
+test one_shot_exec_via_dash_e ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_connect-e1eaca4cb3c64e5d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/connect.rs (target/debug/deps/connect-73239f9754f964a5)
+
+running 6 tests
+test ingest_needs_prepare ... ok
+test json_rows_apply_by_primary_key ... ok
+test live_export_emits_rows_by_primary_key ... ok
+test debezium_events ... ok
+test bigint_columns_ingest_and_export ... ok
+test offsets_survive_reopen_and_replays_are_skipped ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_ffi-71c28b553416e768)
+
+running 9 tests
+test tests::guard_i32_passes_through_normal_return ... ok
+test tests::null_args_rejected ... ok
+test tests::version_returns_valid_string ... ok
+test tests::guard_i32_converts_panic_to_error_without_aborting ... ok
+test tests::error_propagates ... ok
+test tests::open_and_close ... ok
+test tests::notif_state_use_case_via_ffi ... ok
+test tests::exec_create_insert ... ok
+test tests::query_returns_rows ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_kafka-7c6924a9787668cf)
+
+running 1 test
+test tests::murmur2_matches_kafka ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/kafka.rs (target/debug/deps/kafka-29c8c7a6b2fdcf1c)
+
+running 2 tests
+test kafka_bigint_round_trip ... ok
+test kafka_in_live_out_and_resume ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_ngram-173e511b2e0c9830)
+
+running 48 tests
+test gram::tests::extract_matches_window_count ... ok
+test bigram::tests::key_roundtrip ... ok
+test bigram::tests::key_ascii ... ok
+test gram::tests::distinct_keys_across_n ... ok
+test bigram::tests::extract_short ... ok
+test gram::tests::n2_key_is_bit_identical_to_legacy_u32 ... ok
+test gram::tests::key_roundtrip_all_n ... ok
+test bigram::tests::extract_basic ... ok
+test gram::tests::n2_keys_never_exceed_u32 ... ok
+test gram::tests::non_bmp_truncates_to_low_16_bits ... ok
+test gram::tests::out_of_range_n_extracts_nothing ... ok
+test gram::tests::rolling_window_equals_pack ... ok
+test gram::tests::validate_n_range ... ok
+test index::tests::candidates_no_match ... ok
+test index::tests::candidates_short_query_is_empty ... ok
+test index::tests::from_bytes_round_trip ... ok
+test index::tests::index_and_candidates ... ok
+test index::tests::open_nonexistent ... ok
+test index::tests::postings_only_write_to_bytes_guard_mut ... ok
+test index::tests::remove_text ... ok
+test index::tests::scan_single_char ... ok
+test index::tests::stats ... ok
+test index::tests::update_text ... ok
+test posting::tests::add_and_get ... ok
+test posting::tests::intersect_basic ... ok
+test posting::tests::intersect_empty ... ok
+test posting::tests::remove_entity ... ok
+test posting::tests::wide_eid ... ok
+test posting::tests::wide_key ... ok
+test storage::tests::corrupt_doc_len_rejected ... ok
+test storage::tests::corrupt_gram_offset_rejected ... ok
+test storage::tests::corrupt_header_count_rejected ... ok
+test storage::tests::postings_only_omits_text ... ok
+test storage::tests::default_n_still_writes_v2 ... ok
+test storage::tests::text_holding_bytes_are_unchanged ... ok
+test storage::tests::unknown_version_rejected ... ok
+test storage::tests::v2_write_rejects_wide_key ... ok
+test storage::tests::v3_bad_n_in_header_rejected ... ok
+test storage::tests::truncated_bytes_error_instead_of_panic ... ok
+test storage::tests::v3_records_n_and_wide_keys ... ok
+test storage::tests::valid_bytes_load_and_search ... ok
+test storage::tests::write_rejects_out_of_range_n ... ok
+test index::tests::open_mut_round_trip ... ok
+test storage::tests::truncated_file_error_instead_of_panic ... ok
+test index::tests::save_and_open_wide_eid ... ok
+test index::tests::postings_only_candidates_no_text ... ok
+test storage::tests::v3_binary_search_over_many_wide_keys ... ok
+test index::tests::save_and_open ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/and_matches_gram_scan.rs (target/debug/deps/and_matches_gram_scan-f29ab810a39c1ff0)
+
+running 1 test
+test and_matches_a_scan_of_the_grams ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.03s
+
+     Running tests/issue121_variable_n.rs (target/debug/deps/issue121_variable_n-d7adcf24a7b9be1d)
+
+running 9 tests
+test out_of_range_n_is_rejected_at_construction ... ok
+test legacy_v2_file_reads_as_n2 ... ok
+test postings_only_keeps_n ... ok
+test query_shorter_than_n_yields_no_candidates ... ok
+test default_n_output_is_byte_identical_to_v2 ... ok
+test with_n4_round_trip_through_bytes ... ok
+test wide_keys_are_exact_not_hashed ... ok
+test with_n3_round_trip_through_file ... ok
+test rebuild_inherits_n_from_file ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/issue188_segment_merge.rs (target/debug/deps/issue188_segment_merge-43976547bafc4680)
+
+running 9 tests
+test merge_rejects_empty_input_list ... ok
+test later_segment_supersedes_earlier_doc ... ok
+test merge_rejects_mixed_text_flags ... ok
+test merge_rejects_mismatched_n ... ok
+test merge_single_input_round_trips ... ok
+test merge_postings_only_keeps_the_flag ... ok
+test merge_of_two_segments_is_byte_identical_to_one_shot ... ok
+test merge_v3_is_byte_identical_to_one_shot ... ok
+test merge_of_many_segments_is_byte_identical_to_one_shot ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_oplog-246a47568bba7fe1)
+
+running 66 tests
+test keys::tests::pubkey_fp_is_first_8_bytes ... ok
+test filelock::tests::public_lock_unlock_roundtrip ... ok
+test filelock::tests::try_lock_does_not_block_and_reports_holder ... ok
+test filelock::tests::exclusive_held_probes_without_keeping_a_lock ... ok
+test keys::tests::verify_unknown_peer_returns_false ... ok
+test keys::tests::tofu_rejects_changed_pubkey ... ok
+test keys::tests::from_bytes_preserves_identity ... ok
+test filelock::tests::fallback_lock_excludes_other_fd_and_releases ... ok
+test keys::tests::tampered_message_fails_verify ... ok
+test keys::tests::sign_and_verify_roundtrip ... ok
+test oplog::tests::capacity_at_or_above_4gib_is_rejected ... ok
+test keys::tests::load_or_create_persists_key ... ok
+test oplog::tests::commit_fault_injection_fails_only_commits ... ok
+test oplog::tests::append_dead_agrees_with_a_real_append_failure_after_another_fd_filled_it ... ok
+test oplog::tests::checksum_catches_torn_write ... ok
+test oplog::tests::append_many_still_mints_monotonic_hlcs_without_override ... ok
+test oplog::tests::append_at_hlc_uses_the_minted_hlc_verbatim ... ok
+test oplog::tests::advance_and_reset_checkpoint ... ok
+test oplog::tests::alias_round_trips_and_is_skippable ... ok
+test oplog::tests::append_with_hlc_returns_exactly_what_the_record_carries ... ok
+test oplog::tests::append_returns_err_when_full_not_panic ... ok
+test oplog::tests::append_many_with_hlcs_uses_the_given_hlcs ... ok
+test oplog::tests::create_and_append ... ok
+test oplog::tests::append_many_with_hlcs_rejects_length_mismatch - should panic ... ok
+test oplog::tests::fold_advances_the_lap_and_stamps_records_with_it ... ok
+test oplog::tests::full_wal_returns_error ... ok
+test oplog::tests::hlc_monotonic ... ok
+test oplog::tests::a_full_wal_remembers_whose_records_were_dropped ... ok
+test oplog::tests::holder_appends_requests_left_in_slots ... ok
+test oplog::tests::durable_cut_bounds_the_records_and_sees_dropped_ones ... ok
+test oplog::tests::header_scan_matches_the_record_scan_and_stops_at_a_bad_crc_after_the_checkpoint ... ok
+test oplog::tests::multi_process_append_no_offset_collision ... ok
+test oplog::tests::pending_writes_balanced_on_append_panic ... ok
+test oplog::tests::quiet_since_ignores_commits_and_relays_but_not_own_data ... ok
+test oplog::tests::append_waits_again_when_another_writer_takes_the_room ... ok
+test oplog::tests::quiet_since_does_not_see_a_dropped_record ... ok
+test oplog::tests::records_of_a_previous_lap_left_in_the_ring_stop_the_scan ... ok
+test oplog::tests::room_freed_before_waiting_is_retried_but_other_failures_are_not ... ok
+test oplog::tests::recover_committed_only ... ok
+test oplog::tests::quiet_without_mark_sees_own_records_of_this_and_earlier_processes ... ok
+test oplog::tests::recover_content ... ok
+test oplog::tests::data_records_leave_room_for_a_closing_commit ... ok
+test oplog::tests::tie_leaf_wire_roundtrip ... ok
+test oplog::tests::concurrent_append ... ok
+test oplog::tests::session_lock_held_by_a_live_oplog_fails_fast ... ok
+test oplog::tests::panic_while_appending_a_request_fails_only_that_request ... ok
+test oplog::tests::scan_diag_separates_unclosed_group_from_unreadable_cursor ... ok
+test oplog::tests::session_lock_skips_per_record_flock_and_holds_the_file_lock ... ok
+test oplog::tests::v1_file_rejected ... ok
+test oplog::tests::try_reset_recycles_without_auto_reset_flag ... ok
+test wal_lock::tests::try_lock_takes_a_free_lock_even_with_sleepers ... ok
+test oplog::tests::wide_tie_values_round_trip ... ok
+test oplog::tests::signature_slot_is_zero ... ok
+test oplog::tests::try_reset_recycles_wal_space ... ok
+test oplog::tests::v2_file_reads_without_lap_marks_and_becomes_v3_at_the_first_fold ... ok
+test oplog::tests::a_corrupted_header_field_stops_the_scan ... ok
+test oplog::tests::v2_records_are_still_read_and_their_signatures_still_verify ... ok
+test oplog::tests::ring_buffer_long_run_does_not_exhaust ... ok
+test oplog::tests::concurrent_append_no_offset_collision_or_dup_hlc ... ok
+test oplog::tests::unknown_skippable_op_is_skipped_but_unknown_critical_op_stops ... ok
+test oplog::tests::session_lock_appends_from_threads_do_not_collide ... ok
+test oplog::tests::counted_wall_clock_tracks_the_system_clock ... ok
+test oplog::tests::slot_index_is_unique_among_live_threads_and_reused ... ok
+test wal_lock::tests::lock_excludes_and_wakes_sleepers ... ok
+test oplog::tests::concurrent_hlcs_are_unique ... ok
+test oplog::tests::concurrent_appends_get_back_their_own_record ... ok
+
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+
+     Running tests/combine_many_threads.rs (target/debug/deps/combine_many_threads-ef43a7e1af84ffc4)
+
+running 1 test
+test more_writers_than_slots_get_back_their_own_record ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/issue268_stale_record.rs (target/debug/deps/issue268_stale_record-53e5e6d413ee58c6)
+
+running 1 test
+test scan_never_reads_the_previous_cycle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.67s
+
+     Running tests/truncated_oplog.rs (target/debug/deps/truncated_oplog-7e2ffeff90444286)
+
+running 5 tests
+test reopen_intact_oplog_is_ok ... ok
+test truncated_oplog_open_is_invalid_data ... ok
+test tiny_truncated_oplog_open_is_invalid_data ... ok
+test corrupt_checkpoint_below_header_is_invalid_data ... ok
+test corrupt_head_beyond_capacity_is_invalid_data ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_rag-8005d2acb972245a)
+
+running 16 tests
+test bm25::tests::rrf_combines ... ok
+test chunker::tests::short_text_single_chunk ... ok
+test distance::tests::cosine_identity ... ok
+test bm25::tests::bm25_basic ... ok
+test bm25::tests::bm25_candidates_filter ... ok
+test chunker::tests::split_on_paragraph ... ok
+test distance::tests::cosine_opposite ... ok
+test chunker::tests::force_split_multibyte ... ok
+test distance::tests::cosine_orthogonal ... ok
+test distance::tests::l2_zero ... ok
+test distance::tests::normalize_unit ... ok
+test embedder::tests::hash_embedder_deterministic ... ok
+test chunker::tests::overlap_applied ... ok
+test embedder::tests::hash_embedder_different_text ... ok
+test embedder::tests::hash_embedder_dim ... ok
+test filter::tests::diff_basic ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/basic.rs (target/debug/deps/basic-7359e604aeabee12)
+
+running 7 tests
+test hybrid_search_combines_vector_and_bm25 ... ok
+test range_filter ... ok
+test delete_and_upsert ... ok
+test meta_filter_narrows_candidates ... ok
+test insert_and_search_no_filter ... ok
+test bm25_rebuilt_on_reopen ... ok
+test persistence_roundtrip ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/fastembed_integration.rs (target/debug/deps/fastembed_integration-24a78ffb82a7a87d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/filter_eval.rs (target/debug/deps/filter_eval-418a2eae5af48e5e)
+
+running 1 test
+test filters_match_a_scan_of_the_written_values ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_sql-e332648165ad1c28)
+
+running 34 tests
+test tests::between_expands ... ok
+test tests::duplicate_pk_insert_errors ... ok
+test tests::bigint_columns_hold_64_bit_values ... ok
+test tests::is_null_filter ... ok
+test tests::delete_by_pk ... ok
+test tests::leaf_column_basic ... ok
+test tests::integer_columns_of_old_tables_stay_u32 ... ok
+test tests::distinct_group_by_having_error_cleanly ... ok
+test tests::integer_columns_of_new_tables_are_64_bit ... ok
+test tests::eq_with_value_out_of_integer_range_matches_nothing ... ok
+test tests::insert_or_replace ... ok
+test tests::leaf_eq_query_returns_empty ... ok
+test tests::delete_with_range ... ok
+test tests::duplicate_pk_text_key ... ok
+test tests::duplicate_pk_within_multi_row_insert ... ok
+test tests::create_and_insert_select ... ok
+test tests::schema_round_trip_serialize_deserialize ... ok
+test tests::leaf_persists_across_reopen ... ok
+test tests::schema_persists_across_reopen ... ok
+test tests::open_existing_schema_data_visible_without_create_table ... ok
+test tests::limit_offset_paginates ... ok
+test tests::unknown_table ... ok
+test tests::limit_truncates ... ok
+test tests::notif_history_query ... ok
+test tests::unknown_column ... ok
+test tests::notif_state_use_case ... ok
+test tests::order_by_asc_desc ... ok
+test tests::select_with_text_eq ... ok
+test tests::range_where_lt_gt ... ok
+test tests::select_star ... ok
+test tests::range_where_le_ge ... ok
+test tests::select_and_predicates ... ok
+test tests::multi_table_schema_persists ... ok
+test tests::update_by_pk ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_sync-d488e940f3fdf003)
+
+running 13 tests
+test subscription::tests::custom_filter_can_drop_by_author ... ok
+test shard::tests::hash_router_determinism ... ok
+test shard::tests::sorted_intersect_basic ... ok
+test subscription::tests::all_records_passes_everything ... ok
+test shard::tests::explicit_router_map_and_fallback ... ok
+test shard::tests::hash_router_distributes ... ok
+test sync::tests::lww_newer_wins ... ok
+test sync::tests::untranslatable_remote_vid_is_dropped_not_written ... ok
+test sync::tests::pull_incremental_advances_cursor ... ok
+test sync::tests::custom_filter_can_partition_records_per_peer ... ok
+test sync::tests::publish_since_for_peer_targets_one_peer_only ... ok
+test sync::tests::two_peer_pull_and_apply ... ok
+test sync::tests::default_filter_is_backward_compatible ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+     Running tests/issue140_bootstrap_state_sync.rs (target/debug/deps/issue140_bootstrap_state_sync-c89af18886bc4571)
+
+running 2 tests
+test ghost_rows_are_swept_on_bootstrap ... ok
+test late_joiner_bootstraps_and_connects_to_diff_pull ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests/issue149_pull_as_ack.rs (target/debug/deps/issue149_pull_as_ack-f522123719df28d3)
+
+running 4 tests
+test reclaims_under_pressure_without_manual_ack ... ok
+test no_reclaim_below_pressure_late_joiner_gets_full_history ... ok
+test slowest_puller_limits_reclaim ... ok
+test ring_overflow_survives_with_pull_loop ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+
+     Running tests/issue154_hydrate_after_fold.rs (target/debug/deps/issue154_hydrate_after_fold-9ba13fcacbc14717)
+
+running 1 test
+test folded_record_hlc_survives_reopen_and_blocks_stale_rollback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/issue160_lww_survives_reclaim_and_reopen.rs (target/debug/deps/issue160_lww_survives_reclaim_and_reopen-5b0d611e589b1fc9)
+
+running 1 test
+test newer_local_row_is_not_rolled_back_after_reclaim_and_reopen ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/issue178_alias.rs (target/debug/deps/issue178_alias-7e975a6444ef6dc7)
+
+running 3 tests
+test without_alias_the_key_folds_the_duplicate_rows ... ok
+test alias_folds_the_duplicate_rows_on_every_peer ... ok
+test alias_maps_the_unseen_identity_onto_the_existing_row ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.52s
+
+     Running tests/issue191_floor_max_reclaimed.rs (target/debug/deps/issue191_floor_max_reclaimed-2b95ff42803a314e)
+
+running 2 tests
+test floor_survives_reopen ... ok
+test caught_up_follower_survives_reclaim ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/issue209_relay_verbatim.rs (target/debug/deps/issue209_relay_verbatim-e1d182790295ac4f)
+
+running 3 tests
+test relay_preserves_signature ... ok
+test relay_preserves_origin_identity_under_slot_collision ... ok
+test relayed_records_survive_relay_reopen ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+
+     Running tests/issue210_capacity_reject_redelivers.rs (target/debug/deps/issue210_capacity_reject_redelivers-ce062b147c19b021)
+
+running 1 test
+test capacity_reject_holds_the_cursor_and_redelivers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/issue216_relay_cursor_gap.rs (target/debug/deps/issue216_relay_cursor_gap-eabb33f87d8d3b3c)
+
+running 5 tests
+test legacy_scalar_cursor_self_heals ... ok
+test relayed_old_hlc_record_reaches_advanced_cursor ... ok
+test legacy_baseline_floor_folds_into_all_authors ... ok
+test steady_relay_reclaim_does_not_false_truncate ... ok
+test new_author_starts_from_zero ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.11s
+
+     Running tests/issue217_ack_prefix.rs (target/debug/deps/issue217_ack_prefix-da84764b3272cd9f)
+
+running 5 tests
+test author_zero_rows_are_consumable_by_scalar_ack ... ok
+test vector_ack_consumes_per_author ... ok
+test inflated_stored_consumed_lsn_is_not_trusted ... ok
+test scalar_ack_stops_at_first_unconsumed_row ... ok
+test dead_row_is_purged_not_a_permanent_blocker ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests/issue218_dead_row_floor.rs (target/debug/deps/issue218_dead_row_floor-0c3afd00b89036f6)
+
+running 6 tests
+test puller_below_a_purged_dead_row_is_told_truncated ... ok
+test dead_row_without_peer_id_falls_back_to_baseline ... ok
+test ack_prefix_purge_of_dead_row_raises_floor ... ok
+test healthy_reclaim_does_not_raise_baseline ... ok
+test reclaim_purge_of_undecodable_row_raises_floor_for_its_author ... ok
+test dead_row_with_implausible_peer_id_falls_back_to_baseline ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+     Running tests/issue219_filter_scope_cursor.rs (target/debug/deps/issue219_filter_scope_cursor-a5945a7646fe039c)
+
+running 2 tests
+test all_records_filter_suppresses_nothing ... ok
+test filtered_record_is_skipped_by_cursor_and_widening_scope_does_not_bring_it_back ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/issue221_purge_atomicity.rs (target/debug/deps/issue221_purge_atomicity-a9c0cfef9f42e1f0)
+
+running 2 tests
+test concurrent_reclaim_purge_count_is_exact ... ok
+test concurrent_reclaim_does_not_double_free_slots ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/issue226_replica_state_provider.rs (target/debug/deps/issue226_replica_state_provider-04d6dcdc78b286c0)
+
+running 5 tests
+test non_relay_peer_serves_only_itself ... ok
+test replica_state_matches_author_state ... ok
+test truncation_names_the_author ... ok
+test author_provider_is_preferred_over_replica ... ok
+test truncated_follower_recovers_via_replica ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+
+     Running tests/issue227_transitive_watermark.rs (target/debug/deps/issue227_transitive_watermark-136e6f1ef0fef4a5)
+
+running 3 tests
+test leaf_relay_acks_fully ... ok
+test non_relay_ack_is_not_capped ... ok
+test relay_ack_waits_for_downstream ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running tests/issue236_state_records_dropped.rs (target/debug/deps/issue236_state_records_dropped-0d2c2e3e45ef45d2)
+
+running 3 tests
+test self_state_records_do_not_count_as_dropped ... ok
+test basic_relay_replica_state_drops_nothing ... ok
+test relay_write_back_to_a_replicated_row_is_counted_as_dropped ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/issue381_vocab_reclaim_sync.rs (target/debug/deps/issue381_vocab_reclaim_sync-91a2ec0af751bb86)
+
+running 2 tests
+test rolling_labels_sync_while_both_peers_reuse_slots ... ok
+test sync_ops_payload_survives_recount_after_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
+
+     Running tests/issue449_drop_floor_on_close.rs (target/debug/deps/issue449_drop_floor_on_close-ce9caf7adef5fed7)
+
+running 1 test
+test writes_dropped_right_before_close_reach_the_peer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/issue450_orphan_group_floor.rs (target/debug/deps/issue450_orphan_group_floor-f9d3aa18d295b966)
+
+running 1 test
+test a_folded_orphan_group_reaches_the_peer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s
+
+     Running tests/issue568_signed_bytes_match.rs (target/debug/deps/issue568_signed_bytes_match-88608e38ab54ac48)
+
+running 1 test
+test a_record_whose_fields_differ_from_its_signed_bytes_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/issue57_wal_drop_bootstrap.rs (target/debug/deps/issue57_wal_drop_bootstrap-e47a582be46123b3)
+
+running 5 tests
+test a_dropped_relayed_record_raises_its_authors_floor_to_its_own_hlc ... ok
+test async_writes_dropped_from_a_full_wal_reach_the_peer_through_bootstrap ... ok
+test writes_dropped_from_a_full_wal_reach_the_peer_through_bootstrap ... ok
+test a_per_peer_publish_carries_the_raised_floor ... ok
+test the_floor_is_raised_once_when_the_full_episode_ends ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.32s
+
+     Running tests/issue631_wal_peer_on_attach.rs (target/debug/deps/issue631_wal_peer_on_attach-ea35ff1148d11456)
+
+running 2 tests
+test a_peer_id_set_before_the_wal_is_attached_reaches_the_wal ... ok
+test a_reopened_db_keeps_its_peer_id_in_the_wal ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/issue9_destructive.rs (target/debug/deps/issue9_destructive-e6cd617fee38e7c6)
+
+running 10 tests
+test concurrent_resolve_distinct_foreigns_no_collision ... ok
+test foreign_delete_tombstone_survives_reopen ... ok
+test concurrent_resolve_same_foreign_is_consistent ... ok
+test truncated_eidmap_sidecar_falls_back_gracefully ... ok
+test corrupt_eidmap_sidecar_falls_back_gracefully ... ok
+test huge_count_eidmap_sidecar_does_not_oom ... ok
+test double_apply_is_idempotent_on_translator ... ok
+test content_sync_does_not_panic ... ok
+test content_before_tie_is_buffered_then_applied ... ok
+test replica_writeback_is_not_propagated ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s
+
+     Running tests/issue9_foreign_eid_collision.rs (target/debug/deps/issue9_foreign_eid_collision-1171c05a0f9d43d3)
+
+running 3 tests
+test foreign_eid_collision_must_not_clobber_local_entity ... ok
+test translation_mapping_survives_reopen ... ok
+test cross_peer_ref_value_is_translated ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/live_keyed_remote.rs (target/debug/deps/live_keyed_remote-99cd52112a7a42a6)
+
+running 1 test
+test keyed_subscription_follows_remote_writes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.11s
+
+     Running tests/live_query_remote.rs (target/debug/deps/live_query_remote-d962bd0026e6a3ee)
+
+running 1 test
+test remote_writes_enter_and_leave_subscription ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/local_write_lww_gap.rs (target/debug/deps/local_write_lww_gap-057c7f023ffa0572)
+
+running 1 test
+test local_write_must_not_be_overwritten_by_older_remote_record ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/number64_sync.rs (target/debug/deps/number64_sync-0d41f29a4e7de97c)
+
+running 2 tests
+test number64_values_survive_state_bootstrap ... ok
+test number64_values_sync_whole ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+     Running tests/phase2_sync_ops_publish.rs (target/debug/deps/phase2_sync_ops_publish-f07e8480b50cf5de)
+
+running 3 tests
+test publish_since_uses_sync_ops_when_enabled ... ok
+test records_after_ring_reset_are_still_synced ... ok
+test publish_since_filters_by_hlc_through_sync_ops ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/tombstone_survives_reopen.rs (target/debug/deps/tombstone_survives_reopen-2442bb6286f14e48)
+
+running 2 tests
+test tombstone_written_in_the_enable_sync_window_survives_reopen ... ok
+test deleted_entity_does_not_resurrect_after_reopen_with_empty_transport ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/vocab_dedupe.rs (target/debug/deps/vocab_dedupe-dc7926d95f71aefa)
+
+running 2 tests
+test vocab_record_dedupe_distinguishes_bytes ... ok
+test vocab_record_dedupe_on_second_apply ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests/writeback_reverse_eidmap.rs (target/debug/deps/writeback_reverse_eidmap-a7e018278d995a93)
+
+running 4 tests
+test writeback_survives_reopen ... ok
+test ref_value_to_replica_propagates_as_tie_ref ... ok
+test writeback_converges_on_author_entity ... ok
+test lww_concurrent_same_card_converges ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.76s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_textsearch-7b51d8b7a93b744f)
+
+running 14 tests
+test tests::from_bytes_round_trip ... ok
+test tests::remove_text ... ok
+test tests::false_positive_filtered ... ok
+test tests::ascii_search ... ok
+test tests::mixed_jp_ascii ... ok
+test tests::search_single_char ... ok
+test tests::index_and_search ... ok
+test tests::search_no_match ... ok
+test tests::substring_match_is_correct_for_humans ... ok
+test tests::two_char_query_skips_filter ... ok
+test tests::update_text ... ok
+test tests::open_mut_round_trip ... ok
+test tests::postings_only_caller_side_verification ... ok
+test tests::save_and_open ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/issue121_query_len_policy.rs (target/debug/deps/issue121_query_len_policy-6c6879e0c0aeace0)
+
+running 9 tests
+test out_of_range_n_rejected ... ok
+test long_query_on_postings_only_is_an_explicit_error ... ok
+test false_positives_are_filtered_at_every_n ... ok
+test min_query_len_follows_the_index ... ok
+test short_query_on_postings_only_is_an_explicit_error ... ok
+test short_query_falls_back_to_scan_when_text_is_present ... ok
+test search_agrees_with_try_search_when_answerable ... ok
+test empty_query_is_always_empty ... ok
+test exactly_n_chars_needs_no_verification ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/enchudb_transport-f21b2cfaea21c3e6)
+
+running 20 tests
+test host::tests::the_forget_line_does_not_pass_a_clients_published_line ... ok
+test http::tests::relay_start_and_stop ... ok
+test host::tests::cursors_and_state_round_trip ... ok
+test ws::tests::hub_starts_and_stops ... ok
+test host::tests::a_pull_answer_below_the_floor_is_held_back ... ok
+test http::tests::sparse_stream_encode_decode_roundtrip ... ok
+test http::tests::pull_unknown_peer_empty ... ok
+test http::tests::bootstrap_returns_404_when_disabled ... ok
+test http::tests::pull_with_since_filters ... ok
+test http::tests::publish_and_pull_roundtrip ... ok
+test http::tests::bootstrap_downloads_file_and_returns_hlc ... ok
+test http::tests::room_and_legacy_paths_do_not_collide ... ok
+test http::tests::bootstrap_handles_sparse_file_efficiently ... ok
+test http::tests::rooms_are_isolated_and_legacy_untouched ... ok
+test ws::tests::relayed_old_hlc_record_is_not_filtered_out ... ok
+test ws::tests::client_subscribes_and_receives_broadcast ... ok
+test ws::tests::changelistener_adapter_pushes_engine_commits_to_subscriber ... ok
+test ws::tests::scalar_since_still_applies_as_baseline ... ok
+test ws::tests::since_filter_excludes_old_records ... ok
+test ws::tests::broadcast_to_other_peer_does_not_reach ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running unittests src/bin/bench_distributed.rs (target/debug/deps/bench_distributed-03d276673b584e38)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/enchu_demo.rs (target/debug/deps/enchu_demo-5ec807d58c087fa3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/http_host.rs (target/debug/deps/http_host-2db08e93d158acf3)
+
+running 7 tests
+test the_host_asks_a_client_for_its_state ... ok
+test an_old_client_still_syncs ... ok
+test a_lagging_client_does_not_hold_back_the_others ... ok
+test acks_flow_both_ways ... ok
+test a_client_behind_the_floor_bootstraps_from_the_host ... ok
+test the_host_keeps_going_after_a_restart ... ok
+test three_clients_converge_through_the_host ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s
+
+     Running tests/http_host_horizon.rs (target/debug/deps/http_host_horizon-2c7453dd6a263ece)
+
+running 7 tests
+test a_host_without_a_state_file_forgets_nothing ... ok
+test a_restarted_host_keeps_the_line ... ok
+test a_new_clients_offline_writes_are_accepted ... ok
+test a_client_forgets_before_it_applies_the_answer ... ok
+test deletes_are_forgotten_once_everyone_is_past_them ... ok
+test a_client_that_has_not_published_holds_the_line ... ok
+test a_silent_client_stops_holding_the_line_and_is_refused_when_it_returns ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.39s
+
+     Running tests/relay_large_response.rs (target/debug/deps/relay_large_response-dc6a964163e902d3)
+
+running 1 test
+test relay_pull_large_body_survives_slow_reader ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+   Doc-tests enchudb
+
+running 2 tests
+test src/lib.rs - (line 12) - compile ... ok
+test src/lib.rs - (line 30) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+all doctests ran in 3.86s; merged doctests compilation took 3.44s
+   Doc-tests enchudb_connect
+
+running 1 test
+test crates/enchudb-connect/src/lib.rs - (line 22) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+all doctests ran in 3.80s; merged doctests compilation took 3.30s
+   Doc-tests enchudb_ffi
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enchudb_kafka
+
+running 1 test
+test crates/enchudb-kafka/src/lib.rs - (line 12) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 1.59s; merged doctests compilation took 1.18s
+   Doc-tests enchudb_ngram
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enchudb_oplog
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enchudb_rag
+
+running 1 test
+test crates/enchudb-rag/src/lib.rs - (line 17) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 1.60s; merged doctests compilation took 1.27s
+   Doc-tests enchudb_sql
+
+running 1 test
+test crates/enchudb-sql/src/lib.rs - (line 45) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 1.73s; merged doctests compilation took 1.35s
+   Doc-tests enchudb_sync
+
+running 3 tests
+test crates/enchudb-sync/src/shard.rs - shard (line 10) - compile ... ok
+test crates/enchudb-sync/src/sync.rs - sync (line 5) ... ok
+test crates/enchudb-sync/src/lib.rs - (line 8) ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+all doctests ran in 1.96s; merged doctests compilation took 1.32s
+   Doc-tests enchudb_textsearch
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enchudb_transport
+
+running 4 tests
+test crates/enchudb-transport/src/http.rs - http::HttpTransport::bootstrap_to (line 660) ... ok
+test crates/enchudb-transport/src/ws.rs - ws (line 13) ... ok
+test crates/enchudb-transport/src/http.rs - http (line 31) ... ok
+test crates/enchudb-transport/src/ws.rs - ws::WsPushHubAdapter (line 430) ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+all doctests ran in 1.86s; merged doctests compilation took 1.34s
