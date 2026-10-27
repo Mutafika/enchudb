@@ -15488,10 +15488,11 @@ impl Engine {
         Ok(())
     }
 
-    /// 球の土台 (試作) を記録と照らして持ち、 記録に捨てる前の口として付ける。 記録を開いた時 (捨て始める前) に呼ぶ。
+    /// 球の土台 (試作) の番号を控え、 記録に捨てる前の口として付ける。 記録を開いた時 (捨て始める前) に呼ぶ。 土台を開いて記録と
+    /// 照らすのは、 最初に記録へ写す時か宣言の時 (`BallBases::ready`、 開く時間を変えない)。
     fn attach_ball_bases(&self, dir: &std::path::Path, log: &crate::change_log::ChangeLog) {
         self.ball_bases.set_self_peer(self.peer_id());
-        self.ball_bases.attach(dir, log, |hid| self.himo_name_at(hid as usize).map(str::to_string));
+        self.ball_bases.attach(dir, |hid| self.himo_name_at(hid as usize).map(str::to_string));
         log.set_on_discard(self.ball_bases.clone());
     }
 
@@ -15613,6 +15614,8 @@ impl Engine {
         with_tail: bool,
     ) -> io::Result<usize> {
         use std::sync::atomic::Ordering;
+        // 球の土台 (試作): 開いた後に控えた土台を、 捨てる前に開いて記録と照らす
+        self.ball_bases.ready(log);
         let (recs, end) = wal.scan_for_change_log(c.log_wal, wal.checkpoint(), with_tail);
         let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
         if recs.is_empty() {
@@ -18125,6 +18128,7 @@ impl Engine {
         self.oplog_sync()?;
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         self.pump_change_log(wal, log, &mut c, false)?;
+        self.ball_bases.ready(log);
         let pack = |t: enchudb_oplog::Hlc| crate::ball::pack_hlc(t.wall, t.logical);
         if !self.ball_bases.has(hid) {
             let at = wal.mint_hlc();

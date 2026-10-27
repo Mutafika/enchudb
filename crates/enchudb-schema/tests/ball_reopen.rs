@@ -262,8 +262,10 @@ fn a_base_the_log_no_longer_covers_starts_over() {
     std::fs::remove_file(std::path::Path::new(&path).join("changefeed.seg")).unwrap();
     let db = Database::open_with_oplog(&path, WAL).unwrap();
     db.engine().enable_change_log(1 << 20).unwrap();
-    assert_eq!(std::fs::read_dir(std::path::Path::new(&path).join("ball")).unwrap().count(), 0, "使えない土台は消す");
     assert_eq!(declare(&db), (true, true));
+    // 使えない土台は宣言の前 (最初に記録へ写す時か宣言の時) に消し、 宣言が今の列で作り直す
+    let ball = std::path::Path::new(&path).join("ball");
+    assert_eq!(std::fs::read_dir(&ball).unwrap().count(), 2, "作り直した土台 2 本");
     assert!(db.engine().ball_rebuild_stats().is_none(), "組み直していない (今から)");
     assert_eq!(w.verify(&db, "作り直した後"), (0, 10));
     // 今からの履歴は残る

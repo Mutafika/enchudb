@@ -21,7 +21,7 @@
 //! header に `end` = 捨てる終わり を書いて書き出す → `done` 以上の番号の record を cell に当てて書き出す → 返る (記録が捨てる
 //! header を書く)。 header の `done` は次に捨てる時に書く (メモリの `done` は cell を書き出した後に進める)。
 //!
-//! # 落ちた時 ([`BallBases::attach`]、 開く時)
+//! # 落ちた時 ([`BallBases::ready`]、 開いた後に最初に記録へ写す時か宣言の時。 開く時は土台の番号を控えるだけ)
 //!
 //! `done < end` なら、 記録に残っている `[done, end)` を当て直す (番号の順に上書きするので、 途中まで当たっていても同じ列になる)。
 //! 記録が `done` より先を捨てていれば、 捨てる header より先に cell を書き出したので、 その分は当たっている。 記録の始まりが `end`
@@ -274,6 +274,8 @@ impl Base {
 pub(crate) struct BallBases {
     self_peer: std::sync::atomic::AtomicU32,
     bases: Mutex<Vec<Base>>,
+    /// 開く時に控えた、 まだ開いていない土台 (directory, 紐の番号, 名前)。 [`Self::ready`] が開く。
+    pending: Mutex<Vec<(PathBuf, u16, Option<String>)>>,
     recent: Mutex<Recent>,
     /// 試験: 捨てる時に止める所 (1 = header を書き出した後・cell の前、 2 = cell を半分当てて書き出した後)。
     #[cfg(test)]
@@ -285,6 +287,7 @@ impl BallBases {
         Self {
             self_peer: std::sync::atomic::AtomicU32::new(0),
             bases: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
             recent: Mutex::new(Recent::default()),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicU8::new(0),
@@ -299,28 +302,35 @@ impl BallBases {
         self.self_peer.store(p, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 開く時 (記録を開いた後、 捨て始める前): `{dir}/ball/` の土台を開き、 記録と照らして使えるものを持つ。 落ちて当てている途中の
-    /// 土台は記録から当て直す。 使えない土台は消す。 `name_of` は紐の番号 → 名前 (無い紐の土台も消す)。
-    pub(crate) fn attach(&self, dir: &Path, log: &ChangeLog, name_of: impl Fn(u16) -> Option<String>) {
-        let sub = dir.join(DIR);
-        let Ok(rd) = std::fs::read_dir(&sub) else { return };
+    /// 開く時: `{dir}/ball/` にある土台の番号だけを控える (開く時間を変えない。 開いて記録と照らすのは [`Self::ready`])。
+    /// `name_of` は紐の番号 → 名前 (無い紐の土台は `ready` で消す)。
+    pub(crate) fn attach(&self, dir: &Path, name_of: impl Fn(u16) -> Option<String>) {
+        let Ok(rd) = std::fs::read_dir(dir.join(DIR)) else { return };
         let mut found: Vec<u16> =
             rd.flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".seg")?.parse::<u16>().ok()).collect();
         found.sort_unstable();
+        let mut p = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        p.extend(found.into_iter().map(|hid| (dir.to_path_buf(), hid, name_of(hid))));
+    }
+
+    /// 控えた土台を開き、 記録と照らして使えるものを持つ。 落ちて当てている途中の土台は記録から当て直す。 使えない土台は消す。
+    /// 記録に写す前 (engine の `pump_change_log` の頭) と宣言の時に呼ぶ = 記録が捨てる前に必ず開いてある。
+    pub(crate) fn ready(&self, log: &ChangeLog) {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()));
         let peer = self.self_peer.load(std::sync::atomic::Ordering::Relaxed);
-        for hid in found {
-            let res = name_of(hid)
+        for (dir, hid, name) in pending {
+            let res = name
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such himo"))
-                .and_then(|name| Base::open(dir, hid, &name))
+                .and_then(|name| Base::open(&dir, hid, &name))
                 .and_then(|(mut b, h)| Self::repair(&mut b, h, log, peer).map(|()| b));
             match res {
                 Ok(b) => self.lock().push(b),
                 Err(e) => {
                     eprintln!(
                         "[enchudb] warning: ball base {} cannot be used ({e}) — its history is lost; the ball starts over when declared",
-                        path_of(dir, hid).display()
+                        path_of(&dir, hid).display()
                     );
-                    let _ = std::fs::remove_file(path_of(dir, hid));
+                    let _ = std::fs::remove_file(path_of(&dir, hid));
                 }
             }
         }
@@ -407,10 +417,14 @@ impl BallBases {
 
 impl OnDiscard for BallBases {
     fn wants(&self) -> bool {
-        !self.lock().is_empty()
+        !self.lock().is_empty() || !self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
     }
 
     fn discard(&self, first: u64, end: u64, end_hlc: Hlc, hole: Option<u64>, read: &mut dyn FnMut(u64, u64) -> Vec<Entry>) -> io::Result<()> {
+        if !self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+            // 開いていない土台がある (ready の前に捨てる道は無いはず): 捨てない (記録の lock の中では記録を読めないので開けない)
+            return Err(io::Error::other("ball bases are not opened yet"));
+        }
         let peer = self.self_peer.load(std::sync::atomic::Ordering::Relaxed);
         let mut g = self.lock();
         // 当てる番号: 土台のうち一番手前の done (記録の始まりより前は無い) から end まで
@@ -591,8 +605,9 @@ mod tests {
     fn reopen(dir: &Path) -> (ChangeLog, Arc<BallBases>) {
         let log = ChangeLog::open(dir, MIN_CAP, false, false).unwrap();
         let bases = Arc::new(BallBases::new());
-        bases.attach(dir, &log, |h| (h == HID).then(|| NAME.to_string()));
+        bases.attach(dir, |h| (h == HID).then(|| NAME.to_string()));
         log.set_on_discard(bases.clone());
+        bases.ready(&log);
         (log, bases)
     }
 
@@ -800,7 +815,9 @@ mod tests {
         add(&log, &BallBases::new(), false, &ws, &mut at, 10_000).unwrap();
         assert!(log.range().0 > 0);
         let bases = BallBases::new();
-        bases.attach(&dir, &log, |h| (h == HID).then(|| NAME.to_string()));
+        bases.attach(&dir, |h| (h == HID).then(|| NAME.to_string()));
+        assert!(path_of(&dir, HID).exists(), "開く時は控えるだけ");
+        bases.ready(&log);
         assert!(!bases.has(HID));
         assert!(!path_of(&dir, HID).exists(), "使えない土台は消す");
     }
