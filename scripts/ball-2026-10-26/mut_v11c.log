@@ -1,4 +1,4 @@
-baseline: pass 3 秒 → 1 run の上限 39 秒
+baseline: pass 8 秒 → 1 run の上限 54 秒
   killed 8s              記録より先の終わりを受け入れる
   killed 8s              今の列と比べない
   killed 8s              合わない時に地平を進めない

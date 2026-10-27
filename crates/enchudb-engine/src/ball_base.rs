@@ -335,8 +335,9 @@ impl BallBases {
         if first > h.end {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the change log dropped {}..{first} without the base", h.end)));
         }
-        if h.done < h.end {
-            // [done, first) は記録が捨てた = 捨てる header より先に cell を書き出してある
+        // [done, first) は記録が捨てた = 捨てる header より先に cell を書き出してある。 残っている分 [max(done, first), end) が
+        // あれば当て直す (捨てる header の前に落ちた)。 無ければ header の done は次に捨てる時に追いつく (開く時に書き出さない)
+        if h.done.max(first) < h.end {
             let mut pos = h.done.max(first);
             while pos < h.end {
                 let es = log.read(pos, READ_CHUNK).map_err(|t| io::Error::new(io::ErrorKind::InvalidData, t.to_string()))?;
@@ -763,20 +764,22 @@ mod tests {
         }
     }
 
-    /// 置けない大きさの record (中身を残さない番号) で全部捨てても、 土台は番号を数えて記録の始まりに居る。
+    /// 置けない大きさの record (中身を残さない番号) で全部捨てても、 土台は番号を数えて記録の始まりに居る。 控えあり / なしの両方で。
     #[test]
     fn a_record_too_large_to_keep_is_a_hole() {
-        let dir = tempdir("hole");
-        let ws = writes(3_000, 77);
-        let (log, bases) = setup(&dir);
-        let mut at = 0;
-        add(&log, &bases, true, &ws, &mut at, 2_000).unwrap();
-        let big = NewEntry { hlc: hlc(2_000), wal_id: 2_000, bytes: vec![0; MIN_CAP / 2] };
-        log.append(&[big], &[], &mut Vec::new()).unwrap();
-        assert_eq!(log.range(), (2_001, 2_001));
-        let (done, hz, m) = cells(&bases);
-        assert_eq!((done, hz), (2_001, hlc(2_000)));
-        assert_eq!(m, state(&ws, 2_000));
+        for noting in [true, false] {
+            let dir = tempdir(&format!("hole{noting}"));
+            let ws = writes(3_000, 77);
+            let (log, bases) = setup(&dir);
+            let mut at = 0;
+            add(&log, &bases, noting, &ws, &mut at, 2_000).unwrap();
+            let big = NewEntry { hlc: hlc(2_000), wal_id: 2_000, bytes: vec![0; MIN_CAP / 2] };
+            log.append(&[big], &[], &mut Vec::new()).unwrap();
+            assert_eq!(log.range(), (2_001, 2_001));
+            let (done, hz, m) = cells(&bases);
+            assert_eq!((done, hz), (2_001, hlc(2_000)), "控え {noting}");
+            assert_eq!(m, state(&ws, 2_000), "控え {noting}");
+        }
     }
 
     /// 記録が土台に当てずに捨てた (土台を知らない binary で開いた等): 開く時に土台を消す。

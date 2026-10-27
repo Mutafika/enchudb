@@ -1,13 +1,13 @@
 baseline: pass 8 秒 → 1 run の上限 54 秒
-  killed 7s              開く時に土台を持たない
+  killed 8s              開く時に土台を持たない
   killed 8s              記録を作る時に土台を照らさない
   killed 8s              記録に捨てる前の口を付けない
   killed 8s              土台を作らない (メモリだけ)
   killed 8s              組み直しの地平を今にする
-  killed 9s              記録の残りを当てない
+  killed 8s              記録の残りを当てない
   killed 8s              記録の時刻で当てない
-  killed 9s              消すを当てない (組み直し)
-  SURVIVED 9s            今の列と比べない
+  killed 8s              消すを当てない (組み直し)
+  killed 8s              今の列と比べない
   killed 8s              宣言の時に WAL を書き出さない
   SURVIVED 8s            宣言の時に記録に写さない
   killed 4s              地平より前も答える (value_at)
@@ -16,6 +16,5 @@ baseline: pass 8 秒 → 1 run の上限 54 秒
   killed 3s              地平の境目を含めない
   killed 4s              地平を置かない
   killed 8s              当てる時に球を回さない
-killed 15 / survived 2 / その他 0
-  生き残り: 今の列と比べない
+killed 16 / survived 1 / その他 0
   生き残り: 宣言の時に記録に写さない

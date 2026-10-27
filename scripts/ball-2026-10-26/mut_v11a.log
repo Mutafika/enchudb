@@ -1,25 +1,29 @@
-baseline: pass 3 秒 → 1 run の上限 39 秒
+baseline: pass 1 秒 → 1 run の上限 33 秒
   killed 3s              捨てる前に土台の header を書かない
-  killed 2s              捨てる時に cell を当てない
+  killed 3s              捨てる時に cell を当てない
   killed 3s              当て終えた終わりを進めない
-  killed 2s              地平を進めない (捨てる時)
-  killed 3s              中身を残さない番号を欠けと見る
+  killed 3s              地平を進めない (捨てる時)
+  SURVIVED 3s            中身を残さない番号を欠けと見る
   killed 3s              開く時に当て直さない
-  killed 2s              当て直しを記録の始まりから読まない
-  SURVIVED 3s            記録より先の終わりを受け入れる
+  killed 3s              当て直しを記録の始まりから読まない
+  SURVIVED 4s            記録より先の終わりを受け入れる
   killed 3s              当てずに捨てた土台を受け入れる
   killed 2s              cell を値 + 1 にしない
-  killed 2s              名前で指す書き込みを読まない
-  killed 2s              消すを読まない
-  killed 2s              外すを読まない
-  killed 2s              別の紐の書き込みも当てる
+  killed 3s              名前で指す書き込みを読まない
+  killed 3s              消すを読まない
+  killed 3s              外すを読まない
+  killed 3s              別の紐の書き込みも当てる
   killed 3s              消すを当てない
-  SURVIVED 3s            開く時に地平を header から戻さない
-  killed 2s              捨てる前の口を呼ばない
+  killed 3s              控えの前の番号を記録から読まない
+  killed 4s              控えの続きでない時に始め直さない
+  killed 3s              作った時より前の番号の時に早く返らない
+  killed 3s              控えに消すを入れない
+  killed 3s              控えに名前で指す書き込みを入れない
+  killed 3s              捨てる前の口を呼ばない
   killed 3s              捨てる header の後で口を呼ぶ
   killed 3s              置けない record の前に口を呼ばない
-  killed 2s              口の Err を捨てる
+  killed 3s              口の Err を捨てる
   killed 3s              地平の HLC を最後の entry から取らない
-killed 19 / survived 2 / その他 0
+killed 23 / survived 2 / その他 0
+  生き残り: 中身を残さない番号を欠けと見る
   生き残り: 記録より先の終わりを受け入れる
-  生き残り: 開く時に地平を header から戻さない
