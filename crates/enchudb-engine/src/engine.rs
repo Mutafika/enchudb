@@ -4945,7 +4945,7 @@ pub struct Engine {
     ball_rebuild_stats: std::sync::Mutex<Option<BallRebuildStats>>,
     /// 球を組む人は 1 人ずつ (`build_ball`)。
     ball_build: std::sync::Mutex<()>,
-    /// 試験: 組む時、 記録の残りを読んだ後に止まる時間 (ms、 最後の回の他。 書き手が並んで書く間を広げる)。
+    /// 試験: 組む時、 記録の残りを読んだ後と追いつきの間に止まる時間 (ms、 書き手が並んで書く間を広げる)。
     ball_build_pause: std::sync::atomic::AtomicU64,
     /// 試験: 公開中を置いた後・H を取る前 / 書き終えを待った後・残りを読む前に止まる時間 (µs、 公開の約束の場所を広げる)。
     ball_publish_pause: [std::sync::atomic::AtomicU64; 2],
@@ -18371,7 +18371,7 @@ impl Engine {
             }
             let log_ns = t_log.elapsed().as_nanos() as u64;
             let pause = self.ball_build_pause.load(std::sync::atomic::Ordering::Relaxed);
-            if pause > 0 && attempt < ATTEMPTS {
+            if pause > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(pause));
             }
             // (2) 記録の残り (読んでいる間に写した分) と WAL の残り。 公開中 (書き手が待つ間) を短くするため、 1 回に当てる数が
@@ -18379,7 +18379,7 @@ impl Engine {
             let t_catch = std::time::Instant::now();
             let mut ok = true;
             for i in 0..16 {
-                if pause > 0 && attempt < ATTEMPTS && i > 0 {
+                if pause > 0 && i > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(pause));
                 }
                 let before = rp.records;
@@ -18465,8 +18465,8 @@ impl Engine {
         self.ball_publish_pause[1].store(after_us, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 試験: 球を組む時、 記録の残りを読んだ後と追いつきの 2 回目から毎回の前に `ms` 止まる (最後の回 = 記録に写すのを止めて組む回の他。
-    /// 書き手が並んで書く間と、 追いつきの間に consumer が写す・畳む間を広げる)。
+    /// 試験: 球を組む時、 記録の残りを読んだ後と追いつきの 2 回目から毎回の前に `ms` 止まる (書き手が並んで書く間と、 追いつきの間に
+    /// consumer が写す・畳む間を広げる。 最後の回 = 記録に写すのを止めて組む回は、 止まっても記録が捨てない)。
     #[doc(hidden)]
     pub fn ball_set_build_pause(&self, ms: u64) {
         self.ball_build_pause.store(ms, std::sync::atomic::Ordering::Relaxed);
