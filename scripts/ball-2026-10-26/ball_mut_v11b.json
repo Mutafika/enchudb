@@ -20,8 +20,8 @@
  {
   "name": "土台を作らない (メモリだけ)",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            && !self.sync_tables_enabled()\n        {\n            return self.declare_ball_kept",
-  "replace": "            && false\n        {\n            return self.declare_ball_kept"
+  "find": "            && !self.is_readonly()\n            && !self.sync_tables_enabled()\n            && !self.tables",
+  "replace": "            && false\n            && !self.sync_tables_enabled()\n            && !self.tables"
  },
  {
   "name": "組み直しの地平を今にする",
