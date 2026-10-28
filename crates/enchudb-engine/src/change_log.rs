@@ -149,6 +149,9 @@ pub struct ChangeLog {
     st: Mutex<State>,
     /// 捨てる前に呼ぶ口 ([`OnDiscard`])。
     on_discard: std::sync::OnceLock<Arc<dyn OnDiscard>>,
+    /// 測り (試作): `read` が lock を待った時間の和 / 足す側が 1 回分 lock を持った時間の最大と和。
+    read_wait_ns: std::sync::atomic::AtomicU64,
+    chunk_ns: [std::sync::atomic::AtomicU64; 2],
     /// 試験: entry を書き出した後・新しい header の前で止める (落ちた形)。
     #[cfg(test)]
     stop_before_header: std::sync::atomic::AtomicBool,
@@ -182,6 +185,8 @@ impl ChangeLog {
             cap,
             st: Mutex::new(State { c: Cursor::default(), marks: VecDeque::new(), marked: true }),
             on_discard: std::sync::OnceLock::new(),
+            read_wait_ns: std::sync::atomic::AtomicU64::new(0),
+            chunk_ns: Default::default(),
             #[cfg(test)]
             stop_before_header: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -298,9 +303,10 @@ impl ChangeLog {
     /// 番号を使うだけで残さず、 その前の entry も全部捨てる (読み手はその番号で [`Truncated`] になる)。 途中で書き出しに失敗したら
     /// Err (それまでに足した分は残る、 `range` の `next` で数が判る)。
     pub fn append(&self, recs: &[NewEntry], watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
-        let mut st = self.st.lock().unwrap();
         let mut i = 0;
         while i < recs.len() {
+            // 1 回分ごとに lock を取り直す (間は header を書き終えた揃った形。 足す側は呼び手の lock で 1 本)
+            let mut st = self.st.lock().unwrap();
             if recs[i].bytes.len() > self.max_entry() {
                 self.skip_one(&mut st, &recs[i], watch, lost)?;
                 i += 1;
@@ -317,7 +323,7 @@ impl ChangeLog {
                 chunk += n;
                 j += 1;
             }
-            self.append_chunk(&mut st, &recs[i..j], watch, lost)?;
+            self.append_chunk(st, &recs[i..j], watch, lost)?;
             i = j;
         }
         Ok(())
@@ -339,7 +345,21 @@ impl ChangeLog {
         self.map.flush_dirty()
     }
 
-    fn append_chunk(&self, st: &mut State, recs: &[NewEntry], watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
+    /// 1 回分を足す。 entry を書いて書き出す間 (2) は lock を放す: 置く場所は (1) で捨てた後の空き (`next` より先) で、 読み手は
+    /// `[first, next)` しか読まない。 足す側は呼び手の lock で 1 本なので、 その間に `c` を変える者は居ない。
+    fn append_chunk(
+        &self,
+        mut st: std::sync::MutexGuard<'_, State>,
+        recs: &[NewEntry],
+        watch: &[u64],
+        lost: &mut Vec<(u64, Hlc)>,
+    ) -> io::Result<()> {
+        let held = |t: std::time::Instant| {
+            let ns = t.elapsed().as_nanos() as u64;
+            self.chunk_ns[0].fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+            self.chunk_ns[1].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+        };
+        let t_held = std::time::Instant::now();
         // (1) 置き場所を決め、 捨てる分を数える (まだ data は触らない)
         let old_next = st.c.next;
         let mut sim = st.c;
@@ -367,7 +387,7 @@ impl ChangeLog {
             sim.next += 1;
         }
         if sim.first != st.c.first {
-            self.before_discard(st, sim.first.min(old_next), None)?;
+            self.before_discard(&mut st, sim.first.min(old_next), None)?;
             // header が捨てた場所を指さないようにしてから上書きする。 古い entry が全部消えたら空の記録
             let mut mid = st.c;
             if sim.first >= old_next {
@@ -381,7 +401,9 @@ impl ChangeLog {
             self.region.mark_dirty(0, HEADER);
             self.map.flush_dirty()?;
         }
-        // (2) entry を書いて書き出す
+        // (2) entry を書いて書き出す (lock の外)
+        drop(st);
+        held(t_held);
         for (k, (r, (at, wrap))) in recs.iter().zip(plan.iter()).enumerate() {
             let no = old_next + k as u64;
             if let Some(w) = *wrap {
@@ -401,6 +423,8 @@ impl ChangeLog {
             return Err(io::Error::other("test: stopped before the header"));
         }
         // (3) 新しい head / next
+        let mut st = self.st.lock().unwrap();
+        let t_held = std::time::Instant::now();
         sim.last = recs.last().map(|r| (r.hlc, r.wal_id)).or(sim.last);
         st.c = sim;
         write_header(&self.region, &st.c);
@@ -418,12 +442,16 @@ impl ChangeLog {
                 }
             }
         }
+        drop(st);
+        held(t_held);
         Ok(())
     }
 
     /// `pos` から最大 `max_bytes` (少なくとも 1 件) 読む。 `pos == next` は空。 `pos` が記録に無ければ [`Truncated`]。
     pub fn read(&self, pos: u64, max_bytes: usize) -> Result<Vec<Entry>, Truncated> {
+        let t0 = std::time::Instant::now();
         let mut st = self.st.lock().unwrap();
+        self.read_wait_ns.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let (first, next) = (st.c.first, st.c.next);
         if pos < first || pos > next {
             return Err(Truncated { from: if pos < first { first } else { next } });
@@ -435,6 +463,44 @@ impl ChangeLog {
             (out, true) => Ok(out),
             (_, false) => Err(Truncated { from: first }),
         }
+    }
+
+    /// 測り (試作): (`read` が lock を待った時間の和, 足す側が 1 回分 lock を持った時間の最大, その和)。
+    pub(crate) fn wait_stats(&self) -> [u64; 3] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [self.read_wait_ns.load(Relaxed), self.chunk_ns[0].load(Relaxed), self.chunk_ns[1].load(Relaxed)]
+    }
+
+    /// `pos` から先で、 HLC が `after` より後 (`(wall, logical)` で比べる) の最初の entry の番号。 無ければ `next`。 entry が HLC の順に
+    /// 並ぶ (sync しない DB は WAL の順 = 採番の順) 前提で、 目印 (64 件ごと) を二分探索してから 1 件ずつ見る (中身は写さない)。
+    /// `pos` が記録に無ければ [`Truncated`]。 読めない entry に当たったら `pos` を返す (呼び手は普通に読んで確かめる)。
+    pub fn seek_after(&self, pos: u64, after: (u64, u32)) -> Result<u64, Truncated> {
+        let mut st = self.st.lock().unwrap();
+        let (first, next) = (st.c.first, st.c.next);
+        if pos < first || pos > next {
+            return Err(Truncated { from: if pos < first { first } else { next } });
+        }
+        if pos == next {
+            return Ok(next);
+        }
+        let Some(at_pos) = self.locate(&mut st, pos) else { return Ok(pos) };
+        let key = |e: &EntryHeader| (e.hlc.wall, e.hlc.logical);
+        // pos より後の目印のうち、 entry が after 以前の最後の物から歩く
+        let lo = st.marks.partition_point(|&(m, _)| m <= pos);
+        let k = lo + st.marks.range(lo..).collect::<Vec<_>>().partition_point(|&&(m, at)| {
+            self.entry_at(self.wrap_at(at)).filter(|e| e.no == m).is_some_and(|e| key(&e) <= after)
+        });
+        let (mut no, mut at) = if k == lo { (pos, at_pos) } else { st.marks[k - 1] };
+        while no < next {
+            at = self.wrap_at(at);
+            let Some(e) = self.entry_at(at).filter(|e| e.no == no) else { return Ok(pos) };
+            if key(&e) > after {
+                return Ok(no);
+            }
+            at = (at + entry_size(e.len)) % self.cap;
+            no += 1;
+        }
+        Ok(next)
     }
 
     /// `pos` から `until` の手前まで、 最大 `max_bytes` (少なくとも 1 件) 読む。 2 つ目は読めない entry に当たらなかったか

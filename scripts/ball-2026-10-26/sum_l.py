@@ -30,6 +30,17 @@ for k in sorted(by):
             if "setup_ns" in d:
                 sn = d["setup_ns"]
                 print(f"      読む前: 円柱 {sn[0]/1e6:.1f} ms / change_emit を待って土台を開く {sn[1]/1e6:.1f} ms / 種を読む {sn[2]/1e6:.1f} ms / 球を作る {sn[3]/1e6:.1f} ms")
+            if "log_prof_ns" in d:
+                for lab, pn2, c2 in (("最初の記録", d["log_prof_ns"], d["log_prof_n"]), ("追いつき", pn, c)):
+                    print(
+                        f"      {lab}: 記録を読む {pn2[0]/1e6:.1f} / 解いて当てる {pn2[1]/1e6:.1f} (entry {c2[0]}) / 控えを当てる {pn2[5]/1e6:.1f} "
+                        f"(捨てていた {c2[3]} 回) / 控えを落とす {pn2[6]/1e6:.1f} / 写した所 {pn2[2]/1e6:.1f} / WAL {pn2[3]/1e6:.1f} + {pn2[4]/1e6:.1f} ms"
+                    )
+            if "skipped" in d:
+                print(f"      畳んだ後に飛んだ entry {d['skipped']} / 公開中の前に書き出しを待つ {d['prequiesce_ns']/1e6:.1f} ms / 読み直し {d.get('refolds', '-')}")
+            if "log_lock_ns" in d:
+                ll = d["log_lock_ns"]
+                print(f"      記録の lock: 読みが待つ 最初 {ll[0]/1e6:.1f} / 追いつき {ll[1]/1e6:.1f} ms、 足す側が 1 回分持つ 最大 {ll[2]/1e6:.1f} ms、 組む間に持った和 {ll[3]/1e6:.1f} ms")
             per = lambda t, n: t / max(n, 1)
             print(
                 f"      1 件: 記録を読む {per(pn[0], c[0]):.0f} ns / 解いて当てる {per(pn[1], c[0]):.0f} ns / WAL を読む {per(pn[3], c[1]):.0f} ns / "
