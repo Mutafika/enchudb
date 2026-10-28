@@ -80,7 +80,7 @@ impl Hist {
             for v in VALS {
                 let mut want: Vec<u64> = (0..self.eids.len()).filter(|&i| cur[i] == Some(v)).map(|i| self.eids[i]).collect();
                 want.sort_unstable();
-                assert_eq!(eng.ball_pull_at("t.a", v, *t).unwrap(), want, "{what}: 回 {k} t={t} v={v}");
+                assert_eq!(eng.ball_pull_at("t.a", v, *t).unwrap(), want, "{what}: 回 {k} t={t} v={v} (地平 {hz}、 宣言の地平 {}、 控え {})", self.hz0, self.checks.len());
             }
             for (i, &e) in self.eids.iter().enumerate() {
                 assert_eq!(eng.ball_value_at(e, "t.a", *t).unwrap(), cur[i], "{what}: 回 {k} t={t} e={e}");
