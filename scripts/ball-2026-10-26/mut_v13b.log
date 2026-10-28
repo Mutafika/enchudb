@@ -1,0 +1,5 @@
+baseline: pass 11 秒 → 1 run の上限 600 秒
+  killed 9s              記録を飛ぶ時に 1 つ先まで飛ぶ
+  killed 9s              目印の二分探索の向きを逆に
+  killed 11s             捨てた後の形を lock を放す前に置かない
+killed 3 / survived 0 / その他 0

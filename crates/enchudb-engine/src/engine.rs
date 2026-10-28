@@ -109,6 +109,8 @@ pub struct BallRebuildStats {
     pub skipped: u64,
     /// 球を回した数 (`Ball::replay`、 値の変わる書き込みだけ、 最初の記録の段も含む)。 当てた数は [`Self::applied`]。
     pub replays: u64,
+    /// 同じ周で WAL の続きを読んだ時に、 写す側が読み終えた所より先まで写していた回数 (試験の前提)。
+    pub ahead: u64,
     /// 公開中に入る前に、 畳む書き出しの終わりを待った時間 (この base の WAL は書き出しから畳むまで append を止める)。
     pub prequiesce_ns: u64,
     /// 記録の lock の測り ([`crate::change_log::ChangeLog::wait_stats`] の組む間の差): 読みが lock を待った時間 (最初の記録 / 追いつき) /
@@ -144,6 +146,8 @@ struct BallReplay<'a> {
     skipped: u64,
     /// 読んだ数 (記録の entry と WAL の record、 球の紐に当たらない物も)。 追いつきが縮んだかをこれで見る。
     work: u64,
+    /// [`BallRebuildStats::ahead`]。
+    ahead: u64,
     /// 球を回した数 (`Ball::replay`、 値の変わる書き込みだけ)。
     replays: u64,
     /// [`BallRebuildStats::prof_ns`] / `prof_n`。
@@ -280,7 +284,11 @@ impl BallReplay<'_> {
             };
             let t1 = std::time::Instant::now();
             let start = match self.wal_mark {
-                Some((l, off)) if l == lap => off,
+                Some((l, off)) if l == lap => {
+                    // 写す側が読み終えた所より先まで写していても、 WAL は読み終えた所から (記録は読まない)
+                    self.ahead += u64::from(log_wal > off);
+                    off
+                }
                 _ => {
                     // 当てた所までは読まずに飛ぶ (畳んだ後の記録は前に WAL で読んだ分を頭に持つ)
                     if let Ok(p) = log.seek_after(*pos, (self.last.wall, self.last.logical))
@@ -18526,6 +18534,7 @@ impl Engine {
             prof_n: [0; 4],
             skipped: 0,
             work: 0,
+            ahead: 0,
             replays: 0,
         };
         let make_ns = t0.elapsed().as_nanos() as u64 - ready_ns - seed_ns;
@@ -18581,8 +18590,8 @@ impl Engine {
         // (4) H より前の残り
         rp.catch_up(log, wal, &mut pos, Some(h));
         // (5) 出す
-        let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays) =
-            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays);
+        let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead) =
+            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead);
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
         self.ball_bases.end_side();
         let st = BallRebuildStats {
@@ -18604,6 +18613,7 @@ impl Engine {
             skipped: rp_skipped,
             prequiesce_ns,
             replays: rp_replays,
+            ahead: rp_ahead,
             log_lock_ns: {
                 let w2 = log.wait_stats();
                 [w1[0] - w0[0], w2[0] - w1[0], w2[1], w2[2] - w0[2]]

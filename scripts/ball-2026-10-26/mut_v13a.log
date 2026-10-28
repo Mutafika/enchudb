@@ -1,0 +1,26 @@
+baseline: pass 13 秒 → 1 run の上限 900 秒
+  killed 10s             公開中の書き手が待たずに球に書かない
+  killed 9s              公開中の書き手が待たずに閾値を見ずに球に書く
+  killed 9s              閾値を見ずに球に書く
+  killed 12s             閾値より後も書き手が書かない
+  killed 17s             最後の残りを当てない
+  killed 16s             最後の残りで H 以降も当てる
+  killed 13s             H を取ってから公開中を置く
+  SURVIVED 43s           H より前の書き終えを待たない
+  skip   WAL の残りを読まない: find が 0 回
+  killed 51s             WAL を前の周の位置から読む
+  killed 26s             読む間に畳んでも周を見ない
+  killed 45s             捨てる口が組む側に控えを渡さない
+  killed 37s             控えを組む前に始めない
+  killed 28s             読めない所を控えから当てない
+  killed 38s             土台の時点を地平にしない
+  killed 7s              開く時に組んでいない球にしない
+  killed 41s             WAL の無い書き込みで印を置かない (書く)
+  killed 36s             印のある土台を作り直さない
+  killed 28s             記録と WAL の重なりを落とさない
+  killed 62s             同じ周の WAL の続きでなく写した所から読む
+  killed 20s             畳んだ後に記録を読まない
+  killed 42s             縮まなくても回し続ける
+  killed 9s              開いていない土台を組む前に開かない
+killed 21 / survived 1 / その他 1
+  生き残り: H より前の書き終えを待たない

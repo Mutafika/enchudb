@@ -167,9 +167,16 @@ fn concurrent_session(
     scan_pause_us: u64,
     seed: u64,
     min_seen: usize,
+    listen: bool,
 ) -> Session {
     let db = Database::open_with_oplog(path, wal).unwrap();
     let eng = db.engine();
+    if listen {
+        // changefeed の listener が居ると、 通知係が consumer の書き出しのたびに記録へ写す (居なければ畳む時だけ)
+        struct Quiet;
+        impl enchudb_engine::changefeed::ChangeListener for Quiet {}
+        eng.add_change_listener(std::sync::Arc::new(Quiet));
+    }
     eng.ball_set_build_pause(pause_ms);
     eng.ball_set_publish_pause(publish_pause_us.0, publish_pause_us.1);
     eng.ball_set_scan_pause(scan_pause_us);
@@ -289,7 +296,7 @@ fn the_first_read_builds_while_writers_write() {
     let (mut overlapped, mut waits, mut covered) = (0, 0, 0);
     for k in 0..9u64 {
         let pp = [(2000, 0), (0, 2000), (0, 0)][k as usize % 3];
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100, false);
         overlapped += usize::from(ss.during > 0);
         waits += ss.waits;
         covered += ss.covered;
@@ -318,12 +325,31 @@ fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     let mut h = create(&path, SMALL_WAL, 1 << 20);
     let mut used = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2, false);
         used += usize::from(ss.st.side_ops > 0);
-        // 追いつきの間を広げて書き手が全力 = 縮まない: 2 回目で公開中へ (16 回まで回さない)
-        assert!(ss.st.rounds <= 4, "縮まない追いつきを回し続けた: {} 回", ss.st.rounds);
+        // 追いつきの間を広げて書き手が全力 = 縮まない: すぐ公開中へ (打ち切らなければ 16 + 2 回。 回の大きさは畳み方で揺れるので幅を持つ)
+        assert!(ss.st.rounds <= 8, "縮まない追いつきを回し続けた: {} 回", ss.st.rounds);
     }
     assert!(used >= 2, "組む間に記録が捨てた所を読んでいない — 試験の前提 ({used}/3)");
+    cleanup(&path);
+}
+
+/// (T5) 同じ周の WAL の続き (WAL 64 MiB = 組む間に畳まない、 追いつきの前に consumer の 1 tick より長く止まる): 写す側が組む側の読み終えた所より
+/// 先まで記録に写していても、 組む側は記録を読まずに WAL を読み終えた所から読む (写した所から読むと間の record を落とす)。 記録へ写すのは
+/// listener が居る時の通知係なので、 何もしない listener を付ける。
+#[test]
+fn a_build_continues_the_wal_where_it_stopped() {
+    let path = tmp_path("t5");
+    cleanup(&path);
+    let _gone = Gone(path.clone());
+    let mut h = create(&path, WAL, 128 << 20);
+    let mut ahead = 0;
+    for k in 0..3u64 {
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3, 4, 150, (0, 0), 0, 0x5555 + k, 100, true);
+        assert_eq!(ss.folds, 0, "組む間に畳んだ — 試験の前提");
+        ahead += usize::from(ss.st.ahead > 0);
+    }
+    assert!(ahead >= 2, "写す側が組む側より先に写していない — 試験の前提 ({ahead}/3)");
     cleanup(&path);
 }
 
@@ -340,7 +366,7 @@ fn a_build_reads_on_while_the_wal_folds() {
     let (mut folded, mut refolds) = (0, 0);
     for k in 0..3u64 {
         // WAL の位置を取った後・読む前に 20 ms 止まる (その間に畳むと、 読む所が新しい周の途中になる)
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 20_000, 0x99 + k, 100);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 20_000, 0x99 + k, 100, false);
         assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         folded += usize::from(ss.folds > 0);
         refolds += usize::from(ss.st.refolds > 0);
