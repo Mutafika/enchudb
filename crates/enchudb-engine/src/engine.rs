@@ -281,11 +281,11 @@ impl BallReplay<'_> {
             tries += 1;
             let t0 = std::time::Instant::now();
             // 組を置き直す前に読み直しが続くなら (畳んだ直後)、 change_emit の下で読む (畳むのと写すのはこの lock の下)
-            let (next, log_wal) = match self.eng.ball_bases.mark().filter(|_| tries <= 3) {
+            let (next, log_wal, folds) = match self.eng.ball_bases.mark().filter(|_| tries <= 3) {
                 Some(m) => m,
                 None => {
                     let c = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-                    (log.range().1, c.log_wal)
+                    (log.range().1, c.log_wal, wal.folds())
                 }
             };
             let t1 = std::time::Instant::now();
@@ -333,10 +333,12 @@ impl BallReplay<'_> {
             self.prof[3] += t2.elapsed().as_nanos() as u64;
             self.prof_n[1] += seen;
             self.work += seen;
-            // 読み始めた所の区画 (周 0 = 頭から全部、 は除く) と読んだ区画が、 読んだ後もあるか
+            // 読み始めた所の区画と読んだ区画が、 読んだ後もあるか。 写した所が 「頭から」 (周 0 = その場で畳んだ後) の時は区画の周が
+            // 無いので、 組を置いた後に畳んでいないかを畳んだ回で見る (畳んでいれば、 頭からの区画は組の後に畳んだ区画の後ろ = 間を飛ぶ)
             let held = |lap: u32| wal.holds(wal_pos(lap, HEADER_SIZE as u64));
             let first = wal_pos_lap(start);
-            if (first != 0 && !held(first)) || !laps.iter().flatten().all(|&l| held(l)) {
+            let start_gone = if first == 0 { wal.folds() != folds } else { !held(first) };
+            if start_gone || !laps.iter().flatten().all(|&l| held(l)) {
                 // 読む前か読む間に畳んだ: 読んだ所は畳んだ区画の途中まで = その区画の残り (記録に写した) を飛ばしている。
                 // 当てずに捨てて、 記録から読み直す
                 self.wal_mark = None;
@@ -15821,7 +15823,7 @@ impl Engine {
         };
         // 畳んだ印を新しい周より先に届ける (続きの位置を探す時に、 前の周と新しい周を取り違えない)
         wal.set_sync_on_reset(true);
-        self.mark_change_log(&log, &c);
+        self.mark_change_log(wal, &log, &c);
         self.attach_ball_bases(set.dir(), &log);
         let _ = self.change_log.set(log);
         Ok(())
@@ -15916,7 +15918,7 @@ impl Engine {
                 {
                     let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
                     c.log_wal = start;
-                    self.mark_change_log(&log, &c);
+                    self.mark_change_log(wal, &log, &c);
                 }
                 wal.set_sync_on_reset(true);
                 self.attach_ball_bases(set.dir(), &log);
@@ -15979,8 +15981,8 @@ impl Engine {
     }
 
     /// 球を組む側に記録に写した所を渡す ([`crate::ball_base::BallBases::set_mark`]、 呼び手が `change_emit` を持つ = 畳まない)。
-    fn mark_change_log(&self, log: &crate::change_log::ChangeLog, c: &ChangeCursor) {
-        self.ball_bases.set_mark(log.range().1, c.log_wal);
+    fn mark_change_log(&self, wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog, c: &ChangeCursor) {
+        self.ball_bases.set_mark(log.range().1, c.log_wal, wal.folds());
     }
 
     fn pump_change_log(
@@ -15997,7 +15999,7 @@ impl Engine {
         let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
         if recs.is_empty() {
             c.log_wal = c.log_wal.max(end);
-            self.mark_change_log(log, c);
+            self.mark_change_log(wal, log, c);
             return Ok(0);
         }
         let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
@@ -16034,7 +16036,7 @@ impl Engine {
         } else {
             c.log_wal
         };
-        self.mark_change_log(log, c);
+        self.mark_change_log(wal, log, c);
         // 捨てた位置で読んでいた listener を外す
         let first = log.range().0;
         if c.readers.iter().any(|(_, p)| *p < first) {
@@ -20513,7 +20515,7 @@ impl Engine {
                 c.log_wal = start;
             }
             if let Some(log) = self.change_log.get() {
-                self.mark_change_log(log, c);
+                self.mark_change_log(wal, log, c);
             }
         }
         if folded && !c.open_tail.is_empty() {
