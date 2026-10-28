@@ -1,0 +1,4 @@
+baseline: pass 31 秒 → 1 run の上限 900 秒
+  killed 11s             WAL の残りを読まない
+  killed 70s             同じ周の WAL の続きでなく写した所から読む
+killed 2 / survived 0 / その他 0

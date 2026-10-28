@@ -111,7 +111,8 @@ pub struct BallRebuildStats {
     pub replays: u64,
     /// 同じ周で WAL の続きを読んだ時に、 写す側が読み終えた所より先まで写していた回数 (試験の前提)。
     pub ahead: u64,
-    /// 公開中に入る前に、 畳む書き出しの終わりを待った時間 (この base の WAL は書き出しから畳むまで append を止める)。
+    /// 公開中に入る前に、 畳む書き出しの終わりを待った時間 (この base の WAL は書き出しから畳むまで append を止める。 1 ms 以上待ったら
+    /// もう一度縮むまで回す)。
     pub prequiesce_ns: u64,
     /// 記録の lock の測り ([`crate::change_log::ChangeLog::wait_stats`] の組む間の差): 読みが lock を待った時間 (最初の記録 / 追いつき) /
     /// 足す側が 1 回分持った時間の最大 (開いてから) / 組む間に持った時間の和。
@@ -18552,24 +18553,32 @@ impl Engine {
         // 小さくなるまで繰り返す。 縮まなくなったら (書き手が追いつきと同じ速さ以上で書く) やめて公開中に入る: その紐の書き手は
         // 最後の残りを当てる間だけ待つ (回し続けても縮まない)
         let t_catch = std::time::Instant::now();
-        let (mut rounds, mut prev) = (0, u64::MAX);
-        for _ in 0..16 {
-            rounds += 1;
-            if pause > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(pause));
+        let (mut rounds, mut prequiesce_ns) = (0, 0);
+        for _ in 0..2 {
+            let mut prev = u64::MAX;
+            for _ in 0..16 {
+                rounds += 1;
+                if pause > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(pause));
+                }
+                let before = rp.work;
+                rp.catch_up(log, wal, &mut pos, None);
+                let n = rp.work - before;
+                if n < 1024 || n.saturating_mul(4) > prev.saturating_mul(3) {
+                    break;
+                }
+                prev = n;
             }
-            let before = rp.work;
-            rp.catch_up(log, wal, &mut pos, None);
-            let n = rp.work - before;
-            if n < 1024 || n.saturating_mul(4) > prev.saturating_mul(3) {
+            // 畳む書き出しの途中なら終わるのを待つ (公開中に入ってから待つと、 その間この紐の書き手が球に書く所で待つ)。 待ったら
+            // (畳んだ = 止まっていた書き手が書き始める) もう一度縮むまで回す
+            let t_pq = std::time::Instant::now();
+            wal.quiesce();
+            let waited = t_pq.elapsed().as_nanos() as u64;
+            prequiesce_ns += waited;
+            if waited < 1_000_000 {
                 break;
             }
-            prev = n;
         }
-        // 畳む書き出しの途中なら終わるのを待ち (公開中に入ってから待つと、 その間この紐の書き手が球に書く所で待つ)、 その後の残りを当てる
-        let t_pq = std::time::Instant::now();
-        wal.quiesce();
-        let prequiesce_ns = t_pq.elapsed().as_nanos() as u64;
         rp.catch_up(log, wal, &mut pos, None);
         rounds += 2; // この 1 回と、 公開中の最後の 1 回
         let catch_ns = t_catch.elapsed().as_nanos() as u64;

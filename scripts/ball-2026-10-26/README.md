@@ -53,6 +53,12 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
 - 12 回目 (宣言を保存 = 土台の file、 最初の読みが書き手を止めずに組む): `ballp.rs` に `l` (書き手 1 本が書き続ける中で組む、 書き込み 1 回ごとの時間) を足した。
   結果 `results_ballp_l_v12.jsonl` (`sum_l.py`) / `results_ballp_o_v12.jsonl` (開く時間) / `results_ballb_v12.jsonl` と `results_ballb_wal_v12.jsonl`
   (11 回目の binary と交互、 `sum_w12.py`)。 変異は `ball_mut_v12.json` (19 本、 schema の `ball_lazy` + `ball_reopen` + `ball_history`)、 結果 `mut_v12.log`
+- 13 回目 (追いつきを速く + 書き込みの +10 ns の理由): `ballp.rs` に段ごとの数 (`setup_ns` / `log_prof_*` / `prof_*` / `log_lock_ns` / 回の数 /
+  飛んだ entry / 球を回した数) を足した。 12 回目 (544ca62 の ballp) と交互の `run_l13.sh` / `sum_l13.py`、 結果 `results_ballp_l13ab64.jsonl` (WAL 64 MiB) /
+  `results_ballp_l13ab.jsonl` (WAL 256 MiB、 畳みを待った後に回し直す前) / `results_ballp_l13ab2.jsonl` (WAL 256 MiB、 直した後)。 書き込みは `run_w13.sh`
+  (11 回目・12 回目・1 つずつ戻した版を seed ごとに順を回して交互、 binary は scratchpad で組んだ物) と `sum_w13.py` / `sum_w13_paired.py` (seed ごとの差の中央値と
+  選び直しの 95% の幅)、 結果 `results_ballb_w13.jsonl` + `_w13b` (v11 / v12 / a / b / ab、 24 seed) / `_w13c` (c) / `_w13d` (d) / `_w13p` (対照のつもりが番地が
+  ずれなかった版)。 変異 `ball_mut_v13a〜c.json`、 結果 `mut_v13a〜c.log`
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。

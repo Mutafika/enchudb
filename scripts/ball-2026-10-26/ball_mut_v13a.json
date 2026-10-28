@@ -50,8 +50,8 @@
  {
   "name": "WAL の残りを読まない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "            for (r, _) in &recs {\n                self.op(r.hlc, &r.op, r.author_peer, limit);\n            }\n            self.prof[4]",
-  "replace": "            for (r, _) in recs.iter().take(0) {\n                self.op(r.hlc, &r.op, r.author_peer, limit);\n            }\n            self.prof[4]"
+  "find": "            for (k, (h, b)) in ops.iter().enumerate() {",
+  "replace": "            for (k, (h, b)) in ops.iter().take(0).enumerate() {"
  },
  {
   "name": "WAL を前の周の位置から読む",
@@ -116,8 +116,8 @@
  {
   "name": "同じ周の WAL の続きでなく写した所から読む",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "                Some((l, off)) if l == lap => off,",
-  "replace": "                Some((l, _)) if l == lap => log_wal,"
+  "find": "                    self.ahead += u64::from(log_wal > off);\n                    off\n",
+  "replace": "                    self.ahead += u64::from(log_wal > off);\n                    log_wal\n"
  },
  {
   "name": "畳んだ後に記録を読まない",
