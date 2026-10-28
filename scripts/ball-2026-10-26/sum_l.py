@@ -15,12 +15,26 @@ for k in sorted(by):
         print(
             f"    seed {d['seed']} load {d['load']}: record {d['records']} 件 / 組む {d['build_ns']/1e6:.0f} ms "
             f"(記録 {d['log_ns']/1e6:.0f} / 追いつき {d['catch_ns']/1e6:.0f} ms、 控え {d['side_ops']}) "
-            f"公開中 {d['publish_ns']/1e3:.0f} µs (書き終え {pp[0]/1e3:.0f} / 記録 {pp[1]/1e3:.0f} / lock の下 {pp[2]/1e3:.0f} / WAL {pp[3]/1e3:.0f})"
+            f"公開中 {d['publish_ns']/1e3:.0f} µs (書き終え {pp[0]/1e3:.0f} / 記録 {pp[1]/1e3:.0f} / 写した所 (12 回目は lock の下) {pp[2]/1e3:.0f} / WAL {pp[3]/1e3:.0f})"
         )
         print(
             f"      書き込み 1 回: 組む間 n={d['in_n']} p99 {d['in_p99_ns']/1e3:.1f} µs 最大 {d['in_max_ns']/1e6:.2f} ms / "
             f"外 n={d['out_n']} p99 {d['out_p99_ns']/1e3:.1f} µs 最大 {d['out_max_ns']/1e6:.2f} ms"
         )
+        if "prof_ns" in d:
+            pn, c = d["prof_ns"], d["prof_n"]
+            print(
+                f"      追いつき {d['rounds']} 回: 記録を読む {pn[0]/1e6:.0f} ms / 記録を解いて当てる {pn[1]/1e6:.0f} ms (entry {c[0]}、 当てた {c[2]}) / "
+                f"写した所 (12 回目は lock の下) {pn[2]/1e6:.0f} ms / WAL を読む {pn[3]/1e6:.0f} ms / WAL を当てる {pn[4]/1e6:.0f} ms (record {c[1]})"
+            )
+            if "setup_ns" in d:
+                sn = d["setup_ns"]
+                print(f"      読む前: 円柱 {sn[0]/1e6:.1f} ms / change_emit を待って土台を開く {sn[1]/1e6:.1f} ms / 種を読む {sn[2]/1e6:.1f} ms / 球を作る {sn[3]/1e6:.1f} ms")
+            per = lambda t, n: t / max(n, 1)
+            print(
+                f"      1 件: 記録を読む {per(pn[0], c[0]):.0f} ns / 解いて当てる {per(pn[1], c[0]):.0f} ns / WAL を読む {per(pn[3], c[1]):.0f} ns / "
+                f"WAL を当てる {per(pn[4], c[1]):.0f} ns"
+            )
     ns = [d["build_ns"] / max(d["records"], 1) for d in by[k]]
     print(f"    組む時間 / 記録の record: 中央値 {st.median(ns):.0f} ns")
 if len(sys.argv) > 2:

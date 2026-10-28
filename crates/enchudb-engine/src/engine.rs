@@ -92,10 +92,20 @@ pub struct BallRebuildStats {
     pub catch_ns: u64,
     /// 公開中を置いてから出すまで (この間、 その紐の書き手は球に書く所で待つ)。
     pub publish_ns: u64,
-    /// その内訳: H より前の append の書き終えを待つ / 記録を lock の外で読む / `change_emit` の下で写した分を読む / WAL を lock の外で読む。
+    /// その内訳: H より前の append の書き終えを待つ / 記録を読む / 記録に写した所を読む (組の周が WAL と違う時は `change_emit` を待つ) /
+    /// WAL を読む。
     pub publish_parts_ns: [u64; 4],
     /// 全部。
     pub total_ns: u64,
+    /// 追いつきの回数 (公開中の最後の 1 回を含む)。
+    pub rounds: u64,
+    /// 段ごとの時間 (全部の回の和): 記録を読む (`ChangeLog::read`) / 記録の entry を解いて当てる / 記録に写した所を読む (組の周が WAL と
+    /// 違う時は `change_emit` を待つ) / WAL を読む (`scan_for_change_log`) / WAL の record を当てる。
+    pub prof_ns: [u64; 5],
+    /// 件数: 記録から読んだ entry / WAL から読んだ record / 記録の entry のうち当てた (HLC が前に当てた所より後) 数。
+    pub prof_n: [u64; 3],
+    /// 記録を読む前: 紐の円柱を組む / `change_emit` を待って土台を開く / 土台を種に読む / 種から球を作る。
+    pub setup_ns: [u64; 4],
 }
 
 /// 組む側の手元: 出す前の球と、 eid ごとの今の値 (`NONE` = 値なし)。 record を HLC の順に当てる (`last` より後だけ)。
@@ -110,13 +120,16 @@ struct BallReplay<'a> {
     last: enchudb_oplog::Hlc,
     /// WAL を読み終えた所 (周, 位置)。 次はここから読む (周が変わった = 畳んだ後は、 記録に写した所から)。
     wal_mark: Option<(u32, u64)>,
-    /// 最後の `catch_up` の内訳 (記録を lock の外で読む / lock の下で写した分を読む / WAL を lock の外で読む)。
+    /// 最後の `catch_up` の内訳 (記録を読む / 記録に写した所を読む / WAL を読む)。
     parts: [u64; 3],
     records: u64,
     applied: u64,
     side_ops: u64,
     /// WAL を読む間に畳んだので読み直した回数。
     refolds: u64,
+    /// [`BallRebuildStats::prof_ns`] / `prof_n`。
+    prof: [u64; 5],
+    prof_n: [u64; 3],
 }
 
 impl BallReplay<'_> {
@@ -170,18 +183,29 @@ impl BallReplay<'_> {
         }
     }
 
-    /// 記録の `pos` から先を読む。 読む前に記録が捨てていたら (`Truncated`)、 捨てる口が渡した控え ([`crate::ball_base::BallBases::take_side`])
-    /// から当てて、 記録の始まりから読み続ける (捨てる口は捨てる header より先に控えを足すので、 読めなくなった番号は全部控えにある)。
-    fn read_log(&mut self, log: &crate::change_log::ChangeLog, pos: &mut u64, limit: Option<enchudb_oplog::Hlc>) {
-        loop {
-            match log.read(*pos, 4 << 20) {
+    /// 記録の `pos` から `until` の前までを読む。 読む前に記録が捨てていたら (`Truncated`)、 捨てる口が渡した控え
+    /// ([`crate::ball_base::BallBases::take_side`]) から当てて、 記録の始まりから読み続ける (捨てる口は捨てる header より先に控えを
+    /// 足すので、 読めなくなった番号は全部控えにある)。
+    fn read_log(&mut self, log: &crate::change_log::ChangeLog, pos: &mut u64, until: u64, limit: Option<enchudb_oplog::Hlc>) {
+        while *pos < until {
+            let t0 = std::time::Instant::now();
+            let got = log.read(*pos, 4 << 20);
+            self.prof[0] += t0.elapsed().as_nanos() as u64;
+            match got {
                 Ok(es) if es.is_empty() => return,
                 Ok(es) => {
-                    *pos = es.last().unwrap().no + 1;
-                    for e in &es {
+                    let t1 = std::time::Instant::now();
+                    let before = self.records;
+                    let mut n = 0;
+                    for e in es.iter().take_while(|e| e.no < until) {
                         self.entry(e, limit);
+                        n += 1;
                     }
+                    *pos = (es.last().unwrap().no + 1).min(until);
+                    self.prof_n[0] += n;
+                    self.prof_n[2] += self.records - before;
                     self.eng.ball_bases.prune_side(*pos);
+                    self.prof[1] += t1.elapsed().as_nanos() as u64;
                 }
                 Err(t) => {
                     if t.from <= *pos {
@@ -199,24 +223,30 @@ impl BallReplay<'_> {
         }
     }
 
-    /// 記録の `pos` から先と、 WAL の記録に写していない残りを当てる。 記録は lock の外で読み、 `change_emit` の下では、 その間に写した
-    /// 分と、 写した所 (`log_wal`) と WAL の周を読むだけ。 WAL は lock の外で読む (前に読み終えた所が同じ周ならそこから)。 読む間に
-    /// 畳んだら (周が変わったら)、 読めた分を当てて記録からやり直す (畳む時は WAL を全部記録に写してから畳む)。 返ると、 呼んだ時に
-    /// WAL に書き終えてあった record は全部当ててある。
+    /// 記録の `pos` から先と、 WAL の記録に写していない残りを当てる。 写した所は写す側が置いた組 (記録の次の番号, 写した WAL の位置,
+    /// 周、 [`crate::ball_base::BallBases::mark`]) で知る (`change_emit` は consumer が書き出しから畳むまで持つので待たない。 組の周が
+    /// 今の WAL と違う時 = 畳んだ直後で置き直す前だけ `change_emit` の下で読む)。 前に WAL を読み終えた所が同じ周ならそこから
+    /// WAL を読み、 記録は読まずに番号だけ進める (その周で写した entry は、 最初に記録から読んだ所の後は全部 WAL で読んだ)。 違う周
+    /// (初めて / 畳んだ後) なら記録を組の番号まで読んで、 WAL は写した所から。 読む前か読む間に畳んだら (周が変わったら)、 読んだ分は
+    /// 当てずに記録から読み直す (畳む時は WAL を全部記録に写してから畳む)。 返ると、 呼んだ時に WAL に書き終えてあった record は全部
+    /// 当ててある。
     fn catch_up(&mut self, log: &crate::change_log::ChangeLog, wal: &enchudb_oplog::oplog::OpLog, pos: &mut u64, limit: Option<enchudb_oplog::Hlc>) {
         loop {
             let t0 = std::time::Instant::now();
-            self.read_log(log, pos, limit);
+            let (next, log_wal, lap) = match self.eng.ball_bases.mark() {
+                Some(m) if m.2 == wal.lap() => m,
+                _ => {
+                    let c = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                    (log.range().1, c.log_wal, wal.lap())
+                }
+            };
             let t1 = std::time::Instant::now();
-            let (start, lap) = {
-                let c = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-                self.read_log(log, pos, limit);
-                let lap = wal.lap();
-                let start = match self.wal_mark {
-                    Some((l, off)) if l == lap && off >= c.log_wal => off,
-                    _ => c.log_wal,
-                };
-                (start, lap)
+            let start = match self.wal_mark {
+                Some((l, off)) if l == lap => off,
+                _ => {
+                    self.read_log(log, pos, next, limit);
+                    log_wal
+                }
             };
             let t2 = std::time::Instant::now();
             let sp = self.eng.ball_publish_pause[2].load(std::sync::atomic::Ordering::Relaxed);
@@ -224,7 +254,10 @@ impl BallReplay<'_> {
                 std::thread::sleep(std::time::Duration::from_micros(sp));
             }
             let (recs, end) = wal.scan_for_change_log(start, u64::MAX, true);
-            self.parts = [(t1 - t0).as_nanos() as u64, (t2 - t1).as_nanos() as u64, t2.elapsed().as_nanos() as u64];
+            self.parts = [(t2 - t1).as_nanos() as u64, (t1 - t0).as_nanos() as u64, t2.elapsed().as_nanos() as u64];
+            self.prof[2] += (t1 - t0).as_nanos() as u64;
+            self.prof[3] += t2.elapsed().as_nanos() as u64;
+            self.prof_n[1] += recs.len() as u64;
             if wal.lap() != lap {
                 // 読む前か読む間に畳んだ: 読んだ所は新しい周の途中 (前の周の位置) かもしれない = 前の record を飛ばしている。
                 // 当てずに捨てて、 記録 (畳む時に全部写した) から読み直す
@@ -232,10 +265,18 @@ impl BallReplay<'_> {
                 self.refolds += 1;
                 continue;
             }
+            let t3 = std::time::Instant::now();
             for (r, _) in &recs {
                 self.op(r.hlc, &r.op, r.author_peer, limit);
             }
-            self.wal_mark = Some((lap, end.max(start)));
+            self.prof[4] += t3.elapsed().as_nanos() as u64;
+            let end = end.max(start);
+            if end >= log_wal && *pos < next {
+                // 記録の `next` より前の entry は WAL の `log_wal` より前を写した物 = 全部当てた
+                *pos = next;
+                self.eng.ball_bases.prune_side(next);
+            }
+            self.wal_mark = Some((lap, end));
             return;
         }
     }
@@ -15653,6 +15694,7 @@ impl Engine {
         };
         // 畳んだ印を新しい周より先に届ける (続きの位置を探す時に、 前の周と新しい周を取り違えない)
         wal.set_sync_on_reset(true);
+        self.mark_change_log(wal, &log, &c);
         self.attach_ball_bases(set.dir(), &log);
         let _ = self.change_log.set(log);
         Ok(())
@@ -15744,7 +15786,11 @@ impl Engine {
         match crate::change_log::ChangeLog::open(set.dir(), 0, false, false) {
             Ok(log) => {
                 let start = Self::change_log_resume_offset(wal, &log);
-                self.change_emit.lock().unwrap_or_else(|p| p.into_inner()).log_wal = start;
+                {
+                    let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                    c.log_wal = start;
+                    self.mark_change_log(wal, &log, &c);
+                }
                 wal.set_sync_on_reset(true);
                 self.attach_ball_bases(set.dir(), &log);
                 let _ = self.change_log.set(log);
@@ -15805,6 +15851,11 @@ impl Engine {
             .collect()
     }
 
+    /// 球を組む側に記録に写した所を渡す ([`crate::ball_base::BallBases::set_mark`]、 呼び手が `change_emit` を持つ = 畳まない)。
+    fn mark_change_log(&self, wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog, c: &ChangeCursor) {
+        self.ball_bases.set_mark(log.range().1, c.log_wal, wal.lap());
+    }
+
     fn pump_change_log(
         &self,
         wal: &enchudb_oplog::oplog::OpLog,
@@ -15819,6 +15870,7 @@ impl Engine {
         let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
         if recs.is_empty() {
             c.log_wal = c.log_wal.max(end);
+            self.mark_change_log(wal, log, c);
             return Ok(0);
         }
         let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
@@ -15855,6 +15907,7 @@ impl Engine {
         } else {
             c.log_wal
         };
+        self.mark_change_log(wal, log, c);
         // 捨てた位置で読んでいた listener を外す
         let first = log.range().0;
         if c.readers.iter().any(|(_, p)| *p < first) {
@@ -18358,14 +18411,18 @@ impl Engine {
         };
         let name = self.himo_name_at(hid as usize).map(str::to_string).ok_or_else(|| io::Error::other("no such himo"))?;
         // 書き手が球に書く前に名簿の鍵で並ぶように (`declare_ball` と同じ)
+        let t_cyl = std::time::Instant::now();
         self.himos[hid as usize].build_cylinder();
+        let cyl_ns = t_cyl.elapsed().as_nanos() as u64;
         let t0 = std::time::Instant::now();
         let peer = self.peer_id();
-        // 開いた後に控えた土台を開いて記録と照らす (写す・捨てると並ばないように change_emit の下で)
-        {
+        // 開いた後に控えた土台を開いて記録と照らす (写す・捨てると並ばないように change_emit の下で。 写す側が先に開いていれば
+        // lock を取らない: consumer は書き出しから畳むまで change_emit を持つ)
+        if self.ball_bases.has_pending() {
             let _c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
             self.ball_bases.ready(log);
         }
+        let ready_ns = t0.elapsed().as_nanos() as u64;
         // 種 = 土台 (地平の時点の列)。 同じ lock の下で 「組む間に捨てた分の控え」 を始める
         let mut cur: Vec<u64> = Vec::new();
         let Some((horizon, done)) = self.ball_bases.start_side(hid, |e, v| {
@@ -18378,6 +18435,7 @@ impl Engine {
             self.balls.unmark_pending(hid);
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("no ball base for '{name}'")));
         };
+        let seed_ns = t0.elapsed().as_nanos() as u64 - ready_ns;
         let ball = self.balls.make(crate::ball::pack_hlc(horizon.wall, horizon.logical), |f| {
             cur.iter().enumerate().filter(|&(_, &v)| v != BallReplay::NONE).for_each(|(e, &v)| f(e as u32, v))
         });
@@ -18395,17 +18453,24 @@ impl Engine {
             applied: 0,
             side_ops: 0,
             refolds: 0,
+            prof: [0; 5],
+            prof_n: [0; 3],
         };
+        let make_ns = t0.elapsed().as_nanos() as u64 - ready_ns - seed_ns;
         let pause = self.ball_build_pause.load(std::sync::atomic::Ordering::Relaxed);
         // (1) 記録の残りを書き手と並んで読む (捨てて読めなくなった所は控えから)
         let t_log = std::time::Instant::now();
         let mut pos = done;
-        rp.read_log(log, &mut pos, None);
+        rp.read_log(log, &mut pos, u64::MAX, None);
         let log_ns = t_log.elapsed().as_nanos() as u64;
+        // 段ごとの数は追いつきの分だけ
+        (rp.prof, rp.prof_n) = ([0; 5], [0; 3]);
         // (2) 記録の残り (読んでいる間に写した分) と WAL の残り。 公開中 (書き手が待つ間) を短くするため、 1 回に当てる数が
         // 小さくなるまで繰り返す
         let t_catch = std::time::Instant::now();
+        let mut rounds = 1;
         for _ in 0..16 {
+            rounds += 1;
             if pause > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(pause));
             }
@@ -18433,7 +18498,7 @@ impl Engine {
         // (4) H より前の残り
         rp.catch_up(log, wal, &mut pos, Some(h));
         // (5) 出す
-        let (records, applied, side_ops, refolds, parts) = (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts);
+        let (records, applied, side_ops, refolds, parts, prof, prof_n) = (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n);
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
         self.ball_bases.end_side();
         let st = BallRebuildStats {
@@ -18446,6 +18511,10 @@ impl Engine {
             publish_ns: t_pub.elapsed().as_nanos() as u64,
             publish_parts_ns: [quiesce_ns, parts[0], parts[1], parts[2]],
             total_ns: t0.elapsed().as_nanos() as u64,
+            rounds,
+            prof_ns: prof,
+            prof_n,
+            setup_ns: [cyl_ns, ready_ns, seed_ns, make_ns],
         };
         *self.ball_rebuild_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(st);
         Ok(())
@@ -20276,6 +20345,9 @@ impl Engine {
         if folded {
             c.offset = enchudb_oplog::oplog::HEADER_SIZE as u64;
             c.log_wal = enchudb_oplog::oplog::HEADER_SIZE as u64;
+            if let Some(log) = self.change_log.get() {
+                self.mark_change_log(wal, log, c);
+            }
         }
         if folded && !c.open_tail.is_empty() {
             let _ = self.append_commit_marker(wal);

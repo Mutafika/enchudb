@@ -300,7 +300,7 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
     let (ni, p99i, maxi) = stat(&mut inside);
     let (no, p99o, maxo) = stat(&mut outside);
     println!(
-        "{{\"mode\":\"l\",\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":{},\"read_records\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"publish_parts_ns\":{:?},\"in_n\":{ni},\"in_p99_ns\":{p99i},\"in_max_ns\":{maxi},\"out_n\":{no},\"out_p99_ns\":{p99o},\"out_max_ns\":{maxo}}}",
-        wal_cap() >> 20, b1 - b0, st.records, st.side_ops, st.log_ns, st.catch_ns, st.publish_ns, st.publish_parts_ns
+        "{{\"mode\":\"l\",\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":{},\"read_records\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"publish_parts_ns\":{:?},\"rounds\":{},\"prof_ns\":{:?},\"prof_n\":{:?},\"setup_ns\":{:?},\"in_n\":{ni},\"in_p99_ns\":{p99i},\"in_max_ns\":{maxi},\"out_n\":{no},\"out_p99_ns\":{p99o},\"out_max_ns\":{maxo}}}",
+        wal_cap() >> 20, b1 - b0, st.records, st.side_ops, st.log_ns, st.catch_ns, st.publish_ns, st.publish_parts_ns, st.rounds, st.prof_ns, st.prof_n, st.setup_ns
     );
 }
