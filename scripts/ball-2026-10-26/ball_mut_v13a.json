@@ -1,0 +1,140 @@
+[
+ {
+  "name": "公開中の書き手が待たずに球に書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                    std::thread::yield_now()\n                }\n                _ => return None,",
+  "replace": "                    return None\n                }\n                _ => return None,"
+ },
+ {
+  "name": "公開中の書き手が待たずに閾値を見ずに球に書く",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                    std::thread::yield_now()\n                }\n                _ => return None,",
+  "replace": "                    return self.get(hid)\n                }\n                _ => return None,"
+ },
+ {
+  "name": "閾値を見ずに球に書く",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                    if t >= b.threshold.load(Ordering::Relaxed) {",
+  "replace": "                    if true {"
+ },
+ {
+  "name": "閾値より後も書き手が書かない",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "                    if t >= b.threshold.load(Ordering::Relaxed) {",
+  "replace": "                    if t < b.threshold.load(Ordering::Relaxed) {"
+ },
+ {
+  "name": "最後の残りを当てない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        rp.catch_up(log, wal, &mut pos, Some(h));\n",
+  "replace": ""
+ },
+ {
+  "name": "最後の残りで H 以降も当てる",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        rp.catch_up(log, wal, &mut pos, Some(h));\n",
+  "replace": "        rp.catch_up(log, wal, &mut pos, None);\n"
+ },
+ {
+  "name": "H を取ってから公開中を置く",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        self.balls.begin_publish(hid);\n        let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n        if pp[0] > 0 {\n            std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n        }\n        let h = wal.mint_hlc();\n        wal.quiesce();\n",
+  "replace": "        let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n        let h = wal.mint_hlc();\n        wal.quiesce();\n        if pp[0] > 0 {\n            std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n        }\n        self.balls.begin_publish(hid);\n"
+ },
+ {
+  "name": "H より前の書き終えを待たない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        let h = wal.mint_hlc();\n        wal.quiesce();\n",
+  "replace": "        let h = wal.mint_hlc();\n"
+ },
+ {
+  "name": "WAL の残りを読まない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            for (r, _) in &recs {\n                self.op(r.hlc, &r.op, r.author_peer, limit);\n            }\n            self.prof[4]",
+  "replace": "            for (r, _) in recs.iter().take(0) {\n                self.op(r.hlc, &r.op, r.author_peer, limit);\n            }\n            self.prof[4]"
+ },
+ {
+  "name": "WAL を前の周の位置から読む",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                Some((l, off)) if l == lap => off,",
+  "replace": "                Some((_, off)) => off,"
+ },
+ {
+  "name": "読む間に畳んでも周を見ない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if wal.lap() != lap {\n                // 読む前か読む間に畳んだ",
+  "replace": "            if false {\n                // 読む前か読む間に畳んだ"
+ },
+ {
+  "name": "捨てる口が組む側に控えを渡さない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "            side.extend(ops.iter().cloned());",
+  "replace": "            let _ = side;"
+ },
+ {
+  "name": "控えを組む前に始めない",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "        *self.side.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());\n        Some((b.horizon, b.done))",
+  "replace": "        Some((b.horizon, b.done))"
+ },
+ {
+  "name": "読めない所を控えから当てない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                    for (_, h, op) in self.eng.ball_bases.take_side(*pos) {",
+  "replace": "                    for (_, h, op) in self.eng.ball_bases.take_side(u64::MAX) {"
+ },
+ {
+  "name": "土台の時点を地平にしない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        let ball = self.balls.make(crate::ball::pack_hlc(horizon.wall, horizon.logical), |f| {",
+  "replace": "        let ball = self.balls.make(0, |f| {"
+ },
+ {
+  "name": "開く時に組んでいない球にしない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            self.balls.mark_pending(hid);\n        }\n        log.set_on_discard",
+  "replace": "        }\n        log.set_on_discard"
+ },
+ {
+  "name": "WAL の無い書き込みで印を置かない (書く)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if hlc == enchudb_oplog::Hlc::ZERO {\n            self.ball_bases.wal_less_write(hid as u16);\n        }\n        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {\n            debug_assert!",
+  "replace": "        if let Some(b) = self.balls.any().then(|| self.balls.for_write(hid as u16, crate::ball::pack_hlc(hlc.wall, hlc.logical))).flatten() {\n            debug_assert!"
+ },
+ {
+  "name": "印のある土台を作り直さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if stale {\n                // WAL の無い書き込みがあった紐: 今の列で作り直す (履歴はここから)\n                self.renew_ball_base(dir, hid, log);\n            }",
+  "replace": "            let _ = stale;"
+ },
+ {
+  "name": "記録と WAL の重なりを落とさない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {",
+  "replace": "        if limit.is_some_and(|l| key(hlc) >= key(l)) {"
+ },
+ {
+  "name": "同じ周の WAL の続きでなく写した所から読む",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                Some((l, off)) if l == lap => off,",
+  "replace": "                Some((l, _)) if l == lap => log_wal,"
+ },
+ {
+  "name": "畳んだ後に記録を読まない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                    self.read_log(log, pos, next, limit);\n                    log_wal",
+  "replace": "                    log_wal"
+ },
+ {
+  "name": "縮まなくても回し続ける",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            if n < 1024 || n.saturating_mul(4) > prev.saturating_mul(3) {",
+  "replace": "            if n < 1024 {"
+ },
+ {
+  "name": "開いていない土台を組む前に開かない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if self.ball_bases.has_pending() {",
+  "replace": "        if false {"
+ }
+]

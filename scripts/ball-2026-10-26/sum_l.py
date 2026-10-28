@@ -41,6 +41,8 @@ for k in sorted(by):
             if "log_lock_ns" in d:
                 ll = d["log_lock_ns"]
                 print(f"      記録の lock: 読みが待つ 最初 {ll[0]/1e6:.1f} / 追いつき {ll[1]/1e6:.1f} ms、 足す側が 1 回分持つ 最大 {ll[2]/1e6:.1f} ms、 組む間に持った和 {ll[3]/1e6:.1f} ms")
+            if "replays" in d:
+                print(f"      当てた (球の紐) {d['applied']} / 球を回した {d['replays']} 回")
             per = lambda t, n: t / max(n, 1)
             print(
                 f"      1 件: 記録を読む {per(pn[0], c[0]):.0f} ns / 解いて当てる {per(pn[1], c[0]):.0f} ns / WAL を読む {per(pn[3], c[1]):.0f} ns / "

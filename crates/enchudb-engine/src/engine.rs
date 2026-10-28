@@ -107,6 +107,8 @@ pub struct BallRebuildStats {
     pub prof_n: [u64; 4],
     /// 畳んだ後に記録を当てた所まで読まずに飛んだ entry の数 ([`crate::change_log::ChangeLog::seek_after`])。
     pub skipped: u64,
+    /// 球を回した数 (`Ball::replay`、 値の変わる書き込みだけ、 最初の記録の段も含む)。 当てた数は [`Self::applied`]。
+    pub replays: u64,
     /// 公開中に入る前に、 畳む書き出しの終わりを待った時間 (この base の WAL は書き出しから畳むまで append を止める)。
     pub prequiesce_ns: u64,
     /// 記録の lock の測り ([`crate::change_log::ChangeLog::wait_stats`] の組む間の差): 読みが lock を待った時間 (最初の記録 / 追いつき) /
@@ -140,6 +142,10 @@ struct BallReplay<'a> {
     refolds: u64,
     /// 記録を当てた所まで読まずに飛んだ entry の数。
     skipped: u64,
+    /// 読んだ数 (記録の entry と WAL の record、 球の紐に当たらない物も)。 追いつきが縮んだかをこれで見る。
+    work: u64,
+    /// 球を回した数 (`Ball::replay`、 値の変わる書き込みだけ)。
+    replays: u64,
     /// [`BallRebuildStats::prof_ns`] / `prof_n`。
     prof: [u64; 7],
     prof_n: [u64; 4],
@@ -171,6 +177,11 @@ impl BallReplay<'_> {
 
     /// 土台に当たる書き込み 1 つを球に当てる (この球の紐の書き込みと消すだけ)。
     fn apply(&mut self, hlc: enchudb_oplog::Hlc, op: &crate::ball_base::BaseOp) {
+        self.apply_in(&crossbeam_epoch::pin(), hlc, op);
+    }
+
+    /// [`Self::apply`] を呼び手の pin の下で。
+    fn apply_in(&mut self, guard: &crossbeam_epoch::Guard, hlc: enchudb_oplog::Hlc, op: &crate::ball_base::BaseOp) {
         use crate::ball_base::BaseOp;
         let (e, v) = match op {
             BaseOp::Set(x, e, v) if *x == self.hid => (*e, *v),
@@ -184,8 +195,9 @@ impl BallReplay<'_> {
         }
         let old = Some(self.cur[e as usize]).filter(|&x| x != Self::NONE);
         if old != v {
-            self.ball.replay(self.eng.balls.clock(), e, old, v, crate::ball::pack_hlc(hlc.wall, hlc.logical));
+            self.ball.replay_in(guard, self.eng.balls.clock(), e, old, v, crate::ball::pack_hlc(hlc.wall, hlc.logical));
             self.eng.ball_observe_raised();
+            self.replays += 1;
             self.cur[e as usize] = v.unwrap_or(Self::NONE);
         }
     }
@@ -216,6 +228,7 @@ impl BallReplay<'_> {
                     }
                     *pos = (es.last().unwrap().no + 1).min(until);
                     self.prof_n[0] += n;
+                    self.work += n;
                     self.prof_n[2] += self.records - before;
                     let t2 = std::time::Instant::now();
                     self.prof[1] += (t2 - t1).as_nanos() as u64;
@@ -286,11 +299,26 @@ impl BallReplay<'_> {
             if sp > 0 {
                 std::thread::sleep(std::time::Duration::from_micros(sp));
             }
-            let (recs, end) = wal.scan_for_change_log(start, u64::MAX, true);
+            // 球の紐に当たる書き込みだけを (HLC, 書き込み) で溜める (WAL の record は写さない。 当てるのは周を確かめてから)
+            let (hid, name, peer) = (self.hid, self.name, self.peer);
+            let mut ops: Vec<(enchudb_oplog::Hlc, crate::ball_base::BaseOp)> = Vec::new();
+            let (end, seen) = wal.scan_ops(start, |hlc, author, op| {
+                use enchudb_oplog::oplog::DecodedOp;
+                let mine = match &op {
+                    DecodedOp::Tie { himo_id, .. } | DecodedOp::Untie { himo_id, .. } => *himo_id == hid,
+                    DecodedOp::TieNamed { himo_name, .. } => himo_name.as_str() == name,
+                    DecodedOp::Delete { .. } => true,
+                    _ => false,
+                };
+                if mine && let Some(b) = crate::ball_base::base_op(&op, author, peer) {
+                    ops.push((hlc, b));
+                }
+            });
             self.parts = [(t2 - t1).as_nanos() as u64, (t1 - t0).as_nanos() as u64, t2.elapsed().as_nanos() as u64];
             self.prof[2] += (t1 - t0).as_nanos() as u64;
             self.prof[3] += t2.elapsed().as_nanos() as u64;
-            self.prof_n[1] += recs.len() as u64;
+            self.prof_n[1] += seen;
+            self.work += seen;
             if wal.lap() != lap {
                 // 読む前か読む間に畳んだ: 読んだ所は新しい周の途中 (前の周の位置) かもしれない = 前の record を飛ばしている。
                 // 当てずに捨てて、 記録 (畳む時に全部写した) から読み直す
@@ -299,9 +327,17 @@ impl BallReplay<'_> {
                 continue;
             }
             let t3 = std::time::Instant::now();
-            for (r, _) in &recs {
-                self.op(r.hlc, &r.op, r.author_peer, limit);
+            // 組んでいる球は自分しか触らない: pin は 1024 件ごとに 1 回
+            let mut guard = crossbeam_epoch::pin();
+            for (k, (h, b)) in ops.iter().enumerate() {
+                if k % 1024 == 1023 {
+                    guard.repin();
+                }
+                if self.admit(*h, limit).is_some() {
+                    self.apply_in(&guard, *h, b);
+                }
             }
+            drop(guard);
             self.prof[4] += t3.elapsed().as_nanos() as u64;
             let end = end.max(start);
             if end >= log_wal && *pos < next {
@@ -18489,6 +18525,8 @@ impl Engine {
             prof: [0; 7],
             prof_n: [0; 4],
             skipped: 0,
+            work: 0,
+            replays: 0,
         };
         let make_ns = t0.elapsed().as_nanos() as u64 - ready_ns - seed_ns;
         let pause = self.ball_build_pause.load(std::sync::atomic::Ordering::Relaxed);
@@ -18511,9 +18549,9 @@ impl Engine {
             if pause > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(pause));
             }
-            let before = rp.records;
+            let before = rp.work;
             rp.catch_up(log, wal, &mut pos, None);
-            let n = rp.records - before;
+            let n = rp.work - before;
             if n < 1024 || n.saturating_mul(4) > prev.saturating_mul(3) {
                 break;
             }
@@ -18543,8 +18581,8 @@ impl Engine {
         // (4) H より前の残り
         rp.catch_up(log, wal, &mut pos, Some(h));
         // (5) 出す
-        let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped) =
-            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped);
+        let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays) =
+            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays);
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
         self.ball_bases.end_side();
         let st = BallRebuildStats {
@@ -18565,6 +18603,7 @@ impl Engine {
             log_prof_n,
             skipped: rp_skipped,
             prequiesce_ns,
+            replays: rp_replays,
             log_lock_ns: {
                 let w2 = log.wait_stats();
                 [w1[0] - w0[0], w2[0] - w1[0], w2[1], w2[2] - w0[2]]

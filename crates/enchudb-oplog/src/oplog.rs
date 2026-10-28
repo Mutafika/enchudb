@@ -2584,6 +2584,64 @@ impl OpLog {
         (s.out.into_iter().filter(|(_, e)| *e <= end).collect(), end)
     }
 
+    /// 試作 (engine の球を組む側の追いつき): `start` から書き終えた所までの record を、 写さずに 1 件ずつ `f(hlc, author, op)` に渡す
+    /// (署名と署名した bytes は写さない、 Commit で閉じていない末尾も渡す)。 止まり方は [`Self::scan_for_change_log`] と同じ (magic /
+    /// 版 / 範囲 / CRC / 周の印 / 解けない op。 飛ばしてよい op は飛ぶ)。 戻り値は (渡した最後の record の後の位置、 なければ `start`,
+    /// 見た record の数)。
+    pub fn scan_ops(&self, start: u64, mut f: impl FnMut(Hlc, PeerId, DecodedOp)) -> (u64, u64) {
+        let (trailer, lap) = (self.trailer.load(Ordering::Acquire), self.lap.load(Ordering::Acquire));
+        let head = self.written.load(Ordering::Acquire);
+        let mmap = self.mmap_slice();
+        let (mut offset, mut seen) = (start, 0u64);
+        while offset < head {
+            let rec_end = offset as usize + REC_HEADER_SIZE;
+            if rec_end > mmap.len() {
+                break;
+            }
+            let header = &mmap[offset as usize..rec_end];
+            if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC || !known_version(header[OFF_VERSION]) {
+                break;
+            }
+            let version = header[OFF_VERSION];
+            let op_byte = header[OFF_OP];
+            let u32_at = |o: usize| u32::from_le_bytes(header[o..o + 4].try_into().unwrap());
+            let payload_len = u32_at(OFF_LEN) as usize;
+            let payload_end = rec_end + payload_len;
+            if payload_end > mmap.len() {
+                break;
+            }
+            if u32_at(OFF_CRC) != record_crc(version, &header[CRC_FIELDS], &mmap[rec_end..payload_end]) {
+                break;
+            }
+            let next_off = payload_end + trailer;
+            if trailer != 0 {
+                if next_off > mmap.len() {
+                    break;
+                }
+                let t = &mmap[payload_end..next_off];
+                let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
+                if u32::from_le_bytes(t[4..8].try_into().unwrap()) != rec_lap ^ LAP_SALT || rec_lap != lap {
+                    break;
+                }
+            }
+            match decode_op(op_byte, &mmap[rec_end..payload_end]) {
+                Some(op) => {
+                    let hlc = Hlc {
+                        wall: u64::from_le_bytes(header[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap()),
+                        logical: u32_at(OFF_HLC_LOGICAL),
+                        peer: u32_at(OFF_HLC_PEER),
+                    };
+                    f(hlc, u32_at(OFF_AUTHOR_PEER), op);
+                }
+                None if op_type::skippable(op_byte) => {}
+                None => break,
+            }
+            seen += 1;
+            offset = next_off as u64;
+        }
+        (offset, seen)
+    }
+
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
     /// CRC 破損レコードに到達したらそこで打ち切り(uncommitted tail の切り捨て)。
     ///
