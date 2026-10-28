@@ -265,18 +265,27 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
     let records = eng.change_log_range().map_or(0, |(f, x)| x - f);
     let stop = std::sync::atomic::AtomicBool::new(false);
     let origin = Instant::now();
-    let (lats, b0, b1) = std::thread::scope(|s| {
+    let ((lats, slow), b0, b1) = std::thread::scope(|s| {
         let w = s.spawn(|| {
             let t = db.get_table("t").unwrap();
             let mut r = Rng(seed ^ 0xABCD);
             let mut lats: Vec<(u64, u64)> = Vec::with_capacity(4 << 20);
+            // 10 ms を越えた書き込みの間に起きたこと (空き作りで畳んだ回 / 区画を畳んだ回 / 区画を移った回、 14 回目)
+            let mut slow: Vec<(u64, u64, [u64; 3])> = Vec::new();
+            let marks = || [eng.wal_room_folds(), eng.oplog().map_or(0, |w| w.folds()), eng.wal_switches()];
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let (i, v) = ((r.next() % rows as u64) as i64, (r.next() % 100) as i64);
+                let m0 = marks();
                 let t0 = Instant::now();
                 t.upsert().set("id", i).set("a", v).commit().unwrap();
-                lats.push(((t0 - origin).as_nanos() as u64, t0.elapsed().as_nanos() as u64));
+                let ns = t0.elapsed().as_nanos() as u64;
+                lats.push(((t0 - origin).as_nanos() as u64, ns));
+                if ns > 10_000_000 {
+                    let m1 = marks();
+                    slow.push(((t0 - origin).as_nanos() as u64, ns, [m1[0] - m0[0], m1[1] - m0[1], m1[2] - m0[2]]));
+                }
             }
-            lats
+            (lats, slow)
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
         let b0 = origin.elapsed().as_nanos() as u64;
@@ -303,10 +312,11 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
     };
     let mut inside: Vec<u64> = lats.iter().filter(|&&(at, l)| at + l >= b0 && at <= b1).map(|&(_, l)| l).collect();
     let mut outside: Vec<u64> = lats.iter().filter(|&&(at, l)| !(at + l >= b0 && at <= b1)).map(|&(_, l)| l).collect();
+    let slow: Vec<String> = slow.iter().map(|&(at, ns, d)| format!("[{},{},{},{},{},{}]", at, ns, d[0], d[1], d[2], u8::from(at + ns >= b0 && at <= b1))).collect();
     let (ni, p99i, maxi) = stat(&mut inside);
     let (no, p99o, maxo) = stat(&mut outside);
     println!(
-        "{{\"mode\":\"l\",\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":{},\"read_records\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"publish_parts_ns\":{:?},\"rounds\":{},\"prof_ns\":{:?},\"prof_n\":{:?},\"setup_ns\":{:?},\"log_prof_ns\":{:?},\"log_prof_n\":{:?},\"skipped\":{},\"prequiesce_ns\":{},\"log_lock_ns\":{:?},\"applied\":{},\"replays\":{},\"in_n\":{ni},\"in_p99_ns\":{p99i},\"in_max_ns\":{maxi},\"out_n\":{no},\"out_p99_ns\":{p99o},\"out_max_ns\":{maxo}}}",
-        wal_cap() >> 20, b1 - b0, st.records, st.side_ops, st.log_ns, st.catch_ns, st.publish_ns, st.publish_parts_ns, st.rounds, st.prof_ns, st.prof_n, st.setup_ns, st.log_prof_ns, st.log_prof_n, st.skipped, st.prequiesce_ns, st.log_lock_ns, st.applied, st.replays
+        "{{\"mode\":\"l\",\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":{},\"read_records\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"publish_parts_ns\":{:?},\"rounds\":{},\"prof_ns\":{:?},\"prof_n\":{:?},\"setup_ns\":{:?},\"log_prof_ns\":{:?},\"log_prof_n\":{:?},\"skipped\":{},\"prequiesce_ns\":{},\"log_lock_ns\":{:?},\"applied\":{},\"replays\":{},\"slow\":[{}],\"in_n\":{ni},\"in_p99_ns\":{p99i},\"in_max_ns\":{maxi},\"out_n\":{no},\"out_p99_ns\":{p99o},\"out_max_ns\":{maxo}}}",
+        wal_cap() >> 20, b1 - b0, st.records, st.side_ops, st.log_ns, st.catch_ns, st.publish_ns, st.publish_parts_ns, st.rounds, st.prof_ns, st.prof_n, st.setup_ns, st.log_prof_ns, st.log_prof_n, st.skipped, st.prequiesce_ns, st.log_lock_ns, st.applied, st.replays, slow.join(",")
     );
 }
