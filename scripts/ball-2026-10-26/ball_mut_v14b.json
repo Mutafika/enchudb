@@ -1,0 +1,20 @@
+[
+ {
+  "name": "記録を飛ぶ時に 1 つ先まで飛ぶ",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "            if key(&e) > after {\n                return Ok(no);",
+  "replace": "            if key(&e) > after {\n                return Ok(no + 1);"
+ },
+ {
+  "name": "目印の二分探索の向きを逆に",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "is_some_and(|e| key(&e) <= after)",
+  "replace": "is_some_and(|e| key(&e) > after)"
+ },
+ {
+  "name": "捨てた後の形を lock を放す前に置かない",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "            st.c.first = mid.first;\n            st.c.tail = mid.tail;\n",
+  "replace": ""
+ }
+]

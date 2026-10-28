@@ -15,3 +15,5 @@ for (w, l, v) in sorted(by):
     print(f"  WAL {w} MiB 記録 {l} MiB {v} ({len(ds)} 回): 組む {f([d['build_ns'] for d in ds])} / 公開中 {f([d['publish_ns'] for d in ds], 1e3, 'µs')}"
           f" / 組む間の書き込み 最大 {f([d['in_max_ns'] for d in ds])} p99 {f([d['in_p99_ns'] for d in ds], 1e3, 'µs')}"
           f" / 1 record {st.median(d['build_ns'] / d['records'] for d in ds):.0f} ns")
+    over = [d['in_max_ns'] - d['out_max_ns'] for d in ds]
+    print(f"      組む間の最大 − 組む外の最大: {', '.join(f'{x/1e6:+.1f}' for x in over)} ms")
