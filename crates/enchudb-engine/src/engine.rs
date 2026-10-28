@@ -113,6 +113,8 @@ pub struct BallRebuildStats {
     pub ahead: u64,
     /// WAL の続きを読んで、 書き手が移った新しい区画でも読んだ回数 (区画を移っても読み直さない所、 試験の前提)。
     pub crossed: u64,
+    /// 前に当てた所より前の HLC なので当てなかった record の数 (記録と WAL・控えの重なり、 試験の前提)。
+    pub dups: u64,
     /// 公開中に入る前に、 畳む書き出しの終わりを待った時間 (この base の WAL は書き出しから畳むまで append を止める。 1 ms 以上待ったら
     /// もう一度縮むまで回す)。
     pub prequiesce_ns: u64,
@@ -153,6 +155,8 @@ struct BallReplay<'a> {
     ahead: u64,
     /// [`BallRebuildStats::crossed`]。
     crossed: u64,
+    /// [`BallRebuildStats::dups`]。
+    dups: u64,
     /// 球を回した数 (`Ball::replay_in`、 値の変わる書き込みだけ)。
     replays: u64,
     /// [`BallRebuildStats::prof_ns`] / `prof_n`。
@@ -177,6 +181,7 @@ impl BallReplay<'_> {
     fn admit(&mut self, hlc: enchudb_oplog::Hlc, limit: Option<enchudb_oplog::Hlc>) -> Option<()> {
         let key = |h: enchudb_oplog::Hlc| (h.wall, h.logical);
         if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {
+            self.dups += u64::from(key(hlc) <= key(self.last));
             return None;
         }
         self.last = hlc;
@@ -18596,6 +18601,7 @@ impl Engine {
             work: 0,
             ahead: 0,
             crossed: 0,
+            dups: 0,
             replays: 0,
         };
         let make_ns = t0.elapsed().as_nanos() as u64 - ready_ns - seed_ns;
@@ -18684,6 +18690,7 @@ impl Engine {
             replays: rp_replays,
             ahead: rp_ahead,
             crossed: rp_crossed,
+            dups: rp.dups,
             log_lock_ns: {
                 let w2 = log.wait_stats();
                 [w1[0] - w0[0], w2[0] - w1[0], w2[1], w2[2] - w0[2]]

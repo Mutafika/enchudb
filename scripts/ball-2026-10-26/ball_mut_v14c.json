@@ -1,0 +1,20 @@
+[
+ {
+  "name": "記録と WAL の重なりを落とさない (1)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {",
+  "replace": "        if limit.is_some_and(|l| key(hlc) >= key(l)) {"
+ },
+ {
+  "name": "記録と WAL の重なりを落とさない (2)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {",
+  "replace": "        if limit.is_some_and(|l| key(hlc) >= key(l)) {"
+ },
+ {
+  "name": "記録と WAL の重なりを落とさない (3)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if key(hlc) <= key(self.last) || limit.is_some_and(|l| key(hlc) >= key(l)) {",
+  "replace": "        if limit.is_some_and(|l| key(hlc) >= key(l)) {"
+ }
+]
