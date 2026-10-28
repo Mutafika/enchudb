@@ -358,6 +358,24 @@ fn a_build_continues_the_wal_where_it_stopped() {
     cleanup(&path);
 }
 
+/// (T6) 組む間に WAL の書き手が区画を移る (0.37 の 2 区画、 WAL 4 MiB = 区画 2 MiB、 追いつきの前に 40 ms 止まる): 区画を移っただけでは
+/// 読み直さず、 前の区画の残りから新しい区画へ続けて読む (新しい区画を読まないと、 移った後の record を落とす)。
+#[test]
+fn a_build_reads_on_across_wal_halves() {
+    let path = tmp_path("t6");
+    cleanup(&path);
+    let _gone = Gone(path.clone());
+    const MID_WAL: usize = 4 << 20;
+    let mut h = create(&path, MID_WAL, 128 << 20);
+    let mut crossed = 0;
+    for k in 0..3u64 {
+        let ss = concurrent_session(&path, MID_WAL, &mut h, 30, 20, 3, 4, 40, (0, 0), 0, 0x6666 + k, 100, true);
+        crossed += usize::from(ss.st.crossed > 0);
+    }
+    assert!(crossed >= 2, "区画を移った後に続けて読んでいない — 試験の前提 ({crossed}/3)");
+    cleanup(&path);
+}
+
 /// (T4) 組む間に consumer が記録に写して WAL を畳む (WAL 1 MiB、 記録 256 MiB = 捨てない、 追いつきの間を試験の口で広げる): 同じ周の
 /// 間は記録を読まずに WAL の続きから (記録は番号だけ進める) / 畳んだ後は WAL の前の位置が前の周の物 (周で見る)、 記録は当てた HLC まで
 /// 飛んで読む / WAL を読む前か読む間に畳むと読んだ所は新しい周の途中 (読んだ分は捨てて記録から読み直す)。 面の数まで合う。

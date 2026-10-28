@@ -109,8 +109,10 @@ pub struct BallRebuildStats {
     pub skipped: u64,
     /// 球を回した数 (`Ball::replay_in`、 値の変わる書き込みだけ、 最初の記録の段も含む)。 当てた数は [`Self::applied`]。
     pub replays: u64,
-    /// 同じ周で WAL の続きを読んだ時に、 写す側が読み終えた所より先まで写していた回数 (試験の前提)。
+    /// 同じ区画で WAL の続きを読んだ時に、 写す側が読み終えた所より先まで写していた回数 (試験の前提)。
     pub ahead: u64,
+    /// WAL の続きを読んで、 書き手が移った新しい区画でも読んだ回数 (区画を移っても読み直さない所、 試験の前提)。
+    pub crossed: u64,
     /// 公開中に入る前に、 畳む書き出しの終わりを待った時間 (この base の WAL は書き出しから畳むまで append を止める。 1 ms 以上待ったら
     /// もう一度縮むまで回す)。
     pub prequiesce_ns: u64,
@@ -149,6 +151,8 @@ struct BallReplay<'a> {
     work: u64,
     /// [`BallRebuildStats::ahead`]。
     ahead: u64,
+    /// [`BallRebuildStats::crossed`]。
+    crossed: u64,
     /// 球を回した数 (`Ball::replay_in`、 値の変わる書き込みだけ)。
     replays: u64,
     /// [`BallRebuildStats::prof_ns`] / `prof_n`。
@@ -289,8 +293,10 @@ impl BallReplay<'_> {
                 }
             };
             let t1 = std::time::Instant::now();
+            let mut continued = false;
             let start = match self.wal_mark {
                 Some(off) if wal.holds(off) => {
+                    continued = true;
                     // 写す側が読み終えた所より先まで写していても、 WAL は読み終えた所から (記録は読まない)
                     self.ahead += u64::from(log_wal > off);
                     off
@@ -338,7 +344,7 @@ impl BallReplay<'_> {
             let held = |lap: u32| wal.holds(wal_pos(lap, HEADER_SIZE as u64));
             let first = wal_pos_lap(start);
             let start_gone = if first == 0 { wal.folds() != folds } else { !held(first) };
-            if start_gone || !laps.iter().flatten().all(|&l| held(l)) {
+            if start_gone || !laps.iter().flatten().all(|&(l, _)| held(l)) {
                 // 読む前か読む間に畳んだ: 読んだ所は畳んだ区画の途中まで = その区画の残り (記録に写した) を飛ばしている。
                 // 当てずに捨てて、 記録から読み直す
                 self.wal_mark = None;
@@ -359,6 +365,8 @@ impl BallReplay<'_> {
             }
             drop(guard);
             self.prof[4] += t3.elapsed().as_nanos() as u64;
+            // 区画を移った後も読み直さずに、 前の区画の残りから新しい区画へ続けて読んだ (試験の前提)
+            self.crossed += u64::from(continued && matches!(laps, [Some((l, _)), Some((_, n))] if l == first && n > 0));
             if end >= log_wal && *pos < next {
                 // 記録の `next` より前の entry は WAL の `log_wal` より前を写した物 = 全部当てた
                 *pos = next;
@@ -18587,6 +18595,7 @@ impl Engine {
             skipped: 0,
             work: 0,
             ahead: 0,
+            crossed: 0,
             replays: 0,
         };
         let make_ns = t0.elapsed().as_nanos() as u64 - ready_ns - seed_ns;
@@ -18650,8 +18659,8 @@ impl Engine {
         // (4) H より前の残り
         rp.catch_up(log, wal, &mut pos, Some(h));
         // (5) 出す
-        let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead) =
-            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead);
+        let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead, rp_crossed) =
+            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead, rp.crossed);
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
         self.ball_bases.end_side();
         let st = BallRebuildStats {
@@ -18674,6 +18683,7 @@ impl Engine {
             prequiesce_ns,
             replays: rp_replays,
             ahead: rp_ahead,
+            crossed: rp_crossed,
             log_lock_ns: {
                 let w2 = log.wait_stats();
                 [w1[0] - w0[0], w2[0] - w1[0], w2[1], w2[2] - w0[2]]
