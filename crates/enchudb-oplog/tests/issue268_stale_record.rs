@@ -69,7 +69,7 @@ fn scan_never_reads_the_previous_cycle() {
             let _g = lock.lock().unwrap();
             // 前の周: ring の先頭から長さ 0 の Commit を並べて畳む (実機の consumer は空の group でも Commit を打つ)
             wal.advance_checkpoint(wal.head());
-            if wal.head() > HEADER_SIZE as u64 {
+            if !wal.is_empty() {
                 assert!(wal.try_reset(), "round {round}: 畳めない");
             }
             for _ in 0..4 {

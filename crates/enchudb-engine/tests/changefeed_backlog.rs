@@ -77,8 +77,9 @@ fn write_in_order(eng: &Engine, n: u64) -> (usize, Duration) {
         if i % 100 == 99 {
             eng.oplog_commit();
         }
+        // 0.37: 位置は周を含むので下がらない。 区画の中の位置が戻った (畳んだ / もう一方の区画へ移った) 回数を数える
         let h = wal.head();
-        if h < last {
+        if enchudb_oplog::oplog::wal_pos_offset(h) < enchudb_oplog::oplog::wal_pos_offset(last) {
             folds += 1;
         }
         last = h;

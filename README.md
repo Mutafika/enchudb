@@ -284,15 +284,19 @@ db.oplog_sync()?;     // fsync + msync
 A returned write is in the mapped file, so it survives a killed process. It survives power loss
 once it has been flushed: by the background flush (every 100 ms) or by `oplog_sync()`.
 
-The oplog is a ring. When it fills up, the background thread pauses appends, flushes, and starts
-the ring over. Writers that append in the meantime wait instead of losing their records, so a
-single writer that never pauses no longer overflows it (#388); `Engine::wal_room_folds()` counts
-these pauses. A DB that syncs to peers cannot restart the ring until those records have been
-handed on. If that is stuck, writes still land in the DB, but their records drop out of the
-stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch up by bootstrap.
+The oplog file is split into two halves that are used in turn (oplog file format 4, since 0.37). Writers append to one
+half; when it is full they move to the other one, and the background thread flushes the full half and empties it while
+the writers keep going. A writer waits only when both halves are full, that is when flushing cannot keep up. Before 0.37
+the oplog was one ring, and to make room the background thread paused every append while it flushed the whole DB
+(#388: 170–190 ms per pause on a disk whose msync takes 5 ms). One record must fit in one half (half of the capacity
+passed to `finish_with_oplog` / `open_concurrent_with_oplog`); a larger record is refused (`FaultKind::WalSpace`). An
+oplog smaller than 32 KiB keeps the single ring and pauses as before. `Engine::wal_switches()` counts the moves between
+halves and `Engine::wal_room_folds()` the times a waiting writer was given room. A DB that syncs to peers cannot empty a
+half until its records have been handed on. If that is stuck, writes still land in the DB, but their records drop out of
+the stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch up by bootstrap.
 
-Change listeners (`add_change_listener`) do not hold the ring. Records they have not received
-yet move to an in-memory backlog when the ring restarts; past its cap (64 MiB,
+Change listeners (`add_change_listener`) do not hold the oplog. Records they have not received
+yet move to an in-memory backlog when a half is emptied; past its cap (64 MiB,
 `set_change_backlog_limit`) the listeners are detached and told so (`on_detached`). Dropping the
 engine waits until the listeners have taken what is left, but not for a listener that has stopped
 returning: after 5 seconds without a return it closes anyway, and the rest is handed over when that
@@ -305,12 +309,14 @@ instead. Writes to local-only tables (names starting with `_`, `define_reserved_
 `_cursors`) are not handed to listeners, just as they are not sent to peers, so a listener can store
 its position in one of them without receiving its own writes back.
 
-Starting the ring over leaves the previous lap's records in the file until they are overwritten. Every record therefore
-carries the lap it was written in (an 8-byte mark after the payload, oplog file format 3), and recovery stops at the first
-record whose lap is not the current one. Without it, a power loss right after a restart of the ring could present the old
-records as the continuation of the new ones when the OS had written the header page before the data pages (#608).
-A format-3 oplog cannot be opened by 0.35 and earlier; to go back, close the DB cleanly and delete `{db}/oplog`
-(after a clean close everything in it is already applied).
+Emptying a half leaves its previous records in the file until they are overwritten. Every record therefore carries the
+lap it was written in (an 8-byte mark after the payload, since oplog file format 3), and recovery stops at the first
+record whose lap is not the current lap of its half. Without it, a power loss right after a half was emptied could present
+the old records as the continuation of the new ones when the OS had written the header page before the data pages (#608).
+Laps keep increasing across both halves, so recovery replays the older half first. A format-3 oplog (0.36) is read as a
+single ring and becomes format 4 the first time it is emptied. A format-4 oplog cannot be opened by 0.36 and earlier (a
+format-3 one by 0.35 and earlier); to go back, close the DB cleanly and delete `{db}/oplog` (after a clean close
+everything in it is already applied).
 
 ### RAG (`enchudb-rag`)
 

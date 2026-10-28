@@ -90,6 +90,15 @@ fn writes_dropped_right_before_close_reach_the_peer() {
     {
         let _no_fold = eng_a.transfer_lock_for_fold();
         let_the_consumer_commit_and_wait_on_the_lock(&eng_a);
+        // 2 区画: A を埋めて B へ移る (A は畳めないまま残るので、 空きは B の残りだけ)
+        let filler = eng_a.entity_in("notes").unwrap();
+        let switched = wal.switches();
+        let mut i = 0u32;
+        while wal.switches() == switched {
+            eng_a.tie_to(filler, "notes.note", i);
+            eng_a.oplog_commit();
+            i += 1;
+        }
         // 閉じた group で WAL を埋め、 残りを 100 B (Tie 136 B も Commit 120 B も入らない) にする。 TieLeaf の record は
         // 文字列の長さ + c B
         let e0 = eng_a.entity_in("notes").unwrap();

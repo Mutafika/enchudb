@@ -65,7 +65,7 @@ fn main() {
         s.spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 for w in logs {
-                    if w.free_bytes() < (wal_mb as u64) << 18 && w.checkpoint_and_reset(|_| true, || true).1 {
+                    if w.free_bytes() < (wal_mb as u64) << 18 && w.checkpoint_and_reset(|_| true, |_| true).1 {
                         folds.fetch_add(1, Ordering::Relaxed);
                     }
                 }

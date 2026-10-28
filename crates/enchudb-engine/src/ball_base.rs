@@ -300,9 +300,9 @@ pub(crate) struct BallBases {
     recent: Mutex<Recent>,
     /// 組む間に捨てた分の控え (`start_side` 〜 `end_side`、 番号, HLC, 書き込み)。 捨てる口が土台に当てる前に足す。
     side: Mutex<Option<Vec<(u64, Hlc, BaseOp)>>>,
-    /// 記録に写した所の組 (記録の次の番号, 写し終えた WAL の位置, WAL の周)。 写す側が `change_emit` の下で写すたび・畳んだ後に置く。
-    /// 組む側は `change_emit` を待たずにこれを読む (consumer は書き出しから畳むまで `change_emit` を持つ)。
-    mark: Mutex<Option<(u64, u64, u32)>>,
+    /// 記録に写した所の組 (記録の次の番号, 写し終えた WAL の位置 = `wal_pos`)。 写す側が `change_emit` の下で写すたび・畳んだ後に
+    /// 置く。 組む側は `change_emit` を待たずにこれを読む (consumer は書き出しから畳むまで `change_emit` を持つ)。
+    mark: Mutex<Option<(u64, u64)>>,
     /// 試験: 捨てる時に止める所 (1 = header を書き出した後・cell の前、 2 = cell を半分当てて書き出した後)。
     #[cfg(test)]
     pub(crate) stop: std::sync::atomic::AtomicU8,
@@ -498,14 +498,14 @@ impl BallBases {
         *self.side.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
-    /// 記録に写した所 (記録の次の番号 `next` より前の entry は、 周 `lap` の WAL の `log_wal` より前の record を写した物)。 呼び手が
+    /// 記録に写した所 (記録の次の番号 `next` より前の entry は、 WAL の位置 `log_wal` より前の record を写した物)。 呼び手が
     /// `change_emit` を持つ。
-    pub(crate) fn set_mark(&self, next: u64, log_wal: u64, lap: u32) {
-        *self.mark.lock().unwrap_or_else(|p| p.into_inner()) = Some((next, log_wal, lap));
+    pub(crate) fn set_mark(&self, next: u64, log_wal: u64) {
+        *self.mark.lock().unwrap_or_else(|p| p.into_inner()) = Some((next, log_wal));
     }
 
     /// 最後に置いた [`Self::set_mark`] の組。
-    pub(crate) fn mark(&self) -> Option<(u64, u64, u32)> {
+    pub(crate) fn mark(&self) -> Option<(u64, u64)> {
         *self.mark.lock().unwrap_or_else(|p| p.into_inner())
     }
 

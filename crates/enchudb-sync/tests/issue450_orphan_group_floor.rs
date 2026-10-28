@@ -52,24 +52,39 @@ const ROOM: u64 = TIE + 50;
 /// ある。 満杯に近い WAL を空けに来る段 (#388) は、 畳む lock (準備の間この test が持つ) を試す前に Commit を打つ (100 ms
 /// ごとの Commit も同じ)。 入ると残りがちょうど Commit 1 つ分ずれて前提を作れないので、 その時だけ作り直す (他のずれは前提の
 /// 誤りとして落とす)。
+///
+/// 1 区画 (v3) の形の WAL で見る (2 区画にできない大きさ)。 2 区画の形では孤児にならない (↓ の test)。
 #[test]
 fn a_folded_orphan_group_reaches_the_peer() {
     for attempt in 0..5 {
-        if folded_orphan_group_reaches_the_peer(attempt) {
+        if folded_orphan_group_reaches_the_peer(attempt, false) {
             return;
         }
     }
     panic!("5 回とも準備の途中で consumer の Commit が WAL に入り、 前提を作れなかった");
 }
 
-/// 1 回分。 準備の途中に consumer の Commit が入ったら false (作り直す)。
-fn folded_orphan_group_reaches_the_peer(attempt: u32) -> bool {
+/// 0.37 の 2 区画の形: 今の区画に閉じの Commit が入らなくても、 次の Commit がもう一方の区画に入って group を閉じる (切り替えは
+/// 閉じの Commit が入らなければ閉じずに移り、 読み手は group を区画をまたいで読む)。 孤児にならず、 相手には普通の差分で届く
+/// (floor は上げない)。
+#[test]
+fn an_unclosed_group_is_closed_in_the_other_half_and_reaches_the_peer() {
+    for attempt in 0..5 {
+        if folded_orphan_group_reaches_the_peer(attempt, true) {
+            return;
+        }
+    }
+    panic!("5 回とも準備の途中で consumer の Commit が WAL に入り、 前提を作れなかった");
+}
+
+/// 1 回分。 準備の途中に consumer の Commit が入ったら false (作り直す)。 `two` = 2 区画の形の WAL。
+fn folded_orphan_group_reaches_the_peer(attempt: u32, two: bool) -> bool {
     let (pa, pb) = (tmp_path("a"), tmp_path("b"));
     let mem = Arc::new(InMemoryTransport::new());
     mem.register_peer(1);
     mem.register_peer(2);
     let transport: Arc<dyn Transport> = mem.clone();
-    let eng_a = make_engine(&pa, 1, 64 * 1024);
+    let eng_a = make_engine(&pa, 1, if two { 64 * 1024 } else { 24 * 1024 });
     let eng_b = make_engine(&pb, 2, 16 * 1024 * 1024);
     let sync_a = Syncer::new(eng_a.clone(), transport.clone());
     let sync_b = Syncer::new(eng_b.clone(), transport.clone());
@@ -97,6 +112,18 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32) -> bool {
     let raced = |free: u64| free.abs_diff(ROOM) == COMMIT;
     let orphan_hlc = {
         let _no_fold = eng_a.transfer_lock_for_fold();
+        assert_eq!(wal.two_halves(), two, "前提: WAL の形");
+        if two {
+            // A を埋めて B へ移る (A は畳めないまま残るので、 空きは B の残りだけ)
+            let filler = eng_a.entity_in("notes").unwrap();
+            let switched = wal.switches();
+            let mut i = 0u32;
+            while wal.switches() == switched {
+                eng_a.tie_to(filler, "notes.note", i);
+                eng_a.oplog_commit();
+                i += 1;
+            }
+        }
         // 閉じた group で WAL を埋め、 残りを ROOM にする。 TieLeaf の record は文字列の長さ + c B
         let e0 = eng_a.entity_in("notes").unwrap();
         let h0 = wal.head();
@@ -134,6 +161,28 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32) -> bool {
     };
     // 死区間では Err を返さない
     eng_a.oplog_sync().unwrap();
+    if two {
+        // 次の Commit がもう一方の区画に入って group を閉じる: 普通の差分で届き、 floor は上げない
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            eng_a.oplog_sync().unwrap();
+            eng_a.transfer_oplog_to_sync_ops();
+            sync_a.publish_since(Hlc::ZERO);
+            let out = sync_b.pull_once(1);
+            assert!(!out.history_truncated, "孤児にならないはずの group で穴を知らされた: {out:?}");
+            if !eng_b.pull_raw("notes.note", 7).is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < end, "閉じていなかった group の note が 5 秒で届かない (head {})", wal.head());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(eng_a.wal_drop_floor_bumps(), 0, "孤児にならないので floor は上げない");
+        assert!(floor_of(&eng_a, 1).is_none_or(|f| f < orphan_hlc));
+        drop((sync_a, sync_b, wal, eng_a, eng_b));
+        cleanup(&pa);
+        cleanup(&pb);
+        return true;
+    }
     // consumer が死区間の例外で畳み、 孤児の group の write を覆う floor を上げる (落ちが止んで 100 ms 後)
     let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while floor_of(&eng_a, 1).is_none_or(|f| f < orphan_hlc) {
@@ -146,7 +195,7 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32) -> bool {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(wal.head() < 32 * 1024, "前提: 畳んでいる (head {})", wal.head());
+    assert!(enchudb_oplog::oplog::wal_pos_offset(wal.head()) < 32 * 1024, "前提: 畳んでいる (head {})", wal.head());
 
     sync_a.publish_since(Hlc::ZERO);
     let out = sync_b.pull_once(1);

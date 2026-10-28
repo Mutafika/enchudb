@@ -144,8 +144,10 @@ fn create(path: &str, wal: usize, log_cap: usize) -> Hist {
 /// 組んだ時の数: (組む間に書いた数, 組んだ時の段ごとの数, 公開中で待った書き手, 閾値より前で球に書かなかった書き手)。
 struct Session {
     during: u64,
-    /// 組む間に WAL を畳んだ回数 (WAL の周の差)。
+    /// 組む間に WAL の区画を畳んだ回数 (`OpLog::folds` の差)。
     folds: u32,
+    /// 組む間に WAL の書き手が区画を移った回数 (`OpLog::switches` の差、 0.37)。
+    switches: u64,
     st: enchudb_engine::engine::BallRebuildStats,
     waits: u64,
     covered: u64,
@@ -189,6 +191,7 @@ fn concurrent_session(
     let round_now = AtomicUsize::new(0);
     let during = AtomicU64::new(0);
     let folds = std::sync::atomic::AtomicU32::new(0);
+    let switches = AtomicU64::new(0);
     // 組み終えた回 + 1 (0 = まだ)
     let built_at = AtomicUsize::new(0);
     let go = std::sync::atomic::AtomicBool::new(true);
@@ -232,17 +235,18 @@ fn concurrent_session(
                 }
             });
         }
-        let (round_now, writes, during, built_at, folds) = (&round_now, &writes, &during, &built_at, &folds);
+        let (round_now, writes, during, built_at, folds, switches) = (&round_now, &writes, &during, &built_at, &folds, &switches);
         s.spawn(move || {
             while round_now.load(Ordering::Acquire) < build_at {
                 std::thread::yield_now();
             }
             let before = writes.load(Ordering::Relaxed);
-            let lap = eng.oplog().unwrap().lap();
+            let (folds0, switches0) = (eng.oplog().unwrap().folds(), eng.oplog().unwrap().switches());
             // 最初の読み: 組む (答えは見ない)
             let _ = eng.ball_value_at(eids[0], "t.a", 0);
             during.store(writes.load(Ordering::Relaxed) - before, Ordering::Relaxed);
-            folds.store(eng.oplog().unwrap().lap() - lap, Ordering::Relaxed);
+            folds.store((eng.oplog().unwrap().folds() - folds0) as u32, Ordering::Relaxed);
+            switches.store(eng.oplog().unwrap().switches() - switches0, Ordering::Relaxed);
             built_at.store(round_now.load(Ordering::Acquire) + 1, Ordering::Release);
         });
         for round in 0..100_000 {
@@ -266,9 +270,10 @@ fn concurrent_session(
     let st = eng.ball_rebuild_stats().expect("組んだ");
     let (waits, covered) = eng.ball_publish_counts();
     eprintln!(
-        "組む: {st:?}、 組む間の書き込み {}、 畳んだ {}、 回 {rounds}、 公開中で待った {waits}、 閾値より前 {covered}",
+        "組む: {st:?}、 組む間の書き込み {}、 畳んだ {}、 区画を移った {}、 回 {rounds}、 公開中で待った {waits}、 閾値より前 {covered}",
         during.load(Ordering::Relaxed),
-        folds.load(Ordering::Relaxed)
+        folds.load(Ordering::Relaxed),
+        switches.load(Ordering::Relaxed)
     );
     let (seen, _) = h.verify(&db, "書き手と並んで組んだ後");
     // 地平以降の控え: 書き手が速いと記録が捨てて地平がこの session の中に入る (T3 は最後の数回だけ)
@@ -280,7 +285,7 @@ fn concurrent_session(
         want.sort_unstable();
         assert_eq!(eng.ball_pull_at("t.a", v, now).unwrap(), want, "今の v={v}");
     }
-    Session { during: during.load(Ordering::Relaxed), folds: folds.load(Ordering::Relaxed), st, waits, covered }
+    Session { during: during.load(Ordering::Relaxed), folds: folds.load(Ordering::Relaxed), switches: switches.load(Ordering::Relaxed), st, waits, covered }
 }
 
 /// (T2) 書き手 4 本が書き続ける中で最初の読みが組む (書き手は 1 件ごとに 20 µs 空けて、 組む側が追いつける速さに)。 開き直しを 9 回重ねる

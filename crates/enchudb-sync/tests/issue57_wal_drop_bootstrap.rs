@@ -164,7 +164,7 @@ fn dropped_writes_reach_the_peer(async_: bool, per_peer: bool) {
     // floor が上がり、 もう一度 bootstrap に回るのが正しい動き)
     let wal = eng_a.oplog().unwrap().clone();
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while wal.head() > 16 * 1024 {
+    while !wal.is_empty() {
         assert!(std::time::Instant::now() < end, "WAL が 10 秒で畳まれない (head {})", wal.head());
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
