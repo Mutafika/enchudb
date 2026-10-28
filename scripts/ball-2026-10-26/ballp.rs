@@ -8,7 +8,7 @@
 //!    控えた時刻 (地平より後のもの) のデッキ = 手元の写し
 //! w <base|nobase> <書き込み数> <seed>: 記録が捨て続ける時の書き手 1 本の書き換え (P2)。 base = 記録を作ってから宣言 (土台あり)、
 //!    nobase = 宣言してから記録を作る (メモリだけの球、 記録が捨てても何も当てない)。 記録 1 MiB、 WAL 8 MiB
-//! l <記録 MiB> <書き込み数> <seed>: (12 回目) 開き直した後、 書き手 1 本が書き続ける中で最初の読みが球を組む。 書き込み 1 回ごとの
+//! l <記録 MiB> <書き込み数> <seed>: (12 回目、 14 回目に BALL_LISTEN=1 で何もしない listener を付ける形) 開き直した後、 書き手 1 本が書き続ける中で最初の読みが球を組む。 書き込み 1 回ごとの
 //!    時間を取り、 組む間 / 外の最大・p99 と、 組んだ時の段ごとの時間 (`ball_rebuild_stats`: 公開中の間 = 書き手が待ちうる間) を出す (P1)
 //! 出力: 1 行 1 JSON (stdout)。
 
@@ -256,6 +256,12 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
     }
     let db = Database::open_with_oplog(&path, wal_cap()).unwrap();
     let eng = db.engine();
+    if std::env::var_os("BALL_LISTEN").is_some() {
+        // 何もしない listener (通知係が consumer の書き出しのたびに記録へ写す。 居なければ畳む時だけ)
+        struct Quiet;
+        impl enchudb::changefeed::ChangeListener for Quiet {}
+        eng.add_change_listener(std::sync::Arc::new(Quiet));
+    }
     let records = eng.change_log_range().map_or(0, |(f, x)| x - f);
     let stop = std::sync::atomic::AtomicBool::new(false);
     let origin = Instant::now();

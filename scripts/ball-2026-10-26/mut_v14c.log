@@ -1,1 +1,5 @@
-baseline: 変異なしで fail (17 秒) — 先に直す
+baseline: pass 30 秒 → 1 run の上限 900 秒
+  killed 17s             記録と WAL の重なりを落とさない (1)
+  killed 14s             記録と WAL の重なりを落とさない (2)
+  killed 12s             記録と WAL の重なりを落とさない (3)
+killed 3 / survived 0 / その他 0
