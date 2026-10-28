@@ -97,7 +97,7 @@ pub struct BallRebuildStats {
     pub publish_parts_ns: [u64; 4],
     /// 全部。
     pub total_ns: u64,
-    /// 追いつきの回数 (公開中の最後の 1 回を含む)。
+    /// 追いつきの回数 (公開中の前の 1 回と、 公開中の最後の 1 回を含む)。
     pub rounds: u64,
     /// 段ごとの時間 (全部の回の和): 記録を読む (`ChangeLog::read`) / 記録の entry を解いて当てる / 記録に写した所を読む (組の周が WAL と
     /// 違う時は `change_emit` を待つ) / WAL を読む (`scan_for_change_log`) / WAL の record を当てる / 捨てた分の控えを取って当てる /
@@ -18502,9 +18502,10 @@ impl Engine {
         // 段ごとの数は追いつきの分を別に
         let (log_prof, log_prof_n) = (std::mem::take(&mut rp.prof), std::mem::take(&mut rp.prof_n));
         // (2) 記録の残り (読んでいる間に写した分) と WAL の残り。 公開中 (書き手が待つ間) を短くするため、 1 回に当てる数が
-        // 小さくなるまで繰り返す
+        // 小さくなるまで繰り返す。 縮まなくなったら (書き手が追いつきと同じ速さ以上で書く) やめて公開中に入る: その紐の書き手は
+        // 最後の残りを当てる間だけ待つ (回し続けても縮まない)
         let t_catch = std::time::Instant::now();
-        let mut rounds = 1;
+        let (mut rounds, mut prev) = (0, u64::MAX);
         for _ in 0..16 {
             rounds += 1;
             if pause > 0 {
@@ -18512,15 +18513,18 @@ impl Engine {
             }
             let before = rp.records;
             rp.catch_up(log, wal, &mut pos, None);
-            if rp.records - before < 1024 {
+            let n = rp.records - before;
+            if n < 1024 || n.saturating_mul(4) > prev.saturating_mul(3) {
                 break;
             }
+            prev = n;
         }
         // 畳む書き出しの途中なら終わるのを待ち (公開中に入ってから待つと、 その間この紐の書き手が球に書く所で待つ)、 その後の残りを当てる
         let t_pq = std::time::Instant::now();
         wal.quiesce();
         let prequiesce_ns = t_pq.elapsed().as_nanos() as u64;
         rp.catch_up(log, wal, &mut pos, None);
+        rounds += 2; // この 1 回と、 公開中の最後の 1 回
         let catch_ns = t_catch.elapsed().as_nanos() as u64;
         // (3) 公開中を置いて WAL の時計から H を取る: H より前の書き込みは組む側、 以降は書き手が球に書く。 H より前に採番した
         // append が書き終えるのを待つ (`quiesce`、 WAL の空きは待たない)

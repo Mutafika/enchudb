@@ -158,6 +158,9 @@ pub struct ChangeLog {
     /// 試験: 捨てる前の口が返った後・捨てる header の前で止める (落ちた形)。
     #[cfg(test)]
     pub(crate) stop_after_discard_hook: std::sync::atomic::AtomicBool,
+    /// 試験: entry を書いた後 (lock の外) に止まる µs (読み手が書きかけの間に読むように)。
+    #[cfg(test)]
+    slow_write_us: std::sync::atomic::AtomicU64,
 }
 
 impl ChangeLog {
@@ -191,6 +194,8 @@ impl ChangeLog {
             stop_before_header: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             stop_after_discard_hook: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            slow_write_us: std::sync::atomic::AtomicU64::new(0),
         };
         log.restore(&h);
         Ok(log)
@@ -400,6 +405,12 @@ impl ChangeLog {
             write_header(&self.region, &mid);
             self.region.mark_dirty(0, HEADER);
             self.map.flush_dirty()?;
+            // 捨てた所の目印を外す ((2) は lock の外でそこを上書きする。 読み手が古い目印から歩くと書きかけを読む)
+            st.c.first = mid.first;
+            st.c.tail = mid.tail;
+            while st.marks.front().is_some_and(|&(m, _)| m < st.c.first) {
+                st.marks.pop_front();
+            }
         }
         // (2) entry を書いて書き出す (lock の外)
         drop(st);
@@ -416,6 +427,13 @@ impl ChangeLog {
             let crc = entry_crc(no, r.bytes.len() as u32, &r.hlc, r.wal_id, &r.bytes);
             self.write_entry_header(base, no, r.bytes.len() as u32, crc, r.hlc, r.wal_id)?;
             self.region.mark_dirty(base, n);
+        }
+        #[cfg(test)]
+        {
+            let us = self.slow_write_us.load(std::sync::atomic::Ordering::Relaxed);
+            if us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(us));
+            }
         }
         self.map.flush_dirty()?;
         #[cfg(test)]
@@ -558,7 +576,7 @@ impl ChangeLog {
             st.marked = true;
         }
         let i = st.marks.partition_point(|&(m, _)| m <= no);
-        let (mut k, mut at) = if i == 0 { (c.first, c.tail) } else { st.marks[i - 1] };
+        let (mut k, mut at) = if i == 0 || st.marks[i - 1].0 < c.first { (c.first, c.tail) } else { st.marks[i - 1] };
         while k < no {
             at = self.wrap_at(at);
             let e = self.entry_at(at).filter(|e| e.no == k)?;
@@ -742,6 +760,88 @@ mod tests {
             p = got.last().unwrap().no + 1;
             out.extend(got);
         }
+    }
+
+    /// `seek_after` (13 回目、 球を組む側が当てた所まで記録を飛ぶ): HLC が after より後の最初の番号。 目印 (64 件ごと) の前後・頭・
+    /// 終わり・捨てた後。
+    #[test]
+    fn seek_after_finds_the_first_later_hlc() {
+        let dir = tempdir("seek");
+        let log = ChangeLog::open(&dir, MIN_CAP, true, false).unwrap();
+        let recs: Vec<_> = (0..500).map(|i| rec(i, 100)).collect();
+        add(&log, &recs, &[]);
+        let key = |no: u64| (1000 + no, 0);
+        for pos in [0u64, 1, 63, 64, 65, 200, 499, 500] {
+            for after in [0u64, 1, 62, 63, 64, 65, 127, 128, 129, 300, 498, 499, 600] {
+                assert_eq!(log.seek_after(pos, key(after)), Ok((after + 1).clamp(pos, 500)), "pos {pos} after {after}");
+            }
+            assert_eq!(log.seek_after(pos, (999, 0)), Ok(pos), "全部が後");
+            // 同じ wall の中は logical で比べる
+            assert_eq!(log.seek_after(pos, (1000 + 300, 1)), Ok(301u64.clamp(pos, 500)));
+        }
+        assert_eq!(log.seek_after(501, key(0)), Err(Truncated { from: 500 }));
+        // 捨てた後: 頭より前は Truncated、 頭からは同じ
+        let more: Vec<_> = (500..3000).map(|i| rec(i, 1000)).collect();
+        add(&log, &more, &[]);
+        let (first, next) = log.range();
+        assert!(first > 500, "捨てていない — 試験の前提 ({first})");
+        assert_eq!(log.seek_after(first - 1, key(0)), Err(Truncated { from: first }));
+        for after in [first - 1, first, first + 63, first + 64, next - 2, next - 1, next + 5] {
+            assert_eq!(log.seek_after(first, key(after)), Ok((after + 1).clamp(first, next)), "after {after}");
+        }
+    }
+
+    /// 足す側は entry を書いて書き出す間 lock を外す (13 回目): その間に読み手が読んでも、 読めた entry はその番号の中身で、 読めない
+    /// entry に当たって途中で止まらない (Truncated は捨てた所 = `from > pos` だけ)。 書く間を試験の口で広げ、 読み手 2 本を並べる。
+    #[test]
+    fn readers_never_see_a_chunk_being_written() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+        let dir = tempdir("race");
+        let log = ChangeLog::open(&dir, MIN_CAP, true, false).unwrap();
+        log.slow_write_us.store(300, Relaxed);
+        let size = |k: u64| 300 + (k % 5) as usize * 50;
+        let (stop, reads, cut) = (AtomicBool::new(false), AtomicU64::new(0), AtomicU64::new(0));
+        std::thread::scope(|s| {
+            let (log, stop, reads, cut) = (&log, &stop, &reads, &cut);
+            s.spawn(move || {
+                for i in (0..20_000u64).step_by(100) {
+                    let batch: Vec<_> = (i..i + 100).map(|k| rec(k, size(k))).collect();
+                    add(log, &batch, &[]);
+                }
+                stop.store(true, Relaxed);
+            });
+            for t in 0..2u64 {
+                s.spawn(move || {
+                    let mut r = 0x9E37_79B9_7F4A_7C15u64 ^ t;
+                    while !stop.load(Relaxed) {
+                        r ^= r << 13;
+                        r ^= r >> 7;
+                        r ^= r << 17;
+                        let (first, next) = log.range();
+                        // 半分は頭の近く (捨てたばかりの所の隣)
+                        let pos = first + r % if r & 1 == 0 { (next - first + 1).min(200) } else { next - first + 1 };
+                        match log.read(pos, 16 << 10) {
+                            Ok(es) => {
+                                for (k, e) in es.iter().enumerate() {
+                                    assert_eq!(e.no, pos + k as u64);
+                                    assert_eq!(e.bytes, rec(e.no, size(e.no)).bytes, "番号 {} の中身", e.no);
+                                }
+                                reads.fetch_add(1, Relaxed);
+                            }
+                            Err(tr) => {
+                                assert!(tr.from > pos, "読めない entry で止まった: pos {pos} from {} (range {first}..{next})", tr.from);
+                                cut.fetch_add(1, Relaxed);
+                            }
+                        }
+                        if let Ok(p) = log.seek_after(pos, (1000 + pos + 10, 0)) {
+                            assert!(p >= pos, "seek_after が戻った: {pos} → {p}");
+                        }
+                    }
+                });
+            }
+        });
+        let first = log.range().0;
+        assert!(reads.load(Relaxed) > 100 && first > 0, "読み {} / 頭 {first} (捨てた所で止まった {}) — 試験の前提", reads.load(Relaxed), cut.load(Relaxed));
     }
 
     #[test]

@@ -307,7 +307,8 @@ fn the_first_read_builds_while_writers_write() {
 }
 
 /// (T3) 組む間に記録が捨てる (記録 1 MiB、 WAL 1 MiB、 追いつきの間を広げて書き手が何周も書く): 組む側が読む前に捨てた所は、 捨てる口が
-/// 土台に当てる前に渡した控えから当てる (組み直さない)。 WAL も何度も畳む。
+/// 土台に当てる前に渡した控えから当てる (組み直さない)。 WAL も何度も畳む。 書き手が全力で追いつきが縮まないので、 2 回目で公開中に入る
+/// (回の数で見る)。
 #[test]
 fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     let path = tmp_path("t3");
@@ -319,14 +320,16 @@ fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     for k in 0..3u64 {
         let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2);
         used += usize::from(ss.st.side_ops > 0);
+        // 追いつきの間を広げて書き手が全力 = 縮まない: 2 回目で公開中へ (16 回まで回さない)
+        assert!(ss.st.rounds <= 4, "縮まない追いつきを回し続けた: {} 回", ss.st.rounds);
     }
     assert!(used >= 2, "組む間に記録が捨てた所を読んでいない — 試験の前提 ({used}/3)");
     cleanup(&path);
 }
 
-/// (T4) 組む間に consumer が記録に写して WAL を畳む (WAL 1 MiB、 記録 256 MiB = 捨てない、 追いつきの間を試験の口で広げる): 追いつきは
-/// 前に読んだ record を記録から読み直す (HLC で落とす) / 畳んだ後は WAL の前の位置が前の周の物 (周で見る) / WAL を読む前か読む間に畳むと
-/// 読んだ所は新しい周の途中 (読んだ分は捨てて記録から読み直す)。 面の数まで合う。
+/// (T4) 組む間に consumer が記録に写して WAL を畳む (WAL 1 MiB、 記録 256 MiB = 捨てない、 追いつきの間を試験の口で広げる): 同じ周の
+/// 間は記録を読まずに WAL の続きから (記録は番号だけ進める) / 畳んだ後は WAL の前の位置が前の周の物 (周で見る)、 記録は当てた HLC まで
+/// 飛んで読む / WAL を読む前か読む間に畳むと読んだ所は新しい周の途中 (読んだ分は捨てて記録から読み直す)。 面の数まで合う。
 #[test]
 fn a_build_reads_on_while_the_wal_folds() {
     let path = tmp_path("t4");
