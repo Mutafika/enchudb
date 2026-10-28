@@ -298,6 +298,10 @@ impl BallReplay<'_> {
                 }
             };
             let t1 = std::time::Instant::now();
+            let mp = self.eng.ball_publish_pause[3].load(std::sync::atomic::Ordering::Relaxed);
+            if mp > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(mp));
+            }
             let mut continued = false;
             let start = match self.wal_mark {
                 Some(off) if wal.holds(off) => {
@@ -5134,7 +5138,7 @@ pub struct Engine {
     ball_build_pause: std::sync::atomic::AtomicU64,
     /// 試験: 公開中を置いた後・H を取る前 / 書き終えを待った後・残りを読む前 / 追いつきで WAL の位置を取った後・WAL を読む前に止まる
     /// 時間 (µs、 公開の約束の場所と、 読む間に畳む場所を広げる)。
-    ball_publish_pause: [std::sync::atomic::AtomicU64; 3],
+    ball_publish_pause: [std::sync::atomic::AtomicU64; 4],
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -5712,7 +5716,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 3],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 4],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -6998,7 +7002,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 3],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 4],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -18735,6 +18739,12 @@ impl Engine {
     #[doc(hidden)]
     pub fn ball_set_scan_pause(&self, us: u64) {
         self.ball_publish_pause[2].store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 試験: 球を組む時、 追いつきで写した所の組を読んだ後・記録を読む前に `us` µs 止まる (その間に記録が組の番号より先まで捨てる場所を広げる)。
+    #[doc(hidden)]
+    pub fn ball_set_mark_pause(&self, us: u64) {
+        self.ball_publish_pause[3].store(us, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 試験: 球を組む時、 追いつきの毎回の前に `ms` 止まる (書き手が並んで書く間と、 追いつきの間に consumer が写す・捨てる・畳む間を広げる)。

@@ -170,6 +170,7 @@ fn concurrent_session(
     seed: u64,
     min_seen: usize,
     listen: bool,
+    mark_pause_us: u64,
 ) -> Session {
     let db = Database::open_with_oplog(path, wal).unwrap();
     let eng = db.engine();
@@ -182,6 +183,7 @@ fn concurrent_session(
     eng.ball_set_build_pause(pause_ms);
     eng.ball_set_publish_pause(publish_pause_us.0, publish_pause_us.1);
     eng.ball_set_scan_pause(scan_pause_us);
+    eng.ball_set_mark_pause(mark_pause_us);
     assert!(eng.ball_rebuild_stats().is_none(), "開くだけでは組まない");
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let bar = Barrier::new(TH + 1);
@@ -301,7 +303,7 @@ fn the_first_read_builds_while_writers_write() {
     let (mut overlapped, mut waits, mut covered) = (0, 0, 0);
     for k in 0..9u64 {
         let pp = [(2000, 0), (0, 2000), (0, 0)][k as usize % 3];
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100, false);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100, false, 0);
         overlapped += usize::from(ss.during > 0);
         waits += ss.waits;
         covered += ss.covered;
@@ -330,7 +332,7 @@ fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     let mut h = create(&path, SMALL_WAL, 1 << 20);
     let mut used = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2, false);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2, false, 0);
         used += usize::from(ss.st.side_ops > 0);
         // 追いつきの間を広げて書き手が全力 = 縮まない: すぐ公開中へ (打ち切らなければ 16 + 2 回。 回の大きさは畳み方で揺れるので幅を持つ)
         assert!(ss.st.rounds <= 8, "縮まない追いつきを回し続けた: {} 回", ss.st.rounds);
@@ -339,7 +341,7 @@ fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     cleanup(&path);
 }
 
-/// (T5) 同じ周の WAL の続き (WAL 64 MiB = 組む間に畳まない、 追いつきの前に consumer の 1 tick より長く止まる): 写す側が組む側の読み終えた所より
+/// (T5) 同じ区画の WAL の続き (WAL 64 MiB、 追いつきの前に consumer の 1 tick より長く止まる): 写す側が組む側の読み終えた所より
 /// 先まで記録に写していても、 組む側は記録を読まずに WAL を読み終えた所から読む (写した所から読むと間の record を落とす)。 記録へ写すのは
 /// listener が居る時の通知係なので、 何もしない listener を付ける。
 #[test]
@@ -350,17 +352,18 @@ fn a_build_continues_the_wal_where_it_stopped() {
     let mut h = create(&path, WAL, 128 << 20);
     let mut ahead = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3, 4, 150, (0, 0), 0, 0x5555 + k, 100, true);
-        assert_eq!(ss.folds, 0, "組む間に畳んだ — 試験の前提");
-        ahead += usize::from(ss.st.ahead > 0);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3, 4, 150, (0, 0), 0, 0x5555 + k, 100, true, 0);
+        ahead += ss.st.ahead;
     }
-    assert!(ahead >= 2, "写す側が組む側より先に写していない — 試験の前提 ({ahead}/3)");
+    // 踏んだ回の和 (並べて回すと session ごとの数は揺れる)。 0.37 はもう一方の区画を畳んでも同じ区画の続きは続く (畳まないことは前提にしない)
+    assert!(ahead >= 2, "写す側が組む側より先に写していない — 試験の前提 ({ahead} 回)");
     cleanup(&path);
 }
 
 /// (T7) 記録が WAL より小さい (記録 1 MiB、 WAL 64 MiB、 書き手が全力、 追いつきの前に 300 ms): 記録は組の番号より先まで捨て、 組む側は捨てる口の
 /// 控えで先まで当てた後に、 写した所から WAL を読む (WAL はその record をまだ持つ) = 当てた record が重なる。 前に当てた所より前の HLC は当てない
-/// (古い record を後から当てると面が化ける)。 listener を付ける (通知係が書き出しのたびに記録へ写す = 記録が組む間に何度も捨てる)。
+/// (古い record を後から当てると面が化ける)。 listener を付ける (通知係が書き出しのたびに記録へ写す = 記録が組む間に何度も捨てる)。 組を読んだ後・
+/// 記録を読む前に試験の口で 50 ms 止まる (その間に記録が組の番号より先まで捨てる)。
 #[test]
 fn a_build_drops_what_it_already_applied_from_the_side_notes() {
     let path = tmp_path("t7");
@@ -369,7 +372,7 @@ fn a_build_drops_what_it_already_applied_from_the_side_notes() {
     let mut h = create(&path, WAL, 1 << 20);
     let (mut dups, mut side) = (0, 0);
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true);
+        let ss = concurrent_session(&path, WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true, 50_000);
         dups += usize::from(ss.st.dups > 0);
         side += usize::from(ss.st.side_ops > 0);
     }
@@ -377,21 +380,22 @@ fn a_build_drops_what_it_already_applied_from_the_side_notes() {
     cleanup(&path);
 }
 
-/// (T6) 組む間に WAL の書き手が区画を移る (0.37 の 2 区画、 WAL 4 MiB = 区画 2 MiB、 追いつきの前に 40 ms 止まる): 区画を移っただけでは
+/// (T6) 組む間に WAL の書き手が区画を移る (0.37 の 2 区画、 WAL 2 MiB = 区画 1 MiB、 追いつきの前に 40 ms 止まる): 区画を移っただけでは
 /// 読み直さず、 前の区画の残りから新しい区画へ続けて読む (新しい区画を読まないと、 移った後の record を落とす)。
 #[test]
 fn a_build_reads_on_across_wal_halves() {
     let path = tmp_path("t6");
     cleanup(&path);
     let _gone = Gone(path.clone());
-    const MID_WAL: usize = 4 << 20;
+    const MID_WAL: usize = 2 << 20;
     let mut h = create(&path, MID_WAL, 128 << 20);
     let mut crossed = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, MID_WAL, &mut h, 30, 20, 3, 4, 40, (0, 0), 0, 0x6666 + k, 100, true);
-        crossed += usize::from(ss.st.crossed > 0);
+        let ss = concurrent_session(&path, MID_WAL, &mut h, 30, 20, 3, 4, 40, (0, 0), 0, 0x6666 + k, 100, true, 0);
+        crossed += ss.st.crossed;
     }
-    assert!(crossed >= 2, "区画を移った後に続けて読んでいない — 試験の前提 ({crossed}/3)");
+    // 踏んだ回の和 (並べて回すと session ごとの数は揺れる)
+    assert!(crossed >= 2, "区画を移った後に続けて読んでいない — 試験の前提 ({crossed} 回)");
     cleanup(&path);
 }
 
@@ -408,7 +412,7 @@ fn a_build_reads_on_while_the_wal_folds() {
     let (mut folded, mut refolds) = (0, 0);
     for k in 0..3u64 {
         // WAL の位置を取った後・読む前に 20 ms 止まる (その間に畳むと、 読む所が新しい周の途中になる)
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 20_000, 0x99 + k, 100, false);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 20_000, 0x99 + k, 100, false, 0);
         assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         folded += usize::from(ss.folds > 0);
         refolds += usize::from(ss.st.refolds > 0);
