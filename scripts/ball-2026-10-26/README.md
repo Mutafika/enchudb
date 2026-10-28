@@ -59,6 +59,11 @@ branch `proto/ball-history` の `crates/enchudb-engine/src/ball.rs` の書き込
   (11 回目・12 回目・1 つずつ戻した版を seed ごとに順を回して交互、 binary は scratchpad で組んだ物) と `sum_w13.py` / `sum_w13_paired.py` (seed ごとの差の中央値と
   選び直しの 95% の幅)、 結果 `results_ballb_w13.jsonl` + `_w13b` (v11 / v12 / a / b / ab、 24 seed) / `_w13c` (c) / `_w13d` (d) / `_w13p` (対照のつもりが番地が
   ずれなかった版)。 変異 `ball_mut_v13a〜c.json`、 結果 `mut_v13a〜c.log`
+- 14 回目 (0.37 の上に載せ直す、 branch `proto/ball-history-037`): `run_l14.sh` (13 回目の ballp と交互)、 `ballp.rs` に `BALL_LISTEN` (何もしない listener) と、
+  書き手が 10 ms を越えた時の畳み・空き作り・区画の移り (`slow`)。 結果 `results_ballp_l14_64.jsonl` / `_256.jsonl` / `_64L.jsonl` (listener あり)、
+  開く時間 `results_ballp_o_v14.jsonl`。 書き込みは `run_w14.sh` (版:球 の組を seed ごとに交互) / `sum_w14_paired.py` (基準の版を引数に)、 結果
+  `results_ballb_w14.jsonl` (WAL なし) / `_w14a` (置き場所をそろえて組んだ 2 版) / `_w14wal` (WAL あり) / `_w14wal8` (書き手 8 本)。 変異 `ball_mut_v14a〜c.json`、
+  結果 `mut_v14a〜c.log`
 - `ball_mut.json`: 変異 24 本 (4 回目で段の道の 7 本を足し、 意味の無くなった 「球の列も詰め直す」 を外した)。 その前は 18 本 (3 回目でカードの時刻の道の 7 本を足した。 全部どちらかで落ちる)。 前は 11 本 (`scripts/mutate.py`、 engine の `ball::` と schema の `ball_history` の 2 通りで回して全部どちらかで落ちる)
 
 負荷は全部の回で 8 未満 (6.8〜8.0)、 空き 109 GiB。
