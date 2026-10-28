@@ -922,11 +922,7 @@ impl Ball {
 
     /// 書き換え 1 つを当てる (組み直し: 書き手の居ない時に、 記録の順に)。 書き手の道 (`note` → `turn` → 控え) と同じ。
     /// 時刻は `hlc` ([`pack_hlc`]、 0 = 数え口)、 帳面と球の順を保つ分だけ上げる (上げたら [`take_raised`] が返す)。
-    pub(crate) fn replay(&self, clock: &Clock, eid: u32, old: Option<u64>, new: Option<u64>, hlc: u64) -> Option<u64> {
-        self.replay_in(&epoch::pin(), clock, eid, old, new, hlc)
-    }
-
-    /// [`Ball::replay`] を呼び手の pin の下で (組む側が束ごとに 1 回 pin する)。
+    /// 呼び手の pin の下で (組む側が束ごとに 1 回 pin する)。
     pub(crate) fn replay_in(&self, guard: &Guard, clock: &Clock, eid: u32, old: Option<u64>, new: Option<u64>, hlc: u64) -> Option<u64> {
         let mut wide = self.reserve(eid, old, new);
         let ts = self.note(eid, old, new, clock, hlc, guard, &mut wide);
@@ -1378,7 +1374,7 @@ impl Balls {
         self.any.store(true, Ordering::SeqCst);
     }
 
-    /// 組む側: 出す前の手元の球を作る (地平 `horizon` の時点の値 `seed` を種に。 この後で [`Ball::replay`] で当てる)。
+    /// 組む側: 出す前の手元の球を作る (地平 `horizon` の時点の値 `seed` を種に。 この後で [`Ball::replay_in`] で当てる)。
     pub fn make(&self, horizon: u64, seed: impl FnOnce(&mut dyn FnMut(u32, u64))) -> Box<Ball> {
         let ball = Box::new(Ball::new(self.snap_min.load(Ordering::Relaxed)));
         ball.horizon.store(horizon, Ordering::Relaxed);

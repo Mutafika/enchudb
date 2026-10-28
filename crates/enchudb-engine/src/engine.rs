@@ -107,7 +107,7 @@ pub struct BallRebuildStats {
     pub prof_n: [u64; 4],
     /// 畳んだ後に記録を当てた所まで読まずに飛んだ entry の数 ([`crate::change_log::ChangeLog::seek_after`])。
     pub skipped: u64,
-    /// 球を回した数 (`Ball::replay`、 値の変わる書き込みだけ、 最初の記録の段も含む)。 当てた数は [`Self::applied`]。
+    /// 球を回した数 (`Ball::replay_in`、 値の変わる書き込みだけ、 最初の記録の段も含む)。 当てた数は [`Self::applied`]。
     pub replays: u64,
     /// 同じ周で WAL の続きを読んだ時に、 写す側が読み終えた所より先まで写していた回数 (試験の前提)。
     pub ahead: u64,
@@ -149,7 +149,7 @@ struct BallReplay<'a> {
     work: u64,
     /// [`BallRebuildStats::ahead`]。
     ahead: u64,
-    /// 球を回した数 (`Ball::replay`、 値の変わる書き込みだけ)。
+    /// 球を回した数 (`Ball::replay_in`、 値の変わる書き込みだけ)。
     replays: u64,
     /// [`BallRebuildStats::prof_ns`] / `prof_n`。
     prof: [u64; 7],
@@ -185,7 +185,7 @@ impl BallReplay<'_> {
         self.apply_in(&crossbeam_epoch::pin(), hlc, op);
     }
 
-    /// [`Self::apply`] を呼び手の pin の下で。
+    /// [`Self::apply`] を呼び手の pin の下で ([`crate::ball::Ball::replay_in`])。
     fn apply_in(&mut self, guard: &crossbeam_epoch::Guard, hlc: enchudb_oplog::Hlc, op: &crate::ball_base::BaseOp) {
         use crate::ball_base::BaseOp;
         let (e, v) = match op {
