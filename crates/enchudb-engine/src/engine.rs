@@ -310,6 +310,14 @@ impl BallReplay<'_> {
             let start = match self.wal_mark {
                 Some(off) if wal.holds(off) => {
                     continued = true;
+                    // 試験の口: 各回の最初だけ、 書き手が次の区画へ移るまで (読み始める区画がある間、 最大 cw µs) 待つ
+                    let cw = self.eng.ball_publish_pause[4].load(std::sync::atomic::Ordering::Relaxed);
+                    if cw > 0 && tries == 1 {
+                        let t = std::time::Instant::now();
+                        while wal_pos_lap(wal.head()) == wal_pos_lap(off) && wal.holds(off) && t.elapsed() < std::time::Duration::from_micros(cw) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
                     // 写す側が読み終えた所より先まで写していても、 WAL は読み終えた所から (記録は読まない)
                     self.ahead += u64::from(log_wal > off);
                     off
@@ -328,9 +336,14 @@ impl BallReplay<'_> {
                 }
             };
             let t2 = std::time::Instant::now();
+            // 試験の口: 各回の最初だけ、 読み始める所の区画が畳まれるまで (最大 sp µs) 待つ (「頭から」 は畳んだ回で見る)
             let sp = self.eng.ball_publish_pause[2].load(std::sync::atomic::Ordering::Relaxed);
-            if sp > 0 {
-                std::thread::sleep(std::time::Duration::from_micros(sp));
+            if sp > 0 && tries == 1 {
+                let t = std::time::Instant::now();
+                let gone = || if wal_pos_lap(start) == 0 { wal.folds() != folds } else { !wal.holds(start) };
+                while !gone() && t.elapsed() < std::time::Duration::from_micros(sp) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             // 球の紐に当たる書き込みだけを (HLC, 書き込み) で溜める (WAL の record は写さない。 当てるのは区画を確かめてから)
             let (hid, name, peer) = (self.hid, self.name, self.peer);
@@ -5438,7 +5451,7 @@ pub struct Engine {
     ball_build_pause: std::sync::atomic::AtomicU64,
     /// 試験: 公開中を置いた後・H を取る前 / 書き終えを待った後・残りを読む前 / 追いつきで WAL の位置を取った後・WAL を読む前に止まる
     /// 時間 (µs、 公開の約束の場所と、 読む間に畳む場所を広げる)。
-    ball_publish_pause: [std::sync::atomic::AtomicU64; 4],
+    ball_publish_pause: [std::sync::atomic::AtomicU64; 5],
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -6016,7 +6029,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 4],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 5],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -7302,7 +7315,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 4],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 5],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -19041,7 +19054,8 @@ impl Engine {
         self.ball_publish_pause[1].store(after_us, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 試験: 球を組む時、 追いつきで WAL の位置を取った後・WAL を lock の外で読む前に `us` µs 止まる (その間に consumer が畳む場所を広げる)。
+    /// 試験: 球を組む時、 追いつきの各回の最初で WAL の位置を取った後・WAL を lock の外で読む前に、 読み始める所の区画が畳まれるまで
+    /// 最大 `us` µs 待つ。 15 回目: 決まった時間だけ止まる形 (20 ms) は、 0.37.1 の上で試験を並べて回すと 16 回中 2 回、 その間に畳まなかった。
     #[doc(hidden)]
     pub fn ball_set_scan_pause(&self, us: u64) {
         self.ball_publish_pause[2].store(us, std::sync::atomic::Ordering::Relaxed);
@@ -19053,6 +19067,14 @@ impl Engine {
     #[doc(hidden)]
     pub fn ball_set_mark_pause(&self, us: u64) {
         self.ball_publish_pause[3].store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 試験: 球を組む時、 追いつきの各回の最初で WAL の続きを読む前に、 書き手が次の区画へ移るまで最大 `us` µs 待つ (読み始める区画が
+    /// 畳まれたら待たない)。 15 回目: 追いつきの前に決まった時間だけ止まる形 (40 ms) は、 試験を 8 本並べて回すと 24 回中 22 回、 その間に
+    /// 区画を移らなかった。
+    #[doc(hidden)]
+    pub fn ball_set_cross_wait(&self, us: u64) {
+        self.ball_publish_pause[4].store(us, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 試験: 球を組む時、 追いつきの毎回の前に `ms` 止まる (書き手が並んで書く間と、 追いつきの間に consumer が写す・捨てる・畳む間を広げる)。
