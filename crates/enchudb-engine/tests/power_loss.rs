@@ -1134,6 +1134,9 @@ fn writes_dropped_from_a_full_wal_are_covered_by_a_floor_after_power_loss() {
     let eng = notes_engine(&live.join("db"), 64 * 1024);
     let note = eng.himo_id("notes.note").unwrap() as u16;
     let wal = eng.oplog().unwrap().clone();
+    // #667: 区画を移った時に consumer を起こすと、 移った直後 (下で残りを 100 B にする途中) に閉じの Commit が入る。 この試験は
+    // 満杯の状態を手で作るので切る
+    eng.set_wal_fold_on_switch(false);
     // 満杯の書き手を待たせず (#388) 畳ませずに、 WAL に載らない write を作る
     wal.set_room_waiter(None);
     let mut dropped = Vec::new();
@@ -1148,12 +1151,6 @@ fn writes_dropped_from_a_full_wal_are_covered_by_a_floor_after_power_loss() {
             eng.tie_to(filler, "notes.note", i);
             eng.oplog_commit();
             i += 1;
-        }
-        // #667: 区画を移ると consumer が待たずに書き出す (閉じの Commit を打つ)。 その書き出しが済むのを待ってから残りを数える
-        // (consumer はその後 bridge の lock で止まる = もう積まない。 待たないと、 下で残りを数えた後に consumer の Commit が入る)
-        let t = std::time::Instant::now();
-        while wal.checkpoint() != wal.head() && t.elapsed() < std::time::Duration::from_secs(5) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         // 閉じた group で WAL を埋め、 残りを 100 B (Tie 136 B も Commit 120 B も入らない) にする。 TieLeaf の record は
         // 文字列の長さ + c B
