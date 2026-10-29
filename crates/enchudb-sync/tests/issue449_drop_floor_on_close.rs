@@ -70,6 +70,8 @@ fn writes_dropped_right_before_close_reach_the_peer() {
     let sync_b = Syncer::new(eng_b.clone(), transport.clone());
 
     let eng_a = make_engine(&pa, 1, 64 * 1024);
+    // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+    eng_a.set_wal_fold_on_switch(false);
     let hid = eng_a.himo_id("notes.note").unwrap() as u16;
     let wal = eng_a.oplog().unwrap().clone();
     // B は差分 pull で追従している

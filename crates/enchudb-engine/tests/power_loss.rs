@@ -1906,6 +1906,8 @@ fn a_mark_never_covers_a_dropped_write_before_its_floor_is_on_disk() {
     std::fs::create_dir_all(&live).unwrap();
     crashsim::start();
     let eng = notes_engine(&live.join("db"), 64 * 1024);
+    // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+    eng.set_wal_fold_on_switch(false);
     let note = eng.himo_id("notes.note").unwrap() as u16;
     let wal = eng.oplog().unwrap().clone();
     // 満杯の書き手を待たせない (#388)

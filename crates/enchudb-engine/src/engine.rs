@@ -2611,6 +2611,8 @@ mod durable_cut_tests {
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 64 * 1024).unwrap();
+        // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+        eng.set_wal_fold_on_switch(false);
         eng.set_peer_id(1);
         let wal = eng.oplog().unwrap().clone();
         wal.set_room_waiter(None);
