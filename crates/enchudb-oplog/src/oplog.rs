@@ -3266,35 +3266,57 @@ impl OpLog {
         out
     }
 
-    /// #663: 開いた時の再生 (`recover_with_tail`) が古い区画の途中で止まった (読めない record = 届かなかった page) のに新しい
-    /// 区画に record があれば、 新しい区画を畳む (周を進めて頭へ)。 新しい区画の record は穴の後に積んだ物で、 再生していない
-    /// (再生は前だけを当てる)。 残すと、 開いた後に古い区画を畳んだ時に読めるようになり、 本体に当てていない record を
-    /// changefeed の記録 (と bridge・audit) に渡した。 開いた直後 (書き手の居ない間) に、 再生と同じ所から読んで決める。
-    /// 戻り値は畳んだか。
+    /// 開いた時の再生 (`recover_with_tail`、 checkpoint から読む) が head より手前で止まったら (読めない record = 届かなかった
+    /// page)、 そこから先の record を捨てる。 再生は前だけを当てるので、 先の record は本体に当てていない。 開いた直後 (書き手の
+    /// 居ない間) に、 再生と同じ所から読んで決める。 戻り値は捨てたか。
+    ///
+    /// - #663: 古い区画の途中で止まったのに新しい区画に record があれば、 新しい区画を畳む (周を進めて頭へ)。 残すと、 開いた後に
+    ///   古い区画を畳んだ時に読めるようになり、 本体に当てていない record を changefeed の記録 (と bridge・audit) に渡した
+    /// - #669: 止まった区画の head (と書き終えた所) を読めた所まで戻す。 戻さないと、 開いた後の書き込みは読めない record の後ろに
+    ///   積まれ、 読み (changefeed の記録・bridge・audit・次に開いた時の再生) が届かなかった。 区画を移った時の閉じの Commit
+    ///   (`switch_locked`) は header の page だけを先に書き出すので、 閉じの Commit の中身が届かずに head だけがその後ろを指す像が
+    ///   出る (#665)
     pub fn drop_records_after_a_hole(&self) -> bool {
         let _in_proc = self.append_lock.lock();
-        if !self.two.load(Ordering::Acquire) {
-            return false;
-        }
-        let ai = self.hot.active.load(Ordering::Relaxed);
-        let (newer, older) = (&self.hot.halves[ai], &self.hot.halves[ai ^ 1]);
-        if newer.is_empty() || older.is_empty() {
-            return false;
-        }
-        // 再生は checkpoint から読む。 古い区画を全部書き出してあれば再生は新しい区画から (古い区画の穴は関係ない)
         let start = self.checkpoint();
-        if wal_pos_lap(start) != older.lap() {
+        let s = self.scan_from_offset(start);
+        if s.stop == ScanStop::Head {
             return false;
         }
-        let end = wal_pos(older.lap(), older.head.load(Ordering::Acquire));
-        if self.scan_range(start, end).stop == ScanStop::Head {
+        // 読めた所 (最後に読めた record の終端。 1 つも読めなければ checkpoint)
+        let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
+        let ai = self.hot.active.load(Ordering::Relaxed);
+        let Some(i) = [ai, ai ^ 1].into_iter().find(|&i| {
+            let h = &self.hot.halves[i];
+            h.size() > 0 && !h.is_empty() && h.lap() == wal_pos_lap(end)
+        }) else {
             return false;
+        };
+        let h = &self.hot.halves[i];
+        let mut dropped = false;
+        if wal_pos_offset(end) < h.head.load(Ordering::Acquire) {
+            self.trim_half_locked(h, wal_pos_offset(end));
+            dropped = true;
         }
-        let folded = self.fold_half_locked(ai);
-        if folded {
+        // 古い区画で止まった: 新しい区画の record は全部穴の後
+        if i != ai && !self.hot.halves[ai].is_empty() {
+            dropped |= self.fold_half_locked(ai);
+        }
+        if dropped {
             let _ = self.fsync();
         }
-        folded
+        dropped
+    }
+
+    /// #669: 区画 `h` の head・書き終えた所・checkpoint を `end` (区画の中の offset) までに戻す (`append_lock` の下、 開いた直後)。
+    fn trim_half_locked(&self, h: &Half, end: u64) {
+        let b = h.base();
+        h.head.store(end, Ordering::Release);
+        self.put_head(h, b, end);
+        if h.checkpoint.load(Ordering::Acquire) > end {
+            h.checkpoint.store(end, Ordering::Release);
+            self.mmap_mut_slice()[b + 16..b + 24].copy_from_slice(&end.to_le_bytes());
+        }
     }
 
     /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
@@ -5492,6 +5514,59 @@ mod tests {
             *v += 1;
         }
         wal.append(Op::Commit).unwrap();
+    }
+
+    /// #669: 区画を移った時の閉じの Commit が header の head だけ届いて中身の届かなかった像 (新しい区画の record も届かなかった) を
+    /// 開くと、 head を閉じの Commit の前に戻す。 戻さないと、 書き足した record は読めない record の後ろに積まれ、 読みが届かない
+    /// (区画に空きが残る形: 入らない大きな record で移る)。 再生は今までと同じ。 閉じの Commit の前の閉じていない record (再生した)
+    /// は残し、 書き足した Commit で閉じる。
+    #[test]
+    fn a_torn_closing_commit_is_trimmed_on_open() {
+        let p = tmp("torn-closing");
+        let mut v = 0u64;
+        let closing_at;
+        {
+            let wal = OpLog::create(&p, 64 * 1024).unwrap();
+            while wal.hot.halves[0].head.load(Ordering::Acquire) < 30 * 1024 {
+                append_group(&wal, &mut v);
+            }
+            // 閉じていない record 2 件 (閉じの Commit が閉じる)
+            for _ in 0..2 {
+                wal.append(Op::Tie { eid: 1, himo_id: 0, value: v }).unwrap();
+                v += 1;
+            }
+            closing_at = wal.hot.halves[0].head.load(Ordering::Acquire);
+            wal.append(Op::Content { eid: 1, key: "k", data: &[7u8; 4000] }).unwrap();
+            assert_eq!(wal.switches(), 1, "前提: 入らない record で移る");
+            let a_head = wal.hot.halves[0].head.load(Ordering::Acquire);
+            assert_eq!(a_head - closing_at, REC_HEADER_SIZE as u64 + LAP_TRAILER as u64, "前提: A の終わりは閉じの Commit");
+            assert!(32 * 1024 - a_head > 1024, "前提: A に空きが残る");
+            wal.fsync().unwrap();
+        }
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            // B の record は届かなかった (B は空)
+            f.seek(SeekFrom::Start(32 * 1024 + 8)).unwrap();
+            f.write_all(&(HEADER_SIZE as u64).to_le_bytes()).unwrap();
+            f.write_all(&(HEADER_SIZE as u64).to_le_bytes()).unwrap();
+            // A の閉じの Commit の中身は届かなかった (head だけが届いた)
+            f.seek(SeekFrom::Start(closing_at)).unwrap();
+            f.write_all(&[0u8; 16]).unwrap();
+        }
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!(tie_values(&wal.recover_with_tail()), (0..v).collect::<Vec<_>>(), "再生は閉じの Commit の前まで全部");
+        assert!(wal.drop_records_after_a_hole(), "閉じの Commit から先を捨てる");
+        assert_eq!(wal.head(), wal_pos(wal.lap(), closing_at), "head は閉じの Commit の前");
+        let before = v;
+        append_group(&wal, &mut v);
+        assert_eq!(tie_values(&wal.iter_committed()), (0..v).collect::<Vec<_>>(), "書き足した {before}.. が読める");
+        drop(wal);
+        // 開き直しても書き足した record から読む
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!(tie_values(&wal.recover_with_tail()).last(), Some(&(v - 1)));
+        assert!(!wal.drop_records_after_a_hole(), "穴は無い");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// #663: 開いた時の再生が古い区画の穴 (読めない record) で止まったら、 穴の後の新しい区画の record (再生していない) を捨てる
