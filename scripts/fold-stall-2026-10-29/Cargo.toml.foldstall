@@ -1,0 +1,17 @@
+[package]
+name = "foldstall"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+# 測る版の checkout (0.37.0 / この branch) を指す
+enchudb = { path = "/path/to/enchudb" }
+
+[[bin]]
+name = "foldstall"
+path = "main.rs"
+
+[profile.release]
+debug = false
