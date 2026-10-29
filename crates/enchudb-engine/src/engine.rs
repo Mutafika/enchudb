@@ -19265,6 +19265,8 @@ impl Engine {
             // ここで適用せずに checkpoint で越えると恒久消失する
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
+            // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
+            w.drop_records_after_a_hole();
             let mut vids = std::collections::HashMap::new();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
@@ -19834,6 +19836,8 @@ impl Engine {
             // ここで適用せずに checkpoint で越えると恒久消失する
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
+            // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
+            w.drop_records_after_a_hole();
             let mut vids = std::collections::HashMap::new();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
@@ -20340,7 +20344,7 @@ impl Engine {
                                 // append された record が「body 効果が msync に
                                 // 含まれないのに checkpoint される」= crash で
                                 // fsync 済み write が replay 対象外になり消失した。
-                                let durable_head = wal.head();
+                                let durable_head = wal.written_head();
                                 let durable_lsn = wal.next_lsn().saturating_sub(1);
                                 // #317: 書き出しに失敗したら checkpoint を進めない (進めると oplog が畳まれ、
                                 // 書き出せなかった本体を復旧する record も消える)
@@ -20436,7 +20440,7 @@ impl Engine {
                         // shutdown 時の最終 Commit + 順序付き同期
                         if let Some(wal) = oplog_for_thread.as_ref() {
                             let committed = engine.append_commit_marker(wal).is_ok();
-                            let durable_head = wal.head(); // #77-H3: msync 前に snapshot
+                            let durable_head = wal.written_head(); // #77-H3: msync 前に snapshot
                             let synced = engine.sync_for_checkpoint(wal); // #317
                             // 0.8.1: shutdown 時に tables sidecar を強制 persist。
                             // 旧 behavior では body_msync のみで `next_local` が
@@ -20988,7 +20992,7 @@ impl Engine {
             let commit_full = matches!(&commit_res, Err(e) if e.kind() == io::ErrorKind::OutOfMemory);
             // #77-H3: checkpoint 上限と durable_lsn は Commit append 直後に
             // snapshot (msync 後の再読は未同期 record まで checkpoint してしまう)
-            let durable_head = wal.head();
+            let durable_head = wal.written_head();
             let durable_lsn = wal.next_lsn().saturating_sub(1);
             // #550: 消した主キーの記録は WAL の後・本体より先に
             let written = wal.fsync().and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
