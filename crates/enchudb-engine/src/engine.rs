@@ -2243,6 +2243,8 @@ mod wal_room_commit_tests {
             eids
         };
         let eng = Engine::open_concurrent_with_oplog(&path, 64 << 10).unwrap();
+        // #667: 満杯の時の空け作りを見るので、 区画を移った時の畳みを切る (移るたびに畳むと満杯まで行かない)
+        eng.set_wal_fold_on_switch(false);
         let wal = eng.oplog.as_ref().unwrap().clone();
         let fired = Arc::new(AtomicBool::new(false));
         let fired_in_hook = fired.clone();
@@ -2397,6 +2399,8 @@ mod wal_room_commit_tests {
             eng.flush().unwrap();
         }
         let eng = Engine::open_concurrent_with_oplog(&path, 256 << 10).unwrap();
+        // #667: 満杯の時の空け作りを見るので、 区画を移った時の畳みを切る (移るたびに畳むと満杯まで行かない)
+        eng.set_wal_fold_on_switch(false);
         eng.set_peer_id(1);
         let hid = eng.himo_id("rows.val").unwrap() as u16;
         let rows: Vec<u64> = (0..1_000).map(|_| eng.entity_in("rows").unwrap()).collect();
