@@ -755,6 +755,46 @@ fn power_loss_keeps_oplog_synced_batches_across_wal_halves() {
     run(Kind::OplogHalves);
 }
 
+/// #663: 区画を移る時、 新しい区画に書く前に古い区画の header (最後の head) を書き出す。 書き出し (fsync) を作った時の 1 度しか
+/// しないまま区画を移り、 新しい区画にも書いた像 (書き出しの済んだ page だけ) でも、 古い区画の header は最後の head を持つ。 前は
+/// 最後に書き出した時の header のままで、 古い区画の終わりの record が届かず新しい区画の record は届いた像 (OS が先に書いた page)
+/// で、 開いた後の読みが古い区画を前の head で読み終えて新しい区画へ進み、 間を飛ばして当てた (`changefeed_log_power_loss` で値が
+/// 飛ぶ形)。
+#[test]
+fn switching_wal_halves_writes_out_the_old_header_first() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("switch_header");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let path = live.join("oplog");
+    let wal = OpLog::create(&path, 64 * 1024).unwrap();
+    assert!(wal.two_halves(), "前提: 2 区画の WAL");
+    wal.fsync().unwrap();
+    let mut v = 0u64;
+    while wal.switches() == 0 {
+        wal.append(enchudb_oplog::oplog::Op::Tie { eid: 1, himo_id: 0, value: v }).unwrap();
+        v += 1;
+    }
+    for _ in 0..10 {
+        wal.append(enchudb_oplog::oplog::Op::Tie { eid: 1, himo_id: 0, value: v }).unwrap();
+        v += 1;
+    }
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(wal);
+    captured.unwrap();
+    let head = |p: &Path| u64::from_le_bytes(std::fs::read(p).unwrap()[8..16].try_into().unwrap());
+    let (live_head, img_head) = (head(&path), head(&img.join("oplog")));
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(live_head > enchudb_oplog::oplog::HEADER_SIZE as u64, "前提: 古い区画に書いた");
+    assert_eq!(img_head, live_head, "区画を移った後の像で、 古い区画の header が最後の head を持たない");
+}
+
 /// 0.37: sync する DB で、 bridge が区画をまたいで読み、 読み終えた古い区画だけを畳む途中の像でも、 書き出しが返った書き込みは
 /// 配る分に全部ある。
 #[test]

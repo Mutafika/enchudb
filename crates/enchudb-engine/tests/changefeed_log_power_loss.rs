@@ -68,11 +68,12 @@ type Replayed = (u64, Vec<(u64, Option<u64>)>, Option<u64>);
 fn replay(db: &str) -> Result<Replayed, String> {
     let eng = Engine::open_concurrent_with_oplog(db, WAL_CAP).map_err(|e| format!("開けない: {e}"))?;
     let value = eng.himo_id("ts").and_then(|ts| eng.get_by_id(0, ts as u16));
-    let (first, _) = eng.change_log_range().ok_or("記録が無い")?;
+    // 再生した末尾の閉じていない group は、 閉じの Commit (`oplog_sync`) で記録に写る。 最古から付けた後に写すと、 一周した
+    // 記録では最古の番号が押し出されて listener が外れるので、 先に写し切ってから付ける
+    eng.oplog_sync().map_err(|e| e.to_string())?;
+    let (first, next) = eng.change_log_range().ok_or("記録が無い")?;
     let rec = Arc::new(Recorder::default());
     eng.add_change_listener_from(rec.clone(), first).map_err(|e| format!("受け直せない: {e}"))?;
-    eng.oplog_sync().map_err(|e| e.to_string())?;
-    let next = eng.change_log_range().unwrap().1;
     let until = Instant::now() + Duration::from_secs(30);
     while (rec.seen.lock().unwrap().len() as u64) < next - first && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));

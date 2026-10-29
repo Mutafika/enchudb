@@ -159,6 +159,11 @@ jobs:
       - name: power loss simulation (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test power_loss --release
 
+      # #663: changefeed の記録 (changefeed.seg) を電源断の像で受け直す。 0.37 の 2 区画で毎回落ちていたのを、 ここで回して
+      # いなかったので見落とした
+      - name: power loss simulation, change log (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test changefeed_log_power_loss --release
+
       # #98 ③④: I/O の点ごとの故障 (I/O エラー / process の死 / 電源断 × flush / oplog の書き手)。 同じ crashsim feature の
       # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
       - name: fault injection / crash matrix (crashsim)

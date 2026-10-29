@@ -1580,6 +1580,15 @@ impl OpLog {
         wal_pos(h.lap(), h.head.load(Ordering::Acquire))
     }
 
+    /// 書き終えた record の終わり ([`wal_pos`])。 `head` は場所を取った所で、 書いている最中の record を含みうる (append は
+    /// 場所を取ってから中身を書く)。 書き出し (fsync) の前に覆う位置を取るのはこちら (#663: head で取ると、 中身を写す前の
+    /// record まで checkpoint が覆い、 changefeed の記録に書き出していない record の番号を振った)。
+    #[inline]
+    pub fn written_head(&self) -> u64 {
+        let h = &self.hot.halves[self.hot.active.load(Ordering::Acquire)];
+        wal_pos(h.lap(), h.written.load(Ordering::Acquire))
+    }
+
     /// 今の checkpoint の位置 (ここまで本体に書き出した、 [`wal_pos`])。 古い区画に書き出していない record があればその区画の
     /// checkpoint、 無ければ今の区画の checkpoint。
     pub fn checkpoint(&self) -> u64 {
@@ -1742,6 +1751,27 @@ impl OpLog {
         Some(Slot { half: h, base: h.base.load(Ordering::Relaxed) as usize, off, lap: h.lap.load(Ordering::Relaxed) })
     }
 
+    /// #663: 区画 `h` の header の page を書き出す (`append_lock` の下、 移る時)。 区画の頭は [`HALF_ALIGN`] にそろっているので、
+    /// そこから [`HALF_ALIGN`] を書く (page が 4 KiB でも 16 KiB でも header の page を含む)。 失敗しても移る (次の fsync が書く)。
+    fn sync_half_header(&self, h: &Half) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let b = h.base();
+            let len = (HALF_ALIGN as usize).min(self.mmap.len() - b);
+            #[cfg(all(feature = "crashsim", unix))]
+            let sim = crate::crashsim::active()
+                .then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, b as u64, &self.mmap[b..b + len]));
+            if crate::io_point("oplog.switch_header").is_ok() && self.mmap.flush_range(b, len).is_ok() {
+                #[cfg(all(feature = "crashsim", unix))]
+                if let Some(copy) = sim {
+                    crate::crashsim::data_synced(&self._file, copy);
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = h;
+    }
+
     /// 今の区画が埋まった時、 もう一方が空なら移る (`append_lock` の下)。 開いている group は今の区画に閉じの Commit を置いて
     /// 閉じる (その分の空きは `alloc` が残している)。 もう一方の周が今の区画より新しくなければ新しい周を置く (畳んだ時に置いて
     /// あればそのまま)。 移った後の古い区画には誰も書き足さない (書き出して畳むのは engine の consumer)。
@@ -1755,6 +1785,11 @@ impl OpLog {
             return false;
         }
         self.close_group_for_switch(a);
+        // #663: 移った先に書く前に、 古い区画の header (最後の head) を書き出す。 新しい区画の record が読める像では、 古い区画の
+        // header が最後の head を持つ = 古い区画の record が欠けていれば読みは古い区画の途中で止まり、 新しい区画を読まない。 書き
+        // 出さないと、 header だけ前の head のまま古い区画の終わりの record が届かず、 新しい区画の record は届いた像で、 読みが古い
+        // 区画を前の head で読み終えて新しい区画へ進み、 間を飛ばして当てた (再生と changefeed の記録の続きが穴の後から)
+        self.sync_half_header(a);
         if !lap_newer(o.lap(), a.lap()) {
             let lap = self.take_next_lap();
             let b = o.base();
@@ -2704,7 +2739,7 @@ impl OpLog {
             // 届かず畳めない (空きを待つ書き手が 「畳めない」 を見て諦めた)。 移っていたら新しい区画の head まで書き出し直す
             let mut advanced = false;
             for _ in 0..3 {
-                let head = self.head();
+                let head = self.written_head();
                 if self.is_empty() || !sync(head) {
                     return (advanced, false);
                 }
@@ -3184,22 +3219,28 @@ impl OpLog {
     /// 末尾の Commit で閉じていない record と、 読み終えた終端 offset を返す。 読むだけ。 返り値は
     /// (Commit で閉じた record, committed_end, 閉じていない末尾の record, 読み終えた終端)。
     pub fn iter_from_with_tail(&self, start_offset: u64) -> (Vec<Record>, u64, Vec<Record>, u64) {
-        let s = self.scan_from_offset(start_offset);
+        self.iter_from_with_tail_upto(start_offset, u64::MAX)
+    }
+
+    /// `iter_from_with_tail` を位置 `upto` ([`wal_pos`]、 畳む区画の終わり) で止める版 (#662: 今の区画は畳まないので読まない)。
+    pub fn iter_from_with_tail_upto(&self, start_offset: u64, upto: u64) -> (Vec<Record>, u64, Vec<Record>, u64) {
+        let s = self.scan_range(start_offset, upto);
         let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
         (strip_offsets(s.out), s.committed_end, strip_offsets(s.tail), end)
     }
 
     /// changefeed の記録 (engine の `changefeed.seg`) 用: `start` から読んで、 (record, その終端 offset) と読み終えた offset を返す。
-    /// `with_tail` が false なら `limit` (書き出し済みの位置 = checkpoint) までに Commit で閉じた group だけ。 true なら閉じていない
-    /// 末尾も含めて全部 (畳む直前、 全部を書き出した後に呼ぶ)。 読むだけ。
+    /// `with_tail` が false なら `limit` (書き出し済みの位置 = checkpoint) までに Commit で閉じた group だけ。 true なら `limit`
+    /// (畳む区画の終わり) までの record を閉じていない末尾も含めて全部 (畳む直前に呼ぶ。 `limit` より先は読まない、 #662)。 読むだけ。
     pub fn scan_for_change_log(&self, start: u64, limit: u64, with_tail: bool) -> (Vec<(Record, u64)>, u64) {
-        let s = self.scan_from_offset(start);
         if with_tail {
+            let s = self.scan_range(start, limit);
             let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
             let mut out = s.out;
             out.extend(s.tail);
             return (out, end);
         }
+        let s = self.scan_from_offset(start);
         let end = s.commit_ends.iter().rev().find(|&&c| c <= limit).copied().unwrap_or(start);
         (s.out.into_iter().filter(|(_, e)| *e <= end).collect(), end)
     }
@@ -3310,6 +3351,37 @@ impl OpLog {
         out
     }
 
+    /// #663: 開いた時の再生 (`recover_with_tail`) が古い区画の途中で止まった (読めない record = 届かなかった page) のに新しい
+    /// 区画に record があれば、 新しい区画を畳む (周を進めて頭へ)。 新しい区画の record は穴の後に積んだ物で、 再生していない
+    /// (再生は前だけを当てる)。 残すと、 開いた後に古い区画を畳んだ時に読めるようになり、 本体に当てていない record を
+    /// changefeed の記録 (と bridge・audit) に渡した。 開いた直後 (書き手の居ない間) に、 再生と同じ所から読んで決める。
+    /// 戻り値は畳んだか。
+    pub fn drop_records_after_a_hole(&self) -> bool {
+        let _in_proc = self.append_lock.lock();
+        if !self.two.load(Ordering::Acquire) {
+            return false;
+        }
+        let ai = self.hot.active.load(Ordering::Relaxed);
+        let (newer, older) = (&self.hot.halves[ai], &self.hot.halves[ai ^ 1]);
+        if newer.is_empty() || older.is_empty() {
+            return false;
+        }
+        // 再生は checkpoint から読む。 古い区画を全部書き出してあれば再生は新しい区画から (古い区画の穴は関係ない)
+        let start = self.checkpoint();
+        if wal_pos_lap(start) != older.lap() {
+            return false;
+        }
+        let end = wal_pos(older.lap(), older.head.load(Ordering::Acquire));
+        if self.scan_range(start, end).stop == ScanStop::Head {
+            return false;
+        }
+        let folded = self.fold_half_locked(ai);
+        if folded {
+            let _ = self.fsync();
+        }
+        folded
+    }
+
     /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
     fn recover_inner(&self) -> (Vec<Record>, Vec<Record>) {
         let start = self.checkpoint();
@@ -3338,6 +3410,12 @@ impl OpLog {
         &self,
         start_offset: u64,
     ) -> ScanOut {
+        self.scan_range(start_offset, u64::MAX)
+    }
+
+    /// `scan_from_offset` を位置 `upto` ([`wal_pos`]、 record の境目 = 区画の終わりか head) で止める版: `upto` から先の record は
+    /// 読まない (`upto` で読み終えたのと同じに扱う)。 畳む区画の終わりまでを読む時に、 今の区画を読まないため (#662)。
+    fn scan_range(&self, start_offset: u64, upto: u64) -> ScanOut {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut commit_ends = Vec::new();
@@ -3361,6 +3439,9 @@ impl OpLog {
             let (base, lap, head) = (part.base, part.lap, part.end);
             let mut offset = part.start;
             while offset < head {
+                if wal_pos(lap, offset) >= upto {
+                    break 'parts;
+                }
                 let at = base + offset as usize;
                 let rec_end = at + REC_HEADER_SIZE;
                 if rec_end > mmap.len() { stop = ScanStop::OutOfBounds; break 'parts; }
@@ -5496,6 +5577,85 @@ mod tests {
             *v += 1;
         }
         wal.append(Op::Commit).unwrap();
+    }
+
+    /// #663: 開いた時の再生が古い区画の穴 (読めない record) で止まったら、 穴の後の新しい区画の record (再生していない) を捨てる
+    /// (`drop_records_after_a_hole`)。 残すと、 開いた後に古い区画を畳んだ時に読めるようになる。 穴が無ければ捨てない。 古い区画を
+    /// 全部書き出してあれば再生は新しい区画から始まるので、 古い区画の穴があっても捨てない。
+    #[test]
+    fn a_hole_in_the_old_half_drops_the_new_half_on_open() {
+        // (穴を作る, 古い区画を書き出しておく, 新しい区画を捨てる)
+        for (hole, written, dropped) in [(true, false, true), (false, false, false), (true, true, false)] {
+            let p = tmp(&format!("halves-hole-{hole}-{written}"));
+            let mut v = 0u64;
+            {
+                let wal = OpLog::create(&p, 64 * 1024).unwrap();
+                while wal.switches() == 0 {
+                    append_group(&wal, &mut v);
+                }
+                for _ in 0..3 {
+                    append_group(&wal, &mut v);
+                }
+                assert_eq!(wal.hot.active.load(Ordering::Acquire), 1, "前提: 古い区画は 0");
+                let old = &wal.hot.halves[0];
+                if written {
+                    wal.advance_checkpoint(wal_pos(old.lap(), old.head.load(Ordering::Acquire)));
+                }
+                if hole {
+                    // 6 つ目の group の最初の Tie (Tie 4 件 + Commit = 664 byte) の payload を壊す = 古い区画の途中の読めない record
+                    let at = old.base() + HEADER_SIZE + 5 * 664 + REC_HEADER_SIZE;
+                    wal.mmap_mut_slice()[at] ^= 0xFF;
+                }
+                wal.fsync().unwrap();
+            }
+            let wal = OpLog::open(&p).unwrap();
+            let recovered = tie_values(&wal.recover_with_tail());
+            if hole && !written {
+                assert_eq!(recovered, (0..20).collect::<Vec<_>>(), "前提: 再生は穴の前まで");
+            }
+            assert_eq!(wal.drop_records_after_a_hole(), dropped, "穴 {hole} / 書き出し済み {written}");
+            assert_eq!(wal.hot.halves[1].is_empty(), dropped, "新しい区画を捨てたか");
+            if dropped {
+                assert_eq!(tie_values(&wal.iter_committed()), (0..20).collect::<Vec<_>>(), "残るのは穴の前の record だけ");
+            }
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// #662: 畳む時の写し (`scan_for_change_log(.., with_tail = true)` / `iter_from_with_tail_upto`) は `limit` (畳む区画の終わり)
+    /// より先を読まない: 古い区画の record は全部、 今の区画の record (閉じていない record も) は返さない。
+    #[test]
+    fn copies_for_a_fold_stop_at_the_end_of_the_old_half() {
+        let p = tmp("halves-upto");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let lap0 = wal.lap();
+        let mut v = 0u64;
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        // 今の区画の閉じていない record
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 << 40 }).unwrap();
+        let old_end = wal_pos(lap0, wal.hot.halves[0].head.load(Ordering::Acquire));
+        let strip = |r: Vec<(Record, u64)>| r.into_iter().map(|(r, _)| r).collect::<Vec<_>>();
+        let (all, _) = wal.scan_for_change_log(HEADER_SIZE as u64, u64::MAX, true);
+        let all = tie_values(&strip(all));
+        assert_eq!(all.last(), Some(&(1 << 40)), "前提: 上限なしなら今の区画の閉じていない record まで読む");
+        let (old, end) = wal.scan_for_change_log(HEADER_SIZE as u64, old_end, true);
+        assert_eq!(end, old_end, "畳む区画の終わりまで読み終える");
+        assert!(old.iter().all(|(_, e)| *e <= old_end));
+        let old = tie_values(&strip(old));
+        let k = old.len();
+        assert!(k > 0 && k < all.len() && old == all[..k], "古い区画の record だけ ({k} / {} 件)", all.len());
+        let (committed, committed_end, tail, end) = wal.iter_from_with_tail_upto(HEADER_SIZE as u64, old_end);
+        assert_eq!((committed_end, end), (old_end, old_end));
+        assert!(tail.is_empty());
+        assert_eq!(tie_values(&committed), old);
+        // 上限は record の境目ならどこでも: その位置から始まる record は読まない
+        let (recs, _) = wal.scan_for_change_log(HEADER_SIZE as u64, old_end, true);
+        let mid = recs[k / 2].1;
+        let (head_part, end) = wal.scan_for_change_log(HEADER_SIZE as u64, mid, true);
+        assert_eq!(end, mid);
+        assert_eq!(tie_values(&strip(head_part)), old[..=k / 2].to_vec(), "上限の位置から始まる record を読んだ");
     }
 
     /// 今の区画が埋まると、 開いている group を閉じてもう一方の区画へ移る (周は新しい数)。 2 つの区画を積んだ順に読む。 古い区画
