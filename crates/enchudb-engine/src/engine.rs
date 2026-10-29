@@ -298,9 +298,13 @@ impl BallReplay<'_> {
                 }
             };
             let t1 = std::time::Instant::now();
+            // 試験の口: 記録を読む回だけ、 記録が組の番号より先まで捨てるまで (最大 mp µs) 待つ
             let mp = self.eng.ball_publish_pause[3].load(std::sync::atomic::Ordering::Relaxed);
-            if mp > 0 {
-                std::thread::sleep(std::time::Duration::from_micros(mp));
+            if mp > 0 && !self.wal_mark.is_some_and(|off| wal.holds(off)) {
+                let t = std::time::Instant::now();
+                while log.range().0 <= next && t.elapsed() < std::time::Duration::from_micros(mp) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             let mut continued = false;
             let start = match self.wal_mark {
@@ -19043,7 +19047,9 @@ impl Engine {
         self.ball_publish_pause[2].store(us, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 試験: 球を組む時、 追いつきで写した所の組を読んだ後・記録を読む前に `us` µs 止まる (その間に記録が組の番号より先まで捨てる場所を広げる)。
+    /// 試験: 球を組む時、 追いつきで写した所の組を読んだ後・記録を読む前 (記録を読む回だけ) に、 記録が組の番号より先まで捨てるまで
+    /// 最大 `us` µs 待つ。 15 回目: 決まった時間だけ止まる形 (50 ms) は、 0.37.1 (#664) で記録に写すのが書き出しの所までになってから、
+    /// その間に写しが来ない回が多くなった (重なりが 3 回中 0〜1 回)。
     #[doc(hidden)]
     pub fn ball_set_mark_pause(&self, us: u64) {
         self.ball_publish_pause[3].store(us, std::sync::atomic::Ordering::Relaxed);
