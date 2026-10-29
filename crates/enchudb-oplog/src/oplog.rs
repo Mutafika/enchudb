@@ -1193,6 +1193,8 @@ pub struct OpLog {
     room_waiter: std::sync::RwLock<Option<RoomWaiter>>,
     /// #391: append が載った後に呼ぶ (engine が consumer を起こす — 書き出しの tick を回すため)。
     append_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// #667: 区画を移った時に呼ぶ処理 ([`Self::set_switch_hook`])。
+    switch_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// #506 まとめ書き: `append_lock` を取れなかった書き手が頼みを置く場所 (書き手の thread ごとに 1 つ、 [`combine_slot_index`])。
     /// lock を持つ書き手が全部を見て積む ([`OpLog::serve_slots`])。
     combine_slots: Box<[CombineSlot]>,
@@ -1398,6 +1400,12 @@ impl OpLog {
         let _ = self.append_hook.set(hook);
     }
 
+    /// #667: 書き手が区画を移るたびに呼ぶ処理を置く (1 回だけ、 2 回目以降は無視)。 `append_lock` の下で呼ぶ (区画を移るのは
+    /// 区画 1 つ分を書くごと)。 engine は consumer を起こし、 待たずに古い区画を書き出して畳ませる。
+    pub fn set_switch_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.switch_hook.set(hook);
+    }
+
     #[inline]
     fn appended(&self) {
         if let Some(h) = self.append_hook.get() {
@@ -1537,6 +1545,7 @@ impl OpLog {
             sync_on_reset: std::sync::atomic::AtomicBool::new(false),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
+            switch_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
             quiet_scanned: std::sync::atomic::AtomicU64::new(0),
@@ -1790,6 +1799,9 @@ impl OpLog {
         }
         self.hot.active.store(ai ^ 1, Ordering::Release);
         self.switches.fetch_add(1, Ordering::Relaxed);
+        if let Some(h) = self.switch_hook.get() {
+            h();
+        }
         true
     }
 
@@ -5691,6 +5703,30 @@ mod tests {
         assert_eq!(wal.hot.active.load(Ordering::Acquire), 0);
         assert!(lap_newer(wal.hot.halves[0].lap(), wal.hot.halves[1].lap()));
         assert_eq!(tie_values(&wal.iter_committed()), (start..v).collect::<Vec<_>>());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #667: 区画を移るたびに switch hook を 1 回呼ぶ (区画の中の append では呼ばない)。 engine はこれで consumer を起こす。
+    #[test]
+    fn the_switch_hook_runs_once_per_switch() {
+        let p = tmp("halves-switch-hook");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        wal.set_switch_hook(Box::new(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+        }));
+        let mut v = 0u64;
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+            assert_eq!(calls.load(Ordering::Relaxed), wal.switches(), "区画の中の append で呼んだ");
+        }
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
+        while wal.switches() == 1 {
+            append_group(&wal, &mut v);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         let _ = std::fs::remove_file(&p);
     }
 

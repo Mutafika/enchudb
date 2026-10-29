@@ -91,6 +91,9 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32, two: bool) -> bool {
     sync_a.serve_state();
     let hid = eng_a.himo_id("notes.note").unwrap() as u16;
     let wal = eng_a.oplog().unwrap().clone();
+    // #667: 区画を移った時に consumer を起こすと、 移った直後 (下の準備の途中) に必ず Commit が入る。 この試験は満杯の死区間の
+    // 状態を手で作るので切る (100 ms ごとの Commit が入った時は今まで通り作り直す)
+    eng_a.set_wal_fold_on_switch(false);
 
     // B は差分 pull で追従している
     let e = eng_a.entity_in("notes").unwrap();

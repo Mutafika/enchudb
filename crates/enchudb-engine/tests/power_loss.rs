@@ -1193,6 +1193,9 @@ fn writes_dropped_from_a_full_wal_are_covered_by_a_floor_after_power_loss() {
     let eng = notes_engine(&live.join("db"), 64 * 1024);
     let note = eng.himo_id("notes.note").unwrap() as u16;
     let wal = eng.oplog().unwrap().clone();
+    // #667: 区画を移った時に consumer を起こすと、 移った直後 (下で残りを 100 B にする途中) に閉じの Commit が入る。 この試験は
+    // 満杯の状態を手で作るので切る
+    eng.set_wal_fold_on_switch(false);
     // 満杯の書き手を待たせず (#388) 畳ませずに、 WAL に載らない write を作る
     wal.set_room_waiter(None);
     let mut dropped = Vec::new();
@@ -1903,6 +1906,8 @@ fn a_mark_never_covers_a_dropped_write_before_its_floor_is_on_disk() {
     std::fs::create_dir_all(&live).unwrap();
     crashsim::start();
     let eng = notes_engine(&live.join("db"), 64 * 1024);
+    // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+    eng.set_wal_fold_on_switch(false);
     let note = eng.himo_id("notes.note").unwrap() as u16;
     let wal = eng.oplog().unwrap().clone();
     // 満杯の書き手を待たせない (#388)

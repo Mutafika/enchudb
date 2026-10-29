@@ -2243,6 +2243,8 @@ mod wal_room_commit_tests {
             eids
         };
         let eng = Engine::open_concurrent_with_oplog(&path, 64 << 10).unwrap();
+        // #667: 満杯の時の空け作りを見るので、 区画を移った時の畳みを切る (移るたびに畳むと満杯まで行かない)
+        eng.set_wal_fold_on_switch(false);
         let wal = eng.oplog.as_ref().unwrap().clone();
         let fired = Arc::new(AtomicBool::new(false));
         let fired_in_hook = fired.clone();
@@ -2397,6 +2399,8 @@ mod wal_room_commit_tests {
             eng.flush().unwrap();
         }
         let eng = Engine::open_concurrent_with_oplog(&path, 256 << 10).unwrap();
+        // #667: 満杯の時の空け作りを見るので、 区画を移った時の畳みを切る (移るたびに畳むと満杯まで行かない)
+        eng.set_wal_fold_on_switch(false);
         eng.set_peer_id(1);
         let hid = eng.himo_id("rows.val").unwrap() as u16;
         let rows: Vec<u64> = (0..1_000).map(|_| eng.entity_in("rows").unwrap()).collect();
@@ -2607,6 +2611,8 @@ mod durable_cut_tests {
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 64 * 1024).unwrap();
+        // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+        eng.set_wal_fold_on_switch(false);
         eng.set_peer_id(1);
         let wal = eng.oplog().unwrap().clone();
         wal.set_room_waiter(None);
@@ -5097,6 +5103,8 @@ pub struct Engine {
     wal_room_folds: std::sync::atomic::AtomicU64,
     /// WAL の空きを待つ書き手が、 待ちの上限 (`WAL_ROOM_WAIT`) まで待って空かなかった回数 (観測用)。
     wal_room_wait_timeouts: std::sync::atomic::AtomicU64,
+    /// #667: 書き手が区画を移ったら consumer が待たずに古い区画を畳むか (既定は畳む。 [`Self::set_wal_fold_on_switch`])。
+    wal_fold_on_switch: std::sync::atomic::AtomicBool,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
     /// #388: consumer が書き出し + 畳みを試して、 畳めない状態だった回数 (待ち手は、 待ち始めた後にこれが 1 回あれば諦める)。
@@ -5676,6 +5684,7 @@ impl Engine {
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
             wal_room_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
+            wal_fold_on_switch: std::sync::atomic::AtomicBool::new(true),
             wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
@@ -6952,6 +6961,7 @@ impl Engine {
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
             wal_room_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
+            wal_fold_on_switch: std::sync::atomic::AtomicBool::new(true),
             wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
@@ -20070,6 +20080,11 @@ impl Engine {
     fn try_fold_with_changes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         let mut moved = 0;
+        // #667: 記録がある時は、 畳めるかによらず書き出した所まで写す (畳む時にまとめて写すと、 区画 1 つ分を写し終えるまで全力の
+        // 書き手が空きを待った)
+        if let Some(log) = self.change_log.get() {
+            moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false).unwrap_or(0);
+        }
         // 先に lock の外で見積もる (畳める区画が無い / bridge が読み終えていないなら append_lock を取らない)。 畳めそうなら、 配って
         // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
         let folded = wal.fold_hint().is_some_and(|through| {
@@ -20286,6 +20301,9 @@ impl Engine {
         if let Some(wal) = oplog.as_ref() {
             let w = waker.clone();
             wal.set_append_hook(Box::new(move || w.wake_if_deep()));
+            // #667: 書き手が区画を移ったら起こす (tick を待たずに古い区画を書き出して畳む)
+            let w = waker.clone();
+            wal.set_switch_hook(Box::new(move || w.wake()));
         }
         let flag_for_thread = shutdown.clone();
         let oplog_for_thread = oplog.clone();
@@ -20317,6 +20335,9 @@ impl Engine {
                 waker.register_current();
                 let fsync_interval = Duration::from_millis(100);
                 let mut last_fsync = Instant::now();
+                // #667: 最後に見た区画の切り替えの回数。 書き手が区画を移ったら、 100 ms を待たずに書き出して古い区画を畳む (待つと、
+                // 全力の書き手は次の区画も埋めて空きを待った。 WAL 64 MiB で 1 回約 130 ms)
+                let mut seen_switches = oplog_for_thread.as_ref().map_or(0, |w| w.switches());
 
                 loop {
                     engine.consumer_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -20333,7 +20354,9 @@ impl Engine {
                     // head が checkpoint より進んでいる時のみ実行。
                     // 順序厳守: auto-Commit → WAL fsync → body msync → checkpoint 前進。
                     if let Some(wal) = oplog_for_thread.as_ref() {
-                        if last_fsync.elapsed() >= fsync_interval {
+                        let switched = engine.wal_fold_on_switch.load(Ordering::Relaxed) && wal.switches() != seen_switches;
+                        if last_fsync.elapsed() >= fsync_interval || switched {
+                            seen_switches = wal.switches();
                             if wal.head() > wal.checkpoint() {
                                 // #451 (段階 1): 配り済みの印の候補は Commit を打つ前に切る (印が覆う record は閉じた group に入る)
                                 let cut = engine.take_durable_cut(wal);
@@ -20535,6 +20558,9 @@ impl Engine {
                             // #555: 空と見てから印を立てるまでに書かれた record を見落とさない (その書き手の `wake_if_deep` は
                             // 印を見ずに素通りした)。 書き出しを待つ短い眠り (WAL が空でない時) は見直さない (毎 append で戻ってしまう)
                             && !idle_wal.is_some_and(|wal| wal_behind(wal))
+                            // #667: 起こされる前に区画を移っていた (起きている間の切り替えは起こさない)
+                            && !(engine.wal_fold_on_switch.load(Ordering::Relaxed)
+                                && oplog_for_thread.as_ref().is_some_and(|wal| wal.switches() != seen_switches))
                     });
                 }
             })
@@ -20775,6 +20801,13 @@ impl Engine {
     /// 0.37: WAL の書き手が今の区画を埋めて、 もう一方の区画へ移った回数 (`OpLog::switches`)。 WAL が無ければ 0。
     pub fn wal_switches(&self) -> u64 {
         self.oplog.as_ref().map_or(0, |w| w.switches())
+    }
+
+    /// 試験: 書き手が区画を移った時に consumer を起こして古い区画を畳むか (#667、 既定は畳む)。 満杯の瞬間 (空け作り、 #388) を
+    /// 試す試験が切る (区画を移るたびに畳むと、 書き手 1 本では満杯まで行かない)。
+    #[doc(hidden)]
+    pub fn set_wal_fold_on_switch(&self, on: bool) {
+        self.wal_fold_on_switch.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// WAL の空きを待つ書き手が、 待ちの上限 (5 秒) まで待っても空かなかった回数。 畳めない状態がすぐ分かった時 (sync の bridge が

@@ -1,0 +1,50 @@
+[
+ {
+  "name": "捨てる時に次の番号で長さを確かめない",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "        self.header_at(next).filter(|n| n.no == e.no + 1).map(|_| e)",
+  "replace": "        let _ = next;\n        Some(e)"
+ },
+ {
+  "name": "捨てる時に毎回中身の crc を取る (直す前)",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "        if e.no + 1 >= limit {\n            return self.entry_at(at);",
+  "replace": "        if true {\n            return self.entry_at(at);"
+ },
+ {
+  "name": "捨てる最後の 1 件も crc を取らない",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "            return self.entry_at(at);",
+  "replace": "            return Some(e);"
+ },
+ {
+  "name": "crc の番号を足さない",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "entry_crc(first + k as u64,",
+  "replace": "entry_crc(first,"
+ },
+ {
+  "name": "並べた crc で番号を落とす",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "        return recs.par_iter().enumerate().map(one).collect();",
+  "replace": "        return recs.par_iter().map(|r| one((0, r))).collect();"
+ },
+ {
+  "name": "tick ごとに写さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false).unwrap_or(0);",
+  "replace": "            let _ = log;"
+ },
+ {
+  "name": "区画を移っても consumer を起こさない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            wal.set_switch_hook(Box::new(move || w.wake()));",
+  "replace": "            drop(w);"
+ },
+ {
+  "name": "区画を移っても 100 ms を待つ",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                        if last_fsync.elapsed() >= fsync_interval || switched {",
+  "replace": "                        if last_fsync.elapsed() >= fsync_interval && (switched || !switched) {"
+ }
+]
