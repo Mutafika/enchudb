@@ -14,4 +14,4 @@ changefeed の記録 64 MiB。
 別の directory で組む。 同じ directory で path だけ変えると組み直されないことがある)。 `run_ab.sh` が 2 つの版を交互に回し、
 `sum_ab.py results_ab.jsonl` が表にする。
 
-`results_ab.jsonl`: 0.37.0 (base) と #662 の直し (fix)、 Apple M4 Max、 macOS 26.0.1、 負荷 6〜22 (別の仕事が走っていた)。
+`results_ab.jsonl`: 0.37.0 (base) と #662 の直し (fix)、 Apple M4 Max、 macOS 26.0.1、 負荷 4.6〜12.7 (別の仕事が走っていた)。

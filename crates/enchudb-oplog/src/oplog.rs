@@ -3168,22 +3168,28 @@ impl OpLog {
     /// 末尾の Commit で閉じていない record と、 読み終えた終端 offset を返す。 読むだけ。 返り値は
     /// (Commit で閉じた record, committed_end, 閉じていない末尾の record, 読み終えた終端)。
     pub fn iter_from_with_tail(&self, start_offset: u64) -> (Vec<Record>, u64, Vec<Record>, u64) {
-        let s = self.scan_from_offset(start_offset);
+        self.iter_from_with_tail_upto(start_offset, u64::MAX)
+    }
+
+    /// `iter_from_with_tail` を位置 `upto` ([`wal_pos`]、 畳む区画の終わり) で止める版 (#662: 今の区画は畳まないので読まない)。
+    pub fn iter_from_with_tail_upto(&self, start_offset: u64, upto: u64) -> (Vec<Record>, u64, Vec<Record>, u64) {
+        let s = self.scan_range(start_offset, upto);
         let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
         (strip_offsets(s.out), s.committed_end, strip_offsets(s.tail), end)
     }
 
     /// changefeed の記録 (engine の `changefeed.seg`) 用: `start` から読んで、 (record, その終端 offset) と読み終えた offset を返す。
-    /// `with_tail` が false なら `limit` (書き出し済みの位置 = checkpoint) までに Commit で閉じた group だけ。 true なら閉じていない
-    /// 末尾も含めて全部 (畳む直前、 全部を書き出した後に呼ぶ)。 読むだけ。
+    /// `with_tail` が false なら `limit` (書き出し済みの位置 = checkpoint) までに Commit で閉じた group だけ。 true なら `limit`
+    /// (畳む区画の終わり) までの record を閉じていない末尾も含めて全部 (畳む直前に呼ぶ。 `limit` より先は読まない、 #662)。 読むだけ。
     pub fn scan_for_change_log(&self, start: u64, limit: u64, with_tail: bool) -> (Vec<(Record, u64)>, u64) {
-        let s = self.scan_from_offset(start);
         if with_tail {
+            let s = self.scan_range(start, limit);
             let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
             let mut out = s.out;
             out.extend(s.tail);
             return (out, end);
         }
+        let s = self.scan_from_offset(start);
         let end = s.commit_ends.iter().rev().find(|&&c| c <= limit).copied().unwrap_or(start);
         (s.out.into_iter().filter(|(_, e)| *e <= end).collect(), end)
     }
@@ -3253,6 +3259,12 @@ impl OpLog {
         &self,
         start_offset: u64,
     ) -> ScanOut {
+        self.scan_range(start_offset, u64::MAX)
+    }
+
+    /// `scan_from_offset` を位置 `upto` ([`wal_pos`]、 record の境目 = 区画の終わりか head) で止める版: `upto` から先の record は
+    /// 読まない (`upto` で読み終えたのと同じに扱う)。 畳む区画の終わりまでを読む時に、 今の区画を読まないため (#662)。
+    fn scan_range(&self, start_offset: u64, upto: u64) -> ScanOut {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut commit_ends = Vec::new();
@@ -3276,6 +3288,9 @@ impl OpLog {
             let (base, lap, head) = (part.base, part.lap, part.end);
             let mut offset = part.start;
             while offset < head {
+                if wal_pos(lap, offset) >= upto {
+                    break 'parts;
+                }
                 let at = base + offset as usize;
                 let rec_end = at + REC_HEADER_SIZE;
                 if rec_end > mmap.len() { stop = ScanStop::OutOfBounds; break 'parts; }
@@ -5411,6 +5426,42 @@ mod tests {
             *v += 1;
         }
         wal.append(Op::Commit).unwrap();
+    }
+
+    /// #662: 畳む時の写し (`scan_for_change_log(.., with_tail = true)` / `iter_from_with_tail_upto`) は `limit` (畳む区画の終わり)
+    /// より先を読まない: 古い区画の record は全部、 今の区画の record (閉じていない record も) は返さない。
+    #[test]
+    fn copies_for_a_fold_stop_at_the_end_of_the_old_half() {
+        let p = tmp("halves-upto");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        let lap0 = wal.lap();
+        let mut v = 0u64;
+        while wal.switches() == 0 {
+            append_group(&wal, &mut v);
+        }
+        // 今の区画の閉じていない record
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 << 40 }).unwrap();
+        let old_end = wal_pos(lap0, wal.hot.halves[0].head.load(Ordering::Acquire));
+        let strip = |r: Vec<(Record, u64)>| r.into_iter().map(|(r, _)| r).collect::<Vec<_>>();
+        let (all, _) = wal.scan_for_change_log(HEADER_SIZE as u64, u64::MAX, true);
+        let all = tie_values(&strip(all));
+        assert_eq!(all.last(), Some(&(1 << 40)), "前提: 上限なしなら今の区画の閉じていない record まで読む");
+        let (old, end) = wal.scan_for_change_log(HEADER_SIZE as u64, old_end, true);
+        assert_eq!(end, old_end, "畳む区画の終わりまで読み終える");
+        assert!(old.iter().all(|(_, e)| *e <= old_end));
+        let old = tie_values(&strip(old));
+        let k = old.len();
+        assert!(k > 0 && k < all.len() && old == all[..k], "古い区画の record だけ ({k} / {} 件)", all.len());
+        let (committed, committed_end, tail, end) = wal.iter_from_with_tail_upto(HEADER_SIZE as u64, old_end);
+        assert_eq!((committed_end, end), (old_end, old_end));
+        assert!(tail.is_empty());
+        assert_eq!(tie_values(&committed), old);
+        // 上限は record の境目ならどこでも: その位置から始まる record は読まない
+        let (recs, _) = wal.scan_for_change_log(HEADER_SIZE as u64, old_end, true);
+        let mid = recs[k / 2].1;
+        let (head_part, end) = wal.scan_for_change_log(HEADER_SIZE as u64, mid, true);
+        assert_eq!(end, mid);
+        assert_eq!(tie_values(&strip(head_part)), old[..=k / 2].to_vec(), "上限の位置から始まる record を読んだ");
     }
 
     /// 今の区画が埋まると、 開いている group を閉じてもう一方の区画へ移る (周は新しい数)。 2 つの区画を積んだ順に読む。 古い区画

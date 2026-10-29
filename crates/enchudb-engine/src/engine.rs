@@ -1971,10 +1971,12 @@ mod fold_copy_tests {
 
     /// 古い区画を畳む時、 changefeed の record を写している間も書き手は WAL に積める (写しは `append_lock` の外)。 前は
     /// `try_reset_if` の述語 (lock の下) で cursor から今の区画の head まで全部を写し、 書き手が速いと畳むたびに 100〜200 ms 止まった。
-    /// `log` = 記録 (`changefeed.seg`) に写す形、 でなければ listener の溜めに移す形。
-    fn copies_for_a_fold_leave_the_wal_open(log: bool) {
+    /// `log` = 記録 (`changefeed.seg`) に写す形、 でなければ listener の溜めに移す形。 `room` = 試験の thread から空け作り
+    /// (`make_wal_room_inner`、 sync の表の無い DB は書き出してその場で畳む) を呼んで畳む形。 でなければ consumer の 100 ms ごとの
+    /// 書き出しの後に畳む形 (`try_fold_with_changes`)。 どちらも区画を移って少し書いてから止める。
+    fn copies_for_a_fold_leave_the_wal_open(log: bool, room: bool) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = format!("/tmp/enchudb-foldcopy-{}-{log}-{nanos}.db", std::process::id());
+        let path = format!("/tmp/enchudb-foldcopy-{}-{log}-{room}-{nanos}.db", std::process::id());
         let eids: Vec<u64> = {
             let mut eng = Engine::create_standalone(&path).unwrap();
             eng.define_himo("v", ValueType::Number, 0);
@@ -1992,7 +1994,7 @@ mod fold_copy_tests {
         let (seen, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
         watch_copies(wal.clone(), seen.clone(), stop.clone());
         // 区画を移るまで書き、 今の区画にも少し書いて止める (今の区画は埋まらないので、 積む thread は空きを待たない)
-        let (lap0, switches0) = (wal.lap(), eng.wal_switches());
+        let (lap0, switches0, room0) = (wal.lap(), eng.wal_switches(), eng.wal_room_folds());
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut i = 0u32;
         while eng.wal_switches() == switches0 && Instant::now() < deadline {
@@ -2004,6 +2006,11 @@ mod fold_copy_tests {
             eng.tie_to(eids[i as usize % eids.len()], "v", i);
             i += 1;
         }
+        // 空け作りは試験の thread から呼ぶ (空きが 1/4 を切るのを consumer に待たせると、 100 ms ごとの書き出しが先に畳むことがある。
+        // その時は空け作りが今の区画をその場で畳む)
+        while room && eng.make_wal_room(&wal) != WalRoom::Folded && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         // consumer が古い区画を畳むまで待つ
         let old = wal_pos(lap0, HEADER_SIZE as u64);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -2012,6 +2019,7 @@ mod fold_copy_tests {
         }
         assert!(!wal.holds(old), "前提: 古い区画を畳んだ");
         stop.store(true, Ordering::Release);
+        assert_eq!(eng.wal_room_folds() > room0, room, "前提: 空け作りで畳んだか");
         let seen = seen.lock().unwrap().clone();
         assert!(!seen.is_empty(), "前提: 畳む時に写した");
         assert!(seen.iter().all(|&ok| ok), "写している間、 WAL に積めなかった (append_lock の下で写した): {seen:?}");
@@ -2024,12 +2032,22 @@ mod fold_copy_tests {
 
     #[test]
     fn copying_into_the_change_log_for_a_fold_does_not_stop_writers() {
-        copies_for_a_fold_leave_the_wal_open(true);
+        copies_for_a_fold_leave_the_wal_open(true, false);
     }
 
     #[test]
     fn moving_records_to_the_listener_backlog_for_a_fold_does_not_stop_writers() {
-        copies_for_a_fold_leave_the_wal_open(false);
+        copies_for_a_fold_leave_the_wal_open(false, false);
+    }
+
+    #[test]
+    fn copying_into_the_change_log_while_making_wal_room_does_not_stop_writers() {
+        copies_for_a_fold_leave_the_wal_open(true, true);
+    }
+
+    #[test]
+    fn moving_records_to_the_listener_backlog_while_making_wal_room_does_not_stop_writers() {
+        copies_for_a_fold_leave_the_wal_open(false, true);
     }
 
     /// 受けた Tie の値を順に控える。
@@ -2104,13 +2122,35 @@ mod fold_copy_tests {
         an_open_tail_folded_in_place_reaches_the_listener(false);
     }
 
-    /// 畳む時も、 書き出していない record には記録の番号を振らない (畳む前に lock の外で写すのは書き出した所まで)。 畳む時の写しが
-    /// 始まる所で別の thread が 1 件積み、 それ以後の書き出しを止めて (`write_out_fault`)、 記録の最後の record が checkpoint
-    /// より前にあるかを見る (`tests/changefeed_log.rs` の `records_not_yet_written_out_get_no_number` を畳む時に)。
-    #[test]
-    fn a_fold_numbers_no_record_not_yet_written_out() {
+    /// 写し始める所 (`change_copy_hook`) で別の thread が `MARK` と Commit を積み (閉じた group)、 それ以後の書き出しを止める
+    /// (`write_out_fault`)。
+    /// `only` の thread 以外から呼ばれた時は何もせず置き直す (試験の thread が呼ぶ空け作りの写しで積む)。
+    fn mark_at_copy(wal: Arc<OpLog>, fired: Arc<AtomicBool>, eid: u64, hid: u16, only: Option<std::thread::ThreadId>) {
+        let at = wal.clone();
+        change_copy_hook::set(&at, move |w| {
+            if only.is_some_and(|t| t != std::thread::current().id()) {
+                mark_at_copy(wal, fired, eid, hid, only);
+                return;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid, himo_id: hid, value: MARK });
+                let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+                let _ = tx.send(());
+            });
+            assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "写しの前に積めない");
+            write_out_fault::set(w, true);
+            fired.store(true, Ordering::Release);
+        });
+    }
+
+    /// 畳む時も、 書き出していない record には記録の番号を振らない (畳む前に lock の外で写すのは書き出した所まで、 lock の下は畳む
+    /// 区画の終わりまで)。 畳む時の写しが始まる所で 1 件積み、 それ以後の書き出しを止めて、 記録の最後の record が checkpoint より
+    /// 前にあるかを見る (`tests/changefeed_log.rs` の `records_not_yet_written_out_get_no_number` を畳む時に)。 `room` = 試験の thread
+    /// から空け作りを呼んで畳む形、 でなければ consumer の 100 ms ごとの書き出しの後の形。
+    fn a_fold_numbers_no_record_not_yet_written_out(room: bool) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = format!("/tmp/enchudb-foldnumber-{}-{nanos}.db", std::process::id());
+        let path = format!("/tmp/enchudb-foldnumber-{}-{room}-{nanos}.db", std::process::id());
         let eids: Vec<u64> = {
             let mut eng = Engine::create_standalone(&path).unwrap();
             eng.define_himo("v", ValueType::Number, 0);
@@ -2121,29 +2161,30 @@ mod fold_copy_tests {
         let eng = Engine::open_concurrent_with_oplog(&path, 4 << 20).unwrap();
         eng.enable_change_log(4 << 20).unwrap();
         let hid = eng.himo_id("v").unwrap() as u16;
-        for i in 0..1_000u32 {
-            eng.tie_to_by_id(eids[i as usize], hid, i);
-        }
         let wal = eng.oplog.as_ref().unwrap().clone();
         let fired = Arc::new(AtomicBool::new(false));
-        let (fired_in_hook, at, eid) = (fired.clone(), wal.clone(), eids[0]);
-        change_copy_hook::set(&wal, move |w| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = at.append(enchudb_oplog::oplog::Op::Tie { eid, himo_id: hid, value: MARK });
-                let _ = tx.send(());
-            });
-            assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "写しの前に積めない");
-            write_out_fault::set(w, true);
-            fired_in_hook.store(true, Ordering::Release);
-        });
+        let room0 = eng.wal_room_folds();
         let deadline = Instant::now() + Duration::from_secs(20);
+        // 空け作りの形は区画を移ってから (古い区画を畳み、 積む record は今の区画に入る)
+        let switches0 = eng.wal_switches();
+        let mut i = 0u32;
+        while i < 1_000 || (room && eng.wal_switches() == switches0 && Instant::now() < deadline) {
+            eng.tie_to_by_id(eids[i as usize % eids.len()], hid, i);
+            i += 1;
+        }
+        mark_at_copy(wal.clone(), fired.clone(), eids[0], hid, room.then(|| std::thread::current().id()));
+        while room && eng.make_wal_room(&wal) != WalRoom::Folded && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         while !fired.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(fired.load(Ordering::Acquire), "前提: 畳もうとして記録に写した");
         // 畳む試しが終わるまで待つ (`change_emit` を持ったまま写して畳む。 ここで写すのは checkpoint まで)
         eng.change_log_range().unwrap();
+        if room {
+            assert!(eng.wal_room_folds() > room0, "前提: 空け作りで畳んだ");
+        }
         let (hlc, id) = crate::change_log::ChangeLog::open(std::path::Path::new(&path), 0, false, true)
             .unwrap()
             .last_written()
@@ -2158,8 +2199,20 @@ mod fold_copy_tests {
         write_out_fault::set(&wal, false);
         assert!(end <= cp, "書き出していない record に番号を振った (記録の最後の record の終端 {end}, checkpoint {cp})");
         drop(eng);
+        change_copy_hook::set(&wal, |_| {});
+        drop(wal);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    #[test]
+    fn a_fold_numbers_no_record_not_yet_written_out_after_the_periodic_write_out() {
+        a_fold_numbers_no_record_not_yet_written_out(false);
+    }
+
+    #[test]
+    fn a_fold_numbers_no_record_not_yet_written_out_while_making_wal_room() {
+        a_fold_numbers_no_record_not_yet_written_out(true);
     }
 }
 
@@ -15602,7 +15655,7 @@ impl Engine {
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(wal) = self.oplog.as_ref() {
-                let _ = self.pump_change_log(wal, log, &mut c, false);
+                let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
             }
             c.readers.push((listener.clone(), log.range().1));
             self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
@@ -15677,7 +15730,7 @@ impl Engine {
         let log = self.change_log.get()?;
         if let Some(wal) = self.oplog.as_ref() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = self.pump_change_log(wal, log, &mut c, false);
+            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
         }
         Some(log.range())
     }
@@ -15696,7 +15749,7 @@ impl Engine {
         };
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(wal) = self.oplog.as_ref() {
-            let _ = self.pump_change_log(wal, log, &mut c, false);
+            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
         }
         let (first, next) = log.range();
         if pos < first || pos > next {
@@ -15781,17 +15834,21 @@ impl Engine {
             .collect()
     }
 
+    /// 記録の cursor から先を記録に写す (呼び手が `change_emit` を持って)。 `limit` は写してよい終わり: `with_tail` が false なら
+    /// `limit` (書き出した所) までに Commit で閉じた group、 true なら `limit` (畳む区画の終わり) までの record を閉じていない末尾も
+    /// 含めて全部 ([`enchudb_oplog::oplog::OpLog::scan_for_change_log`])。 戻り値は写した record の数。
     fn pump_change_log(
         &self,
         wal: &enchudb_oplog::oplog::OpLog,
         log: &crate::change_log::ChangeLog,
         c: &mut ChangeCursor,
+        limit: u64,
         with_tail: bool,
     ) -> io::Result<usize> {
         use std::sync::atomic::Ordering;
         #[cfg(test)]
         change_copy_hook::call(wal);
-        let (recs, end) = wal.scan_for_change_log(c.log_wal, wal.checkpoint(), with_tail);
+        let (recs, end) = wal.scan_for_change_log(c.log_wal, limit, with_tail);
         let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
         if recs.is_empty() {
             c.log_wal = c.log_wal.max(end);
@@ -19845,7 +19902,7 @@ impl Engine {
         // 記録がある時は記録に写す (渡すのは listener ごとの位置から)
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = self.pump_change_log(wal, log, &mut c, false) {
+            if let Err(e) = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false) {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
@@ -19883,8 +19940,9 @@ impl Engine {
     /// changefeed: ring を畳む直前 (`append_lock` の下、 呼び手が `change_emit` を持って) に、 畳む区画 (`through` まで) の record
     /// で listener に配っていないものを移す。 呼び手は先に lock の外で [`Self::move_changes_before_fold`] を呼んでおく。 cursor が
     /// `through` に届いていれば何もしない (古い区画を畳む時。 移る時に閉じの Commit を置いた後は誰も書き足さないので、 lock の外で
-    /// 読み切れる)。 届いていなければ (今の区画をその場で畳む時の閉じていない末尾 / lock の外で写せなかった時)、 cursor から先を
-    /// 閉じていない末尾も含めて全部移す。 戻り値は移した record の数 (None = 畳まない: 記録に写せなかった)。
+    /// 読み切れる)。 届いていなければ (今の区画をその場で畳む時の閉じていない末尾 / lock の外で写せなかった時)、 cursor から
+    /// `through` までを閉じていない末尾も含めて移す。 `through` より先 (古い区画を畳む時の今の区画) は畳んでも WAL に残るので移さない
+    /// (書き出す前の record もあり、 記録に写すと番号を振ってしまう)。 戻り値は移した record の数 (None = 畳まない: 記録に写せなかった)。
     ///
     /// 記録 (`changefeed.seg`) がある時は記録に写す (畳む前は全部書き出してある)。 無い時は溜めに移す ([`Self::move_changes_to_backlog`])。
     ///
@@ -19895,7 +19953,7 @@ impl Engine {
             if c.log_wal >= through {
                 return Some(0);
             }
-            return match self.pump_change_log(wal, log, c, true) {
+            return match self.pump_change_log(wal, log, c, through, true) {
                 Ok(n) => Some(n),
                 Err(e) => {
                     self.record_fault(FaultKind::DiskSpace, "changefeed.seg に写せない — WAL を畳まない");
@@ -19907,36 +19965,38 @@ impl Engine {
         if c.offset >= through {
             return Some(0);
         }
-        Some(self.move_changes_to_backlog(wal, c, true))
+        Some(self.move_changes_to_backlog(wal, c, Some(through)))
     }
 
     /// changefeed (#662): 畳む前に、 `append_lock` の外で (呼び手が `change_emit` を持って)、 listener に配っていない Commit で閉じた
-    /// record を記録 / 溜めに移す。 lock の下の [`Self::spill_changes_for_fold`] は、 ここで届かなかった分だけを写す。 記録に写せ
-    /// なかった時は何もしない (lock の下でもう一度写し、 そこで fault を数える)。 戻り値は移した record の数。
-    fn move_changes_before_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor) -> usize {
+    /// record を記録 / 溜めに移す。 記録には書き出した所 (`written`: checkpoint、 または書き出しの返った head) まで。 lock の下の
+    /// [`Self::spill_changes_for_fold`] は、 ここで届かなかった分だけを写す。 記録に写せなかった時は何もしない (lock の下でもう一度
+    /// 写し、 そこで fault を数える)。 戻り値は移した record の数。
+    fn move_changes_before_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, written: u64) -> usize {
         match self.change_log.get() {
-            Some(log) => self.pump_change_log(wal, log, c, false).unwrap_or(0),
-            None => self.move_changes_to_backlog(wal, c, false),
+            Some(log) => self.pump_change_log(wal, log, c, written, false).unwrap_or(0),
+            None => self.move_changes_to_backlog(wal, c, None),
         }
     }
 
     /// changefeed: cursor から先の record を溜めに移す (呼び手が `change_emit` を持って)。 Commit で閉じた分は `committed` に (前に
-    /// 閉じていなかった末尾を頭に付けて)、 `with_tail` なら閉じていない末尾も `open_tail` に足す。 cursor は読み終えた終端に進める
+    /// 閉じていなかった末尾を頭に付けて)。 `tail_upto` が Some なら、 その位置 (畳む区画の終わり) までに止めて、 閉じていない末尾も
+    /// `open_tail` に足す。 cursor は読み終えた終端に進める
     /// (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。 listener が居なければ何もしない。 戻り値は移した
     /// record の数。
     ///
     /// #560: 移すと溜めが上限 (`change_backlog_limit`) を越えるなら、 移さずに溜めごと捨て、 listener を全部外す (止まった・遅すぎる
     /// listener のために書き手を止めない・メモリを使い切らない。 前は上限が無く、 止まった listener の間は畳むたびに ring の
     /// 全部を `append_lock` の下で写して溜め続けた)。 外した listener には通知係が `on_detached` で知らせる。
-    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, with_tail: bool) -> usize {
+    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, tail_upto: Option<u64>) -> usize {
         use std::sync::atomic::Ordering;
         if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
             return 0;
         }
         #[cfg(test)]
         change_copy_hook::call(wal);
-        let (recs, committed_end, tail, end) = if with_tail {
-            wal.iter_from_with_tail(c.offset)
+        let (recs, committed_end, tail, end) = if let Some(upto) = tail_upto {
+            wal.iter_from_with_tail_upto(c.offset, upto)
         } else {
             let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
             (recs, committed_end, Vec::new(), committed_end)
@@ -20010,7 +20070,7 @@ impl Engine {
         // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
         let folded = wal.fold_hint().is_some_and(|through| {
             self.wal_fold_safe_to(through) && {
-                moved = self.move_changes_before_fold(wal, &mut c);
+                moved = self.move_changes_before_fold(wal, &mut c, wal.checkpoint());
                 true
             }
         }) && wal.try_reset_if(|through| {
@@ -20579,26 +20639,36 @@ impl Engine {
                 // changefeed の cursor の巻き戻しを配信の取り出しと直列にする (#337)。 書き出しの間も持つ (配信の取り出しが待つ
                 // だけで、 listener の callback は待たない)
                 let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-                let mut moved = 0;
+                // 書き出した後 (lock の外) と畳む時 (lock の下) の両方で cursor を進めるので、 2 つの closure から借りる
+                let cursor = std::cell::RefCell::new(&mut *c);
+                let moved = std::cell::Cell::new(0);
                 let (_, folded) = wal.checkpoint_and_reset(
-                    |_head| {
+                    |head| {
                         let durable_lsn = wal.next_lsn().saturating_sub(1);
                         let ok = self.sync_for_checkpoint(wal);
                         if ok {
                             self.durable_lsn.store(durable_lsn, Ordering::Release);
+                            // #662: 畳む前に lock の外で、 書き出した所 (head) まで写す (lock の下は畳む区画の終わりまでの残りだけ)。
+                            // 1 区画の形は、 ここも append_lock の下 (書き出してから畳むまで append を止める形)
+                            if direct {
+                                moved.set(moved.get() + self.move_changes_before_fold(wal, &mut cursor.borrow_mut(), head));
+                            }
                         }
                         ok
                     },
                     |through| {
                         direct
                             && self.wal_fold_safe_locked_to(through)
-                            && self.spill_changes_for_fold(wal, &mut c, through).map(|m| moved = m).is_some()
+                            && self
+                                .spill_changes_for_fold(wal, &mut cursor.borrow_mut(), through)
+                                .map(|m| moved.set(moved.get() + m))
+                                .is_some()
                     },
                 );
                 if folded {
                     self.reset_sync_ops_offset();
                 }
-                self.after_fold_changes(wal, &mut c, folded, moved);
+                self.after_fold_changes(wal, &mut c, folded, moved.get());
                 folded
             };
             // 書き出した分を listener に渡すよう頼む (畳めなかった時も、 checkpoint は進んでいる)
