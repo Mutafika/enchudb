@@ -39,6 +39,8 @@ const IMAGES: usize = 60;
 struct Recorder {
     /// (番号, Tie の値)
     seen: Mutex<Vec<(u64, Option<u64>)>>,
+    /// 外された時の HLC (診断用)
+    detached: Mutex<Option<enchudb_oplog::Hlc>>,
 }
 
 impl ChangeListener for Recorder {
@@ -51,6 +53,10 @@ impl ChangeListener for Recorder {
             };
             s.push((first + k as u64, v));
         }
+    }
+
+    fn on_detached(&self, lost_from: enchudb_oplog::Hlc) {
+        *self.detached.lock().unwrap() = Some(lost_from);
     }
 }
 
@@ -68,18 +74,38 @@ type Replayed = (u64, Vec<(u64, Option<u64>)>, Option<u64>);
 fn replay(db: &str) -> Result<Replayed, String> {
     let eng = Engine::open_concurrent_with_oplog(db, WAL_CAP).map_err(|e| format!("開けない: {e}"))?;
     let value = eng.himo_id("ts").and_then(|ts| eng.get_by_id(0, ts as u16));
+    // 診断 (#667 の CI の Linux だけで、 再生の間に記録が進んだ): 段ごとの WAL の位置と記録の範囲
+    let wal = eng.oplog().unwrap().clone();
+    let mut trace = vec![format!("開いた: head {:#x} cp {:#x} 周 {} 移った {}", wal.head(), wal.checkpoint(), wal.lap(), wal.switches())];
     // 再生した末尾の閉じていない group は、 閉じの Commit (`oplog_sync`) で記録に写る。 最古から付けた後に写すと、 一周した
     // 記録では最古の番号が押し出されて listener が外れるので、 先に写し切ってから付ける
     eng.oplog_sync().map_err(|e| e.to_string())?;
     let (first, next) = eng.change_log_range().ok_or("記録が無い")?;
+    trace.push(format!("写し切った: 記録 {first}..{next} head {:#x} cp {:#x} 周 {}", wal.head(), wal.checkpoint(), wal.lap()));
     let rec = Arc::new(Recorder::default());
-    eng.add_change_listener_from(rec.clone(), first).map_err(|e| format!("受け直せない: {e}"))?;
+    if let Err(e) = eng.add_change_listener_from(rec.clone(), first) {
+        trace.push(format!("付ける時: 記録 {:?} head {:#x} cp {:#x} 周 {}", eng.change_log_range(), wal.head(), wal.checkpoint(), wal.lap()));
+        return Err(format!("受け直せない: {e} [{}]", trace.join(" / ")));
+    }
     let until = Instant::now() + Duration::from_secs(30);
     while (rec.seen.lock().unwrap().len() as u64) < next - first && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));
     }
-    drop(eng);
     let seen = rec.seen.lock().unwrap().clone();
+    if (seen.len() as u64) < next - first {
+        trace.push(format!(
+            "受けた {} / {} 件、 外された {:?}、 記録 {:?} head {:#x} cp {:#x} 周 {}",
+            seen.len(),
+            next - first,
+            rec.detached.lock().unwrap(),
+            eng.change_log_range(),
+            wal.head(),
+            wal.checkpoint(),
+            wal.lap()
+        ));
+        eprintln!("[再生の診断] {db}: {}", trace.join(" / "));
+    }
+    drop((wal, eng));
     Ok((first, seen, value))
 }
 
