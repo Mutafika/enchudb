@@ -1119,6 +1119,65 @@ fn nothing_is_relogged_when_every_write_on_disk_is_in_the_oplog() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// #669: 区画を移った直後の像 (古い区画の header の page だけが届き、 閉じの Commit の中身と新しい区画の record は届かなかった) を
+/// 開いても、 開いた後の書き込みは WAL から読める (audit と、 sync の配る分)。 前は head が届かなかった閉じの Commit の後ろのままで、
+/// 書き込みはその後ろに積まれ、 読みが閉じの Commit で止まって届かなかった。
+#[test]
+fn writes_after_a_torn_closing_commit_are_read_from_the_wal() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("torn_closing");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let eng = notes_engine(&live.join("db"), 64 * 1024);
+    let wal = eng.oplog().unwrap().clone();
+    let (img, closing) = {
+        // 畳ませない (consumer は書き出しの後、 この lock で止まる = 区画を移った後に書き出さない)
+        let _no_fold = eng.transfer_lock_for_fold();
+        let e = eng.entity_in("notes").unwrap();
+        let mut i = 0u32;
+        while enchudb_oplog::oplog::wal_pos_offset(wal.head()) < 30 * 1024 {
+            eng.tie_to(e, "notes.note", i);
+            eng.oplog_commit();
+            i += 1;
+        }
+        assert_eq!(wal.switches(), 0, "前提: まだ A");
+        // consumer の書き出しが済んで lock で止まるのを待つ
+        let t = std::time::Instant::now();
+        while wal.checkpoint() != wal.head() && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // 入らない Leaf で区画を移る: A の終わりに閉じの Commit を置き、 A の header の page だけを書き出す
+        let closing = enchudb_oplog::oplog::wal_pos_offset(wal.head()) as usize;
+        let big = eng.entity_in("notes").unwrap();
+        eng.tie_text_to(big, "notes.body", &"b".repeat(4000));
+        assert_eq!(wal.switches(), 1, "前提: 区画を移った");
+        let img = root.join("img");
+        crashsim::capture(&live, &img, Mode::Lost).unwrap();
+        (img, closing)
+    };
+    crashsim::stop();
+    let live_wal = std::fs::read(live.join("db").join("oplog")).unwrap();
+    drop((wal, eng));
+    let img_wal = std::fs::read(img.join("db").join("oplog")).unwrap();
+    assert_ne!(img_wal[closing..closing + 120], live_wal[closing..closing + 120], "前提: 閉じの Commit の中身が届いていない");
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), 64 * 1024).unwrap();
+    let e = eng.entity_in("notes").unwrap();
+    eng.tie_to(e, "notes.note", 777_777u32);
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    let is_new = |op: &DecodedOp| matches!(op, DecodedOp::Tie { value: 777_777, .. });
+    let audited = eng.audit(&enchudb_engine::AuditFilter::default()).iter().any(|r| is_new(&r.op));
+    let distributed = distributed(&eng).iter().any(|r| is_new(&r.op));
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(audited, "開いた後の書き込みが audit に無い");
+    assert!(distributed, "開いた後の書き込みが sync の配る分に無い");
+}
+
 /// #451 / #449: WAL が満杯で載らなかった write (#57) は、 floor を上げる前に電源が落ちると本体にだけ残る。 開く時に
 /// 作り直そうとしても oplog が満杯なら、 floor を上げて相手に取り直させる (floor = 開いた時の今 は落ちた write を覆う)。
 #[test]
