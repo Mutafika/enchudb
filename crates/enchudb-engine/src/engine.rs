@@ -20070,6 +20070,11 @@ impl Engine {
     fn try_fold_with_changes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         let mut moved = 0;
+        // #667: 記録がある時は、 畳めるかによらず書き出した所まで写す (畳む時にまとめて写すと、 区画 1 つ分を写し終えるまで全力の
+        // 書き手が空きを待った)
+        if let Some(log) = self.change_log.get() {
+            moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false).unwrap_or(0);
+        }
         // 先に lock の外で見積もる (畳める区画が無い / bridge が読み終えていないなら append_lock を取らない)。 畳めそうなら、 配って
         // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
         let folded = wal.fold_hint().is_some_and(|through| {
@@ -20286,6 +20291,9 @@ impl Engine {
         if let Some(wal) = oplog.as_ref() {
             let w = waker.clone();
             wal.set_append_hook(Box::new(move || w.wake_if_deep()));
+            // #667: 書き手が区画を移ったら起こす (tick を待たずに古い区画を書き出して畳む)
+            let w = waker.clone();
+            wal.set_switch_hook(Box::new(move || w.wake()));
         }
         let flag_for_thread = shutdown.clone();
         let oplog_for_thread = oplog.clone();
@@ -20317,6 +20325,9 @@ impl Engine {
                 waker.register_current();
                 let fsync_interval = Duration::from_millis(100);
                 let mut last_fsync = Instant::now();
+                // #667: 最後に見た区画の切り替えの回数。 書き手が区画を移ったら、 100 ms を待たずに書き出して古い区画を畳む (待つと、
+                // 全力の書き手は次の区画も埋めて空きを待った。 WAL 64 MiB で 1 回約 130 ms)
+                let mut seen_switches = oplog_for_thread.as_ref().map_or(0, |w| w.switches());
 
                 loop {
                     engine.consumer_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -20333,7 +20344,9 @@ impl Engine {
                     // head が checkpoint より進んでいる時のみ実行。
                     // 順序厳守: auto-Commit → WAL fsync → body msync → checkpoint 前進。
                     if let Some(wal) = oplog_for_thread.as_ref() {
-                        if last_fsync.elapsed() >= fsync_interval {
+                        let switched = wal.switches() != seen_switches;
+                        if last_fsync.elapsed() >= fsync_interval || switched {
+                            seen_switches = wal.switches();
                             if wal.head() > wal.checkpoint() {
                                 // #451 (段階 1): 配り済みの印の候補は Commit を打つ前に切る (印が覆う record は閉じた group に入る)
                                 let cut = engine.take_durable_cut(wal);
@@ -20535,6 +20548,8 @@ impl Engine {
                             // #555: 空と見てから印を立てるまでに書かれた record を見落とさない (その書き手の `wake_if_deep` は
                             // 印を見ずに素通りした)。 書き出しを待つ短い眠り (WAL が空でない時) は見直さない (毎 append で戻ってしまう)
                             && !idle_wal.is_some_and(|wal| wal_behind(wal))
+                            // #667: 起こされる前に区画を移っていた (起きている間の切り替えは起こさない)
+                            && !oplog_for_thread.as_ref().is_some_and(|wal| wal.switches() != seen_switches)
                     });
                 }
             })

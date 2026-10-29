@@ -339,6 +339,7 @@ impl ChangeLog {
             self.map.flush_dirty()?;
         }
         // (2) entry を書いて書き出す
+        let crcs = entry_crcs(old_next, recs);
         for (k, (r, (at, wrap))) in recs.iter().zip(plan.iter()).enumerate() {
             let no = old_next + k as u64;
             if let Some(w) = *wrap {
@@ -348,7 +349,7 @@ impl ChangeLog {
             let n = entry_size(r.bytes.len());
             self.region.ensure_committed(base + n)?;
             self.region.write_at(base + ENTRY_HEADER, &r.bytes);
-            let crc = entry_crc(no, r.bytes.len() as u32, &r.hlc, r.wal_id, &r.bytes);
+            let crc = crcs[k];
             self.write_entry_header(base, no, r.bytes.len() as u32, crc, r.hlc, r.wal_id)?;
             self.region.mark_dirty(base, n);
         }
@@ -463,6 +464,16 @@ impl ChangeLog {
 
     /// `at` の entry の header。 crc が合わない / 範囲外 / 書かれていなければ None。
     fn entry_at(&self, at: usize) -> Option<EntryHeader> {
+        let e = self.header_at(at)?;
+        let base = HEADER + at;
+        let s = self.region.slice();
+        let crc = u32::from_le_bytes(s[base + 12..base + 16].try_into().unwrap());
+        let bytes = &s[base + ENTRY_HEADER..base + ENTRY_HEADER + e.len];
+        (entry_crc(e.no, e.len as u32, &e.hlc, e.wal_id, bytes) == crc).then_some(e)
+    }
+
+    /// `at` の entry の header (crc は見ない)。 範囲外 / 書かれていなければ None。
+    fn header_at(&self, at: usize) -> Option<EntryHeader> {
         let base = HEADER + at;
         if self.cap - at < ENTRY_HEADER || !self.region.is_committed(base + ENTRY_HEADER) {
             return None;
@@ -471,14 +482,23 @@ impl ChangeLog {
         let u32_at = |a: usize| u32::from_le_bytes(s[a..a + 4].try_into().unwrap());
         let no = self.u64_at(base);
         let len = u32_at(base + 8) as usize;
-        let crc = u32_at(base + 12);
         if no == WRAP || at + entry_size(len) > self.cap || !self.region.is_committed(base + ENTRY_HEADER + len) {
             return None;
         }
         let hlc = Hlc { wall: self.u64_at(base + 16), logical: u32_at(base + 24), peer: u32_at(base + 28) };
-        let wal_id = self.u64_at(base + 32);
-        let bytes = &s[base + ENTRY_HEADER..base + ENTRY_HEADER + len];
-        (entry_crc(no, len as u32, &hlc, wal_id, bytes) == crc).then_some(EntryHeader { no, len, hlc, wal_id })
+        Some(EntryHeader { no, len, hlc, wal_id: self.u64_at(base + 32) })
+    }
+
+    /// 捨てる entry の header。 中身は読まない (#667: 捨てる 1 件ごとに中身の crc を取ると、 記録に写す時間の 3 割ほどだった)。
+    /// 長さが壊れていないかは、 次の entry の番号が 1 つ先かで見る。 次が今回置く entry (`limit` の番号、 まだ書いていない) の
+    /// 最後の 1 件だけは crc で見る。
+    fn dropped_at(&self, at: usize, first: u64, limit: u64) -> Option<EntryHeader> {
+        let e = self.header_at(at).filter(|e| e.no == first)?;
+        if e.no + 1 >= limit {
+            return self.entry_at(at);
+        }
+        let next = self.wrap_at((at + entry_size(e.len)) % self.cap);
+        self.header_at(next).filter(|n| n.no == e.no + 1).map(|_| e)
     }
 
     /// 最古の entry を捨てる (`sim` の上で)。 `watch` に入っている番号なら HLC を `lost` に積む。 `limit` 以上の番号 (今回置く
@@ -488,8 +508,8 @@ impl ChangeLog {
             return;
         }
         let at = self.wrap_at(sim.tail);
-        match self.entry_at(at) {
-            Some(e) if e.no == sim.first => {
+        match self.dropped_at(at, sim.first, limit) {
+            Some(e) => {
                 if watch.contains(&e.no) {
                     lost.push((e.no, e.hlc));
                 }
@@ -554,6 +574,21 @@ struct EntryHeader {
     len: usize,
     hlc: Hlc,
     wal_id: u64,
+}
+
+/// 並べて crc を取る回の大きさの下限 (entry の数)。
+const PAR_CRC_MIN: usize = 4096;
+
+/// `first` 番から並ぶ entry の crc。 大きな回は rayon で並べる (#667: FNV は 1 byte ずつの掛け算の連鎖で、 1 件 (約 200 B) に約
+/// 0.25 µs かかり、 記録に写す時間の 4 割ほどだった。 1 件ごとに独立)。
+fn entry_crcs(first: u64, recs: &[NewEntry]) -> Vec<u32> {
+    let one = |(k, r): (usize, &NewEntry)| entry_crc(first + k as u64, r.bytes.len() as u32, &r.hlc, r.wal_id, &r.bytes);
+    #[cfg(not(target_arch = "wasm32"))]
+    if recs.len() >= PAR_CRC_MIN {
+        use rayon::prelude::*;
+        return recs.par_iter().enumerate().map(one).collect();
+    }
+    recs.iter().enumerate().map(one).collect()
 }
 
 fn entry_crc(no: u64, len: u32, hlc: &Hlc, wal_id: u64, bytes: &[u8]) -> u32 {
@@ -785,6 +820,64 @@ mod tests {
         drop(log);
         let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
         assert_eq!(log.range(), (3, 4));
+    }
+
+    /// 捨てる entry は中身を読まない (#667)。 中身が壊れていても、 要る分だけ捨てる。 長さが壊れていれば (次の entry の番号が
+    /// 合わない) それより古い entry を全部捨て、 header が壊れた所を指さない (捨てる最後の 1 件が長さの壊れた entry の時に、
+    /// 長さを確かめないと tail が中身の途中を指して読めなくなる)。
+    #[test]
+    fn dropping_skips_the_body_but_catches_a_damaged_length() {
+        // 6000 B を 173 件で一杯の手前 (捨てない)、 次の 9000 B は頭に折り返して 0 番と 1 番を捨てる
+        let fill: Vec<_> = (0..173).map(|k| rec(k, 6000)).collect();
+        let big = rec(173, 9000);
+        let control = {
+            let log = ChangeLog::open(&tempdir("drop-control"), MIN_CAP, true, false).unwrap();
+            add(&log, &fill, &[]);
+            assert_eq!(log.range(), (0, 173), "試験の前提: 一杯の手前で捨てていない");
+            add(&log, std::slice::from_ref(&big), &[]);
+            log.range()
+        };
+        assert_eq!(control, (2, 174), "試験の前提: 捨てる最後の 1 件が 1 番");
+        for (tag, offset, value, want) in [
+            ("drop-body", ENTRY_HEADER + 100, vec![0xEE], control),        // 中身の 1 byte
+            ("drop-len", 8, 3000u32.to_le_bytes().to_vec(), (173, 174)), // 長さ (範囲の中の別の値)
+        ] {
+            let log = ChangeLog::open(&tempdir(tag), MIN_CAP, true, false).unwrap();
+            add(&log, &fill, &[]);
+            let one = HEADER + entry_size(6000);
+            log.region.write_at(one + offset, &value);
+            add(&log, std::slice::from_ref(&big), &[]);
+            assert_eq!(log.range(), want, "{tag}");
+            let got = read_all(&log, want.0).unwrap_or_else(|t| panic!("{tag}: 最古の番号から読めない: {t:?}"));
+            assert_eq!(got.len() as u64, want.1 - want.0, "{tag}");
+            for e in &got {
+                let r = if e.no == 173 { &big } else { &fill[e.no as usize] };
+                assert_eq!(e.bytes, r.bytes, "{tag}: {} 番の中身が違う", e.no);
+            }
+        }
+    }
+
+    /// 1 回に置く entry が多い (`PAR_CRC_MIN` 件以上) と crc を並べて取る (#667)。 その entry も、 開き直した後も、 どの位置からも
+    /// 読める (crc の番号がずれると読めない)。
+    #[test]
+    fn entries_of_a_large_append_read_back_with_parallel_crcs() {
+        let dir = tempdir("parcrc");
+        let recs: Vec<_> = (0..6000).map(|i| rec(i, 8)).collect();
+        assert!(MIN_CAP / 4 / entry_size(8) >= PAR_CRC_MIN, "試験の前提: 1 回 (記録の 1/4) に PAR_CRC_MIN 件以上置く");
+        {
+            let log = ChangeLog::open(&dir, MIN_CAP, true, false).unwrap();
+            add(&log, &recs, &[]);
+            assert_eq!(log.range(), (0, 6000));
+        }
+        let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
+        assert_eq!(log.range(), (0, 6000));
+        for pos in [0u64, 1, 4095, 4096, 5999] {
+            let got = read_all(&log, pos).unwrap_or_else(|t| panic!("{pos} から読めない: {t:?}"));
+            assert_eq!(got.len() as u64, 6000 - pos);
+            for e in &got {
+                assert_eq!(e.bytes, recs[e.no as usize].bytes);
+            }
+        }
     }
 
     /// 1 回で記録の大きさを越える量を足しても (畳む時の写し)、 最後の分が残る。

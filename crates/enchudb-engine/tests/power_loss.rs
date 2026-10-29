@@ -1149,6 +1149,12 @@ fn writes_dropped_from_a_full_wal_are_covered_by_a_floor_after_power_loss() {
             eng.oplog_commit();
             i += 1;
         }
+        // #667: 区画を移ると consumer が待たずに書き出す (閉じの Commit を打つ)。 その書き出しが済むのを待ってから残りを数える
+        // (consumer はその後 bridge の lock で止まる = もう積まない。 待たないと、 下で残りを数えた後に consumer の Commit が入る)
+        let t = std::time::Instant::now();
+        while wal.checkpoint() != wal.head() && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         // 閉じた group で WAL を埋め、 残りを 100 B (Tie 136 B も Commit 120 B も入らない) にする。 TieLeaf の record は
         // 文字列の長さ + c B
         let e0 = eng.entity_in("notes").unwrap();

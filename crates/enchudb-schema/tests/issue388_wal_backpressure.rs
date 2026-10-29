@@ -32,6 +32,10 @@ const WAL: usize = 4 << 20;
 /// 5 回繰り返す (1 回あたりの検出率は約 1/3)。 0.32.1 まで残っていた窓 (consumer が空けに来て、 開いている group を閉じる
 /// Commit を 「満杯でない」 と見てから打つまでの間に、 書き手の Commit が残りを埋める。 この test が数 % で 「打てなかった
 /// Commit」 = 1 で落ちていた) は、 engine の `wal_room_commit_tests` が割り込み点で必ず踏む。
+///
+/// #667 からは、 書き手が区画を移るたびに consumer が待たずに古い区画を畳むので、 この形 (WAL 4 MiB = 区画 2 MiB) は満杯の
+/// 瞬間 (空け作り) まで行かない (`wal_room_folds` は 0)。 前提は 「区画を何度も移った」 にした。 満杯の瞬間の窓は上の engine の
+/// 単体が踏む。
 #[test]
 fn single_writer_insert_delete_never_drops_wal_records() {
     for round in 0..5 {
@@ -74,7 +78,7 @@ fn single_writer_round(round: u32) {
         e.oplog_sync().unwrap();
         assert_eq!(e.wal_dropped_records(), 0, "WAL に載らなかった record");
         assert_eq!(e.wal_commit_failures(), 0, "打てなかった Commit");
-        assert!(e.wal_room_folds() > 0, "WAL の容量を何度も越えたので畳んでいる");
+        assert!(e.wal_switches() >= 4, "WAL の区画を何度も移っている — 試験の前提 ({} 回)", e.wal_switches());
         live.into_iter().map(|(_, id)| id).collect()
     };
     let db = Database::open_with_oplog(&path, WAL).unwrap();
