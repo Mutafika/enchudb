@@ -35,16 +35,18 @@ const WAL: usize = 4 << 20;
 ///
 /// #667 からは、 書き手が区画を移るたびに consumer が待たずに古い区画を畳むので、 この形 (WAL 4 MiB = 区画 2 MiB) は満杯の
 /// 瞬間 (空け作り) まで行かない (`wal_room_folds` は 0)。 満杯の瞬間を踏む 5 回はそれを切り (`set_wal_fold_on_switch(false)`)、
+/// consumer の 100 ms ごとの書き出しの後の畳みも切る (`set_wal_fold_on_tick(false)`、 #676: 書き手が遅いと周期の畳みが先に
+/// 空けて空け作りまで行かない。 計装した build の CI で 1 回 0 回になり、 書き手を 1 行 30 µs 遅らせると 4 本とも 1 回目で 0 回)。
 /// 最後の 1 回は既定のまま (前提は 「区画を何度も移った」)。
 #[test]
 fn single_writer_insert_delete_never_drops_wal_records() {
     for round in 0..5 {
-        single_writer_round(round, false);
+        single_writer_round(round, true);
     }
-    single_writer_round(5, true);
+    single_writer_round(5, false);
 }
 
-fn single_writer_round(round: u32, fold_on_switch: bool) {
+fn single_writer_round(round: u32, room_only: bool) {
     let path = tmp(&format!("burst{round}"));
     let rows = 60_000u64;
     let live_ids: Vec<String> = {
@@ -60,7 +62,8 @@ fn single_writer_round(round: u32, fold_on_switch: bool) {
         let db = b.finish_with_oplog(WAL).unwrap();
         let t = db.get_table("events").unwrap();
         let e = db.engine();
-        e.set_wal_fold_on_switch(fold_on_switch);
+        e.set_wal_fold_on_switch(!room_only);
+        e.set_wal_fold_on_tick(!room_only);
         let mut live = VecDeque::new();
         for i in 0..rows {
             let id = format!("ev_{i:016x}");
@@ -80,10 +83,10 @@ fn single_writer_round(round: u32, fold_on_switch: bool) {
         e.oplog_sync().unwrap();
         assert_eq!(e.wal_dropped_records(), 0, "WAL に載らなかった record");
         assert_eq!(e.wal_commit_failures(), 0, "打てなかった Commit");
-        if fold_on_switch {
-            assert!(e.wal_switches() >= 4, "WAL の区画を何度も移っている — 試験の前提 ({} 回)", e.wal_switches());
-        } else {
+        if room_only {
             assert!(e.wal_room_folds() > 0, "WAL の容量を何度も越えたので畳んでいる");
+        } else {
+            assert!(e.wal_switches() >= 4, "WAL の区画を何度も移っている — 試験の前提 ({} 回)", e.wal_switches());
         }
         live.into_iter().map(|(_, id)| id).collect()
     };
