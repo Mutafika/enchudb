@@ -1,9 +1,13 @@
 //! 束 × 購読 (`LiveQuery::members_in`) を書き手と並べて使う: 書き手 4 本が自分の row を書き換え (年齢・住所・備考を付ける / 外す・
 //! 消す)、 その間に読み手 1 本が購読を読み続ける (members_in・count・poll・contains。 読むたびに印を評価し、 members_in を使った購読は
 //! 今の集合の bit を立て直す)。 書き終えた後の答え (members と束 × 購読) が、 手元に覚えた値をなめた答えと同じこと。
+//!
+//! #674: 読み 1 回は前に読んでから書かれた分の印を全部評価するので、 単独でも書き手が書き終えるまでに 20 回ほどしか読めず、 混んだ
+//! 機械では読み手に順番が回らないうちに書き手が書き終えた。 書き手は 1,000 回ごとに読み手が進むのを待つ (書く間に読みが 19 回以上挟まる)。
 
 use enchudb_schema::{Database, LiveQuery, Table};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 fn tmp_path(tag: &str) -> String {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -41,6 +45,15 @@ const ADDRS: u64 = 7;
 
 fn addr(i: u64) -> String {
     format!("p{i:02}")
+}
+
+/// 読み手が `n` 回読み終えるまで待つ (読み手が止まった時のために上限 60 秒)
+fn wait_reads(reads: &AtomicU64, n: u64) {
+    let end = Instant::now() + Duration::from_secs(60);
+    while reads.load(Ordering::Acquire) < n {
+        assert!(Instant::now() < end, "読み手が 60 秒で {n} 回読まない (読んだ回数 {})", reads.load(Ordering::Acquire));
+        std::thread::sleep(Duration::from_micros(50));
+    }
 }
 
 fn check(t: &Table, q: &LiveQuery, rows: &[(u64, Row)], want: &dyn Fn(&Row) -> bool, what: &str) {
@@ -85,6 +98,7 @@ fn members_in_under_concurrent_writers_and_a_reader() {
     assert!(hits > 100 && hits < rows.len() / 2, "test の前提: 当たり {hits}");
     const W: usize = 4;
     let done = AtomicBool::new(false);
+    let read_count = AtomicU64::new(0);
     // 書き手は読み手が読み始めてから書く
     let started = std::sync::Barrier::new(W + 1);
     let mut parts: Vec<Vec<(u64, Row)>> = vec![Vec::new(); W];
@@ -113,6 +127,7 @@ fn members_in_under_concurrent_writers_and_a_reader() {
                     }
                 }
                 n += 1;
+                read_count.store(n, Ordering::Release);
             }
             n
         });
@@ -120,11 +135,14 @@ fn members_in_under_concurrent_writers_and_a_reader() {
             .iter_mut()
             .enumerate()
             .map(|(w, part)| {
-                let (t, db, started) = (&t, &db, &started);
+                let (t, db, started, read_count) = (&t, &db, &started, &read_count);
                 sc.spawn(move || {
                     let mut r = Rng(0xD1B5_4A32_D192_ED03 ^ ((w as u64 + 1) << 32));
                     started.wait();
-                    for _ in 0..20_000 {
+                    for i in 0..20_000u64 {
+                        if i > 0 && i % 1000 == 0 {
+                            wait_reads(read_count, i / 1000);
+                        }
                         let j = r.below(part.len() as u64) as usize;
                         let (e, row) = &mut part[j];
                         if !row.alive {
@@ -162,7 +180,7 @@ fn members_in_under_concurrent_writers_and_a_reader() {
         done.store(true, Ordering::Release);
         reader.join().unwrap()
     });
-    assert!(reads > 10, "test の前提: 読み手が書き込みの間に読んだ回数 {reads}");
+    assert!(reads >= 19, "test の前提: 読み手が書き込みの間に読んだ回数 {reads}");
     let rows: Vec<(u64, Row)> = parts.into_iter().flatten().collect();
     check(&t, &q, &rows, &want_q, "書いた後");
     check(&t, &q_eq, &rows, &want_eq, "書いた後 (値の穴)");
