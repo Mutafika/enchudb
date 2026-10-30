@@ -13,11 +13,14 @@ use enchudb_oplog::{Hlc, PeerId};
 use enchudb_sync::Syncer;
 use std::sync::Arc;
 
+/// #671: 2 本の試験は同じ process で並んで始まるので、 時計だけでは同じ path を引く (Mac の時計は µs 刻み)。 通し番号を足す。
 fn tmp_path(tag: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
-        "/tmp/enchudb-issue450-{}-{}-{}",
+        "/tmp/enchudb-issue450-{}-{}-{}-{}",
         tag,
         std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     )
 }
