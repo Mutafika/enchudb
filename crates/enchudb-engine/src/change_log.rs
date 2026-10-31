@@ -492,10 +492,13 @@ impl ChangeLog {
         if pos == next {
             return Ok(Vec::new());
         }
-        match self.read_in(&mut st, pos, next, max_bytes) {
-            (out, true) => Ok(out),
-            (_, false) => Err(Truncated { from: first }),
-        }
+        // lock の下では header でたどって写すだけ。 crc は lock を放してから写しに対して見る (16 回目: 1 回 4 MiB を crc 付きで写すと
+        // lock を最大 7.6 ms 持ち、 consumer の写しと畳みがそれを待って書き手が WAL の空きを待った)
+        let (raw, ok) = self.copy_in(&mut st, pos, next, max_bytes);
+        drop(st);
+        let n = raw.len();
+        let out = verified(raw);
+        if ok && out.len() == n { Ok(out) } else { Err(Truncated { from: first }) }
     }
 
     /// 測り (試作): (`read` が lock を待った時間の和, 足す側が 1 回分 lock を持った時間の最大, その和)。
@@ -536,23 +539,26 @@ impl ChangeLog {
         Ok(next)
     }
 
-    /// `pos` から `until` の手前まで、 最大 `max_bytes` (少なくとも 1 件) 読む。 2 つ目は読めない entry に当たらなかったか
-    /// (当たったら、 そこまでの entry を返す)。 `pos` は `[first, next)` の中。
-    fn read_in(&self, st: &mut State, pos: u64, until: u64, max_bytes: usize) -> (Vec<Entry>, bool) {
+    /// `pos` から `until` の手前まで、 最大 `max_bytes` (少なくとも 1 件) を header でたどって (header, 置いた crc, 中身) で写す (crc は
+    /// 見ない、 [`verified`] が lock の外で見る)。 2 つ目は番号の続かない entry に当たらなかったか (当たったら、 そこまでの entry を
+    /// 返す)。 `pos` は `[first, next)` の中。
+    fn copy_in(&self, st: &mut State, pos: u64, until: u64, max_bytes: usize) -> (Vec<RawEntry>, bool) {
         let mut out = Vec::new();
         let Some(mut at) = self.locate(st, pos) else {
             return (out, false);
         };
+        let s = self.region.slice();
         let mut bytes = 0;
         let mut no = pos;
         while no < until {
             at = self.wrap_at(at);
-            match self.entry_at(at) {
+            match self.header_at(at) {
                 Some(e) if e.no == no => {
-                    let base = HEADER + at + ENTRY_HEADER;
-                    let b = self.region.slice()[base..base + e.len].to_vec();
+                    let base = HEADER + at;
+                    let crc = u32::from_le_bytes(s[base + 12..base + 16].try_into().unwrap());
+                    let b = s[base + ENTRY_HEADER..base + ENTRY_HEADER + e.len].to_vec();
                     bytes += b.len();
-                    out.push(Entry { no, hlc: e.hlc, bytes: b });
+                    out.push(RawEntry { e, crc, bytes: b });
                     at = (at + entry_size(e.len)) % self.cap;
                 }
                 _ => return (out, false),
@@ -819,6 +825,31 @@ struct EntryHeader {
 
 /// 並べて crc を取る回の大きさの下限 (entry の数)。
 const PAR_CRC_MIN: usize = 4096;
+
+/// lock の下で写した entry (crc はまだ見ていない、 [`ChangeLog::read`])。
+struct RawEntry {
+    e: EntryHeader,
+    crc: u32,
+    bytes: Vec<u8>,
+}
+
+/// 写した entry の crc を見て、 合わない entry の手前までを返す (`PAR_CRC_MIN` 件以上は並べる)。
+fn verified(mut raw: Vec<RawEntry>) -> Vec<Entry> {
+    let bad = |r: &RawEntry| entry_crc(r.e.no, r.e.len as u32, &r.e.hlc, r.e.wal_id, &r.bytes) != r.crc;
+    #[cfg(not(target_arch = "wasm32"))]
+    let at = if raw.len() >= PAR_CRC_MIN {
+        use rayon::prelude::*;
+        raw.par_iter().position_first(bad)
+    } else {
+        raw.iter().position(bad)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let at = raw.iter().position(bad);
+    if let Some(k) = at {
+        raw.truncate(k);
+    }
+    raw.into_iter().map(|r| Entry { no: r.e.no, hlc: r.e.hlc, bytes: r.bytes }).collect()
+}
 
 /// `first` 番から並ぶ entry の crc。 大きな回は rayon で並べる (#667: FNV は 1 byte ずつの掛け算の連鎖で、 1 件 (約 200 B) に約
 /// 0.25 µs かかり、 記録に写す時間の 4 割ほどだった。 1 件ごとに独立)。
