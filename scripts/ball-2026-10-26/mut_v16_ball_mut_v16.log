@@ -1,0 +1,5 @@
+baseline: pass 20 秒 → 1 run の上限 1200 秒
+  killed 27s             控えが覆う所を next で切らない (16 回目)
+  killed 20s             捨てる時の最後の HLC を最初の entry から (16 回目)
+  killed 21s             捨てる entry の crc の比べを逆に (16 回目)
+killed 3 / survived 0 / その他 0
