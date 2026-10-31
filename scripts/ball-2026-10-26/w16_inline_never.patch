@@ -1,0 +1,130 @@
+diff --git a/crates/enchudb-engine/src/ball.rs b/crates/enchudb-engine/src/ball.rs
+index 46d45ca..2f50f62 100644
+--- a/crates/enchudb-engine/src/ball.rs
++++ b/crates/enchudb-engine/src/ball.rs
+@@ -157,7 +157,7 @@ impl Clock {
+     }
+ 
+     /// 書き込みの時刻の元: HLC (`hlc`、 [`pack_hlc`]) があればそれ、 無ければ (0) 数え口を 1 進めた値。 返り値の 2 つ目は HLC から取ったか。
+-    #[inline]
++    #[inline(never)] // 一時 (測り)
+     fn base(&self, hlc: u64) -> (u64, bool) {
+         match hlc {
+             0 => (self.counter.fetch_add(1, Ordering::Relaxed) + 1, false),
+@@ -166,7 +166,7 @@ impl Clock {
+     }
+ 
+     /// 付けた時刻を自分の置き場に置く。
+-    #[inline]
++    #[inline(never)] // 一時 (測り)
+     fn publish(&self, ts: u64) {
+         let i = CLOCK_SLOT.with(|c| {
+             if c.get() == usize::MAX {
+@@ -354,6 +354,7 @@ impl DiffLog {
+     }
+ 
+     /// 後ろに足す。 名簿の鍵を持つ 1 thread だけ。 控えを登録したらその番号 (名簿の鍵を離した後で [`DiffLog::build`] に渡す)。
++    #[inline(never)] // 一時 (測り)
+     fn push(&self, d: Diff, snap_min: usize, guard: &Guard) -> Option<usize> {
+         let cur = self.buf.load(Ordering::Acquire, guard);
+         // SAFETY: buf は常に非 null。
+@@ -608,6 +609,7 @@ struct WideStripe {
+ 
+ impl WideStripe {
+     /// 値 `v` の糸の先に足す。 返り値は足す前の糸の頭 (取り消す時に戻す)。
++    #[inline(never)] // 一時 (測り)
+     fn push(&mut self, v: u64, d: Diff) -> u32 {
+         let i = self.diffs.len();
+         assert!(i < (1 << 31) - 1, "ball: 大きい値の差分の列が一杯 (試作)");
+@@ -726,6 +728,7 @@ impl Ball {
+     }
+ 
+     /// [`Ball::note`] が登録した控えを作る。 名簿の鍵を離した後で、 登録した書き手が呼ぶ。
++    #[inline(never)] // 一時 (測り)
+     pub(crate) fn build_snaps(&self, snaps: [Option<(u32, usize)>; 2]) {
+         if snaps == [None, None] {
+             return;
+@@ -756,6 +759,7 @@ impl Ball {
+ 
+     /// 書き換え `old` → `new` の大きい値の側の差分の場所を、 **名簿の鍵を取る前に** 取る (時刻は未定)。 返り値は列の lock を
+     /// 持ったまま、 [`Ball::note`] が時刻を書き込む。 `note` を呼ばずに落とすと取り消す。 どちらも小さい値なら何も取らない。
++    #[inline(never)] // 一時 (測り)
+     pub(crate) fn reserve(&self, eid: u32, old: Option<u64>, new: Option<u64>) -> Reserved<'_> {
+         let mut r = Reserved { held: [None, None], slots: [None, None], filled: false, snaps: [None, None] };
+         let wide = |v: Option<u64>| v.filter(|&v| v >= LOG_DENSE);
+@@ -788,6 +792,7 @@ impl Ball {
+     /// 返り値は時刻 (同じ値なら何もせず None)。 鍵を離した後、 `wide` から控えを取り出して ([`Reserved::take_snaps`]) 落とし、
+     /// 行の lock の下で [`Ball::turn`] にこの時刻を渡し、 控えを [`Ball::build_snaps`] で作ること。
+     #[allow(clippy::too_many_arguments)]
++    #[inline(never)] // 一時 (測り)
+     pub(crate) fn note(&self, eid: u32, old: Option<u64>, new: Option<u64>, clock: &Clock, hlc: u64, guard: &Guard, wide: &mut Reserved<'_>) -> Option<u64> {
+         if old == new {
+             return None;
+@@ -828,6 +833,7 @@ impl Ball {
+ 
+     /// 面の場所を 1 つ。 この thread の塊から渡し、 尽きたら `BLOCK` 個まとめて取る。 NONE は糸の終わりに使うので、
+     /// 場所を使い切ったら記録をやめる (試作)。
++    #[inline(never)] // 一時 (測り)
+     fn alloc(&self) -> Option<u32> {
+         BLOCKS.with(|c| {
+             let mut b = c.get();
+@@ -865,6 +871,7 @@ impl Ball {
+     }
+ 
+     /// 球を回す: `new` を上に向ける (None = 今の面を閉じるだけ)、 時刻 `ts` ([`Ball::note`] の返り値)。 行の lock の下で呼ぶ。
++    #[inline(never)] // 一時 (測り)
+     pub(crate) fn turn(&self, eid: u32, new: Option<u64>, ts: u64) {
+         let head = self.heads.get_or_alloc(eid);
+         let h = head.load(Ordering::Relaxed);
+@@ -888,7 +895,7 @@ impl Ball {
+     }
+ 
+     /// この球の最後の時刻 (今の面の上を向いた時刻、 閉じていれば外れた時刻、 球が無ければ 0)。 行の lock の下で。
+-    #[inline]
++    #[inline(never)] // 一時 (測り)
+     fn last_time(&self, eid: u32) -> u64 {
+         let Some(cur) = self.heads.get(eid).map(|h| h.load(Ordering::Relaxed) as u32).filter(|&c| c != 0) else { return 0 };
+         let f = self.face(cur - 1);
+@@ -1305,7 +1312,7 @@ impl Balls {
+ 
+     /// 書き手 (WAL に積んだ後、 名簿の鍵の前): この書き込み (時刻 `t` = HLC を [`pack_hlc`] で詰めたもの、 WAL の無い書き込みは 0) を
+     /// 球に書くか。 組んでいる最中 (公開中) は組み終えるまで待つ。
+-    #[inline]
++    #[inline(never)] // 一時 (測り)
+     pub fn for_write(&self, hid: u16, t: u64) -> Option<&Ball> {
+         let mut waited = false;
+         loop {
+diff --git a/crates/enchudb-engine/src/engine.rs b/crates/enchudb-engine/src/engine.rs
+index 0090914..47ea1fd 100644
+--- a/crates/enchudb-engine/src/engine.rs
++++ b/crates/enchudb-engine/src/engine.rs
+@@ -12377,7 +12377,7 @@ impl Engine {
+     /// 名簿 (円柱) と列に書く (`live_set` の中、 行の lock の下)。 球にした紐 (試作、 `crate::ball` の順序) は、 大きい値の
+     /// 差分の場所を名簿の鍵の前に取り、 名簿の鍵の中で名簿を書き換える前に帳面に書き足し (時刻 = この書き込みの HLC `hlc`、
+     /// `ZERO` なら数え口)、 鍵を離した後で球を回し、 帳面に登録した控え (時刻ごとのデッキ) があれば作る。
+-    #[inline]
++    #[inline(never)] // 一時 (測り)
+     fn himo_set(&self, hid: usize, local: u32, value: u64, hlc: enchudb_oplog::Hlc) -> bool {
+         if hlc == enchudb_oplog::Hlc::ZERO {
+             self.ball_bases.wal_less_write(hid as u16);
+diff --git a/crates/enchudb-engine/src/himo_store.rs b/crates/enchudb-engine/src/himo_store.rs
+index 168c063..934a82b 100644
+--- a/crates/enchudb-engine/src/himo_store.rs
++++ b/crates/enchudb-engine/src/himo_store.rs
+@@ -748,6 +748,7 @@ impl HimoStore {
+     /// cell に値を書く。 **書けなかったら `false`** (#167: growable backing で
+     /// commit を伸ばせない = ディスク満杯。 未 commit page に書くと SIGBUS になるので
+     /// 書かずに諦める)。 戻り値を無視しても従来どおり動く。
++    #[inline(never)] // 一時 (測り)
+     pub fn set(&self, eid: u32, value: u64) -> bool {
+         self.set_noting(eid, value, |_, _| {})
+     }
+@@ -755,7 +756,7 @@ impl HimoStore {
+     /// `set` と同じ。 円柱を組んだ紐で値が変わる時、 名簿 (円柱) の鍵 (古い値と新しい値の、 値の鍵か write_lock) を持ったまま、
+     /// 名簿と列を書き換える**前に** `note(古い値, guard)` を呼ぶ (球の試作、 `crate::ball`: 帳面の書き手を名簿の書き手と同じ鍵で
+     /// 並べる)。 円柱を組んでいない紐・同じ値の書き直し・書けなかった時は呼ばない。
+-    #[inline]
++    #[inline(never)] // 一時 (測り)
+     pub(crate) fn set_noting(&self, eid: u32, value: u64, note: impl FnOnce(Option<u64>, &Guard)) -> bool {
+         // 幅に入らない値は書かない (呼び側 = engine の tie 系が先に弾いて fault に積む)
+         if value > self.value_type.max_value() {
