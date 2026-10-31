@@ -1234,6 +1234,27 @@ mod tests {
         }
     }
 
+    /// 16 回目: 読み (`read`) は lock の下で写すだけにして、 crc は lock を放してから写しに対して見る。 中身の壊れた entry を含む
+    /// 読みは前と同じく `Truncated` (壊れた entry の手前も返さない)、 その後ろからは読める。 1 件ずつ見る大きさと、 並べて見る
+    /// 大きさ (`PAR_CRC_MIN` 件以上) の両方。
+    #[test]
+    fn a_read_over_a_damaged_body_is_truncated() {
+        for (tag, n, len, bad) in [("damaged-seq", 100u64, 600usize, 37u64), ("damaged-par", 6000, 8, 5000)] {
+            let log = ChangeLog::open(&tempdir(tag), MIN_CAP, true, false).unwrap();
+            let recs: Vec<_> = (0..n).map(|k| rec(k, len)).collect();
+            add(&log, &recs, &[]);
+            assert_eq!(log.range(), (0, n), "{tag}: 試験の前提: 捨てていない");
+            assert_eq!(log.read(0, usize::MAX).unwrap().len() as u64, n, "{tag}: 試験の前提: 1 回で全部読む");
+            let at = HEADER + bad as usize * entry_size(len) + ENTRY_HEADER + len / 2;
+            log.region.write_at(at, &[!recs[bad as usize].bytes[len / 2]]);
+            assert_eq!(log.read(0, usize::MAX), Err(Truncated { from: 0 }), "{tag}: 中身の壊れた entry を含む読み");
+            assert_eq!(log.read(bad, 1), Err(Truncated { from: 0 }), "{tag}: 壊れた entry から");
+            let after = log.read(bad + 1, usize::MAX).unwrap();
+            assert_eq!(after.len() as u64, n - bad - 1, "{tag}: 後ろは読める");
+            assert!(after.iter().all(|e| e.bytes == recs[e.no as usize].bytes), "{tag}");
+        }
+    }
+
     /// 1 回で記録の大きさを越える量を足しても (畳む時の写し)、 最後の分が残る。
     #[test]
     fn one_append_larger_than_the_log_keeps_the_newest() {
