@@ -344,6 +344,9 @@ impl BallReplay<'_> {
             let sp = self.eng.ball_publish_pause[2].load(std::sync::atomic::Ordering::Relaxed);
             if sp > 0 && tries == 1 {
                 let t = std::time::Instant::now();
+                if wal_pos_lap(start) == 0 {
+                    self.eng.ball_bases.head_waits.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
                 let gone = || if wal_pos_lap(start) == 0 { wal.folds() != folds } else { !wal.holds(start) };
                 while !gone() && t.elapsed() < std::time::Duration::from_micros(sp) {
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -19116,6 +19119,13 @@ impl Engine {
     #[doc(hidden)]
     pub fn ball_set_scan_pause(&self, us: u64) {
         self.ball_publish_pause[2].store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 試験: [`Self::ball_set_scan_pause`] の口で、 組む側が 「頭から」 (WAL が空になった後に写した所 = 周 0) 読み始める所が畳まれるのを
+    /// 待ち始めた回数。
+    #[doc(hidden)]
+    pub fn ball_head_waits(&self) -> u64 {
+        self.ball_bases.head_waits.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 試験: 球を組む時、 追いつきで写した所の組を読んだ後・記録を読む前 (記録を読む回だけ) に、 記録が組の番号より先まで捨てるまで

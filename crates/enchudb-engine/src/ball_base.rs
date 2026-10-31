@@ -304,6 +304,10 @@ pub(crate) struct BallBases {
     /// `change_emit` の下で写すたび・畳んだ後に置く。 組む側は `change_emit` を待たずにこれを読む (consumer は書き出しから畳むまで
     /// `change_emit` を持つ)。 畳んだ回は、 位置が 「頭から」 (周 0) の時に組の後で畳んだかを見るため。
     mark: Mutex<Option<(u64, u64, u64)>>,
+    /// 試験: 組む側が追いつきの最初の回で、 「頭から」 (周 0) 読み始める所が畳まれるのを待ち始めた回数 (試験の口
+    /// `Engine::ball_set_scan_pause`)。 試験はこれを見て止めていた書き手を戻す (組む側が位置を取る前に書き手が区画を埋めて畳むと
+    /// 位置は頭からでなくなる)。
+    pub(crate) head_waits: std::sync::atomic::AtomicU64,
     /// 試験: 捨てる時に止める所 (1 = header を書き出した後・cell の前、 2 = cell を半分当てて書き出した後)。
     #[cfg(test)]
     pub(crate) stop: std::sync::atomic::AtomicU8,
@@ -319,6 +323,7 @@ impl BallBases {
             recent: Mutex::new(Recent::default()),
             side: Mutex::new(None),
             mark: Mutex::new(None),
+            head_waits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicU8::new(0),
         }

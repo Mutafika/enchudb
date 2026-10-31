@@ -151,10 +151,15 @@ struct Session {
     st: enchudb_engine::engine::BallRebuildStats,
     waits: u64,
     covered: u64,
+    /// 「頭から」 の段取り (`head_wait_us`): 組む回の前に書き手を止めた間に WAL が空になったか / 組む側が頭から読む所で待ち始めたか。
+    emptied: bool,
+    head_waited: bool,
 }
 
 /// 開き直して、 書き手 TH 本が 1 回 `per` 件ずつ書き続ける間に、 回 `build_at` の後で別の thread が最初の読みを呼んで球を組む。
-/// 書き手は組み終えた後も `after` 回書く (公開の時に書き手が居るように)。
+/// 書き手は組み終えた後も `after` 回書く (公開の時に書き手が居るように)。 `head_wait_us` > 0 なら 「頭から」 の段取り: 組む回の前に
+/// 書き手を止めたまま WAL が空になるのを待ち (最大 `head_wait_us`)、 組む側が頭から読む所で畳まれるのを待ち始めてから (試験の口
+/// `ball_set_scan_pause`、 最大 `head_wait_us`) 書き手を戻す。
 #[allow(clippy::too_many_arguments)]
 fn concurrent_session(
     path: &str,
@@ -172,6 +177,7 @@ fn concurrent_session(
     listen: bool,
     mark_pause_us: u64,
     cross_wait_us: u64,
+    head_wait_us: u64,
 ) -> Session {
     let db = Database::open_with_oplog(path, wal).unwrap();
     let eng = db.engine();
@@ -201,6 +207,7 @@ fn concurrent_session(
     let go = std::sync::atomic::AtomicBool::new(true);
     let eids = &h.eids;
     let mut checks = Vec::new();
+    let (mut emptied, mut head_waited) = (false, false);
     std::thread::scope(|s| {
         for th in 0..TH {
             let (bar, shared, writes, go, faces) = (&bar, &shared, &writes, &go, &faces);
@@ -253,10 +260,27 @@ fn concurrent_session(
             switches.store(eng.oplog().unwrap().switches() - switches0, Ordering::Relaxed);
             built_at.store(round_now.load(Ordering::Acquire) + 1, Ordering::Release);
         });
+        let wal = eng.oplog().unwrap();
+        let until = |f: &dyn Fn() -> bool| {
+            let t = std::time::Instant::now();
+            while !f() && t.elapsed() < std::time::Duration::from_micros(head_wait_us) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            f()
+        };
         for round in 0..100_000 {
             bar.wait();
             checks.push((wal_now(&db), shared.lock().unwrap().clone()));
+            // 「頭から」: 書き手は止まっている (次の柵の前)。 consumer が書き出して全部の区画を畳むと、 写した所は周 0 になる
+            let head = head_wait_us > 0 && round + 1 == build_at;
+            let waits0 = eng.ball_head_waits();
+            if head {
+                emptied = until(&|| wal.is_empty());
+            }
             round_now.store(round + 1, Ordering::Release);
+            if head {
+                head_waited = until(&|| eng.ball_head_waits() != waits0);
+            }
             let b = built_at.load(Ordering::Acquire);
             if b != 0 && round + 1 >= b + after {
                 go.store(false, Ordering::Release);
@@ -274,7 +298,7 @@ fn concurrent_session(
     let st = eng.ball_rebuild_stats().expect("組んだ");
     let (waits, covered) = eng.ball_publish_counts();
     eprintln!(
-        "組む: {st:?}、 組む間の書き込み {}、 畳んだ {}、 区画を移った {}、 回 {rounds}、 公開中で待った {waits}、 閾値より前 {covered}",
+        "組む: {st:?}、 組む間の書き込み {}、 畳んだ {}、 区画を移った {}、 回 {rounds}、 公開中で待った {waits}、 閾値より前 {covered}、 空 {emptied}、 頭から {head_waited}",
         during.load(Ordering::Relaxed),
         folds.load(Ordering::Relaxed),
         switches.load(Ordering::Relaxed)
@@ -289,7 +313,16 @@ fn concurrent_session(
         want.sort_unstable();
         assert_eq!(eng.ball_pull_at("t.a", v, now).unwrap(), want, "今の v={v}");
     }
-    Session { during: during.load(Ordering::Relaxed), folds: folds.load(Ordering::Relaxed), switches: switches.load(Ordering::Relaxed), st, waits, covered }
+    Session {
+        during: during.load(Ordering::Relaxed),
+        folds: folds.load(Ordering::Relaxed),
+        switches: switches.load(Ordering::Relaxed),
+        st,
+        waits,
+        covered,
+        emptied,
+        head_waited,
+    }
 }
 
 /// (T2) 書き手 4 本が書き続ける中で最初の読みが組む (書き手は 1 件ごとに 20 µs 空けて、 組む側が追いつける速さに)。 開き直しを 9 回重ねる
@@ -305,7 +338,7 @@ fn the_first_read_builds_while_writers_write() {
     let (mut overlapped, mut waits, mut covered) = (0, 0, 0);
     for k in 0..9u64 {
         let pp = [(2000, 0), (0, 2000), (0, 0)][k as usize % 3];
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100, false, 0, 0);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100, false, 0, 0, 0);
         overlapped += usize::from(ss.during > 0);
         waits += ss.waits;
         covered += ss.covered;
@@ -334,7 +367,7 @@ fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     let mut h = create(&path, SMALL_WAL, 1 << 20);
     let mut used = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2, false, 0, 0);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2, false, 0, 0, 0);
         used += usize::from(ss.st.side_ops > 0);
         // 追いつきの間を広げて書き手が全力 = 縮まない: すぐ公開中へ (打ち切らなければ 16 + 2 回。 回の大きさは畳み方で揺れるので幅を持つ)
         assert!(ss.st.rounds <= 8, "縮まない追いつきを回し続けた: {} 回", ss.st.rounds);
@@ -354,7 +387,7 @@ fn a_build_continues_the_wal_where_it_stopped() {
     let mut h = create(&path, WAL, 128 << 20);
     let mut ahead = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3, 4, 150, (0, 0), 0, 0x5555 + k, 100, true, 0, 0);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3, 4, 150, (0, 0), 0, 0x5555 + k, 100, true, 0, 0, 0);
         ahead += ss.st.ahead;
     }
     // 踏んだ回の和 (並べて回すと session ごとの数は揺れる)。 0.37 はもう一方の区画を畳んでも同じ区画の続きは続く (畳まないことは前提にしない)
@@ -374,7 +407,7 @@ fn a_build_drops_what_it_already_applied_from_the_side_notes() {
     let mut h = create(&path, WAL, 1 << 20);
     let (mut dups, mut side) = (0, 0);
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true, 2_000_000, 0);
+        let ss = concurrent_session(&path, WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true, 2_000_000, 0, 0);
         dups += usize::from(ss.st.dups > 0);
         side += usize::from(ss.st.side_ops > 0);
     }
@@ -394,7 +427,7 @@ fn a_build_reads_on_across_wal_halves() {
     let mut h = create(&path, MID_WAL, 128 << 20);
     let mut crossed = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, MID_WAL, &mut h, 30, 20, 3, 4, 40, (0, 0), 0, 0x6666 + k, 100, true, 0, 1_000_000);
+        let ss = concurrent_session(&path, MID_WAL, &mut h, 30, 20, 3, 4, 40, (0, 0), 0, 0x6666 + k, 100, true, 0, 1_000_000, 0);
         crossed += ss.st.crossed;
     }
     // 踏んだ回の和 (並べて回すと session ごとの数は揺れる)
@@ -416,13 +449,40 @@ fn a_build_reads_on_while_the_wal_folds() {
     for k in 0..3u64 {
         // WAL の位置を取った後・読む前に、 読み始める所の区画が畳まれるまで最大 200 ms 待つ (畳むと、 読む所が新しい周の途中になる。
         // 15 回目まで 20 ms 止まる形で、 並べて回すと 16 回中 2 回その間に畳まなかった)
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 200_000, 0x99 + k, 100, false, 0, 0);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 200_000, 0x99 + k, 100, false, 0, 0, 0);
         assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         folded += usize::from(ss.folds > 0);
         refolds += usize::from(ss.st.refolds > 0);
     }
     assert!(folded >= 2, "組む間に WAL を畳んでいない — 試験の前提 ({folded}/3)");
     assert!(refolds >= 2, "WAL を読む間に畳んでいない — 試験の前提 ({refolds}/3)");
+    let db = Database::open_with_oplog(&path, SMALL_WAL).unwrap();
+    assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
+    drop(db);
+    cleanup(&path);
+}
+
+/// (T8) WAL が空になった後に組む (WAL 1 MiB、 記録 256 MiB = 捨てない): 書き手を止めて consumer が全部の区画を畳むと、 写した所は
+/// 「頭から」 (周 0、 区画の周が無い) になる。 組む側が位置を取った後・WAL を読む前に書き手を戻し、 区画が埋まって畳まれるまで待つ
+/// (試験の口): 頭からの位置は、 組を置いた後に畳んだかを畳んだ回で見て、 畳んでいれば記録から読み直す (見ないと、 畳んで記録に写した
+/// 区画を飛ばして次の区画だけを読む)。 面の数まで合う。 T4 は書き手が止まらないので写した所が頭からにならない (16 回目: 9 session で 0 回)。
+#[test]
+fn a_build_from_an_empty_wal_rereads_when_it_folds() {
+    let path = tmp_path("t8");
+    cleanup(&path);
+    let _gone = Gone(path.clone());
+    const SMALL_WAL: usize = 1 << 20;
+    let mut h = create(&path, SMALL_WAL, 256 << 20);
+    let (mut emptied, mut waited, mut heads) = (0, 0, 0);
+    for k in 0..3u64 {
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 0, (0, 0), 500_000, 0xAA + k, 100, false, 0, 0, 2_000_000);
+        assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
+        emptied += usize::from(ss.emptied);
+        waited += usize::from(ss.head_waited);
+        heads += usize::from(ss.st.head_refolds > 0);
+    }
+    assert!(emptied >= 2 && waited >= 2, "WAL が空になった後に頭から組んでいない — 試験の前提 (空 {emptied}/3、 頭から {waited}/3)");
+    assert!(heads >= 2, "頭からの位置で組の後に畳んでいない — 試験の前提 ({heads}/3)");
     let db = Database::open_with_oplog(&path, SMALL_WAL).unwrap();
     assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
     drop(db);
