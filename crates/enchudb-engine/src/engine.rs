@@ -19033,24 +19033,15 @@ impl Engine {
             std::thread::sleep(std::time::Duration::from_micros(pp[1]));
         }
         // (4) H より前の残り
-        let probe_c = std::time::Instant::now();
-        let probe_w0 = rp.work;
         rp.catch_up(log, wal, &mut pos, Some(h));
-        let probe_catch = probe_c.elapsed();
-        let probe_n = rp.work - probe_w0;
         // (5) 出す
         let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead, rp_crossed) =
             (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead, rp.crossed);
-        let probe_p = std::time::Instant::now();
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
-        let probe_pub = probe_p.elapsed();
+        // 公開中 = この紐の書き手が待つ間 (出した所まで)。 組む間の控えを手放す (`end_side`) のは書き手が動き出した後 (16 回目: 控えが大きいと
+        // 手放すのに 0.9 ms、 前は公開中に数えていた)
+        let publish_ns = t_pub.elapsed().as_nanos() as u64;
         self.ball_bases.end_side();
-        eprintln!(
-            "probe16 publish: quiesce={:?} catch={probe_catch:?} (n={probe_n}) publish={probe_pub:?} end_side={:?} total={:?}",
-            std::time::Duration::from_nanos(quiesce_ns),
-            probe_p.elapsed() - probe_pub,
-            t_pub.elapsed()
-        );
         let st = BallRebuildStats {
             records,
             applied,
@@ -19058,7 +19049,7 @@ impl Engine {
             refolds,
             log_ns,
             catch_ns,
-            publish_ns: t_pub.elapsed().as_nanos() as u64,
+            publish_ns,
             publish_parts_ns: [quiesce_ns, parts[0], parts[1], parts[2]],
             total_ns: t0.elapsed().as_nanos() as u64,
             rounds,

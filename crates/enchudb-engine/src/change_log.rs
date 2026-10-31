@@ -286,18 +286,24 @@ impl ChangeLog {
         let _ = self.on_discard.set(h);
     }
 
-    /// 捨てる header を書く前: 口があれば捨てる番号 `[first, end)` を知らせる (entry は口が要る分だけ読む)。 `end_hlc` = 捨てる場所を
-    /// 決める時に読んだ最後の entry (`end - 1`) の HLC (読めなかったら None、 ここで読み直す)。
-    fn before_discard(&self, st: &mut State, end: u64, hole: Option<(u64, Hlc)>, end_hlc: Option<Hlc>) -> io::Result<()> {
+    /// 捨てる header を書く前: 口があれば捨てる番号 `[first, end)` を知らせる (entry は口が要る分だけ読む)。 `dropped` = 捨てる場所を
+    /// 決める時に読んだ `[first, end)` の entry の (位置, header) (読めない entry で切った時は None、 ここで始まりからたどり直す)。
+    fn before_discard(&self, st: &mut State, end: u64, hole: Option<(u64, Hlc)>, dropped: Option<&[(usize, EntryHeader)]>) -> io::Result<()> {
         let Some(h) = self.on_discard.get().filter(|h| h.wants()) else { return Ok(()) };
         let first = st.c.first;
         // 捨てる番号は始まりから続くので、 目印を使わず始まりから header だけでたどる (16 回目: 開き直した後は目印が無く、 ここで最初に
         // 読む 1 回が記録の全部を crc 付きでたどって目印を作っていた。 記録 64 MiB = 32 万件で 56 ms、 その間に書き手が WAL の空きを待った)
-        let end_hlc = match (hole, end_hlc) {
-            (Some((_, hlc)), _) | (None, Some(hlc)) => hlc,
+        let dropped = dropped.filter(|d| d.len() as u64 == end - first);
+        let end_hlc = match (hole, dropped.and_then(|d| d.last())) {
+            (Some((_, hlc)), _) => hlc,
+            (None, Some((_, e))) => e.hlc,
             (None, None) => self.seek_from_first(st, end - 1).and_then(|at| self.entry_at(at)).filter(|e| e.no == end - 1).map_or(Hlc::ZERO, |e| e.hlc),
         };
-        let mut read = |a: u64, b: u64| if a < b { self.read_discarded(st, a, b) } else { Vec::new() };
+        let mut read = |a: u64, b: u64| match dropped {
+            _ if a >= b => Vec::new(),
+            Some(d) => self.verify_copy(&d[(a - first) as usize..(b - first) as usize]),
+            None => self.read_discarded(st, a, b),
+        };
         h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &mut read)?;
         #[cfg(test)]
         if self.stop_after_discard_hook.load(std::sync::atomic::Ordering::Relaxed) {
@@ -372,7 +378,8 @@ impl ChangeLog {
         let old_next = st.c.next;
         let mut sim = st.c;
         let mut plan: Vec<(usize, Option<usize>)> = Vec::with_capacity(recs.len()); // (位置, 折り返しの印の位置)
-        let mut last_dropped = None; // 最後に捨てた entry の HLC (読めない entry で切った時は None)
+        // 捨てる entry の (位置, header) (捨てる口がある時だけ、 読めない entry で切ったら None)。 捨てる時に読み直さない (16 回目)
+        let mut dropped: Option<Vec<(usize, EntryHeader)>> = self.on_discard.get().is_some_and(|h| h.wants()).then(Vec::new);
         for r in recs {
             let n = entry_size(r.bytes.len());
             let at = loop {
@@ -388,7 +395,10 @@ impl ChangeLog {
                     // 古い entry を全部捨てても入らない = 1 回分が大きすぎる (append の切り方の誤り)
                     return Err(io::Error::other("changefeed.seg: chunk larger than the log"));
                 }
-                last_dropped = self.drop_oldest(&mut sim, old_next, watch, lost);
+                match self.drop_oldest(&mut sim, old_next, watch, lost) {
+                    Some(d) => dropped.iter_mut().for_each(|v| v.push(d)),
+                    None => dropped = None,
+                }
             };
             let wrap = (at != sim.head && self.cap - sim.head >= ENTRY_HEADER).then_some(sim.head);
             plan.push((at, wrap));
@@ -396,7 +406,7 @@ impl ChangeLog {
             sim.next += 1;
         }
         if sim.first != st.c.first {
-            self.before_discard(&mut st, sim.first.min(old_next), None, last_dropped)?;
+            self.before_discard(&mut st, sim.first.min(old_next), None, dropped.as_deref())?;
             // header が捨てた場所を指さないようにしてから上書きする。 古い entry が全部消えたら空の記録
             let mut mid = st.c;
             if sim.first >= old_next {
@@ -606,6 +616,11 @@ impl ChangeLog {
             at = (at + entry_size(e.len)) % self.cap;
             no += 1;
         }
+        self.verify_copy(&hs)
+    }
+
+    /// 捨てる entry (位置, header) の中身の crc を確かめて写す (`PAR_CRC_MIN` 件以上は並べる)。 crc の合わない entry があればその手前まで。
+    fn verify_copy(&self, hs: &[(usize, EntryHeader)]) -> Vec<Entry> {
         let s = self.region.slice();
         let one = |&(at, e): &(usize, EntryHeader)| {
             let base = HEADER + at;
@@ -691,7 +706,7 @@ impl ChangeLog {
 
     /// 最古の entry を捨てる (`sim` の上で)。 `watch` に入っている番号なら HLC を `lost` に積む。 `limit` 以上の番号 (今回置く
     /// entry、 まだ書いていない) は捨てない。
-    fn drop_oldest(&self, sim: &mut Cursor, limit: u64, watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> Option<Hlc> {
+    fn drop_oldest(&self, sim: &mut Cursor, limit: u64, watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> Option<(usize, EntryHeader)> {
         if sim.first >= limit {
             return None;
         }
@@ -719,7 +734,7 @@ impl ChangeLog {
         if sim.first == sim.next {
             sim.tail = sim.head;
         }
-        dropped.map(|e| e.hlc)
+        dropped.map(|e| (at, e))
     }
 
     /// `at` から `n` byte が生きている entry (`[tail, head)`、 循環) に重ならないか。 `at` は head か 0 (折り返し)。
