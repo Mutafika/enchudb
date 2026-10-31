@@ -572,11 +572,14 @@ impl OnDiscard for BallBases {
             return Ok(());
         }
         let split = r.from.map_or(end, |f| f.clamp(start, end));
+        // 控えが覆うのは [from, next) (控えを積まずに足した分 = next から先は記録から読む。 16 回目: 控えを先に作った後に積まずに足すと、
+        // 足した分を土台に当てずに捨てていた)
+        let covered = if r.from.is_some() { r.next.clamp(split, end) } else { end };
         let mut read_ok = true;
-        if start < split {
-            let es = read(start, split);
-            let want = (split - start) - u64::from(hole.is_some_and(|h| (start..split).contains(&h)));
-            read_ok = es.len() as u64 == want;
+        // [a, b) を記録から読んで足す。 読めた数が足りなければ false
+        let mut read_range = |a: u64, b: u64, ops: &mut Vec<(u64, Hlc, BaseOp)>| -> bool {
+            let es = read(a, b);
+            let want = (b - a) - u64::from(hole.is_some_and(|h| (a..b).contains(&h)));
             let one = |e: &Entry| decode(e, peer).map(|op| (e.no, e.hlc, op));
             // 開き直した後の最初の 1 周は捨てる 1 回が数万件 (16 回目): decode も並べる (当てるのは番号の順のまま)
             #[cfg(not(target_arch = "wasm32"))]
@@ -589,6 +592,10 @@ impl OnDiscard for BallBases {
             }
             #[cfg(target_arch = "wasm32")]
             ops.extend(es.iter().filter_map(one));
+            es.len() as u64 == want
+        };
+        if start < split {
+            read_ok &= read_range(start, split, &mut ops);
         }
         while r.ops.front().is_some_and(|&(no, _, _)| no < end) {
             let (no, h, op) = r.ops.pop_front().unwrap();
@@ -597,6 +604,9 @@ impl OnDiscard for BallBases {
             }
         }
         drop(r);
+        if covered < end {
+            read_ok &= read_range(covered, end, &mut ops);
+        }
         // 組んでいる球があれば、 捨てる分を渡す (記録が捨てる header を書く前 = 組む側が読めなくなる前)
         if let Some(side) = self.side.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
             side.extend(ops.iter().cloned());
@@ -607,7 +617,7 @@ impl OnDiscard for BallBases {
                 continue; // 作った時より前の番号 (cell に入っている)
             }
             // [done, end) が全部そろったか (記録から読む分が読めない entry で切れた / 捨てた所が土台より先 / 最後の HLC が読めない)
-            if b.done < first || (b.done < split && !read_ok) || end_hlc == Hlc::ZERO {
+            if b.done < first || ((b.done < split || covered < end) && !read_ok) || end_hlc == Hlc::ZERO {
                 broken.push(k);
                 continue;
             }
