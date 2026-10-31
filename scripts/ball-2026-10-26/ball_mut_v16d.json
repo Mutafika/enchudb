@@ -2,25 +2,25 @@
  {
   "name": "大きい値の末尾を不安定に並べる (16 回目、 run)",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        run.sort_by_key(|d| d.v);",
-  "replace": "        run.sort_unstable_by_key(|d| d.v);"
+  "find": "        tail.sort_by_key(|d| d.v);",
+  "replace": "        tail.sort_unstable_by_key(|d| d.v);"
  },
  {
   "name": "大きい値の run の併合で同じ値を新しい run から (16 回目)",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        if older[i].v <= newer[j].v {",
-  "replace": "        if older[i].v < newer[j].v {"
+  "find": "            if older.vals[i] <= newer.vals[j] {",
+  "replace": "            if older.vals[i] < newer.vals[j] {"
  },
  {
   "name": "大きい値の t より後を t 以後に (16 回目)",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        let hit = |d: &&WideDiff| d.t > t;",
-  "replace": "        let hit = |d: &&WideDiff| d.t >= t;"
+  "find": "            out.extend((a..a + n).filter(|&k| r.ts[k] > t).map(|k| (r.eids[k], r.into[k] == 1)));",
+  "replace": "            out.extend((a..a + n).filter(|&k| r.ts[k] >= t).map(|k| (r.eids[k], r.into[k] == 1)));"
  },
  {
   "name": "大きい値の run を新しい方から読む (16 回目)",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        for r in &self.runs {\n            let a = r.partition_point(|d| d.v < v);",
-  "replace": "        for r in self.runs.iter().rev() {\n            let a = r.partition_point(|d| d.v < v);"
+  "find": "        for r in &self.runs {\n            let a = r.vals.partition_point(|&x| x < v);",
+  "replace": "        for r in self.runs.iter().rev() {\n            let a = r.vals.partition_point(|&x| x < v);"
  }
 ]

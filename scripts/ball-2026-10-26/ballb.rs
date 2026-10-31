@@ -7,6 +7,7 @@
 //!                                     BALL_WAL=1 で WAL 付き (BALL_WAL_CAP 既定 2 GiB)、 9 回目で足した)
 //!        ballb r <seed>              (feature ball のみ。 読みの段)
 //!        ballb h <seed>              (feature ball のみ。 熱い行の読み、 10 回目)
+//!        ballb rw <seed>             (feature ball のみ。 大きい値の列の時点の読み、 16 回目)
 //!
 //! r: 表 t (id、 a = Number 0..99) に BALL_TOTAL 行、 a を球にしてから、 1 回につき 10% の行の a を書き換えるのを BALL_ROUNDS 回
 //!    (既定 10、 7 回目で足した)。 回の終わりの時刻を控え、 1 回目の終わり (t1)、 5 回目の終わり (t5) と今について:
@@ -23,6 +24,9 @@
 //!    - value_at_hot_recent: 熱い行の、 最後の 1% の書き込みの間の t
 //!    - value_at_cold      : 書き換えていない行 (面は前からの 1 つ) の一様な t
 //!    答え合わせ: 測る組 (行, t) を全部、 手元の (時刻, 値) の列の二分探索と比べる。
+//! rw: 大きい値 (16 回目で足した)。 表 t (id、 w = BigInt) に BALL_TOTAL 行 (w = 2^20〜2^40 の乱数 = ほぼ 1 行に 1 値) を入れて w を球に
+//!    した後、 1 回につき 10% の行を新しい乱数に書き換えるのを BALL_ROUNDS 回。 乱数の行の、 その時の値で引く:
+//!    pull_now (pull_raw)、 pull_at_now / pull_at_t5 / pull_at_t1 (ball_pull_at)。 答え合わせ: 200 行 × 3 時点を手元の写しと比べる。
 //! 出力: 1 行 1 JSON (stdout)。
 
 use enchudb::schema::Database;
@@ -279,6 +283,86 @@ fn mode_r(seed: u64) {
     );
 }
 
+/// 大きい値 (2^20 以上、 ID / 時刻の列の形: 値はほぼ 1 行に 1 つ) の列の時点の読み (16 回目、 大きい値の差分を値の順の run にした時)。
+/// 入れた後に球にして、 1 割ずつ新しい大きい値に書き換える回を `BALL_ROUNDS` 回。 昔の値で時点 t を引く (答えは普通 1 行)。
+#[cfg(feature = "ball")]
+fn mode_rw(seed: u64) {
+    let path = db_path("rw");
+    let _c = Cleanup(path.clone());
+    let total = env_usize("BALL_TOTAL", 960_000);
+    let mut db = Database::create(&path).unwrap();
+    db.table("t").number("id").bigint("w").primary_key("id").with_capacity(total as u32 + 1000).build().unwrap();
+    let eng: Arc<Engine> = db.arc_engine();
+    let (hid, hw) = (eng.himo_id("t.id").unwrap() as u16, eng.himo_id("t.w").unwrap() as u16);
+    let mut r = Rng(seed | 1);
+    let wide = |r: &mut Rng| (1u64 << 20) + r.next() % ((1u64 << 40) - (1 << 20));
+    let mut cur: Vec<u64> = Vec::with_capacity(total);
+    let mut eids = Vec::with_capacity(total);
+    for i in 0..total {
+        let e = eng.entity_in("t").unwrap();
+        let w = wide(&mut r);
+        eng.tie_to_by_id(e, hid, i as u32);
+        eng.tie_to_by_id(e, hw, w);
+        cur.push(w);
+        eids.push(e);
+    }
+    eng.declare_ball("t.w").unwrap();
+    let rounds = env_usize("BALL_ROUNDS", 10);
+    let (mut t1, mut t5) = (0, 0);
+    let (mut at1, mut at5) = (Vec::new(), Vec::new());
+    for round in 1..=rounds {
+        for _ in 0..total / 10 {
+            let i = (r.next() % total as u64) as usize;
+            let w = wide(&mut r);
+            eng.tie_to_by_id(eids[i], hw, w);
+            cur[i] = w;
+        }
+        if round == 1 {
+            t1 = eng.ball_now();
+            at1 = cur.clone();
+        }
+        if round == 5 {
+            t5 = eng.ball_now();
+            at5 = cur.clone();
+        }
+    }
+    let now = eng.ball_now();
+    let picks: Vec<usize> = (0..10_000).map(|k| (Rng(k as u64 * 0x9E37 + seed | 1).next() % total as u64) as usize).collect();
+    // 答え合わせ (200 本): その時の値を持っていた行の全部
+    for &i in picks.iter().take(200) {
+        for (t, at) in [(t1, &at1), (t5, &at5), (now, &cur)] {
+            let v = at[i];
+            let want: Vec<u64> = (0..total).filter(|&j| at[j] == v).map(|j| eids[j]).collect();
+            assert_eq!(eng.ball_pull_at("t.w", v, t).unwrap(), want, "t={t} v={v}");
+        }
+    }
+    let time = |name: &str, n: usize, f: &dyn Fn(usize) -> usize| {
+        let mut xs: Vec<f64> = (0..5)
+            .map(|_| {
+                let t0 = Instant::now();
+                let mut acc = 0usize;
+                for k in 0..n {
+                    acc += f(k);
+                }
+                black_box(acc);
+                t0.elapsed().as_nanos() as f64 / n as f64
+            })
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        println!("{{\"mode\":\"rw\",\"kind\":\"{name}\",\"seed\":{seed},\"total\":{total},\"ns\":{:.1}}}", xs[2]);
+    };
+    time("pull_now", 10_000, &|k| eng.pull_raw("t.w", cur[picks[k]]).len());
+    time("pull_at_now", 10_000, &|k| eng.ball_pull_at("t.w", cur[picks[k]], now).unwrap().len());
+    time("pull_at_t5", 10_000, &|k| eng.ball_pull_at("t.w", at5[picks[k]], t5).unwrap().len());
+    time("pull_at_t1", 10_000, &|k| eng.ball_pull_at("t.w", at1[picks[k]], t1).unwrap().len());
+    let (faces, bytes) = eng.ball_stats("t.w").unwrap();
+    println!(
+        "{{\"mode\":\"rw\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"rounds\":{rounds},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{},\"rss_peak_kb\":{}}}",
+        eng.ball_diff_count("t.w").unwrap(),
+        rss_peak_kb()
+    );
+}
+
 #[cfg(feature = "ball")]
 fn mode_h(seed: u64) {
     let path = db_path("h");
@@ -383,6 +467,8 @@ fn main() {
         "r" => mode_r(a[2].parse().unwrap()),
         #[cfg(feature = "ball")]
         "h" => mode_h(a[2].parse().unwrap()),
+        #[cfg(feature = "ball")]
+        "rw" => mode_rw(a[2].parse().unwrap()),
         m => panic!("unknown mode {m}"),
     }
 }

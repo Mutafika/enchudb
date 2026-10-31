@@ -613,8 +613,73 @@ const WIDE_FANOUT: usize = 4;
 /// 書き換えのたびに新しい鍵を足すので表が伸び続け、 書き換え 1 回に約 285 ns (値の種類とともに伸びる) かかっていた。
 #[derive(Default)]
 struct WideStripe {
-    runs: Vec<Vec<WideDiff>>,
+    runs: Vec<WideRun>,
     tail: Vec<WideDiff>,
+}
+
+/// 値で並べた run。 値 / 時刻 / 球 / 入った は別の並び (二分探索は値の並びだけを触る。 1 件 24 B の並びのままだと、 読みが
+/// 前の表より 1 回 300 ns ほど遅かった)。
+#[derive(Default)]
+struct WideRun {
+    vals: Vec<u64>,
+    ts: Vec<u64>,
+    eids: Vec<u32>,
+    into: Vec<u8>,
+}
+
+impl WideRun {
+    fn with_capacity(n: usize) -> Self {
+        Self { vals: Vec::with_capacity(n), ts: Vec::with_capacity(n), eids: Vec::with_capacity(n), into: Vec::with_capacity(n) }
+    }
+
+    fn len(&self) -> usize {
+        self.vals.len()
+    }
+
+    /// 末尾を値で安定に並べて run にする (同じ値は足した順のまま)。
+    fn from_tail(mut tail: Vec<WideDiff>) -> Self {
+        tail.sort_by_key(|d| d.v);
+        let mut r = Self::with_capacity(tail.len());
+        for d in tail {
+            r.vals.push(d.v);
+            r.ts.push(d.t);
+            r.eids.push(d.eid);
+            r.into.push(d.into as u8);
+        }
+        r
+    }
+
+    /// 2 本を併合する (同じ値は `older` を先に)。
+    fn merge(older: &WideRun, newer: &WideRun) -> WideRun {
+        let mut out = Self::with_capacity(older.len() + newer.len());
+        let take = |out: &mut WideRun, r: &WideRun, k: usize| {
+            out.vals.push(r.vals[k]);
+            out.ts.push(r.ts[k]);
+            out.eids.push(r.eids[k]);
+            out.into.push(r.into[k]);
+        };
+        let (mut i, mut j) = (0, 0);
+        while i < older.len() && j < newer.len() {
+            if older.vals[i] <= newer.vals[j] {
+                take(&mut out, older, i);
+                i += 1;
+            } else {
+                take(&mut out, newer, j);
+                j += 1;
+            }
+        }
+        for (r, k) in [(older, i), (newer, j)] {
+            out.vals.extend_from_slice(&r.vals[k..]);
+            out.ts.extend_from_slice(&r.ts[k..]);
+            out.eids.extend_from_slice(&r.eids[k..]);
+            out.into.extend_from_slice(&r.into[k..]);
+        }
+        out
+    }
+
+    fn bytes(&self) -> usize {
+        self.vals.capacity() * 8 + self.ts.capacity() * 8 + self.eids.capacity() * 4 + self.into.capacity()
+    }
 }
 
 impl WideStripe {
@@ -623,11 +688,10 @@ impl WideStripe {
         if self.tail.len() < WIDE_TAIL {
             return;
         }
-        let mut run = std::mem::replace(&mut self.tail, Vec::with_capacity(WIDE_TAIL));
-        run.sort_by_key(|d| d.v);
+        let mut run = WideRun::from_tail(std::mem::replace(&mut self.tail, Vec::with_capacity(WIDE_TAIL)));
         while self.runs.last().is_some_and(|r| r.len() < run.len() * WIDE_FANOUT) {
             let older = self.runs.pop().unwrap();
-            run = merge_wide(&older, &run);
+            run = WideRun::merge(&older, &run);
         }
         self.runs.push(run);
     }
@@ -641,40 +705,22 @@ impl WideStripe {
     /// 値 `v` の t より後の差分を、 球ごとに時刻の順に (古い run → 新しい run → 末尾)。
     fn after(&self, v: u64, t: u64) -> TailBuf {
         let mut out = Vec::new();
-        let hit = |d: &&WideDiff| d.t > t;
         for r in &self.runs {
-            let a = r.partition_point(|d| d.v < v);
-            out.extend(r[a..].iter().take_while(|d| d.v == v).filter(hit).map(|d| (d.eid, d.into == 1)));
+            let a = r.vals.partition_point(|&x| x < v);
+            let n = r.vals[a..].iter().take_while(|&&x| x == v).count();
+            out.extend((a..a + n).filter(|&k| r.ts[k] > t).map(|k| (r.eids[k], r.into[k] == 1)));
         }
-        out.extend(self.tail.iter().filter(|d| d.v == v).filter(hit).map(|d| (d.eid, d.into == 1)));
+        out.extend(self.tail.iter().filter(|d| d.v == v && d.t > t).map(|d| (d.eid, d.into == 1)));
         TailBuf::new(out)
     }
 
     fn len(&self) -> usize {
-        self.runs.iter().map(Vec::len).sum::<usize>() + self.tail.len()
+        self.runs.iter().map(WideRun::len).sum::<usize>() + self.tail.len()
     }
 
     fn bytes(&self) -> usize {
-        (self.runs.iter().map(Vec::capacity).sum::<usize>() + self.tail.capacity()) * std::mem::size_of::<WideDiff>()
+        self.runs.iter().map(WideRun::bytes).sum::<usize>() + self.tail.capacity() * std::mem::size_of::<WideDiff>()
     }
-}
-
-/// 値で並んだ run 2 本を併合する (同じ値は `older` を先に)。
-fn merge_wide(older: &[WideDiff], newer: &[WideDiff]) -> Vec<WideDiff> {
-    let mut out = Vec::with_capacity(older.len() + newer.len());
-    let (mut i, mut j) = (0, 0);
-    while i < older.len() && j < newer.len() {
-        if older[i].v <= newer[j].v {
-            out.push(older[i]);
-            i += 1;
-        } else {
-            out.push(newer[j]);
-            j += 1;
-        }
-    }
-    out.extend_from_slice(&older[i..]);
-    out.extend_from_slice(&newer[j..]);
-    out
 }
 
 /// [`Ball::reserve`] で取った場所 1 つ: (`held` の添字, 列の末尾の中の場所, 値)。
@@ -794,10 +840,16 @@ impl Ball {
         if old == new || vs == [None, None] {
             return r;
         }
-        // 列の lock は番号の小さい方から (同じ列なら 1 つ)
-        let mut ks: Vec<usize> = vs.iter().flatten().map(|&v| v as usize % WIDE).collect();
+        // 列の lock は番号の小さい方から (同じ列なら 1 つ)。 書き換えのたびに呼ぶので heap を使わない
+        let (mut ks, mut nk) = ([0usize; 2], 0);
+        for k in vs.iter().flatten().map(|&v| v as usize % WIDE) {
+            if !ks[..nk].contains(&k) {
+                ks[nk] = k;
+                nk += 1;
+            }
+        }
+        let ks = &mut ks[..nk];
         ks.sort_unstable();
-        ks.dedup();
         for (h, &k) in ks.iter().enumerate() {
             let mut g = self.wide[k].lock().unwrap_or_else(|e| e.into_inner());
             // 一杯なら先に run にする (この後に足す差分は時刻が未定で、 並べられない)
@@ -1073,16 +1125,13 @@ impl Ball {
             let w = w.lock().unwrap_or_else(|e| e.into_inner());
             let mut last: BTreeMap<(u64, u32), u64> = BTreeMap::new();
             for r in &w.runs {
-                ok &= r.windows(2).all(|p| p[0].v <= p[1].v);
-            }
-            let mut seq: Vec<&WideDiff> = Vec::new();
-            for r in &w.runs {
-                seq.extend(r.iter());
+                ok &= r.vals.windows(2).all(|p| p[0] <= p[1]);
             }
             // run の中は値の順に並べ替えてあるので、 (値, 球) ごとに見れば足した順
-            for d in seq.into_iter().chain(w.tail.iter()) {
-                let prev = last.insert((d.v, d.eid), d.t);
-                ok &= prev.is_none_or(|p| p < d.t);
+            let seq = w.runs.iter().flat_map(|r| (0..r.len()).map(move |k| (r.vals[k], r.eids[k], r.ts[k])));
+            for (v, eid, t) in seq.chain(w.tail.iter().map(|d| (d.v, d.eid, d.t))) {
+                let prev = last.insert((v, eid), t);
+                ok &= prev.is_none_or(|p| p < t);
             }
         }
         ok
@@ -1095,7 +1144,7 @@ impl Ball {
             .iter()
             .map(|w| {
                 let w = w.lock().unwrap_or_else(|e| e.into_inner());
-                (w.runs.iter().map(Vec::len).collect::<Vec<_>>(), w.tail.len())
+                (w.runs.iter().map(WideRun::len).collect::<Vec<_>>(), w.tail.len())
             })
             .filter(|(r, t)| !r.is_empty() || *t > 0)
             .collect()

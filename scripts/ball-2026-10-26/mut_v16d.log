@@ -1,0 +1,6 @@
+baseline: pass 25 秒 → 1 run の上限 900 秒
+  killed 8s              大きい値の末尾を不安定に並べる (16 回目、 run)
+  killed 8s              大きい値の run の併合で同じ値を新しい run から (16 回目)
+  killed 7s              大きい値の t より後を t 以後に (16 回目)
+  killed 7s              大きい値の run を新しい方から読む (16 回目)
+killed 4 / survived 0 / その他 0
