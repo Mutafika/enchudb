@@ -1,0 +1,14 @@
+[
+ {
+  "name": "記録の読みで crc の合わない entry も返す (16 回目、 lock の外の crc)",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "        if ok && out.len() == n { Ok(out) } else { Err(Truncated { from: first }) }",
+  "replace": "        if ok { Ok(out) } else { Err(Truncated { from: first }) }"
+ },
+ {
+  "name": "lock の外の crc を見ない (16 回目)",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "    if let Some(k) = at {\n        raw.truncate(k);\n    }",
+  "replace": "    let _ = at;"
+ }
+]
