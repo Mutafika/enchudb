@@ -19033,12 +19033,24 @@ impl Engine {
             std::thread::sleep(std::time::Duration::from_micros(pp[1]));
         }
         // (4) H より前の残り
+        let probe_c = std::time::Instant::now();
+        let probe_w0 = rp.work;
         rp.catch_up(log, wal, &mut pos, Some(h));
+        let probe_catch = probe_c.elapsed();
+        let probe_n = rp.work - probe_w0;
         // (5) 出す
         let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead, rp_crossed) =
             (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead, rp.crossed);
+        let probe_p = std::time::Instant::now();
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
+        let probe_pub = probe_p.elapsed();
         self.ball_bases.end_side();
+        eprintln!(
+            "probe16 publish: quiesce={:?} catch={probe_catch:?} (n={probe_n}) publish={probe_pub:?} end_side={:?} total={:?}",
+            std::time::Duration::from_nanos(quiesce_ns),
+            probe_p.elapsed() - probe_pub,
+            t_pub.elapsed()
+        );
         let st = BallRebuildStats {
             records,
             applied,
