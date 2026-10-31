@@ -22,5 +22,17 @@
   "file": "crates/enchudb-engine/src/ball.rs",
   "find": "        for r in &self.runs {\n            let a = r.vals.partition_point(|&x| x < v);",
   "replace": "        for r in self.runs.iter().rev() {\n            let a = r.vals.partition_point(|&x| x < v);"
+ },
+ {
+  "name": "大きい値の末尾の t より後を t 以後に (16 回目)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "            if d.t > t {\n                out.push((d.eid, d.into == 1));",
+  "replace": "            if d.t >= t {\n                out.push((d.eid, d.into == 1));"
+ },
+ {
+  "name": "大きい値の末尾の値の並びを run にする時に空けない (16 回目)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        self.tail_vals.clear();",
+  "replace": ""
  }
 ]

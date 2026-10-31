@@ -615,6 +615,8 @@ const WIDE_FANOUT: usize = 4;
 struct WideStripe {
     runs: Vec<WideRun>,
     tail: Vec<WideDiff>,
+    /// `tail` の値だけの並び (読みは末尾を値で比べて回る。 1 件 24 B の並びを回ると 1 回 250 ns ほどかかった)。
+    tail_vals: Vec<u64>,
 }
 
 /// 値で並べた run。 値 / 時刻 / 球 / 入った は別の並び (二分探索は値の並びだけを触る。 1 件 24 B の並びのままだと、 読みが
@@ -689,6 +691,7 @@ impl WideStripe {
             return;
         }
         let mut run = WideRun::from_tail(std::mem::replace(&mut self.tail, Vec::with_capacity(WIDE_TAIL)));
+        self.tail_vals.clear();
         while self.runs.last().is_some_and(|r| r.len() < run.len() * WIDE_FANOUT) {
             let older = self.runs.pop().unwrap();
             run = WideRun::merge(&older, &run);
@@ -699,7 +702,14 @@ impl WideStripe {
     /// 末尾に足す。 返り値は末尾の中の場所 (時刻を書く / 取り消す)。
     fn push(&mut self, d: WideDiff) -> usize {
         self.tail.push(d);
+        self.tail_vals.push(d.v);
         self.tail.len() - 1
+    }
+
+    /// 最後に足した差分を取り消す。
+    fn pop(&mut self) {
+        self.tail.pop();
+        self.tail_vals.pop();
     }
 
     /// 値 `v` の t より後の差分を、 球ごとに時刻の順に (古い run → 新しい run → 末尾)。
@@ -710,7 +720,12 @@ impl WideStripe {
             let n = r.vals[a..].iter().take_while(|&&x| x == v).count();
             out.extend((a..a + n).filter(|&k| r.ts[k] > t).map(|k| (r.eids[k], r.into[k] == 1)));
         }
-        out.extend(self.tail.iter().filter(|d| d.v == v && d.t > t).map(|d| (d.eid, d.into == 1)));
+        for (k, _) in self.tail_vals.iter().enumerate().filter(|&(_, &x)| x == v) {
+            let d = &self.tail[k];
+            if d.t > t {
+                out.push((d.eid, d.into == 1));
+            }
+        }
         TailBuf::new(out)
     }
 
@@ -719,7 +734,7 @@ impl WideStripe {
     }
 
     fn bytes(&self) -> usize {
-        self.runs.iter().map(WideRun::bytes).sum::<usize>() + self.tail.capacity() * std::mem::size_of::<WideDiff>()
+        self.runs.iter().map(WideRun::bytes).sum::<usize>() + self.tail.capacity() * std::mem::size_of::<WideDiff>() + self.tail_vals.capacity() * 8
     }
 }
 
@@ -762,7 +777,7 @@ impl Drop for Reserved<'_> {
         for s in self.slots.iter().rev().flatten() {
             let g = &mut self.held[s.held].as_mut().unwrap().1;
             debug_assert_eq!(g.tail.len(), s.at + 1);
-            g.tail.pop();
+            g.pop();
         }
     }
 }
