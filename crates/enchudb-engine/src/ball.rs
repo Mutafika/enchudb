@@ -627,11 +627,38 @@ struct WideRun {
     ts: Vec<u64>,
     eids: Vec<u32>,
     into: Vec<u8>,
+    /// `WIDE_FENCE` 件おきの値 (`vals[i * WIDE_FENCE]`)。 引く時はまずこれを二分探索して塊を決める (run 全体を二分探索すると、
+    /// 値の種類の多い列で 1 本あたり十数回 cache を外し、 読みが前の表の倍かかった)。
+    fence: Vec<u64>,
 }
+
+/// run の目印の間隔 (件)。
+const WIDE_FENCE: usize = 64;
 
 impl WideRun {
     fn with_capacity(n: usize) -> Self {
-        Self { vals: Vec::with_capacity(n), ts: Vec::with_capacity(n), eids: Vec::with_capacity(n), into: Vec::with_capacity(n) }
+        Self {
+            vals: Vec::with_capacity(n),
+            ts: Vec::with_capacity(n),
+            eids: Vec::with_capacity(n),
+            into: Vec::with_capacity(n),
+            fence: Vec::new(),
+        }
+    }
+
+    /// 並べ終えた後に目印を置く。
+    fn sealed(mut self) -> Self {
+        self.fence = self.vals.iter().step_by(WIDE_FENCE).copied().collect();
+        self
+    }
+
+    /// 値 `v` 以上の最初の場所。
+    fn lower_bound(&self, v: u64) -> usize {
+        // 目印 b は 「最初の値が v 以上の塊」。 答えはその 1 つ前の塊の中か、 塊 b の頭
+        let b = self.fence.partition_point(|&x| x < v);
+        let lo = b.saturating_sub(1) * WIDE_FENCE;
+        let hi = (b * WIDE_FENCE).min(self.vals.len());
+        lo + self.vals[lo..hi].partition_point(|&x| x < v)
     }
 
     fn len(&self) -> usize {
@@ -648,7 +675,7 @@ impl WideRun {
             r.eids.push(d.eid);
             r.into.push(d.into as u8);
         }
-        r
+        r.sealed()
     }
 
     /// 2 本を併合する (同じ値は `older` を先に)。
@@ -676,11 +703,11 @@ impl WideRun {
             out.eids.extend_from_slice(&r.eids[k..]);
             out.into.extend_from_slice(&r.into[k..]);
         }
-        out
+        out.sealed()
     }
 
     fn bytes(&self) -> usize {
-        self.vals.capacity() * 8 + self.ts.capacity() * 8 + self.eids.capacity() * 4 + self.into.capacity()
+        (self.vals.capacity() + self.ts.capacity() + self.fence.capacity()) * 8 + self.eids.capacity() * 4 + self.into.capacity()
     }
 }
 
@@ -716,7 +743,7 @@ impl WideStripe {
     fn after(&self, v: u64, t: u64) -> TailBuf {
         let mut out = Vec::new();
         for r in &self.runs {
-            let a = r.vals.partition_point(|&x| x < v);
+            let a = r.lower_bound(v);
             let n = r.vals[a..].iter().take_while(|&&x| x == v).count();
             out.extend((a..a + n).filter(|&k| r.ts[k] > t).map(|k| (r.eids[k], r.into[k] == 1)));
         }

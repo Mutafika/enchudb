@@ -20,8 +20,8 @@
  {
   "name": "大きい値の run を新しい方から読む (16 回目)",
   "file": "crates/enchudb-engine/src/ball.rs",
-  "find": "        for r in &self.runs {\n            let a = r.vals.partition_point(|&x| x < v);",
-  "replace": "        for r in self.runs.iter().rev() {\n            let a = r.vals.partition_point(|&x| x < v);"
+  "find": "        for r in &self.runs {\n            let a = r.lower_bound(v);",
+  "replace": "        for r in self.runs.iter().rev() {\n            let a = r.lower_bound(v);"
  },
  {
   "name": "大きい値の末尾の t より後を t 以後に (16 回目)",
@@ -34,5 +34,11 @@
   "file": "crates/enchudb-engine/src/ball.rs",
   "find": "        self.tail_vals.clear();",
   "replace": ""
+ },
+ {
+  "name": "大きい値の run の目印の塊を 1 つ後ろから (16 回目)",
+  "file": "crates/enchudb-engine/src/ball.rs",
+  "find": "        let lo = b.saturating_sub(1) * WIDE_FENCE;",
+  "replace": "        let lo = b * WIDE_FENCE;"
  }
 ]

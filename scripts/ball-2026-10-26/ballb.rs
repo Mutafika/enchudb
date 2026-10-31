@@ -351,10 +351,12 @@ fn mode_rw(seed: u64) {
         xs.sort_by(f64::total_cmp);
         println!("{{\"mode\":\"rw\",\"kind\":\"{name}\",\"seed\":{seed},\"total\":{total},\"ns\":{:.1}}}", xs[2]);
     };
-    time("pull_now", 10_000, &|k| eng.pull_raw("t.w", cur[picks[k]]).len());
-    time("pull_at_now", 10_000, &|k| eng.ball_pull_at("t.w", cur[picks[k]], now).unwrap().len());
-    time("pull_at_t5", 10_000, &|k| eng.ball_pull_at("t.w", at5[picks[k]], t5).unwrap().len());
-    time("pull_at_t1", 10_000, &|k| eng.ball_pull_at("t.w", at1[picks[k]], t1).unwrap().len());
+    // BALL_RW_N: 1 回の測りの読みの数 (既定 1 万、 sample で段を測る時に増やす)。 行は 1 万行を回す
+    let n = env_usize("BALL_RW_N", 10_000);
+    time("pull_now", n, &|k| eng.pull_raw("t.w", cur[picks[k % picks.len()]]).len());
+    time("pull_at_now", n, &|k| eng.ball_pull_at("t.w", cur[picks[k % picks.len()]], now).unwrap().len());
+    time("pull_at_t5", n, &|k| eng.ball_pull_at("t.w", at5[picks[k % picks.len()]], t5).unwrap().len());
+    time("pull_at_t1", n, &|k| eng.ball_pull_at("t.w", at1[picks[k % picks.len()]], t1).unwrap().len());
     let (faces, bytes) = eng.ball_stats("t.w").unwrap();
     println!(
         "{{\"mode\":\"rw\",\"kind\":\"ok\",\"seed\":{seed},\"total\":{total},\"rounds\":{rounds},\"faces\":{faces},\"ball_bytes\":{bytes},\"diffs\":{},\"rss_peak_kb\":{}}}",
