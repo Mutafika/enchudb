@@ -406,6 +406,8 @@ impl BallBases {
         }
         let (first, next) = log.range();
         let start = start.max(first);
+        let probe_t = std::time::Instant::now();
+        let _probe = Probe16(probe_t, next - start);
         // 記録を読む間は控えの lock を持たない (捨てる道の lock の順は 記録 → 土台 → 控え)
         let Some(ops) = log.map_range(start, next, |bytes| {
             let (r, _) = crate::transport::WireRecord::decode(bytes).ok()?;
@@ -967,5 +969,14 @@ mod tests {
         bases.ready(&log);
         assert!(!bases.has(HID));
         assert!(!path_of(&dir, HID).exists(), "使えない土台は消す");
+    }
+}
+
+/// 一時の測り (16 回目、 後で消す)。
+struct Probe16(std::time::Instant, u64);
+impl Drop for Probe16 {
+    fn drop(&mut self) {
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000;
+        eprintln!("probe16 prefill: {} entries in {:?} (ended at {since} ms mod 100s)", self.1, self.0.elapsed());
     }
 }

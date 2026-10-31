@@ -268,6 +268,9 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
     let records = eng.change_log_range().map_or(0, |(f, x)| x - f);
     let stop = std::sync::atomic::AtomicBool::new(false);
     let origin = Instant::now();
+    if std::env::var_os("BALL_PROBE").is_some() {
+        eprintln!("probe16 origin at {} ms mod 100s", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000);
+    }
     let ((lats, slow), b0, b1) = std::thread::scope(|s| {
         let w = s.spawn(|| {
             let t = db.get_table("t").unwrap();
