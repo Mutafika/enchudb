@@ -292,10 +292,14 @@ impl ChangeLog {
         let first = st.c.first;
         // 捨てる番号は始まりから続くので、 目印を使わず始まりから header だけでたどる (16 回目: 開き直した後は目印が無く、 ここで最初に
         // 読む 1 回が記録の全部を crc 付きでたどって目印を作っていた。 記録 64 MiB = 32 万件で 56 ms、 その間に書き手が WAL の空きを待った)
+        let probe_s = std::time::Instant::now();
         let end_hlc = match hole {
             Some((_, hlc)) => hlc,
             None => self.seek_from_first(st, end - 1).and_then(|at| self.entry_at(at)).filter(|e| e.no == end - 1).map_or(Hlc::ZERO, |e| e.hlc),
         };
+        if probe_s.elapsed() > std::time::Duration::from_micros(500) {
+            eprintln!("probe16 end_hlc seek n={} {:?}", end - first, probe_s.elapsed());
+        }
         let mut read = |a: u64, b: u64| match self.seek_from_first(st, a) {
             Some(at) if a < b => self.read_at(at, a, b, usize::MAX).0,
             _ => Vec::new(),
