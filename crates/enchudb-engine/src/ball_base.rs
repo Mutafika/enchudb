@@ -371,6 +371,9 @@ impl BallBases {
     /// 記録に写す前 (engine の `pump_change_log` の頭) と宣言の時に呼ぶ = 記録が捨てる前に必ず開いてある。
     pub(crate) fn ready(&self, log: &ChangeLog) {
         let pending = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()));
+        if pending.is_empty() {
+            return;
+        }
         let peer = self.self_peer.load(std::sync::atomic::Ordering::Relaxed);
         for (dir, hid, name) in pending {
             let res = name
@@ -387,6 +390,34 @@ impl BallBases {
                     let _ = std::fs::remove_file(path_of(&dir, hid));
                 }
             }
+        }
+        self.prefill(log);
+    }
+
+    /// 記録に残っている分の控え (`recent`) を先に作る (開いた後に土台を開いた時、 控えがまだ無ければ)。 16 回目: 作らないと開いた後の
+    /// 1 周目は、 捨てるたびに記録から読み直して当てる仕事が consumer の写しに乗り、 書き手が WAL の空きを待った (WAL 64 MiB・
+    /// 記録 64 MiB で 15〜28 ms)。 ここ (開いた後の最初の写し、 WAL にはまだ空きがある) で並べて 1 回で読む。 読めない entry が
+    /// あれば作らない (捨てる時に記録から読んで、 読めなければその土台を捨てる今までの道)。
+    fn prefill(&self, log: &ChangeLog) {
+        let Some(filter) = self.filter() else { return };
+        let Some(start) = self.lock().iter().map(|b| b.done).min() else { return };
+        if self.recent.lock().unwrap_or_else(|p| p.into_inner()).from.is_some() {
+            return;
+        }
+        let (first, next) = log.range();
+        let start = start.max(first);
+        // 記録を読む間は控えの lock を持たない (捨てる道の lock の順は 記録 → 土台 → 控え)
+        let Some(ops) = log.map_range(start, next, |bytes| {
+            let (r, _) = crate::transport::WireRecord::decode(bytes).ok()?;
+            filter.pick(&r.op, r.author_peer)
+        }) else {
+            return;
+        };
+        let mut r = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        if r.from.is_none() {
+            r.ops = ops.into();
+            r.from = Some(start);
+            r.next = next;
         }
     }
 

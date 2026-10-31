@@ -602,6 +602,41 @@ impl ChangeLog {
         Some(self.wrap_at(at))
     }
 
+    /// `[from, until)` の entry を、 中身の crc を確かめて `f` で写す (番号の順、 `PAR_CRC_MIN` 件以上は並べる、 写さない entry は `f` が
+    /// None)。 範囲が記録に無い / 読めない entry があれば None。 球の土台が開いた後に控えを先に作る (16 回目、 `BallBases::ready`)。
+    pub(crate) fn map_range<T: Send>(&self, from: u64, until: u64, f: impl Fn(&[u8]) -> Option<T> + Sync) -> Option<Vec<(u64, Hlc, T)>> {
+        let st = self.st.lock().unwrap();
+        if from >= until {
+            return Some(Vec::new());
+        }
+        let mut at = self.seek_from_first(&st, from)?;
+        let mut hs: Vec<(usize, EntryHeader)> = Vec::with_capacity((until - from) as usize);
+        for no in from..until {
+            at = self.wrap_at(at);
+            let e = self.header_at(at).filter(|e| e.no == no)?;
+            hs.push((at, e));
+            at = (at + entry_size(e.len)) % self.cap;
+        }
+        let s = self.region.slice();
+        let one = |&(at, e): &(usize, EntryHeader)| -> Result<Option<(u64, Hlc, T)>, ()> {
+            let base = HEADER + at;
+            let crc = u32::from_le_bytes(s[base + 12..base + 16].try_into().unwrap());
+            let bytes = &s[base + ENTRY_HEADER..base + ENTRY_HEADER + e.len];
+            if entry_crc(e.no, e.len as u32, &e.hlc, e.wal_id, bytes) != crc {
+                return Err(());
+            }
+            Ok(f(bytes).map(|t| (e.no, e.hlc, t)))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if hs.len() >= PAR_CRC_MIN {
+            use rayon::prelude::*;
+            let got: Result<Vec<_>, ()> = hs.par_iter().map(one).collect();
+            return got.ok().map(|v| v.into_iter().flatten().collect());
+        }
+        let got: Result<Vec<_>, ()> = hs.iter().map(one).collect();
+        got.ok().map(|v| v.into_iter().flatten().collect())
+    }
+
     /// 捨てる時の読み: `[pos, until)` を始まりから header でたどって場所を集め、 中身の crc を確かめて写す (`PAR_CRC_MIN` 件以上は
     /// 並べて、 #667 の置く時と同じ。 16 回目: 1 件ずつ取ると開き直した後の捨てる 1 回 (8 万件) が 15 ms)。 crc の合わない entry が
     /// あればその手前まで。
