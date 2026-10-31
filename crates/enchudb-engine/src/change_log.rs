@@ -563,6 +563,9 @@ impl ChangeLog {
             return None;
         }
         if !st.marked {
+            let probe_t0 = std::time::Instant::now();
+            let probe_n = c.next - c.first;
+            let _probe = Probe676(probe_t0, probe_n, no);
             let (mut at, mut k) = (c.tail, c.first);
             st.marks.clear();
             while k < c.next {
@@ -1113,5 +1116,13 @@ mod tests {
         for e in &got {
             assert_eq!(e.bytes, recs[e.no as usize].bytes);
         }
+    }
+}
+
+/// 一時の測り (16 回目、 後で消す): 目印を作った時間。
+struct Probe676(std::time::Instant, u64, u64);
+impl Drop for Probe676 {
+    fn drop(&mut self) {
+        eprintln!("probe16 marks: {} entries in {:?} (for no {})", self.1, self.0.elapsed(), self.2);
     }
 }
