@@ -1,0 +1,20 @@
+[
+ {
+  "name": "控えが覆う所を next で切らない (16 回目)",
+  "file": "crates/enchudb-engine/src/ball_base.rs",
+  "find": "let covered = if r.from.is_some() { r.next.clamp(split, end) } else { end };",
+  "replace": "let covered = end;"
+ },
+ {
+  "name": "捨てる時の最後の HLC を最初の entry から (16 回目)",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "let end_hlc = match (hole, dropped.and_then(|d| d.last())) {",
+  "replace": "let end_hlc = match (hole, dropped.and_then(|d| d.first())) {"
+ },
+ {
+  "name": "捨てる entry の crc の比べを逆に (16 回目)",
+  "file": "crates/enchudb-engine/src/change_log.rs",
+  "find": "(entry_crc(e.no, e.len as u32, &e.hlc, e.wal_id, bytes) == crc).then(|| Entry {",
+  "replace": "(entry_crc(e.no, e.len as u32, &e.hlc, e.wal_id, bytes) != crc).then(|| Entry {"
+ }
+]
