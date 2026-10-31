@@ -189,6 +189,8 @@ fn dropped_writes_reach_the_peer(async_: bool, per_peer: bool) {
 fn a_dropped_relayed_record_raises_its_authors_floor_to_its_own_hlc() {
     let pa = tmp_path("relay");
     let eng = make_engine(&pa, 1, 64 * 1024);
+    // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+    eng.set_wal_fold_on_switch(false);
     let src_p = format!("{pa}-src.oplog");
     let src = enchudb_oplog::oplog::OpLog::create(std::path::Path::new(&src_p), 1024 * 1024).unwrap();
     src.set_peer_id(7);
@@ -227,6 +229,8 @@ fn a_dropped_relayed_record_raises_its_authors_floor_to_its_own_hlc() {
 fn the_floor_is_raised_once_when_the_full_episode_ends() {
     let pa = tmp_path("episode");
     let eng = make_engine(&pa, 1, 64 * 1024);
+    // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+    eng.set_wal_fold_on_switch(false);
     // #388 から満杯の書き手は consumer が畳むのを待つので、 速い machine では 1 件も落ちず floor も上がらない (#604)。 待ち手を
     // 外して、 満杯で落ちる経路にする (畳むのは consumer の周のまま)
     eng.oplog().unwrap().set_room_waiter(None);

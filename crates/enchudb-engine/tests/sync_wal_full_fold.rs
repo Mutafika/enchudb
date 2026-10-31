@@ -93,6 +93,8 @@ fn round(tag: &str, sync: bool, writers: u64, writes: u64, reclaim: bool) -> Rou
 fn round_in(wal: usize, tag: &str, sync: bool, writers: u64, writes: u64, reclaim: bool) -> Round {
     let path = tmp_path(tag);
     let (eng, hid, rows) = open(&path, sync, wal);
+    // #667: 区画を移るたびに畳むと書き手 1 本では満杯まで行かない。 この試験は満杯の時の畳み (空け作り) を見るので切る
+    eng.set_wal_fold_on_switch(false);
     let rows = Arc::new(rows);
     let stop = Arc::new(AtomicBool::new(false));
     // 0 = reclaim していない、 それ以外 = 今の reclaim を始めた時刻 (base からの µs + 1)

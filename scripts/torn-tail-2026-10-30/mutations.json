@@ -1,0 +1,38 @@
+[
+ {
+  "name": "止まった区画の head を戻さない",
+  "file": "crates/enchudb-oplog/src/oplog.rs",
+  "find": "            self.trim_half_locked(h, wal_pos_offset(end));",
+  "replace": "            let _ = h;"
+ },
+ {
+  "name": "読めた所でなく閉じた group の終わりまで戻す",
+  "file": "crates/enchudb-oplog/src/oplog.rs",
+  "find": "        // 読めた所 (最後に読めた record の終端。 1 つも読めなければ checkpoint)\n        let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);",
+  "replace": "        let end = s.committed_end;"
+ },
+ {
+  "name": "古い区画で止まっても新しい区画を畳まない",
+  "file": "crates/enchudb-oplog/src/oplog.rs",
+  "find": "        if i != ai && !self.hot.halves[ai].is_empty() {",
+  "replace": "        if false && i != ai && !self.hot.halves[ai].is_empty() {"
+ },
+ {
+  "name": "checkpoint を戻さない",
+  "file": "crates/enchudb-oplog/src/oplog.rs",
+  "find": "        if h.checkpoint.load(Ordering::Acquire) > end {",
+  "replace": "        if false && h.checkpoint.load(Ordering::Acquire) > end {"
+ },
+ {
+  "name": "header の head を書かない",
+  "file": "crates/enchudb-oplog/src/oplog.rs",
+  "find": "        h.head.store(end, Ordering::Release);\n        self.put_head(h, b, end);",
+  "replace": "        h.head.store(end, Ordering::Release);\n        h.written.store(end, Ordering::Release);"
+ },
+ {
+  "name": "戻した後に書き出さない",
+  "file": "crates/enchudb-oplog/src/oplog.rs",
+  "find": "        if dropped {\n            let _ = self.fsync();\n        }\n        dropped",
+  "replace": "        dropped"
+ }
+]

@@ -94,6 +94,8 @@ fn the_mark_follows_each_durable_point_and_never_covers_later_writes() {
 fn dropped_writes_hold_the_mark_until_their_floor_is_recorded() {
     let root = scratch("dropped");
     let eng = notes_engine(&root.join("db"), 64 * 1024);
+    // #667: 満杯の状態を手で作るので、 区画を移った時の畳みを切る (移った直後に consumer の Commit が入る)
+    eng.set_wal_fold_on_switch(false);
     let note = eng.himo_id("notes.note").unwrap() as u16;
     let wal = eng.oplog().unwrap().clone();
     wal.set_room_waiter(None);

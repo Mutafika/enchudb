@@ -1,0 +1,10 @@
+baseline: pass 11 秒 → 1 run の上限 64 秒
+  killed 1s              止まった区画の head を戻さない
+  killed 2s              読めた所でなく閉じた group の終わりまで戻す
+  killed 2s              古い区画で止まっても新しい区画を畳まない
+  SURVIVED 12s           checkpoint を戻さない
+  killed 1s              header の head を書かない
+  SURVIVED 12s           戻した後に書き出さない
+killed 4 / survived 2 / その他 0
+  生き残り: checkpoint を戻さない
+  生き残り: 戻した後に書き出さない

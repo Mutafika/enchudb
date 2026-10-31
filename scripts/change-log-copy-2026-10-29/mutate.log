@@ -1,0 +1,14 @@
+baseline: pass 32 秒 → 1 run の上限 125 秒
+  killed 3s              捨てる時に次の番号で長さを確かめない
+  killed 2s              捨てる時に毎回中身の crc を取る (直す前)
+  SURVIVED 36s           捨てる最後の 1 件も crc を取らない
+  killed 22s             crc の番号を足さない
+  killed 3s              並べた crc で番号を落とす
+  SURVIVED 38s           tick ごとに写さない
+  SURVIVED 38s           区画を移っても consumer を起こさない
+  SURVIVED 38s           区画を移っても 100 ms を待つ
+killed 4 / survived 4 / その他 0
+  生き残り: 捨てる最後の 1 件も crc を取らない
+  生き残り: tick ごとに写さない
+  生き残り: 区画を移っても consumer を起こさない
+  生き残り: 区画を移っても 100 ms を待つ
