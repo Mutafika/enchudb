@@ -290,11 +290,16 @@ impl ChangeLog {
     fn before_discard(&self, st: &mut State, end: u64, hole: Option<(u64, Hlc)>) -> io::Result<()> {
         let Some(h) = self.on_discard.get().filter(|h| h.wants()) else { return Ok(()) };
         let first = st.c.first;
+        // 捨てる番号は始まりから続くので、 目印を使わず始まりから header だけでたどる (16 回目: 開き直した後は目印が無く、 ここで最初に
+        // 読む 1 回が記録の全部を crc 付きでたどって目印を作っていた。 記録 64 MiB = 32 万件で 56 ms、 その間に書き手が WAL の空きを待った)
         let end_hlc = match hole {
             Some((_, hlc)) => hlc,
-            None => self.read_in(st, end - 1, end, 0).0.first().map_or(Hlc::ZERO, |e| e.hlc),
+            None => self.seek_from_first(st, end - 1).and_then(|at| self.entry_at(at)).filter(|e| e.no == end - 1).map_or(Hlc::ZERO, |e| e.hlc),
         };
-        let mut read = |a: u64, b: u64| if a < b { self.read_in(st, a, b, usize::MAX).0 } else { Vec::new() };
+        let mut read = |a: u64, b: u64| match self.seek_from_first(st, a) {
+            Some(at) if a < b => self.read_at(at, a, b, usize::MAX).0,
+            _ => Vec::new(),
+        };
         h.discard(first, end, end_hlc, hole.map(|(no, _)| no), &mut read)?;
         #[cfg(test)]
         if self.stop_after_discard_hook.load(std::sync::atomic::Ordering::Relaxed) {
@@ -525,10 +530,15 @@ impl ChangeLog {
     /// `pos` から `until` の手前まで、 最大 `max_bytes` (少なくとも 1 件) 読む。 2 つ目は読めない entry に当たらなかったか
     /// (当たったら、 そこまでの entry を返す)。 `pos` は `[first, next)` の中。
     fn read_in(&self, st: &mut State, pos: u64, until: u64, max_bytes: usize) -> (Vec<Entry>, bool) {
+        match self.locate(st, pos) {
+            Some(at) => self.read_at(at, pos, until, max_bytes),
+            None => (Vec::new(), false),
+        }
+    }
+
+    /// [`Self::read_in`] の、 番号 `pos` の entry の位置 `at` が分かっている版。
+    fn read_at(&self, mut at: usize, pos: u64, until: u64, max_bytes: usize) -> (Vec<Entry>, bool) {
         let mut out = Vec::new();
-        let Some(mut at) = self.locate(st, pos) else {
-            return (out, false);
-        };
         let mut bytes = 0;
         let mut no = pos;
         while no < until {
@@ -556,7 +566,8 @@ impl ChangeLog {
         self.map.flush_dirty()
     }
 
-    /// `no` の entry の位置。 目印から番号の順にたどる。 目印がまだ無ければ tail から作る。
+    /// `no` の entry の位置。 目印から番号の順にたどる。 目印がまだ無ければ tail から作る。 たどるのは header と番号の並びだけ
+    /// (crc は返す entry を読む所 = `read_at` で見る。 16 回目: たどる entry ごとに crc を取ると、 開き直した後の最初の 1 回が記録 64 MiB で 56 ms)。
     fn locate(&self, st: &mut State, no: u64) -> Option<usize> {
         let c = st.c;
         if no < c.first || no >= c.next {
@@ -570,7 +581,7 @@ impl ChangeLog {
             st.marks.clear();
             while k < c.next {
                 at = self.wrap_at(at);
-                let e = self.entry_at(at).filter(|e| e.no == k)?;
+                let e = self.header_at(at).filter(|e| e.no == k)?;
                 if k.is_multiple_of(MARK_EVERY) {
                     st.marks.push_back((k, at));
                 }
@@ -583,7 +594,24 @@ impl ChangeLog {
         let (mut k, mut at) = if i == 0 || st.marks[i - 1].0 < c.first { (c.first, c.tail) } else { st.marks[i - 1] };
         while k < no {
             at = self.wrap_at(at);
-            let e = self.entry_at(at).filter(|e| e.no == k)?;
+            let e = self.header_at(at).filter(|e| e.no == k)?;
+            at = (at + entry_size(e.len)) % self.cap;
+            k += 1;
+        }
+        Some(self.wrap_at(at))
+    }
+
+    /// `no` の entry の位置を、 始まり (`first` の entry = `tail`) から header と番号の並びだけでたどる (目印を作らない)。 捨てる時の
+    /// 読み用 (捨てる番号は始まりから続く)。 手間は `no - first` に比例する。
+    fn seek_from_first(&self, st: &State, no: u64) -> Option<usize> {
+        let c = st.c;
+        if no < c.first || no >= c.next {
+            return None;
+        }
+        let (mut k, mut at) = (c.first, c.tail);
+        while k < no {
+            at = self.wrap_at(at);
+            let e = self.header_at(at).filter(|e| e.no == k)?;
             at = (at + entry_size(e.len)) % self.cap;
             k += 1;
         }
