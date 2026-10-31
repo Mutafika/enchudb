@@ -1,0 +1,8 @@
+[
+ {
+  "name": "頭からの時に組の後に畳んだかを見ない (16 回目、 T8)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "let start_gone = if first == 0 { wal.folds() != folds } else { !held(first) };",
+  "replace": "let start_gone = if first == 0 { false } else { !held(first) };"
+ }
+]
