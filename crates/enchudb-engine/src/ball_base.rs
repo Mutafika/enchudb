@@ -549,7 +549,18 @@ impl OnDiscard for BallBases {
             probe_read = probe_t0.elapsed();
             let want = (split - start) - u64::from(hole.is_some_and(|h| (start..split).contains(&h)));
             read_ok = es.len() as u64 == want;
-            ops.extend(es.iter().filter_map(|e| decode(e, peer).map(|op| (e.no, e.hlc, op))));
+            let one = |e: &Entry| decode(e, peer).map(|op| (e.no, e.hlc, op));
+            // 開き直した後の最初の 1 周は捨てる 1 回が数万件 (16 回目): decode も並べる (当てるのは番号の順のまま)
+            #[cfg(not(target_arch = "wasm32"))]
+            if es.len() >= 4096 {
+                use rayon::prelude::*;
+                let got: Vec<Option<(u64, Hlc, BaseOp)>> = es.par_iter().map(one).collect();
+                ops.extend(got.into_iter().flatten());
+            } else {
+                ops.extend(es.iter().filter_map(one));
+            }
+            #[cfg(target_arch = "wasm32")]
+            ops.extend(es.iter().filter_map(one));
             probe_dec = probe_t0.elapsed() - probe_read;
         }
         let probe_from_log = split.saturating_sub(start);
