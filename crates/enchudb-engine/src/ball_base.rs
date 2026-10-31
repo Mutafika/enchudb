@@ -542,11 +542,8 @@ impl OnDiscard for BallBases {
         }
         let split = r.from.map_or(end, |f| f.clamp(start, end));
         let mut read_ok = true;
-        let probe_t0 = std::time::Instant::now();
-        let (mut probe_read, mut probe_dec) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         if start < split {
             let es = read(start, split);
-            probe_read = probe_t0.elapsed();
             let want = (split - start) - u64::from(hole.is_some_and(|h| (start..split).contains(&h)));
             read_ok = es.len() as u64 == want;
             let one = |e: &Entry| decode(e, peer).map(|op| (e.no, e.hlc, op));
@@ -561,9 +558,7 @@ impl OnDiscard for BallBases {
             }
             #[cfg(target_arch = "wasm32")]
             ops.extend(es.iter().filter_map(one));
-            probe_dec = probe_t0.elapsed() - probe_read;
         }
-        let probe_from_log = split.saturating_sub(start);
         while r.ops.front().is_some_and(|&(no, _, _)| no < end) {
             let (no, h, op) = r.ops.pop_front().unwrap();
             if no >= start {
@@ -601,22 +596,12 @@ impl OnDiscard for BallBases {
                 b.map.flush_dirty()?;
                 return Err(io::Error::other("test: stopped after half of the cells"));
             }
-            let probe_a = std::time::Instant::now();
             for op in todo {
                 b.apply(op)?;
             }
-            let probe_apply = probe_a.elapsed();
             b.map.flush_dirty()?;
-            let probe_flush = probe_a.elapsed() - probe_apply;
             b.done = end;
             b.horizon = end_hlc;
-            if probe_t0.elapsed() > std::time::Duration::from_millis(1) {
-                eprintln!(
-                    "probe16 discard n={} from_log={probe_from_log} read={probe_read:?} decode={probe_dec:?} apply={probe_apply:?} flush={probe_flush:?} total={:?}",
-                    end - first,
-                    probe_t0.elapsed()
-                );
-            }
         }
         for k in broken.into_iter().rev() {
             let b = g.remove(k);

@@ -529,15 +529,10 @@ impl ChangeLog {
     /// `pos` から `until` の手前まで、 最大 `max_bytes` (少なくとも 1 件) 読む。 2 つ目は読めない entry に当たらなかったか
     /// (当たったら、 そこまでの entry を返す)。 `pos` は `[first, next)` の中。
     fn read_in(&self, st: &mut State, pos: u64, until: u64, max_bytes: usize) -> (Vec<Entry>, bool) {
-        match self.locate(st, pos) {
-            Some(at) => self.read_at(at, pos, until, max_bytes),
-            None => (Vec::new(), false),
-        }
-    }
-
-    /// [`Self::read_in`] の、 番号 `pos` の entry の位置 `at` が分かっている版。
-    fn read_at(&self, mut at: usize, pos: u64, until: u64, max_bytes: usize) -> (Vec<Entry>, bool) {
         let mut out = Vec::new();
+        let Some(mut at) = self.locate(st, pos) else {
+            return (out, false);
+        };
         let mut bytes = 0;
         let mut no = pos;
         while no < until {
@@ -566,16 +561,13 @@ impl ChangeLog {
     }
 
     /// `no` の entry の位置。 目印から番号の順にたどる。 目印がまだ無ければ tail から作る。 たどるのは header と番号の並びだけ
-    /// (crc は返す entry を読む所 = `read_at` で見る。 16 回目: たどる entry ごとに crc を取ると、 開き直した後の最初の 1 回が記録 64 MiB で 56 ms)。
+    /// (crc は返す entry を読む所 = `read_in` で見る。 16 回目: たどる entry ごとに crc を取ると、 開き直した後の最初の 1 回が記録 64 MiB で 56 ms)。
     fn locate(&self, st: &mut State, no: u64) -> Option<usize> {
         let c = st.c;
         if no < c.first || no >= c.next {
             return None;
         }
         if !st.marked {
-            let probe_t0 = std::time::Instant::now();
-            let probe_n = c.next - c.first;
-            let _probe = Probe676(probe_t0, probe_n, no);
             let (mut at, mut k) = (c.tail, c.first);
             st.marks.clear();
             while k < c.next {
@@ -1176,13 +1168,5 @@ mod tests {
         for e in &got {
             assert_eq!(e.bytes, recs[e.no as usize].bytes);
         }
-    }
-}
-
-/// 一時の測り (16 回目、 後で消す): 目印を作った時間。
-struct Probe676(std::time::Instant, u64, u64);
-impl Drop for Probe676 {
-    fn drop(&mut self) {
-        eprintln!("probe16 marks: {} entries in {:?} (for no {})", self.1, self.0.elapsed(), self.2);
     }
 }

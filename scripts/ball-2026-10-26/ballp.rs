@@ -248,7 +248,10 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
         let db = build(&path, rows).finish_with_oplog(wal_cap()).unwrap();
         let eng = db.engine();
         eng.enable_change_log(log_mib << 20).unwrap();
-        assert!(eng.declare_ball("t.a").unwrap());
+        // BALL_NONE: 球を宣言しない対照 (16 回目、 同じ書き方で球の分を分ける)
+        if std::env::var_os("BALL_NONE").is_none() {
+            assert!(eng.declare_ball("t.a").unwrap());
+        }
         let t = db.get_table("t").unwrap();
         for _ in 0..n {
             t.upsert().set("id", (r.next() % rows as u64) as i64).set("a", (r.next() % 100) as i64).commit().unwrap();
@@ -289,12 +292,23 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
         let b0 = origin.elapsed().as_nanos() as u64;
-        let _ = eng.ball_horizon("t.a");
+        if std::env::var_os("BALL_NONE").is_none() {
+            let _ = eng.ball_horizon("t.a");
+        }
         let b1 = origin.elapsed().as_nanos() as u64;
         std::thread::sleep(std::time::Duration::from_millis(300));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         (w.join().unwrap(), b0, b1)
     });
+    if std::env::var_os("BALL_NONE").is_some() {
+        let slow: Vec<String> = slow.iter().map(|&(at, ns, d)| format!("[{},{},{},{},{},0]", at, ns, d[0], d[1], d[2])).collect();
+        let max = lats.iter().map(|&(_, l)| l).max().unwrap_or(0);
+        println!(
+            "{{\"mode\":\"l\",\"none\":1,\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":0,\"publish_ns\":0,\"slow\":[{}],\"out_max_ns\":{max},\"out_n\":{}}}",
+            wal_cap() >> 20, slow.join(","), lats.len()
+        );
+        return;
+    }
     let st = eng.ball_rebuild_stats().expect("組んだ");
     // 答え合わせ: 今のデッキ
     let now = eng.ball_now();
