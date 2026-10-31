@@ -15,11 +15,11 @@
 //!     読むのは eid と bit (1 差分 4 B + 1 bit)、 時刻は t の二分探索だけが読む (1 つの構造体 16 B に並べていた時は、 真ん中の
 //!     時点の読みの大半が cache の外から差分を読む分だった)
 //!   - それより大きい値 (時刻 / ID の列: 1 つの値の差分が 1〜2 個) は値ごとに帳面を作らず、 値の下位 bit で分けた
-//!     `WIDE` 本の列 (`WideStripe`) に足し、 同じ値の 1 つ前の差分へ糸を張る。 列への書き足し (値 → 糸の頭の表を引く) は
-//!     名簿の鍵の**外**で済ませる: 名簿の鍵を取る前に列の lock を取って場所を取り ([`Ball::reserve`]、 時刻は未定)、
-//!     名簿の鍵の中では時刻を書き込むだけ。 列の lock は名簿を書き換え終わるまで持つ (読み手は列の lock の下で読むので、
-//!     時刻の未定の差分は見えない)。 sparse の値の名簿の鍵は紐 1 本の write_lock なので、 その中で表を引くと書き手が並ぶ
-//!     (書き手 4 本で書き換え 1 回 +950 ns だった)
+//!     `WIDE` 本の列 (`WideStripe`) の末尾に足し、 溜まったら値の順の run に並べる (`SparseRuns` と同じ LSM の形。 読みは
+//!     run ごとの二分探索と末尾)。 列への書き足しは名簿の鍵の**外**で済ませる: 名簿の鍵を取る前に列の lock を取って場所を取り
+//!     ([`Ball::reserve`]、 時刻は未定)、 名簿の鍵の中では時刻を書き込むだけ。 列の lock は名簿を書き換え終わるまで持つ
+//!     (読み手は列の lock の下で読むので、 時刻の未定の差分は見えない)。 sparse の値の名簿の鍵は紐 1 本の write_lock なので、
+//!     その中で列を触ると書き手が並ぶ (書き手 4 本で書き換え 1 回 +950 ns だった)
 //!
 //! 同じ値の書き直しは球を回さない (面も差分も足さない)。 外す (untie / delete) は今の面を閉じ、 「出た」 を書く。
 //!
@@ -29,7 +29,8 @@
 //! 取った中で、 名簿と列を書き換える**前に** [`Ball::note`] が時刻を取って帳面に書き足す (len を Release)。 鍵を離した後、
 //! 行の lock の下で [`Ball::turn`] が球を回す。 同じ値に触る書き手は、 その値が配列の中ならその値の鍵、 sparse なら write_lock
 //! を必ず持ち、 配列を伸ばす書き手は write_lock と全部の鍵を持つので、 同じ値の帳面の書き手は 1 本ずつ並ぶ (帳面の並び = 時刻の順)。
-//! 大きい値の列は、 同じ値の書き手が列の lock を場所を取ってから時刻を書くまで持つので、 糸の並び = 時刻の順。 鍵の順は
+//! 大きい値の列は、 同じ球の書き手が行の lock で並び、 列の lock を場所を取ってから時刻を書くまで持つので、 足した順 (run の中の
+//! 同じ値の並び) は同じ球の中では時刻の順 (違う球の間は問わない: 当てる時に決めるのは球ごとの最初 / 最後の差分)。 鍵の順は
 //! 列の lock (番号の小さい方から) → 名簿の鍵。
 //! 宣言 ([`Balls::declare`]) は円柱を先に組む (組んでいない紐の書き手は鍵を取らない。 組んだ印は戻らない)。
 //!
@@ -590,67 +591,97 @@ impl Drop for DiffLog {
 /// 大きい値の差分の、 時刻の未定の印 (列の lock を持つ書き手の外には見えない)。
 const PENDING: u64 = u64::MAX;
 
-/// 大きい値の差分 1 つ (16 B)。 `link` = 同じ値の 1 つ前の差分の場所 + 1 (0 = 最初) << 1 | 入った。
+/// 大きい値の差分 1 つ (24 B)。 `into` = 入った (1) / 出た (0)。
 #[derive(Clone, Copy)]
 struct WideDiff {
+    v: u64,
     t: u64,
     eid: u32,
-    link: u32,
+    into: u32,
 }
 
-/// 大きい値の差分の列 1 本 (値の下位 bit で選ぶ)。 値ごとの帳面の代わりに、 全部の値の差分を 1 本に足して値ごとの糸でつなぐ。
+/// 大きい値の差分の末尾が何件で run にするか。 読みは末尾をなめるので小さく保つ。
+const WIDE_TAIL: usize = 256;
+/// 大きい値の差分の run の大きさの比 (`SparseRuns` と同じ)。
+const WIDE_FANOUT: usize = 4;
+
+/// 大きい値の差分の列 1 本 (値の下位 bit で選ぶ)。 値ごとの帳面の代わりに、 全部の値の差分を値の順の run に置く: 書き手は末尾
+/// (`tail`) に足すだけで、 `WIDE_TAIL` 件溜まったら値で安定に並べて run にする。 run は大きい (古い) 順で、 足した run の
+/// `WIDE_FANOUT` 倍より小さい末尾の run とは併合を繰り返す (同じ値は古い run を先に)。 同じ球の書き手は行の lock で並び、 列の
+/// lock の下で足すので、 足した順は同じ球の中では時刻の順 = run の中の同じ値の並びも同じ球の中では時刻の順 (読みが要るのは
+/// 球ごとの順だけ、 [`apply`])。 16 回目: 前は値 → 糸の頭の `BTreeMap` を引いて同じ値の糸でつないでいた。 値の種類の多い列は
+/// 書き換えのたびに新しい鍵を足すので表が伸び続け、 書き換え 1 回に約 285 ns (値の種類とともに伸びる) かかっていた。
 #[derive(Default)]
 struct WideStripe {
-    /// 値 → その値の最後の差分の場所 + 1。
-    heads: BTreeMap<u64, u32>,
-    diffs: Vec<WideDiff>,
+    runs: Vec<Vec<WideDiff>>,
+    tail: Vec<WideDiff>,
 }
 
 impl WideStripe {
-    /// 値 `v` の糸の先に足す。 返り値は足す前の糸の頭 (取り消す時に戻す)。
-    fn push(&mut self, v: u64, d: Diff) -> u32 {
-        let i = self.diffs.len();
-        assert!(i < (1 << 31) - 1, "ball: 大きい値の差分の列が一杯 (試作)");
-        let head = self.heads.entry(v).or_insert(0);
-        let prev = *head;
-        self.diffs.push(WideDiff { t: d.t, eid: d.eid, link: prev << 1 | d.into });
-        *head = i as u32 + 1;
-        prev
-    }
-
-    /// 最後に足した値 `v` の差分を取り消す (`push` の返り値を `prev` に)。
-    fn pop(&mut self, v: u64, prev: u32) {
-        self.diffs.pop();
-        if prev == 0 {
-            self.heads.remove(&v);
-        } else {
-            self.heads.insert(v, prev);
+    /// 末尾が一杯なら run にする。 列の lock を取った直後 (時刻の未定の差分が無い時) に呼ぶ。
+    fn make_room(&mut self) {
+        if self.tail.len() < WIDE_TAIL {
+            return;
         }
+        let mut run = std::mem::replace(&mut self.tail, Vec::with_capacity(WIDE_TAIL));
+        run.sort_by_key(|d| d.v);
+        while self.runs.last().is_some_and(|r| r.len() < run.len() * WIDE_FANOUT) {
+            let older = self.runs.pop().unwrap();
+            run = merge_wide(&older, &run);
+        }
+        self.runs.push(run);
     }
 
-    /// 値 `v` の t より後の差分を時刻の順に。
+    /// 末尾に足す。 返り値は末尾の中の場所 (時刻を書く / 取り消す)。
+    fn push(&mut self, d: WideDiff) -> usize {
+        self.tail.push(d);
+        self.tail.len() - 1
+    }
+
+    /// 値 `v` の t より後の差分を、 球ごとに時刻の順に (古い run → 新しい run → 末尾)。
     fn after(&self, v: u64, t: u64) -> TailBuf {
         let mut out = Vec::new();
-        let mut at = self.heads.get(&v).copied().unwrap_or(0);
-        while at != 0 {
-            let d = self.diffs[at as usize - 1];
-            if d.t <= t {
-                break;
-            }
-            out.push((d.eid, d.link & 1 == 1));
-            at = d.link >> 1;
+        let hit = |d: &&WideDiff| d.t > t;
+        for r in &self.runs {
+            let a = r.partition_point(|d| d.v < v);
+            out.extend(r[a..].iter().take_while(|d| d.v == v).filter(hit).map(|d| (d.eid, d.into == 1)));
         }
-        TailBuf::new(out.into_iter().rev())
+        out.extend(self.tail.iter().filter(|d| d.v == v).filter(hit).map(|d| (d.eid, d.into == 1)));
+        TailBuf::new(out)
+    }
+
+    fn len(&self) -> usize {
+        self.runs.iter().map(Vec::len).sum::<usize>() + self.tail.len()
+    }
+
+    fn bytes(&self) -> usize {
+        (self.runs.iter().map(Vec::capacity).sum::<usize>() + self.tail.capacity()) * std::mem::size_of::<WideDiff>()
     }
 }
 
-/// [`Ball::reserve`] で取った場所 1 つ: (`held` の添字, 列の中の場所, 値, 足す前の糸の頭, 糸の 1 つ前の差分の時刻 (無ければ 0))。
+/// 値で並んだ run 2 本を併合する (同じ値は `older` を先に)。
+fn merge_wide(older: &[WideDiff], newer: &[WideDiff]) -> Vec<WideDiff> {
+    let mut out = Vec::with_capacity(older.len() + newer.len());
+    let (mut i, mut j) = (0, 0);
+    while i < older.len() && j < newer.len() {
+        if older[i].v <= newer[j].v {
+            out.push(older[i]);
+            i += 1;
+        } else {
+            out.push(newer[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&older[i..]);
+    out.extend_from_slice(&newer[j..]);
+    out
+}
+
+/// [`Ball::reserve`] で取った場所 1 つ: (`held` の添字, 列の末尾の中の場所, 値)。
 struct Slot {
     held: usize,
     at: usize,
     v: u64,
-    prev: u32,
-    prev_t: u64,
 }
 
 /// 書き換え 1 回の帳面の仕事: 大きい値の差分の、 取った場所と列の lock (`slots` は [古い値 (出た), 新しい値 (入った)])、 と
@@ -672,7 +703,7 @@ impl Reserved<'_> {
     fn fill(&mut self, i: usize, v: u64, ts: u64) {
         let s = self.slots[i].as_ref().expect("ball: 大きい値の場所は名簿の鍵の前に取ってある");
         debug_assert_eq!(s.v, v);
-        self.held[s.held].as_mut().unwrap().1.diffs[s.at].t = ts;
+        self.held[s.held].as_mut().unwrap().1.tail[s.at].t = ts;
     }
 }
 
@@ -684,8 +715,8 @@ impl Drop for Reserved<'_> {
         // 書かなかった (同じ値 / 書けなかった): 足した順の逆に取り消す
         for s in self.slots.iter().rev().flatten() {
             let g = &mut self.held[s.held].as_mut().unwrap().1;
-            debug_assert_eq!(g.diffs.len(), s.at + 1);
-            g.pop(s.v, s.prev);
+            debug_assert_eq!(g.tail.len(), s.at + 1);
+            g.tail.pop();
         }
     }
 }
@@ -768,17 +799,16 @@ impl Ball {
         ks.sort_unstable();
         ks.dedup();
         for (h, &k) in ks.iter().enumerate() {
-            r.held[h] = Some((k, self.wide[k].lock().unwrap_or_else(|e| e.into_inner())));
+            let mut g = self.wide[k].lock().unwrap_or_else(|e| e.into_inner());
+            // 一杯なら先に run にする (この後に足す差分は時刻が未定で、 並べられない)
+            g.make_room();
+            r.held[h] = Some((k, g));
         }
         for (i, v) in vs.into_iter().enumerate() {
             let Some(v) = v else { continue };
             let h = ks.iter().position(|&k| k == v as usize % WIDE).unwrap();
-            let g = &mut r.held[h].as_mut().unwrap().1;
-            let at = g.diffs.len();
-            let prev = g.push(v, Diff { t: PENDING, eid, into: i as u32 });
-            // 糸の 1 つ前の差分の時刻 (この差分の時刻はこれより後にする)。 名簿の鍵の外で読んでおく (古い差分は cache の外)
-            let prev_t = if prev == 0 { 0 } else { g.diffs[prev as usize - 1].t };
-            r.slots[i] = Some(Slot { held: h, at, v, prev, prev_t });
+            let at = r.held[h].as_mut().unwrap().1.push(WideDiff { v, t: PENDING, eid, into: i as u32 });
+            r.slots[i] = Some(Slot { held: h, at, v });
         }
         r
     }
@@ -794,15 +824,12 @@ impl Ball {
         }
         // 時刻: HLC (無ければ数え口)。 HLC は名簿の鍵より前に決まるので、 同じ値に書く 2 人の HLC の順と鍵の順はずれうる。
         // 古い値と新しい値の名簿の鍵を持っている今、 両方の帳面の最後とこの球の最後の面より後に上げる (帳面の並び = 時刻の順、
-        // 球の面も時刻の順)。 上がるのは同時に書いた書き手の間だけで、 その順は鍵を取った順
+        // 球の面も時刻の順)。 上がるのは同時に書いた書き手の間だけで、 その順は鍵を取った順。 大きい値の差分は値の順の run に
+        // 並べるので、 同じ球の中の順 (球の最後の面より後) だけでよい
         let (base, from_hlc) = clock.base(hlc);
         let mut floor = self.last_time(eid);
-        for (i, v) in [old, new].into_iter().enumerate() {
-            match v {
-                Some(v) if v < LOG_DENSE => floor = floor.max(self.logs.get(v as u32).and_then(|l| l.get()).map_or(0, |l| l.last_t(guard))),
-                Some(_) => floor = floor.max(wide.slots[i].as_ref().map_or(0, |s| s.prev_t)),
-                None => {}
-            }
+        for v in [old, new].into_iter().flatten().filter(|&v| v < LOG_DENSE) {
+            floor = floor.max(self.logs.get(v as u32).and_then(|l| l.get()).map_or(0, |l| l.last_t(guard)));
         }
         let ts = base.max(floor + 1);
         if from_hlc || ts != base {
@@ -1041,19 +1068,37 @@ impl Ball {
                 ok &= l.read(&guard, |ts, _, _| ts.windows(2).all(|w| w[0] < w[1]));
             }
         });
+        // 大きい値の差分: run は値の順、 同じ (値, 球) は足した順 (古い run → 新しい run → 末尾) に時刻の順
         for w in self.wide.iter() {
             let w = w.lock().unwrap_or_else(|e| e.into_inner());
-            for &head in w.heads.values() {
-                let (mut at, mut next_t) = (head, u64::MAX);
-                while at != 0 {
-                    let d = w.diffs[at as usize - 1];
-                    ok &= d.t < next_t;
-                    next_t = d.t;
-                    at = d.link >> 1;
-                }
+            let mut last: BTreeMap<(u64, u32), u64> = BTreeMap::new();
+            for r in &w.runs {
+                ok &= r.windows(2).all(|p| p[0].v <= p[1].v);
+            }
+            let mut seq: Vec<&WideDiff> = Vec::new();
+            for r in &w.runs {
+                seq.extend(r.iter());
+            }
+            // run の中は値の順に並べ替えてあるので、 (値, 球) ごとに見れば足した順
+            for d in seq.into_iter().chain(w.tail.iter()) {
+                let prev = last.insert((d.v, d.eid), d.t);
+                ok &= prev.is_none_or(|p| p < d.t);
             }
         }
         ok
+    }
+
+    /// 大きい値の列ごとの (run の大きさ, 末尾の数)。 試験用。
+    #[cfg(test)]
+    fn wide_shape(&self) -> Vec<(Vec<usize>, usize)> {
+        self.wide
+            .iter()
+            .map(|w| {
+                let w = w.lock().unwrap_or_else(|e| e.into_inner());
+                (w.runs.iter().map(Vec::len).collect::<Vec<_>>(), w.tail.len())
+            })
+            .filter(|(r, t)| !r.is_empty() || *t > 0)
+            .collect()
     }
 
     /// 帳面の控えの数: (登録した数, 作り終えた数)。 書き手が返った後は同じ (登録した書き手が鍵を離した後で作る)。
@@ -1076,10 +1121,10 @@ impl Ball {
         let guard = epoch::pin();
         let mut n = 0u64;
         self.logs.for_each(|l| n += l.get().map_or(0, |l| l.len(&guard) as u64));
-        n + self.wide.iter().map(|w| w.lock().unwrap_or_else(|e| e.into_inner()).diffs.len() as u64).sum::<u64>()
+        n + self.wide.iter().map(|w| w.lock().unwrap_or_else(|e| e.into_inner()).len() as u64).sum::<u64>()
     }
 
-    /// 取った大きさ (byte、 塊の表は除く。 大きい値の表は 1 つ 24 B と見積もる)。
+    /// 取った大きさ (byte、 塊の表は除く)。
     pub fn bytes(&self) -> usize {
         let guard = epoch::pin();
         let mut logs = 0usize;
@@ -1087,10 +1132,7 @@ impl Ball {
         let wide: usize = self
             .wide
             .iter()
-            .map(|w| {
-                let w = w.lock().unwrap_or_else(|e| e.into_inner());
-                w.diffs.capacity() * std::mem::size_of::<WideDiff>() + w.heads.len() * 24
-            })
+            .map(|w| w.lock().unwrap_or_else(|e| e.into_inner()).bytes())
             .sum();
         self.faces.allocated() * CHUNK * std::mem::size_of::<Face>()
             + self.heads.allocated() * CHUNK * 8
@@ -1557,8 +1599,9 @@ mod tests {
         );
     }
 
-    /// 大きい値の差分は値ごとの帳面でなく列 1 本に足し、 同じ値の糸でつなぐ。 同じ列に落ちる値 (下位 bit が同じ) が
-    /// 交互に書かれても、 値ごとの答えは混ざらない。
+    /// 大きい値の差分は値ごとの帳面でなく列 1 本の末尾に足し、 溜まったら値の順の run に並べて併合する。 同じ列に落ちる値 (下位
+    /// bit が同じ) が交互に書かれても、 末尾と run と併合した run にまたがっても、 値ごとの答えは混ざらない (16 回目に run の形に
+    /// して、 回数を run にする所と併合を踏む数に増やした)。
     #[test]
     fn wide_values_sharing_a_stripe_keep_their_own_threads() {
         let mut x = T::new();
@@ -1566,7 +1609,7 @@ mod tests {
         let vals: Vec<u64> = (0..4).map(|k| (1u64 << 30) + k * WIDE as u64).collect(); // 全部同じ列
         let mut log: Vec<(u64, BTreeMap<u32, u64>)> = vec![(0, BTreeMap::new())];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
-        for _ in 0..400 {
+        for _ in 0..3000 {
             r ^= r << 13;
             r ^= r >> 7;
             r ^= r << 17;
@@ -1578,6 +1621,11 @@ mod tests {
             let snap: BTreeMap<u32, u64> = x.cur.iter().map(|(&(_, e), &v)| (e, v)).collect();
             log.push((x.b.now(), snap));
         }
+        let shape = x.b.get(0).unwrap().wide_shape();
+        assert!(shape.iter().any(|(runs, _)| runs.len() >= 2), "試験の前提: run が 2 本以上 {shape:?}");
+        assert!(shape.iter().any(|(runs, _)| runs.iter().any(|&n| n > WIDE_TAIL)), "試験の前提: 併合した run がある {shape:?}");
+        assert!(shape.iter().any(|&(_, tail)| tail > 0), "試験の前提: 末尾にも差分がある {shape:?}");
+        assert!(x.b.get(0).unwrap().ledgers_in_time_order());
         for (t, snap) in &log {
             for &v in &vals {
                 let want: Vec<u32> = snap.iter().filter(|&(_, &x)| x == v).map(|(&e, _)| e).collect();
@@ -1878,7 +1926,8 @@ mod tests {
     }
 
     /// 時刻を HLC (名簿の鍵の前に決まる) から取る時: HLC の小さい書き手が後から鍵を取ったら、 帳面の最後の後に上げる (帳面は時刻の
-    /// 順)。 古い HLC で届いた外す / 書き換えは、 その球の前の面の後に上げる (球の面も時刻の順)。 上げない時は HLC のまま。
+    /// 順)。 古い HLC で届いた外す / 書き換えは、 その球の前の面の後に上げる (球の面も時刻の順)。 上げない時は HLC のまま。 大きい値は
+    /// 値の順の run に並べるので、 同じ値の他の球の差分より前の時刻でも上げない (16 回目まで、 糸の 1 つ前の差分の後に上げていた)。
     #[test]
     fn hlc_times_are_raised_to_keep_ledgers_and_balls_in_order() {
         let mut x = T::new();
@@ -1892,7 +1941,7 @@ mod tests {
         assert_eq!(x.put_at(0, 3, None, 250), 301, "球の最後の面 (300) の後に上げる");
         // 大きい値: e4 が HLC 500、 e5 が HLC 400 で同じ値に
         assert_eq!(x.put_at(0, 4, Some(big), 500), 500);
-        assert_eq!(x.put_at(0, 5, Some(big), 400), 501, "大きい値の糸の 1 つ前 (500) の後に上げる");
+        assert_eq!(x.put_at(0, 5, Some(big), 400), 400, "大きい値は他の球の差分の後に上げない");
         // 球だけが知っている時刻: e6 を値 4 に (600)、 外す (610)、 まだ誰も居ない値 5 に古い HLC 605 で。 値 5 の帳面は空なので、
         // 球の最後の面の外れた時刻 (610) の後に上げる
         assert_eq!(x.put_at(0, 6, Some(4), 600), 600);
@@ -1905,8 +1954,10 @@ mod tests {
         assert_eq!(ball.value_at(1, 200), None);
         assert_eq!(ball.value_at(1, 201), Some(1));
         assert_eq!(ball.faces_of(3), vec![FaceView { value: 2, from: 300, to: 301 }]);
-        assert_eq!(x.pull_at(0, big, 500), vec![4]);
-        assert_eq!(x.pull_at(0, big, 501), vec![4, 5]);
+        assert_eq!(x.pull_at(0, big, 399), Vec::<u32>::new());
+        assert_eq!(x.pull_at(0, big, 400), vec![5]);
+        assert_eq!(x.pull_at(0, big, 499), vec![5]);
+        assert_eq!(x.pull_at(0, big, 500), vec![4, 5]);
         assert_eq!(
             ball.faces_of(6),
             vec![FaceView { value: 4, from: 600, to: 610 }, FaceView { value: 5, from: 611, to: OPEN }]
