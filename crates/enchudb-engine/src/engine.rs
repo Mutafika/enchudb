@@ -86,6 +86,8 @@ pub struct BallRebuildStats {
     pub side_ops: u64,
     /// WAL を読む間に畳んだので (周が変わったので) 読んだ分を捨てて読み直した回数。
     pub refolds: u64,
+    /// そのうち、 読み始めた所が 「頭から」 (周 0 = その場で畳んだ後) で、 組を置いた後に畳んでいたので読み直した回数 (16 回目、 試験の前提を数える)。
+    pub head_refolds: u64,
     /// 記録の残りを書き手と並んで読んで当てた時間。
     pub log_ns: u64,
     /// その後に写した分と WAL の残りを当てた時間。
@@ -147,6 +149,8 @@ struct BallReplay<'a> {
     side_ops: u64,
     /// WAL を読む間に畳んだので読み直した回数。
     refolds: u64,
+    /// そのうち 「頭から」 読んで組の後に畳んでいた回数。
+    head_refolds: u64,
     /// 記録を当てた所まで読まずに飛んだ entry の数。
     skipped: u64,
     /// 読んだ数 (記録の entry と WAL の record、 球の紐に当たらない物も)。 追いつきが縮んだかをこれで見る。
@@ -375,6 +379,7 @@ impl BallReplay<'_> {
                 // 当てずに捨てて、 記録から読み直す
                 self.wal_mark = None;
                 self.refolds += 1;
+                self.head_refolds += u64::from(first == 0 && start_gone);
                 std::thread::yield_now();
                 continue;
             }
@@ -18965,6 +18970,7 @@ impl Engine {
             applied: 0,
             side_ops: 0,
             refolds: 0,
+            head_refolds: 0,
             prof: [0; 7],
             prof_n: [0; 4],
             skipped: 0,
@@ -19035,8 +19041,8 @@ impl Engine {
         // (4) H より前の残り
         rp.catch_up(log, wal, &mut pos, Some(h));
         // (5) 出す
-        let (records, applied, side_ops, refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead, rp_crossed) =
-            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead, rp.crossed);
+        let (records, applied, side_ops, refolds, head_refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead, rp_crossed) =
+            (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.head_refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead, rp.crossed);
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
         // 公開中 = この紐の書き手が待つ間 (出した所まで)。 組む間の控えを手放す (`end_side`) のは書き手が動き出した後 (16 回目: 控えが大きいと
         // 手放すのに 0.9 ms、 前は公開中に数えていた)
@@ -19047,6 +19053,7 @@ impl Engine {
             applied,
             side_ops,
             refolds,
+            head_refolds,
             log_ns,
             catch_ns,
             publish_ns,

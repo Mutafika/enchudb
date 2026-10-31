@@ -420,6 +420,7 @@ fn a_build_reads_on_while_the_wal_folds() {
         assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         folded += usize::from(ss.folds > 0);
         refolds += usize::from(ss.st.refolds > 0);
+        eprintln!("probe16 t4 session {k}: folds {} refolds {} head_refolds {}", ss.folds, ss.st.refolds, ss.st.head_refolds);
     }
     assert!(folded >= 2, "組む間に WAL を畳んでいない — 試験の前提 ({folded}/3)");
     assert!(refolds >= 2, "WAL を読む間に畳んでいない — 試験の前提 ({refolds}/3)");
