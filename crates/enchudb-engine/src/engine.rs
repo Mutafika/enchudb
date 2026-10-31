@@ -2110,6 +2110,10 @@ mod fold_copy_tests {
         while !got.0.lock().unwrap().contains(&MARK) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
+        // 空け作りは畳んで listener を起こしてから回数を足す。 MARK が届いた後も回数が増えるまで待つ (#684)
+        while eng.wal_room_folds() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(eng.wal_room_folds() > 0, "前提: 空け作りで畳んだ");
         assert!(got.0.lock().unwrap().contains(&MARK), "畳んだ区画の閉じていない末尾が listener に届かない");
         drop(eng);
