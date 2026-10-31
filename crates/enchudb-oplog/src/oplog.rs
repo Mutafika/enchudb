@@ -3227,7 +3227,8 @@ impl OpLog {
 
     /// changefeed の記録 (engine の `changefeed.seg`) 用: `start` から読んで、 (record, その終端 offset) と読み終えた offset を返す。
     /// `with_tail` が false なら `limit` (書き出し済みの位置 = checkpoint) までに Commit で閉じた group だけ。 true なら `limit`
-    /// (畳む区画の終わり) までの record を閉じていない末尾も含めて全部 (畳む直前に呼ぶ。 `limit` より先は読まない、 #662)。 読むだけ。
+    /// (畳む区画の終わり) までの record を閉じていない末尾も含めて全部 (畳む直前に呼ぶ。 #662)。 どちらも `limit` より先は読まない (#678)。
+    /// 読むだけ。
     pub fn scan_for_change_log(&self, start: u64, limit: u64, with_tail: bool) -> (Vec<(Record, u64)>, u64) {
         if with_tail {
             let s = self.scan_range(start, limit);
@@ -3236,7 +3237,9 @@ impl OpLog {
             out.extend(s.tail);
             return (out, end);
         }
-        let s = self.scan_from_offset(start);
+        // #678: 前は head まで全部を解いてから `limit` で切った。 畳む前の 2 回目の写しは cursor がもう checkpoint にあり、 書き手が
+        // 今の区画に積んだ分 (WAL 64 MiB で約 25 万件) を解いて 0 件を返していた (1 回 10 ms ほど、 その間 書き手は古い区画が畳まれるのを待つ)
+        let s = self.scan_range(start, limit);
         let end = s.commit_ends.iter().rev().find(|&&c| c <= limit).copied().unwrap_or(start);
         (s.out.into_iter().filter(|(_, e)| *e <= end).collect(), end)
     }
@@ -5658,6 +5661,56 @@ mod tests {
         let (head_part, end) = wal.scan_for_change_log(HEADER_SIZE as u64, mid, true);
         assert_eq!(end, mid);
         assert_eq!(tie_values(&strip(head_part)), old[..=k / 2].to_vec(), "上限の位置から始まる record を読んだ");
+    }
+
+    /// #678: 書き出した所までの写し (`scan_for_change_log(.., with_tail = false)`) も `limit` より先を読まない。 返す物は先まで読んでも
+    /// 同じ (`limit` までに閉じた group) なので、 `limit` の先に 「読み飛ばしてよい知らない op」 の record を置き、 読んだら増える
+    /// `skipped_ops` で見る。
+    #[test]
+    fn copies_of_written_records_stop_at_the_limit() {
+        let p = tmp("written-limit");
+        let limit = {
+            let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 9 }).unwrap();
+            wal.append(Op::Commit).unwrap();
+            let limit = wal.head();
+            for eid in 2..=3u64 {
+                wal.append(Op::Tie { eid, himo_id: 0, value: 9 }).unwrap();
+            }
+            wal.append(Op::Commit).unwrap();
+            limit
+        };
+        // limit の直後の record (eid 2) の op の種類を 「読み飛ばしてよい知らない op」 に書き換えて CRC を付け直す
+        let mut bytes = std::fs::read(&p).unwrap();
+        let at = wal_pos_offset(limit) as usize;
+        let h = &bytes[at..at + REC_HEADER_SIZE];
+        let rd8 = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
+        let rd4 = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+        let (len, lsn, author) = (rd4(OFF_LEN), rd8(OFF_LSN), rd4(OFF_AUTHOR_PEER));
+        let hlc = Hlc { wall: rd8(OFF_HLC_WALL), logical: rd4(OFF_HLC_LOGICAL), peer: rd4(OFF_HLC_PEER) };
+        let payload = bytes[at + REC_HEADER_SIZE..at + REC_HEADER_SIZE + len as usize].to_vec();
+        let op_byte = op_type::SKIPPABLE | 0x7f;
+        let crc = new_record_crc(op_byte, len, lsn, hlc, author, &payload);
+        bytes[at + OFF_OP] = op_byte;
+        bytes[at + OFF_CRC..at + OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+
+        let wal = OpLog::open(&p).unwrap();
+        let eids = |r: Vec<(Record, u64)>| {
+            r.into_iter()
+                .map(|(r, _)| match r.op {
+                    DecodedOp::Tie { eid, .. } => eid,
+                    o => panic!("Tie 以外が出た: {o:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let (got, end) = wal.scan_for_change_log(HEADER_SIZE as u64, limit, false);
+        assert_eq!((eids(got), end), (vec![1], limit), "limit までに閉じた group");
+        assert_eq!(wal.skipped_ops(), 0, "limit より先の record を読んだ");
+        let (all, _) = wal.scan_for_change_log(HEADER_SIZE as u64, u64::MAX, false);
+        assert_eq!(eids(all), vec![1, 3], "前提: 上限なしなら書き換えた record を読み飛ばして後ろまで読む");
+        assert_eq!(wal.skipped_ops(), 1, "前提: 書き換えた record を読むと数える");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// 今の区画が埋まると、 開いている group を閉じてもう一方の区画へ移る (周は新しい数)。 2 つの区画を積んだ順に読む。 古い区画
