@@ -576,8 +576,20 @@ struct EntryHeader {
     wal_id: u64,
 }
 
-/// 並べて crc を取る回の大きさの下限 (entry の数)。
+/// 並べて crc / 印を取る回の大きさの下限 (entry の数)。
 const PAR_CRC_MIN: usize = 4096;
+
+/// WAL の record の印 (`wal_id` = `bytes` の返す署名の範囲の FNV)。 大きな回は rayon で並べる (#683: 書き手が速いと記録への写しが
+/// 追いつかず、 区画を埋めるたびに書き手が待った。 印と符号化の段が 1 件 54 → 37 ns)。 並べるのは印だけで、 entry の bytes は
+/// 写す thread で作る。
+pub(crate) fn wal_ids<T: Sync>(recs: &[T], bytes: impl Fn(&T) -> &[u8] + Sync) -> Vec<u64> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if recs.len() >= PAR_CRC_MIN {
+        use rayon::prelude::*;
+        return recs.par_iter().map(|r| fnv1a64(bytes(r))).collect();
+    }
+    recs.iter().map(|r| fnv1a64(bytes(r))).collect()
+}
 
 /// `first` 番から並ぶ entry の crc。 大きな回は rayon で並べる (#667: FNV は 1 byte ずつの掛け算の連鎖で、 1 件 (約 200 B) に約
 /// 0.25 µs かかり、 記録に写す時間の 4 割ほどだった。 1 件ごとに独立)。
