@@ -178,6 +178,7 @@ fn concurrent_session(
     mark_pause_us: u64,
     cross_wait_us: u64,
     head_wait_us: u64,
+    refold_wait: (u64, u64),
 ) -> Session {
     let db = Database::open_with_oplog(path, wal).unwrap();
     let eng = db.engine();
@@ -192,6 +193,7 @@ fn concurrent_session(
     eng.ball_set_scan_pause(scan_pause_us);
     eng.ball_set_mark_pause(mark_pause_us);
     eng.ball_set_cross_wait(cross_wait_us);
+    eng.ball_set_refold_wait(refold_wait.0, refold_wait.1);
     assert!(eng.ball_rebuild_stats().is_none(), "開くだけでは組まない");
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let bar = Barrier::new(TH + 1);
@@ -338,7 +340,7 @@ fn the_first_read_builds_while_writers_write() {
     let (mut overlapped, mut waits, mut covered) = (0, 0, 0);
     for k in 0..9u64 {
         let pp = [(2000, 0), (0, 2000), (0, 0)][k as usize % 3];
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100, false, 0, 0, 0);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3 + k as usize % 5, 4, k % 3, pp, 0, 0x1234 + k, 100, false, 0, 0, 0, (0, 0));
         overlapped += usize::from(ss.during > 0);
         waits += ss.waits;
         covered += ss.covered;
@@ -367,7 +369,7 @@ fn a_build_reads_what_the_log_dropped_from_the_side_notes() {
     let mut h = create(&path, SMALL_WAL, 1 << 20);
     let mut used = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2, false, 0, 0, 0);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x77 + k, 2, false, 0, 0, 0, (0, 0));
         used += usize::from(ss.st.side_ops > 0);
         // 追いつきの間を広げて書き手が全力 = 縮まない: すぐ公開中へ (打ち切らなければ 16 + 2 回。 回の大きさは畳み方で揺れるので幅を持つ)
         assert!(ss.st.rounds <= 8, "縮まない追いつきを回し続けた: {} 回", ss.st.rounds);
@@ -387,7 +389,7 @@ fn a_build_continues_the_wal_where_it_stopped() {
     let mut h = create(&path, WAL, 128 << 20);
     let mut ahead = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3, 4, 150, (0, 0), 0, 0x5555 + k, 100, true, 0, 0, 0);
+        let ss = concurrent_session(&path, WAL, &mut h, 30, 20, 3, 4, 150, (0, 0), 0, 0x5555 + k, 100, true, 0, 0, 0, (0, 0));
         ahead += ss.st.ahead;
     }
     // 踏んだ回の和 (並べて回すと session ごとの数は揺れる)。 0.37 はもう一方の区画を畳んでも同じ区画の続きは続く (畳まないことは前提にしない)
@@ -407,7 +409,7 @@ fn a_build_drops_what_it_already_applied_from_the_side_notes() {
     let mut h = create(&path, WAL, 1 << 20);
     let (mut dups, mut side) = (0, 0);
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true, 2_000_000, 0, 0);
+        let ss = concurrent_session(&path, WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true, 2_000_000, 0, 0, (0, 0));
         dups += usize::from(ss.st.dups > 0);
         side += usize::from(ss.st.side_ops > 0);
     }
@@ -427,7 +429,7 @@ fn a_build_reads_on_across_wal_halves() {
     let mut h = create(&path, MID_WAL, 128 << 20);
     let mut crossed = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, MID_WAL, &mut h, 30, 20, 3, 4, 40, (0, 0), 0, 0x6666 + k, 100, true, 0, 1_000_000, 0);
+        let ss = concurrent_session(&path, MID_WAL, &mut h, 30, 20, 3, 4, 40, (0, 0), 0, 0x6666 + k, 100, true, 0, 1_000_000, 0, (0, 0));
         crossed += ss.st.crossed;
     }
     // 踏んだ回の和 (並べて回すと session ごとの数は揺れる)
@@ -449,7 +451,7 @@ fn a_build_reads_on_while_the_wal_folds() {
     for k in 0..3u64 {
         // WAL の位置を取った後・読む前に、 読み始める所の区画が畳まれるまで最大 200 ms 待つ (畳むと、 読む所が新しい周の途中になる。
         // 15 回目まで 20 ms 止まる形で、 並べて回すと 16 回中 2 回その間に畳まなかった)
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 200_000, 0x99 + k, 100, false, 0, 0, 0);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 40, (0, 0), 200_000, 0x99 + k, 100, false, 0, 0, 0, (0, 0));
         assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         folded += usize::from(ss.folds > 0);
         refolds += usize::from(ss.st.refolds > 0);
@@ -476,7 +478,7 @@ fn a_build_from_an_empty_wal_rereads_when_it_folds() {
     let mut h = create(&path, SMALL_WAL, 256 << 20);
     let (mut emptied, mut waited, mut heads) = (0, 0, 0);
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 0, (0, 0), 500_000, 0xAA + k, 100, false, 0, 0, 2_000_000);
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 0, (0, 0), 500_000, 0xAA + k, 100, false, 0, 0, 2_000_000, (0, 0));
         assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
         emptied += usize::from(ss.emptied);
         waited += usize::from(ss.head_waited);
@@ -484,6 +486,30 @@ fn a_build_from_an_empty_wal_rereads_when_it_folds() {
     }
     assert!(emptied >= 2 && waited >= 2, "WAL が空になった後に頭から組んでいない — 試験の前提 (空 {emptied}/3、 頭から {waited}/3)");
     assert!(heads >= 2, "頭からの位置で組の後に畳んでいない — 試験の前提 ({heads}/3)");
+    let db = Database::open_with_oplog(&path, SMALL_WAL).unwrap();
+    assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
+    drop(db);
+    cleanup(&path);
+}
+
+/// (T9) 追いつきの読み直しに上限 (18 回目、 WAL 1 MiB = 区画 512 KiB、 記録 256 MiB = 捨てない): 試験の口 (`ball_set_refold_wait`) で、
+/// 組みの最初の 6 回の読みは読み始める所の区画が畳まれるまで (最大 1 秒) 待つ = change_emit を持たずに読む回は毎回読み直しになる。
+/// 3 回続いた後の回は change_emit を持って読むので畳まれず (待ち切ってから読む)、 その回で返る: 1 回の追いつきで続いた読み直しは
+/// ちょうど 3 回 (3 未満は試験の口が読み直しにしていない = 前提)、 持って読んだ回は 1 回以上。 面の数まで合う。 持たずに読み直し続ける
+/// 形は、 書き手が区画を埋めて畳まれるのが区画を読むより速いと終わらない (17 回目の T7、 merge の後に 4 回中 2 回)。
+#[test]
+fn a_build_reads_holding_the_copy_lock_after_three_refolds() {
+    let path = tmp_path("t9");
+    cleanup(&path);
+    let _gone = Gone(path.clone());
+    const SMALL_WAL: usize = 1 << 20;
+    let mut h = create(&path, SMALL_WAL, 256 << 20);
+    for k in 0..3u64 {
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 0, (0, 0), 0, 0xBB + k, 100, false, 0, 0, 0, (1_000_000, 6));
+        assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
+        assert_eq!(ss.st.refold_run_max, 3, "1 回の追いつきで続いた読み直し (session {k}): {:?}", ss.st);
+        assert!(ss.st.held_reads >= 1, "change_emit を持って読んでいない (session {k})");
+    }
     let db = Database::open_with_oplog(&path, SMALL_WAL).unwrap();
     assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
     drop(db);
