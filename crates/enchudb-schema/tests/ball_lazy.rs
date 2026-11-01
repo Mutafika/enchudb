@@ -657,14 +657,15 @@ fn a_build_reads_holding_the_copy_lock_after_three_refolds() {
 }
 
 /// (T10) 頭からを読んで何も無かった次の回 (18 回目、 WAL 64 MiB = 書き手がもう一方の区画へ移らず、 使っていない区画の周は 0。 記録 128 MiB =
-/// 捨てない。 listener なし = 記録に写すのは畳む時だけ): 開き直した後の WAL が空の時に、 組む側が頭から (周 0 の位置) を読んで何も無い。
-/// 次の回の組を取る前に、 書く → 今の区画をその場で畳む (畳む前の record は記録にだけある) → また書く。 頭からの位置を続きにすると
-/// (`OpLog::holds` は周 0 の区画があれば真)、 畳んだ後の区画だけを読んで記録を組の番号まで飛ばす = 畳む前の書き込みを落とす (T5 を 12 本
-/// 並べて 360 本中 4 本)。 書き手はこの thread だけ。 組む側は 1 回目の追いつきが返った後、 次の回の試験の口で最大 3 秒待つ (続きなら
-/// 写す側が先へ進むまで、 記録を読む回なら記録が捨てるまで = 捨てないので待ち切る)。 直した形は、 組を取った後に畳んだのを見て読み直す。
+/// 捨てない。 listener なし = 記録に写すのは畳む時だけ): 組む側の追いつきの前ごとに 3 秒休ませ、 書き手 (この thread) は休みに合わせて書く。
+/// 1 回目の休み: 2000 件書いて今の区画をその場で畳ませる = 1 回目の追いつきは記録から 1024 件以上を読み (縮んでいないので次の回へ続ける)、
+/// WAL は頭から (周 0 の位置) 読んで何も無い。 2 回目の休み: 書く → その場で畳む (畳む前の record は記録にだけある) → また書く。
+/// 頭からの位置を続きにすると (`OpLog::holds` は周 0 の区画があれば真)、 2 回目は畳んだ後の区画だけを読んで記録を組の番号まで飛ばす =
+/// 畳む前の書き込みを落とす (T5 を 12 本並べて 360 本中 4 本)。 直した形は 2 回目に記録を読む。
 #[test]
 fn a_build_does_not_continue_from_the_head_after_a_fold() {
     use enchudb_oplog::oplog::{wal_pos, HEADER_SIZE};
+    const PAUSE_MS: u64 = 3000;
     let path = tmp_path("t10");
     cleanup(&path);
     let _gone = Gone(path.clone());
@@ -682,8 +683,7 @@ fn a_build_does_not_continue_from_the_head_after_a_fold() {
     };
     assert!(until(&|| wal.is_empty(), 3000), "開き直した後に WAL が空にならない — 試験の前提");
     assert!(wal.holds(wal_pos(0, HEADER_SIZE as u64)), "周 0 の区画が無い — 試験の前提 (使っていない区画の周は 0)");
-    eng.ball_set_ahead_wait(3_000_000);
-    eng.ball_set_mark_pause(3_000_000);
+    eng.ball_set_build_pause(PAUSE_MS);
     let e0 = h.eids[0];
     let mut r = Rng(0x7E10);
     let mut write = |h: &mut Hist, n: usize| {
@@ -701,29 +701,34 @@ fn a_build_does_not_continue_from_the_head_after_a_fold() {
         }
         h.checks.push((wal_now(&db), h.cur.clone()));
     };
-    let mut folded = 0;
+    // 書いた後、 consumer が今の区画をその場で畳む (畳む前に記録へ写す) まで待つ
+    let folded_since = |f0: u64| until(&|| wal.folds() > f0 && wal.is_empty(), 2000);
+    // 組む側が休んでいる間に済ませた (次の追いつきは休みの後)
+    let in_pause = |t: std::time::Instant| t.elapsed() < std::time::Duration::from_millis(PAUSE_MS - 200);
     std::thread::scope(|s| {
         let b = s.spawn(|| {
             let _ = eng.ball_value_at(e0, "t.a", 0);
         });
-        assert!(until(&|| eng.ball_catch_up_calls() >= 1, 10_000), "1 回目の追いつきが返らない");
-        let folds0 = wal.folds();
+        assert!(until(&|| eng.ball_build_steps() >= 1, 10_000), "最初の記録の読みが返らない");
+        let t1 = std::time::Instant::now();
+        let f0 = wal.folds();
+        write(&mut h, 2000);
+        assert!(folded_since(f0), "1 回目の休み: 書いた後に今の区画をその場で畳んでいない — 試験の前提");
+        assert!(in_pause(t1), "1 回目の休みの間に書いて畳み終えていない — 試験の前提");
+        assert!(until(&|| eng.ball_build_steps() >= 2, 10_000), "1 回目の追いつきが返らない");
+        let t2 = std::time::Instant::now();
+        let f1 = wal.folds();
         write(&mut h, 200);
-        assert!(until(&|| wal.folds() > folds0 && wal.is_empty(), 3000), "書いた後に今の区画をその場で畳んでいない — 試験の前提");
+        assert!(folded_since(f1), "2 回目の休み: 書いた後に今の区画をその場で畳んでいない — 試験の前提");
         write(&mut h, 50);
-        assert!(eng.ball_rebuild_stats().is_none(), "書き終える前に組み終えた — 試験の前提");
-        folded = wal.folds() - folds0;
-        // 今待っている口は待ち切る。 その後の回は待たない
-        eng.ball_set_ahead_wait(0);
-        eng.ball_set_mark_pause(0);
+        assert!(in_pause(t2), "2 回目の休みの間に書いて畳み終えていない — 試験の前提");
+        eng.ball_set_build_pause(0);
         b.join().unwrap();
     });
-    let st = eng.ball_rebuild_stats().expect("組んだ");
     let trace = eng.ball_rebuild_trace();
-    eprintln!("組む: {st:?}、 畳んだ {folded}、 記録 {trace:#?}");
+    eprintln!("組む: {:?}、 記録 {trace:#?}", eng.ball_rebuild_stats());
     assert!(trace.iter().any(|l| l.contains("start 0x20 end 0x20")), "頭からを読んで何も無い回が無い — 試験の前提: {trace:#?}");
     h.verify(&db, "頭からを読んだ次の回の後");
-    assert!(st.refolds >= 1, "組を取った後に畳んだのを見て読み直していない — 試験の前提: {trace:#?}");
     drop(db);
     cleanup(&path);
 }

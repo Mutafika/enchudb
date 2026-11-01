@@ -1,0 +1,8 @@
+[
+ {
+  "name": "頭から (周 0) の位置も続きにする (直す前の形、 T10 / T5)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "self.wal_mark = (wal_pos_lap(end) != 0).then_some(end);",
+  "replace": "self.wal_mark = Some(end);"
+ }
+]

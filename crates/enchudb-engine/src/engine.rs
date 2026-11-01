@@ -503,7 +503,7 @@ impl BallReplay<'_> {
             // 畳んだ後の区画だけを読んで記録を組の番号まで飛ばす。 次の回は記録を読み、 畳んだかは組を取った後の畳んだ回で見る
             // (18 回目: WAL 64 MiB の T5 を並べて、 何も無い頭からを読んだ次の回に書き込みを落とした)
             self.wal_mark = (wal_pos_lap(end) != 0).then_some(end);
-            self.eng.ball_catch_ups.fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.eng.ball_build_steps.fetch_add(1, std::sync::atomic::Ordering::Release);
             return;
         }
     }
@@ -5601,8 +5601,8 @@ pub struct Engine {
     ball_rebuild_stats: std::sync::Mutex<Option<BallRebuildStats>>,
     /// 最後の球の組み直しの、 追いつきの各回の記録 (試作、 [`Engine::ball_rebuild_trace`])。
     ball_rebuild_trace: std::sync::Mutex<Vec<String>>,
-    /// 球の組み直しの追いつき (`BallReplay::catch_up`) が返った回数 (試作、 試験が組む側の今いる所を知る)。
-    ball_catch_ups: std::sync::atomic::AtomicU64,
+    /// 球の組み直しの段 (最初の記録の読み、 追いつき `BallReplay::catch_up` の 1 回) を終えた回数 (試作、 試験が組む側の今いる所を知る)。
+    ball_build_steps: std::sync::atomic::AtomicU64,
     /// 球を組む人は 1 人ずつ (`build_ball`)。
     ball_build: std::sync::Mutex<()>,
     /// 試験: 組む時、 追いつきの毎回の前に止まる時間 (ms、 書き手が並んで書く間を広げる)。
@@ -6188,7 +6188,7 @@ impl Engine {
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_rebuild_trace: std::sync::Mutex::new(Vec::new()),
-            ball_catch_ups: std::sync::atomic::AtomicU64::new(0),
+            ball_build_steps: std::sync::atomic::AtomicU64::new(0),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
             ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
@@ -7477,7 +7477,7 @@ impl Engine {
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_rebuild_trace: std::sync::Mutex::new(Vec::new()),
-            ball_catch_ups: std::sync::atomic::AtomicU64::new(0),
+            ball_build_steps: std::sync::atomic::AtomicU64::new(0),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
             ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
@@ -19101,6 +19101,7 @@ impl Engine {
         rp.read_log(log, &mut pos, u64::MAX, None);
         let pk = |h: enchudb_oplog::Hlc| crate::ball::pack_hlc(h.wall, h.logical);
         rp.trace.push(format!("記録: 地平 {} 番号 {done}→{pos} 当てた {} last {}", pk(horizon), rp.records, pk(rp.last)));
+        self.ball_build_steps.fetch_add(1, std::sync::atomic::Ordering::Release);
         let log_ns = t_log.elapsed().as_nanos() as u64;
         let w1 = log.wait_stats();
         // 段ごとの数は追いつきの分を別に
@@ -19288,10 +19289,10 @@ impl Engine {
         *self.ball_rebuild_stats.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// 球の組み直しの追いつきが返った回数 (試作、 試験用: 1 回目の追いつきの後・次の回の試験の口で待つ間に書く)。
+    /// 球の組み直しの段 (最初の記録の読み、 追いつきの 1 回) を終えた回数 (試作、 試験用: 組む側が追いつきの前に休む間に書く)。
     #[doc(hidden)]
-    pub fn ball_catch_up_calls(&self) -> u64 {
-        self.ball_catch_ups.load(std::sync::atomic::Ordering::Acquire)
+    pub fn ball_build_steps(&self) -> u64 {
+        self.ball_build_steps.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 最後の球の組み直しの、 記録の読み・追いつきの各回・公開の記録 (試作、 18 回目の答えの食い違いの調べ。 時刻は球の時刻に詰めた HLC)。
