@@ -72,10 +72,17 @@ fn fnv1a(parts: &[&[u8]]) -> u32 {
 
 /// 64 bit の FNV-1a (呼び手が record の印を作るのに使う)。
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_parts(&[bytes])
+}
+
+/// [`fnv1a64`] を、 つなげると 1 つの bytes になる片に。
+fn fnv1a64_parts(parts: &[&[u8]]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    for p in parts {
+        for &b in *p {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
     h
 }
@@ -102,6 +109,69 @@ pub struct NewEntry {
     /// 呼び手の record の印 (開き直した時に探す)。
     pub wal_id: u64,
     pub bytes: Vec<u8>,
+}
+
+/// 足す entry の並び ([`ChangeLog::append_from`])。 `wal_id` / `write` は並べた thread からも呼ぶ。
+pub trait Entries: Sync {
+    fn count(&self) -> usize;
+    fn hlc(&self, i: usize) -> Hlc;
+    /// `i` 件目の bytes の長さ (`write` が足す長さ)。
+    fn bytes_len(&self, i: usize) -> usize;
+    fn wal_id(&self, i: usize) -> u64;
+    /// `i` 件目の bytes を `out` の後ろに足す。
+    fn write(&self, i: usize, out: &mut Vec<u8>);
+}
+
+impl Entries for [NewEntry] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+    fn hlc(&self, i: usize) -> Hlc {
+        self[i].hlc
+    }
+    fn bytes_len(&self, i: usize) -> usize {
+        self[i].bytes.len()
+    }
+    fn wal_id(&self, i: usize) -> u64 {
+        self[i].wal_id
+    }
+    fn write(&self, i: usize, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self[i].bytes);
+    }
+}
+
+/// WAL の record を記録の entry として (#683: record ごとに WireRecord と bytes の Vec を作らず、 写す時に記録の mmap へ直接
+/// 符号化する)。 bytes は [`crate::transport::WireRecord::encode`] と同じ、 印は署名の範囲 (signed_bytes) の [`fnv1a64`]。
+pub(crate) struct WalRecords<'r, 'w> {
+    recs: &'r [(enchudb_oplog::oplog::RecordRef<'w>, u64)],
+    /// bytes の長さ (置き場所を決める間に何度も引くので先に 1 回だけ。 record の並びは大きく、 読み直すと遅い)
+    lens: Vec<u32>,
+}
+
+impl<'r, 'w> WalRecords<'r, 'w> {
+    pub(crate) fn new(recs: &'r [(enchudb_oplog::oplog::RecordRef<'w>, u64)]) -> Self {
+        let lens = recs.iter().map(|(r, _)| crate::transport::wire_len(r.signed_len(), &r.op) as u32).collect();
+        Self { recs, lens }
+    }
+}
+
+impl Entries for WalRecords<'_, '_> {
+    fn count(&self) -> usize {
+        self.recs.len()
+    }
+    fn hlc(&self, i: usize) -> Hlc {
+        self.recs[i].0.hlc
+    }
+    fn bytes_len(&self, i: usize) -> usize {
+        self.lens[i] as usize
+    }
+    fn wal_id(&self, i: usize) -> u64 {
+        fnv1a64_parts(&self.recs[i].0.signed_parts())
+    }
+    fn write(&self, i: usize, out: &mut Vec<u8>) {
+        let r = &self.recs[i].0;
+        crate::transport::encode_wire_into(out, r.hlc, r.author_peer, r.signature(), r.pubkey_fp(), &r.signed_parts(), &r.op);
+    }
 }
 
 /// 読んだ 1 件。
@@ -257,39 +327,44 @@ impl ChangeLog {
     /// 番号を使うだけで残さず、 その前の entry も全部捨てる (読み手はその番号で [`Truncated`] になる)。 途中で書き出しに失敗したら
     /// Err (それまでに足した分は残る、 `range` の `next` で数が判る)。
     pub fn append(&self, recs: &[NewEntry], watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
+        self.append_from(recs, watch, lost)
+    }
+
+    /// [`Self::append`] の entry を [`Entries`] から (bytes は置く場所へ直接書く)。
+    pub fn append_from<E: Entries + ?Sized>(&self, recs: &E, watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
         let mut st = self.st.lock().unwrap();
         let mut i = 0;
-        while i < recs.len() {
-            if recs[i].bytes.len() > self.max_entry() {
-                self.skip_one(&mut st, &recs[i], watch, lost)?;
+        while i < recs.count() {
+            if recs.bytes_len(i) > self.max_entry() {
+                self.skip_one(&mut st, (recs.hlc(i), recs.wal_id(i)), watch, lost)?;
                 i += 1;
                 continue;
             }
             // 1 回の書き出しで置く分 (data の 1/4 まで)。 折り返しの隙間を足しても、 同じ回の entry が互いを捨てない大きさ
             let mut chunk = 0usize;
             let mut j = i;
-            while j < recs.len() && recs[j].bytes.len() <= self.max_entry() {
-                let n = entry_size(recs[j].bytes.len());
+            while j < recs.count() && recs.bytes_len(j) <= self.max_entry() {
+                let n = entry_size(recs.bytes_len(j));
                 if j > i && chunk + n > self.cap / 4 {
                     break;
                 }
                 chunk += n;
                 j += 1;
             }
-            self.append_chunk(&mut st, &recs[i..j], watch, lost)?;
+            self.append_chunk(&mut st, recs, i..j, watch, lost)?;
             i = j;
         }
         Ok(())
     }
 
-    /// 置けない大きさの record: 生きている entry を全部捨て、 番号を 1 つ使う。
-    fn skip_one(&self, st: &mut State, rec: &NewEntry, watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
+    /// 置けない大きさの record (`last` = その (HLC, 印)): 生きている entry を全部捨て、 番号を 1 つ使う。
+    fn skip_one(&self, st: &mut State, last: (Hlc, u64), watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
         let mut sim = st.c;
         let limit = sim.next;
         while sim.first < limit {
             self.drop_oldest(&mut sim, limit, watch, lost);
         }
-        st.c = Cursor { tail: st.c.head, head: st.c.head, first: limit + 1, next: limit + 1, last: Some((rec.hlc, rec.wal_id)) };
+        st.c = Cursor { tail: st.c.head, head: st.c.head, first: limit + 1, next: limit + 1, last: Some(last) };
         st.marks.clear();
         st.marked = true;
         write_header(&self.region, &st.c);
@@ -297,13 +372,20 @@ impl ChangeLog {
         self.map.flush_dirty()
     }
 
-    fn append_chunk(&self, st: &mut State, recs: &[NewEntry], watch: &[u64], lost: &mut Vec<(u64, Hlc)>) -> io::Result<()> {
+    fn append_chunk<E: Entries + ?Sized>(
+        &self,
+        st: &mut State,
+        recs: &E,
+        range: std::ops::Range<usize>,
+        watch: &[u64],
+        lost: &mut Vec<(u64, Hlc)>,
+    ) -> io::Result<()> {
         // (1) 置き場所を決め、 捨てる分を数える (まだ data は触らない)
         let old_next = st.c.next;
         let mut sim = st.c;
-        let mut plan: Vec<(usize, Option<usize>)> = Vec::with_capacity(recs.len()); // (位置, 折り返しの印の位置)
-        for r in recs {
-            let n = entry_size(r.bytes.len());
+        let mut plan: Vec<(usize, usize, Option<usize>)> = Vec::with_capacity(range.len()); // (位置, entry の大きさ, 折り返しの印の位置)
+        for i in range.clone() {
+            let n = entry_size(recs.bytes_len(i));
             let at = loop {
                 let at = if self.cap - sim.head >= n { sim.head } else { 0 };
                 if sim.first == sim.next {
@@ -320,7 +402,7 @@ impl ChangeLog {
                 self.drop_oldest(&mut sim, old_next, watch, lost);
             };
             let wrap = (at != sim.head && self.cap - sim.head >= ENTRY_HEADER).then_some(sim.head);
-            plan.push((at, wrap));
+            plan.push((at, n, wrap));
             sim.head = (at + n) % self.cap;
             sim.next += 1;
         }
@@ -339,19 +421,30 @@ impl ChangeLog {
             self.map.flush_dirty()?;
         }
         // (2) entry を書いて書き出す
-        let crcs = entry_crcs(old_next, recs);
-        for (k, (r, (at, wrap))) in recs.iter().zip(plan.iter()).enumerate() {
-            let no = old_next + k as u64;
-            if let Some(w) = *wrap {
+        if let Some(end) = plan.iter().map(|&(at, n, _)| HEADER + at + n).max() {
+            self.region.ensure_committed(end)?;
+        }
+        for &(_, _, wrap) in &plan {
+            if let Some(w) = wrap {
                 self.write_entry_header(HEADER + w, WRAP, 0, 0, Hlc::ZERO, 0)?;
             }
-            let base = HEADER + at;
-            let n = entry_size(r.bytes.len());
-            self.region.ensure_committed(base + n)?;
-            self.region.write_at(base + ENTRY_HEADER, &r.bytes);
-            let crc = crcs[k];
-            self.write_entry_header(base, no, r.bytes.len() as u32, crc, r.hlc, r.wal_id)?;
-            self.region.mark_dirty(base, n);
+        }
+        self.write_entries(recs, range.clone(), &plan, old_next);
+        // 書いた所に印 (entry は置いた順に隙間なく並ぶ。 折り返しで切れる)
+        let mut run: Option<(usize, usize)> = None;
+        for &(at, n, _) in &plan {
+            let end = at + n;
+            run = match run {
+                Some((s, e)) if e == at => Some((s, end)),
+                Some((s, e)) => {
+                    self.region.mark_dirty(HEADER + s, e - s);
+                    Some((at, end))
+                }
+                None => Some((at, end)),
+            };
+        }
+        if let Some((s, e)) = run {
+            self.region.mark_dirty(HEADER + s, e - s);
         }
         self.map.flush_dirty()?;
         #[cfg(test)]
@@ -359,7 +452,7 @@ impl ChangeLog {
             return Err(io::Error::other("test: stopped before the header"));
         }
         // (3) 新しい head / next
-        sim.last = recs.last().map(|r| (r.hlc, r.wal_id)).or(sim.last);
+        sim.last = range.clone().last().map(|i| (recs.hlc(i), recs.wal_id(i))).or(sim.last);
         st.c = sim;
         write_header(&self.region, &st.c);
         self.region.mark_dirty(0, HEADER);
@@ -369,7 +462,7 @@ impl ChangeLog {
             st.marks.pop_front();
         }
         if st.marked {
-            for (k, (at, _)) in plan.iter().enumerate() {
+            for (k, (at, _, _)) in plan.iter().enumerate() {
                 let no = old_next + k as u64;
                 if no.is_multiple_of(MARK_EVERY) {
                     st.marks.push_back((no, *at));
@@ -549,17 +642,42 @@ impl ChangeLog {
         }
     }
 
+    /// `range` の entry を `plan` の位置に書く (書き出しの印は呼び手が付ける。 置く範囲は commit 済みであること)。 bytes は置く
+    /// thread で作り、 crc もそこで取る。 大きな回は rayon で並べる (#667 / #683: crc は FNV の 1 byte ずつの掛け算の連鎖で 1 件
+    /// 約 0.25 µs、 1 件ごとに独立。 前は bytes を写す thread で作って後から crc を並べ、 符号化・crc・写しを別々に回していた)。
+    fn write_entries<E: Entries + ?Sized>(
+        &self,
+        recs: &E,
+        range: std::ops::Range<usize>,
+        plan: &[(usize, usize, Option<usize>)],
+        first: u64,
+    ) {
+        let one = |buf: &mut Vec<u8>, k: usize| {
+            let i = range.start + k;
+            buf.clear();
+            recs.write(i, buf);
+            debug_assert_eq!(buf.len(), recs.bytes_len(i), "Entries::bytes_len と write の長さが違う");
+            let (no, hlc, wal_id) = (first + k as u64, recs.hlc(i), recs.wal_id(i));
+            let crc = entry_crc(no, buf.len() as u32, &hlc, wal_id, buf);
+            let base = HEADER + plan[k].0;
+            self.region.write_at(base + ENTRY_HEADER, buf);
+            self.region.write_at(base, &entry_header(no, buf.len() as u32, crc, hlc, wal_id));
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if range.len() >= PAR_CRC_MIN {
+            use rayon::prelude::*;
+            (0..range.len()).into_par_iter().for_each_init(|| Vec::with_capacity(256), |buf, k| one(buf, k));
+            return;
+        }
+        let mut buf = Vec::new();
+        for k in 0..range.len() {
+            one(&mut buf, k);
+        }
+    }
+
     fn write_entry_header(&self, base: usize, no: u64, len: u32, crc: u32, hlc: Hlc, wal_id: u64) -> io::Result<()> {
         self.region.ensure_committed(base + ENTRY_HEADER)?;
-        let mut h = [0u8; ENTRY_HEADER];
-        h[0..8].copy_from_slice(&no.to_le_bytes());
-        h[8..12].copy_from_slice(&len.to_le_bytes());
-        h[12..16].copy_from_slice(&crc.to_le_bytes());
-        h[16..24].copy_from_slice(&hlc.wall.to_le_bytes());
-        h[24..28].copy_from_slice(&hlc.logical.to_le_bytes());
-        h[28..32].copy_from_slice(&hlc.peer.to_le_bytes());
-        h[32..40].copy_from_slice(&wal_id.to_le_bytes());
-        self.region.write_at(base, &h);
+        self.region.write_at(base, &entry_header(no, len, crc, hlc, wal_id));
         self.region.mark_dirty(base, ENTRY_HEADER);
         Ok(())
     }
@@ -576,31 +694,19 @@ struct EntryHeader {
     wal_id: u64,
 }
 
-/// 並べて crc / 印を取る回の大きさの下限 (entry の数)。
+/// entry を並べて書く回の大きさの下限 (entry の数、 [`ChangeLog::write_entries`])。
 const PAR_CRC_MIN: usize = 4096;
 
-/// WAL の record の印 (`wal_id` = `bytes` の返す署名の範囲の FNV)。 大きな回は rayon で並べる (#683: 書き手が速いと記録への写しが
-/// 追いつかず、 区画を埋めるたびに書き手が待った。 印と符号化の段が 1 件 54 → 37 ns)。 並べるのは印だけで、 entry の bytes は
-/// 写す thread で作る。
-pub(crate) fn wal_ids<T: Sync>(recs: &[T], bytes: impl Fn(&T) -> &[u8] + Sync) -> Vec<u64> {
-    #[cfg(not(target_arch = "wasm32"))]
-    if recs.len() >= PAR_CRC_MIN {
-        use rayon::prelude::*;
-        return recs.par_iter().map(|r| fnv1a64(bytes(r))).collect();
-    }
-    recs.iter().map(|r| fnv1a64(bytes(r))).collect()
-}
-
-/// `first` 番から並ぶ entry の crc。 大きな回は rayon で並べる (#667: FNV は 1 byte ずつの掛け算の連鎖で、 1 件 (約 200 B) に約
-/// 0.25 µs かかり、 記録に写す時間の 4 割ほどだった。 1 件ごとに独立)。
-fn entry_crcs(first: u64, recs: &[NewEntry]) -> Vec<u32> {
-    let one = |(k, r): (usize, &NewEntry)| entry_crc(first + k as u64, r.bytes.len() as u32, &r.hlc, r.wal_id, &r.bytes);
-    #[cfg(not(target_arch = "wasm32"))]
-    if recs.len() >= PAR_CRC_MIN {
-        use rayon::prelude::*;
-        return recs.par_iter().enumerate().map(one).collect();
-    }
-    recs.iter().enumerate().map(one).collect()
+fn entry_header(no: u64, len: u32, crc: u32, hlc: Hlc, wal_id: u64) -> [u8; ENTRY_HEADER] {
+    let mut h = [0u8; ENTRY_HEADER];
+    h[0..8].copy_from_slice(&no.to_le_bytes());
+    h[8..12].copy_from_slice(&len.to_le_bytes());
+    h[12..16].copy_from_slice(&crc.to_le_bytes());
+    h[16..24].copy_from_slice(&hlc.wall.to_le_bytes());
+    h[24..28].copy_from_slice(&hlc.logical.to_le_bytes());
+    h[28..32].copy_from_slice(&hlc.peer.to_le_bytes());
+    h[32..40].copy_from_slice(&wal_id.to_le_bytes());
+    h
 }
 
 fn entry_crc(no: u64, len: u32, hlc: &Hlc, wal_id: u64, bytes: &[u8]) -> u32 {
@@ -888,6 +994,91 @@ mod tests {
             assert_eq!(got.len() as u64, 6000 - pos);
             for e in &got {
                 assert_eq!(e.bytes, recs[e.no as usize].bytes);
+            }
+        }
+    }
+
+    /// WAL の record を写しを作らずに置いた entry (`WalRecords`、 #683) は、 前の道 (Record → WireRecord → encode、 印は
+    /// signed_bytes の FNV) で置いた entry と、 記録の bytes (entry の header の番号・長さ・crc・HLC・印を含む) が全部同じ。
+    /// op の種類を全部混ぜ、 中継した record (author・署名が自分のでない) も入れる。 並べて書く回 (`PAR_CRC_MIN` 件以上) と、
+    /// 小さな記録で折り返して古い entry を捨てる回の両方。 前の道も WAL の record の切り出し (`RecordRef`) を通るので、 そこが
+    /// 揃って壊れても一致してしまう。 それは読み戻した bytes で自分の record の署名が通ること (署名の範囲が record の header から
+    /// 始まること) で見る。
+    #[test]
+    fn wal_records_lay_out_the_same_bytes_as_wire_records() {
+        use enchudb_oplog::oplog::{Op, OpLog, RelayedHeader, HEADER_SIZE};
+        let dir = tempdir("walrecs");
+        let wal = OpLog::create(&dir.join("oplog"), 64 << 20).unwrap();
+        let kp = std::sync::Arc::new(enchudb_oplog::keys::Keypair::generate());
+        wal.set_keypair(Some(kp.clone()));
+        let keys = enchudb_oplog::keys::PubkeyStore::new();
+        keys.force_register(0, &kp.public_bytes());
+        static LEAF: [u8; 300] = [7; 300];
+        for i in 0..5000u64 {
+            let op = match i % 12 {
+                0 => Op::Tie { eid: i, himo_id: 3, value: i * 7 },
+                1 => Op::Tie { eid: i, himo_id: 4, value: (1 << 40) + i },
+                2 => Op::Untie { eid: i, himo_id: 5 },
+                3 => Op::Delete { eid: i },
+                4 => Op::Content { eid: i, key: "memo", data: &LEAF[..(i % 97) as usize] },
+                5 => Op::Vocab { vid: i as u32, bytes: &LEAF[..(i % 31) as usize] },
+                6 => Op::TieNamed { eid: i, himo_name: "_c_memo", himo_kind: 2, value: i },
+                7 => Op::TieNamed { eid: i, himo_name: "wide", himo_kind: 1, value: (1 << 33) + i },
+                8 => Op::TieLeaf { eid: i, himo_name: "note", himo_kind: 3, bytes: &LEAF[..(i % 251) as usize] },
+                9 => Op::TieRef { eid: i, himo_id: 6, target: (2 << 32) | i },
+                10 => Op::Alias { eid: i, same_as: (3 << 32) | i },
+                _ => Op::Commit,
+            };
+            if i % 3 == 0 {
+                let mut signature = [0u8; 64];
+                signature.iter_mut().enumerate().for_each(|(k, b)| *b = (i as u8).wrapping_add(k as u8));
+                let header = RelayedHeader {
+                    hlc: Hlc { wall: 5_000_000 + i, logical: (i % 5) as u32, peer: 9 },
+                    author: 9,
+                    signature,
+                    pubkey_fp: (i * 31).to_le_bytes(),
+                };
+                wal.append_relayed(op, header).unwrap();
+            } else {
+                wal.append(op).unwrap();
+            }
+        }
+        wal.append(Op::Commit).unwrap();
+        let (refs, end) = wal.scan_refs_for_change_log(HEADER_SIZE as u64, u64::MAX, true);
+        let (recs, end2) = wal.scan_for_change_log(HEADER_SIZE as u64, u64::MAX, true);
+        assert_eq!((refs.len(), end), (recs.len(), end2));
+        assert!(refs.len() > PAR_CRC_MIN, "試験の前提: 並べて書く大きさ");
+        let want: Vec<NewEntry> = recs
+            .into_iter()
+            .map(|(r, _)| {
+                let wal_id = fnv1a64(&r.signed_bytes);
+                let w = crate::transport::WireRecord::from(r);
+                NewEntry { hlc: w.hlc, wal_id, bytes: w.encode() }
+            })
+            .collect();
+        for (tag, cap) in [("par", 8 << 20), ("wrap", MIN_CAP)] {
+            let (a, b) = (tempdir(&format!("walrecs-{tag}-a")), tempdir(&format!("walrecs-{tag}-b")));
+            let (old, new) = (ChangeLog::open(&a, cap, true, false).unwrap(), ChangeLog::open(&b, cap, true, false).unwrap());
+            let (mut lost_old, mut lost_new) = (Vec::new(), Vec::new());
+            // 小さな回を挟んで、 番号と置き場所を 0 からずらす
+            for r in [0..37, 37..refs.len()] {
+                old.append(&want[r.clone()], &[0, 40], &mut lost_old).unwrap();
+                new.append_from(&WalRecords::new(&refs[r]), &[0, 40], &mut lost_new).unwrap();
+            }
+            assert_eq!(new.range(), old.range(), "{tag}");
+            assert_eq!(new.last_written(), old.last_written(), "{tag}");
+            assert_eq!(lost_new, lost_old, "{tag}");
+            assert!(new.region.slice() == old.region.slice(), "{tag}: 記録の bytes が前の道と違う");
+            let (first, next) = new.range();
+            assert_eq!(next, refs.len() as u64);
+            assert!(tag == "par" || first > 0, "{tag}: 試験の前提: 折り返して捨てる");
+            for e in read_all(&new, first).unwrap() {
+                assert_eq!(e.bytes, want[e.no as usize].bytes, "{tag}: {} 番", e.no);
+                let (w, _) = crate::transport::WireRecord::decode(&e.bytes).unwrap();
+                assert_eq!(&w.signed_bytes[..2], b"WL", "{tag}: {} 番の署名の範囲が record の header から始まらない", e.no);
+                if w.author_peer != 9 {
+                    assert!(keys.verify(0, &w.signed_bytes, &w.signature), "{tag}: {} 番の署名が読み戻した bytes で通らない", e.no);
+                }
             }
         }
     }
