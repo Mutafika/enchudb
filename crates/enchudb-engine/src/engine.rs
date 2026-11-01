@@ -2447,6 +2447,10 @@ mod fold_copy_tests {
         while !got.0.lock().unwrap().contains(&MARK) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
+        // 空け作りは畳んで listener を起こしてから回数を足す。 MARK が届いた後も回数が増えるまで待つ (#684)
+        while eng.wal_room_folds() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(eng.wal_room_folds() > 0, "前提: 空け作りで畳んだ");
         assert!(got.0.lock().unwrap().contains(&MARK), "畳んだ区画の閉じていない末尾が listener に届かない");
         drop(eng);
@@ -16372,7 +16376,7 @@ impl Engine {
 
     /// 記録の cursor から先を記録に写す (呼び手が `change_emit` を持って)。 `limit` は写してよい終わり: `with_tail` が false なら
     /// `limit` (書き出した所) までに Commit で閉じた group、 true なら `limit` (畳む区画の終わり) までの record を閉じていない末尾も
-    /// 含めて全部 ([`enchudb_oplog::oplog::OpLog::scan_for_change_log`])。 戻り値は写した record の数。
+    /// 含めて全部 ([`enchudb_oplog::oplog::OpLog::scan_refs_for_change_log`])。 戻り値は写した record の数。
     fn pump_change_log(
         &self,
         wal: &enchudb_oplog::oplog::OpLog,
@@ -16386,44 +16390,40 @@ impl Engine {
         change_copy_hook::call(wal);
         // 球の土台 (試作): 開いた後に控えた土台を、 捨てる前に開いて記録と照らす
         self.ball_bases.ready(log);
-        let (recs, end) = wal.scan_for_change_log(c.log_wal, limit, with_tail);
+        // record は記録に置き終えるまで WAL の mmap を借りる (#683: 写しを作らない)。 畳む道 (`try_fold_with_changes` / 空け作り) は
+        // `change_emit` を持ったまま写してから畳むので、 呼び手が `change_emit` を持つ間に借りた区画は畳まれない
+        let (recs, end) = wal.scan_refs_for_change_log(c.log_wal, limit, with_tail);
         let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
         if recs.is_empty() {
             c.log_wal = c.log_wal.max(end);
             self.mark_change_log(wal, log, c);
             return Ok(0);
         }
-        let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
         // 球の土台 (試作): 土台に当たる書き込みを控える (捨てる時に記録を読み直さない)
         let filter = self.ball_bases.filter();
-        let mut picked = Vec::new();
-        let batch: Vec<crate::change_log::NewEntry> = recs
-            .into_iter()
-            .enumerate()
-            .map(|(k, (r, _))| {
-                if let Some(op) = filter.as_ref().and_then(|f| f.pick(&r.op, r.author_peer)) {
-                    picked.push((k as u64, r.hlc, op));
-                }
-                let wal_id = crate::change_log::fnv1a64(&r.signed_bytes);
-                let w = crate::transport::WireRecord::from(r);
-                crate::change_log::NewEntry { hlc: w.hlc, wal_id, bytes: w.encode() }
-            })
-            .collect();
+        let picked: Vec<_> = match filter.as_ref() {
+            Some(f) => recs
+                .iter()
+                .enumerate()
+                .filter_map(|(k, (r, _))| f.pick(&r.op, r.author_peer).map(|op| (k as u64, r.hlc, op)))
+                .collect(),
+            None => Vec::new(),
+        };
         let watch: Vec<u64> = c.readers.iter().map(|(_, p)| *p).collect();
         let before = log.range().1;
         if filter.is_some() {
-            self.ball_bases.noted(before, batch.len(), picked);
+            self.ball_bases.noted(before, recs.len(), picked);
         }
         let mut lost = Vec::new();
-        let res = log.append(&batch, &watch, &mut lost);
+        let res = log.append_from(&crate::change_log::WalRecords::new(&recs), &watch, &mut lost);
         let done = (log.range().1 - before) as usize;
         if filter.is_some() {
             self.ball_bases.appended(log.range().1);
         }
-        c.log_wal = if done == ends.len() {
+        c.log_wal = if done == recs.len() {
             end
         } else if done > 0 {
-            ends[done - 1]
+            recs[done - 1].1
         } else {
             c.log_wal
         };
@@ -26384,16 +26384,37 @@ mod v10_dir_tests {
 
     const LEGACY_TEST_MAX_HIMOS: u32 = 2048;
 
+    /// 試験の DB の path。 前の run の残りを消してから返す。 試験の後に消すのは [`Cleanup`] (試験の終わりまで持つ)。
     fn tmp(name: &str) -> String {
         let path = format!("/tmp/enchu_v10dir_{name}.db");
-        for base in [path.clone(), format!("{path}.packed"), format!("{path}.dst"), format!("{path}.copy")] {
+        remove_all(&path);
+        path
+    }
+
+    /// `path` の DB と、 試験が作る写し (`.packed` / `.dst` / `.copy` / `.packed.dst`) と legacy の sidecar を消す。
+    fn remove_all(path: &str) {
+        for base in [
+            path.to_string(),
+            format!("{path}.packed"),
+            format!("{path}.dst"),
+            format!("{path}.copy"),
+            format!("{path}.packed.dst"),
+        ] {
             let _ = std::fs::remove_dir_all(&base);
             let _ = std::fs::remove_file(&base);
             for n in db_files::ALL {
                 let _ = std::fs::remove_file(db_files::legacy_path_for(&base, n));
             }
         }
-        path
+    }
+
+    /// 試験の終わりに (落ちた時も) [`remove_all`] する (#680: 前は使う前に消すだけで、 `cargo test` の 1 回で `/tmp` に約 4.5 GB 残った)。
+    struct Cleanup(String);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            remove_all(&self.0);
+        }
     }
 
     /// table 1 つ + himo `n` + entity 3 つを書いて tables を persist した WAL 付き DB。
@@ -26458,6 +26479,7 @@ mod v10_dir_tests {
     #[test]
     fn sidecars_live_inside_db_dir() {
         let path = tmp("inside");
+        let _c = Cleanup(path.clone());
         let rows = seed(&path);
         for n in [db_files::TABLES, db_files::OPLOG, db_files::LOCK] {
             assert!(db_files::path_for(&path, n).exists(), "{n} should be inside the DB dir");
@@ -26471,6 +26493,7 @@ mod v10_dir_tests {
     #[test]
     fn open_missing_dir_leaves_no_residue() {
         let path = tmp("missing");
+        let _c = Cleanup(path.clone());
         let err = Engine::open(&path).err().expect("open of a missing DB must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
         assert!(!std::path::Path::new(&path).exists(), "open must not create an empty DB dir");
@@ -26484,6 +26507,7 @@ mod v10_dir_tests {
     #[test]
     fn copy_db_dir_clones_sidecars_but_not_lock() {
         let path = tmp("copy");
+        let _c = Cleanup(path.clone());
         let rows = seed(&path);
         let dst = format!("{path}.copy");
         copy_db_dir(std::path::Path::new(&path), std::path::Path::new(&dst)).unwrap();
@@ -26505,6 +26529,7 @@ mod v10_dir_tests {
     #[test]
     fn snapshot_export_puts_sidecars_in_target_dir() {
         let path = tmp("snap");
+        let _c = Cleanup(path.clone());
         let rows = seed(&path);
         let eng = Engine::open(&path).unwrap();
         let dst = format!("{path}.dst");
@@ -26545,6 +26570,7 @@ mod v10_dir_tests {
 
     fn migrate_roundtrip(name: &str, version: u32) {
         let path = tmp(name);
+        let _c = Cleanup(path.clone());
         let rows = seed_with(&path, Some(1024));
         let packed = make_legacy_single_file(&path, version);
         let _ = std::fs::remove_dir_all(&path);
@@ -26581,6 +26607,7 @@ mod v10_dir_tests {
     #[test]
     fn migrate_rejects_older_than_v8() {
         let path = tmp("mig7");
+        let _c = Cleanup(path.clone());
         seed_with(&path, Some(1024));
         let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V7);
         let err = Engine::migrate_v9_to_v10(&packed, &format!("{path}.dst")).err().unwrap();
@@ -26613,6 +26640,7 @@ mod v10_dir_tests {
     #[test]
     fn migrate_accepts_legacy_file_shorter_than_total_size() {
         let path = tmp("mig8_short");
+        let _c = Cleanup(path.clone());
         let rows = seed_with(&path, Some(1024));
         let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V8);
         let _ = std::fs::remove_dir_all(&path);
@@ -26663,6 +26691,7 @@ mod v10_dir_tests {
     #[test]
     fn migrate_rejects_legacy_file_cut_inside_entities() {
         let path = tmp("mig8_cut");
+        let _c = Cleanup(path.clone());
         seed_with(&path, Some(1024));
         let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V8);
         let bytes = std::fs::read(&packed).unwrap();
@@ -26681,20 +26710,20 @@ mod v10_dir_tests {
     /// 境界。 max_himos 2048 では max_values 表が 2304 から始まるので、 定義済み himo が
     /// 448 本まではちょうど 4096 に収まり、 449 本目から entities bitset を上書きしていた。
     /// `himos` 本まで define した legacy file を migrate した結果を返す。
-    fn migrate_legacy_with_himos(name: &str, himos: usize) -> (String, io::Result<()>) {
+    fn migrate_legacy_with_himos(name: &str, himos: usize) -> (Cleanup, String, io::Result<()>) {
         let path = tmp(name);
         seed_padded(&path, Some(1024), himos);
         assert_eq!(Engine::open_readonly(&path).unwrap().himo_count(), himos);
         let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V9);
         let dst = format!("{path}.dst");
         let r = Engine::migrate_v9_to_v10(&packed, &dst);
-        (dst, r)
+        (Cleanup(path), dst, r)
     }
 
     #[test]
     fn migrate_accepts_legacy_himo_table_that_fits_fixed_header() {
         assert_eq!(himo_maxv_base(LEGACY_TEST_MAX_HIMOS) + 448 * 4, HEADER_SIZE, "boundary assumption");
-        let (dst, r) = migrate_legacy_with_himos("mig_himo448", 448);
+        let (_c, dst, r) = migrate_legacy_with_himos("mig_himo448", 448);
         r.unwrap();
         let eng = Engine::open(&dst).unwrap();
         assert_eq!(eng.himo_count(), 448);
@@ -26704,7 +26733,7 @@ mod v10_dir_tests {
     /// magic に当たる。 header を潰した file は旧 engine でも開けないので、 一律拒否でよい。
     #[test]
     fn migrate_rejects_legacy_himo_table_overlapping_entity_header() {
-        let (dst, r) = migrate_legacy_with_himos("mig_himo449", 449);
+        let (_c, dst, r) = migrate_legacy_with_himos("mig_himo449", 449);
         let err = r.err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains("#257") && err.to_string().contains("entity-set header"), "{err}");
@@ -26716,7 +26745,7 @@ mod v10_dir_tests {
     /// 1 ファイル化する。 戻り値は (packed path, 生き残った (eid, value))。
     fn legacy_fixture(
         name: &str, max_entities: u32, max_himos: u32, himos: usize, entities: u32, deletes: u32,
-    ) -> (String, Vec<(enchudb_oplog::EntityId, u32)>) {
+    ) -> (Cleanup, String, Vec<(enchudb_oplog::EntityId, u32)>) {
         let path = tmp(name);
         let mut eng = Engine::create_growable_opts(
             &path,
@@ -26752,7 +26781,7 @@ mod v10_dir_tests {
         drop(eng);
         let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V8);
         let _ = std::fs::remove_dir_all(&path);
-        (packed, rows)
+        (Cleanup(path), packed, rows)
     }
 
     /// 旧 engine が max_values 表 (全 0) を書いた跡を再現する: packed offset
@@ -26774,7 +26803,7 @@ mod v10_dir_tests {
     /// packed 4352..4820 = bitset の eid 1920〜5663 に 0 を書くが、 そこに entity が無ければ実害無し。
     #[test]
     fn migrate_accepts_sf_shape_zero_max_values_over_empty_bitset() {
-        let (packed, rows) = legacy_fixture("mig257_sf", 8192, 4096, 117, 300, 0);
+        let (_c, packed, rows) = legacy_fixture("mig257_sf", 8192, 4096, 117, 300, 0);
         assert!(rows.iter().all(|(e, _)| enchudb_oplog::eid_local(*e) < 1920), "fixture must keep entities below the overwritten bits");
         let (a, b) = overwrite_legacy_maxv_table_with_zeros(&packed);
         assert_eq!((a, b), (4352, 4820), "sf shape");
@@ -26795,11 +26824,10 @@ mod v10_dir_tests {
     /// bit が 0 = live entity を消している → 拒否。
     #[test]
     fn migrate_rejects_sf_shape_when_overwritten_bits_held_live_entities() {
-        let (packed, rows) = legacy_fixture("mig257_live", 8192, 4096, 117, 3000, 0);
+        let (_c, packed, rows) = legacy_fixture("mig257_live", 8192, 4096, 117, 3000, 0);
         assert!(rows.iter().any(|(e, _)| (1920..5664).contains(&enchudb_oplog::eid_local(*e))), "fixture must place entities under the overwritten bits");
         overwrite_legacy_maxv_table_with_zeros(&packed);
         let dst = format!("{packed}.dst");
-        let _ = std::fs::remove_dir_all(&dst); // `tmp()` は `.packed.dst` を掃除しない
         let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains("#257") && err.to_string().contains("live entity"), "{err}");
@@ -26810,7 +26838,7 @@ mod v10_dir_tests {
     /// (max_entities 1024: bitset 128 B → entry 27〜144)。 free が無ければ (count 0) 無害。
     #[test]
     fn migrate_accepts_zero_max_values_over_unused_free_stack() {
-        let (packed, rows) = legacy_fixture("mig257_fs_ok", 1024, 4096, 117, 200, 0);
+        let (_c, packed, rows) = legacy_fixture("mig257_fs_ok", 1024, 4096, 117, 200, 0);
         overwrite_legacy_maxv_table_with_zeros(&packed);
         let dst = format!("{packed}.dst");
         let _ = std::fs::remove_dir_all(&dst);
@@ -26825,7 +26853,7 @@ mod v10_dir_tests {
     /// 潰されて id 0 が再払い出しされる → 拒否。
     #[test]
     fn migrate_rejects_zero_max_values_over_used_free_stack() {
-        let (packed, _rows) = legacy_fixture("mig257_fs_ng", 1024, 4096, 117, 200, 150);
+        let (_c, packed, _rows) = legacy_fixture("mig257_fs_ng", 1024, 4096, 117, 200, 150);
         overwrite_legacy_maxv_table_with_zeros(&packed);
         let dst = format!("{packed}.dst");
         let _ = std::fs::remove_dir_all(&dst);
@@ -26838,7 +26866,7 @@ mod v10_dir_tests {
     /// max_values を宣言していた file は越えた範囲に非 0 が並ぶ = bit / entry が信用できない → 拒否。
     #[test]
     fn migrate_rejects_nonzero_max_values_over_entity_set() {
-        let (packed, _rows) = legacy_fixture("mig257_nz", 8192, 4096, 117, 300, 0);
+        let (_c, packed, _rows) = legacy_fixture("mig257_nz", 8192, 4096, 117, 300, 0);
         // 旧 engine が max_values = 7 を書いた跡
         {
             use std::io::{Seek, SeekFrom, Write};
@@ -26860,6 +26888,7 @@ mod v10_dir_tests {
     #[test]
     fn packed_with_a_corrupt_column_header_fails_to_open() {
         let path = tmp("pack_colhdr");
+        let _c = Cleanup(path.clone());
         let rows = seed_with(&path, None);
         let packed = format!("{path}.packed");
         Engine::pack_dir(&path, std::path::Path::new(&packed)).unwrap();
@@ -26891,6 +26920,7 @@ mod v10_dir_tests {
     #[test]
     fn unpack_rejects_short_v10_packed() {
         let path = tmp("pack_short");
+        let _c = Cleanup(path.clone());
         seed_with(&path, Some(1024));
         let packed = format!("{path}.packed");
         let total = Engine::pack_dir(&path, std::path::Path::new(&packed)).unwrap();
@@ -26926,6 +26956,7 @@ mod v10_dir_tests {
     #[test]
     fn grow_entity_cap_extends_allocation_and_persists() {
         let path = tmp("grow");
+        let _c = Cleanup(path.clone());
         let mut eng = tiny(&path, 16, 64);
         eng.define_himo("n", ValueType::Number, 100);
         assert_eq!((eng.max_entities(), eng.reserve_entities()), (16, 64));
@@ -26965,6 +26996,7 @@ mod v10_dir_tests {
     #[test]
     fn free_stack_keeps_working_across_grow() {
         let path = tmp("grow_free");
+        let _c = Cleanup(path.clone());
         let eng = tiny(&path, 8, 32);
         let ids = fill(&eng);
         assert_eq!(ids.len(), 8);
@@ -26980,6 +27012,7 @@ mod v10_dir_tests {
     #[test]
     fn define_table_can_use_grown_cap() {
         let path = tmp("grow_table");
+        let _c = Cleanup(path.clone());
         let mut eng = tiny(&path, 8, 64);
         eng.define_table("a", 8).unwrap();
         let err = eng.define_table("b", 8).err().expect("no room for a second table at cap 8");
@@ -26993,6 +27026,7 @@ mod v10_dir_tests {
     #[test]
     fn migrated_legacy_db_gets_default_reservation_and_grows() {
         let path = tmp("grow_mig");
+        let _c = Cleanup(path.clone());
         let rows = seed_with(&path, Some(1024));
         let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V9);
         let _ = std::fs::remove_dir_all(&path);
@@ -27017,6 +27051,7 @@ mod v10_dir_tests {
     #[test]
     fn table_auto_grows_into_free_eid_space_and_persists() {
         let path = tmp("tbl_grow");
+        let _c = Cleanup(path.clone());
         let mut eng = tiny(&path, 64, 128);
         eng.define_table("a", 4).unwrap();
         eng.define_himo_in("a", "n", ValueType::Number, 100).unwrap();
@@ -27064,6 +27099,7 @@ mod v10_dir_tests {
     #[test]
     fn deleted_row_in_second_extent_is_reused() {
         let path = tmp("tbl_grow_reuse");
+        let _c = Cleanup(path.clone());
         let mut eng = tiny(&path, 64, 64);
         eng.define_table("a", 2).unwrap();
         eng.define_table("b", 2).unwrap();
@@ -27078,6 +27114,7 @@ mod v10_dir_tests {
     #[test]
     fn grow_table_explicit_and_exhaustion_message() {
         let path = tmp("tbl_grow_explicit");
+        let _c = Cleanup(path.clone());
         let mut eng = tiny(&path, 16, 16);
         eng.define_table("a", 4).unwrap();
         assert_eq!(eng.grow_table("a", 4).unwrap(), 8);
@@ -27094,6 +27131,7 @@ mod v10_dir_tests {
     fn migrate_real_fixture_if_provided() {
         let Ok(src) = std::env::var("ENCHU_LEGACY_FIXTURE") else { return };
         let dst = tmp("fixture") ;
+        let _c = Cleanup(dst.clone());
         let t0 = std::time::Instant::now();
         Engine::migrate_v9_to_v10(&src, &dst).unwrap();
         let eng = Engine::open_readonly(&dst).unwrap();
@@ -27110,6 +27148,7 @@ mod v10_dir_tests {
     #[test]
     fn failed_create_leaves_nothing() {
         let path = tmp("323_failed_create");
+        let _c = Cleanup(path.clone());
         FAIL_CREATE_AFTER_SEGMENTS.with(|f| f.set(true));
         let r = Engine::create_growable_with_capacity(&path, 65_536);
         FAIL_CREATE_AFTER_SEGMENTS.with(|f| f.set(false));
@@ -27137,6 +27176,7 @@ mod v10_dir_tests {
     #[test]
     fn create_reclaims_a_remnant() {
         let path = tmp("323_remnant");
+        let _c = Cleanup(path.clone());
         make_remnant(&path);
         assert!(Engine::open_standalone(&path).is_err());
         assert_eq!(Engine::probe(&path), DbState::Incomplete, "残骸を Damaged と言っている");
@@ -27153,6 +27193,7 @@ mod v10_dir_tests {
     #[test]
     fn create_leaves_a_locked_remnant_alone() {
         let path = tmp("323_locked");
+        let _c = Cleanup(path.clone());
         make_remnant(&path);
         let holder = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
             .open(format!("{path}/{}", db_files::LOCK)).unwrap();
@@ -27170,6 +27211,7 @@ mod v10_dir_tests {
     fn issue437_create_that_loses_the_race_to_lock_leaves_the_winner_alone() {
         for winner_closes in [true, false] {
             let path = tmp(&format!("437_race_{winner_closes}"));
+            let _c = Cleanup(path.clone());
             // 割り込んだ create の engine (閉じた時は None) と、 書いた entity
             let winner = std::sync::Arc::new(std::sync::Mutex::new(None::<(Option<Engine>, u64)>));
             BEFORE_CREATE_LOCK.with(|h| {
@@ -27204,6 +27246,7 @@ mod v10_dir_tests {
     #[test]
     fn issue437_create_waits_out_a_brief_lock_holder() {
         let path = tmp("437_brief_holder");
+        let _c = Cleanup(path.clone());
         BEFORE_CREATE_LOCK.with(|h| {
             let path = path.clone();
             *h.borrow_mut() = Some(Box::new(move || {
@@ -27230,6 +27273,7 @@ mod v10_dir_tests {
     #[test]
     fn issue437_create_backs_off_when_its_lock_file_was_removed() {
         let path = tmp("437_removed_lock");
+        let _c = Cleanup(path.clone());
         AFTER_LOCK_FILE_OPEN.with(|h| {
             let path = path.clone();
             *h.borrow_mut() = Some(Box::new(move || {
@@ -27255,6 +27299,7 @@ mod v10_dir_tests {
     #[test]
     fn zeroed_header_with_data_is_not_a_remnant() {
         let path = tmp("323_data");
+        let _c = Cleanup(path.clone());
         {
             let mut eng = Engine::create_growable_with_capacity(&path, 65_536).unwrap();
             eng.define_himo("n", ValueType::Number, 0);

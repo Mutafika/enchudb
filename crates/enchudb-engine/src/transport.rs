@@ -92,91 +92,8 @@ impl WireRecord {
     ///   4 = Commit:  (empty)
     /// ```
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(128 + self.signed_bytes.len());
-        out.push(1u8); // version
-        out.extend_from_slice(&self.hlc.wall.to_le_bytes());
-        out.extend_from_slice(&self.hlc.logical.to_le_bytes());
-        out.extend_from_slice(&self.hlc.peer.to_le_bytes());
-        out.extend_from_slice(&self.author_peer.to_le_bytes());
-        out.extend_from_slice(&self.signature);
-        out.extend_from_slice(&self.pubkey_fp);
-        out.extend_from_slice(&(self.signed_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.signed_bytes);
-        match &self.op {
-            DecodedOp::Tie { eid, himo_id, value } if *value > u32::MAX as u64 => {
-                out.push(9);
-                out.extend_from_slice(&eid.to_le_bytes());
-                out.extend_from_slice(&himo_id.to_le_bytes());
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-            DecodedOp::Tie { eid, himo_id, value } => {
-                out.push(0);
-                out.extend_from_slice(&eid.to_le_bytes());
-                out.extend_from_slice(&himo_id.to_le_bytes());
-                out.extend_from_slice(&(*value as u32).to_le_bytes());
-            }
-            DecodedOp::Untie { eid, himo_id } => {
-                out.push(1);
-                out.extend_from_slice(&eid.to_le_bytes());
-                out.extend_from_slice(&himo_id.to_le_bytes());
-            }
-            DecodedOp::Delete { eid } => {
-                out.push(2);
-                out.extend_from_slice(&eid.to_le_bytes());
-            }
-            DecodedOp::Content { eid, key, data } => {
-                out.push(3);
-                out.extend_from_slice(&eid.to_le_bytes());
-                out.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                out.extend_from_slice(key.as_bytes());
-                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                out.extend_from_slice(data);
-            }
-            DecodedOp::Commit => {
-                out.push(4);
-            }
-            DecodedOp::Vocab { vid, bytes } => {
-                out.push(5);
-                out.extend_from_slice(&vid.to_le_bytes());
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes);
-            }
-            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
-                let wide = *value > u32::MAX as u64;
-                out.push(if wide { 10 } else { 6 });
-                out.extend_from_slice(&eid.to_le_bytes());
-                if wide {
-                    out.extend_from_slice(&value.to_le_bytes());
-                } else {
-                    out.extend_from_slice(&(*value as u32).to_le_bytes());
-                }
-                out.push(*himo_kind);
-                out.extend_from_slice(&(himo_name.len() as u16).to_le_bytes());
-                out.extend_from_slice(himo_name.as_bytes());
-            }
-            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
-                out.push(7);
-                out.extend_from_slice(&eid.to_le_bytes());
-                out.push(*himo_kind);
-                out.extend_from_slice(&(himo_name.len() as u16).to_le_bytes());
-                out.extend_from_slice(himo_name.as_bytes());
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes);
-            }
-            DecodedOp::TieRef { eid, himo_id, target } => {
-                // #183: Ref target の世界番号 (u64) 同乗版 Tie
-                out.push(8);
-                out.extend_from_slice(&eid.to_le_bytes());
-                out.extend_from_slice(&himo_id.to_le_bytes());
-                out.extend_from_slice(&target.to_le_bytes());
-            }
-            DecodedOp::Alias { eid, same_as } => {
-                // #178: 読み飛ばしてよい印付き (oplog の op の種類と同じ番号)
-                out.push(op_type::ALIAS);
-                out.extend_from_slice(&eid.to_le_bytes());
-                out.extend_from_slice(&same_as.to_le_bytes());
-            }
-        }
+        let mut out = Vec::with_capacity(wire_len(self.signed_bytes.len(), &self.op));
+        encode_wire_into(&mut out, self.hlc, self.author_peer, &self.signature, &self.pubkey_fp, &[&self.signed_bytes], &self.op);
         out
     }
 
@@ -326,6 +243,127 @@ impl WireRecord {
             p,
         ))
     }
+}
+
+/// [`WireRecord::encode`] の bytes を、 借りた部品から `out` の後ろに足す (#683: changefeed の記録へ WAL の record を写す時に
+/// WireRecord と record ごとの Vec を作らない)。 `signed` はつなげると signed_bytes になる片。 足す長さは [`wire_len`]。
+pub(crate) fn encode_wire_into(
+    out: &mut Vec<u8>,
+    hlc: Hlc,
+    author_peer: PeerId,
+    signature: &[u8; 64],
+    pubkey_fp: &[u8; 8],
+    signed: &[&[u8]],
+    op: &DecodedOp,
+) {
+    out.push(1u8); // version
+    out.extend_from_slice(&hlc.wall.to_le_bytes());
+    out.extend_from_slice(&hlc.logical.to_le_bytes());
+    out.extend_from_slice(&hlc.peer.to_le_bytes());
+    out.extend_from_slice(&author_peer.to_le_bytes());
+    out.extend_from_slice(signature);
+    out.extend_from_slice(pubkey_fp);
+    let signed_len: usize = signed.iter().map(|p| p.len()).sum();
+    out.extend_from_slice(&(signed_len as u32).to_le_bytes());
+    for p in signed {
+        out.extend_from_slice(p);
+    }
+    match op {
+        DecodedOp::Tie { eid, himo_id, value } if *value > u32::MAX as u64 => {
+            out.push(9);
+            out.extend_from_slice(&eid.to_le_bytes());
+            out.extend_from_slice(&himo_id.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        DecodedOp::Tie { eid, himo_id, value } => {
+            out.push(0);
+            out.extend_from_slice(&eid.to_le_bytes());
+            out.extend_from_slice(&himo_id.to_le_bytes());
+            out.extend_from_slice(&(*value as u32).to_le_bytes());
+        }
+        DecodedOp::Untie { eid, himo_id } => {
+            out.push(1);
+            out.extend_from_slice(&eid.to_le_bytes());
+            out.extend_from_slice(&himo_id.to_le_bytes());
+        }
+        DecodedOp::Delete { eid } => {
+            out.push(2);
+            out.extend_from_slice(&eid.to_le_bytes());
+        }
+        DecodedOp::Content { eid, key, data } => {
+            out.push(3);
+            out.extend_from_slice(&eid.to_le_bytes());
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        DecodedOp::Commit => {
+            out.push(4);
+        }
+        DecodedOp::Vocab { vid, bytes } => {
+            out.push(5);
+            out.extend_from_slice(&vid.to_le_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
+            let wide = *value > u32::MAX as u64;
+            out.push(if wide { 10 } else { 6 });
+            out.extend_from_slice(&eid.to_le_bytes());
+            if wide {
+                out.extend_from_slice(&value.to_le_bytes());
+            } else {
+                out.extend_from_slice(&(*value as u32).to_le_bytes());
+            }
+            out.push(*himo_kind);
+            out.extend_from_slice(&(himo_name.len() as u16).to_le_bytes());
+            out.extend_from_slice(himo_name.as_bytes());
+        }
+        DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+            out.push(7);
+            out.extend_from_slice(&eid.to_le_bytes());
+            out.push(*himo_kind);
+            out.extend_from_slice(&(himo_name.len() as u16).to_le_bytes());
+            out.extend_from_slice(himo_name.as_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        DecodedOp::TieRef { eid, himo_id, target } => {
+            // #183: Ref target の世界番号 (u64) 同乗版 Tie
+            out.push(8);
+            out.extend_from_slice(&eid.to_le_bytes());
+            out.extend_from_slice(&himo_id.to_le_bytes());
+            out.extend_from_slice(&target.to_le_bytes());
+        }
+        DecodedOp::Alias { eid, same_as } => {
+            // #178: 読み飛ばしてよい印付き (oplog の op の種類と同じ番号)
+            out.push(op_type::ALIAS);
+            out.extend_from_slice(&eid.to_le_bytes());
+            out.extend_from_slice(&same_as.to_le_bytes());
+        }
+    }
+}
+
+/// [`encode_wire_into`] が足す長さ (signed_bytes が `signed_len` byte の時)。
+pub(crate) fn wire_len(signed_len: usize, op: &DecodedOp) -> usize {
+    let op_len = match op {
+        DecodedOp::Tie { value, .. } if *value > u32::MAX as u64 => 8 + 2 + 8,
+        DecodedOp::Tie { .. } => 8 + 2 + 4,
+        DecodedOp::Untie { .. } => 8 + 2,
+        DecodedOp::Delete { .. } => 8,
+        DecodedOp::Content { key, data, .. } => 8 + 4 + key.len() + 4 + data.len(),
+        DecodedOp::Commit => 0,
+        DecodedOp::Vocab { bytes, .. } => 4 + 4 + bytes.len(),
+        DecodedOp::TieNamed { himo_name, value, .. } => {
+            let value_len = if *value > u32::MAX as u64 { 8 } else { 4 };
+            8 + value_len + 1 + 2 + himo_name.len()
+        }
+        DecodedOp::TieLeaf { himo_name, bytes, .. } => 8 + 1 + 2 + himo_name.len() + 4 + bytes.len(),
+        DecodedOp::TieRef { .. } => 8 + 2 + 8,
+        DecodedOp::Alias { .. } => 8 + 8,
+    };
+    1 + 16 + 4 + 64 + 8 + 4 + signed_len + 1 + op_len
 }
 
 /// WireRecord::decode のエラー。
@@ -966,6 +1004,39 @@ impl Transport for InMemoryTransport {
 mod tests {
     use super::*;
     use enchudb_oplog::oplog::DecodedOp;
+
+    /// `wire_len` は `encode_wire_into` (= `encode`) が足す長さと同じ (#683: 記録の置き場所を先に決めてから直接書く)。 op の
+    /// 種類を全部、 値が u32 に入らない形も。 `encode_wire_into` は signed_bytes を片に分けても同じ bytes。
+    #[test]
+    fn wire_len_matches_the_encoding_of_every_op() {
+        let ops = [
+            DecodedOp::Tie { eid: 1, himo_id: 2, value: 3 },
+            DecodedOp::Tie { eid: 1, himo_id: 2, value: 1 << 40 },
+            DecodedOp::Untie { eid: 1, himo_id: 2 },
+            DecodedOp::Delete { eid: 1 },
+            DecodedOp::Content { eid: 1, key: "memo".into(), data: vec![9; 33] },
+            DecodedOp::Commit,
+            DecodedOp::Vocab { vid: 4, bytes: vec![8; 17] },
+            DecodedOp::TieNamed { eid: 1, himo_name: "_c_memo".into(), himo_kind: 2, value: 5 },
+            DecodedOp::TieNamed { eid: 1, himo_name: "_c_memo".into(), himo_kind: 2, value: 1 << 35 },
+            DecodedOp::TieLeaf { eid: 1, himo_name: "note".into(), himo_kind: 3, bytes: vec![1; 50] },
+            DecodedOp::TieRef { eid: 1, himo_id: 2, target: 7 << 32 },
+            DecodedOp::Alias { eid: 1, same_as: 6 << 32 },
+        ];
+        for op in ops {
+            let mut w = WireRecord::unsigned(Hlc { wall: 11, logical: 2, peer: 3 }, 4, op.clone());
+            w.signature = [5; 64];
+            w.pubkey_fp = [6; 8];
+            w.signed_bytes = (0..57u8).collect();
+            let enc = w.encode();
+            assert_eq!(wire_len(w.signed_bytes.len(), &op), enc.len(), "{op:?}");
+            let mut parts = Vec::new();
+            let (a, b) = w.signed_bytes.split_at(40);
+            encode_wire_into(&mut parts, w.hlc, w.author_peer, &w.signature, &w.pubkey_fp, &[a, b], &op);
+            assert_eq!(parts, enc, "{op:?}");
+            assert_eq!(WireRecord::decode(&enc).unwrap().0.op, op);
+        }
+    }
 
     /// #362: `MIN_WIRE_RECORD_LEN` は、 実際に一番短い record (署名対象も op の中身も空 = 未署名の Commit) の
     /// 長さと一致する。 これより大きく見積もると、 正しい batch で確保が足りなくなる (伸ばすだけで壊れは

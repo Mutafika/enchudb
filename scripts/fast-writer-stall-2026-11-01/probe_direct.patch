@@ -1,0 +1,321 @@
+diff --git a/crates/enchudb-engine/src/change_log.rs b/crates/enchudb-engine/src/change_log.rs
+index 3d38c8f..3d289fe 100644
+--- a/crates/enchudb-engine/src/change_log.rs
++++ b/crates/enchudb-engine/src/change_log.rs
+@@ -416,11 +416,14 @@ impl ChangeLog {
+                 mid.first = sim.first;
+                 mid.tail = sim.tail;
+             }
++            let t683 = enchudb_oplog::t683::now();
+             write_header(&self.region, &mid);
+             self.region.mark_dirty(0, HEADER);
+             self.map.flush_dirty()?;
++            enchudb_oplog::t683::span("ldrop", t683, sim.first - st.c.first);
+         }
+         // (2) entry を書いて書き出す
++        let t683 = enchudb_oplog::t683::now();
+         if let Some(end) = plan.iter().map(|&(at, n, _)| HEADER + at + n).max() {
+             self.region.ensure_committed(end)?;
+         }
+@@ -446,7 +449,10 @@ impl ChangeLog {
+         if let Some((s, e)) = run {
+             self.region.mark_dirty(HEADER + s, e - s);
+         }
++        enchudb_oplog::t683::span("lwrite", t683, range.len() as u64);
++        let t683 = enchudb_oplog::t683::now();
+         self.map.flush_dirty()?;
++        enchudb_oplog::t683::span("lflush", t683, range.len() as u64);
+         #[cfg(test)]
+         if self.stop_before_header.load(std::sync::atomic::Ordering::Relaxed) {
+             return Err(io::Error::other("test: stopped before the header"));
+@@ -454,9 +460,11 @@ impl ChangeLog {
+         // (3) 新しい head / next
+         sim.last = range.clone().last().map(|i| (recs.hlc(i), recs.wal_id(i))).or(sim.last);
+         st.c = sim;
++        let t683 = enchudb_oplog::t683::now();
+         write_header(&self.region, &st.c);
+         self.region.mark_dirty(0, HEADER);
+         self.map.flush_dirty()?;
++        enchudb_oplog::t683::span("lhdr", t683, 0);
+         // 目印: 捨てた分を外し、 足した分を置く
+         while st.marks.front().is_some_and(|&(m, _)| m < st.c.first) {
+             st.marks.pop_front();
+diff --git a/crates/enchudb-engine/src/engine.rs b/crates/enchudb-engine/src/engine.rs
+index 8f9b64f..d0987d1 100644
+--- a/crates/enchudb-engine/src/engine.rs
++++ b/crates/enchudb-engine/src/engine.rs
+@@ -15899,10 +15899,12 @@ impl Engine {
+         use std::sync::atomic::Ordering;
+         #[cfg(test)]
+         change_copy_hook::call(wal);
+-        // record は記録に置き終えるまで WAL の mmap を借りる (#683: 写しを作らない)。 畳む道 (`try_fold_with_changes` / 空け作り) は
+-        // `change_emit` を持ったまま写してから畳むので、 呼び手が `change_emit` を持つ間に借りた区画は畳まれない
++        let t683 = enchudb_oplog::t683::now();
+         let (recs, end) = wal.scan_refs_for_change_log(c.log_wal, limit, with_tail);
++        enchudb_oplog::t683::span("scan", t683, recs.len() as u64);
++        let t683 = enchudb_oplog::t683::now();
+         let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
++        enchudb_oplog::t683::span("keep", t683, recs.len() as u64);
+         if recs.is_empty() {
+             c.log_wal = c.log_wal.max(end);
+             return Ok(0);
+@@ -15910,7 +15912,9 @@ impl Engine {
+         let watch: Vec<u64> = c.readers.iter().map(|(_, p)| *p).collect();
+         let before = log.range().1;
+         let mut lost = Vec::new();
++        let t683 = enchudb_oplog::t683::now();
+         let res = log.append_from(&crate::change_log::WalRecords::new(&recs), &watch, &mut lost);
++        enchudb_oplog::t683::span("lappend", t683, recs.len() as u64);
+         let done = (log.range().1 - before) as usize;
+         c.log_wal = if done == recs.len() {
+             end
+@@ -20117,13 +20121,17 @@ impl Engine {
+         // #667: 記録がある時は、 畳めるかによらず書き出した所まで写す (畳む時にまとめて写すと、 区画 1 つ分を写し終えるまで全力の
+         // 書き手が空きを待った)
+         if let Some(log) = self.change_log.get() {
++            let t683 = enchudb_oplog::t683::now();
+             moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false).unwrap_or(0);
++            enchudb_oplog::t683::span("pump_tick", t683, moved as u64);
+         }
+         // 先に lock の外で見積もる (畳める区画が無い / bridge が読み終えていないなら append_lock を取らない)。 畳めそうなら、 配って
+         // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
+         let folded = wal.fold_hint().is_some_and(|through| {
+             self.wal_fold_safe_to(through) && {
++                let t683 = enchudb_oplog::t683::now();
+                 moved = self.move_changes_before_fold(wal, &mut c, wal.checkpoint());
++                enchudb_oplog::t683::span("mcbf", t683, moved as u64);
+                 true
+             }
+         }) && wal.try_reset_if(|through| {
+@@ -20385,7 +20393,9 @@ impl Engine {
+                         && (engine.wal_room_wanted.load(Ordering::Acquire)
+                             || wal.free_bytes() < wal.capacity() / 4)
+                     {
+-                        engine.make_wal_room_paced(wal);
++                        let t683 = enchudb_oplog::t683::now();
++                        let r = engine.make_wal_room_paced(wal);
++                        enchudb_oplog::t683::span("room", t683, r as u64);
+                     }
+ 
+                     // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &
+@@ -20399,7 +20409,9 @@ impl Engine {
+                             if wal.head() > wal.checkpoint() {
+                                 // #451 (段階 1): 配り済みの印の候補は Commit を打つ前に切る (印が覆う record は閉じた group に入る)
+                                 let cut = engine.take_durable_cut(wal);
++                                let t683 = enchudb_oplog::t683::now();
+                                 let committed = engine.append_commit_marker(wal).is_ok();
++                                enchudb_oplog::t683::span("tick_commit", t683, 0);
+                                 // #77-H3: checkpoint の上限は「今回の fsync/msync に
+                                 // 含まれることが確定した位置」= Commit append 直後の
+                                 // head。 msync 後に head を再読すると、 その間に
+@@ -20410,12 +20422,16 @@ impl Engine {
+                                 let durable_lsn = wal.next_lsn().saturating_sub(1);
+                                 // #317: 書き出しに失敗したら checkpoint を進めない (進めると oplog が畳まれ、
+                                 // 書き出せなかった本体を復旧する record も消える)
++                                let t683 = enchudb_oplog::t683::now();
+                                 let synced = engine.sync_for_checkpoint(wal);
++                                enchudb_oplog::t683::span("tick_sync", t683, switched as u64);
+                                 // 0.8.1: 周期 fsync でも tables sidecar を persist。
+                                 // checkpoint を前進させる前に必ず sidecar を固める
+                                 // (= 直後に process kill されても次 open で sidecar
+                                 // の next_local が oplog の進行と整合する)。
++                                let t683 = enchudb_oplog::t683::now();
+                                 engine.try_persist_tables();
++                                enchudb_oplog::t683::span("persist", t683, 0);
+                                 // #268: Commit が打てなかったら checkpoint を進めない。
+                                 // 進めると未 commit group が checkpoint の後ろに取り残され、
+                                 // bridge からも recovery からも永久に見えなくなる (実機で
+@@ -20490,11 +20506,15 @@ impl Engine {
+                             // (古い区画を畳んだ後、 今の区画も書き出し済みならその場で畳む)。 試験で周期の畳みを切った時は、 区画を
+                             // 移った時だけ畳む (#676)
+                             if switched || fold_off & WAL_FOLD_OFF_TICK == 0 {
++                                let t683 = enchudb_oplog::t683::now();
++                                let mut n683 = 0;
+                                 for _ in 0..2 {
+                                     if !engine.try_fold_with_changes(wal) {
+                                         break;
+                                     }
++                                    n683 += 1;
+                                 }
++                                enchudb_oplog::t683::span("fold_loop", t683, n683 + 10 * switched as u64);
+                             }
+                             drop(fold_guard);
+                             last_fsync = Instant::now();
+@@ -20697,7 +20717,9 @@ impl Engine {
+             if !wal.append_dead() {
+                 #[cfg(test)]
+                 room_commit_hook::call(wal);
++                let t683 = enchudb_oplog::t683::now();
+                 closed = self.append_commit_marker_with(wal, false).is_ok();
++                enchudb_oplog::t683::span("room_commit", t683, closed as u64);
+             }
+             // checkpoint を進める前に sidecar を固める (consumer の tick と同じ)
+             self.try_persist_tables();
+@@ -20723,7 +20745,9 @@ impl Engine {
+                             // #662: 畳む前に lock の外で、 書き出した所 (head) まで写す (lock の下は畳む区画の終わりまでの残りだけ)。
+                             // 1 区画の形は、 ここも append_lock の下 (書き出してから畳むまで append を止める形)
+                             if direct {
++                                let t683 = enchudb_oplog::t683::now();
+                                 moved.set(moved.get() + self.move_changes_before_fold(wal, &mut cursor.borrow_mut(), head));
++                                enchudb_oplog::t683::span("room_mcbf", t683, moved.get() as u64);
+                             }
+                         }
+                         ok
+@@ -20793,6 +20817,7 @@ impl Engine {
+             self.make_wal_room_paced(wal);
+             return wal.free_bytes() >= size;
+         }
++        let t683 = enchudb_oplog::t683::now();
+         let first_blocked = self.wal_room_blocked.load(Ordering::Acquire) + 1;
+         // 頼んだ時に試している最中の 1 回は頼みを見ていないかもしれないので、 その次の 1 回まで待つ
+         let blocked = || self.wal_room_blocked.load(Ordering::Acquire) > first_blocked;
+@@ -20803,10 +20828,12 @@ impl Engine {
+         let deadline = std::time::Instant::now() + WAL_ROOM_WAIT;
+         while std::time::Instant::now() < deadline {
+             if wal.free_bytes() >= size {
++                enchudb_oplog::t683::span("wait", t683, 1);
+                 return true;
+             }
+             // 今は畳めないと分かっている (直前に consumer が試して空かなかった) なら待たない
+             if stopping() || blocked() || self.wal_room_failed_recently() {
++                enchudb_oplog::t683::span("wait", t683, 2 + (wal.free_bytes() >= size) as u64);
+                 return wal.free_bytes() >= size;
+             }
+             self.wal_room_wanted.store(true, Ordering::Release);
+@@ -20819,6 +20846,7 @@ impl Engine {
+         if !room {
+             self.wal_room_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+         }
++        enchudb_oplog::t683::span("wait", t683, 4 + room as u64);
+         room
+     }
+ 
+@@ -20897,11 +20925,15 @@ impl Engine {
+         if write_out_fault::active(wal) {
+             return false;
+         }
++        let t683 = enchudb_oplog::t683::now();
+         let wal_ok = wal.fsync().is_ok();
++        enchudb_oplog::t683::span("fsync", t683, 0);
+         // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
+         // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
+         let names_ok = !wal_ok || self.persist_name_records().is_ok();
++        let t683 = enchudb_oplog::t683::now();
+         let body_ok = names_ok && self.body_msync().is_ok();
++        enchudb_oplog::t683::span("body", t683, 0);
+         if !(wal_ok && body_ok) {
+             self.record_fault(
+                 FaultKind::DiskSpace,
+@@ -21941,6 +21973,7 @@ impl Drop for Engine {
+         if let Ok(mut h) = self.consumer_handle.lock() {
+             if let Some(handle) = h.take() {
+                 let _ = handle.join();
++                enchudb_oplog::t683::dump();
+             }
+         }
+         // 通知係は、 consumer の最後の書き出しの後に残りを配って (溜めに移した分も) exit する。 listener が止まって返らなければ
+diff --git a/crates/enchudb-oplog/src/lib.rs b/crates/enchudb-oplog/src/lib.rs
+index efdf564..2fc6b64 100644
+--- a/crates/enchudb-oplog/src/lib.rs
++++ b/crates/enchudb-oplog/src/lib.rs
+@@ -155,3 +155,49 @@ impl Ord for Hlc {
+         self.cmp_key().cmp(&other.cmp_key())
+     }
+ }
++
++/// PROBE #683: 段ごとの時刻 (ENCHU_T683=<file> の時だけ控え、 `dump` で書き出す)。 commit しない。
++#[doc(hidden)]
++pub mod t683 {
++    use std::sync::{Mutex, OnceLock};
++    use std::time::Instant;
++    static T0: OnceLock<Instant> = OnceLock::new();
++    type Ev = (u64, u8, &'static str, u64, u64);
++    static BUF: Mutex<Vec<Ev>> = Mutex::new(Vec::new());
++    fn on() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| {
++            T0.get_or_init(Instant::now);
++            std::env::var_os("ENCHU_T683").is_some()
++        })
++    }
++    thread_local!(static K: u8 = match std::thread::current().name() {
++        Some("enchudb-consumer") => b'c',
++        Some(n) if n.contains("notif") => b'n',
++        _ => b'w',
++    });
++    #[inline]
++    pub fn now() -> Instant {
++        Instant::now()
++    }
++    /// `t` から今までの区間 (µs) を `tag` で控える。 `x` は付けたい数。
++    pub fn span(tag: &'static str, t: Instant, x: u64) {
++        if !on() {
++            return;
++        }
++        let t0 = *T0.get().unwrap();
++        let s = t.saturating_duration_since(t0).as_micros() as u64;
++        let d = t.elapsed().as_micros() as u64;
++        let k = K.with(|k| *k);
++        BUF.lock().unwrap().push((s, k, tag, d, x));
++    }
++    pub fn dump() {
++        let Some(p) = std::env::var_os("ENCHU_T683") else { return };
++        let buf = std::mem::take(&mut *BUF.lock().unwrap());
++        let mut out = String::new();
++        for (s, k, tag, d, x) in buf {
++            out.push_str(&format!("{s} {} {tag} {d} {x}\n", k as char));
++        }
++        let _ = std::fs::write(p, out);
++    }
++}
+diff --git a/crates/enchudb-oplog/src/oplog.rs b/crates/enchudb-oplog/src/oplog.rs
+index 983d4ae..166d357 100644
+--- a/crates/enchudb-oplog/src/oplog.rs
++++ b/crates/enchudb-oplog/src/oplog.rs
+@@ -1840,12 +1840,15 @@ impl OpLog {
+         if !o.is_empty() || self.alloc_head(o) > HEADER_SIZE as u64 {
+             return false;
+         }
++        let t683 = crate::t683::now();
+         self.close_group_for_switch(a);
+         // #663: 移った先に書く前に、 古い区画の header (最後の head) を書き出す。 新しい区画の record が読める像では、 古い区画の
+         // header が最後の head を持つ = 古い区画の record が欠けていれば読みは古い区画の途中で止まり、 新しい区画を読まない。 書き
+         // 出さないと、 header だけ前の head のまま古い区画の終わりの record が届かず、 新しい区画の record は届いた像で、 読みが古い
+         // 区画を前の head で読み終えて新しい区画へ進み、 間を飛ばして当てた (再生と changefeed の記録の続きが穴の後から)
++        let t683h = crate::t683::now();
+         self.sync_half_header(a);
++        crate::t683::span("swhdr", t683h, 0);
+         if !lap_newer(o.lap(), a.lap()) {
+             let lap = self.take_next_lap();
+             let b = o.base();
+@@ -1857,6 +1860,7 @@ impl OpLog {
+         if let Some(h) = self.switch_hook.get() {
+             h();
+         }
++        crate::t683::span("switch", t683, 0);
+         true
+     }
+ 
+@@ -2641,15 +2645,20 @@ impl OpLog {
+         // チェックと head CAS の間に窓があり、 その間に進入した append の
+         // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
+         // append_lock 保持中は append_inner が進入できないため窓が閉じる。
++        let t683w = crate::t683::now();
+         let _in_proc = self.append_lock.lock();
++        crate::t683::span("reset_lockwait", t683w, 0);
++        let t683 = crate::t683::now();
+         // `pending_writes` は見ない (`checkpoint_and_reset` と同じ)。 全 append は `append_lock` の下で場所を取って
+         // 書き終え、 head も進めるので、 ここで数に入っているのは lock を待っている append と、 満杯で空きを待っている
+         // append (`wait_for_room`、 record はまだ載っていない) だけ。 前は見ていたので、 空きを待つ書き手がいる間は畳めず、
+         // 空きを作れないまま書き手が諦めて record が落ちた (sync の DB で満杯になると、 その後の record がほぼ全部落ちた、 #511)。
+         let Some((i, through)) = self.fold_target_locked() else { return false };
+         // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
+-        if !fold_safe(through) { return false; }
+-        self.fold_half_locked(i)
++        if !fold_safe(through) { crate::t683::span("reset_held", t683, 2); return false; }
++        let r = self.fold_half_locked(i);
++        crate::t683::span("reset_held", t683, r as u64);
++        r
+     }
+ 
+     /// 今畳める区画があれば、 読み手がそこまで読み終えていればよい位置 (`try_reset_if` が `fold_safe` に渡す値)。 lock を取らない
