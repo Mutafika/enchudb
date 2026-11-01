@@ -397,10 +397,12 @@ fn a_build_continues_the_wal_where_it_stopped() {
     cleanup(&path);
 }
 
-/// (T7) 記録が WAL より小さい (記録 1 MiB、 WAL 64 MiB、 書き手が全力、 追いつきの前に 300 ms): 記録は組の番号より先まで捨て、 組む側は捨てる口の
-/// 控えで先まで当てた後に、 写した所から WAL を読む (WAL はその record をまだ持つ) = 当てた record が重なる。 前に当てた所より前の HLC は当てない
-/// (古い record を後から当てると面が化ける)。 listener を付ける (通知係が書き出しのたびに記録へ写す = 記録が組む間に何度も捨てる)。 組を読んだ後・
-/// 記録を読む前に試験の口で、 記録が組の番号より先まで捨てるまで待つ (最大 2 秒。 15 回目まで 50 ms 止まる形だった)。
+/// (T7) 記録が WAL より小さい (記録 1 MiB、 WAL 64 MiB、 書き手は 1 件ごとに 20 µs 空ける、 追いつきの前に 300 ms): 記録は組の番号より先まで捨て、
+/// 組む側は捨てる口の控えで先まで当てた後に、 写した所から WAL を読む (WAL はその record をまだ持つ) = 当てた record が重なる。 前に当てた所より前の
+/// HLC は当てない (古い record を後から当てると面が化ける)。 listener を付ける (通知係が書き出しのたびに記録へ写す = 記録が組む間に何度も捨てる)。
+/// 組を読んだ後・記録を読む前に試験の口で、 記録が組の番号より先まで捨てるまで待つ (最大 2 秒。 15 回目まで 50 ms 止まる形だった)。 重なるのは
+/// change_emit を持たずに読んだ回だけ (持つ回は記録が捨てない)。 18 回目: 書き手が全力 (17 回目まで) だと、 #686 / #687 の後は静かな機械で
+/// 読みが毎回区画の畳みに追い越され、 3 回の読み直しの後の持って読む回で終わるので重ならない (負荷 5 前後で 3 session とも重なり 0)。
 #[test]
 fn a_build_drops_what_it_already_applied_from_the_side_notes() {
     let path = tmp_path("t7");
@@ -409,7 +411,7 @@ fn a_build_drops_what_it_already_applied_from_the_side_notes() {
     let mut h = create(&path, WAL, 1 << 20);
     let (mut dups, mut side) = (0, 0);
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, WAL, &mut h, 400, 0, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true, 2_000_000, 0, 0, (0, 0));
+        let ss = concurrent_session(&path, WAL, &mut h, 400, 20, 3, 3, 300, (0, 0), 0, 0x7777 + k, 2, true, 2_000_000, 0, 0, (0, 0));
         dups += usize::from(ss.st.dups > 0);
         side += usize::from(ss.st.side_ops > 0);
     }
