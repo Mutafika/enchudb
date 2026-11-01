@@ -1689,6 +1689,11 @@ impl OpLog {
         self.hot.halves.iter().all(|h| h.size() == 0 || h.is_empty())
     }
 
+    /// 試作 (球の試験の口): 2 区画の形で、 書き手が今書いていない方の区画が空 (書き手は今の区画が埋まるとそこへ移れる)。
+    pub fn other_half_empty(&self) -> bool {
+        self.two.load(Ordering::Acquire) && self.hot.halves[self.hot.active.load(Ordering::Acquire) ^ 1].is_empty()
+    }
+
     /// 区画を切り替えた回数 (観測用)。
     pub fn switches(&self) -> u64 {
         self.switches.load(Ordering::Relaxed)

@@ -1,0 +1,12 @@
+v17 r=1 load=27.52 ok=4/8 panics:    1 crates/enchudb-schema/tests/ball_lazy.rs:394    2 crates/enchudb-schema/tests/ball_lazy.rs:434 
+v18 r=1 load=12.22 ok=8/8 panics: 
+v18 r=2 load=44.56 ok=8/8 panics: 
+v17 r=2 load=62.49 ok=6/8 panics:    2 crates/enchudb-schema/tests/ball_lazy.rs:434 
+v17 r=3 load=68.30 ok=5/8 panics:    2 crates/enchudb-schema/tests/ball_lazy.rs:83    1 crates/enchudb-schema/tests/ball_lazy.rs:91 
+v18 r=3 load=65.43 ok=8/8 panics: 
+v18 r=4 load=76.49 ok=8/8 panics: 
+v17 r=4 load=75.74 ok=7/8 panics:    1 crates/enchudb-schema/tests/ball_lazy.rs:394    1 crates/enchudb-schema/tests/ball_lazy.rs:434 
+v17 r=5 load=40.86 ok=5/8 panics:    1 crates/enchudb-schema/tests/ball_lazy.rs:394    2 crates/enchudb-schema/tests/ball_lazy.rs:434 
+v18 r=5 load=57.87 ok=8/8 panics: 
+v18 r=6 load=77.61 ok=8/8 panics: 
+v17 r=6 load=88.62 ok=6/8 panics:    2 crates/enchudb-schema/tests/ball_lazy.rs:434 

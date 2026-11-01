@@ -303,12 +303,24 @@ impl BallReplay<'_> {
         let mut tries = 0u64;
         loop {
             tries += 1;
+            // 試験の口: 各回の最初だけ、 WAL の続きを読む回なら、 写す側が読み終えた所より先まで写すまで (最大 aw µs) 待ってから組を取る
+            // (18 回目: 決まった時間だけ止まる形 (追いつきの前に 150 ms) は、 8 本並べて 24 本中 7 本が前提を踏まなかった)
+            let aw = self.eng.ball_publish_pause[7].load(std::sync::atomic::Ordering::Relaxed);
+            if aw > 0
+                && tries == 1
+                && let Some(off) = self.wal_mark.filter(|&off| wal.holds(off))
+            {
+                let t = std::time::Instant::now();
+                while self.eng.ball_bases.mark().is_none_or(|m| m.1 <= off) && wal.holds(off) && t.elapsed() < std::time::Duration::from_micros(aw) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
             let t0 = std::time::Instant::now();
             // 読み直しが続いたら (書き手が区画を埋めて畳まれるのが、 区画を読むより速い)、 この回は change_emit を持ったまま組を取り、
             // 記録と WAL を読んで確かめるまで放さない: 写すのと畳むのはこの lock の下なので、 この回は読む間に畳まれない (18 回目。
             // 持たずに読み直し続けると、 #686 / #687 で書き手が 1.6 倍速くなった後の T7 で、 1 回の組みに読み直し 116 回・113 秒)。
             // 持つ間に書き手が今の区画を埋めると、 書き手は空きを待つ
-            let emit = (tries > Self::REFOLDS_BEFORE_HOLD).then(|| self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()));
+            let mut emit = (tries > Self::REFOLDS_BEFORE_HOLD).then(|| self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()));
             self.held_reads += u64::from(emit.is_some());
             // 組を置き直す前に読み直しが続く時 (畳んだ直後) も、 組は change_emit の下で読む
             let (next, log_wal, folds) = match &emit {
@@ -335,11 +347,23 @@ impl BallReplay<'_> {
             let start = match self.wal_mark {
                 Some(off) if wal.holds(off) => {
                     continued = true;
-                    // 試験の口: 各回の最初だけ、 書き手が次の区画へ移るまで (読み始める区画がある間、 最大 cw µs) 待つ
+                    // 試験の口: 各回の最初だけ、 書き手が次の区画へ移るまで (読み始める区画がある間、 最大 cw µs) 待つ。 18 回目: 移る先が
+                    // 空く (畳まれる) のを待ってから change_emit を取り、 移るのを待って、 読んで確かめるまで持つ (持たないと移った後の古い
+                    // 区画が読む前に畳まれて読み直しになり、 8 本並べて 24 本中 10〜12 本が前提を踏まなかった。 移る先が空かないうちに
+                    // 持つと、 畳めないので書き手が移れない)
                     let cw = self.eng.ball_publish_pause[4].load(std::sync::atomic::Ordering::Relaxed);
                     if cw > 0 && tries == 1 {
                         let t = std::time::Instant::now();
-                        while wal_pos_lap(wal.head()) == wal_pos_lap(off) && wal.holds(off) && t.elapsed() < std::time::Duration::from_micros(cw) {
+                        let until = std::time::Duration::from_micros(cw);
+                        while !wal.other_half_empty() && wal.holds(off) && t.elapsed() < until {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        if emit.is_none() {
+                            // 持つ前に読み始める区画が畳まれていたら持たない (この回は読み直し)。 持った後は畳まれない
+                            let c = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                            emit = wal.holds(off).then_some(c);
+                        }
+                        while wal_pos_lap(wal.head()) == wal_pos_lap(off) && wal.holds(off) && t.elapsed() < until {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                     }
@@ -5550,8 +5574,8 @@ pub struct Engine {
     ball_build_pause: std::sync::atomic::AtomicU64,
     /// 試験: 公開中を置いた後・H を取る前 / 書き終えを待った後・残りを読む前 / 追いつきで WAL の位置を取った後・WAL を読む前に止まる
     /// 時間 (µs、 公開の約束の場所と、 読む間に畳む場所を広げる)。 [3] 以降は各 setter (`ball_set_mark_pause` / `ball_set_cross_wait` /
-    /// `ball_set_refold_wait` の µs と回数)。
-    ball_publish_pause: [std::sync::atomic::AtomicU64; 7],
+    /// `ball_set_refold_wait` の µs と回数 / `ball_set_ahead_wait`)。
+    ball_publish_pause: [std::sync::atomic::AtomicU64; 8],
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -6130,7 +6154,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -7417,7 +7441,7 @@ impl Engine {
             ball_rebuild_stats: std::sync::Mutex::new(None),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 7],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -19185,10 +19209,18 @@ impl Engine {
 
     /// 試験: 球を組む時、 追いつきの各回の最初で WAL の続きを読む前に、 書き手が次の区画へ移るまで最大 `us` µs 待つ (読み始める区画が
     /// 畳まれたら待たない)。 15 回目: 追いつきの前に決まった時間だけ止まる形 (40 ms) は、 試験を 8 本並べて回すと 24 回中 22 回、 その間に
-    /// 区画を移らなかった。
+    /// 区画を移らなかった。 18 回目: 移る先が空くのを待ってから `change_emit` を取り、 移るのを待って、 読んで確かめるまで持つ (移った後の
+    /// 古い区画が読む前に畳まれないように)。
     #[doc(hidden)]
     pub fn ball_set_cross_wait(&self, us: u64) {
         self.ball_publish_pause[4].store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 試験: 球を組む時、 追いつきの各回の最初で WAL の続きを読む回なら、 写す側が読み終えた所より先まで写すまで最大 `us` µs 待ってから
+    /// 組を取る (18 回目、 T5。 決まった時間だけ止まる形は、 8 本並べて回すと前提を踏まない回が多かった)。
+    #[doc(hidden)]
+    pub fn ball_set_ahead_wait(&self, us: u64) {
+        self.ball_publish_pause[7].store(us, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 試験: 球を組む時、 組みの最初の `tries` 回の読み (追いつきをまたいで数える) で、 WAL を読んだ後・確かめる前に、 読み始めた所の
