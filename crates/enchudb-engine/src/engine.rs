@@ -171,6 +171,8 @@ struct BallReplay<'a> {
     dups: u64,
     /// 球を回した数 (`Ball::replay_in`、 値の変わる書き込みだけ)。
     replays: u64,
+    /// 追いつきの各回の記録 ([`Engine::ball_rebuild_trace`]、 18 回目の調べ)。
+    trace: Vec<String>,
     /// [`BallRebuildStats::prof_ns`] / `prof_n`。
     prof: [u64; 7],
     prof_n: [u64; 4],
@@ -269,12 +271,14 @@ impl BallReplay<'_> {
                     }
                     let t1 = std::time::Instant::now();
                     self.prof_n[3] += 1;
+                    let (side0, from0) = (self.side_ops, *pos);
                     for (_, h, op) in self.eng.ball_bases.take_side(*pos) {
                         if self.admit(h, limit).is_some() {
                             self.side_ops += 1;
                             self.apply(h, &op);
                         }
                     }
+                    self.trace.push(format!("  控え: 番号 {from0} (捨てた所 {}) 当てた {} last {}", t.from, self.side_ops - side0, crate::ball::pack_hlc(self.last.wall, self.last.logical)));
                     *pos = t.from;
                     // 控えで当てた所までは読まずに飛ぶ (記録の entry は HLC の順)
                     if let Ok(p) = log.seek_after(*pos, (self.last.wall, self.last.logical))
@@ -301,8 +305,10 @@ impl BallReplay<'_> {
     fn catch_up(&mut self, log: &crate::change_log::ChangeLog, wal: &enchudb_oplog::oplog::OpLog, pos: &mut u64, limit: Option<enchudb_oplog::Hlc>) {
         use enchudb_oplog::oplog::{wal_pos, wal_pos_lap, HEADER_SIZE};
         let mut tries = 0u64;
+        let pk = |h: enchudb_oplog::Hlc| crate::ball::pack_hlc(h.wall, h.logical);
         loop {
             tries += 1;
+            let (pos0, last0) = (*pos, self.last);
             // 試験の口: 各回の最初だけ、 WAL の続きを読む回なら、 写す側が読み終えた所より先まで写すまで (最大 aw µs) 待ってから組を取る
             // (18 回目: 決まった時間だけ止まる形 (追いつきの前に 150 ms) は、 8 本並べて 24 本中 7 本が前提を踏まなかった)
             let aw = self.eng.ball_publish_pause[7].load(std::sync::atomic::Ordering::Relaxed);
@@ -380,7 +386,9 @@ impl BallReplay<'_> {
                         *pos = p;
                         self.eng.ball_bases.prune_side(p);
                     }
+                    let rec0 = self.records;
                     self.read_log(log, pos, next, limit);
+                    self.trace.push(format!("  記録 {pos0}→{} (組の番号 {next}) 当てた {} last {}", *pos, self.records - rec0, pk(self.last)));
                     log_wal
                 }
             };
@@ -442,6 +450,11 @@ impl BallReplay<'_> {
                 // 当てずに捨てて、 記録から読み直す。 change_emit を持つ回は畳まれない (畳んだ区画を指す写した所は、 畳む側が lock の
                 // 下で頭 = 周 0 に戻し、 周 0 は畳んだ回で見る)
                 debug_assert!(emit.is_none(), "change_emit を持って読んだのに畳まれた");
+                self.trace.push(format!(
+                    "回 {tries}: 読み直し 続き {continued} start {start:#x} end {end:#x} 組 ({next}, {log_wal:#x}) 番号 {pos0}→{} ops {} 頭 {start_gone} 区画 {laps:?}",
+                    *pos,
+                    ops.len()
+                ));
                 self.wal_mark = None;
                 self.refolds += 1;
                 self.head_refolds += u64::from(first == 0 && start_gone);
@@ -451,7 +464,9 @@ impl BallReplay<'_> {
                 continue;
             }
             // 当てるのは lock の外 (読んだ分は区画を確かめてある)
+            let held = emit.is_some();
             drop(emit);
+            let rec1 = self.records;
             let t3 = std::time::Instant::now();
             // 組んでいる球は自分しか触らない: pin は 1024 件ごとに 1 回
             let mut guard = crossbeam_epoch::pin();
@@ -472,6 +487,17 @@ impl BallReplay<'_> {
                 *pos = next;
                 self.eng.ball_bases.prune_side(next);
             }
+            self.trace.push(format!(
+                "回 {tries}: 続き {continued} 持つ {held} start {start:#x} end {end:#x} 組 ({next}, {log_wal:#x}) 番号 {pos0}→{} ops {} 当てた {} HLC {}..{} last {}→{} limit {:?} 区画 {laps:?}",
+                *pos,
+                ops.len(),
+                self.records - rec1,
+                ops.first().map_or(0, |o| pk(o.0)),
+                ops.last().map_or(0, |o| pk(o.0)),
+                pk(last0),
+                pk(self.last),
+                limit.map(pk)
+            ));
             self.wal_mark = Some(end);
             return;
         }
@@ -5568,6 +5594,8 @@ pub struct Engine {
     ball_bases: std::sync::Arc<crate::ball_base::BallBases>,
     /// 最後の球の組み直しの数と時間 (試作、 測り用)。
     ball_rebuild_stats: std::sync::Mutex<Option<BallRebuildStats>>,
+    /// 最後の球の組み直しの、 追いつきの各回の記録 (試作、 [`Engine::ball_rebuild_trace`])。
+    ball_rebuild_trace: std::sync::Mutex<Vec<String>>,
     /// 球を組む人は 1 人ずつ (`build_ball`)。
     ball_build: std::sync::Mutex<()>,
     /// 試験: 組む時、 追いつきの毎回の前に止まる時間 (ms、 書き手が並んで書く間を広げる)。
@@ -6152,6 +6180,7 @@ impl Engine {
             balls: crate::ball::Balls::new(),
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
+            ball_rebuild_trace: std::sync::Mutex::new(Vec::new()),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
             ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
@@ -7439,6 +7468,7 @@ impl Engine {
             balls: crate::ball::Balls::new(),
             ball_bases: std::sync::Arc::new(crate::ball_base::BallBases::new()),
             ball_rebuild_stats: std::sync::Mutex::new(None),
+            ball_rebuild_trace: std::sync::Mutex::new(Vec::new()),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
             ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
@@ -19051,6 +19081,7 @@ impl Engine {
             crossed: 0,
             dups: 0,
             replays: 0,
+            trace: Vec::new(),
         };
         let make_ns = t0.elapsed().as_nanos() as u64 - ready_ns - seed_ns;
         let pause = self.ball_build_pause.load(std::sync::atomic::Ordering::Relaxed);
@@ -19059,6 +19090,8 @@ impl Engine {
         let w0 = log.wait_stats();
         let mut pos = done;
         rp.read_log(log, &mut pos, u64::MAX, None);
+        let pk = |h: enchudb_oplog::Hlc| crate::ball::pack_hlc(h.wall, h.logical);
+        rp.trace.push(format!("記録: 地平 {} 番号 {done}→{pos} 当てた {} last {}", pk(horizon), rp.records, pk(rp.last)));
         let log_ns = t_log.elapsed().as_nanos() as u64;
         let w1 = log.wait_stats();
         // 段ごとの数は追いつきの分を別に
@@ -19111,7 +19144,9 @@ impl Engine {
             std::thread::sleep(std::time::Duration::from_micros(pp[1]));
         }
         // (4) H より前の残り
+        rp.trace.push(format!("公開中: H {}", pk(h)));
         rp.catch_up(log, wal, &mut pos, Some(h));
+        *self.ball_rebuild_trace.lock().unwrap_or_else(|p| p.into_inner()) = std::mem::take(&mut rp.trace);
         // (5) 出す
         let (records, applied, side_ops, refolds, head_refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead, rp_crossed) =
             (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.head_refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead, rp.crossed);
@@ -19242,6 +19277,12 @@ impl Engine {
     #[doc(hidden)]
     pub fn ball_rebuild_stats(&self) -> Option<BallRebuildStats> {
         *self.ball_rebuild_stats.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 最後の球の組み直しの、 記録の読み・追いつきの各回・公開の記録 (試作、 18 回目の答えの食い違いの調べ。 時刻は球の時刻に詰めた HLC)。
+    #[doc(hidden)]
+    pub fn ball_rebuild_trace(&self) -> Vec<String> {
+        self.ball_rebuild_trace.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 球の今の時刻 (試作)。 この後の書き換えは、 これより大きい時刻になる。

@@ -120,13 +120,13 @@ impl Hist {
                     let only_hist: Vec<u64> = want.iter().filter(|e| !got.contains(e)).copied().collect();
                     let diff: Vec<u64> = only_ball.iter().chain(&only_hist).copied().collect();
                     let head = format!("回 {k} t={t} v={v} (地平 {hz}、 宣言の地平 {}、 控え {}): 球だけ {only_ball:?}、 写しだけ {only_hist:?}", self.hz0, self.checks.len());
-                    self.fail(db, what, k, &diff, false, head);
+                    self.fail(db, what, k, &diff, head);
                 }
             }
             for (i, &e) in self.eids.iter().enumerate() {
                 let got = eng.ball_value_at(e, "t.a", *t).unwrap();
                 if got != cur[i] {
-                    self.fail(db, what, k, &[e], false, format!("回 {k} t={t} e={e}: 球 {got:?}、 写し {:?}", cur[i]));
+                    self.fail(db, what, k, &[e], format!("回 {k} t={t} e={e}: 球 {got:?}、 写し {:?}", cur[i]));
                 }
             }
         }
@@ -134,7 +134,7 @@ impl Hist {
             for (i, &e) in self.eids.iter().enumerate() {
                 let n = eng.ball_faces(e, "t.a").len();
                 if n != self.faces[i] {
-                    self.fail(db, what, self.checks.len() - 1, &[e], true, format!("e={e} 面の数: 球 {n}、 写し {}", self.faces[i]));
+                    self.fail(db, what, self.checks.len() - 1, &[e], format!("e={e} 面の数: 球 {n}、 写し {}", self.faces[i]));
                 }
             }
         }
@@ -150,13 +150,13 @@ impl Hist {
         (seen, old)
     }
 
-    /// 食い違い: 食い違った entity ごとに、 回 `k` の前後 3 回の控え (時刻、 写し、 球の答え) と、 その間に掛かる球の面 (`all` なら全部の面)
-    /// を並べて panic する。 `BALL_KEEP` があれば写しと控えを残す。
-    fn fail(&self, db: &Database, what: &str, k: usize, eids: &[u64], all: bool, head: String) -> ! {
+    /// 食い違い: 食い違った entity ごとに、 回 `k` の前後 3 回の控え (時刻、 写し、 球の答え) と球の面を全部と、 列と名簿の今を並べ、
+    /// 最後に組んだ時の追いつきの記録 (`Engine::ball_rebuild_trace`) を足して panic する。 `BALL_KEEP` があれば写しと控えを残す。
+    fn fail(&self, db: &Database, what: &str, k: usize, eids: &[u64], head: String) -> ! {
         let eng = db.engine();
         let mut why = format!("{what}: {head}\n");
         let (lo, hi) = (k.saturating_sub(3), (k + 3).min(self.checks.len() - 1));
-        let (t_lo, t_hi) = (self.checks[lo].0, self.checks[hi].0);
+        let ha = eng.himo_id("t.a").unwrap() as u16;
         for &e in eids.iter().take(4) {
             let i = self.eids.iter().position(|&x| x == e).unwrap();
             why += &format!("e={e}: 控え (回, 時刻, 写し, 球の答え)\n");
@@ -164,10 +164,16 @@ impl Hist {
                 why += &format!("  {j} {t} {:?} {:?}\n", cur[i], eng.ball_value_at(e, "t.a", *t));
             }
             let fs = eng.ball_faces(e, "t.a");
-            why += &format!("e={e}: 面 {} 枚 (写しの数 {})、 {} (値, from, to)\n", fs.len(), self.faces[i], if all { "全部" } else { "控えの間に掛かる面" });
-            for f in fs.iter().filter(|f| all || (f.to >= t_lo && f.from <= t_hi)) {
+            let col = eng.get_by_id(e, ha);
+            let in_deck: Vec<u64> = VALS.iter().copied().filter(|&v| eng.pull_raw("t.a", v as u32).contains(&e)).collect();
+            why += &format!("e={e}: 列の今 {col:?}、 名簿の今 {in_deck:?}、 面 {} 枚 (写しの数 {}) (値, from, to)\n", fs.len(), self.faces[i]);
+            for f in &fs {
                 why += &format!("  {} {} {}\n", f.value, f.from, f.to);
             }
+        }
+        why += "最後に組んだ時の記録:\n";
+        for l in eng.ball_rebuild_trace() {
+            why += &format!("  {l}\n");
         }
         if let Some(c) = keep_case(&self.path) {
             clone_dir(&self.path, &c.join("post"));
@@ -663,6 +669,17 @@ fn keep_replay() {
     clone_dir(case.join("pre").to_str().unwrap(), std::path::Path::new(&path));
     let h = Hist::load(&case.join("hist.txt"), &path);
     let db = Database::open_with_oplog(&path, wal).unwrap();
+    // `BALL_KEEP_EIDS` (eid を `,` で区切る) の面を出す (落ちた時の面と比べて、 抜けた書き込みの時刻を見る)
+    if let Ok(list) = std::env::var("BALL_KEEP_EIDS") {
+        let _ = db.engine().ball_value_at(h.eids[0], "t.a", 0);
+        for e in list.split(',').map(|x| x.parse::<u64>().unwrap()) {
+            eprintln!("e={e}: 面 (値, from, to)");
+            for f in db.engine().ball_faces(e, "t.a") {
+                eprintln!("  {} {} {}", f.value, f.from, f.to);
+            }
+        }
+        eprintln!("組んだ時の記録: {:#?}", db.engine().ball_rebuild_trace());
+    }
     let (seen, old) = h.verify(&db, "残した写しを静かに開き直した後");
     eprintln!("合った: 控え {} (地平以降 {seen}、 前 {old})、 組む: {:?}", h.checks.len(), db.engine().ball_rebuild_stats());
 }
