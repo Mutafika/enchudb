@@ -1,0 +1,26 @@
+[
+ {
+  "name": "読み直しが続いても change_emit を持たない (上限なし、 17 回目の形、 T9)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "let emit = (tries > Self::REFOLDS_BEFORE_HOLD).then(",
+  "replace": "let emit = (tries > u64::MAX - 1).then("
+ },
+ {
+  "name": "持つ回でも組を取った後すぐ放す (16 回目までの tries > 3 の形、 T9)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            let t1 = std::time::Instant::now();\n            // 試験の口: 記録を読む回だけ",
+  "replace": "            let emit: Option<()> = { drop(emit); None };\n            let t1 = std::time::Instant::now();\n            // 試験の口: 記録を読む回だけ"
+ },
+ {
+  "name": "持つ回でも WAL を読む前に放す (T9)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "            // 球の紐に当たる書き込みだけを (HLC, 書き込み) で溜める",
+  "replace": "            let emit: Option<()> = { drop(emit); None };\n            // 球の紐に当たる書き込みだけを (HLC, 書き込み) で溜める"
+ },
+ {
+  "name": "持つ回も記録が捨てるのを待つ (試験の口、 答えは変わらず持つ間に最大 2 秒待つだけ = 等価の候補)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "if mp > 0 && emit.is_none() && !self.wal_mark.is_some_and(|off| wal.holds(off)) {",
+  "replace": "if mp > 0 && !self.wal_mark.is_some_and(|off| wal.holds(off)) {"
+ }
+]

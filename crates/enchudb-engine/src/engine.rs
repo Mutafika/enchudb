@@ -373,21 +373,6 @@ impl BallReplay<'_> {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
-            // 試験の口: 組みの最初の n 回の読み (追いつきをまたいで数える) は、 読み始める所の区画が畳まれるまで (最大 rw µs) 待つ (毎回
-            // 読み直しにする)。 change_emit を持つ回は畳まれないので待ち切ってから読む
-            let rw = self.eng.ball_publish_pause[5].load(std::sync::atomic::Ordering::Relaxed);
-            let left = |n: u64| n.checked_sub(1);
-            if rw > 0
-                && self.eng.ball_publish_pause[6]
-                    .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, left)
-                    .is_ok()
-            {
-                let t = std::time::Instant::now();
-                let gone = || if wal_pos_lap(start) == 0 { wal.folds() != folds } else { !wal.holds(start) };
-                while !gone() && t.elapsed() < std::time::Duration::from_micros(rw) {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
             // 球の紐に当たる書き込みだけを (HLC, 書き込み) で溜める (WAL の record は写さない。 当てるのは区画を確かめてから)
             let (hid, name, peer) = (self.hid, self.name, self.peer);
             let mut ops: Vec<(enchudb_oplog::Hlc, crate::ball_base::BaseOp)> = Vec::new();
@@ -408,6 +393,21 @@ impl BallReplay<'_> {
             self.prof[3] += t2.elapsed().as_nanos() as u64;
             self.prof_n[1] += seen;
             self.work += seen;
+            // 試験の口: 組みの最初の n 回の読み (追いつきをまたいで数える) は、 WAL を読んだ後・確かめる前に、 読み始めた所の区画が
+            // 畳まれるまで (最大 rw µs) 待つ (毎回読み直しにする)。 change_emit を持つ回は畳まれないので待ち切ってから確かめる
+            let rw = self.eng.ball_publish_pause[5].load(std::sync::atomic::Ordering::Relaxed);
+            let left = |n: u64| n.checked_sub(1);
+            if rw > 0
+                && self.eng.ball_publish_pause[6]
+                    .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, left)
+                    .is_ok()
+            {
+                let t = std::time::Instant::now();
+                let gone = || if wal_pos_lap(start) == 0 { wal.folds() != folds } else { !wal.holds(start) };
+                while !gone() && t.elapsed() < std::time::Duration::from_micros(rw) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
             // 読み始めた所の区画と読んだ区画が、 読んだ後もあるか。 写した所が 「頭から」 (周 0 = その場で畳んだ後) の時は区画の周が
             // 無いので、 組を置いた後に畳んでいないかを畳んだ回で見る (畳んでいれば、 頭からの区画は組の後に畳んだ区画の後ろ = 間を飛ぶ)
             let held = |lap: u32| wal.holds(wal_pos(lap, HEADER_SIZE as u64));
@@ -19191,9 +19191,9 @@ impl Engine {
         self.ball_publish_pause[4].store(us, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 試験: 球を組む時、 組みの最初の `tries` 回の読み (追いつきをまたいで数える) で、 WAL を読む前に読み始める所の区画が畳まれるまで
-    /// 最大 `us` µs 待つ (毎回読み直しにする、 18 回目)。 読み直しが 3 回続いた後の回は `change_emit` を持つので畳まれず、 待ち切ってから
-    /// 読んで返る。
+    /// 試験: 球を組む時、 組みの最初の `tries` 回の読み (追いつきをまたいで数える) で、 WAL を読んだ後・確かめる前に、 読み始めた所の
+    /// 区画が畳まれるまで最大 `us` µs 待つ (毎回読み直しにする、 18 回目)。 読み直しが 3 回続いた後の回は `change_emit` を持つので畳まれず、
+    /// 待ち切ってから確かめて返る。
     #[doc(hidden)]
     pub fn ball_set_refold_wait(&self, us: u64, tries: u64) {
         self.ball_publish_pause[6].store(tries, std::sync::atomic::Ordering::Relaxed);
