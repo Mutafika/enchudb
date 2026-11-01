@@ -1,0 +1,23 @@
+Traceback (most recent call last):
+  File "/Users/kubo/Desktop/mutafika/enchudb-ball/scripts/mutate.py", line 119, in run
+    rc = p.wait(timeout=timeout)
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/subprocess.py", line 1189, in wait
+    return self._wait(timeout=timeout)
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/subprocess.py", line 1911, in _wait
+    time.sleep(delay)
+  File "/Users/kubo/Desktop/mutafika/enchudb-ball/scripts/mutate.py", line 105, in on_signal
+    sys.exit(128 + signum)
+SystemExit: 143
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/kubo/Desktop/mutafika/enchudb-ball/scripts/mutate.py", line 207, in <module>
+    sys.exit(main())
+  File "/Users/kubo/Desktop/mutafika/enchudb-ball/scripts/mutate.py", line 163, in main
+    outcome, secs = run(cmd, a.timeout or 3600)
+  File "/Users/kubo/Desktop/mutafika/enchudb-ball/scripts/mutate.py", line 125, in run
+    kill_group(p.pid)
+  File "/Users/kubo/Desktop/mutafika/enchudb-ball/scripts/mutate.py", line 96, in kill_group
+    os.killpg(pgid, signal.SIGKILL)
+PermissionError: [Errno 1] Operation not permitted
