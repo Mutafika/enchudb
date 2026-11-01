@@ -24,11 +24,16 @@ fn cleanup(path: &str) {
     let _ = enchudb_engine::db_files::remove_db(path);
 }
 
-/// 試験が落ちても (panic でも) DB を消す。
+/// 試験が落ちても (panic でも) DB を消す。 `BALL_KEEP` の写しは通った時だけ消す (落ちた試験の写しを残す)。
 struct Gone(String);
 impl Drop for Gone {
     fn drop(&mut self) {
         cleanup(&self.0);
+        if !std::thread::panicking()
+            && let Some(c) = keep_case(&self.0)
+        {
+            let _ = std::fs::remove_dir_all(c);
+        }
     }
 }
 
@@ -62,12 +67,13 @@ fn clone_dir(from: &str, to: &std::path::Path) {
     assert!(ok, "写せない: {from} → {to:?}");
 }
 
-/// 開く (`BALL_KEEP` があれば、 開く前の DB を写して、 その時の控えの数と面の数を覚える)。
+/// 開く (`BALL_KEEP` があれば、 開く前の DB を写して、 その時の控えの数と面の数を覚え、 控えも書き出す = 食い違わなくても `keep_replay` で開ける)。
 fn open_kept(path: &str, wal: usize, h: &mut Hist) -> std::sync::Arc<Database> {
     if let Some(c) = keep_case(path) {
         clone_dir(path, &c.join("pre"));
         h.pre_checks = h.checks.len();
         h.pre_faces = h.faces.clone();
+        h.dump(&c.join("hist.txt"));
     }
     Database::open_with_oplog(path, wal).unwrap()
 }
