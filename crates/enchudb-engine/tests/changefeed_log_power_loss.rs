@@ -240,6 +240,61 @@ fn run(tag: &str, wal_cap: usize) {
     assert!(failures.is_empty(), "{} 枚が合わない:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// 記録のある DB の WAL (`set_sync_on_reset`) は、 区画を畳んだ時に畳んだ区画の header の page だけを書き出す (#683)。 畳んだ印は
+/// 届き (開いても畳んだ区画の record を再生しない)、 書き手がもう一方の区画に積んだ書き出し前の record は書き出さない (前は WAL
+/// 全体を fsync し、 2 区画の形ではその分も書いて、 1 回 4〜5 ms 書き手を止めた)。
+#[test]
+fn a_fold_writes_out_only_the_folded_half_header() {
+    use enchudb_oplog::oplog::{DecodedOp, Op, OpLog};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("foldhdr");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let path = live.join("oplog");
+    crashsim::start();
+    let wal = OpLog::create(&path, 64 << 10).unwrap();
+    wal.set_sync_on_reset(true);
+    let mut v = 0u64;
+    let group = |v: &mut u64| {
+        for _ in 0..4 {
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: *v }).unwrap();
+            *v += 1;
+        }
+        wal.append(Op::Commit).unwrap();
+    };
+    // A を埋めて B に移り、 B に少し積んでから全部を書き出す
+    while wal.switches() == 0 {
+        group(&mut v);
+    }
+    group(&mut v);
+    wal.fsync().unwrap();
+    let written = v;
+    wal.advance_checkpoint(wal.written_head());
+    // 書き出した後に B に積む (書き出していない record)
+    for _ in 0..3 {
+        group(&mut v);
+    }
+    assert!(wal.try_reset(), "前提: A を畳んだ");
+    assert_eq!(wal.switches(), 1, "前提: B に居たまま");
+    let img = root.join("img");
+    crashsim::capture(&live, &img, Mode::Lost).unwrap();
+    crashsim::stop();
+    drop(wal);
+    let back = OpLog::open(&img.join("oplog")).unwrap();
+    let got: Vec<u64> = back
+        .recover_with_tail()
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Tie { value, .. } => Some(value),
+            _ => None,
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(!got.is_empty() && got.windows(2).all(|w| w[1] == w[0] + 1), "前提: B の書き出した record が続いて残る: {got:?}");
+    assert_ne!(got[0], 0, "畳んだ印が届かず、 畳んだ区画 (A) の record を再生した");
+    assert_eq!(*got.last().unwrap(), written - 1, "畳む時に、 B に積んだ書き出し前の record まで書き出した");
+}
+
 /// 撮ったままの像 (`ENCHU_CFLOG_IMAGE` = `imgNNN.raw/db`) の記録と WAL を、 開かずに読んで並べる (調べる用)。
 #[test]
 #[ignore]

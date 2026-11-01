@@ -1755,6 +1755,11 @@ impl OpLog {
     /// #663: 区画 `h` の header の page を書き出す (`append_lock` の下、 移る時)。 区画の頭は [`HALF_ALIGN`] にそろっているので、
     /// そこから [`HALF_ALIGN`] を書く (page が 4 KiB でも 16 KiB でも header の page を含む)。 失敗しても移る (次の fsync が書く)。
     fn sync_half_header(&self, h: &Half) {
+        self.sync_header_page(h, "oplog.switch_header");
+    }
+
+    /// 区画 `h` の header の page を書き出す ([`Self::sync_half_header`] と同じ範囲、 `io` は故障を入れる点の名前)。 失敗しても何もしない。
+    fn sync_header_page(&self, h: &Half, io: &'static str) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let b = h.base();
@@ -1762,7 +1767,7 @@ impl OpLog {
             #[cfg(all(feature = "crashsim", unix))]
             let sim = crate::crashsim::active()
                 .then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, b as u64, &self.mmap[b..b + len]));
-            if crate::io_point("oplog.switch_header").is_ok() && self.mmap.flush_range(b, len).is_ok() {
+            if crate::io_point(io).is_ok() && self.mmap.flush_range(b, len).is_ok() {
                 #[cfg(all(feature = "crashsim", unix))]
                 if let Some(copy) = sim {
                     crate::crashsim::data_synced(&self._file, copy);
@@ -1770,7 +1775,7 @@ impl OpLog {
             }
         }
         #[cfg(target_arch = "wasm32")]
-        let _ = h;
+        let _ = (h, io);
     }
 
     /// 今の区画が埋まった時、 もう一方が空なら移る (`append_lock` の下)。 開いている group は今の区画に閉じの Commit を置いて
@@ -2652,14 +2657,16 @@ impl OpLog {
         mmap[b + 16..b + 24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         self.split_locked();
         if self.sync_on_reset.load(Ordering::Acquire) {
-            // append_lock の下: 次の record が前の周の page を上書きする前に、 頭に戻した header を届ける
-            let _ = self.fsync();
+            // append_lock の下: 次の record が前の周の page を上書きする前に、 頭に戻した header を届ける。 書くのは区画の header の
+            // page だけ (#683: 前は WAL 全体を fsync していた。 2 区画の形では書き手がもう一方の区画に積んだ分も書くので、 1 回 4〜5 ms
+            // 書き手を止めた)
+            self.sync_header_page(h, "oplog.fsync");
         }
         true
     }
 
-    /// 畳んだ印 (head / checkpoint を頭に戻した header) を、 次の record を書く前に書き出す (append_lock の下で fsync 1 回。
-    /// 畳む前に全部を書き出してあるので、 書くのは header の page だけ)。 既定は書き出さない: 電源が落ちると、 前の周の header
+    /// 畳んだ印 (head / checkpoint を頭に戻した header) を、 次の record を書く前に書き出す (append_lock の下で、 畳んだ区画の
+    /// header の page だけ。 畳む前に全部を書き出してある)。 既定は書き出さない: 電源が落ちると、 前の周の header
     /// のまま、 新しい周の page だけが OS に先に書かれた姿がありうる。 本体は前の周を当て終えているので困らないが、 WAL の中で
     /// 記録した record の続きを探す changefeed の記録 (engine の `changefeed.seg`) は、 前の周を途中までしか読めずに取り違える。
     pub fn set_sync_on_reset(&self, on: bool) {
