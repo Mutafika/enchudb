@@ -656,6 +656,78 @@ fn a_build_reads_holding_the_copy_lock_after_three_refolds() {
     cleanup(&path);
 }
 
+/// (T10) 頭からを読んで何も無かった次の回 (18 回目、 WAL 64 MiB = 書き手がもう一方の区画へ移らず、 使っていない区画の周は 0。 記録 128 MiB =
+/// 捨てない。 listener なし = 記録に写すのは畳む時だけ): 開き直した後の WAL が空の時に、 組む側が頭から (周 0 の位置) を読んで何も無い。
+/// 次の回の組を取る前に、 書く → 今の区画をその場で畳む (畳む前の record は記録にだけある) → また書く。 頭からの位置を続きにすると
+/// (`OpLog::holds` は周 0 の区画があれば真)、 畳んだ後の区画だけを読んで記録を組の番号まで飛ばす = 畳む前の書き込みを落とす (T5 を 12 本
+/// 並べて 360 本中 4 本)。 書き手はこの thread だけ。 組む側は 1 回目の追いつきが返った後、 次の回の試験の口で最大 3 秒待つ (続きなら
+/// 写す側が先へ進むまで、 記録を読む回なら記録が捨てるまで = 捨てないので待ち切る)。 直した形は、 組を取った後に畳んだのを見て読み直す。
+#[test]
+fn a_build_does_not_continue_from_the_head_after_a_fold() {
+    use enchudb_oplog::oplog::{wal_pos, HEADER_SIZE};
+    let path = tmp_path("t10");
+    cleanup(&path);
+    let _gone = Gone(path.clone());
+    let mut h = create(&path, WAL, 128 << 20);
+    let db = open_kept(&path, WAL, &mut h);
+    let eng = db.engine();
+    let wal = eng.oplog().unwrap();
+    let ha = eng.himo_id("t.a").unwrap() as u16;
+    let until = |f: &dyn Fn() -> bool, ms: u64| {
+        let t = std::time::Instant::now();
+        while !f() && t.elapsed() < std::time::Duration::from_millis(ms) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        f()
+    };
+    assert!(until(&|| wal.is_empty(), 3000), "開き直した後に WAL が空にならない — 試験の前提");
+    assert!(wal.holds(wal_pos(0, HEADER_SIZE as u64)), "周 0 の区画が無い — 試験の前提 (使っていない区画の周は 0)");
+    eng.ball_set_ahead_wait(3_000_000);
+    eng.ball_set_mark_pause(3_000_000);
+    let e0 = h.eids[0];
+    let mut r = Rng(0x7E10);
+    let mut write = |h: &mut Hist, n: usize| {
+        for _ in 0..n {
+            let i = r.below((TH * PER) as u64) as usize;
+            let x = r.below(VALS.len() as u64 + 1) as usize;
+            let new = (x < VALS.len()).then(|| VALS[x]);
+            match new {
+                None => eng.untie_by_id(h.eids[i], ha),
+                Some(v) => eng.tie_to_by_id(h.eids[i], ha, v as u32),
+            }
+            eng.commit();
+            h.faces[i] += usize::from(turns(h.cur[i], new));
+            h.cur[i] = new;
+        }
+        h.checks.push((wal_now(&db), h.cur.clone()));
+    };
+    let mut folded = 0;
+    std::thread::scope(|s| {
+        let b = s.spawn(|| {
+            let _ = eng.ball_value_at(e0, "t.a", 0);
+        });
+        assert!(until(&|| eng.ball_catch_up_calls() >= 1, 10_000), "1 回目の追いつきが返らない");
+        let folds0 = wal.folds();
+        write(&mut h, 200);
+        assert!(until(&|| wal.folds() > folds0 && wal.is_empty(), 3000), "書いた後に今の区画をその場で畳んでいない — 試験の前提");
+        write(&mut h, 50);
+        assert!(eng.ball_rebuild_stats().is_none(), "書き終える前に組み終えた — 試験の前提");
+        folded = wal.folds() - folds0;
+        // 今待っている口は待ち切る。 その後の回は待たない
+        eng.ball_set_ahead_wait(0);
+        eng.ball_set_mark_pause(0);
+        b.join().unwrap();
+    });
+    let st = eng.ball_rebuild_stats().expect("組んだ");
+    let trace = eng.ball_rebuild_trace();
+    eprintln!("組む: {st:?}、 畳んだ {folded}、 記録 {trace:#?}");
+    assert!(trace.iter().any(|l| l.contains("start 0x20 end 0x20")), "頭からを読んで何も無い回が無い — 試験の前提: {trace:#?}");
+    h.verify(&db, "頭からを読んだ次の回の後");
+    assert!(st.refolds >= 1, "組を取った後に畳んだのを見て読み直していない — 試験の前提: {trace:#?}");
+    drop(db);
+    cleanup(&path);
+}
+
 /// 18 回目の調べ (`#[ignore]`): 残した写し (`BALL_KEEP_CASE` = `BALL_KEEP` の下の 1 つ) の `pre` を別の場所に写して書き手なしで開き
 /// (WAL `BALL_KEEP_WAL` byte、 既定 64 MiB)、 最初の読みで組み直して、 写した時までの控えを比べる (食い違えば `fail` と同じ説明)。
 #[test]
