@@ -110,8 +110,8 @@
  {
   "name": "畳んだ後に記録を読まない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "                    self.read_log(log, pos, next, limit);\n                    log_wal",
-  "replace": "                    log_wal"
+  "find": "                    self.read_log(log, pos, next, limit);\n                    self.trace.push(",
+  "replace": "                    self.trace.push("
  },
  {
   "name": "縮まなくても回し続ける",
@@ -158,7 +158,7 @@
  {
   "name": "続きを読む時に新しい区画を読まない",
   "file": "crates/enchudb-oplog/src/oplog.rs",
-  "find": "            let Some(part) = part else { continue };\n            laps[k] = Some((part.lap, 0));",
-  "replace": "            let Some(part) = part.filter(|_| laps.iter().all(Option::is_none)) else { continue };\n            laps[k] = Some((part.lap, 0));"
+  "find": "        'parts: for (k, part) in self.read_plan(start, false).into_iter().enumerate() {\n            let Some(part) = part else { continue };\n            if part.start < part.end {",
+  "replace": "        let mut first_part = true;\n        'parts: for (k, part) in self.read_plan(start, false).into_iter().enumerate() {\n            let Some(part) = part.filter(|_| std::mem::replace(&mut first_part, false)) else { continue };\n            if part.start < part.end {"
  }
 ]

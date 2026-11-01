@@ -2,14 +2,14 @@
  {
   "name": "読み直しが続いても change_emit を持たない (上限なし、 17 回目の形、 T9)",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "let emit = (tries > Self::REFOLDS_BEFORE_HOLD).then(",
-  "replace": "let emit = (tries > u64::MAX - 1).then("
+  "find": "let mut emit = (tries > Self::REFOLDS_BEFORE_HOLD).then(",
+  "replace": "let mut emit = (tries > u64::MAX - 1).then("
  },
  {
   "name": "持つ回でも組を取った後すぐ放す (16 回目までの tries > 3 の形、 T9)",
   "file": "crates/enchudb-engine/src/engine.rs",
   "find": "            let t1 = std::time::Instant::now();\n            // 試験の口: 記録を読む回だけ",
-  "replace": "            let emit: Option<()> = { drop(emit); None };\n            let t1 = std::time::Instant::now();\n            // 試験の口: 記録を読む回だけ"
+  "replace": "            let mut emit = { drop(emit); None };\n            let t1 = std::time::Instant::now();\n            // 試験の口: 記録を読む回だけ"
  },
  {
   "name": "持つ回でも WAL を読む前に放す (T9)",
