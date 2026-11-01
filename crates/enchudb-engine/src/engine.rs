@@ -15906,10 +15906,11 @@ impl Engine {
             return Ok(0);
         }
         let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
+        let ids = crate::change_log::wal_ids(&recs, |(r, _)| &r.signed_bytes);
         let batch: Vec<crate::change_log::NewEntry> = recs
             .into_iter()
-            .map(|(r, _)| {
-                let wal_id = crate::change_log::fnv1a64(&r.signed_bytes);
+            .zip(ids)
+            .map(|((r, _), wal_id)| {
                 let w = crate::transport::WireRecord::from(r);
                 crate::change_log::NewEntry { hlc: w.hlc, wal_id, bytes: w.encode() }
             })
