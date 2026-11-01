@@ -3341,14 +3341,19 @@ impl OpLog {
     /// [`Self::scan_for_change_log`] と同じ (`read_plan`: `start` の区画はその offset から、 新しい区画は頭から、 終わりは新しい区画を
     /// 先に読む)。 止まり方も同じ (magic / 版 / 範囲 / CRC / 周の印 / 解けない op、 止まったら後ろの区画も読まない)。 戻り値は
     /// (渡した最後の record の後の位置、 なければ `start`, 見た record の数, 読んだ区画の (周, その区画で見た数) (古い順))。 呼び手は
-    /// 読んだ後に、 読んだ区画がまだあるか ([`Self::holds`]) を見る (読む間に畳まれた区画の続きは読めていない)。
+    /// 読んだ後に、 読んだ区画がまだあるか ([`Self::holds`]) を見る (読む間に畳まれた区画の続きは読めていない)。 読んだ区画は、 読む時に
+    /// 読む物があった区画だけ (18 回目): 空の区画の周は、 書き手がその区画へ移る時 (`switch_locked`、 `append_lock` の下) に置き直すので、
+    /// 返すと畳まれていないのに 「もう無い」 になる (畳むのは record のある区画だけ)。 前は返していて、 組む側が `change_emit` を持って
+    /// 読んでも読み直しになった
     pub fn scan_ops(&self, start: u64, mut f: impl FnMut(Hlc, PeerId, DecodedOp)) -> (u64, u64, [Option<(u32, u64)>; 2]) {
         let trailer = self.trailer.load(Ordering::Acquire);
         let mmap = self.mmap_slice();
         let (mut end, mut seen, mut laps) = (start, 0u64, [None, None]);
         'parts: for (k, part) in self.read_plan(start, false).into_iter().enumerate() {
             let Some(part) = part else { continue };
-            laps[k] = Some((part.lap, 0));
+            if part.start < part.end {
+                laps[k] = Some((part.lap, 0));
+            }
             let (base, lap) = (part.base, part.lap);
             let mut offset = part.start;
             while offset < part.end {
