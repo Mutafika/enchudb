@@ -1022,6 +1022,56 @@ pub struct Record {
     pub signed_bytes: Vec<u8>,
 }
 
+/// WAL の mmap を借りたままの 1 レコード ([`Record`] の写しを作らない版、 [`OpLog::scan_refs_for_change_log`])。
+/// 借りている間は、 その record のある区画を畳まないこと (畳むと次の周の record で上書きされる)。
+#[derive(Debug)]
+pub struct RecordRef<'a> {
+    pub lsn: u64,
+    pub hlc: Hlc,
+    pub author_peer: PeerId,
+    pub op: DecodedOp,
+    /// record の header (署名と公開鍵の先頭を含む全部)。
+    header: &'a [u8],
+    payload: &'a [u8],
+}
+
+impl<'a> RecordRef<'a> {
+    pub fn signature(&self) -> &'a [u8; 64] {
+        self.header[OFF_SIGNATURE..OFF_SIGNATURE + 64].try_into().unwrap()
+    }
+
+    pub fn pubkey_fp(&self) -> &'a [u8; 8] {
+        self.header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].try_into().unwrap()
+    }
+
+    /// [`Record::signed_bytes`] を 2 つに分けたもの (header の固定部、 payload)。 つなげると `signed_bytes` と同じ bytes。
+    /// 署名はその record の版の bytes に掛かっている。 header の先頭は signed_bytes と同じ並びなのでそのまま切り出す (v2 の
+    /// record を v3 として組み直さない)
+    pub fn signed_parts(&self) -> [&'a [u8]; 2] {
+        [&self.header[..SIGNED_PAYLOAD_HEADER_SIZE], self.payload]
+    }
+
+    pub fn signed_len(&self) -> usize {
+        SIGNED_PAYLOAD_HEADER_SIZE + self.payload.len()
+    }
+
+    pub fn to_record(self) -> Record {
+        let mut signed_bytes = Vec::with_capacity(self.signed_len());
+        for p in self.signed_parts() {
+            signed_bytes.extend_from_slice(p);
+        }
+        Record {
+            lsn: self.lsn,
+            hlc: self.hlc,
+            author_peer: self.author_peer,
+            signature: *self.signature(),
+            pubkey_fp: *self.pubkey_fp(),
+            op: self.op,
+            signed_bytes,
+        }
+    }
+}
+
 /// #268: scan が **なぜそこで止まったか**。
 ///
 /// bridge cursor が進むのは Commit に到達したときだけなので、 「空 scan が続く」 の
@@ -1064,16 +1114,16 @@ impl ScanStop {
     }
 }
 
-/// `scan_from_offset` の結果。
-struct ScanOut {
+/// `scan_from_offset` の結果。 `R` は record 1 件の形 (既定は写しを作った [`Record`]、 [`OpLog::scan_range_with`])。
+struct ScanOut<R = Record> {
     /// Commit で閉じた group の record 群。
-    out: Vec<(Record, u64)>,
+    out: Vec<(R, u64)>,
     max_lsn: u64,
     max_hlc: Hlc,
     /// 最後に読み切った Commit の直後 offset (1 つも無ければ start_offset)。
     committed_end: u64,
     /// 末尾の **未 commit** batch (Commit で閉じられなかった分)。
-    tail: Vec<(Record, u64)>,
+    tail: Vec<(R, u64)>,
     stop: ScanStop,
     /// 読んだ Commit の直後の offset (古い順)。
     commit_ends: Vec<u64>,
@@ -3237,8 +3287,24 @@ impl OpLog {
     /// (畳む区画の終わり) までの record を閉じていない末尾も含めて全部 (畳む直前に呼ぶ。 #662)。 どちらも `limit` より先は読まない (#678)。
     /// 読むだけ。
     pub fn scan_for_change_log(&self, start: u64, limit: u64, with_tail: bool) -> (Vec<(Record, u64)>, u64) {
+        self.change_log_scan(start, limit, with_tail, RecordRef::to_record)
+    }
+
+    /// [`Self::scan_for_change_log`] の写しを作らない版: record は WAL の mmap を借りる (#683: record ごとに署名の範囲の Vec を
+    /// 作って捨てていた。 これをやめて WAL を読む段が 1 件 78 → 54 ns)。 返した record を使い終えるまで、 読んだ区画を畳まないこと。
+    pub fn scan_refs_for_change_log(&self, start: u64, limit: u64, with_tail: bool) -> (Vec<(RecordRef<'_>, u64)>, u64) {
+        self.change_log_scan(start, limit, with_tail, |r| r)
+    }
+
+    fn change_log_scan<'s, R>(
+        &'s self,
+        start: u64,
+        limit: u64,
+        with_tail: bool,
+        mk: impl FnMut(RecordRef<'s>) -> R,
+    ) -> (Vec<(R, u64)>, u64) {
         if with_tail {
-            let s = self.scan_range(start, limit);
+            let s = self.scan_range_with(start, limit, mk);
             let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
             let mut out = s.out;
             out.extend(s.tail);
@@ -3246,9 +3312,12 @@ impl OpLog {
         }
         // #678: 前は head まで全部を解いてから `limit` で切った。 畳む前の 2 回目の写しは cursor がもう checkpoint にあり、 書き手が
         // 今の区画に積んだ分 (WAL 64 MiB で約 25 万件) を解いて 0 件を返していた (1 回 10 ms ほど、 その間 書き手は古い区画が畳まれるのを待つ)
-        let s = self.scan_range(start, limit);
+        let s = self.scan_range_with(start, limit, mk);
         let end = s.commit_ends.iter().rev().find(|&&c| c <= limit).copied().unwrap_or(start);
-        (s.out.into_iter().filter(|(_, e)| *e <= end).collect(), end)
+        // record は位置の順なので `end` までは先頭から続く (#683: 前は filter で全部を動かし直し、 WAL を読む時間の半分ほどだった)
+        let mut out = s.out;
+        out.truncate(out.partition_point(|(_, e)| *e <= end));
+        (out, end)
     }
 
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
@@ -3375,8 +3444,15 @@ impl OpLog {
     /// `scan_from_offset` を位置 `upto` ([`wal_pos`]、 record の境目 = 区画の終わりか head) で止める版: `upto` から先の record は
     /// 読まない (`upto` で読み終えたのと同じに扱う)。 畳む区画の終わりまでを読む時に、 今の区画を読まないため (#662)。
     fn scan_range(&self, start_offset: u64, upto: u64) -> ScanOut {
+        self.scan_range_with(start_offset, upto, RecordRef::to_record)
+    }
+
+    /// [`Self::scan_range`] の record 1 件の形を `mk` で決める版 (確かめ方は同じ)。 `mk` は Commit 以外の読めた record ごとに 1 回。
+    fn scan_range_with<'s, R>(&'s self, start_offset: u64, upto: u64, mut mk: impl FnMut(RecordRef<'s>) -> R) -> ScanOut<R> {
+        // `out[..committed]` は Commit で閉じた group、 その後ろは閉じていない末尾 (#683: 前は group ごとに別の Vec に積んで Commit で
+        // 移していた。 changefeed の記録への写しでは group が 1〜2 件で、 移すのが record ごとの memmove になっていた)
         let mut out = Vec::new();
-        let mut batch = Vec::new();
+        let mut committed = 0;
         let mut commit_ends = Vec::new();
         let mut committed_end = start_offset;
         let trailer = self.trailer.load(Ordering::Acquire);
@@ -3423,10 +3499,6 @@ impl OpLog {
                 let hlc_peer = u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap());
                 let author_peer = u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap());
                 let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
-                let mut signature = [0u8; 64];
-                signature.copy_from_slice(&header[OFF_SIGNATURE..OFF_SIGNATURE + 64]);
-                let mut pubkey_fp = [0u8; 8];
-                pubkey_fp.copy_from_slice(&header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8]);
                 let hlc = Hlc { wall: hlc_wall, logical: hlc_logical, peer: hlc_peer };
 
                 let payload_off = rec_end;
@@ -3462,24 +3534,15 @@ impl OpLog {
                 if lsn > max_lsn { max_lsn = lsn; }
                 if hlc > max_hlc { max_hlc = hlc; }
 
-                // 署名はその record の版の bytes に掛かっている。 header の先頭は signed_bytes と同じ並びなので
-                // そのまま切り出す (v2 の record を v3 として組み直さない)
-                let mut signed_bytes = Vec::with_capacity(SIGNED_PAYLOAD_HEADER_SIZE + payload_len);
-                signed_bytes.extend_from_slice(&header[..SIGNED_PAYLOAD_HEADER_SIZE]);
-                signed_bytes.extend_from_slice(payload_slice);
-
                 match op {
                     Some(DecodedOp::Commit) => {
-                        out.append(&mut batch);
+                        committed = out.len();
                         committed_end = wal_pos(lap, (next_off - base) as u64);
                         commit_ends.push(committed_end);
                     }
                     Some(other) => {
-                        batch.push((
-                            Record {
-                                lsn, hlc, author_peer, op: other,
-                                signature, pubkey_fp, signed_bytes,
-                            },
+                        out.push((
+                            mk(RecordRef { lsn, hlc, author_peer, op: other, header, payload: payload_slice }),
                             wal_pos(lap, (next_off - base) as u64),
                         ));
                     }
@@ -3528,14 +3591,15 @@ impl OpLog {
         // 全部を読み切って閉じていない record も無ければ、 読み終えた位置まで進めてよい (区画を畳んだ後の空の区画 / 読み飛ばした
         // op の後。 位置を進めないと、 畳んだ区画を指す位置 (= 先頭) のまま `head` より小さく見え、 読み手が追いついたと分からない)
         if stop == ScanStop::Head
-            && batch.is_empty()
+            && out.len() == committed
             && let Some(e) = read_end
         {
             committed_end = committed_end.max(e);
         }
 
         // 未 commit batch は `out` には混ぜず、 呼び手が選べるよう別枠で返す。
-        ScanOut { out, max_lsn, max_hlc, committed_end, tail: batch, stop, commit_ends }
+        let tail = out.split_off(committed);
+        ScanOut { out, max_lsn, max_hlc, committed_end, tail, stop, commit_ends }
     }
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。

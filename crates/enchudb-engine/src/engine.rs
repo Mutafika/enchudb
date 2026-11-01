@@ -15887,7 +15887,7 @@ impl Engine {
 
     /// 記録の cursor から先を記録に写す (呼び手が `change_emit` を持って)。 `limit` は写してよい終わり: `with_tail` が false なら
     /// `limit` (書き出した所) までに Commit で閉じた group、 true なら `limit` (畳む区画の終わり) までの record を閉じていない末尾も
-    /// 含めて全部 ([`enchudb_oplog::oplog::OpLog::scan_for_change_log`])。 戻り値は写した record の数。
+    /// 含めて全部 ([`enchudb_oplog::oplog::OpLog::scan_refs_for_change_log`])。 戻り値は写した record の数。
     fn pump_change_log(
         &self,
         wal: &enchudb_oplog::oplog::OpLog,
@@ -15899,31 +15899,23 @@ impl Engine {
         use std::sync::atomic::Ordering;
         #[cfg(test)]
         change_copy_hook::call(wal);
-        let (recs, end) = wal.scan_for_change_log(c.log_wal, limit, with_tail);
+        // record は記録に置き終えるまで WAL の mmap を借りる (#683: 写しを作らない)。 畳む道 (`try_fold_with_changes` / 空け作り) は
+        // `change_emit` を持ったまま写してから畳むので、 呼び手が `change_emit` を持つ間に借りた区画は畳まれない
+        let (recs, end) = wal.scan_refs_for_change_log(c.log_wal, limit, with_tail);
         let recs = self.keep_for_changefeed(recs, |(r, _)| &r.op);
         if recs.is_empty() {
             c.log_wal = c.log_wal.max(end);
             return Ok(0);
         }
-        let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
-        let ids = crate::change_log::wal_ids(&recs, |(r, _)| &r.signed_bytes);
-        let batch: Vec<crate::change_log::NewEntry> = recs
-            .into_iter()
-            .zip(ids)
-            .map(|((r, _), wal_id)| {
-                let w = crate::transport::WireRecord::from(r);
-                crate::change_log::NewEntry { hlc: w.hlc, wal_id, bytes: w.encode() }
-            })
-            .collect();
         let watch: Vec<u64> = c.readers.iter().map(|(_, p)| *p).collect();
         let before = log.range().1;
         let mut lost = Vec::new();
-        let res = log.append(&batch, &watch, &mut lost);
+        let res = log.append_from(&crate::change_log::WalRecords::new(&recs), &watch, &mut lost);
         let done = (log.range().1 - before) as usize;
-        c.log_wal = if done == ends.len() {
+        c.log_wal = if done == recs.len() {
             end
         } else if done > 0 {
-            ends[done - 1]
+            recs[done - 1].1
         } else {
             c.log_wal
         };

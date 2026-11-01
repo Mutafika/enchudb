@@ -295,6 +295,65 @@ fn a_fold_writes_out_only_the_folded_half_header() {
     assert_eq!(*got.last().unwrap(), written - 1, "畳む時に、 B に積んだ書き出し前の record まで書き出した");
 }
 
+/// 記録への 1 回の足しが data の終わりで折り返しても (終わりの手前の entry と頭の entry)、 足しが返った直後の電源断の像で、 その回の
+/// entry が全部読める (#683: entry を置き場所へ直接書くようにして、 書き出しの印は entry の並びが折り返しで切れた所ごとに付ける。
+/// 手前の分の印が抜けると、 新しい head を持つ header だけが届き、 手前の entry が読めない)。 書き出しの印は page の 1 つの範囲なので、
+/// 終わりに折り返しの印 (`WRAP`) を置くと範囲がそこまで広がって抜けが隠れる。 終わりの手前の entry で data をちょうど埋めて、
+/// 折り返しの印を置かない形にする。
+#[test]
+fn entries_of_an_append_that_wraps_survive_power_loss() {
+    use enchudb_engine::change_log::{ChangeLog, NewEntry, MIN_CAP};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("wrap");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let log = ChangeLog::open(&live, MIN_CAP, true, false).unwrap();
+    // 1 MiB の記録に、 100 件 × 10,040 B (entry の header 40 B 込み) + 4 件 × 11,144 B でちょうど埋まる。 次の 6 件は頭へ
+    let all: Vec<NewEntry> = (0..110u64)
+        .map(|i| {
+            let mut bytes = vec![(i % 251) as u8; if (100..104).contains(&i) { 11_104 } else { 10_000 }];
+            bytes[..8].copy_from_slice(&i.to_le_bytes());
+            NewEntry { hlc: enchudb_oplog::Hlc { wall: 1000 + i, logical: 0, peer: 1 }, wal_id: i, bytes }
+        })
+        .collect();
+    let mut lost = Vec::new();
+    // 100 件を 20 件ずつ積み、 次の 1 回 (10 件) は 4 件が終わりの手前、 6 件が頭
+    assert_eq!(MIN_CAP, 100 * 10_040 + 4 * 11_144, "試験の前提: 終わりの手前の 4 件で data がちょうど埋まる");
+    for c in all[..100].chunks(20) {
+        log.append(c, &[], &mut lost).unwrap();
+    }
+    let head_before = log.range();
+    log.append(&all[100..], &[], &mut lost).unwrap();
+    let (first, next) = log.range();
+    assert!(next == 110 && first > head_before.0, "前提: 最後の 1 回で折り返して古い entry を捨てた: {head_before:?} → {:?}", (first, next));
+    let img = root.join("img");
+    crashsim::capture(&live, &img, Mode::Lost).unwrap();
+    crashsim::stop();
+    drop(log);
+    let back = ChangeLog::open(&img, MIN_CAP, false, false).unwrap();
+    let range = back.range();
+    let mut got = Vec::new();
+    let mut pos = first;
+    let res = loop {
+        match back.read(pos, 64 << 10) {
+            Ok(es) if es.is_empty() => break Ok(()),
+            Ok(es) => {
+                pos = es.last().unwrap().no + 1;
+                got.extend(es);
+            }
+            Err(t) => break Err(t),
+        }
+    };
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(range, (first, next), "足しの返った header が届いていない");
+    assert_eq!(res, Ok(()), "{pos} 番から読めない (足しの返った entry が届いていない)");
+    assert_eq!(got.len() as u64, next - first);
+    for e in &got {
+        assert_eq!(e.bytes, all[e.no as usize].bytes, "{} 番の中身", e.no);
+    }
+}
+
 /// 撮ったままの像 (`ENCHU_CFLOG_IMAGE` = `imgNNN.raw/db`) の記録と WAL を、 開かずに読んで並べる (調べる用)。
 #[test]
 #[ignore]
