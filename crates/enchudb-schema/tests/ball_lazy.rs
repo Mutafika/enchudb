@@ -48,7 +48,32 @@ fn wal_now(db: &Database) -> u64 {
     h.wall << 23 | (h.logical as u64).min((1 << 23) - 1)
 }
 
+/// 18 回目 (答えの食い違いの調べ): `BALL_KEEP` (directory) があれば、 session を開く前ごとに DB の写し (APFS の clone、 前の session を
+/// 閉じた後の形) を `{BALL_KEEP}/{DB の名前}/pre` に置き直し、 答えが食い違ったら、 控え (`hist.txt`) と説明 (`why.txt`) と食い違った時の
+/// DB の写し (`post`、 開いたまま写す) を足して残す。 `keep_replay` (`#[ignore]`) が `pre` を静かに開いて組み直し、 写した時までの控えを比べる。
+fn keep_case(path: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("BALL_KEEP").map(|r| std::path::PathBuf::from(r).join(std::path::Path::new(path).file_name().unwrap()))
+}
+
+fn clone_dir(from: &str, to: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    let ok = std::process::Command::new("cp").arg("-cR").arg(from).arg(to).status().is_ok_and(|s| s.success());
+    assert!(ok, "写せない: {from} → {to:?}");
+}
+
+/// 開く (`BALL_KEEP` があれば、 開く前の DB を写して、 その時の控えの数と面の数を覚える)。
+fn open_kept(path: &str, wal: usize, h: &mut Hist) -> std::sync::Arc<Database> {
+    if let Some(c) = keep_case(path) {
+        clone_dir(path, &c.join("pre"));
+        h.pre_checks = h.checks.len();
+        h.pre_faces = h.faces.clone();
+    }
+    Database::open_with_oplog(path, wal).unwrap()
+}
+
 struct Hist {
+    path: String,
     eids: Vec<u64>,
     cur: Vec<Option<u64>>,
     checks: Vec<(u64, Vec<Option<u64>>)>,
@@ -57,6 +82,9 @@ struct Hist {
     /// entity ごとの、 宣言からの面の数 (宣言の時の値の面 1 + 値を変えて上を向いた回数)。 地平が宣言のままなら球の面の数と同じ
     /// (同じ書き込みを 2 度当てると、 同じ値の面 / 戻って進む面が増える)。
     faces: Vec<usize>,
+    /// 最後に `open_kept` が写した時の控えの数と面の数 (`BALL_KEEP` の時だけ)。
+    pre_checks: usize,
+    pre_faces: Vec<usize>,
 }
 
 /// 書き込み 1 つで面が増えるか (値があって前と違う)。
@@ -80,15 +108,28 @@ impl Hist {
             for v in VALS {
                 let mut want: Vec<u64> = (0..self.eids.len()).filter(|&i| cur[i] == Some(v)).map(|i| self.eids[i]).collect();
                 want.sort_unstable();
-                assert_eq!(eng.ball_pull_at("t.a", v, *t).unwrap(), want, "{what}: 回 {k} t={t} v={v} (地平 {hz}、 宣言の地平 {}、 控え {})", self.hz0, self.checks.len());
+                let got = eng.ball_pull_at("t.a", v, *t).unwrap();
+                if got != want {
+                    let only_ball: Vec<u64> = got.iter().filter(|e| !want.contains(e)).copied().collect();
+                    let only_hist: Vec<u64> = want.iter().filter(|e| !got.contains(e)).copied().collect();
+                    let diff: Vec<u64> = only_ball.iter().chain(&only_hist).copied().collect();
+                    let head = format!("回 {k} t={t} v={v} (地平 {hz}、 宣言の地平 {}、 控え {}): 球だけ {only_ball:?}、 写しだけ {only_hist:?}", self.hz0, self.checks.len());
+                    self.fail(db, what, k, &diff, false, head);
+                }
             }
             for (i, &e) in self.eids.iter().enumerate() {
-                assert_eq!(eng.ball_value_at(e, "t.a", *t).unwrap(), cur[i], "{what}: 回 {k} t={t} e={e}");
+                let got = eng.ball_value_at(e, "t.a", *t).unwrap();
+                if got != cur[i] {
+                    self.fail(db, what, k, &[e], false, format!("回 {k} t={t} e={e}: 球 {got:?}、 写し {:?}", cur[i]));
+                }
             }
         }
         if hz == self.hz0 {
             for (i, &e) in self.eids.iter().enumerate() {
-                assert_eq!(eng.ball_faces(e, "t.a").len(), self.faces[i], "{what}: e={e} 面の数");
+                let n = eng.ball_faces(e, "t.a").len();
+                if n != self.faces[i] {
+                    self.fail(db, what, self.checks.len() - 1, &[e], true, format!("e={e} 面の数: 球 {n}、 写し {}", self.faces[i]));
+                }
             }
         }
         // 同じ書き込みを組む側と書き手の両方が当てると、 同じ値の面が隙間なく続く (答えは集合として同じなので、 面で見る)。
@@ -101,6 +142,65 @@ impl Hist {
             }
         }
         (seen, old)
+    }
+
+    /// 食い違い: 食い違った entity ごとに、 回 `k` の前後 3 回の控え (時刻、 写し、 球の答え) と、 その間に掛かる球の面 (`all` なら全部の面)
+    /// を並べて panic する。 `BALL_KEEP` があれば写しと控えを残す。
+    fn fail(&self, db: &Database, what: &str, k: usize, eids: &[u64], all: bool, head: String) -> ! {
+        let eng = db.engine();
+        let mut why = format!("{what}: {head}\n");
+        let (lo, hi) = (k.saturating_sub(3), (k + 3).min(self.checks.len() - 1));
+        let (t_lo, t_hi) = (self.checks[lo].0, self.checks[hi].0);
+        for &e in eids.iter().take(4) {
+            let i = self.eids.iter().position(|&x| x == e).unwrap();
+            why += &format!("e={e}: 控え (回, 時刻, 写し, 球の答え)\n");
+            for (j, (t, cur)) in self.checks.iter().enumerate().take(hi + 1).skip(lo) {
+                why += &format!("  {j} {t} {:?} {:?}\n", cur[i], eng.ball_value_at(e, "t.a", *t));
+            }
+            let fs = eng.ball_faces(e, "t.a");
+            why += &format!("e={e}: 面 {} 枚 (写しの数 {})、 {} (値, from, to)\n", fs.len(), self.faces[i], if all { "全部" } else { "控えの間に掛かる面" });
+            for f in fs.iter().filter(|f| all || (f.to >= t_lo && f.from <= t_hi)) {
+                why += &format!("  {} {} {}\n", f.value, f.from, f.to);
+            }
+        }
+        if let Some(c) = keep_case(&self.path) {
+            clone_dir(&self.path, &c.join("post"));
+            self.dump(&c.join("hist.txt"));
+            std::fs::write(c.join("why.txt"), &why).unwrap();
+            why += &format!("残した: {c:?}\n");
+        }
+        panic!("{why}");
+    }
+
+    /// 控えを書き出す: 1 行目 `hz0 pre_checks`、 2 行目 eid、 3 行目 写した時の面の数、 以降は控えごとに `時刻 値…` (`-` = 値なし)。
+    fn dump(&self, to: &std::path::Path) {
+        let join = |it: &mut dyn Iterator<Item = String>| it.collect::<Vec<_>>().join(" ");
+        let mut s = format!("{} {}\n", self.hz0, self.pre_checks);
+        s += &(join(&mut self.eids.iter().map(|e| e.to_string())) + "\n");
+        s += &(join(&mut self.pre_faces.iter().map(|n| n.to_string())) + "\n");
+        for (t, cur) in &self.checks {
+            s += &format!("{t} {}\n", join(&mut cur.iter().map(|v| v.map_or("-".into(), |v| v.to_string()))));
+        }
+        std::fs::write(to, s).unwrap();
+    }
+
+    /// [`Self::dump`] を読む (写した時までの控えと面の数、 `path` は開く DB)。
+    fn load(from: &std::path::Path, path: &str) -> Hist {
+        let s = std::fs::read_to_string(from).unwrap();
+        let mut lines = s.lines();
+        let head: Vec<u64> = lines.next().unwrap().split(' ').map(|x| x.parse().unwrap()).collect();
+        let eids: Vec<u64> = lines.next().unwrap().split(' ').map(|x| x.parse().unwrap()).collect();
+        let faces: Vec<usize> = lines.next().unwrap().split(' ').map(|x| x.parse().unwrap()).collect();
+        let checks: Vec<(u64, Vec<Option<u64>>)> = lines
+            .take(head[1] as usize)
+            .map(|l| {
+                let mut it = l.split(' ');
+                let t = it.next().unwrap().parse().unwrap();
+                (t, it.map(|v| (v != "-").then(|| v.parse().unwrap())).collect())
+            })
+            .collect();
+        let cur = checks.last().unwrap().1.clone();
+        Hist { path: path.into(), eids, cur, checks, hz0: head[0], faces: faces.clone(), pre_checks: head[1] as usize, pre_faces: faces }
     }
 }
 
@@ -123,7 +223,16 @@ fn create(path: &str, wal: usize, log_cap: usize) -> Hist {
     eng.enable_change_log(log_cap).unwrap();
     assert!(eng.declare_ball("t.a").unwrap());
     let n = eids.len();
-    let mut h = Hist { eids, cur, checks: Vec::new(), hz0: eng.ball_horizon("t.a").unwrap(), faces: vec![1; n] };
+    let mut h = Hist {
+        path: path.into(),
+        eids,
+        cur,
+        checks: Vec::new(),
+        hz0: eng.ball_horizon("t.a").unwrap(),
+        faces: vec![1; n],
+        pre_checks: 0,
+        pre_faces: Vec::new(),
+    };
     h.checks.push((eng.ball_now(), h.cur.clone()));
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let mut r = Rng(0x2545_F491_4F6C_DD1D);
@@ -181,7 +290,7 @@ fn concurrent_session(
     refold_wait: (u64, u64),
     ahead_wait_us: u64,
 ) -> Session {
-    let db = Database::open_with_oplog(path, wal).unwrap();
+    let db = open_kept(path, wal, h);
     let eng = db.engine();
     if listen {
         // changefeed の listener が居ると、 通知係が consumer の書き出しのたびに記録へ写す (居なければ畳む時だけ)
@@ -202,6 +311,7 @@ fn concurrent_session(
     let shared = Mutex::new(h.cur.clone());
     let faces = Mutex::new(h.faces.clone());
     let writes = AtomicU64::new(0);
+    let refused = AtomicU64::new(0);
     let round_now = AtomicUsize::new(0);
     let during = AtomicU64::new(0);
     let folds = std::sync::atomic::AtomicU32::new(0);
@@ -214,7 +324,7 @@ fn concurrent_session(
     let (mut emptied, mut head_waited) = (false, false);
     std::thread::scope(|s| {
         for th in 0..TH {
-            let (bar, shared, writes, go, faces) = (&bar, &shared, &writes, &go, &faces);
+            let (bar, shared, writes, go, faces, refused) = (&bar, &shared, &writes, &go, &faces, &refused);
             let mut mine: Vec<Option<u64>> = h.cur[th * PER..(th + 1) * PER].to_vec();
             let mut turned = vec![0usize; PER];
             s.spawn(move || {
@@ -225,12 +335,21 @@ fn concurrent_session(
                         let e = eids[th * PER + k];
                         let x = r.below(VALS.len() as u64 + 1) as usize;
                         let new = (x < VALS.len()).then(|| VALS[x]);
-                        match new {
-                            None => eng.untie_by_id(e, ha),
-                            Some(v) => eng.tie_to_by_id(e, ha, v as u32),
+                        // 断られた書き込み (WAL が満杯で畳めない、 #553) は列にも球にも入らない = 写しにも入れない。 この行を書くのは
+                        // この thread だけなので、 外した後に値が残っていれば断られた
+                        let ok = match new {
+                            None => {
+                                eng.untie_by_id(e, ha);
+                                eng.get_by_id(e, ha).is_none()
+                            }
+                            Some(v) => eng.try_tie_to_by_id(e, ha, v as u32).is_ok(),
+                        };
+                        if ok {
+                            turned[k] += usize::from(turns(mine[k], new));
+                            mine[k] = new;
+                        } else {
+                            refused.fetch_add(1, Ordering::Relaxed);
                         }
-                        turned[k] += usize::from(turns(mine[k], new));
-                        mine[k] = new;
                         eng.commit();
                         writes.fetch_add(1, Ordering::Relaxed);
                         if gap_us > 0 {
@@ -302,10 +421,12 @@ fn concurrent_session(
     let st = eng.ball_rebuild_stats().expect("組んだ");
     let (waits, covered) = eng.ball_publish_counts();
     eprintln!(
-        "組む: {st:?}、 組む間の書き込み {}、 畳んだ {}、 区画を移った {}、 回 {rounds}、 公開中で待った {waits}、 閾値より前 {covered}、 空 {emptied}、 頭から {head_waited}",
+        "組む: {st:?}、 組む間の書き込み {}、 畳んだ {}、 区画を移った {}、 回 {rounds}、 公開中で待った {waits}、 閾値より前 {covered}、 空 {emptied}、 頭から {head_waited}、 断られた {}、 控え {}",
         during.load(Ordering::Relaxed),
         folds.load(Ordering::Relaxed),
-        switches.load(Ordering::Relaxed)
+        switches.load(Ordering::Relaxed),
+        refused.load(Ordering::Relaxed),
+        h.checks.len()
     );
     let (seen, _) = h.verify(&db, "書き手と並んで組んだ後");
     // 地平以降の控え: 書き手が速いと記録が捨てて地平がこの session の中に入る (T3 は最後の数回だけ)
@@ -350,7 +471,7 @@ fn the_first_read_builds_while_writers_write() {
     assert!(overlapped >= 7, "組むのと書くのが重なっていない — 試験の前提 ({overlapped}/9)");
     assert!(waits > 0 && covered > 0, "公開の時の約束の場所を踏んでいない — 試験の前提 (待った {waits}, 閾値より前 {covered})");
     // 最後にもう 1 回開き直して、 書かずに全部の控え
-    let db = Database::open_with_oplog(&path, WAL).unwrap();
+    let db = open_kept(&path, WAL, &mut h);
     let (seen, old) = h.verify(&db, "最後に開き直した後");
     assert_eq!(seen + old, h.checks.len());
     assert!(seen >= 100, "地平以降の控え {seen}");
@@ -521,4 +642,21 @@ fn a_build_reads_holding_the_copy_lock_after_three_refolds() {
     assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
     drop(db);
     cleanup(&path);
+}
+
+/// 18 回目の調べ (`#[ignore]`): 残した写し (`BALL_KEEP_CASE` = `BALL_KEEP` の下の 1 つ) の `pre` を別の場所に写して書き手なしで開き
+/// (WAL `BALL_KEEP_WAL` byte、 既定 64 MiB)、 最初の読みで組み直して、 写した時までの控えを比べる (食い違えば `fail` と同じ説明)。
+#[test]
+#[ignore]
+fn keep_replay() {
+    let case = std::path::PathBuf::from(std::env::var("BALL_KEEP_CASE").expect("BALL_KEEP_CASE"));
+    let wal = std::env::var("BALL_KEEP_WAL").ok().map_or(WAL, |s| s.parse().unwrap());
+    let path = tmp_path("replay");
+    cleanup(&path);
+    let _gone = Gone(path.clone());
+    clone_dir(case.join("pre").to_str().unwrap(), std::path::Path::new(&path));
+    let h = Hist::load(&case.join("hist.txt"), &path);
+    let db = Database::open_with_oplog(&path, wal).unwrap();
+    let (seen, old) = h.verify(&db, "残した写しを静かに開き直した後");
+    eprintln!("合った: 控え {} (地平以降 {seen}、 前 {old})、 組む: {:?}", h.checks.len(), db.engine().ball_rebuild_stats());
 }
