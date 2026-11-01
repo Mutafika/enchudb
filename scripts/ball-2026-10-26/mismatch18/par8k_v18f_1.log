@@ -1,0 +1,13 @@
+r=1 t=12 load=†’23.00 ok=8/8 refused=0 
+r=2 t=12 load=†’56.00 ok=8/8 refused=0 
+r=3 t=22 load=†’61.04 ok=7/8 refused=0    1 å…¬é–‹ã®æ™‚ã®ç´„æŸã®å ´æ‰€ã‚’è¸ã‚“ã§ã„ãªã„ â€” è©¦é¨“ã®å‰æ (å¾…ã£ãŸ 8, é–¾å€¤ã‚ˆã‚Šå‰ 0) 
+r=4 t=14 load=†’67.37 ok=8/8 refused=0 
+r=5 t=18 load=†’83.02 ok=8/8 refused=0 
+r=6 t=16 load=†’85.45 ok=8/8 refused=0 
+r=7 t=14 load=†’85.06 ok=8/8 refused=0 
+r=8 t=16 load=†’85.87 ok=8/8 refused=0 
+r=9 t=18 load=†’94.93 ok=8/8 refused=0 
+r=10 t=22 load=†’77.65 ok=8/8 refused=0 
+r=11 t=16 load=†’91.99 ok=8/8 refused=0 
+r=12 t=18 load=†’103.19 ok=8/8 refused=0 
+kept: enchudb-ball-lazy-t2-33529 

@@ -1,0 +1,30 @@
+r=1 t=10 load=8.31-18.15 mismatch=0    1 区画を移った後に続けて読んでいない — 試験の前提 (N 回) 
+r=2 t=10 load=18.15-28.11 mismatch=1    1 書き手と並んで組んだ後: 回 N t=N v=N 
+r=3 t=10 load=28.11-35.73 mismatch=0 
+r=4 t=10 load=35.73-44.41 mismatch=0    1 縮まない追いつきを回し続けた: N 回 
+r=5 t=10 load=44.41-60.38 mismatch=1    1 縮まない追いつきを回し続けた: N 回    1 書き手と並んで組んだ後: 回 N t=N v=N  
+r=6 t=10 load=60.38-65.37 mismatch=0    1 公開の時の約束の場所を踏んでいない — 試験の前提 (待った N, 閾値より前 N) 
+r=7 t=14 load=65.37-58.34 mismatch=0 
+r=8 t=10 load=58.34-68.07 mismatch=0 
+r=9 t=10 load=68.07-71.38 mismatch=0 
+r=10 t=10 load=71.38-72.02 mismatch=0 
+r=11 t=10 load=72.02-73.74 mismatch=1    1 書き手と並んで組んだ後: 回 N t=N v=N  
+r=12 t=10 load=73.74-77.25 mismatch=0 
+r=13 t=12 load=77.25-85.71 mismatch=0    1 縮まない追いつきを回し続けた: N 回 
+r=14 t=10 load=79.41-86.38 mismatch=0 
+r=15 t=12 load=86.38-84.74 mismatch=1    1 書き手と並んで組んだ後: 回 N t=N v=N 
+r=16 t=16 load=84.74-90.67 mismatch=0 
+r=17 t=10 load=90.67-87.78 mismatch=0 
+r=18 t=16 load=87.78-77.65 mismatch=0 
+r=19 t=32 load=77.65-54.87 mismatch=0 
+r=20 t=20 load=54.87-59.43 mismatch=0 
+r=21 t=18 load=59.43-62.42 mismatch=0 
+r=22 t=20 load=62.42-56.58 mismatch=0 
+r=23 t=16 load=56.58-50.54 mismatch=0    1 縮まない追いつきを回し続けた: N 回 
+r=24 t=14 load=50.54-55.02 mismatch=0    1 縮まない追いつきを回し続けた: N 回 
+r=25 t=20 load=55.02-56.44 mismatch=0 
+r=26 t=18 load=56.44-59.25 mismatch=0 
+r=27 t=36 load=59.25-73.61 mismatch=0 
+r=28 t=28 load=73.61-83.37 mismatch=0 
+r=29 t=28 load=83.37-92.51 mismatch=0 
+r=30 t=18 load=92.51-100.89 mismatch=0 

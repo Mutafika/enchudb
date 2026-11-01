@@ -1,0 +1,37 @@
+r=1 t=12 load=5.46-28.66 ok=8/8 refused=0 
+r=2 t=14 load=28.66-44.84 ok=8/8 refused=0 
+r=3 t=14 load=44.84-59.27 ok=8/8 refused=0 
+r=4 t=14 load=59.27-70.97 ok=8/8 refused=0 
+r=5 t=14 load=70.97-73.58 ok=8/8 refused=0 
+r=6 t=14 load=73.58-91.65 ok=7/8 refused=0    1 縮まない追いつきを回し続けた: 11 回 
+r=7 t=14 load=91.65-92.33 ok=7/8 refused=0    1 縮まない追いつきを回し続けた: 9 回 
+r=8 t=16 load=92.33-100.21 ok=8/8 refused=0 
+r=9 t=24 load=100.21-86.01 ok=8/8 refused=0 
+r=10 t=34 load=86.01-83.36 ok=6/8 refused=0    1 縮まない追いつきを回し続けた: 9 回    1 組む間に記録が捨てた所を読んでいない — 試験の前提 (1/3) 
+r=11 t=36 load=83.36-89.41 ok=6/8 refused=0    1 控えと WAL が重なっていない — 試験の前提 (控え 2/3、 重なり 1/3)    1 縮まない追いつきを回し続けた: 9 回 
+r=12 t=32 load=89.41-123.62 ok=5/8 refused=0    2 区画を移った後に続けて読んでいない — 試験の前提 (1 回)    1 縮まない追いつきを回し続けた: 9 回 
+r=13 t=92 load=123.62-164.13 ok=2/8 refused=0    1 assertion `left == right` failed: 1 回の追いつきで続いた読み直し (session 0): BallRe    1 区画を移った後に続けて読んでいない — 試験の前提 (0 回)    3 区画を移った後に続けて読んでいない — 試験の前提 (1 回)    3 控えと WAL が重なっていない — 試験の前提 (控え 2/3、 重なり 1/3)    3 頭からの位置で組の後に畳んでいない — 試験の前提 (1/3) 
+r=14 t=54 load=164.13-274.45 ok=2/8 refused=0    2 WAL が空になった後に頭から組んでいない — 試験の前提 (空 3/3、 頭から 1/3)    2 控えと WAL が重なっていない — 試験の前提 (控え 0/3、 重なり 0/3)    2 控えと WAL が重なっていない — 試験の前提 (控え 2/3、 重なり 1/3)    1 控えと WAL が重なっていない — 試験の前提 (控え 3/3、 重なり 1/3)    1 縮まない追いつきを回し続けた: 9 回 
+r=15 t=12 load=274.45-232.11 ok=8/8 refused=0 
+r=16 t=14 load=232.11-225.08 ok=8/8 refused=0 
+r=17 t=12 load=225.08-207.17 ok=6/8 refused=0    1 公開の時の約束の場所を踏んでいない — 試験の前提 (待った 11, 閾値より前 0)    1 控えと WAL が重なっていない — 試験の前提 (控え 2/3、 重なり 1/3) 
+r=18 t=14 load=207.17-191.00 ok=8/8 refused=0 
+r=19 t=14 load=191.00-190.81 ok=6/8 refused=0    1 書き手と並んで組んだ後: 回 0 t=15045596389373378562 v=2000000 (地平 1504559638937337    1 書き手と並んで組んだ後: 回 0 t=15045596390388400128 v=2000000 (地平 1504559639038840 
+r=20 t=14 load=190.81-177.50 ok=8/8 refused=0 
+r=21 t=14 load=177.50-167.41 ok=8/8 refused=0 
+r=22 t=18 load=167.41-136.22 ok=5/8 refused=0    1 公開の時の約束の場所を踏んでいない — 試験の前提 (待った 13, 閾値より前 0)    1 控えと WAL が重なっていない — 試験の前提 (控え 2/3、 重なり 1/3)    1 縮まない追いつきを回し続けた: 9 回 
+r=23 t=14 load=136.22-139.78 ok=8/8 refused=0 
+r=24 t=14 load=139.78-137.84 ok=8/8 refused=0 
+r=25 t=16 load=137.84-115.51 ok=8/8 refused=0 
+r=26 t=18 load=115.51-116.03 ok=8/8 refused=0 
+r=27 t=14 load=116.03-112.43 ok=7/8 refused=0    1 書き手と並んで組んだ後: 回 1 t=15045597421381877923 v=2000000 (地平 1504559741866396 
+r=28 t=20 load=112.43-101.27 ok=6/8 refused=0    1 控えと WAL が重なっていない — 試験の前提 (控え 2/3、 重なり 1/3)    1 組む間に記録が捨てた所を読んでいない — 試験の前提 (1/3) 
+r=29 t=16 load=101.27-97.31 ok=8/8 refused=0 
+r=30 t=18 load=97.31-96.10 ok=8/8 refused=0 
+r=31 t=24 load=96.10-92.00 ok=7/8 refused=0    1 控えと WAL が重なっていない — 試験の前提 (控え 1/3、 重なり 1/3) 
+r=32 t=30 load=92.00-75.11 ok=4/8 refused=0    1 assertion `left == right` failed: 1 回の追いつきで続いた読み直し (session 2): BallRe    3 控えと WAL が重なっていない — 試験の前提 (控え 1/3、 重なり 1/3)    1 控えと WAL が重なっていない — 試験の前提 (控え 2/3、 重なり 1/3)    1 組む間に記録が捨てた所を読んでいない — 試験の前提 (1/3) 
+r=33 t=26 load=75.11-86.47 ok=6/8 refused=0    1 控えと WAL が重なっていない — 試験の前提 (控え 3/3、 重なり 1/3)    1 組んだ 
+r=34 t=24 load=86.47-94.24 ok=8/8 refused=0 
+r=35 t=28 load=94.24-95.49 ok=6/8 refused=0    1 assertion `left == right` failed: 1 回の追いつきで続いた読み直し (session 1): BallRe    1 頭からの位置で組の後に畳んでいない — 試験の前提 (1/3) 
+r=36 t=24 load=95.49-87.41 ok=6/8 refused=0    1 縮まない追いつきを回し続けた: 10 回    1 組んだ 
+kept: enchudb-ball-lazy-t2-11366 enchudb-ball-lazy-t2-53507 enchudb-ball-lazy-t2-85761 enchudb-ball-lazy-t2-94430 enchudb-ball-lazy-t3-10423 enchudb-ball-lazy-t3-11372 enchudb-ball-lazy-t3-2124 enchudb-ball-lazy-t3-28164 enchudb-ball-lazy-t3-44327 enchudb-ball-lazy-t3-60600 enchudb-ball-lazy-t3-68735 enchudb-ball-lazy-t3-77297 enchudb-ball-lazy-t3-93447 enchudb-ball-lazy-t3-93448 enchudb-ball-lazy-t3-94433 enchudb-ball-lazy-t5-36218 enchudb-ball-lazy-t5-69891 enchudb-ball-lazy-t5-69893 enchudb-ball-lazy-t6-10424 enchudb-ball-lazy-t6-10426 enchudb-ball-lazy-t6-19076 enchudb-ball-lazy-t6-19077 enchudb-ball-lazy-t6-19081 enchudb-ball-lazy-t6-19082 enchudb-ball-lazy-t7-19079 enchudb-ball-lazy-t7-19081 enchudb-ball-lazy-t7-19082 enchudb-ball-lazy-t7-2118 enchudb-ball-lazy-t7-28160 enchudb-ball-lazy-t7-28161 enchudb-ball-lazy-t7-28162 enchudb-ball-lazy-t7-28165 enchudb-ball-lazy-t7-28166 enchudb-ball-lazy-t7-44333 enchudb-ball-lazy-t7-53504 enchudb-ball-lazy-t7-68962 enchudb-ball-lazy-t7-77297 enchudb-ball-lazy-t7-77300 enchudb-ball-lazy-t7-77303 enchudb-ball-lazy-t7-77305 enchudb-ball-lazy-t7-85764 enchudb-ball-lazy-t7-94432 enchudb-ball-lazy-t8-19077 enchudb-ball-lazy-t8-19078 enchudb-ball-lazy-t8-19081 enchudb-ball-lazy-t8-28162 enchudb-ball-lazy-t8-28164 enchudb-ball-lazy-t8-3012 enchudb-ball-lazy-t9-19079 enchudb-ball-lazy-t9-3014 enchudb-ball-lazy-t9-77300 
