@@ -20,6 +20,18 @@ fn tmp(tag: &str) -> String {
     format!("/tmp/enchudb-httphost-{tag}-{}-{nanos}", std::process::id())
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// 表 `notes` (列 `v`) を持つ sync の DB を作って開く。
 fn db(path: &str, peer: PeerId) -> Arc<Engine> {
     {
@@ -76,10 +88,12 @@ impl Client {
 #[test]
 fn three_clients_converge_through_the_host() {
     let hp = tmp("host");
+    let _cleanup = Cleanup(vec![hp.clone()]);
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
     let url = format!("http://{}", host.addr());
     let paths: Vec<String> = (1..=3).map(|i| tmp(&format!("c{i}"))).collect();
+    let _cleanup = Cleanup(paths.clone());
     let cs: Vec<Client> = (0..3).map(|i| client(db(&paths[i], i as u32 + 1), &url)).collect();
 
     let rows: Vec<u64> = (0..3).map(|i| cs[i].write(10 + i as u32)).collect();
@@ -124,10 +138,12 @@ fn three_clients_converge_through_the_host() {
 #[test]
 fn acks_flow_both_ways() {
     let hp = tmp("ack-host");
+    let _cleanup = Cleanup(vec![hp.clone()]);
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
     let url = format!("http://{}", host.addr());
     let (p1, p2) = (tmp("ack-c1"), tmp("ack-c2"));
+    let _cleanup = Cleanup(vec![p1.clone(), p2.clone()]);
     let (c1, c2) = (client(db(&p1, 1), &url), client(db(&p2, 2), &url));
     for i in 0..20 {
         c1.write(100 + i);
@@ -152,11 +168,14 @@ fn acks_flow_both_ways() {
 #[test]
 fn the_host_keeps_going_after_a_restart() {
     let hp = tmp("restart-host");
+    // cursor の置き場は DB の外で、 ホストはその横に client ごとの線 (`.clients`) を置く
+    let _cleanup = Cleanup(vec![hp.clone(), format!("{hp}.cursors"), format!("{hp}.cursors.clients")]);
     let cursors = std::path::PathBuf::from(format!("{hp}.cursors"));
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(cursors.clone())).unwrap();
     let url = format!("http://{}", host.addr());
     let (p1, p2) = (tmp("restart-c1"), tmp("restart-c2"));
+    let _cleanup = Cleanup(vec![p1.clone(), p2.clone()]);
     let c1 = client(db(&p1, 1), &url);
     c1.write(1);
     c1.sync();
@@ -186,10 +205,12 @@ fn the_host_keeps_going_after_a_restart() {
 #[test]
 fn a_client_behind_the_floor_bootstraps_from_the_host() {
     let hp = tmp("floor-host");
+    let _cleanup = Cleanup(vec![hp.clone()]);
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
     let url = format!("http://{}", host.addr());
     let (p1, p3) = (tmp("floor-c1"), tmp("floor-c3"));
+    let _cleanup = Cleanup(vec![p1.clone(), p3.clone()]);
     let c1 = client(db(&p1, 1), &url);
     for i in 0..10 {
         c1.write(200 + i);
@@ -225,10 +246,12 @@ fn a_client_behind_the_floor_bootstraps_from_the_host() {
 #[test]
 fn the_host_asks_a_client_for_its_state() {
     let hp = tmp("state-host");
+    let _cleanup = Cleanup(vec![hp.clone()]);
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
     let url = format!("http://{}", host.addr());
     let p1 = tmp("state-c1");
+    let _cleanup = Cleanup(vec![p1.clone()]);
     let c1 = client(db(&p1, 1), &url);
     // 送らなかった行 (record は ring にあるが、 floor で 「ここまでは配れない」 と言う)
     c1.write(400);
@@ -255,10 +278,12 @@ fn the_host_asks_a_client_for_its_state() {
 #[test]
 fn an_old_client_still_syncs() {
     let hp = tmp("old-host");
+    let _cleanup = Cleanup(vec![hp.clone()]);
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
     let url = format!("http://{}", host.addr());
     let (p1, p2) = (tmp("old-c1"), tmp("old-c2"));
+    let _cleanup = Cleanup(vec![p1.clone(), p2.clone()]);
     let new = client(db(&p1, 1), &url);
     let old_eng = db(&p2, 2);
     let old_t: Arc<dyn Transport> = Arc::new(HttpTransport::new(url.clone()));
@@ -285,10 +310,12 @@ fn an_old_client_still_syncs() {
 #[test]
 fn a_lagging_client_does_not_hold_back_the_others() {
     let hp = tmp("lag-host");
+    let _cleanup = Cleanup(vec![hp.clone()]);
     let host_eng = db(&hp, HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
     let url = format!("http://{}", host.addr());
     let (p1, p2) = (tmp("lag-c1"), tmp("lag-c2"));
+    let _cleanup = Cleanup(vec![p1.clone(), p2.clone()]);
     let (c1, c2) = (client(db(&p1, 1), &url), client(db(&p2, 2), &url));
     c1.write(600);
     c1.sync();

@@ -23,6 +23,18 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
     let _ = std::fs::remove_dir_all(path);
 }
@@ -62,6 +74,7 @@ fn let_the_consumer_commit_and_wait_on_the_lock(eng: &Engine) {
 #[test]
 fn writes_dropped_right_before_close_reach_the_peer() {
     let (pa, pb) = (tmp_path("a"), tmp_path("b"));
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone()]);
     let mem = Arc::new(InMemoryTransport::new());
     mem.register_peer(1);
     mem.register_peer(2);

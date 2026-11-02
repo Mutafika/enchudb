@@ -31,7 +31,20 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(path); // 0.26 から DB は directory (#688)
     for suf in
         ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".cursors", ".cursors.tmp"]
     {
@@ -114,6 +127,7 @@ fn shape(op: &DecodedOp) -> String {
 #[test]
 fn replica_state_matches_author_state() {
     let (pa, pr) = (tmp_path("a1"), tmp_path("r1"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone()]);
     let transport = make_transport(&[1, 2]);
     let eng_a = make_engine(&pa, 1);
     let eng_r = make_engine(&pr, 2);
@@ -173,6 +187,7 @@ fn replica_state_matches_author_state() {
 #[test]
 fn truncated_follower_recovers_via_replica() {
     let (pa, pr, pc) = (tmp_path("a2"), tmp_path("r2"), tmp_path("c2"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone()]);
     let transport = make_transport(&[1, 2, 3]);
     let eng_a = make_engine(&pa, 1);
     let eng_r = make_engine(&pr, 2);
@@ -218,6 +233,7 @@ fn truncated_follower_recovers_via_replica() {
 #[test]
 fn author_provider_is_preferred_over_replica() {
     let (pa, pr, pc) = (tmp_path("a3"), tmp_path("r3"), tmp_path("c3"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone()]);
     let transport = make_transport(&[1, 2, 3]);
     let eng_a = make_engine(&pa, 1);
     let eng_r = make_engine(&pr, 2);
@@ -251,6 +267,7 @@ fn author_provider_is_preferred_over_replica() {
 #[test]
 fn non_relay_peer_serves_only_itself() {
     let (pa, pr) = (tmp_path("a4"), tmp_path("r4"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone()]);
     let transport = make_transport(&[1, 2]);
     let eng_a = make_engine(&pa, 1);
     let eng_r = make_engine(&pr, 2);
@@ -276,6 +293,7 @@ fn non_relay_peer_serves_only_itself() {
 #[test]
 fn truncation_names_the_author() {
     let (pa, pr, pc) = (tmp_path("a5"), tmp_path("r5"), tmp_path("c5"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone()]);
     let transport = make_transport(&[1, 2, 3]);
     let eng_a = make_engine(&pa, 1);
     let eng_r = make_engine(&pr, 2);

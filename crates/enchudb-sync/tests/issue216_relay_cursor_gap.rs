@@ -34,7 +34,20 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(path); // 0.26 から DB は directory (#688)
     for suf in
         ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".cursors", ".cursors.tmp"]
     {
@@ -89,6 +102,7 @@ fn relayed_old_hlc_record_reaches_advanced_cursor() {
     let pa = tmp_path("a1");
     let pr = tmp_path("r1");
     let pc = tmp_path("c1");
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone()]);
     let transport = make_transport(&[1, 2, 3]);
 
     let eng_a = make_engine(&pa, 1);
@@ -144,6 +158,7 @@ fn new_author_starts_from_zero() {
     let pb = tmp_path("b2");
     let pr = tmp_path("r2");
     let pc = tmp_path("c2");
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone(), pr.clone(), pc.clone()]);
     let transport = make_transport(&[1, 2, 3, 4]);
 
     let eng_a = make_engine(&pa, 1);
@@ -201,6 +216,7 @@ fn steady_relay_reclaim_does_not_false_truncate() {
     let pr = tmp_path("r5");
     let pc = tmp_path("c5");
     let pd = tmp_path("d5");
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone(), pd.clone()]);
     let transport = make_transport(&[1, 2, 3, 4]);
 
     let eng_a = make_engine(&pa, 1);
@@ -263,6 +279,7 @@ fn legacy_baseline_floor_folds_into_all_authors() {
     let pr = tmp_path("r6");
     let pc = tmp_path("c6");
     let pd = tmp_path("d6");
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone(), pd.clone()]);
     let transport = make_transport(&[1, 2, 3, 4]);
 
     let eng_a = make_engine(&pa, 1);
@@ -320,6 +337,7 @@ fn legacy_scalar_cursor_self_heals() {
     let pa = tmp_path("a3");
     let pr = tmp_path("r3");
     let pc = tmp_path("c3");
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone()]);
     let cursor_file = format!("{pc}.cursors");
     let transport = make_transport(&[1, 2, 3]);
 

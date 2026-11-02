@@ -18,6 +18,18 @@ fn tmp(tag: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc"] {
@@ -44,6 +56,7 @@ fn single_condition_routes_to_owner_peer() {
     // 2 peer: A が "color"、B が "size"
     let pa = tmp("single_a");
     let pb = tmp("single_b");
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone()]);
     let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
     let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
@@ -89,6 +102,7 @@ fn single_condition_routes_to_owner_peer() {
 #[test]
 fn explicit_router_falls_back_for_unknown_himo() {
     let pa = tmp("fallback_a");
+    let _cleanup = Cleanup(vec![pa.clone()]);
     let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
 
     let transport = Arc::new(InMemoryShardTransport::new());
@@ -119,6 +133,7 @@ fn hash_router_deterministic_across_peers() {
 fn is_mine_filter() {
     // peer 自身が owner の himo だけ tie できるようにする運用判定
     let pa = tmp("mine_a");
+    let _cleanup = Cleanup(vec![pa.clone()]);
     let eng_a = make_sharded_peer(&pa, 1, &[("a_himo", ValueType::Number)]);
 
     let transport = Arc::new(InMemoryShardTransport::new());
@@ -147,6 +162,7 @@ fn two_condition_query_crosses_shards() {
     // 別の entity が条件 Y を満たすか (peer B で check)、交差が空」を確認。
     let pa = tmp("two_a");
     let pb = tmp("two_b");
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone()]);
     let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
     let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
@@ -199,6 +215,7 @@ fn replicated_entity_matches_across_shards_via_sync() {
     // ここでは Syncer を介さず、手動で remote_tie_apply を呼んで「同じ eid 共有」を再現。
     let pa = tmp("repl_a");
     let pb = tmp("repl_b");
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone()]);
     let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
     let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 

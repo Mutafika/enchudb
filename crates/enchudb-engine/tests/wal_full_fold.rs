@@ -27,6 +27,19 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine より後に drop させる (engine を持ったまま消すと、 engine の drop が `tables` / `leaf.free` を書いて directory が
+/// 残る。 この file の 3 本は 12 本並べて回すと半分ほどの run で残した)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".schema"] {
@@ -70,6 +83,7 @@ const LEAF_BASE: u64 = 112 + 16 + 10 + 8;
 #[test]
 fn record_size_assumptions() {
     let path = tmp_path("sizes");
+    let _cleanup = Cleanup(vec![path.clone()]);
     cleanup(&path);
     let eng = small_engine(&path, 8 * 1024);
     let e = eng.entity_in("notes").unwrap();
@@ -101,6 +115,7 @@ fn record_size_assumptions() {
 #[test]
 fn wal_full_mid_group_folds_after_bridge_drains() {
     let path = tmp_path("brick");
+    let _cleanup = Cleanup(vec![path.clone()]);
     cleanup(&path);
     let eng = small_engine(&path, 8 * 1024);
     let e = eng.entity_in("notes").unwrap();
@@ -227,6 +242,7 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
 #[test]
 fn uncommitted_tail_with_room_blocks_fold() {
     let path = tmp_path("guard");
+    let _cleanup = Cleanup(vec![path.clone()]);
     cleanup(&path);
     let eng = small_engine(&path, 8 * 1024);
     let e = eng.entity_in("notes").unwrap();

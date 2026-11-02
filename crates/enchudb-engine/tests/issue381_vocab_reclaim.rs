@@ -16,6 +16,18 @@ fn tmp(tag: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn create(path: &str, reclaim: bool) -> Engine {
     let mut eng = Engine::create_growable_opts(
         path,
@@ -31,6 +43,7 @@ fn create(path: &str, reclaim: bool) -> Engine {
 #[test]
 fn stale_vid_is_rejected() {
     let path = tmp("stale");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let eng = create(&path, true);
     let k = eng.himo_id("k").unwrap() as u16;
     let a = eng.entity().unwrap();
@@ -60,6 +73,7 @@ fn stale_vid_is_rejected() {
 #[test]
 fn counting_at_open_then_concurrent_writers_keep_live_values() {
     let path = tmp("concurrent");
+    let _cleanup = Cleanup(vec![path.clone()]);
     // 回収しない DB で既存の行を作り、 半分消してから回収する DB にする
     let mut survivors: HashMap<u64, (String, String)> = HashMap::new();
     {
@@ -127,6 +141,7 @@ fn counting_at_open_then_concurrent_writers_keep_live_values() {
 #[test]
 fn queued_writes_keep_their_vids_until_applied() {
     let path = tmp("async");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let eng = create(&path, true);
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 64 << 20).unwrap();
     let mut applied: std::collections::VecDeque<(u64, String)> = std::collections::VecDeque::new();
