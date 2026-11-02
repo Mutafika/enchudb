@@ -1,0 +1,708 @@
+Analysis of sampling ball_lazy-7acdd4e82ec46d01 (pid 10796) every 1 millisecond
+Process:         ball_lazy-7acdd4e82ec46d01 [10796]
+Path:            /private/tmp/*/ball_lazy-7acdd4e82ec46d01
+Load Address:    0x1006f4000
+Identifier:      ball_lazy-7acdd4e82ec46d01
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  cargo [10734]
+Target Type:     live task
+
+Date/Time:       2026-11-02 09:35:22.324 +0900
+Launch Time:     2026-11-02 09:22:35.110 +0900
+OS Version:      macOS 26.0.1 (25A362)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         26.4M
+Physical footprint (peak):  181.6M
+Idle exit:                  untracked
+----
+
+Call graph:
+    689 Thread_49274553: main
+    + 689 start  (in dyld) + 7184  [0x191ae5d54]
+    +   689 main  (in ball_lazy-7acdd4e82ec46d01) + 36  [0x100707f94]
+    +     689 _RINvNtCs1SSuMAdGM58_3std2rt10lang_startuECsbSOMAKVSy9g_9ball_lazy  (in ball_lazy-7acdd4e82ec46d01) + 84  [0x1006fb67c]  rt.rs:205
+    +       689 _RNvNtCs1SSuMAdGM58_3std2rt19lang_start_internal  (in ball_lazy-7acdd4e82ec46d01) + 936  [0x100b037f0]
+    +         689 _RNCINvNtCs1SSuMAdGM58_3std2rt10lang_startuE0CsbSOMAKVSy9g_9ball_lazy  (in ball_lazy-7acdd4e82ec46d01) + 28  [0x1006fb6a4]  rt.rs:206
+    +           689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceFEuuECsbSOMAKVSy9g_9ball_lazy  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1006fe4a4]  backtrace.rs:166
+    +             689 _RNvYFEuINtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_onceCsbSOMAKVSy9g_9ball_lazy  (in ball_lazy-7acdd4e82ec46d01) + 20  [0x1006f62ec]  function.rs:250
+    +               689 _RNvCsbSOMAKVSy9g_9ball_lazy4main  (in ball_lazy-7acdd4e82ec46d01) + 28  [0x100700050]  ball_lazy.rs:1
+    +                 689 _RNvCslPnnYyqfaRn_4test16test_main_static  (in ball_lazy-7acdd4e82ec46d01) + 612  [0x100721970]
+    +                   689 _RNvNtCslPnnYyqfaRn_4test7console17run_tests_console  (in ball_lazy-7acdd4e82ec46d01) + 5892  [0x100731b28]
+    +                     689 _RNvMs1_NtNtNtCs1SSuMAdGM58_3std4sync4mpmc4listINtB5_7ChannelNtNtCslPnnYyqfaRn_4test5event13CompletedTestE4recvB10_  (in ball_lazy-7acdd4e82ec46d01) + 428  [0x10072796c]
+    +                       689 _RNCNvMs1_NtNtNtCs1SSuMAdGM58_3std4sync4mpmc4listINtB7_7ChannelNtNtCslPnnYyqfaRn_4test5event13CompletedTestE4recvs_0B12_  (in ball_lazy-7acdd4e82ec46d01) + 248  [0x10071e89c]
+    +                         689 _RNvMs_NtNtCs1SSuMAdGM58_3std6thread6threadNtB4_6Thread4park  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100af8864]
+    +                           689 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x191ceaf40]
+    +                             689 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x191cea990]
+    +                               689 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x191e61bb0]
+    689 Thread_49274573: a_build_reads_on_across_wal_halves
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvCslPnnYyqfaRn_4test8run_tests_0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB17_  (in ball_lazy-7acdd4e82ec46d01) + 64  [0x1007202d0]
+    +         689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCslPnnYyqfaRn_4test8run_tests_0uEB1b_  (in ball_lazy-7acdd4e82ec46d01) + 132  [0x1007187ac]
+    +           689 _RNCNvCslPnnYyqfaRn_4test8run_test0B3_  (in ball_lazy-7acdd4e82ec46d01) + 940  [0x10071de0c]
+    +             689 _RINvCslPnnYyqfaRn_4test28___rust_begin_short_backtraceINtNtCsjIpoRzUjyHQ_4core6result6ResultuNtNtCs6zY7rJBZy9D_5alloc6string6StringEFEBQ_EB2_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100712898]
+    +               689 _RNvYNCNvCsbSOMAKVSy9g_9ball_lazy34a_build_reads_on_across_wal_halves0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_onceB6_  (in ball_lazy-7acdd4e82ec46d01) + 20  [0x1006f6470]  function.rs:250
+    +                 689 _RNCNvCsbSOMAKVSy9g_9ball_lazy34a_build_reads_on_across_wal_halves0B3_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1006f8700]  ball_lazy.rs:564
+    +                   689 _RNvCsbSOMAKVSy9g_9ball_lazys_34a_build_reads_on_across_wal_halves  (in ball_lazy-7acdd4e82ec46d01) + 768  [0x100702340]  ball_lazy.rs:572
+    +                     689 _RNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session  (in ball_lazy-7acdd4e82ec46d01) + 1432  [0x1006ff698]  ball_lazy.rs:337
+    +                       689 _RINvNtNtCs1SSuMAdGM58_3std6thread6scoped5scopeNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session0uEBM_  (in ball_lazy-7acdd4e82ec46d01) + 448  [0x1007096f4]  scoped.rs:158
+    +                         689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100709cbc]
+    +                           689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCINvNtNtB6_6thread6scoped5scopeNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session0uE0EuEB2v_  (in ball_lazy-7acdd4e82ec46d01) + 52  [0x10070fd58]  panicking.rs:576
+    +                             689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCINvNtNtCs1SSuMAdGM58_3std6thread6scoped5scopeNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session0uE0EINtNtNtB9_3ops8function6FnOnceuE9call_onceB1Y_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100708b78]  unwind_safe.rs:275
+    +                               689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread6scoped5scopeNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session0uE0BO_  (in ball_lazy-7acdd4e82ec46d01) + 56  [0x100709c18]  scoped.rs:158
+    +                                 689 _RNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session0B3_  (in ball_lazy-7acdd4e82ec46d01) + 624  [0x1006f820c]  ball_lazy.rs:407
+    +                                   689 _RNvMs0_NtNtCs1SSuMAdGM58_3std4sync7barrierNtB5_7Barrier4wait  (in ball_lazy-7acdd4e82ec46d01) + 168  [0x100af184c]
+    +                                     689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                       689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274605: enchudb-consumer
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB1b_6Engine25spawn_consumer_with_oplogs1_0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1009dafd0]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB16_6Engine25spawn_consumer_with_oplogs1_0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 212  [0x10085d280]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x10085dcf0]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB2P_6Engine25spawn_consumer_with_oplogs1_0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a5dd9c]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB2i_6Engine25spawn_consumer_with_oplogs1_0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x10085a364]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB18_6Engine25spawn_consumer_with_oplogs1_0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 124  [0x10085d8b8]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB1f_6Engine25spawn_consumer_with_oplogs1_0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100875a9c]
+    +                     689 _RNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB7_6Engine25spawn_consumer_with_oplogs1_0B9_  (in ball_lazy-7acdd4e82ec46d01) + 3028  [0x100955d50]
+    +                       689 _RINvMNtCs4ovHgCYZptI_14enchudb_engine14consumer_wakerNtB3_13ConsumerWaker5sleepNCNCNvMsj_NtB5_6engineNtB1p_6Engine25spawn_consumer_with_oplogs1_0s0_0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 264  [0x100812b24]
+    +                         689 _RNvNtNtCs1SSuMAdGM58_3std6thread9functions4park  (in ball_lazy-7acdd4e82ec46d01) + 96  [0x100b06314]
+    +                           689 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x191ceaf40]
+    +                             689 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x191cea990]
+    +                               689 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x191e61bb0]
+    689 Thread_49274633: enchudb-notifier
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB1b_6Engine15ensure_notifiers0_0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1009dafac]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB16_6Engine15ensure_notifiers0_0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 192  [0x10085cf74]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x10085dcf0]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB2P_6Engine15ensure_notifiers0_0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a5dd60]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB2i_6Engine15ensure_notifiers0_0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x10085a32c]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB18_6Engine15ensure_notifiers0_0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x10085d6d8]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB1f_6Engine15ensure_notifiers0_0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100875a80]
+    +                     689 _RNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB7_6Engine15ensure_notifiers0_0B9_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x1009507f4]
+    +                       689 _RINvMNtCs4ovHgCYZptI_14enchudb_engine14consumer_wakerNtB3_13ConsumerWaker5sleepNCNCNvMsj_NtB5_6engineNtB1p_6Engine15ensure_notifiers0_00EB5_  (in ball_lazy-7acdd4e82ec46d01) + 244  [0x100812a04]
+    +                         689 _RNvNtNtCs1SSuMAdGM58_3std6thread9functions4park  (in ball_lazy-7acdd4e82ec46d01) + 96  [0x100b06314]
+    +                           689 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x191ceaf40]
+    +                             689 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x191cea990]
+    +                               689 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x191e61bb0]
+    689 Thread_49274634
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB19_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1006f573c]  function.rs:250
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0B14_  (in ball_lazy-7acdd4e82ec46d01) + 228  [0x1006fcc9c]  lifecycle.rs:68
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x1006fd98c]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EuEB2N_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x10070fdd4]  panicking.rs:576
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2g_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100708bec]  unwind_safe.rs:275
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00B16_  (in ball_lazy-7acdd4e82ec46d01) + 124  [0x1006fd568]  lifecycle.rs:70
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEB1d_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x1006fe514]  backtrace.rs:166
+    +                     689 _RNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00B5_  (in ball_lazy-7acdd4e82ec46d01) + 1816  [0x1006f773c]  ball_lazy.rs:357
+    +                       689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine16try_tie_to_by_idmEB8_  (in ball_lazy-7acdd4e82ec46d01) + 1044  [0x100949490]
+    +                         689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine11set_cell_inyEB8_  (in ball_lazy-7acdd4e82ec46d01) + 1060  [0x1009466b8]
+    +                           689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine8live_setyEB8_  (in ball_lazy-7acdd4e82ec46d01) + 376  [0x10094a4b4]
+    +                             689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine8himo_setB7_  (in ball_lazy-7acdd4e82ec46d01) + 128  [0x100928198]
+    +                               689 _RINvMNtCsjIpoRzUjyHQ_4core4boolb4thenINtNtB5_6option6OptionRNtNtCs4ovHgCYZptI_14enchudb_engine4ball4BallENCNvMsj_NtB10_6engineNtB1N_6Engine8himo_set0EB10_  (in ball_lazy-7acdd4e82ec46d01) + 64  [0x100834654]
+    +                                 689 _RNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB7_6Engine8himo_set0B9_  (in ball_lazy-7acdd4e82ec46d01) + 80  [0x100957514]
+    +                                   664 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 312  [0x100784c08]
+    +                                   ! 663 cthread_yield  (in libsystem_pthread.dylib) + 36  [0x191ea1bc4]
+    +                                   ! : 663 swtch_pri  (in libsystem_kernel.dylib) + 8,4,...  [0x191e61c88,0x191e61c84,...]
+    +                                   ! 1 DYLD-STUB$$sched_yield  (in ball_lazy-7acdd4e82ec46d01) + 0  [0x100b3ef80]
+    +                                   21 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 56  [0x100784b08]
+    +                                   ! 9 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 36  [0x1007847e0]
+    +                                   ! : 6 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a2ee48]
+    +                                   ! : | 6 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadOuECsitACaqgcTw2_13enchudb_oplog  (in ball_lazy-7acdd4e82ec46d01) + 60,236,...  [0x100a8745c,0x100a8750c,...]
+    +                                   ! : 3 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 84,0  [0x100a2ee70,0x100a2ee1c]
+    +                                   ! 9 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x1007847ec]
+    +                                   ! : 6 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x1008b1910]
+    +                                   ! : | 5 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 128  [0x1007c4ad8]
+    +                                   ! : | + 5 _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 28  [0x100811f70]
+    +                                   ! : | +   5 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadhECs9u1aRYsPT6N_11parking_lot  (in ball_lazy-7acdd4e82ec46d01) + 236,32,...  [0x100acd494,0x100acd3c8,...]
+    +                                   ! : | 1 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x1007c4a78]
+    +                                   ! : 3 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 36,40,...  [0x1008b18e8,0x1008b18ec,...]
+    +                                   ! 3 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 48,0  [0x1007847ec,0x1007847bc]
+    +                                   2 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 56,312  [0x100784b08,0x100784c08]
+    +                                   2 cthread_yield  (in libsystem_pthread.dylib) + 44  [0x191ea1bcc]
+    689 Thread_49274635
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB19_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1006f573c]  function.rs:250
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0B14_  (in ball_lazy-7acdd4e82ec46d01) + 228  [0x1006fcc9c]  lifecycle.rs:68
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x1006fd98c]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EuEB2N_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x10070fdd4]  panicking.rs:576
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2g_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100708bec]  unwind_safe.rs:275
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00B16_  (in ball_lazy-7acdd4e82ec46d01) + 124  [0x1006fd568]  lifecycle.rs:70
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEB1d_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x1006fe514]  backtrace.rs:166
+    +                     689 _RNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00B5_  (in ball_lazy-7acdd4e82ec46d01) + 1816  [0x1006f773c]  ball_lazy.rs:357
+    +                       689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine16try_tie_to_by_idmEB8_  (in ball_lazy-7acdd4e82ec46d01) + 1044  [0x100949490]
+    +                         689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine11set_cell_inyEB8_  (in ball_lazy-7acdd4e82ec46d01) + 1060  [0x1009466b8]
+    +                           689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine8live_setyEB8_  (in ball_lazy-7acdd4e82ec46d01) + 376  [0x10094a4b4]
+    +                             689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine8himo_setB7_  (in ball_lazy-7acdd4e82ec46d01) + 128  [0x100928198]
+    +                               689 _RINvMNtCsjIpoRzUjyHQ_4core4boolb4thenINtNtB5_6option6OptionRNtNtCs4ovHgCYZptI_14enchudb_engine4ball4BallENCNvMsj_NtB10_6engineNtB1N_6Engine8himo_set0EB10_  (in ball_lazy-7acdd4e82ec46d01) + 64  [0x100834654]
+    +                                 689 _RNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB7_6Engine8himo_set0B9_  (in ball_lazy-7acdd4e82ec46d01) + 80  [0x100957514]
+    +                                   648 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 312  [0x100784c08]
+    +                                   ! 643 cthread_yield  (in libsystem_pthread.dylib) + 36  [0x191ea1bc4]
+    +                                   ! : 642 swtch_pri  (in libsystem_kernel.dylib) + 8,4  [0x191e61c88,0x191e61c84]
+    +                                   ! : 1 DYLD-STUB$$swtch_pri  (in libsystem_pthread.dylib) + 12  [0x191ea97e0]
+    +                                   ! 3 DYLD-STUB$$sched_yield  (in ball_lazy-7acdd4e82ec46d01) + 4  [0x100b3ef84]
+    +                                   ! 2 cthread_yield  (in libsystem_pthread.dylib) + 36  [0x191ea1bc4]
+    +                                   36 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 56  [0x100784b08]
+    +                                   ! 24 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x1007847ec]
+    +                                   ! : 22 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x1008b1910]
+    +                                   ! : | 16 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 128  [0x1007c4ad8]
+    +                                   ! : | + 8 _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 28  [0x100811f70]
+    +                                   ! : | + ! 8 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadhECs9u1aRYsPT6N_11parking_lot  (in ball_lazy-7acdd4e82ec46d01) + 32,236,...  [0x100acd3c8,0x100acd494,...]
+    +                                   ! : | + 8 _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 28,20,...  [0x100811f70,0x100811f68,...]
+    +                                   ! : | 6 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 128,44,...  [0x1007c4ad8,0x1007c4a84,...]
+    +                                   ! : 2 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 40,104  [0x1008b18ec,0x1008b192c]
+    +                                   ! 9 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 36  [0x1007847e0]
+    +                                   ! : 6 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a2ee48]
+    +                                   ! : | 6 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadOuECsitACaqgcTw2_13enchudb_oplog  (in ball_lazy-7acdd4e82ec46d01) + 236,0,...  [0x100a8750c,0x100a87420,...]
+    +                                   ! : 3 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 0,44,...  [0x100a2ee1c,0x100a2ee48,...]
+    +                                   ! 3 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 48,0  [0x1007847ec,0x1007847bc]
+    +                                   5 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 312,148  [0x100784c08,0x100784b64]
+    689 Thread_49274636
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB19_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1006f573c]  function.rs:250
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0B14_  (in ball_lazy-7acdd4e82ec46d01) + 228  [0x1006fcc9c]  lifecycle.rs:68
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x1006fd98c]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EuEB2N_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x10070fdd4]  panicking.rs:576
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2g_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100708bec]  unwind_safe.rs:275
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00B16_  (in ball_lazy-7acdd4e82ec46d01) + 124  [0x1006fd568]  lifecycle.rs:70
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEB1d_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x1006fe514]  backtrace.rs:166
+    +                     689 _RNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00B5_  (in ball_lazy-7acdd4e82ec46d01) + 1816  [0x1006f773c]  ball_lazy.rs:357
+    +                       689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine16try_tie_to_by_idmEB8_  (in ball_lazy-7acdd4e82ec46d01) + 1044  [0x100949490]
+    +                         689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine11set_cell_inyEB8_  (in ball_lazy-7acdd4e82ec46d01) + 1060  [0x1009466b8]
+    +                           689 _RINvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB6_6Engine8live_setyEB8_  (in ball_lazy-7acdd4e82ec46d01) + 376  [0x10094a4b4]
+    +                             689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine8himo_setB7_  (in ball_lazy-7acdd4e82ec46d01) + 128  [0x100928198]
+    +                               689 _RINvMNtCsjIpoRzUjyHQ_4core4boolb4thenINtNtB5_6option6OptionRNtNtCs4ovHgCYZptI_14enchudb_engine4ball4BallENCNvMsj_NtB10_6engineNtB1N_6Engine8himo_set0EB10_  (in ball_lazy-7acdd4e82ec46d01) + 64  [0x100834654]
+    +                                 689 _RNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB7_6Engine8himo_set0B9_  (in ball_lazy-7acdd4e82ec46d01) + 80  [0x100957514]
+    +                                   654 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 312  [0x100784c08]
+    +                                   ! 651 cthread_yield  (in libsystem_pthread.dylib) + 36  [0x191ea1bc4]
+    +                                   ! : 650 swtch_pri  (in libsystem_kernel.dylib) + 8,4  [0x191e61c88,0x191e61c84]
+    +                                   ! : 1 DYLD-STUB$$swtch_pri  (in libsystem_pthread.dylib) + 12  [0x191ea97e0]
+    +                                   ! 2 cthread_yield  (in libsystem_pthread.dylib) + 0,16  [0x191ea1ba0,0x191ea1bb0]
+    +                                   ! 1 DYLD-STUB$$sched_yield  (in ball_lazy-7acdd4e82ec46d01) + 0  [0x100b3ef80]
+    +                                   28 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 56  [0x100784b08]
+    +                                   ! 19 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x1007847ec]
+    +                                   ! : 10 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x1008b1910]
+    +                                   ! : | 9 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 128  [0x1007c4ad8]
+    +                                   ! : | + 8 _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 28  [0x100811f70]
+    +                                   ! : | + ! 8 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadhECs9u1aRYsPT6N_11parking_lot  (in ball_lazy-7acdd4e82ec46d01) + 236,44,...  [0x100acd494,0x100acd3d4,...]
+    +                                   ! : | + 1 _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 20  [0x100811f68]
+    +                                   ! : | 1 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x1007c4a84]
+    +                                   ! : 9 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 104,40,...  [0x1008b192c,0x1008b18ec,...]
+    +                                   ! 8 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 36  [0x1007847e0]
+    +                                   ! : 4 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a2ee48]
+    +                                   ! : | 4 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadOuECsitACaqgcTw2_13enchudb_oplog  (in ball_lazy-7acdd4e82ec46d01) + 60,236  [0x100a8745c,0x100a8750c]
+    +                                   ! : 4 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 84,28,...  [0x100a2ee70,0x100a2ee38,...]
+    +                                   ! 1 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x1007847ec]
+    +                                   4 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 56,312  [0x100784b08,0x100784c08]
+    +                                   3 cthread_yield  (in libsystem_pthread.dylib) + 44  [0x191ea1bcc]
+    689 Thread_49274637
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB19_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x1006f573c]  function.rs:250
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_0B14_  (in ball_lazy-7acdd4e82ec46d01) + 228  [0x1006fcc9c]  lifecycle.rs:68
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x1006fd98c]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EuEB2N_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x10070fdd4]  panicking.rs:576
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2g_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100708bec]  unwind_safe.rs:275
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEs_00B16_  (in ball_lazy-7acdd4e82ec46d01) + 124  [0x1006fd568]  lifecycle.rs:70
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00uEB1d_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x1006fe514]  backtrace.rs:166
+    +                     689 _RNCNCNvCsbSOMAKVSy9g_9ball_lazy18concurrent_session00B5_  (in ball_lazy-7acdd4e82ec46d01) + 1844  [0x1006f7758]  ball_lazy.rs:354
+    +                       689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine11untie_by_id  (in ball_lazy-7acdd4e82ec46d01) + 668  [0x1008ecd38]
+    +                         689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine26clear_cell_in_freeing_leaf  (in ball_lazy-7acdd4e82ec46d01) + 344  [0x10092162c]
+    +                           689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine24remove_cell_freeing_leaf  (in ball_lazy-7acdd4e82ec46d01) + 104  [0x10091f090]
+    +                             689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine11live_removeB7_  (in ball_lazy-7acdd4e82ec46d01) + 136  [0x1008ec824]
+    +                               689 _RNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB5_6Engine11himo_removeB7_  (in ball_lazy-7acdd4e82ec46d01) + 124  [0x1008ec550]
+    +                                 689 _RINvMNtCsjIpoRzUjyHQ_4core4boolb4thenINtNtB5_6option6OptionRNtNtCs4ovHgCYZptI_14enchudb_engine4ball4BallENCNvMsj_NtB10_6engineNtB1N_6Engine11himo_remove0EB10_  (in ball_lazy-7acdd4e82ec46d01) + 64  [0x1008345f0]
+    +                                   689 _RNCNvMsj_NtCs4ovHgCYZptI_14enchudb_engine6engineNtB7_6Engine11himo_remove0B9_  (in ball_lazy-7acdd4e82ec46d01) + 80  [0x10094ea20]
+    +                                     650 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 312  [0x100784c08]
+    +                                     ! 647 cthread_yield  (in libsystem_pthread.dylib) + 36  [0x191ea1bc4]
+    +                                     ! : 647 swtch_pri  (in libsystem_kernel.dylib) + 8,4  [0x191e61c88,0x191e61c84]
+    +                                     ! 2 cthread_yield  (in libsystem_pthread.dylib) + 16,36  [0x191ea1bb0,0x191ea1bc4]
+    +                                     ! 1 DYLD-STUB$$sched_yield  (in ball_lazy-7acdd4e82ec46d01) + 4  [0x100b3ef84]
+    +                                     30 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 56  [0x100784b08]
+    +                                     ! 15 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x1007847ec]
+    +                                     ! : 9 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x1008b1910]
+    +                                     ! : | 7 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 128  [0x1007c4ad8]
+    +                                     ! : | + 5 _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 28  [0x100811f70]
+    +                                     ! : | + ! 5 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadhECs9u1aRYsPT6N_11parking_lot  (in ball_lazy-7acdd4e82ec46d01) + 32,76,...  [0x100acd3c8,0x100acd3f4,...]
+    +                                     ! : | + 2 _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 28  [0x100811f70]
+    +                                     ! : | 2 _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01) + 32,128  [0x1007c4a78,0x1007c4ad8]
+    +                                     ! : 6 _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01) + 104,36,...  [0x1008b192c,0x1008b18e8,...]
+    +                                     ! 11 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 36  [0x1007847e0]
+    +                                     ! : 7 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a2ee48]
+    +                                     ! : | 7 _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadOuECsitACaqgcTw2_13enchudb_oplog  (in ball_lazy-7acdd4e82ec46d01) + 32,236,...  [0x100a87440,0x100a8750c,...]
+    +                                     ! : 4 _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01) + 84,0  [0x100a2ee70,0x100a2ee1c]
+    +                                     ! 4 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01) + 0,48  [0x1007847bc,0x1007847ec]
+    +                                     9 _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01) + 312,56,...  [0x100784c08,0x100784b08,...]
+    689 Thread_49274652
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274653
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274654
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274655
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274656
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274657
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274658
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274659
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274660
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274661
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274662
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274663
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274664
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274665
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274666
+    + 689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+    +   689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+    +     689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+    +       689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+    +         689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+    +           689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+    +             689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+    +               689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+    +                 689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+    +                   689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+    +                     689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+    +                       689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+    +                         689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+    +                           689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+    +                             689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+    +                               689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+    +                                 689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+    +                                   689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+    +                                     689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+    +                                       689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+    +                                         689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+    +                                           689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+    689 Thread_49274667
+      689 thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+        689 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+          689 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+            689 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+              689 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+                689 __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+                  689 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+                    689 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+                      689 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+                        689 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+                          689 _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+                            689 _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+                              689 _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+                                689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+                                  689 _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+                                    689 _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+                                      689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+                                        689 _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+                                          689 _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+                                            689 _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+                                              689 _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+                                                689 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x191e654f8]
+
+Total number in stack (recursive counted multiple, when >=5):
+        23       _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ball_lazy-7acdd4e82ec46d01) + 392  [0x100b0b608]
+        23       _pthread_start  (in libsystem_pthread.dylib) + 136  [0x191ea4c08]
+        23       thread_start  (in libsystem_pthread.dylib) + 8  [0x191e9fba8]
+        17       __psynch_cvwait  (in libsystem_kernel.dylib) + 0  [0x191e654f0]
+        17       _pthread_cond_wait  (in libsystem_pthread.dylib) + 984  [0x191ea50dc]
+        16       _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep13no_work_foundNCNvMs8_NtB5_8registryNtB19_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 284  [0x100a6d7e8]
+        16       _RINvMNtCse2LYyWVK2rh_10rayon_core5sleepNtB3_5Sleep5sleepNCNvMs8_NtB5_8registryNtB10_12WorkerThread15wait_until_cold0EB5_  (in ball_lazy-7acdd4e82ec46d01) + 900  [0x100b36eb4]
+        16       _RINvMNtNtNtCs1SSuMAdGM58_3std4sync6poison7condvarNtB3_7Condvar4waitbECse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a6da58]
+        16       _RINvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB6_12WorkerThread10wait_untilNtNtB8_5latch9OnceLatchEB8_  (in ball_lazy-7acdd4e82ec46d01) + 76  [0x100a6e8c0]
+        16       _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1f_12DefaultSpawnNtB1f_11ThreadSpawn5spawn0uEB1h_  (in ball_lazy-7acdd4e82ec46d01) + 16  [0x100a76ce4]
+        16       _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2P_12DefaultSpawnNtB2P_11ThreadSpawn5spawn0uEs_00EuEB2R_  (in ball_lazy-7acdd4e82ec46d01) + 48  [0x100a72920]
+        16       _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB16_12DefaultSpawnNtB16_11ThreadSpawn5spawn0uEs_0B18_  (in ball_lazy-7acdd4e82ec46d01) + 208  [0x100a77ebc]
+        16       _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB18_12DefaultSpawnNtB18_11ThreadSpawn5spawn0uEs_00B1a_  (in ball_lazy-7acdd4e82ec46d01) + 120  [0x100a78170]
+        16       _RNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB7_12DefaultSpawnNtB7_11ThreadSpawn5spawn0B9_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6f63c]
+        16       _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB1b_12DefaultSpawnNtB1b_11ThreadSpawn5spawn0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ball_lazy-7acdd4e82ec46d01) + 24  [0x100a68aec]
+        16       _RNvMNtCse2LYyWVK2rh_10rayon_core8registryNtB2_13ThreadBuilder3run  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a6fb84]
+        16       _RNvMNtNtNtNtCs1SSuMAdGM58_3std3sys4sync7condvar7pthreadNtB2_7Condvar4waitCse2LYyWVK2rh_10rayon_core  (in ball_lazy-7acdd4e82ec46d01) + 116  [0x100a78444]
+        16       _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread15wait_until_cold  (in ball_lazy-7acdd4e82ec46d01) + 488  [0x100b372c0]
+        16       _RNvMs8_NtCse2LYyWVK2rh_10rayon_core8registryNtB5_12WorkerThread22wait_until_out_of_work  (in ball_lazy-7acdd4e82ec46d01) + 184  [0x100a70684]
+        16       _RNvNtCse2LYyWVK2rh_10rayon_core8registry9main_loop  (in ball_lazy-7acdd4e82ec46d01) + 260  [0x100a70e48]
+        16       _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvXs0_NtCse2LYyWVK2rh_10rayon_core8registryNtB2i_12DefaultSpawnNtB2i_11ThreadSpawn5spawn0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2k_  (in ball_lazy-7acdd4e82ec46d01) + 44  [0x100a76694]
+        16       __rust_try  (in ball_lazy-7acdd4e82ec46d01) + 32  [0x100a7b804]
+        5       cthread_yield  (in libsystem_pthread.dylib) + 0  [0x191ea1ba0]
+
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        11713
+        swtch_pri  (in libsystem_kernel.dylib)        2602
+        semaphore_wait_trap  (in libsystem_kernel.dylib)        2067
+        _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadhECs9u1aRYsPT6N_11parking_lot  (in ball_lazy-7acdd4e82ec46d01)        26
+        _RINvNtNtCsjIpoRzUjyHQ_4core4sync6atomic11atomic_loadOuECsitACaqgcTw2_13enchudb_oplog  (in ball_lazy-7acdd4e82ec46d01)        23
+        _RINvMNtCsjIpoRzUjyHQ_4core6optionINtB3_6OptionRINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtB5_4sync6atomic6AtomichEEE6map_orhNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB26_5Balls5phase0EB28_  (in ball_lazy-7acdd4e82ec46d01)        20
+        _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls9for_writeB7_  (in ball_lazy-7acdd4e82ec46d01)        20
+        _RNvMNtNtCs1SSuMAdGM58_3std4sync9once_lockINtB2_8OnceLockINtNtCs6zY7rJBZy9D_5alloc5boxed3BoxSINtNtNtCsjIpoRzUjyHQ_4core4sync6atomic6AtomichEEE3getCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01)        14
+        _RNvMsC_NtNtCsjIpoRzUjyHQ_4core4sync6atomicINtB5_6AtomichE4loadCs4ovHgCYZptI_14enchudb_engine  (in ball_lazy-7acdd4e82ec46d01)        11
+        _RNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB5_5Balls5phaseB7_  (in ball_lazy-7acdd4e82ec46d01)        11
+        cthread_yield  (in libsystem_pthread.dylib)        11
+        _RNCNvMse_NtCs4ovHgCYZptI_14enchudb_engine4ballNtB7_5Balls5phase0B9_  (in ball_lazy-7acdd4e82ec46d01)        10
+        DYLD-STUB$$sched_yield  (in ball_lazy-7acdd4e82ec46d01)        6
+
+Binary Images:
+       0x1006f4000 -        0x100cd08c7 +ball_lazy-7acdd4e82ec46d01 (0) <ACE6E93F-ABEC-3926-8262-887A6E33D078> /tmp/*/ball_lazy-7acdd4e82ec46d01
+       0x191a58000 -        0x191aab4eb  libobjc.A.dylib (950) <7443A268-C9F9-3D65-B497-4F8081799514> /usr/lib/libobjc.A.dylib
+       0x191aac000 -        0x191adcc2a  libdyld.dylib (1323.3) <E0C6C827-A8D1-3886-AAA2-51567B79AC29> /usr/lib/system/libdyld.dylib
+       0x191add000 -        0x191b7bf73  dyld (1.0.0 - 1323.3) <ABFD3247-50AC-3C8E-B72A-83710166E982> /usr/lib/dyld
+       0x191b7c000 -        0x191b7f1d0  libsystem_blocks.dylib (96) <BD46B343-1278-35B2-8EA2-C4E7529BFA29> /usr/lib/system/libsystem_blocks.dylib
+       0x191b80000 -        0x191bccb1f  libxpc.dylib (3089.0.11) <0CEC3289-F166-35F6-8CEF-DE3D17EB0228> /usr/lib/system/libxpc.dylib
+       0x191bcd000 -        0x191bed7df  libsystem_trace.dylib (1815.0.16) <28139651-FFE2-3795-95AC-1C7CB27A3A9B> /usr/lib/system/libsystem_trace.dylib
+       0x191bee000 -        0x191c9a0df  libcorecrypto.dylib (1922.0.25) <A0E62907-B331-3246-9080-3CDA7C308C43> /usr/lib/system/libcorecrypto.dylib
+       0x191c9b000 -        0x191ce6b8f  libsystem_malloc.dylib (792.1.1) <9DAE12FA-D761-3362-AFAC-978D7020F202> /usr/lib/system/libsystem_malloc.dylib
+       0x191ce7000 -        0x191d2de9f  libdispatch.dylib (1542.0.4) <17D849C6-A785-3DBB-BFB5-8321706C4B8D> /usr/lib/system/libdispatch.dylib
+       0x191d2e000 -        0x191d30feb  libsystem_featureflags.dylib (101) <934F53FD-04AE-34AC-9E90-77A1486ACF2F> /usr/lib/system/libsystem_featureflags.dylib
+       0x191d31000 -        0x191db2ff7  libsystem_c.dylib (1725.0.11) <1E2FC910-E211-3A48-90C1-402C82129EA8> /usr/lib/system/libsystem_c.dylib
+       0x191db3000 -        0x191e45e53  libc++.1.dylib (2000.63) <21DFDB11-8328-31D9-A35D-08C1B52621A6> /usr/lib/libc++.1.dylib
+       0x191e46000 -        0x191e6092f  libc++abi.dylib (2000.63) <1DB24A4F-6A19-3415-B7C4-79C43340EC7B> /usr/lib/libc++abi.dylib
+       0x191e61000 -        0x191e9d45f  libsystem_kernel.dylib (12377.1.9) <2EB73BF1-8C71-3E1F-A160-6DA83DC82606> /usr/lib/system/libsystem_kernel.dylib
+       0x191e9e000 -        0x191eaaabb  libsystem_pthread.dylib (539) <5D31D65C-2ECF-36DA-84F5-BA4CAAB06ADB> /usr/lib/system/libsystem_pthread.dylib
+       0x191eab000 -        0x191eb33bf  libsystem_platform.dylib (359.1.2) <36396B66-54EB-30FA-8E3B-E71AE63DA30C> /usr/lib/system/libsystem_platform.dylib
+       0x191eb4000 -        0x191ee3e23  libsystem_info.dylib (600) <4E5BF873-660C-36FE-8E4A-FC916808E458> /usr/lib/system/libsystem_info.dylib
+       0x195e33000 -        0x195e3d397  libsystem_darwin.dylib (1725.0.11) <B83F8970-B1D7-35C6-8F56-89E2DB5C04BB> /usr/lib/system/libsystem_darwin.dylib
+       0x1962a3000 -        0x1962b4ff3  libsystem_notify.dylib (344.0.1) <0E0BAE18-A7A4-399A-8FE0-A640F31553A2> /usr/lib/system/libsystem_notify.dylib
+       0x198541000 -        0x19855bfbb  libsystem_networkextension.dylib (2205) <627EB451-D762-3680-AF0D-182E35425832> /usr/lib/system/libsystem_networkextension.dylib
+       0x1985de000 -        0x1985f5ff3  libsystem_asl.dylib (404) <0FD0B166-66DD-38B0-9463-CC35A421828F> /usr/lib/system/libsystem_asl.dylib
+       0x19a186000 -        0x19a18e3a7  libsystem_symptoms.dylib (2153) <978A0E08-A471-3C68-9837-9163D078DA0E> /usr/lib/system/libsystem_symptoms.dylib
+       0x19e094000 -        0x19e0ca847  libsystem_containermanager.dylib (725.0.13) <029BBE3D-7F39-3157-B26D-20B43466473B> /usr/lib/system/libsystem_containermanager.dylib
+       0x19f4c6000 -        0x19f4ca66f  libsystem_configuration.dylib (1385.0.7) <6B59700C-7AA8-300D-8E0B-10A01FDF2E7D> /usr/lib/system/libsystem_configuration.dylib
+       0x19f4cb000 -        0x19f4d16a7  libsystem_sandbox.dylib (2680.0.50) <B7204A7E-874B-302C-A691-5023A8913F96> /usr/lib/system/libsystem_sandbox.dylib
+       0x1a0a49000 -        0x1a0a4c1fb  libquarantine.dylib (196.0.1) <ED58E0DD-9ECA-30D3-AB04-70CCBDF87976> /usr/lib/system/libquarantine.dylib
+       0x1a11ca000 -        0x1a11d110b  libsystem_coreservices.dylib (188) <A8A4FE79-E9CE-3C05-808D-9DE53977E3C6> /usr/lib/system/libsystem_coreservices.dylib
+       0x1a1706000 -        0x1a17438b7  libsystem_m.dylib (3307.0.1) <83BA9FD3-4E11-3C37-AF2F-34AFAA203301> /usr/lib/system/libsystem_m.dylib
+       0x1a1744000 -        0x1a1744c9b  libcharset.1.dylib (113) <3D39A158-6A4E-36C7-BBC6-2313F29DAD7E> /usr/lib/libcharset.1.dylib
+       0x1a1745000 -        0x1a1748537  libmacho.dylib (1030.6.3) <FB98601C-60DB-3D5D-834C-87250AE97CAD> /usr/lib/system/libmacho.dylib
+       0x1a1762000 -        0x1a176f62f  libcommonCrypto.dylib (600035) <C5AB2E8E-1959-3341-B1DE-AD770F63689F> /usr/lib/system/libcommonCrypto.dylib
+       0x1a1770000 -        0x1a1779b0b  libunwind.dylib (1900.125) <6706BE80-9222-389B-BBC4-0DECA6FEE37F> /usr/lib/system/libunwind.dylib
+       0x1a1782000 -        0x1a178c6ff  libcopyfile.dylib (230.0.1.0.1) <FD20B81E-EA30-3D96-805E-45D65A70151E> /usr/lib/system/libcopyfile.dylib
+       0x1a178d000 -        0x1a179095f  libcompiler_rt.dylib (103.3) <FC2EAAE6-5773-3F9E-B5B1-111E55081E8A> /usr/lib/system/libcompiler_rt.dylib
+       0x1a1791000 -        0x1a1795a1b  libsystem_collections.dylib (1725.0.11) <4D48025A-6744-309B-9085-5AE36F8E17F1> /usr/lib/system/libsystem_collections.dylib
+       0x1a1796000 -        0x1a17992bf  libsystem_secinit.dylib (168.0.3) <5CBD67B8-69E3-3E57-916E-8989EC05611E> /usr/lib/system/libsystem_secinit.dylib
+       0x1a179a000 -        0x1a179cb57  libremovefile.dylib (84) <A51AC2D9-0595-33D1-B11F-E594D7B70641> /usr/lib/system/libremovefile.dylib
+       0x1a179d000 -        0x1a179df27  libkeymgr.dylib (31) <E35A3B55-412F-32CE-AB32-2C2F0EB98B7F> /usr/lib/system/libkeymgr.dylib
+       0x1a179e000 -        0x1a17a6f87  libsystem_dnssd.dylib (2881.0.25) <698A86B3-1913-3A4F-A1E7-B42035AF2E62> /usr/lib/system/libsystem_dnssd.dylib
+       0x1a17a7000 -        0x1a17ac0b3  libcache.dylib (95) <708DF955-9A54-3E51-A9B5-1B1BAA00ADC3> /usr/lib/system/libcache.dylib
+       0x1a17ad000 -        0x1a17aecf3  libSystem.B.dylib (1356) <BD5B2A22-2FC5-323E-84AD-7DB1AA09C9B5> /usr/lib/libSystem.B.dylib
+       0x1a17e8000 -        0x1a17ef1bb  libiconv.2.dylib (113) <1ABE251C-6DB9-34D5-ACE7-086C6D10CC37> /usr/lib/libiconv.2.dylib
+       0x289210000 -        0x289217319  libRosetta.dylib (362) <4BA14AEC-4DD2-32D2-BD57-86191F088278> /usr/lib/libRosetta.dylib
+       0x28a88e000 -        0x28a891deb  libsystem_darwindirectory.dylib (122) <516B0D64-3E6F-300D-AA37-1182A5A56576> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x28a892000 -        0x28a89936b  libsystem_eligibility.dylib (286) <66C8328E-7B68-3454-882F-5C300D117039> /usr/lib/system/libsystem_eligibility.dylib
+       0x28a89a000 -        0x28a8a1873  libsystem_sanitizers.dylib (25) <AB0CAD83-AB06-3424-8C06-ADC1615E16C9> /usr/lib/system/libsystem_sanitizers.dylib
+       0x28a8a2000 -        0x28a8a2baf  libsystem_trial.dylib (474) <4C5F6FE4-DDC5-31C5-B0CC-815F0C5F13D6> /usr/lib/system/libsystem_trial.dylib

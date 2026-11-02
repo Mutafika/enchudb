@@ -1,0 +1,3 @@
+baseline: pass 73 秒 → 1 run の上限 1500 秒
+  killed 76s             H より前の書き終えを待たない
+killed 1 / survived 0 / その他 0
