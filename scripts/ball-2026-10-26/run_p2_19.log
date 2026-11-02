@@ -1,0 +1,66 @@
+held wal=4MiB log=16MiB seed=41 load=7.83
+none wal=4MiB log=16MiB seed=41 load=7.83
+held wal=4MiB log=64MiB seed=41 load=7.83
+none wal=4MiB log=64MiB seed=41 load=7.74
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=16MiB seed=41 load=7.74
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+none wal=64MiB log=16MiB seed=41 load=7.74
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=64MiB seed=41 load=7.74
+none wal=64MiB log=64MiB seed=41 load=7.76
+none wal=4MiB log=16MiB seed=42 load=7.76
+held wal=4MiB log=16MiB seed=42 load=7.76
+none wal=4MiB log=64MiB seed=42 load=7.76
+held wal=4MiB log=64MiB seed=42 load=7.76
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+none wal=64MiB log=16MiB seed=42 load=7.30
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=16MiB seed=42 load=7.30
+none wal=64MiB log=64MiB seed=42 load=7.30
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=64MiB seed=42 load=7.30
+held wal=4MiB log=16MiB seed=43 load=7.03
+none wal=4MiB log=16MiB seed=43 load=7.03
+held wal=4MiB log=64MiB seed=43 load=7.03
+none wal=4MiB log=64MiB seed=43 load=7.03
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=16MiB seed=43 load=7.03
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+none wal=64MiB log=16MiB seed=43 load=6.63
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=64MiB seed=43 load=6.63
+none wal=64MiB log=64MiB seed=43 load=6.63
+none wal=4MiB log=16MiB seed=44 load=6.63
+held wal=4MiB log=16MiB seed=44 load=6.42
+none wal=4MiB log=64MiB seed=44 load=6.42
+held wal=4MiB log=64MiB seed=44 load=6.42
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+none wal=64MiB log=16MiB seed=44 load=6.42
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=16MiB seed=44 load=6.42
+none wal=64MiB log=64MiB seed=44 load=6.30
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=64MiB seed=44 load=6.30
+held wal=4MiB log=16MiB seed=45 load=6.30
+none wal=4MiB log=16MiB seed=45 load=6.30
+held wal=4MiB log=64MiB seed=45 load=6.12
+none wal=4MiB log=64MiB seed=45 load=6.12
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=16MiB seed=45 load=6.12
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+none wal=64MiB log=16MiB seed=45 load=6.12
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=64MiB seed=45 load=6.12
+none wal=64MiB log=64MiB seed=45 load=6.03
+none wal=4MiB log=16MiB seed=46 load=6.03
+held wal=4MiB log=16MiB seed=46 load=6.03
+none wal=4MiB log=64MiB seed=46 load=6.03
+held wal=4MiB log=64MiB seed=46 load=5.71
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+none wal=64MiB log=16MiB seed=46 load=5.71
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=16MiB seed=46 load=5.71
+none wal=64MiB log=64MiB seed=46 load=5.71
+[enchudb] warning: 1 change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)
+held wal=64MiB log=64MiB seed=46 load=5.71
