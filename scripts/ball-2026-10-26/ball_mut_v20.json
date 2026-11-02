@@ -1,0 +1,26 @@
+[
+ {
+  "name": "持つ回も持っている間に記録を読む (直し 7 を外す、 値段だけ = 答えには出ない、 P2b で見る)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                _ if emit.is_some() => {\n                    // 持つ回: 記録は放した後に読む (上)\n                    deferred = Some(next);\n                    log_wal\n                }\n",
+  "replace": ""
+ },
+ {
+  "name": "持つ回で放した後に記録を読まない (T9 / T12)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                let (rec0, n0, side0) = (self.records, self.prof_n[0], self.side_ops);\n                self.read_log(log, pos, next, limit);\n",
+  "replace": "                let (rec0, n0, side0) = (self.records, self.prof_n[0], self.side_ops);\n                let _ = next;\n"
+ },
+ {
+  "name": "持つ回で放した後の記録を WAL の分の後に当てる (T9 / T12)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                let (rec0, n0, side0) = (self.records, self.prof_n[0], self.side_ops);\n                self.read_log(log, pos, next, limit);\n",
+  "replace": "                let (rec0, n0, side0) = (self.records, self.prof_n[0], self.side_ops);\n                for (h, b) in ops.iter() {\n                    if self.admit(*h, limit).is_some() {\n                        self.apply(*h, b);\n                    }\n                }\n                self.read_log(log, pos, next, limit);\n"
+ },
+ {
+  "name": "持つ回で放した後に記録が捨てた分を控えから当てない (控えを先に捨てる、 T12)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                let (rec0, n0, side0) = (self.records, self.prof_n[0], self.side_ops);\n                self.read_log(log, pos, next, limit);\n",
+  "replace": "                let (rec0, n0, side0) = (self.records, self.prof_n[0], self.side_ops);\n                let _ = self.eng.ball_bases.take_side(u64::MAX);\n                self.read_log(log, pos, next, limit);\n"
+ }
+]
