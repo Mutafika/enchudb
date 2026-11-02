@@ -1977,8 +1977,8 @@ mod fold_copy_tests {
     /// 古い区画を畳む時、 changefeed の record を写している間も書き手は WAL に積める (写しは `append_lock` の外)。 前は
     /// `try_reset_if` の述語 (lock の下) で cursor から今の区画の head まで全部を写し、 書き手が速いと畳むたびに 100〜200 ms 止まった。
     /// `log` = 記録 (`changefeed.seg`) に写す形、 でなければ listener の溜めに移す形。 `room` = 試験の thread から空け作り
-    /// (`make_wal_room_inner`、 sync の表の無い DB は書き出してその場で畳む) を呼んで畳む形。 でなければ consumer の 100 ms ごとの
-    /// 書き出しの後に畳む形 (`try_fold_with_changes`)。 どちらも区画を移って少し書いてから止める。
+    /// (`make_wal_room_inner`、 sync の表の無い DB は書き出してその場で畳む) を呼んで畳む形 (consumer の畳みは切る)。 でなければ
+    /// consumer の 100 ms ごとの書き出しの後に畳む形 (`try_fold_with_changes`)。 どちらも区画を移って少し書いてから止める。
     fn copies_for_a_fold_leave_the_wal_open(log: bool, room: bool) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = format!("/tmp/enchudb-foldcopy-{}-{log}-{room}-{nanos}.db", std::process::id());
@@ -1990,6 +1990,13 @@ mod fold_copy_tests {
             eids
         };
         let eng = Engine::open_concurrent_with_oplog(&path, 4 << 20).unwrap();
+        // #689: 空け作りで畳む形は、 consumer の畳み (区画を移った時 / 周期の書き出しの後) を切る。 consumer が先に古い区画を畳むと、
+        // 空け作りはその後で今の区画をその場で畳むことがある。 その場で畳む時は作りどおり append_lock の下で写す (書き手を止める)
+        // ので、 試したい形 (古い区画を畳む) にならない (混んだ Mac で、 写しの最後の 1 回だけ積めずに落ちた)
+        if room {
+            eng.set_wal_fold_on_switch(false);
+            eng.set_wal_fold_on_tick(false);
+        }
         if log {
             eng.enable_change_log(4 << 20).unwrap();
         } else {
@@ -2007,16 +2014,18 @@ mod fold_copy_tests {
             i += 1;
         }
         assert!(eng.wal_switches() > switches0, "前提: 区画を移った");
+        let lap1 = wal.lap();
         for _ in 0..100 {
             eng.tie_to(eids[i as usize % eids.len()], "v", i);
             i += 1;
         }
-        // 空け作りは試験の thread から呼ぶ (空きが 1/4 を切るのを consumer に待たせると、 100 ms ごとの書き出しが先に畳むことがある。
-        // その時は空け作りが今の区画をその場で畳む)
+        // 空け作りは試験の thread から呼ぶ (空きが 1/4 を切るのを consumer に待たせない)
         while room && eng.make_wal_room(&wal) != WalRoom::Folded && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        // consumer が古い区画を畳むまで待つ
+        // 区画を移らず (今の区画の周のまま)、 今の区画をその場で畳んでもいない
+        assert_eq!(wal.lap(), lap1, "前提: 畳んだのは古い区画");
+        // 古い区画が畳まれるまで待つ (空け作りの形は畳み終えている)
         let old = wal_pos(lap0, HEADER_SIZE as u64);
         let deadline = Instant::now() + Duration::from_secs(20);
         while wal.holds(old) && Instant::now() < deadline {
@@ -2083,6 +2092,8 @@ mod fold_copy_tests {
             eids
         };
         let eng = Engine::open_concurrent_with_oplog(&path, 24 << 10).unwrap();
+        // #689: 周期の書き出しの後の畳みを切る (書き手が遅いと、 空きが 1/4 を切る前に周期の畳みが空けて、 空け作りまで行かない)
+        eng.set_wal_fold_on_tick(false);
         if log {
             eng.enable_change_log(1 << 20).unwrap();
         }
@@ -2168,6 +2179,12 @@ mod fold_copy_tests {
             eids
         };
         let eng = Engine::open_concurrent_with_oplog(&path, 4 << 20).unwrap();
+        // #689: 空け作りの形は consumer の畳み (区画を移った時 / 周期の書き出しの後) を切る (consumer が先に古い区画を畳むと、
+        // 空け作りは今の区画を書き出せずに畳めない)
+        if room {
+            eng.set_wal_fold_on_switch(false);
+            eng.set_wal_fold_on_tick(false);
+        }
         eng.enable_change_log(4 << 20).unwrap();
         let hid = eng.himo_id("v").unwrap() as u16;
         let wal = eng.oplog.as_ref().unwrap().clone();

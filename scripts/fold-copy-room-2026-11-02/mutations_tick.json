@@ -1,0 +1,20 @@
+[
+ {
+  "name": "consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (1)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                        engine.make_wal_room_paced(wal);\n                    }\n\n                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &\n",
+  "replace": "                        engine.make_wal_room_paced(wal);\n                    }\n                    std::thread::sleep(std::time::Duration::from_millis(150));\n\n                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &\n"
+ },
+ {
+  "name": "consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (2)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                        engine.make_wal_room_paced(wal);\n                    }\n\n                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &\n",
+  "replace": "                        engine.make_wal_room_paced(wal);\n                    }\n                    std::thread::sleep(std::time::Duration::from_millis(150));\n\n                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &\n"
+ },
+ {
+  "name": "consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (3)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                        engine.make_wal_room_paced(wal);\n                    }\n\n                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &\n",
+  "replace": "                        engine.make_wal_room_paced(wal);\n                    }\n                    std::thread::sleep(std::time::Duration::from_millis(150));\n\n                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &\n"
+ }
+]
