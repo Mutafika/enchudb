@@ -20,6 +20,18 @@ fn tmp(name: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn assert_fast_fail(res: std::io::Result<impl Sized>, started: Instant) {
     let err = match res {
         Ok(_) => panic!("2nd writer open は成功してはいけない"),
@@ -44,6 +56,7 @@ fn assert_fast_fail(res: std::io::Result<impl Sized>, started: Instant) {
 #[test]
 fn second_writer_open_fails_fast_in_same_process() {
     let path = tmp("standalone");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let eng1 = Engine::create_standalone(&path).expect("create");
 
     // (1) 2 回目は block ではなく即エラー
@@ -59,6 +72,7 @@ fn second_writer_open_fails_fast_in_same_process() {
 #[test]
 fn second_concurrent_oplog_open_fails_fast_in_same_process() {
     let path = tmp("oplog");
+    let _cleanup = Cleanup(vec![path.clone()]);
     drop(Engine::create_standalone(&path).expect("create"));
 
     let eng1 = Engine::open_concurrent_with_oplog(&path, 1 << 20).expect("1st open");
@@ -74,6 +88,7 @@ fn second_concurrent_oplog_open_fails_fast_in_same_process() {
 #[test]
 fn readonly_open_coexists_with_writer() {
     let path = tmp("readonly");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let mut eng1 = Engine::create_standalone(&path).expect("create");
     // 反映のため一度 flush (create 直後でも open_readonly できる状態にする)
     let _ = eng1.flush();
@@ -91,6 +106,7 @@ fn readonly_open_coexists_with_writer() {
 fn different_paths_do_not_interfere() {
     let p1 = tmp("multi-a");
     let p2 = tmp("multi-b");
+    let _cleanup = Cleanup(vec![p1.clone(), p2.clone()]);
     let a = Engine::create_standalone(&p1).expect("create a");
     let b = Engine::create_standalone(&p2).expect("create b (別 path は干渉しない)");
     drop(a);

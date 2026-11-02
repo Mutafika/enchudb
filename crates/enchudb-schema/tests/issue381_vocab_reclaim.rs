@@ -15,6 +15,18 @@ fn tmp(tag: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn opts(reclaim: bool) -> GrowableOptions {
     GrowableOptions { max_entities: 1_000, vocab_max_entries: Some(16_000), vocab_reclaim: reclaim, ..Default::default() }
 }
@@ -24,6 +36,7 @@ fn opts(reclaim: bool) -> GrowableOptions {
 fn rolling_unique_ids_stay_within_the_vocab_budget() {
     for reclaim in [false, true] {
         let path = tmp(if reclaim { "reclaim" } else { "plain" });
+        let _cleanup = Cleanup(vec![path.clone()]);
         let mut b = Database::create_growable_with(&path, opts(reclaim)).unwrap();
         b.table("events").tag("id").tag("owner").primary_key("id").build().unwrap();
         let db = b.finish_with_oplog(16 << 20).unwrap();
@@ -66,6 +79,7 @@ fn rolling_unique_ids_stay_within_the_vocab_budget() {
 #[test]
 fn enabling_on_an_existing_db_takes_effect_on_reopen() {
     let path = tmp("enable");
+    let _cleanup = Cleanup(vec![path.clone()]);
     {
         let mut b = Database::create_growable_with(&path, opts(false)).unwrap();
         b.table("kv").tag("k").tag("v").primary_key("k").build().unwrap();
@@ -105,6 +119,7 @@ fn enabling_on_an_existing_db_takes_effect_on_reopen() {
 #[test]
 fn subscription_on_a_text_survives_reuse() {
     let path = tmp("live");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let mut b = Database::create_growable_with(&path, opts(true)).unwrap();
     b.table("events").tag("id").primary_key("id").build().unwrap();
     let db = b.finish_with_oplog(16 << 20).unwrap();
@@ -131,6 +146,7 @@ fn subscription_on_a_text_survives_reuse() {
 #[test]
 fn negated_subscription_rereads_a_reused_text() {
     let path = tmp("ne");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let mut b = Database::create_growable_with(&path, opts(true)).unwrap();
     b.table("events").tag("id").tag("kind").primary_key("id").build().unwrap();
     let db = b.finish_with_oplog(16 << 20).unwrap();

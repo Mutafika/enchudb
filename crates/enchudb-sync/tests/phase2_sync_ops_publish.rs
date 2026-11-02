@@ -25,6 +25,18 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// 条件が立つまで 5ms 間隔で待つ (上限 10 秒)。 固定 sleep は CI の負荷で足りなくなる (#336)。
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -57,6 +69,7 @@ fn cleanup(path: &str) {
 #[test]
 fn publish_since_uses_sync_ops_when_enabled() {
     let path = tmp_path("publish_sync_ops");
+    let _cleanup = Cleanup(vec![path.clone()]);
     cleanup(&path);
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
@@ -86,6 +99,7 @@ fn publish_since_uses_sync_ops_when_enabled() {
 #[test]
 fn publish_since_filters_by_hlc_through_sync_ops() {
     let path = tmp_path("filter_hlc");
+    let _cleanup = Cleanup(vec![path.clone()]);
     cleanup(&path);
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
@@ -145,6 +159,7 @@ fn publish_since_filters_by_hlc_through_sync_ops() {
 #[test]
 fn records_after_ring_reset_are_still_synced() {
     let path = tmp_path("after_reset_synced");
+    let _cleanup = Cleanup(vec![path.clone()]);
     cleanup(&path);
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();

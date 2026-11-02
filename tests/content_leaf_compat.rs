@@ -18,9 +18,22 @@ fn tmp(name: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 #[test]
 fn content_roundtrip_and_reopen() {
     let path = tmp("roundtrip");
+    let _cleanup = Cleanup(vec![path.clone()]);
     {
         let mut eng = Engine::create_standalone(&path).expect("create");
         let e = eng.entity().unwrap();
@@ -46,6 +59,7 @@ fn content_roundtrip_and_reopen() {
 #[test]
 fn colliding_keys_are_independent() {
     let path = tmp("collide");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let mut eng = Engine::create_standalone(&path).expect("create");
     let e = eng.entity().unwrap();
     eng.content(e, "memo", b"private");
@@ -72,6 +86,7 @@ fn colliding_keys_are_independent() {
 #[test]
 fn delete_clears_content() {
     let path = tmp("delete");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let mut eng = Engine::create_standalone(&path).expect("create");
     let e = eng.entity().unwrap();
     eng.content(e, "secret", b"classified");
@@ -89,6 +104,7 @@ fn delete_clears_content() {
 #[test]
 fn content_async_survives_wal_recovery() {
     let path = tmp("walrec");
+    let _cleanup = Cleanup(vec![path.clone()]);
     drop(Engine::create_standalone(&path).expect("create"));
     let e;
     {

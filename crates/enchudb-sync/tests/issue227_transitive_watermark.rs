@@ -31,7 +31,20 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(path); // 0.26 から DB は directory (#688)
     for suf in
         ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".cursors", ".cursors.tmp"]
     {
@@ -85,6 +98,7 @@ fn relay_cycle(eng: &Arc<Engine>, sync: &Syncer, from: PeerId) {
 #[test]
 fn relay_ack_waits_for_downstream() {
     let (pa, pr, pc) = (tmp_path("a1"), tmp_path("r1"), tmp_path("c1"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pc.clone()]);
     let transport = make_transport(&[1, 2, 3]);
     let eng_a = make_engine(&pa, 1);
     let eng_r = make_engine(&pr, 2);
@@ -146,6 +160,7 @@ fn relay_ack_waits_for_downstream() {
 #[test]
 fn leaf_relay_acks_fully() {
     let (pa, pr) = (tmp_path("a2"), tmp_path("r2"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone()]);
     let transport = make_transport(&[1, 2]);
     let eng_a = make_engine(&pa, 1);
     let eng_r = make_engine(&pr, 2);
@@ -171,6 +186,7 @@ fn leaf_relay_acks_fully() {
 #[test]
 fn non_relay_ack_is_not_capped() {
     let (pa, pf, pd) = (tmp_path("a3"), tmp_path("f3"), tmp_path("d3"));
+    let _cleanup = Cleanup(vec![pa.clone(), pf.clone(), pd.clone()]);
     let transport = make_transport(&[1, 3, 4]);
     let eng_a = make_engine(&pa, 1);
     let eng_f = make_engine(&pf, 3);
