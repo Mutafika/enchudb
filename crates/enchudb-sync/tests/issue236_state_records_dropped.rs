@@ -33,7 +33,20 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(path); // 0.26 から DB は directory (#688)
     for suf in [
         "", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".cursors",
         ".cursors.tmp",
@@ -111,6 +124,7 @@ fn relayed_pair(pa: &str, pr: &str) -> (Arc<Engine>, Arc<Engine>, Syncer, Syncer
 #[test]
 fn basic_relay_replica_state_drops_nothing() {
     let (pa, pr) = (tmp_path("a1"), tmp_path("r1"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone()]);
     let (eng_a, eng_r, sync_a, sync_r) = relayed_pair(&pa, &pr);
 
     let (recs, _) = eng_r.state_records_for(1);
@@ -139,6 +153,7 @@ fn basic_relay_replica_state_drops_nothing() {
 #[test]
 fn relay_write_back_to_a_replicated_row_is_counted_as_dropped() {
     let (pa, pr) = (tmp_path("a2"), tmp_path("r2"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone()]);
     let (eng_a, eng_r, sync_a, sync_r) = relayed_pair(&pa, &pr);
 
     // 基準点 (ここまでで落ちていないこと自体は上の test が見ている)。
@@ -178,6 +193,7 @@ fn relay_write_back_to_a_replicated_row_is_counted_as_dropped() {
 #[test]
 fn self_state_records_do_not_count_as_dropped() {
     let pa = tmp_path("a3");
+    let _cleanup = Cleanup(vec![pa.clone()]);
     let eng_a = make_engine(&pa, 1);
     for i in 1..=3 {
         author_note(&eng_a, i, "Tokyo");

@@ -33,6 +33,18 @@ fn tmp_path(tag: &str) -> String {
     )
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap"] {
@@ -109,6 +121,7 @@ fn late_joiner_bootstraps_and_connects_to_diff_pull() {
     let pa = tmp_path("a1");
     let pb = tmp_path("b1");
     let pc = tmp_path("c1");
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone(), pc.clone()]);
     let (_mem, transport) = make_transport(&[1, 2, 3]);
 
     let eng_a = make_engine(&pa, 1);
@@ -169,6 +182,7 @@ fn late_joiner_bootstraps_and_connects_to_diff_pull() {
 fn ghost_rows_are_swept_on_bootstrap() {
     let pa = tmp_path("a2");
     let pb = tmp_path("b2");
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone()]);
     let (_mem, transport) = make_transport(&[1, 2]);
 
     let eng_a = make_engine(&pa, 1);

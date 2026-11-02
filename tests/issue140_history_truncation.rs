@@ -47,6 +47,18 @@ fn tmp(tag: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn cleanup(path: &str) {
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc", ".tables", ".schema", ".eidmap", ".vocabmap", ".db.lock"] {
@@ -77,6 +89,7 @@ fn flush(db: &Database) {
 fn full_pull_after_reclaim_must_not_silently_lose_history() {
     let pa = tmp("origin");
     let pb = tmp("fresh");
+    let _cleanup = Cleanup(vec![pa.clone(), pb.clone()]);
 
     let db_a = make_peer(&pa, 1);
 

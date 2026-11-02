@@ -21,6 +21,18 @@ fn tmp(tag: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn create(path: &str, vocab_max_entries: u32, vocab_data_size: usize) -> Engine {
     let mut eng = Engine::create_growable_opts(
         path,
@@ -50,6 +62,7 @@ fn is_vocab_full(r: Result<(), TieRejected>) -> bool {
 #[test]
 fn grow_vocab_raises_the_entry_limit_while_open_and_after_reopen() {
     let path = tmp("entries");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let eng = create(&path, 16, 64 * 1024);
     let u = eng.vocab_usage();
     assert_eq!((u.entries, u.max_entries), (0, 16));
@@ -104,6 +117,7 @@ fn grow_vocab_raises_the_entry_limit_while_open_and_after_reopen() {
 #[test]
 fn grow_vocab_raises_the_data_limit() {
     let path = tmp("data");
+    let _cleanup = Cleanup(vec![path.clone()]);
     // 予約の切り上げ (64 KiB) に隠れない大きさ
     let eng = create(&path, 10_000, 256 * 1024);
     let value = |i: usize| format!("{i:0>1000}");
@@ -153,6 +167,7 @@ fn vocab_segments_do_not_grow_past_the_declared_size() {
 
     // data を上限まで使う
     let path = tmp("compat-data");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let u = fill(&path, 200_000, 768 * 1024, 1000);
     assert!(u.data_bytes > 768 * 1024 - 1000, "data を上限まで使う前提: {u:?}");
     let got = len(&path, "vocab.data.seg");
@@ -160,6 +175,7 @@ fn vocab_segments_do_not_grow_past_the_declared_size() {
 
     // 語数を上限まで使う (offsets)
     let path = tmp("compat-offsets");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let u = fill(&path, 20_000, 1 << 20, 8);
     assert_eq!(u.entries, 20_000, "語数を上限まで使う前提: {u:?}");
     let got = len(&path, "vocab.offsets.seg");

@@ -32,10 +32,23 @@ fn tmp(tag: &str) -> String {
     p
 }
 
+/// 試験の終わり (落ちた時も) に DB の directory ごと消す (#688: 名前が run ごとに違うので、 消さないと回すたびに /tmp に増える)。 path を
+/// 作った直後に置き、 engine と transport より後に drop させる (engine を持つ物が残ったまま消すと、 後の drop が directory を作り直す)。
+struct Cleanup(Vec<String>);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// entity 枠を使い切っても panic しない。 `entity()` が `Err`、 fault が計上される。
 #[test]
 fn entity_space_exhaustion_returns_err_instead_of_panicking() {
     let path = tmp("entity-space");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let eng = Engine::create_with_capacity(&path, 8).expect("create");
 
     let mut made = 0usize;
@@ -68,6 +81,7 @@ fn entity_space_exhaustion_returns_err_instead_of_panicking() {
 #[test]
 fn sentinel_value_is_rejected_not_panicked() {
     let path = tmp("sentinel");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let mut eng = Engine::create_standalone(&path).expect("create");
     eng.define_himo("age", ValueType::Number, 100);
     let e = eng.entity().unwrap();
@@ -94,6 +108,7 @@ fn sentinel_value_is_rejected_not_panicked() {
 fn vocabulary_full_rejects_text_writes_instead_of_panicking() {
     use enchudb_engine::GrowableOptions;
     let path = tmp("vocab-full");
+    let _cleanup = Cleanup(vec![path.clone()]);
     let mut eng = Engine::create_growable_opts(
         &path,
         GrowableOptions {
