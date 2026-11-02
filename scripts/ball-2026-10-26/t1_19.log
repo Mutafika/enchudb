@@ -1,0 +1,3116 @@
+   Compiling libc v0.2.184
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.0
+   Compiling semver v1.0.28
+   Compiling smallvec v1.15.1
+   Compiling parking_lot_core v0.9.12
+   Compiling subtle v2.6.1
+   Compiling signature v2.2.0
+   Compiling scopeguard v1.2.0
+   Compiling zeroize v1.8.2
+   Compiling crossbeam-utils v0.8.21
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.3.4
+   Compiling rustversion v1.0.22
+   Compiling lock_api v0.4.14
+   Compiling ed25519 v2.2.3
+   Compiling regex-syntax v0.8.10
+   Compiling shlex v1.3.0
+   Compiling zerocopy v0.8.48
+   Compiling rustix v1.1.4
+   Compiling find-msvc-tools v0.1.9
+   Compiling generic-array v0.14.7
+   Compiling rustc_version v0.4.1
+   Compiling getrandom v0.4.2
+   Compiling tracing-core v0.1.36
+   Compiling log v0.4.29
+   Compiling cc v1.2.60
+   Compiling bitflags v2.11.1
+   Compiling autocfg v1.5.0
+   Compiling curve25519-dalek v4.1.3
+   Compiling lazy_static v1.5.0
+   Compiling pin-project-lite v0.2.17
+   Compiling num-traits v0.2.19
+   Compiling fastrand v2.4.1
+   Compiling tracing v0.1.44
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling nu-ansi-term v0.50.3
+   Compiling quick-error v1.2.3
+   Compiling regex-automata v0.4.14
+   Compiling bit-vec v0.8.0
+   Compiling fnv v1.0.7
+   Compiling bit-set v0.8.0
+   Compiling unarray v0.1.4
+   Compiling scoped-tls v1.0.1
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling crossbeam-epoch v0.9.18
+   Compiling crossbeam-queue v0.3.12
+   Compiling crossbeam-deque v0.8.6
+   Compiling rayon v1.12.0
+   Compiling cpufeatures v0.2.17
+   Compiling getrandom v0.2.17
+   Compiling memmap2 v0.9.10
+   Compiling errno v0.3.14
+   Compiling wait-timeout v0.2.1
+   Compiling rand_core v0.6.4
+   Compiling rand_core v0.9.5
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling parking_lot v0.12.5
+   Compiling generator v0.8.9
+   Compiling tempfile v3.27.0
+   Compiling rusty-fork v0.3.1
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling ed25519-dalek v2.2.0
+   Compiling enchudb-oplog v0.37.3 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-oplog)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-oplog/src/oplog.rs:3179:14
+     |
+3179 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+3179 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+3179 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+   Compiling enchudb-engine v0.37.3 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-engine)
+warning: `enchudb-oplog` (lib) generated 1 warning (run `cargo fix --lib -p enchudb-oplog` to apply 1 suggestion)
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.11.0
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1250:40
+     |
+1250 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1250 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1250 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/enchudb-engine/src/vocabulary.rs:1304:40
+     |
+1304 |         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |                                        ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1304 -         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+1304 +         let Ok(offset) = self.data_end.try_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/enchudb-engine/src/engine.rs:462:22
+    |
+462 |                     .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, left)
+    |                      ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+462 -                     .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, left)
+462 +                     .try_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, left)
+    |
+
+   Compiling loom v0.7.2
+warning: `enchudb-oplog` (lib test) generated 1 warning (1 duplicate)
+warning: methods `horizon` and `done` are never used
+   --> crates/enchudb-engine/src/ball_base.rs:269:19
+    |
+170 | impl Base {
+    | --------- methods in this implementation
+...
+269 |     pub(crate) fn horizon(&self) -> Hlc {
+    |                   ^^^^^^^
+...
+274 |     pub(crate) fn done(&self) -> u64 {
+    |                   ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `with` is never used
+   --> crates/enchudb-engine/src/ball_base.rs:472:19
+    |
+316 | impl BallBases {
+    | -------------- method in this implementation
+...
+472 |     pub(crate) fn with<R>(&self, hid: u16, f: impl FnOnce(&Base) -> R) -> Option<R> {
+    |                   ^^^^
+
+   Compiling enchudb-schema v0.37.3 (/Users/kubo/Desktop/mutafika/enchudb-ball/crates/enchudb-schema)
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:24589:13
+      |
+24589 |         let mut eng = Engine::create_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:24602:13
+      |
+24602 |         let mut eng = Engine::create_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:24725:13
+      |
+24725 |         let mut eng = Engine::create_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25303:13
+      |
+25303 |         let mut eng = Engine::open_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25370:13
+      |
+25370 |         let mut eng = setup_scale(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25381:13
+      |
+25381 |         let mut eng = setup_scale(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25393:13
+      |
+25393 |         let mut eng = setup_scale(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25406:13
+      |
+25406 |         let mut eng = setup_scale(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25422:13
+      |
+25422 |         let mut eng = setup_scale(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25482:13
+      |
+25482 |         let mut eng = Engine::open_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25494:13
+      |
+25494 |         let mut eng = setup_scale(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25518:13
+      |
+25518 |         let mut eng = Engine::open_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25596:13
+      |
+25596 |         let mut eng = Engine::open_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25730:13
+      |
+25730 |         let mut eng = setup_scale_prefix(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25741:13
+      |
+25741 |         let mut eng = setup_scale_prefix(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25753:13
+      |
+25753 |         let mut eng = setup_scale_prefix(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25766:13
+      |
+25766 |         let mut eng = setup_scale_prefix(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25823:13
+      |
+25823 |         let mut eng = Engine::open_standalone(&dir).unwrap();
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/enchudb-engine/src/engine.rs:25835:13
+      |
+25835 |         let mut eng = setup_scale_prefix(&dir);
+      |             ----^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: unused variable: `eng`
+   --> crates/enchudb-engine/src/ravn.rs:405:14
+    |
+405 |         let (eng, ravn) = setup("path1");
+    |              ^^^ help: if this is intentional, prefix it with an underscore: `_eng`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `enchudb-engine` (lib) generated 5 warnings (run `cargo fix --lib -p enchudb-engine` to apply 3 suggestions)
+warning: variable does not need to be mutable
+   --> crates/enchudb-engine/tests/table_api.rs:137:9
+    |
+137 |     let mut eng = Engine::create_standalone(&path).unwrap();
+    |         ----^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/enchudb-engine/tests/table_api.rs:514:13
+    |
+514 |         let mut eng = Engine::open_standalone(&path).unwrap();
+    |             ----^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: `enchudb-engine` (test "table_api") generated 2 warnings (run `cargo fix --test "table_api" -p enchudb-engine` to apply 2 suggestions)
+warning: calls to `std::mem::drop` with a value that implements `Copy` does nothing
+   --> crates/enchudb-engine/tests/issue122_vocab_index_sizing.rs:203:5
+    |
+203 |     drop(writer_marker(&eng));
+    |     ^^^^^-------------------^
+    |          |
+    |          argument has type `()`
+    |
+    = note: `#[warn(dropping_copy_types)]` on by default
+help: use `let _ = ...` to ignore the expression or result
+    |
+203 -     drop(writer_marker(&eng));
+203 +     let _ = writer_marker(&eng);
+    |
+
+warning: `enchudb-engine` (test "issue122_vocab_index_sizing") generated 1 warning
+warning: variable does not need to be mutable
+  --> crates/enchudb-engine/tests/phase5_initial_sync.rs:68:9
+   |
+68 |     let mut eng_b = Engine::open_standalone(&path_b).unwrap();
+   |         ----^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `switches` is never read
+   --> crates/enchudb-schema/tests/ball_lazy.rs:271:5
+    |
+266 | struct Session {
+    |        ------- field in this struct
+...
+271 |     switches: u64,
+    |     ^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `enchudb-engine` (test "phase5_initial_sync") generated 1 warning (run `cargo fix --test "phase5_initial_sync" -p enchudb-engine` to apply 1 suggestion)
+warning: `enchudb-schema` (test "ball_lazy") generated 1 warning
+warning: `enchudb-engine` (lib test) generated 23 warnings (3 duplicates) (run `cargo fix --lib -p enchudb-engine --tests` to apply 20 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.92s
+     Running unittests src/lib.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/enchudb_engine-f2a787d9d85ae2c8)
+
+running 560 tests
+test acl::tests::default_allows_all ... ok
+test acl::tests::clear_disables_enforcement ... ok
+test acl::tests::remove_writer_does_not_disable_enforcement ... ok
+test acl::tests::add_writer_enforces ... ok
+test append_bucket::tests::basic_push_read ... ok
+test append_bucket::tests::with_read_zero_copy ... ok
+test append_bucket::tests::writer_len_follows_len ... ok
+test append_bucket::tests::compact_filters_and_dedups ... ok
+test append_vec::tests::capacity_overflow_returns_err ... ok
+test append_vec::tests::push_get_index_iter ... ok
+test append_bucket::tests::realloc_growth ... ok
+test ball::tests::packed_hlc_keeps_the_order ... ok
+test ball::tests::reads_start_from_the_nearest_snapshot ... ok
+test ball::tests::many_round_trips_of_one_ball ... ok
+test ball::tests::faces_and_diffs_keep_the_old_values ... ok
+test ball::tests::snapshot_interval_follows_the_deck_size ... ok
+test ball::tests::hlc_times_are_raised_to_keep_ledgers_and_balls_in_order ... ok
+test ball::tests::seeded_faces_are_from_the_start ... ok
+test ball::tests::wide_values_and_reused_eids ... ok
+test ball::tests::unused_wide_reservations_are_taken_back ... ok
+test append_bucket::tests::concurrent_writer_readers ... ok
+test ball::tests::jumps_find_the_face_in_log_steps ... ok
+test blob_store::tests::blob_id_from_hex_rejects_bad_input ... ok
+test blob_store::tests::blob_id_hex_roundtrip ... ok
+test append_vec::tests::concurrent_readers_see_prefix ... ok
+test blob_store::tests::local_delete ... ok
+test blob_store::tests::local_detects_corruption ... ok
+test blob_store::tests::local_get_missing_returns_none ... ok
+test ball_base::tests::a_base_behind_the_log_is_dropped ... ok
+test append_bucket::tests::compact_sorts_by_eid ... ok
+test blob_store::tests::local_concurrent_put_same_blob ... ok
+test ball_base::tests::a_record_too_large_to_keep_is_a_hole ... ok
+test ball_base::tests::a_gap_in_the_notes_restarts_them ... ok
+test cas::tests::dedup ... ok
+test blob_store::tests::local_put_dedup ... ok
+test cas::tests::dedup_after_add_remove ... ok
+test cas::tests::empty_block ... ok
+test cas::tests::empty_never_deleted ... ok
+test cas::tests::insert_and_get ... ok
+test cas::tests::ref_counting ... ok
+test cas::tests::insert_with_add_and_remove ... ok
+test blob_store::tests::local_put_get_roundtrip ... ok
+test change_log::tests::a_damaged_header_opens_as_an_empty_log ... ok
+test blob_store::tests::local_put_repairs_truncated_blob ... ok
+test blob_store::tests::local_put_repairs_same_size_corruption ... ok
+test change_log::tests::a_record_too_large_for_the_log_uses_its_number_and_truncates ... ok
+test change_log::tests::a_crash_after_overwriting_old_entries_keeps_the_log_readable ... ok
+test change_log::tests::a_read_over_a_damaged_body_is_truncated ... ok
+test change_log::tests::entries_read_back_in_order_from_any_position ... ok
+test change_log::tests::entries_of_a_large_append_read_back_with_parallel_crcs ... ok
+test change_log::tests::entries_written_after_the_last_header_are_picked_up ... ok
+test ball_base::tests::a_base_made_mid_log_ignores_older_numbers ... ok
+test change_log::tests::one_append_larger_than_the_log_keeps_the_newest ... ok
+test change_log::tests::dropping_skips_the_body_but_catches_a_damaged_length ... ok
+test change_log::tests::reopen_keeps_numbers_and_entries ... ok
+test db_files::tests::entry_classification ... ok
+test db_files::tests::paths_live_inside_the_db_dir ... ok
+test db_files::tests::remove_db_and_disk_usage_cover_dir_and_legacy_layout ... ok
+test change_log::tests::seek_after_finds_the_first_later_hlc ... ok
+test eid_translator::tests::a_displaced_reverse_key_goes_with_the_slot ... ok
+test eid_translator::tests::alias_maps_forward_only ... ok
+test column::tests::concurrent_growth_never_lowers_the_header_count ... ok
+test eid_translator::tests::get_returns_none_for_unknown ... ok
+test eid_translator::tests::if_unmapped_calls_only_without_a_mapping ... ok
+test eid_translator::tests::insert_overwrites_same_key ... ok
+test eid_translator::tests::insert_then_get_roundtrips ... ok
+test eid_translator::tests::remove_local_does_not_kill_a_rebound_mapping ... ok
+test eid_translator::tests::remove_local_drops_both_directions ... ok
+test eid_translator::tests::remove_local_is_noop_for_unmapped ... ok
+test eid_translator::tests::reverse_roundtrips ... ok
+test eidmap_log::tests::a_log_for_another_snapshot_is_not_read ... ok
+test eidmap_log::tests::a_torn_or_corrupt_record_ends_the_log ... ok
+test eidmap_log::tests::records_round_trip_and_merge_in_order ... ok
+test change_log::tests::wrapping_drops_the_oldest_and_reports_watched_positions ... ok
+test ball_base::tests::discards_keep_the_base_at_the_start_of_the_log ... ok
+test eid_translator::tests::every_change_to_the_eidmap_face_is_marked ... ok
+test change_log::tests::readers_never_see_a_chunk_being_written ... ok
+test append_bucket::tests::sort_eids_matches_sort_unstable ... ok
+test db_files::tests::write_atomic_skips_identical_content ... ok
+test engine::cell_version_tests::async_untie_and_delete_are_versioned ... ok
+test engine::cell_version_tests::default_reserve_follows_the_os ... ok
+test engine::cell_version_tests::async_write_puts_the_same_hlc_on_cell_and_record ... ok
+test engine::cell_version_tests::clear_cell_is_versioned ... ok
+test engine::answer_decl_sidecar_tests::ans1_is_appended_after_mrk1_and_round_trips ... ok
+test engine::answer_decl_sidecar_tests::restore_keeps_only_declarations_it_can_register ... ok
+test engine::answer_decl_sidecar_tests::declare_persists_same_shape_is_noop_different_shape_replaces_and_drop_removes ... ok
+test engine::cell_version_tests::local_write_still_wins_after_a_far_future_remote_hlc ... ok
+test engine::cell_version_tests::growable_backing_writes_versions_without_sigbus ... ok
+test engine::answer_decl_sidecar_tests::reopen_restores_and_first_poll_seeds ... ok
+test engine::cell_version_tests::no_sync_db_does_not_record_versions_at_all ... ok
+test engine::cell_version_tests::newer_hlc_wins ... ok
+test engine::cell_version_tests::no_version_column_means_writes_are_always_accepted ... ok
+test engine::cell_version_tests::pre_v9_local_writes_are_unchanged ... ok
+test engine::cell_version_tests::older_hlc_is_rejected_without_touching_the_cell ... ok
+test engine::cell_version_tests::plain_db_is_not_migrated_on_open ... ok
+test append_bucket::tests::sort_appended_matches_sort_unstable ... ok
+test ball_base::tests::crash_points_recover_on_open ... ok
+test engine::cell_version_tests::remote_apply_is_lww_without_any_sync_layer_help ... ok
+test engine::cell_version_tests::enable_sync_tables_grows_version_columns_immediately ... ok
+test engine::cell_version_tests::reused_entity_set_slot_does_not_inherit_previous_tenant_version ... ok
+test engine::cell_version_tests::reused_slot_does_not_inherit_previous_tenant_version_on_pre_v9 ... ok
+test engine::cell_version_tests::set_cell_local_rejects_when_the_column_cannot_grow ... ok
+test engine::cell_version_tests::reused_table_slot_does_not_inherit_previous_tenant_version ... ok
+test engine::cell_version_tests::set_cell_writes_value_and_version_together ... ok
+test engine::cell_version_tests::sync_local_tie_records_the_same_hlc_as_the_record ... ok
+test engine::cell_version_tests::sync_local_delete_records_tombstone ... ok
+test engine::cell_version_tests::sync_local_untie_advances_the_version ... ok
+test engine::cell_version_tests::tombstone_blocks_older_remote_tie ... ok
+test engine::cell_version_tests::tombstone_column_is_lww_and_separate_from_himo_versions ... ok
+test engine::cell_version_tests::pre_v9_sync_db_opens_and_migrates_without_touching_the_data ... ok
+test engine::cell_version_tests::unknown_version_cell_accepts_any_write ... ok
+test engine::cell_version_tests::v9_db_without_sync_tables_still_honors_recorded_versions ... ok
+test engine::cell_version_tests::versions_are_independent_per_cell ... ok
+test engine::cell_version_tests::zero_hlc_write_applies_and_keeps_recorded_version ... ok
+test engine::cell_version_tests::versions_survive_reopen ... ok
+test engine::cell_version_tests::wal_hlcs_are_monotonic_in_record_order ... ok
+test engine::cell_version_tests::v9_db_has_version_region_and_pre_v9_does_not ... ok
+test engine::consumer_sleep_tests::record_written_while_the_consumer_decides_to_sleep_is_written_out ... ok
+test engine::cell_wal_order_tests::same_cell_writers_apply_in_wal_order_without_cell_versions ... ok
+test engine::cell_wal_order_tests::same_cell_writers_apply_in_wal_order_with_cell_versions ... ok
+test engine::fold_copy_tests::a_fold_numbers_no_record_not_yet_written_out_while_making_wal_room ... ok
+test engine::fold_copy_tests::a_fold_numbers_no_record_not_yet_written_out_after_the_periodic_write_out ... ok
+test engine::layout_v9_tests::enabling_v9_does_not_move_existing_regions ... ok
+test engine::layout_v9_tests::v9_disabled_layout_is_byte_identical ... ok
+test ball::tests::wide_values_sharing_a_stripe_keep_their_own_threads ... ok
+test engine::fold_copy_tests::an_open_tail_folded_in_place_reaches_the_listener_through_the_backlog ... ok
+test engine::layout_v9_tests::version_column_holds_raw_hlc_16b_per_cell ... ok
+test engine::layout_v9_tests::version_columns_do_not_overlap_and_leave_room_for_tombstone ... ok
+test engine::fold_copy_tests::an_open_tail_folded_in_place_reaches_the_listener_through_the_change_log ... ok
+test engine::fold_copy_tests::copying_into_the_change_log_for_a_fold_does_not_stop_writers ... ok
+test engine::fold_copy_tests::copying_into_the_change_log_while_making_wal_room_does_not_stop_writers ... ok
+test change_log::tests::wal_records_lay_out_the_same_bytes_as_wire_records ... ok
+test engine::eidmap_log_read_tests::a_compaction_between_the_reads_keeps_the_log ... ok
+test engine::fold_copy_tests::moving_records_to_the_listener_backlog_while_making_wal_room_does_not_stop_writers ... ok
+test engine::fold_copy_tests::moving_records_to_the_listener_backlog_for_a_fold_does_not_stop_writers ... ok
+test ball::tests::every_snapshot_agrees_with_a_log ... ok
+test engine::marks_decl_sidecar_tests::mrk1_is_appended_after_dia1_and_round_trips ... ok
+test engine::marks_decl_sidecar_tests::restore_keeps_only_valid_declarations ... ok
+test engine::marks_decl_sidecar_tests::declare_persists_and_drop_removes ... ok
+test engine::durable_cut_tests::the_cut_waits_while_a_floor_is_being_written ... ok
+test engine::tests::boundary_consecutive_values ... ok
+test engine::order_decl_sidecar_tests::dia1_is_appended_after_the_blocks_old_binaries_read ... ok
+test engine::tests::boundary_value_zero ... ok
+test engine::tests::boundary_value_large ... ok
+test engine::tests::by_id_out_of_range_panics - should panic ... ok
+test engine::order_decl_sidecar_tests::restore_keeps_only_valid_declarations ... ok
+test engine::tests::bulk_delete_query_consistency ... ok
+test engine::tests::by_id_untie_equivalence_sync ... ok
+test engine::reclaimed_floor_tests::sentinel_baseline_is_preserved_and_exposed ... ok
+test engine::sync_ops_purge_tests::rebuild_does_not_duplicate_purged_slots ... ok
+test engine::sync_ops_purge_tests::stale_snapshot_does_not_purge_the_reused_slot ... ok
+test engine::tests::commit_persists ... ok
+test engine::sync_ops_purge_tests::concurrent_exhaustion_and_purge_do_not_duplicate_slots ... ok
+test engine::tests::boundary_many_dims ... ok
+test engine::tests::concurrent_tie_async_basic ... ok
+test engine::tests::delete_all_then_reinsert ... ok
+test engine::tests::engine_blob_store_default_none ... ok
+test engine::tests::content_set_get ... ok
+test engine::tests::delete_removes_all_ties ... ok
+test engine::tests::by_id_tie_equivalence_sync ... ok
+test engine::tests::engine_blob_store_injected_put_get ... ok
+test engine::tests::concurrent_multi_reader_writer ... ok
+test ball::tests::both_roll_backs_agree_with_the_first_diff_after_t ... ok
+test engine::tests::engine_blob_store_tie_hash_lookup ... ok
+test engine::tests::concurrent_engine_without_wal_has_no_background_thread ... ok
+test engine::tests::entity_create_and_count ... ok
+test engine::tests::entity_delete_and_reuse ... ok
+test engine::tests::ensure_himo_dynamic_in_attaches_to_table ... ok
+test engine::tests::growable_create_tie_query_roundtrip ... ok
+test engine::tests::growable_then_open_standalone ... ok
+test engine::tests::issue128_stalled_slot_returns_none_without_hang ... ok
+test engine::tests::himos_of_entity ... ok
+test engine::tests::growable_tiny_file_is_small ... ok
+test engine::tests::issue131_stalled_slot_while_holding_another_row_returns_none ... ok
+test engine::tests::himo_names_all ... ok
+test engine::tests::lazy_cylinder_pull_observe ... ok
+test engine::tests::lazy_cylinder_pull_range ... ok
+test engine::tests::issue431_replay_remaps_vids_of_own_vocab_records ... ok
+test engine::tests::many_entities_1k ... ok
+test engine::tests::prefix_sum_boundary_max ... ok
+test engine::tests::prefix_sum_bulk_delete_reinsert ... ok
+test engine::tests::cursor_overtaking_head_blocks_the_fold_and_self_heals ... ok
+test engine::tests::ps_scale_delete_reinsert ... ignored
+test engine::tests::ps_scale_group_by ... ignored
+test engine::tests::ps_scale_insert_1m ... ignored
+test engine::tests::ps_scale_multi_condition ... ignored
+test engine::tests::ps_scale_persistence ... ignored
+test engine::tests::ps_scale_point_query ... ignored
+test engine::tests::ps_scale_range_query ... ignored
+test engine::tests::ps_scale_three_conditions ... ignored
+test engine::tests::ps_scale_update ... ignored
+test engine::tests::prefix_sum_delete ... ok
+test engine::tests::prefix_sum_mixed_with_bsearch ... ok
+test engine::tests::persistence_after_delete ... ok
+test engine::tests::prefix_sum_overwrite ... ok
+test engine::tests::persistence_full_roundtrip ... ok
+test engine::tests::prefix_sum_point_query ... ok
+test engine::tests::bridge_counters_separate_a_quiet_bridge_from_a_stalled_one ... ok
+test engine::tests::ordered_and_counts_match_column_scan ... ok
+test engine::tests::scale_100m_insert_and_query ... ignored
+test engine::tests::scale_delete_reinsert ... ignored
+test engine::tests::scale_empty_result ... ignored
+test engine::tests::scale_group_by_equivalent ... ignored
+test engine::tests::scale_insert_1m ... ignored
+test engine::tests::scale_multi_condition ... ignored
+test engine::tests::scale_persistence ... ignored
+test engine::tests::scale_point_query ... ignored
+test engine::tests::scale_range_query ... ignored
+test engine::tests::scale_three_conditions ... ignored
+test engine::tests::scale_update ... ignored
+test engine::tests::prefix_sum_persistence ... ok
+test engine::tests::prefix_sum_untie ... ok
+test engine::tests::pull_range ... ok
+test engine::tests::prefix_sum_value_zero ... ok
+test engine::tests::query_single_condition ... ok
+test engine::tests::query_empty_result ... ok
+test engine::tests::query_multi_condition ... ok
+test engine::tests::query_count_matches_len ... ok
+test engine::tests::readonly_write_panics - should panic ... ok
+test engine::tests::readonly_does_not_block_other_opens ... ok
+test engine::tests::readonly_open_does_not_mutate_file ... ok
+test engine::tests::tie_overwrite ... ok
+test engine::tests::tie_value_roundtrip ... ok
+test engine::tests::tie_entity_ref ... ok
+test engine::tests::tie_value_zero ... ok
+test engine::tests::tie_text_roundtrip ... ok
+test engine::tests::test_late_himo_on_existing_entities ... ok
+test engine::tests::test_late_himo_sparse_large_eid ... ok
+test engine::tests::untie_removes_value ... ok
+test engine::tests::ensure_himo_dynamic_concurrent_idempotent ... ok
+test engine::tests::vocab_id_lookup ... ok
+test engine::v10_dir_tests::create_leaves_a_locked_remnant_alone ... ok
+test engine::v10_dir_tests::define_table_can_use_grown_cap ... ok
+test engine::tests::writer_blocks_concurrent_writer ... ok
+test engine::v10_dir_tests::free_stack_keeps_working_across_grow ... ok
+test engine::tests::stall_warning_needs_head_ahead_and_fires_once_per_episode ... ok
+test engine::v10_dir_tests::issue437_create_backs_off_when_its_lock_file_was_removed ... ok
+test engine::v10_dir_tests::deleted_row_in_second_extent_is_reused ... ok
+test engine::v10_dir_tests::migrate_real_fixture_if_provided ... ok
+test ball::tests::concurrent_writers_agree_with_a_log ... ok
+test engine::v10_dir_tests::grow_table_explicit_and_exhaustion_message ... ok
+test ball::tests::concurrent_writers_with_times_from_before_the_locks ... ok
+test engine::v10_dir_tests::grow_entity_cap_extends_allocation_and_persists ... ok
+test engine::v10_dir_tests::failed_create_leaves_nothing ... ok
+test engine::tests::stale_transfer_store_cannot_clobber_a_fold_rewind ... ok
+test engine::v10_dir_tests::issue437_create_waits_out_a_brief_lock_holder ... ok
+test engine::v10_dir_tests::create_reclaims_a_remnant ... ok
+test engine::v10_dir_tests::copy_db_dir_clones_sidecars_but_not_lock ... ok
+test engine::v10_dir_tests::open_missing_dir_leaves_no_residue ... ok
+test engine::v10_dir_tests::issue437_create_that_loses_the_race_to_lock_leaves_the_winner_alone ... ok
+test engine::v10_dir_tests::packed_with_a_corrupt_column_header_fails_to_open ... ok
+test engine::v10_dir_tests::migrate_rejects_older_than_v8 ... ok
+test engine::v10_dir_tests::migrate_rejects_legacy_file_cut_inside_entities ... ok
+test engine::v10_dir_tests::sidecars_live_inside_db_dir ... ok
+test engine::v10_dir_tests::zeroed_header_with_data_is_not_a_remnant ... ok
+test engine::v10_dir_tests::unpack_rejects_short_v10_packed ... ok
+test engine::v10_dir_tests::snapshot_export_puts_sidecars_in_target_dir ... ok
+test engine::v10_dir_tests::table_auto_grows_into_free_eid_space_and_persists ... ok
+test engine::wal_reject_tests::writes_that_cannot_reach_the_wal_are_rejected_without_sync_tables ... ok
+test blob_store::tests::local_large_blob_100mb ... ok
+test entity_set::tests::concurrent_allocate_no_lost_bits ... ok
+test entity_set::tests::concurrent_double_free_no_double_push ... ok
+test himo_store::tests::barrier_waits_for_a_writer_inside_the_gate ... ok
+test engine::wal_room_commit_tests::room_commit_lost_to_a_full_wal_is_neither_a_failure_nor_a_failed_fold ... ok
+test himo_store::tests::compaction_reads_cells_atomically_while_other_writers_store ... ok
+test himo_store::tests::cyl_backing_bytes_does_not_build ... ok
+test himo_store::tests::barrier_waits_for_a_writer_inside_the_value_locks ... ok
+test himo_store::tests::indexed_writers_take_value_locks_not_the_write_lock ... ok
+test himo_store::tests::lazy_build_waits_for_a_writer_inside_the_gate ... ok
+test himo_store::tests::load_of_never_written_header_is_an_empty_column ... ok
+test himo_store::tests::long_bucket_compacts_on_the_second_read ... ok
+test himo_store::tests::marks_declared_reads_skip_the_column_check ... ok
+test himo_store::tests::marks_survive_growing_and_compacting_the_bucket ... ok
+test engine::wal_room_commit_tests::appends_after_every_write_out_are_not_a_failed_fold ... ok
+test himo_store::tests::pull_into_matches_pull_and_keeps_the_prefix ... ok
+test engine::wal_room_commit_tests::a_busy_bridge_does_not_make_a_waiting_writer_give_up ... ok
+test himo_store::tests::removes_compact_once_per_half ... ok
+test himo_store::tests::rereading_a_churned_bucket_compacts_it ... ok
+test himo_store::tests::read_compaction_holds_the_value_lock ... ok
+test himo_store::tests::unindexed_writers_pass_the_gate_without_the_lock ... ok
+test engine::v10_dir_tests::migrate_v8_single_file_to_dir ... ok
+test himo_store::tests::present_count_follows_every_writer ... ok
+test himo_store::tests::walk_values_yields_sorted_live_eids_without_copying_the_bucket ... ok
+test himo_store::tests::sparse_runs_stay_exact_under_churn ... ok
+test himo_store::tests::writers_never_build_the_cylinder ... ok
+test himo_store::tests::verified_pull_is_sorted_after_churn ... ok
+test hlc_store::tests::hlc_ordering_breaks_ties_by_peer ... ok
+test hlc_store::tests::remove_entity_drops_all_himos ... ok
+test hlc_store::tests::try_set_accepts_newer_hlc ... ok
+test hlc_store::tests::try_set_first_time_succeeds ... ok
+test hlc_store::tests::try_set_rejects_older_hlc ... ok
+test integrity::tests::diff_finds_mismatched_regions ... ok
+test integrity::tests::missing_file_returns_none ... ok
+test integrity::tests::roundtrip ... ok
+test leaf_store::tests::addresses_beyond_4gb_via_word_offset ... ok
+test himo_store::tests::write_guard_stops_writers_and_reopens_the_gate ... ok
+test leaf_store::tests::cap_scales_with_shift ... ok
+test engine::v10_dir_tests::migrate_v9_single_file_to_dir ... ok
+test leaf_store::tests::coalesce_adjacent_holes ... ok
+test leaf_store::tests::free_reuses_hole_no_growth ... ok
+test leaf_store::tests::handle_is_word_offset ... ok
+test leaf_store::tests::issue132_freed_slot_is_never_readable ... ok
+test leaf_store::tests::issue132_freed_slot_unreadable_even_when_coalesced_backward ... ok
+test leaf_store::tests::issue132_reused_slot_reads_new_value ... ok
+test leaf_store::tests::churn_footprint_bounded_and_falsified ... ok
+test leaf_store::tests::issue132_split_remainder_is_never_readable ... ok
+test leaf_store::tests::rebuild_free_list_ignores_stale_size_of_dead_slot ... ok
+test leaf_store::tests::rebuild_free_list_reconstructs_holes ... ok
+test leaf_store::tests::rebuild_free_list_treats_freed_slot_under_live_cell_as_broken ... ok
+test leaf_store::tests::rebuild_free_list_skips_headers_lost_in_power_loss ... ok
+test leaf_store::tests::retired_slot_waits_for_a_write_out_started_after_it ... ok
+test leaf_store::tests::retired_slots_freed_together_stay_unreadable_and_spare_live_slots ... ok
+test leaf_store::tests::round_trip ... ok
+test leaf_store::tests::shift0_byte_offset_compat ... ok
+test leaf_store::tests::tail_free_retracts_high_water ... ok
+test live::answer_spec_tests::any_truncation_is_none_without_panic ... ok
+test live::answer_spec_tests::round_trips_every_variant ... ok
+test live::answer_spec_tests::nesting_deeper_than_the_limit_is_none ... ok
+test live::answer_spec_tests::unknown_kind_or_tag_is_none ... ok
+test live::delta_log_tests::composes_first_and_last_moves_per_entity ... ok
+test live::delta_log_tests::empty_deltas_and_off_logs_record_nothing ... ok
+test live::delta_log_tests::evicts_oldest_past_cap_and_reports_truncated ... ok
+test live::delta_log_tests::groups_since_unions_changed_values ... ok
+test live::delta_log_tests::later_logs_start_at_larger_versions ... ok
+test live::tests::add_order_caps_at_max_orders ... ok
+test live::tests::candidates_come_from_positive_conditions ... ok
+test live::tests::delta_consolidates_and_flags_reentry ... ok
+test live::tests::dnf_distributes_via_and_multiplies ... ok
+test live::tests::drain_empties_member_marks ... ok
+test live::tests::drop_unregisters ... ok
+test live::tests::eq_text_matches_after_vocab_appears ... ok
+test live::tests::exists_alone_takes_candidates_from_referenced_entities ... ok
+test engine::wal_room_commit_tests::appends_before_every_write_out_are_not_a_failed_fold ... ok
+test live::tests::few_matches_a_sorted_set ... ok
+test live::tests::forgotten_true_record_still_expands ... ok
+test live::tests::freed_root_reported_as_leave_and_reenter ... ok
+test live::tests::group_poll_leaves_other_subscriptions_alone ... ok
+test live::tests::late_member_gets_roots_noted_but_not_yet_polled_by_others ... ok
+test live::tests::late_member_gets_roots_recorded_across_a_flip_and_back ... ok
+test live::tests::flat_set_matches_btreeset ... ok
+test live::tests::late_member_sees_hub_recorded_while_unsubscribed ... ok
+test live::tests::marks_clear_keeps_only_small_buffers ... ok
+test live::tests::late_range_member_forgets_stale_64_bit_values_in_the_last_band ... ok
+test live::tests::or_branch_with_unknown_text_joins_later ... ok
+test live::tests::or_counts_rows_held_by_several_branches ... ok
+test live::tests::or_reports_reentry_of_freed_slot ... ok
+test live::tests::parent_uses_record_and_later_change_expands ... ok
+test live::tests::pending_marks_keep_room_for_the_next_poll ... ok
+test live::tests::marks_take_sorts_and_dedups ... ok
+test live::tests::range_split_refreshes_values_carried_up_within_a_slab ... ok
+test live::tests::ranges_share_one_family ... ok
+test live::tests::same_shape_or_is_one_member_with_two_keys ... ok
+test live::tests::unrecorded_grandparent_expands_only_if_read_as_true ... ok
+test live::tests::unrecorded_parent_expands_only_if_read_as_true ... ok
+test live::tests::unsubscribed_key_leaves_table_and_resubscribe_works ... ok
+test live::tests::via_expands_only_when_truth_flips ... ok
+test lockfree_cylinder::tests::bucket_local_verify_and_live_counters ... ok
+test lockfree_cylinder::tests::compact_bucket_shrinks_and_resets_flag ... ok
+test lockfree_cylinder::tests::concurrent_writer_readers ... ok
+test himo_store::tests::values_moving_from_sparse_to_dense_stay_exact_under_churn ... ok
+test lockfree_cylinder::tests::dense_crowded_far_value_moves_from_sparse ... ok
+test lockfree_cylinder::tests::dense_grow ... ok
+test lockfree_cylinder::tests::dense_grown_slots_stay_empty_until_first_insert ... ok
+test lockfree_cylinder::tests::dense_grows_while_readers_read ... ok
+test engine::v10_dir_tests::migrated_legacy_db_gets_default_reservation_and_grows ... ok
+test live::tests::bits_matches_btreeset_across_mode_switches ... ok
+test lockfree_cylinder::tests::dense_insert_read ... ok
+test lockfree_cylinder::tests::dense_low_base_never_overlaps_the_signed_windows ... ok
+test lockfree_cylinder::tests::dense_move_does_not_count_the_inserted_entry_twice ... ok
+test lockfree_cylinder::tests::dense_prealloc_makes_no_buckets ... ok
+test lockfree_cylinder::tests::dense_range_beyond_array_is_empty ... ok
+test lockfree_cylinder::tests::dense_moved_values_are_not_counted_twice_before_cleanup ... ok
+test live::tests::pending_marks_move_to_bits_only_when_smaller ... ok
+test lockfree_cylinder::tests::dense_reader_into_rechecks_after_values_move_out_of_sparse ... ok
+test lockfree_cylinder::tests::dense_reader_rechecks_after_values_move_out_of_sparse ... ok
+test lockfree_cylinder::tests::dense_slot_clone_shares_bucket_and_drop_releases ... ok
+test lockfree_cylinder::tests::dense_unique_values_skips_emptied_buckets ... ok
+test lockfree_cylinder::tests::dense_waiting_is_recounted_after_compaction ... ok
+test lockfree_cylinder::tests::dense_scattered_values_stay_in_sparse ... ok
+test lockfree_cylinder::tests::dense_readers_never_miss_values_moved_from_sparse ... ok
+test lockfree_cylinder::tests::sparse_path ... ok
+test lockfree_cylinder::tests::sparse_reader_checks_stale_before_reading ... ok
+test lockfree_cylinder::tests::values_near_mid_are_dense ... ok
+test lockfree_cylinder::tests::dense_low_base_puts_values_far_beyond_2_20 ... ok
+test order_index::tests::bands_and_exact_ranges ... ok
+test lockfree_cylinder::tests::no_double_buffer_backing_bound ... ok
+test order_index::tests::far_values_cost_only_their_leaves ... ok
+test order_index::tests::merge2_matches_sorting_for_skewed_lengths ... ok
+test order_index::tests::merge_sorted_runs_matches_sorting_the_concatenation ... ok
+test order_index::tests::place_moves_between_bands_and_counts_stay_exact ... ok
+test order_index::tests::radix_places_leaves_only_where_used ... ok
+test order_index::tests::concurrent_writers_on_disjoint_entities_keep_counts_exact ... ok
+test order_index::tests::scattered_values_disable_the_index ... ok
+test order_index::tests::sorted_reads_merge_bands_while_they_are_in_order ... ok
+test order_index::tests::values_before_base_disable_the_index ... ok
+test pk_former::tests::a_name_moves_to_the_row_that_took_it_last_and_leaves_with_the_slot ... ok
+test pk_former::tests::cards_keep_the_newest_per_identity_and_column_and_round_trip ... ok
+test pk_former::tests::identity_names_round_trip_and_version_1_still_reads ... ok
+test pk_former::tests::round_trips_and_rejects_torn_files ... ok
+test pk_former::tests::the_name_timeline_answers_by_version_not_by_arrival ... ok
+test pk_tombs::tests::a_failed_write_is_rewritten_and_many_records_are_compacted ... ok
+test pk_tombs::tests::a_torn_tail_is_dropped_and_rewritten_next_time ... ok
+test pk_tombs::tests::appends_what_changed_and_reads_back_the_same ... ok
+test pk_tombs::tests::deletes_before_the_line_are_forgotten ... ok
+test engine::v10_dir_tests::migrate_rejects_zero_max_values_over_used_free_stack ... ok
+test engine::v10_dir_tests::migrate_rejects_nonzero_max_values_over_entity_set ... ok
+test engine::v10_dir_tests::migrate_rejects_sf_shape_when_overwritten_bits_held_live_entities ... ok
+test pk_tombs::tests::note_keeps_the_newest_delete_per_key ... ok
+test leaf_store::tests::best_fit_matches_linear_scan ... ok
+test lockfree_cylinder::tests::dense_build_matches_inserting_one_by_one ... ok
+test pk_tombs::tests::keys_of_every_length_are_found_and_read_back ... ok
+test pk_tombs::tests::the_same_bytes_under_another_himo_are_another_key ... ok
+test publish_gate::tests::other_columns_pass_while_one_is_closed ... ok
+test publish_gate::tests::written_marks_follow_the_columns_entered ... ok
+test publish_gate::tests::close_waits_for_writers_inside ... ok
+test publish_gate::tests::closers_take_turns ... ok
+test publish_gate::tests::writers_wait_while_closed ... ok
+test pk_tombs::tests::memory_no_longer_needed_is_released ... ok
+test lockfree_cylinder::tests::fast_path_never_returns_duplicates_under_churn ... ok
+test himo_store::tests::writers_racing_the_lazy_build_all_reach_the_cylinder ... ok
+test order_index::tests::readers_never_see_a_band_move_twice_or_not_at_all ... ok
+test query_lang::tests::count ... ok
+test query_lang::tests::avg_simple ... ok
+test query_lang::tests::delete_nonexistent_eid_is_error ... ok
+test query_lang::tests::display_group_count ... ok
+test query_lang::tests::delete ... ok
+test query_lang::tests::distinct_numeric ... ok
+test query_lang::tests::distinct_text ... ok
+test query_lang::tests::empty_result ... ok
+test query_lang::tests::group_count ... ok
+test query_lang::tests::group_by_text_himo ... ok
+test query_lang::tests::insert ... ok
+test query_lang::tests::group_count_default ... ok
+test query_lang::tests::group_sum ... ok
+test query_lang::tests::multi_condition ... ok
+test query_lang::tests::min_max ... ok
+test query_lang::tests::range_invalid ... ok
+test query_lang::tests::range_only ... ok
+test query_lang::tests::range_plus_eq ... ok
+test query_lang::tests::sum_simple ... ok
+test himo_store::tests::indexed_writers_racing_keep_the_cylinder_exact ... ok
+test query_lang::tests::update_deleted_eid_is_error ... ok
+test query_lang::tests::single_pull ... ok
+test query_lang::tests::update_no_kvs ... ok
+test query_lang::tests::update_invalid_eid ... ok
+test query_lang::tests::update_nonexistent_eid_is_error ... ok
+test query_lang::tests::update_replaces_value ... ok
+test pk_tombs::tests::the_bloom_grows_with_the_keys_and_misses_none ... ok
+test ravn::tests::bfs_explores_by_depth ... ok
+test ravn::tests::exec_bfs_pipe ... ok
+test ravn::tests::exec_count ... ok
+test ravn::tests::exec_where_pipe ... ok
+test ravn::tests::exec_reverse_pipe ... ok
+test ravn::tests::extract_values ... ok
+test ravn::tests::extract_text_names ... ok
+test ravn::tests::filter_by_text_finds_named ... ok
+test ravn::tests::follow_keeps_the_peer_head_and_bfs_stops_on_a_cycle ... ok
+test ravn::tests::filter_by_value ... ok
+test row_lock::tests::a_thread_holding_a_row_does_not_lock_another_row_to_read ... ok
+test row_lock::tests::internal_ranges_are_counted_once_and_found_beyond_the_fixed_slots ... ok
+test row_lock::tests::a_reader_that_has_to_lock_goes_before_waiting_writers ... ok
+test ravn::tests::follow_basic ... ok
+test segment_map::tests::create_write_reopen_roundtrip ... ok
+test segment_map::tests::dirty_range_flush_only_touches_committed ... ok
+test ravn::tests::follow_multi_step ... ok
+test ravn::tests::path_missing ... ok
+test segment_map::tests::enospc_is_reported_as_error ... ok
+test ravn::tests::path_multi_step ... ok
+test ravn::tests::path_single_step ... ok
+test segment_map::tests::failed_flush_dirty_keeps_the_range_marked ... ok
+test segment_map::tests::grow_past_reservation_fails_and_is_idempotent ... ok
+test segment_map::tests::failed_remap_rolls_the_file_length_back ... ok
+test segment_map::tests::mark_dirty_unions_page_ranges ... ok
+test segment_map::tests::open_accepts_segment_created_by_larger_page_host ... ok
+test segment_map::tests::open_rejects_file_larger_than_reservation ... ok
+test segment_map::tests::fd_budget_caps_retained_fds_and_growth_still_works ... ok
+test segment_map::tests::unflushed_counting_follows_the_filesystem ... ok
+test ravn::tests::reverse_follow_finds_children ... ok
+test segment_map::tests::partial_flush_keeps_the_unflushed_count ... ok
+test segment_map::tests::reader_follows_writer_growth_via_refresh ... ok
+test ravn::tests::path_text_last_step ... ok
+test segment_map::tests::reads_beyond_committed_are_zero_without_fault ... ok
+test sparse_copy::tests::copy_via_holes_handles_an_empty_file ... ok
+test sparse_copy::tests::copy_sparse_roundtrips_content ... ok
+test sparse_runs::tests::rebuild_drops_duplicates ... ok
+test sparse_runs::tests::concurrent_readers_see_consistent_sets ... ok
+test ravn::tests::select_basic ... ok
+test row_lock::tests::internal_rows_do_not_wait_for_user_rows ... ok
+test sparse_copy::tests::copy_via_holes_handles_a_dense_file ... ok
+test sync_payload_ring::tests::place_wraps_and_respects_the_live_range ... ok
+test sync_payload_ring::tests::create_replaces_a_leftover_temporary_file ... ok
+test sync_payload_ring::tests::durable_mark_round_trips_and_rejects_older_marks_and_garbage ... ok
+test sync_payload_ring::tests::entries_round_trip_and_reused_slots_read_as_gone ... ok
+test transport::tests::batch_empty ... ok
+test transport::tests::batch_roundtrip ... ok
+test transport::tests::decode_batch_skips_only_skippable_unknown_ops ... ok
+test transport::tests::decode_rejects_truncated ... ok
+test transport::tests::encode_decode_all_ops ... ok
+test sparse_copy::tests::copy_via_holes_keeps_the_holes ... ok
+test sync_payload_ring::tests::reopen_restores_header_and_entries ... ok
+test transport::tests::encode_decode_tie_roundtrip ... ok
+test transport::tests::min_wire_record_len_is_the_shortest_record ... ok
+test transport::tests::pull_as_multi_link_author_carries_link_cursor ... ok
+test transport::tests::pull_as_multi_default_drops_cursor ... ok
+test transport::tests::publish_sorts_by_hlc ... ok
+test transport::tests::pull_returns_records_after_since ... ok
+test transport::tests::pull_unknown_peer_empty ... ok
+test transport::tests::pull_with_same_hlc_excluded ... ok
+test transport::tests::wire_len_matches_the_encoding_of_every_op ... ok
+test value_locks::tests::pair_takes_one_lock_for_values_on_the_same_stripe ... ok
+test vocabulary::tests::concurrent_get_or_insert_stays_findable ... ok
+test vocabulary::tests::data_limit_holds_when_another_insert_slips_past_the_precheck ... ok
+test vocabulary::tests::dirty_rebuild_preserves_all_values ... ok
+test vocabulary::tests::dirty_rebuild_self_heals_missing_slot ... ok
+test vocabulary::tests::dirty_rebuild_tolerates_corrupt_slot_no_oob ... ok
+test vocabulary::tests::churn_does_not_fill_the_index_with_dead_entries ... ok
+test vocabulary::tests::durable_words_are_the_words_before_the_mark ... ok
+test vocabulary::tests::failed_take_is_not_reissued ... ok
+test vocabulary::tests::generation_survives_reload ... ok
+test vocabulary::tests::growth_without_space_does_not_rescan_the_table ... ok
+test vocabulary::tests::insert_after_clean_re_dirties_flag ... ok
+test vocabulary::tests::issue122_vocab_full_returns_sentinel_instead_of_panicking ... ok
+test value_locks::tests::writers_on_a_stripe_and_lock_all_never_overlap ... ok
+test vocabulary::tests::durable_mark_waits_for_a_word_being_written ... ok
+test sparse_copy::tests::copy_via_holes_handles_a_file_that_is_all_hole ... ok
+test vocabulary::tests::issue123_crash_left_tombstones_are_reclaimed ... ok
+test vocabulary::tests::issue123_home_slot_handles_degenerate_cap ... ok
+test vocabulary::tests::issue123_low_bits_collide_high_bits_spread ... ok
+test vocabulary::tests::issue123_migrated_index_is_clean_on_next_open ... ok
+test vocabulary::tests::issue123_readonly_open_of_legacy_index_uses_shadow ... ok
+test vocabulary::tests::issue123_vix2_index_migrates_without_stale_slots ... ok
+test vocabulary::tests::issue374_reader_rereads_when_the_table_is_rebuilt_under_it ... ok
+test engine::v10_dir_tests::migrate_rejects_legacy_himo_table_overlapping_entity_header ... ok
+test vocabulary::tests::issue374_reopen_keeps_or_rebuilds_the_table ... ok
+test vocabulary::tests::issue374_vix3_index_is_converted_by_the_writer ... ok
+test vocabulary::tests::issue374_concurrent_writers_across_growth ... ok
+test sparse_runs::tests::matches_a_plain_vec ... ok
+test vocabulary::tests::issue374_table_falls_back_to_the_whole_region_and_keeps_the_capacity ... ok
+test vocabulary::tests::issue374_vix4_closed_by_an_old_binary_is_rebuilt ... ok
+test vocabulary::tests::no_reuse_before_counting_or_after_revival ... ok
+test vocabulary::tests::readonly_load_does_not_touch_shared_index ... ok
+test vocabulary::tests::issue378_a_full_insert_releases_its_slot ... ok
+test vocabulary::tests::issue374_readers_never_miss_values_while_the_table_grows ... ok
+test vocabulary::tests::released_slot_is_reused_with_the_next_generation ... ok
+test vocabulary::tests::reuse_is_first_in_first_out ... ok
+test vocabulary::tests::vocab_lookup_on_full_index_terminates ... ok
+test vocabulary::tests::without_reclaim_nothing_changes ... ok
+test write_gate::tests::closed_gate_turns_writers_away_until_opened ... ok
+test write_gate::tests::close_waits_for_writers_inside ... ok
+test segment_map::tests::concurrent_flush_dirty_waits_for_the_one_in_flight ... ok
+test vocabulary::tests::issue374_table_grows_with_the_number_of_values ... ok
+test segment_map::tests::many_segments_grow_independently ... ok
+test engine::v10_dir_tests::migrate_accepts_zero_max_values_over_unused_free_stack ... ok
+test engine::v10_dir_tests::migrate_accepts_sf_shape_zero_max_values_over_empty_bitset ... ok
+test tests_issue131::leaf_read_under_retie_storm_returns_a_written_value_in_bounded_time ... ok
+test tests_issue131::readonly_reader_does_not_return_none_under_a_retie_storm ... ok
+test engine::v10_dir_tests::migrate_accepts_legacy_file_shorter_than_total_size ... ok
+test engine::v10_dir_tests::migrate_accepts_legacy_himo_table_that_fits_fixed_header ... ok
+test lockfree_cylinder::tests::walk_and_count_range_match_cells_across_regions ... ok
+test sparse_runs::tests::walk_matches_a_plain_vec ... ok
+
+test result: ok. 540 passed; 0 failed; 20 ignored; 0 measured; 0 filtered out; finished in 44.43s
+
+     Running unittests src/bin/bench_compare.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/bench_compare-422ab5d684c77036)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/crash_writer.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/crash_writer-fa876d5672533750)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ack_by_hlc.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/ack_by_hlc-f155002a44627117)
+
+running 2 tests
+test cursor_hlc_ack_advances_watermark_and_reclaims ... ok
+test ack_never_covers_records_newer_than_cursor_under_concurrent_bridge ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/bind_over_local_writes.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/bind_over_local_writes-21d308b8adbb2f63)
+
+running 2 tests
+test binding_over_an_untouched_row_is_not_counted ... ok
+test binding_over_a_row_this_peer_wrote_is_counted ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/bridge_cursor_lost_update.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/bridge_cursor_lost_update-5582bf9fad827b10)
+
+running 1 test
+test oplog_sync_bridges_every_record_under_scheduling_pressure ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.47s
+
+     Running tests/changefeed_backlog.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/changefeed_backlog-2bda71b582934092)
+
+running 9 tests
+test drop_returns_at_once_with_a_prompt_or_panicking_listener ... ok
+test a_listener_may_drop_the_last_reference_to_the_engine ... ok
+test stalled_listener_does_not_stall_writers ... ok
+test stalled_listener_is_detached_when_the_backlog_overflows ... ok
+test prompt_listener_is_not_detached_under_a_small_limit ... ok
+test slow_listener_gets_every_record_in_order_once_across_folds ... ok
+test oplog_sync_does_not_wait_forever_behind_a_stuck_listener ... ok
+test drop_does_not_wait_forever_behind_a_stuck_listener ... ok
+test drop_waits_for_slow_listeners_that_keep_returning ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.65s
+
+     Running tests/changefeed_local_only.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/changefeed_local_only-187eec71c0e4b465)
+
+running 2 tests
+test local_only_writes_are_not_delivered ... ok
+test local_only_writes_are_not_recorded_in_the_change_log ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+
+     Running tests/changefeed_log.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/changefeed_log-0353afd6a287377f)
+
+running 9 tests
+test enable_after_a_listener_is_refused_and_resume_without_a_log_is_truncated ... ok
+test records_not_yet_written_out_get_no_number ... ok
+test oplog_sync_hands_its_records_over_before_returning ... ok
+test resuming_from_a_dropped_number_is_truncated ... ok
+test records_folded_out_of_the_wal_before_any_listener_are_kept ... ok
+test a_listener_resumes_after_reopen_from_the_number_it_stopped_at ... ok
+test drop_does_not_wait_forever_behind_a_stuck_listener_and_the_rest_stays_in_the_record ... ok
+test drop_waits_for_slow_listeners_with_the_record ... ok
+test a_stalled_listener_overrun_by_the_log_is_detached ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.32s
+
+     Running tests/changefeed_log_power_loss.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/changefeed_log_power_loss-bfd691ea804e8efa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/corrupt_header_open.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/corrupt_header_open-5b7d47ffaf9c6eb9)
+
+running 5 tests
+test corrupt_himo_count_is_invalid_data ... ok
+test corrupt_max_himos_huge_is_invalid_data ... ok
+test corrupt_vocab_data_size_huge_is_invalid_data ... ok
+test legacy_crc_zero_with_intact_fields_still_opens ... ok
+test corrupt_vocab_index_cap_zero_is_invalid_data ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/create_no_clobber.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/create_no_clobber-2785a2b0f1aea1de)
+
+running 4 tests
+test create_over_non_db_file_is_already_exists ... ok
+test create_growable_over_existing_is_already_exists ... ok
+test create_wal_variant_over_existing_is_already_exists ... ok
+test create_standalone_over_existing_is_already_exists ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/destructive_0_7_0.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/destructive_0_7_0-e5d4b36c0034529d)
+
+running 9 tests
+test double_writer_open_blocks_until_first_drops ... ok
+test entity_in_auto_grows_when_table_eid_range_exhausted ... ok
+test oplog_tail_garbage_is_dropped_on_reopen ... ok
+test readonly_open_succeeds_alongside_writer ... ok
+test oplog_truncation_mid_record_recovers ... ok
+test enable_sync_clamps_when_eid_space_is_tight ... ok
+test ack_with_future_lsn_does_not_corrupt_reclaim ... ok
+test transfer_after_reclaim_continues_lsn_monotonically ... ok
+test stress_10k_cycle ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests/dirty_range_msync.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/dirty_range_msync-7e6c02541e358a53)
+
+running 2 tests
+test oplog_sync_with_dirty_range ... ok
+test body_msync_handles_dirty_range_correctly ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/durable_mark.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/durable_mark-5e2cccb38d11080a)
+
+running 5 tests
+test the_mark_follows_each_durable_point_and_never_covers_later_writes ... ok
+test a_reopen_does_not_hand_out_lsns_at_or_below_the_mark ... ok
+test an_orphaned_group_dropped_by_the_commit_after_the_cut_is_not_covered ... ok
+test dropped_writes_hold_the_mark_until_their_floor_is_recorded ... ok
+test rows_from_records_after_the_cut_are_not_covered_by_its_mark ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+     Running tests/eid_capacity.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/eid_capacity-0e40c5ee5332a17f)
+
+running 3 tests
+test remaining_eid_capacity_tells_how_much_is_left_to_carve ... ok
+test a_full_table_still_accepts_deletes ... ok
+test table_eid_usage_counts_live_rows_and_free_slots ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/eid_offset_descending.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/eid_offset_descending-3a762b6e1d405c52)
+
+running 2 tests
+test mixed_high_then_low_eid_tie ... ok
+test descending_eid_tie_does_not_explode ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/eidmap_log.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/eidmap_log-1b537a40caa90b66)
+
+running 5 tests
+test appended_mappings_survive_an_unclean_close ... ok
+test bootstrap_serves_the_eidmap_with_the_log_applied ... ok
+test a_delete_before_its_row_survives_an_unclean_close ... ok
+test a_torn_log_tail_is_dropped_and_rewritten ... ok
+test a_clean_close_compacts_the_log ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+     Running tests/eids_par_aggregations.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/eids_par_aggregations-d2670c8c6eacf24c)
+
+running 7 tests
+test eids_par_falls_back_to_seq_under_threshold ... ok
+test histogram_eids_edge_cases ... ok
+test eids_par_matches_range_par_when_contiguous ... ok
+test eids_par_sparse_subset ... ok
+test histogram_eids_matches_range ... ok
+test eids_par_matches_seq_large ... ok
+test group_eids_par_matches_seq_large ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/engine_model_proptest.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/engine_model_proptest-b4bd83071ef602fd)
+
+running 1 test
+test engine_matches_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.57s
+
+     Running tests/fault_matrix.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/fault_matrix-ba7a44d4a787512e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/flush_writes_barrier.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/flush_writes_barrier-17d07eb93f1149fc)
+
+running 2 tests
+test flush_writes_waits_for_all_ties_including_entity_created_path ... ok
+test oplog_sync_bridges_all_records_pushed_before_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/forget_deletes.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/forget_deletes-a2c158801d44164b)
+
+running 1 test
+test foreign_deletes_before_the_line_are_forgotten_and_written_out ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/group_beyond_hint.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/group_beyond_hint-a948cf362590a9be)
+
+running 2 tests
+test group_values_beyond_hint_small ... ok
+test group_values_beyond_hint_parallel ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests/group_zero_sum.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/group_zero_sum-e55c75cae2ef775b)
+
+running 2 tests
+test zero_sum_groups_small ... ok
+test zero_sum_groups_parallel ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+     Running tests/grouped_batch.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/grouped_batch-5155e0163c3fbc98)
+
+running 4 tests
+test members_many_follows_the_given_order ... ok
+test grouped_batch_reads_under_concurrent_writes ... ok
+test grouped_batch_reads_match_shadow_with_dense_company_lists ... ok
+test grouped_batch_reads_match_shadow_with_sparse_company_lists ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.52s
+
+     Running tests/interrupted_delete.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/interrupted_delete-4b585c98cbda8086)
+
+running 7 tests
+test redelivered_delete_finishes_a_half_applied_one ... ok
+test a_stale_delete_does_not_wipe_a_newer_row ... ok
+test redelivered_delete_removes_cells_written_after_it ... ok
+test the_audit_count_excludes_rows_recreated_after_the_delete ... ok
+test a_row_recreated_after_the_delete_survives ... ok
+test reopen_finishes_a_delete_that_stopped_after_the_tombstone ... ok
+test a_migrated_row_whose_delete_was_interrupted_is_finished_too ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/issue101_clean_reopen.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue101_clean_reopen-14fccd5ed8dcf221)
+
+running 3 tests
+test explicit_flush_clean_marks_clean ... ok
+test readonly_close_stays_nondestructive ... ok
+test graceful_close_skips_rebuild_crash_does_not ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/issue106_leaf_cross_process.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue106_leaf_cross_process-13f6180781f3eccf)
+
+running 1 test
+test leaf_read_while_write_cross_process ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.05s
+
+     Running tests/issue106_leaf_torn_read.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue106_leaf_torn_read-04b84cb7e831e1f2)
+
+running 1 test
+test leaf_read_while_write_torn_read ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.57s
+
+     Running tests/issue107_borrowed_leaf_guard.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue107_borrowed_leaf_guard-06705f143562feb3)
+
+running 10 tests
+test single_thread_write_then_borrow_is_allowed_on_concurrent_engine ... ok
+test many_reader_threads_after_writes_finished_are_allowed ... ok
+test standalone_borrow_is_allowed ... ok
+test get_content_and_get_entity_are_stopped_too ... ok
+test get_entity_owned_matches_get_entity ... ok
+test write_by_one_of_two_borrowing_threads_is_stopped ... ok
+test readonly_borrow_of_leaf_is_stopped ... ok
+test readers_borrowing_while_a_writer_runs_are_all_stopped ... ok
+test borrow_after_another_thread_wrote_is_stopped ... ok
+test old_slots_released_by_the_consumer_do_not_stop_a_single_thread ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
+     Running tests/issue119_retie_order_all_paths.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue119_retie_order_all_paths-f817d1a24571b759)
+
+running 4 tests
+test vocab_max_entries_over_2p31_is_clean_err ... ok
+test async_apply_path_no_silent_none_or_torn ... ok
+test sync_apply_path_no_silent_none_or_torn ... ok
+test direct_path_no_silent_none_or_torn ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+     Running tests/issue120_create_open_roundtrip.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue120_create_open_roundtrip-9a198e161369b74e)
+
+running 3 tests
+test vocab_data_size_u32_max_is_rejected_at_create ... ok
+test content_data_size_u32_max_is_rejected_at_create ... ok
+test vocab_data_size_at_aligned_limit_roundtrips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/issue122_vocab_index_sizing.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue122_vocab_index_sizing-bf622cd3b742287a)
+
+running 4 tests
+test default_keeps_legacy_multiplier ... ok
+test explicit_vocab_max_entries_shrinks_index ... ok
+test legacy_version_in_v10_header_is_rejected ... ok
+test get_content_owned_matches_borrow_and_survives_rewrite ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/issue123_two_process_migration.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue123_two_process_migration-79e742c507c44628)
+
+running 1 test
+
+running 1 test
+warning: failed to persist tables sidecar: No such file or directory (os error 2) (rate-limited to 1/s)
+warning: failed to persist tables sidecar: No such file or directory (os error 2) (rate-limited to 1/s)
+child: 388984 writes
+test readonly_process_reads_while_writer_migrates ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+
+test readonly_process_reads_while_writer_migrates ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s
+
+     Running tests/issue127_readonly_shadow_compact.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue127_readonly_shadow_compact-23d2928543bb893c)
+
+running 1 test
+test dirty_readonly_open_heap_is_count_proportional ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/issue166_translator_slot_reuse.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue166_translator_slot_reuse-cdc50ae77066044e)
+
+running 5 tests
+test record_for_deleted_foreign_entity_does_not_hit_the_new_tenant ... ok
+test older_record_does_not_resurrect_a_deleted_foreign_entity_after_slot_reuse ... ok
+test newer_record_for_a_deleted_entity_is_dropped_after_slot_reuse ... ok
+test translating_into_a_reused_slot_does_not_deadlock ... ok
+test evicted_tombstone_survives_reopen ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/issue167_enospc_not_sigbus.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue167_enospc_not_sigbus-b5cb62760505f76c)
+
+running 1 test
+test full_disk_rejects_writes_instead_of_sigbus ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/issue178_merge_entity.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue178_merge_entity-502e84eaf3a85702)
+
+running 5 tests
+test merging_applies_the_src_delete_to_dst ... ok
+test unversioned_src_cells_only_fill_empty_dst_cells ... ok
+test merge_refuses_own_into_translated_same_dead_and_cross_table_rows ... ok
+test merging_a_translated_row_moves_newer_cells_and_redirects_its_identity ... ok
+test reusing_the_merged_slot_drops_the_alias ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running tests/issue190_sidecar_persist_race.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue190_sidecar_persist_race-974cbc7606ed6c22)
+
+running 1 test
+test concurrent_persist_tables_never_races ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/issue195_consumer_self_push.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue195_consumer_self_push-9e65fc696faa15fe)
+
+running 1 test
+test bridge_tick_during_full_queue_burst_does_not_livelock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/issue21_recent.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue21_recent-745bedace509ece5)
+
+running 7 tests
+test column_outside_any_table ... ok
+test reused_eid_after_the_table_is_full_is_not_newest ... ok
+test skips_deleted_rows_and_rows_without_the_column ... ok
+test scoped_to_the_table_of_the_column ... ok
+test newest_first_and_stops_at_n ... ok
+test walks_back_across_extents ... ok
+test matches_the_insertion_log_under_mixed_writes ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/issue235_inflight_bridge_row.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue235_inflight_bridge_row-eea97d73a0b9f3fd)
+
+running 2 tests
+test over_ack_does_not_let_reclaim_eat_an_undecodable_newest_row ... ok
+test inflight_bridge_row_is_not_eaten_by_ack ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.42s
+
+     Running tests/issue255_rw_open_lazy_cylinder.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue255_rw_open_lazy_cylinder-e5cbffbac58ad5dd)
+
+running 2 tests
+test rebuilt_free_list_keeps_live_slots_and_reuses_holes ... ok
+test rw_open_builds_no_cylinder_until_touched ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/issue259_ref_reopen_no_persist.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue259_ref_reopen_no_persist-7a2c79ace28de1af)
+
+running 2 tests
+test reregistering_existing_relations_does_not_rewrite_tables_sidecar ... ok
+test new_relation_is_still_persisted_and_survives_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/issue264_tie_by_id.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue264_tie_by_id-d3bd8d7a2ae7800d)
+
+running 4 tests
+test eid_outside_the_himo_table_still_panics_in_release - should panic ... ok
+test ref_target_outside_the_table_still_panics_in_release - should panic ... ok
+test sentinel_is_rejected_the_same_way_and_does_not_define_the_himo ... ok
+test by_id_matches_the_named_version ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/issue268_commit_failure.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue268_commit_failure-5484e0d68ccc61d4)
+
+running 3 tests
+test records_dropped_from_the_sync_path_are_counted_not_just_warned_once ... ok
+test records_dropped_from_the_sync_api_are_counted ... ok
+test commit_failure_keeps_checkpoint_behind_and_recovers_without_reopen ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/issue316_remote_apply_capacity.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue316_remote_apply_capacity-0685f5fbe74b8150)
+
+running 2 tests
+test remote_tieleaf_without_room_is_rejected_and_redeliverable ... ok
+test remote_tie_without_room_is_rejected_and_redeliverable ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/issue337_changefeed_fold.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue337_changefeed_fold-17cc533f8a5b0201)
+
+running 4 tests
+test oplog_sync_inside_a_listener_does_not_block ... ok
+test oplog_sync_returns_after_its_records_are_delivered ... ok
+test two_writers_with_sync_tables_lose_nothing ... ok
+test listener_gets_every_committed_record_across_folds ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s
+
+     Running tests/issue343_leaf_free_after_clear.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue343_leaf_free_after_clear-ff715b48ebf7f683)
+
+running 2 tests
+test delete_does_not_expose_another_rows_value ... ok
+test untie_does_not_expose_another_rows_value ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+
+     Running tests/issue349_clears_take_row_lock.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue349_clears_take_row_lock-0864093bf22bb1d3)
+
+running 2 tests
+test repair_interrupted_deletes_does_not_show_a_half_removed_row ... ok
+test clear_local_only_tables_does_not_show_a_half_cleared_row ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+     Running tests/issue362_decode_batch_alloc.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue362_decode_batch_alloc-7844d782975f7b30)
+
+running 1 test
+test decode_batch_allocation_is_bounded_by_the_input_length ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/issue368_sync_ring_bounded.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue368_sync_ring_bounded-b81c9d089735e27e)
+
+running 4 tests
+test sync_peers_table_still_grows ... ok
+test full_ring_error_names_the_way_out ... ok
+test explicit_grow_table_enlarges_the_ring ... ok
+test unacked_backlog_leaves_free_eid_space_to_user_tables ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/issue374_vocab_index_grows.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue374_vocab_index_grows-31632df4848a8cba)
+
+running 1 test
+test vocab_index_touches_pages_in_proportion_to_the_values ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/issue378_vocab_race.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue378_vocab_race-b549fadd3ceeb619)
+
+running 3 tests
+test a_rejected_insert_leaves_no_pending_slot ... ok
+test racing_writers_use_one_number_per_value ... ok
+test racing_writers_use_one_number_per_value_with_reclaim ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+     Running tests/issue381_vocab_grow.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue381_vocab_grow-a6b24879ccb0c1c6)
+
+running 3 tests
+test grow_vocab_raises_the_entry_limit_while_open_and_after_reopen ... ok
+test grow_vocab_raises_the_data_limit ... ok
+test vocab_segments_do_not_grow_past_the_declared_size ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/issue381_vocab_reclaim.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue381_vocab_reclaim-0fd71ff4b8287c32)
+
+running 3 tests
+test stale_vid_is_rejected ... ok
+test queued_writes_keep_their_vids_until_applied ... ok
+test counting_at_open_then_concurrent_writers_keep_live_values ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/issue385_vocab_refs.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue385_vocab_refs-08463eacabc44254)
+
+running 8 tests
+test subscription_pins_are_not_persisted ... ok
+test missing_file_recounts ... ok
+test after_an_older_binary_recounts ... ok
+test a_file_from_another_point_in_time_is_not_trusted ... ok
+test clean_close_reuses_the_persisted_counts ... ok
+test recount_skips_dead_slots_but_counts_every_live_row ... ok
+test crash_recounts ... ok
+test many_new_words_in_one_session ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/issue391_consumer_idle.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue391_consumer_idle-85e4c03d116b5adb)
+
+running 5 tests
+test drop_wakes_a_sleeping_consumer ... ok
+test async_write_after_idle_is_visible_on_return ... ok
+test back_to_back_async_writes_are_visible_on_return ... ok
+test idle_consumer_sleeps ... ok
+test writes_after_idle_are_applied_and_flushed ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.21s
+
+     Running tests/issue394_index_build_heap.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue394_index_build_heap-36b942d9ae00337d)
+
+running 1 test
+test building_the_index_leaves_no_transient_heap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+     Running tests/issue395_open_immutable.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue395_open_immutable-1a533f079218f422)
+
+running 5 tests
+test two_readers_borrow_leaf_values ... ok
+test readers_do_not_block_a_writer ... ok
+test a_writer_arriving_later_stops_borrowed_reads_in_debug ... ok
+test writes_are_rejected ... ok
+test open_fails_while_a_writer_has_the_db ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/issue400_column_pad.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue400_column_pad-4573160a2a80017c)
+
+running 8 tests
+test the_reservation_covers_the_pad ... ok
+test version_columns_are_padded_too ... ok
+test premise_the_old_layout_materializes_the_gap_on_apfs ... ok
+test a_late_table_column_does_not_materialize_the_gap ... ok
+test migrate_moves_existing_columns ... ok
+test a_late_column_grows_by_its_own_rows ... ok
+test a_half_migrated_db_reads_both_layouts ... ok
+test packed_roundtrip_of_a_padded_db ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.14s
+
+     Running tests/issue414_leaf_slot_waits_for_write_out.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue414_leaf_slot_waits_for_write_out-25e6c69e8bb90115)
+
+running 6 tests
+test rewritten_slot_is_reused_only_after_flush ... ok
+test waiting_slots_become_free_on_reopen ... ok
+test untied_and_deleted_slots_are_reused_only_after_flush ... ok
+test rewrites_without_flush_stay_bounded ... ok
+test memory_backing_reuses_at_once ... ok
+test oplog_sync_releases_old_slots ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/issue415_create_interrupted.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue415_create_interrupted-5ab839a00298d65d)
+
+running 4 tests
+test create_removes_its_marker ... ok
+test directory_left_right_after_mkdir_can_be_created_again ... ok
+test never_written_oplog_is_created_again ... ok
+test interrupted_create_is_reported_and_can_be_created_again ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/issue417_readonly_leaf_growth.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue417_readonly_leaf_growth-3aed2d393f6e1231)
+
+running 2 tests
+test readonly_first_read_past_its_mapping_is_not_empty ... ok
+test readonly_reader_sees_values_in_grown_leaf_region ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+
+     Running tests/issue424_cell_clear_is_atomic.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue424_cell_clear_is_atomic-92fe7a64f6bb08b3)
+
+running 2 tests
+test untie_never_shows_an_unwritten_value ... ok
+test delete_never_shows_an_unwritten_value ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+     Running tests/issue429_replay_tieleaf.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue429_replay_tieleaf-390a49ac20b60e02)
+
+running 3 tests
+test issue429_child ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test leaf_rewritten_after_untie_survives_a_crash_with_cell_versions ... ok
+test leaf_rewritten_after_untie_survives_a_crash ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+     Running tests/issue435_remote_tieleaf_loses.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue435_remote_tieleaf_loses-ec1b8098442f282e)
+
+running 1 test
+test remote_tieleaf_that_loses_to_a_newer_write_keeps_the_cells_slot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/issue437_concurrent_create.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue437_concurrent_create-753276858186bb38)
+
+running 5 tests
+test issue437_child ... ok
+test create_does_not_reclaim_a_directory_with_other_files ... ok
+test create_leaves_a_directory_being_created_alone ... ok
+test concurrent_creates_in_threads_leave_exactly_one_db ... ok
+test concurrent_creates_in_processes_never_remove_the_winners_db ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.05s
+
+     Running tests/issue440_sync_fold_after_write_out.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue440_sync_fold_after_write_out-15c5d836c29670a8)
+
+running 3 tests
+test fold_waits_until_bridged_rows_are_written_out ... ok
+test clean_close_folds_so_reopen_does_not_bridge_again ... ok
+test idle_sync_db_folds_the_oplog_after_writing_out_bridged_rows ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/issue442_ring_restore_dead_rows.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue442_ring_restore_dead_rows-dadaf0b19a5a39fb)
+
+running 1 test
+test reopen_with_rows_whose_payload_did_not_reach_disk_keeps_bridging ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/issue47_remote_tie_next_local.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue47_remote_tie_next_local-0989e8a5773ce495)
+
+running 1 test
+test remote_tie_apply_advances_next_local ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/issue490_delete_before_create.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue490_delete_before_create-4383673bec0510ad)
+
+running 5 tests
+test create_older_than_an_early_delete_does_not_land ... ok
+test early_deletes_follow_the_same_lww_as_mapped_deletes ... ok
+test record_newer_than_an_early_delete_is_dropped ... ok
+test mapped_entity_is_deleted_as_before ... ok
+test early_delete_survives_reopen ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/issue52_fail_readable.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue52_fail_readable-e69963566bf044cb)
+
+running 2 tests
+test open_self_heals_stale_tables_tmp ... ok
+test open_recovers_from_corrupt_tables_sidecar ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/issue533_sidecar_read_error.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue533_sidecar_read_error-1c7b0e50626a3650)
+
+running 1 test
+test unreadable_tables_sidecar_fails_the_open_and_keeps_the_file ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/issue534_lazy_segment_io.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue534_lazy_segment_io-3b9c2fd7afb4a3ac)
+
+running 2 tests
+test writes_to_a_column_that_cannot_be_opened_are_refused_not_panicked ... ok
+test a_read_that_cannot_open_the_column_panics_without_poisoning ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/issue537_himo_name_register.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue537_himo_name_register-ef09f996228ecfff)
+
+running 1 test
+test a_column_whose_name_cannot_be_registered_is_not_defined ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/issue54_vocab_orphan.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue54_vocab_orphan-693f627db38d8404)
+
+running 4 tests
+test tag_dedup_no_orphan ... ok
+test leaf_remove_reclaims ... ok
+test leaf_churn_footprint_bounded ... ok
+test leaf_retie_reclaims ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/issue553_554_wal_reject.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue553_554_wal_reject-ed9d72f522007740)
+
+running 1 test
+test a_record_larger_than_the_wal_is_rejected_at_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/issue561_purge_unlogged.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue561_purge_unlogged-f23e606a5b4d0f58)
+
+running 3 tests
+test a_purge_puts_nothing_in_the_wal ... ok
+test an_unclean_close_after_purges_keeps_the_floor ... ok
+test an_unclean_close_right_after_purges_relogs_nothing ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/issue59_no_host_kill.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue59_no_host_kill-139682e48c129825)
+
+running 3 tests
+test entity_space_exhaustion_returns_err_instead_of_panicking ... ok
+test sentinel_value_is_rejected_not_panicked ... ok
+test vocabulary_full_rejects_text_writes_instead_of_panicking ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/issue7_add_himo_after_reopen.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue7_add_himo_after_reopen-fe9e3aba824a1261)
+
+running 3 tests
+test append_mixed_type_himos_after_reopen ... ok
+test append_himos_after_reopen_does_not_sigbus ... ok
+test append_himos_after_seal_integrity ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/issue90_leaf_scale.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue90_leaf_scale-fbc2081c35958f11)
+
+running 3 tests
+test leaf_data_size_exceeding_cap_is_rejected ... ok
+test reclaim_works_at_each_scale ... ok
+test scale_persists_across_reopen ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/issue92_dirty_index_full_commit.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue92_dirty_index_full_commit-f402f0ce17bb44e7)
+
+running 1 test
+
+running 1 test
+test dirty_reopen_does_not_commit_full_index_region ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/issue95_lockfree_read.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue95_lockfree_read-478459b89b16bd33)
+
+running 3 tests
+test update_stale_filtered_by_verify ... ok
+test concurrent_pull_during_writes ... ok
+test concurrent_sync_writes_from_many_threads ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/issue95_stress.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue95_stress-d56785b5cec59b5d)
+
+running 3 tests
+test crash_recovery_compacts ... ok
+test grow_under_read ... ok
+test churn_storm_exact ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s
+
+     Running tests/live_join.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_join-947389cc7eba4646)
+
+running 3 tests
+test value_join_needs_columns_of_the_same_type ... ok
+test sum_threshold_follows_the_summed_column ... ok
+test value_join_under_concurrent_writes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/live_keyed.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_keyed-2944304b0aee364e)
+
+running 3 tests
+test reused_eid_with_the_same_key_leaves_and_reenters ... ok
+test keyed_subscriptions_match_oracle ... ok
+test keyed_under_concurrent_writes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+     Running tests/live_query.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_query-56cc162d54aede02)
+
+running 8 tests
+test rejects_empty_and_unknown_himo ... ok
+test reused_slot_is_reported_as_leave_and_reenter ... ok
+test all_write_paths_match_full_scan ... ok
+test unpolled_reuse_burst_reports_leave_and_reenter ... ok
+test subscribe_while_writing_loses_nothing ... ok
+test via_subscription_under_concurrent_flips ... ok
+test unpolled_bursts_deliver_every_mark ... ok
+test new_kinds_under_concurrent_writes ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+
+     Running tests/live_settle_peak_heap.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_settle_peak_heap-be6395c570cbbfb6)
+
+running 1 test
+test the_first_poll_does_not_hold_every_root_answer_at_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/local_only_table.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/local_only_table-a498ff2acf175632)
+
+running 5 tests
+test local_only_writes_are_logged_in_the_wal ... ok
+test local_only_write_is_replayed_after_crash ... ok
+test writes_to_a_local_only_table_are_not_bridged ... ok
+test clear_local_only_tables_wipes_only_those ... ok
+test local_only_survives_reopen_and_stays_local ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+     Running tests/loom_append_publish.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_append_publish-d2e788069fc3ab17)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_flush_dirty.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_flush_dirty-cdf5e241e8c8964a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_lazy_cylinder_build.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_lazy_cylinder_build-ab1f19b7fd7da233)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_live_dirty.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_live_dirty-ef4db86745e5c997)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_live_subscribe.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_live_subscribe-7012bb6d665b7241)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_order_index_build.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_order_index_build-73e7456b9a0b2ab0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_publish_gate_durable.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_publish_gate_durable-9970e4d7c085026b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_row_lock.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_row_lock-a109d1508edaa179)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_row_seqlock.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_row_seqlock-3d4ff64552340371)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_row_wal_order.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_row_wal_order-51ad86b8396401a1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_wal_combine_slots.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_wal_combine_slots-ef0575aab3520820)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loom_wal_halves.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/loom_wal_halves-4a6f84f25a5903b2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/marks_undeclared_heap.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/marks_undeclared_heap-23552b9c9ed41c63)
+
+running 1 test
+test undeclared_buckets_carry_no_marks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/name_pulls_peer_prefix.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/name_pulls_peer_prefix-e2b4cd8ab3c30c11)
+
+running 2 tests
+test name_pulls_default_peer_zero_still_works ... ok
+test name_pulls_return_eids_with_peer_prefix ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/number64.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/number64-e2dd0668ba078680)
+
+running 13 tests
+test u32_aggregates_panic_on_64_bit_columns - should panic ... ok
+test concurrent_writes_go_through_the_oplog ... ok
+test values_that_do_not_fit_are_rejected_with_a_fault ... ok
+test wide_segments_are_sized_for_8_byte_cells ... ok
+test live_accepts_64_bit_columns ... ok
+test recovery_replays_wide_values ... ok
+test values_beyond_u32_round_trip_and_are_pulled ... ok
+test ranges_and_64_bit_aggregates_match_oracle ... ok
+test reopen_keeps_values_and_only_wide_dbs_become_v11 ... ok
+test live_queries_on_64_bit_columns_match_oracle ... ok
+test memory_backing_opens_packed_64_bit_columns ... ok
+test packed_round_trip_keeps_64_bit_columns ... ok
+test packed_finds_64_bit_columns_past_the_first_header_page ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.69s
+
+     Running tests/open_time_leaf_free_file.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/open_time_leaf_free_file-3a00fed96c0d92db)
+
+running 6 tests
+test child_entry ... ok
+test remove_db_removes_the_file ... ok
+test a_flush_during_the_session_does_not_vouch_for_the_file ... ok
+test an_unclean_exit_rebuilds_from_the_columns ... ok
+test clean_close_leaves_the_free_list_and_the_next_open_installs_it ... ok
+test a_damaged_or_mismatched_file_is_ignored ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/oplog_recovery_fault.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/oplog_recovery_fault-f63deb8ff32e9cd8)
+
+running 3 tests
+test reopen_recovers_with_zeroed_wal_tail ... ok
+test reopen_survives_oplog_truncation ... ok
+test reopen_survives_oplog_byte_flips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+
+     Running tests/order_index.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/order_index-b52483ddf5409967)
+
+running 14 tests
+test count_in_reads_no_entities_when_ticks_align ... ok
+test find_by_via_and_range_reads_only_the_range_bands ... ok
+test declare_order_validates ... ok
+test order_under_concurrent_writes_and_build ... ok
+test subscriptions_build_the_arrangement_they_read ... ok
+test touched_with_order ... ok
+test row_subscription_with_order ... ok
+test grouped_without_order_is_the_control ... ok
+test grouped_with_misaligned_order ... ok
+test grouped_with_order_companies_after_users ... ok
+test grouped_with_aligned_order_sparse_companies ... ok
+test grouped_with_aligned_order_dense_companies ... ok
+test grouped_with_order_declared_late ... ok
+test via_reads_without_a_range_come_from_the_cylinder_like_an_undeclared_db ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.62s
+
+     Running tests/order_persist.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/order_persist-c3babaa303fd86c3)
+
+running 6 tests
+test without_declaration_nothing_is_stored ... ok
+test snapshot_export_keeps_declarations ... ok
+test open_and_build_do_not_rewrite_tables_sidecar ... ok
+test declaration_survives_reopen_and_answers_match ... ok
+test redeclare_replaces_and_drop_falls_back ... ok
+test concurrent_writers_while_the_first_read_builds ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.70s
+
+     Running tests/phase1_auto_transfer.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/phase1_auto_transfer-41a70185fc4953f0)
+
+running 2 tests
+test consumer_thread_auto_transfers_to_sync_ops ... ok
+test manual_transfer_remains_idempotent_after_auto ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/phase4_ring_buffer.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/phase4_ring_buffer-720a78af64bb8986)
+
+running 3 tests
+test reclaim_pushes_local_id_to_free_list ... ok
+test entity_in_reuses_freed_locals_after_reclaim ... ok
+test long_cycle_does_not_exhaust_eid_range ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+
+     Running tests/phase4_sync_ops.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/phase4_sync_ops-51461f29ea61d252)
+
+running 4 tests
+test enable_sync_creates_reserved_tables ... ok
+test reserved_table_writes_do_not_reappear_in_oplog ... ok
+test transfer_and_pending_roundtrip ... ok
+test ack_and_watermark_drive_reclaim ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/phase5_initial_sync.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/phase5_initial_sync-bc0747880a118576)
+
+running 2 tests
+test current_sync_lsn_advances_with_transfer ... ok
+test snapshot_export_carries_sync_state ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/power_loss.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/power_loss-ae64a4a264adc112)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/present_count.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/present_count-dd35549e5b954a00)
+
+running 3 tests
+test readonly_engine_counts_what_another_writer_wrote ... ok
+test present_count_after_reopen ... ok
+test present_count_follows_concurrent_writers ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/query_by_id_peer_prefix.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/query_by_id_peer_prefix-7ce04c817908e82e)
+
+running 2 tests
+test query_by_id_returns_eid_with_peer_prefix ... ok
+test query_by_id_default_peer_zero_still_works ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/queue_backpressure.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/queue_backpressure-4d4079a6cf78ba30)
+
+running 1 test
+test small_queue_cap_does_not_hang ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/range_min_max_histogram.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/range_min_max_histogram-1f57446cffcbe2e5)
+
+running 8 tests
+test histogram_range_edge_cases ... ok
+test min_max_range_with_zero_value ... ok
+test histogram_range_basic ... ok
+test group_max_range_dense ... ok
+test min_max_range_basic ... ok
+test min_max_consistency_with_per_eid_api ... ok
+test group_min_range_dense ... ok
+test group_min_max_partial_range ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/range_par.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/range_par-63866169e35caf83)
+
+running 8 tests
+test par_falls_back_to_seq_under_threshold ... ok
+test par_handles_empty_range_gracefully ... ok
+test min_max_range_par_matches_seq_large ... ok
+test sum_count_range_par_matches_seq_large ... ok
+test range_scan_par_matches_seq_large ... ok
+test histogram_range_par_matches_seq_large ... ok
+test group_sum_range_par_matches_seq_large ... ok
+test group_min_max_range_par_matches_seq_large ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/recover_short_lived_cli.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/recover_short_lived_cli-df41157a93a6fe22)
+
+running 3 tests
+test reopen_after_concurrent_tie_recovers_himo_value ... ok
+test reopen_after_concurrent_tie_advances_next_local ... ok
+test persist_tables_api_works_under_arc ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/recovery_replays_uncommitted_tail.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/recovery_replays_uncommitted_tail-da6ea87a68db1b78)
+
+running 1 test
+test a_record_the_body_never_got_is_replayed_not_buried ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/ref_cylinder_dense_base.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/ref_cylinder_dense_base-228bbcfd567572e1)
+
+running 3 tests
+test fresh_db_uses_the_target_table_start ... ok
+test ref_without_a_target_table_stays_sparse ... ok
+test ref_to_a_far_table_is_dense_and_answers_match ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.06s
+
+     Running tests/req12_bucket_local_meta.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/req12_bucket_local_meta-342f801c418d4327)
+
+running 7 tests
+test untie_updates_counts ... ok
+test query_with_all_stale_bucket_returns_empty ... ok
+test explicit_compact_himo ... ok
+test retie_roundtrip_dedups ... ok
+test cardinality_stays_exact_under_churn ... ok
+test untouched_value_pull_correct_after_churn ... ok
+test compaction_bounds_backing_under_heavy_churn ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/same_cell_wal_order.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/same_cell_wal_order-7a3eee86a996a36e)
+
+running 8 tests
+test child_writes_until_a_mismatch_then_waits_to_be_killed ... ok
+test ref_race_leaves_the_last_wal_record ... ok
+test tie_delete_race_leaves_the_last_wal_record ... ok
+test tie_untie_race_leaves_the_last_wal_record ... ok
+test tie_race_leaves_the_last_wal_record ... ok
+test a_value_read_before_a_kill_is_the_value_after_reopen ... ok
+test tag_race_leaves_the_last_wal_record ... ok
+test sync_db_race_rejects_no_local_write ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.91s
+
+     Running tests/sidecar_mode_preserved.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/sidecar_mode_preserved-a7bb7218a783e7a9)
+
+running 1 test
+test persist_keeps_the_mode_the_caller_set_on_sidecars ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/snapshot_export_keeps_holes.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/snapshot_export_keeps_holes-02d71ec080449130)
+
+running 1 test
+test snapshot_export_does_not_bloat_the_copy ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/sns_scale_stress.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/sns_scale_stress-2daa634a4f97c956)
+
+running 3 tests
+test sns_workload_with_fk_refs ... ok
+test sns_reopen_preserves_full_schema ... ok
+test sns_workload_10_tables_5_himos_each ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+     Running tests/sync_bridge_row_lock.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/sync_bridge_row_lock-eb449b18f2cc1287)
+
+running 2 tests
+test a_writer_holding_its_row_does_not_stall_the_bridge ... ok
+test a_leaf_writer_does_not_stall_the_bridge ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+     Running tests/sync_ops_backlog_drain.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/sync_ops_backlog_drain-8d2bf2082ae9f5b5)
+
+running 1 test
+test backlog_larger_than_ring_drains_instead_of_livelocking ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.32s
+
+     Running tests/sync_ops_freelist_reopen.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/sync_ops_freelist_reopen-7c1a87085580b11c)
+
+running 2 tests
+test reopened_store_recovers_reclaimed_slots_and_keeps_bridging ... ok
+test full_ring_backpressures_instead_of_dropping ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.20s
+
+     Running tests/sync_payload_ring.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/sync_payload_ring-6bb0146d0c8142bd)
+
+running 4 tests
+test rows_are_kept_while_the_ring_cannot_be_opened ... ok
+test ring_payloads_survive_a_reopen ... ok
+test column_pad_migration_keeps_the_ring_version ... ok
+test bridged_payloads_do_not_grow_the_vocabulary ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+
+     Running tests/sync_wal_full_fold.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/sync_wal_full_fold-780c188e69671aac)
+
+running 5 tests
+test crowded_writers_drop_nothing has been running for over 60 seconds
+test many_writers_drop_few_records has been running for over 60 seconds
+test reclaim_does_not_stall_while_the_wal_is_full has been running for over 60 seconds
+test reclaiming_writer_drops_few_records has been running for over 60 seconds
+test sync_db_folds_when_the_wal_is_full has been running for over 60 seconds
+test reclaiming_writer_drops_few_records ... ok
+test crowded_writers_drop_nothing ... ok
+test reclaim_does_not_stall_while_the_wal_is_full ... ok
+test many_writers_drop_few_records ... ok
+test sync_db_folds_when_the_wal_is_full ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 386.78s
+
+     Running tests/table_api.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/table_api-4bfa4adec3c40e0d)
+
+running 24 tests
+test define_himo_in_unknown_table_errors ... ok
+test define_ref_in_unknown_target_errors ... ok
+test entity_in_unknown_table_errors ... ok
+test anonymous_open_skips_eid_range_validation ... ok
+test define_table_creates_separate_eid_range ... ok
+test define_himo_in_rejects_dot_in_name ... ok
+test entity_in_range_exhausted_errors ... ok
+test anonymous_keeps_open_until_first_define_table ... ok
+test duplicate_table_name_errors ... ok
+test anonymous_closed_validates_eid_range ... ok
+test entity_after_define_table_panics ... ok
+test define_himo_in_namespaces_full_name ... ok
+test define_ref_in_creates_fk_link ... ok
+test define_himo_in_separates_two_tables ... ok
+test entity_in_allocates_within_range ... ok
+test entity_in_continues_after_reopen ... ok
+test ref_without_fk_link_skips_validation ... ok
+test legacy_api_works_without_define_table ... ok
+test positions_isolated_per_table ... ok
+test two_tables_have_disjoint_eid_ranges ... ok
+test tie_out_of_table_range_panics ... ok
+test ref_tie_out_of_range_panics ... ok
+test legacy_v4_db_opens_as_anonymous_only ... ok
+test tables_persist_across_reopen ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/touched.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/touched-1c375af6787233cc)
+
+running 5 tests
+test touched_rejects_conditions_it_cannot_watch ... ok
+test touched_negative_control_app_ignoring_touched_drifts - should panic ... ok
+test touched_keeps_the_app_view_under_concurrent_writes ... ok
+test touched_keeps_the_app_view_with_dense_company_lists ... ok
+test touched_keeps_the_app_view_with_sparse_company_lists ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.16s
+
+     Running tests/v10_crash_consistency.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v10_crash_consistency-74ad89775a1212b9)
+
+running 2 tests
+test crash_writer_child ... ok
+test sigkill_mid_write_keeps_everything_that_was_flushed ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+
+     Running tests/v10_cross_process_readonly.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v10_cross_process_readonly-7e85437709e55465)
+
+running 2 tests
+test readonly_probe_child ... ok
+test another_process_opens_dir_db_readonly_while_writer_holds_lock ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/v10_fd_budget.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v10_fd_budget-7636d093ba52cdc2)
+
+running 2 tests
+test fd_limited_child ... ok
+test himo_200_db_works_under_tight_fd_limits ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.34s
+
+     Running tests/v10_lazy_himo_open.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v10_lazy_himo_open-74914971b1309dfd)
+
+running 3 tests
+test manifest_keeps_untouched_himo_entries ... ok
+test missing_or_short_himo_segment_still_fails_open ... ok
+test untouched_himo_segments_are_not_opened ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+     Running tests/v10_legacy_open_is_read_only.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v10_legacy_open_is_read_only-189ce551a977bf09)
+
+running 1 test
+test opening_a_single_file_db_rejects_without_touching_it ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.34s
+
+     Running tests/v10_probe_db_state.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v10_probe_db_state-e73047d10a218389)
+
+running 1 test
+test probe_tells_missing_ready_incomplete_damaged_and_legacy_apart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/v10_segment_damage_matrix.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v10_segment_damage_matrix-c8e8f091cbc51d76)
+
+running 2 tests
+test damage_child ... ok
+test damage_never_crashes_and_sealed_dbs_always_report ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+
+     Running tests/v8_to_v9_auto_migration.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/v8_to_v9_auto_migration-7b3e0414fd519fd8)
+
+running 3 tests
+test plain_db_is_not_migrated_on_open ... ok
+test enable_sync_tables_grows_version_columns_immediately ... ok
+test sync_db_missing_the_flag_is_repaired_on_writer_open ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/verify_invariants.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/verify_invariants-6d8a932a7d9f855f)
+
+running 4 tests
+test an_interrupted_delete_is_a_violation ... ok
+test duplicate_names_in_a_table_are_a_warning_for_now ... ok
+test a_normally_used_db_has_no_violations_and_no_warnings ... ok
+test a_hole_covering_a_live_slot_is_a_violation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/wal_full_fold.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/wal_full_fold-1fca50e9b25c1e0c)
+
+running 3 tests
+test record_size_assumptions ... ok
+test uncommitted_tail_with_room_blocks_fold ... ok
+test wal_full_mid_group_folds_after_bridge_drains ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/wal_session_lock.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/wal_session_lock-84177bf3e076a524)
+
+running 1 test
+test writer_engine_holds_the_wal_lock_while_open ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/wal_stale_lap_power_loss.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/wal_stale_lap_power_loss-ef1a354e7e6c04e9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/write_gate.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/write_gate-7f07d1df75d44799)
+
+running 3 tests
+test parallel_writers_extending_one_column_survive_reopen ... ok
+test parallel_writers_while_subscribing_and_building ... ok
+test parallel_writers_on_built_cylinders_while_subscribing ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+
+     Running unittests src/lib.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/enchudb_oplog-395493ddd1861310)
+
+running 82 tests
+test keys::tests::pubkey_fp_is_first_8_bytes ... ok
+test filelock::tests::public_lock_unlock_roundtrip ... ok
+test filelock::tests::exclusive_held_probes_without_keeping_a_lock ... ok
+test filelock::tests::try_lock_does_not_block_and_reports_holder ... ok
+test keys::tests::load_or_create_persists_key ... ok
+test keys::tests::verify_unknown_peer_returns_false ... ok
+test keys::tests::tofu_rejects_changed_pubkey ... ok
+test keys::tests::sign_and_verify_roundtrip ... ok
+test keys::tests::tampered_message_fails_verify ... ok
+test filelock::tests::fallback_lock_excludes_other_fd_and_releases ... ok
+test keys::tests::from_bytes_preserves_identity ... ok
+test oplog::tests::a_wal_too_small_for_two_halves_stays_one_v3_half ... ok
+test oplog::tests::a_record_larger_than_a_half_is_refused ... ok
+test oplog::tests::a_full_wal_remembers_whose_records_were_dropped ... ok
+test oplog::tests::advance_and_reset_checkpoint ... ok
+test oplog::tests::alias_round_trips_and_is_skippable ... ok
+test oplog::tests::a_cursor_in_a_folded_half_reads_the_other_half_from_its_start ... ok
+test oplog::tests::a_torn_closing_commit_is_trimmed_on_open ... ok
+test oplog::tests::append_dead_agrees_with_a_real_append_failure_after_another_fd_filled_it ... ok
+test oplog::tests::a_switch_during_the_write_out_still_folds_the_old_half ... ok
+test oplog::tests::append_many_still_mints_monotonic_hlcs_without_override ... ok
+test oplog::tests::a_reader_does_not_skip_records_added_while_it_reads_the_half_ends ... ok
+test oplog::tests::capacity_at_or_above_4gib_is_rejected ... ok
+test oplog::tests::append_returns_err_when_full_not_panic ... ok
+test oplog::tests::append_many_with_hlcs_uses_the_given_hlcs ... ok
+test oplog::tests::append_many_with_hlcs_rejects_length_mismatch - should panic ... ok
+test oplog::tests::append_at_hlc_uses_the_minted_hlc_verbatim ... ok
+test oplog::tests::append_with_hlc_returns_exactly_what_the_record_carries ... ok
+test oplog::tests::append_waits_again_when_another_writer_takes_the_room ... ok
+test oplog::tests::a_v3_file_becomes_two_halves_at_the_first_fold ... ok
+test oplog::tests::checksum_catches_torn_write ... ok
+test oplog::tests::copies_for_a_fold_stop_at_the_end_of_the_old_half ... ok
+test oplog::tests::commit_fault_injection_fails_only_commits ... ok
+test oplog::tests::a_corrupted_header_field_stops_the_scan ... ok
+test oplog::tests::appends_fail_only_while_both_halves_are_full ... ok
+test oplog::tests::create_and_append ... ok
+test oplog::tests::fold_advances_the_lap_and_stamps_records_with_it ... ok
+test oplog::tests::durable_cut_bounds_the_records_and_sees_dropped_ones ... ok
+test oplog::tests::halves_switch_when_full_and_scans_keep_the_wal_order ... ok
+test oplog::tests::full_wal_returns_error ... ok
+test oplog::tests::data_records_leave_room_for_a_closing_commit ... ok
+test oplog::tests::header_scan_matches_the_record_scan_and_stops_at_a_bad_crc_after_the_checkpoint ... ok
+test oplog::tests::a_hole_in_the_old_half_drops_the_new_half_on_open ... ok
+test oplog::tests::copies_of_written_records_stop_at_the_limit ... ok
+test oplog::tests::pending_writes_balanced_on_append_panic ... ok
+test oplog::tests::holder_appends_requests_left_in_slots ... ok
+test oplog::tests::hlc_monotonic ... ok
+test oplog::tests::quiet_since_ignores_commits_and_relays_but_not_own_data ... ok
+test oplog::tests::quiet_without_mark_sees_own_records_of_this_and_earlier_processes ... ok
+test oplog::tests::panic_while_appending_a_request_fails_only_that_request ... ok
+test oplog::tests::quiet_since_does_not_see_a_dropped_record ... ok
+test oplog::tests::recover_committed_only ... ok
+test oplog::tests::multi_process_append_no_offset_collision ... ok
+test oplog::tests::records_of_a_previous_lap_left_in_the_ring_stop_the_scan ... ok
+test oplog::tests::room_freed_before_waiting_is_retried_but_other_failures_are_not ... ok
+test oplog::tests::reopening_with_both_halves_written_replays_the_older_half_first ... ok
+test oplog::tests::concurrent_append ... ok
+test oplog::tests::tie_leaf_wire_roundtrip ... ok
+test oplog::tests::concurrent_append_no_offset_collision_or_dup_hlc ... ok
+test oplog::tests::recover_content ... ok
+test oplog::tests::scan_diag_separates_unclosed_group_from_unreadable_cursor ... ok
+test oplog::tests::signature_slot_is_zero ... ok
+test oplog::tests::session_lock_skips_per_record_flock_and_holds_the_file_lock ... ok
+test oplog::tests::session_lock_held_by_a_live_oplog_fails_fast ... ok
+test oplog::tests::v1_file_rejected ... ok
+test oplog::tests::the_header_visit_from_a_durable_cut_crosses_halves ... ok
+test oplog::tests::try_reset_recycles_wal_space ... ok
+test wal_lock::tests::try_lock_takes_a_free_lock_even_with_sleepers ... ok
+test oplog::tests::try_reset_recycles_without_auto_reset_flag ... ok
+test oplog::tests::v2_file_reads_without_lap_marks_and_becomes_v3_at_the_first_fold ... ok
+test oplog::tests::v2_records_are_still_read_and_their_signatures_still_verify ... ok
+test oplog::tests::the_switch_hook_runs_once_per_switch ... ok
+test oplog::tests::ring_buffer_long_run_does_not_exhaust ... ok
+test oplog::tests::wide_tie_values_round_trip ... ok
+test oplog::tests::unknown_skippable_op_is_skipped_but_unknown_critical_op_stops ... ok
+test oplog::tests::session_lock_appends_from_threads_do_not_collide ... ok
+test oplog::tests::slot_index_is_unique_among_live_threads_and_reused ... ok
+test oplog::tests::counted_wall_clock_tracks_the_system_clock ... ok
+test wal_lock::tests::lock_excludes_and_wakes_sleepers ... ok
+test oplog::tests::readers_see_every_record_once_while_writers_switch_halves ... ok
+test oplog::tests::concurrent_hlcs_are_unique ... ok
+test oplog::tests::concurrent_appends_get_back_their_own_record ... ok
+
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests/combine_many_threads.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/combine_many_threads-144bdfe5b01cebe9)
+
+running 1 test
+test more_writers_than_slots_get_back_their_own_record ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+     Running tests/issue268_stale_record.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue268_stale_record-25f25367bc9924e3)
+
+running 1 test
+test scan_never_reads_the_previous_cycle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.13s
+
+     Running tests/truncated_oplog.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/truncated_oplog-8115e1d6a8e56046)
+
+running 5 tests
+test tiny_truncated_oplog_open_is_invalid_data ... ok
+test reopen_intact_oplog_is_ok ... ok
+test truncated_oplog_open_is_invalid_data ... ok
+test corrupt_head_beyond_capacity_is_invalid_data ... ok
+test corrupt_checkpoint_below_header_is_invalid_data ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/enchudb_schema-9e1642e2743caf2f)
+
+running 20 tests
+test tests::bindings_extract_himo_id_and_engine_direct_write ... ok
+test tests::concurrent_upsert_same_pk_does_not_duplicate ... ok
+test tests::delete_and_update ... ok
+test tests::handles_borrow_the_table_without_counting ... ok
+test tests::leaf_does_not_dedupe ... ok
+test tests::leaf_column_basic_write_read ... ok
+test tests::enable_sync_creates_reserved_tables ... ok
+test tests::schema_persists_across_reopen ... ok
+test tests::create_table_and_insert ... ok
+test tests::finish_with_wal_transitions_to_concurrent ... ok
+test tests::open_readonly_coexists_with_writer ... ok
+test tests::open_with_wal_recovers_writes ... ok
+test tests::leaf_column_persists_across_reopen ... ok
+test tests::create_growable_with_capacity_apparent_size_scales_down ... ok
+test tests::user_table_starting_with_underscore_rejected ... ok
+test tests::relation_ref_query ... ok
+test tests::tag_dedupes_but_leaf_does_not_in_same_db ... ok
+test tests::upsert_replaces_pk_row ... ok
+test tests::where_eq_and_chain ... ok
+test tests::arena_chains_match_a_model ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+
+     Running tests/aggregations_min_max_histogram.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/aggregations_min_max_histogram-6ca3b1c7107070e0)
+
+running 5 tests
+test table_histogram_basic ... ok
+test table_group_min_max_basic ... ok
+test table_histogram_edge_cases ... ok
+test table_min_max_basic ... ok
+test table_min_max_consistency_with_sum ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/ball_history.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/ball_history-d11c496ac7403288)
+
+running 8 tests
+test leaf_columns_cannot_be_balls ... ok
+test deletes_close_faces_at_their_wal_time ... ok
+test raised_times_move_the_wal_clock ... ok
+test as_of_answers_match_a_log_of_schema_writes ... ok
+test concurrent_writers_with_wal_hlc_times_and_many_removes ... ok
+test concurrent_writers_leave_history_in_the_ledgers ... ok
+test concurrent_writers_with_wal_hlc_times ... ok
+test concurrent_writers_on_wide_values ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.89s
+
+     Running tests/ball_lazy.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/ball_lazy-7acdd4e82ec46d01)
+
+running 11 tests
+test keep_replay ... ignored
+test writers_go_on_when_a_build_panics_while_publishing ... ok
+test a_build_from_an_empty_wal_rereads_when_it_folds ... ok
+test a_build_reads_on_while_the_wal_folds ... ok
+test a_build_reads_on_across_wal_halves ... ok
+test the_first_read_builds_while_writers_write ... ok
+test a_build_drops_what_it_already_applied_from_the_side_notes ... ok
+test a_build_continues_the_wal_where_it_stopped ... ok
+test a_build_reads_what_the_log_dropped_from_the_side_notes ... ok
+test a_build_reads_holding_the_copy_lock_after_three_refolds ... ok
+test a_build_does_not_continue_from_the_head_after_a_fold ... ok
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.46s
+
+     Running tests/ball_reopen.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/ball_reopen-a9bb61a6d4c02d55)
+
+running 6 tests
+test local_only_tables_keep_no_base ... ok
+test writes_that_never_reached_the_log_move_the_horizon_to_now ... ok
+test a_base_the_log_no_longer_covers_starts_over ... ok
+test reopen_reads_the_history_before_close ... ok
+test bases_follow_the_log_in_sessions_without_a_declaration ... ok
+test reopen_after_the_log_dropped_records ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+
+     Running tests/bigint.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/bigint-5c84858d4871fc02)
+
+running 5 tests
+test bigint_keys_aggregates_and_rejections ... ok
+test bigint_live_aggregates_match_oracle ... ok
+test bigint_survives_reopen ... ok
+test bigint_subscriptions_match_oracle ... ok
+test bigint_values_and_queries_match_oracle ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+     Running tests/cold_open_coalesce.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/cold_open_coalesce-13e7abd952acc051)
+
+running 3 tests
+test schema_persists_via_drop_safety_net ... ok
+test schema_persists_via_finish_with_oplog ... ok
+test declare_phase_does_not_scale_linearly_with_table_count ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/cursors_poll_since.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/cursors_poll_since-8ea389333339f308)
+
+running 10 tests
+test child_entry ... ok
+test cursors_round_trip_and_survive_a_reopen ... ok
+test top_k_and_group_polls_are_in_the_record ... ok
+test versions_dropped_from_the_record_are_truncated ... ok
+test poll_since_composes_the_moves_since_a_version ... ok
+test subscriptions_start_recording_at_the_first_poll_since ... ok
+test a_cursor_written_after_the_rows_is_replayed_with_them ... ok
+test counts_poll_since_reports_the_groups_that_moved ... ok
+test declared_answers_record_from_the_declaration ... ok
+test versions_from_a_previous_open_are_truncated ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests/declared_answers.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/declared_answers-a2f9c5d5bf44229a)
+
+running 5 tests
+test child_entry ... ok
+test same_shape_is_the_same_subscription_different_shape_replaces_and_drop_removes ... ok
+test readonly_open_can_take_declared_answers ... ok
+test rows_replayed_from_the_wal_reach_the_declared_answer ... ok
+test declarations_survive_reopen_and_first_poll_seeds ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+     Running tests/eid_capacity.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/eid_capacity-3c1d9fbedba0bbd3)
+
+running 1 test
+test the_builder_can_ask_how_much_eid_space_is_left ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/engine_built_db_open.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/engine_built_db_open-51232e2ce76385d4)
+
+running 2 tests
+test database_create_and_open_writes_schema_sidecar ... ok
+test database_open_works_on_engine_built_db_without_schema_marker ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/group_cardinality.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/group_cardinality-e89fb099a94170bc)
+
+running 6 tests
+test group_sum_correct_with_cardinality_hint ... ok
+test cardinality_before_any_column_is_noop ... ok
+test cardinality_hint_survives_reopen ... ok
+test group_sum_identical_with_and_without_hint ... ok
+test group_values_beyond_hint_are_kept ... ok
+test zero_sum_groups_are_returned ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+     Running tests/insert_allocs.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/insert_allocs-ec2e744df3cfebc4)
+
+running 1 test
+test inserting_a_named_row_allocates_little ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/issue109_create_growable_with_leaf.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue109_create_growable_with_leaf-966b66f9894d54bb)
+
+running 2 tests
+test create_growable_with_leaf_rejects_over_scale_cap ... ok
+test create_growable_with_leaf_round_trips_above_default ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/issue116_queue_cap.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue116_queue_cap-f0969bec43fbe11a)
+
+running 4 tests
+test queue_cap_knob_without_oplog ... ok
+test queue_cap_knob_is_accepted_and_ignored ... ok
+test open_side_queue_cap_knob ... ok
+test no_write_queue_in_any_mode ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/issue117_raw_define_reopen.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue117_raw_define_reopen-ac27bed4d94ba6f2)
+
+running 2 tests
+test face1_table_definition_survives_reopen ... ok
+test face2_reopen_does_not_reissue_live_eids ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/issue118_max_himos.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue118_max_himos-479993ba9a8cf4ab)
+
+running 2 tests
+test default_max_himos_stays_conservative ... ok
+test create_growable_with_exposes_max_himos ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/issue119_step0_owned_text_read.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue119_step0_owned_text_read-a1be9b0b2e78590e)
+
+running 1 test
+test schema_text_read_survives_concurrent_rewrite ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.53s
+
+     Running tests/issue12_where_in_standalone.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue12_where_in_standalone-3ccd02efcaaf0fe9)
+
+running 3 tests
+test where_in_combined_with_eq_still_intersects ... ok
+test where_in_returns_same_eids_as_where_ref ... ok
+test where_in_standalone_seeds_candidates ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/issue135_concurrent_retie.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue135_concurrent_retie-e2fdb40d3f027648)
+
+running 1 test
+test concurrent_retie_of_one_cell_keeps_every_cell ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+
+     Running tests/issue184_ref_read_prefix.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue184_ref_read_prefix-30b810562b5963c0)
+
+running 2 tests
+test ref_roundtrip_preserves_peer_prefix ... ok
+test ref_roundtrip_unchanged_for_peer_zero ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/issue206_row_boundary.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue206_row_boundary-b9a0555eabd93c95)
+
+running 1 test
+test get_many_never_sees_half_of_a_commit ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.03s
+
+     Running tests/issue21_table_recent.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue21_table_recent-3e03b52d7edacde4)
+
+running 2 tests
+test recent_uses_the_primary_key_as_the_representative_column ... ok
+test recent_is_all_find_reversed_and_survives_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/issue259_rw_open_no_sidecar_rewrite.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue259_rw_open_no_sidecar_rewrite-0891909532cb3c7c)
+
+running 1 test
+test rw_open_with_relations_does_not_rewrite_tables_sidecar ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/issue261_drop_skips_unchanged_sidecar.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue261_drop_skips_unchanged_sidecar-80df1e673aec48b7)
+
+running 3 tests
+test write_zero_rw_session_does_not_rewrite_sidecars ... ok
+test row_insert_still_rewrites_tables_sidecar ... ok
+test schema_change_still_rewrites_schema_sidecar ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/issue316_write_rejected.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue316_write_rejected-a9e993eac16aaeb1)
+
+running 3 tests
+test refused_growth_is_an_error ... ok
+test refused_column_growth_is_an_error ... ok
+test tags_are_written_when_free_space_is_small ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/issue317_concurrent_flush.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue317_concurrent_flush-1aa7839d456f6d9d)
+
+running 1 test
+test syncing_while_writing_does_not_reject ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.08s
+
+     Running tests/issue317_sparse_pages.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue317_sparse_pages-b07fa4a855020f43)
+
+running 1 test
+test new_index_pages_are_counted ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/issue317_unflushed_space.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue317_unflushed_space-0980efb4fc742e5b)
+
+running 1 test
+test stops_before_the_space_it_was_given ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s
+
+     Running tests/issue327_rebuild_space.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue327_rebuild_space-b82e0c6ed23e681a)
+
+running 1 test
+test rebuild_checks_space_before_writing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/issue355_grow_entity_cap_columns.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue355_grow_entity_cap_columns-97c13e2a01ae0cec)
+
+running 2 tests
+test rows_past_the_grown_cap_are_written ... ok
+test grown_cap_covers_version_and_tombstone_columns_across_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests/issue358_tag_index_heap.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue358_tag_index_heap-3fda089cf75f242e)
+
+running 1 test
+test tag_index_heap_does_not_scale_with_table_count ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.31s
+
+     Running tests/issue381_vocab_reclaim.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue381_vocab_reclaim-ebecefff43e18e85)
+
+running 4 tests
+test enabling_on_an_existing_db_takes_effect_on_reopen ... ok
+test subscription_on_a_text_survives_reuse ... ok
+test negated_subscription_rereads_a_reused_text ... ok
+test rolling_unique_ids_stay_within_the_vocab_budget ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/issue388_wal_backpressure.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue388_wal_backpressure-95075d4338e9c442)
+
+running 4 tests
+test writers_do_not_stall_when_the_wal_cannot_be_folded ... ok
+test a_record_larger_than_the_headroom_is_not_dropped ... ok
+test large_rows_wait_instead_of_dropping ... ok
+test single_writer_insert_delete_never_drops_wal_records ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.06s
+
+     Running tests/issue47_entity_in_reissue.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue47_entity_in_reissue-9fbfa065720efe33)
+
+running 2 tests
+test minimal_no_reopen ... ok
+test with_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/issue50_build_idempotent.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue50_build_idempotent-30e762224322d27f)
+
+running 2 tests
+test build_twice_in_same_process_is_idempotent ... ok
+test build_recovers_from_already_exists_on_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/issue52_fail_readable.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue52_fail_readable-1f4d386474fd7889)
+
+running 2 tests
+test open_self_heals_stale_schema_tmp ... ok
+test open_recovers_from_corrupt_schema_sidecar ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/issue548_no_nameless_rows.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue548_no_nameless_rows-4c4370295c6d2368)
+
+running 2 tests
+test a_row_without_its_name_is_not_made ... ok
+test the_name_is_written_first ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/issue551_leaf_name.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue551_leaf_name-eb84550d3a0a6378)
+
+running 1 test
+test a_leaf_column_cannot_be_the_name ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/issue601_duplicate_names.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue601_duplicate_names-2457c37f7f0e23b2)
+
+running 3 tests
+test renaming_into_a_name_another_row_has_is_refused ... ok
+test a_second_row_with_the_same_name_is_refused ... ok
+test concurrent_writers_of_the_same_names_make_one_row_each ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/issue61_name_validation.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue61_name_validation-6ecf95d96cb88e7b)
+
+running 5 tests
+test column_name_with_colon_rejected ... ok
+test column_name_with_semicolon_rejected ... ok
+test table_name_with_pipe_rejected ... ok
+test name_with_arrow_rejected ... ok
+test clean_names_still_build ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/issue73_add_column_paths.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/issue73_add_column_paths-a465ebd3d34f9168)
+
+running 8 tests
+test c_prefixed_column_names_are_rejected ... ok
+test redeclare_superset_in_same_session ... ok
+test conflicting_redeclaration_is_loud ... ok
+test redeclare_superset_auto_migrates_trailing_column ... ok
+test add_column_on_concurrent_oplog_db_works ... ok
+test redeclare_superset_on_concurrent_oplog_db_works ... ok
+test add_column_standalone_still_works ... ok
+test redeclare_with_trailing_ref_column_standalone ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/live_concurrent_composites.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_concurrent_composites-655fd6163d8f82a4)
+
+running 1 test
+test composite_subscriptions_survive_concurrent_writes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+
+     Running tests/live_having.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_having-f1c197e16286deab)
+
+running 1 test
+test count_thresholds_match_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+
+     Running tests/live_join.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_join-7d83eb6f00188440)
+
+running 1 test
+test value_join_subscriptions_match_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.55s
+
+     Running tests/live_join_range.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_join_range-3c65fd1161fbfb06)
+
+running 1 test
+test range_joins_match_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+
+     Running tests/live_lag.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_lag-d4880b705339c047)
+
+running 1 test
+test lag_matches_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/live_members_in.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_members_in-2fd6ab0a5af5501b)
+
+running 1 test
+test members_in_matches_a_scan_of_the_written_values ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/live_members_in_concurrent.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_members_in_concurrent-e1133c7f96f26e56)
+
+running 1 test
+test members_in_under_concurrent_writers_and_a_reader ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/live_multi.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_multi-6075ec2d19ccd414)
+
+running 2 tests
+test tuple_whose_rows_move_together_stays ... ok
+test multi_joins_match_oracle ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests/live_pairs.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_pairs-f9dfebb37d7130c3)
+
+running 1 test
+test pair_joins_match_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests/live_query.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_query-940b3dcce0c102a4)
+
+running 2 tests
+test subscribe_rejects_what_find_silently_empties ... ok
+test subscribe_tracks_find_through_row_operations ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/live_query_path.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_query_path-697a19786b875988)
+
+running 9 tests
+test dotted_column_errors ... ok
+test ref_path_subscriptions_match_hand_followed_oracle ... ok
+test top_k_subscriptions_match_oracle ... ok
+test count_subscriptions_match_oracle ... ok
+test shared_shape_subscriptions_match_oracle ... ok
+test not_subscriptions_match_oracle ... ok
+test range_subscriptions_match_oracle ... ok
+test exists_subscriptions_match_oracle ... ok
+test or_subscriptions_match_oracle ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.95s
+
+     Running tests/live_reach.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_reach-4c1a97833dcc01c2)
+
+running 2 tests
+test resupported_row_reaches_rows_decided_before_it ... ok
+test reachable_matches_oracle ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+     Running tests/live_reborn.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_reborn-8eae61896d65fa19)
+
+running 1 test
+test reborn_rows_leave_and_reenter_pairs_and_tuples ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/live_under.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/live_under-11ed1c3579467f9d)
+
+running 2 tests
+test big_batches_past_first_page ... ok
+test under_matches_oracle ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s
+
+     Running tests/local_only_table.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/local_only_table-9461cab7d57cacbd)
+
+running 2 tests
+test local_only_table_is_not_bridged_to_peers ... ok
+test local_only_table_round_trips_through_the_schema_layer ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/marks_decl.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/marks_decl-cd82d199ecdfcedc)
+
+running 1 test
+test marks_are_declared_persisted_and_dropped ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/order_decl.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/order_decl-e793a18ae0a47e75)
+
+running 4 tests
+test order_validation_errors ... ok
+test bigint_key_with_negative_ticks ... ok
+test order_is_declared_at_build_and_used_by_queries ... ok
+test declarations_survive_reopen_and_follow_redeclaration ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+
+     Running tests/probe18.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/probe18-428a56b7ed2eefb6)
+
+running 1 test
+test probe18 ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/query_aggregations.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/query_aggregations-8e769cf42b824cc5)
+
+running 6 tests
+test query_unknown_col_returns_err ... ok
+test query_histogram ... ok
+test query_scalar_aggregations ... ok
+test query_empty_sub_set ... ok
+test query_with_range_filter ... ok
+test query_group_aggregations ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/query_count_matches_find.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/query_count_matches_find-7d00ebf6be703146)
+
+running 1 test
+test count_matches_find_and_mirror ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/query_index_paths.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/query_index_paths-6ee5ec6cfa953808)
+
+running 4 tests
+test index_paths_keep_errors ... ok
+test order_by_a_column_without_order_is_an_error ... ok
+test wide_range_find_scans_the_column ... ok
+test index_paths_match_mirror ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/row_builder_columns.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/row_builder_columns-5f98d7e535e68cf6)
+
+running 4 tests
+test unknown_column_in_update_stops_there ... ok
+test setting_a_column_twice_keeps_the_last_value ... ok
+test column_names_are_case_insensitive ... ok
+test unknown_column_in_insert_writes_nothing ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/same_row_writers_wal.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/same_row_writers_wal-cff3cf7d54080431)
+
+running 1 test
+test eight_writers_on_one_row_keep_rows_whole_and_end_on_the_last_wal_record ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/scope.rs (/private/tmp/claude-501/-Users-kubo-Desktop-mutafika-enchudb/77e3aeaf-161f-46e4-b8a5-21b7fdab094f/scratchpad/tgt-ball/debug/deps/scope-a1813506d36a04c0)
+
+running 6 tests
+test list_tables_isolation_and_prefix_stripping ... ok
+test as_scope_sees_all_tables_unprefixed ... ok
+test interleaved_build_and_read_via_scope ... ok
+test build_via_scope_mut_round_trip ... ok
+test invariant_holds_across_topologies ... ok
+test realistic_multi_tenant_scenario ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+   Doc-tests enchudb_engine
+
+running 8 tests
+test crates/enchudb-engine/src/engine.rs - engine::Engine::probe (line 6937) ... ignored
+test crates/enchudb-engine/src/engine.rs - engine::Engine::subscribe (line 18783) ... ignored
+test crates/enchudb-engine/src/engine.rs - engine::GrowableOptions (line 4405) ... ignored
+test crates/enchudb-engine/src/transport.rs - transport::Transport::pull_as_multi_link_author (line 550) ... ignored
+test crates/enchudb-engine/src/acl.rs - acl (line 28) ... ok
+test crates/enchudb-engine/src/blob_store.rs - blob_store (line 24) ... ok
+test crates/enchudb-engine/src/lib.rs - (line 3) ... ok
+test crates/enchudb-engine/src/changefeed.rs - changefeed (line 58) ... ok
+
+test result: ok. 4 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 1 test
+test crates/enchudb-engine/src/engine.rs - engine::DbState (line 4071) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.69s; merged doctests compilation took 0.22s
+   Doc-tests enchudb_oplog
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests enchudb_schema
+
+running 28 tests
+test crates/enchudb-schema/src/lib.rs - Database::create_growable_with (line 481) ... ignored
+test crates/enchudb-schema/src/lib.rs - JoinQuery<'a>::subscribe_counts (line 2855) ... ignored
+test crates/enchudb-schema/src/lib.rs - JoinQuery<'a>::then_ref (line 2835) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::above (line 6049) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::answer (line 6682) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::join_eq (line 6081) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::join_range (line 6096) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::join_ref (line 6017) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::lag (line 6115) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::or (line 6295) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::reachable (line 6064) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::subscribe (line 6487) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::subscribe_counts (line 6586) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::subscribe_having (line 6602) ... ignored
+test crates/enchudb-schema/src/lib.rs - (line 43) - compile ... ok
+test crates/enchudb-schema/src/lib.rs - Query<'a>::subscribe_having_sum (line 6623) ... ignored
+test crates/enchudb-schema/src/lib.rs - (line 9) - compile ... ok
+test crates/enchudb-schema/src/lib.rs - Query<'a>::subscribe_sums (line 6635) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::subscribe_touched (line 6559) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::under (line 6033) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::where_count_ge (line 6136) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::where_exists (line 5936) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::where_exists_eq (line 5968) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::where_exists_eq (line 5983) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::where_sum_ge (line 6203) ... ignored
+test crates/enchudb-schema/src/lib.rs - Query<'a>::where_value_count_ge (line 6168) ... ignored
+test crates/enchudb-schema/src/lib.rs - TableBuilder<'a>::marks (line 1615) ... ignored
+test crates/enchudb-schema/src/lib.rs - TableBuilder<'a>::order (line 1591) ... ignored
+
+test result: ok. 2 passed; 0 failed; 26 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.49s; merged doctests compilation took 0.18s
