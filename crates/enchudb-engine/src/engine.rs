@@ -94,6 +94,10 @@ pub struct BallRebuildStats {
     pub held_reads: u64,
     /// `change_emit` を持った長さの最大 (ns、 持って組を取ってから記録と WAL を読んで確かめ終えるまで。 19 回目、 持つ回の書き手の値段を見る)。
     pub held_max_ns: u64,
+    /// 持った長さが最大だった回の内訳 (ns、 20 回目): 持ってから組を取り終えるまで / 記録を読む / WAL を読む (読んで確かめ終えるまで)。
+    pub held_parts_ns: [u64; 3],
+    /// その回に読んだ記録の entry の数 / WAL の record の数。
+    pub held_parts_n: [u64; 2],
     /// 記録の残りを書き手と並んで読んで当てた時間。
     pub log_ns: u64,
     /// その後に写した分と WAL の残りを当てた時間。
@@ -163,6 +167,9 @@ struct BallReplay<'a> {
     held_reads: u64,
     /// [`BallRebuildStats::held_max_ns`]。
     held_max_ns: u64,
+    /// [`BallRebuildStats::held_parts_ns`] / `held_parts_n`。
+    held_parts: [u64; 3],
+    held_n: [u64; 2],
     /// 記録を当てた所まで読まずに飛んだ entry の数。
     skipped: u64,
     /// 読んだ数 (記録の entry と WAL の record、 球の紐に当たらない物も)。 追いつきが縮んだかをこれで見る。
@@ -208,6 +215,17 @@ impl BallReplay<'_> {
     const NONE: u64 = u64::MAX;
     /// 1 回の追いつきで、 change_emit を持たずに読み直してよい回数 (次の回は持って読む)。
     const REFOLDS_BEFORE_HOLD: u64 = 3;
+
+    /// 持った長さの最大と、 その回の内訳を控える (20 回目)。
+    fn note_held(&mut self, held_at: Option<std::time::Instant>, parts: [u64; 3], n: [u64; 2]) {
+        let Some(h) = held_at else { return };
+        let ns = h.elapsed().as_nanos() as u64;
+        if ns > self.held_max_ns {
+            self.held_max_ns = ns;
+            self.held_parts = parts;
+            self.held_n = n;
+        }
+    }
 
     /// record 1 件 (HLC の順)。 `limit` があれば HLC がそれ以上の record は当てない (書き手が球に書く)。
     fn op(&mut self, hlc: enchudb_oplog::Hlc, op: &enchudb_oplog::oplog::DecodedOp, author: u32, limit: Option<enchudb_oplog::Hlc>) {
@@ -335,6 +353,7 @@ impl BallReplay<'_> {
         loop {
             tries += 1;
             let (pos0, last0) = (*pos, self.last);
+            let log_n0 = self.prof_n[0];
             // 試験の口: 各回の最初だけ、 WAL の続きを読む回なら、 写す側が読み終えた所より先まで写すまで (最大 aw µs) 待ってから組を取る
             // (18 回目: 決まった時間だけ止まる形 (追いつきの前に 150 ms) は、 8 本並べて 24 本中 7 本が前提を踏まなかった)
             let aw = self.eng.ball_publish_pause[7].load(std::sync::atomic::Ordering::Relaxed);
@@ -449,6 +468,12 @@ impl BallReplay<'_> {
                 }
             });
             self.parts = [(t2 - t1).as_nanos() as u64, (t1 - t0).as_nanos() as u64, t2.elapsed().as_nanos() as u64];
+            // 20 回目: 持つ回の内訳 (持ってから組を取り終えるまで / 記録を読む / WAL を読む) と読んだ数 (記録の entry / WAL の record)
+            let held_parts = held_at.map_or([0; 3], |h| {
+                let ns = |d: std::time::Duration| d.as_nanos() as u64;
+                [ns(t1.saturating_duration_since(h)), ns(t2.saturating_duration_since(t1.max(h))), ns(t2.max(h).elapsed())]
+            });
+            let held_n = [self.prof_n[0] - log_n0, seen];
             self.prof[2] += (t1 - t0).as_nanos() as u64;
             self.prof[3] += t2.elapsed().as_nanos() as u64;
             self.prof_n[1] += seen;
@@ -488,14 +513,14 @@ impl BallReplay<'_> {
                 self.head_refolds += u64::from(first == 0 && start_gone);
                 self.refold_run_max = self.refold_run_max.max(tries);
                 drop(emit);
-                self.held_max_ns = self.held_max_ns.max(held_at.map_or(0, |t| t.elapsed().as_nanos() as u64));
+                self.note_held(held_at, held_parts, held_n);
                 std::thread::yield_now();
                 continue;
             }
             // 当てるのは lock の外 (読んだ分は区画を確かめてある)
             let held = emit.is_some();
             drop(emit);
-            self.held_max_ns = self.held_max_ns.max(held_at.map_or(0, |t| t.elapsed().as_nanos() as u64));
+            self.note_held(held_at, held_parts, held_n);
             let rec1 = self.records;
             let t3 = std::time::Instant::now();
             // 組んでいる球は自分しか触らない: pin は 1024 件ごとに 1 回
@@ -19114,6 +19139,8 @@ impl Engine {
             refold_run_max: 0,
             held_reads: 0,
             held_max_ns: 0,
+            held_parts: [0; 3],
+            held_n: [0; 2],
             prof: [0; 7],
             prof_n: [0; 4],
             skipped: 0,
@@ -19211,6 +19238,8 @@ impl Engine {
             refold_run_max: rp.refold_run_max,
             held_reads: rp.held_reads,
             held_max_ns: rp.held_max_ns,
+            held_parts_ns: rp.held_parts,
+            held_parts_n: rp.held_n,
             log_ns,
             catch_ns,
             publish_ns,
