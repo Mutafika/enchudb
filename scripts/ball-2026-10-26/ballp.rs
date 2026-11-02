@@ -11,6 +11,7 @@
 //! l <記録 MiB> <書き込み数> <seed>: (12 回目、 14 回目に BALL_LISTEN=1 で何もしない listener を付ける形) 開き直した後、 書き手 1 本が書き続ける中で最初の読みが球を組む。 書き込み 1 回ごとの
 //!    時間を取り、 組む間 / 外の最大・p99 と、 組んだ時の段ごとの時間 (`ball_rebuild_stats`: 公開中の間 = 書き手が待ちうる間) を出す (P1)
 //!    19 回目: `BALL_REFOLD_WAIT=<µs>,<回>` で組みの最初の <回> 回の読みを読み直しにする (3 なら 4 回目が change_emit を持って読む)。
+//!    20 回目: `BALL_TRACE=1` で組み直しの各回の記録 (`ball_rebuild_trace`) を stderr に出す。
 //! 出力: 1 行 1 JSON (stdout)。
 
 use enchudb::schema::Database;
@@ -320,6 +321,12 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
         return;
     }
     let st = eng.ball_rebuild_stats().expect("組んだ");
+    // 20 回目: BALL_TRACE=1 で組み直しの各回の記録を stderr に出す
+    if std::env::var_os("BALL_TRACE").is_some() {
+        for l in eng.ball_rebuild_trace() {
+            eprintln!("trace {l}");
+        }
+    }
     // 答え合わせ: 今のデッキ
     let now = eng.ball_now();
     for v in 0..100u64 {
