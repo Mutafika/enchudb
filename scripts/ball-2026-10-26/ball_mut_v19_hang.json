@@ -1,0 +1,8 @@
+[
+ {
+  "name": "同じ周の WAL の続きでなく写した所から読む",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "                    self.ahead += u64::from(log_wal > off);\n                    off\n",
+  "replace": "                    self.ahead += u64::from(log_wal > off);\n                    log_wal\n"
+ }
+]
