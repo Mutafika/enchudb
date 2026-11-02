@@ -1,0 +1,4 @@
+baseline: pass 1 秒 → 1 run の上限 300 秒
+  killed 3s              満杯の WAL の孤児 group を畳んでよいとしない (brick に戻す)
+  killed 3s              wal_fold_safe が常に false (commit 後も畳めない)
+killed 2 / survived 0 / その他 0
