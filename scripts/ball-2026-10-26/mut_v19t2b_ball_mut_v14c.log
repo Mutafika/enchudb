@@ -1,0 +1,5 @@
+baseline: pass 40 秒 → 1 run の上限 1200 秒
+  killed 29s             記録と WAL の重なりを落とさない (1)
+  killed 27s             記録と WAL の重なりを落とさない (2)
+  killed 32s             記録と WAL の重なりを落とさない (3)
+killed 3 / survived 0 / その他 0

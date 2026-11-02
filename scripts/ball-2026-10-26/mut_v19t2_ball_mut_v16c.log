@@ -1,0 +1,4 @@
+baseline: pass 52 秒 → 1 run の上限 1200 秒
+  killed 61s             記録の読みで crc の合わない entry も返す (16 回目、 lock の外の crc)
+  killed 57s             lock の外の crc を見ない (16 回目)
+killed 2 / survived 0 / その他 0
