@@ -8397,12 +8397,19 @@ impl Engine {
     }
 
     /// #268: 「head は先にあるのに bridge が空を返し続けている」 を 1 episode 1 行だけ
-    /// 警告する。 転送が 1 件でも成立すればラッチが降りて、 次の episode でまた出る。
+    /// 警告する。 転送が 1 件でも成立するか、 追いついた (head ≤ cursor) 読みでラッチが降りて、
+    /// 次の episode でまた出る。
     ///
     /// host が観測値を配線していなくても、 次に踏んだときに**無音にならない**ことが目的。
     /// 閾値の意味: head は record 本体を書く前に bump されるので、 書き込み途中の batch を
     /// 見ている間は head > cursor かつ空 scan が正常。 consumer thread の fsync 周期
     /// (100 ms) で commit が付くので、 それを十分に跨ぐ長さにしてある。
+    ///
+    /// episode は head が先にある読みから始まる (#694)。 前は静かな読み (運ぶ物が無いだけ) でも
+    /// 始まって転送が成立するまで続いたので、 30 秒を越える暇な時間の後、 最初の書き込みを Commit の
+    /// 前に読んだ瞬間 / 書かない peer を閉じる時の Commit で、 止まっていないのに鳴った。
+    /// `empties` (公開の `bridge_empty_scans`) は doc の通り静かな読みも数えるので、 閾値の回数は
+    /// 暇な時間の分も含む。 止まりの長さは since (head が先にある読みが続いた時間) で見る。
     fn warn_if_bridge_stalled(
         &self,
         from: u64,
@@ -8413,12 +8420,18 @@ impl Engine {
         stop: enchudb_oplog::oplog::ScanStop,
     ) {
         use std::sync::atomic::Ordering;
+        if head <= from {
+            // 追いついている = 止まっていない。 episode を閉じる (#694)
+            self.bridge_stall_since_ms.store(0, Ordering::Relaxed);
+            self.bridge_stall_warned.store(false, Ordering::Relaxed);
+            return;
+        }
         let now = Self::unix_millis();
-        // episode の開始時刻を 1 回だけ刻む (0 = 未開始)。 転送が成立すると 0 に戻る。
+        // episode の開始時刻を 1 回だけ刻む (0 = 未開始)。 転送が成立する / 追いつくと 0 に戻る。
         let _ = self.bridge_stall_since_ms.compare_exchange(
             0, now, Ordering::Relaxed, Ordering::Relaxed,
         );
-        if head <= from || empties < BRIDGE_STALL_WARN_AFTER {
+        if empties < BRIDGE_STALL_WARN_AFTER {
             return;
         }
         let since = self.bridge_stall_since_ms.load(Ordering::Relaxed);
@@ -23362,6 +23375,54 @@ mod tests {
         backdate(&eng);
         warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER);
         assert!(eng.bridge_stall_warned.load(Ordering::Relaxed), "次の episode で鳴り直さない");
+
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// #694: 追いついた読み (head ≤ cursor) で episode が閉じる。 前は静かな読み (運ぶ物が無いだけ) でも
+    /// episode が始まって転送が成立するまで続いたので、 30 秒を越える暇な時間の後、 最初に head が先にある
+    /// 読み (Commit の前の書き込み / 書かない peer を閉じる時の Commit) で、 止まっていないのに鳴った
+    /// (実時間の再現: 空の bridge 300 回 → 31 秒待つ → Commit 前の tie を 1 件読ませると鳴った)。
+    /// `backdate` は 「その episode が始まったのは昔」 の代わり (暇な時間を本当に 30 秒待たない)。
+    #[test]
+    fn stall_warning_episode_ends_when_the_bridge_catches_up() {
+        let path = tmp("bridge_stall_idle");
+        let _ = std::fs::remove_dir_all(&path);
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_table("rows", 1_000).unwrap();
+        eng.enable_sync_tables().unwrap();
+        use std::sync::atomic::Ordering;
+        let warn = |eng: &Engine, head: u64, empties: u64| {
+            eng.warn_if_bridge_stalled(
+                4096, head, 4096, empties, 1,
+                enchudb_oplog::oplog::ScanStop::Head,
+            )
+        };
+        let warned = |eng: &Engine| eng.bridge_stall_warned.load(Ordering::Relaxed);
+        let long_ago = Engine::unix_millis() - BRIDGE_STALL_WARN_AFTER_MS * 2;
+        let backdate = |eng: &Engine| eng.bridge_stall_since_ms.store(long_ago, Ordering::Relaxed);
+
+        // 長い暇な時間: 昔に始まった episode の中で、 静かな読みが閾値の何倍も続いた
+        backdate(&eng);
+        warn(&eng, 4096, BRIDGE_STALL_WARN_AFTER * 10);
+        // 暇な時間の後の最初の書き込みを Commit の前に読んだ (head が先、 回数は暇な時間の分で閾値を越えている)
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER * 10 + 1);
+        assert!(!warned(&eng), "暇な時間の後の最初の書き込みで鳴った (静かな読みを止まりに数えている)");
+
+        // head が先にある読みが 30 秒続けば鳴る (本物の止まりは今まで通り拾う)
+        backdate(&eng);
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER * 10 + 2);
+        assert!(warned(&eng), "head が先にある読みが続いているのに鳴らない");
+
+        // 追いついたらラッチが降りる (転送が成立しなくても。 次の止まりでまた鳴る)
+        warn(&eng, 4096, BRIDGE_STALL_WARN_AFTER * 10 + 3);
+        assert!(!warned(&eng), "追いついたのにラッチが降りない (次の止まりで鳴らない)");
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER * 10 + 4);
+        assert!(!warned(&eng), "追いついた後の最初の先行で鳴った (episode が閉じていない)");
+        backdate(&eng);
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER * 10 + 5);
+        assert!(warned(&eng), "追いついた後の次の止まりで鳴り直さない");
 
         drop(eng);
         let _ = std::fs::remove_dir_all(&path);
