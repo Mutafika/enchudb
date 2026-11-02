@@ -10,6 +10,7 @@
 //!    nobase = 宣言してから記録を作る (メモリだけの球、 記録が捨てても何も当てない)。 記録 1 MiB、 WAL 8 MiB
 //! l <記録 MiB> <書き込み数> <seed>: (12 回目、 14 回目に BALL_LISTEN=1 で何もしない listener を付ける形) 開き直した後、 書き手 1 本が書き続ける中で最初の読みが球を組む。 書き込み 1 回ごとの
 //!    時間を取り、 組む間 / 外の最大・p99 と、 組んだ時の段ごとの時間 (`ball_rebuild_stats`: 公開中の間 = 書き手が待ちうる間) を出す (P1)
+//!    19 回目: `BALL_REFOLD_WAIT=<µs>,<回>` で組みの最初の <回> 回の読みを読み直しにする (3 なら 4 回目が change_emit を持って読む)。
 //! 出力: 1 行 1 JSON (stdout)。
 
 use enchudb::schema::Database;
@@ -265,7 +266,14 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
         impl enchudb::changefeed::ChangeListener for Quiet {}
         eng.add_change_listener(std::sync::Arc::new(Quiet));
     }
+    // BALL_REFOLD_WAIT=<µs>,<回> (19 回目): 組みの最初の <回> 回の読みは、 WAL を読んだ後に読み始めた区画が畳まれるまで待つ (読み直しにする)。
+    // <回> = 3 なら 4 回目は待たずに change_emit を持って読む = 持つ回の値段を測る
+    if let Ok(v) = std::env::var("BALL_REFOLD_WAIT") {
+        let (us, n) = v.split_once(',').expect("BALL_REFOLD_WAIT=<µs>,<回>");
+        eng.ball_set_refold_wait(us.parse().unwrap(), n.parse().unwrap());
+    }
     let records = eng.change_log_range().map_or(0, |(f, x)| x - f);
+    let sw0 = eng.wal_switches();
     let stop = std::sync::atomic::AtomicBool::new(false);
     let origin = Instant::now();
     let ((lats, slow), b0, b1) = std::thread::scope(|s| {
@@ -300,11 +308,13 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         (w.join().unwrap(), b0, b1)
     });
+    // 19 回目: 書き手の走った時間と区画を移った回数 (区画が埋まるまでの時間 = w_ns / switches)
+    let (w_ns, switches) = (origin.elapsed().as_nanos() as u64, eng.wal_switches() - sw0);
     if std::env::var_os("BALL_NONE").is_some() {
         let slow: Vec<String> = slow.iter().map(|&(at, ns, d)| format!("[{},{},{},{},{},0]", at, ns, d[0], d[1], d[2])).collect();
         let max = lats.iter().map(|&(_, l)| l).max().unwrap_or(0);
         println!(
-            "{{\"mode\":\"l\",\"none\":1,\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":0,\"publish_ns\":0,\"slow\":[{}],\"out_max_ns\":{max},\"out_n\":{}}}",
+            "{{\"mode\":\"l\",\"none\":1,\"w_ns\":{w_ns},\"switches\":{switches},\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":0,\"publish_ns\":0,\"slow\":[{}],\"out_max_ns\":{max},\"out_n\":{}}}",
             wal_cap() >> 20, slow.join(","), lats.len()
         );
         return;
@@ -330,7 +340,7 @@ fn lazy(log_mib: usize, n: usize, seed: u64, rows: usize) {
     let (ni, p99i, maxi) = stat(&mut inside);
     let (no, p99o, maxo) = stat(&mut outside);
     println!(
-        "{{\"mode\":\"l\",\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":{},\"read_records\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"publish_parts_ns\":{:?},\"rounds\":{},\"prof_ns\":{:?},\"prof_n\":{:?},\"setup_ns\":{:?},\"log_prof_ns\":{:?},\"log_prof_n\":{:?},\"skipped\":{},\"prequiesce_ns\":{},\"refolds\":{},\"refold_run_max\":{},\"held_reads\":{},\"log_lock_ns\":{:?},\"applied\":{},\"replays\":{},\"slow\":[{}],\"in_n\":{ni},\"in_p99_ns\":{p99i},\"in_max_ns\":{maxi},\"out_n\":{no},\"out_p99_ns\":{p99o},\"out_max_ns\":{maxo}}}",
-        wal_cap() >> 20, b1 - b0, st.records, st.side_ops, st.log_ns, st.catch_ns, st.publish_ns, st.publish_parts_ns, st.rounds, st.prof_ns, st.prof_n, st.setup_ns, st.log_prof_ns, st.log_prof_n, st.skipped, st.prequiesce_ns, st.refolds, st.refold_run_max, st.held_reads, st.log_lock_ns, st.applied, st.replays, slow.join(",")
+        "{{\"mode\":\"l\",\"w_ns\":{w_ns},\"switches\":{switches},\"wal_mib\":{},\"log_mib\":{log_mib},\"rows\":{rows},\"writes\":{n},\"seed\":{seed},\"records\":{records},\"build_ns\":{},\"read_records\":{},\"side_ops\":{},\"log_ns\":{},\"catch_ns\":{},\"publish_ns\":{},\"publish_parts_ns\":{:?},\"rounds\":{},\"prof_ns\":{:?},\"prof_n\":{:?},\"setup_ns\":{:?},\"log_prof_ns\":{:?},\"log_prof_n\":{:?},\"skipped\":{},\"prequiesce_ns\":{},\"refolds\":{},\"refold_run_max\":{},\"held_reads\":{},\"held_max_ns\":{},\"log_lock_ns\":{:?},\"applied\":{},\"replays\":{},\"slow\":[{}],\"in_n\":{ni},\"in_p99_ns\":{p99i},\"in_max_ns\":{maxi},\"out_n\":{no},\"out_p99_ns\":{p99o},\"out_max_ns\":{maxo}}}",
+        wal_cap() >> 20, b1 - b0, st.records, st.side_ops, st.log_ns, st.catch_ns, st.publish_ns, st.publish_parts_ns, st.rounds, st.prof_ns, st.prof_n, st.setup_ns, st.log_prof_ns, st.log_prof_n, st.skipped, st.prequiesce_ns, st.refolds, st.refold_run_max, st.held_reads, st.held_max_ns, st.log_lock_ns, st.applied, st.replays, slow.join(",")
     );
 }

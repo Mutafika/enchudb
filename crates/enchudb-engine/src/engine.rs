@@ -92,6 +92,8 @@ pub struct BallRebuildStats {
     pub refold_run_max: u64,
     /// `change_emit` を持って読んだ回数 (読み直しが 3 回続いた後の回)。 持つ間は写しと畳みが止まり、 書き手が今の区画を埋めると空きを待つ。
     pub held_reads: u64,
+    /// `change_emit` を持った長さの最大 (ns、 持って組を取ってから記録と WAL を読んで確かめ終えるまで。 19 回目、 持つ回の書き手の値段を見る)。
+    pub held_max_ns: u64,
     /// 記録の残りを書き手と並んで読んで当てた時間。
     pub log_ns: u64,
     /// その後に写した分と WAL の残りを当てた時間。
@@ -159,6 +161,8 @@ struct BallReplay<'a> {
     refold_run_max: u64,
     /// [`BallRebuildStats::held_reads`]。
     held_reads: u64,
+    /// [`BallRebuildStats::held_max_ns`]。
+    held_max_ns: u64,
     /// 記録を当てた所まで読まずに飛んだ entry の数。
     skipped: u64,
     /// 読んだ数 (記録の entry と WAL の record、 球の紐に当たらない物も)。 追いつきが縮んだかをこれで見る。
@@ -349,6 +353,7 @@ impl BallReplay<'_> {
             // 持たずに読み直し続けると、 #686 / #687 で書き手が 1.6 倍速くなった後の T7 で、 1 回の組みに読み直し 116 回・113 秒)。
             // 持つ間に書き手が今の区画を埋めると、 書き手は空きを待つ
             let mut emit = (tries > Self::REFOLDS_BEFORE_HOLD).then(|| self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()));
+            let mut held_at = emit.as_ref().map(|_| std::time::Instant::now());
             self.held_reads += u64::from(emit.is_some());
             // 組を置き直す前に読み直しが続く時 (畳んだ直後) も、 組は change_emit の下で読む
             let (next, log_wal, folds) = match &emit {
@@ -390,6 +395,7 @@ impl BallReplay<'_> {
                             // 持つ前に読み始める区画が畳まれていたら持たない (この回は読み直し)。 持った後は畳まれない
                             let c = self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner());
                             emit = wal.holds(off).then_some(c);
+                            held_at = emit.as_ref().map(|_| std::time::Instant::now());
                         }
                         while wal_pos_lap(wal.head()) == wal_pos_lap(off) && wal.holds(off) && t.elapsed() < until {
                             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -482,12 +488,14 @@ impl BallReplay<'_> {
                 self.head_refolds += u64::from(first == 0 && start_gone);
                 self.refold_run_max = self.refold_run_max.max(tries);
                 drop(emit);
+                self.held_max_ns = self.held_max_ns.max(held_at.map_or(0, |t| t.elapsed().as_nanos() as u64));
                 std::thread::yield_now();
                 continue;
             }
             // 当てるのは lock の外 (読んだ分は区画を確かめてある)
             let held = emit.is_some();
             drop(emit);
+            self.held_max_ns = self.held_max_ns.max(held_at.map_or(0, |t| t.elapsed().as_nanos() as u64));
             let rec1 = self.records;
             let t3 = std::time::Instant::now();
             // 組んでいる球は自分しか触らない: pin は 1024 件ごとに 1 回
@@ -19105,6 +19113,7 @@ impl Engine {
             head_refolds: 0,
             refold_run_max: 0,
             held_reads: 0,
+            held_max_ns: 0,
             prof: [0; 7],
             prof_n: [0; 4],
             skipped: 0,
@@ -19201,6 +19210,7 @@ impl Engine {
             head_refolds,
             refold_run_max: rp.refold_run_max,
             held_reads: rp.held_reads,
+            held_max_ns: rp.held_max_ns,
             log_ns,
             catch_ns,
             publish_ns,
