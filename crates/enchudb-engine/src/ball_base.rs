@@ -530,6 +530,11 @@ impl BallBases {
         }
     }
 
+    /// 組む間の控えを足している最中か (試験)。
+    pub(crate) fn side_active(&self) -> bool {
+        self.side.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
+
     /// 組み終えた: 控えをやめる。
     pub(crate) fn end_side(&self) {
         *self.side.lock().unwrap_or_else(|p| p.into_inner()) = None;

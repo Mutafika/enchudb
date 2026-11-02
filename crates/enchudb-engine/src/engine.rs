@@ -98,6 +98,8 @@ pub struct BallRebuildStats {
     pub held_parts_ns: [u64; 3],
     /// その回に読んだ記録の entry の数 / WAL の record の数。
     pub held_parts_n: [u64; 2],
+    /// 持つ回に、 記録の先読み (lock の外) の後に写した分として持ってから読んだ entry の数 (20 回目、 試験の前提)。
+    pub held_late: u64,
     /// 記録の残りを書き手と並んで読んで当てた時間。
     pub log_ns: u64,
     /// その後に写した分と WAL の残りを当てた時間。
@@ -170,6 +172,8 @@ struct BallReplay<'a> {
     /// [`BallRebuildStats::held_parts_ns`] / `held_parts_n`。
     held_parts: [u64; 3],
     held_n: [u64; 2],
+    /// [`BallRebuildStats::held_late`]。
+    held_late: u64,
     /// 記録を当てた所まで読まずに飛んだ entry の数。
     skipped: u64,
     /// 読んだ数 (記録の entry と WAL の record、 球の紐に当たらない物も)。 追いつきが縮んだかをこれで見る。
@@ -353,7 +357,6 @@ impl BallReplay<'_> {
         loop {
             tries += 1;
             let (pos0, last0) = (*pos, self.last);
-            let log_n0 = self.prof_n[0];
             // 試験の口: 各回の最初だけ、 WAL の続きを読む回なら、 写す側が読み終えた所より先まで写すまで (最大 aw µs) 待ってから組を取る
             // (18 回目: 決まった時間だけ止まる形 (追いつきの前に 150 ms) は、 8 本並べて 24 本中 7 本が前提を踏まなかった)
             let aw = self.eng.ball_publish_pause[7].load(std::sync::atomic::Ordering::Relaxed);
@@ -366,12 +369,42 @@ impl BallReplay<'_> {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
+            let hold = tries > Self::REFOLDS_BEFORE_HOLD;
+            // 20 回目: 持つ回も、 記録は lock の外で先に読む (持たない回と同じく写す側が置いた組の番号まで。 読む前に捨てられた分は控えから
+            // 当てる)。 持った後に記録から読むのは、 先読みの後に写した分だけ。 P2a (WAL 64 MiB): 持つ長さの 85〜90% が記録を読む時間だった
+            // (記録が区画 1 つより小さいと、 前の回から記録が丸ごと入れ替わり、 持つ回は記録を全部読む)
+            let mut pre_read = false;
+            if hold
+                && !self.wal_mark.is_some_and(|off| wal.holds(off))
+                && let Some((until, _, _)) = self.eng.ball_bases.mark()
+            {
+                if let Ok(p) = log.seek_after(*pos, (self.last.wall, self.last.logical))
+                    && p > *pos
+                {
+                    self.skipped += p - *pos;
+                    *pos = p;
+                    self.eng.ball_bases.prune_side(p);
+                }
+                let rec0 = self.records;
+                self.read_log(log, pos, until, limit);
+                self.trace.push(format!("  先読み 記録 {pos0}→{} (組の番号 {until}) 当てた {} last {}", *pos, self.records - rec0, pk(self.last)));
+                pre_read = true;
+                // 試験の口: 先読みの後、 写す側が先読みの所より先まで写すまで (最大 lw µs) 待つ (持った後に記録から読む分を作る)
+                let lw = self.eng.ball_publish_pause[9].load(std::sync::atomic::Ordering::Relaxed);
+                if lw > 0 {
+                    let t = std::time::Instant::now();
+                    while self.eng.ball_bases.mark().is_none_or(|m| m.0 <= until) && t.elapsed() < std::time::Duration::from_micros(lw) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            let log_n0 = self.prof_n[0];
             let t0 = std::time::Instant::now();
             // 読み直しが続いたら (書き手が区画を埋めて畳まれるのが、 区画を読むより速い)、 この回は change_emit を持ったまま組を取り、
             // 記録と WAL を読んで確かめるまで放さない: 写すのと畳むのはこの lock の下なので、 この回は読む間に畳まれない (18 回目。
             // 持たずに読み直し続けると、 #686 / #687 で書き手が 1.6 倍速くなった後の T7 で、 1 回の組みに読み直し 116 回・113 秒)。
             // 持つ間に書き手が今の区画を埋めると、 書き手は空きを待つ
-            let mut emit = (tries > Self::REFOLDS_BEFORE_HOLD).then(|| self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()));
+            let mut emit = hold.then(|| self.eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()));
             let mut held_at = emit.as_ref().map(|_| std::time::Instant::now());
             self.held_reads += u64::from(emit.is_some());
             // 組を置き直す前に読み直しが続く時 (畳んだ直後) も、 組は change_emit の下で読む
@@ -439,6 +472,9 @@ impl BallReplay<'_> {
                     log_wal
                 }
             };
+            if pre_read && emit.is_some() {
+                self.held_late += self.prof_n[0] - log_n0;
+            }
             let t2 = std::time::Instant::now();
             // 試験の口: 各回の最初だけ、 読み始める所の区画が畳まれるまで (最大 sp µs) 待つ (「頭から」 は畳んだ回で見る)
             let sp = self.eng.ball_publish_pause[2].load(std::sync::atomic::Ordering::Relaxed);
@@ -5665,7 +5701,7 @@ pub struct Engine {
     /// 試験: 公開中を置いた後・H を取る前 / 書き終えを待った後・残りを読む前 / 追いつきで WAL の位置を取った後・WAL を読む前に止まる
     /// 時間 (µs、 公開の約束の場所と、 読む間に畳む場所を広げる)。 [3] 以降は各 setter (`ball_set_mark_pause` / `ball_set_cross_wait` /
     /// `ball_set_refold_wait` の µs と回数 / `ball_set_ahead_wait` / `ball_set_publish_panic`)。
-    ball_publish_pause: [std::sync::atomic::AtomicU64; 9],
+    ball_publish_pause: [std::sync::atomic::AtomicU64; 10],
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -6246,7 +6282,7 @@ impl Engine {
             ball_build_steps: std::sync::atomic::AtomicU64::new(0),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 10],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -7535,7 +7571,7 @@ impl Engine {
             ball_build_steps: std::sync::atomic::AtomicU64::new(0),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 10],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -19141,6 +19177,7 @@ impl Engine {
             held_max_ns: 0,
             held_parts: [0; 3],
             held_n: [0; 2],
+            held_late: 0,
             prof: [0; 7],
             prof_n: [0; 4],
             skipped: 0,
@@ -19240,6 +19277,7 @@ impl Engine {
             held_max_ns: rp.held_max_ns,
             held_parts_ns: rp.held_parts,
             held_parts_n: rp.held_n,
+            held_late: rp.held_late,
             log_ns,
             catch_ns,
             publish_ns,
@@ -19333,6 +19371,19 @@ impl Engine {
     #[doc(hidden)]
     pub fn ball_set_ahead_wait(&self, us: u64) {
         self.ball_publish_pause[7].store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 試験: 球を組む時、 持つ回の記録の先読み (lock の外) の後・`change_emit` を取る前に、 写す側が先読みの所より先まで写すまで最大 `us` µs
+    /// 待つ (20 回目、 T12: 持った後に先読みの後の分を読む)。
+    #[doc(hidden)]
+    pub fn ball_set_late_wait(&self, us: u64) {
+        self.ball_publish_pause[9].store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 試験: 組む間の控え (記録が捨てる分を組む側のために控える) を足している最中か (20 回目、 T11: 組む側が落ちた後は止まっている)。
+    #[doc(hidden)]
+    pub fn ball_side_active(&self) -> bool {
+        self.ball_bases.side_active()
     }
 
     /// 試験: 次に球を組む時、 公開中 (書き終えを待った後・残りを読む前、 `ball_set_publish_pause` の後の止まりの後) に 1 回 panic する
