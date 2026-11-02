@@ -38,8 +38,8 @@
  {
   "name": "H を取ってから公開中を置く",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "        self.balls.begin_publish(hid);\n        let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n        if pp[0] > 0 {\n            std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n        }\n        let h = wal.mint_hlc();\n        wal.quiesce();\n",
-  "replace": "        let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n        let h = wal.mint_hlc();\n        wal.quiesce();\n        if pp[0] > 0 {\n            std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n        }\n        self.balls.begin_publish(hid);\n"
+  "find": "        self.balls.begin_publish(hid);\n        guard.publishing = true;\n        let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n        if pp[0] > 0 {\n            std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n        }\n        let h = wal.mint_hlc();\n        wal.quiesce();\n",
+  "replace": "        let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));\n        let h = wal.mint_hlc();\n        wal.quiesce();\n        if pp[0] > 0 {\n            std::thread::sleep(std::time::Duration::from_micros(pp[0]));\n        }\n        self.balls.begin_publish(hid);\n        guard.publishing = true;\n"
  },
  {
   "name": "H より前の書き終えを待たない",
