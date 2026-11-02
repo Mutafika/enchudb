@@ -178,6 +178,28 @@ struct BallReplay<'a> {
     prof_n: [u64; 4],
 }
 
+/// 組む途中で抜けた時 (panic) の後始末 (19 回目): 公開中を置いた後なら組んでいないに戻し (公開中で待っている書き手は球に書かずに進む =
+/// 次に組む時に WAL / 記録から当てる)、 組む間の控えを手放す。 組み終えたら `done` を立てて何もしない。 戻さないと、 その紐の書き手は
+/// 公開中のまま待ち続ける (18 回目の T2: 組む側が公開中に落ちる変異で T6 が止まった)。
+struct BuildGuard<'a> {
+    eng: &'a Engine,
+    hid: u16,
+    publishing: bool,
+    done: bool,
+}
+
+impl Drop for BuildGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if self.publishing {
+            self.eng.balls.abort_publish(self.hid);
+        }
+        self.eng.ball_bases.end_side();
+    }
+}
+
 impl BallReplay<'_> {
     const NONE: u64 = u64::MAX;
     /// 1 回の追いつきで、 change_emit を持たずに読み直してよい回数 (次の回は持って読む)。
@@ -5609,8 +5631,8 @@ pub struct Engine {
     ball_build_pause: std::sync::atomic::AtomicU64,
     /// 試験: 公開中を置いた後・H を取る前 / 書き終えを待った後・残りを読む前 / 追いつきで WAL の位置を取った後・WAL を読む前に止まる
     /// 時間 (µs、 公開の約束の場所と、 読む間に畳む場所を広げる)。 [3] 以降は各 setter (`ball_set_mark_pause` / `ball_set_cross_wait` /
-    /// `ball_set_refold_wait` の µs と回数 / `ball_set_ahead_wait`)。
-    ball_publish_pause: [std::sync::atomic::AtomicU64; 8],
+    /// `ball_set_refold_wait` の µs と回数 / `ball_set_ahead_wait` / `ball_set_publish_panic`)。
+    ball_publish_pause: [std::sync::atomic::AtomicU64; 9],
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
@@ -6191,7 +6213,7 @@ impl Engine {
             ball_build_steps: std::sync::atomic::AtomicU64::new(0),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -7480,7 +7502,7 @@ impl Engine {
             ball_build_steps: std::sync::atomic::AtomicU64::new(0),
             ball_build: std::sync::Mutex::new(()),
             ball_build_pause: std::sync::atomic::AtomicU64::new(0),
-            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 8],
+            ball_publish_pause: [const { std::sync::atomic::AtomicU64::new(0) }; 9],
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
@@ -19061,6 +19083,7 @@ impl Engine {
             self.balls.unmark_pending(hid);
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("no ball base for '{name}'")));
         };
+        let mut guard = BuildGuard { eng: self, hid, publishing: false, done: false };
         let seed_ns = t0.elapsed().as_nanos() as u64 - ready_ns;
         let ball = self.balls.make(crate::ball::pack_hlc(horizon.wall, horizon.logical), |f| {
             cur.iter().enumerate().filter(|&(_, &v)| v != BallReplay::NONE).for_each(|(e, &v)| f(e as u32, v))
@@ -19143,6 +19166,7 @@ impl Engine {
         // append が書き終えるのを待つ (`quiesce`、 WAL の空きは待たない)
         let t_pub = std::time::Instant::now();
         self.balls.begin_publish(hid);
+        guard.publishing = true;
         let pp = [0, 1].map(|i| self.ball_publish_pause[i].load(std::sync::atomic::Ordering::Relaxed));
         if pp[0] > 0 {
             std::thread::sleep(std::time::Duration::from_micros(pp[0]));
@@ -19153,6 +19177,9 @@ impl Engine {
         if pp[1] > 0 {
             std::thread::sleep(std::time::Duration::from_micros(pp[1]));
         }
+        if self.ball_publish_pause[8].swap(0, std::sync::atomic::Ordering::Relaxed) != 0 {
+            panic!("試験の口: 公開中に panic する (ball_set_publish_panic)");
+        }
         // (4) H より前の残り
         rp.trace.push(format!("公開中: H {}", pk(h)));
         rp.catch_up(log, wal, &mut pos, Some(h));
@@ -19161,6 +19188,7 @@ impl Engine {
         let (records, applied, side_ops, refolds, head_refolds, parts, prof, prof_n, rp_skipped, rp_replays, rp_ahead, rp_crossed) =
             (rp.records, rp.applied, rp.side_ops, rp.refolds, rp.head_refolds, rp.parts, rp.prof, rp.prof_n, rp.skipped, rp.replays, rp.ahead, rp.crossed);
         self.balls.publish(hid, rp.ball, crate::ball::pack_hlc(h.wall, h.logical));
+        guard.done = true;
         // 公開中 = この紐の書き手が待つ間 (出した所まで)。 組む間の控えを手放す (`end_side`) のは書き手が動き出した後 (16 回目: 控えが大きいと
         // 手放すのに 0.9 ms、 前は公開中に数えていた)
         let publish_ns = t_pub.elapsed().as_nanos() as u64;
@@ -19266,6 +19294,13 @@ impl Engine {
     #[doc(hidden)]
     pub fn ball_set_ahead_wait(&self, us: u64) {
         self.ball_publish_pause[7].store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 試験: 次に球を組む時、 公開中 (書き終えを待った後・残りを読む前、 `ball_set_publish_pause` の後の止まりの後) に 1 回 panic する
+    /// (19 回目、 T11: 組む側が公開中に落ちても、 その紐の書き手を公開中のまま止めない)。
+    #[doc(hidden)]
+    pub fn ball_set_publish_panic(&self, on: bool) {
+        self.ball_publish_pause[8].store(u64::from(on), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 試験: 球を組む時、 組みの最初の `tries` 回の読み (追いつきをまたいで数える) で、 WAL を読んだ後・確かめる前に、 読み始めた所の

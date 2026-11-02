@@ -382,7 +382,7 @@ fn concurrent_session(
             });
         }
         let (round_now, writes, during, built_at, folds, switches) = (&round_now, &writes, &during, &built_at, &folds, &switches);
-        s.spawn(move || {
+        let builder = s.spawn(move || {
             while round_now.load(Ordering::Acquire) < build_at {
                 std::thread::yield_now();
             }
@@ -418,6 +418,10 @@ fn concurrent_session(
             }
             let b = built_at.load(Ordering::Acquire);
             if b != 0 && round + 1 >= b + after {
+                go.store(false, Ordering::Release);
+            }
+            // 組む側が組み終えずに終わった (panic): 書き手を止めて抜ける (scope の終わりで panic を伝える。 見ないと回の上限まで回り続ける)
+            if b == 0 && builder.is_finished() {
                 go.store(false, Ordering::Release);
             }
             bar.wait();
@@ -729,6 +733,85 @@ fn a_build_does_not_continue_from_the_head_after_a_fold() {
     eprintln!("組む: {:?}、 記録 {trace:#?}", eng.ball_rebuild_stats());
     assert!(trace.iter().any(|l| l.contains("start 0x20 end 0x20")), "頭からを読んで何も無い回が無い — 試験の前提: {trace:#?}");
     h.verify(&db, "頭からを読んだ次の回の後");
+    drop(db);
+    cleanup(&path);
+}
+
+/// (T11) 組む側が公開中に落ちる (19 回目、 WAL 64 MiB、 記録 128 MiB): 試験の口で、 公開中 (書き終えを待った後) に 300 ms 止まってから panic する。
+/// 止まる間に書き手は公開中で待つ (前提: 待った書き手 ≥ 1)。 panic の後、 書き手は公開中のまま待たずに進む (2 秒以内に全部の書き手の数が増える)。
+/// 書き手を止めた後の次の読みで組み直し、 全部の控えの答えと面の数が合う (待っていた書き手の書き込みは次に組む時に WAL / 記録から当てる)。
+/// 書き手は scope の外の thread (公開中のまま止まった書き手を待たずに試験を落とすため)。
+#[test]
+fn writers_go_on_when_a_build_panics_while_publishing() {
+    let path = tmp_path("t11");
+    cleanup(&path);
+    let _gone = Gone(path.clone());
+    let mut h = create(&path, WAL, 128 << 20);
+    let db = open_kept(&path, WAL, &mut h);
+    let eng = db.engine();
+    let ha = eng.himo_id("t.a").unwrap() as u16;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let counts: std::sync::Arc<Vec<AtomicU64>> = std::sync::Arc::new((0..TH).map(|_| AtomicU64::new(0)).collect());
+    let writers: Vec<_> = (0..TH)
+        .map(|th| {
+            let (db, stop, counts) = (db.clone(), stop.clone(), counts.clone());
+            let eids = h.eids[th * PER..(th + 1) * PER].to_vec();
+            let mut mine: Vec<Option<u64>> = h.cur[th * PER..(th + 1) * PER].to_vec();
+            std::thread::spawn(move || {
+                let eng = db.engine();
+                let mut turned = vec![0usize; PER];
+                let mut r = Rng(0x1111_2222 ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul(th as u64 + 1)));
+                while !stop.load(Ordering::Acquire) {
+                    let k = r.below(PER as u64) as usize;
+                    let x = r.below(VALS.len() as u64 + 1) as usize;
+                    let new = (x < VALS.len()).then(|| VALS[x]);
+                    let ok = match new {
+                        None => {
+                            eng.untie_by_id(eids[k], ha);
+                            eng.get_by_id(eids[k], ha).is_none()
+                        }
+                        Some(v) => eng.try_tie_to_by_id(eids[k], ha, v as u32).is_ok(),
+                    };
+                    if ok {
+                        turned[k] += usize::from(turns(mine[k], new));
+                        mine[k] = new;
+                    }
+                    eng.commit();
+                    counts[th].fetch_add(1, Ordering::Release);
+                    std::thread::sleep(std::time::Duration::from_micros(20));
+                }
+                (mine, turned)
+            })
+        })
+        .collect();
+    eng.ball_set_publish_pause(0, 300_000);
+    eng.ball_set_publish_panic(true);
+    let e0 = h.eids[0];
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eng.ball_value_at(e0, "t.a", 0)));
+    assert!(built.is_err(), "試験の口で panic していない — 試験の前提");
+    let (waits, _) = eng.ball_publish_counts();
+    assert!(waits >= 1, "公開中で待った書き手が居ない — 試験の前提");
+    let c0: Vec<u64> = counts.iter().map(|c| c.load(Ordering::Acquire)).collect();
+    let t = std::time::Instant::now();
+    while counts.iter().zip(&c0).any(|(c, &c0)| c.load(Ordering::Acquire) <= c0) && t.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let moved: Vec<bool> = counts.iter().zip(&c0).map(|(c, &c0)| c.load(Ordering::Acquire) > c0).collect();
+    assert!(moved.iter().all(|&m| m), "組む側が公開中に落ちた後、 書き手が公開中のまま動かない: {moved:?}");
+    stop.store(true, Ordering::Release);
+    for (th, w) in writers.into_iter().enumerate() {
+        let (mine, turned) = w.join().unwrap();
+        h.cur[th * PER..(th + 1) * PER].copy_from_slice(&mine);
+        for (k, n) in turned.into_iter().enumerate() {
+            h.faces[th * PER + k] += n;
+        }
+    }
+    h.checks.push((wal_now(&db), h.cur.clone()));
+    eng.ball_set_publish_pause(0, 0);
+    // 次の読みで組み直す (試験の口は 1 回で落ちた)
+    let _ = eng.ball_value_at(e0, "t.a", 0);
+    assert!(eng.ball_rebuild_stats().is_some(), "落ちた後の次の読みで組み直していない");
+    h.verify(&db, "公開中に落ちた後に組み直した後");
     drop(db);
     cleanup(&path);
 }
