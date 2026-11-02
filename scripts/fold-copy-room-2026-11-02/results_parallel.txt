@@ -1,0 +1,25 @@
+## master 47433de, 12 本並べて 3 回 (負荷 14〜16)
+36 run, 落ちた 10
+   6 thread 'engine::fold_copy_tests::a_fold_numbers_no_record_not_yet_written_out_while_making_wal_room' panicked at crates/enchudb-engine/src/engine.rs:2195:13:
+   1 thread 'engine::fold_copy_tests::an_open_tail_folded_in_place_reaches_the_listener_through_the_change_log' panicked at crates/enchudb-engine/src/engine.rs:2109:9:
+   6 thread 'engine::fold_copy_tests::copying_into_the_change_log_while_making_wal_room_does_not_stop_writers' panicked at crates/enchudb-engine/src/engine.rs:2030:9:
+   6 写している間、 WAL に積めなかった (append_lock の下で写した): [true, …]
+   1 前提: 空け作りが割り込み点を通った
+   6 前提: 空け作りで畳んだ
+
+## 直し 1 本目 (写しの試験だけ), 12 本並べて 3 回 (負荷 14〜16)
+36 run, 落ちた 3
+   3 thread 'engine::fold_copy_tests::a_fold_numbers_no_record_not_yet_written_out_while_making_wal_room' panicked at crates/enchudb-engine/src/engine.rs:2204:13:
+   3 前提: 空け作りで畳んだ
+
+## 直し (3 本), 12 本並べて 6 回 (負荷 10〜16)
+72 run, 落ちた 0
+
+## master と直しを交互に, 12 本並べて 3 回ずつ (負荷 9)
+master: 36 run, 落ちた 0
+fix2: 36 run, 落ちた 0
+
+## master と直しを交互に, 24 本並べて 3 回ずつ (負荷 8)
+master: 72 run, 落ちた 0
+fix2: 72 run, 落ちた 0
+

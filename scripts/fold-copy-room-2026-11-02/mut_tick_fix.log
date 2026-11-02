@@ -1,0 +1,8 @@
+baseline: pass 2 秒 → 1 run の上限 300 秒
+  SURVIVED 4s            consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (1)
+  SURVIVED 2s            consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (2)
+  SURVIVED 2s            consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (3)
+killed 0 / survived 3 / その他 0
+  生き残り: consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (1)
+  生き残り: consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (2)
+  生き残り: consumer が空きを見た後、 周期の書き出しの前に 150 ms 眠る (3)
