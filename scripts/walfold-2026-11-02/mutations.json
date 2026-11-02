@@ -1,0 +1,14 @@
+[
+ {
+  "name": "満杯の WAL の孤児 group を畳んでよいとしない (brick に戻す)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if wal.append_dead() {\n            let (records, _) = wal.iter_committed_from_with_offsets(offset);\n            return records.is_empty();\n        }\n",
+  "replace": "        if false && wal.append_dead() {\n            let (records, _) = wal.iter_committed_from_with_offsets(offset);\n            return records.is_empty();\n        }\n"
+ },
+ {
+  "name": "wal_fold_safe が常に false (commit 後も畳めない)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "    pub fn wal_fold_safe(&self) -> bool {\n        let through = self.oplog.as_ref().map_or(0, |w| w.head());\n",
+  "replace": "    pub fn wal_fold_safe(&self) -> bool {\n        let through = self.oplog.as_ref().map_or(0, |w| w.head());\n        if through != u64::MAX { return false; }\n"
+ }
+]

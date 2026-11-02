@@ -45,6 +45,20 @@ fn small_engine(path: &str, wal_bytes: usize) -> Arc<Engine> {
     eng
 }
 
+/// `f` が最大 2 秒の間に一度でも真になるか (consumer が同じ WAL を触るので、 1 回だけ見ると畳む途中や書き出しの途中を読む、 #691)。
+fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    let t = std::time::Instant::now();
+    loop {
+        if f() {
+            return true;
+        }
+        if t.elapsed() > Duration::from_secs(2) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Record サイズの前提 (oplog file v3、 #608): Tie = 112 + 16 + 8 (周の印) = 136、 Commit = 112 + 8 = 120、
 /// TieLeaf = 112 + 16 + name + bytes + 8。 前提が変わったら本テストの操縦計算も崩れるので、 まず実測でズレを検出する
 /// (`OpLog::record_size_of` と `free_bytes` の減りが合うことも)。
@@ -109,8 +123,12 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
         while eng.transfer_oplog_to_sync_ops() > 0 {}
         eng.oplog_sync().unwrap();
         eng.body_msync().unwrap(); // #440: 畳むのは bridge した行を書き出した後
-        if !eng.wal_fold_safe() {
-            break; // 読み残し committed が残った = ring 満杯 (backpressure 成立)
+        // 読み残し committed が残った = ring 満杯 (backpressure 成立)。 ring の満杯も見る (#691: consumer の空け作りが畳んでいる
+        // 最中は、 畳んだ後の周の head と巻き戻す前の bridge の位置で wal_fold_safe が一瞬 false になる。 ring に空きがあるのに 1 周目で
+        // 抜けると、 Phase 2 の満杯の WAL に積む Commit を空け作りが bridge して畳んで通し、 12 本並べて 72 回中 4〜5 回落ちた)
+        let ring_full = eng.table_eid_usage("_sync_ops").is_some_and(|u| u.free == 0);
+        if ring_full && !eng.wal_fold_safe() {
+            break;
         }
         if wal.try_reset() {
             eng.reset_sync_ops_offset();
@@ -167,9 +185,12 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     // ── 本丸: 旧実装は offset < head（未 commit の孤児 tail）で fold を恒久拒否
     // = brick。 修正後は「append_dead + committed 残なし」で畳んでよい。
     // consumer tick が先に畳んでいたら (満杯が解けている)、 それが答え。 その後に積まれた record が bridge 前だと
-    // fold_safe は一時的に false なので、 false の時は満杯のままかを後から見る (先に満杯を見ると、 間に畳まれる、 #407)
+    // fold_safe は一時的に false なので、 false の時は満杯のままかを後から見る (先に満杯を見ると、 間に畳まれる、 #407)。
+    // consumer がその場で畳んでいる最中は両方とも悪く見える (#691: 畳んだ周の head と巻き戻す前の bridge の位置で fold_safe が
+    // false、 alloc の head が古いまま append_dead が true。 50 ms 後には safe / 満杯でない)。 見たいのは 「恒久に」 塞ぐかなので、
+    // 最大 2 秒見直す (旧実装の塞ぎは誰も畳めないので解けない)。 判定は見直しで通った時の値 (もう一度見ると、 また途中を読む)
     assert!(
-        eng.wal_fold_safe() || !wal.append_dead(),
+        eventually(|| eng.wal_fold_safe() || !wal.append_dead()),
         "満杯 WAL の未 commit tail (孤児 group) が fold を恒久ブロックしている"
     );
 
@@ -192,11 +213,12 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     let before = eng.pending_sync_ops(0).len();
     wal.append(Op::Tie { eid: e, himo_id: note_hid, value: 777_777 }).unwrap();
     wal.append(Op::Commit).unwrap();
-    let moved = eng.transfer_oplog_to_sync_ops();
-    assert!(moved > 0, "fold 後の新規 write が bridge に乗らない");
+    // 試験の transfer より先に consumer が bridge することがある (#691: 試験の transfer が 0 を返して落ちた、 12 本並べて 144 回中 1 回)
+    // ので、 どちらが運んでも _sync_ops に現れるかを見る
+    eng.transfer_oplog_to_sync_ops();
     assert!(
-        eng.pending_sync_ops(0).len() > before,
-        "fold 後の新規 write が _sync_ops に現れない"
+        eventually(|| eng.pending_sync_ops(0).len() > before),
+        "fold 後の新規 write が bridge に乗らない (_sync_ops に現れない)"
     );
 
     cleanup(&path);
@@ -232,7 +254,8 @@ fn uncommitted_tail_with_room_blocks_fold() {
     wal.append(Op::Commit).unwrap();
     while eng.transfer_oplog_to_sync_ops() > 0 {}
     eng.body_msync().unwrap(); // #440
-    assert!(eng.wal_fold_safe(), "commit 後も fold 可能にならない");
+    // 1 回だけ見ると、 背景の consumer が同じ WAL を触る途中で false を読むことがある (#691: 12 本並べて 144 回中 2 回。 どの途中かは見ていない)
+    assert!(eventually(|| eng.wal_fold_safe()), "commit 後も fold 可能にならない");
 
     cleanup(&path);
 }
