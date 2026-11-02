@@ -301,7 +301,7 @@ fn concurrent_session(
     head_wait_us: u64,
     refold_wait: (u64, u64),
     ahead_wait_us: u64,
-    late_wait_us: u64,
+    held_drop_wait_us: u64,
 ) -> Session {
     let db = open_kept(path, wal, h);
     let eng = db.engine();
@@ -318,7 +318,7 @@ fn concurrent_session(
     eng.ball_set_cross_wait(cross_wait_us);
     eng.ball_set_refold_wait(refold_wait.0, refold_wait.1);
     eng.ball_set_ahead_wait(ahead_wait_us);
-    eng.ball_set_late_wait(late_wait_us);
+    eng.ball_set_held_drop_wait(held_drop_wait_us);
     assert!(eng.ball_rebuild_stats().is_none(), "開くだけでは組まない");
     let ha = eng.himo_id("t.a").unwrap() as u16;
     let bar = Barrier::new(TH + 1);
@@ -662,26 +662,24 @@ fn a_build_reads_holding_the_copy_lock_after_three_refolds() {
     cleanup(&path);
 }
 
-/// (T12) 持つ回の記録の先読み (20 回目、 WAL 1 MiB、 記録 256 MiB = 捨てない): T9 と同じく組みの最初の 6 回の読みを読み直しにして持つ回を
-/// 作り、 試験の口 (`ball_set_late_wait`) で、 持つ回の記録の先読み (lock の外) の後・change_emit を取る前に、 写す側が先読みの所より先まで
-/// 写すまで (最大 1 秒) 待つ。 持った後に、 先読みの後に写した分を記録から読む (前提: `held_late` ≥ 1)。 面の数まで合う (読まないと、 先読みの
-/// 後に写して畳んだ区画の書き込みを飛ばす)。
+/// (T12) 持つ回は放した後に記録を読む (20 回目、 WAL 1 MiB、 記録 1 MiB = 書き手が何周も書くと捨てる): T9 と同じく組みの最初の 6 回の読みを
+/// 読み直しにして持つ回を作り、 試験の口 (`ball_set_held_drop_wait`) で、 持つ回で放した後・記録を読む前に、 記録が読む所より先まで捨てるまで
+/// (最大 1 秒) 待つ。 放した後に捨てた分は、 捨てる口が渡した控えから当てる (前提: 放した後に控えから当てた数 ≥ 1)。 全部の控えの答えが合う。
 #[test]
-fn a_held_read_reads_what_was_copied_after_its_pre_read() {
+fn a_held_read_reads_the_log_after_letting_go() {
     let path = tmp_path("t12");
     cleanup(&path);
     let _gone = Gone(path.clone());
     const SMALL_WAL: usize = 1 << 20;
-    let mut h = create(&path, SMALL_WAL, 256 << 20);
+    let mut h = create(&path, SMALL_WAL, 1 << 20);
+    let mut side = 0;
     for k in 0..3u64 {
-        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 0, (0, 0), 0, 0xC2 + k, 100, false, 0, 0, 0, (1_000_000, 6), 0, 1_000_000);
-        assert_eq!(ss.st.side_ops, 0, "記録が捨てた — 試験の前提");
+        let ss = concurrent_session(&path, SMALL_WAL, &mut h, 30, 20, 3, 3, 0, (0, 0), 0, 0xC2 + k, 2, false, 0, 0, 0, (1_000_000, 6), 0, 1_000_000);
         assert!(ss.st.held_reads >= 1, "change_emit を持って読んでいない — 試験の前提 (session {k})");
-        assert!(ss.st.held_late >= 1, "持った後に先読みの後の分を読んでいない — 試験の前提 (session {k}): {:?}", ss.st);
+        assert!(ss.st.held_after >= 1, "持つ回で放した後に記録を読んでいない — 試験の前提 (session {k}): {:?}", ss.st);
+        side += usize::from(ss.st.held_after_side > 0);
     }
-    let db = Database::open_with_oplog(&path, SMALL_WAL).unwrap();
-    assert_eq!(db.engine().ball_horizon("t.a"), Some(h.hz0), "記録が捨てていない (面の数を確かめた) — 試験の前提");
-    drop(db);
+    assert!(side >= 2, "持つ回で放した後に記録が捨てた分を控えから当てていない — 試験の前提 ({side}/3)");
     cleanup(&path);
 }
 
