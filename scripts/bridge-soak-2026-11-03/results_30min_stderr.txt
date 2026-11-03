@@ -1,0 +1,8 @@
+== seed 11
+[enchudb] warning: sync bridge has returned 0 for 1797 consecutive scans over 1803849 ms while the oplog head (4294967448) is ahead of the bridge cursor (4294967328) [checkpoint=4294967448, scan stopped: reached-head, 0 record(s) read but not closed by a Commit] — no readable record at the cursor; distribution is silently stalled (#268). Reopening the DB resets the cursor to the ring start and re-bridges them.
+== seed 12
+[enchudb] warning: sync bridge has returned 0 for 1797 consecutive scans over 1803642 ms while the oplog head (4294967448) is ahead of the bridge cursor (4294967328) [checkpoint=4294967448, scan stopped: reached-head, 0 record(s) read but not closed by a Commit] — no readable record at the cursor; distribution is silently stalled (#268). Reopening the DB resets the cursor to the ring start and re-bridges them.
+== seed 13
+[enchudb] warning: sync bridge has returned 0 for 1797 consecutive scans over 1803903 ms while the oplog head (4294967448) is ahead of the bridge cursor (4294967328) [checkpoint=4294967448, scan stopped: reached-head, 0 record(s) read but not closed by a Commit] — no readable record at the cursor; distribution is silently stalled (#268). Reopening the DB resets the cursor to the ring start and re-bridges them.
+== seed 14
+[enchudb] warning: sync bridge has returned 0 for 1797 consecutive scans over 1803153 ms while the oplog head (4294967448) is ahead of the bridge cursor (4294967328) [checkpoint=4294967448, scan stopped: reached-head, 0 record(s) read but not closed by a Commit] — no readable record at the cursor; distribution is silently stalled (#268). Reopening the DB resets the cursor to the ring start and re-bridges them.

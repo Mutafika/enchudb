@@ -1,0 +1,27 @@
+== 1 回目 (落ちと truncation をまだ数えていない soak)
+baseline: pass 63 秒 → 1 run の上限 218 秒
+  SURVIVED 71s           M1 bridge の cursor を 1 回だけ record の途中 (+8 byte) にずらす (#268 の 3 回目の症状)
+  SURVIVED 71s           M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)
+killed 0 / survived 2 / その他 0
+  生き残り: M1 bridge の cursor を 1 回だけ record の途中 (+8 byte) にずらす (#268 の 3 回目の症状)
+  生き残り: M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)
+
+== 2 回目 (数えるようにした後)
+baseline: pass 63 秒 → 1 run の上限 218 秒
+  killed 131s            M1 bridge の cursor を 1 回だけ record の途中 (+8 byte) にずらす (#268 の 3 回目の症状)
+  SURVIVED 71s           M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)
+killed 1 / survived 1 / その他 0
+  生き残り: M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)
+
+== M2 だけ、 A が署名する形
+baseline: pass 62 秒 → 1 run の上限 216 秒
+  SURVIVED 71s           M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)
+killed 0 / survived 1 / その他 0
+  生き残り: M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)
+
+== 3 回目 (この directory の run_mut.sh、 master ef3ba91 の上)
+baseline: pass 63 秒 → 1 run の上限 218 秒
+  killed 131s            M1 bridge の cursor を 1 回だけ record の途中 (+8 byte) にずらす (#268 の 3 回目の症状)
+  SURVIVED 70s           M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)
+killed 1 / survived 1 / その他 0
+  (done 行: baseline = 落ち 0・取りこぼし 0、 M1 = 落ち 0・取りこぼし 186、 M2 = 落ち 0・取りこぼし 0)

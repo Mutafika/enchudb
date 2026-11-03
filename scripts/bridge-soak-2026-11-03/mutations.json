@@ -1,0 +1,14 @@
+[
+ {
+  "name": "M1 bridge の cursor を 1 回だけ record の途中 (+8 byte) にずらす (#268 の 3 回目の症状)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        let from = self.sync_ops_offset.load(Ordering::Acquire);\n        let trace = Self::trace_bridge_enabled();",
+  "replace": "        let from = {\n            static SHIFTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\n            static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n            let f = self.sync_ops_offset.load(Ordering::Acquire);\n            let h = wal.head();\n            if CALLS.fetch_add(1, Ordering::Relaxed) >= 300 && (h >> 32) == (f >> 32) && h > f + 256 && !SHIFTED.swap(true, Ordering::Relaxed) {\n                self.sync_ops_offset.store(f + 8, Ordering::Release);\n                f + 8\n            } else {\n                f\n            }\n        };\n        let trace = Self::trace_bridge_enabled();"
+ },
+ {
+  "name": "M2 今の区画を書き終えた所 (written) でなく場所を取った所 (head) まで読む (#268 の 3 回目の直しを外す)",
+  "file": "crates/enchudb-oplog/src/oplog.rs",
+  "find": "let newer_end = order[1].map_or(0, |i| self.hot.halves[i].written.load(Ordering::Acquire));",
+  "replace": "let newer_end = order[1].map_or(0, |i| self.hot.halves[i].head.load(Ordering::Acquire));"
+ }
+]
