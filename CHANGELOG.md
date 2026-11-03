@@ -3,6 +3,83 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.37.4 — 2026-11-03
+
+patch。 on-disk 形式 (oplog v4・changefeed.seg)・wire 形式は 0.37.3 と同じ。 API は記録への写しの部品が増えただけ (`enchudb-oplog` の
+`oplog::RecordRef` / `OpLog::scan_refs_for_change_log`、 `enchudb-engine` の `change_log::Entries` / `ChangeLog::append_from`)。
+changefeed の記録のある DB の止まりの直し 2 つ、 sync の警告の直し 1 つと、 試験の直し:
+
+- changefeed の記録 (`enable_change_log`) のある DB で、 書き手が速いと (書き手 1 本で 1 秒 350 万件ほど) WAL の区画を埋めるたびに
+  書き手が 30〜60 ms 止まっていた (#683、 #686 / #687)。 0.37.3 の 「上げる時の注意」 に書いた残りの止まり。 速い状態の測りで 10 ms を越えた
+  止まりが 12 run で 72 回 → 0 回、 最大 5〜50 ms → 3 ms 以下
+- sync の bridge が止まった時の警告 (#268 の形) が、 止まっていないのに出ていた (#694、 #695)。 30 秒を越える暇な時間の後の最初の書き込みと、
+  書かない peer を閉じる時
+
+**上げる時の注意**:
+
+- 形式を変える変更は無い (#686 / #687 は形式を変えない。 記録の bytes が前の道と同じことは `change_log::tests::wal_records_lay_out_the_same_bytes_as_wire_records`
+  が見る)。 今回は版を混ぜた sync と上げ下げを回していない
+- changefeed の記録のある DB で書き手が全力の時、 書き込み 1 件の p99 は 0.37.3 より 0.13〜0.2 µs 長い (666〜709 → 834〜875 ns、 12 組全部で)。
+  中央値は同じか短く (167〜208 ns)、 最大は 5〜50 ms → 3 ms 以下。 原因は測っていない (記録への写しの印を並べて取る #686 の rayon は候補だが
+  確かめていない)
+- 全力の書き手で、 consumer の写しが追いつかずに空け作りに落ちる回がまだまれにある (速い状態の master だけの 39 run で 2 回、 1 回 8〜11 ms)
+
+### Performance — 書き手が速いと、 記録のある DB が WAL の区画ごとに止まる (#683、 #686 / #687)
+
+段ごとの時刻 (`scripts/fast-writer-stall-2026-11-01/` の `probe.patch`) で 2 つが分かった。
+
+1. 畳むたびに WAL 全体を fsync していた (`set_sync_on_reset`、 append の lock を持ったまま)。 守りたいのは 「頭に戻した header が次の周の record
+   より先に届く」 ことだけだが、 2 区画の形では書き手がもう一方の区画に積んだ分も書くので、 1 回 4〜5 ms 書き手を止めた
+2. consumer が WAL の record を記録に写す仕事 (1 件約 245 ns) が書き手に追いつかず、 空け作り (#388) に落ちて書き手が待った
+
+→ #686: 畳んだ印は畳んだ区画の header の page だけ書き出す (lock を持つ時間 p50 4,050 → 26〜46 µs)。 写す時の印 (wal_id) を、 entry の crc と
+同じく 4096 件以上の回は rayon で並べて取る。
+→ #687: WAL の record を写さずに mmap から借りて読み (`RecordRef`)、 記録の置き場所へ直接符号化する (`ChangeLog::append_from`)。 写し 1 件
+225〜230 → 116〜118 ns。 借りた record は `change_emit` を持つ間だけ使い、 畳む道はどちらも `change_emit` を持ったまま写してから畳む。
+
+速い状態 (常駐アプリを閉じた Mac、 記録なしの全力で 4 秒 1,900 万件ほど) で 0.37.3 と交互に (`foldstall`、 書き手 1 本の upsert + `commit()`、
+表 10 万行、 WAL 64 MiB、 記録 64 MiB、 全力 4 秒、 12 seed、 負荷 2.0〜3.8、 Apple M4 Max):
+
+| | 0.37.3 | 0.37.4 |
+|---|---|---|
+| 記録ありの書けた数 (中央値) | 1446 万 | 1578 万 (比の中央値 1.096、 1.047〜1.117) |
+| 最大の止まり | 5.1〜50.5 ms | 2.8〜3.0 ms |
+| 10 ms を越えた止まり | 9 / 12 run で計 72 回 (1,846 ms) | 0 回 |
+| 空け作り | 0〜25 回 | 0 回 |
+| 書き込み 1 件の p50 / p99 | 167〜208 / 666〜709 ns | 167〜208 / 834〜875 ns |
+| 記録なしの書けた数 (中央値) | 1914 万 | 1955 万 (比の中央値 1.006、 揺れの範囲) |
+
+この止まりは書き手が速い時の形 (0.37.3 を切った時の測りで残ったのもこの速さの時)。 測る Mac の常駐アプリが CPU を使い続けると性能コアの
+クロックが下がり (3.85 GHz、 閉じると 4.45 GHz)、 この速さが出ない。 各 PR の測りは `scripts/fast-writer-stall-2026-11-01/README.md`。
+
+### Fixed — #268 の警告が、 止まっていない bridge で出ていた (#694、 #695)
+
+#268 の再発を拾う警告 (`sync bridge has returned 0 for N consecutive scans ...`) は、 空の読みが 256 回続き、 30 秒を越え、 WAL の head が
+bridge の位置より先にある時に出る。 その episode の始まりと 「鳴らした」 印が、 転送が成立した時にしか戻らなかった。 そのため 30 秒を越える
+暇な時間の後、 最初の書き込みを Commit の前に読んだ瞬間 (Commit が入れば次の読みで運ばれる) や、 書かない peer を閉じる時の Commit (120 B)
+で、 止まっていないのに鳴った。 → 追いついた読み (head ≤ 位置) で episode を閉じる。 鳴るのは head が先にある読みが 30 秒続いた時だけ。
+
+### #268 の soak (#696)
+
+`crates/enchudb-sync/examples/bridge_soak.rs` (書き続ける peer から pull する peer へ、 配布が止まらず全部届くかを長く回す。 止まり・落ち・
+取りこぼし・truncation で exit 1) と、 その結果 `scripts/bridge-soak-2026-11-03/` を置いた。 0.37.3 の後の master で 30 分 × 4 本 (WAL 1 MiB /
+256 KiB、 2 万 / 10 万件/秒、 署名あり、 合わせて約 2,000 万回の書き換え・約 3 万周) が全部 0 で、 #268 を閉じた。 出たのは上の偽の警告だけ。
+
+### Tests — 混んだ機械 / coverage でたまに落ちる試験と、 試験が `/tmp` に残す DB
+
+- `fold_copy_tests::an_open_tail_folded_in_place_reaches_the_listener_*` の 2 本: 空け作りの回数を足す前に確かめていた (#684、 #685。 coverage で 1 回)
+- `engine::fold_copy_tests` の空け作りを試す 3 本: consumer の別の畳みが先に空けて前提が崩れた (#689、 #690)。 その試験の間だけ consumer の畳みを切る
+- `tests/wal_full_fold.rs`: 1 回だけ見る判定が、 背景の consumer の書き出し・bridge・空け作りの途中の値を拾った (#691、 #693。 12 本並べて
+  144 回中 5 回)。 満杯を ring の空きでも見る / 一度でも通るかで見る
+- 17 本の試験 file が `/tmp/enchudb-{名前}-{pid}-{時刻}` の DB を消さずに増え続けた (#688、 #692)。 試験の終わり (落ちた時も) に消す
+
+### 切る前の確かめ
+
+- 版の比べは上の Performance の表 (#683 の測り)。 記録の無い DB (書き手 1 本) は #686 / #687 の測りでも各 PR の前と揺れの範囲 (比 0.992 /
+  1.017)。 書き手 8 本 (dbw)・版を混ぜた sync・上げ下げは今回回していない (変えたのは記録のある DB の道だけで、 形式も同じ)
+- 試験: `cargo test --workspace --no-fail-fast` (debug) 1,924 本通過・失敗 0、 ignored 61。 crashsim `--release --test power_loss
+  --test changefeed_log_power_loss --test fault_matrix`: 31 + 4 + 8 本通過
+
 ## 0.37.3 — 2026-10-31
 
 patch。 on-disk 形式 (oplog v4)・wire 形式は 0.37.2 と同じ。 API は試験用の `Engine::set_wal_fold_on_tick()` (doc(hidden)) が増えただけ。
