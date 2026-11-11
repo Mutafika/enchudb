@@ -15866,9 +15866,24 @@ impl Engine {
         match crate::change_log::ChangeLog::open(set.dir(), 0, false, false) {
             Ok(log) => {
                 let start = Self::change_log_resume_offset(wal, &log);
-                self.change_emit.lock().unwrap_or_else(|p| p.into_inner()).log_wal = start;
+                let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                c.log_wal = start;
                 wal.set_sync_on_reset(true);
                 let _ = self.change_log.set(log);
+                // #702: 並行の形にする前 (standalone / schema の build phase) に付けた listener は `change_listeners` にだけ居る
+                // (その時は記録がまだ付いていない)。 記録がある時の配信は `readers` しか見ないので、 ここで読み手に移す。
+                // 位置は記録の今の終わり (`add_change_listener` と同じ: 先に書き出し済みの record を写してから取るので、
+                // 前の session の record は渡らず、 付けた後の commit だけが渡る)
+                let early = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
+                if let (false, Some(log)) = (early.is_empty(), self.change_log.get()) {
+                    let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+                    let at = log.range().1;
+                    for l in early {
+                        if !c.readers.iter().any(|(r, _)| std::sync::Arc::ptr_eq(r, &l)) {
+                            c.readers.push((l, at));
+                        }
+                    }
+                }
             }
             Err(e) => eprintln!(
                 "[enchudb] warning: could not open {} ({e}) — the changefeed runs without its record",
