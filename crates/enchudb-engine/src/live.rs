@@ -4916,7 +4916,7 @@ impl LiveRegistry {
         let (sig, flats, alts) = one_shape(branches, (group.0, group.1, carry), "subscribe_counts")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
         let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None, &[]);
-        Ok(LiveCounts { family, slot, id, registry: self.clone() })
+        Ok(LiveCounts { family, slot, id, registry: self.clone(), handed: Default::default() })
     }
 
     /// 鍵付きの購読を登録する: `branches` の結果を、 各 entity の `key` (ref の道 + 紐) の値と一緒に持つ。
@@ -5749,6 +5749,10 @@ pub struct LiveCounts {
     slot: usize,
     id: u64,
     registry: Arc<LiveRegistry>,
+    /// 上の層 (schema の `LiveCounts`) が group ごとに最後に渡した (件数, 合計) を置く所 (#703)。 engine は読まない。
+    /// 購読と同じ寿命で 1 つ: 宣言された答えは同じ購読を何本もの handle が指す (`Arc`) ので、 handle ごとに持つと
+    /// 取り直した handle が他の handle の渡した値を知らない。 std の Mutex (poll の時だけ取る、 書き手の道には無い)
+    handed: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, i128)>>,
 }
 
 impl LiveCounts {
@@ -5886,6 +5890,12 @@ impl LiveCounts {
     /// engine 内で一意な購読 id。
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 上の層が最後に渡した (件数, 合計) の表 (#703、 欄の doc)。 握ったまま poll してよい (engine はこの lock を取らない)。
+    #[doc(hidden)]
+    pub fn handed(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<u64, (u64, i128)>> {
+        self.handed.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// 未 poll の変化がありうるか (評価しない)。
