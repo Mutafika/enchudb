@@ -98,6 +98,24 @@
 //! v3 の file は 1 区画の形のまま読み書きし、 最初に畳む時に v4 になる (B の header を書いて fsync → A の capacity → version の
 //! 順。 どの途中の像も v3 か v4 として開ける)。 2 区画にできない小さい WAL (`2 * HALF_ALIGN` 未満) は v3 の 1 区画の形で作る。
 //! v4 の file は 0.36 以前の binary では開けない — 下げるには、 きれいに閉じてから `{db}/oplog` を消す。
+//!
+//! # 周の印が守る約束と、 header より先 / 後に届く page (#608 / #706 / #707)
+//!
+//! header の page と record の page は別々に disk に届く (OS はいつでも好きな page を書く)。 開く時の再生は header の
+//! (周, head, checkpoint) を信じて record を読むので、 「header と合わない page に、 周の印も CRC も合う古い record が居る」 像が
+//! あると、 それを続きとして当てる (書き出しの返った値が前に戻る)。 保存の形は変えずに、 次の 2 つを守る:
+//!
+//! - **畳んだ区画には、 畳んだ header が disk に届くまで書かない** (#707、 `fold_pending` / [`OpLog::settle_fold`])。 畳むと
+//!   前の周の record を新しい周の record が上書きする。 header が前の周のままその page だけ届くと、 再生は前の周を checkpoint
+//!   (disk の値は 1 回分遅れている) から上書きされた所までだけ当て直す = 本体は最後まで当ててあるのに途中の値に戻る。 畳む側
+//!   (consumer) は `append_lock` を放してから header の page を書き出し、 それまでその区画への append は遠回りの道
+//!   (`alloc_after_switch`) で止まる (待つのは、 その間に書きに来た書き手だけ。 自分で同じ page を書き出して進む)
+//! - **開いた session は、 この session が置いた周の区画にしか書かない** (#706、 [`OpLog::drop_records_after_a_hole`] の後半)。
+//!   前の session が書いて header に届かなかった record は head の先に同じ周のまま残る。 同じ周で書き足すと、 新しい record の
+//!   後ろにそれが続きとして読める像ができる。 開いた時に、 最初に書く空の区画には新しい周を置き (その header が届くまで
+//!   書かない。 届かないまま落ちると次の session が同じ数の周を置く)、 record のある今の区画には書き足さずに (`stale_tail`)
+//!   最初の append でもう一方へ移る。 移れない形 (どちらの区画にも record がある / 1 区画の形) だけは、 畳めるまで同じ周で
+//!   書き足す (その間は前のままの穴が残る)
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -179,6 +197,11 @@ struct Half {
     checkpoint: AtomicU64,
     /// #608: この区画の今の周。 record の周の印に書き、 scan はこれと違う record で止まる。 v2 の file は 0
     lap: std::sync::atomic::AtomicU32,
+    /// append が場所を取る時の上限 (`alloc_off`)。 普段は `size`。 0 = この区画にはそのまま書けない (#707: 畳んだ header が
+    /// まだ disk に届いていない / #706: 前の session の record が head の先に残っているかもしれない)。 0 の間の append は
+    /// 遠回りの道 (`alloc_after_switch`) に入り、 そこで理由を見る。 `append_lock` の下で変える。 `size` の代わりに読むので、
+    /// いつもの道の読みは増えない (struct の padding に入るので [`Hot`] の大きさも同じ)
+    limit: std::sync::atomic::AtomicU32,
 }
 
 impl Half {
@@ -190,6 +213,15 @@ impl Half {
             written: AtomicU64::new(head),
             checkpoint: AtomicU64::new(checkpoint),
             lap: std::sync::atomic::AtomicU32::new(lap),
+            limit: std::sync::atomic::AtomicU32::new(size as u32),
+        }
+    }
+
+    /// 区画の大きさを置く (`append_lock` の下)。 `open` なら append の上限も同じ値に (閉じている区画は閉じたまま)。
+    fn set_size(&self, size: u32, open: bool) {
+        self.size.store(size, Ordering::Release);
+        if open {
+            self.limit.store(size, Ordering::Release);
         }
     }
 
@@ -1222,8 +1254,16 @@ pub struct OpLog {
     /// group を閉じない record が残す、 閉じの Commit の分の空き (`alloc`)。 普段は `REC_HEADER_SIZE`。 test だけが 0 にする
     /// ([`OpLog::keep_commit_room_for_test`])。
     commit_room: std::sync::atomic::AtomicU64,
-    /// 畳んだ (ring を頭に戻した) 印を、 次の record を書く前に書き出すか ([`OpLog::set_sync_on_reset`])。
-    sync_on_reset: std::sync::atomic::AtomicBool,
+    /// #707: 区画ごとの、 畳んで置いた周のうち header がまだ disk に届いていないもの (0 = 無い)。 0 でない間、 その区画には
+    /// 書かない (`Half::limit` を 0 にしてある / 切り替えで移る前に見る)。 畳む時に `append_lock` の下で置き、 header の page を
+    /// 書き出した者 (畳んだ consumer が lock を放した後 / 全体の fsync / その間に書きに来た書き手) が、 書き出す前に読んだ値の
+    /// ままなら 0 に戻す ([`OpLog::settle_fold`])。
+    fold_pending: [std::sync::atomic::AtomicU32; 2],
+    /// #706: 区画ごとの、 「head の先に、 同じ周の古い record (前の session が書いて header に届かなかった分 / 開く時に穴の
+    /// 後ろとして捨てた分) が残っているかもしれない」 印。 開いた直後に、 record のある今の区画に立てる
+    /// ([`OpLog::drop_records_after_a_hole`])。 立っている間、 その区画には書き足さずにもう一方へ移る (移れない間だけ書き足す)。
+    /// 畳むと (新しい周になるので) 倒す。 `append_lock` の下で読み書きする。
+    stale_tail: [std::sync::atomic::AtomicBool; 2],
     /// #57: append に失敗して WAL に載らなかった record の (author, その author の落ちた HLC の max)
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
@@ -1592,7 +1632,8 @@ impl OpLog {
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + l.trailer) as u64),
-            sync_on_reset: std::sync::atomic::AtomicBool::new(false),
+            fold_pending: [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)],
+            stale_tail: [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)],
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             switch_hook: std::sync::OnceLock::new(),
@@ -1765,6 +1806,39 @@ impl OpLog {
     fn alloc_after_switch(&self, size: u64, closes_group: bool) -> io::Result<u64> {
         // 空の区画にも入らない record では移らない (移ると閉じの Commit だけが古い区画に残り、 次に移れなくなる)
         let need = size + if closes_group { 0 } else { self.commit_room.load(Ordering::Relaxed) };
+        let i = self.hot.active.load(Ordering::Relaxed);
+        let a = &self.hot.halves[i];
+        let full_size = a.size.load(Ordering::Relaxed);
+        if full_size != 0 && a.limit.load(Ordering::Relaxed) == 0 {
+            // この区画は閉じてある (`Half::limit`)。 理由を見る
+            // #707: 畳んだ header がまだ disk に届いていない。 畳んだ側 (consumer) は lock を放してすぐ書き出すので、 ここに来るのは
+            // その短い間に書きに来た時だけ。 待つ代わりに自分で同じ page を書き出す (lock の下の msync 1 page。 届く前に新しい周の
+            // record を書くと、 前の周の header のままその page だけが届いた像で、 再生が前の周を途中まで当て直す)
+            if !self.settle_fold(i) {
+                // 満杯とは別の失敗として返す (満杯 = `OutOfMemory` だと、 空きはあるので呼び手が書き直し続ける)
+                return Err(io::Error::other("oplog: could not write out the header of a folded half"));
+            }
+            if !self.stale_tail[i].load(Ordering::Relaxed) {
+                a.limit.store(full_size, Ordering::Release);
+                if let Some(off) = self.alloc_off(a, size, closes_group) {
+                    return Ok(((i as u64) << 32) | off);
+                }
+            } else {
+                // #706: head の先に同じ周の古い record が残っているかもしれない区画。 もう一方が空ならそちらへ移って書く
+                // (この区画には 1 byte も足さない)。 移れなければ (もう一方にも record がある / 1 区画の形) ここに書き足す
+                if !self.larger_than_ring(need) && self.switch_locked() {
+                    let i = self.hot.active.load(Ordering::Relaxed);
+                    if let Some(off) = self.alloc_off(&self.hot.halves[i], size, closes_group) {
+                        return Ok(((i as u64) << 32) | off);
+                    }
+                    return Err(self.wal_full_err());
+                }
+                return match self.alloc_off_within(a, size, closes_group, full_size) {
+                    Some(off) => Ok(((i as u64) << 32) | off),
+                    None => Err(self.wal_full_err()),
+                };
+            }
+        }
         if !self.larger_than_ring(need) && self.switch_locked() {
             let i = self.hot.active.load(Ordering::Relaxed);
             if let Some(off) = self.alloc_off(&self.hot.halves[i], size, closes_group) {
@@ -1783,12 +1857,20 @@ impl OpLog {
 
     /// 区画 `h` に `size` bytes を取れれば offset。 区画の位置・大きさ・周は `append_lock` の下でしか変えないので、 ここ (lock の下)
     /// では Relaxed で読む。
+    ///
+    /// 上限は `Half::limit` (普段は区画の大きさ。 0 = 閉じてある区画で、 必ず None = 呼び手は遠回りの道へ)。
     #[inline]
     fn alloc_off(&self, h: &Half, size: u64, closes_group: bool) -> Option<u64> {
+        self.alloc_off_within(h, size, closes_group, h.limit.load(Ordering::Relaxed))
+    }
+
+    /// `alloc_off` の、 上限を呼び手が渡す版。
+    #[inline(always)]
+    fn alloc_off_within(&self, h: &Half, size: u64, closes_group: bool, limit: u32) -> Option<u64> {
         let cur = self.alloc_head_at(h, h.base.load(Ordering::Relaxed) as usize);
         let new = cur + size;
         let need = if closes_group { new } else { new + self.commit_room.load(Ordering::Relaxed) };
-        if need > h.size.load(Ordering::Relaxed) as u64 {
+        if need > limit as u64 {
             return None;
         }
         h.head.store(new, Ordering::Release);
@@ -1805,11 +1887,12 @@ impl OpLog {
     /// #663: 区画 `h` の header の page を書き出す (`append_lock` の下、 移る時)。 区画の頭は [`HALF_ALIGN`] にそろっているので、
     /// そこから [`HALF_ALIGN`] を書く (page が 4 KiB でも 16 KiB でも header の page を含む)。 失敗しても移る (次の fsync が書く)。
     fn sync_half_header(&self, h: &Half) {
-        self.sync_header_page(h, "oplog.switch_header");
+        let _ = self.sync_header_page(h, "oplog.switch_header");
     }
 
-    /// 区画 `h` の header の page を書き出す ([`Self::sync_half_header`] と同じ範囲、 `io` は故障を入れる点の名前)。 失敗しても何もしない。
-    fn sync_header_page(&self, h: &Half, io: &'static str) {
+    /// 区画 `h` の header の page を書き出す ([`Self::sync_half_header`] と同じ範囲、 `io` は故障を入れる点の名前)。 戻り値は
+    /// 書き出せたか (失敗しても他には何もしない)。
+    fn sync_header_page(&self, h: &Half, io: &'static str) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let b = h.base();
@@ -1822,10 +1905,33 @@ impl OpLog {
                 if let Some(copy) = sim {
                     crate::crashsim::data_synced(&self._file, copy);
                 }
+                return true;
             }
+            false
         }
         #[cfg(target_arch = "wasm32")]
-        let _ = (h, io);
+        {
+            let _ = (h, io);
+            true
+        }
+    }
+
+    /// #707: 区画 `i` の、 畳んで置いた header (`fold_pending`) を disk に届ける。 戻り値は 「もう待つものが無い」 か
+    /// (届いた / 元から無い)。 `append_lock` は要らない: 書き出す前に読んだ周のままの時だけ印を倒すので、 書き出しの間に
+    /// もう一度畳まれた区画 (別の周が置かれている) の印は残る。 header の page は、 印を読んだ後に写す = その周の header を含む。
+    fn settle_fold(&self, i: usize) -> bool {
+        let p = self.fold_pending[i].load(Ordering::Acquire);
+        if p == 0 {
+            return true;
+        }
+        if !self.sync_header_page(&self.hot.halves[i], "oplog.fold_header") {
+            return false;
+        }
+        // 並んだ者 (畳んだ consumer / 全体の fsync) が先に倒していれば、 それで届いている
+        match self.fold_pending[i].compare_exchange(p, 0, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => true,
+            Err(now) => now == 0,
+        }
     }
 
     /// 今の区画が埋まった時、 もう一方が空なら移る (`append_lock` の下)。 開いている group は今の区画に閉じの Commit を置いて
@@ -1840,7 +1946,17 @@ impl OpLog {
         if !o.is_empty() || self.alloc_head(o) > HEADER_SIZE as u64 {
             return false;
         }
-        self.close_group_for_switch(a);
+        // #707: 移る先を畳んだ header がまだ届いていなければ、 先に届ける (畳んだ側が lock を放してすぐ書き出すので、 ここで
+        // 書き出すのはその短い間に区画を埋め切った時だけ)。 届かなければ移らない
+        if !self.settle_fold(ai ^ 1) {
+            return false;
+        }
+        // #706: 古い record が head の先に残っているかもしれない区画 (`stale_tail`) からは、 閉じの Commit も置かずに移る
+        // (同じ周で 1 件でも足すと、 その後ろの古い record が続きとして読める)。 開いている group は移った先の Commit で閉じる
+        // (読み手は group を区画をまたいで読む)
+        if !self.stale_tail[ai].load(Ordering::Relaxed) {
+            self.close_group_for_switch(a);
+        }
         // #663: 移った先に書く前に、 古い区画の header (最後の head) を書き出す。 新しい区画の record が読める像では、 古い区画の
         // header が最後の head を持つ = 古い区画の record が欠けていれば読みは古い区画の途中で止まり、 新しい区画を読まない。 書き
         // 出さないと、 header だけ前の head のまま古い区画の終わりの record が届かず、 新しい区画の record は届いた像で、 読みが古い
@@ -1852,6 +1968,8 @@ impl OpLog {
             self.mmap_mut_slice()[b + OFF_LAP..b + OFF_LAP + 4].copy_from_slice(&lap.to_le_bytes());
             o.lap.store(lap, Ordering::Release);
         }
+        // 移る先は空で、 header も届いている = そのまま書ける (畳んだ時に閉じた上限を開く)
+        o.limit.store(o.size.load(Ordering::Relaxed), Ordering::Release);
         self.hot.active.store(ai ^ 1, Ordering::Release);
         self.switches.fetch_add(1, Ordering::Relaxed);
         if let Some(h) = self.switch_hook.get() {
@@ -2641,15 +2759,31 @@ impl OpLog {
         // チェックと head CAS の間に窓があり、 その間に進入した append の
         // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
         // append_lock 保持中は append_inner が進入できないため窓が閉じる。
-        let _in_proc = self.append_lock.lock();
-        // `pending_writes` は見ない (`checkpoint_and_reset` と同じ)。 全 append は `append_lock` の下で場所を取って
-        // 書き終え、 head も進めるので、 ここで数に入っているのは lock を待っている append と、 満杯で空きを待っている
-        // append (`wait_for_room`、 record はまだ載っていない) だけ。 前は見ていたので、 空きを待つ書き手がいる間は畳めず、
-        // 空きを作れないまま書き手が諦めて record が落ちた (sync の DB で満杯になると、 その後の record がほぼ全部落ちた、 #511)。
-        let Some((i, through)) = self.fold_target_locked() else { return false };
-        // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
-        if !fold_safe(through) { return false; }
-        self.fold_half_locked(i)
+        // 前に畳んだ header の書き出しに失敗していたら、 ここでもう一度 (普段は読み 2 回で返る)
+        self.settle_folds();
+        let folded = {
+            let _in_proc = self.append_lock.lock();
+            // `pending_writes` は見ない (`checkpoint_and_reset` と同じ)。 全 append は `append_lock` の下で場所を取って
+            // 書き終え、 head も進めるので、 ここで数に入っているのは lock を待っている append と、 満杯で空きを待っている
+            // append (`wait_for_room`、 record はまだ載っていない) だけ。 前は見ていたので、 空きを待つ書き手がいる間は畳めず、
+            // 空きを作れないまま書き手が諦めて record が落ちた (sync の DB で満杯になると、 その後の record がほぼ全部落ちた、 #511)。
+            let Some((i, through)) = self.fold_target_locked() else { return false };
+            // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
+            if !fold_safe(through) { return false; }
+            self.fold_half_locked(i)
+        };
+        // #707: 畳んだ header を、 lock を放してから届ける (書き手を止めない。 届くまでその区画には書けない)
+        if folded {
+            self.settle_folds();
+        }
+        folded
+    }
+
+    /// #707: 畳んで置いた header のうち、 まだ disk に届いていないものを届ける ([`Self::settle_fold`])。 `append_lock` の外から呼ぶ。
+    fn settle_folds(&self) {
+        for i in 0..2 {
+            self.settle_fold(i);
+        }
     }
 
     /// 今畳める区画があれば、 読み手がそこまで読み終えていればよい位置 (`try_reset_if` が `fold_safe` に渡す値)。 lock を取らない
@@ -2687,6 +2821,13 @@ impl OpLog {
     /// 区画 `i` を頭に戻す (`append_lock` を持った呼び手から、 その区画の head == checkpoint を確かめた後)。 新しい周を置くので、
     /// 前の周の record は読まれない。 古い区画を畳んだ後は、 次に切り替えで移る時に周を置き直さない (今の区画より新しい周)。
     /// 1 区画の形 (v3 / v2) は、 畳んだ後に 2 区画にできれば v4 にする (`split_locked`)。
+    ///
+    /// #707: 畳んだ区画は、 この header が disk に届くまで閉じる (`fold_pending` に置いた周、 `Half::limit` = 0)。 呼び手は
+    /// `append_lock` を放してから [`Self::settle_folds`] を呼ぶ (または全体を fsync する)。 届く前に新しい周の record で前の周の
+    /// record を上書きすると、 「header は前の周 (head = 畳む前の終わり、 checkpoint = 1 回前の書き出しの位置) のまま、 後ろの
+    /// page だけ新しい周」 の像ができ、 再生は前の周の record を checkpoint から上書きされた所までだけ当て直す。 本体は畳む前の
+    /// 終わりまで当てて書き出してあるので、 同じ cell の値が途中の値に戻る (前は 「本体は前の周を当て終えているので困らない」 と
+    /// していた。 当て終えているからこそ、 途中までの当て直しが値を戻す)。
     fn fold_half_locked(&self, i: usize) -> bool {
         let h = &self.hot.halves[i];
         let head = h.head.load(Ordering::Acquire);
@@ -2705,22 +2846,20 @@ impl OpLog {
         let b = h.base();
         mmap[b + 8..b + 16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         mmap[b + 16..b + 24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        // 新しい周になったので、 head の先に残る record は周の印で読まれない
+        self.stale_tail[i].store(false, Ordering::Relaxed);
+        // 閉じてから印を置く (どちらも lock の下。 lock を取らない `settle_fold` は印を倒すだけで、 上限は書き手が lock の下で開く)
+        h.limit.store(0, Ordering::Release);
+        self.fold_pending[i].store(h.lap(), Ordering::Release);
         self.split_locked();
-        if self.sync_on_reset.load(Ordering::Acquire) {
-            // append_lock の下: 次の record が前の周の page を上書きする前に、 頭に戻した header を届ける。 書くのは区画の header の
-            // page だけ (#683: 前は WAL 全体を fsync していた。 2 区画の形では書き手がもう一方の区画に積んだ分も書くので、 1 回 4〜5 ms
-            // 書き手を止めた)
-            self.sync_header_page(h, "oplog.fsync");
-        }
         true
     }
 
-    /// 畳んだ印 (head / checkpoint を頭に戻した header) を、 次の record を書く前に書き出す (append_lock の下で、 畳んだ区画の
-    /// header の page だけ。 畳む前に全部を書き出してある)。 既定は書き出さない: 電源が落ちると、 前の周の header
-    /// のまま、 新しい周の page だけが OS に先に書かれた姿がありうる。 本体は前の周を当て終えているので困らないが、 WAL の中で
-    /// 記録した record の続きを探す changefeed の記録 (engine の `changefeed.seg`) は、 前の周を途中までしか読めずに取り違える。
+    /// 0.37.4 まで: 畳んだ header を次の record より先に書き出すか (changefeed の記録のある DB だけが立て、 `append_lock` の下で
+    /// header の page を書き出していた)。 今はどの DB でも、 畳んだ header が届くまでその区画に書かない (#707、
+    /// `fold_half_locked`) ので、 何もしない (呼び手の互換のために残す)。
     pub fn set_sync_on_reset(&self, on: bool) {
-        self.sync_on_reset.store(on, Ordering::Release);
+        let _ = on;
     }
 
     /// #608: 区画 `h` に新しい周を置いて header に書く (`append_lock` の下、 区画が空の時)。 v2 の file はここで v3 になる
@@ -2769,9 +2908,10 @@ impl OpLog {
         }
         mmap[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(hs as u32).to_le_bytes());
         mmap[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
-        a.size.store(hs as u32, Ordering::Release);
+        // A は畳んだ直後 = 閉じたまま (`fold_pending`)。 B は header を上の fsync で届けた、 まだ使っていない区画
+        a.set_size(hs as u32, false);
         b.base.store(hs as u32, Ordering::Release);
-        b.size.store(hs as u32, Ordering::Release);
+        b.set_size(hs as u32, true);
         self.two.store(true, Ordering::Release);
     }
 
@@ -2807,17 +2947,24 @@ impl OpLog {
             }
             return (advanced, false);
         }
-        let _in_proc = self.append_lock.lock();
-        let head = self.head();
-        if self.is_empty() || !sync(head) {
-            return (false, false);
+        let out = {
+            let _in_proc = self.append_lock.lock();
+            let head = self.head();
+            if self.is_empty() || !sync(head) {
+                return (false, false);
+            }
+            self.advance_checkpoint_locked(head);
+            let Some((i, through)) = self.fold_target_locked() else { return (true, false) };
+            if !fold_safe(through) {
+                return (true, false);
+            }
+            (true, self.fold_half_locked(i))
+        };
+        // #707: 畳んだ header を届ける (lock を放してから。 届くまでこの区画には書けない)
+        if out.1 {
+            self.settle_folds();
         }
-        self.advance_checkpoint_locked(head);
-        let Some((i, through)) = self.fold_target_locked() else { return (true, false) };
-        if !fold_safe(through) {
-            return (true, false);
-        }
-        (true, self.fold_half_locked(i))
+        out
     }
 
     /// WAL の容量 (byte、 2 区画の和)。
@@ -3164,6 +3311,8 @@ impl OpLog {
     /// fsync(WAL 本体のみ)。consumer スレッドが定期実行。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn fsync(&self) -> io::Result<()> {
+        // #707: 全体の書き出しは区画の header も届ける。 書き出す前に読んだ周のままなら、 畳んだ header の印を倒す
+        let pending = [self.fold_pending[0].load(Ordering::Acquire), self.fold_pending[1].load(Ordering::Acquire)];
         #[cfg(all(feature = "crashsim", unix))]
         let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, 0, &self.mmap));
         crate::io_point("oplog.fsync")?;
@@ -3171,6 +3320,11 @@ impl OpLog {
         #[cfg(all(feature = "crashsim", unix))]
         if let Some(copy) = sim {
             crate::crashsim::data_synced(&self._file, copy);
+        }
+        for (i, p) in pending.into_iter().enumerate() {
+            if p != 0 {
+                let _ = self.fold_pending[i].compare_exchange(p, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
         }
         Ok(())
     }
@@ -3367,8 +3521,63 @@ impl OpLog {
     ///   積まれ、 読み (changefeed の記録・bridge・audit・次に開いた時の再生) が届かなかった。 区画を移った時の閉じの Commit
     ///   (`switch_locked`) は header の page だけを先に書き出すので、 閉じの Commit の中身が届かずに head だけがその後ろを指す像が
     ///   出る (#665)
+    ///
+    /// # 開いた session が書く区画 (#706)
+    ///
+    /// 上の後、 穴の有無によらず、 この session の最初の append が 「この session が置いた周」 の区画に入るようにする
+    /// (`begin_session_locked`)。 前の session が書いて header に届かなかった record (と、 上で捨てた穴の後ろの record) は
+    /// head の先に **同じ周のまま** 残っている (周の印も CRC も合う)。 同じ周で head から書き足すと、 新しい record を書いた後に
+    /// 「header の head は先まで進んだのに、 途中の page から先は古いまま」 の像 (区画を移る時は header の page だけを書き出す、
+    /// #663) で、 再生が新しい record の後ろに古い record を続きとして当てた (書き出しの返った値が前の session の値に戻る)。
+    /// [`LAP_SKIP_ON_OPEN`] が守るのは 「次に置く周」 だけで、 開いた区画の周は守らない。
+    ///
+    /// - 空の、 最初に書く区画: 新しい周を置き、 その header が disk に届くまで書かない (この session が落ちても、 次の
+    ///   session は別の周を置く)
+    /// - record のある今の区画: 触らない (`stale_tail` を立てる)。 最初の append がもう一方の空の区画へ新しい周で移る。
+    ///   移れない間 (もう一方にも record がある / 1 区画の形) だけ、 同じ周で書き足す (畳めば新しい周になる)
+    ///
+    /// 書き手として開いた時に、 再生 ([`Self::recover_with_tail`]) の後・最初の append の前に 1 回呼ぶ (engine の開く道)。
+    /// 読むだけの開き方では呼ばない (header を書く)。
     pub fn drop_records_after_a_hole(&self) -> bool {
         let _in_proc = self.append_lock.lock();
+        let dropped = self.drop_after_hole_locked();
+        self.begin_session_locked();
+        dropped
+    }
+
+    /// #706: [`Self::drop_records_after_a_hole`] の後半 (`append_lock` の下、 開いた直後 = 書き手の居ない間)。
+    fn begin_session_locked(&self) {
+        if self.trailer.load(Ordering::Acquire) == 0 {
+            return; // v2 の file: 周の印が無い (最初に畳む時に v3 になる)
+        }
+        let ai = self.hot.active.load(Ordering::Relaxed);
+        let a = &self.hot.halves[ai];
+        // 最初に書く区画: 今の区画が空ならそれ、 record があればもう一方 (空の時だけ)
+        let first = if a.is_empty() && self.alloc_head(a) <= HEADER_SIZE as u64 {
+            Some(ai)
+        } else {
+            self.stale_tail[ai].store(true, Ordering::Relaxed);
+            a.limit.store(0, Ordering::Release);
+            let o = &self.hot.halves[ai ^ 1];
+            (o.size() > 0 && o.is_empty() && self.alloc_head(o) <= HEADER_SIZE as u64).then_some(ai ^ 1)
+        };
+        let Some(i) = first else { return };
+        // 空の区画に新しい周を置く。 header に届いた周 (空の区画のものでも) は、 前の session がその周で書いた record が
+        // 後ろの page に残りうるので使い直さない。 畳んだ時と同じに、 header が届くまで閉じる (届かないまま書いて落ちると、
+        // 次の session が同じ数の周を置く)。 届けるのは、 開く道のこの後の fsync (engine は再生を当てた後に必ず呼ぶ) か、
+        // それが無ければ最初の append (`alloc_after_switch`)。 ここでは書き出さない (開く時間を足さない)。
+        // 今の区画が空なら、 周はどの区画よりも新しいまま (読み手の約束、 `scan_range_with`)
+        let h = &self.hot.halves[i];
+        let lap = self.take_next_lap();
+        let b = h.base();
+        self.mmap_mut_slice()[b + OFF_LAP..b + OFF_LAP + 4].copy_from_slice(&lap.to_le_bytes());
+        h.lap.store(lap, Ordering::Release);
+        h.limit.store(0, Ordering::Release);
+        self.fold_pending[i].store(lap, Ordering::Release);
+    }
+
+    /// [`Self::drop_records_after_a_hole`] の前半 (`append_lock` の下)。
+    fn drop_after_hole_locked(&self) -> bool {
         let start = self.checkpoint();
         let s = self.scan_from_offset(start);
         if s.stop == ScanStop::Head {
@@ -5364,8 +5573,8 @@ mod tests {
             wal.trailer.store(0, Ordering::Release);
             // 1 区画 (file 全体)、 周なし
             wal.two.store(false, Ordering::Release);
-            wal.hot.halves[0].size.store(cap as u32, Ordering::Release);
-            wal.hot.halves[1].size.store(0, Ordering::Release);
+            wal.hot.halves[0].set_size(cap as u32, true);
+            wal.hot.halves[1].set_size(0, true);
             wal.hot.halves[0].lap.store(0, Ordering::Release);
             wal.commit_room.store(REC_HEADER_SIZE as u64, Ordering::Relaxed);
             for i in 0..3u64 {
@@ -5925,8 +6134,8 @@ mod tests {
                 m[half..half + HEADER_SIZE].fill(0);
             }
             wal.two.store(false, Ordering::Release);
-            wal.hot.halves[0].size.store(cap as u32, Ordering::Release);
-            wal.hot.halves[1].size.store(0, Ordering::Release);
+            wal.hot.halves[0].set_size(cap as u32, true);
+            wal.hot.halves[1].set_size(0, true);
             while wal_pos_offset(wal.head()) < 40 * 1024 {
                 append_group(&wal, &mut v);
             }
