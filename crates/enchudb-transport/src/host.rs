@@ -18,7 +18,7 @@
 //!
 //! 計画は repo 直下の `HOST_PLAN.md`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -247,6 +247,9 @@ struct HostInner {
     loopback: Arc<Loopback>,
     /// client ごとの publish を 1 本ずつに並べる (同じ client の record を当てる順を保つ)。
     client_locks: Mutex<HashMap<PeerId, Arc<Mutex<()>>>>,
+    /// ホストが state を求めた client (publish の返事に `NEED_STATE` を立てた)。 `POST /v2/state` はここに居る書き手の分だけ受け、
+    /// 受けたら外す (#699: 求めていない state を受けると、 空で complete の state 1 つでその書き手の行を全部掃除していた)。
+    asked_state: Mutex<HashSet<PeerId>>,
     /// client ごとの状態と、 削除を忘れてよい線 (F、 下がらない)。
     lines: Mutex<Lines>,
     /// client の状態の置き場 (`cursor_path` の横)。 無ければ線を出さない (開き直した後に誰を待つか分からないので、 忘れない側)。
@@ -398,6 +401,9 @@ impl HostInner {
             .unwrap()
             .remove(&from)
             .unwrap_or_else(|| self.syncer.cursors_of(from));
+        if out.history_truncated {
+            self.asked_state.lock().unwrap().insert(from);
+        }
         (if out.history_truncated { NEED_STATE } else { 0 }, ack)
     }
 
@@ -568,6 +574,7 @@ impl HttpHost {
             syncer,
             loopback,
             client_locks: Mutex::new(HashMap::new()),
+            asked_state: Mutex::new(HashSet::new()),
             lines: Mutex::new(lines),
             lines_path,
             gate: RwLock::new(()),
@@ -714,6 +721,10 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             let Some(state) = decode_state(&req.body) else { return send_response(&mut stream, 400, b"state") };
             let lock = host.client_lock(author);
             let _serial = lock.lock().unwrap();
+            // #699: ホストが求めた state だけ受ける (求めるのは、 その client の publish を当てて履歴が足りなかった時だけ)
+            if !host.asked_state.lock().unwrap().remove(&author) {
+                return send_response(&mut stream, 409, b"state not requested");
+            }
             host.loopback.pushed_state.lock().unwrap().insert(author, state);
             let ok = host.syncer.bootstrap_pull_via(author, author).is_some();
             host.loopback.pushed_state.lock().unwrap().remove(&author);
