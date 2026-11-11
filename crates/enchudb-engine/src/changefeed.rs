@@ -37,7 +37,10 @@
 //! 閉じ (#636、 前は永久に止まる listener なら Drop も返らなかった)、 残りはその listener が戻った後に通知係が配る (記録がある時は
 //! 記録に残り、 開き直した後に続きから受ける)。 listener の中で engine の最後の参照を落としてもよい (その Drop は通知係を待たない)。
 //! listener の中から `oplog_sync()` を呼んでもよい (その呼び出しは配らずに返る、 残りは
-//! 呼び出し元の配信か consumer が配る)。 listener の中で **別の thread の `oplog_sync()` を待たない** こと
+//! 呼び出し元の配信か consumer が配る)。 配らずに返るのは **同じ engine** の `oplog_sync()` だけ: listener の中で別の engine に
+//! 書いて、 その engine の `oplog_sync()` を呼べば、 その engine の commit は返る前に配られる (#719。 前は別の engine でも
+//! 配らずに返った)。 2 つの engine が互いの listener の中から相手の `oplog_sync()` を別々の thread で呼び合うと、 互いの配信が
+//! 終わるのを待つので、 5 秒待って配らずに返る (残りは通知係が配る)。 listener の中で **別の thread の `oplog_sync()` を待たない** こと
 //! (その thread はこちらの配信が終わるのを待っているので、 互いに待って止まる)。 WAL は配り終えるのを待たずに畳む
 //! (渡していない分は溜めへ移す)。
 //!
