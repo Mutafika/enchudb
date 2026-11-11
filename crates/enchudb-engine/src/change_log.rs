@@ -25,7 +25,10 @@
 //! 足す 1 回 ([`ChangeLog::append`]) は、 (1) 捨てる分を header に書いて書き出す → (2) entry を書いて書き出す → (3) 新しい
 //! head / next を header に書いて書き出す、 の順。 header は書き出した entry しか指さない。 (2) の途中で落ちても、 (1) で捨てた
 //! 場所にしか書いていない。 開く時は header の head から、 番号が続き crc の合う entry を拾い足す ((2) の後・(3) の前に落ちた分)。
-//! header の crc が合わない時は空の記録として開く (番号を 0 から振り直し、 古い番号の読み手は全員 [`Truncated`])。
+//! header の crc が合わない時は空の記録として開く。 番号は前の世代より必ず大きい所から振る (data に残っている crc の合う
+//! entry の最大の番号 + 1 + [`RESTART_GAP`]。 #717)。 古い番号の読み手は全員 [`Truncated`] になり、 data に残った前の世代の
+//! entry は、 番号が新しい世代の続きにならないので、 次に開いた時にも拾わない。 前は 0 から振り直していたので、 次に開いた時に
+//! head の先の前の世代の entry (番号が続き crc も合う) を新しい番号の続きとして拾い、 古い位置の読み手も黙って通った。
 //!
 //! 書き手 (呼び手の pump) と読み手 (通知係) は同じ lock を取る。
 
@@ -54,6 +57,10 @@ const WRAP: u64 = u64::MAX;
 const MARK_EVERY: u64 = 64;
 /// 小さすぎる記録は作らない。
 pub const MIN_CAP: usize = 1 << 20;
+/// #717: header の壊れた記録を空として開く時、 番号の始まりを 「data に残っている最大の番号 + 1」 からさらに離す幅。 中身を
+/// 残さずに番号だけ使った record (置けない大きさ、 [`ChangeLog::max_entry`]) と、 上書きで消えた新しい entry の分。 header が
+/// 読めないので前の `next` は分からない: 「残っている最大の番号から前の `next` までが 2^32 件未満」 を前提にしている。
+pub const RESTART_GAP: u64 = 1 << 32;
 
 fn entry_size(len: usize) -> usize {
     (ENTRY_HEADER + len).next_multiple_of(ALIGN)
@@ -282,10 +289,16 @@ impl ChangeLog {
                 .then(|| (Hlc { wall: u64_at(56), logical: u32_at(64), peer: u32_at(68) }, u64_at(48))),
         };
         if !crc_ok || c.tail >= self.cap || c.head >= self.cap || c.first > c.next {
+            // #717: 番号を 0 から振り直さない。 data は残っているので、 0 から振ると (1) 古い位置の読み手が、 新しい番号が
+            // そこへ届いた時に黙って通り、 (2) 次に開いた時に、 head の先の前の世代の entry を 「番号が続き crc の合う entry」
+            // として拾い足す。 前の世代のどの番号よりも大きい所から始める
+            let start = self.first_number_after_damage();
             eprintln!(
-                "[enchudb] warning: changefeed.seg header is damaged — starting an empty change log (readers resume as truncated)"
+                "[enchudb] warning: changefeed.seg header is damaged — starting an empty change log at number {start} \
+                 (readers resume as truncated)"
             );
-            *st = State { c: Cursor::default(), marks: VecDeque::new(), marked: true };
+            let c = Cursor { tail: 0, head: 0, first: start, next: start, last: None };
+            *st = State { c, marks: VecDeque::new(), marked: true };
             return;
         }
         // header を書いた後に書き出した entry (足す途中で落ちた分) を拾う
@@ -304,6 +317,28 @@ impl ChangeLog {
             c.tail = c.head;
         }
         *st = State { c, marks: VecDeque::new(), marked: c.first == c.next };
+    }
+
+    /// #717: header が壊れていた時の番号の始まり。 data の全域から crc の合う entry を探し、 最大の番号 + 1 + [`RESTART_GAP`]
+    /// (1 つも無ければ `RESTART_GAP`)。 data を書き換えないので、 header を書き直す (次に足す) まで何度開いても同じ値になる。
+    /// 足した後・新しい header の前に落ちた時は、 その entry も数えるので、 前より大きい所から始まる。
+    ///
+    /// entry の始まりは header が無いと分からない (折り返しと上書きで、 頭からたどる鎖は途中で切れる) ので、 読めた entry は
+    /// 次の entry へ飛び、 読めない所は 8 B (entry の整列) ずつ進む。 置けない長さは中身の crc を取る前に落とす。
+    fn first_number_after_damage(&self) -> u64 {
+        let mut newest: Option<u64> = None;
+        let mut at = 0usize;
+        while self.cap - at >= ENTRY_HEADER {
+            let found = self.header_at(at).filter(|e| e.len <= self.max_entry()).and_then(|_| self.entry_at(at));
+            match found {
+                Some(e) => {
+                    newest = Some(newest.map_or(e.no, |n| n.max(e.no)));
+                    at += entry_size(e.len);
+                }
+                None => at += ALIGN,
+            }
+        }
+        newest.map_or(0, |n| n.saturating_add(1)).saturating_add(RESTART_GAP)
     }
 
     /// 生きている番号の範囲 `(first, next)`。
@@ -932,10 +967,84 @@ mod tests {
             log.flush().unwrap();
         }
         let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
-        assert_eq!(log.range(), (0, 0));
+        // #717: 番号は前の世代 (0..10) より先から (0 から振り直さない)
+        let start = 10 + RESTART_GAP;
+        assert_eq!(log.range(), (start, start));
         assert_eq!(log.last_written(), None);
         // 前の番号で読む読み手は Truncated (黙って別の entry を返さない)
-        assert_eq!(log.read(5, 1), Err(Truncated { from: 0 }));
+        assert_eq!(log.read(5, 1), Err(Truncated { from: start }));
+    }
+
+    /// #717: header の壊れた記録を空として開いて足した後、 次に開いた時に、 data に残っている前の世代の entry を新しい番号の
+    /// 続きとして拾わない。 前の番号の読み手は、 新しい世代が何件足しても Truncated のまま。
+    #[test]
+    fn a_damaged_header_does_not_resurrect_the_old_generation_on_the_next_open() {
+        let dir = tempdir("damaged-reopen");
+        let old: Vec<_> = (0..100).map(|k| rec(k, 100)).collect();
+        {
+            let log = ChangeLog::open(&dir, MIN_CAP, true, false).unwrap();
+            add(&log, &old, &[]);
+            assert_eq!(log.range(), (0, 100));
+            // header の crc だけを壊す (data は残る)
+            let crc = u32::from_le_bytes(log.region.slice()[HEADER_CRC..HEADER_CRC + 4].try_into().unwrap());
+            log.region.write_at(HEADER_CRC, &(!crc).to_le_bytes());
+            log.region.mark_dirty(0, HEADER);
+            log.flush().unwrap();
+        }
+        let start = 100 + RESTART_GAP;
+        // 新しい世代は中身で見分ける (番号 1000 から)
+        let new: Vec<_> = (0..3).map(|k| rec(1000 + k, 100)).collect();
+        {
+            let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
+            assert_eq!(log.range(), (start, start), "壊れた header は空の記録、 番号は前の世代の先から");
+            // 前提: 前の世代の entry は data に残っている (新しい世代の 3 件が置かれる所の先、 crc も合う)
+            let stale = log.entry_at(3 * entry_size(100)).expect("前提: 前の世代の entry が data に残っている");
+            assert_eq!(stale.no, 3);
+            add(&log, &new, &[]);
+            assert_eq!(log.range(), (start, start + 3));
+        }
+        // 何度開いても同じ
+        for round in 0..2 {
+            let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
+            assert_eq!(log.range(), (start, start + 3), "{round} 回目: 前の世代の entry が新しい番号の続きとして戻った");
+            let got = read_all(&log, start).unwrap();
+            assert_eq!(got.iter().map(id_of).collect::<Vec<_>>(), vec![1000, 1001, 1002]);
+            assert_eq!(got.iter().map(|e| e.no).collect::<Vec<_>>(), vec![start, start + 1, start + 2]);
+            // 前の世代の位置の読み手は Truncated (黙って別の entry を返さない)
+            for pos in [0u64, 2, 3, 50, 99, 100] {
+                assert_eq!(log.read(pos, 1), Err(Truncated { from: start }), "前の世代の位置 {pos}");
+            }
+            assert_eq!(log.last_written(), Some((new[2].hlc, new[2].wal_id)));
+        }
+    }
+
+    /// #717: 壊れた header で開いて足した後、 新しい header を書く前に落ち (header は壊れたまま)、 もう一度開いた時も、
+    /// 番号は前より大きい所から (足した entry の番号と重ならない)。
+    #[test]
+    fn a_damaged_header_restarts_past_entries_written_before_the_next_header() {
+        let dir = tempdir("damaged-twice");
+        {
+            let log = ChangeLog::open(&dir, MIN_CAP, true, false).unwrap();
+            add(&log, &(0..10).map(|k| rec(k, 100)).collect::<Vec<_>>(), &[]);
+            let crc = u32::from_le_bytes(log.region.slice()[HEADER_CRC..HEADER_CRC + 4].try_into().unwrap());
+            log.region.write_at(HEADER_CRC, &(!crc).to_le_bytes());
+            log.region.mark_dirty(0, HEADER);
+            log.flush().unwrap();
+        }
+        let first = 10 + RESTART_GAP;
+        {
+            let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
+            assert_eq!(log.range(), (first, first));
+            // entry を書き出した後・新しい header の前で止める (header は壊れたまま残る)
+            log.stop_before_header.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut lost = Vec::new();
+            assert!(log.append(&(0..4).map(|k| rec(2000 + k, 100)).collect::<Vec<_>>(), &[], &mut lost).is_err());
+        }
+        let log = ChangeLog::open(&dir, MIN_CAP, false, false).unwrap();
+        // 書いた 4 件 (first..first + 4) より先から
+        let second = first + 4 + RESTART_GAP;
+        assert_eq!(log.range(), (second, second));
+        assert_eq!(log.read(first, 1), Err(Truncated { from: second }));
     }
 
     /// 置けない大きさの record は番号を使い、 その位置と前の位置の読み手は Truncated。 その後の record は読める。 印は残る。
