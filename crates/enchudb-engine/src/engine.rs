@@ -9990,15 +9990,22 @@ impl Engine {
             if fl.is_empty() {
                 table.free_locals_nonempty.store(false, Ordering::Release);
             }
-            popped.and_then(|local| table.global_of(local))
+            let global = popped.and_then(|local| table.global_of(local));
+            if let Some(global) = global {
+                // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす
+                // (`clear_cell_versions` の doc 参照)。
+                self.clear_cell_versions(global);
+                // #733: live の印は `free_locals` を握ったまま立てる。 放してから立てると、 その間に枯渇した別の thread の
+                // `rebuild_free_locals` が、 まだ live でないこの slot を穴として拾い直し、 同じ eid を 2 本に払い出した (2 つの
+                // 行が 1 つに混ざる)。 rebuild は同じ lock の下で liveness をなめるので、 ここを待った後は live を見る。
+                // lock の順は `free_locals` → `EntitySet` の中、 の一方向のまま (`purge_sync_ops_row` の doc)
+                self.entities.allocate_at(global);
+            }
+            global
         } else {
             None
         };
         if let Some(global) = reused_global {
-            // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす
-            // (`clear_cell_versions` の doc 参照)。
-            self.clear_cell_versions(global);
-            self.entities.allocate_at(global);
             let peer = self.peer_id.load(Ordering::Acquire);
             return Ok(enchudb_oplog::make_eid(peer, global));
         }
