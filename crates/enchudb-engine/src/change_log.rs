@@ -664,9 +664,11 @@ impl ChangeLog {
             self.region.write_at(base, &entry_header(no, buf.len() as u32, crc, hlc, wal_id));
         };
         #[cfg(not(target_arch = "wasm32"))]
-        if range.len() >= PAR_CRC_MIN {
+        if range.len() >= PAR_CRC_MIN
+            && let Some(pool) = crc_pool()
+        {
             use rayon::prelude::*;
-            (0..range.len()).into_par_iter().for_each_init(|| Vec::with_capacity(256), |buf, k| one(buf, k));
+            pool.install(|| (0..range.len()).into_par_iter().for_each_init(|| Vec::with_capacity(256), |buf, k| one(buf, k)));
             return;
         }
         let mut buf = Vec::new();
@@ -696,6 +698,20 @@ struct EntryHeader {
 
 /// entry を並べて書く回の大きさの下限 (entry の数、 [`ChangeLog::write_entries`])。
 const PAR_CRC_MIN: usize = 4096;
+
+/// 記録への写しを並べる専用の pool (#700)。 rayon の global pool に頼むと、 写す consumer (pool の外の thread) は worker が空くまで
+/// 待つ。 アプリの書き手がその global pool の上に居て全員 WAL の空きを待っていると、 空きを作る consumer は worker を待ち、 worker は
+/// consumer を待つ (書き手は 5 秒で `WalSpace`)。 ここの worker はこの写しだけをするので、 アプリの仕事で埋まらない。 process に 1 つ、
+/// 最初の大きな回で作る (作れなければ None = 並べずに写す)。
+#[cfg(not(target_arch = "wasm32"))]
+fn crc_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+        rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("enchudb-cflog-{i}")).build().ok()
+    })
+    .as_ref()
+}
 
 fn entry_header(no: u64, len: u32, crc: u32, hlc: Hlc, wal_id: u64) -> [u8; ENTRY_HEADER] {
     let mut h = [0u8; ENTRY_HEADER];
