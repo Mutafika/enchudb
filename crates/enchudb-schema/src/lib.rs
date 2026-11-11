@@ -2188,10 +2188,12 @@ impl<'a> RowBuilder<'a> {
         //
         // #60 / #601: 確かめと書き込みを名前ごとの lock で並べて TOCTOU を防ぐ。 guard は commit の末尾まで持つ = 名前のカードが
         // 次の書き手から見えてから離す。 名前の無い表 / 名前を書かない行は lock 不要で並行のまま。
+        //
+        // #715: 名前の列を 2 回以上 set した時は、 最後の値がこの行の名前 (`EntityUpdate::commit` と同じ)。 確かめ・lock・書き込みの
+        // 全部を最後の値でする。 前は確かめと lock が最初の値、 書くのは全部 (最後が残る) で、 既にある名前の 2 つ目の行ができた
         let pk_col = self.table.pk.map(|i| &self.table.cols[i]);
-        let pk_value = pk_col
-            .and_then(|pc| resolved.clone().find(|(c, _)| c.himo_id == pc.himo_id).map(|(_, v)| v))
-            .filter(|v| !matches!(v, Value::Null));
+        let name_set = pk_col.and_then(|pc| resolved.clone().rfind(|(c, _)| c.himo_id == pc.himo_id));
+        let pk_value = name_set.map(|(_, v)| v).filter(|v| !matches!(v, Value::Null));
         let _name_guard = pk_value.map(|v| self.table.name_locks.lock(v));
         // #701: 当たった行は、 行の lock を握ってから 「まだ生きていて、 まだその名前か」 を確かめ直す。 delete は名前の lock を
         // 取らない (行の lock だけ) ので、 名前で引いてから行を握るまでの間に行が消えうる。 確かめずに書くと、 当たった行には名前の
@@ -2227,7 +2229,7 @@ impl<'a> RowBuilder<'a> {
         // 当たった既にある行は名前を持っている
         if target_eid.is_none()
             && let Some(nc) = pk_col
-            && !resolved.clone().any(|(c, v)| c.himo_id == nc.himo_id && !matches!(v, Value::Null))
+            && pk_value.is_none()
         {
             return Err(SchemaError::BadValue(format!(
                 "table '{}': a new row needs a value for its name column '{}' (rows without it are not rows)",
@@ -2240,7 +2242,8 @@ impl<'a> RowBuilder<'a> {
         // 名前になった時刻 = 行の作成が分からなくなる。 sync は束ねた行の切り離しを作成の時刻で決める)
         let name_hid = pk_col.map(|nc| nc.himo_id);
         let is_name = move |c: &&ColumnInner| Some(c.himo_id) == name_hid;
-        let names = resolved.clone().filter(move |(c, _)| target_eid.is_none() && is_name(c));
+        // #715: 名前のカードは最後に set した値の 1 枚だけ書く (前の値を先に書くと、 lock していない名前が束の間この行に付く)
+        let names = name_set.into_iter().filter(|_| target_eid.is_none());
         let resolved = names.chain(resolved.filter(move |(c, _)| !is_name(c)));
 
         let eid = match target_eid {
