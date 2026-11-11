@@ -300,12 +300,17 @@ yet move to an in-memory backlog when a half is emptied; past its cap (64 MiB,
 `set_change_backlog_limit`) the listeners are detached and told so (`on_detached`). Dropping the
 engine waits until the listeners have taken what is left, but not for a listener that has stopped
 returning: after 5 seconds without a return it closes anyway, and the rest is handed over when that
-listener comes back (#636). To keep the stream across restarts, call `enable_change_log(cap)` once: records then go to
+listener comes back (#636). A listener that panics inside its callback is detached alone and told so
+(`on_detached`); the other listeners keep receiving, that batch included (#718). To keep the stream across restarts, call `enable_change_log(cap)` once: records then go to
 `changefeed.seg` with numbers that never repeat. `on_changes_at(first, records)` tells a
 listener those numbers. Store the next number with your own commit, and after a restart call
 `add_change_listener_from(listener, next)` to continue where you stopped. If the log has
 already dropped that number, the call returns `Truncated { from }`; re-read the current state
-instead. Writes to local-only tables (names starting with `_`, `define_reserved_table`, such as
+instead. Size the log above what you write between two write-outs (the 100 ms tick, or your own
+`oplog_sync()` calls): records are copied into the log one write-out at a time and listeners read
+after the copy, so a single write-out larger than the log detaches even a listener that had caught
+up (#716). One write to a number column takes about 210 bytes in the log (about 5000 per MiB); see
+`enable_change_log` for a sizing table. Writes to local-only tables (names starting with `_`, `define_reserved_table`, such as
 `_cursors`) are not handed to listeners, just as they are not sent to peers, so a listener can store
 its position in one of them without receiving its own writes back.
 
