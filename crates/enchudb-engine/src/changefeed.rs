@@ -41,6 +41,13 @@
 //! (その thread はこちらの配信が終わるのを待っているので、 互いに待って止まる)。 WAL は配り終えるのを待たずに畳む
 //! (渡していない分は溜めへ移す)。
 //!
+//! listener が callback (`on_changes` / `on_changes_at`) の中で **panic したら、 その listener だけを外す** (#718):
+//! panic は捕まえ (中身は panic hook が出す)、 同じ回の残りの listener には渡し、 panic した listener を外して
+//! [`ChangeListener::on_detached`] (`lost_from` = panic した回の最初の record の HLC。 その回の record は処理し終えていないものと
+//! して扱う) で知らせ、 [`crate::engine::Engine::change_listeners_detached`] に数える。 通知係は止まらず、 `oplog_sync()` を呼んだ
+//! thread にも panic は伝わらない。 前は通知係の thread ごと終わり、 以後 `oplog_sync()` を呼ばない限りどの listener にも渡らなかった。
+//! `on_detached` の中の panic は捨てる。 (`panic = "abort"` で組んだ binary は今まで通り process が終わる。)
+//!
 //! # 記録 (開き直しを越えて続きから受ける)
 //!
 //! [`crate::engine::Engine::enable_change_log`] で `{dir}/changefeed.seg` を作ると、 listener に渡す record を番号付きで disk に
@@ -52,6 +59,10 @@
 //! - WAL を畳む前に記録へ写す (listener が居ない間に畳んだ record も残る)。 記録がある間はメモリの溜めを使わず、 記録が
 //!   listener の位置を越えて捨てたら外して `on_detached` で知らせる
 //! - 記録の 1/4 より大きい record は番号だけ使って中身を残さない (その番号を読む listener は外れる)
+//! - **記録の大きさは、 1 回の書き出しの間に書く量より大きく取る** (#716)。 記録へ写すのは書き出しのたび (consumer の 100 ms の
+//!   周期・`oplog_sync()`・WAL の区画を畳む時) に、 その回の分を全部。 listener が読むのはその後なので、 1 回の写しが記録を一周
+//!   すると、 遅れていない listener も位置ごと捨てられて外れる (付け直しても次の回でまた外れる)。 数値の紐 1 本の書き込みで
+//!   1 件 約 210 B (1 MiB に約 5000 件)。 大きさの目安の表は [`crate::engine::Engine::enable_change_log`]
 //!
 //! # 使い方
 //!
@@ -112,7 +123,10 @@ pub trait ChangeListener: Send + Sync {
     }
 
     /// #560: 渡していない record が溜めの上限 (`Engine::set_change_backlog_limit`、 既定 64 MiB) を越えたので外された。
-    /// `lost_from` (渡せなかった最初の record の HLC) から先は、 この listener には渡らない。 WAL はもう畳んでいるので
+    /// `lost_from` (渡せなかった最初の record の HLC) から先は、 この listener には渡らない。
+    ///
+    /// #718: `on_changes` / `on_changes_at` の中で panic した listener も外され、 ここで知らされる (`lost_from` = panic した回の
+    /// 最初の record の HLC)。 WAL はもう畳んでいるので
     /// `audit` でも取り直せないことがある: 続けて受けたいなら今の状態から読み直し、 `add_change_listener` で付け直す。
     /// 既定は何もしない。
     fn on_detached(&self, lost_from: enchudb_oplog::Hlc) {

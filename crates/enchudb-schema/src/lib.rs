@@ -282,11 +282,19 @@ const NAME_LOCKS: usize = 64;
 /// #601: 名前の値で選ぶ lock の並び。 値は辞書の番号でなく値そのもの (文字なら bytes) で選ぶ: 新しい文字は書く途中で番号が
 /// 付くので、 番号で選ぶと同じ名前の 2 本が別の lock を取りうる。
 #[derive(Debug)]
-struct NameLocks(Box<[std::sync::Mutex<()>]>);
+struct NameLocks {
+    locks: Box<[std::sync::Mutex<()>]>,
+    /// #701: upsert が名前で引いた行を握ってみたら、 消えていた / 別の名前になっていた回数 (引き直した回数)。 試験が
+    /// 「窓を踏んだ」 ことを見るための数で、 引き直す時にだけ足す (当たった行にそのまま書く道・新しい行の道は触らない)
+    relookups: std::sync::atomic::AtomicU64,
+}
 
 impl NameLocks {
     fn new() -> Self {
-        NameLocks((0..NAME_LOCKS).map(|_| std::sync::Mutex::new(())).collect())
+        NameLocks {
+            locks: (0..NAME_LOCKS).map(|_| std::sync::Mutex::new(())).collect(),
+            relookups: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     fn lock(&self, v: &Value) -> std::sync::MutexGuard<'_, ()> {
@@ -303,7 +311,7 @@ impl NameLocks {
             Value::Ref(e) => eat(&e.to_le_bytes()),
             _ => {}
         }
-        self.0[(h % NAME_LOCKS as u64) as usize].lock().unwrap_or_else(|e| e.into_inner())
+        self.locks[(h % NAME_LOCKS as u64) as usize].lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -720,7 +728,7 @@ impl Database {
                 };
                 let ty = self.column_type_of(group).unwrap_or(ColumnType::Number);
                 let sum_big = sum.and_then(|h| self.column_type_of(h)) == Some(ColumnType::BigInt);
-                Answer::Counts(LiveCounts { inner, eng, ty, sum_big, last: Default::default() })
+                Answer::Counts(LiveCounts { inner, eng, ty, sum_big })
             }
         }
     }
@@ -1928,6 +1936,12 @@ pub struct Table<'a> {
 impl<'a> Table<'a> {
     pub fn name(&self) -> &str { &self.inner.name }
 
+    /// #701 の試験用: upsert が名前で引いた行を握ってみたら消えていた / 別の名前になっていて、 引き直した回数。
+    #[doc(hidden)]
+    pub fn upsert_relookups(&self) -> u64 {
+        self.inner.name_locks.relookups.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn columns(&self) -> Vec<ColumnInfo> {
         self.inner.cols.iter().map(|c| ColumnInfo {
             name: c.name.clone(),
@@ -2174,33 +2188,48 @@ impl<'a> RowBuilder<'a> {
         //
         // #60 / #601: 確かめと書き込みを名前ごとの lock で並べて TOCTOU を防ぐ。 guard は commit の末尾まで持つ = 名前のカードが
         // 次の書き手から見えてから離す。 名前の無い表 / 名前を書かない行は lock 不要で並行のまま。
+        //
+        // #715: 名前の列を 2 回以上 set した時は、 最後の値がこの行の名前 (`EntityUpdate::commit` と同じ)。 確かめ・lock・書き込みの
+        // 全部を最後の値でする。 前は確かめと lock が最初の値、 書くのは全部 (最後が残る) で、 既にある名前の 2 つ目の行ができた
         let pk_col = self.table.pk.map(|i| &self.table.cols[i]);
-        let pk_value = pk_col
-            .and_then(|pc| resolved.clone().find(|(c, _)| c.himo_id == pc.himo_id).map(|(_, v)| v))
-            .filter(|v| !matches!(v, Value::Null));
+        let name_set = pk_col.and_then(|pc| resolved.clone().rfind(|(c, _)| c.himo_id == pc.himo_id));
+        let pk_value = name_set.map(|(_, v)| v).filter(|v| !matches!(v, Value::Null));
         let _name_guard = pk_value.map(|v| self.table.name_locks.lock(v));
-        let mut target_eid: Option<EntityId> = None;
+        // #701: 当たった行は、 行の lock を握ってから 「まだ生きていて、 まだその名前か」 を確かめ直す。 delete は名前の lock を
+        // 取らない (行の lock だけ) ので、 名前で引いてから行を握るまでの間に行が消えうる。 確かめずに書くと、 当たった行には名前の
+        // カードを書かない (#581) ので、 消えた行に名前以外の列だけが乗って名前の無い行が残った。 消えた eid が別の insert に
+        // 使い回されていても、 その行の名前は違う (この名前は自分が lock している) ので同じ確かめで外れる。 外れたら行を放して
+        // 引き直す (名前の lock は握ったまま = 引き直しの間にこの名前の行を作る書き手は居ない)。 握った行の lock はそのまま
+        // 書き込みに使う。 当たらない道 (insert / 新しい行の upsert) は今まで通り
+        let mut target: Option<(EntityId, enchudb_engine::row_lock::RowWrite<'_>)> = None;
         if let (Some(pk_col), Some(pk_v)) = (pk_col, pk_value) {
             let pk_raw = value_to_raw_for_query(eng, pk_col, pk_v)?;
             if pk_raw != u64::MAX {
                 eng.rebuild();
                 // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
                 // 他テーブルと衝突しない → marker cond は不要。
-                let found = eng.query_by_id64(&[(pk_col.himo_id, pk_raw)]).into_iter().next();
-                if self.replace_on_pk {
-                    target_eid = found;
-                } else if found.is_some() {
-                    return Err(SchemaError::DuplicatePk);
+                while let Some(found) = eng.query_by_id64(&[(pk_col.himo_id, pk_raw)]).into_iter().next() {
+                    if !self.replace_on_pk {
+                        return Err(SchemaError::DuplicatePk);
+                    }
+                    let row = eng.write_row(found);
+                    if eng.is_live(found) && eng.get_by_id(found, pk_col.himo_id) == Some(pk_raw) {
+                        target = Some((found, row));
+                        break;
+                    }
+                    drop(row);
+                    self.table.name_locks.relookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
+        let target_eid = target.as_ref().map(|(e, _)| *e);
 
         // #548: 名前 (表で名前と決めた列) の無い行は作らない。 デッキは名前でしかできないので、 名前の無いカードの塊は表の
         // どこにも現れてはいけない (前は作れてしまい、 表の全部を引く時は出ず、 他の列で引く・数える時は出た)。 upsert で
         // 当たった既にある行は名前を持っている
         if target_eid.is_none()
             && let Some(nc) = pk_col
-            && !resolved.clone().any(|(c, v)| c.himo_id == nc.himo_id && !matches!(v, Value::Null))
+            && pk_value.is_none()
         {
             return Err(SchemaError::BadValue(format!(
                 "table '{}': a new row needs a value for its name column '{}' (rows without it are not rows)",
@@ -2213,7 +2242,8 @@ impl<'a> RowBuilder<'a> {
         // 名前になった時刻 = 行の作成が分からなくなる。 sync は束ねた行の切り離しを作成の時刻で決める)
         let name_hid = pk_col.map(|nc| nc.himo_id);
         let is_name = move |c: &&ColumnInner| Some(c.himo_id) == name_hid;
-        let names = resolved.clone().filter(move |(c, _)| target_eid.is_none() && is_name(c));
+        // #715: 名前のカードは最後に set した値の 1 枚だけ書く (前の値を先に書くと、 lock していない名前が束の間この行に付く)
+        let names = name_set.into_iter().filter(|_| target_eid.is_none());
         let resolved = names.chain(resolved.filter(move |(c, _)| !is_name(c)));
 
         let eid = match target_eid {
@@ -2231,8 +2261,11 @@ impl<'a> RowBuilder<'a> {
         // 個別 row への marker tie は不要。 query 側も marker cond なしで
         // 当該 table の column を持つ entity のみ取れる。
 
-        // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
-        let _row = eng.write_row(eid);
+        // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)。 当たった行は上で握った lock のまま
+        let _row = match target {
+            Some((_, row)) => row,
+            None => eng.write_row(eid),
+        };
         for (cd, v) in resolved {
             if let Err(e) = tie_value(eng, eid, cd, v) {
                 // #316: 新しい row を書きかけで残さない (既存 row の upsert は書けた列までが残る)
@@ -2347,9 +2380,6 @@ pub struct LiveCounts {
     ty: ColumnType,
     /// 合計の列が BigInt (engine の合計を元の値に戻す)。
     sum_big: bool,
-    /// group ごとに最後に渡した (件数, 合計)。 engine は 「合計に足した件数」 (`Agg::summed`) が動いただけの
-    /// group も報告する (値 0 ↔ 値なし) が、 ここから見える (件数, 合計) が同じなら渡さない。
-    last: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, i128)>>,
 }
 
 impl LiveCounts {
@@ -2389,9 +2419,15 @@ impl LiveCounts {
         self.poll_raw().into_iter().map(|(v, n, _)| (v, n)).collect()
     }
 
-    /// engine の報告のうち、 (件数, 合計) が最後に渡したものと違う group だけ (件数 0 = 消えた)。
+    /// engine の報告のうち、 (件数, 合計) が最後に渡したものと違う group だけ (件数 0 = 消えた)。 engine は 「合計に足した件数」
+    /// (`Agg::summed`) が動いただけの group も報告する (値 0 ↔ 値なし) が、 ここから見える (件数, 合計) が同じなら渡さない。
+    ///
+    /// #703: 最後に渡した値は engine の購読に置く (`enchudb_engine::LiveCounts::handed`、 購読ごとに 1 つ)。 前はこの wrapper
+    /// ごとに持ち、 [`Database::answer`] で取り直した wrapper は空から始まったので、 group が消えた報告 (件数 0) を 「渡して
+    /// いない group」 として捨て、 別の wrapper が渡した後で元の値に戻った報告も 「変わっていない」 として捨てた (engine の
+    /// 購読は渡した扱い = どの handle にも二度と来ない)。 表の lock は poll の間握る = 並んだ handle の poll は 1 本ずつ
     fn poll_raw(&self) -> Vec<(Value, u64, i128)> {
-        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut last = self.inner.handed();
         let mut out = Vec::new();
         for (v, a) in self.inner.poll_sums(&self.eng) {
             let now = (a.count, self.sum_of(a));
@@ -2414,7 +2450,7 @@ impl LiveCounts {
     /// `Truncated` と記録の決まりは [`LiveQuery::poll_since`] と同じ ([`snapshot`](Self::snapshot) で取り直す)。
     pub fn poll_since(&self, pos: u64) -> Result<(Vec<GroupSums>, u64), Truncated> {
         let (gs, version) = self.inner.poll_since(&self.eng, pos)?;
-        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut last = self.inner.handed();
         let out = gs
             .into_iter()
             .map(|(v, a)| {
@@ -2434,7 +2470,7 @@ impl LiveCounts {
     /// 渡した扱い = 次の `poll` も空から)。
     pub fn snapshot(&self) -> (Vec<GroupSums>, u64) {
         let (gs, version) = self.inner.snapshot(&self.eng);
-        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut last = self.inner.handed();
         last.clear();
         let out = gs
             .into_iter()
@@ -2901,7 +2937,7 @@ impl<'a> JoinQuery<'a> {
                 }
                 .map_err(io)?;
                 let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big, last: Default::default() })))
+                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big })))
             }
             JoinOn::Range(..) => Err(bad("join subscribe_counts: not supported for join_range yet".into())),
             JoinOn::Eq(my, _) => {
@@ -2928,7 +2964,7 @@ impl<'a> JoinQuery<'a> {
                     }
                     .map_err(io)?;
                     let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                    Ok(LiveCounts { inner: Arc::new(inner), eng: eng.clone(), ty, sum_big, last: Default::default() })
+                    Ok(LiveCounts { inner: Arc::new(inner), eng: eng.clone(), ty, sum_big })
                 };
                 let lsum = side.as_ref().filter(|s| !s.0).map(|s| &s.1);
                 let rsum = side.as_ref().filter(|s| s.0).map(|s| &s.1);
@@ -6672,7 +6708,7 @@ impl<'a> Query<'a> {
             None => eng.subscribe_counts(preds, path, cd.himo_id),
         }
         .map_err(|e| SchemaError::BadValue(e.to_string()))?;
-        Ok(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+        Ok(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1) })
     }
 
     /// この query の答えに名前を付けて **宣言する**: 集合 (`order_by(..).limit(k)` なら先頭 k 件) の購読を engine が持ち、 形は
@@ -6751,7 +6787,7 @@ impl<'a> Query<'a> {
         let spec = AnswerSpec::Counts { preds, group_path, group_himo: cd.himo_id, sum_himo: sum.map(|s| s.0) };
         match eng.declare_answer(name, spec).map_err(|e| SchemaError::BadValue(e.to_string()))? {
             AnswerHandle::Counts(inner) => {
-                Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+                Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1) })
             }
             AnswerHandle::Query(_) => Err(SchemaError::Internal("answer_counts: engine returned a set subscription".into())),
         }
@@ -7127,6 +7163,15 @@ impl<'a> EntityUpdate<'a> {
         }
         // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
         let _row = eng.write_row(self.eid);
+        // #701: 消えた行には書かない。 engine の自分の書き込みは消えた eid にも cell を置けるので、 書くと名前の無い行 (表の全部を
+        // 引く時は出ず、 他の列で引く・数える時は出る) が残り、 開き直しても残った。 delete は行の lock の下で行を死なせるので、
+        // 行を握ってから見れば、 並んだ delete の前か後かのどちらかに決まる
+        if !eng.is_live(self.eid) {
+            return Err(SchemaError::BadValue(format!(
+                "table '{}': row {:#x} is deleted (an update does not bring a row back)",
+                self.table.name, self.eid
+            )));
+        }
         let name = self.table.pk.map(|i| &self.table.cols[i]);
         for (col, v) in &self.values {
             let cd = col.get()?;
