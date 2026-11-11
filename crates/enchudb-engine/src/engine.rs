@@ -192,20 +192,45 @@ struct ChangeBatch {
     records: Vec<crate::transport::WireRecord>,
 }
 
+/// #718: callback の中で panic した listener と、 その時渡していた最初の record の HLC。
+type PanickedListeners = Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, enchudb_oplog::Hlc)>;
+
+/// #718: listener の callback を呼ぶ。 panic は捕まえて true を返す (panic の中身は panic hook が出す)。 前は通知係の thread ごと
+/// 終わり、 同じ回の後ろの listener にも、 その後のどの listener にも渡らなくなった。
+///
+/// `AssertUnwindSafe`: 捕まえた後は、 その listener をもう呼ばない (外して `on_detached` だけ)。 engine 側の状態は callback の外で
+/// 進めてある (cursor / 読み手の位置は渡す前に進める) ので、 途中で抜けても壊れない。
+fn listener_panicked(call: impl FnOnce()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).is_err()
+}
+
+/// #718: panic して外した listener に `on_detached` で知らせる (ここでまた panic しても捨てる)。
+fn tell_panicked(gone: PanickedListeners, progress: &std::sync::atomic::AtomicU64) {
+    for (l, from) in gone {
+        let _ = listener_panicked(|| l.on_detached(from));
+        progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl ChangeBatch {
-    fn run(self, progress: &std::sync::atomic::AtomicU64) {
+    /// 戻り値は `on_changes_at` の中で panic した listener (#718、 呼び手が外す)。 1 つが panic しても残りの listener に渡す。
+    fn run(self, progress: &std::sync::atomic::AtomicU64) -> PanickedListeners {
         use std::sync::atomic::Ordering;
+        let mut panicked = PanickedListeners::new();
         for (l, from) in self.detached {
-            l.on_detached(from);
+            let _ = listener_panicked(|| l.on_detached(from));
             progress.fetch_add(1, Ordering::Relaxed);
         }
         if self.records.is_empty() {
-            return;
+            return panicked;
         }
         for l in &self.listeners {
-            l.on_changes_at(self.first, &self.records);
+            if listener_panicked(|| l.on_changes_at(self.first, &self.records)) {
+                panicked.push((l.clone(), self.records[0].hlc));
+            }
             progress.fetch_add(1, Ordering::Relaxed);
         }
+        panicked
     }
 }
 
@@ -265,7 +290,8 @@ impl ChangeNotifier {
             Some(None) => return true,
             Some(Some(x)) => x,
         };
-        batch.run(&self.progress);
+        let panicked = batch.run(&self.progress);
+        self.detach_panicked(src, panicked);
         if !log {
             return true;
         }
@@ -273,12 +299,13 @@ impl ChangeNotifier {
         loop {
             let Some(work) = src.with(Engine::take_log_work) else { return false };
             for l in work.broken {
-                l.on_detached(enchudb_oplog::Hlc::ZERO);
+                let _ = listener_panicked(|| l.on_detached(enchudb_oplog::Hlc::ZERO));
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
             if work.reads.is_empty() {
                 return true;
             }
+            let mut panicked = PanickedListeners::new();
             for (l, first, es) in work.reads {
                 let recs: Vec<crate::transport::WireRecord> = es
                     .iter()
@@ -290,10 +317,24 @@ impl ChangeNotifier {
                         }
                     })
                     .collect();
-                l.on_changes_at(first, &recs);
+                if listener_panicked(|| l.on_changes_at(first, &recs)) {
+                    panicked.push((l, recs.first().map_or(enchudb_oplog::Hlc::ZERO, |r| r.hlc)));
+                }
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
+            self.detach_panicked(src, panicked);
         }
+    }
+
+    /// #718: callback の中で panic した listener を外し (engine がまだ在れば、 門の下で)、 `on_detached` で知らせる
+    /// (callback は門の外)。 外すのは、 panic した回の record をその listener が処理し終えていないから: 残して次の回を渡すと、
+    /// 抜けに気付けない。 外れた listener は今の状態から読み直して付け直す (溜めの上限で外れた時と同じ)。
+    fn detach_panicked(&self, src: &impl ChangeSource, panicked: PanickedListeners) {
+        if panicked.is_empty() {
+            return;
+        }
+        let _ = src.with(|e| e.remove_panicked_listeners(&panicked));
+        tell_panicked(panicked, &self.progress);
     }
 }
 
@@ -16023,6 +16064,30 @@ impl Engine {
         work
     }
 
+    /// #718: callback の中で panic した listener を外す (`change_listeners` と記録の読み手の両方から)。 外した数は
+    /// [`Self::change_listeners_detached`] に数える。 知らせ (`on_detached`) は呼び手が engine の外で呼ぶ。
+    fn remove_panicked_listeners(&self, panicked: &PanickedListeners) {
+        let is_gone = |l: &std::sync::Arc<dyn crate::changefeed::ChangeListener>| {
+            panicked.iter().any(|(g, _)| std::sync::Arc::ptr_eq(g, l))
+        };
+        // lock の順は写し (`pump_change_log`) と同じ: `change_emit` → `change_listeners`
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        c.readers.retain(|(l, _)| !is_gone(l));
+        let mut listeners = self.change_listeners.write().unwrap_or_else(|p| p.into_inner());
+        let before = listeners.len();
+        listeners.retain(|l| !is_gone(l));
+        let gone = before - listeners.len();
+        drop(listeners);
+        drop(c);
+        if gone > 0 {
+            self.change_listeners_detached.fetch_add(gone as u64, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[enchudb] warning: {gone} change listener(s) panicked in on_changes — detached them \
+                 (ChangeListener::on_detached tells each one; the other listeners keep receiving)"
+            );
+        }
+    }
+
     // ──── blob store (大容量バイナリ: 画像/動画/モデル等) ────
 
     /// 大容量 blob の外部保管を注入する。通常 `LocalBlobStore` を渡す。
@@ -20268,7 +20333,9 @@ impl Engine {
                     }
                 };
                 if let Some(rest) = rest {
-                    rest.run(&n.progress);
+                    // engine はもう無いので、 panic した listener は知らせるだけ
+                    let panicked = rest.run(&n.progress);
+                    tell_panicked(panicked, &n.progress);
                 }
             });
             match spawned {

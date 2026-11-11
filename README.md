@@ -300,7 +300,8 @@ yet move to an in-memory backlog when a half is emptied; past its cap (64 MiB,
 `set_change_backlog_limit`) the listeners are detached and told so (`on_detached`). Dropping the
 engine waits until the listeners have taken what is left, but not for a listener that has stopped
 returning: after 5 seconds without a return it closes anyway, and the rest is handed over when that
-listener comes back (#636). To keep the stream across restarts, call `enable_change_log(cap)` once: records then go to
+listener comes back (#636). A listener that panics inside its callback is detached alone and told so
+(`on_detached`); the other listeners keep receiving, that batch included (#718). To keep the stream across restarts, call `enable_change_log(cap)` once: records then go to
 `changefeed.seg` with numbers that never repeat. `on_changes_at(first, records)` tells a
 listener those numbers. Store the next number with your own commit, and after a restart call
 `add_change_listener_from(listener, next)` to continue where you stopped. If the log has
