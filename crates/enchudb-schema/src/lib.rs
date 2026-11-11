@@ -728,7 +728,7 @@ impl Database {
                 };
                 let ty = self.column_type_of(group).unwrap_or(ColumnType::Number);
                 let sum_big = sum.and_then(|h| self.column_type_of(h)) == Some(ColumnType::BigInt);
-                Answer::Counts(LiveCounts { inner, eng, ty, sum_big, last: Default::default() })
+                Answer::Counts(LiveCounts { inner, eng, ty, sum_big })
             }
         }
     }
@@ -2380,9 +2380,6 @@ pub struct LiveCounts {
     ty: ColumnType,
     /// 合計の列が BigInt (engine の合計を元の値に戻す)。
     sum_big: bool,
-    /// group ごとに最後に渡した (件数, 合計)。 engine は 「合計に足した件数」 (`Agg::summed`) が動いただけの
-    /// group も報告する (値 0 ↔ 値なし) が、 ここから見える (件数, 合計) が同じなら渡さない。
-    last: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, i128)>>,
 }
 
 impl LiveCounts {
@@ -2422,9 +2419,15 @@ impl LiveCounts {
         self.poll_raw().into_iter().map(|(v, n, _)| (v, n)).collect()
     }
 
-    /// engine の報告のうち、 (件数, 合計) が最後に渡したものと違う group だけ (件数 0 = 消えた)。
+    /// engine の報告のうち、 (件数, 合計) が最後に渡したものと違う group だけ (件数 0 = 消えた)。 engine は 「合計に足した件数」
+    /// (`Agg::summed`) が動いただけの group も報告する (値 0 ↔ 値なし) が、 ここから見える (件数, 合計) が同じなら渡さない。
+    ///
+    /// #703: 最後に渡した値は engine の購読に置く (`enchudb_engine::LiveCounts::handed`、 購読ごとに 1 つ)。 前はこの wrapper
+    /// ごとに持ち、 [`Database::answer`] で取り直した wrapper は空から始まったので、 group が消えた報告 (件数 0) を 「渡して
+    /// いない group」 として捨て、 別の wrapper が渡した後で元の値に戻った報告も 「変わっていない」 として捨てた (engine の
+    /// 購読は渡した扱い = どの handle にも二度と来ない)。 表の lock は poll の間握る = 並んだ handle の poll は 1 本ずつ
     fn poll_raw(&self) -> Vec<(Value, u64, i128)> {
-        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut last = self.inner.handed();
         let mut out = Vec::new();
         for (v, a) in self.inner.poll_sums(&self.eng) {
             let now = (a.count, self.sum_of(a));
@@ -2447,7 +2450,7 @@ impl LiveCounts {
     /// `Truncated` と記録の決まりは [`LiveQuery::poll_since`] と同じ ([`snapshot`](Self::snapshot) で取り直す)。
     pub fn poll_since(&self, pos: u64) -> Result<(Vec<GroupSums>, u64), Truncated> {
         let (gs, version) = self.inner.poll_since(&self.eng, pos)?;
-        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut last = self.inner.handed();
         let out = gs
             .into_iter()
             .map(|(v, a)| {
@@ -2467,7 +2470,7 @@ impl LiveCounts {
     /// 渡した扱い = 次の `poll` も空から)。
     pub fn snapshot(&self) -> (Vec<GroupSums>, u64) {
         let (gs, version) = self.inner.snapshot(&self.eng);
-        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut last = self.inner.handed();
         last.clear();
         let out = gs
             .into_iter()
@@ -2934,7 +2937,7 @@ impl<'a> JoinQuery<'a> {
                 }
                 .map_err(io)?;
                 let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big, last: Default::default() })))
+                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big })))
             }
             JoinOn::Range(..) => Err(bad("join subscribe_counts: not supported for join_range yet".into())),
             JoinOn::Eq(my, _) => {
@@ -2961,7 +2964,7 @@ impl<'a> JoinQuery<'a> {
                     }
                     .map_err(io)?;
                     let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
-                    Ok(LiveCounts { inner: Arc::new(inner), eng: eng.clone(), ty, sum_big, last: Default::default() })
+                    Ok(LiveCounts { inner: Arc::new(inner), eng: eng.clone(), ty, sum_big })
                 };
                 let lsum = side.as_ref().filter(|s| !s.0).map(|s| &s.1);
                 let rsum = side.as_ref().filter(|s| s.0).map(|s| &s.1);
@@ -6705,7 +6708,7 @@ impl<'a> Query<'a> {
             None => eng.subscribe_counts(preds, path, cd.himo_id),
         }
         .map_err(|e| SchemaError::BadValue(e.to_string()))?;
-        Ok(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+        Ok(LiveCounts { inner: Arc::new(inner), eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1) })
     }
 
     /// この query の答えに名前を付けて **宣言する**: 集合 (`order_by(..).limit(k)` なら先頭 k 件) の購読を engine が持ち、 形は
@@ -6784,7 +6787,7 @@ impl<'a> Query<'a> {
         let spec = AnswerSpec::Counts { preds, group_path, group_himo: cd.himo_id, sum_himo: sum.map(|s| s.0) };
         match eng.declare_answer(name, spec).map_err(|e| SchemaError::BadValue(e.to_string()))? {
             AnswerHandle::Counts(inner) => {
-                Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
+                Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1) })
             }
             AnswerHandle::Query(_) => Err(SchemaError::Internal("answer_counts: engine returned a set subscription".into())),
         }
