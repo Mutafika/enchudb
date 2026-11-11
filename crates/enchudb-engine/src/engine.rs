@@ -15774,6 +15774,25 @@ impl Engine {
     /// `InvalidInput`)。 WAL 付きの並行の engine (`open_concurrent_with_oplog` など) だけ。 既に在れば何もしない。
     /// 記録の 1/4 より大きい record は番号だけ使って中身を残さない (その番号を読む listener は外れ、 受け直しは
     /// [`crate::change_log::Truncated`])。 記録を知らない binary で開いて書いた間の record は記録に入らない。
+    ///
+    /// # `cap` の決め方 (#716)
+    ///
+    /// **1 回の書き出しの間に書く量が `cap` を越えると、 追いついている listener も外れる** (`on_detached`)。 記録へ写すのは
+    /// 書き出しのたび (consumer の 100 ms の周期・`oplog_sync()`・WAL の区画を畳む時) で、 その回に書き出した分を全部写してから
+    /// listener が読む (写しと渡しは交互でない)。 1 回の写しが記録を一周すると、 listener の位置ごと古い方から捨てる。 付け直しても、
+    /// 書く量が変わらなければ次の回でまた外れる。
+    ///
+    /// `cap` は 1 回の書き出しの間に書く量より十分大きく取る。 entry 1 件は 40 B + record の長さ (8 B に切り上げ) で、
+    /// 数値の紐 1 本の書き込みが約 210 B (1 MiB に約 5000 件)。 目安 (計算):
+    ///
+    /// | 書く速さ (件/秒) | 100 ms の周期 1 回の量 | `cap` の下限 | 余裕を見た `cap` (4 倍) |
+    /// |---|---|---|---|
+    /// | 1 万 | 約 0.2 MiB | 1 MiB (下限) | 1 MiB |
+    /// | 10 万 | 約 2 MiB | 2 MiB | 8 MiB |
+    /// | 35 万 | 約 7 MiB | 7 MiB | 32 MiB |
+    ///
+    /// `oplog_sync()` を自分で呼ぶ形で、 呼ぶ間にまとめて書くなら、 その 1 回分が上の 「1 回の量」。 既に在る記録は作った時の
+    /// 大きさのまま (この呼び出しの `cap` では変わらない)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn enable_change_log(&self, cap: usize) -> io::Result<()> {
         if self.change_log.get().is_some() {
@@ -20187,6 +20206,9 @@ impl Engine {
 
     /// #560: 溜めの上限 (byte、 既定 [`DEFAULT_CHANGE_BACKLOG_LIMIT`] = 64 MiB)。 畳む時に移す分で越えたら、 溜めを捨てて listener を
     /// 全部外す (`ChangeListener::on_detached` で知らせる)。 書き手は止めない。
+    ///
+    /// 記録 ([`Self::enable_change_log`]) がある間はこの上限を使わない。 代わりに記録の大きさが上限になり、 1 回の書き出しの間に
+    /// 書く量が記録の大きさを越えると、 追いついている listener も外れる (#716、 大きさの目安は `enable_change_log`)。
     pub fn set_change_backlog_limit(&self, bytes: usize) {
         self.change_backlog_limit.store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
