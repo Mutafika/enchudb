@@ -192,6 +192,33 @@ struct ChangeBatch {
     records: Vec<crate::transport::WireRecord>,
 }
 
+/// #779: slot の前の宛名。 bridge (`transfer_oplog_to_sync_ops`) は、 自分が書いた record の宛名 (行の世界番号) を **bridge する時の**
+/// 逆写像で決める。 record を書いてから bridge するまでの間 (consumer の周期 = 100 ms、 bridge が ring の満杯で止まっていればもっと) に
+/// その slot の住人か逆写像が変わると、 前の住人宛ての record が別の宛名で出た:
+///
+/// - 満杯の表で、 消した行の slot を使い回した (`entity_in` の空き拾い)。 消したのが他の peer の行で、 新しい住人が自分の行なら、
+///   削除が自分の世界番号宛てに出る (相手では消えず、 その世界番号は消えた物になって新しい行も届かない)。 新しい住人が別の peer の
+///   行なら、 削除がその行宛てに出る (相手で別の行が消える)。 消したのが自分の行で、 新しい住人が他の peer の行でも同じ
+/// - 翻訳した行を別の行に畳んだ (`merge_entity_into`)。 畳む前の書き換えが自分の世界番号宛てに出る (相手で名前の無い行になる)
+///
+/// ここに、 変わる前の宛名を 「その時刻より前に書いた record の宛名」 として覚える。 時刻は変わる時に採る自分の時計の HLC: 前の住人
+/// 宛ての自分の record は全部それより前の HLC で (行が消える / 畳まれるより前に書いた)、 その後に書く自分の record は全部それより後。
+///
+/// 外すのは bridge が追いついた時: 変わる時の WAL の位置 (前の住人宛ての record は全部それより前に積まれている) を一緒に覚え、
+/// bridge の位置がそこを越えたか、 その周の区画が畳まれた (畳むのは bridge が読み終えた後) ら外す。
+///
+/// メモリの上だけ (開き直すと無い)。 落ちた後に WAL に残っていた、 bridge の前の record の宛名は前と同じ (bridge する時の逆写像)。
+#[derive(Default)]
+struct FormerAddresses {
+    /// (slot, その HLC より前に書いた record に当てる) → (宛名 = (作った peer, その peer での番号)。 自分の peer なら自分の行、
+    /// 変わる時の WAL の位置)
+    until: std::collections::BTreeMap<(u32, enchudb_oplog::Hlc), ((enchudb_oplog::PeerId, u32), u64)>,
+}
+
+/// #779: [`FormerAddresses`] に覚える数の上限。 bridge が進めば外れるので、 越えるのは bridge が止まったまま slot を回し続けた時だけ。
+/// 越えた分は覚えない (その slot の前の住人宛ての record は、 前と同じく bridge する時の逆写像で出る)。
+const FORMER_ADDRESS_LIMIT: usize = 1 << 20;
+
 /// #718: callback の中で panic した listener と、 その時渡していた最初の record の HLC。
 type PanickedListeners = Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, enchudb_oplog::Hlc)>;
 
@@ -5388,6 +5415,10 @@ pub struct Engine {
     /// 起きていない DB (= 常態) で、 受信 apply の hot path が read lock すら
     /// 取らないようにするためだけのもの。
     foreign_tombs_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #779: slot の前の宛名 ([`FormerAddresses`])。 bridge が、 slot の住人 / 逆写像が変わる前に書いた自分の record の宛名を引く。
+    former_addresses: std::sync::Mutex<FormerAddresses>,
+    /// #779: `former_addresses` に何かあるか (常態の bridge が lock を取らないため)。 立てる / 倒すのは lock の下。
+    former_addresses_on: std::sync::atomic::AtomicBool,
     /// #513: 消した主キーの記録 (`pk_tombs.rs`)。 主キーのある表の行を消した時に覚え、 後から同じ主キーの行が届いたら
     /// その削除を当てる (主キーが同じなら同じ行)。
     pk_tombs: std::sync::RwLock<crate::pk_tombs::PkTombs>,
@@ -5935,6 +5966,8 @@ impl Engine {
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            former_addresses: std::sync::Mutex::new(FormerAddresses::default()),
+            former_addresses_on: std::sync::atomic::AtomicBool::new(false),
             pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
             pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -7212,6 +7245,8 @@ impl Engine {
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            former_addresses: std::sync::Mutex::new(FormerAddresses::default()),
+            former_addresses_on: std::sync::atomic::AtomicBool::new(false),
             pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
             pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -7580,6 +7615,7 @@ impl Engine {
         // row insert → offset store の 4 step を排他化。 per-fsync 頻度 (= 100ms
         // 周期) なので lock 競合の hot path 影響なし。
         let _guard = self.transfer_lock.lock().unwrap();
+        self.prune_former_addresses();
 
         // #57: WAL に載らなかった record (満杯) は `_sync_ops` にも入らず、 差分 pull では二度と
         // 届かない。 その author の history floor を上げて、 それより前の cursor の puller を
@@ -7794,20 +7830,11 @@ impl Engine {
                     enchudb_oplog::oplog::DecodedOp::Tie { eid, himo_id, value } => {
                         // Ref の列は u32 (local eid)
                         let ref_local = u32::try_from(*value).ok().filter(|_| self.himo_is_ref(*himo_id));
-                        if let Some(local) = ref_local.filter(|&l| self.eid_translator.is_translated_local(l)) {
-                            match self.eid_translator.reverse(local) {
-                                Some((owner, owner_local)) => {
-                                    tie_ref = Some((
-                                        enchudb_oplog::make_eid(owner, owner_local),
-                                        *eid,
-                                    ));
-                                    false
-                                }
-                                None => true, // 逆写像なし = 元 entity を導けない
-                            }
-                        } else {
-                            false
+                        // #779: 指す先の宛名も、 書いた時の住人の物 (`bridge_address`)
+                        if let Some((owner, owner_local)) = ref_local.and_then(|l| self.bridge_address(l, rec.hlc)) {
+                            tie_ref = Some((enchudb_oplog::make_eid(owner, owner_local), *eid));
                         }
+                        false
                     }
                     enchudb_oplog::oplog::DecodedOp::TieNamed { himo_kind, value, .. } => {
                         *himo_kind == crate::himo_store::ValueType::Ref as u8
@@ -7838,10 +7865,9 @@ impl Engine {
                     }
                     _ => None,
                 };
-                // 行 eid 自体が translated foreign なら世界番号へ書き戻す (0.11 #76)
+                // 行 eid 自体が translated foreign なら世界番号へ書き戻す (0.11 #76)。 #779: 書いた時の住人の宛名
                 let row_world = row_local.and_then(|local| {
-                    self.eid_translator
-                        .reverse(local)
+                    self.bridge_address(local, rec.hlc)
                         .map(|(owner, owner_local)| enchudb_oplog::make_eid(owner, owner_local))
                 });
                 if let Some((target_world, orig_eid)) = tie_ref {
@@ -10256,6 +10282,10 @@ impl Engine {
             }
             let global = popped.and_then(|local| table.global_of(local));
             if let Some(global) = global {
+                // #779: 前の住人宛ての、 bridge の前の record の宛名を覚える (逆写像を外す前に。 配らない表は bridge しない)
+                if !table.is_reserved() {
+                    self.remember_former_address(global, true);
+                }
                 // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす
                 // (`clear_cell_versions` の doc 参照)。
                 self.clear_cell_versions(global);
@@ -11275,6 +11305,8 @@ impl Engine {
             }
         }
         // 3. 世界番号を dst へ (以後 src の世界番号宛ての record は dst に当たる)
+        // #779: src に書いた、 bridge の前の record の宛名を覚える (src の逆写像はここで外れる)
+        self.remember_former_address(s, false);
         for (peer, foreign_local) in self.eid_translator.remove_local(s) {
             self.eid_translator.alias(peer, foreign_local, d);
         }
@@ -11551,6 +11583,8 @@ impl Engine {
             ));
         };
         if reused {
+            // #779: `entity_in` の再利用枝と同じ
+            self.remember_former_address(local, true);
             self.clear_cell_versions(local);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
@@ -13927,6 +13961,79 @@ impl Engine {
             return eid;
         }
         enchudb_oplog::make_eid(enchudb_oplog::eid_peer(eid), self.forward_local_slow(enchudb_oplog::eid_local(eid)))
+    }
+
+    /// #779: slot `local` の住人 (`reused`) か逆写像が変わる直前に、 今の宛名を覚える ([`FormerAddresses`])。 sync の表の無い DB と
+    /// WAL の無い DB (bridge しない) は何もしない。 `reused` でなければ、 逆写像のある slot だけ (逆写像が外れる時)。
+    fn remember_former_address(&self, local: u32, reused: bool) {
+        use std::sync::atomic::Ordering;
+        if !self.sync_tables_on() {
+            return;
+        }
+        let Some(wal) = self.oplog.as_ref() else { return };
+        let world = match self.eid_translator.reverse(local) {
+            Some(w) => w,
+            None if reused => (self.peer_id(), local),
+            None => return,
+        };
+        let mut g = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
+        if g.until.len() >= FORMER_ADDRESS_LIMIT {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[enchudb] warning: more than {FORMER_ADDRESS_LIMIT} slots changed owner while the oplog→sync bridge was \
+                     not advancing — records written to the previous owners before the bridge may go out under the wrong eid"
+                );
+            }
+            return;
+        }
+        // 時刻は lock の下で採る (この後に書く record は全部これより後の HLC、 これより後ろの位置)
+        let until = wal.mint_hlc();
+        g.until.insert((local, until), (world, wal.head()));
+        self.former_addresses_on.store(true, Ordering::Release);
+    }
+
+    /// #779: bridge が、 行 `local` 宛ての、 版数 `hlc` の自分の record の宛名を引く。 Some = 他の peer の行の世界番号 (作った peer,
+    /// その peer での番号)、 None = 自分の行 (宛名を書き戻さない)。 書いた後に slot の住人 / 逆写像が変わっていれば、 変わる前の宛名
+    /// ([`FormerAddresses`])、 変わっていなければ今の逆写像。
+    ///
+    /// 今の逆写像を先に読む: 覚える (`remember_former_address`) のは逆写像を変える前なので、 変わった後の逆写像を読んだなら、 その
+    /// entry は必ず見える。
+    fn bridge_address(&self, local: u32, hlc: enchudb_oplog::Hlc) -> Option<(enchudb_oplog::PeerId, u32)> {
+        use std::sync::atomic::Ordering;
+        let now = self.eid_translator.reverse(local);
+        if !self.former_addresses_on.load(Ordering::Acquire) {
+            return now;
+        }
+        let g = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
+        let last = enchudb_oplog::Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX };
+        // slot を何度も回していれば、 この record より後で、 いちばん近い変わり目の宛名
+        match g.until.range((local, hlc)..=(local, last)).find(|(k, _)| k.1 > hlc) {
+            Some((_, &(world, _))) => (world.0 != self.peer_id()).then_some(world),
+            None => now,
+        }
+    }
+
+    /// #779: 覚えている 「slot の前の宛名」 の数 ([`FormerAddresses`]、 観測・試験用)。 bridge が追いつけば 0 に戻る。
+    #[doc(hidden)]
+    pub fn former_addresses_len(&self) -> usize {
+        self.former_addresses.lock().unwrap_or_else(|p| p.into_inner()).until.len()
+    }
+
+    /// #779: bridge が読み終えた所より前の変わり目を外す (bridge の入口、 `transfer_lock` の下)。
+    fn prune_former_addresses(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.former_addresses_on.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(wal) = self.oplog.as_ref() else { return };
+        // bridge の位置 (読み切った所)。 畳んだ区画を指す古い位置は、 今の周の位置より小さいので 「越えた」 にならない
+        let cursor = self.sync_ops_offset.load(Ordering::Acquire);
+        let mut g = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
+        g.until.retain(|_, &mut (_, pos)| cursor < pos && wal.holds(pos));
+        if g.until.is_empty() {
+            self.former_addresses_on.store(false, Ordering::Release);
+        }
     }
 
     /// #612: slot `local` は畳んだ自分の行 (別名を持つ、 使い回さない) か。 残した行の slot が使い回された後は、 自分自身を指す別名で
