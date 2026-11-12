@@ -20497,6 +20497,15 @@ impl Engine {
         // changefeed の記録は consumer が畳む前に WAL の続きの位置を合わせる
         #[cfg(not(target_arch = "wasm32"))]
         eng.attach_change_log();
+        // #732: 並行の形にする前 (standalone / schema の build phase) に付けた listener は、 付けた時に WAL が無かったので
+        // cursor を head に合わせていない (0 のまま)。 今 WAL に在る record は全部それより前 (前の session がきれいに閉じずに
+        // 残した分。 standalone の間の書き込みは WAL に載らない) なので、 ここで head に合わせる (`add_change_listener` の
+        // 「付けた後の commit だけ流れる」。 記録がある時の位置は `attach_change_log` が合わせる、 #702)
+        if let Some(wal) = oplog.as_ref()
+            && !eng.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty()
+        {
+            eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()).offset = wal.head();
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(crate::consumer_waker::ConsumerWaker::default());
         eng.consumer_waker = Some(waker.clone());
