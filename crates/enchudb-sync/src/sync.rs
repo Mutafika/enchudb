@@ -834,6 +834,10 @@ impl Syncer {
                         // #761: author の行の record だけ数える。 author の state には、 author が他の peer の行に書いた cell
                         // も入る (宛名はその行の世界番号)。 番号 (local) だけで数えると、 同じ番号の author の消した行が
                         // 「state にある」 ことになって掃除されない
+                        //
+                        // #766: author の state の Untie は author の生きている行の外した cell (自分の行なら数える = cell が
+                        // 全部外れた行も、 生きていれば残す)、 Delete は author が消した他の peer の行。 他の peer の行宛ての
+                        // Untie / Delete は上の理由で数えない
                         (enchudb_oplog::eid_peer(*eid) == author).then(|| enchudb_oplog::eid_local(*eid))
                     }
                     // #178: 行の state ではない (state 転写には現れない)
