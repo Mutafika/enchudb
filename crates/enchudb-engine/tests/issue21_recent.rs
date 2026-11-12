@@ -225,16 +225,19 @@ fn matches_the_insertion_log_under_mixed_writes() {
     cleanup(&path);
 }
 
-/// doc に書いた但し書きの実物: 枠を使い切った table は、 削除済みの eid があればそれを使い直す (無ければ枠を
-/// 足す)。 使い直された row は一番新しいのに、 元の位置 (古い側) に出る — 払い出しの順 ≠ 書き込みの順。
+/// doc に書いた但し書きの実物: 枠を使い切った table は空きの eid 空間から枠を足し、 eid 空間も尽きていれば、 削除済みの
+/// eid を使い直す (#731)。 使い直された row は一番新しいのに、 元の位置 (古い側) に出る — 払い出しの順 ≠ 書き込みの順。
 /// 直す対象ではなく、 今の挙動の記録。
 #[test]
 fn reused_eid_after_the_table_is_full_is_not_newest() {
-    let (path, eng, ts, _body) = posts("reuse", 8);
+    let (path, mut eng, ts, _body) = posts("reuse", 8);
+    // #731 から、 枠を使い切った表は空きの eid 空間から枠を足す。 使い回しを起こすために、 残りの eid 空間を詰め物の表で埋める
+    eng.define_table("pad", eng.remaining_eid_capacity()).unwrap();
+    assert_eq!(eng.remaining_eid_capacity(), 0, "前提: 空きの eid 空間が無い");
     let cap = eng.table_eid_usage("posts").unwrap().capacity;
     let rows: Vec<u64> = (0..cap).map(|i| add(&eng, "posts", ts, i)).collect();
 
-    // 枠を使い切る前の削除 + 追加は末尾に足す (上の test)。 使い切った後は、 空いた eid を使い直す
+    // 枠を使い切る前の削除 + 追加は末尾に足す (上の test)。 使い切った後 (足す枠も無い) は、 空いた eid を使い直す
     eng.delete(rows[2]);
     let reborn = add(&eng, "posts", ts, 999);
     assert_eq!(reborn, rows[2], "枠を使い切った table が、 空いた eid を使い直さなかった (test の前提)");

@@ -5,6 +5,9 @@
 //! (2 つの insert の列が 1 つの行に混ざる)。 user の表の delete は空きの一覧に足さないので、 満杯の表の insert はいつも作り直しを
 //! 通る = この窓が普通の道だった。
 //!
+//! #731 から、 枠を使い切った表は消えた eid を拾う前に空きの eid 空間から枠を足す。 作り直しを通るのは eid 空間も尽きた DB だけに
+//! なったので、 この試験は eid 空間をちょうど表の枠だけにした DB で回す (足す枠が無い = 毎回の insert が作り直しを通る)。
+//!
 //! 判定は状態で: 各 thread は自分の行を 1 つ持ち、 「消す → 別の名前で insert」 を繰り返す。 insert が返した eid を、 今ほかの thread が
 //! 持っていたら二重払い出し。 自分の行の中身 (名前と値) が自分の書いた物かも毎回見る。
 
@@ -40,9 +43,11 @@ fn concurrent_inserts_into_a_full_table_never_get_the_same_eid() {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     );
     let _c = Cleanup(path.clone());
-    let mut db = Database::create(&path).unwrap();
+    // eid 空間 = 表の枠 (足す枠が無い)
+    let mut db = Database::create_with_capacity(&path, CAP).unwrap();
     db.table("t").number("id").number("a").primary_key("id").with_capacity(CAP).build().unwrap();
     let db = db.finish_with_oplog(4 << 20).unwrap();
+    assert_eq!(db.remaining_eid_capacity(), 0, "試験の前提: 空きの eid 空間が無い (あれば枠を足して、 穴を拾わない)");
     let t = db.get_table("t").unwrap();
     // 表を満杯にする: thread ごとの行 1 つ + 残りは動かさない行
     let mut mine = Vec::new();
@@ -93,10 +98,8 @@ fn concurrent_inserts_into_a_full_table_never_get_the_same_eid() {
     });
     let distinct = seen.lock().unwrap().len() as i64;
     // 試験の前提: 表は伸びずに穴を使い回した (伸びていたら枯渇の道 = 空きの一覧の作り直しを通っていない)
-    assert!(
-        distinct <= (CAP as i64) * 4,
-        "試験の前提: eid を使い回していない ({distinct} 種類の eid、 枠 {CAP})"
-    );
+    assert!(distinct <= CAP as i64, "試験の前提: eid を使い回していない ({distinct} 種類の eid、 枠 {CAP})");
+    assert_eq!(db.engine().table_eid_usage("t").unwrap().capacity, CAP, "試験の前提: 表は伸びていない");
     assert_eq!(doubled.load(Ordering::Relaxed), 0, "同じ eid が 2 本の insert に払い出された");
     assert_eq!(mixed.load(Ordering::Relaxed), 0, "自分の行に他の insert の列が混ざった");
     assert_eq!(t.all().count().unwrap(), CAP as usize, "行の数 (thread ごとに 1 つ + 動かさない行)");

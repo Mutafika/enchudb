@@ -134,7 +134,7 @@ fn an_upsert_that_lost_its_row_to_a_delete_writes_a_named_row() {
 }
 
 /// 消えた eid が別の名前の insert に使い回された時: 窓の中の upsert は、 その行に自分の値を混ぜない。
-/// 表を満杯にしておく (満杯の表の insert は消えた行の eid を使い回す)。 A が e を握ったまま消し、 同じ thread で別の名前 Y を
+/// 表を満杯にし、 eid 空間も表の枠ちょうどにしておく (#731 から、 消えた行の eid を使い回すのは足す枠が無い時だけ)。 A が e を握ったまま消し、 同じ thread で別の名前 Y を
 /// insert して e を使い回させてから放す。 B (名前 X の upsert) は e が生きているのを見るが、 名前が違うので引き直す。
 #[test]
 fn an_upsert_does_not_write_into_a_reused_eid_of_another_name() {
@@ -148,9 +148,10 @@ fn an_upsert_does_not_write_into_a_reused_eid_of_another_name() {
         rounds += 1;
         let path = tmp_path(&format!("reuse{rounds}"));
         let _c = Cleanup(path.clone());
-        let mut db = Database::create(&path).unwrap();
+        let mut db = Database::create_with_capacity(&path, CAP as u32).unwrap();
         db.table("t").number("id").number("a").primary_key("id").with_capacity(CAP as u32).build().unwrap();
         let db = db.finish_with_oplog(1 << 20).unwrap();
+        assert_eq!(db.remaining_eid_capacity(), 0, "試験の前提: 空きの eid 空間が無い");
         let t = db.get_table("t").unwrap();
         let mut rows = Vec::new();
         for id in 0..CAP {
@@ -172,13 +173,14 @@ fn an_upsert_does_not_write_into_a_reused_eid_of_another_name() {
                 std::thread::yield_now();
             }
             t.entity(e).delete().unwrap();
-            let y = t.insert().set("id", 100i64).commit().unwrap(); // 満杯なので e を使い回す
+            // 満杯で足す枠も無いので e を使い回す。 B が先に e を拾っていたら (B は消えたのを見て新しい行を作る)、 表は満杯で断られる
+            let y = t.insert().set("id", 100i64).commit().ok();
             drop(row);
             (h.join().unwrap(), y)
         });
-        if y != e {
+        let Some(y) = y.filter(|&y| y == e) else {
             continue; // 使い回されなかった (この回は数えない)
-        }
+        };
         reused += 1;
         if t.upsert_relookups() == 0 {
             // B が引く前に消えた (窓を踏んでいない)。 それでも Y の行に値は付かない

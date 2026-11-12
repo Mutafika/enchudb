@@ -53,6 +53,11 @@ fn hlc(w: u64, p: u32) -> Hlc {
 /// slot 1 個の table を用意し、 foreign entity を 1 つ翻訳して返す。
 /// 戻り値: (engine, himo_id, foreign_eid, translated_local_eid)
 fn setup(path: &str) -> (Engine, u16, enchudb_oplog::EntityId, enchudb_oplog::EntityId) {
+    setup_with(path, true)
+}
+
+/// `pad`: 残りの eid 空間を詰め物の表で埋めるか (埋めなければ、 枠を使い切った表は枠を足して、 slot を使い回さない)。
+fn setup_with(path: &str, pad: bool) -> (Engine, u16, enchudb_oplog::EntityId, enchudb_oplog::EntityId) {
     cleanup(path);
     // request18: 版数・tombstone を持つのは sync に参加する DB だけになったので、
     // foreign record を受ける前提のこの test は v9 込みで作る (= 本番で
@@ -61,6 +66,11 @@ fn setup(path: &str) -> (Engine, u16, enchudb_oplog::EntityId, enchudb_oplog::En
     // slot 3 個。 X が 1 個使い、 詰め物 2 個で枯渇 → 再利用が起きる。
     // 「再利用後にもう一度翻訳する」 ために詰め物を 1 個消して席を空ける。
     eng.define_table("t", 3).unwrap();
+    // #731 から、 枠を使い切った表は空きの eid 空間から枠を足す。 使い回しを起こすために、 残りの eid 空間を詰め物の表で埋める
+    if pad {
+        eng.define_table("pad", eng.remaining_eid_capacity()).unwrap();
+        assert_eq!(eng.remaining_eid_capacity(), 0, "前提: 空きの eid 空間が無い");
+    }
     eng.define_himo_in("t", "age", ValueType::Number, 0).unwrap();
     let hid = eng.himo_id("t.age").unwrap() as u16;
     eng.set_peer_id(2);
@@ -247,6 +257,37 @@ fn translating_into_a_reused_slot_does_not_deadlock() {
             eng.remote_tie_apply(t, hid, 700 + i, hlc(4000 + i as u64, 3));
         }
     }
+    drop(eng);
+    cleanup(&path);
+}
+
+/// #731: 空きの eid 空間が残っている間は、 受け側 (翻訳した行の払い出し) も消えた行の slot を使い回さない。 写像は消えた
+/// entity の slot を指したままで、 その entity 宛ての record は、 削除より古くても新しくても捨てる (削除優先は変わらない)。
+#[test]
+fn while_eid_space_remains_the_deleted_slot_is_not_handed_out() {
+    let path = tmp("grow_first");
+    let (eng, hid, foreign, translated) = setup_with(&path, false);
+    let slot = enchudb_oplog::eid_local(translated);
+    assert!(eng.remote_delete_apply(translated, hlc(2000, 1)));
+
+    // 自分の行と、 別の foreign entity の写しを、 枠 (3) を越えて払い出す
+    let mut handed = Vec::new();
+    for i in 0..8u32 {
+        handed.push(eng.entity_in("t").unwrap());
+        let other = enchudb_oplog::make_eid(1, 1000 + i);
+        handed.push(eng.resolve_remote_eid(other, hid).expect("翻訳できない"));
+    }
+    assert!(eng.table_eid_usage("t").unwrap().capacity > 3, "前提: 枠を使い切って足した");
+    assert!(handed.iter().all(|&e| enchudb_oplog::eid_local(e) != slot), "空きの eid 空間があるのに、 消えた行の slot を渡した");
+
+    // 消えた entity 宛ての record は、 同じ slot に着いて捨てられる
+    for (w, v) in [(1500u64, 111u32), (3000, 999)] {
+        let t = eng.resolve_remote_eid(foreign, hid).expect("翻訳できない");
+        assert_eq!(enchudb_oplog::eid_local(t), slot, "写像は消えた entity の slot のまま");
+        assert!(!eng.remote_tie_apply(t, hid, v, hlc(w, 1)), "消えた entity 宛ての record (wall {w}) が当たった");
+        assert!(eng.pull("t.age", v).is_empty());
+    }
+    assert_eq!(eng.get(translated, "t.age"), None);
     drop(eng);
     cleanup(&path);
 }

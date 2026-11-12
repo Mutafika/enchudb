@@ -39,6 +39,12 @@ fn schema(path: &str) -> Database {
     db.table("companies").number("id").tag("city").primary_key("id").build().unwrap();
     db.table("users").number("id").tag("city").ref_to("company", "companies").primary_key("id").build().unwrap();
     db.table("shops").number("id").tag("city").primary_key("id").build().unwrap();
+    // #731 から、 枠を使い切った表は空きの eid 空間から枠を足す。 使い回しを起こすために、 残りの eid 空間を詰め物の表で埋める
+    let rest = db.remaining_eid_capacity();
+    if rest > 0 {
+        db.table("pad").number("x").with_capacity(rest).build().unwrap();
+    }
+    assert_eq!(db.remaining_eid_capacity(), 0, "前提: 空きの eid 空間が無い");
     db
 }
 

@@ -69,9 +69,10 @@ pub struct TableEidUsage {
     pub allocated: u32,
     /// いま生きている行数。
     pub live: u32,
-    /// 今ある枠にあと何行入るか (= `capacity - live`)。 削除で空いた slot は
-    /// `entity_in` が free list 経由で再利用するのでここに戻る。 0 でも、 空き eid 空間が
-    /// 残っていれば次の `entity_in` で枠が足される。
+    /// 今ある枠のうち生きている行の居ない数 (= `capacity - live`)。 0 でも、 空き eid 空間が
+    /// 残っていれば次の `entity_in` で枠が足される。 削除で空いた slot もここに数えるが、 `entity_in` が
+    /// それを使い回すのは空き eid 空間も尽きた後だけ (#731: 消えた eid をすぐ別の行に渡すと、 アプリが持つ古い eid への
+    /// 書き込みがその行に当たる。 それまでは枠を足す)。 `_sync_ops` (ring) は今までどおり空いた slot から使う。
     pub free: u32,
 }
 
@@ -10065,41 +10066,43 @@ impl Engine {
         let global = match table.global_of(cur) {
             Some(g) => g,
             None => {
-                // 0.18.2: `free_locals` は in-memory のみで reopen で消える。 reclaim 済み
-                // slot を持つ store を reopen すると、 range は「満杯」に見えるのに実際は
-                // 穴だらけで、 ここが恒久 Err になる。 `_sync_ops` ではこれが
-                // 「transfer が row を挿せない → 変更が sync から**無言で欠落**」として
-                // 実機発現した (ring ~25K 全 reclaim 後の reopen で bridge 全停止)。
-                // 枯渇時に一度 EntitySet の liveness から穴を再構築して自己修復する。
-                if self.rebuild_free_locals(tid) {
-                    // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
-                    // 再構築後も枯渇なら fl が空のままなので次は grow / Err に落ちる。
-                    return self.entity_in(table_name);
-                }
-                // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
-                match self.grow_table_extent_for(tid, cur) {
-                    Some(g) => g,
-                    None => {
-                        // 払出した分を rollback (= overflow 状態を維持しないため厳密には
-                        // 必要だが、 単調 monotone な next_local なので少々超過しても
-                        // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
-                        if is_sync_ring_table(&table.name) {
-                            // #368: ring は自動では足さない。 entity cap を伸ばしても空かない
-                            return Err(format!(
-                                "table '{}' ring is full ({} eids — ack_sync + reclaim_sync_ops \
-                                 frees it, Engine::grow_table enlarges it)",
-                                table_name,
-                                table.capacity(),
-                            ));
-                        }
+                // #731: 枠を使い切ったら、 消えた行の eid を拾う前に、 空きの eid 空間から枠を足す。 消えた eid をすぐ別の行に
+                // 渡すと、 アプリが持ち続けている古い eid (`find()` / `commit()` が返した裸の u64) への update / delete が
+                // その別の行に当たる。 使い回すのは eid 空間も尽きた時だけ。 `_sync_ops` (ring) には足さないので
+                // (`grow_table_extent_for` が None、 #368)、 あれは今までどおり下の作り直しへ進む。
+                if let Some(g) = self.grow_table_extent_for(tid, cur) {
+                    g
+                } else {
+                    // 0.18.2: `free_locals` は in-memory のみで reopen で消える。 reclaim 済み
+                    // slot を持つ store を reopen すると、 range は「満杯」に見えるのに実際は
+                    // 穴だらけで、 ここが恒久 Err になる。 `_sync_ops` ではこれが
+                    // 「transfer が row を挿せない → 変更が sync から**無言で欠落**」として
+                    // 実機発現した (ring ~25K 全 reclaim 後の reopen で bridge 全停止)。
+                    // 枯渇時に一度 EntitySet の liveness から穴を再構築して自己修復する。
+                    if self.rebuild_free_locals(tid) {
+                        // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
+                        // 再構築後も枯渇なら fl が空のままなので次は Err に落ちる。
+                        return self.entity_in(table_name);
+                    }
+                    // 払出した分を rollback (= overflow 状態を維持しないため厳密には
+                    // 必要だが、 単調 monotone な next_local なので少々超過しても
+                    // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
+                    if is_sync_ring_table(&table.name) {
+                        // #368: ring は自動では足さない。 entity cap を伸ばしても空かない
                         return Err(format!(
-                            "table '{}' eid range exhausted ({} eids reserved, entity cap {} — \
-                             Engine::grow_entity_cap to add room)",
+                            "table '{}' ring is full ({} eids — ack_sync + reclaim_sync_ops \
+                             frees it, Engine::grow_table enlarges it)",
                             table_name,
                             table.capacity(),
-                            self.max_entities(),
                         ));
                     }
+                    return Err(format!(
+                        "table '{}' eid range exhausted ({} eids reserved, entity cap {} — \
+                         Engine::grow_entity_cap to add room)",
+                        table_name,
+                        table.capacity(),
+                        self.max_entities(),
+                    ));
                 }
             }
         };
@@ -10738,10 +10741,14 @@ impl Engine {
         if let Some(g) = table.global_of(local) {
             return Some(g); // 別 thread が足した
         }
-        // 既定は先頭 range と同じ大きさ、 最低でも `local` が入る分
+        // 既定は先頭 range と同じ大きさ、 最低でも `local` が入る分。 小さい表は今の枠と同じだけ (上限 `GROW_STEP_MAX`)
+        // 足す: #731 から、 消しては足す表は使い回さずに枠を足し続けるので、 枠 8 の表が 8 行ごとに表の定義を
+        // 書き出す (fsync) のを避ける。 先頭が大きい表 (既定の 100 万) は今までどおり先頭と同じ大きさ。
+        const GROW_STEP_MAX: u32 = 1 << 16;
         let first = table.eid_range_hi - table.eid_range_lo;
-        let need = local.saturating_sub(table.capacity()).saturating_add(1);
-        let got = self.push_table_extent_locked(tid, first.max(need).max(1));
+        let cap = table.capacity();
+        let need = local.saturating_sub(cap).saturating_add(1);
+        let got = self.push_table_extent_locked(tid, first.max(cap.min(GROW_STEP_MAX)).max(need).max(1));
         if got < need {
             return None;
         }
@@ -10760,7 +10767,15 @@ impl Engine {
         if size == 0 {
             return 0;
         }
-        self.tables[tid].extra.write().unwrap().push((new_lo, new_lo + size));
+        {
+            // 自分の最後の extent の続きなら伸ばす (extent の数は 「間に他の表が入った回数」 まで。 消しては足す表が
+            // 足すたびに 1 本増やすと、 local ↔ eid の変換と表の定義の書き出しが足した回数に比例して遅くなる)
+            let mut extra = self.tables[tid].extra.write().unwrap();
+            match extra.last_mut() {
+                Some(last) if last.1 == new_lo => last.1 = new_lo + size,
+                _ => extra.push((new_lo, new_lo + size)),
+            }
+        }
         // 内部の表の行は別の stripe を使う。 足した範囲の eid を払い出す前に教える
         if is_engine_internal_table(&self.tables[tid].name) {
             self.row_locks.add_internal_range(new_lo, new_lo + size);
@@ -16691,8 +16706,8 @@ impl Engine {
     /// (枠を足した table は extent をまたぐ)。
     ///
     /// 「新しい順」 は **eid を払い出した順**の逆で、 次の時は書き込みの順とずれる:
-    /// - 削除で空いた eid が使い直された時。 table のある列は、 枠 (`table_eid_usage().capacity`) を使い切って
-    ///   初めて削除済みの eid を使い直す (それまでは末尾に足すだけ)。 table に属さない列 (`define_himo` /
+    /// - 削除で空いた eid が使い直された時。 table のある列は、 枠を使い切ると空きの eid 空間から枠を足し、 eid 空間
+    ///   (`remaining_eid_capacity()`) も尽きて初めて削除済みの eid を使い直す (#731、 それまでは末尾に足すだけ)。 table に属さない列 (`define_himo` /
     ///   `entity()`) は削除のたびに使い直すので、 削除のある使い方では順序の保証が無い
     /// - sync で届いた row は、 届いた順に払い出される (相手が書いた順ではない)
     ///
@@ -23051,8 +23066,10 @@ mod cell_version_tests {
         let mut eng = Engine::create_with_cell_version(&tmp("slot_reuse_table"), 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
-        // slot 1 個だけの table → 2 個目の entity_in は必ず再利用に落ちる
+        // slot 1 個だけの table + 残りの eid 空間を詰め物の表で埋める (#731: 足す枠があれば使い回さない)
+        // → 2 個目の entity_in は必ず再利用に落ちる
         eng.define_table("t", 1).unwrap();
+        eng.define_table("pad", eng.remaining_eid_capacity()).unwrap();
 
         let first = eng.entity_in("t").unwrap();
         assert!(eng.set_cell(first, hid, 42, hlc(300, 1)));
@@ -23117,7 +23134,8 @@ mod cell_version_tests {
         let mut eng = Engine::create_without_cell_version(&tmp("slot_reuse_prev9"), 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
-        eng.define_table("t", 1).unwrap(); // slot 1 個 → 2 個目は必ず再利用
+        eng.define_table("t", 1).unwrap(); // slot 1 個 → 2 個目は必ず再利用 (足す枠も無い時、 #731)
+        eng.define_table("pad", eng.remaining_eid_capacity()).unwrap();
         assert!(!eng.has_cell_version(), "前提が崩れた: pre-v9 DB でない");
 
         let first = eng.entity_in("t").unwrap();
@@ -26822,19 +26840,65 @@ mod v10_dir_tests {
         assert!(eng.entity_in("a").is_ok(), "after grow_entity_cap the table must auto-grow again");
     }
 
+    /// #731: 枠を使い切った表は、 消えた行の eid を拾う前に空きの eid 空間から枠を足す。 拾うのは eid 空間も尽きた時だけ
+    /// (2 本目の extent に居た行の slot も拾える)。
     #[test]
-    fn deleted_row_in_second_extent_is_reused() {
+    fn deleted_row_is_reused_only_after_the_eid_space_is_gone() {
         let path = tmp("tbl_grow_reuse");
         let _c = Cleanup(path.clone());
         let mut eng = tiny(&path, 64, 64);
         eng.define_table("a", 2).unwrap();
         eng.define_table("b", 2).unwrap();
-        let ids: Vec<_> = (0..6).map(|_| eng.entity_in("a").unwrap()).collect();
+        let mut ids: Vec<_> = (0..6).map(|_| eng.entity_in("a").unwrap()).collect();
         let victim = ids[4]; // 2 本目の extent に居る
         assert!(enchudb_oplog::eid_local(victim) >= 4);
         eng.delete(victim);
+        // eid 空間が残っている間は、 枠を使い切っても victim を渡さない
+        while eng.remaining_eid_capacity() > 0 || {
+            let u = eng.table_eid_usage("a").unwrap();
+            u.allocated < u.capacity
+        } {
+            let e = eng.entity_in("a").unwrap();
+            assert!(!ids.contains(&e), "eid 空間が残っているのに払い出し済みの eid {e:#x} を渡した");
+            ids.push(e);
+        }
+        let u = eng.table_eid_usage("a").unwrap();
+        assert_eq!((u.capacity, u.free), (62, 1), "前提: a は b の 2 を除く eid 空間を全部取り、 穴は victim だけ");
         let again = eng.entity_in("a").unwrap();
-        assert_eq!(again, victim, "free slot in a later extent must be reused before growing");
+        assert_eq!(again, victim, "eid 空間が尽きたら、 後ろの extent の空いた slot を使い回す");
+        assert!(eng.entity_in("a").unwrap_err().contains("exhausted"));
+    }
+
+    /// 続きの extent は 1 本に伸ばす (間に他の表が入った時だけ増える)。 小さい表は今の枠と同じだけ足す。
+    #[test]
+    fn grown_extents_are_merged_when_contiguous() {
+        let path = tmp("tbl_grow_merge");
+        let _c = Cleanup(path.clone());
+        let mut eng = tiny(&path, 4096, 4096);
+        eng.define_table("a", 2).unwrap();
+        eng.define_table("b", 2).unwrap();
+        for _ in 0..1000 {
+            eng.entity_in("a").unwrap();
+        }
+        let ext = eng.table_eid_extents("a").unwrap();
+        assert_eq!(ext.len(), 2, "{ext:?}");
+        assert_eq!((ext[0], ext[1].0), ((0, 2), 4));
+        // b が間に足すと、 a の次は別の extent
+        for _ in 0..3 {
+            eng.entity_in("b").unwrap();
+        }
+        let a_hi = ext[1].1;
+        assert_eq!(eng.table_eid_extents("b").unwrap(), vec![(2, 4), (a_hi, a_hi + 2)]);
+        while eng.table_eid_extents("a").unwrap().len() == 2 {
+            eng.entity_in("a").unwrap();
+        }
+        let ext2 = eng.table_eid_extents("a").unwrap();
+        assert_eq!((ext2.len(), ext2[2].0), (3, a_hi + 2), "{ext2:?}");
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert_eq!(eng.table_eid_extents("a").unwrap(), ext2, "伸ばした extent は開き直しても同じ");
     }
 
     #[test]

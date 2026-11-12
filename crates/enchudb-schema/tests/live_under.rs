@@ -67,7 +67,13 @@ const SIZE: i64 = 64;
 fn run(path: &str) {
     // slot の再利用 (同じ eid が別の row になる) は table の枠が埋まってからだけ — 容量を小さくし、 row の数を枠に合わせて起こす
     let mut db = Database::create_with_capacity(path, 128).unwrap();
-    db.table("emps").number("id").number("dept").number("age").ref_to("boss", "emps").primary_key("id").build().unwrap();
+    db.table("emps").number("id").number("dept").number("age").ref_to("boss", "emps").primary_key("id").with_capacity(SIZE as u32).build().unwrap();
+    // #731 から、 枠を使い切った表は空きの eid 空間から枠を足す。 使い回しを起こすために、 残りの eid 空間を詰め物の表で埋める
+    let rest = db.remaining_eid_capacity();
+    if rest > 0 {
+        db.table("pad").number("x").with_capacity(rest).build().unwrap();
+    }
+    assert_eq!(db.remaining_eid_capacity(), 0, "前提: 空きの eid 空間が無い");
     let et = db.get_table("emps").unwrap();
     let t = &et;
     let mut rng = Rng(0x7ee5_0000_0000_0001);

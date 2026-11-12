@@ -62,6 +62,12 @@ fn run(path: &str) {
     let mut db = Database::create_with_capacity(path, 128).unwrap();
     db.table("users").number("id").tag("team").primary_key("id").build().unwrap();
     db.table("events").number("id").number("at").bigint("big").number("kind").ref_to("user", "users").primary_key("id").build().unwrap();
+    // #731 から、 枠を使い切った表は空きの eid 空間から枠を足す。 使い回しを起こすために、 残りの eid 空間を詰め物の表で埋める
+    let rest = db.remaining_eid_capacity();
+    if rest > 0 {
+        db.table("pad").number("x").with_capacity(rest).build().unwrap();
+    }
+    assert_eq!(db.remaining_eid_capacity(), 0, "前提: 空きの eid 空間が無い");
     let (ut, et) = (db.get_table("users").unwrap(), db.get_table("events").unwrap());
     let (u, ev) = (&ut, &et);
     let mut rng = Rng(0x1a90_0000_0000_0001);

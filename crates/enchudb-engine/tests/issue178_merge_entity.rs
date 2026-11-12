@@ -134,18 +134,26 @@ fn reusing_the_merged_slot_drops_the_alias() {
 
     eng.delete(dst);
     eng.flush_writes();
-    // slot が回るまで払い出す (表の範囲 256 を使い切ると、 空いた slot を数え直して使い回す)
+    // #731 から、 枠を使い切った表は空きの eid 空間から枠を足す。 使い回しを起こすために、 残りの eid 空間を別の表に取らせる
+    eng.grow_table("other", eng.remaining_eid_capacity()).unwrap();
+    assert_eq!(eng.remaining_eid_capacity(), 0, "前提: 空きの eid 空間が無い");
+    // slot が回るまで払い出す (表の範囲 256 を使い切ると、 足す枠が無いので、 空いた slot を数え直して使い回す)
     let mut reused = false;
+    let mut fillers = Vec::new();
     for _ in 0..600 {
         let e = eng.entity_in("files").unwrap();
         if enchudb_oplog::eid_local(e) == enchudb_oplog::eid_local(dst) {
             reused = true;
             break;
         }
+        fillers.push(e);
     }
     assert!(reused, "前提: dst の slot が回る");
     assert_eq!(eng.resolve_remote_eid_existing(foreign), None, "回った slot に別名が残った");
     let old = Hlc { wall: 1, logical: 0, peer: OTHER_PEER };
+    // 写しの行を払い出す席を 1 つ空ける (表は満杯で、 足す枠も無い)
+    eng.delete(*fillers.first().expect("前提: 詰め物の行がある"));
+    eng.flush_writes();
     let fresh = translated_row(&eng, foreign);
     assert_ne!(enchudb_oplog::eid_local(fresh), enchudb_oplog::eid_local(dst));
     assert!(!eng.remote_tie_apply(fresh, hid(&eng, "files.size"), 1, old), "削除より古い record が新しい行に入った");

@@ -1999,7 +1999,7 @@ impl<'a> Table<'a> {
     /// 「直近 N 件」 用。 table の末尾から逆にたどって `n` 件そろった所で止まるので、 table の大きさによらない
     /// (`all().find()` は全 row を集める)。 `all()` と同じく、 代表列 (主キー、 無ければ最初の列) に値のある row が対象。
     ///
-    /// 順序は eid を払い出した順の逆。 table の枠を使い切った後に削除済みの eid が使い直された時と、 sync で
+    /// 順序は eid を払い出した順の逆。 table の枠も空きの eid 空間も使い切った後に削除済みの eid が使い直された時と、 sync で
     /// 届いた row (届いた順) は、 書き込みの順とずれる (`Engine::recent_by_id` の doc)。 時刻で並べるなら
     /// 時刻の列で `all().order_by_desc(col).limit(n)`。
     pub fn recent(&self, n: usize) -> Vec<EntityId> {
