@@ -742,12 +742,44 @@ impl Syncer {
         // が as_of を越え、 同じ間に書かれて state に入らなかった (走査の済んだ cell の) record が、 後で差分で届いても cursor の
         // 手前で落ちた。 載せなかった cell は、 書き手自身の書き込みなら差分 (as_of より後) で届いてそこで載り、 他の client の
         // 書き込み (書き手が作っている間にホストから受けた物) は、 ホストがもう持っていて当たらない
+        //
+        // #769 (ホストだけ): 載せない record の中の Vocab (語の写像) は、 版数を付け替えて載せる。 state の中で Vocab は語ごとに
+        // 1 回だけ、 最初に走査した cell の版数で出る。 その cell が作っている間に書かれた物だと Vocab も as_of より後で、
+        // 載せないと (1) 同じ語を持つ、 載せる Tie (as_of 以前の cell) を下の受け手が翻訳できずに捨て、 (2) その cell の Tie が
+        // 後で差分で届いて載っても、 差分の Vocab はホストがもう写像を持っているので載らない (`apply_records_impl`: 当たった
+        // Vocab は載せた、 が前提)。 付け替える先は、 その語を指す最初の載せる Tie の版数 (state が普段出す形 = Vocab と Tie が
+        // 同じ版数で並ぶ)、 指す Tie を載せなければ state の最後に as_of (版数の無い cell が state で持つのと同じ版数)。
+        // どちらも as_of 以下なので、 受け手の cursor は as_of を越えない。 語の写像は版数によらず、 state の record は書き手が
+        // 署名していない合成なので、 付け替えても同じ意味
         if gossip {
             let host = self.is_host();
+            // 載せなかった Vocab: (書き手, 番号) → batch の中の位置
+            let mut withheld: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
             for &(i, applied) in &relay_accepted {
-                if applied && !(host && batch.records[i].hlc > batch.as_of) {
-                    let _ = self.engine.relay_record(&batch.records[i]);
+                let r = &batch.records[i];
+                if !applied {
+                    continue;
                 }
+                if host && r.hlc > batch.as_of {
+                    if let DecodedOp::Vocab { vid, .. } = &r.op {
+                        withheld.insert((r.author_peer, *vid), i);
+                    }
+                    continue;
+                }
+                if !withheld.is_empty()
+                    && let DecodedOp::Tie { himo_id, value, .. } = &r.op
+                    && self.engine.value_type_at(*himo_id as usize) == Some(enchudb_engine::ValueType::Tag)
+                    && let Ok(vid) = u32::try_from(*value)
+                    && let Some(v) = withheld.remove(&(r.author_peer, vid))
+                {
+                    let _ = self.engine.relay_record(&WireRecord { hlc: r.hlc, ..batch.records[v].clone() });
+                }
+                let _ = self.engine.relay_record(r);
+            }
+            let mut rest: Vec<usize> = withheld.into_values().collect();
+            rest.sort_unstable();
+            for v in rest {
+                let _ = self.engine.relay_record(&WireRecord { hlc: batch.as_of, ..batch.records[v].clone() });
             }
         }
 
