@@ -247,8 +247,10 @@ impl ChangeNotifier {
     ///
     /// 配信は `deliver_lock` で 1 本ずつ (#337)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路: 戻った
     /// 時点で自分の commit を配り終えている、 という約束のため。 先に取り出した配信は、 lock を返す前に配り終えている)。
-    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
-    /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
+    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が **この engine の** record を
+    /// 配っている最中) は、 待つと止まるのでどちらでも配らずに返る。 別の engine の listener の中から呼ばれた時は配る (#719:
+    /// 配信中の印が thread ごとで engine ごとでなかったので、 engine A の listener の中の `B.oplog_sync()` が B の commit を
+    /// 配らずに返っていた)。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
     /// 待たない)。
     ///
     /// #560: 待つのは [`LISTENER_WAIT`] まで。 配っている listener がそれより長く返らなければ、 配らずに返る (残りは通知係が
@@ -258,10 +260,13 @@ impl ChangeNotifier {
     fn deliver(&self, src: &impl ChangeSource, wait: bool) -> bool {
         use std::sync::atomic::Ordering;
         thread_local! {
-            /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
-            static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            /// この thread が listener に配っている最中の engine (の通知係の住所。 engine ごとに 1 つで、 配っている間は
+            /// `&self` で生きている)。 listener の中から同じ engine の oplog_sync を呼んだ再入を見分ける。 入れ子 (A の listener
+            /// の中で B が配り、 その listener の中で…) の深さだけ積む。
+            static EMITTING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        if EMITTING.with(|e| e.get()) {
+        let me = self as *const ChangeNotifier as usize;
+        if EMITTING.with(|e| e.borrow().contains(&me)) {
             return true;
         }
         let deliver = if wait { self.deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.deliver_lock.try_lock() };
@@ -277,14 +282,20 @@ impl ChangeNotifier {
             }
             return true;
         };
-        struct Emitting;
+        /// 抜ける時 (listener の panic も) に、 積んだ自分の印を外す。 入れ子は入った順の逆に抜けるので、 自分は末尾に居る。
+        struct Emitting(usize);
         impl Drop for Emitting {
             fn drop(&mut self) {
-                EMITTING.with(|e| e.set(false));
+                EMITTING.with(|e| {
+                    let mut e = e.borrow_mut();
+                    if let Some(i) = e.iter().rposition(|x| *x == self.0) {
+                        e.remove(i);
+                    }
+                });
             }
         }
-        EMITTING.with(|e| e.set(true));
-        let _emitting = Emitting;
+        EMITTING.with(|e| e.borrow_mut().push(me));
+        let _emitting = Emitting(me);
         let (batch, log) = match src.with(Engine::take_changes) {
             None => return false,
             Some(None) => return true,
