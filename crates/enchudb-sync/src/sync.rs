@@ -735,9 +735,17 @@ impl Syncer {
         // state の record は当たった物だけ (#698 の 「負けた record も載せる」 は差分の流れだけ): state の record の HLC は
         // cell の版数で、 書き手の record の順に並ばない (他の peer の時計の版数も混ざる)。 負けた分まで載せると、 受け手の
         // 書き手ごとの cursor がその版数まで進む record を増やす
+        //
+        // #753 (ホストだけ): `as_of` より後の版数の record は載せない。 ホストが受ける state は書き手が自分で作った物で、 `as_of` は
+        // 作り始めた時の書き手の時計、 ホストの `cursor[author]` も `as_of` になる (以後その書き手の record は as_of より後だけ
+        // 受ける)。 作っている間に書かれた cell は as_of より後の版数で state に入る。 それを載せると、 受け手の `cursor[author]`
+        // が as_of を越え、 同じ間に書かれて state に入らなかった (走査の済んだ cell の) record が、 後で差分で届いても cursor の
+        // 手前で落ちた。 載せなかった cell は、 書き手自身の書き込みなら差分 (as_of より後) で届いてそこで載り、 他の client の
+        // 書き込み (書き手が作っている間にホストから受けた物) は、 ホストがもう持っていて当たらない
         if gossip {
+            let host = self.is_host();
             for &(i, applied) in &relay_accepted {
-                if applied {
+                if applied && !(host && batch.records[i].hlc > batch.as_of) {
                     let _ = self.engine.relay_record(&batch.records[i]);
                 }
             }

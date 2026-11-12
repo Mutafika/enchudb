@@ -300,6 +300,8 @@ struct HostInner {
     /// client の record を当てる間 (read) と、 F を進めてホストが忘れる間 (write) を分ける。 忘れる前に当てた record と、 忘れた
     /// 後に当てた record で答えが変わる (忘れた削除より前の作成) ので、 F を配る前に忘れ終え、 その間は当てない。 client は返事の
     /// F で忘れてから当てる (`Syncer::pull_once`)
+    ///
+    /// #753: client が送った state を当てて載せる間 (write) と、 ring を読んで配る間 (read、 `records_for`) も分ける。
     gate: RwLock<()>,
 }
 
@@ -558,6 +560,10 @@ impl HostInner {
         // ring の順 (lsn = ホストが当てた順) のまま渡す。 書き手ごとには HLC の昇順 (client は自分の record を HLC の順に送り、
         // ホストはその順に当てる)。 当てる側は届く順に依らない作り。
         // ring を毎回全部読む (100 万行で重い。 書き手ごとの位置を覚えて途中から読むのは後で)
+        //
+        // #753: state を載せている間は読まない (`POST /v2/state` が write で持つ)。 state の record は HLC の順に並ばないので、
+        // 途中まで載った所を配ると、 受け手の cursor が、 まだ載っていない (版数の小さい) record を越える
+        let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
         self.engine
             .pending_sync_ops(0)
             .iter()
@@ -798,6 +804,9 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             if !host.asked_state.lock().unwrap().remove(&author) {
                 return send_response(&mut stream, 409, b"state not requested");
             }
+            // #753: 当てて、 載せて、 ring に写し終える (`oplog_sync`) まで pull を止める (`records_for` が read で待つ)。
+            // 差分 (`accept`) の record は書き手ごとに HLC の昇順で載るので止めなくてよいが、 state の record はそう並ばない
+            let _gate = host.gate.write().unwrap_or_else(|p| p.into_inner());
             host.loopback.pushed_state.lock().unwrap().insert(author, state);
             let ok = host.syncer.bootstrap_pull_via(author, author).is_some();
             host.loopback.pushed_state.lock().unwrap().remove(&author);
