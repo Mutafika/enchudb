@@ -1917,7 +1917,7 @@ mod write_out_fault {
     }
 }
 
-/// test 用の割り込み点: ローカルの cell の書き込み (`try_tie_to_by_id`) が WAL に積んだ後、 cell に当てる前 (#563)。 同じ cell の
+/// test 用の割り込み点: ローカルの cell の書き込み (`try_tie_to_by_id` / `untie_by_id` / `delete`) が WAL に積んだ後、 cell に当てる前 (#563)。 同じ cell の
 /// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
 #[cfg(test)]
 mod cell_append_hook {
@@ -2647,6 +2647,117 @@ mod cell_wal_order_tests {
     #[test]
     fn same_cell_writers_apply_in_wal_order_with_cell_versions() {
         run("ver", true);
+    }
+}
+
+/// #776: state (`state_records`) の `as_of` より前に版数を採った書き込みは、 cell に着く前でも state から抜けない。 書き手が WAL に
+/// 積んだ後・cell に当てる前 (割り込み点) に、 別の thread で state を作る。 直す前は、 state にその cell の古い値が入り、
+/// 書き込みの版数は as_of より前 = 受け手が `cursor = as_of` にすると差分でも届かない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod state_as_of_tests {
+    use super::*;
+    use enchudb_oplog::oplog::DecodedOp;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type State = (Vec<crate::transport::WireRecord>, enchudb_oplog::Hlc);
+
+    /// 行 e の `v` を 1 にしてある DB で、 `write` (v を変える書き込み) の割り込み点の間に state を作る。 戻り値: その state。
+    fn state_built_inside_a_write(tag: &str, write: impl FnOnce(&Engine, u64, u16)) -> (State, Arc<Engine>, u64, u16, String) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-stateasof-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_cell_version(&path, 1024).unwrap();
+        eng.define_table("t", 100).unwrap();
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        let e = eng.entity_in("t").unwrap();
+        eng.try_tie_to_by_id(e, v, 1u32).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let built: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<State>>>> = Arc::default();
+        let (eng2, built2) = (eng.clone(), built.clone());
+        cell_append_hook::set(&wal, move |_| {
+            let done = Arc::new(AtomicBool::new(false));
+            let done2 = done.clone();
+            let h = std::thread::spawn(move || {
+                let s = eng2.state_records();
+                done2.store(true, Ordering::Release);
+                s
+            });
+            // 今の形では、 state は as_of を採った後この書き手が行を離すのを待つので、 ここでは終わらない。 直す前は、 値の走査は
+            // 待たずに古い値を読む (その後の、 外した cell の走査がこの行で待つ)
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            *built2.lock().unwrap() = Some(h);
+        });
+        write(&eng, e, v);
+        let h = built.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        (h.join().unwrap(), eng, e, v, path)
+    }
+
+    fn cleanup(eng: Arc<Engine>, path: &str) {
+        drop(eng);
+        let _ = crate::db_files::remove_db(path);
+        let _ = std::fs::remove_file(oplog_path_for(path));
+    }
+
+    #[test]
+    fn a_write_stamped_before_as_of_is_in_the_state() {
+        let ((records, as_of), eng, e, v, path) = state_built_inside_a_write("tie", |eng, e, v| {
+            eng.try_tie_to_by_id(e, v, 2u32).unwrap();
+        });
+        let written = eng.cell_hlc(e, v);
+        let in_state: Vec<(u64, enchudb_oplog::Hlc)> = records
+            .iter()
+            .filter_map(|r| match &r.op {
+                DecodedOp::Tie { eid, himo_id, value } if *eid == e && *himo_id == v => Some((*value, r.hlc)),
+                _ => None,
+            })
+            .collect();
+        cleanup(eng, &path);
+        assert!(written < as_of, "前提: 書き込みの版数 {written:?} は as_of {as_of:?} より前 (as_of は割り込み点の中で採った)");
+        assert_eq!(in_state, vec![(2, written)], "as_of より前の版数の書き込みが state に無い (古い値が入った)");
+    }
+
+    /// 同じ窓の untie: state に、 外す前の値でなく Untie の record が入る。
+    #[test]
+    fn an_untie_stamped_before_as_of_is_in_the_state() {
+        let ((records, as_of), eng, e, v, path) = state_built_inside_a_write("untie", |eng, e, v| eng.untie_by_id(e, v));
+        let written = eng.cell_hlc(e, v);
+        let of_cell: Vec<(bool, enchudb_oplog::Hlc)> = records
+            .iter()
+            .filter_map(|r| match &r.op {
+                DecodedOp::Tie { eid, himo_id, .. } if *eid == e && *himo_id == v => Some((true, r.hlc)),
+                DecodedOp::Untie { eid, himo_id } if *eid == e && *himo_id == v => Some((false, r.hlc)),
+                _ => None,
+            })
+            .collect();
+        let gone = eng.get_by_id(e, v).is_none();
+        cleanup(eng, &path);
+        assert!(gone, "前提: untie が当たった");
+        assert!(written < as_of, "前提: untie の版数 {written:?} は as_of {as_of:?} より前");
+        assert_eq!(of_cell, vec![(false, written)], "as_of より前の版数の untie が state に無い (外す前の値が入った)。 (値か, 版数)");
+    }
+
+    /// 同じ窓の削除: 自分の行の削除は state に record を持たない (受け手は state に無い行を掃除する) ので、 消える行の cell が
+    /// state に入ってはいけない。
+    #[test]
+    fn a_delete_stamped_before_as_of_leaves_no_cell_in_the_state() {
+        let ((records, as_of), eng, e, _v, path) = state_built_inside_a_write("delete", |eng, e, _| eng.delete(e));
+        let tomb = eng.tombstone_version_of(enchudb_oplog::eid_local(e));
+        let of_row = records
+            .iter()
+            .filter(|r| matches!(&r.op, DecodedOp::Tie { eid, .. } | DecodedOp::Untie { eid, .. } if *eid == e))
+            .count();
+        let dead = !eng.is_live(e);
+        cleanup(eng, &path);
+        assert!(dead, "前提: 削除が当たった");
+        assert!(tomb != enchudb_oplog::Hlc::ZERO && tomb < as_of, "前提: 削除の版数 {tomb:?} は as_of {as_of:?} より前");
+        assert_eq!(of_row, 0, "as_of より前の版数で消えた行の cell が state に入った (受け手は掃除しない)");
     }
 }
 
@@ -9418,7 +9529,9 @@ impl Engine {
     ///   の cell は `as_of` で stamp する (単一 author cell では現在値が最新なので
     ///   LWW 的に安全)
     /// - `as_of` は合成**開始前**に採番する。 合成中の並行 write は HLC > as_of に
-    ///   なるので、 適用後の cursor = as_of からの差分 pull で必ず拾える
+    ///   なるので、 適用後の cursor = as_of からの差分 pull で必ず拾える。 採番の時に cell に当てている途中だった書き込み
+    ///   (版数は as_of より前) は、 着くのを待ってから走査する (`RowLocks::wait_for_writers`) = as_of 以下の版数の
+    ///   書き込みは全部 state に入る
     /// - 語彙は bridge (`transfer_oplog_to_sync_ops`) と同じ: Number = `Tie`、
     ///   Tag = `Vocab` + `Tie`、 Leaf = `TieLeaf` (bytes 同乗)、 Ref は translated
     ///   target のみ `TieRef` (世界番号同乗、 #183)、 自 entity target は `Tie`
@@ -9512,6 +9625,13 @@ impl Engine {
         // self: 合成**開始前**に採番 (合成中の write は HLC > as_of なので差分で拾える)。
         // foreign: 自分の clock を author の HLC 空間に混ぜないため、 emit 後に max を採る。
         let as_of = if is_self { wal.mint_hlc() } else { enchudb_oplog::Hlc::ZERO };
+        // #776: `as_of` より前の版数を採った書き込みが、 全部 cell に着くのを待つ。 書き手は行を握ってから WAL に積み (そこで版数が
+        // 決まる)、 それから cell に当てる。 待たないと、 版数 h を採った後・cell に当てる前に `as_of` が採られ (h < as_of)、 走査が
+        // その cell を先に読んだ時、 state には古い値が入る。 受け手 (ホスト) は `cursor = as_of` にして as_of 以下の record を
+        // 差分で受けないので、 その書き込み (値・untie・削除) は state にも差分にも乗らなかった
+        if is_self {
+            self.row_locks.wait_for_writers();
+        }
 
         // foreign author の行 = translated local。 local -> foreign_local の写像。
         let foreign: std::collections::HashMap<u32, u32> = if is_self {
@@ -16015,6 +16135,10 @@ impl Engine {
         let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id }) else {
             return;
         };
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            cell_append_hook::call(wal);
+        }
         let cleared = self.clear_cell_in_freeing_leaf(row.as_ref(), eid, himo_id, hlc);
         drop(row);
         if cleared {
@@ -16045,6 +16169,10 @@ impl Engine {
         let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }) else {
             return;
         };
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            cell_append_hook::call(wal);
+        }
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc);
         drop(row);
         if applied {

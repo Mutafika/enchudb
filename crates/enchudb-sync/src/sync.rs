@@ -854,10 +854,20 @@ impl Syncer {
                 })
                 .collect();
             for (foreign_local, local) in self.engine.translated_locals_of(author) {
-                if !covered.contains(&foreign_local) {
-                    self.engine.delete(local as u64);
-                    swept += 1;
+                if covered.contains(&foreign_local) {
+                    continue;
                 }
+                // #782: もう消えている行 (生きていなくて、 削除の版数がある) は消し直さない。 author が前に消して、 その削除が
+                // もう届いている行は state に無くて当たり前で、 掃除がする事は無い。 前は state を取り直すたびに今の時刻の
+                // 新しい Delete で消し直していて、 その行の名前の削除の時刻が上がり (#551)、 前の削除の後に同じ名前で足し直された
+                // 行 (新しいデッキ) が、 掃除の Delete を受けた peer で消えた。 削除の版数の無い slot (まだ何も当たっていない
+                // 写像) は今までどおり消す (版数を置いて、 後から届く古い書き込みで行ができないようにする)
+                let row = local as u64;
+                if !self.engine.is_live(row) && self.engine.tombstone_hlc(row) != Hlc::ZERO {
+                    continue;
+                }
+                self.engine.delete(row);
+                swept += 1;
             }
         }
 
