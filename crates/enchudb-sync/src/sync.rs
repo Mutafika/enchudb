@@ -81,8 +81,11 @@ pub struct Syncer {
     /// `{link: {author=link: hlc}}` の 1 entry で従来と同一挙動。
     /// `cursor_path` が設定されていれば update のたびにディスクに保存し、
     /// `Syncer::new` 時にロードして差分同期を継続する。
-    last_pulled:
+    ///
+    /// `Arc`: state の配布元 (`refresh_state_providers`) が、 replica の state の `as_of` に読む (#710)。
+    last_pulled: Arc<
         std::sync::Mutex<std::collections::HashMap<PeerId, std::collections::HashMap<PeerId, Hlc>>>,
+    >,
     /// `last_pulled` の永続化先。 `None` ならメモリのみ。
     cursor_path: std::sync::RwLock<Option<PathBuf>>,
     /// Phase C: true なら署名検証を強制。未署名 or 検証失敗 op は reject。
@@ -309,7 +312,7 @@ impl Syncer {
         let syncer = Self {
             engine: engine.clone(),
             transport,
-            last_pulled: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_pulled: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             cursor_path: std::sync::RwLock::new(None),
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
@@ -602,13 +605,27 @@ impl Syncer {
             // #236: replica batch が cell 単位で欠けていたら一度だけ warn する。
             // provider は transport から何度も呼ばれるので flag は provider ごとに持つ。
             let warned_incomplete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let last_pulled = self.last_pulled.clone();
             self.transport.register_state_provider_for(
                 author,
                 self_peer,
                 Arc::new(move || {
                     let eng = engine.upgrade()?;
                     let before = eng.state_records_dropped();
+                    // #710: replica の state の `as_of` は、 **author 自身の record をどこまで受けたか** (自分の cursor)。 受け手は
+                    // `cursor[author] = as_of` にして、 以後その author の record を as_of より後だけ受ける。 engine の `as_of`
+                    // (出した record の版数の最大) は、 author の行を他の peer が書き換えていると他人の時計の版数になり、 author が
+                    // それより前に書いてまだ出していない record を受け手の cursor が越える (二度と届かない)。 state を作る**前**に読む
+                    // (作る間に当たった record は as_of より後 = 差分で届く)
+                    let received = (!is_self)
+                        .then(|| {
+                            let g = last_pulled.lock().unwrap();
+                            g.values().filter_map(|m| m.get(&author)).copied().max()
+                        })
+                        .flatten();
                     let (records, as_of) = eng.state_records_for(author);
+                    // cursor の無い author (自分の cursor を通らずに入った行) は今までどおり
+                    let as_of = received.unwrap_or(as_of);
                     let dropped = eng.state_records_dropped().saturating_sub(before);
                     // #236: `complete: false` は 「row が足りないかも」 としか読まれない。
                     // cell 単位の欠けは受信側からは絶対に見えない (欠けた cell は
