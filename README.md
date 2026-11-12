@@ -611,6 +611,7 @@ if out.history_truncated {
 }
 ```
 
+- **The host relays every record it takes, not only the ones that won on it** (#698). Clients only hear from the host, so a record that lost last-write-wins on the host still goes out: a losing key write is the only record that says "this row id is the row with this key", and a client that never saw it could not attach later writes, deletes or renames addressed to that row id to its own row. Each client resolves last-write-wins itself, as it would pulling from the author directly. Records the host refused (ACL, signature, out of space) are not relayed; they are redelivered.
 - The host acknowledges what it applied, so each client's `_sync_ops` is reclaimed as soon as the host has its records (a client that stays away does not hold the others back). A client's pull acknowledges the host's stream, so the host's `_sync_ops` is reclaimed too.
 - A client whose cursor is below the host's reclaimed floor is told so (`history_truncated`) and catches up from the host's state.
 - **Give the client a cursor file** (`Syncer::with_cursor_path`). The cursor is what tells the host how far this client has received. A client without one starts every restart as a first-time client: once the host has reclaimed anything, its first pull applies nothing and returns `history_truncated`, and it receives nothing until the app runs `bootstrap_pull_via` for the listed authors.
