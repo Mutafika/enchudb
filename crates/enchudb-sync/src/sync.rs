@@ -775,9 +775,16 @@ impl Syncer {
             let mut relayed = false;
             // 載せなかった Vocab: (書き手, 番号) → `records` の中の位置
             let mut withheld: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
+            // #780: 登録済みの Vocab (当たらなかった)。 載せる Tie が指す時だけ、 その Tie の版数で前に載せる (`withheld` と同じ形)。
+            // 前は載せず (「前に載せた」)、 その 1 回が回収された後に来て中継の state で取り直した受け手が、 state の Tie を
+            // 翻訳できなかった。 指す Tie を載せなければ載せない (下の受け手に要る Tie が無い)
+            let mut known: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
             for &(i, applied) in &relay_accepted {
                 let r = &records[i];
                 if !applied {
+                    if let DecodedOp::Vocab { vid, .. } = &r.op {
+                        known.insert((r.author_peer, *vid), i);
+                    }
                     continue;
                 }
                 if host && r.hlc > batch.as_of {
@@ -786,11 +793,9 @@ impl Syncer {
                     }
                     continue;
                 }
-                if !withheld.is_empty()
-                    && let DecodedOp::Tie { himo_id, value, .. } = &r.op
-                    && self.engine.value_type_at(*himo_id as usize) == Some(enchudb_engine::ValueType::Tag)
-                    && let Ok(vid) = u32::try_from(*value)
-                    && let Some(v) = withheld.remove(&(r.author_peer, vid))
+                if (!withheld.is_empty() || !known.is_empty())
+                    && let Some(vid) = self.vocab_of(r)
+                    && let Some(v) = withheld.remove(&(r.author_peer, vid)).or_else(|| known.remove(&(r.author_peer, vid)))
                 {
                     relayed |= self.engine.relay_record(&WireRecord { hlc: r.hlc, ..records[v].clone() });
                 }
@@ -882,6 +887,24 @@ impl Syncer {
         self.refresh_state_providers();
 
         Some(BootstrapOutcome { outcome, swept, as_of: batch.as_of })
+    }
+
+    /// record が指す語の番号 (書き手 `author_peer` の空間): Tag の列の `Tie` と、 名前で運ぶ Tag / Leaf の `TieNamed`。 語を
+    /// 指さない record は None。 中継が、 載せる Tie の前にその語の Vocab を載せるために見る (#769 / #780)。
+    fn vocab_of(&self, r: &WireRecord) -> Option<u32> {
+        match &r.op {
+            DecodedOp::Tie { himo_id, value, .. }
+                if self.engine.value_type_at(*himo_id as usize) == Some(enchudb_engine::ValueType::Tag) =>
+            {
+                u32::try_from(*value).ok()
+            }
+            DecodedOp::TieNamed { himo_kind, value, .. }
+                if *himo_kind == enchudb_engine::ValueType::Tag as u8 || *himo_kind == enchudb_engine::ValueType::Leaf as u8 =>
+            {
+                u32::try_from(*value).ok()
+            }
+            _ => None,
+        }
     }
 
     /// #762: ホストでない中継が取り直した state のうち、 **当てずに差分に任せる** record を外した列 (外す物が無ければ None)。
@@ -1105,16 +1128,35 @@ impl Syncer {
         // 昇順 = 途中まで載った所で client が pull しても、 その書き手の cursor は載った所までしか進まない)。 負けた record は、
         // cursor が進まずに届き直した時に 2 度載せない (`relay_held`)。 当たった record は今までどおり必ず載せる。
         // 容量で断った record の後ろの同じ書き手の record は、 そもそも当てていない (#754、 `apply_records_impl`)
+        //
+        // #780: 登録済みの Vocab (当たらなかった)。 ホストは他の当たらなかった record と同じに載せる (受けた record の全部)。
+        // ホストでない中継は、 **載せる Tie が指す物だけ**を、 その Tie の前に載せる (当たった Tie 1 つにつき高々 1 つ = 閉路の
+        // 反響は今までどおり Tie の LWW で止まる)。 中継の流れでも、 Tag の Tie の前には必ずその語の Vocab がある
         let host = gossip && self.is_host();
         let mut relayed = 0usize;
         if gossip {
             let mut held = self.relay_held.lock().unwrap();
             let held = held.entry(from).or_default();
+            // ホストでない中継: まだ載せていない登録済みの Vocab。 (書き手, 番号) → `records` の中の位置
+            let mut known: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
             for &(i, applied) in &relay_accepted {
                 let r = &records[i];
                 let key = (r.author_peer, r.hlc);
-                if !applied && (!host || held.contains(&key)) {
+                if !applied && !host {
+                    if let DecodedOp::Vocab { vid, .. } = &r.op {
+                        known.insert((r.author_peer, *vid), i);
+                    }
                     continue;
+                }
+                if !applied && held.contains(&key) {
+                    continue;
+                }
+                if !known.is_empty()
+                    && let Some(vid) = self.vocab_of(r)
+                    && let Some(v) = known.remove(&(r.author_peer, vid))
+                    && self.engine.relay_record(&records[v])
+                {
+                    relayed += 1;
                 }
                 if self.engine.relay_record(r) {
                     relayed += 1;
@@ -1744,7 +1786,13 @@ impl Syncer {
     ///
     /// #698: 当たらなかった record (LWW で負けた / 消えた行宛て / 宛先を解決できない) も `(index, false)` で集める。 載せるかは
     /// 呼び手が決める (ホストだけが載せる、 [`Syncer::set_host`])。 検査 (ACL・署名) と容量で断った record は集めない
-    /// (cursor を止めて届き直させる物)。 登録済みの Vocab (同じ書き手・番号・語を前に当てた = 前に載せた) も集めない。
+    /// (cursor を止めて届き直させる物)。
+    ///
+    /// #780: 登録済みの Vocab (同じ書き手・番号・語を前に当てた) も `(index, false)` で集める。 前は 「前に載せた」 として
+    /// 集めなかった = ある語の Vocab は中継の流れに最初の 1 回しか載らず、 その 1 回が ring から回収された後に来て中継の state
+    /// (今 cell にある語だけ) で取り直した受け手は、 書き手が前に使った語をもう一度使った時に Tie だけを受けて翻訳できなかった。
+    /// 載せ方は呼び手: ホストは他の当たらなかった record と同じに載せる。 ホストでない中継は、 載せる Tie が指す物だけを
+    /// その Tie の前に載せる ([`Syncer::vocab_of`])。
     ///
     /// #754 (中継だけ = `relay_accepted` が Some): **容量で**断った record より後 (HLC) の、 同じ書き手の record は、 この batch
     /// では**当てずに飛ばす** (載せもしない)。 断った record は cursor を止めるので、 飛ばした record も一緒に届き直し、 空きが
@@ -1842,8 +1890,7 @@ impl Syncer {
                 let relayable = !matches!(rec.op, DecodedOp::Commit) && rec.author_peer != self_peer;
                 let applied = result == ApplyResult::Applied;
                 let passed_over = match result {
-                    ApplyResult::SkippedOlder => !matches!(rec.op, DecodedOp::Vocab { .. }),
-                    ApplyResult::Dropped | ApplyResult::DroppedVocab => true,
+                    ApplyResult::SkippedOlder | ApplyResult::Dropped | ApplyResult::DroppedVocab => true,
                     ApplyResult::Applied | ApplyResult::RejectedCapacity => false,
                 };
                 if relayable && (applied || passed_over) {
