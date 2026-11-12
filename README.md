@@ -610,6 +610,7 @@ if out.history_truncated {
 }
 ```
 
+- **The host relays every record it takes, not only the ones that won on it** (#698). Clients only hear from the host, so a record that lost last-write-wins on the host still goes out: a losing key write is the only record that says "this row id is the row with this key", and a client that never saw it could not attach later writes, deletes or renames addressed to that row id to its own row. Each client resolves last-write-wins itself, as it would pulling from the author directly. Records the host refused (ACL, signature, out of space) are not relayed; they are redelivered.
 - The host acknowledges what it applied, so each client's `_sync_ops` is reclaimed as soon as the host has its records (a client that stays away does not hold the others back). A client's pull acknowledges the host's stream, so the host's `_sync_ops` is reclaimed too.
 - A client whose cursor is below the host's reclaimed floor is told so (`history_truncated`) and catches up from the host's state.
 - **Deleted-row bookkeeping is forgotten once everyone is past it.** Each client tells the host how far it has published its own writes and how far it has received the host's stream. The host hands out the line every active client has passed, and the host and the clients drop the deleted keys (`pktombs`) and the deletes of rows they no longer map that are older than it. A host started without a `cursor_path` hands out no line (after a restart it would not know whom to wait for), so nothing is forgotten under it.

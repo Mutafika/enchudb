@@ -5,6 +5,11 @@
 //! 中継として自分の `_sync_ops` に載せ、 client はホストの `_sync_ops` から pull する。 共有の掲示板 (`HttpRelay`) と違い、
 //! record の置き場はホストの DB だけで、 再起動しても続く。
 //!
+//! ホストが中継に載せるのは **受けた record の全部** (#698): ホストの LWW で負けた record も載せる。 client はホストからしか
+//! 受けないので、 負けた record (特に負けた名前のカード = 「この世界番号はこの名前のデッキ」 を運ぶ唯一の record) を配らないと、
+//! その世界番号宛ての後の書き込み・削除・改名を他の client が自分の行に結べず、 相手から直に pull する形と答えが割れる。
+//! LWW は受け手がそれぞれ自分でする。 載せないのは、 検査 (ACL・署名) や容量で断った record (届き直す) と Commit だけ。
+//!
 //! - `POST /v2/publish?peer=c` : client c の record。 ホストが当てて中継し、 WAL を書き出してから、 ホストが当てた位置 (c への ack)
 //!   を返す。 client の `_sync_ops` はこの ack で回収される (ホストは record の置き場の権威なので、 #227 の下流の消化で丸めない)
 //! - `POST /v2/pull?to=c` (body = 書き手ごとの cursor) : ホストの `_sync_ops` のうち cursor より後 (c 自身の record は除く) と、
@@ -383,8 +388,9 @@ impl HostInner {
             // 全部当てた (from の cursor が batch の最大に届いた) 時だけ、 配り終えの線を進める
             let all_in = top.is_none_or(|t| seen(self) >= t) && !out.history_truncated;
             // 中継として WAL に載せた record を書き出してから ack を返す (ack で client は自分の ring から消すので、 その後にホストが
-            // 落ちて中継の record を失うと、 他の client に届く道が無くなる)
-            if out.applied > 0 {
+            // 落ちて中継の record を失うと、 他の client に届く道が無くなる)。 #698: LWW で負けた record / 宛先を解決できなかった
+            // record も中継に載っている
+            if out.applied + out.skipped + out.dropped_unresolved + out.dropped_vocab > 0 {
                 let _ = self.engine.oplog_sync();
             }
             (out, all_in)

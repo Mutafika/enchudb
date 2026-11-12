@@ -11403,7 +11403,8 @@ impl Engine {
     /// #209: 受信 record を**素通し** (原 eid / 原 value / 原 HLC / 原 author /
     /// 原署名) で自分の WAL に relay append する。 Syncer が「apply が accept した
     /// record」に限って呼ぶ (LWW gate が cyclic topology の echo を止める唯一の
-    /// 栓なので、 skip した record を relay してはいけない)。
+    /// 栓なので、 skip した record を relay してはいけない)。 例外はホスト (`Syncer::set_host`、 #698):
+    /// 星形で反響しないので、 LWW で負けた record も載せる (client はホストからしか受けない)。
     ///
     /// 翻訳 (eid/vid/ref) は body apply 専用で、 relay stream には漏らさない —
     /// 「中継であって作者交代ではない」。 WAL recovery はこの record を
