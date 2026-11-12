@@ -20562,7 +20562,8 @@ impl Engine {
         // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
         let folded = wal.fold_hint().is_some_and(|through| {
             self.wal_fold_safe_to(through) && {
-                moved = self.move_changes_before_fold(wal, &mut c, wal.checkpoint());
+                // #742: 足す (上の先写しで数えた分を消すと、 その分で通知係を起こさない)
+                moved += self.move_changes_before_fold(wal, &mut c, wal.checkpoint());
                 true
             }
         }) && wal.try_reset_if(|through| {
