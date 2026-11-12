@@ -745,7 +745,9 @@ impl Syncer {
 
         // pull_once と同じ barrier: 派生 state (eidmap / vocabmap / tables) が
         // durable になる前に cursor を進めない。
-        if outcome.applied > 0 && !self.persist_applied_state(link) {
+        // #755: 1 件も当たらなかった state でも、 派生 state に書き出していない変化があれば通す (pull_once と同じ)
+        let derived = !batch.records.is_empty() && self.engine.sync_state_dirty();
+        if (outcome.applied > 0 || derived) && !self.persist_applied_state(link) {
             return Some(BootstrapOutcome { outcome, swept: 0, as_of: batch.as_of });
         }
 
@@ -1014,7 +1016,15 @@ impl Syncer {
         // #698: ホストが負けた record だけを載せた batch (applied = 0) も通す。 負けた名前のカードは束ねた写像を作っていて、
         // 中継の record は WAL の再生で当て直される (`replay_relayed_op` は名前で束ねない) ので、 写像が残っていないと
         // 再生が新しい行を払い出す
-        if (outcome.applied > 0 || (host && relayed > 0)) && !self.persist_applied_state(from) {
+        //
+        // #755: ホストでない peer も同じ。 1 件も当たらなかった batch でも、 派生 state に書き出していない変化があれば通す
+        // (負けた名前のカードが束ねた写像は、 その世界番号宛ての後の record を自分の行に結ぶのに要る。 cursor が先に進むと、
+        // 落ちた後は名前のカードがもう届かない = 後の record が名前の無い別の行になる)。 record の無い pull と、 変化の無い batch は
+        // 今までどおり何も書かない
+        let derived = !records.is_empty() && self.engine.sync_state_dirty();
+        if (outcome.applied > 0 || (host && relayed > 0) || derived)
+            && !self.persist_applied_state(from)
+        {
             return outcome;
         }
 
