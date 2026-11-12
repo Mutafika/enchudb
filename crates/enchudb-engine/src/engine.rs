@@ -11951,7 +11951,11 @@ impl Engine {
         }
         if changed {
             match (ok, old) {
-                (true, Some(o)) => self.vocab.release(o),
+                (true, Some(o)) => {
+                    self.vocab.release(o);
+                    // #708: 返した場所は書き出しの後まで使い回せない。 溜まっていたら書き出す
+                    self.settle_retired_words();
+                }
                 (false, _) => self.vocab.release(value as u32),
                 _ => {}
             }
@@ -12001,12 +12005,40 @@ impl Engine {
                     // SAFETY: size <= map の予約 (`map_vocab_refs` が size で予約する)
                     let region = unsafe { Region::from_segment(map.clone(), size) };
                     let _ = self.vocab_refs_map.set(map);
-                    return self.vocab.enable_reclaim(Some(region));
+                    let trusted = self.vocab.enable_reclaim(Some(region));
+                    // #708: ディスクに書き出す DB は、 参照 0 になった場所を書き出しの後まで使い回さない
+                    self.vocab.defer_reuse();
+                    return trusted;
                 }
                 Err(e) => eprintln!("warning: vocab.refs.seg を開けない ({e}) — 参照数は heap に置き、 開くたびに数える"),
             }
         }
-        self.vocab.enable_reclaim(None)
+        let trusted = self.vocab.enable_reclaim(None);
+        if self.backing.is_on_disk() {
+            self.vocab.defer_reuse();
+        }
+        trusted
+    }
+
+    /// #708: 書き出しを待つ辞書の場所 (参照 0 になった語) が溜まった時に、 本体を書き出して使い回せるようにする。 Leaf の
+    /// `settle_retired_leaves` (#414) と同じ: consumer の居る DB は 100 ms ごとに書き出すので普段は届かない。 flush せずに
+    /// Tag の値を書き換え続ける書き手 (standalone / 空きの少ない辞書) が、 使い回せる場所を待たせたまま辞書を使い切らない
+    /// ための上限。 書き出すのは 1 本の thread だけ (他の thread は待たずに続ける)。 待っていなければ atomic の load 1 回。
+    #[inline]
+    fn settle_retired_words(&self) {
+        if self.vocab.settle_due() {
+            self.settle_retired_words_now();
+        }
+    }
+
+    #[cold]
+    fn settle_retired_words_now(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(_one) = self.vocab.begin_settle() else { return };
+            let ok = self.body_msync().is_ok();
+            self.vocab.settle_finished(ok);
+        }
     }
 
     /// #385: 開いた時に参照数を使えなかった (`attach_vocab_refs` が false) なら、 ここで数え直して回収を始める。
@@ -12103,6 +12135,8 @@ impl Engine {
         self.live.touch(hid as u16, local);
         if let Some(o) = old {
             self.vocab.release(o);
+            // #708: `live_set` と同じ
+            self.settle_retired_words();
         }
     }
 
@@ -21061,6 +21095,8 @@ impl Engine {
             Backing::Segments(set) => {
                 // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
                 let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
+                // #708: 書き出しの前に参照 0 になった辞書の場所も、 書き出しが成功したら使い回せる
+                let vocab_token = self.vocab.durable_begin();
                 // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める (bridge は行を書いて
                 // から cursor を進めるので、 読んだ cursor より前の record の行は書き出しに入る)
                 let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
@@ -21074,6 +21110,7 @@ impl Engine {
                 if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
                     leaf.durable_end(t);
                 }
+                self.vocab.durable_end(vocab_token);
                 self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
                 self.sync_bridged_durable_pos.fetch_max(bridged_pos, std::sync::atomic::Ordering::AcqRel);
                 // 「この時点の segment 長」 を記録する。 次の open で切り詰めを検出できる。
@@ -21502,7 +21539,8 @@ impl Engine {
             reserved_data_bytes: reserved_data as u64,
             reclaim: self.vocab.reclaim_enabled(),
             reclaim_ready: self.vocab.reclaim_ready(),
-            reclaimable_entries: reclaimable_entries as u32,
+            // #708: 書き出しを待っている場所も数える (次の書き出しの後に使い回せる)
+            reclaimable_entries: (reclaimable_entries + self.vocab.retired_words()) as u32,
             reclaimed,
         }
     }
@@ -21867,6 +21905,8 @@ impl Engine {
     fn sync_and_mark_clean_with(&self, refs: bool, closing: bool) -> io::Result<()> {
         // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
         let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
+        // #708: 書き出しの前に参照 0 になった辞書の場所も同じ
+        let vocab_token = self.vocab.durable_begin();
         // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める。 ring は行より先に
         let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
         let bridged_pos = self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
@@ -21875,6 +21915,7 @@ impl Engine {
         if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
             leaf.durable_end(t);
         }
+        self.vocab.durable_end(vocab_token);
         self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
         self.sync_bridged_durable_pos.fetch_max(bridged_pos, std::sync::atomic::Ordering::AcqRel);
         if refs {

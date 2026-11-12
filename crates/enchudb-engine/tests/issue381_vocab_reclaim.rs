@@ -50,6 +50,8 @@ fn stale_vid_is_rejected() {
     eng.try_tie_text_to_by_id(a, k, "old").unwrap();
     let old = eng.vocab_id("old").unwrap();
     eng.delete(a);
+    // #708: 空いた場所を使い回すのは、 行を消したことが書き出された後
+    eng.body_msync().unwrap();
     let b = eng.entity().unwrap();
     eng.try_tie_text_to_by_id(b, k, "new").unwrap();
     let new = eng.vocab_id("new").unwrap();
@@ -155,6 +157,9 @@ fn queued_writes_keep_their_vids_until_applied() {
         if queued.len() == 500 {
             eng.flush_writes();
             applied.extend(queued.drain(..));
+            // #708: 空いた場所を使い回すのは、 行を消したことが書き出された後。 周期の書き出し (100 ms) を待つと使い回しの
+            // 量が時間で変わるので、 ここで書き出す (queue に積んだ 500 件が番号を押さえている形は変わらない)
+            eng.oplog_sync().unwrap();
         }
         // 適用済みの行を古い順に消す (queue には常に 500 件まで積まれている)
         while applied.len() > 200 {
