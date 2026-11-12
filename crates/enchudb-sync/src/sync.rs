@@ -123,6 +123,15 @@ pub struct Syncer {
         std::sync::Mutex<std::collections::HashMap<PeerId, std::collections::HashMap<PeerId, Hlc>>>,
     /// #219: filter が落とした record の累計 (観測用)。 `AllRecords` なら常に 0。
     suppressed_records: std::sync::atomic::AtomicU64,
+    /// #762: 中継 (ホストでない) が取り直した state を当てて載せ、 ring に写し終えるまで (write) と、 自分の ring を読んで配る間
+    /// (read、 `collect_records_since`) を分ける。 state の record は HLC の順に並ばないので、 途中まで載った所を配ると、
+    /// 受け手の書き手ごとの cursor が、 まだ載っていない (版数の小さい) record を越える。 ホストは自分の口の gate で同じ事を
+    /// する (#753)
+    state_relay: std::sync::RwLock<()>,
+    /// `state_relay` を write で持っている thread。 その thread 自身が ring を読む時 (`bootstrap_pull_via` の中の `oplog_sync` が
+    /// 呼んだ changefeed の listener が、 その場で publish する形) は待たない (待つと自分を待つ)。 listener が呼ばれるのは ring に
+    /// 写し終えた後
+    state_relay_owner: std::sync::Mutex<Option<std::thread::ThreadId>>,
     /// ホスト (全員が経由する DB の peer) として動くか ([`Syncer::set_host`])。
     host: std::sync::atomic::AtomicBool,
     /// #698 (ホストだけ): 中継に載せた record のうち、 その link の cursor がまだ越えていない物 (`{link: {(author, HLC)}}`)。
@@ -333,6 +342,8 @@ impl Syncer {
             served_authors: std::sync::Mutex::new(None),
             suppressed_since: std::sync::Mutex::new(std::collections::HashMap::new()),
             suppressed_records: std::sync::atomic::AtomicU64::new(0),
+            state_relay: std::sync::RwLock::new(()),
+            state_relay_owner: std::sync::Mutex::new(None),
             host: std::sync::atomic::AtomicBool::new(false),
             relay_held: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
@@ -726,9 +737,14 @@ impl Syncer {
             return None;
         };
         let gossip = self.engine.gossip_remote_apply();
+        let host = gossip && self.is_host();
+        // #762 (ホストでない中継): state を当てて、 載せて、 ring に写し終えるまで、 自分の ring を配らない
+        // (`collect_records_since` が read で待つ)。 ホストは自分の口の gate が同じ事をする (#753)
+        let relaying = (gossip && !host).then(|| self.state_relay.write().unwrap_or_else(|p| p.into_inner()));
+        let later = self.records_left_to_the_diff(link, author, &batch, gossip && !host);
+        let records: &[WireRecord] = later.as_deref().unwrap_or(&batch.records);
         let mut relay_accepted: Vec<(usize, bool)> = Vec::new();
-        let outcome =
-            self.apply_records_impl(&batch.records, gossip.then_some(&mut relay_accepted));
+        let outcome = self.apply_records_impl(records, gossip.then_some(&mut relay_accepted));
 
         // #209: relay が bootstrap で取った state も原型のまま relay stream へ —
         // これで新規 relay も author の複製 + 配布点として立ち上がれる。
@@ -743,6 +759,10 @@ impl Syncer {
         // 手前で落ちた。 載せなかった cell は、 書き手自身の書き込みなら差分 (as_of より後) で届いてそこで載り、 他の client の
         // 書き込み (書き手が作っている間にホストから受けた物) は、 ホストがもう持っていて当たらない
         //
+        // #762 (ホストでない中継): 負けた record を載せない中継は、 「当てて載せない」 では済まない (後で差分で届いた時に負けて、
+        // 載らないまま)。 書き手自身の、 取り直した後の cursor より後の record は **当てずに** 差分に任せる
+        // (`records_left_to_the_diff`、 上で `records` から外した)
+        //
         // #769 (ホストだけ): 載せない record の中の Vocab (語の写像) は、 版数を付け替えて載せる。 state の中で Vocab は語ごとに
         // 1 回だけ、 最初に走査した cell の版数で出る。 その cell が作っている間に書かれた物だと Vocab も as_of より後で、
         // 載せないと (1) 同じ語を持つ、 載せる Tie (as_of 以前の cell) を下の受け手が翻訳できずに捨て、 (2) その cell の Tie が
@@ -752,11 +772,11 @@ impl Syncer {
         // どちらも as_of 以下なので、 受け手の cursor は as_of を越えない。 語の写像は版数によらず、 state の record は書き手が
         // 署名していない合成なので、 付け替えても同じ意味
         if gossip {
-            let host = self.is_host();
-            // 載せなかった Vocab: (書き手, 番号) → batch の中の位置
+            let mut relayed = false;
+            // 載せなかった Vocab: (書き手, 番号) → `records` の中の位置
             let mut withheld: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
             for &(i, applied) in &relay_accepted {
-                let r = &batch.records[i];
+                let r = &records[i];
                 if !applied {
                     continue;
                 }
@@ -772,16 +792,23 @@ impl Syncer {
                     && let Ok(vid) = u32::try_from(*value)
                     && let Some(v) = withheld.remove(&(r.author_peer, vid))
                 {
-                    let _ = self.engine.relay_record(&WireRecord { hlc: r.hlc, ..batch.records[v].clone() });
+                    relayed |= self.engine.relay_record(&WireRecord { hlc: r.hlc, ..records[v].clone() });
                 }
-                let _ = self.engine.relay_record(r);
+                relayed |= self.engine.relay_record(r);
             }
             let mut rest: Vec<usize> = withheld.into_values().collect();
             rest.sort_unstable();
             for v in rest {
-                let _ = self.engine.relay_record(&WireRecord { hlc: batch.as_of, ..batch.records[v].clone() });
+                relayed |= self.engine.relay_record(&WireRecord { hlc: batch.as_of, ..records[v].clone() });
+            }
+            // 載せた record を ring に写し終えてから、 配るのを通す
+            if relayed && relaying.is_some() {
+                *self.state_relay_owner.lock().unwrap() = Some(std::thread::current().id());
+                let _ = self.engine.oplog_sync();
+                *self.state_relay_owner.lock().unwrap() = None;
             }
         }
+        drop(relaying);
 
         // pull_once と同じ barrier: 派生 state (eidmap / vocabmap / tables) が
         // durable になる前に cursor を進めない。
@@ -846,6 +873,62 @@ impl Syncer {
         self.refresh_state_providers();
 
         Some(BootstrapOutcome { outcome, swept, as_of: batch.as_of })
+    }
+
+    /// #762: ホストでない中継が取り直した state のうち、 **当てずに差分に任せる** record を外した列 (外す物が無ければ None)。
+    ///
+    /// 外すのは、 書き手 `author` 自身の record (`author_peer` も版数の時計も `author`) で、 版数が取り直した後の
+    /// `cursor[link][author]` (= max(今の cursor, `as_of`)) より後の物 = 書き手が state を作っている間に書いた cell。 その record は
+    /// cursor より後なので、 差分で必ず届き、 そこで当たって載る (書き手ごとに HLC の昇順)。 state から当てて載せると、 下の
+    /// 受け手の `cursor[author]` が `as_of` を越え、 同じ間に書かれて state に入らなかった (走査の済んだ cell の) record が、
+    /// 後で差分で届いて載っても cursor の手前で落ちる (#753 の形 1 の、 中継の版)。
+    ///
+    /// 他の peer の時計の版数の record (書き手の行を別の peer が書き換えた cell) は、 差分で届くとは限らないので今までどおり
+    /// 当てて載せる (その版数が `as_of` より後なら、 同じ越えが残る)。
+    ///
+    /// 外した Vocab を、 残した Tie が指す時 (同じ語を持つ古い cell。 Vocab は state の中で語ごとに 1 回、 最初に出た cell の
+    /// 版数で出る) は、 その Vocab を Tie の版数に付け替えて Tie の前に残す (語の写像は版数によらない。 state の record は
+    /// 書き手が署名していない合成なので、 付け替えても同じ意味)。
+    fn records_left_to_the_diff(
+        &self,
+        link: PeerId,
+        author: PeerId,
+        batch: &enchudb_engine::transport::StateBatch,
+        relay: bool,
+    ) -> Option<Vec<WireRecord>> {
+        if !relay {
+            return None;
+        }
+        let cursor = {
+            let guard = self.last_pulled.lock().unwrap();
+            guard.get(&link).and_then(|m| m.get(&author)).copied().unwrap_or(Hlc::ZERO)
+        };
+        let resume = cursor.max(batch.as_of);
+        let left = |r: &WireRecord| r.author_peer == author && r.hlc.peer == author && r.hlc > resume;
+        if !batch.records.iter().any(left) {
+            return None;
+        }
+        let mut kept: Vec<WireRecord> = Vec::with_capacity(batch.records.len());
+        // 外した Vocab (vid → record)
+        let mut vocab: std::collections::HashMap<u32, &WireRecord> = std::collections::HashMap::new();
+        for r in &batch.records {
+            if left(r) {
+                if let DecodedOp::Vocab { vid, .. } = &r.op {
+                    vocab.insert(*vid, r);
+                }
+                continue;
+            }
+            if r.author_peer == author
+                && let DecodedOp::Tie { himo_id, value, .. } = &r.op
+                && self.engine.value_type_at(*himo_id as usize) == Some(enchudb_engine::ValueType::Tag)
+                && let Ok(vid) = u32::try_from(*value)
+                && let Some(v) = vocab.remove(&vid)
+            {
+                kept.push(WireRecord { hlc: r.hlc, ..v.clone() });
+            }
+            kept.push(r.clone());
+        }
+        Some(kept)
     }
 
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。
@@ -1382,6 +1465,9 @@ impl Syncer {
         // gossip 有効時は常に全量 collect し、 重複は transport 側の dedupe
         // ((peer, hlc) 一意) に任せる。
         let since = if self.engine.gossip_remote_apply() { Hlc::ZERO } else { since };
+        // #762: 中継が取り直した state を ring に載せている間は読まない (`bootstrap_pull_via` が write で持つ)
+        let mine = *self.state_relay_owner.lock().unwrap() == Some(std::thread::current().id());
+        let _relaying = (!mine).then(|| self.state_relay.read().unwrap_or_else(|p| p.into_inner()));
         let payloads = self.engine.pending_sync_ops(0);
         let mut out = Vec::with_capacity(payloads.len());
         for p in &payloads {
@@ -2247,6 +2333,75 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
+    }
+
+    /// #762: 中継が取り直した state から差分に任せる record を外す時、 外した Vocab を残した Tie が指していれば、 その Vocab は
+    /// Tie の版数に付け替えて残る (同じ語を持つ、 as_of より前の cell)。 Number の列の同じ値は語ではない。 中継でなければ何も
+    /// 外さない。 cursor が as_of より先なら cursor まで残す。
+    #[test]
+    fn records_left_to_the_diff_keeps_a_vocab_a_kept_tie_needs() {
+        use enchudb_engine::transport::StateBatch;
+        let path = test_path("leftdiff");
+        let eng = new_eng(&path, 2);
+        let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+        let syncer = Syncer::new(eng.clone(), transport);
+        let (val, name) = (eng.himo_id("rows.val").unwrap() as u16, eng.himo_id("rows.name").unwrap() as u16);
+        let at = |wall: u64, peer: PeerId| Hlc { wall, logical: 0, peer };
+        let eid = |l: u32| enchudb_oplog::make_eid(1, l);
+        let rec = |h: Hlc, by: PeerId, op: DecodedOp| WireRecord::unsigned(h, by, op);
+        let as_of = at(100, 1);
+        let records = vec![
+            // 書き手が state を作っている間に書いた cell (語 7 が最初に出る)
+            rec(at(130, 1), 1, DecodedOp::Vocab { vid: 7, bytes: b"word".to_vec() }),
+            rec(at(130, 1), 1, DecodedOp::Tie { eid: eid(1), himo_id: name, value: 7 }),
+            // Number の列の 7 (語ではない)
+            rec(at(50, 1), 1, DecodedOp::Tie { eid: eid(3), himo_id: val, value: 7 }),
+            // 同じ語を持つ古い cell
+            rec(at(60, 1), 1, DecodedOp::Tie { eid: eid(2), himo_id: name, value: 7 }),
+            rec(at(70, 1), 1, DecodedOp::Tie { eid: eid(4), himo_id: name, value: 7 }),
+            // 別の peer の時計の版数 (as_of より後でも残す)
+            rec(at(140, 9), 1, DecodedOp::Tie { eid: eid(5), himo_id: val, value: 1 }),
+            // as_of より後、 cursor の手前
+            rec(at(110, 1), 1, DecodedOp::Tie { eid: eid(6), himo_id: val, value: 2 }),
+            rec(at(125, 1), 1, DecodedOp::Tie { eid: eid(7), himo_id: val, value: 3 }),
+        ];
+        let batch = StateBatch { records, as_of, complete: true };
+        let shape = |v: &[WireRecord]| -> Vec<(u64, PeerId, String)> {
+            v.iter()
+                .map(|r| {
+                    let what = match &r.op {
+                        DecodedOp::Vocab { vid, .. } => format!("vocab {vid}"),
+                        DecodedOp::Tie { eid, .. } => format!("tie {}", enchudb_oplog::eid_local(*eid)),
+                        _ => "other".to_string(),
+                    };
+                    (r.hlc.wall, r.hlc.peer, what)
+                })
+                .collect()
+        };
+        assert!(syncer.records_left_to_the_diff(1, 1, &batch, false).is_none(), "中継でなければ外さない");
+        let kept = syncer.records_left_to_the_diff(1, 1, &batch, true).expect("as_of より後の書き手の record がある");
+        assert_eq!(
+            shape(&kept),
+            vec![
+                (50, 1, "tie 3".to_string()),
+                (60, 1, "vocab 7".to_string()),
+                (60, 1, "tie 2".to_string()),
+                (70, 1, "tie 4".to_string()),
+                (140, 9, "tie 5".to_string()),
+            ]
+        );
+        // cursor が as_of より先 (120): そこまでの record は差分でもう届かないので残す
+        syncer.last_pulled.lock().unwrap().entry(1).or_default().insert(1, at(120, 1));
+        let kept = syncer.records_left_to_the_diff(1, 1, &batch, true).unwrap();
+        assert!(shape(&kept).contains(&(110, 1, "tie 6".to_string())), "cursor の手前の record は残す");
+        assert!(!shape(&kept).contains(&(125, 1, "tie 7".to_string())), "cursor より後の書き手の record は差分に任せる");
+        // 外す物が無ければ写しを作らない
+        let quiet = StateBatch { records: batch.records[2..5].to_vec(), as_of, complete: true };
+        assert!(syncer.records_left_to_the_diff(1, 1, &quiet, true).is_none());
+
+        drop(syncer);
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// publish_since_for_peer を直接呼んだ場合の動作確認。
