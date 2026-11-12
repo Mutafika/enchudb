@@ -155,6 +155,39 @@ impl<'r, 'w> WalRecords<'r, 'w> {
     }
 }
 
+impl WalRecords<'_, '_> {
+    /// #716: 頭から何件までなら、 空き `room` byte ([`ChangeLog::room_keeping`]) に、 読み手の位置の entry を捨てずに足せるか。
+    /// 折り返しで 1 回、 entry 1 件分より小さい隙間を捨てうるので、 その分 (いちばん大きい entry 1 件) を空けて数える。
+    /// 置けない大きさの record (`max_entry` より大きい。 足すと生きている entry を全部捨てる) は、 読み手が追いついている
+    /// (`caught_up`) 時の先頭の 1 件だけ通し、 他はその手前で止める (読み手に手前の entry を先に読ませる)。
+    pub(crate) fn fitting(&self, room: usize, max_entry: usize, caught_up: bool) -> usize {
+        let (mut sum, mut largest) = (0usize, 0usize);
+        for (i, &len) in self.lens.iter().enumerate() {
+            if len as usize > max_entry {
+                return if i == 0 && caught_up { 1 } else { i };
+            }
+            let n = entry_size(len as usize);
+            largest = largest.max(n);
+            if sum + n + largest > room {
+                return i;
+            }
+            sum += n;
+        }
+        self.lens.len()
+    }
+
+    /// #716: `from` 件目から後ろを記録に置いた時の大きさ (byte)。
+    pub(crate) fn bytes_from(&self, from: usize) -> usize {
+        self.lens[from..].iter().map(|&len| entry_size(len as usize)).sum()
+    }
+
+    /// #716: 頭の `n` 件だけにする。
+    pub(crate) fn truncate(&mut self, n: usize) {
+        self.recs = &self.recs[..n];
+        self.lens.truncate(n);
+    }
+}
+
 impl Entries for WalRecords<'_, '_> {
     fn count(&self) -> usize {
         self.recs.len()
@@ -315,6 +348,24 @@ impl ChangeLog {
     /// 最後に記録した record の (HLC, 印)。 開き直した時に WAL の中で続きの位置を探す手がかり。
     pub fn last_written(&self) -> Option<(Hlc, u64)> {
         self.st.lock().unwrap().c.last
+    }
+
+    /// #716: `pos` 番の entry (と、 その後ろ) を捨てずに足せる大きさ (byte) と、 `pos` が記録の終わり (読み手が追いついている)
+    /// か。 `pos` が記録に無い (捨てた後 / 記録の先 / 読めない) なら None。 折り返しの隙間の分は呼び手が空けて数える
+    /// ([`WalRecords::fitting`])。
+    pub(crate) fn room_keeping(&self, pos: u64) -> Option<(usize, bool)> {
+        let mut st = self.st.lock().unwrap();
+        let c = st.c;
+        if pos < c.first || pos > c.next {
+            return None;
+        }
+        if pos == c.next {
+            return Some((self.cap, true));
+        }
+        let at = self.locate(&mut st, pos)?;
+        // 生きている = [at, head) (循環)。 at == head は一周 (満杯)
+        let used = if c.head > at { c.head - at } else { self.cap - at + c.head };
+        Some((self.cap - used, false))
     }
 
     /// 1 件として置ける大きさの上限 (record の bytes)。 越える record は番号だけ使い、 中身は残さない ([`Self::append`])。

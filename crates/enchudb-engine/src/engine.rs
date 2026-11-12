@@ -15784,7 +15784,8 @@ impl Engine {
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(wal) = self.oplog.as_ref() {
-                let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+                // 全部写す (新しい listener の位置 = 今書き出してある record の後)
+                let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false, None);
             }
             c.readers.push((listener.clone(), log.range().1));
             self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
@@ -15825,12 +15826,22 @@ impl Engine {
     ///
     /// # `cap` の決め方 (#716)
     ///
-    /// **1 回の書き出しの間に書く量が `cap` を越えると、 追いついている listener も外れる** (`on_detached`)。 記録へ写すのは
-    /// 書き出しのたび (consumer の 100 ms の周期・`oplog_sync()`・WAL の区画を畳む時) で、 その回に書き出した分を全部写してから
-    /// listener が読む (写しと渡しは交互でない)。 1 回の写しが記録を一周すると、 listener の位置ごと古い方から捨てる。 付け直しても、
-    /// 書く量が変わらなければ次の回でまた外れる。
+    /// 記録へ写すのは書き出しのたび (consumer の 100 ms の周期・`oplog_sync()`・WAL の区画を畳む時)。 配る道 (通知係 /
+    /// `oplog_sync()`) は、 いちばん遅い listener の位置を捨てない所まで写す → listener に渡す → 続きを写す、 を繰り返すので、
+    /// 1 回の書き出しの量が `cap` より多くても、 追いついている listener は外れない (#716。 前は 1 回で全部写してから渡して
+    /// いたので、 1 回の量が `cap` を越えると位置ごと捨てて外れた)。 consumer の周期の写しと [`Self::change_log_range`] も、
+    /// 急がない間は listener を越えない所で止める。
     ///
-    /// `cap` は 1 回の書き出しの間に書く量より十分大きく取る。 entry 1 件は 40 B + record の長さ (8 B に切り上げ) で、
+    /// **今も外れるのは、 書き手を待たせないために listener を待たずに全部写す時**:
+    ///
+    /// - listener がまだ受けていない量が、 `cap` + WAL の大きさの 1/32 を越えた (急がない写しが WAL に残してよい量を越えた)
+    /// - 書き手が WAL の区画を移った後、 古い区画を畳む時 (その区画の残りを全部写す)。 書き出し 1 回の量が `cap` を越える
+    ///   書き方を続けると、 区画を畳むたびに外れうる
+    /// - WAL の空きが半分を切っている時の畳み
+    /// - [`Self::add_change_listener`] / [`Self::add_change_listener_from`] を呼んだ時 (新しい listener の位置を決めるために、
+    ///   書き出してある record を全部写す)
+    ///
+    /// なので `cap` は、 1 回の書き出しの間に書く量より十分大きく取るのが安全。 entry 1 件は 40 B + record の長さ (8 B に切り上げ) で、
     /// 数値の紐 1 本の書き込みが約 210 B (1 MiB に約 5000 件)。 目安 (計算):
     ///
     /// | 書く速さ (件/秒) | 100 ms の周期 1 回の量 | `cap` の下限 | 余裕を見た `cap` (4 倍) |
@@ -15878,7 +15889,8 @@ impl Engine {
         let log = self.change_log.get()?;
         if let Some(wal) = self.oplog.as_ref() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+            // #716: 範囲を見るだけの呼び出しが、 追いついている listener を外さない
+            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false, Some(Self::change_log_hold(wal)));
         }
         Some(log.range())
     }
@@ -15897,7 +15909,8 @@ impl Engine {
         };
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(wal) = self.oplog.as_ref() {
-            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+            // 全部写す (`pos` が記録の先かを、 今書き出してある record まで写した上で見る)
+            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false, None);
         }
         let (first, next) = log.range();
         if pos < first || pos > next {
@@ -15932,7 +15945,7 @@ impl Engine {
                 // 前の session の record は渡らず、 付けた後の commit だけが渡る)
                 let early = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
                 if let (false, Some(log)) = (early.is_empty(), self.change_log.get()) {
-                    let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+                    let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false, None);
                     let at = log.range().1;
                     for l in early {
                         if !c.readers.iter().any(|(r, _)| std::sync::Arc::ptr_eq(r, &l)) {
@@ -16000,6 +16013,11 @@ impl Engine {
     /// 記録の cursor から先を記録に写す (呼び手が `change_emit` を持って)。 `limit` は写してよい終わり: `with_tail` が false なら
     /// `limit` (書き出した所) までに Commit で閉じた group、 true なら `limit` (畳む区画の終わり) までの record を閉じていない末尾も
     /// 含めて全部 ([`enchudb_oplog::oplog::OpLog::scan_refs_for_change_log`])。 戻り値は写した record の数。
+    ///
+    /// #716: `spare` が Some(上限) なら、 いちばん遅い読み手の位置を捨てない所で止める (残りは、 読み手が読んだ後の次の回が写す。
+    /// 通知係を起こす)。 ただし残す量 (記録に置いた時の byte) が上限を越えるなら、 今まで通り全部写す (読み手が遅い = 位置ごと
+    /// 捨てて外す)。 None は今まで通り全部 (畳む前の写し: 書き手を待たせないので読み手を待たない)。 前は誰が呼んでも全部を
+    /// 1 回で写し、 listener が読むのはその後だったので、 1 回の写しが記録の大きさを越えると追いついている listener も外れた。
     fn pump_change_log(
         &self,
         wal: &enchudb_oplog::oplog::OpLog,
@@ -16007,6 +16025,7 @@ impl Engine {
         c: &mut ChangeCursor,
         limit: u64,
         with_tail: bool,
+        spare: Option<usize>,
     ) -> io::Result<usize> {
         use std::sync::atomic::Ordering;
         #[cfg(test)]
@@ -16020,9 +16039,25 @@ impl Engine {
             return Ok(0);
         }
         let watch: Vec<u64> = c.readers.iter().map(|(_, p)| *p).collect();
+        let mut entries = crate::change_log::WalRecords::new(&recs);
+        // #716: 読み手を越えない所まで
+        if let Some(hold_max) = spare
+            && let Some(slowest) = watch.iter().copied().min()
+            && let Some((room, caught_up)) = log.room_keeping(slowest)
+        {
+            let fit = entries.fitting(room, log.max_entry(), caught_up);
+            if fit < recs.len() && entries.bytes_from(fit) <= hold_max {
+                // 残りは読み手が読んだ後に (配る道の次の回 / 通知係)
+                self.notify_listeners();
+                if fit == 0 {
+                    return Ok(0);
+                }
+                entries.truncate(fit);
+            }
+        }
         let before = log.range().1;
         let mut lost = Vec::new();
-        let res = log.append_from(&crate::change_log::WalRecords::new(&recs), &watch, &mut lost);
+        let res = log.append_from(&entries, &watch, &mut lost);
         let done = (log.range().1 - before) as usize;
         c.log_wal = if done == recs.len() {
             end
@@ -16061,12 +16096,19 @@ impl Engine {
     /// changefeed: 記録がある時の配信 1 回分を取り出す (#636: listener は呼び手が engine の外で呼ぶ)。 listener ごとに位置から
     /// 読み、 位置は渡す前に進める (畳む側の写しが、 渡した分を 「まだ読んでいない」 と見て外さないように)。 読めない listener
     /// は外す。
+    ///
+    /// #716: 読む前に、 読み手を越えない所まで記録に写す。 呼び手 ([`ChangeNotifier::deliver`]) は読めた分を渡してまた呼ぶので、
+    /// 写しと渡しが交互になる (読み手が全員追いついていれば、 写せるのは記録の大きさ近くまで = 写す物が在る間は必ず進む)。
     fn take_log_work(&self) -> LogWork {
         /// 1 回に 1 listener へ渡す量の目安。
         const CHUNK: usize = 4 << 20;
         let mut work = LogWork::default();
         let Some(log) = self.change_log.get() else { return work };
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(wal) = self.oplog.as_ref() {
+            // 失敗は `take_changes` が知らせている (次の配信でやり直す)
+            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false, Some(usize::MAX));
+        }
         for (l, pos) in c.readers.iter_mut() {
             match log.read(*pos, CHUNK) {
                 Ok(es) if !es.is_empty() => {
@@ -20086,7 +20128,8 @@ impl Engine {
         // 記録がある時は記録に写す (渡すのは listener ごとの位置から)
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false) {
+            // #716: 読み手を越えない所まで (続きは `take_log_work` が、 読み手に渡すのと交互に写す)
+            if let Err(e) = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false, Some(usize::MAX)) {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
@@ -20137,7 +20180,7 @@ impl Engine {
             if c.log_wal >= through {
                 return Some(0);
             }
-            return match self.pump_change_log(wal, log, c, through, true) {
+            return match self.pump_change_log(wal, log, c, through, true, None) {
                 Ok(n) => Some(n),
                 Err(e) => {
                     self.record_fault(FaultKind::DiskSpace, "changefeed.seg に写せない — WAL を畳まない");
@@ -20158,7 +20201,7 @@ impl Engine {
     /// 写し、 そこで fault を数える)。 戻り値は移した record の数。
     fn move_changes_before_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, written: u64) -> usize {
         match self.change_log.get() {
-            Some(log) => self.pump_change_log(wal, log, c, written, false).unwrap_or(0),
+            Some(log) => self.pump_change_log(wal, log, c, written, false, None).unwrap_or(0),
             None => self.move_changes_to_backlog(wal, c, None),
         }
     }
@@ -20252,18 +20295,33 @@ impl Engine {
         let mut moved = 0;
         // #667: 記録がある時は、 畳めるかによらず書き出した所まで写す (畳む時にまとめて写すと、 区画 1 つ分を写し終えるまで全力の
         // 書き手が空きを待った)
+        // #716: 急がない回の先写しは、 読み手を越えない所で止める。 残す量は `change_log_hold` まで (越えたら今まで通り全部 =
+        // 畳む時にまとめて写す量を増やさない)。 急がない回 = 畳む区画が無い、 または畳めるのが 「今書き足している区画」 で
+        // WAL の半分以上が空いている (全部書き出した後の、 誰も待っていない畳み。 2 区画の形ならもう一方の区画が丸ごと空いて
+        // いて、 書き手は今の区画が埋まればそこへ移れる)。 古い区画を畳む回 (書き手が区画を移った後) と、 空きの少ない回は
+        // 今まで通り全部写して畳む (書き手を待たせない)
+        let unhurried = |through: u64| {
+            enchudb_oplog::oplog::wal_pos_lap(through) == enchudb_oplog::oplog::wal_pos_lap(wal.head())
+                && wal.free_bytes() >= wal.capacity() / 2
+        };
+        let has_log = self.change_log.get().is_some();
         if let Some(log) = self.change_log.get() {
-            moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false).unwrap_or(0);
+            let spare = wal.fold_hint().is_none_or(unhurried).then(|| Self::change_log_hold(wal));
+            moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false, spare).unwrap_or(0);
         }
         // 先に lock の外で見積もる (畳める区画が無い / bridge が読み終えていないなら append_lock を取らない)。 畳めそうなら、 配って
-        // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
+        // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)。
+        // #716: 急がない畳みは、 記録がその区画の終わりまで写せている時だけ (読み手を越えないために残した回は見送る。 畳むには
+        // 残りを全部写すことになり、 読み手の位置ごと捨てる。 残りは通知係が渡しながら写し、 後の回が畳む)。 畳める位置は
+        // 見るたびに変わりうる (`oplog_sync` が checkpoint を進める) ので、 lock の外でも下でも、 その時の位置で見る
         let folded = wal.fold_hint().is_some_and(|through| {
-            self.wal_fold_safe_to(through) && {
+            !(has_log && unhurried(through) && c.log_wal < through) && self.wal_fold_safe_to(through) && {
                 moved = self.move_changes_before_fold(wal, &mut c, wal.checkpoint());
                 true
             }
         }) && wal.try_reset_if(|through| {
-            self.wal_fold_safe_locked_to(through)
+            !(has_log && unhurried(through) && c.log_wal < through)
+                && self.wal_fold_safe_locked_to(through)
                 && self.spill_changes_for_fold(wal, &mut c, through).map(|m| moved += m).is_some()
         });
         if folded {
@@ -20271,6 +20329,14 @@ impl Engine {
         }
         self.after_fold_changes(wal, &mut c, folded, moved);
         folded
+    }
+
+    /// #716: 急がない写し (consumer の周期の先写し / `change_log_range`) が、 読み手を越えないために WAL に残してよい量
+    /// (記録に置いた時の byte)。 WAL の 1/32 (2 区画の形で 1 区画の 1/16)。 残した分は、 区画を畳む時に lock の外でまとめて
+    /// 写すので (`move_changes_before_fold`)、 そこで写す量をこれ以上は増やさない (#667: 畳む時に区画 1 つ分をまとめて写すと、
+    /// 全力の書き手が空きを待った)。
+    fn change_log_hold(wal: &enchudb_oplog::oplog::OpLog) -> usize {
+        (wal.capacity() / 32) as usize
     }
 
     /// changefeed: 通知係に配るよう頼む (通知係が居なければ何もしない。 その時は `oplog_sync` が配る)。
@@ -20294,8 +20360,8 @@ impl Engine {
     /// #560: 溜めの上限 (byte、 既定 [`DEFAULT_CHANGE_BACKLOG_LIMIT`] = 64 MiB)。 畳む時に移す分で越えたら、 溜めを捨てて listener を
     /// 全部外す (`ChangeListener::on_detached` で知らせる)。 書き手は止めない。
     ///
-    /// 記録 ([`Self::enable_change_log`]) がある間はこの上限を使わない。 代わりに記録の大きさが上限になり、 1 回の書き出しの間に
-    /// 書く量が記録の大きさを越えると、 追いついている listener も外れる (#716、 大きさの目安は `enable_change_log`)。
+    /// 記録 ([`Self::enable_change_log`]) がある間はこの上限を使わない。 代わりに記録の大きさが上限になる (listener がまだ
+    /// 受けていない分が記録から捨てられると外れる。 どういう時に捨てるかと大きさの目安は `enable_change_log`、 #716)。
     pub fn set_change_backlog_limit(&self, bytes: usize) {
         self.change_backlog_limit.store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
