@@ -12487,12 +12487,26 @@ impl Engine {
     /// 間があることを示す: 年表が無ければ作り (今の名前とその版数から)、 前の名前として覚え (後から届く、 その間に作られた行を
     /// 束ねる)、 その間にその名前で作られた別の生きた行を畳む (先に届いていた行。 書き込みを順に受けた peer では、 改名の時に今の
     /// 名前で畳んでいる)。 今の名前と同じ名前の書き込みは、 年表のある行にだけ載せる。
+    ///
+    /// #751: 今の名前と同じ名前の、 名前の cell より古い書き込みは、 その行がその名前をもっと前から持っていたことを示す (その行の
+    /// 作成が、 その行宛ての後の改名より遅れて届いた。 改名して元の名前に戻した形)。 その時刻にその名前だった別の行 (今は別の
+    /// 名前 = 前の名前の持ち主) があれば、 年表に載せて 1 つに畳む (同じ時刻に同じ名前 = 同じデッキ。 作成を先に受けた peer では、
+    /// 束ねた時に同じ行になっている)。 前は、 後の改名の時刻をその行の作成と見て 「改名の後に前の名前で作られた別のデッキ」 と
+    /// したまま、 本当の作成が届いても畳み直さなかった。
     fn note_name_of(&self, local: u32, id: (u32, u32), himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
         use std::sync::atomic::Ordering;
         let current = self.himos.get(himo as usize).and_then(|h| h.get_value(local));
         let differs = current.is_some_and(|c| c != value) && self.entities.is_live(local);
         let has = !self.pk_former_empty.load(Ordering::Acquire) && self.pk_former.read().unwrap().has_timeline(local);
-        if !has && !differs {
+        // #751: 今の名前を、 名前の cell より前から持っていたと分かり、 その時刻にその名前だった別の行がある
+        let held_earlier = !differs
+            && current == Some(value)
+            && self.entities.is_live(local)
+            && hlc < self.version_of(local, himo)
+            && self
+                .former_pk_holder(himo, PkValue::Local(value), hlc)
+                .is_some_and(|holder| enchudb_oplog::eid_local(holder) != local);
+        if !has && !differs && !held_earlier {
             return;
         }
         let mut changed = false;
@@ -12513,6 +12527,8 @@ impl Engine {
         }
         if differs {
             self.fold_rows_named_while_held(local, himo, value);
+            self.fold_former_holder(local, himo, value, hlc);
+        } else if held_earlier {
             self.fold_former_holder(local, himo, value, hlc);
         }
     }
