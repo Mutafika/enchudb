@@ -540,7 +540,12 @@ only has the 64 KiB rounding slack to work with.
 To have the dictionary give values back, enable reclaiming: `GrowableOptions { vocab_reclaim:
 true, .. }` at create, or `Engine::enable_vocab_reclaim()` on an existing DB (takes effect on
 the next open; the file version becomes 12, which older binaries refuse). A value whose last
-referencing cell is gone frees its slot, and slots are reused oldest-freed-first. Value ids
+referencing cell is gone frees its slot, and slots are reused oldest-freed-first — but only
+after the write that freed the slot has been written out (the periodic write-out, `flush` or
+`oplog_sync`), so that a power loss never leaves a cell on disk pointing at a reused slot. The
+dictionary therefore holds the live values plus whatever was freed since the last write-out; a
+writer that frees slots faster than the write-out runs writes the body out itself once the
+waiting slots reach half of the remaining headroom (or 65,536). Value ids
 carry a 2-bit generation, so an id kept from before the reuse (an app-cached `vocab_id`, say)
 resolves to nothing instead of to the new value — **an id is only valid while its value is
 alive**. Reference counts live in `vocab.refs.seg` inside the DB directory and are reused as-is

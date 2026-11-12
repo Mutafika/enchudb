@@ -130,6 +130,10 @@ fn sync_ops_payload_survives_recount_after_reopen() {
         let e = eng_a.entity_in("notes").unwrap();
         eng_a.tie_text_to(e, "notes.label", &format!("churn-{i}"));
         eng_a.delete(e);
+        // #708: 空いた場所を使い回すのは、 行を消したことが書き出された後
+        if i % 100 == 99 {
+            eng_a.oplog_sync().unwrap();
+        }
     }
     assert!(eng_a.vocab_usage().reclaimed > 1_000, "{:?}", eng_a.vocab_usage());
     let eng_b = make_engine(&path_b, 2);

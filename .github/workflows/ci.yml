@@ -149,6 +149,12 @@ jobs:
       - name: loom model check (書き出しの門の境目と列の印)
         run: cargo test -p enchudb-engine --test loom_publish_gate_durable --release
 
+      # #708 辞書の回収: 最後の参照を返す側は 「書き出しを待つ印」 を立ててから参照を 0 にし、 場所を取る側は 0 → CLAIMED の
+      # 後に印を読む (待ち行列の古い entry で、 付け替えの書き出しを待つ場所を取らない)。 印を後に立てる形の対照で、 loom が
+      # 窓を見つけることも見る。
+      - name: loom model check (辞書の回収の書き出しを待つ印)
+        run: cargo test -p enchudb-engine --test loom_vocab_retire_stamp --release
+
       # 0.37 の WAL の 2 区画: lock を取らない読み手は新しい区画の終端を先に読む (古い区画の終端を先に読むと、 その後に足して
       # 移った書き手の古い区画の残りを飛ばす)。 古い区画を先に読む形・Relaxed の形の対照で、 loom が窓を見つけることも見る。
       - name: loom model check (WAL の 2 区画の終端を読む順)
