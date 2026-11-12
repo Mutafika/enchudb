@@ -299,9 +299,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
         if !enchudb::db_files::BOOTSTRAP.contains(&name) {
             return send_response(&mut stream, 404, b"unknown sidecar");
         }
-        // #560: `eidmap` は `eidmap.log` を当てた形で配る (log は配らない)
+        // #560: `eidmap` は `eidmap.log` を当てた形で配る (log は配らない)。 #720: `pkformer` も `pkformer.log` を当てた形で
         let bytes = if name == enchudb::db_files::EIDMAP {
             enchudb::Engine::eidmap_for_bootstrap(&src.db_path).ok().flatten()
+        } else if name == enchudb::db_files::PKFORMER {
+            enchudb::Engine::pkformer_for_bootstrap(&src.db_path).ok().flatten()
         } else {
             std::fs::read(enchudb::db_files::path_for(&src.db_path, name)).ok()
         };

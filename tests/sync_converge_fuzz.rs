@@ -135,6 +135,8 @@ impl Peer {
         if let Some((disk, mem)) = eng.eidmap_disk_diff().unwrap() {
             out.push(format!("eidmap: disk にだけ {disk:?} / memory にだけ {mem:?}"));
         }
+        // #720: `pkformer` + `pkformer.log` を読み直した中身 = memory の中身 (変えた slot の印の付け忘れを拾う)
+        out.extend(eng.pkformer_disk_diff().unwrap());
         out
     }
 
