@@ -129,6 +129,33 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// ホストの時計 (#713): **ホストが動いていた時間** (ms)。 client の沈黙 (`last_seen_ms`) はこれで数える。
+///
+/// 前は壁時計だった。 ホストが止まっていた間も client の沈黙に数えるので、 ホストが沈黙の上限より長く止まった後は、 最初の
+/// client が来た時点で他の全員が 「黙った」 として外され、 その後に来て record を出すと `STALE` で断られた (client は黙って
+/// いたのではなく、 ホストに届かなかっただけ)。 壁時計が大きく進んだ時 (起動時に時計が古い機械) も同じだった。
+///
+/// 動いている間は単調な時計 (`Instant`) で進め、 止まる時 / client の状態を書く時に今の値を置き場に残し (`T` の行)、 開き直すと
+/// そこから続ける = 止まっていた間は数えない。 最初の値は壁時計 (ms) なので、 止まったことの無いホストでは壁時計と同じ。
+struct HostClock {
+    base: u64,
+    started: std::time::Instant,
+}
+
+impl HostClock {
+    /// 置き場から読んだ状態の続きから。 `T` の行があればその値。 無い置き場 (この版より前のホストが書いた、 `last_seen` は
+    /// 壁時計) は、 いちばん最近来た client の時刻 (それより後は、 動いていたか止まっていたか分からない = 数えない)。 client の
+    /// 居ない / 置き場の無いホストは今の壁時計 `wall`。
+    fn resume(lines: &Lines, wall: u64) -> Self {
+        let base = lines.clock_ms.or_else(|| lines.clients.values().map(|c| c.last_seen_ms).max()).unwrap_or(wall);
+        Self { base, started: std::time::Instant::now() }
+    }
+
+    fn now(&self) -> u64 {
+        self.base + self.started.elapsed().as_millis() as u64
+    }
+}
+
 /// HLC を `w.l.p` に (query の値)。
 fn hlc_param(h: Hlc) -> String {
     format!("{}.{}.{}", h.wall, h.logical, h.peer)
@@ -143,7 +170,7 @@ fn parse_hlc(s: &str) -> Option<Hlc> {
 /// ホストが client ごとに覚えること (削除を忘れてよい線のため、 `HOST_PLAN.md` の段 2)。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ClientState {
-    /// 最後に来た時刻 (ms)。
+    /// 最後に来た時刻 (ms、 ホストの時計 [`HostClock`] = ホストが動いていた時間)。
     last_seen_ms: u64,
     /// この client の配り終えの線 (HLC がこれ以下の自分の record は全部ホストに出した)。 一度も言っていない client は F を止める
     /// (まだ出していない自分の record が、 線を越えた後に届きうる)。
@@ -254,6 +281,8 @@ struct HostInner {
     lines: Mutex<Lines>,
     /// client の状態の置き場 (`cursor_path` の横)。 無ければ線を出さない (開き直した後に誰を待つか分からないので、 忘れない側)。
     lines_path: Option<PathBuf>,
+    /// client の沈黙を数える時計 (ホストが動いていた時間、 #713)。
+    clock: HostClock,
     /// client の record を当てる間 (read) と、 F を進めてホストが忘れる間 (write) を分ける。 忘れる前に当てた record と、 忘れた
     /// 後に当てた record で答えが変わる (忘れた削除より前の作成) ので、 F を配る前に忘れ終え、 その間は当てない。 client は返事の
     /// F で忘れてから当てる (`Syncer::pull_once`)
@@ -266,11 +295,13 @@ struct Lines {
     silence: Option<Duration>,
     /// 最後に書き出した中身 (変わった時だけ書く)。
     saved: Option<(HashMap<PeerId, ClientState>, Hlc)>,
+    /// 置き場にあったホストの時計 (`T` の行、 [`HostClock`])。 この版より前のホストが書いた置き場には無い。
+    clock_ms: Option<u64>,
 }
 
 impl Default for Lines {
     fn default() -> Self {
-        Self { clients: HashMap::new(), forget: Hlc::ZERO, silence: None, saved: None }
+        Self { clients: HashMap::new(), forget: Hlc::ZERO, silence: None, saved: None, clock_ms: None }
     }
 }
 
@@ -296,9 +327,9 @@ impl Lines {
             .filter(|f| *f > self.forget)
     }
 
-    /// 書き出す中身。
-    fn encode(&self) -> String {
-        let mut out = format!("F {}\n", hlc_param(self.forget));
+    /// 書き出す中身。 `now` = 今のホストの時計 (`T` の行。 知らない版は読み飛ばす)。
+    fn encode(&self, now: u64) -> String {
+        let mut out = format!("F {}\nT {now}\n", hlc_param(self.forget));
         let mut ids: Vec<_> = self.clients.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
@@ -321,6 +352,7 @@ impl Lines {
             let f: Vec<&str> = line.split(' ').collect();
             match f.as_slice() {
                 ["F", h] => l.forget = parse_hlc(h).unwrap_or(Hlc::ZERO),
+                ["T", t] => l.clock_ms = t.parse().ok(),
                 ["C", id, seen, through, caught, dropped, returned] => {
                     let (Ok(id), Ok(seen)) = (id.parse::<PeerId>(), seen.parse::<u64>()) else { continue };
                     l.clients.insert(
@@ -409,7 +441,7 @@ impl HostInner {
 
     /// client `c` が来た: last_seen を今にして `f` を当て、 線を計算し直す。 外した client が来たら、 戻ったとして断る側に回す。
     fn touch(&self, c: PeerId, f: impl FnOnce(&mut ClientState)) {
-        let now = now_ms();
+        let now = self.clock.now();
         {
             let mut l = self.lines.lock().unwrap();
             let st = l.clients.entry(c).or_default();
@@ -426,7 +458,7 @@ impl HostInner {
     /// 配り終えの線 P: ホスト自身の書き込みと、 数える client のうち線を言ったものの最小。
     fn publish_line(&self) -> Hlc {
         let mut p = self.engine.sync_published_through().unwrap_or(Hlc::ZERO);
-        let now = now_ms();
+        let now = self.clock.now();
         let l = self.lines.lock().unwrap();
         for c in l.clients.values().filter(|c| l.counted(c, now)) {
             if let Some(t) = c.through {
@@ -450,7 +482,9 @@ impl HostInner {
     /// 黙った client を外し、 忘れてよい線 F を進め、 進んだらホストの削除の記録を捨てる。 F = min([`Lines::forget_candidate`]、
     /// ホストの ring に残る record) で下がらない (pull しかしない client は F を止める)。 置き場が無ければ何もしない。
     fn recompute(&self, now: u64) {
-        let Some(path) = &self.lines_path else { return };
+        if self.lines_path.is_none() {
+            return;
+        }
         let mut drop_peers = Vec::new();
         let candidate = {
             let mut l = self.lines.lock().unwrap();
@@ -478,11 +512,17 @@ impl HostInner {
                 self.lines.lock().unwrap().forget = f;
             }
         }
+        self.save_lines(false);
+    }
+
+    /// client の状態とホストの時計を置き場に書く。 `force` でなければ、 前に書いた中身から変わった時だけ。
+    fn save_lines(&self, force: bool) {
+        let Some(path) = &self.lines_path else { return };
         let text = {
             let mut l = self.lines.lock().unwrap();
-            l.changed().then(|| {
+            (force || l.changed()).then(|| {
                 l.saved = Some((l.clients.clone(), l.forget));
-                l.encode()
+                l.encode(self.clock.now())
             })
         };
         if let Some(text) = text {
@@ -564,6 +604,7 @@ impl HttpHost {
             .map(|t| Lines::decode(&t))
             .unwrap_or_default();
         lines.saved = Some((lines.clients.clone(), lines.forget));
+        let clock = HostClock::resume(&lines, now_ms());
         if let Some(p) = cursor_path {
             syncer = syncer.with_cursor_path(p);
         }
@@ -577,6 +618,7 @@ impl HttpHost {
             asked_state: Mutex::new(HashSet::new()),
             lines: Mutex::new(lines),
             lines_path,
+            clock,
             gate: RwLock::new(()),
         });
 
@@ -618,9 +660,13 @@ impl HttpHost {
 
     /// 黙った client を線と回収の数から外すまでの長さ (既定 30 日)。 外した client が戻って自分の record を出すと、 ホストは受けずに
     /// `STALE` を返す (client は新しい peer id の DB に取り直してから書き直す)。
+    ///
+    /// 長さは **ホストが動いていた時間**で数える (#713): ホストが止まっていた間 (と、 壁時計が飛んだ分) は client の沈黙に
+    /// 数えない。 `cursor_path` の横の置き場に時計を残し、 開き直すと続きから数える。 きれいに止めた (drop した) 時はその時点
+    /// まで、 落ちた時は最後に置き場を書いた時点 (client の出入り・線の変化、 遅くとも 1 時間ごと) までを数える。
     pub fn set_silence_limit(&self, limit: Duration) {
         self.inner.lines.lock().unwrap().silence = Some(limit);
-        self.inner.recompute(now_ms());
+        self.inner.recompute(self.inner.clock.now());
     }
 
     /// 削除を忘れてよい線 (配っている物、 観測・試験用)。 線を配らないホストは ZERO。
@@ -635,6 +681,8 @@ impl Drop for HttpHost {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        // #713: 止まる時点のホストの時計を残す (開き直すと続きから数える)
+        self.inner.save_lines(true);
     }
 }
 
@@ -1045,6 +1093,37 @@ mod tests {
         assert_eq!(l.forget_candidate(now), Some(h(50)), "外した / 戻った client が F を止めた");
         l.forget = h(50);
         assert_eq!(l.forget_candidate(now), None, "F が下がらずに同じ値を言い直した");
+    }
+
+    /// #713: ホストの時計は置き場の値の続きから進む (止まっていた間を数えない)。 壁時計が 60 日進んでいても、 止まる直前に来た
+    /// client は黙っていない。
+    #[test]
+    fn the_host_clock_resumes_from_the_saved_value() {
+        let day = 24 * 60 * 60 * 1000u64;
+        let stopped_at = 1_790_000_000_000u64;
+        let wall = stopped_at + 60 * day;
+        let mut l = Lines::default();
+        l.clients.insert(1, ClientState { last_seen_ms: stopped_at - 1_000, ..ClientState::default() });
+        l.clients.insert(2, ClientState { last_seen_ms: stopped_at - 31 * day, ..ClientState::default() });
+        // 置き場を通す: 時計の行が残り、 知らない行として読み飛ばされない
+        let back = Lines::decode(&l.encode(stopped_at));
+        assert_eq!(back.clock_ms, Some(stopped_at));
+        assert_eq!(back.clients, l.clients);
+        let now = HostClock::resume(&back, wall).now();
+        assert!((stopped_at..stopped_at + 60_000).contains(&now), "時計が置き場の続きでない: {now}");
+        assert!(back.counted(&back.clients[&1], now), "止まっていた間を沈黙に数えた");
+        assert!(!back.counted(&back.clients[&2], now), "止まる前から上限より長く黙っていた client を数えた");
+        // 前提: 壁時計で数えると、 止まる直前に来た client も黙ったことになる (直す前の形)
+        assert!(!back.counted(&back.clients[&1], wall));
+
+        // この版より前のホストが書いた置き場 (`T` の行なし、 last_seen は壁時計): いちばん最近来た client の時刻から
+        let old = Lines::decode(&format!("F 0.0.0\nC 1 {} - 0.0.0 0 0\nC 2 {} - 0.0.0 0 0\n", stopped_at - 1_000, stopped_at - 5_000));
+        assert_eq!(old.clock_ms, None);
+        let now = HostClock::resume(&old, wall).now();
+        assert!((stopped_at - 1_000..stopped_at + 59_000).contains(&now), "{now}");
+        // client の居ない / 置き場の無いホスト: 今の壁時計から
+        let now = HostClock::resume(&Lines::default(), wall).now();
+        assert!((wall..wall + 60_000).contains(&now), "{now}");
     }
 
     #[test]
