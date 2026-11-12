@@ -735,9 +735,17 @@ impl Syncer {
         // state の record は当たった物だけ (#698 の 「負けた record も載せる」 は差分の流れだけ): state の record の HLC は
         // cell の版数で、 書き手の record の順に並ばない (他の peer の時計の版数も混ざる)。 負けた分まで載せると、 受け手の
         // 書き手ごとの cursor がその版数まで進む record を増やす
+        //
+        // #753 (ホストだけ): `as_of` より後の版数の record は載せない。 ホストが受ける state は書き手が自分で作った物で、 `as_of` は
+        // 作り始めた時の書き手の時計、 ホストの `cursor[author]` も `as_of` になる (以後その書き手の record は as_of より後だけ
+        // 受ける)。 作っている間に書かれた cell は as_of より後の版数で state に入る。 それを載せると、 受け手の `cursor[author]`
+        // が as_of を越え、 同じ間に書かれて state に入らなかった (走査の済んだ cell の) record が、 後で差分で届いても cursor の
+        // 手前で落ちた。 載せなかった cell は、 書き手自身の書き込みなら差分 (as_of より後) で届いてそこで載り、 他の client の
+        // 書き込み (書き手が作っている間にホストから受けた物) は、 ホストがもう持っていて当たらない
         if gossip {
+            let host = self.is_host();
             for &(i, applied) in &relay_accepted {
-                if applied {
+                if applied && !(host && batch.records[i].hlc > batch.as_of) {
                     let _ = self.engine.relay_record(&batch.records[i]);
                 }
             }
@@ -745,7 +753,9 @@ impl Syncer {
 
         // pull_once と同じ barrier: 派生 state (eidmap / vocabmap / tables) が
         // durable になる前に cursor を進めない。
-        if outcome.applied > 0 && !self.persist_applied_state(link) {
+        // #755: 1 件も当たらなかった state でも、 派生 state に書き出していない変化があれば通す (pull_once と同じ)
+        let derived = !batch.records.is_empty() && self.engine.sync_state_dirty();
+        if (outcome.applied > 0 || derived) && !self.persist_applied_state(link) {
             return Some(BootstrapOutcome { outcome, swept: 0, as_of: batch.as_of });
         }
 
@@ -969,7 +979,8 @@ impl Syncer {
         //
         // #698: ホストは LWW で負けた record も載せる ([`Syncer::set_host`])。 batch の順のまま 1 回で載せる (書き手ごとに HLC の
         // 昇順 = 途中まで載った所で client が pull しても、 その書き手の cursor は載った所までしか進まない)。 負けた record は、
-        // cursor が進まずに届き直した時に 2 度載せない (`relay_held`)。 当たった record は今までどおり必ず載せる
+        // cursor が進まずに届き直した時に 2 度載せない (`relay_held`)。 当たった record は今までどおり必ず載せる。
+        // 容量で断った record の後ろの同じ書き手の record は、 そもそも当てていない (#754、 `apply_records_impl`)
         let host = gossip && self.is_host();
         let mut relayed = 0usize;
         if gossip {
@@ -1014,7 +1025,15 @@ impl Syncer {
         // #698: ホストが負けた record だけを載せた batch (applied = 0) も通す。 負けた名前のカードは束ねた写像を作っていて、
         // 中継の record は WAL の再生で当て直される (`replay_relayed_op` は名前で束ねない) ので、 写像が残っていないと
         // 再生が新しい行を払い出す
-        if (outcome.applied > 0 || (host && relayed > 0)) && !self.persist_applied_state(from) {
+        //
+        // #755: ホストでない peer も同じ。 1 件も当たらなかった batch でも、 派生 state に書き出していない変化があれば通す
+        // (負けた名前のカードが束ねた写像は、 その世界番号宛ての後の record を自分の行に結ぶのに要る。 cursor が先に進むと、
+        // 落ちた後は名前のカードがもう届かない = 後の record が名前の無い別の行になる)。 record の無い pull と、 変化の無い batch は
+        // 今までどおり何も書かない
+        let derived = !records.is_empty() && self.engine.sync_state_dirty();
+        if (outcome.applied > 0 || (host && relayed > 0) || derived)
+            && !self.persist_applied_state(from)
+        {
             return outcome;
         }
 
@@ -1599,6 +1618,18 @@ impl Syncer {
     /// #698: 当たらなかった record (LWW で負けた / 消えた行宛て / 宛先を解決できない) も `(index, false)` で集める。 載せるかは
     /// 呼び手が決める (ホストだけが載せる、 [`Syncer::set_host`])。 検査 (ACL・署名) と容量で断った record は集めない
     /// (cursor を止めて届き直させる物)。 登録済みの Vocab (同じ書き手・番号・語を前に当てた = 前に載せた) も集めない。
+    ///
+    /// #754 (中継だけ = `relay_accepted` が Some): **容量で**断った record より後 (HLC) の、 同じ書き手の record は、 この batch
+    /// では**当てずに飛ばす** (載せもしない)。 断った record は cursor を止めるので、 飛ばした record も一緒に届き直し、 空きが
+    /// 戻って断った record が通った batch で、 順に当たって載る。 前は後ろを先に当てて載せていて、 下の受け手の
+    /// `cursor[author]` が断った record を越え、 それが後で通って載っても届かなかった (受け手の cursor は 「この書き手の
+    /// record はここまで受けた」 で、 中継が書き手ごとに HLC の順に載せることに頼る)。 飛ばした record は `received` にだけ
+    /// 数える。 中継しない peer は今までどおり後ろも当てる (自分の DB に当てるだけなら順は要らない、 LWW)。
+    ///
+    /// 飛ばすのは batch の順で後ろの record だけ (容量で断るかは当てて初めて分かる。 書き手ごとに HLC の昇順で届く約束)。
+    /// ACL と署名で断った record の後ろは今までどおり当てて載せる: ACL と鍵の未登録は書き手ごとなので、 同じ書き手の後ろの
+    /// record も同じに断られる。 record ごとに署名が欠けている形 (後ろだけ通る) は、 断った record が後で通ること自体が
+    /// 設定の変更 (`set_require_signature(false)`) でしか起きず、 その時は今も届かない (#754 に残した)
     fn apply_records_impl(
         &self,
         records: &[WireRecord],
@@ -1659,6 +1690,9 @@ impl Syncer {
                 _ => None,
             })
             .collect();
+        // #754 (中継だけ): 書き手ごとの、 容量で断った record の HLC の最小。 その後ろは当てずに飛ばす
+        let hold_behind_refused = relay_accepted.is_some();
+        let mut refused_from: std::collections::HashMap<PeerId, Hlc> = std::collections::HashMap::new();
         for (idx, rec) in records.iter().enumerate() {
             out.received += 1;
             if let Some(r) = rejects(rec) {
@@ -1669,7 +1703,13 @@ impl Syncer {
                 note_reject(&mut out, rec.hlc);
                 continue;
             }
-            let bound = self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none());
+            let behind_refused =
+                |r: &WireRecord| refused_from.get(&r.author_peer).is_some_and(|m| r.hlc > *m);
+            if behind_refused(rec) {
+                continue;
+            }
+            // 束ねに使う名前のカードは、 この batch で当たる物だけ (断った物と、 その後ろで飛ばす物は使わない)
+            let bound = self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none() && !behind_refused(r));
             let result = self.apply_one(&store, rec, bound, &dying);
             if let Some(list) = relay_accepted.as_deref_mut() {
                 let relayable = !matches!(rec.op, DecodedOp::Commit) && rec.author_peer != self_peer;
@@ -1692,6 +1732,10 @@ impl Syncer {
                     // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。
                     out.rejected_capacity += 1;
                     note_reject(&mut out, rec.hlc);
+                    if hold_behind_refused {
+                        let m = refused_from.entry(rec.author_peer).or_insert(rec.hlc);
+                        *m = (*m).min(rec.hlc);
+                    }
                 }
             }
         }

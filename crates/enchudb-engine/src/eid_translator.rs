@@ -101,6 +101,11 @@ impl EidTranslator {
         self.dirty.lock().unwrap_or_else(|p| p.into_inner()).push(key);
     }
 
+    /// #755: 書き出していない変化があるか (印が 1 つでも積まれている)。
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
     /// #560: 印の付いた key を取り出す (重ねて積まれた key は 1 つに)。
     pub fn take_dirty(&self) -> Vec<Key> {
         let mut v = std::mem::take(&mut *self.dirty.lock().unwrap_or_else(|p| p.into_inner()));

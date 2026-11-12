@@ -10311,6 +10311,27 @@ impl Engine {
         Ok(())
     }
 
+    /// #755: 受信の apply が動かした派生 state (世界番号の写像 / 別名 / 語の写像 / 消した名前・前の名前の記録) に、 まだ書き出して
+    /// いない変化があるか。 `Syncer::pull_once` は、 1 件も当たらなかった batch でもこれが立っていれば [`Engine::persist_sync_state`]
+    /// を通してから cursor を進める (LWW で負けた名前のカードは、 当たらないまま世界番号を自分の行に束ねる)。 memory-only は false。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sync_state_dirty(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        !self.path.is_empty()
+            && (self.eid_translator.has_dirty()
+                || self.eidmap_compact.load(Ordering::Acquire)
+                || self.peer_vocab_map_dirty.load(Ordering::Acquire)
+                || self.pk_tombs_dirty.load(Ordering::Acquire)
+                || self.pk_pending_nonempty.load(Ordering::Acquire)
+                || self.pk_former_dirty.load(Ordering::Acquire))
+    }
+
+    /// wasm 版 (sidecar を持たない)。
+    #[cfg(target_arch = "wasm32")]
+    pub fn sync_state_dirty(&self) -> bool {
+        false
+    }
+
     /// **sync 由来 state の durability barrier**。
     ///
     /// `body_msync()` (cell 本体) + [`Engine::persist_tables`] (sidecar 3 つ)。
