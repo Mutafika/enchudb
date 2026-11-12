@@ -236,6 +236,25 @@ impl RowLocks {
         RowWrite { locks: self, i, _not_send: std::marker::PhantomData }
     }
 
+    /// 今どれかの行を握っている書き手が、 全部離すまで待つ (この thread が握っている stripe は数えない)。 呼んだ後に握る書き手は
+    /// 待たない: stripe ごとに 「握られていない」 を 1 回見るだけ。
+    ///
+    /// 書き手は行を握ってから WAL に積み (版数が決まる)、 cell に当ててから離す。 時計から時刻 T を採った後にこれを呼ぶと、
+    /// 返った時には 「T より前の版数を採った書き込みは全部 cell に着いている」 (T より前に版数を採った書き手は、 T の時点で行を
+    /// 握っていて、 ここで離すのを待たれる。 T の後に握る書き手の版数は T より後)。
+    pub fn wait_for_writers(&self) {
+        let me = me();
+        for (i, s) in self.stripes.iter().enumerate() {
+            if self.held(i, me) {
+                continue;
+            }
+            let mut spins = 0;
+            while s.ver.load(Ordering::Acquire) & 1 == 1 {
+                backoff(&mut spins);
+            }
+        }
+    }
+
     /// 行 `local` を、 同じ行への書き込みと重ならずに読む。 `f` は途中の書き込みを見たら捨てられ、
     /// 呼び直される (副作用を持たないこと)。 書き手が休まず同じ stripe を書き続けて揃わない時は、 握って読む。
     pub fn read<R>(&self, local: u32, mut f: impl FnMut() -> R) -> R {
