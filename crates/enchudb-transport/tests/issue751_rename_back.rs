@@ -21,8 +21,6 @@ const OPLOG: usize = 1 << 20;
 const AUTHORS: usize = 3;
 const OBSERVERS: usize = 2;
 const RECEIVER_BASE: u32 = 10;
-const KEYS: u8 = 3;
-const TITLES: u8 = 3;
 
 static RUN: AtomicU64 = AtomicU64::new(0);
 
@@ -103,24 +101,9 @@ impl Peer {
             Step::Upsert { key: k, title: v, .. } => {
                 t.upsert().set("key", key(k).as_str()).set("title", title(v).as_str()).commit().unwrap();
             }
-            Step::InsertKeyLast { key: k, title: v, .. } => {
-                // 名前を最後に set する (その名前の行が無い時だけ: insert は同じ名前を断るかもしれない)
-                if self.row(k).is_some() {
-                    return;
-                }
-                let _ = t.insert().set("title", title(v).as_str()).set("key", key(k).as_str()).commit();
-            }
             Step::Rename { from, to, .. } => {
                 let (Some(e), None) = (self.row(from), self.row(to)) else { return };
                 let _ = t.entity(e).set("key", key(to).as_str()).commit();
-            }
-            Step::Delete { key: k, .. } => {
-                let Some(e) = self.row(k) else { return };
-                t.entity(e).delete().unwrap();
-            }
-            Step::Retitle { key: k, title: v, .. } => {
-                let Some(e) = self.row(k) else { return };
-                t.entity(e).set("title", title(v).as_str()).commit().unwrap();
             }
             _ => unreachable!(),
         }
@@ -159,13 +142,9 @@ impl Peer {
 #[derive(Debug, Clone, PartialEq)]
 enum Step {
     Upsert { by: usize, key: u8, title: u8 },
-    InsertKeyLast { by: usize, key: u8, title: u8 },
     Rename { by: usize, from: u8, to: u8 },
-    Delete { by: usize, key: u8 },
-    Retitle { by: usize, key: u8, title: u8 },
     /// by: 0..AUTHORS は書き手、 その先は観測者
     Pull { by: usize, from: usize },
-    Reopen { by: usize },
 }
 
 fn permutations(n: usize) -> Vec<Vec<usize>> {
@@ -194,30 +173,14 @@ fn run(steps: &[Step]) -> Result<Answer, String> {
     for k in 0..orders.len() as u32 {
         tr.register_peer(RECEIVER_BASE + k);
     }
-    let mut peers: Vec<Option<Peer>> =
+    let peers: Vec<Option<Peer>> =
         (1..=n_peers).map(|id| Some(attach(&dir, create(&dir, id), &tr, true))).collect();
     for s in steps {
         match *s {
             Step::Pull { by, from } => {
                 peers[by].as_ref().unwrap().sync.pull_once(from as u32 + 1);
             }
-            Step::Reopen { by } => {
-                let p = peers[by].take().unwrap();
-                p.settle();
-                drop(p);
-                let db = Database::open_with_oplog(&dir.db(by as u32 + 1), OPLOG).map_err(|e| format!("reopen: {e:?}"))?;
-                db.engine().set_peer_id(by as u32 + 1);
-                let p = attach(&dir, db, &tr, true);
-                if by < AUTHORS {
-                    p.publish();
-                }
-                peers[by] = Some(p);
-            }
-            Step::Upsert { by, .. }
-            | Step::InsertKeyLast { by, .. }
-            | Step::Rename { by, .. }
-            | Step::Delete { by, .. }
-            | Step::Retitle { by, .. } => peers[by].as_ref().unwrap().write(s),
+            Step::Upsert { by, .. } | Step::Rename { by, .. } => peers[by].as_ref().unwrap().write(s),
         }
     }
     let mut answers: Vec<(String, Answer)> = Vec::new();
