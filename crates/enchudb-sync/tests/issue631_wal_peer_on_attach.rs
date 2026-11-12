@@ -37,7 +37,17 @@ fn make(path: &str, peer: u32, peer_before_wal: bool) -> Arc<Engine> {
     if !peer_before_wal {
         e.set_peer_id(peer);
     }
+    keep_wal(&e);
     e
+}
+
+/// #735: `last_author` は書き出しの後に WAL を読む。 consumer の畳みが `oplog_sync()` と読みの間に入ると record が 1 つも
+/// 残らない (`unwrap` が None で落ちた) ので、 この試験の DB は consumer の畳みを切る: 周期 (100 ms) の畳みと、 区画を移った時の
+/// 畳み (開き直した session は最初の append でもう一方の区画へ移るので、 開き直した後はこちらが入る)。 配る道 (`_sync_ops`) は
+/// 変わらない。
+fn keep_wal(eng: &Engine) {
+    eng.set_wal_fold_on_tick(false);
+    eng.set_wal_fold_on_switch(false);
 }
 
 fn write(eng: &Engine, row: Option<u64>, v: u32) -> u64 {
@@ -60,7 +70,9 @@ fn publish(eng: &Arc<Engine>, tr: &Arc<dyn Transport>) {
 
 /// 最後に WAL に載った record の書き手。
 fn last_author(eng: &Engine) -> u32 {
-    eng.audit(&enchudb_engine::AuditFilter::default()).iter().rev().find(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Tie { .. })).unwrap().author_peer
+    let recs = eng.audit(&enchudb_engine::AuditFilter::default());
+    let tie = recs.iter().rev().find(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Tie { .. }));
+    tie.expect("前提: 書いた Tie が WAL に残っている (読む前に畳まれた)").author_peer
 }
 
 /// 形 1: WAL を付ける前に peer id を決めた DB の record も、 その peer id で載る。 次の session で `set_peer_id` を呼び直して
@@ -106,6 +118,7 @@ fn a_reopened_db_keeps_its_peer_id_in_the_wal() {
     drop(a);
 
     let a = Engine::open_concurrent_with_oplog(&pa, 16 << 20).unwrap();
+    keep_wal(&a);
     assert_eq!(a.peer_id(), A, "前提: engine は header から peer id を戻す");
     write(&a, Some(row), 20);
     write(&a, None, 30);

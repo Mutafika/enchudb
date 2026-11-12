@@ -2595,6 +2595,10 @@ mod cell_wal_order_tests {
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        // #735: 下で WAL の record を読むので、 consumer の周期の畳みを切る。 切らないと、 2 本目の書き込みで起きた consumer が
+        // 書き出して畳むのと、 この thread が WAL を読むのとの競争になる (1 本目は割り込み点で 200 ms 待つので、 2 本目が積む頃には
+        // 周期の 100 ms が過ぎている。 thread が書き出し 1 回分 (数 ms) 止まると Tie が 1 つも残らず `last` が None になった)
+        eng.set_wal_fold_on_tick(false);
         let e = eng.entity_in("t").unwrap();
         let wal = eng.oplog.as_ref().unwrap().clone();
         let second: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), TieRejected>>>>> = Arc::default();
@@ -2631,6 +2635,7 @@ mod cell_wal_order_tests {
         let _ = std::fs::remove_file(oplog_path_for(&path));
         assert_eq!(first, Ok(()), "{tag}: 1 本目が弾かれた (2 本目が後に積んで先に当てた)");
         assert_eq!(second, Ok(()), "{tag}: 2 本目が弾かれた");
+        assert!(last.is_some(), "{tag}: 前提: WAL に Tie の record が残っている (読む前に畳まれた)");
         assert_eq!(cell, last, "{tag}: cell が WAL の最後の record と違う (積む順と当てる順がずれた)");
     }
 
