@@ -13,7 +13,9 @@
 //! - `POST /v2/publish?peer=c` : client c の record。 ホストが当てて中継し、 WAL を書き出してから、 ホストが当てた位置 (c への ack)
 //!   を返す。 client の `_sync_ops` はこの ack で回収される (ホストは record の置き場の権威なので、 #227 の下流の消化で丸めない)
 //! - `POST /v2/pull?to=c` (body = 書き手ごとの cursor) : ホストの `_sync_ops` のうち cursor より後 (c 自身の record は除く) と、
-//!   ホストの floor。 floor は record を読んだ後に読む (間に回収が入っても穴を見逃さない側)。 cursor は ack も兼ねる
+//!   ホストの floor。 floor は record を読んだ後に読む (間に回収が入っても穴を見逃さない側)。 cursor は ack も兼ねる。
+//!   返事は `[framed records][floor の列][配り終えの線 16][忘れてよい線 16]`、 c が黙って外された後に戻った client の時だけ、
+//!   後ろに印 1 byte (`STALE`) が付く (#712)
 //! - `POST /v2/ack?peer=c` (body = cursor) : c がホストの流れを当てた位置。 ホストの回収を回す
 //! - `POST /v2/floor?peer=c` (body = floor) : c の floor (c が WAL に載らずに落とした record など)。 ホストの c の cursor が届かなければ、
 //!   次の publish の返事で c の state を求める → c は `POST /v2/state?author=c` で自分の state を送る
@@ -125,6 +127,11 @@ fn decode_state(buf: &[u8]) -> Option<StateBatch> {
 const NEED_STATE: u8 = 1;
 /// publish の返事の印: 黙ったので外した後に戻ってきた client の record なので受けなかった。 c は新しい peer id の DB にホストから
 /// 取り直してから書き直す (留守の間に消えた行を持ったままなので、 受けると忘れた削除を越えて消えた行が生き返りうる)。
+///
+/// pull の返事の後ろにも付く (#712、 外した後に戻ってきた client の時だけ): 何も出さずに受けるだけの client は publish の返事を
+/// 受けないので、 留守の間に消えた行を持ったまま何も知らされなかった (ホストの state は replica の物で、 消えた行の掃除は走らない)。
+/// record は今までどおり配る。 印の無い返事は今までと同じ長さなので、 古い client には外された時だけ長さが変わる (古い client は
+/// 長さの違う後ろを読まず、 線を ZERO と読む = 何も忘れない側。 外された client は線に数えていない)
 const STALE: u8 = 2;
 
 /// 黙った client を線と回収の数から外すまでの既定 (30 日)。
@@ -404,8 +411,7 @@ impl HostInner {
         let lock = self.client_lock(from);
         let _serial = lock.lock().unwrap();
         let seen = |s: &Self| s.syncer.cursors_of(from).into_iter().find(|(a, _)| *a == from).map_or(Hlc::ZERO, |(_, h)| h);
-        let returning = self.lines_path.is_some()
-            && self.lines.lock().unwrap().clients.get(&from).is_some_and(|c| c.dropped || c.returned);
+        let returning = self.is_stale(from);
         let mine = records.iter().any(|r| r.author_peer == from);
         if returning && mine {
             self.touch(from, |_| {});
@@ -483,6 +489,11 @@ impl HostInner {
             .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
             .map(|r| r.hlc)
             .min()
+    }
+
+    /// 黙ったので外した client か、 外した後に戻ってきた client か (線を持つホストだけ)。
+    fn is_stale(&self, c: PeerId) -> bool {
+        self.lines_path.is_some() && self.lines.lock().unwrap().clients.get(&c).is_some_and(|c| c.dropped || c.returned)
     }
 
     /// 黙った client を外し、 忘れてよい線 F を進め、 進んだらホストの削除の記録を捨てる。 F = min([`Lines::forget_candidate`]、
@@ -665,7 +676,8 @@ impl HttpHost {
     }
 
     /// 黙った client を線と回収の数から外すまでの長さ (既定 30 日)。 外した client が戻って自分の record を出すと、 ホストは受けずに
-    /// `STALE` を返す (client は新しい peer id の DB に取り直してから書き直す)。
+    /// `STALE` を返す (client は新しい peer id の DB に取り直してから書き直す)。 受けるだけの時も、 pull の返事で `STALE` を返す
+    /// (record は配る、 #712)。
     ///
     /// 長さは **ホストが動いていた時間**で数える (#713): ホストが止まっていた間 (と、 壁時計が飛んだ分) は client の沈黙に
     /// 数えない。 `cursor_path` の横の置き場に時計を残し、 開き直すと続きから数える。 きれいに止めた (drop した) 時はその時点
@@ -715,6 +727,8 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             let Some(since) = decode_cursors(&req.body) else { return send_response(&mut stream, 400, b"cursors") };
             // 前の返事を全部当てた client は、 その返事の配り終えの線まで受け終えた
             let seen_line = q.get("seen").and_then(|s| parse_hlc(s));
+            // 外した client かは、 来たことを記す前に見る (記すと 「戻ってきた」 に変わるが、 どちらも同じ扱い)
+            let stale = host.is_stale(to);
             host.touch(to, |c| {
                 if let Some(h) = seen_line {
                     c.caught_up = c.caught_up.max(h);
@@ -728,6 +742,9 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             out.extend_from_slice(&encode_cursors(&host.floors_for(to)));
             put_hlc(&mut out, publish_line);
             put_hlc(&mut out, host.lines.lock().unwrap().forget);
+            if stale {
+                out.push(STALE);
+            }
             // pull の cursor は ack も兼ねる (`Syncer::pull_once` は当てて書き出した後にしか cursor を進めない、 #149)。 自分の record
             // しか無い client は何も受けないので `record_pull_ack_multi` を呼ばない — ここで受けないと、 その client の record の行が
             // ホストの ring から回収されない
@@ -848,8 +865,10 @@ impl HttpHostTransport {
         })
     }
 
-    /// ホストがこの client の record を受けなかった (黙ったので外された後に戻ってきた)。 新しい peer id の DB にホストから取り直して
-    /// から書き直すこと (この peer id の record はもう受けない)。 受けると、 忘れた削除を越えて消えた行が生き返りうる。
+    /// ホストがこの client を外した後に戻ってきた (黙っていたので、 線と回収の数から外された)。 新しい peer id の DB にホストから
+    /// 取り直してから書き直すこと (この peer id の record はもう受けない。 受けると、 忘れた削除を越えて消えた行が生き返りうる)。
+    /// 自分の record を出した時 (publish の返事) だけでなく、 受けた時 (pull の返事) にも立つ (#712): 受けるだけの client も、
+    /// 留守の間に消えた行を持ったままなので、 この DB の中身はホストと揃わない。
     pub fn rebase_required(&self) -> bool {
         self.rebase.load(Ordering::Acquire)
     }
@@ -957,10 +976,15 @@ impl Transport for HttpHostTransport {
         };
         let Some((records, rest)) = decode_framed(&body) else { return Vec::new() };
         let Some((floors, rest)) = decode_cursors_prefix(rest) else { return Vec::new() };
-        let (publish_line, forget) = match rest.len() {
-            32 => (get_hlc(&rest[..16]), get_hlc(&rest[16..])),
-            _ => (Hlc::ZERO, Hlc::ZERO),
+        // 後ろの 1 byte は印 (#712、 外された後に戻った時だけ付く)
+        let (publish_line, forget, flags) = match rest.len() {
+            32 => (get_hlc(&rest[..16]), get_hlc(&rest[16..]), 0),
+            33 => (get_hlc(&rest[..16]), get_hlc(&rest[16..32]), rest[32]),
+            _ => (Hlc::ZERO, Hlc::ZERO, 0),
         };
+        if flags & STALE != 0 {
+            self.rebase.store(true, Ordering::Release);
+        }
         // 返事の floor は record を読んだ後の物。 cursor が floor に届かない書き手は、 この返事の record も途中から始まりうる
         // (間に回収が入った) ので渡さない — cursor は進まず、 次の `pull_once` の前の判定が floor で抜けを知らせる
         let baseline = floors.iter().find(|(a, _)| *a == u32::MAX).map_or(Hlc::ZERO, |(_, h)| *h);
@@ -1074,6 +1098,27 @@ mod tests {
         server.join().unwrap();
         assert_eq!(got.iter().map(|r| r.author_peer).collect::<Vec<_>>(), vec![6], "floor に届かない書き手の record を渡した");
         assert_eq!(t.history_floor_multi(7), Some(vec![(5, h(9))]), "floor を覚えない");
+    }
+
+    /// #712: pull の返事の後ろの印。 `STALE` が付いていれば `rebase_required` が立ち、 線は今までどおり読む。 印の無い返事
+    /// (今までの長さ) では立たない。
+    #[test]
+    fn a_stale_mark_on_a_pull_answer_sets_rebase_required() {
+        let h = |w| Hlc { wall: w, logical: 0, peer: 0 };
+        for (mark, want) in [(Some(STALE), true), (Some(0), false), (None, false)] {
+            let mut answer = encode_framed(&[]);
+            answer.extend_from_slice(&encode_cursors(&[]));
+            put_hlc(&mut answer, h(40));
+            put_hlc(&mut answer, h(30));
+            answer.extend(mark);
+            let (addr, server) = fake_host(answer);
+            let t = HttpHostTransport::connect(format!("http://{addr}"), 1).unwrap();
+            assert!(!t.rebase_required());
+            t.pull_as_multi(1, 7, &[]);
+            server.join().unwrap();
+            assert_eq!(t.rebase_required(), want, "印 {mark:?}");
+            assert_eq!(t.forget_horizon(7), Some(h(30)), "印 {mark:?}: 忘れてよい線を読めていない");
+        }
     }
 
     /// F は数える client の配り終えの線を越えない: 線を言う前に計算された P を受け終えた client (時計が遅れていて、 配り終えの線が
