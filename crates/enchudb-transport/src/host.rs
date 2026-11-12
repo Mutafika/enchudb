@@ -742,6 +742,10 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
 /// ホストと話す client の transport。 `Syncer::new(engine, Arc::new(HttpHostTransport::connect(url, me)?))` で使い、
 /// `publish_since` / `pull_once(t.host_id())` を回す。 自分の state をホストに送れるよう、 client も `serve_state()` を呼ぶこと
 /// (ホストが求めた時だけ送る)。
+///
+/// `Syncer` には cursor の置き場 (`Syncer::with_cursor_path`) を付けること。 無いと受けた位置は memory だけで、 開き直すたびに
+/// 「初めて来た client」 になる: ホストが一度でも回収していれば、 最初の pull は何も当てずに `history_truncated` を返し、 アプリが
+/// 取り直し (`bootstrap_pull_via`) を呼ぶまで受け取りが止まる (#710)。
 pub struct HttpHostTransport {
     http: HttpTransport,
     host: PeerId,

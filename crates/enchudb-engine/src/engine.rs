@@ -9426,7 +9426,10 @@ impl Engine {
     /// - `as_of` は emit した record の **max HLC**。 self 版のように `mint_hlc()`
     ///   すると自分の clock で author の HLC 空間を進めてしまい、 受信側の
     ///   `cursor[author]` が author の後続 record を飛び越す (#216 で cursor が
-    ///   author 別になったのでここが直撃する)。
+    ///   author 別になったのでここが直撃する)。 **この max も author の時計とは限らない**
+    ///   (author の行を他の peer が書き換えた cell の版数は、 その peer の時計)。 `Syncer` の
+    ///   配布元は、 自分がその author の record を受けた位置 (cursor) があればそちらを
+    ///   `as_of` にする (#710)。
     /// - Tag は **author の vid 空間に戻して**配る (`peer_vocab_map` の逆引き)。
     ///   自分の local vid のまま `(author, vid)` として配ると、 author 直 pull で
     ///   来る同じ key の別テキストと衝突して vocab 写像が壊れる (#209 と同種)。
