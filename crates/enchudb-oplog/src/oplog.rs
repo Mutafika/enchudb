@@ -6328,14 +6328,21 @@ mod tests {
                 cursor.store(end, Ordering::Release);
             }
         };
+        // 畳む係の 1 回: 読んで進め、 読み終えた区画を畳む
+        let fold = {
+            let (wal, cursor, transfer, read) = (wal.clone(), cursor.clone(), transfer.clone(), read.clone());
+            move || {
+                read();
+                wal.advance_checkpoint(wal.head());
+                let _g = transfer.lock().unwrap();
+                wal.try_reset_if(|through| cursor.load(Ordering::Acquire) >= through);
+            }
+        };
         let consumer = {
-            let (wal, cursor, transfer, done, read) = (wal.clone(), cursor.clone(), transfer.clone(), done.clone(), read.clone());
+            let (done, fold) = (done.clone(), fold.clone());
             std::thread::spawn(move || {
                 while !done.load(Ordering::Acquire) {
-                    read();
-                    wal.advance_checkpoint(wal.head());
-                    let _g = transfer.lock().unwrap();
-                    wal.try_reset_if(|through| cursor.load(Ordering::Acquire) >= through);
+                    fold();
                 }
             })
         };
@@ -6364,7 +6371,13 @@ mod tests {
         }
         done.store(true, Ordering::Release);
         consumer.join().unwrap();
-        wal.append(Op::Commit).unwrap();
+        // #735: 畳む係は `done` を見たら畳まずに抜ける。 書き手の最後の Commit が今の区画の残り (閉じの Commit 1 つ分) を使い切り、
+        // もう一方の区画がまだ畳まれていないと、 ここの Commit は満杯で入らない (CI で 1 回、 `unwrap` が OutOfMemory で落ちた)。
+        // 書き手と同じく、 入るまで畳む
+        while let Err(e) = wal.append(Op::Commit) {
+            assert_eq!(e.kind(), io::ErrorKind::OutOfMemory, "{e}");
+            fold();
+        }
         read();
         assert!(wal.switches() >= 10, "前提: 何度も切り替えた ({})", wal.switches());
         let seen = seen.lock().unwrap();
