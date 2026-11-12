@@ -969,7 +969,8 @@ impl Syncer {
         //
         // #698: ホストは LWW で負けた record も載せる ([`Syncer::set_host`])。 batch の順のまま 1 回で載せる (書き手ごとに HLC の
         // 昇順 = 途中まで載った所で client が pull しても、 その書き手の cursor は載った所までしか進まない)。 負けた record は、
-        // cursor が進まずに届き直した時に 2 度載せない (`relay_held`)。 当たった record は今までどおり必ず載せる
+        // cursor が進まずに届き直した時に 2 度載せない (`relay_held`)。 当たった record は今までどおり必ず載せる。
+        // 容量で断った record の後ろの同じ書き手の record は、 そもそも当てていない (#754、 `apply_records_impl`)
         let host = gossip && self.is_host();
         let mut relayed = 0usize;
         if gossip {
@@ -1599,6 +1600,18 @@ impl Syncer {
     /// #698: 当たらなかった record (LWW で負けた / 消えた行宛て / 宛先を解決できない) も `(index, false)` で集める。 載せるかは
     /// 呼び手が決める (ホストだけが載せる、 [`Syncer::set_host`])。 検査 (ACL・署名) と容量で断った record は集めない
     /// (cursor を止めて届き直させる物)。 登録済みの Vocab (同じ書き手・番号・語を前に当てた = 前に載せた) も集めない。
+    ///
+    /// #754 (中継だけ = `relay_accepted` が Some): **容量で**断った record より後 (HLC) の、 同じ書き手の record は、 この batch
+    /// では**当てずに飛ばす** (載せもしない)。 断った record は cursor を止めるので、 飛ばした record も一緒に届き直し、 空きが
+    /// 戻って断った record が通った batch で、 順に当たって載る。 前は後ろを先に当てて載せていて、 下の受け手の
+    /// `cursor[author]` が断った record を越え、 それが後で通って載っても届かなかった (受け手の cursor は 「この書き手の
+    /// record はここまで受けた」 で、 中継が書き手ごとに HLC の順に載せることに頼る)。 飛ばした record は `received` にだけ
+    /// 数える。 中継しない peer は今までどおり後ろも当てる (自分の DB に当てるだけなら順は要らない、 LWW)。
+    ///
+    /// 飛ばすのは batch の順で後ろの record だけ (容量で断るかは当てて初めて分かる。 書き手ごとに HLC の昇順で届く約束)。
+    /// ACL と署名で断った record の後ろは今までどおり当てて載せる: ACL と鍵の未登録は書き手ごとなので、 同じ書き手の後ろの
+    /// record も同じに断られる。 record ごとに署名が欠けている形 (後ろだけ通る) は、 断った record が後で通ること自体が
+    /// 設定の変更 (`set_require_signature(false)`) でしか起きず、 その時は今も届かない (#754 に残した)
     fn apply_records_impl(
         &self,
         records: &[WireRecord],
@@ -1659,6 +1672,9 @@ impl Syncer {
                 _ => None,
             })
             .collect();
+        // #754 (中継だけ): 書き手ごとの、 容量で断った record の HLC の最小。 その後ろは当てずに飛ばす
+        let hold_behind_refused = relay_accepted.is_some();
+        let mut refused_from: std::collections::HashMap<PeerId, Hlc> = std::collections::HashMap::new();
         for (idx, rec) in records.iter().enumerate() {
             out.received += 1;
             if let Some(r) = rejects(rec) {
@@ -1669,7 +1685,13 @@ impl Syncer {
                 note_reject(&mut out, rec.hlc);
                 continue;
             }
-            let bound = self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none());
+            let behind_refused =
+                |r: &WireRecord| refused_from.get(&r.author_peer).is_some_and(|m| r.hlc > *m);
+            if behind_refused(rec) {
+                continue;
+            }
+            // 束ねに使う名前のカードは、 この batch で当たる物だけ (断った物と、 その後ろで飛ばす物は使わない)
+            let bound = self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none() && !behind_refused(r));
             let result = self.apply_one(&store, rec, bound, &dying);
             if let Some(list) = relay_accepted.as_deref_mut() {
                 let relayable = !matches!(rec.op, DecodedOp::Commit) && rec.author_peer != self_peer;
@@ -1692,6 +1714,10 @@ impl Syncer {
                     // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。
                     out.rejected_capacity += 1;
                     note_reject(&mut out, rec.hlc);
+                    if hold_behind_refused {
+                        let m = refused_from.entry(rec.author_peer).or_insert(rec.hlc);
+                        *m = (*m).min(rec.hlc);
+                    }
                 }
             }
         }
