@@ -133,28 +133,19 @@ fn differing(a: &Client, b_row: impl Fn(u32) -> Option<u64>, keys: std::ops::Ran
     keys.filter(|k| a.v(*k) != b_row(*k)).collect()
 }
 
-/// 形 1: c1 が state を作っている間も書き続ける。 state に入らなかった書き込みは後で差分で届き、 c3 もそれを受ける。
-#[test]
-fn writes_made_while_the_state_is_built_reach_a_client_that_pulled_the_state() {
-    const N: u32 = 12_000;
-    let dir = Dir::new("w1");
-    let host_eng = db(&dir.db(HOST), HOST);
-    let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
-    let url = format!("http://{}", host.addr());
-    // c1 の state の配布元は 「engine の state をそのまま」 (`Syncer::serve_state` が自分の分として登録する物と同じ中身)。
-    // 送った batch を控えて、 前提を確かめる
-    let eng1 = db(&dir.db(1), 1);
-    let t1 = Arc::new(HttpHostTransport::connect(url.clone(), 1).unwrap());
-    let c1 = Client { eng: eng1.clone(), t: t1.clone(), s: Syncer::new(eng1.clone(), t1.clone()) };
+/// state の配布元が 「engine の state をそのまま」 (`Syncer::serve_state` が自分の分として登録する物と同じ中身) の client。 送った
+/// batch を控え (前提を確かめる)、 state を作っている間だけ印を立てる。
+fn recording_client(eng: Arc<Engine>, url: &str) -> (Client, Arc<Mutex<Vec<StateBatch>>>, Arc<AtomicBool>) {
+    let t = Arc::new(HttpHostTransport::connect(url.to_string(), eng.peer_id()).unwrap());
+    let s = Syncer::new(eng.clone(), t.clone());
     let sent: Arc<Mutex<Vec<StateBatch>>> = Arc::new(Mutex::new(Vec::new()));
-    // state を作っている間だけ立つ印 (書き手はこの間だけ書く)
     let building = Arc::new(AtomicBool::new(false));
     {
-        let (eng, sent, building) = (Arc::downgrade(&eng1), sent.clone(), building.clone());
-        t1.register_state_provider(
-            1,
+        let (weak, sent, building) = (Arc::downgrade(&eng), sent.clone(), building.clone());
+        t.register_state_provider(
+            eng.peer_id(),
             Arc::new(move || {
-                let eng = eng.upgrade()?;
+                let eng = weak.upgrade()?;
                 building.store(true, Ordering::Release);
                 let (records, as_of) = eng.state_records();
                 building.store(false, Ordering::Release);
@@ -164,6 +155,18 @@ fn writes_made_while_the_state_is_built_reach_a_client_that_pulled_the_state() {
             }),
         );
     }
+    (Client { eng, t, s }, sent, building)
+}
+
+/// 形 1: c1 が state を作っている間も書き続ける。 state に入らなかった書き込みは後で差分で届き、 c3 もそれを受ける。
+#[test]
+fn writes_made_while_the_state_is_built_reach_a_client_that_pulled_the_state() {
+    const N: u32 = 12_000;
+    let dir = Dir::new("w1");
+    let host_eng = db(&dir.db(HOST), HOST);
+    let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
+    let url = format!("http://{}", host.addr());
+    let (c1, sent, building) = recording_client(db(&dir.db(1), 1), &url);
     let c3 = client(db(&dir.db(3), 3), &url);
     for k in 1..=N {
         c1.write(k, 0);
@@ -342,4 +345,55 @@ fn a_pull_while_the_host_relays_a_state_misses_nothing() {
     let bad = differing(&c1, |k| c3.v(k), 1..=hi);
     assert!(bad.is_empty(), "c1 の行が c3 と食い違う行が {} 行 (例 k = {:?})", bad.len(), &bad[..bad.len().min(5)]);
     drop((c1, c3, host));
+}
+
+/// 対照 (issue に書いた形、 前から通る): c1 の行を c2 が書き換え、 c1 がそれを受けた後に state を送る。 state には c2 の時計の
+/// 版数が c1 の record として入るが、 c1 の時計は受けた版数より後に進んでいて (`as_of` はその後)、 ホストは as_of より前の
+/// c1 の record を受けない。 c3 の cursor は as_of を越えず、 c1 の後の書き込みは届く。
+#[test]
+fn control_a_state_that_carries_another_clients_clock() {
+    let dir = Dir::new("ctl");
+    let host_eng = db(&dir.db(HOST), HOST);
+    let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
+    let url = format!("http://{}", host.addr());
+    let (c1, sent, _) = recording_client(db(&dir.db(1), 1), &url);
+    let (c2, c3) = (client(db(&dir.db(2), 2), &url), client(db(&dir.db(3), 3), &url));
+    let all = |c: &[&Client]| {
+        for _ in 0..2 {
+            for c in c {
+                c.eng.oplog_commit();
+                c.sync();
+            }
+        }
+    };
+    c1.write(1, 10);
+    all(&[&c1, &c2, &c3]);
+    assert_eq!([c2.v(1), c3.v(1)], [Some(10), Some(10)], "前提: c1 の行が届いた");
+    // c1 が出さずに行 2 を書き、 その後で c2 が c1 の行 1 を書き換える (c2 の時計、 c1 の行 2 より後)
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    c1.write(2, 20);
+    c1.eng.oplog_commit();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    c2.eng.tie_to(c2.row(1).unwrap(), "notes.v", 11u32);
+    all(&[&c2]);
+    assert!(c1.pull().is_empty());
+    let v_himo = c1.eng.himo_id("notes.v").unwrap() as u16;
+    let edited = c1.eng.cell_hlc(c1.row(1).unwrap(), v_himo);
+    let unpublished = c1.eng.cell_hlc(c1.row(2).unwrap(), v_himo);
+    assert!(edited.peer == 2 && edited > unpublished, "前提: c1 の行 1 の版数は c2 の時計で、 c1 の出していない行 2 より後 ({edited:?} / {unpublished:?})");
+    // ホストが c1 の state を求める
+    ask_for_state(&host, &c1);
+    c1.push();
+    let batch = sent.lock().unwrap().last().cloned().expect("前提: c1 が state を送った");
+    assert!(batch.records.iter().any(|r| r.author_peer == 1 && r.hlc == edited), "前提: state に、 c2 の時計の版数が c1 の record として入った");
+    assert!(batch.as_of > edited, "c1 の時計は、 受けた c2 の版数より後");
+    assert!(c3.pull().is_empty());
+    assert!(c3.cursor(1) <= batch.as_of, "c3 の、 書き手 1 の cursor が as_of を越えた");
+    assert_eq!(c3.v(2), Some(20), "c1 の出していなかった行 2 が state で届いた");
+    // c1 の後の書き込み
+    c1.write(3, 30);
+    all(&[&c1, &c2, &c3]);
+    assert_eq!([c2.v(3), c3.v(3)], [Some(30), Some(30)]);
+    assert_eq!([c1.v(1), c2.v(1), c3.v(1)], [Some(11); 3]);
+    drop((c1, c2, c3, host));
 }
