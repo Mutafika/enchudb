@@ -540,7 +540,12 @@ only has the 64 KiB rounding slack to work with.
 To have the dictionary give values back, enable reclaiming: `GrowableOptions { vocab_reclaim:
 true, .. }` at create, or `Engine::enable_vocab_reclaim()` on an existing DB (takes effect on
 the next open; the file version becomes 12, which older binaries refuse). A value whose last
-referencing cell is gone frees its slot, and slots are reused oldest-freed-first. Value ids
+referencing cell is gone frees its slot, and slots are reused oldest-freed-first — but only
+after the write that freed the slot has been written out (the periodic write-out, `flush` or
+`oplog_sync`), so that a power loss never leaves a cell on disk pointing at a reused slot. The
+dictionary therefore holds the live values plus whatever was freed since the last write-out; a
+writer that frees slots faster than the write-out runs writes the body out itself once the
+waiting slots reach half of the remaining headroom (or 65,536). Value ids
 carry a 2-bit generation, so an id kept from before the reuse (an app-cached `vocab_id`, say)
 resolves to nothing instead of to the new value — **an id is only valid while its value is
 alive**. Reference counts live in `vocab.refs.seg` inside the DB directory and are reused as-is
@@ -611,13 +616,14 @@ if out.history_truncated {
 }
 ```
 
+- **The host relays every record it takes, not only the ones that won on it** (#698). Clients only hear from the host, so a record that lost last-write-wins on the host still goes out: a losing key write is the only record that says "this row id is the row with this key", and a client that never saw it could not attach later writes, deletes or renames addressed to that row id to its own row. Each client resolves last-write-wins itself, as it would pulling from the author directly. Records the host refused (ACL, signature, out of space) are not relayed; they are redelivered.
 - The host acknowledges what it applied, so each client's `_sync_ops` is reclaimed as soon as the host has its records (a client that stays away does not hold the others back). A client's pull acknowledges the host's stream, so the host's `_sync_ops` is reclaimed too.
 - A client whose cursor is below the host's reclaimed floor is told so (`history_truncated`) and catches up from the host's state.
 - **Give the client a cursor file** (`Syncer::with_cursor_path`). The cursor is what tells the host how far this client has received. A client without one starts every restart as a first-time client: once the host has reclaimed anything, its first pull applies nothing and returns `history_truncated`, and it receives nothing until the app runs `bootstrap_pull_via` for the listed authors.
 - The state the host serves for an author carries, as its cursor, how far the host has received **that author's own records** — not the newest version in the author's rows, which can be another client's clock when someone else edited them (#710). Records the author publishes later still reach a client that caught up from the state.
 - **Deleted-row bookkeeping is forgotten once everyone is past it.** Each client tells the host how far it has published its own writes and how far it has received the host's stream. The host hands out the line every active client has passed, and the host and the clients drop the deleted keys (`pktombs`) and the deletes of rows they no longer map that are older than it. A host started without a `cursor_path` hands out no line (after a restart it would not know whom to wait for), so nothing is forgotten under it.
 - **A client that has never published holds the line.** Until it publishes once (an empty publish counts: `Syncer::publish_since` tells the host how far it has published even when it has nothing to send), the host does not move the line, because the client may still hold offline writes older than it. A client that only pulls and never publishes keeps the line where it is.
-- **A client that stays away for 30 days** (`HttpHost::set_silence_limit`) stops counting, both for the line and for the host's `_sync_ops` reclaim. The 30 days are counted in time the host was running: while the host is down (or its wall clock jumps) no client grows more silent, so a host that comes back after a long stop does not turn its clients away (#713). When it comes back it can still pull, but the host refuses every record it publishes from then on and `HttpHostTransport::rebase_required()` turns true: rebuild the local DB from the host under a new peer id, then redo those writes (the old DB still holds rows deleted while it was away, so even a new write could bring one back). A client syncing for the first time is never refused: its offline writes are taken even when they are older than the line.
+- **A client that stays away for 30 days** (`HttpHost::set_silence_limit`) stops counting, both for the line and for the host's `_sync_ops` reclaim. The 30 days are counted in time the host was running: while the host is down (or its wall clock jumps) no client grows more silent, so a host that comes back after a long stop does not turn its clients away (#713). When it comes back it can still pull, but the host refuses every record it publishes from then on and `HttpHostTransport::rebase_required()` turns true: rebuild the local DB from the host under a new peer id, then redo those writes (the old DB still holds rows deleted while it was away, so even a new write could bring one back). `rebase_required()` also turns true on the first pull after coming back, so a client that only reads learns that its DB no longer matches the host (#712). A client syncing for the first time is never refused: its offline writes are taken even when they are older than the line.
 - Old clients (`HttpTransport`, `/publish` and `/pull`) can talk to a host; their acks don't reach it, so their part of the host's `_sync_ops` is not reclaimed, and while one is active the line does not move.
 - Not yet: the host reads its whole `_sync_ops` for every pull.
 
@@ -628,9 +634,9 @@ if out.history_truncated {
 A puller's cursor advances to the **max HLC it received, per author**. Two things follow, and both are contracts rather than bugs:
 
 - **A publisher-side `SubscriptionFilter` makes the cursor scope-dependent.** Records the filter drops are skipped by the cursor, so widening a subscription later does **not** bring the past back through a differential pull — and no truncation is signalled either. Recover the widened range with `Syncer::bootstrap_pull_via`. `Syncer::suppressed_since(target)` shows what a publisher declined to send, per author; `suppressed_records()` is the running total (always 0 with the default `AllRecords`).
-- **A state batch served by a *replica* can be incomplete at cell granularity**, not just row granularity — a relay cannot always map a cell back into the author's namespace. `Engine::state_records_dropped()` counts the cells it declined to serve (0 on the ordinary relay path), and the replica warns once when it serves such a batch.
+- **A state batch served by a *replica* can be incomplete at cell granularity**, not just row granularity — a relay cannot always map a cell back into the author's namespace. A text (Tag) cell another peer wrote into the author's row is served as that peer's record (same row id, that peer's dictionary ids), so a batch for one author can carry records whose `author_peer` is someone else (#711); a cell no peer's namespace can carry is left out. `Engine::state_records_dropped()` counts the cells it declined to serve (0 on the ordinary relay path), and the replica warns once when it serves such a batch.
 
-Neither is silent any more, but neither is fixed by retrying: both recover through a direct bootstrap from the author.
+Neither is silent any more, but neither is fixed by retrying: both recover through a direct bootstrap from the author (behind a host there is no such path — a cell left out of the host's state stays missing until it is written again).
 
 ## Testing
 

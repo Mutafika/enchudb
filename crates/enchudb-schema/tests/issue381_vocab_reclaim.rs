@@ -62,7 +62,10 @@ fn rolling_unique_ids_stay_within_the_vocab_budget() {
         }
         assert_eq!(failed_at, None, "回収する辞書は止まらない: {u:?}");
         assert!(u.reclaim && u.reclaim_ready, "{u:?}");
-        assert!(u.entries < 1_000, "使う場所は生きている行の分 + 余裕: {u:?}");
+        // #708: 空いた場所は、 行を消したことが書き出されるまで使い回さない。 書き出しの間に空いた分は新しい場所を使うので、
+        // 使う場所は 「生きている行の分 + 書き出し 1 回の間に空いた分」。 書き出しが追いつかない書き手は、 待つ場所が
+        // 残りの半分になった所で自分で書き出す (上限 16,000 のこの辞書では 5,400 語あたり)
+        assert!(u.entries < 8_000, "使う場所は生きている行の分 + 書き出しを待つ分: {u:?}");
         assert!(u.reclaimed > 40_000, "{u:?}");
         // 生きている行は id で引ける、 消した行の id は引けない
         for &(i, eid) in &live {
@@ -133,6 +136,10 @@ fn subscription_on_a_text_survives_reuse() {
     for i in 0..2_000 {
         let x = t.insert().set("id", format!("other{i}")).commit().unwrap();
         t.entity(x).delete().unwrap();
+        // #708: 空いた場所を使い回すのは、 行を消したことが書き出された後
+        if i % 50 == 49 {
+            db.engine().oplog_sync().unwrap();
+        }
     }
     assert!(db.engine().vocab_usage().reclaimed > 1_000);
     let again = t.insert().set("id", "watched").commit().unwrap();
@@ -159,6 +166,10 @@ fn negated_subscription_rereads_a_reused_text() {
     for i in 0..2_000 {
         let y = t.insert().set("id", format!("y{i}")).set("kind", format!("k{i}")).commit().unwrap();
         t.entity(y).delete().unwrap();
+        // #708: 空いた場所を使い回すのは、 行を消したことが書き出された後
+        if i % 50 == 49 {
+            db.engine().oplog_sync().unwrap();
+        }
     }
     live.poll();
     assert!(db.engine().vocab_usage().reclaimed > 1_000);

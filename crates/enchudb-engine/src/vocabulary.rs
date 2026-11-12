@@ -67,7 +67,43 @@ struct Reclaim {
     ready: AtomicBool,
     /// 使い回した回数 (観測用)。
     claims: AtomicU64,
+    /// #708: 参照 0 になった場所を、 その後に始まった本体の書き出しが成功するまで使い回さない ([`Vocabulary::defer_reuse`]
+    /// で有効、 ディスクに書き出す DB)。 中身は場所ごとの 「書き出しを待っている印」 (0 = 待っていない、 他 = 積んだ時の epoch)。
+    /// 書くのは `retired` の lock の下だけ、 読むのは `claim` (lock なし)。
+    stamps: std::sync::OnceLock<Box<[AtomicU32]>>,
+    /// #708: 書き出しを待っている場所 ([`RetiredWords`])。
+    retired: std::sync::Mutex<RetiredWords>,
+    /// `retired.pending` の長さ (lock なしで読む目安)。
+    waiting: AtomicU32,
+    /// `free` の長さ (lock なしで読む目安)。
+    free_len: AtomicU32,
+    /// #708: 溜まった場所のために本体を書き出す thread を 1 本にする ([`Vocabulary::begin_settle`])。
+    settle: std::sync::Mutex<()>,
+    /// #708: 前の書き出しが失敗した時の、 次に書き出す目安 (待っている数、 0 = 失敗していない)。
+    settle_backoff: AtomicU32,
 }
+
+/// #708: 参照 0 になった場所のうち、 cell の付け替えがまだディスクに届いていないかもしれないもの。
+///
+/// 辞書の回収は、 参照 0 になった場所の offsets を **その場で** 次の語 (世代 +1) に書き換える。 本体の書き出しは中身
+/// (辞書の data / offsets) を列より先に届かせる (#419) ので、 すぐ使い回すと、 「cell を別の値に書き換えた」 ことが
+/// ディスクに届く前に、 ディスクの cell がまだ指している語が潰れる。 その間に電源が落ちると、 書き出しの返った値が
+/// 読めない (番号の世代が合わない)。 Leaf の slot の #414 ([`crate::leaf_store::LeafStore::retire`]) と同じ形。
+///
+/// そこで、 使い回すのは **参照 0 になった後に始まった本体の書き出し** ([`Vocabulary::durable_begin`] → msync →
+/// [`Vocabulary::durable_end`]) が成功した後にする。 参照を返すのは cell を書き換えた後なので、 その書き出しで cell の
+/// 付け替えはディスクに届いている。 待っている場所は永続化しない — 落ちた後に開く時は参照数を列から数え直し (#385)、
+/// きれいに閉じた後は参照数の file の 0 の場所を全部待ち行列に入れる (どちらも、 開いた時の列 = ディスクの列)。
+struct RetiredWords {
+    /// `durable_begin` のたびに 1 進む (1 から。 0 は 「待っていない」 の印)
+    epoch: u32,
+    /// (積んだ時の epoch, 場所)。 epoch の昇順
+    pending: std::collections::VecDeque<(u32, u32)>,
+}
+
+/// #708: 書き手が自分で本体を書き出す目安の上限 (待っている場所の数)。 consumer の居る DB は 100 ms ごとに書き出すので
+/// 普段は届かない。
+const RETIRED_WORDS_SETTLE: u32 = 65_536;
 
 /// #385: 参照数の置き場。 file (`vocab.refs.seg`) に置けば閉じても残り、 次に開いた時に数え直さずに使える。
 /// file を持てない backing (packed / wasm) は heap に置き、 開くたびに数える。
@@ -874,6 +910,12 @@ impl Vocabulary {
             free: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ready: AtomicBool::new(false),
             claims: AtomicU64::new(0),
+            stamps: std::sync::OnceLock::new(),
+            retired: std::sync::Mutex::new(RetiredWords { epoch: 1, pending: std::collections::VecDeque::new() }),
+            waiting: AtomicU32::new(0),
+            free_len: AtomicU32::new(0),
+            settle: std::sync::Mutex::new(()),
+            settle_backoff: AtomicU32::new(0),
         });
         if set.is_ok() && trusted {
             self.finish_refs();
@@ -941,13 +983,118 @@ impl Vocabulary {
                 debug_assert!(false, "vocab slot {slot}: release without acquire (refs {cur})");
                 return;
             }
+            // #708: 最後の参照を返す時は、 書き出しを待つ印を **参照を 0 にする前に** 立てる (`retired` の lock の下)。
+            // `claim` は 「参照 0 → CLAIMED」 の CAS の後に印を読むので、 0 を見た claim は必ずこの印も見る (参照の CAS が
+            // 印の store より後 = Release / Acquire の順)。 逆の順 (0 にしてから印) だと、 その間に claim が古い待ち行列の
+            // entry でこの場所を取れる
+            if cur == 1
+                && r.ready.load(Ordering::Acquire)
+                && let Some(stamp) = r.stamps.get().and_then(|s| s.get(slot as usize))
+            {
+                let mut w = r.retired.lock().unwrap_or_else(|p| p.into_inner());
+                let e = w.epoch;
+                let prev = stamp.swap(e, Ordering::AcqRel);
+                match c.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        w.pending.push_back((e, slot));
+                        r.waiting.store(w.pending.len() as u32, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(x) => {
+                        // 並行の acquire が参照を足した: 印を戻してやり直す
+                        stamp.store(prev, Ordering::Release);
+                        cur = x;
+                        continue;
+                    }
+                }
+            }
             match c.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => break,
                 Err(x) => cur = x,
             }
         }
         if cur == 1 && r.ready.load(Ordering::Acquire) {
-            r.free.lock().unwrap_or_else(|p| p.into_inner()).push_back(slot);
+            let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
+            q.push_back(slot);
+            r.free_len.store(q.len() as u32, Ordering::Relaxed);
+        }
+    }
+
+    /// #708: 参照 0 になった場所を、 その後に始まった本体の書き出しが成功するまで使い回さないようにする ([`RetiredWords`])。
+    /// ディスクに書き出す DB の engine が、 回収を有効にした直後 (書き手が動く前) に 1 回呼ぶ。 呼ばなければ今までどおり
+    /// すぐ使い回す (ディスクの無い store)。
+    pub fn defer_reuse(&self) {
+        if let Some(r) = self.reclaim.get() {
+            let _ = r.stamps.set(zeroed_counters(self.offsets_cap as usize));
+        }
+    }
+
+    /// #708: 本体の書き出し (msync) を始める前に呼ぶ。 返り値を、 書き出しが成功した後の [`Self::durable_end`] に渡す。
+    pub fn durable_begin(&self) -> u32 {
+        let Some(r) = self.reclaim.get() else { return 0 };
+        let mut w = r.retired.lock().unwrap_or_else(|p| p.into_inner());
+        let token = w.epoch;
+        w.epoch += 1;
+        token
+    }
+
+    /// #708: [`Self::durable_begin`] が `token` を返した書き出しが成功した: それより前に参照 0 になった場所を待ち行列に
+    /// 入れる (cell の付け替えはディスクに届いた)。 待っている間に使い直されて (同じ語をもう一度書いた) また参照 0 に
+    /// なった場所は、 後の方の entry が入れる (印が自分の epoch でない entry は捨てる)。 失敗した書き出しでは呼ばないこと。
+    pub fn durable_end(&self, token: u32) {
+        let Some(r) = self.reclaim.get() else { return };
+        let Some(stamps) = r.stamps.get() else { return };
+        let mut w = r.retired.lock().unwrap_or_else(|p| p.into_inner());
+        let n = w.pending.iter().take_while(|&&(e, _)| e <= token).count();
+        if n == 0 {
+            return;
+        }
+        // lock の順は retired → free (free だけ取る `claim` / `unclaim` と逆にならない)
+        let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
+        for (e, slot) in w.pending.drain(..n) {
+            let mine = stamps
+                .get(slot as usize)
+                .is_some_and(|s| s.compare_exchange(e, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok());
+            if mine {
+                q.push_back(slot);
+            }
+        }
+        r.free_len.store(q.len() as u32, Ordering::Relaxed);
+        r.waiting.store(w.pending.len() as u32, Ordering::Relaxed);
+    }
+
+    /// #708: 書き出しを待っている場所の数。 test / 観測用。
+    pub fn retired_words(&self) -> usize {
+        self.reclaim.get().map_or(0, |r| r.waiting.load(Ordering::Relaxed) as usize)
+    }
+
+    /// #708: 書き出しを待っている場所が、 書き手が自分で本体を書き出す目安を越えたか。 目安は、 すぐ使える場所
+    /// (まだ使っていない番号 + 待ち行列) の半分 (待つ場所が辞書を使い切らせない) と [`RETIRED_WORDS_SETTLE`] の小さい方。
+    /// 前の書き出しが失敗していたら、 その時の 2 倍。 待っていなければ atomic の load 1 回で戻る。
+    #[inline]
+    pub fn settle_due(&self) -> bool {
+        let Some(r) = self.reclaim.get() else { return false };
+        let waiting = r.waiting.load(Ordering::Relaxed);
+        if waiting == 0 {
+            return false;
+        }
+        let fresh = self.max_entries.load(Ordering::Relaxed).saturating_sub(self.count.load(Ordering::Relaxed));
+        let usable = fresh.saturating_add(r.free_len.load(Ordering::Relaxed));
+        let due = RETIRED_WORDS_SETTLE.min((usable / 2).max(1)).max(r.settle_backoff.load(Ordering::Relaxed));
+        waiting >= due
+    }
+
+    /// #708: 溜まった場所のために本体を書き出す thread を 1 本にする。 `None` = 他の thread が書き出している (待たない)。
+    pub fn begin_settle(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.reclaim.get()?.settle.try_lock().ok()
+    }
+
+    /// #708: [`Self::begin_settle`] の後の書き出しの結果。 失敗したら目安を今の 2 倍にする (失敗し続ける書き出しを、
+    /// 書き換えのたびに繰り返さない)。
+    pub fn settle_finished(&self, ok: bool) {
+        if let Some(r) = self.reclaim.get() {
+            let next = if ok { 0 } else { r.waiting.load(Ordering::Relaxed).saturating_mul(2) };
+            r.settle_backoff.store(next, Ordering::Relaxed);
         }
     }
 
@@ -970,6 +1117,7 @@ impl Vocabulary {
                 q.push_back(slot);
             }
         }
+        r.free_len.store(q.len() as u32, Ordering::Relaxed);
     }
 
     /// 回収を始めたか (既存の cell を数え終えたか)。
@@ -997,12 +1145,24 @@ impl Vocabulary {
             return None;
         }
         let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
+        let mut got = None;
         while let Some(slot) = q.pop_front() {
-            if r.refs.at(slot).is_some_and(|c| c.compare_exchange(0, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
-                return Some(slot);
+            let Some(c) = r.refs.at(slot) else { continue };
+            if c.compare_exchange(0, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                continue;
             }
+            // #708: 参照は 0 だが、 cell の付け替えの書き出しを待っている (待ち行列に入った後に使い直されて、 また参照 0 に
+            // なった場所の古い entry)。 取らずに戻す — 待っている方の entry が、 書き出しの後に入れ直す。 印は参照を 0 に
+            // する前に立つ (`release_slot`) ので、 0 を見た後のこの読みは必ず見る
+            if r.stamps.get().and_then(|s| s.get(slot as usize)).is_some_and(|s| s.load(Ordering::Acquire) != 0) {
+                c.store(0, Ordering::Release);
+                continue;
+            }
+            got = Some(slot);
+            break;
         }
-        None
+        r.free_len.store(q.len() as u32, Ordering::Relaxed);
+        got
     }
 
     /// 取った場所を使えなかった (data の上限 / 空き不足): 元に戻して待ち行列の先頭へ。
@@ -1011,7 +1171,9 @@ impl Vocabulary {
             if let Some(c) = r.refs.at(slot) {
                 c.store(0, Ordering::Release);
             }
-            r.free.lock().unwrap_or_else(|p| p.into_inner()).push_front(slot);
+            let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
+            q.push_front(slot);
+            r.free_len.store(q.len() as u32, Ordering::Relaxed);
         }
     }
 
@@ -1157,6 +1319,7 @@ impl Vocabulary {
     pub fn is_full(&self) -> bool {
         self.count.load(Ordering::Relaxed) >= self.max_entries.load(Ordering::Relaxed)
             && self.reclaim_stats().0 == 0
+            && self.retired_words() == 0
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
@@ -2027,6 +2190,62 @@ mod tests {
         assert_ne!(vid_slot(c), vid_slot(a), "使い直された場所は回収しない");
         assert_eq!(v.get_checked(a), Some(&b"alpha"[..]));
         assert_eq!(v.reclaim_stats().0, 0);
+    }
+
+    /// #708: 書き出しを待つ形 (`defer_reuse`) では、 参照 0 になった場所を、 その後に始まった書き出しが済むまで使い回さない。
+    #[test]
+    fn deferred_slot_waits_for_a_write_out_started_after_the_release() {
+        let (_r, v) = reclaiming(64);
+        v.defer_reuse();
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.finish_refs();
+        let early = v.durable_begin(); // 返す前に始まった書き出し
+        v.release(a);
+        assert_eq!((v.reclaim_stats().0, v.retired_words()), (0, 1));
+        v.durable_end(early);
+        assert_eq!(v.retired_words(), 1, "返す前に始まった書き出しで使い回せるようになった");
+        let b = v.try_get_or_insert_pinned(b"beta").unwrap();
+        assert_ne!(vid_slot(b), vid_slot(a), "書き出しを待つ場所を使い回した");
+        assert_eq!(v.get_checked(a), Some(&b"alpha"[..]), "待っている語は読める");
+        assert!(!v.is_full());
+        let t = v.durable_begin();
+        v.durable_end(t);
+        assert_eq!((v.reclaim_stats().0, v.retired_words()), (1, 0));
+        let c = v.try_get_or_insert_pinned(b"gamma").unwrap();
+        assert_eq!(vid_slot(c), vid_slot(a), "書き出しの後は使い回す");
+        assert_eq!(v.get_checked(a), None);
+    }
+
+    /// #708: 待っている間 / 待ち行列に入った後に使い直されて、 また参照 0 になった場所は、 後の方の付け替えの書き出しを待つ。
+    #[test]
+    fn deferred_slot_revived_while_waiting_waits_again() {
+        let (_r, v) = reclaiming(64);
+        v.defer_reuse();
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.finish_refs();
+        v.release(a); // 待つ
+        assert!(v.acquire(a)); // 待っている間に使い直す
+        let t1 = v.durable_begin();
+        v.release(a); // t1 の書き出しが始まった後に、 また参照 0
+        v.durable_end(t1);
+        assert_eq!(v.reclaim_stats().0, 0, "後の方の付け替えが届く前に待ち行列に入った");
+        assert_eq!(v.retired_words(), 1);
+        let t2 = v.durable_begin();
+        v.durable_end(t2);
+        assert_eq!((v.reclaim_stats().0, v.retired_words()), (1, 0));
+        // 待ち行列に入った後に使い直して、 また返す: 待ち行列には古い entry が残っている
+        assert!(v.acquire(a));
+        v.release(a);
+        assert_eq!((v.reclaim_stats().0, v.retired_words()), (1, 1));
+        let b = v.try_get_or_insert_pinned(b"beta").unwrap();
+        assert_ne!(vid_slot(b), vid_slot(a), "書き出しを待つ場所を、 待ち行列の古い entry で取った");
+        assert_eq!(v.get_checked(a), Some(&b"alpha"[..]));
+        assert!(v.acquire(a), "取りかけて戻した場所は、 そのまま使い直せる");
+        v.release(a);
+        let t3 = v.durable_begin();
+        v.durable_end(t3);
+        let c = v.try_get_or_insert_pinned(b"gamma").unwrap();
+        assert_eq!(vid_slot(c), vid_slot(a));
     }
 
     /// #381: 使い回しを繰り返しても、 死んだ entry で表が埋まらない (作り直して落とす)。 引きは常に正しい。

@@ -302,6 +302,17 @@ impl PkFormer {
         self.cards.get(&slot).map_or(&[], |v| &v[..])
     }
 
+    /// 行 `slot` の名前の年表で、 identity `ids` 宛ての書き込みの名前 (主キーの himo, 値の鍵)。 LWW で負けた書き込みも。
+    pub(crate) fn names_written_to(&self, slot: u32, ids: &[(u32, u32)]) -> Vec<(u16, Box<[u8]>)> {
+        let mut out: Vec<(u16, Box<[u8]>)> = Vec::new();
+        for (id, himo, key, _) in self.timeline.get(&slot).into_iter().flatten() {
+            if ids.contains(id) && !out.iter().any(|(h, k)| h == himo && k == key) {
+                out.push((*himo, key.clone()));
+            }
+        }
+        out
+    }
+
     /// slot `slot` から identity `ids` のカードを取り出す。
     pub(crate) fn take_cards(&mut self, slot: u32, ids: &[(u32, u32)]) -> Vec<BoundCard> {
         let Some(v) = self.cards.get_mut(&slot) else { return Vec::new() };
