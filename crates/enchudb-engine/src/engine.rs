@@ -15884,7 +15884,8 @@ impl Engine {
             // 今から: 閉じた group の後ろから写す (閉じていない group は閉じた時に入る)
             wal.scan_for_change_log(enchudb_oplog::oplog::HEADER_SIZE as u64, u64::MAX, false).1
         };
-        // 畳んだ印を新しい周より先に届ける (続きの位置を探す時に、 前の周と新しい周を取り違えない)
+        // 続きの位置を探す時に前の周と新しい周を取り違えないよう、 畳んだ印は新しい周の record より先に届いている必要がある。
+        // #707 から oplog がどの DB でもそうする (`OpLog::fold_half_locked` / `settle_fold`)。 下の呼び出しは何もしない (互換)
         wal.set_sync_on_reset(true);
         let _ = self.change_log.set(log);
         Ok(())
@@ -15967,8 +15968,9 @@ impl Engine {
 
     /// 記録の続きの WAL の位置: 最後に記録した record を WAL の中で探し、 その直後。 見つからなければ WAL の頭 (記録した後に
     /// 畳んだ = WAL の record は全部その後。 畳む前に全部を写して書き出すので抜けない)。 「見つからない = 畳んだ後」 は、 畳んだ
-    /// 印を新しい周より先に書き出すので成り立つ (`OpLog::set_sync_on_reset`。 書き出さないと、 前の周の header のまま新しい周の
-    /// page だけが届いた像で前の周を途中までしか読めず、 記録した record を頭から写し直した)。
+    /// 印を新しい周より先に書き出すので成り立つ (#707 から oplog がどの DB でも、 畳んだ header が届くまでその区画に書かない:
+    /// `OpLog` の `fold_half_locked` / `settle_fold`。 届く前に書くと、 前の周の header のまま新しい周の page だけが届いた像で
+    /// 前の周を途中までしか読めず、 記録した record を頭から写し直した)。
     fn change_log_resume_offset(wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog) -> u64 {
         let start = enchudb_oplog::oplog::HEADER_SIZE as u64;
         let Some((hlc, id)) = log.last_written() else { return start };
