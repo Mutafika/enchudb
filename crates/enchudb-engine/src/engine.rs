@@ -9417,9 +9417,12 @@ impl Engine {
     /// - 語彙は bridge (`transfer_oplog_to_sync_ops`) と同じ: Number = `Tie`、
     ///   Tag = `Vocab` + `Tie`、 Leaf = `TieLeaf` (bytes 同乗)、 Ref は translated
     ///   target のみ `TieRef` (世界番号同乗、 #183)、 自 entity target は `Tie`
+    /// - 他の peer の行 (translated local) は、 **自分が書いた cell** (版数が自分の時計) だけを、 自分の record の形
+    ///   (宛名は行の世界番号 = bridge が差分で出す時と同じ) で出す (#761)。 = batch の record の宛名は自分の行とは
+    ///   限らない。 前は行ごと飛ばしていて、 ホストが state を取り直すと (`cursor = as_of`、 as_of より前の差分は
+    ///   受けない)、 まだ出していなかった他の peer の行への書き込みがどこにも配られなかった
     /// - **含まないもの** (v1): 署名 (signature = zeros — require_signature な受信側
-    ///   では使えない)、 content blob、 他 peer 行への self-authored write
-    ///   (translated local 行は skip)、 untie 済み cell の tombstone
+    ///   では使えない)、 content blob、 untie 済み cell の tombstone、 他の peer の行の削除
     ///
     /// 戻り値 `(records, as_of)`。 oplog 無効 (standalone) では `as_of` が採番
     /// できないため空を返す。
@@ -9538,15 +9541,20 @@ impl Engine {
             let vt = self.value_types[hid];
             for eid in self.entities_with_himo(himo_id) {
                 let local = enchudb_oplog::eid_local(eid);
-                // 出力する eid。 self 版は自分が author した行だけ (translated local は
-                // 他 peer が author なので skip、 self-authored cross-row write は v1
-                // 対象外)。 replica 版はその逆で、 author の translated local だけを
-                // **原 eid に戻して**配る (#226)。
+                // 出力する eid。 self 版は自分が author した行はそのまま。 replica 版は
+                // author の translated local だけを **原 eid に戻して**配る (#226)。
+                //
+                // #761: self 版は、 他の peer の行 (translated local) のうち **自分の時計の版数の cell** も出す (下の
+                // `foreign_row`)。 宛名は行の世界番号 = bridge が差分で出す時と同じ形。
+                let mut foreign_row = false;
                 let out_eid = if is_self {
-                    if self.eid_translator.is_translated_local(local) {
-                        continue;
+                    match self.eid_translator.reverse(local) {
+                        Some((owner, owner_local)) => {
+                            foreign_row = true;
+                            enchudb_oplog::make_eid(owner, owner_local)
+                        }
+                        None => eid,
                     }
-                    eid
                 } else {
                     let Some(&foreign_local) = foreign.get(&local) else { continue };
                     enchudb_oplog::make_eid(author, foreign_local)
@@ -9555,6 +9563,11 @@ impl Engine {
                 // Number64 以外の列は u32 (vid / local eid / leaf offset)
                 let value = wide as u32;
                 let mut hlc = self.version_of(local, himo_id);
+                // #761: 他の peer の行は、 自分が書いた cell (版数が自分の時計) だけ。 他の peer が書いた cell は、 その peer の
+                // record / state が運ぶ。 版数不明 (ZERO) の cell は誰が書いたか分からないので出さない (replica 版と同じ)
+                if foreign_row && hlc.peer != self_peer {
+                    continue;
+                }
                 if hlc == enchudb_oplog::Hlc::ZERO {
                     // self: 現在値が最新なので `as_of` stamp で LWW 的に安全。
                     // replica: foreign cell に自分の clock を stamp する権利が無い
