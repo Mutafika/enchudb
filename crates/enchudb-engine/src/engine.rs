@@ -1506,6 +1506,9 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
 /// flock は open file description 単位なので、同一プロセスからの二重 open は
 /// block 検知できず無期限ハングになる。flock に入る前にここで fast-fail する。
 #[cfg(not(target_arch = "wasm32"))]
+/// #704: [`Engine::cursor_create_races`] の数 (作る道でだけ足す)。
+static CURSOR_CREATE_RACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static WRITER_LOCK_REGISTRY: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -18627,10 +18630,13 @@ impl Engine {
 
     /// 名前 `name` の位置 (無ければ None、 `_cursors` が無くても None)。 行の lock の下で読む = [`cursor_set`](Self::cursor_set)
     /// で置いた組のまま。
+    ///
+    /// 0.36〜0.37.4 が作った DB には同じ名前の行が複数ありうる (#704)。 その時は eid のいちばん小さい行を読む (索引の並びに
+    /// よらない = 開き直す前も後も同じ答え。 その版が開き直した後に読み書きしていた行)。 重複はその名前の次の `cursor_set` が片付ける。
     pub fn cursor_get(&self, name: &str) -> Option<Cursor> {
         let [name_h, kind_h, pos_h, wall_h, rest_h] = self.cursor_himos()?;
         let vid = self.vocab_id(name)?;
-        let eid = self.query_by_id(&[(name_h, vid)]).into_iter().next()?;
+        let eid = self.query_by_id(&[(name_h, vid)]).into_iter().min()?;
         self.read_row(eid, || {
             let pos = self.get_by_id(eid, pos_h)?;
             let kind = self.get_by_id(eid, kind_h).unwrap_or(0) as u32;
@@ -18663,12 +18669,8 @@ impl Engine {
         if cursor.pos == u64::MAX || cursor.hlc.is_some_and(|h| h.wall == u64::MAX) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cursor_set: pos / hlc.wall must be < u64::MAX"));
         }
-        let existing = self.vocab_id(name).and_then(|vid| self.query_by_id(&[(name_h, vid)]).into_iter().next());
-        let (eid, fresh) = match existing {
-            Some(e) => (e, false),
-            None => (self.entity_in(CURSORS_TABLE).map_err(io::Error::other)?, true),
-        };
-        let write = || -> Result<(), TieRejected> {
+        let rows_of = || self.vocab_id(name).map(|vid| (vid, self.query_by_id(&[(name_h, vid)])));
+        let write = |eid: enchudb_oplog::EntityId| -> Result<(), TieRejected> {
             let _row = self.write_row(eid);
             self.try_tie_text_to_by_id(eid, name_h, name)?;
             self.try_tie_to_by_id(eid, kind_h, cursor.kind)?;
@@ -18685,15 +18687,46 @@ impl Engine {
             }
             Ok(())
         };
-        match write() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if fresh {
-                    self.delete(eid);
-                }
-                Err(io::Error::other(format!("cursor_set: {e}")))
+        let rejected = |e: TieRejected| io::Error::other(format!("cursor_set: {e}"));
+        // 行がちょうど 1 つ (いつもの道): lock なし。 行を握ってから 「生きていて、 名前がこの語」 を確かめる (作った書き手が書き込みを
+        // 断られて消した行・重複の片付けで消えた行に書かない)。 外れたら下の道で引き直す
+        if let Some((vid, rows)) = rows_of()
+            && let [eid] = rows[..]
+        {
+            let _row = self.write_row(eid);
+            if self.is_live(eid) && self.get_by_id(eid, name_h) == Some(vid as u64) {
+                return write(eid).map_err(rejected);
             }
         }
+        // #704: 行が無い / 重複している時は 1 本ずつ。 前は 「在るかの確かめ → 行を作る」 が lock の外で、 同じ名前の最初の 1 回が
+        // 並ぶと書き手ごとに行ができた (以後は索引の先頭の行を使い、 先頭は開き直すと変わるので、 開き直した後に古い位置が返った)。
+        // lock は process に 1 本 (engine の欄にしない = `Engine` の並びを変えない)。 ここを通るのは名前ごとに最初の 1 回と重複の
+        // 片付けだけで、 名前の行は書き終えるまで握る (名前のカードが次の書き手から見えてから放す)
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _create = CREATE.lock().unwrap_or_else(|p| p.into_inner());
+        let rows = rows_of().map(|(_, rows)| rows).unwrap_or_default();
+        // 残すのは eid のいちばん小さい行 (`cursor_get` が読む行)。 残りは消す (0.36〜0.37.4 が作った重複)
+        if let Some(&keep) = rows.iter().min() {
+            if rows.len() == 1 {
+                CURSOR_CREATE_RACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            write(keep).map_err(rejected)?;
+            for &e in rows.iter().filter(|&&e| e != keep) {
+                self.delete(e);
+            }
+            return Ok(());
+        }
+        let eid = self.entity_in(CURSORS_TABLE).map_err(io::Error::other)?;
+        write(eid).map_err(|e| {
+            self.delete(eid);
+            rejected(e)
+        })
+    }
+
+    /// #704 の試験用: `cursor_set` が 「行が無い」 と見て作りに来たら、 他の書き手が先に作っていた回数 (process の合計)。
+    #[doc(hidden)]
+    pub fn cursor_create_races() -> u64 {
+        CURSOR_CREATE_RACES.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `{db}/tables` に書く宣言 (名前, 形)。
