@@ -621,8 +621,10 @@ impl Syncer {
                              incomplete at cell granularity — dropped {dropped} cell(s) \
                              (undeliverable: ZERO version / unmapped Tag vid / \
                              unresolvable Ref). Followers bootstrapping via this replica \
-                             will be missing them; recover with a direct bootstrap from \
-                             the author — see #236"
+                             will be missing them. Where followers can reach the author \
+                             directly, a direct bootstrap from the author recovers them; \
+                             behind a host there is no such path, and the cells stay \
+                             missing until they are written again — see #236 / #711"
                         );
                     }
                     if !is_self && records.is_empty() {
