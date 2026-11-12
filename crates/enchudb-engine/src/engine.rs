@@ -9426,8 +9426,16 @@ impl Engine {
     ///   (宛名は行の世界番号 = bridge が差分で出す時と同じ) で出す (#761)。 = batch の record の宛名は自分の行とは
     ///   限らない。 前は行ごと飛ばしていて、 ホストが state を取り直すと (`cursor = as_of`、 as_of より前の差分は
     ///   受けない)、 まだ出していなかった他の peer の行への書き込みがどこにも配られなかった
+    /// - 外した cell (#766): 生きている行の、 **版数が自分の時計で値の無い cell** を `Untie` で出す (自分の行も他の peer の行も、
+    ///   宛名は上と同じ)。 版数は untie の版数。 他の peer が外した cell (版数がその peer の時計)、 版数不明 (ZERO) の cell、
+    ///   消えた行の cell は出さない。 版数の列の無い DB (sync の表を持たない) では出さない
+    /// - 他の peer の行の削除 (#766): **自分の時計の削除の版数**を持つ、 消えた他の peer の行を `Delete` (宛名は行の世界番号、
+    ///   版数は削除の版数) で出す。 slot を使い回して写像の外れた行は、 退避してある削除の版数から。 他の peer が消した行
+    ///   (その peer の record が運ぶ) と、 自分の行の削除 (state に現れない行は受け手の掃除が消す) は出さない。 前は
+    ///   どちらも運ばず、 ホストが state を取り直すと、 まだ出していなかった untie と他の peer の行の削除がどこにも
+    ///   配られなかった
     /// - **含まないもの** (v1): 署名 (signature = zeros — require_signature な受信側
-    ///   では使えない)、 content blob、 untie 済み cell の tombstone、 他の peer の行の削除
+    ///   では使えない)、 content blob、 他の peer が外した cell・消した行の記録
     ///
     /// 戻り値 `(records, as_of)`。 oplog 無効 (standalone) では `as_of` が採番
     /// できないため空を返す。
@@ -9682,6 +9690,9 @@ impl Engine {
                 }
             }
         }
+        if is_self {
+            self.state_unties_and_foreign_deletes(self_peer, &mut records);
+        }
         if dropped > 0 {
             // #236: 呼び出し側は差分を見て 「この batch は cell 単位で欠けている」 を
             // 判定する (`Syncer::refresh_state_providers` の provider が前後で読む)。
@@ -9695,6 +9706,76 @@ impl Engine {
             records.iter().map(|r| r.hlc).max().unwrap_or(enchudb_oplog::Hlc::ZERO)
         };
         (records, as_of)
+    }
+
+    /// #766: 自分の state に足す、 値の無い物の record (`state_records` の rustdoc の 「外した cell」 「他の peer の行の削除」)。
+    ///
+    /// どちらも差分 (bridge) で出す時と同じ形: 書き手は自分、 宛名は行の世界番号 (他の peer の行は逆写像)、 版数は
+    /// 書いた時の版数。 **自分の時計の版数の物だけ** — 他の peer の untie / 削除は、 その peer の record が運ぶ。
+    ///
+    /// - Untie: 版数の列をなめ、 生きている行の、 値が無くて版数が自分の時計の cell。 値と版数は行の lock の読みで
+    ///   揃えて読む (間に書き込みが入ると、 値は前・版数は後を掴んで、 書いた cell を外す record になる)。 slot を使い回す時に
+    ///   前の住人の版数は消してある (`clear_cell_versions`) ので、 生きている行の版数はその行の物
+    /// - Delete: 翻訳した行 (他の peer の行) のうち、 消えていて (`slot_is_dead`) 削除の版数が自分の時計の物。 slot を
+    ///   使い回して写像が外れた行は退避表 (`foreign_tombs`) から。 生きている行は、 削除の版数が残っていても出さない
+    fn state_unties_and_foreign_deletes(
+        &self,
+        self_peer: enchudb_oplog::PeerId,
+        records: &mut Vec<crate::transport::WireRecord>,
+    ) {
+        use enchudb_oplog::oplog::DecodedOp;
+        let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
+            hlc,
+            author_peer: self_peer,
+            op,
+            signature: [0u8; 64],
+            pubkey_fp: [0u8; 8],
+            signed_bytes: Vec::new(),
+        };
+        let mine = |h: enchudb_oplog::Hlc| h != enchudb_oplog::Hlc::ZERO && h.peer == self_peer;
+        if self.has_cell_version() {
+            for hid in 0..self.himos.len() {
+                if self.himo_is_in_reserved_table(hid) {
+                    continue;
+                }
+                let himo_id = hid as u16;
+                let Some(col) = self.ver_col(himo_id) else { continue };
+                for local in 0..col.count().min(self.max_entities()) {
+                    // 版数を先に見る (ほとんどの slot はここで外れる)
+                    if !mine(self.cell_hlc_local(local, himo_id)) || !self.entities.is_live(local) {
+                        continue;
+                    }
+                    let (empty, hlc) = self.row_locks.read(local, || {
+                        (self.himos[hid].get_value(local).is_none(), self.cell_hlc_local(local, himo_id))
+                    });
+                    if !empty || !mine(hlc) || !self.entities.is_live(local) {
+                        continue;
+                    }
+                    let (owner, owner_local) = self.eid_translator.reverse(local).unwrap_or((self_peer, local));
+                    let eid = enchudb_oplog::make_eid(owner, owner_local);
+                    records.push(mk(DecodedOp::Untie { eid, himo_id }, hlc));
+                }
+            }
+        }
+        let mut deletes: Vec<(enchudb_oplog::Hlc, enchudb_oplog::EntityId)> = Vec::new();
+        for (owner, owner_local, local) in self.eid_translator.snapshot() {
+            if owner == self_peer || !self.slot_is_dead(local) {
+                continue;
+            }
+            let tomb = self.tombstone_version_of(local);
+            if mine(tomb) {
+                deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
+            }
+        }
+        for (owner, owner_local, tomb) in self.orphan_foreign_tombstones() {
+            // 写像のある行は上で見た (払い出す時に退避表の版数を slot に書き戻してある)
+            if owner != self_peer && mine(tomb) && self.eid_translator.get(owner, owner_local).is_none() {
+                deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
+            }
+        }
+        deletes.sort_unstable();
+        deletes.dedup_by_key(|d| d.1);
+        records.extend(deletes.into_iter().map(|(tomb, eid)| mk(DecodedOp::Delete { eid }, tomb)));
     }
 
     /// #226: `author` の remote vid → local vid 写像 (`peer_vocab_map`) の逆引き。
