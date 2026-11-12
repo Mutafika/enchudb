@@ -773,26 +773,30 @@ impl Syncer {
         // 署名していない合成なので、 付け替えても同じ意味
         if gossip {
             let mut relayed = false;
-            // 載せなかった Vocab: (書き手, 番号) → `records` の中の位置
+            // 当たった Vocab のうち、 まだ載せていない物: (書き手, 番号) → `records` の中の位置
             let mut withheld: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
             // #780: 登録済みの Vocab (当たらなかった)。 載せる Tie が指す時だけ、 その Tie の版数で前に載せる (`withheld` と同じ形)。
             // 前は載せず (「前に載せた」)、 その 1 回が回収された後に来て中継の state で取り直した受け手が、 state の Tie を
             // 翻訳できなかった。 指す Tie を載せなければ載せない (下の受け手に要る Tie が無い)
             let mut known: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
+            // #787: **版数の昇順に並べて**載せる (同じ版数は state の順)。 state の順 (列ごと) のまま載せると、 途中まで載った所を
+            // 受けた下の受け手の cursor が、 まだ載っていない (版数の小さい) record を越える。 gate (#753 / #762) は ring に写し
+            // 終えるまで配るのを止めるが、 ring に空きが足りないと bridge は入る所まで写して止まり (空くのは下の受け手が受けて
+            // ack した後)、 途中まで載った所が配られた。 昇順なら、 どこで切れても cursor は載った所までしか進まない (差分の
+            // 流れと同じ性質)。 Vocab は先に全部控える (並べ直すと、 それを指す Tie の後ろに来うる): 当たった物は `withheld`
+            // (指す最初の載せる Tie の版数でその前に、 無ければ最後に as_of)、 登録済みの物は `known`
+            let mut order: Vec<usize> = Vec::with_capacity(relay_accepted.len());
             for &(i, applied) in &relay_accepted {
                 let r = &records[i];
-                if !applied {
-                    if let DecodedOp::Vocab { vid, .. } = &r.op {
-                        known.insert((r.author_peer, *vid), i);
-                    }
-                    continue;
+                if let DecodedOp::Vocab { vid, .. } = &r.op {
+                    if applied { &mut withheld } else { &mut known }.insert((r.author_peer, *vid), i);
+                } else if applied && !(host && r.hlc > batch.as_of) {
+                    order.push(i);
                 }
-                if host && r.hlc > batch.as_of {
-                    if let DecodedOp::Vocab { vid, .. } = &r.op {
-                        withheld.insert((r.author_peer, *vid), i);
-                    }
-                    continue;
-                }
+            }
+            order.sort_by_key(|&i| records[i].hlc);
+            for i in order {
+                let r = &records[i];
                 if (!withheld.is_empty() || !known.is_empty())
                     && let Some(vid) = self.vocab_of(r)
                     && let Some(v) = withheld.remove(&(r.author_peer, vid)).or_else(|| known.remove(&(r.author_peer, vid)))
