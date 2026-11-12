@@ -35,8 +35,31 @@
 //!   順によらない (2 人が別々の名前に改名しても、 版数の順で決まる)。 最初の改名で、 束ねた identity のカード (無ければ行の元の
 //!   identity の、 改名の前の名前と版数) を載せ、 以後はその行への名前の書き込みを全部載せる
 //!
-//! 永続化は DB directory の `pkformer` に、 変わった時にまるごと書く (改名の数だけなので小さい)。 無ければ空。 読まない旧
+//! 永続化は DB directory の `pkformer` と、 その後に変わった分の追記 `pkformer.log` (#720)。 無ければ空。 読まない旧
 //! binary は前の名前を知らないだけ (前と同じ、 今の名前でだけ束ねる)。
+//!
+//! 前は変わるたびに `pkformer` をまるごと書いていた。 束ねた行は identity ごとのカードを Leaf の中身ごと持つので、 同じ名前の
+//! 行を 2 台が 2,000 個ずつ作る表で 1.36 MB になり、 1 行の書き換えのたびに全部を書き直した。 今は `eidmap.log` (#560) と同じ形:
+//!
+//! - 変える method は、 変えた slot / identity に印を付ける (`LogTrack`)。 書き出しは、 印の付いた slot / identity の**今の中身**
+//!   (slot なら前の名前・束ねた identity・カード・名前の年表の全部) を 1 record にして log に足す。 読む時は record の順に、
+//!   その slot / identity の中身を置き換える
+//! - `pkformer` の形は変えない (版 4)。 log を読まない 0.37.4 以前は `pkformer` だけを読む。 きれいに閉じる時にまとめ直す
+//!   (`pkformer` を書き直して log を header だけにする) ので、 きれいに閉じた後は全部ある。 落ちた後 (log に record が残って
+//!   いる) に 0.37.4 以前で開くと、 log の分 (最後にまとめ直した後のカード・年表・前の名前の変化) を読まない
+//! - log の header は、 続く `pkformer` の長さと FNV-1a 64。 合わない log は読まない (まとめ直しの途中で落ちた跡か、 log を
+//!   知らない binary が `pkformer` を書き直した跡)。 まとめ直しは `pkformer` → 空の log の順に置き換える
+//! - 切れた / 壊れた / 知らない種類の record から後は捨て、 次の書き出しでまとめ直す (切れた跡の後ろに追記すると、 次に読む
+//!   時にそこで止まって失う)
+//! - まとめ直すのは他に、 disk (`pkformer` + log) が今の中身の 2 倍 + 64 KiB を越えた時 (書き換えが溜まった / 消えた行の
+//!   カードを落として中身が減った)。 今の中身の大きさは slot / identity ごとの record の長さの和で持つ
+//! - 消えた行のカードは落とす (engine の `drop_cards_of_dead_slot`。 カードは生きた行を切り離す時にだけ使う)
+//!
+//! log の file: magic "PKFL"(4) + version u32 + 続く `pkformer` の長さ u64 + その FNV-1a 64、 続いて record: 種類 u8 (1 = slot /
+//! 2 = identity) + 中身の長さ u32 + 中身 + そこまでの FNV-1a 32。 slot の中身は slot u32、 前の名前 (数 u32、 (himo u16, 鍵の長さ
+//! u32, 鍵))、 束ねた identity (数、 (peer, 番号, HLC 16 B))、 カード (数、 (peer, 番号, himo, HLC, 種類 u8, 値 u64 か 長さ u32 +
+//! 中身))、 名前の年表 (数、 (peer, 番号, HLC, himo, 鍵の長さ, 鍵))。 identity の中身は peer u32、 番号 u32、 名前 (数、 (himo,
+//! 鍵の長さ, 鍵))。
 //!
 //! file: magic "PKFN"(4) + version u32 + count u32、 続いて (himo u16, slot u32, 鍵の長さ u32, 鍵) × count。 version 2 は続けて
 //! identity の名前: count u32、 (peer u32, その peer での番号 u32, himo u16, 鍵の長さ u32, 鍵) × count。 version 3 は続けて
@@ -47,7 +70,7 @@
 //! × count (version 1〜3 も読む。
 //! 年表の無い行の前の名前は、 前と同じく作成の時刻によらず束ねる)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// (主キーの himo, 値の鍵)
 type Name = (u16, Box<[u8]>);
@@ -104,6 +127,8 @@ pub(crate) struct PkFormer {
     cards: HashMap<u32, Vec<BoundCard>>,
     /// slot → 名前の年表。 改名した行だけ
     timeline: HashMap<u32, Vec<NameWrite>>,
+    /// 追記の log (`pkformer.log`) の様子と、 前の書き出しから変わった slot / identity (#720)
+    log: LogTrack,
 }
 
 impl PkFormer {
@@ -128,6 +153,7 @@ impl PkFormer {
             return false;
         }
         v.push((id, himo, key.into(), hlc));
+        self.touch(slot);
         true
     }
 
@@ -221,6 +247,9 @@ impl PkFormer {
         } else {
             *self.timeline.get_mut(&slot).unwrap() = kept;
         }
+        if !taken.is_empty() {
+            self.touch(slot);
+        }
         taken
     }
 
@@ -252,22 +281,25 @@ impl PkFormer {
     pub(crate) fn note_card(&mut self, slot: u32, id: (u32, u32), himo: u16, card: Card, hlc: enchudb_oplog::Hlc) -> bool {
         let v = self.cards.entry(slot).or_default();
         match v.iter_mut().find(|(i, h, _, _)| *i == id && *h == himo) {
-            Some(e) if hlc != enchudb_oplog::Hlc::ZERO && e.3 >= hlc => false,
+            Some(e) if hlc != enchudb_oplog::Hlc::ZERO && e.3 >= hlc => return false,
             Some(e) => {
                 e.2 = card;
                 e.3 = hlc;
-                true
             }
-            None => {
-                v.push((id, himo, card, hlc));
-                true
-            }
+            None => v.push((id, himo, card, hlc)),
         }
+        self.touch(slot);
+        true
     }
 
     /// slot `slot` の identity `id` の列 `himo` のカード。
     pub(crate) fn card_of(&self, slot: u32, id: (u32, u32), himo: u16) -> Option<(&Card, enchudb_oplog::Hlc)> {
         self.cards.get(&slot)?.iter().find(|(i, h, _, _)| *i == id && *h == himo).map(|(_, _, c, t)| (c, *t))
+    }
+
+    /// slot `slot` のカード全部 (束ねた identity ごと・列ごと)。
+    pub(crate) fn cards_of(&self, slot: u32) -> &[BoundCard] {
+        self.cards.get(&slot).map_or(&[], |v| &v[..])
     }
 
     /// slot `slot` から identity `ids` のカードを取り出す。
@@ -279,12 +311,19 @@ impl PkFormer {
         } else {
             *self.cards.get_mut(&slot).unwrap() = kept;
         }
+        if !taken.is_empty() {
+            self.touch(slot);
+        }
         taken
     }
 
     /// slot `slot` のカードを全部取り出す。
     pub(crate) fn drop_cards(&mut self, slot: u32) -> Vec<BoundCard> {
-        self.cards.remove(&slot).unwrap_or_default()
+        let out = self.cards.remove(&slot).unwrap_or_default();
+        if !out.is_empty() {
+            self.touch(slot);
+        }
+        out
     }
 
     /// slot `slot` にカードを積む (`note_card` と同じく identity と列ごとに新しい方)。
@@ -298,16 +337,12 @@ impl PkFormer {
     pub(crate) fn add_bound(&mut self, slot: u32, id: (u32, u32), created: enchudb_oplog::Hlc) -> bool {
         let v = self.bound.entry(slot).or_default();
         match v.iter_mut().find(|(i, _)| *i == id) {
-            Some((_, c)) if *c <= created => false,
-            Some((_, c)) => {
-                *c = created;
-                true
-            }
-            None => {
-                v.push((id, created));
-                true
-            }
+            Some((_, c)) if *c <= created => return false,
+            Some((_, c)) => *c = created,
+            None => v.push((id, created)),
         }
+        self.touch(slot);
+        true
     }
 
     /// #581: slot `slot` に束ねた identity。
@@ -317,6 +352,9 @@ impl PkFormer {
 
     /// #581: slot `slot` に束ねた identity を `v` に置き換える (空なら外す)。
     pub(crate) fn set_bound(&mut self, slot: u32, v: Vec<Bound>) {
+        if self.bound_of(slot) != &v[..] {
+            self.touch(slot);
+        }
         if v.is_empty() {
             self.bound.remove(&slot);
         } else {
@@ -344,10 +382,12 @@ impl PkFormer {
                 if let Some(v) = self.by_slot.get_mut(&old) {
                     v.retain(|x| *x != k);
                 }
+                self.touch(old);
             }
             None => {}
         }
         self.by_slot.entry(slot).or_default().push(k);
+        self.touch(slot);
         true
     }
 
@@ -358,6 +398,7 @@ impl PkFormer {
             return false;
         }
         names.push((himo, key.into()));
+        self.log.ids.insert((peer, foreign_local));
         true
     }
 
@@ -375,7 +416,12 @@ impl PkFormer {
             }
             None => false,
         };
+        if moved_timeline {
+            self.touch(from);
+        }
         let Some(keys) = self.by_slot.remove(&from) else { return moved_timeline };
+        self.touch(from);
+        self.touch(to);
         for k in keys {
             if let Some(e) = self.by_key.get_mut(&k)
                 && *e == from
@@ -394,7 +440,11 @@ impl PkFormer {
     pub(crate) fn forget_slot(&mut self, slot: u32) -> bool {
         let unbound =
             self.bound.remove(&slot).is_some() | self.cards.remove(&slot).is_some() | self.timeline.remove(&slot).is_some();
+        if unbound {
+            self.touch(slot);
+        }
         let Some(keys) = self.by_slot.remove(&slot) else { return unbound };
+        self.touch(slot);
         for k in keys {
             if self.by_key.get(&k) == Some(&slot) {
                 self.by_key.remove(&k);
@@ -580,7 +630,392 @@ impl PkFormer {
         if p != buf.len() {
             return Err(format!("pkformer sidecar: {} trailing bytes (corrupt)", buf.len() - p));
         }
+        // 読み込みで付いた印は捨てる (読んだ中身は disk と同じ)
+        out.log = LogTrack::default();
         Ok(out)
+    }
+}
+
+// ---- 追記の log (`pkformer.log`、 #720) ----
+
+const LOG_MAGIC: &[u8; 4] = b"PKFL";
+const LOG_VERSION: u32 = 1;
+/// log の header の長さ: magic(4) + version u32 + 続く `pkformer` の長さ u64 + その FNV-1a 64。
+pub(crate) const LOG_HEADER_LEN: usize = 24;
+/// record の種類: slot の今の中身 (前の名前・束ねた identity・カード・名前の年表) / identity に移した名前。
+const REC_SLOT: u8 = 1;
+const REC_IDENTITY: u8 = 2;
+/// まとめ直しの余裕: disk (`pkformer` + log) が今の中身の 2 倍とこの和を越えたらまとめ直す。
+const LOG_SLACK: u64 = 64 * 1024;
+
+/// 追記の log の様子と、 前の書き出しから変わった所。
+#[derive(Default, Debug)]
+struct LogTrack {
+    /// 前の書き出しの後に変わった slot
+    slots: HashSet<u32>,
+    /// 前の書き出しの後に変わった identity (移した名前)
+    ids: HashSet<(u32, u32)>,
+    /// log が今の `pkformer` の続きとして信用できるか。 false なら次の書き出しでまとめ直す (log が無い / header が合わない /
+    /// 切れた record がある / 前の書き出しが失敗した)
+    ok: bool,
+    /// disk の `pkformer` の長さ
+    snapshot_bytes: u64,
+    /// disk の log の長さ (header 込み)
+    log_bytes: u64,
+    /// 今の中身の大きさ (中身のある slot / identity の record の長さの和。 まとめ直した `pkformer` の長さの目安)
+    live_bytes: u64,
+    /// slot → その record の長さ (中身のある slot だけ。 `live_bytes` を変わった分だけ直すため)
+    slot_bytes: HashMap<u32, u32>,
+    /// identity → その record の長さ
+    id_bytes: HashMap<(u32, u32), u32>,
+}
+
+/// 書き出す仕事 (`PkFormer::take_for_persist`)。
+#[derive(Debug)]
+pub(crate) enum Persist {
+    /// `pkformer` を `snapshot` に書き直し (空なら file を消す)、 log を `log` (header だけ) に置き換える
+    Rewrite { snapshot: Vec<u8>, log: Vec<u8> },
+    /// log に `bytes` を追記する
+    Append { bytes: Vec<u8> },
+}
+
+/// `pkformer` の bytes `snapshot` (無ければ空) の続きの、 record の無い log。
+pub(crate) fn log_header(snapshot: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LOG_HEADER_LEN);
+    out.extend_from_slice(LOG_MAGIC);
+    out.extend_from_slice(&LOG_VERSION.to_le_bytes());
+    out.extend_from_slice(&(snapshot.len() as u64).to_le_bytes());
+    out.extend_from_slice(&crate::change_log::fnv1a64(snapshot).to_le_bytes());
+    out
+}
+
+fn put_hlc(out: &mut Vec<u8>, h: enchudb_oplog::Hlc) {
+    out.extend_from_slice(&h.wall.to_le_bytes());
+    out.extend_from_slice(&h.logical.to_le_bytes());
+    out.extend_from_slice(&h.peer.to_le_bytes());
+}
+
+fn put_key(out: &mut Vec<u8>, himo: u16, key: &[u8]) {
+    out.extend_from_slice(&himo.to_le_bytes());
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+}
+
+/// record 1 つ: 種類 u8 + 中身の長さ u32 + 中身 + そこまでの FNV-1a 32。
+fn push_record(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    let start = out.len();
+    out.push(kind);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    let sum = crate::integrity::fnv1a_region(&out[start..]);
+    out.extend_from_slice(&sum.to_le_bytes());
+}
+
+/// 読む側の位置付きの切り出し (足りなければ None)。
+struct Cur<'a>(&'a [u8]);
+impl<'a> Cur<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let (a, b) = self.0.split_at_checked(n)?;
+        self.0 = b;
+        Some(a)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        self.take(2).map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        self.take(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn hlc(&mut self) -> Option<enchudb_oplog::Hlc> {
+        Some(enchudb_oplog::Hlc { wall: self.u64()?, logical: self.u32()?, peer: self.u32()? })
+    }
+    fn id(&mut self) -> Option<(u32, u32)> {
+        Some((self.u32()?, self.u32()?))
+    }
+    fn key(&mut self) -> Option<Name> {
+        let himo = self.u16()?;
+        let n = self.u32()? as usize;
+        Some((himo, self.take(n)?.into()))
+    }
+}
+
+impl PkFormer {
+    fn touch(&mut self, slot: u32) {
+        self.log.slots.insert(slot);
+    }
+
+    /// slot `slot` の今の中身の record (何も無い slot は中身の空の record = 外す)。
+    fn encode_slot(&self, slot: u32, out: &mut Vec<u8>) {
+        let mut p = Vec::new();
+        p.extend_from_slice(&slot.to_le_bytes());
+        let names = self.by_slot.get(&slot).map_or(&[][..], |v| &v[..]);
+        p.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for (himo, key) in names {
+            put_key(&mut p, *himo, key);
+        }
+        let bound = self.bound_of(slot);
+        p.extend_from_slice(&(bound.len() as u32).to_le_bytes());
+        for ((peer, fl), h) in bound {
+            p.extend_from_slice(&peer.to_le_bytes());
+            p.extend_from_slice(&fl.to_le_bytes());
+            put_hlc(&mut p, *h);
+        }
+        let cards = self.cards_of(slot);
+        p.extend_from_slice(&(cards.len() as u32).to_le_bytes());
+        for ((peer, fl), himo, card, h) in cards {
+            p.extend_from_slice(&peer.to_le_bytes());
+            p.extend_from_slice(&fl.to_le_bytes());
+            p.extend_from_slice(&himo.to_le_bytes());
+            put_hlc(&mut p, *h);
+            match card {
+                Card::Gone => p.push(0),
+                Card::Value(v) => {
+                    p.push(1);
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
+                Card::Bytes(b) => {
+                    p.push(2);
+                    p.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    p.extend_from_slice(b);
+                }
+            }
+        }
+        let names = self.timeline.get(&slot).map_or(&[][..], |v| &v[..]);
+        p.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for ((peer, fl), himo, key, h) in names {
+            p.extend_from_slice(&peer.to_le_bytes());
+            p.extend_from_slice(&fl.to_le_bytes());
+            put_hlc(&mut p, *h);
+            put_key(&mut p, *himo, key);
+        }
+        push_record(out, REC_SLOT, &p);
+    }
+
+    /// identity `id` に移した名前の record。
+    fn encode_identity(&self, id: (u32, u32), out: &mut Vec<u8>) {
+        let mut p = Vec::new();
+        p.extend_from_slice(&id.0.to_le_bytes());
+        p.extend_from_slice(&id.1.to_le_bytes());
+        let names = self.by_identity.get(&id).map_or(&[][..], |v| &v[..]);
+        p.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for (himo, key) in names {
+            put_key(&mut p, *himo, key);
+        }
+        push_record(out, REC_IDENTITY, &p);
+    }
+
+    /// record の中身を当てる (slot / identity の中身をその record の物に置き換える)。 読めなければ None (何も変えない)。
+    fn apply_record(&mut self, kind: u8, payload: &[u8]) -> Option<()> {
+        let mut c = Cur(payload);
+        match kind {
+            REC_SLOT => {
+                let slot = c.u32()?;
+                let names: Vec<Name> = (0..c.u32()?).map(|_| c.key()).collect::<Option<_>>()?;
+                let bound: Vec<Bound> = (0..c.u32()?).map(|_| Some((c.id()?, c.hlc()?))).collect::<Option<_>>()?;
+                let cards: Vec<BoundCard> = (0..c.u32()?)
+                    .map(|_| {
+                        let id = c.id()?;
+                        let himo = c.u16()?;
+                        let h = c.hlc()?;
+                        let card = match c.u8()? {
+                            0 => Card::Gone,
+                            1 => Card::Value(c.u64()?),
+                            2 => {
+                                let n = c.u32()? as usize;
+                                Card::Bytes(c.take(n)?.into())
+                            }
+                            _ => return None,
+                        };
+                        Some((id, himo, card, h))
+                    })
+                    .collect::<Option<_>>()?;
+                let timeline: Vec<NameWrite> = (0..c.u32()?)
+                    .map(|_| {
+                        let id = c.id()?;
+                        let h = c.hlc()?;
+                        let (himo, key) = c.key()?;
+                        Some((id, himo, key, h))
+                    })
+                    .collect::<Option<_>>()?;
+                if !c.0.is_empty() {
+                    return None;
+                }
+                // 前の名前: この slot の分を外してから置く (他の slot が持っていた名前は、 後から持った方 = この record の slot)
+                for k in self.by_slot.remove(&slot).unwrap_or_default() {
+                    if self.by_key.get(&k) == Some(&slot) {
+                        self.by_key.remove(&k);
+                    }
+                }
+                for (himo, key) in names {
+                    self.insert(himo, &key, slot);
+                }
+                self.set_bound(slot, bound);
+                self.cards.remove(&slot);
+                if !cards.is_empty() {
+                    self.cards.insert(slot, cards);
+                }
+                self.timeline.remove(&slot);
+                if !timeline.is_empty() {
+                    self.timeline.insert(slot, timeline);
+                }
+            }
+            REC_IDENTITY => {
+                let id = c.id()?;
+                let names: Vec<Name> = (0..c.u32()?).map(|_| c.key()).collect::<Option<_>>()?;
+                if !c.0.is_empty() {
+                    return None;
+                }
+                self.by_identity.remove(&id);
+                if !names.is_empty() {
+                    self.by_identity.insert(id, names);
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// `pkformer` の bytes `snapshot` と、 その続きの log `log` (どちらも無ければ None) を読む。 log は header が `snapshot` と合う
+    /// 時だけ当てる (合わない log は、 まとめ直しの途中で落ちた跡か、 log を知らない binary が `pkformer` を書き直した跡)。 切れた /
+    /// 壊れた / 知らない種類の record から後は捨て、 次の書き出しでまとめ直す (切れた跡の後ろに追記すると、 次に読む時にそこで
+    /// 止まって失う)。 `snapshot` が読めなければ Err。
+    pub(crate) fn load(snapshot: Option<&[u8]>, log: Option<&[u8]>) -> Result<Self, String> {
+        let mut out = match snapshot {
+            Some(buf) => Self::deserialize(buf)?,
+            None => Self::default(),
+        };
+        let snap = snapshot.unwrap_or(&[]);
+        let mut ok = false;
+        let mut log_bytes = 0u64;
+        if let Some(log) = log
+            && log.len() >= LOG_HEADER_LEN
+            && log[..LOG_HEADER_LEN] == log_header(snap)[..]
+        {
+            let mut off = LOG_HEADER_LEN;
+            ok = true;
+            while off < log.len() {
+                let rec = (|| {
+                    let head = log.get(off..off + 5)?;
+                    let len = u32::from_le_bytes(head[1..5].try_into().unwrap()) as usize;
+                    let end = off.checked_add(5)?.checked_add(len)?;
+                    let sum = log.get(end..end.checked_add(4)?)?;
+                    if crate::integrity::fnv1a_region(&log[off..end]) != u32::from_le_bytes(sum.try_into().unwrap()) {
+                        return None;
+                    }
+                    Some((head[0], &log[off + 5..end], end + 4))
+                })();
+                match rec.and_then(|(kind, payload, next)| out.apply_record(kind, payload).map(|()| next)) {
+                    Some(next) => off = next,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            log_bytes = off as u64;
+        }
+        out.log = LogTrack { ok, snapshot_bytes: snap.len() as u64, log_bytes, ..LogTrack::default() };
+        // 今の中身の大きさを数える (slot / identity ごとの record の長さ)
+        let mut slots: HashSet<u32> = out.by_slot.keys().copied().collect();
+        slots.extend(out.bound.keys().chain(out.cards.keys()).chain(out.timeline.keys()));
+        let ids: Vec<(u32, u32)> = out.by_identity.keys().copied().collect();
+        let mut scratch = Vec::new();
+        for slot in slots {
+            scratch.clear();
+            out.account_slot(slot, &mut scratch);
+        }
+        for id in ids {
+            scratch.clear();
+            out.account_identity(id, &mut scratch);
+        }
+        Ok(out)
+    }
+
+    /// log に record があるか (きれいに閉じる時にまとめ直すかの判定)。
+    pub(crate) fn log_has_records(&self) -> bool {
+        self.log.log_bytes > LOG_HEADER_LEN as u64
+    }
+
+    /// slot `slot` に中身があるか。
+    fn slot_has_state(&self, slot: u32) -> bool {
+        self.by_slot.get(&slot).is_some_and(|v| !v.is_empty())
+            || !self.bound_of(slot).is_empty()
+            || !self.cards_of(slot).is_empty()
+            || self.timeline.contains_key(&slot)
+    }
+
+    /// slot `slot` の今の record を `out` に足し、 今の中身の大きさ (`live_bytes`) を直す。
+    fn account_slot(&mut self, slot: u32, out: &mut Vec<u8>) {
+        let start = out.len();
+        self.encode_slot(slot, out);
+        let now = if self.slot_has_state(slot) { (out.len() - start) as u32 } else { 0 };
+        let before = match now {
+            0 => self.log.slot_bytes.remove(&slot),
+            n => self.log.slot_bytes.insert(slot, n),
+        };
+        self.log.live_bytes = self.log.live_bytes + now as u64 - before.unwrap_or(0) as u64;
+    }
+
+    /// [`Self::account_slot`] の identity 版。
+    fn account_identity(&mut self, id: (u32, u32), out: &mut Vec<u8>) {
+        let start = out.len();
+        self.encode_identity(id, out);
+        let now = if self.by_identity.contains_key(&id) { (out.len() - start) as u32 } else { 0 };
+        let before = match now {
+            0 => self.log.id_bytes.remove(&id),
+            n => self.log.id_bytes.insert(id, n),
+        };
+        self.log.live_bytes = self.log.live_bytes + now as u64 - before.unwrap_or(0) as u64;
+    }
+
+    /// 書き出す仕事を取り出す (変わった所の印を下ろす)。 何も変わっていなければ None。
+    ///
+    /// - log が信用できない / `compact` (きれいに閉じる時、 log に record があれば) / 足した後の disk の大きさ (`pkformer` +
+    ///   log) が今の中身の 2 倍 + 64 KiB を越える (書き換えが溜まった / 消えた行のカードを落として中身が減った) → まとめ直す
+    /// - それ以外 → 変わった slot / identity の今の中身を log に足す
+    ///
+    /// 書けたら [`Self::persisted`]、 書けなかったら [`Self::persist_failed`] を呼ぶ。
+    pub(crate) fn take_for_persist(&mut self, compact: bool) -> Option<Persist> {
+        let mut slots: Vec<u32> = std::mem::take(&mut self.log.slots).into_iter().collect();
+        let mut ids: Vec<(u32, u32)> = std::mem::take(&mut self.log.ids).into_iter().collect();
+        slots.sort_unstable();
+        ids.sort_unstable();
+        let mut bytes = Vec::new();
+        for slot in slots {
+            self.account_slot(slot, &mut bytes);
+        }
+        for id in ids {
+            self.account_identity(id, &mut bytes);
+        }
+        let after = self.log.snapshot_bytes + self.log.log_bytes + bytes.len() as u64;
+        if !self.log.ok || (compact && self.log_has_records()) || after > 2 * self.log.live_bytes + LOG_SLACK {
+            let snapshot = if self.is_empty() { Vec::new() } else { self.serialize() };
+            let log = log_header(&snapshot);
+            return Some(Persist::Rewrite { snapshot, log });
+        }
+        (!bytes.is_empty()).then_some(Persist::Append { bytes })
+    }
+
+    /// `job` を書けた。
+    pub(crate) fn persisted(&mut self, job: &Persist) {
+        match job {
+            Persist::Rewrite { snapshot, log } => {
+                self.log.ok = true;
+                self.log.snapshot_bytes = snapshot.len() as u64;
+                self.log.log_bytes = log.len() as u64;
+            }
+            Persist::Append { bytes } => self.log.log_bytes += bytes.len() as u64,
+        }
+    }
+
+    /// 書けなかった: 次の書き出しでまとめ直す (途中まで書けた record の後ろに足さない)。
+    pub(crate) fn persist_failed(&mut self) {
+        self.log.ok = false;
     }
 }
 
@@ -781,5 +1216,211 @@ mod tests {
         for cut in [bytes.len() - 1, bytes.len() - 3, bytes.len() - 20] {
             assert!(PkFormer::deserialize(&bytes[..cut]).is_err(), "{cut} byte で切れた file を読んだ");
         }
+    }
+    /// #720 の試験の disk: `pkformer` (無ければ None) と `pkformer.log`。
+    #[derive(Default)]
+    struct Disk {
+        snapshot: Option<Vec<u8>>,
+        log: Option<Vec<u8>>,
+    }
+
+    impl Disk {
+        /// 書き出しを 1 回 (engine の `persist_pk_former` と同じ当て方)。 何を書いたか。
+        fn persist(&mut self, f: &mut PkFormer, compact: bool) -> Option<&'static str> {
+            let job = f.take_for_persist(compact)?;
+            let what = match &job {
+                Persist::Rewrite { snapshot, log } => {
+                    self.snapshot = (!snapshot.is_empty()).then(|| snapshot.clone());
+                    self.log = Some(log.clone());
+                    "rewrite"
+                }
+                Persist::Append { bytes } => {
+                    self.log.as_mut().expect("log の無い所に追記した").extend_from_slice(bytes);
+                    "append"
+                }
+            };
+            f.persisted(&job);
+            Some(what)
+        }
+
+        fn load(&self) -> PkFormer {
+            PkFormer::load(self.snapshot.as_deref(), self.log.as_deref()).unwrap()
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) % n
+        }
+    }
+
+    /// 変える method を乱数で 1 つ呼ぶ (engine が呼ぶ物を全部)。
+    fn mutate(f: &mut PkFormer, r: &mut Rng) {
+        let slot = r.below(6) as u32;
+        let other = r.below(6) as u32;
+        let id = (1 + r.below(3) as u32, r.below(3) as u32);
+        let himo = r.below(2) as u16;
+        let key = [b"k0".as_slice(), b"k1", b"k2", b"k3"][r.below(4) as usize];
+        let t = h(1 + r.below(50));
+        match r.below(15) {
+            0 => drop(f.insert(himo, key, slot)),
+            1 => drop(f.insert_identity(id.0, id.1, himo, key)),
+            2 => drop(f.move_names(slot, other)),
+            3 => drop(f.forget_slot(slot)),
+            4 => drop(f.add_bound(slot, id, t)),
+            5 => {
+                let mut v = f.bound_of(slot).to_vec();
+                v.pop();
+                f.set_bound(slot, v);
+            }
+            6 => drop(f.note_card(slot, id, himo, Card::Value(r.below(9)), t)),
+            7 => drop(f.note_card(slot, id, himo, Card::Bytes(vec![7u8; r.below(40) as usize].into()), t)),
+            8 => drop(f.note_card(slot, id, himo, Card::Gone, t)),
+            9 => {
+                let taken = f.take_cards(slot, &[id]);
+                f.put_cards(other, taken);
+            }
+            10 => drop(f.drop_cards(slot)),
+            11 => drop(f.note_name(slot, id, himo, key, t)),
+            12 => {
+                let taken = f.take_names(slot, &[id]);
+                f.put_names(other, taken);
+            }
+            13 => drop(f.move_names_by_timeline(slot, other)),
+            _ => drop(f.note_name(slot, id, himo, key, t)),
+        }
+    }
+
+    /// #720: どの method で変えても、 変わった所には印が付く = 追記した log を当てた disk の中身が memory と同じ。 まとめ直しと
+    /// 追記の両方を踏む (前提)。 印を 1 つ外すと落ちる (変異で確かめた)。
+    #[test]
+    fn the_log_plus_the_snapshot_always_reads_back_what_is_in_memory() {
+        let (mut appends, mut rewrites) = (0, 0);
+        for seed in 0..200u64 {
+            let mut r = Rng(seed);
+            let mut f = PkFormer::default();
+            let mut disk = Disk::default();
+            for round in 0..40 {
+                for _ in 0..1 + r.below(4) {
+                    mutate(&mut f, &mut r);
+                }
+                match disk.persist(&mut f, false) {
+                    Some("append") => appends += 1,
+                    Some(_) => rewrites += 1,
+                    None => {}
+                }
+                assert_eq!(disk.load().serialize(), f.serialize(), "seed {seed} round {round}: disk と memory が違う");
+                // 開き直した物に続けて足しても同じ (log の様子が戻る)
+                if round % 9 == 8 {
+                    f = disk.load();
+                }
+            }
+            // きれいに閉じる: log は header だけ、 `pkformer` だけで全部ある (log を読まない旧 binary の読み方 = deserialize)
+            disk.persist(&mut f, true);
+            assert_eq!(disk.log.as_ref().unwrap().len(), LOG_HEADER_LEN, "seed {seed}: 閉じた後の log に record が残った");
+            let old_reader = disk.snapshot.as_deref().map(|b| PkFormer::deserialize(b).unwrap()).unwrap_or_default();
+            assert_eq!(old_reader.serialize(), f.serialize(), "seed {seed}: 閉じた後の pkformer だけでは足りない");
+        }
+        assert!(appends > 1000 && rewrites >= 200, "前提: 追記 {appends} 回 / まとめ直し {rewrites} 回");
+    }
+
+    /// #720: 追記の途中で切れた / 壊れた record から後は捨て、 次の書き出しでまとめ直す。 header が今の `pkformer` と合わない log
+    /// (まとめ直しの途中で落ちた / log を知らない binary が `pkformer` を書き直した) は読まない。 log の無い `pkformer` (0.37.4 が
+    /// 書いた物) はそのまま読め、 最初の書き出しでまとめ直して log を作る。
+    #[test]
+    fn a_torn_or_foreign_log_is_not_trusted() {
+        let mut f = PkFormer::default();
+        let mut disk = Disk::default();
+        f.insert(3, b"tokyo", 10);
+        assert_eq!(disk.persist(&mut f, false), Some("rewrite"), "log の無い所はまとめて書く");
+        f.note_card(10, (1, 1), 0, Card::Bytes(b"memo".as_slice().into()), h(3));
+        f.add_bound(10, (1, 1), h(2));
+        assert_eq!(disk.persist(&mut f, false), Some("append"));
+        let after_first = f.serialize();
+        f.insert(3, b"osaka", 11);
+        assert_eq!(disk.persist(&mut f, false), Some("append"));
+        assert_eq!(disk.persist(&mut f, false), None, "変わっていないのに書いた");
+        let full = disk.log.clone().unwrap();
+
+        // 最後の record の途中で切れた / 1 byte 化けた
+        for damage in ["cut", "flip"] {
+            let mut log = full.clone();
+            match damage {
+                "cut" => log.truncate(full.len() - 3),
+                _ => *log.last_mut().unwrap() ^= 1,
+            }
+            let torn = Disk { snapshot: disk.snapshot.clone(), log: Some(log) };
+            let mut back = torn.load();
+            assert_eq!(back.serialize(), after_first, "{damage}: 切れていない record まで読む");
+            assert!(!back.log.ok, "{damage}: 切れた log を信用した");
+            back.insert(3, b"kyoto", 12);
+            let mut torn = torn;
+            assert_eq!(torn.persist(&mut back, false), Some("rewrite"), "{damage}: 切れた跡の後ろに追記した");
+            assert_eq!(torn.load().serialize(), back.serialize());
+        }
+        // header が合わない log (別の `pkformer` の続き)
+        let mut other = PkFormer::default();
+        other.insert(3, b"nagoya", 20);
+        let foreign = Disk { snapshot: Some(other.serialize()), log: Some(full.clone()) };
+        let back = foreign.load();
+        assert_eq!(back.serialize(), other.serialize(), "別の pkformer の続きの log を当てた");
+        assert!(!back.log.ok);
+        // log が無い (0.37.4 が書いた `pkformer`)
+        let old = Disk { snapshot: Some(f.serialize()), log: None };
+        let mut back = old.load();
+        assert_eq!(back.serialize(), f.serialize());
+        back.insert(3, b"kyoto", 12);
+        let mut old = old;
+        assert_eq!(old.persist(&mut back, false), Some("rewrite"));
+        assert_eq!(old.log.as_ref().unwrap().len(), LOG_HEADER_LEN);
+        // どちらも無い
+        assert!(Disk::default().load().is_empty());
+        // 書けなかった後はまとめ直す
+        let mut g = disk.load();
+        g.insert(3, b"kobe", 13);
+        let _lost = g.take_for_persist(false).unwrap();
+        g.persist_failed();
+        assert_eq!(disk.persist(&mut g, false), Some("rewrite"), "失敗した追記の後ろに足した");
+        assert_eq!(disk.load().serialize(), g.serialize());
+    }
+
+    /// #720: 1 つの slot の書き換えは、 その slot の record だけを足す (全体の大きさによらない)。 中身が減って disk が今の中身の
+    /// 2 倍 + 64 KiB を越えたら、 まとめ直して縮む。
+    #[test]
+    fn an_append_is_one_slot_and_a_shrunk_store_is_compacted() {
+        let mut f = PkFormer::default();
+        let mut disk = Disk::default();
+        let body = vec![b'x'; 200];
+        for slot in 0..2000u32 {
+            for id in [(1, slot), (2, slot)] {
+                f.add_bound(slot, id, h(1));
+                f.note_card(slot, id, 0, Card::Value(slot as u64), h(1));
+                f.note_card(slot, id, 2, Card::Bytes(body.clone().into()), h(1));
+            }
+        }
+        assert_eq!(disk.persist(&mut f, false), Some("rewrite"));
+        let snapshot = disk.snapshot.as_ref().unwrap().len();
+        assert!(snapshot > 1_000_000, "前提: pkformer は 1 MB を越える ({snapshot} B)");
+        for round in 0..5u64 {
+            f.note_card(7, (1, 7), 1, Card::Value(round), h(10 + round));
+            let before = disk.log.as_ref().unwrap().len();
+            assert_eq!(disk.persist(&mut f, false), Some("append"));
+            let grew = disk.log.as_ref().unwrap().len() - before;
+            assert!(grew < 1024, "1 つの slot の書き換えで {grew} B 足した");
+            assert_eq!(disk.snapshot.as_ref().unwrap().len(), snapshot, "pkformer を書き直した");
+        }
+        // 全部の行が消えた (カードを落とす)
+        for slot in 0..2000u32 {
+            f.drop_cards(slot);
+        }
+        assert_eq!(disk.persist(&mut f, false), Some("rewrite"), "中身が減ったのにまとめ直さない");
+        let after = disk.snapshot.as_ref().map_or(0, |s| s.len()) + disk.log.as_ref().unwrap().len();
+        assert!(after < snapshot / 4, "消した後も {after} B (前は {snapshot} B)");
+        assert_eq!(disk.load().serialize(), f.serialize());
     }
 }

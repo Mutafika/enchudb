@@ -29,6 +29,9 @@ pub const PKTOMBS: &str = "pktombs";
 pub const EIDALIAS: &str = "eidalias";
 /// 主キーの前の名前 (`crate::pk_former`)。 読まない旧 binary は今の名前でだけ束ねる。
 pub const PKFORMER: &str = "pkformer";
+/// #720: `pkformer` の後に変わった分の追記 (`crate::pk_former`)。 header が今の `pkformer` と合う時だけ読む。 読まない旧 binary は
+/// `pkformer` だけを読む (きれいに閉じた後は追記が空なので全部ある)。
+pub const PKFORMER_LOG: &str = "pkformer.log";
 /// region CRC table (`integrity`)。
 pub const CRC: &str = "crc";
 /// writer 排他 (flock)。 中身は空。
@@ -46,8 +49,9 @@ pub const LEAFFREE: &str = "leaf.free";
 pub const CREATING: &str = "creating";
 
 /// segment 以外に DB directory へ置かれ得る file 名の一覧 (migrate / copy 用)。
-pub const ALL: [&str; 13] =
-    [OPLOG, TABLES, EIDMAP, EIDMAP_LOG, EIDALIAS, VOCABMAP, PKTOMBS, PKFORMER, CRC, LOCK, SCHEMA, LEAFFREE, SEGMENTS];
+pub const ALL: [&str; 14] = [
+    OPLOG, TABLES, EIDMAP, EIDMAP_LOG, EIDALIAS, VOCABMAP, PKTOMBS, PKFORMER, PKFORMER_LOG, CRC, LOCK, SCHEMA, LEAFFREE, SEGMENTS,
+];
 
 /// HTTP bootstrap (`/bootstrap/{name}`) で本体と別に配る sidecar。 `.eidmap` 無しの
 /// restore は再 sync で重複 entity / tombstone 喪失、 `.vocabmap` 無しは受信済み `Vocab`
@@ -55,7 +59,8 @@ pub const ALL: [&str; 13] =
 /// 古い行に当たらない (#513。 旧 server は 404 を返し、 受け手は無しで続ける)。 `eidalias` 無しは、 畳んだ行の世界番号宛ての
 /// record が新しい行として払い出される (#178)。 `pkformer` 無しは、 改名を知らない peer の古い名前の行が改名した行に束ならない。
 /// `eidmap` は `eidmap.log` を当てた形で配る (`Engine::eidmap_for_bootstrap`、 #560)。 log は配らない (古い受け手は取りに来ない、
-/// 別々に読むと間にまとめ直しが入って合わなくなる)。
+/// 別々に読むと間にまとめ直しが入って合わなくなる)。 `pkformer` も同じく `pkformer.log` を当てた形で配る
+/// (`Engine::pkformer_for_bootstrap`、 #720)。
 pub const BOOTSTRAP: [&str; 6] = [EIDMAP, EIDALIAS, TABLES, VOCABMAP, PKTOMBS, PKFORMER];
 
 /// `{db_dir}/{name}`。

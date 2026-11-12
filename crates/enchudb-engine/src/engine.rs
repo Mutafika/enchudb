@@ -1360,30 +1360,34 @@ fn pkformer_path_for(path: &str) -> std::path::PathBuf {
     crate::db_files::path_for(path, crate::db_files::PKFORMER)
 }
 
-/// 主キーの前の名前を sidecar に atomic 書き換え。 無ければ file を消す。
+/// 主キーの前の名前の追記 (`pkformer.log`、 #720) の path。
 #[cfg(not(target_arch = "wasm32"))]
-fn persist_pkformer_to_sidecar(db_path: &str, former: &crate::pk_former::PkFormer) -> io::Result<()> {
-    let p = pkformer_path_for(db_path);
-    if former.is_empty() {
-        return match std::fs::remove_file(&p) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-    }
-    crate::db_files::write_atomic_if_changed(&p, &former.serialize()).map(|_| ())
+fn pkformer_log_path_for(path: &str) -> std::path::PathBuf {
+    crate::db_files::path_for(path, crate::db_files::PKFORMER_LOG)
 }
 
-/// 主キーの前の名前の sidecar を読む。 不在なら Ok(None)。
+/// 主キーの前の名前の sidecar (`pkformer` と、 その続きの `pkformer.log`、 #720) を読む。 どちらも不在なら Ok(None)。 2 つ目は
+/// `pkformer` の bytes (無ければ None)。
+///
+/// log を先に読む (`read_eidmap_sidecars` と同じ): まとめ直しは `pkformer` → 空の log の順に置き換えるので、 log の後に読んだ
+/// `pkformer` が合わなければ、 その `pkformer` は log より新しい = 全部を持つ (別の process の書き手と並ぶ読み手 (readonly で開く /
+/// relay の bootstrap) でも、 log にだけある記録を落とさない)。
 #[cfg(not(target_arch = "wasm32"))]
-fn load_pkformer_from_sidecar(db_path: &str) -> io::Result<Option<crate::pk_former::PkFormer>> {
+fn load_pkformer_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_former::PkFormer, Option<Vec<u8>>)>> {
     enchudb_oplog::io_point("sidecar.read_pkformer")?;
-    match std::fs::read(pkformer_path_for(db_path)) {
-        Ok(buf) => crate::pk_former::PkFormer::deserialize(&buf)
-            .map(Some)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+    let read = |p: std::path::PathBuf| match std::fs::read(p) {
+        Ok(buf) => Ok(Some(buf)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
+    };
+    let log = read(pkformer_log_path_for(db_path))?;
+    let snapshot = read(pkformer_path_for(db_path))?;
+    if log.is_none() && snapshot.is_none() {
+        return Ok(None);
     }
+    crate::pk_former::PkFormer::load(snapshot.as_deref(), log.as_deref())
+        .map(|f| Some((f, snapshot)))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// #513: `pktombs` を読む。 不在なら Ok(None)。 2 つ目は切れた末尾を捨てたか。
@@ -6302,7 +6306,7 @@ impl Engine {
         eng.eid_translator.clear_dirty();
         // 主キーの前の名前。 壊れていたら警告して無しで続ける (今の名前でだけ束ねる = 前の版の動き)
         match load_pkformer_from_sidecar(path) {
-            Ok(Some(former)) => {
+            Ok(Some((former, _))) => {
                 if !former.is_empty() {
                     eng.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
                 }
@@ -10180,18 +10184,82 @@ impl Engine {
         self.persist_vocab_map_if_dirty()
     }
 
-    /// 主キーの前の名前を、 変わっていれば書き出す。
+    /// 主キーの前の名前を、 変わっていれば書き出す。 #720: 変わった slot / identity の今の中身だけを `pkformer.log` に追記する
+    /// (前は `pkformer` をまるごと書き直していた。 束ねた行は Leaf の中身ごとカードを持つので、 行の数に比例した)。 log が
+    /// 信用できない / 大きくなった / きれいに閉じる時 (`compact`) は、 まとめ直す (`pkformer` を書き直して log を header だけに
+    /// する。 `pk_former.rs` の `take_for_persist`)。 印を先に下ろしてから取り出すので、 取り出した後に変わった分は印が立ち直り、
+    /// 次に書く。 書けなかったら印を戻し、 次はまとめ直す。 呼び手は `sidecar_persist_lock` を握っている。
     #[cfg(not(target_arch = "wasm32"))]
-    fn persist_pk_former_if_dirty(&self) -> io::Result<()> {
+    fn persist_pk_former(&self, compact: bool) -> io::Result<()> {
+        use crate::pk_former::Persist;
         use std::sync::atomic::Ordering;
-        if !self.pk_former_dirty.swap(false, Ordering::AcqRel) {
+        let dirty = self.pk_former_dirty.swap(false, Ordering::AcqRel);
+        if !dirty && !(compact && self.pk_former.read().unwrap().log_has_records()) {
             return Ok(());
         }
-        let r = persist_pkformer_to_sidecar(&self.path, &self.pk_former.read().unwrap());
-        if r.is_err() {
-            self.pk_former_dirty.store(true, Ordering::Release);
+        let Some(job) = self.pk_former.write().unwrap().take_for_persist(compact) else { return Ok(()) };
+        let (path, log_path) = (pkformer_path_for(&self.path), pkformer_log_path_for(&self.path));
+        let r = match &job {
+            // `pkformer` → 空の log の順 (間で落ちても、 header の合わない log は読まれない)
+            Persist::Rewrite { snapshot, log } => {
+                let snap = if snapshot.is_empty() {
+                    // 電源断の模擬: 消す file の控えを捨てる (inode の番号は次に作った file に渡る)
+                    #[cfg(all(feature = "crashsim", unix))]
+                    let r = enchudb_oplog::crashsim::releasing(&path, || std::fs::remove_file(&path));
+                    #[cfg(not(all(feature = "crashsim", unix)))]
+                    let r = std::fs::remove_file(&path);
+                    match r {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                        _ => Ok(()),
+                    }
+                } else {
+                    crate::db_files::write_atomic_if_changed(&path, snapshot).map(|_| ())
+                };
+                snap.and_then(|()| crate::db_files::write_atomic_if_changed(&log_path, log).map(|_| ()))
+            }
+            Persist::Append { bytes } => crate::db_files::append_synced(&log_path, bytes),
+        };
+        let mut g = self.pk_former.write().unwrap();
+        match &r {
+            Ok(()) => g.persisted(&job),
+            Err(_) => {
+                g.persist_failed();
+                self.pk_former_dirty.store(true, Ordering::Release);
+            }
         }
         r
+    }
+
+    /// [`Self::persist_pk_former`] の、 まとめ直しを求めない形。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_pk_former_if_dirty(&self) -> io::Result<()> {
+        self.persist_pk_former(false)
+    }
+
+    /// #720: 書き出した `pkformer` + `pkformer.log` を読み直した中身が、 memory の中身と同じか。 印の付け忘れ (変えたのに log に
+    /// 載らない) を試験で拾う。 違えば Some(説明)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn pkformer_disk_diff(&self) -> io::Result<Option<String>> {
+        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let disk = load_pkformer_from_sidecar(&self.path)?.map(|(f, _)| f).unwrap_or_default();
+        let (disk, mem) = (disk.serialize(), self.pk_former.read().unwrap().serialize());
+        Ok((disk != mem).then(|| format!("pkformer: disk {} B と memory {} B の中身が違う", disk.len(), mem.len())))
+    }
+
+    /// #720: relay の bootstrap (`/bootstrap/pkformer`) が配る `pkformer` (`pkformer.log` を当てた形)。 不在なら Ok(None)。 受け手は
+    /// log を取りに来ない (`eidmap_for_bootstrap` と同じ理由)。 開いている DB の横で読んでよい。 中身が読めない `pkformer` は
+    /// そのまま返す (受け手が開く時に警告して無しで続ける、 前と同じ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn pkformer_for_bootstrap(db_path: &str) -> io::Result<Option<Vec<u8>>> {
+        match load_pkformer_from_sidecar(db_path) {
+            Ok(None) => Ok(None),
+            // log に record が無ければ `pkformer` をそのまま (無ければ無し)
+            Ok(Some((f, snapshot))) if !f.log_has_records() => Ok(snapshot),
+            Ok(Some((f, _))) => Ok((!f.is_empty()).then(|| f.serialize())),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => std::fs::read(pkformer_path_for(db_path)).map(Some),
+            Err(e) => Err(e),
+        }
     }
 
     /// #550: 消した主キー (`pktombs`) と主キーの前の名前 (`pkformer`) の記録を、 変わっていれば書き出す。 本体の書き出し
@@ -10446,6 +10514,18 @@ impl Engine {
                     self.warn_persist_failure_rate_limited(&e);
                 }
             }
+        }
+    }
+
+    /// #720: きれいに閉じる時に `pkformer` をまとめ直す (読まない旧 binary も `pkformer` だけで全部ある)。 best effort。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compact_pk_former_on_close(&self) {
+        if self.path.is_empty() || self.defer_tables_persist.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(e) = self.persist_pk_former(true) {
+            self.warn_persist_failure_rate_limited(&e);
         }
     }
 
@@ -13119,7 +13199,29 @@ impl Engine {
         // 新しくても捨てる。 受け取った書き込みは `slot_is_dead` で弾く)。 前は削除より新しい cell を残し (#514)、 名前の無い塊が
         // 生きた (#547)
         self.remove_entity_body(local, enchudb_oplog::Hlc::ZERO);
+        // #720: 消えた行のカードは落とす (束ねた identity ごとの値は、 生きた行を切り離す時にだけ使う。 持ち続けると `pkformer` が
+        // 消した行の Leaf の中身ごと残る)。 前の名前・束ねた identity・名前の年表は残す (消えた行にも束ねる / 削除の時刻を上げる)
+        self.drop_cards_of_dead_slot(local);
         true
+    }
+
+    /// #720: 消えた行 `local` の、 束ねた identity ごとのカードを落とす。 束ねたことの無い DB は atomic 1 回、 目印の立っていない
+    /// slot は 2 回。 呼び手は行の lock を握っている (名前の記録の lock は行の lock の内側、 `note_pk_former` と同じ順)。
+    fn drop_cards_of_dead_slot(&self, local: u32) {
+        use std::sync::atomic::Ordering;
+        if self.pk_former_empty.load(Ordering::Acquire) {
+            return;
+        }
+        let bit = local as usize % (BOUND_FILTER_WORDS * 64);
+        if self.bound_filter[bit / 64].load(Ordering::Acquire) & (1 << (bit % 64)) == 0 {
+            return;
+        }
+        if self.pk_former.read().unwrap().cards_of(local).is_empty() {
+            return;
+        }
+        if !self.pk_former.write().unwrap().drop_cards(local).is_empty() {
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
     }
 
     /// 削除優先: 消えた行 (削除の版数があり、 生きていない) か。 受け取った書き込み (`remote_*_apply`) は版数によらず捨てる。
@@ -14229,7 +14331,11 @@ impl Engine {
         card: impl FnOnce() -> crate::pk_former::Card,
         hlc: enchudb_oplog::Hlc,
     ) {
-        if self.is_bound_slot(local) && self.pk_former.write().unwrap().note_card(local, id, himo, card(), hlc) {
+        // #720: 消えた行にはカードを積まない (消す時に落としている。 その行を切り離すことはもう無い)
+        if self.is_bound_slot(local)
+            && !self.slot_is_dead(local)
+            && self.pk_former.write().unwrap().note_card(local, id, himo, card(), hlc)
+        {
             self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
     }
@@ -21967,6 +22073,7 @@ impl Engine {
         // #560: graceful close も `eidmap` をまとめ直す
         self.eidmap_compact.store(true, std::sync::atomic::Ordering::Release);
         self.try_persist_tables();
+        self.compact_pk_former_on_close();
         for ds in &self.himos {
             ds.sync();
         }
@@ -22164,6 +22271,7 @@ impl Drop for Engine {
             // #560: 閉じる時は `eidmap` をまとめ直す (読まない旧 binary も `eidmap` だけで全部ある)
             self.eidmap_compact.store(true, Ordering::Release);
             self.try_persist_tables();
+            self.compact_pk_former_on_close();
             for ds in &self.himos {
                 ds.sync();
             }
