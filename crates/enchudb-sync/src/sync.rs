@@ -830,7 +830,12 @@ impl Syncer {
                     | DecodedOp::Content { eid, .. }
                     | DecodedOp::TieNamed { eid, .. }
                     | DecodedOp::TieLeaf { eid, .. }
-                    | DecodedOp::TieRef { eid, .. } => Some(enchudb_oplog::eid_local(*eid)),
+                    | DecodedOp::TieRef { eid, .. } => {
+                        // #761: author の行の record だけ数える。 author の state には、 author が他の peer の行に書いた cell
+                        // も入る (宛名はその行の世界番号)。 番号 (local) だけで数えると、 同じ番号の author の消した行が
+                        // 「state にある」 ことになって掃除されない
+                        (enchudb_oplog::eid_peer(*eid) == author).then(|| enchudb_oplog::eid_local(*eid))
+                    }
                     // #178: 行の state ではない (state 転写には現れない)
                     DecodedOp::Commit | DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } => None,
                 })
