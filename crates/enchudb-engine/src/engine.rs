@@ -247,8 +247,10 @@ impl ChangeNotifier {
     ///
     /// 配信は `deliver_lock` で 1 本ずつ (#337)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路: 戻った
     /// 時点で自分の commit を配り終えている、 という約束のため。 先に取り出した配信は、 lock を返す前に配り終えている)。
-    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
-    /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
+    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が **この engine の** record を
+    /// 配っている最中) は、 待つと止まるのでどちらでも配らずに返る。 別の engine の listener の中から呼ばれた時は配る (#719:
+    /// 配信中の印が thread ごとで engine ごとでなかったので、 engine A の listener の中の `B.oplog_sync()` が B の commit を
+    /// 配らずに返っていた)。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
     /// 待たない)。
     ///
     /// #560: 待つのは [`LISTENER_WAIT`] まで。 配っている listener がそれより長く返らなければ、 配らずに返る (残りは通知係が
@@ -258,10 +260,13 @@ impl ChangeNotifier {
     fn deliver(&self, src: &impl ChangeSource, wait: bool) -> bool {
         use std::sync::atomic::Ordering;
         thread_local! {
-            /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
-            static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            /// この thread が listener に配っている最中の engine (の通知係の住所。 engine ごとに 1 つで、 配っている間は
+            /// `&self` で生きている)。 listener の中から同じ engine の oplog_sync を呼んだ再入を見分ける。 入れ子 (A の listener
+            /// の中で B が配り、 その listener の中で…) の深さだけ積む。
+            static EMITTING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        if EMITTING.with(|e| e.get()) {
+        let me = self as *const ChangeNotifier as usize;
+        if EMITTING.with(|e| e.borrow().contains(&me)) {
             return true;
         }
         let deliver = if wait { self.deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.deliver_lock.try_lock() };
@@ -277,14 +282,20 @@ impl ChangeNotifier {
             }
             return true;
         };
-        struct Emitting;
+        /// 抜ける時 (listener の panic も) に、 積んだ自分の印を外す。 入れ子は入った順の逆に抜けるので、 自分は末尾に居る。
+        struct Emitting(usize);
         impl Drop for Emitting {
             fn drop(&mut self) {
-                EMITTING.with(|e| e.set(false));
+                EMITTING.with(|e| {
+                    let mut e = e.borrow_mut();
+                    if let Some(i) = e.iter().rposition(|x| *x == self.0) {
+                        e.remove(i);
+                    }
+                });
             }
         }
-        EMITTING.with(|e| e.set(true));
-        let _emitting = Emitting;
+        EMITTING.with(|e| e.borrow_mut().push(me));
+        let _emitting = Emitting(me);
         let (batch, log) = match src.with(Engine::take_changes) {
             None => return false,
             Some(None) => return true,
@@ -1495,6 +1506,9 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
 /// flock は open file description 単位なので、同一プロセスからの二重 open は
 /// block 検知できず無期限ハングになる。flock に入る前にここで fast-fail する。
 #[cfg(not(target_arch = "wasm32"))]
+/// #704: [`Engine::cursor_create_races`] の数 (作る道でだけ足す)。
+static CURSOR_CREATE_RACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static WRITER_LOCK_REGISTRY: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -9426,7 +9440,10 @@ impl Engine {
     /// - `as_of` は emit した record の **max HLC**。 self 版のように `mint_hlc()`
     ///   すると自分の clock で author の HLC 空間を進めてしまい、 受信側の
     ///   `cursor[author]` が author の後続 record を飛び越す (#216 で cursor が
-    ///   author 別になったのでここが直撃する)。
+    ///   author 別になったのでここが直撃する)。 **この max も author の時計とは限らない**
+    ///   (author の行を他の peer が書き換えた cell の版数は、 その peer の時計)。 `Syncer` の
+    ///   配布元は、 自分がその author の record を受けた位置 (cursor) があればそちらを
+    ///   `as_of` にする (#710)。
     /// - Tag は **author の vid 空間に戻して**配る (`peer_vocab_map` の逆引き)。
     ///   自分の local vid のまま `(author, vid)` として配ると、 author 直 pull で
     ///   来る同じ key の別テキストと衝突して vocab 写像が壊れる (#209 と同種)。
@@ -18617,10 +18634,13 @@ impl Engine {
 
     /// 名前 `name` の位置 (無ければ None、 `_cursors` が無くても None)。 行の lock の下で読む = [`cursor_set`](Self::cursor_set)
     /// で置いた組のまま。
+    ///
+    /// 0.36〜0.37.4 が作った DB には同じ名前の行が複数ありうる (#704)。 その時は eid のいちばん小さい行を読む (索引の並びに
+    /// よらない = 開き直す前も後も同じ答え。 その版が開き直した後に読み書きしていた行)。 重複はその名前の次の `cursor_set` が片付ける。
     pub fn cursor_get(&self, name: &str) -> Option<Cursor> {
         let [name_h, kind_h, pos_h, wall_h, rest_h] = self.cursor_himos()?;
         let vid = self.vocab_id(name)?;
-        let eid = self.query_by_id(&[(name_h, vid)]).into_iter().next()?;
+        let eid = self.query_by_id(&[(name_h, vid)]).into_iter().min()?;
         self.read_row(eid, || {
             let pos = self.get_by_id(eid, pos_h)?;
             let kind = self.get_by_id(eid, kind_h).unwrap_or(0) as u32;
@@ -18653,12 +18673,8 @@ impl Engine {
         if cursor.pos == u64::MAX || cursor.hlc.is_some_and(|h| h.wall == u64::MAX) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cursor_set: pos / hlc.wall must be < u64::MAX"));
         }
-        let existing = self.vocab_id(name).and_then(|vid| self.query_by_id(&[(name_h, vid)]).into_iter().next());
-        let (eid, fresh) = match existing {
-            Some(e) => (e, false),
-            None => (self.entity_in(CURSORS_TABLE).map_err(io::Error::other)?, true),
-        };
-        let write = || -> Result<(), TieRejected> {
+        let rows_of = || self.vocab_id(name).map(|vid| (vid, self.query_by_id(&[(name_h, vid)])));
+        let write = |eid: enchudb_oplog::EntityId| -> Result<(), TieRejected> {
             let _row = self.write_row(eid);
             self.try_tie_text_to_by_id(eid, name_h, name)?;
             self.try_tie_to_by_id(eid, kind_h, cursor.kind)?;
@@ -18675,15 +18691,46 @@ impl Engine {
             }
             Ok(())
         };
-        match write() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if fresh {
-                    self.delete(eid);
-                }
-                Err(io::Error::other(format!("cursor_set: {e}")))
+        let rejected = |e: TieRejected| io::Error::other(format!("cursor_set: {e}"));
+        // 行がちょうど 1 つ (いつもの道): lock なし。 行を握ってから 「生きていて、 名前がこの語」 を確かめる (作った書き手が書き込みを
+        // 断られて消した行・重複の片付けで消えた行に書かない)。 外れたら下の道で引き直す
+        if let Some((vid, rows)) = rows_of()
+            && let [eid] = rows[..]
+        {
+            let _row = self.write_row(eid);
+            if self.is_live(eid) && self.get_by_id(eid, name_h) == Some(vid as u64) {
+                return write(eid).map_err(rejected);
             }
         }
+        // #704: 行が無い / 重複している時は 1 本ずつ。 前は 「在るかの確かめ → 行を作る」 が lock の外で、 同じ名前の最初の 1 回が
+        // 並ぶと書き手ごとに行ができた (以後は索引の先頭の行を使い、 先頭は開き直すと変わるので、 開き直した後に古い位置が返った)。
+        // lock は process に 1 本 (engine の欄にしない = `Engine` の並びを変えない)。 ここを通るのは名前ごとに最初の 1 回と重複の
+        // 片付けだけで、 名前の行は書き終えるまで握る (名前のカードが次の書き手から見えてから放す)
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _create = CREATE.lock().unwrap_or_else(|p| p.into_inner());
+        let rows = rows_of().map(|(_, rows)| rows).unwrap_or_default();
+        // 残すのは eid のいちばん小さい行 (`cursor_get` が読む行)。 残りは消す (0.36〜0.37.4 が作った重複)
+        if let Some(&keep) = rows.iter().min() {
+            if rows.len() == 1 {
+                CURSOR_CREATE_RACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            write(keep).map_err(rejected)?;
+            for &e in rows.iter().filter(|&&e| e != keep) {
+                self.delete(e);
+            }
+            return Ok(());
+        }
+        let eid = self.entity_in(CURSORS_TABLE).map_err(io::Error::other)?;
+        write(eid).map_err(|e| {
+            self.delete(eid);
+            rejected(e)
+        })
+    }
+
+    /// #704 の試験用: `cursor_set` が 「行が無い」 と見て作りに来たら、 他の書き手が先に作っていた回数 (process の合計)。
+    #[doc(hidden)]
+    pub fn cursor_create_races() -> u64 {
+        CURSOR_CREATE_RACES.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `{db}/tables` に書く宣言 (名前, 形)。
@@ -20451,6 +20498,15 @@ impl Engine {
         // changefeed の記録は consumer が畳む前に WAL の続きの位置を合わせる
         #[cfg(not(target_arch = "wasm32"))]
         eng.attach_change_log();
+        // #732: 並行の形にする前 (standalone / schema の build phase) に付けた listener は、 付けた時に WAL が無かったので
+        // cursor を head に合わせていない (0 のまま)。 今 WAL に在る record は全部それより前 (前の session がきれいに閉じずに
+        // 残した分。 standalone の間の書き込みは WAL に載らない) なので、 ここで head に合わせる (`add_change_listener` の
+        // 「付けた後の commit だけ流れる」。 記録がある時の位置は `attach_change_log` が合わせる、 #702)
+        if let Some(wal) = oplog.as_ref()
+            && !eng.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty()
+        {
+            eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()).offset = wal.head();
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(crate::consumer_waker::ConsumerWaker::default());
         eng.consumer_waker = Some(waker.clone());
