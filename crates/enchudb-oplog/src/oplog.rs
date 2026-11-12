@@ -1264,6 +1264,10 @@ pub struct OpLog {
     /// ([`OpLog::drop_records_after_a_hole`])。 立っている間、 その区画には書き足さずにもう一方へ移る (移れない間だけ書き足す)。
     /// 畳むと (新しい周になるので) 倒す。 `append_lock` の下で読み書きする。
     stale_tail: [std::sync::atomic::AtomicBool; 2],
+    /// `stale_tail` の区画の、 全体の fsync が届かせた head (区画の中の offset、 0 = まだ無い)。 今の head と同じなら header の
+    /// head は disk でも最後の値なので、 そこから移る時に header の page を書き出し直さない (`switch_locked`)。 `stale_tail` の
+    /// 間は区画の周が変わらず head は進むだけなので、 offset だけで比べられる。
+    stale_synced_head: [AtomicU64; 2],
     /// #57: append に失敗して WAL に載らなかった record の (author, その author の落ちた HLC の max)
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
@@ -1634,6 +1638,7 @@ impl OpLog {
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + l.trailer) as u64),
             fold_pending: [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)],
             stale_tail: [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)],
+            stale_synced_head: [AtomicU64::new(0), AtomicU64::new(0)],
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             switch_hook: std::sync::OnceLock::new(),
@@ -1826,6 +1831,7 @@ impl OpLog {
             } else {
                 // #706: head の先に同じ周の古い record が残っているかもしれない区画。 もう一方が空ならそちらへ移って書く
                 // (この区画には 1 byte も足さない)。 移れなければ (もう一方にも record がある / 1 区画の形) ここに書き足す
+                self.settle_switch_target(i ^ 1)?;
                 if !self.larger_than_ring(need) && self.switch_locked() {
                     let i = self.hot.active.load(Ordering::Relaxed);
                     if let Some(off) = self.alloc_off(&self.hot.halves[i], size, closes_group) {
@@ -1839,6 +1845,7 @@ impl OpLog {
                 };
             }
         }
+        self.settle_switch_target(i ^ 1)?;
         if !self.larger_than_ring(need) && self.switch_locked() {
             let i = self.hot.active.load(Ordering::Relaxed);
             if let Some(off) = self.alloc_off(&self.hot.halves[i], size, closes_group) {
@@ -1846,6 +1853,17 @@ impl OpLog {
             }
         }
         Err(self.wal_full_err())
+    }
+
+    /// 移る先の区画 `o` を畳んだ header がまだ届いていなければ届ける (`append_lock` の下、 `switch_locked` の前)。 届かなければ
+    /// 満杯とは別の失敗を返す: 満杯 (`OutOfMemory`) で返すと、 空の区画は 「空き」 に数えるので (`free_bytes`)、 書き出しの故障が
+    /// 続く間 呼び手が書き直し続ける。
+    fn settle_switch_target(&self, o: usize) -> io::Result<()> {
+        if self.settle_fold(o) {
+            Ok(())
+        } else {
+            Err(io::Error::other("oplog: could not write out the header of a folded half"))
+        }
     }
 
     /// `alloc` の戻り値から場所を引く (`append_lock` の下、 区画の位置と周は Relaxed で読む)。
@@ -1954,14 +1972,19 @@ impl OpLog {
         // #706: 古い record が head の先に残っているかもしれない区画 (`stale_tail`) からは、 閉じの Commit も置かずに移る
         // (同じ周で 1 件でも足すと、 その後ろの古い record が続きとして読める)。 開いている group は移った先の Commit で閉じる
         // (読み手は group を区画をまたいで読む)
-        if !self.stale_tail[ai].load(Ordering::Relaxed) {
+        let stale = self.stale_tail[ai].load(Ordering::Relaxed);
+        if !stale {
             self.close_group_for_switch(a);
         }
         // #663: 移った先に書く前に、 古い区画の header (最後の head) を書き出す。 新しい区画の record が読める像では、 古い区画の
         // header が最後の head を持つ = 古い区画の record が欠けていれば読みは古い区画の途中で止まり、 新しい区画を読まない。 書き
         // 出さないと、 header だけ前の head のまま古い区画の終わりの record が届かず、 新しい区画の record は届いた像で、 読みが古い
         // 区画を前の head で読み終えて新しい区画へ進み、 間を飛ばして当てた (再生と changefeed の記録の続きが穴の後から)
-        self.sync_half_header(a);
+        // 書き足していない区画 (`stale_tail`) で、 全体の fsync がこの head を届かせた後なら、 disk の header の head はもう最後の
+        // 値 (engine の開く道は再生の後に必ず fsync する)。 その時は lock の下で書き出し直さない
+        if !(stale && self.stale_synced_head[ai].load(Ordering::Acquire) == a.head.load(Ordering::Acquire)) {
+            self.sync_half_header(a);
+        }
         if !lap_newer(o.lap(), a.lap()) {
             let lap = self.take_next_lap();
             let b = o.base();
@@ -2848,6 +2871,7 @@ impl OpLog {
         mmap[b + 16..b + 24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         // 新しい周になったので、 head の先に残る record は周の印で読まれない
         self.stale_tail[i].store(false, Ordering::Relaxed);
+        self.stale_synced_head[i].store(0, Ordering::Release);
         // 閉じてから印を置く (どちらも lock の下。 lock を取らない `settle_fold` は印を倒すだけで、 上限は書き手が lock の下で開く)
         h.limit.store(0, Ordering::Release);
         self.fold_pending[i].store(h.lap(), Ordering::Release);
@@ -3313,6 +3337,10 @@ impl OpLog {
     pub fn fsync(&self) -> io::Result<()> {
         // #707: 全体の書き出しは区画の header も届ける。 書き出す前に読んだ周のままなら、 畳んだ header の印を倒す
         let pending = [self.fold_pending[0].load(Ordering::Acquire), self.fold_pending[1].load(Ordering::Acquire)];
+        // #706: 書き足さない区画 (`stale_tail`) の、 この書き出しが届かせる head (header の head は書き終えた終端)
+        let stale_heads = [0, 1].map(|i| {
+            self.stale_tail[i].load(Ordering::Acquire).then(|| self.hot.halves[i].written.load(Ordering::Acquire))
+        });
         #[cfg(all(feature = "crashsim", unix))]
         let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, 0, &self.mmap));
         crate::io_point("oplog.fsync")?;
@@ -3324,6 +3352,9 @@ impl OpLog {
         for (i, p) in pending.into_iter().enumerate() {
             if p != 0 {
                 let _ = self.fold_pending[i].compare_exchange(p, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
+            if let Some(h) = stale_heads[i] {
+                self.stale_synced_head[i].fetch_max(h, Ordering::AcqRel);
             }
         }
         Ok(())
@@ -3556,7 +3587,8 @@ impl OpLog {
         let first = if a.is_empty() && self.alloc_head(a) <= HEADER_SIZE as u64 {
             Some(ai)
         } else {
-            self.stale_tail[ai].store(true, Ordering::Relaxed);
+            self.stale_synced_head[ai].store(0, Ordering::Release);
+            self.stale_tail[ai].store(true, Ordering::Release);
             a.limit.store(0, Ordering::Release);
             let o = &self.hot.halves[ai ^ 1];
             (o.size() > 0 && o.is_empty() && self.alloc_head(o) <= HEADER_SIZE as u64).then_some(ai ^ 1)
