@@ -247,8 +247,10 @@ impl ChangeNotifier {
     ///
     /// 配信は `deliver_lock` で 1 本ずつ (#337)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路: 戻った
     /// 時点で自分の commit を配り終えている、 という約束のため。 先に取り出した配信は、 lock を返す前に配り終えている)。
-    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
-    /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
+    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が **この engine の** record を
+    /// 配っている最中) は、 待つと止まるのでどちらでも配らずに返る。 別の engine の listener の中から呼ばれた時は配る (#719:
+    /// 配信中の印が thread ごとで engine ごとでなかったので、 engine A の listener の中の `B.oplog_sync()` が B の commit を
+    /// 配らずに返っていた)。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
     /// 待たない)。
     ///
     /// #560: 待つのは [`LISTENER_WAIT`] まで。 配っている listener がそれより長く返らなければ、 配らずに返る (残りは通知係が
@@ -258,10 +260,13 @@ impl ChangeNotifier {
     fn deliver(&self, src: &impl ChangeSource, wait: bool) -> bool {
         use std::sync::atomic::Ordering;
         thread_local! {
-            /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
-            static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            /// この thread が listener に配っている最中の engine (の通知係の住所。 engine ごとに 1 つで、 配っている間は
+            /// `&self` で生きている)。 listener の中から同じ engine の oplog_sync を呼んだ再入を見分ける。 入れ子 (A の listener
+            /// の中で B が配り、 その listener の中で…) の深さだけ積む。
+            static EMITTING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        if EMITTING.with(|e| e.get()) {
+        let me = self as *const ChangeNotifier as usize;
+        if EMITTING.with(|e| e.borrow().contains(&me)) {
             return true;
         }
         let deliver = if wait { self.deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.deliver_lock.try_lock() };
@@ -277,14 +282,20 @@ impl ChangeNotifier {
             }
             return true;
         };
-        struct Emitting;
+        /// 抜ける時 (listener の panic も) に、 積んだ自分の印を外す。 入れ子は入った順の逆に抜けるので、 自分は末尾に居る。
+        struct Emitting(usize);
         impl Drop for Emitting {
             fn drop(&mut self) {
-                EMITTING.with(|e| e.set(false));
+                EMITTING.with(|e| {
+                    let mut e = e.borrow_mut();
+                    if let Some(i) = e.iter().rposition(|x| *x == self.0) {
+                        e.remove(i);
+                    }
+                });
             }
         }
-        EMITTING.with(|e| e.set(true));
-        let _emitting = Emitting;
+        EMITTING.with(|e| e.borrow_mut().push(me));
+        let _emitting = Emitting(me);
         let (batch, log) = match src.with(Engine::take_changes) {
             None => return false,
             Some(None) => return true,
@@ -1495,6 +1506,9 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
 /// flock は open file description 単位なので、同一プロセスからの二重 open は
 /// block 検知できず無期限ハングになる。flock に入る前にここで fast-fail する。
 #[cfg(not(target_arch = "wasm32"))]
+/// #704: [`Engine::cursor_create_races`] の数 (作る道でだけ足す)。
+static CURSOR_CREATE_RACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static WRITER_LOCK_REGISTRY: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -1818,6 +1832,8 @@ pub mod write_out_hook {
         Opened,
         /// #656: 残りの中身を指す列 (紐の番号) の門を閉じた後 (その列を書き出す前)。 列ごとに呼ぶ
         Column(u16),
+        /// #705: 列を全部書き出した後 (版数の列・tombstone を書き出す前)
+        BeforeVersions,
         /// 0.37: `body_msync` が本体を書き出し終えた後 (書き出しが届かせた bridge の位置を置く前)
         WrittenOut,
     }
@@ -9426,11 +9442,18 @@ impl Engine {
     /// - `as_of` は emit した record の **max HLC**。 self 版のように `mint_hlc()`
     ///   すると自分の clock で author の HLC 空間を進めてしまい、 受信側の
     ///   `cursor[author]` が author の後続 record を飛び越す (#216 で cursor が
-    ///   author 別になったのでここが直撃する)。
+    ///   author 別になったのでここが直撃する)。 **この max も author の時計とは限らない**
+    ///   (author の行を他の peer が書き換えた cell の版数は、 その peer の時計)。 `Syncer` の
+    ///   配布元は、 自分がその author の record を受けた位置 (cursor) があればそちらを
+    ///   `as_of` にする (#710)。
     /// - Tag は **author の vid 空間に戻して**配る (`peer_vocab_map` の逆引き)。
     ///   自分の local vid のまま `(author, vid)` として配ると、 author 直 pull で
     ///   来る同じ key の別テキストと衝突して vocab 写像が壊れる (#209 と同種)。
-    ///   逆引きできない cell は配らない。
+    ///   author の vid 空間に無い語 (author の行を別の peer が書き換えた cell) は、
+    ///   **書いた peer (版数の peer) の record の形**で配る (#711): `author_peer` は
+    ///   その peer、 vid はその peer の空間、 宛名は author の世界番号。 書いたのが
+    ///   自分なら自分の record として。 = batch の record の `author_peer` は `author`
+    ///   とは限らない。 どの空間にも戻せない cell は配らない。
     ///
     /// 呼び元は `StateBatch.complete` を **false** にすること — relay が author の
     /// live state を全部持っている保証は無い (途中から relay を始めた場合)。
@@ -9444,7 +9467,7 @@ impl Engine {
     /// | 条件 | 理由 |
     /// |---|---|
     /// | 版数が `Hlc::ZERO` | foreign cell に自分の clock を stamp する権利が無い |
-    /// | Tag の vid を逆引きできない | author の vid 空間に戻せない |
+    /// | Tag の vid を逆引きできない | author の vid 空間にも、 書いた peer (版数の peer) の vid 空間にも戻せない (#711) |
     /// | Ref の target を `reverse` できない | 元 entity を導けない |
     /// | Ref の値が translated local でない | author の行が自分の entity を指すことはない |
     ///
@@ -9488,15 +9511,20 @@ impl Engine {
         // 記録が無いと 「この replica の state は cell 単位で欠けている」 が
         // 観測できない ([`Engine::state_records_dropped`])。
         let mut dropped: u64 = 0;
-        let mut vocab_sent: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
+        // (record の書き手, その書き手の vid) ごとに Vocab を 1 回
+        let mut vocab_sent: std::collections::HashSet<(enchudb_oplog::PeerId, u32)> = std::collections::HashSet::new();
+        // #711: author 以外の書き手の vid 空間への逆引き (要る時に作る)
+        let mut vid_back_of: std::collections::HashMap<enchudb_oplog::PeerId, std::collections::HashMap<u32, u32>> =
+            std::collections::HashMap::new();
+        let mk_by = |by: enchudb_oplog::PeerId, op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
             hlc,
-            author_peer: author,
+            author_peer: by,
             op,
             signature: [0u8; 64],
             pubkey_fp: [0u8; 8],
             signed_bytes: Vec::new(),
         };
+        let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| mk_by(author, op, hlc);
 
         for hid in 0..self.himos.len() {
             if self.himo_is_in_reserved_table(hid) {
@@ -9585,23 +9613,36 @@ impl Engine {
                         // replica は author の vid 空間に戻す。 戻せない vid は
                         // 配らない — 自分の local vid を `(author, vid)` として送ると
                         // author 直 pull の同 key と衝突して写像が壊れる。
-                        let out_vid = if is_self {
-                            value
+                        //
+                        // #711: author の vid 空間に無い語 = author の行を別の peer が書き換えた cell (author はその語を
+                        // 自分の record で言っていない)。 その cell は、 **書いた peer の record の形** (書き手 = 版数の peer、
+                        // 宛名は author の世界番号、 vid はその peer の空間) で出す = その peer が元々出した record と同じ形。
+                        // 書いたのが自分 (replica 自身の書き戻し) なら自分の vid のまま自分の record として。 受け手は record ごとの
+                        // 書き手の写像で vid を引くので、 author の写像は汚れない。 前は落としていて、 ホストを置く形では
+                        // その書き換えがどの state にも入らなかった (書き換えた側の state は自分の行だけ)
+                        let (by, out_vid) = if is_self {
+                            (author, value)
+                        } else if let Some(v) = vid_back.get(&value) {
+                            (author, *v)
+                        } else if hlc.peer == self_peer {
+                            (self_peer, value)
+                        } else if hlc.peer != author
+                            && let Some(v) = vid_back_of
+                                .entry(hlc.peer)
+                                .or_insert_with(|| self.remote_vid_reverse_of(hlc.peer))
+                                .get(&value)
+                        {
+                            (hlc.peer, *v)
                         } else {
-                            match vid_back.get(&value) {
-                                Some(v) => *v,
-                                None => {
-                                    dropped += 1; // #236
-                                    continue;
-                                }
-                            }
+                            dropped += 1; // #236
+                            continue;
                         };
-                        if vocab_sent.insert(out_vid) {
+                        if vocab_sent.insert((by, out_vid)) {
                             let bytes = self.vocab.get(value).to_vec();
-                            records.push(mk(DecodedOp::Vocab { vid: out_vid, bytes }, hlc));
+                            records.push(mk_by(by, DecodedOp::Vocab { vid: out_vid, bytes }, hlc));
                         }
                         records
-                            .push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid as u64 }, hlc));
+                            .push(mk_by(by, DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid as u64 }, hlc));
                     }
                     ValueType::Leaf => {
                         let Some(bytes) = self.text_owned_by_id(hid, local) else { continue };
@@ -11403,7 +11444,8 @@ impl Engine {
     /// #209: 受信 record を**素通し** (原 eid / 原 value / 原 HLC / 原 author /
     /// 原署名) で自分の WAL に relay append する。 Syncer が「apply が accept した
     /// record」に限って呼ぶ (LWW gate が cyclic topology の echo を止める唯一の
-    /// 栓なので、 skip した record を relay してはいけない)。
+    /// 栓なので、 skip した record を relay してはいけない)。 例外はホスト (`Syncer::set_host`、 #698):
+    /// 星形で反響しないので、 LWW で負けた record も載せる (client はホストからしか受けない)。
     ///
     /// 翻訳 (eid/vid/ref) は body apply 専用で、 relay stream には漏らさない —
     /// 「中継であって作者交代ではない」。 WAL recovery はこの record を
@@ -11765,8 +11807,15 @@ impl Engine {
     }
 
     /// cell への write を採用してよいか。 `set_cell` / `clear_cell` の唯一の判定。
+    ///
+    /// #705: cell の版数が `hlc` と **同じ** 時は `differs` (その record の値と cell の今の中身が違うか) を呼び、 違えば採用する。
+    /// (peer, HLC) は record ごとに一意なので、 版数が同じ = 同じ record。 その record の値と cell の中身が違うのは、 版数だけが
+    /// ディスクに届いた像を開いた時 (書き手は 値 → 版数 の順に書き、 書き出しは 列 → 版数の列 の順に msync するので、 その間に
+    /// 入った write は版数だけ届く。 OS が版数の page を先に書いた時も同じ)。 前は同じ HLC を無条件に弾いていて、 開く時の再生も
+    /// 相手の再配送もその cell を直せなかった (値は古いまま、 版数は新しい = 永久に失う)。 中身が同じなら今までどおり不採用
+    /// (再配送は skip のまま)。 `differs` を呼ぶのは版数が同じ時だけ = 普通の書き込み (版数が進む) の道には何も足さない。
     #[inline]
-    fn accepts_write(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+    fn accepts_write(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc, differs: impl FnOnce() -> bool) -> bool {
         if hlc == enchudb_oplog::Hlc::ZERO {
             return true; // 版数不明 (standalone のローカル write) は従来どおり通す
         }
@@ -11787,7 +11836,8 @@ impl Engine {
         if tomb != enchudb_oplog::Hlc::ZERO && hlc < tomb {
             return false;
         }
-        Self::accepts_hlc(self.version_of(local, himo_id), hlc)
+        let cur = self.version_of(local, himo_id);
+        Self::accepts_hlc(cur, hlc) || (cur == hlc && differs())
     }
 
     /// LWW 判定 (A-2)。 true = 採用してよい。
@@ -11900,6 +11950,10 @@ impl Engine {
     /// 書く順序は **値 → HLC** (A-4)。 value と HLC は別 region なので 1 命令では
     /// 書けず、 逆順にすると「HLC だけ新しい」窓ができて後続の正しい record が
     /// 永久に負ける。 「値は新しいが HLC は古い」窓は次の write で必ず解消する。
+    ///
+    /// #705: この順はメモリの上の話で、 ディスクには 「HLC だけ新しい」 像が届きうる (列と版数の列は別の segment で、
+    /// 書き出しはその間に入った write の版数だけを届かせる)。 その像は、 同じ HLC の record の当て直し (開く時の再生 /
+    /// 相手の再配送) が値の違いを見て直す (`accepts_write`)。
     ///
     /// `value` は `tie_to_by_id` と同じ raw な cell 値。 Leaf himo の旧 payload
     /// 解放 (`take_leaf_cell` / `free_leaf_offset`) は呼び元の責務。
@@ -12279,7 +12333,9 @@ impl Engine {
         }
         let _own = row.is_none().then(|| self.row_locks.write(local));
         debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
-        if !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record の当て直しは、 cell の値が record の値と違う時だけ採用する (Leaf の値は書くたびに新しい slot なので
+        // 必ず違う — 中身の比べは slot を取る前に `remote_tieleaf_apply` が済ませている)
+        if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local) != Some(value)) {
             return false;
         }
         let renamed_from = self.pk_rename_from(local, himo_id, value).map(|old| (old, self.version_of(local, himo_id)));
@@ -12562,7 +12618,8 @@ impl Engine {
     /// **採用が決まってから**呼ぶこと (不採用なら cell は変わらないので解放しない)。
     fn clear_cell_local(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
         let _row = self.row_locks.write(local);
-        if !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record (untie) の当て直しは、 cell にまだ値が残っている時だけ採用する
+        if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local).is_some()) {
             return false;
         }
         self.live_remove(himo_id as usize, local);
@@ -12587,7 +12644,8 @@ impl Engine {
     ) -> bool {
         let _own = row.is_none().then(|| self.row_locks.write(local));
         debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
-        if !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record (untie) の当て直しは、 cell にまだ値が残っている時だけ採用する
+        if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local).is_some()) {
             return false;
         }
         self.remove_cell_freeing_leaf(local, himo_id as usize);
@@ -13988,7 +14046,8 @@ impl Engine {
         // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
         self.observe_remote_hlc(hlc);
         // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。 削除優先: 消えた行への書き込みは捨てる
-        if self.slot_is_dead(local) || !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record の当て直しは、 cell の今の中身が record の bytes と違う時だけ採用する (同じなら slot を取らない)
+        if self.slot_is_dead(local) || !self.accepts_write(local, himo_id, hlc, || self.text_owned_by_id(hid, local).as_deref() != Some(bytes)) {
             return RemoteApply::Stale;
         }
         // #316: cell の列を伸ばせないなら payload を置く前に断る (置いてから cell を書けないと orphan)
@@ -15901,7 +15960,8 @@ impl Engine {
             // 今から: 閉じた group の後ろから写す (閉じていない group は閉じた時に入る)
             wal.scan_for_change_log(enchudb_oplog::oplog::HEADER_SIZE as u64, u64::MAX, false).1
         };
-        // 畳んだ印を新しい周より先に届ける (続きの位置を探す時に、 前の周と新しい周を取り違えない)
+        // 続きの位置を探す時に前の周と新しい周を取り違えないよう、 畳んだ印は新しい周の record より先に届いている必要がある。
+        // #707 から oplog がどの DB でもそうする (`OpLog::fold_half_locked` / `settle_fold`)。 下の呼び出しは何もしない (互換)
         wal.set_sync_on_reset(true);
         let _ = self.change_log.set(log);
         Ok(())
@@ -15984,8 +16044,9 @@ impl Engine {
 
     /// 記録の続きの WAL の位置: 最後に記録した record を WAL の中で探し、 その直後。 見つからなければ WAL の頭 (記録した後に
     /// 畳んだ = WAL の record は全部その後。 畳む前に全部を写して書き出すので抜けない)。 「見つからない = 畳んだ後」 は、 畳んだ
-    /// 印を新しい周より先に書き出すので成り立つ (`OpLog::set_sync_on_reset`。 書き出さないと、 前の周の header のまま新しい周の
-    /// page だけが届いた像で前の周を途中までしか読めず、 記録した record を頭から写し直した)。
+    /// 印を新しい周より先に書き出すので成り立つ (#707 から oplog がどの DB でも、 畳んだ header が届くまでその区画に書かない:
+    /// `OpLog` の `fold_half_locked` / `settle_fold`。 届く前に書くと、 前の周の header のまま新しい周の page だけが届いた像で
+    /// 前の周を途中までしか読めず、 記録した record を頭から写し直した)。
     fn change_log_resume_offset(wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog) -> u64 {
         let start = enchudb_oplog::oplog::HEADER_SIZE as u64;
         let Some((hlc, id)) = log.last_written() else { return start };
@@ -18650,10 +18711,13 @@ impl Engine {
 
     /// 名前 `name` の位置 (無ければ None、 `_cursors` が無くても None)。 行の lock の下で読む = [`cursor_set`](Self::cursor_set)
     /// で置いた組のまま。
+    ///
+    /// 0.36〜0.37.4 が作った DB には同じ名前の行が複数ありうる (#704)。 その時は eid のいちばん小さい行を読む (索引の並びに
+    /// よらない = 開き直す前も後も同じ答え。 その版が開き直した後に読み書きしていた行)。 重複はその名前の次の `cursor_set` が片付ける。
     pub fn cursor_get(&self, name: &str) -> Option<Cursor> {
         let [name_h, kind_h, pos_h, wall_h, rest_h] = self.cursor_himos()?;
         let vid = self.vocab_id(name)?;
-        let eid = self.query_by_id(&[(name_h, vid)]).into_iter().next()?;
+        let eid = self.query_by_id(&[(name_h, vid)]).into_iter().min()?;
         self.read_row(eid, || {
             let pos = self.get_by_id(eid, pos_h)?;
             let kind = self.get_by_id(eid, kind_h).unwrap_or(0) as u32;
@@ -18686,12 +18750,8 @@ impl Engine {
         if cursor.pos == u64::MAX || cursor.hlc.is_some_and(|h| h.wall == u64::MAX) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cursor_set: pos / hlc.wall must be < u64::MAX"));
         }
-        let existing = self.vocab_id(name).and_then(|vid| self.query_by_id(&[(name_h, vid)]).into_iter().next());
-        let (eid, fresh) = match existing {
-            Some(e) => (e, false),
-            None => (self.entity_in(CURSORS_TABLE).map_err(io::Error::other)?, true),
-        };
-        let write = || -> Result<(), TieRejected> {
+        let rows_of = || self.vocab_id(name).map(|vid| (vid, self.query_by_id(&[(name_h, vid)])));
+        let write = |eid: enchudb_oplog::EntityId| -> Result<(), TieRejected> {
             let _row = self.write_row(eid);
             self.try_tie_text_to_by_id(eid, name_h, name)?;
             self.try_tie_to_by_id(eid, kind_h, cursor.kind)?;
@@ -18708,15 +18768,46 @@ impl Engine {
             }
             Ok(())
         };
-        match write() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if fresh {
-                    self.delete(eid);
-                }
-                Err(io::Error::other(format!("cursor_set: {e}")))
+        let rejected = |e: TieRejected| io::Error::other(format!("cursor_set: {e}"));
+        // 行がちょうど 1 つ (いつもの道): lock なし。 行を握ってから 「生きていて、 名前がこの語」 を確かめる (作った書き手が書き込みを
+        // 断られて消した行・重複の片付けで消えた行に書かない)。 外れたら下の道で引き直す
+        if let Some((vid, rows)) = rows_of()
+            && let [eid] = rows[..]
+        {
+            let _row = self.write_row(eid);
+            if self.is_live(eid) && self.get_by_id(eid, name_h) == Some(vid as u64) {
+                return write(eid).map_err(rejected);
             }
         }
+        // #704: 行が無い / 重複している時は 1 本ずつ。 前は 「在るかの確かめ → 行を作る」 が lock の外で、 同じ名前の最初の 1 回が
+        // 並ぶと書き手ごとに行ができた (以後は索引の先頭の行を使い、 先頭は開き直すと変わるので、 開き直した後に古い位置が返った)。
+        // lock は process に 1 本 (engine の欄にしない = `Engine` の並びを変えない)。 ここを通るのは名前ごとに最初の 1 回と重複の
+        // 片付けだけで、 名前の行は書き終えるまで握る (名前のカードが次の書き手から見えてから放す)
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _create = CREATE.lock().unwrap_or_else(|p| p.into_inner());
+        let rows = rows_of().map(|(_, rows)| rows).unwrap_or_default();
+        // 残すのは eid のいちばん小さい行 (`cursor_get` が読む行)。 残りは消す (0.36〜0.37.4 が作った重複)
+        if let Some(&keep) = rows.iter().min() {
+            if rows.len() == 1 {
+                CURSOR_CREATE_RACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            write(keep).map_err(rejected)?;
+            for &e in rows.iter().filter(|&&e| e != keep) {
+                self.delete(e);
+            }
+            return Ok(());
+        }
+        let eid = self.entity_in(CURSORS_TABLE).map_err(io::Error::other)?;
+        write(eid).map_err(|e| {
+            self.delete(eid);
+            rejected(e)
+        })
+    }
+
+    /// #704 の試験用: `cursor_set` が 「行が無い」 と見て作りに来たら、 他の書き手が先に作っていた回数 (process の合計)。
+    #[doc(hidden)]
+    pub fn cursor_create_races() -> u64 {
+        CURSOR_CREATE_RACES.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `{db}/tables` に書く宣言 (名前, 形)。
@@ -19811,8 +19902,10 @@ impl Engine {
                         _ => *value,
                     };
                     // request17 step 4: replay も版数付きで書く。 不採用 (= cell に
-                    // 既に同じか新しい版数が載っている = body に msync 済み) なら
+                    // より新しい版数が載っている、 または同じ版数で値も同じ) なら
                     // 値を戻さない — 戻すと新しい write を古い record で潰す。
+                    // #705: 版数が同じでも値が違えば当てる。 「版数が載っている = 値も本体に届いている」 は成り立たない
+                    // (版数の列だけ先にディスクに届く像がある、 `accepts_write`)
                     self.set_cell_local(local, *himo_id, value, hlc);
                 }
                 // eid 空間の整合 (live bitmap / next_local) は適用可否に依らず進める。
@@ -20484,6 +20577,15 @@ impl Engine {
         // changefeed の記録は consumer が畳む前に WAL の続きの位置を合わせる
         #[cfg(not(target_arch = "wasm32"))]
         eng.attach_change_log();
+        // #732: 並行の形にする前 (standalone / schema の build phase) に付けた listener は、 付けた時に WAL が無かったので
+        // cursor を head に合わせていない (0 のまま)。 今 WAL に在る record は全部それより前 (前の session がきれいに閉じずに
+        // 残した分。 standalone の間の書き込みは WAL に載らない) なので、 ここで head に合わせる (`add_change_listener` の
+        // 「付けた後の commit だけ流れる」。 記録がある時の位置は `attach_change_log` が合わせる、 #702)
+        if let Some(wal) = oplog.as_ref()
+            && !eng.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty()
+        {
+            eng.change_emit.lock().unwrap_or_else(|p| p.into_inner()).offset = wal.head();
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(crate::consumer_waker::ConsumerWaker::default());
         eng.consumer_waker = Some(waker.clone());
@@ -21223,7 +21325,14 @@ impl Engine {
             write_out_hook::call(write_out_hook::Phase::Column(column(*k)));
             SegmentSet::flush_segment(*k, seg, all)?;
         }
-        set.flush_where(all, |k| !content(k) && !points(k))
+        // 残りは 「版数でないもの (中身を指さない列 / header / entity …) → 版数の列・tombstone」 の順 (`SegmentSet::all` の並びと
+        // 同じ順を、 段として書く)。 版数を後にするのは、 書き終えた write の版数だけが届く像 (間で電源が落ちた時) を作らないため。
+        // 列の msync と版数の msync の間に入った write は版数だけ届くが、 それは同じ HLC の record の当て直しが直す (#705)
+        let version = |k: SegmentKind| matches!(k, SegmentKind::Ver(_) | SegmentKind::Tomb);
+        set.flush_where(all, |k| !content(k) && !points(k) && !version(k))?;
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::BeforeVersions);
+        set.flush_where(all, version)
     }
 
     /// #656: 書き手が書き出しの門で待った回数 (Tag / Leaf の cell を書こうとして、 その列の門が閉じていた)。 当たっているかを
@@ -22525,7 +22634,7 @@ mod cell_version_tests {
     }
 
     /// A-2 の核: 古い HLC は **値も版数も cylinder も** 触らずに落とす。
-    /// 同値 HLC も不採用 (`cur >= hlc`)。
+    /// 同値 HLC で値も同じ (= 同じ record の再配送) も不採用。
     #[test]
     fn older_hlc_is_rejected_without_touching_the_cell() {
         let (eng, hid, eid) = v9_engine("reject_old", "age");
@@ -22536,8 +22645,34 @@ mod cell_version_tests {
         assert_eq!(eng.cell_hlc(eid, hid), hlc(200, 1), "不採用なのに版数が変わった");
         assert!(eng.pull("age", 7).is_empty(), "不採用なのに cylinder に載った");
 
-        assert!(!eng.set_cell(eid, hid, 8, hlc(200, 1)), "同値 HLC を採用した");
+        assert!(!eng.set_cell(eid, hid, 42, hlc(200, 1)), "同値 HLC・同じ値 (同じ record の再配送) を採用した");
         assert_eq!(eng.get(eid, "age"), Some(42));
+        assert!(!eng.clear_cell(eid, hid, hlc(100, 1)), "古い untie を採用した");
+        assert_eq!(eng.get(eid, "age"), Some(42));
+    }
+
+    /// #705: 同値 HLC で cell の中身が record と違うのは、 版数だけがディスクに届いた像 (書き出しが 列 → 版数の列 の間に
+    /// 入った write)。 (peer, HLC) は record ごとに一意なので、 その record を当て直して中身をそろえる。 版数は動かない。
+    #[test]
+    fn same_hlc_with_a_different_value_repairs_the_cell() {
+        let (eng, hid, eid) = v9_engine("same_hlc_repair", "age");
+        assert!(eng.set_cell(eid, hid, 42, hlc(200, 1)));
+        // 版数だけ届いた像を作る: 値を版数なしで戻す (旧経路は版数を書かない)
+        eng.tie_to_by_id(eid, hid, 7);
+        assert_eq!((eng.get(eid, "age"), eng.cell_hlc(eid, hid)), (Some(7), hlc(200, 1)), "前提: 値は古く、 版数は新しい");
+
+        assert!(eng.set_cell(eid, hid, 42, hlc(200, 1)), "同じ record の当て直しを弾いた");
+        assert_eq!((eng.get(eid, "age"), eng.cell_hlc(eid, hid)), (Some(42), hlc(200, 1)));
+        assert_eq!(eng.pull("age", 42), vec![enchudb_oplog::eid_local(eid)]);
+        assert!(!eng.set_cell(eid, hid, 42, hlc(200, 1)), "そろった後の同じ record を採用した");
+
+        // untie: 版数は untie の物、 値が残っている
+        assert!(eng.clear_cell(eid, hid, hlc(300, 1)));
+        eng.tie_to_by_id(eid, hid, 9);
+        assert_eq!((eng.get(eid, "age"), eng.cell_hlc(eid, hid)), (Some(9), hlc(300, 1)), "前提: 値が残り、 版数は untie の物");
+        assert!(eng.clear_cell(eid, hid, hlc(300, 1)), "同じ untie の当て直しを弾いた");
+        assert_eq!(eng.get(eid, "age"), None);
+        assert!(!eng.clear_cell(eid, hid, hlc(300, 1)), "外れた後の同じ untie を採用した");
     }
 
     #[test]
