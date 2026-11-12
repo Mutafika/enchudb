@@ -13707,19 +13707,30 @@ impl Engine {
     }
 
     /// #612: 切り離した identity `ids` を slot `moved` に付け替える。 `moved` が自分の行 (生き返らせた slot) なら、 全部を別名に
-    /// する (逆写像を張ると、 その行に書いた record の宛名が相手の世界番号になる)。 新しい slot なら最初の相手の identity を逆写像
+    /// する (逆写像を張ると、 その行に書いた record の宛名が相手の世界番号になる)。 新しい slot なら相手の identity の 1 つを逆写像
     /// (宛名)、 残りを別名に。 自分の peer の identity は自分の slot 以外なら別名。
-    fn point_identities_to(&self, ids: &[(enchudb_oplog::PeerId, u32)], moved: u32, moved_is_own: bool) {
+    ///
+    /// 宛名にするのは、 作成のいちばん新しい相手の identity (同じなら (peer, 番号) の大きい方)。 並び (`ids`) の順では選ばない:
+    /// 束ねた identity の並びは、 memory では束ねた順、 開き直した後は (peer, 番号) の順 (`PkFormer::serialize`、 #756 と同じ根) で、
+    /// 「最初の相手」 は開き直すと変わる。 宛名が変わると、 この行への以後の書き込みが別の世界番号宛てに出る。 当たった record だけを
+    /// 先へ運ぶ中継 (ホストでない中継) の下流は、 ここで負けた identity (先に届いた新しい行に負けた、 古い方の行) を知らないので、
+    /// その世界番号宛ての書き込みを自分の行に結べない。 作成のいちばん新しい identity の名前のカードは、 束ねた他の identity の
+    /// 作成に負けない。
+    fn point_identities_to(&self, ids: &[crate::pk_former::Bound], moved: u32, moved_is_own: bool) {
         let self_peer = self.peer_id();
-        let mut first = !moved_is_own;
-        for &(peer, fl) in ids {
+        let addressee = if moved_is_own {
+            None
+        } else {
+            ids.iter().filter(|&&((peer, _), _)| peer != self_peer).max_by_key(|&&(id, created)| (created, id)).map(|b| b.0)
+        };
+        for &((peer, fl), _) in ids {
             if peer == self_peer {
                 if fl != moved {
                     self.eid_translator.alias(peer, fl, moved);
                 }
                 continue;
             }
-            if std::mem::take(&mut first) {
+            if addressee == Some((peer, fl)) {
                 self.eid_translator.insert(peer, fl, moved);
             } else {
                 self.eid_translator.alias(peer, fl, moved);
@@ -14493,7 +14504,7 @@ impl Engine {
     ///
     /// - 行に残るのは、 自分の行なら自分の identity の側 (自分の peer の番号は slot に固定で、 写像で移せない)、 翻訳した行なら
     ///   書き込みの宛名 (逆写像 = 行の元の identity、 #613: 束ねても替えない) の側。 他方を新しい slot に移す (写像を付け替え、
-    ///   移す側の先頭の相手の identity を新しい slot の逆写像にする)
+    ///   移す側の、 作成のいちばん新しい相手の identity を新しい slot の逆写像にする)
     /// - 行に残る側の cell は、 その側のカードの値と版数に戻す (他方の新しい値で上書きされていた cell も戻る)
     /// - 移す側は新しい slot に、 名前のカードを先にして当てる
     ///
@@ -14557,7 +14568,7 @@ impl Engine {
                 f.put_cards(moved, go_cards);
             }
             f.set_bound(local, if stay.len() > 1 { stay } else { Vec::new() });
-            f.set_bound(moved, if go.len() > 1 { go } else { Vec::new() });
+            f.set_bound(moved, if go.len() > 1 { go.clone() } else { Vec::new() });
             (stay_now, go_now)
         };
         if go_ids.len() > 1 {
@@ -14565,7 +14576,7 @@ impl Engine {
         }
         self.pk_former_dirty.store(true, Ordering::Release);
         // 移す側: 写像を移す先の slot へ (行の持ち主の自分の identity は残る側に居る)
-        self.point_identities_to(&go_ids, moved, moved_is_own);
+        self.point_identities_to(&go, moved, moved_is_own);
         // 残る側: cell をその側のカードに戻す (値と版数ごと。 カードの無い列は空にする)
         {
             let _row = self.row_locks.write(local);
@@ -14752,7 +14763,7 @@ impl Engine {
             };
             self.copy_later_cells(local, moved, t, pk, &later_now, &dead_writes);
             let later_ids: Vec<_> = later.iter().map(|b| b.0).collect();
-            self.point_identities_to(&later_ids, moved, moved_is_own);
+            self.point_identities_to(&later, moved, moved_is_own);
             {
                 let mut f = self.pk_former.write().unwrap();
                 let names = f.take_names(local, &later_ids);
