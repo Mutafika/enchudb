@@ -13736,10 +13736,17 @@ impl Engine {
 
     /// #612: 行 `here` から切り離す identity `ids` の中に畳んだ自分の行 (自分の peer, x) が居れば、 その slot x を生き返らせて返す
     /// (別名を外す)。 自分の行の世界番号は slot に固定なので、 切り離す先は新しい slot でなく元の slot。
-    fn revive_folded_own(&self, ids: &[(enchudb_oplog::PeerId, u32)], here: u32) -> Option<u32> {
+    ///
+    /// #775: 畳んだ自分の行が 2 つ以上あれば、 作成のいちばん新しいもの (同じなら番号の大きい方)。 並び (`ids`) の順では選ばない:
+    /// 並びは memory では束ねた順、 開き直した後は (peer, 番号) の順で (`PkFormer::serialize`、 #756 / #765 と同じ根)、 「最初の 1 つ」
+    /// は開き直すと変わる = 行の世界番号と、 以後の書き込みの宛名が変わる。 規則は、 この行を翻訳して持つ他の peer が同じ切り離しで
+    /// 宛名に選ぶ identity ([`Self::point_identities_to`]) と同じ。
+    fn revive_folded_own(&self, ids: &[crate::pk_former::Bound], here: u32) -> Option<u32> {
         let self_peer = self.peer_id();
-        let &(_, x) =
-            ids.iter().find(|&&(p, l)| p == self_peer && l != here && self.eid_translator.get(p, l) == Some(here))?;
+        let &((_, x), _) = ids
+            .iter()
+            .filter(|&&((p, l), _)| p == self_peer && l != here && self.eid_translator.get(p, l) == Some(here))
+            .max_by_key(|&&(id, created)| (created, id))?;
         self.eid_translator.unalias(self_peer, x);
         self.entities.ensure_live(x);
         Some(x)
@@ -14582,8 +14589,7 @@ impl Engine {
         // 残る側は固定の identity を先頭に (宛名 = 元の identity は固定の側に居るので、 移す側には居ない)
         stay.sort_by_key(|&(id, _)| id != pinned);
         // #612: 移す側に畳んだ自分の行が居れば、 その元の slot に戻す (自分の identity を先頭 = 行の元の identity に)
-        let go_all: Vec<_> = go.iter().map(|b| b.0).collect();
-        let (moved, moved_is_own) = match self.revive_folded_own(&go_all, local) {
+        let (moved, moved_is_own) = match self.revive_folded_own(&go, local) {
             Some(x) => {
                 go.sort_by_key(|&(id, _)| id != (self_peer, x));
                 (x, true)
@@ -14790,7 +14796,7 @@ impl Engine {
         } else {
             // 元の行は消える: 後の identity を新しい slot に移す (#612: 畳んだ自分の行が居れば、 その元の slot に戻す)
             let mut later = later;
-            let (moved, moved_is_own) = match self.revive_folded_own(&later_ids, local) {
+            let (moved, moved_is_own) = match self.revive_folded_own(&later, local) {
                 Some(x) => {
                     later.sort_by_key(|&(id, _)| id != (self_peer, x));
                     (x, true)
