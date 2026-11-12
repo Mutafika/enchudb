@@ -19477,7 +19477,7 @@ impl Engine {
 
     /// clean flag (#101) を倒して即書き出す。 書き始める前に呼ぶ: 立ったまま書いて落ちると、 次の open が 「きれいに閉じた」
     /// と読んで、 辞書の索引の作り直し (#101) と、 本体にあって oplog に無い write の照合 (#451) を飛ばす。 立てるのは
-    /// きれいに閉じた時 (`sync_and_mark_clean_with`) だけ。 該当 page (辞書 / 紐名の data の header) だけ書き出すので
+    /// `sync_and_mark_clean_with` だけで、 紐名の辞書の印 (#451 の照合が見る方) は、 oplog 付きの engine では閉じる時だけ (#709)。 該当 page (辞書 / 紐名の data の header) だけ書き出すので
     /// 1 ms 以下。
     fn mark_session_dirty(&self) {
         self.vocab.mark_index_clean(false);
@@ -21884,9 +21884,16 @@ impl Engine {
         }
         if closing && self.persist_leaf_free_list().unwrap_or(false) {
             self.himo_reg.mark_index_clean_leaf();
-        } else {
+        } else if closing || self.oplog.is_none() {
             self.himo_reg.mark_index_clean(true);
         }
+        // #709: oplog 付きの engine の途中の flush (`flush_clean` / `flush`) では、 紐名の辞書の印を立てない (倒れたまま)。
+        // この印は 「きれいに閉じた」 の印でもあり、 立っていると次の open が、 本体にあって oplog に無い write の照合 (#451
+        // `relog_unlogged_writes`) を飛ばす。 途中で立てると、 その後の普通の書き込みは倒さない (倒すのは新しい紐を作る時だけ)
+        // ので、 その後に落ちた session が 「きれいに閉じた」 に見えた。 立てた時点でも正しくない: ここは oplog を fsync しない
+        // ので、 本体に書き出した write の record がまだ届いていないことがある。 「きれいに閉じた」 と言えるのは、 consumer の
+        // 最後の書き出し (oplog の fsync → 本体) の後の Drop だけ。 辞書 (vocab) の印は今までどおり立てる (#101: 次の open が
+        // 索引の作り直しを飛ばせる。 その後に語を足せば辞書が自分で倒す)。 紐名の索引の作り直しは紐の数 (高々数百) なので安い
         self.write_out_body(true)?;
         if let Backing::Segments(set) = &self.backing {
             set.write_manifest()?;
@@ -21895,12 +21902,17 @@ impl Engine {
     }
 
     /// #101: graceful close 用の clean-flush (`&self` 版)。 滞留 write を全 apply して
-    /// msync し、 vocab/himo_reg の整合性マーク (clean=1) を永続化する。 次 open は
+    /// msync し、 vocab の整合性マーク (clean=1) を永続化する。 次 open は
     /// rebuild_index (O(count)) を skip でき、 readonly open の shadow rebuild も消える。
     ///
     /// `flush()` (&mut) と違い header は書き直さない (himo 定義は define 時に persist 済み)。
     /// readonly open では no-op。 書き込み thread が並行中に呼んだ場合、 mark 後の
     /// insert が flag を 0 に戻すので安全側 (次 open が rebuild) に倒れる。
+    ///
+    /// #709: **「きれいに閉じた」 ことにはならない。** oplog 付きの engine では紐名の辞書の印 (= 「きれいに閉じた」 の印)
+    /// を立てない。 この後 Drop を通らずに終わった process の次の open は、 紐名の索引を作り直し (紐の数だけ、 安い)、
+    /// 落ちた後と同じく本体にあって oplog に無い write の照合 (#451) をする。 oplog の無い engine (standalone) は今まで
+    /// どおり両方の印を立てる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn flush_clean(&self) -> io::Result<()> {
         if self.is_readonly.load(std::sync::atomic::Ordering::Acquire) {
