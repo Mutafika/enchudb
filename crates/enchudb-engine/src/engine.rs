@@ -242,6 +242,19 @@ struct LogWork {
 }
 
 impl ChangeNotifier {
+    /// #789: 通知係に 「配るものがあるかもしれない」 と頼んで起こす ([`Engine::notify_listeners`] と同じ)。 `oplog_sync()` が
+    /// 自分の commit を配らずに返る道 (listener の中からの再入 / 止まった listener を待つのを諦めた) で呼ぶ。 前はどちらも頼まず、
+    /// 書き出しは済んでいる (checkpoint = head) ので consumer の周期も通知係を起こさず (起こすのは head が checkpoint より先に
+    /// ある時)、 渡るのは次に畳む時 (畳む前に溜めへ移した分で起こす) だった: 畳める DB で次の周期 (100 ms)、 畳めない間 (sync の
+    /// bridge が ring の満杯で止まっている等) は次に誰かが書くまで。
+    ///
+    /// 通知係の thread 自身が呼んだ時 (通知係が配っている listener の中からの再入) は、 印だけが効く: 今の配信から戻った通知係は、
+    /// 印を見て眠らずにもう 1 周する。 通知係が居なければ何も起きない (listener が居れば居る)。
+    fn ask_notifier(&self) {
+        self.pending.store(true, std::sync::atomic::Ordering::Release);
+        self.waker.wake();
+    }
+
     /// changefeed: 溜め (畳んだ ring から移した分) と、 cursor から先の Commit で閉じた record を取り出して全 listener に渡し、
     /// cursor を進める。
     ///
@@ -267,6 +280,8 @@ impl ChangeNotifier {
         }
         let me = self as *const ChangeNotifier as usize;
         if EMITTING.with(|e| e.borrow().contains(&me)) {
+            // #789: 配らずに返るので、 通知係に頼む ([`Self::ask_notifier`])
+            self.ask_notifier();
             return true;
         }
         let deliver = if wait { self.deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.deliver_lock.try_lock() };
@@ -279,6 +294,8 @@ impl ChangeNotifier {
                          without delivering its commit (the notifier delivers it later)"
                     );
                 }
+                // #789: 配らずに返るので、 通知係に頼む
+                self.ask_notifier();
             }
             return true;
         };
