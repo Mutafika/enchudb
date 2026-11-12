@@ -14495,12 +14495,15 @@ impl Engine {
     /// 作られた行 = 削除を先に受けた peer では別のデッキ) を切り離す。 切り離して消したら true (呼び手は消さない)、 束ねた
     /// identity が無い / 全部 `t` 以前なら false (呼び手が普通に消す)。
     ///
-    /// - 元の identity が後: 行は残る。 早い identity を消えた slot に付け替え (その宛ての書き込みは捨てる)、 `t` 以前の cell
-    ///   (早い identity の書き込み) を落とし、 名前の削除を覚える
-    /// - 元の identity が早い: 後の identity を新しい slot に移し (`t` より新しい cell を写す)、 行を消す
+    /// - 元の identity が後: 行は残る。 早い identity を消えた slot に付け替え (その宛ての書き込みは捨てる)、 早い identity の
+    ///   書き込みを落とし、 その名前の削除を覚える
+    /// - 元の identity が早い: 後の identity を新しい slot に移し (後の identity の書き込みを写す)、 行を消す
     ///
-    /// `t` より新しい cell のうち、 削除を知らない peer が消えた identity 宛てに書いた分は、 後の identity の書き込みと分けられない
-    /// (cell は書いた宛名を持たない) ので、 後の identity の側に残る。
+    /// どの cell がどちらの identity の書き込みかは、 束ねた identity ごとのカード (宛名付き、 `pk_former.rs`) で決める (#714):
+    /// 残る側の列は、 後の identity 宛てのカードの新しい方の値と版数に戻す。 消えた identity 宛ての書き込みは、 削除より新しくても
+    /// 捨てる (削除優先。 削除を知らない peer が消えたデッキを改名した名前のカードが、 削除の後に作られたデッキに写らない。
+    /// 削除を先に受けた peer は、 その書き込みを消えた slot 宛てとして捨てている)。 どのカードにも無い cell (カードを持たない
+    /// 前の版の file の束ね) だけは、 前と同じく版数で分ける (`t` より新しければ残る側)。
     fn split_later_identities(&self, local: u32, t: enchudb_oplog::Hlc) -> bool {
         use std::sync::atomic::Ordering;
         if self.pk_former_empty.load(Ordering::Acquire) || !self.entities.is_live(local) {
@@ -14514,6 +14517,17 @@ impl Engine {
         }
         let Some(pk) = self.pk_himo_of_slot(local) else { return false };
         let self_peer = self.peer_id();
+        let later_ids: Vec<_> = later.iter().map(|b| b.0).collect();
+        let earlier_ids: Vec<_> = earlier.iter().map(|b| b.0).collect();
+        // 宛名で分ける: 後の identity の今の値 (列ごとに新しいカード) と、 消える identity 宛ての書き込みの版数
+        let (later_now, dead_writes) = {
+            let f = self.pk_former.read().unwrap();
+            let cards = f.cards_of(local);
+            let later_cards: Vec<_> = cards.iter().filter(|c| later_ids.contains(&c.0)).cloned().collect();
+            let dead: Vec<(u16, enchudb_oplog::Hlc)> =
+                cards.iter().filter(|c| earlier_ids.contains(&c.0)).map(|c| (c.1, c.3)).collect();
+            (crate::pk_former::newest_per_himo(&later_cards), dead)
+        };
         if later.iter().any(|&(id, _)| id == native) {
             // 元の行は残る: 早い identity を消えた slot に付け替える
             for &((peer, fl), _) in &earlier {
@@ -14535,33 +14549,60 @@ impl Engine {
                 }
             }
             let name = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
+            // 残る側のカードに戻す列 (今の cell が後の identity のカードそのものでない列)
+            let mut restore: Vec<(u16, crate::pk_former::Card, enchudb_oplog::Hlc)> = Vec::new();
             {
                 let _row = self.row_locks.write(local);
                 for hid in 0..self.himos.len() {
-                    if self.himos[hid].get_value(local).is_some() && self.version_of(local, hid as u16) <= t {
+                    let h = hid as u16;
+                    let ver = self.version_of(local, h);
+                    let has = self.himos[hid].get_value(local).is_some();
+                    let want = later_now.iter().find(|c| c.0 == h);
+                    if want.is_some_and(|w| w.2 == ver && (w.1 == crate::pk_former::Card::Gone) != has) {
+                        continue;
+                    }
+                    let dead = ver != enchudb_oplog::Hlc::ZERO && dead_writes.contains(&(h, ver));
+                    if !(dead || want.is_some() || (has && ver <= t)) {
+                        continue;
+                    }
+                    if has {
                         self.remove_cell_freeing_leaf(local, hid);
+                    }
+                    if dead || want.is_some() {
+                        self.reset_cell_version(local, h);
+                    }
+                    if let Some(w) = want {
+                        restore.push(w.clone());
                     }
                 }
             }
-            if let Some(v) = name {
-                let mut g = self.pk_tombs.write().unwrap();
-                self.drain_pk_pending(&mut g);
-                self.with_pk_key(pk, PkValue::Local(v), |k| self.note_pk_locked(&mut g, pk, k, crate::pk_tombs::NO_SLOT, t));
-            }
-            {
+            self.apply_cards(enchudb_oplog::make_eid(self_peer, local), pk, &restore);
+            // 消える identity の名前 (消える時の行の名前、 その identity 宛ての名前の書き込み) は消した名前
+            let dead_names = {
                 let mut f = self.pk_former.write().unwrap();
-                let earlier_ids: Vec<_> = earlier.iter().map(|b| b.0).collect();
+                let names = f.names_written_to(local, &earlier_ids);
+                f.take_names(local, &earlier_ids);
                 f.take_cards(local, &earlier_ids);
                 if later.len() <= 1 {
                     f.drop_cards(local);
                 }
                 f.set_bound(local, if later.len() > 1 { later } else { Vec::new() });
+                names
+            };
+            {
+                let mut g = self.pk_tombs.write().unwrap();
+                self.drain_pk_pending(&mut g);
+                if let Some(v) = name {
+                    self.with_pk_key(pk, PkValue::Local(v), |k| self.note_pk_locked(&mut g, pk, k, crate::pk_tombs::NO_SLOT, t));
+                }
+                for (h, k) in &dead_names {
+                    self.note_pk_locked(&mut g, *h, k, crate::pk_tombs::NO_SLOT, t);
+                }
             }
         } else {
             // 元の行は消える: 後の identity を新しい slot に移す (#612: 畳んだ自分の行が居れば、 その元の slot に戻す)
             let mut later = later;
-            let later_all: Vec<_> = later.iter().map(|b| b.0).collect();
-            let (moved, moved_is_own) = match self.revive_folded_own(&later_all, local) {
+            let (moved, moved_is_own) = match self.revive_folded_own(&later_ids, local) {
                 Some(x) => {
                     later.sort_by_key(|&(id, _)| id != (self_peer, x));
                     (x, true)
@@ -14571,11 +14612,13 @@ impl Engine {
                     None => return false,
                 },
             };
-            self.copy_cells_newer_than(local, moved, t);
+            self.copy_later_cells(local, moved, t, pk, &later_now, &dead_writes);
             let later_ids: Vec<_> = later.iter().map(|b| b.0).collect();
             self.point_identities_to(&later_ids, moved, moved_is_own);
             {
                 let mut f = self.pk_former.write().unwrap();
+                let names = f.take_names(local, &later_ids);
+                f.put_names(moved, names);
                 let cards = f.take_cards(local, &later_ids);
                 if later.len() > 1 {
                     f.put_cards(moved, cards);
@@ -14590,14 +14633,25 @@ impl Engine {
         true
     }
 
-    /// #581: 行 `from` の cell のうち版数が `t` より新しいものを行 `to` に写す (`merge_entity_into` の 2 段目と同じ当て方)。
-    fn copy_cells_newer_than(&self, from: u32, to: u32, t: enchudb_oplog::Hlc) {
+    /// #581 / #714: 行 `from` から切り離す後の identity の値を行 `to` に写す。 後の identity 宛てのカードのある列 (`later_now`) は
+    /// カードの値と版数。 カードの無い列は、 版数が `t` より新しく、 消える identity 宛ての書き込み (`dead_writes` = 列と版数) で
+    /// ない cell を写す (カードを持たない前の版の file の束ね。 `merge_entity_into` の 2 段目と同じ当て方)。
+    fn copy_later_cells(
+        &self,
+        from: u32,
+        to: u32,
+        t: enchudb_oplog::Hlc,
+        pk: u16,
+        later_now: &[(u16, crate::pk_former::Card, enchudb_oplog::Hlc)],
+        dead_writes: &[(u16, enchudb_oplog::Hlc)],
+    ) {
         let self_peer = self.peer_id();
         let to_eid = enchudb_oplog::make_eid(self_peer, to);
+        self.apply_cards(to_eid, pk, later_now);
         for hid in 0..self.himos.len() {
             let h = hid as u16;
             let ver = self.version_of(from, h);
-            if ver <= t {
+            if ver <= t || later_now.iter().any(|c| c.0 == h) || dead_writes.contains(&(h, ver)) {
                 continue;
             }
             match self.himos[hid].get_value(from) {
