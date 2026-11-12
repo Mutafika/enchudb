@@ -629,9 +629,9 @@ if out.history_truncated {
 A puller's cursor advances to the **max HLC it received, per author**. Two things follow, and both are contracts rather than bugs:
 
 - **A publisher-side `SubscriptionFilter` makes the cursor scope-dependent.** Records the filter drops are skipped by the cursor, so widening a subscription later does **not** bring the past back through a differential pull — and no truncation is signalled either. Recover the widened range with `Syncer::bootstrap_pull_via`. `Syncer::suppressed_since(target)` shows what a publisher declined to send, per author; `suppressed_records()` is the running total (always 0 with the default `AllRecords`).
-- **A state batch served by a *replica* can be incomplete at cell granularity**, not just row granularity — a relay cannot always map a cell back into the author's namespace. `Engine::state_records_dropped()` counts the cells it declined to serve (0 on the ordinary relay path), and the replica warns once when it serves such a batch.
+- **A state batch served by a *replica* can be incomplete at cell granularity**, not just row granularity — a relay cannot always map a cell back into the author's namespace. A text (Tag) cell another peer wrote into the author's row is served as that peer's record (same row id, that peer's dictionary ids), so a batch for one author can carry records whose `author_peer` is someone else (#711); a cell no peer's namespace can carry is left out. `Engine::state_records_dropped()` counts the cells it declined to serve (0 on the ordinary relay path), and the replica warns once when it serves such a batch.
 
-Neither is silent any more, but neither is fixed by retrying: both recover through a direct bootstrap from the author.
+Neither is silent any more, but neither is fixed by retrying: both recover through a direct bootstrap from the author (behind a host there is no such path — a cell left out of the host's state stays missing until it is written again).
 
 ## Testing
 

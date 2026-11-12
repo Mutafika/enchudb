@@ -9447,7 +9447,11 @@ impl Engine {
     /// - Tag は **author の vid 空間に戻して**配る (`peer_vocab_map` の逆引き)。
     ///   自分の local vid のまま `(author, vid)` として配ると、 author 直 pull で
     ///   来る同じ key の別テキストと衝突して vocab 写像が壊れる (#209 と同種)。
-    ///   逆引きできない cell は配らない。
+    ///   author の vid 空間に無い語 (author の行を別の peer が書き換えた cell) は、
+    ///   **書いた peer (版数の peer) の record の形**で配る (#711): `author_peer` は
+    ///   その peer、 vid はその peer の空間、 宛名は author の世界番号。 書いたのが
+    ///   自分なら自分の record として。 = batch の record の `author_peer` は `author`
+    ///   とは限らない。 どの空間にも戻せない cell は配らない。
     ///
     /// 呼び元は `StateBatch.complete` を **false** にすること — relay が author の
     /// live state を全部持っている保証は無い (途中から relay を始めた場合)。
@@ -9461,7 +9465,7 @@ impl Engine {
     /// | 条件 | 理由 |
     /// |---|---|
     /// | 版数が `Hlc::ZERO` | foreign cell に自分の clock を stamp する権利が無い |
-    /// | Tag の vid を逆引きできない | author の vid 空間に戻せない |
+    /// | Tag の vid を逆引きできない | author の vid 空間にも、 書いた peer (版数の peer) の vid 空間にも戻せない (#711) |
     /// | Ref の target を `reverse` できない | 元 entity を導けない |
     /// | Ref の値が translated local でない | author の行が自分の entity を指すことはない |
     ///
@@ -9505,15 +9509,20 @@ impl Engine {
         // 記録が無いと 「この replica の state は cell 単位で欠けている」 が
         // 観測できない ([`Engine::state_records_dropped`])。
         let mut dropped: u64 = 0;
-        let mut vocab_sent: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
+        // (record の書き手, その書き手の vid) ごとに Vocab を 1 回
+        let mut vocab_sent: std::collections::HashSet<(enchudb_oplog::PeerId, u32)> = std::collections::HashSet::new();
+        // #711: author 以外の書き手の vid 空間への逆引き (要る時に作る)
+        let mut vid_back_of: std::collections::HashMap<enchudb_oplog::PeerId, std::collections::HashMap<u32, u32>> =
+            std::collections::HashMap::new();
+        let mk_by = |by: enchudb_oplog::PeerId, op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
             hlc,
-            author_peer: author,
+            author_peer: by,
             op,
             signature: [0u8; 64],
             pubkey_fp: [0u8; 8],
             signed_bytes: Vec::new(),
         };
+        let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| mk_by(author, op, hlc);
 
         for hid in 0..self.himos.len() {
             if self.himo_is_in_reserved_table(hid) {
@@ -9602,23 +9611,36 @@ impl Engine {
                         // replica は author の vid 空間に戻す。 戻せない vid は
                         // 配らない — 自分の local vid を `(author, vid)` として送ると
                         // author 直 pull の同 key と衝突して写像が壊れる。
-                        let out_vid = if is_self {
-                            value
+                        //
+                        // #711: author の vid 空間に無い語 = author の行を別の peer が書き換えた cell (author はその語を
+                        // 自分の record で言っていない)。 その cell は、 **書いた peer の record の形** (書き手 = 版数の peer、
+                        // 宛名は author の世界番号、 vid はその peer の空間) で出す = その peer が元々出した record と同じ形。
+                        // 書いたのが自分 (replica 自身の書き戻し) なら自分の vid のまま自分の record として。 受け手は record ごとの
+                        // 書き手の写像で vid を引くので、 author の写像は汚れない。 前は落としていて、 ホストを置く形では
+                        // その書き換えがどの state にも入らなかった (書き換えた側の state は自分の行だけ)
+                        let (by, out_vid) = if is_self {
+                            (author, value)
+                        } else if let Some(v) = vid_back.get(&value) {
+                            (author, *v)
+                        } else if hlc.peer == self_peer {
+                            (self_peer, value)
+                        } else if hlc.peer != author
+                            && let Some(v) = vid_back_of
+                                .entry(hlc.peer)
+                                .or_insert_with(|| self.remote_vid_reverse_of(hlc.peer))
+                                .get(&value)
+                        {
+                            (hlc.peer, *v)
                         } else {
-                            match vid_back.get(&value) {
-                                Some(v) => *v,
-                                None => {
-                                    dropped += 1; // #236
-                                    continue;
-                                }
-                            }
+                            dropped += 1; // #236
+                            continue;
                         };
-                        if vocab_sent.insert(out_vid) {
+                        if vocab_sent.insert((by, out_vid)) {
                             let bytes = self.vocab.get(value).to_vec();
-                            records.push(mk(DecodedOp::Vocab { vid: out_vid, bytes }, hlc));
+                            records.push(mk_by(by, DecodedOp::Vocab { vid: out_vid, bytes }, hlc));
                         }
                         records
-                            .push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid as u64 }, hlc));
+                            .push(mk_by(by, DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid as u64 }, hlc));
                     }
                     ValueType::Leaf => {
                         let Some(bytes) = self.text_owned_by_id(hid, local) else { continue };
