@@ -611,6 +611,7 @@ if out.history_truncated {
 }
 ```
 
+- **The host relays every record it takes, not only the ones that won on it** (#698). Clients only hear from the host, so a record that lost last-write-wins on the host still goes out: a losing key write is the only record that says "this row id is the row with this key", and a client that never saw it could not attach later writes, deletes or renames addressed to that row id to its own row. Each client resolves last-write-wins itself, as it would pulling from the author directly. Records the host refused (ACL, signature, out of space) are not relayed; they are redelivered.
 - The host acknowledges what it applied, so each client's `_sync_ops` is reclaimed as soon as the host has its records (a client that stays away does not hold the others back). A client's pull acknowledges the host's stream, so the host's `_sync_ops` is reclaimed too.
 - A client whose cursor is below the host's reclaimed floor is told so (`history_truncated`) and catches up from the host's state.
 - **Give the client a cursor file** (`Syncer::with_cursor_path`). The cursor is what tells the host how far this client has received. A client without one starts every restart as a first-time client: once the host has reclaimed anything, its first pull applies nothing and returns `history_truncated`, and it receives nothing until the app runs `bootstrap_pull_via` for the listed authors.
@@ -628,9 +629,9 @@ if out.history_truncated {
 A puller's cursor advances to the **max HLC it received, per author**. Two things follow, and both are contracts rather than bugs:
 
 - **A publisher-side `SubscriptionFilter` makes the cursor scope-dependent.** Records the filter drops are skipped by the cursor, so widening a subscription later does **not** bring the past back through a differential pull — and no truncation is signalled either. Recover the widened range with `Syncer::bootstrap_pull_via`. `Syncer::suppressed_since(target)` shows what a publisher declined to send, per author; `suppressed_records()` is the running total (always 0 with the default `AllRecords`).
-- **A state batch served by a *replica* can be incomplete at cell granularity**, not just row granularity — a relay cannot always map a cell back into the author's namespace. `Engine::state_records_dropped()` counts the cells it declined to serve (0 on the ordinary relay path), and the replica warns once when it serves such a batch.
+- **A state batch served by a *replica* can be incomplete at cell granularity**, not just row granularity — a relay cannot always map a cell back into the author's namespace. A text (Tag) cell another peer wrote into the author's row is served as that peer's record (same row id, that peer's dictionary ids), so a batch for one author can carry records whose `author_peer` is someone else (#711); a cell no peer's namespace can carry is left out. `Engine::state_records_dropped()` counts the cells it declined to serve (0 on the ordinary relay path), and the replica warns once when it serves such a batch.
 
-Neither is silent any more, but neither is fixed by retrying: both recover through a direct bootstrap from the author.
+Neither is silent any more, but neither is fixed by retrying: both recover through a direct bootstrap from the author (behind a host there is no such path — a cell left out of the host's state stays missing until it is written again).
 
 ## Testing
 

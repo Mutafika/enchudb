@@ -120,6 +120,12 @@ pub struct Syncer {
     suppressed_records: std::sync::atomic::AtomicU64,
     /// ホスト (全員が経由する DB の peer) として動くか ([`Syncer::set_host`])。
     host: std::sync::atomic::AtomicBool,
+    /// #698 (ホストだけ): 中継に載せた record のうち、 その link の cursor がまだ越えていない物 (`{link: {(author, HLC)}}`)。
+    /// cursor が進まずに同じ record が届き直した時 (reject で止まった batch / 書き出しの失敗)、 LWW で負けた record を
+    /// 2 度載せないために見る。 cursor が越えたら外す (cursor より前の record は当てる前に落ちるので届かない)。 memory だけ
+    relay_held: std::sync::Mutex<
+        std::collections::HashMap<PeerId, std::collections::HashSet<(PeerId, Hlc)>>,
+    >,
     // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
     // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
 }
@@ -323,6 +329,7 @@ impl Syncer {
             suppressed_since: std::sync::Mutex::new(std::collections::HashMap::new()),
             suppressed_records: std::sync::atomic::AtomicU64::new(0),
             host: std::sync::atomic::AtomicBool::new(false),
+            relay_held: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
         //
@@ -350,6 +357,14 @@ impl Syncer {
     /// ホスト (全員が経由する、 DB を持つ peer) として動く。 ホストは受けた record を自分の DB と ring に持つ (record の置き場の
     /// 権威) ので、 client への ack を下流の消化で丸めない (#227 の丸めは、 中継が権威でない時の安全策)。 丸めると、 止まった
     /// client が 1 台いるだけで全員の `_sync_ops` の回収が止まる。 ホストの口 (`enchudb-transport` の `HttpHost`) が立てる
+    ///
+    /// #698: ホストは、 受けた record を **LWW で負けた物も** 中継に載せる (`pull_once`)。 client はホストからしか record を
+    /// 受けないので、 ホストで負けた record を配らないと、 相手から直に pull する形 (record を全部受ける) と答えが割れる:
+    /// 負けた名前のカード (主キーの Tie) は 「この世界番号はこの名前のデッキ」 を運ぶ唯一の record で、 受けていない client は
+    /// その世界番号宛ての後の書き込み・削除・改名を自分の行に結べない。 ホストの `_sync_ops` は 「ホストが当てた record」 では
+    /// なく 「ホストが受けた record」 の列になる (LWW は受け手がそれぞれ自分でする)。 ホストを通る形は星形 (client は中継
+    /// しない) なので、 負けた record を載せても反響しない。 ホストでない中継 (`set_gossip_remote_apply` だけ) は今までどおり
+    /// 当たった record だけ載せる (閉路の反響を LWW で止める)
     pub fn set_host(&self, on: bool) {
         self.host.store(on, std::sync::atomic::Ordering::Release);
     }
@@ -638,8 +653,10 @@ impl Syncer {
                              incomplete at cell granularity — dropped {dropped} cell(s) \
                              (undeliverable: ZERO version / unmapped Tag vid / \
                              unresolvable Ref). Followers bootstrapping via this replica \
-                             will be missing them; recover with a direct bootstrap from \
-                             the author — see #236"
+                             will be missing them. Where followers can reach the author \
+                             directly, a direct bootstrap from the author recovers them; \
+                             behind a host there is no such path, and the cells stay \
+                             missing until they are written again — see #236 / #711"
                         );
                     }
                     if !is_self && records.is_empty() {
@@ -704,15 +721,20 @@ impl Syncer {
             return None;
         };
         let gossip = self.engine.gossip_remote_apply();
-        let mut relay_accepted: Vec<usize> = Vec::new();
+        let mut relay_accepted: Vec<(usize, bool)> = Vec::new();
         let outcome =
             self.apply_records_impl(&batch.records, gossip.then_some(&mut relay_accepted));
 
         // #209: relay が bootstrap で取った state も原型のまま relay stream へ —
         // これで新規 relay も author の複製 + 配布点として立ち上がれる。
+        // state の record は当たった物だけ (#698 の 「負けた record も載せる」 は差分の流れだけ): state の record の HLC は
+        // cell の版数で、 書き手の record の順に並ばない (他の peer の時計の版数も混ざる)。 負けた分まで載せると、 受け手の
+        // 書き手ごとの cursor がその版数まで進む record を増やす
         if gossip {
-            for &i in &relay_accepted {
-                let _ = self.engine.relay_record(&batch.records[i]);
+            for &(i, applied) in &relay_accepted {
+                if applied {
+                    let _ = self.engine.relay_record(&batch.records[i]);
+                }
             }
         }
 
@@ -921,7 +943,7 @@ impl Syncer {
         }
         let new_author_on_reclaimed_link = !new_authors.is_empty();
         let gossip = self.engine.gossip_remote_apply();
-        let mut relay_accepted: Vec<usize> = Vec::new();
+        let mut relay_accepted: Vec<(usize, bool)> = Vec::new();
         let mut outcome =
             self.apply_records_impl(&records, gossip.then_some(&mut relay_accepted));
         if new_author_on_reclaimed_link {
@@ -939,9 +961,27 @@ impl Syncer {
         // 再適用+再判定される。 既知の狭い窓 (apply 済み・append 前の crash で
         // 当該 record が relay stream から漏れる) は #209 に記録済み — 下流の
         // 回収路は author 直 bootstrap。
+        //
+        // #698: ホストは LWW で負けた record も載せる ([`Syncer::set_host`])。 batch の順のまま 1 回で載せる (書き手ごとに HLC の
+        // 昇順 = 途中まで載った所で client が pull しても、 その書き手の cursor は載った所までしか進まない)。 負けた record は、
+        // cursor が進まずに届き直した時に 2 度載せない (`relay_held`)。 当たった record は今までどおり必ず載せる
+        let host = gossip && self.is_host();
+        let mut relayed = 0usize;
         if gossip {
-            for &i in &relay_accepted {
-                let _ = self.engine.relay_record(&records[i]);
+            let mut held = self.relay_held.lock().unwrap();
+            let held = held.entry(from).or_default();
+            for &(i, applied) in &relay_accepted {
+                let r = &records[i];
+                let key = (r.author_peer, r.hlc);
+                if !applied && (!host || held.contains(&key)) {
+                    continue;
+                }
+                if self.engine.relay_record(r) {
+                    relayed += 1;
+                    if host {
+                        held.insert(key);
+                    }
+                }
             }
         }
 
@@ -965,7 +1005,11 @@ impl Syncer {
         // 未永続の slot を残しうるが、 その slot には何も書かれていないので crash で
         // 失われても **leak であって破損ではない** (次に同じ entity が来たら別 slot に
         // 張り直る)。
-        if outcome.applied > 0 && !self.persist_applied_state(from) {
+        //
+        // #698: ホストが負けた record だけを載せた batch (applied = 0) も通す。 負けた名前のカードは束ねた写像を作っていて、
+        // 中継の record は WAL の再生で当て直される (`replay_relayed_op` は名前で束ねない) ので、 写像が残っていないと
+        // 再生が新しい行を払い出す
+        if (outcome.applied > 0 || (host && relayed > 0)) && !self.persist_applied_state(from) {
             return outcome;
         }
 
@@ -1002,6 +1046,15 @@ impl Syncer {
         }
         if advanced {
             self.save_cursors();
+        }
+        if host {
+            // cursor が越えた record はもう届かない (当てる前に cursor で落ちる)
+            let guard = self.last_pulled.lock().unwrap();
+            let link = guard.get(&from);
+            let cursor = |a: PeerId| link.and_then(|m| m.get(&a)).copied().unwrap_or(Hlc::ZERO);
+            if let Some(held) = self.relay_held.lock().unwrap().get_mut(&from) {
+                held.retain(|(a, h)| *h > cursor(*a));
+            }
         }
 
         // #149: 確定 cursor を pull-as-ack として transport に記録する。 cursor は
@@ -1533,15 +1586,18 @@ impl Syncer {
         self.apply_records_impl(records, None)
     }
 
-    /// #209: `relay_accepted` が Some なら、 relay (gossip) すべき record の index を
-    /// 集める: **apply が accept (Applied) したものだけ** — LWW gate が cyclic
-    /// topology の echo を止める栓なので、 skip した record を relay してはいけない。
-    /// Commit (dedupe identity なし) と自 author の record (発信元に戻ってきた echo)
-    /// も除外する。
+    /// #209: `relay_accepted` が Some なら、 relay (gossip) の候補の record を `(index, 当たったか)` で集める (batch の順)。
+    /// **apply が accept (Applied) したもの** は中継が必ず載せる — LWW gate が cyclic topology の echo を止める栓なので、
+    /// ホストでない中継は skip した record を relay してはいけない。 Commit (dedupe identity なし) と自 author の record
+    /// (発信元に戻ってきた echo) も除外する。
+    ///
+    /// #698: 当たらなかった record (LWW で負けた / 消えた行宛て / 宛先を解決できない) も `(index, false)` で集める。 載せるかは
+    /// 呼び手が決める (ホストだけが載せる、 [`Syncer::set_host`])。 検査 (ACL・署名) と容量で断った record は集めない
+    /// (cursor を止めて届き直させる物)。 登録済みの Vocab (同じ書き手・番号・語を前に当てた = 前に載せた) も集めない。
     fn apply_records_impl(
         &self,
         records: &[WireRecord],
-        mut relay_accepted: Option<&mut Vec<usize>>,
+        mut relay_accepted: Option<&mut Vec<(usize, bool)>>,
     ) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         // #9 foot-gun ガード: self_peer 未設定 (= 0) で foreign record を apply すると、
@@ -1609,17 +1665,21 @@ impl Syncer {
                 continue;
             }
             let bound = self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none());
-            match self.apply_one(&store, rec, bound, &dying) {
-                ApplyResult::Applied => {
-                    out.applied += 1;
-                    if let Some(list) = relay_accepted.as_deref_mut() {
-                        let relayable = !matches!(rec.op, DecodedOp::Commit)
-                            && rec.author_peer != self_peer;
-                        if relayable {
-                            list.push(idx);
-                        }
-                    }
+            let result = self.apply_one(&store, rec, bound, &dying);
+            if let Some(list) = relay_accepted.as_deref_mut() {
+                let relayable = !matches!(rec.op, DecodedOp::Commit) && rec.author_peer != self_peer;
+                let applied = result == ApplyResult::Applied;
+                let passed_over = match result {
+                    ApplyResult::SkippedOlder => !matches!(rec.op, DecodedOp::Vocab { .. }),
+                    ApplyResult::Dropped | ApplyResult::DroppedVocab => true,
+                    ApplyResult::Applied | ApplyResult::RejectedCapacity => false,
+                };
+                if relayable && (applied || passed_over) {
+                    list.push((idx, applied));
                 }
+            }
+            match result {
+                ApplyResult::Applied => out.applied += 1,
                 ApplyResult::SkippedOlder => out.skipped += 1,
                 ApplyResult::Dropped => out.dropped_unresolved += 1,
                 ApplyResult::DroppedVocab => out.dropped_vocab += 1,

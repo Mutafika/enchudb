@@ -13,9 +13,13 @@
 //!
 //! 挙動は変えず、 観測できるようにした ([`Engine::state_records_dropped`] +
 //! provider の once-warn + doc)。
+//!
+//! #711: Tag の cell は、 author の空間に戻せなくても、 書いた peer (版数の peer) の空間に戻せればその peer の record の形で
+//! 配るようになった (relay 自身の書き戻しも)。 どの空間にも戻せない cell だけが落ちて counter に載る。
 
 use enchudb_engine::engine::Engine;
-use enchudb_engine::transport::{InMemoryTransport, Transport};
+use enchudb_engine::transport::{InMemoryTransport, Transport, WireRecord};
+use enchudb_oplog::oplog::DecodedOp;
 use enchudb_engine::ValueType;
 use enchudb_oplog::{Hlc, PeerId};
 use enchudb_sync::Syncer;
@@ -144,19 +148,15 @@ fn basic_relay_replica_state_drops_nothing() {
     cleanup(&pr);
 }
 
-/// relay 自身が author の行へ Tag を write-back すると、 その cell の vid は
-/// author の vid 空間へ逆引きできない → **配らない**。 その事実が counter に載ること。
-///
-/// 落とす判断自体は正しい (relay の local vid を `(author, vid)` として配ると、
-/// author 直 pull で来る同じ key の別テキストと衝突して vocab 写像が壊れる、#209 と
-/// 同種)。 見たいのは 「正しく落としたことが観測できるか」 の方。
+/// relay 自身が author の行へ Tag を write-back した cell は、 author の vid 空間へ逆引きできない。 前は **配らなかった** (#236 は
+/// それを counter で見えるようにした)。 #711 から、 その cell は **書いた peer (ここでは relay 自身) の record の形**で配る:
+/// 書き手は relay、 宛名は author の世界番号、 vid は relay の空間。 author の写像は汚さない。 受けた follower に値が入ること。
 #[test]
-fn relay_write_back_to_a_replicated_row_is_counted_as_dropped() {
-    let (pa, pr) = (tmp_path("a2"), tmp_path("r2"));
-    let _cleanup = Cleanup(vec![pa.clone(), pr.clone()]);
+fn relay_write_back_to_a_replicated_row_is_served_as_the_relays_own_record() {
+    let (pa, pr, pf) = (tmp_path("a2"), tmp_path("r2"), tmp_path("f2"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone(), pf.clone()]);
     let (eng_a, eng_r, sync_a, sync_r) = relayed_pair(&pa, &pr);
 
-    // 基準点 (ここまでで落ちていないこと自体は上の test が見ている)。
     let (before_recs, _) = eng_r.state_records_for(1);
     let base = eng_r.state_records_dropped();
 
@@ -164,26 +164,66 @@ fn relay_write_back_to_a_replicated_row_is_counted_as_dropped() {
     let target = *eng_r.pull_raw("notes.note", 2).first().expect("relay に届いている");
     eng_r.tie_text_to(target, "notes.city", "Sapporo");
     eng_r.flush_writes();
+    let city = eng_r.himo_id("notes.city").unwrap() as u16;
+    assert_eq!(eng_r.cell_hlc(target, city).peer, 2, "前提: cell の版数は relay (peer 2) の時計");
 
     let (after_recs, _) = eng_r.state_records_for(1);
-    let dropped = eng_r.state_records_dropped() - base;
+    assert_eq!(eng_r.state_records_dropped() - base, 0, "relay の書き戻しを落とした");
+    // 行 2 の city は relay の record (Vocab + Tie)、 他は author 1 の record のまま
+    let by_relay: Vec<_> = after_recs.iter().filter(|r| r.author_peer == 2).collect();
+    assert_eq!(by_relay.len(), 2, "relay の record は Vocab と Tie の 2 件: {by_relay:?}");
+    assert!(by_relay.iter().any(|r| matches!(&r.op, DecodedOp::Vocab { bytes, .. } if bytes == b"Sapporo")));
+    assert!(by_relay.iter().any(|r| matches!(&r.op, DecodedOp::Tie { eid, himo_id, .. }
+        if enchudb_oplog::eid_peer(*eid) == 1 && *himo_id == city)), "宛名は author 1 の世界番号: {by_relay:?}");
+    assert_eq!(after_recs.len(), before_recs.len() + 1, "Tie は書き手が替わり、 Vocab が 1 件増える");
 
-    assert!(
-        dropped > 0,
-        "author の vid 空間へ戻せない cell を落としたのに counter に載っていない — \
-         これが #236 の症状 (呼び出し側からは 「bootstrap は成功した」 としか見えない)"
-    );
-    assert!(
-        after_recs.len() < before_recs.len(),
-        "落ちた分だけ record が減っていること (before={}, after={})",
-        before_recs.len(),
-        after_recs.len()
-    );
+    // follower (peer 3) が state を当てると、 行 2 の city は relay の書いた値
+    let eng_f = make_engine(&pf, 3);
+    let sync_f = Syncer::new(eng_f.clone(), make_transport(&[3]));
+    let out = sync_f.apply_records(&after_recs);
+    assert_eq!(out.dropped_vocab + out.dropped_unresolved, 0, "{out:?}");
+    let row = *eng_f.pull_raw("notes.note", 2).first().expect("follower に行 2");
+    assert_eq!(eng_f.get_text_owned(row, "notes.city").as_deref(), Some(&b"Sapporo"[..]));
+    let other = *eng_f.pull_raw("notes.note", 1).first().expect("follower に行 1");
+    assert_eq!(eng_f.get_text_owned(other, "notes.city").as_deref(), Some(&b"Tokyo"[..]));
 
-    drop(sync_a);
-    drop(sync_r);
-    drop(eng_a);
-    drop(eng_r);
+    drop((sync_a, sync_r, sync_f, eng_a, eng_r, eng_f));
+    cleanup(&pa);
+    cleanup(&pr);
+    cleanup(&pf);
+}
+
+/// どの vid 空間にも戻せない Tag の cell (版数の peer の語彙を relay が持っていない) は今も配らず、 counter に載る。
+#[test]
+fn a_tag_cell_no_vid_space_can_carry_is_counted_as_dropped() {
+    let (pa, pr) = (tmp_path("a4"), tmp_path("r4"));
+    let _cleanup = Cleanup(vec![pa.clone(), pr.clone()]);
+    let (eng_a, eng_r, sync_a, sync_r) = relayed_pair(&pa, &pr);
+    let (before_recs, _) = eng_r.state_records_for(1);
+    let base = eng_r.state_records_dropped();
+
+    // peer 9 が中継した体の record: 語彙は peer 9 の空間、 版数は peer 5 の時計 (relay は peer 5 の語彙を知らない)
+    let target = *eng_r.pull_raw("notes.note", 2).first().expect("relay に届いている");
+    let city = eng_r.himo_id("notes.city").unwrap() as u16;
+    let world = eng_r
+        .translated_locals_of(1)
+        .into_iter()
+        .find(|(_, local)| *local == enchudb_oplog::eid_local(target))
+        .map(|(foreign, _)| enchudb_oplog::make_eid(1, foreign))
+        .expect("行 2 の世界番号");
+    let later = Hlc { wall: eng_r.cell_hlc(target, city).wall + 10_000, logical: 0, peer: 5 };
+    let out = sync_r.apply_records(&[
+        WireRecord::unsigned(later, 9, DecodedOp::Vocab { vid: 777, bytes: b"Nagoya".to_vec() }),
+        WireRecord::unsigned(later, 9, DecodedOp::Tie { eid: world, himo_id: city, value: 777 }),
+    ]);
+    assert_eq!(out.applied, 2, "前提: 書き換えが relay に当たった: {out:?}");
+    assert_eq!(eng_r.get_text_owned(target, "notes.city").as_deref(), Some(&b"Nagoya"[..]));
+
+    let (after_recs, _) = eng_r.state_records_for(1);
+    assert_eq!(eng_r.state_records_dropped() - base, 1, "戻せない cell を落としたのに counter に載っていない (#236)");
+    assert_eq!(after_recs.len(), before_recs.len() - 1, "落ちた分だけ record が減る");
+
+    drop((sync_a, sync_r, eng_a, eng_r));
     cleanup(&pa);
     cleanup(&pr);
 }
