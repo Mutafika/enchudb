@@ -14363,6 +14363,18 @@ impl Engine {
         }
     }
 
+    /// 束ねた行 `local` の、 slot に固定の identity: 束ねた中に自分の世界番号 (自分の peer, local) が居ればそれ (自分の行の世界番号は
+    /// slot に固定)、 居なければ今の宛名 ([`Self::native_identity`])。 束ねた identity の並び (`bound`) の順には頼らない (#756:
+    /// 並びは開き直すと変わる)。
+    fn pinned_identity(&self, local: u32, bound: &[crate::pk_former::Bound]) -> (u32, u32) {
+        self.pinned_identity_of(local, bound.iter())
+    }
+
+    fn pinned_identity_of<'a>(&self, local: u32, mut bound: impl Iterator<Item = &'a crate::pk_former::Bound>) -> (u32, u32) {
+        let own = (self.peer_id(), local);
+        if bound.any(|&(id, _)| id == own) { own } else { self.native_identity(local) }
+    }
+
     /// #581: 行 `local` の元の identity (自分の行は (自分の peer, local)、 翻訳した行は逆写像)。
     fn native_identity(&self, local: u32) -> (u32, u32) {
         self.eid_translator.reverse(local).unwrap_or((self.peer_id(), local))
@@ -14536,9 +14548,7 @@ impl Engine {
             return None;
         }
         let self_peer = self.peer_id();
-        let own = (self_peer, local);
-        let published = self.native_identity(local);
-        let pinned = if later.iter().chain(&earlier).any(|&(id, _)| id == own) { own } else { published };
+        let pinned = self.pinned_identity_of(local, later.iter().chain(&earlier));
         let (mut stay, mut go) = if later.iter().any(|&(id, _)| id == pinned) { (later, earlier) } else { (earlier, later) };
         // 残る側は固定の identity を先頭に (宛名 = 元の identity は固定の側に居るので、 移す側には居ない)
         stay.sort_by_key(|&(id, _)| id != pinned);
@@ -14653,7 +14663,13 @@ impl Engine {
             return false;
         }
         let list = self.pk_former.read().unwrap().bound_of(local).to_vec();
-        let Some(&(native, _)) = list.first() else { return false };
+        if list.is_empty() {
+            return false;
+        }
+        // #756: 元の identity は並びの先頭から読まない。 `pkformer` のまとめ直し (`PkFormer::serialize`) は束ねた identity を
+        // (peer, 番号) の順に並べて書くので、 開き直した後の先頭は 「番号のいちばん小さい identity」 で、 行の元の identity とは
+        // 限らない (自分の行に番号の小さい peer の identity を束ねていると、 相手の identity を元と読んで自分の行を消した)
+        let native = self.pinned_identity(local, &list);
         let (later, earlier): (Vec<_>, Vec<_>) = list.into_iter().partition(|&(_, c)| c > t);
         if later.is_empty() {
             return false;
