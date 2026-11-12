@@ -1832,6 +1832,8 @@ pub mod write_out_hook {
         Opened,
         /// #656: 残りの中身を指す列 (紐の番号) の門を閉じた後 (その列を書き出す前)。 列ごとに呼ぶ
         Column(u16),
+        /// #705: 列を全部書き出した後 (版数の列・tombstone を書き出す前)
+        BeforeVersions,
         /// 0.37: `body_msync` が本体を書き出し終えた後 (書き出しが届かせた bridge の位置を置く前)
         WrittenOut,
     }
@@ -11805,8 +11807,15 @@ impl Engine {
     }
 
     /// cell への write を採用してよいか。 `set_cell` / `clear_cell` の唯一の判定。
+    ///
+    /// #705: cell の版数が `hlc` と **同じ** 時は `differs` (その record の値と cell の今の中身が違うか) を呼び、 違えば採用する。
+    /// (peer, HLC) は record ごとに一意なので、 版数が同じ = 同じ record。 その record の値と cell の中身が違うのは、 版数だけが
+    /// ディスクに届いた像を開いた時 (書き手は 値 → 版数 の順に書き、 書き出しは 列 → 版数の列 の順に msync するので、 その間に
+    /// 入った write は版数だけ届く。 OS が版数の page を先に書いた時も同じ)。 前は同じ HLC を無条件に弾いていて、 開く時の再生も
+    /// 相手の再配送もその cell を直せなかった (値は古いまま、 版数は新しい = 永久に失う)。 中身が同じなら今までどおり不採用
+    /// (再配送は skip のまま)。 `differs` を呼ぶのは版数が同じ時だけ = 普通の書き込み (版数が進む) の道には何も足さない。
     #[inline]
-    fn accepts_write(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+    fn accepts_write(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc, differs: impl FnOnce() -> bool) -> bool {
         if hlc == enchudb_oplog::Hlc::ZERO {
             return true; // 版数不明 (standalone のローカル write) は従来どおり通す
         }
@@ -11827,7 +11836,8 @@ impl Engine {
         if tomb != enchudb_oplog::Hlc::ZERO && hlc < tomb {
             return false;
         }
-        Self::accepts_hlc(self.version_of(local, himo_id), hlc)
+        let cur = self.version_of(local, himo_id);
+        Self::accepts_hlc(cur, hlc) || (cur == hlc && differs())
     }
 
     /// LWW 判定 (A-2)。 true = 採用してよい。
@@ -11940,6 +11950,10 @@ impl Engine {
     /// 書く順序は **値 → HLC** (A-4)。 value と HLC は別 region なので 1 命令では
     /// 書けず、 逆順にすると「HLC だけ新しい」窓ができて後続の正しい record が
     /// 永久に負ける。 「値は新しいが HLC は古い」窓は次の write で必ず解消する。
+    ///
+    /// #705: この順はメモリの上の話で、 ディスクには 「HLC だけ新しい」 像が届きうる (列と版数の列は別の segment で、
+    /// 書き出しはその間に入った write の版数だけを届かせる)。 その像は、 同じ HLC の record の当て直し (開く時の再生 /
+    /// 相手の再配送) が値の違いを見て直す (`accepts_write`)。
     ///
     /// `value` は `tie_to_by_id` と同じ raw な cell 値。 Leaf himo の旧 payload
     /// 解放 (`take_leaf_cell` / `free_leaf_offset`) は呼び元の責務。
@@ -12285,7 +12299,9 @@ impl Engine {
         }
         let _own = row.is_none().then(|| self.row_locks.write(local));
         debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
-        if !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record の当て直しは、 cell の値が record の値と違う時だけ採用する (Leaf の値は書くたびに新しい slot なので
+        // 必ず違う — 中身の比べは slot を取る前に `remote_tieleaf_apply` が済ませている)
+        if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local) != Some(value)) {
             return false;
         }
         let renamed_from = self.pk_rename_from(local, himo_id, value).map(|old| (old, self.version_of(local, himo_id)));
@@ -12568,7 +12584,8 @@ impl Engine {
     /// **採用が決まってから**呼ぶこと (不採用なら cell は変わらないので解放しない)。
     fn clear_cell_local(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
         let _row = self.row_locks.write(local);
-        if !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record (untie) の当て直しは、 cell にまだ値が残っている時だけ採用する
+        if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local).is_some()) {
             return false;
         }
         self.live_remove(himo_id as usize, local);
@@ -12593,7 +12610,8 @@ impl Engine {
     ) -> bool {
         let _own = row.is_none().then(|| self.row_locks.write(local));
         debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
-        if !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record (untie) の当て直しは、 cell にまだ値が残っている時だけ採用する
+        if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local).is_some()) {
             return false;
         }
         self.remove_cell_freeing_leaf(local, himo_id as usize);
@@ -13994,7 +14012,8 @@ impl Engine {
         // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
         self.observe_remote_hlc(hlc);
         // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。 削除優先: 消えた行への書き込みは捨てる
-        if self.slot_is_dead(local) || !self.accepts_write(local, himo_id, hlc) {
+        // #705: 同じ record の当て直しは、 cell の今の中身が record の bytes と違う時だけ採用する (同じなら slot を取らない)
+        if self.slot_is_dead(local) || !self.accepts_write(local, himo_id, hlc, || self.text_owned_by_id(hid, local).as_deref() != Some(bytes)) {
             return RemoteApply::Stale;
         }
         // #316: cell の列を伸ばせないなら payload を置く前に断る (置いてから cell を書けないと orphan)
@@ -19849,8 +19868,10 @@ impl Engine {
                         _ => *value,
                     };
                     // request17 step 4: replay も版数付きで書く。 不採用 (= cell に
-                    // 既に同じか新しい版数が載っている = body に msync 済み) なら
+                    // より新しい版数が載っている、 または同じ版数で値も同じ) なら
                     // 値を戻さない — 戻すと新しい write を古い record で潰す。
+                    // #705: 版数が同じでも値が違えば当てる。 「版数が載っている = 値も本体に届いている」 は成り立たない
+                    // (版数の列だけ先にディスクに届く像がある、 `accepts_write`)
                     self.set_cell_local(local, *himo_id, value, hlc);
                 }
                 // eid 空間の整合 (live bitmap / next_local) は適用可否に依らず進める。
@@ -21267,7 +21288,14 @@ impl Engine {
             write_out_hook::call(write_out_hook::Phase::Column(column(*k)));
             SegmentSet::flush_segment(*k, seg, all)?;
         }
-        set.flush_where(all, |k| !content(k) && !points(k))
+        // 残りは 「版数でないもの (中身を指さない列 / header / entity …) → 版数の列・tombstone」 の順 (`SegmentSet::all` の並びと
+        // 同じ順を、 段として書く)。 版数を後にするのは、 書き終えた write の版数だけが届く像 (間で電源が落ちた時) を作らないため。
+        // 列の msync と版数の msync の間に入った write は版数だけ届くが、 それは同じ HLC の record の当て直しが直す (#705)
+        let version = |k: SegmentKind| matches!(k, SegmentKind::Ver(_) | SegmentKind::Tomb);
+        set.flush_where(all, |k| !content(k) && !points(k) && !version(k))?;
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::BeforeVersions);
+        set.flush_where(all, version)
     }
 
     /// #656: 書き手が書き出しの門で待った回数 (Tag / Leaf の cell を書こうとして、 その列の門が閉じていた)。 当たっているかを
@@ -22565,7 +22593,7 @@ mod cell_version_tests {
     }
 
     /// A-2 の核: 古い HLC は **値も版数も cylinder も** 触らずに落とす。
-    /// 同値 HLC も不採用 (`cur >= hlc`)。
+    /// 同値 HLC で値も同じ (= 同じ record の再配送) も不採用。
     #[test]
     fn older_hlc_is_rejected_without_touching_the_cell() {
         let (eng, hid, eid) = v9_engine("reject_old", "age");
@@ -22576,8 +22604,34 @@ mod cell_version_tests {
         assert_eq!(eng.cell_hlc(eid, hid), hlc(200, 1), "不採用なのに版数が変わった");
         assert!(eng.pull("age", 7).is_empty(), "不採用なのに cylinder に載った");
 
-        assert!(!eng.set_cell(eid, hid, 8, hlc(200, 1)), "同値 HLC を採用した");
+        assert!(!eng.set_cell(eid, hid, 42, hlc(200, 1)), "同値 HLC・同じ値 (同じ record の再配送) を採用した");
         assert_eq!(eng.get(eid, "age"), Some(42));
+        assert!(!eng.clear_cell(eid, hid, hlc(100, 1)), "古い untie を採用した");
+        assert_eq!(eng.get(eid, "age"), Some(42));
+    }
+
+    /// #705: 同値 HLC で cell の中身が record と違うのは、 版数だけがディスクに届いた像 (書き出しが 列 → 版数の列 の間に
+    /// 入った write)。 (peer, HLC) は record ごとに一意なので、 その record を当て直して中身をそろえる。 版数は動かない。
+    #[test]
+    fn same_hlc_with_a_different_value_repairs_the_cell() {
+        let (eng, hid, eid) = v9_engine("same_hlc_repair", "age");
+        assert!(eng.set_cell(eid, hid, 42, hlc(200, 1)));
+        // 版数だけ届いた像を作る: 値を版数なしで戻す (旧経路は版数を書かない)
+        eng.tie_to_by_id(eid, hid, 7);
+        assert_eq!((eng.get(eid, "age"), eng.cell_hlc(eid, hid)), (Some(7), hlc(200, 1)), "前提: 値は古く、 版数は新しい");
+
+        assert!(eng.set_cell(eid, hid, 42, hlc(200, 1)), "同じ record の当て直しを弾いた");
+        assert_eq!((eng.get(eid, "age"), eng.cell_hlc(eid, hid)), (Some(42), hlc(200, 1)));
+        assert_eq!(eng.pull("age", 42), vec![enchudb_oplog::eid_local(eid)]);
+        assert!(!eng.set_cell(eid, hid, 42, hlc(200, 1)), "そろった後の同じ record を採用した");
+
+        // untie: 版数は untie の物、 値が残っている
+        assert!(eng.clear_cell(eid, hid, hlc(300, 1)));
+        eng.tie_to_by_id(eid, hid, 9);
+        assert_eq!((eng.get(eid, "age"), eng.cell_hlc(eid, hid)), (Some(9), hlc(300, 1)), "前提: 値が残り、 版数は untie の物");
+        assert!(eng.clear_cell(eid, hid, hlc(300, 1)), "同じ untie の当て直しを弾いた");
+        assert_eq!(eng.get(eid, "age"), None);
+        assert!(!eng.clear_cell(eid, hid, hlc(300, 1)), "外れた後の同じ untie を採用した");
     }
 
     #[test]
