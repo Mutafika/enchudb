@@ -104,6 +104,8 @@ pub struct Syncer {
     /// 「単調増加しているのに bootstrap 成功が無い」= 回復経路が塞がっている
     /// (state provider 不在等) の運用 signal。
     truncated_pulls: std::sync::atomic::AtomicU64,
+    /// #783: ホストが、 取り直した state の遅れて載った record のために、 書き手の floor を上げた回数 (観測用)。
+    late_state_floors: std::sync::atomic::AtomicU64,
     /// #216: 「truncated なのに transport が state を運べない (fetch_state = None)」
     /// の一度だけ警告 — この構成では truncation が回復経路の無い行き止まりになる。
     warned_no_state_provider: std::sync::atomic::AtomicBool,
@@ -136,7 +138,7 @@ pub struct Syncer {
     /// 写し終えた後
     state_relay_owner: std::sync::Mutex<Option<std::thread::ThreadId>>,
     /// ホスト (全員が経由する DB の peer) として動くか ([`Syncer::set_host`])。
-    host: std::sync::atomic::AtomicBool,
+    host: Arc<std::sync::atomic::AtomicBool>,
     /// #698 (ホスト): 中継に載せた record のうち、 その link の cursor がまだ越えていない物 (`{link: {(author, HLC)}}`)。
     /// cursor が進まずに同じ record が届き直した時 (reject で止まった batch / 書き出しの失敗)、 LWW で負けた record を
     /// 2 度載せないために見る。 cursor が越えたら外す (cursor より前の record は当てる前に落ちるので届かない)。 memory だけ
@@ -360,6 +362,7 @@ impl Syncer {
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
             truncated_pulls: std::sync::atomic::AtomicU64::new(0),
+            late_state_floors: std::sync::atomic::AtomicU64::new(0),
             warned_no_state_provider: std::sync::atomic::AtomicBool::new(false),
             served_authors: std::sync::Mutex::new(None),
             forget_seen: Arc::new(std::sync::Mutex::new(Hlc::ZERO)),
@@ -367,7 +370,7 @@ impl Syncer {
             suppressed_records: std::sync::atomic::AtomicU64::new(0),
             state_relay: std::sync::RwLock::new(()),
             state_relay_owner: std::sync::Mutex::new(None),
-            host: std::sync::atomic::AtomicBool::new(false),
+            host: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_held: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
@@ -643,6 +646,15 @@ impl Syncer {
                     authors.push(a);
                 }
             }
+            // #783: 行の写像を持たない書き手 (他の peer の行に書くだけで、 自分の行を作っていない) も、 record を受けていれば
+            // 配布元として名乗る。 その書き手の state は 「他の行への、 その書き手の時計の版数の書き込み」 で、 名乗らないと、
+            // その書き手の floor (遅れて載った state / 回収) で抜けを言われた下の受け手が取り直せない
+            let guard = self.last_pulled.lock().unwrap();
+            for a in guard.values().flat_map(|m| m.keys()) {
+                if *a != self_peer && !authors.contains(a) {
+                    authors.push(*a);
+                }
+            }
         }
         let fresh: Vec<PeerId> = {
             let mut g = self.served_authors.lock().unwrap();
@@ -661,6 +673,7 @@ impl Syncer {
             let warned_incomplete = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let last_pulled = self.last_pulled.clone();
             let forget_seen = self.forget_seen.clone();
+            let host = self.host.clone();
             self.transport.register_state_provider_for(
                 author,
                 self_peer,
@@ -703,7 +716,12 @@ impl Syncer {
                              missing until they are written again — see #236 / #711"
                         );
                     }
-                    if !is_self && records.is_empty() {
+                    // #783: ホストは、 record を受けた書き手 (cursor がある) の state が空でも配る。 ホストはその書き手の
+                    // record を cursor まで全部受けていて、 配布元はホストだけ (譲る先が無い)。 空 = その書き手の書いた cell /
+                    // untie / 削除が、 今は 1 つも残っていない (全部他の peer が書き換えた)。 配らないと、 その書き手の floor
+                    // で抜けを言われた下の受け手が、 取り直せずに抜けを言われ続ける
+                    let host_has_all = received.is_some() && host.load(std::sync::atomic::Ordering::Acquire);
+                    if !is_self && records.is_empty() && !host_has_all {
                         // 何も持っていない replica は None を返して次の候補に譲る。
                         // 空 batch でも `Some` を返すと、 caller は「state を受け取った
                         // = 回復した」と見なして truncation を解除してしまう。
@@ -855,6 +873,7 @@ impl Syncer {
         // 同じ版数で並ぶ)、 指す Tie を載せなければ state の最後に as_of (版数の無い cell が state で持つのと同じ版数)。
         // どちらも as_of 以下なので、 受け手の cursor は as_of を越えない。 語の写像は版数によらず、 state の record は書き手が
         // 署名していない合成なので、 付け替えても同じ意味
+        let mut late_relay = false;
         if gossip {
             let mut relayed = false;
             // 当たった Vocab のうち、 まだ載せていない物: (書き手, 番号) → `records` の中の位置
@@ -879,6 +898,14 @@ impl Syncer {
                 }
             }
             order.sort_by_key(|&i| records[i].hlc);
+            // #783: author 自身の record で、 版数が取り直す前の cursor 以下の物を、 今初めて載せる (差分で受けていれば
+            // 当たらない = ここに居ない)。 下の受け手の `cursor[author]` はもうその版数を越えているかもしれない
+            late_relay = host
+                && cursor_before > Hlc::ZERO
+                && order.iter().any(|&i| {
+                    let r = &records[i];
+                    r.author_peer == author && r.hlc <= cursor_before && !matches!(r.op, DecodedOp::Vocab { .. })
+                });
             for i in order {
                 let r = &records[i];
                 if (!withheld.is_empty() || !known.is_empty())
@@ -983,6 +1010,17 @@ impl Syncer {
             let cursors = self.cap_ack_by_downstream(cursors);
             self.transport.record_pull_ack_multi(link, self_peer, &cursors);
         }
+        // #783 (ホストだけ): 取り直した state が、 自分の `cursor[author]` 以下の版数の record を載せた (書き手が WAL に載せられずに
+        // 落として、 その後の record を先に配っていた、 など)。 下の受け手は書き手ごとの cursor より後しか受けないので、 その
+        // record は ring に載っても配られない。 author の floor を今の cursor (= as_of) に上げて、 下の受け手に抜けを知らせる
+        // (受け手は、 このホストの持つ author の state を取り直す)。 上げるのは cursor を進めた後 (受け手が取り直す state の
+        // as_of = この cursor が、 floor に届いているように)
+        if late_relay {
+            let cur = self.last_pulled.lock().unwrap().get(&link).and_then(|m| m.get(&author)).copied().unwrap_or(Hlc::ZERO);
+            if self.engine.raise_history_floor(author, cur) {
+                self.late_state_floors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // #226: relay が bootstrap で新しい author を取り込んだ → その author の
         // 配布元としても名乗る (opt-in 済みなら)。
         self.refresh_state_providers();
@@ -1016,8 +1054,19 @@ impl Syncer {
     /// 受け手の `cursor[author]` が `as_of` を越え、 同じ間に書かれて state に入らなかった (走査の済んだ cell の) record が、
     /// 後で差分で届いて載っても cursor の手前で落ちる (#753 の形 1 の、 中継の版)。
     ///
-    /// 他の peer の時計の版数の record (書き手の行を別の peer が書き換えた cell) は、 差分で届くとは限らないので今までどおり
-    /// 当てて載せる (その版数が `as_of` より後なら、 同じ越えが残る)。
+    /// #825 / #786: **別の peer k の時計の版数**の record (書き手の行を k が書き換えた cell。 `author_peer` は書き手か、 Tag の
+    /// 書き手の語彙に無い語なら k = #711) も、 k の元の record が `link` の差分で届く時は外す。 当てて載せると、 自分は k の record を
+    /// そこまで受けていないのに、 下の受け手の cursor がその版数まで進む:
+    /// - `author_peer` が k の record → 下の `cursor[k]` が進み、 k がそれより前に書いて自分にまだ届いていない record が、 後で
+    ///   差分で届いて載っても落ちる。 外すのは、 版数が自分の `cursor[link][k]` より後の物
+    /// - `author_peer` が書き手の record → 下の `cursor[author]` が進む。 外すのは、 版数が取り直した後の `cursor[link][author]`
+    ///   より後の物 (それ以下なら、 書き手の record はもうそこまで載せてある)
+    ///
+    /// 「差分で届く」 と見るのは、 `link` から k の record を受けたことがあり (`cursor[link][k]` がある)、 版数がその cursor より後で、
+    /// `link` が広告する k の floor (回収した record の最大) より後の時。 k の元の record は、 k 自身の順 (HLC の昇順) で届いて
+    /// 当たって載る。 それ以外 (`link` が k の record を運ばない / もう回収した / cursor がもう越えている) は、 state の他に届く道が
+    /// 無いので今までどおり当てて載せる (`author_peer` が書き手で版数が cursor より後なら、 #786 の越えが残る)。 自分の時計の
+    /// 版数の record (自分が書いた cell) は外さない
     ///
     /// 外した Vocab を、 残した Tie が指す時 (同じ語を持つ古い cell。 Vocab は state の中で語ごとに 1 回、 最初に出た cell の
     /// 版数で出る) は、 その Vocab を Tie の版数に付け替えて Tie の前に残す (語の写像は版数によらない。 state の record は
@@ -1032,30 +1081,45 @@ impl Syncer {
         if !relay {
             return None;
         }
-        let cursor = {
-            let guard = self.last_pulled.lock().unwrap();
-            guard.get(&link).and_then(|m| m.get(&author)).copied().unwrap_or(Hlc::ZERO)
+        let cursors: std::collections::HashMap<PeerId, Hlc> =
+            self.last_pulled.lock().unwrap().get(&link).cloned().unwrap_or_default();
+        let resume = cursors.get(&author).copied().unwrap_or(Hlc::ZERO).max(batch.as_of);
+        let self_peer = self.engine.peer_id();
+        // `link` が広告する、 回収した record の最大 (書き手ごと。 書き手の分からない下限は全員に効く)
+        let floors = self.transport.history_floor_multi(link);
+        let scalar_floor = self.transport.history_floor(link);
+        let floor_of = |k: PeerId| match &floors {
+            Some(f) => f.iter().filter(|(a, _)| *a == k || *a == u32::MAX).map(|(_, h)| *h).max().unwrap_or(Hlc::ZERO),
+            None => scalar_floor.unwrap_or(Hlc::ZERO),
         };
-        let resume = cursor.max(batch.as_of);
-        let left = |r: &WireRecord| r.author_peer == author && r.hlc.peer == author && r.hlc > resume;
+        let left = |r: &WireRecord| {
+            let k = r.hlc.peer;
+            if k == author {
+                return r.author_peer == author && r.hlc > resume;
+            }
+            if k == self_peer || !(r.author_peer == k || (r.author_peer == author && r.hlc > resume)) {
+                return false;
+            }
+            cursors.get(&k).is_some_and(|c| r.hlc > *c) && r.hlc > floor_of(k)
+        };
         if !batch.records.iter().any(left) {
             return None;
         }
         let mut kept: Vec<WireRecord> = Vec::with_capacity(batch.records.len());
-        // 外した Vocab (vid → record)
-        let mut vocab: std::collections::HashMap<u32, &WireRecord> = std::collections::HashMap::new();
+        // 外した Vocab ((書き手, vid) → record)
+        let mut vocab: std::collections::HashMap<(PeerId, u32), &WireRecord> = std::collections::HashMap::new();
         for r in &batch.records {
             if left(r) {
                 if let DecodedOp::Vocab { vid, .. } = &r.op {
-                    vocab.insert(*vid, r);
+                    vocab.insert((r.author_peer, *vid), r);
                 }
                 continue;
             }
-            if r.author_peer == author
+            if !vocab.is_empty()
                 && let DecodedOp::Tie { himo_id, value, .. } = &r.op
                 && self.engine.value_type_at(*himo_id as usize) == Some(enchudb_engine::ValueType::Tag)
                 && let Ok(vid) = u32::try_from(*value)
-                && let Some(v) = vocab.remove(&vid)
+                && let Some(v) = vocab.remove(&(r.author_peer, vid))
             {
                 kept.push(WireRecord { hlc: r.hlc, ..v.clone() });
             }
@@ -1461,6 +1525,12 @@ impl Syncer {
     /// (state provider 不在、 または app が bootstrap を呼んでいない)。
     pub fn truncated_pulls(&self) -> u64 {
         self.truncated_pulls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #783: ホストが、 取り直した state の中の 「自分の cursor 以下の版数の、 初めて受けた record」 のために、 その書き手の
+    /// floor を上げた回数。 上げるたびに、 下の受け手は全員その書き手の state を取り直す。
+    pub fn late_state_floors(&self) -> u64 {
+        self.late_state_floors.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 適用した state を durable にする。 失敗したら `false` (= cursor を進めない)。
