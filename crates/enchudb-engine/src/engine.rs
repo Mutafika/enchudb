@@ -22388,10 +22388,21 @@ impl Engine {
         // 同じ順を、 段として書く)。 版数を後にするのは、 書き終えた write の版数だけが届く像 (間で電源が落ちた時) を作らないため。
         // 列の msync と版数の msync の間に入った write は版数だけ届くが、 それは同じ HLC の record の当て直しが直す (#705)
         let version = |k: SegmentKind| matches!(k, SegmentKind::Ver(_) | SegmentKind::Tomb);
-        set.flush_where(all, |k| !content(k) && !points(k) && !version(k))?;
+        // #841: きれいに閉じなかった後の最初の書き出し (`catch_up`) は、 印の無い segment も全部、 全域で書き出す。 全域の msync は
+        // 汚れた page が無くても segment 1 つごとに時間がかかるので、 段の中で並べる (段の順は同じ: 版数は列の後)
+        let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k);
+        if catch_up {
+            set.flush_all_spread(rest)?;
+        } else {
+            set.flush_where(all, rest)?;
+        }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeVersions);
-        set.flush_where(all, version)?;
+        if catch_up {
+            set.flush_all_spread(version)?;
+        } else {
+            set.flush_where(all, version)?;
+        }
         if all {
             self.columns_settled.store(true, Ordering::Release);
         }

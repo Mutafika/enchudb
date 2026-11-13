@@ -33,6 +33,11 @@ const OPLOG_CAP: usize = 4 * 1024 * 1024;
 const OLD: &str = "old-value-written-out";
 const NEW: &str = "new-value-left-in-the-page-cache";
 const THIRD: &str = "a-third-word";
+/// #841 の試験: 大きい表の数の列の数 (並べて書き出す thread の数 8 より多く) と、 小さい表の中の行の位置 (4 B の cell で 2 page 目)。
+const NUM_COLS: usize = 10;
+const S_ROW: usize = 4_500;
+const NUM_OLD: u32 = 1;
+const NUM_NEW: u32 = 2;
 /// e0 と e1 の間の行の数 (cell 8 B × 16 KiB の page でも別の page になる)。
 const FAR: usize = 20_000;
 
@@ -70,6 +75,10 @@ fn read_ids(db: &str) -> (u64, u64, u16) {
     let s = std::fs::read_to_string(ids_file(db)).unwrap();
     let mut it = s.split_whitespace().map(|x| x.parse::<u64>().unwrap());
     (it.next().unwrap(), it.next().unwrap(), it.next().unwrap() as u16)
+}
+
+fn read_all_ids(db: &str) -> Vec<u64> {
+    std::fs::read_to_string(ids_file(db)).unwrap().split_whitespace().map(|x| x.parse::<u64>().unwrap()).collect()
 }
 
 /// 子 process の入口 (親が環境変数を付けて呼ぶ。 普通に回した時は何もしない)。
@@ -110,6 +119,46 @@ fn child_entry() {
             let (e0, _, k) = read_ids(&db);
             let eng = Engine::open_concurrent_with_oplog(&db, OPLOG_CAP).unwrap();
             eng.try_tie_text_to_by_id(e0, k, NEW).unwrap();
+            unsafe { libc::_exit(0) }
+        }
+        // #841: 中身を指さない列 (数の列) と、 その版数の列。 大きい表 t の列 `NUM_COLS` 本 (離れた行) と、 表 s の列 1 本
+        // (segment が 2 page で、 header と別の page の行)
+        "build-num" => {
+            let mut eng = Engine::create_growable_opts(
+                &db,
+                GrowableOptions { max_entities: 100_000, column_pad: Some(false), ..Default::default() },
+            )
+            .unwrap();
+            eng.enable_sync_tables().unwrap();
+            // s を先に作る (eid が小さい = s の列の segment は小さいまま)
+            eng.define_table("s", 6_000).unwrap();
+            let m = eng.define_himo_in("s", "m", ValueType::Number, 0).unwrap();
+            eng.define_table("t", 30_000).unwrap();
+            let ns: Vec<u32> =
+                (0..NUM_COLS).map(|c| eng.define_himo_in("t", &format!("n{c}"), ValueType::Number, 0).unwrap()).collect();
+            // x0 は s の列の 2 page 目 (16 KiB の page でも 4 KiB の page でも、 header の page ではない)
+            let x0 = (0..S_ROW).map(|_| eng.entity_in("s").unwrap()).last().unwrap();
+            let e1 = eng.entity_in("t").unwrap();
+            let e0 = (0..FAR).map(|_| eng.entity_in("t").unwrap()).last().unwrap();
+            eng.flush().unwrap();
+            eng.persist_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+            for &n in &ns {
+                eng.try_tie_to_by_id(e0, n as u16, NUM_OLD).unwrap();
+            }
+            eng.try_tie_to_by_id(x0, m as u16, NUM_OLD).unwrap();
+            eng.oplog_sync().unwrap();
+            let ns: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
+            std::fs::write(ids_file(&db), format!("{e0} {e1} {x0} {m} {}", ns.join(" "))).unwrap();
+            drop(eng);
+        }
+        "write-num" => {
+            let ids = read_all_ids(&db);
+            let eng = Engine::open_concurrent_with_oplog(&db, OPLOG_CAP).unwrap();
+            for &n in &ids[4..] {
+                eng.try_tie_to_by_id(ids[0], n as u16, NUM_NEW).unwrap();
+            }
+            eng.try_tie_to_by_id(ids[2], ids[3] as u16, NUM_NEW).unwrap();
             unsafe { libc::_exit(0) }
         }
         other => panic!("知らない役: {other}"),
@@ -212,4 +261,76 @@ fn previous_sessions_pages_reach_disk_before_the_checkpoint_moves() {
 #[test]
 fn previous_sessions_pages_reach_disk_before_a_reclaimed_slot_is_reused() {
     run(true);
+}
+
+/// #841: 中身を指さない列 (数の列) と版数の列も同じ。 #813 の直しは、 きれいに閉じなかった後の最初の書き出しで全部の segment を
+/// 全域で書き出す。 上の 2 本は Tag の列 (中身を指す列の段) しか通らないので、 残りの段 (中身を指さない列 → 版数の列) を通す。
+/// その段は大きい segment を thread に分けて書き出す (`SegmentSet::flush_all_spread`) ので、 thread の数より多い大きい segment
+/// (t の列 `NUM_COLS` 本とその版数の列) と、 呼んだ thread で書く小さい segment (s の列。 16 KiB の page の OS で 2 page) の
+/// 両方に、 前の session の page を置く。
+#[test]
+fn previous_sessions_number_cells_and_versions_reach_disk_before_the_checkpoint_moves() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Scratch::new("num");
+    let live = s.0.join("live");
+    let db = live.join("db");
+    let db_str = db.to_str().unwrap();
+    child("build-num", &db);
+    let ids = read_all_ids(db_str);
+    let (e0, e1, x0, m) = (ids[0], ids[1], ids[2], ids[3] as u16);
+    let ns: Vec<u16> = ids[4..].iter().map(|&n| n as u16).collect();
+    assert_eq!(ns.len(), NUM_COLS);
+
+    crashsim::start();
+    baseline(&live);
+    child("write-num", &db);
+
+    // 前提 1: 控えの上では、 どれも前の値
+    let img0 = s.0.join("img0");
+    crashsim::capture(&live, &img0, Mode::Lost).unwrap();
+    {
+        let probe = Engine::open_standalone(img0.join("db").to_str().unwrap()).unwrap();
+        for &n in &ns {
+            assert_eq!(probe.get_by_id(e0, n), Some(NUM_OLD as u64), "前提: 控えの上の e0 は前の値");
+        }
+        assert_eq!(probe.get_by_id(x0, m), Some(NUM_OLD as u64), "前提: 控えの上の x0 は前の値");
+    }
+
+    // 前提 2: 落ちた後に開いた process からは新しい値が読める (page cache)
+    let eng = Engine::open_concurrent_with_oplog(db_str, OPLOG_CAP).unwrap();
+    for &n in &ns {
+        assert_eq!(eng.get_by_id(e0, n), Some(NUM_NEW as u64), "前提: 開いた process からは新しい値が読める");
+    }
+    assert_eq!(eng.get_by_id(x0, m), Some(NUM_NEW as u64));
+    let v_e0: Vec<_> = ns.iter().map(|&n| eng.cell_hlc(e0, n)).collect();
+    let v_x0 = eng.cell_hlc(x0, m);
+    assert!(v_e0.iter().all(|v| *v != enchudb_oplog::Hlc::ZERO) && v_x0 != enchudb_oplog::Hlc::ZERO, "前提: 版数の列がある");
+    eng.try_tie_to_by_id(e1, ns[0], 7u32).unwrap();
+    eng.oplog_sync().unwrap();
+    eng.oplog_sync().unwrap();
+
+    let img = s.0.join("img");
+    crashsim::capture(&live, &img, Mode::Lost).unwrap();
+    crashsim::stop();
+    drop(eng);
+
+    // 前提 3: 像の WAL に、 e0 / x0 の再生される record が無い (あれば再生が当て直す)
+    let probe_dir = s.0.join("probe");
+    copy_dir(&img, &probe_dir);
+    let recs = OpLog::open(&probe_dir.join("db").join("oplog")).unwrap().recover_with_tail();
+    let locals = [e0 & 0xffff_ffff, x0 & 0xffff_ffff];
+    assert!(
+        !recs.iter().any(|r| matches!(&r.op, DecodedOp::Tie { eid, .. } if locals.contains(&(eid & 0xffff_ffff)))),
+        "前提: 像の WAL に e0 / x0 の record が残っている (checkpoint が進んでいない)"
+    );
+
+    let back = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    for (c, &n) in ns.iter().enumerate() {
+        assert_eq!(back.get_by_id(e0, n), Some(NUM_NEW as u64), "大きい表の数の列 n{c}: 前の session の書き込みが消えた");
+        assert_eq!(back.cell_hlc(e0, n), v_e0[c], "大きい表の版数の列 n{c}: 前の session の版数が消えた");
+    }
+    assert_eq!(back.get_by_id(x0, m), Some(NUM_NEW as u64), "小さい表の数の列: 前の session の書き込みが消えた");
+    assert_eq!(back.cell_hlc(x0, m), v_x0, "小さい表の版数の列: 前の session の版数が消えた");
+    assert_eq!(back.get_by_id(e1, ns[0]), Some(7));
+    drop(back);
 }
