@@ -42,9 +42,17 @@ fn prepare_db(path: &str) {
 fn crash_writer_bin() -> PathBuf {
     static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BIN.get_or_init(|| {
-        // test binary は <target>/<profile>/deps/<name>、 bin は <target>/<profile>/<bin>
+        // test binary は <target>/<profile>/deps/<name> (古い cargo)、 bin は <target>/<profile>/<bin>
         let exe = std::env::current_exe().unwrap();
-        let profile_dir = exe.parent().and_then(|d| d.parent()).unwrap().to_path_buf();
+        // #805: 新しい cargo は test binary を <target>/<profile>/build/<package>/<hash>/out/ に置く。 上へたどって
+        // `deps` か `build` の親を profile の directory にする (2 つ上、 と決めると hash を profile に読む)
+        let profile_dir = exe
+            .ancestors()
+            .skip(1)
+            .find(|d| matches!(d.file_name().and_then(|s| s.to_str()), Some("deps" | "build")))
+            .and_then(|d| d.parent())
+            .expect("test binary の場所から profile の directory を決められない")
+            .to_path_buf();
         let target_dir = profile_dir.parent().unwrap();
         let profile = match profile_dir.file_name().and_then(|s| s.to_str()) {
             Some("debug") | None => "dev",
