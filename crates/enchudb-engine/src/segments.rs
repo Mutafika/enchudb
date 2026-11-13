@@ -116,6 +116,13 @@ pub trait SegmentSizes {
 /// `ensure_committed` が書きに応じて伸ばす。
 const INITIAL_COMMIT: usize = 4096;
 
+/// [`SegmentSet::flush_all_spread`] が並べる thread の数 (呼んだ thread を含む)。
+const FLUSH_ALL_WORKERS: usize = 8;
+
+/// [`SegmentSet::flush_all_spread`] が thread を立てる数に数えない segment の大きさ (commit 済みがこれ以下。 16 KiB の page で
+/// 2 枚)。 page の大きさを OS に聞かない定数にしてある (Windows の `segment_map` には `runtime_page_size` が無い)。
+const FLUSH_ALL_SMALL: usize = 32 * 1024;
+
 /// himo / ver segment の遅延 slot (request23 D2)。
 ///
 /// `map: None` = まだ mmap していない。 存在と長さは `open` が stat で確かめ済みで、
@@ -508,6 +515,39 @@ impl SegmentSet {
             }
         }
         Ok(())
+    }
+
+    /// `pick` が選んだ segment の commit 済み全域を msync する。 [`Self::flush_where`] の `all` = true と同じ物を書き出すが、
+    /// [`FLUSH_ALL_WORKERS`] 本までの thread に分ける (#841)。
+    ///
+    /// 全域の msync は、 汚れた page が無くても segment 1 つごとに時間がかかる (Mac の実測: 20 万行の列 / 版数の列 1 本
+    /// 70〜180 µs、 1 page の segment は 1〜2 µs)。 きれいに閉じなかった後の最初の書き出し (#813) は全部の segment を全域で
+    /// 書き出すので、 列の数だけこれが並ぶ。 file ごとの msync は互いに待たないので、 thread が 1 つずつ取って書く。 thread の
+    /// 数は [`FLUSH_ALL_SMALL`] より大きい segment の数まで (小さい segment しか無ければ、 呼んだ thread だけで書く)。 どれかが失敗したら
+    /// Err (残りの書き出しも試みる。 呼び手は 「書き出せなかった」 として扱う)。
+    pub fn flush_all_spread(&self, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
+        let segs: Vec<(SegmentKind, Arc<SegmentMap>)> = self.all().into_iter().filter(|(k, _)| pick(*k)).collect();
+        let workers = segs.iter().filter(|(_, s)| s.committed() > FLUSH_ALL_SMALL).count().clamp(1, FLUSH_ALL_WORKERS);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = || -> io::Result<()> {
+            let mut res = Ok(());
+            while let Some((k, s)) = segs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                res = res.and(Self::flush_segment(*k, s, true));
+            }
+            res
+        };
+        if workers == 1 {
+            return work();
+        }
+        std::thread::scope(|scope| {
+            let others: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
+            let mut res = work();
+            for h in others {
+                let r = h.join().unwrap_or_else(|_| Err(io::Error::other("segment の書き出しの thread が panic した")));
+                res = res.and(r);
+            }
+            res
+        })
     }
 
     /// `pick` が選んだ segment を並べて msync する (#656: 書き出しの門を閉じている間を短くする。 遅いディスクでは msync 1 回の
