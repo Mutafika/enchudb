@@ -1527,6 +1527,158 @@ fn a_writer_waits_only_while_its_own_column_is_written_out() {
     );
 }
 
+/// #801 並んだ書き出し: 後から来た書き出しは、 前の書き出しが msync している最中の segment を 「印が無い = 書くものが無い」 と見て
+/// 飛ばさない。 `SegmentMap::flush_dirty` は印を取り出してから msync するので、 その間 `has_dirty()` は false。 前は中身を指す
+/// 列 (と、 門を閉じた後に書き出し直す中身) を `has_dirty()` で選んでいて、 後の書き出しが前の msync を待たずに `Ok` を返した
+/// (#421 の約束 = 「返った時、 呼ぶ前に印を付けた page は書き出してある」 が外から破れる)。
+///
+/// 2 本目の書き出しを途中 (中身を書き出した後。 列の時は残りの列を見る直前) で止め、 その間に書き手が書き、 1 本目の書き出しを msync の直前 (crashsim が写した後) で
+/// 止めてから、 2 本目を進める。 2 本目が 1 本目の msync の終わる前に `Ok` で返ったら、 その時の電源断の像を開く:
+///
+/// - 列: 書き出しの済んだ語を指す Tag の cell を書く。 1 本目はその列の msync で止まる。 像の cell は前の値のまま
+///   (= 書き出しの返った書き込みが消える)
+/// - 中身: Leaf の値を書く (slot と cell)。 1 本目は Leaf の slot の msync で止まる。 2 本目は門を閉じた後に slot を
+///   書き出し直さずに列を書き出すので、 像の cell は中身の無い slot を指す
+///
+/// 直した形では 2 本目は 1 本目を待つ (止めている間は返らない)。 1 本目は 2 本目が返るのを 1 秒だけ待ってから進む —
+/// 時間が決めるのは 「飛ばす実装を見つけられるか」 だけで、 待つ実装が落ちることは無い。
+#[test]
+fn a_write_out_waits_for_a_segment_another_write_out_is_still_writing() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for himo in ["t.tg", "t.lf"] {
+        overlapping_write_outs(himo);
+    }
+}
+
+fn overlapping_write_outs(himo: &'static str) {
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    const NEW: &str = "a new value, longer than the old one";
+    const FIRST: &str = "first-write-out";
+    const SECOND: &str = "second-write-out";
+    let column_case = himo == "t.tg";
+    let root = scratch(&format!("overlap_write_out_{}", &himo[2..]));
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 100).unwrap();
+    eng.define_himo_in("t", "lf", ValueType::Leaf, 0).unwrap();
+    eng.define_himo_in("t", "tg", ValueType::Tag, 0).unwrap();
+    let e = eng.entity_in("t").unwrap();
+    let other = eng.entity_in("t").unwrap();
+    eng.tie_text(e, himo, "old");
+    // Tag: 新しい値の語を先に辞書に置いて書き出しておく (その語を指す cell は門を通らず、 列だけが書かれる)
+    eng.tie_text(other, "t.tg", NEW);
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let column = eng.himo_id(himo).unwrap() as u16;
+    let eng = Arc::new(eng);
+    // 開いて最初の書き出し (中身の全域) を済ませ、 書き出しの済んだ語の境目を進める
+    eng.body_msync().unwrap();
+
+    let on = |name: &str| std::thread::current().name() == Some(name);
+    // 2 本目が止まる所: 中身の時は門を閉じる前。 列の時は門を開いた後 (残りの列を 1 本ずつ見る前) — 門を閉じる所は閉じる側を
+    // 1 本に並べるので、 そこより前で止めると 2 本目は 1 本目が列を書き出す間そこで待つ (列を見る所まで来ない)
+    let second_stops_at = if column_case { Phase::Opened } else { Phase::BeforeGate };
+    // 1 本目が止まる所: 列の時は 「その列の門を閉じた後」 に写した segment、 中身の時は最初に写した segment (Leaf の slot)
+    let armed = Arc::new(AtomicBool::new(!column_case));
+    let (at_gate_tx, at_gate_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let (at_gate_tx, resume_rx) = (Mutex::new(Some(at_gate_tx)), Mutex::new(resume_rx));
+    {
+        let armed = armed.clone();
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            let reached = on(SECOND) && p == second_stops_at;
+            if let Some(tx) = reached.then(|| at_gate_tx.lock().unwrap().take()).flatten() {
+                tx.send(()).unwrap();
+                resume_rx.lock().unwrap().recv_timeout(Duration::from_secs(10)).expect("2 本目を進める合図が来ない");
+            }
+            if on(FIRST) && p == Phase::Column(column) {
+                armed.store(true, Ordering::Release);
+            }
+        })));
+    }
+    let (in_msync_tx, in_msync_rx) = mpsc::channel::<()>();
+    let (second_done_tx, second_done_rx) = mpsc::channel::<std::io::Result<()>>();
+    let (finish_tx, finish_rx) = mpsc::channel::<()>();
+    let stall = Mutex::new(Some((in_msync_tx, finish_rx)));
+    {
+        let armed = armed.clone();
+        crashsim::set_after_copy_hook(Some(Arc::new(move |what| {
+            if what != Copied::Segment || !on(FIRST) || !armed.load(Ordering::Acquire) {
+                return;
+            }
+            let taken = stall.lock().unwrap().take();
+            if let Some((in_msync, finish)) = taken {
+                in_msync.send(()).unwrap();
+                finish.recv_timeout(Duration::from_secs(10)).expect("1 本目を進める合図が来ない");
+            }
+        })));
+    }
+
+    let second = {
+        let eng = eng.clone();
+        std::thread::Builder::new()
+            .name(SECOND.into())
+            .spawn(move || {
+                let _ = second_done_tx.send(eng.body_msync());
+            })
+            .unwrap()
+    };
+    at_gate_rx.recv_timeout(Duration::from_secs(10)).expect("2 本目の書き出しが途中で止まらない");
+    // 2 本目は中身を書き出し終えている。 ここで書いた分は、 2 本目が返る前に誰かが書き出すこと
+    eng.tie_text_to(e, himo, NEW);
+    let first = {
+        let eng = eng.clone();
+        std::thread::Builder::new().name(FIRST.into()).spawn(move || eng.body_msync()).unwrap()
+    };
+    in_msync_rx.recv_timeout(Duration::from_secs(10)).expect("1 本目の書き出しが msync の前で止まらない");
+    resume_tx.send(()).unwrap();
+    // 1 本目の msync はまだ届いていない。 2 本目がここで返ったら、 待たずに飛ばした
+    let early = root.join("early");
+    let returned_early = second_done_rx.recv_timeout(Duration::from_secs(1)).ok();
+    if returned_early.is_some() {
+        crashsim::capture(&live, &early, Mode::Lost).unwrap();
+    }
+    finish_tx.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    let second_result = match returned_early {
+        Some(r) => r,
+        None => second_done_rx.recv_timeout(Duration::from_secs(10)).expect("2 本目の書き出しが返らない"),
+    };
+    second.join().unwrap();
+    let after = root.join("after");
+    crashsim::capture(&live, &after, Mode::Lost).unwrap();
+    write_out_hook::set(None);
+    crashsim::set_after_copy_hook(None);
+    crashsim::stop();
+    drop(eng);
+
+    let read = |img: &Path| {
+        img.exists().then(|| {
+            let opened = Engine::open_standalone(img.join("db").to_str().unwrap()).unwrap();
+            opened.get_text_owned(e, himo).map(|b| String::from_utf8_lossy(&b).into_owned())
+        })
+    };
+    let (got_early, got_after) = (read(&early), read(&after));
+    let _ = std::fs::remove_dir_all(&root);
+    second_result.unwrap();
+    if let Some(got) = got_early {
+        assert_eq!(
+            got.as_deref(),
+            Some(NEW),
+            "{himo}: 2 本目の書き出しが、 1 本目の msync が終わる前に Ok で返った。 その時の電源断の像に、 書き出しの前に書いた値が無い"
+        );
+    }
+    assert_eq!(got_after.unwrap().as_deref(), Some(NEW), "{himo}: 両方の書き出しが返った後の像に値が無い");
+}
+
 /// #656: 前の session が書き出さずに終わった (process が落ちた) 語は、 page cache にあってもディスクに無い。 開いた後に
 /// その語を指す cell を書いても、 最初の書き出しが辞書の全域を書き出すので、 cell だけが届くことは無い (書き出しの済んだ語の
 /// 境目は、 その後でないと進めない)。 前の session は子 process で書いて、 書き出さずに exit する。

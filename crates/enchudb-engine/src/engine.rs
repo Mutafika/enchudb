@@ -21829,6 +21829,11 @@ impl Engine {
     /// 3. 残りの中身を指す列を 1 本ずつ: 門を閉じる → (閉じる前に門を通った書き手が居れば) 中身をもう一度 → 列 → 開く
     /// 4. 残り (header / entity / 中身を指さない列 …)
     ///
+    /// #801: 書き出しは並んで走る (consumer の周期 / `oplog_sync` の呼び手 / 書き手の `body_msync`)。 返った時 「呼ぶ前に印を
+    /// 付けた page は全部届いた」 を守るため、 書くものの無い segment を飛ばす所は `SegmentMap::flush_pending` で見る
+    /// (`has_dirty` は、 別の書き出しが msync している最中の segment で false。 飛ばすと、 その msync が失敗するか届く前に
+    /// 電源が落ちた時、 こちらは Ok を返した後 = 語の場所の使い回し・書き出しの済んだ語の境目・checkpoint が先に進む)。
+    ///
     /// 2 / 3 で届く cell は門を閉じる前に書かれたもので、 書き手は中身を書いてから門に入る (入ると列に印を立てる) ので、
     /// その中身は列の前の中身の書き出しで届いている。 書き手が待つのは自分の列の門が閉じている間だけ (#656: 前は 1 つの門を
     /// 中身を指す列の全部の msync の間閉じていて、 Tag 列が 16 本の表の書き手は書き出しのたびに 16 回の msync を待った)。
@@ -21889,14 +21894,15 @@ impl Engine {
             }
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::GateClosed);
-            let fresh: Vec<_> = fresh.into_iter().filter(|(_, seg)| all || seg.has_dirty()).collect();
+            let fresh: Vec<_> = fresh.into_iter().filter(|(_, seg)| all || seg.flush_pending()).collect();
             SegmentSet::flush_segments(&fresh, all)?;
         }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::Opened);
         for (k, seg) in &rest {
-            // 書いた範囲の無い列は msync しない = 閉じなくてよい (同じ組の列の書き手を止めない)
-            if !all && !seg.has_dirty() {
+            // 書いた範囲の無い列は msync しない = 閉じなくてよい (同じ組の列の書き手を止めない)。 並んだ書き出しが msync して
+            // いる最中の列は印が無いが飛ばさない (その msync が届く前に 「全部書き出した」 と返ることになる)
+            if !all && !seg.flush_pending() {
                 continue;
             }
             let _closed = self.publish_gate.close([column(*k)]);
