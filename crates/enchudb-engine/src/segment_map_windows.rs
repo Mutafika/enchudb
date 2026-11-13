@@ -314,6 +314,12 @@ impl SegmentMap {
         self.dirty_hi.load(Ordering::Acquire) > self.dirty_lo.load(Ordering::Acquire)
     }
 
+    /// 書き出す分が残っているか (unix 版の `flush_pending` と同じ口)。 こちらの `flush_dirty` は flush を 1 本に並べて
+    /// いないので、 印だけを見る (別の flush が書き出している最中の segment は見えない)。
+    pub fn flush_pending(&self) -> bool {
+        self.has_dirty()
+    }
+
     pub fn flush_dirty(&self) -> io::Result<()> {
         let lo = self.dirty_lo.swap(usize::MAX, Ordering::AcqRel);
         let hi = self.dirty_hi.swap(0, Ordering::AcqRel);
