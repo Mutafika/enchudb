@@ -1719,7 +1719,8 @@ impl Syncer {
         // #762: 中継が取り直した state を ring に載せている間は読まない (`bootstrap_pull_via` が write で持つ)
         let mine = *self.state_relay_owner.lock().unwrap() == Some(std::thread::current().id());
         let _relaying = (!mine).then(|| self.state_relay.read().unwrap_or_else(|p| p.into_inner()));
-        let payloads = self.engine.pending_sync_ops(0);
+        // #828: 同じ (書き手, 版数) の組が ring の端で割れている間、 その組は出さない
+        let payloads = self.engine.settled_sync_ops();
         let mut out = Vec::with_capacity(payloads.len());
         for p in &payloads {
             let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(p) else {

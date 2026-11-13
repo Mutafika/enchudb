@@ -48,6 +48,64 @@ pub enum EntityValueOwned {
     Text(Vec<u8>),
 }
 
+/// #828: record の組の鍵 = (書き手, 版数)。 受け手の cursor は書き手ごとの版数なので、 同じ鍵の record は 1 回の受け取りに
+/// 全部入っていないと、 後から載った分が `hlc > cursor` を通らない。
+type GroupKey = (enchudb_oplog::PeerId, enchudb_oplog::Hlc);
+
+/// [`BridgeRecent`] が覚える鍵の数。 同じ鍵の record の間に、 これより多くの別の鍵の record が WAL に挟まると、 組の頭を
+/// 見失う (state を載せる側は同じ鍵の record を並べて載せるので、 挟まるのは同時に書いた自分の record だけ)。
+const BRIDGE_RECENT_KEYS: usize = 64;
+
+/// #828: bridge が直近に `_sync_ops` へ写した鍵と、 その鍵の最初の行の lsn (最後に出た順に並べる)。 bridge が途中で止まった時、
+/// まだ写していない record と同じ鍵の行がどこから始まるかを引く。
+#[derive(Default)]
+struct BridgeRecent {
+    keys: Vec<(GroupKey, u32)>,
+    /// 開いた後、 ring に残っている行から埋めたか。
+    seeded: bool,
+}
+
+impl BridgeRecent {
+    /// 鍵 `key` の行を lsn `lsn` で写した。
+    fn note(&mut self, key: GroupKey, lsn: u32) {
+        if self.keys.last().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        match self.keys.iter().position(|(k, _)| *k == key) {
+            Some(i) => {
+                let e = self.keys.remove(i);
+                self.keys.push(e);
+            }
+            None => {
+                if self.keys.len() == BRIDGE_RECENT_KEYS {
+                    self.keys.remove(0);
+                }
+                self.keys.push((key, lsn));
+            }
+        }
+    }
+
+    /// まだ写していない record の鍵 `remaining` のどれかと同じ鍵の、 写し済みの行: (その最初の lsn の最小, 鍵の列,
+    /// `remaining` の中のその鍵の record の数)。 無ければ None (= 写し済みの行は全部、 組がそろっている)。
+    fn open_groups(&self, remaining: impl Iterator<Item = GroupKey>) -> Option<(u32, Vec<GroupKey>, u64)> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<(GroupKey, u32, bool)> = self.keys.iter().map(|(k, l)| (*k, *l, false)).collect();
+        sorted.sort_unstable_by_key(|(k, _, _)| *k);
+        let mut more = 0u64;
+        for key in remaining {
+            if let Ok(i) = sorted.binary_search_by_key(&key, |(k, _, _)| *k) {
+                sorted[i].2 = true;
+                more += 1;
+            }
+        }
+        let open: Vec<(GroupKey, u32)> = sorted.into_iter().filter(|(_, _, hit)| *hit).map(|(k, l, _)| (k, l)).collect();
+        let from = open.iter().map(|(_, l)| *l).min()?;
+        Some((from, open.into_iter().map(|(k, _)| k).collect(), more))
+    }
+}
+
 /// table の eid 枠の使用状況。 `Engine::table_eid_usage` の戻り値。
 ///
 /// 数えるのは**今ある枠**だけ。 枠を使い切ると `entity_in` は、 どの table にも割り当てていない eid 空間
@@ -5634,6 +5692,14 @@ pub struct Engine {
     /// 重複転送を根本解消。 lock 競合は per-fsync 頻度 (= 100ms 周期) で頻度低、
     /// hot path 影響は無視できる。
     transfer_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// #828: `_sync_ops` の行のうち、 配ってよい所の終わり (lsn)。 これより後の行は、 同じ (書き手, 版数) の組の続きがまだ
+    /// WAL にあって載っていない (ring が満杯で bridge が組の途中で止まった) ので、 配る側 ([`Engine::settled_sync_ops`]) は
+    /// 出さない。 bridge が周の終わりに置く。 `u32::MAX` = 制限なし (bridge の無い engine)。
+    sync_settled_lsn: std::sync::atomic::AtomicU32,
+    /// #828: 開いてから bridge が 1 周して [`Self::sync_settled_lsn`] を置いたか (置く前の読み手は自分で 1 周させる)。
+    sync_settled_known: std::sync::atomic::AtomicBool,
+    /// #828: bridge が直近に写した (書き手, 版数) の組 (`transfer_lock` の下でだけ触る)。
+    bridge_recent: std::sync::Mutex<BridgeRecent>,
     /// 0.8.15: `try_persist_tables` 内の warning emit を rate-limit するための
     /// 最後の emit timestamp (millis since UNIX_EPOCH)。 ENOSPC 等で連続失敗
     /// すると consumer thread が毎 batch eprintln → ターミナル不能なので 1 秒
@@ -6084,6 +6150,9 @@ impl Engine {
             sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            sync_settled_lsn: std::sync::atomic::AtomicU32::new(u32::MAX),
+            sync_settled_known: std::sync::atomic::AtomicBool::new(false),
+            bridge_recent: std::sync::Mutex::new(BridgeRecent::default()),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicU64::new(0)
@@ -7371,6 +7440,9 @@ impl Engine {
             last_fault_warn_ms: std::sync::atomic::AtomicU64::new(0),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            sync_settled_lsn: std::sync::atomic::AtomicU32::new(u32::MAX),
+            sync_settled_known: std::sync::atomic::AtomicBool::new(false),
+            bridge_recent: std::sync::Mutex::new(BridgeRecent::default()),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
@@ -7666,6 +7738,11 @@ impl Engine {
         // 周期) なので lock 競合の hot path 影響なし。
         let _guard = self.transfer_lock.lock().unwrap();
         self.prune_former_addresses();
+        // #828: 直近に写した鍵 (開いた後の最初の周は ring に残っている行から)
+        let mut recent = self.bridge_recent.lock().unwrap_or_else(|p| p.into_inner());
+        if !recent.seeded {
+            self.seed_bridge_recent(&mut recent);
+        }
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
         let trace = Self::trace_bridge_enabled();
@@ -7774,9 +7851,14 @@ impl Engine {
             }
         }
         // #783: floor を上げなかった (待っている / 書けなかった) ので、 落ちた record より後の record は写さない
+        // #828: 止めた record から後ろの鍵 (この周では写さない)
+        let mut held_keys: Vec<GroupKey> = Vec::new();
         let records = match held_at {
             Some(i) => {
                 self.wal_drop_bridge_holds.fetch_add(1, Ordering::Relaxed);
+                held_keys = records[i..].iter().map(|(r, _)| (r.author_peer, r.hlc)).collect();
+                held_keys.sort_unstable();
+                held_keys.dedup();
                 records.into_iter().take(i).collect::<Vec<_>>()
             }
             None => records,
@@ -7808,8 +7890,10 @@ impl Engine {
         if records.is_empty() {
             // #783: 先頭の record から止めている時は進めない (止めた record を越える)
             if held {
+                self.settle_sync_ops(&recent, held_keys.iter().copied(), false);
                 return 0;
             }
+            self.settle_sync_ops(&recent, std::iter::empty(), false);
             let empties = self.bridge_empty_scans.fetch_add(1, Ordering::Relaxed) + 1;
             self.warn_if_bridge_stalled(from, wal.head(), wal.checkpoint(), empties, pending, stop);
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
@@ -7826,6 +7910,7 @@ impl Engine {
             // #268: 「0 を返す」 もう一方の経路。 空 scan と混ざると切り分けられない。
             None => {
                 self.bridge_himo_lookup_failures.fetch_add(1, Ordering::Relaxed);
+                self.settle_sync_ops(&recent, records.iter().map(|(r, _)| (r.author_peer, r.hlc)).chain(held_keys.iter().copied()), false);
                 return 0;
             }
         };
@@ -7838,6 +7923,7 @@ impl Engine {
             self.himo_id("_sync_ops.payload"),
         ) else {
             self.bridge_himo_lookup_failures.fetch_add(1, Ordering::Relaxed);
+            self.settle_sync_ops(&recent, records.iter().map(|(r, _)| (r.author_peer, r.hlc)).chain(held_keys.iter().copied()), false);
             return 0;
         };
         let (peer_id_hid, op_type_hid, hlc_wall_lo_hid, payload_hid) = (
@@ -7877,7 +7963,11 @@ impl Engine {
         // でなく、 skip した record も「処理し切った」に含める (再訪しても同じく skip
         // されるので、 進めておく方が backlog を残さない)。
         let mut done_end: Option<u64> = None;
-        for (rec, rec_end) in &records {
+        // #828: 満杯で止まった時に、 配ってよい所の終わりを置く。 `at` から後ろの record はまだ写していない
+        let stopped_full = |recent: &BridgeRecent, at: usize| {
+            self.settle_sync_ops(recent, records[at..].iter().map(|(r, _)| (r.author_peer, r.hlc)).chain(held_keys.iter().copied()), true);
+        };
+        for (at, (rec, rec_end)) in records.iter().enumerate() {
             // 自己再帰 op は skip。 Commit (= barrier marker) / Vocab (= global
             // sync 必須) は eid 持たないのでそのまま通す。
             let skip = match &rec.op {
@@ -8011,13 +8101,19 @@ impl Engine {
             let ring_slot = match payload_ring.filter(|(r, _)| r.accepts(wire_payload.len())) {
                 Some((r, at_hid)) => match r.reserve(wire_payload.len(), || self.sync_ring_extremes(r).1) {
                     Some(off) => Some((r, at_hid, off)),
-                    None => return self.sync_ops_backpressure(from, done_end, count, "payload ring"),
+                    None => {
+                        stopped_full(&recent, at);
+                        return self.sync_ops_backpressure(from, done_end, count, "payload ring");
+                    }
                 },
                 None => None,
             };
             let row_eid = match self.entity_in("_sync_ops") {
                 Ok(e) => e,
-                Err(_) => return self.sync_ops_backpressure(from, done_end, count, "_sync_ops ring"),
+                Err(_) => {
+                    stopped_full(&recent, at);
+                    return self.sync_ops_backpressure(from, done_end, count, "_sync_ops ring");
+                }
             };
             count += 1;
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
@@ -8089,8 +8185,14 @@ impl Engine {
             // 逆順にすると 「識別子だけ新しい」 窓ができる、 も同じ。
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.sync_bridged.fetch_add(1, Ordering::Release);
+            // #828: Commit は組にならない (版数は自分の時計で 1 つずつ)
+            if !matches!(rec.op, enchudb_oplog::oplog::DecodedOp::Commit) {
+                recent.note((rec.author_peer, rec.hlc), lsn);
+            }
             done_end = Some(*rec_end);
         }
+        // #828: この周で読んだ record は全部写した (止めた record があれば、 その鍵の組は続きがある)
+        self.settle_sync_ops(&recent, held_keys.iter().copied(), false);
 
         // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)。
         // committed_end は最後の Commit record の直後なので、 最終 record の終端
@@ -8136,6 +8238,76 @@ impl Engine {
             );
         }
         count
+    }
+
+    /// #828: bridge の周の終わりに、 配ってよい `_sync_ops` の行の終わり ([`Self::sync_settled_lsn`]) を置く。
+    ///
+    /// `remaining` = この周で写さなかった (止めた所から後ろの) record の鍵。 その中に、 もう写した行と同じ鍵 (書き手, 版数) の
+    /// 物があれば、 その鍵の組は ring の上で途中までしか無い: 受け手がそこまで受けると `cursor[書き手]` がその版数に進み、 後から
+    /// 載る残りは `hlc > cursor` を通らない。 組の最初の行の手前までを配ってよい所にする (組の行と、 その後ろの行は、 組が
+    /// そろった周に配る)。 無ければ今ある行の全部。
+    ///
+    /// 同じ鍵の record が並ぶのは state を載せた時だけで (`Syncer::bootstrap_pull_via`: Tag の cell の Vocab と Tie、 版数の無い
+    /// cell の `as_of`)、 載せる側は載せ終えて WAL を書き出す (`oplog_sync` = Commit + この bridge) まで配るのを止めている
+    /// (ホストの口の gate #753、 中継の `state_relay` #762)。 = 読み手が見る時、 組の record は全部 WAL にあって Commit で
+    /// 閉じていて、 写していない物はこの周の `records` の止めた所から後ろにある。
+    ///
+    /// `full` (満杯で止まった) で、 途中の組が ring に入り切らない時 (組の載った行 + まだ写していない組の record が ring の枠より
+    /// 多い、 または ring に残っている行が途中の組とその後ろだけ): 受け手は組の行を受けないので ack で空かず、 待っても組は
+    /// そろわない。 その鍵の書き手の floor を組の版数に上げて、 受け手を state の取り直しに回す (取り直すと cursor が組の版数
+    /// 以上になり、 ack で行が空いて、 残りは cursor の手前として読み捨てられる)。 組の行は配らないまま。
+    fn settle_sync_ops(&self, recent: &BridgeRecent, remaining: impl Iterator<Item = GroupKey>, full: bool) {
+        use std::sync::atomic::Ordering;
+        let last = self.next_sync_lsn.load(Ordering::Acquire).saturating_sub(1);
+        let open = recent.open_groups(remaining);
+        let settled = open.as_ref().map_or(last, |(from, _, _)| from.saturating_sub(1));
+        self.sync_settled_lsn.store(settled, Ordering::Release);
+        self.sync_settled_known.store(true, Ordering::Release);
+        let Some((from, keys, more)) = open.filter(|_| full) else { return };
+        let Some(usage) = self.table_eid_usage("_sync_ops") else { return };
+        let on_ring = u64::from(last.saturating_sub(from)) + 1;
+        if u64::from(usage.live) > on_ring && on_ring + more <= u64::from(usage.capacity) {
+            return;
+        }
+        let mut floors: Vec<(u32, enchudb_oplog::Hlc)> = Vec::new();
+        for (a, h) in keys {
+            match floors.iter_mut().find(|(x, _)| *x == a) {
+                Some((_, m)) => *m = (*m).max(h),
+                None => floors.push((a, h)),
+            }
+        }
+        self.record_reclaimed_floors(&floors);
+    }
+
+    /// #828: 開いた後の最初の bridge の前に、 ring に残っている行の後ろの方から [`BridgeRecent`] を埋める (閉じる前に組の途中で
+    /// 止まっていた時、 その組の頭を引けるように)。
+    fn seed_bridge_recent(&self, recent: &mut BridgeRecent) {
+        recent.seeded = true;
+        let Some(cols) = self.sync_payload_cols() else { return };
+        let mut rows: Vec<(u32, u64)> = self
+            .entities_with_himo(cols.lsn)
+            .into_iter()
+            .filter_map(|e| self.get_by_id32(e, cols.lsn).map(|l| (l, e)))
+            .collect();
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        // 新しい方から。 同じ鍵が続く間は最初の lsn を下げていく
+        let mut found: Vec<(GroupKey, u32)> = Vec::new();
+        for (lsn, eid) in rows {
+            let Some(rec) = self.sync_op_payload(eid, &cols).and_then(|p| enchudb_oplog::oplog::decode_sync_ops_payload(&p)) else {
+                continue;
+            };
+            if matches!(rec.op, enchudb_oplog::oplog::DecodedOp::Commit) {
+                continue;
+            }
+            let key = (rec.author_peer, rec.hlc);
+            match found.iter().position(|(k, _)| *k == key) {
+                Some(i) => found[i].1 = lsn,
+                None if found.len() == BRIDGE_RECENT_KEYS => break,
+                None => found.push((key, lsn)),
+            }
+        }
+        found.reverse();
+        recent.keys = found;
     }
 
     /// transfer の cursor 前進。 **入口で読んだ `from` からの CAS** で行う。
@@ -10331,6 +10503,25 @@ impl Engine {
     /// 返す。 Syncer の publish_since が「peer.consumed_lsn より新しい op を
     /// 流す」 用途で呼ぶ。 返り値の各 entry は payload (= 完全 wire bytes)。
     pub fn pending_sync_ops(&self, since_lsn: u32) -> Vec<Vec<u8>> {
+        self.sync_ops_between(since_lsn, u32::MAX)
+    }
+
+    /// #828: `_sync_ops` の行のうち **配ってよい物** の payload (lsn の順)。 ring が満杯で bridge が同じ (書き手, 版数) の組の
+    /// 途中で止まっている時、 その組の行 (と、 その後ろの行) は入らない (組がそろった後に入る)。 受け手に配る側
+    /// (`Syncer` の publish、 ホストの口の pull) はこちらを読む。 [`Self::pending_sync_ops`] は ring にある行の全部。
+    pub fn settled_sync_ops(&self) -> Vec<Vec<u8>> {
+        use std::sync::atomic::Ordering;
+        // 開いた後、 bridge がまだ 1 周していない: 閉じる前に組の途中で止まっていたかは bridge が WAL を読んで決める
+        if !self.sync_settled_known.load(Ordering::Acquire) {
+            self.transfer_oplog_to_sync_ops();
+        }
+        // 終わりを先に読む: この後に載った行は lsn が大きいので入らない (読んでいる間に bridge が組の途中まで写しても見えない)
+        let settled = self.sync_settled_lsn.load(Ordering::Acquire);
+        self.sync_ops_between(0, settled)
+    }
+
+    /// `_sync_ops` の `since_lsn < lsn <= through_lsn` の行の payload (lsn の順)。
+    fn sync_ops_between(&self, since_lsn: u32, through_lsn: u32) -> Vec<Vec<u8>> {
         if !self.sync_tables_enabled() { return Vec::new(); }
         let Some(cols) = self.sync_payload_cols() else { return Vec::new(); };
         let lsn_hid_u16 = cols.lsn;
@@ -10342,7 +10533,7 @@ impl Engine {
                 Some(l) => l,
                 None => continue,
             };
-            if lsn <= since_lsn { continue; }
+            if lsn <= since_lsn || lsn > through_lsn { continue; }
             let Some(bytes) = self.sync_op_payload(eid, &cols) else { continue };
             pairs.push((lsn, bytes));
         }
