@@ -9903,8 +9903,18 @@ impl Engine {
                 }
                 let himo_id = hid as u16;
                 let Some(col) = self.ver_col(himo_id) else { continue };
+                let vals = &self.himos[hid];
                 for local in 0..col.count().min(self.max_entities()) {
-                    // 版数を先に見る (ほとんどの slot はここで外れる)
+                    // #794: 値のある cell は、 行を握らずにここで落とす (列の 1 語を読むだけ)。 前は版数が自分の時計の cell
+                    // ごとに行の読み (`row_locks.read`) まで進み、 外した cell の無い DB でも cell の数だけ払った (state を
+                    // 作る時間が 1.4 倍)。 握らずに見てよい理由: `as_of` 以下の版数の書き込みは、 走査の前に全部 cell に
+                    // 着いている (`wait_for_writers`)。 走査の間に値が見えたなら、 走査の始まりに値があった (外した cell でない)
+                    // か、 その後の書き込み (版数 > as_of、 差分が運ぶ) が置いた値。 どちらでも、 この state に入れる untie は無い。
+                    // 値が無く見えた cell だけ、 下で行を握って値と版数を揃えて読む (今まで通り)
+                    if vals.get_value(local).is_some() {
+                        continue;
+                    }
+                    // 版数を見る (値の無い slot のほとんどはここで外れる)
                     if !mine(self.cell_hlc_local(local, himo_id)) || !self.entities.is_live(local) {
                         continue;
                     }
