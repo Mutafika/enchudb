@@ -139,9 +139,11 @@ pub struct Syncer {
     state_relay_owner: std::sync::Mutex<Option<std::thread::ThreadId>>,
     /// ホスト (全員が経由する DB の peer) として動くか ([`Syncer::set_host`])。
     host: Arc<std::sync::atomic::AtomicBool>,
-    /// #698 (ホストだけ): 中継に載せた record のうち、 その link の cursor がまだ越えていない物 (`{link: {(author, HLC)}}`)。
+    /// #698 (ホスト): 中継に載せた record のうち、 その link の cursor がまだ越えていない物 (`{link: {(author, HLC)}}`)。
     /// cursor が進まずに同じ record が届き直した時 (reject で止まった batch / 書き出しの失敗)、 LWW で負けた record を
     /// 2 度載せないために見る。 cursor が越えたら外す (cursor より前の record は当てる前に落ちるので届かない)。 memory だけ
+    ///
+    /// #823 (ホストでない中継): 指す Tie がその batch に無いまま載せた、 登録済みの Vocab も同じに覚える
     relay_held: std::sync::Mutex<
         std::collections::HashMap<PeerId, std::collections::HashSet<(PeerId, Hlc)>>,
     >,
@@ -1297,33 +1299,58 @@ impl Syncer {
         // 容量で断った record の後ろの同じ書き手の record は、 そもそも当てていない (#754、 `apply_records_impl`)
         //
         // #780: 登録済みの Vocab (当たらなかった)。 ホストは他の当たらなかった record と同じに載せる (受けた record の全部)。
-        // ホストでない中継は、 **載せる Tie が指す物だけ**を、 その Tie の前に載せる (当たった Tie 1 つにつき高々 1 つ = 閉路の
-        // 反響は今までどおり Tie の LWW で止まる)。 中継の流れでも、 Tag の Tie の前には必ずその語の Vocab がある
+        // ホストでない中継は、 後ろの**載せる Tie が指す物**を載せる (当たった Tie 1 つにつき高々 1 つ = 閉路の反響は今までどおり
+        // Tie の LWW で止まる)。 中継の流れでも、 Tag の Tie の前には必ずその語の Vocab がある
+        //
+        // #823: 指す Tie が**この batch に無い** Vocab も載せる。 Vocab と Tie は別の pull に分かれて届きうる (Tie だけ容量で断った
+        // = #754 / 書き手の bridge がその間で切れた / その間に pull した)。 前は載せずに cursor が Vocab を越え、 次の pull の Tie が
+        // Vocab なしで載った (写像を持たない下の受け手は Tie を翻訳できずに捨てる)。 載せないのは、 指す record がこの batch に
+        // あって、 どれも当たらなかった物だけ (届き直し・閉路の反響 = 下の受け手に要る Tie が無い)。 載せる場所は Vocab 自身の
+        // 位置 (書き手ごとに HLC の昇順のまま = 途中まで載った所を受けた下の受け手の cursor が、 後で載る Vocab を越えない)。
+        // cursor が進まずに届き直した時 (断った Tie の手前で止まっている間) は 2 度載せない (`relay_held`、 ホストと同じ)
         let host = gossip && self.is_host();
         let mut relayed = 0usize;
         if gossip {
             let mut held = self.relay_held.lock().unwrap();
             let held = held.entry(from).or_default();
-            // ホストでない中継: まだ載せていない登録済みの Vocab。 (書き手, 番号) → `records` の中の位置
-            let mut known: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
+            // ホストでない中継: 載せる登録済みの Vocab。 `records` の中の位置 → 指す record がこの batch にあるか
+            let mut known: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+            if !host {
+                // (書き手, 番号) → 後ろにその語を指す record があり、 当たった物があるか
+                let mut pointed: std::collections::HashMap<(PeerId, u32), bool> = std::collections::HashMap::new();
+                for &(i, applied) in relay_accepted.iter().rev() {
+                    let r = &records[i];
+                    if let DecodedOp::Vocab { vid, .. } = &r.op {
+                        if !applied {
+                            match pointed.get(&(r.author_peer, *vid)) {
+                                Some(false) => {}
+                                at => {
+                                    known.insert(i, at.is_some());
+                                }
+                            }
+                        }
+                    } else if let Some(vid) = self.vocab_of(r) {
+                        *pointed.entry((r.author_peer, vid)).or_insert(false) |= applied;
+                    }
+                }
+            }
             for &(i, applied) in &relay_accepted {
                 let r = &records[i];
                 let key = (r.author_peer, r.hlc);
                 if !applied && !host {
-                    if let DecodedOp::Vocab { vid, .. } = &r.op {
-                        known.insert((r.author_peer, *vid), i);
+                    if let Some(&pointed) = known.get(&i)
+                        && (pointed || !held.contains(&key))
+                        && self.engine.relay_record(r)
+                    {
+                        relayed += 1;
+                        if !pointed {
+                            held.insert(key);
+                        }
                     }
                     continue;
                 }
                 if !applied && held.contains(&key) {
                     continue;
-                }
-                if !known.is_empty()
-                    && let Some(vid) = self.vocab_of(r)
-                    && let Some(v) = known.remove(&(r.author_peer, vid))
-                    && self.engine.relay_record(&records[v])
-                {
-                    relayed += 1;
                 }
                 if self.engine.relay_record(r) {
                     relayed += 1;
@@ -1404,7 +1431,7 @@ impl Syncer {
         if advanced {
             self.save_cursors();
         }
-        if host {
+        if gossip {
             // cursor が越えた record はもう届かない (当てる前に cursor で落ちる)
             let guard = self.last_pulled.lock().unwrap();
             let link = guard.get(&from);
