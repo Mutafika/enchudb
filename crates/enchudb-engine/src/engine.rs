@@ -20301,21 +20301,22 @@ impl Engine {
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
             // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
-            w.drop_records_after_a_hole();
+            let dropped = w.drop_records_after_a_hole();
             let mut replay = ReplayVocab::default();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
             eng.finish_replay_vocab(&mut replay);
             // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
-            eng.relog_unlogged_writes(&w);
+            let relogged = eng.relog_unlogged_writes(&w);
+            let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
             // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
             // body より先に writeback すると、 recovery 直後の再 crash で
             // 「一度 durable だった committed record」 が replay 対象外になり
             // 恒久消失した。
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -20329,6 +20330,26 @@ impl Engine {
         };
         eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+    }
+
+    /// #796: 開く道が WAL に何も足さず、 本体に何も当てていないか (再生する record も、 捨てた穴も、 作り直した write (#451) も
+    /// 無い)。 その時は開く道の `OpLog::fsync` を呼ばない: 届ける record が無い。 checkpoint は head まで進める (間にあるのは
+    /// 閉じる時の Commit の印だけ = 当てる物が無いので、 本体より先に届いても、 届かなくても同じ)。
+    ///
+    /// この時 WAL で変わっているのは header だけ: この session が最初に書く区画に置いた周 (`OpLog::drop_records_after_a_hole`
+    /// の後半、 #706) と、 進めた checkpoint。 周を置いた区画は header が届くまで閉じてあり (`fold_pending`)、 届く前にその区画へ
+    /// 書く者は居ない: 最初の append が自分で header の page を書き出してから書く (`alloc_after_switch` の `settle_fold` /
+    /// `settle_switch_target`。 record の残る区画から移る時は、 その区画の header の page も書き出す = `switch_locked`)。 その前に
+    /// 全体の fsync (consumer の書き出し / `oplog_sync`) が来れば、 それが届ける。 = #706 / #707 の約束 (周の header が届く前に
+    /// その区画へ書かない、 開いた session は自分の置いた周の区画にしか書かない) はそのまま。 届く前に落ちた時、 disk の header は
+    /// 前の session のまま (か、 OS が先に書いた新しい周で record の無い区画) = 次に開く session がまた新しい周を置く。
+    ///
+    /// 前は必ず fsync していた。 きれいに閉じた DB を開くたびに、 汚れた header の page の書き出しと WAL 全域の msync の走査を
+    /// 開く道で払っていた (#729 の前は周を置かないので header が汚れず、 走査の分だけ)。 今は header の page の書き出し (1〜2 枚)
+    /// を、 この session の最初の書き込みが払う。 書かずに閉じる session は払わない。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_untouched_by_open(no_records: bool, dropped: bool, relogged: bool) -> bool {
+        no_records && !dropped && !relogged
     }
 
     /// clean flag (#101) を倒して即書き出す。 書き始める前に呼ぶ: 立ったまま書いて落ちると、 次の open が 「きれいに閉じた」
@@ -20896,17 +20917,18 @@ impl Engine {
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
             // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
-            w.drop_records_after_a_hole();
+            let dropped = w.drop_records_after_a_hole();
             let mut replay = ReplayVocab::default();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
             eng.finish_replay_vocab(&mut replay);
             // #451: open_concurrent_with_oplog と同じ
-            eng.relog_unlogged_writes(&w);
+            let relogged = eng.relog_unlogged_writes(&w);
+            let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)

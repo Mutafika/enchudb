@@ -3619,8 +3619,8 @@ impl OpLog {
         let Some(i) = first else { return };
         // 空の区画に新しい周を置く。 header に届いた周 (空の区画のものでも) は、 前の session がその周で書いた record が
         // 後ろの page に残りうるので使い直さない。 畳んだ時と同じに、 header が届くまで閉じる (届かないまま書いて落ちると、
-        // 次の session が同じ数の周を置く)。 届けるのは、 開く道のこの後の fsync (engine は再生を当てた後に必ず呼ぶ) か、
-        // それが無ければ最初の append (`alloc_after_switch`)。 ここでは書き出さない (開く時間を足さない)。
+        // 次の session が同じ数の周を置く)。 届けるのは、 開く道のこの後の fsync (engine は再生で当てた record が
+        // ある時だけ呼ぶ、 #796) か、 それが無ければ最初の append (`alloc_after_switch`)。 ここでは書き出さない (開く時間を足さない)。
         // 今の区画が空なら、 周はどの区画よりも新しいまま (読み手の約束、 `scan_range_with`)
         let h = &self.hot.halves[i];
         let lap = self.take_next_lap();
