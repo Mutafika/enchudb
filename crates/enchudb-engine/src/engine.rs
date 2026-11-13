@@ -111,6 +111,57 @@ impl RingNewest {
     }
 }
 
+/// #846: bridge が `_sync_ops` の ring の満杯で止まった所の覚え (`transfer_lock` の下でだけ触る)。
+///
+/// 止まった bridge は、 cursor の record を ring に置けない。 ring が空く (行が消える / 枠が足される) まで、 何周しても同じ所で
+/// 止まる。 前は周のたびに cursor から先の commit 済みの record を全部読んで decode していた (ack の来ない相手の DB は、 何も
+/// 書かなくても consumer が WAL を読み直し続けた。 64 MiB の WAL で 1 周 20 ms 前後)。 止まった周が record から決めていた事は
+/// 3 つだけなので、 それを覚えて、 次の周は WAL に増えた分だけを読む:
+///
+/// - 落ちた record (#783) より後の record が残っているか → cursor の record の鍵 (`first`) と、 書き手ごとのいちばん新しい
+///   版数 (`author_max`)
+/// - ring に途中まで載った組 (#828) があるか → 残っている record の鍵 (`keys`)。 ring のどの行よりも新しい鍵
+///   ([`RingNewest::is_newer_than_every_row`]) は合う行が無く、 止まっている間 ring に行は足されないので、 覚えない
+/// - 診断 (`pending` / `stop`)
+///
+/// 覚えが使えるのは、 cursor が `from` のままで、 ring が止まった時のまま (`ring` = 生きている行の数と枠) の間。 行を足すのは
+/// bridge だけ (`transfer_lock` の下) なので、 行の数が同じ = 1 行も消えていない。 `ring` は、 置けなかった後に取って、 もう一度
+/// 置こうとして置けなかった時の値 (取る前に空いた分を見逃さない)。
+struct BridgeStall {
+    /// 止まった所の cursor ([`Engine::sync_ops_offset`])。 ここの record が置けなかった。
+    from: u64,
+    /// 止まった時の `_sync_ops` の (生きている行の数, 枠)。
+    ring: (u32, u32),
+    /// 何が満杯だったか (警告の文)。
+    what: &'static str,
+    /// 最後に WAL を読む前の (head, 書き終えた所)。 同じなら WAL に増えた record は無い。
+    wal_at: (u64, u64),
+    /// ここまで読んだ (commit 済みの group の終わり)。 続きはここから読む。
+    scanned_end: u64,
+    /// cursor の record の鍵。
+    first: GroupKey,
+    /// 残っている record の鍵のうち、 ring に合う行が無いと言えなかった物 (重なりごと)。
+    keys: Vec<GroupKey>,
+    /// 残っている record の、 書き手ごとのいちばん新しい版数。
+    author_max: Vec<GroupKey>,
+    /// 診断: 最後の読みの、 閉じていない record の数と、 読みが止まった理由。
+    pending: usize,
+    stop: &'static str,
+}
+
+impl BridgeStall {
+    /// 残っている record を 1 つ足す。
+    fn note(&mut self, key: GroupKey, newest: &RingNewest) {
+        match self.author_max.iter_mut().find(|(a, _)| *a == key.0) {
+            Some((_, m)) => *m = (*m).max(key.1),
+            None => self.author_max.push(key),
+        }
+        if !newest.is_newer_than_every_row(key.1) {
+            self.keys.push(key);
+        }
+    }
+}
+
 /// table の eid 枠の使用状況。 `Engine::table_eid_usage` の戻り値。
 ///
 /// 数えるのは**今ある枠**だけ。 枠を使い切ると `entity_in` は、 どの table にも割り当てていない eid 空間
@@ -2897,6 +2948,22 @@ mod consumer_sleep_hook {
 /// 止めておく (周期の書き出しは Commit を打つので、 止めないと作った残りが Commit 1 つ分減る)。
 #[cfg(test)]
 mod consumer_tick_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// #846 の test: bridge が ring に置けなかった後、 ring の印を取る直前の割り込み点 (その間に行が消えた形を作る)。
+#[cfg(test)]
+mod stall_mark_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -5730,6 +5797,13 @@ pub struct Engine {
     sync_ops_purges: std::sync::atomic::AtomicU64,
     /// #843: [`Self::open_groups_on_ring`] が ring の行をなめた回数 ([`Self::sync_ring_scans`])。
     sync_ring_scans: std::sync::atomic::AtomicU64,
+    /// #846: bridge が ring の満杯で止まった所の覚え ([`BridgeStall`]、 `transfer_lock` の下でだけ触る)。
+    bridge_stall: std::sync::Mutex<Option<BridgeStall>>,
+    /// #846: [`Self::bridge_stall`] の cursor (覚えが無ければ `u64::MAX`)。 cursor がここにある間、 そこに commit 済みの record が
+    /// ある (畳む側が WAL を読まずに知る)。
+    bridge_stalled_from: std::sync::atomic::AtomicU64,
+    /// #846: bridge が WAL から読んだ (decode した) record の数 ([`Self::bridge_wal_records_read`])。
+    bridge_wal_records_read: std::sync::atomic::AtomicU64,
     /// 0.8.15: `try_persist_tables` 内の warning emit を rate-limit するための
     /// 最後の emit timestamp (millis since UNIX_EPOCH)。 ENOSPC 等で連続失敗
     /// すると consumer thread が毎 batch eprintln → ターミナル不能なので 1 秒
@@ -6187,6 +6261,9 @@ impl Engine {
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
+            bridge_stall: std::sync::Mutex::new(None),
+            bridge_stalled_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+            bridge_wal_records_read: std::sync::atomic::AtomicU64::new(0),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicU64::new(0)
@@ -7481,6 +7558,9 @@ impl Engine {
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
+            bridge_stall: std::sync::Mutex::new(None),
+            bridge_stalled_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+            bridge_wal_records_read: std::sync::atomic::AtomicU64::new(0),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
@@ -7805,6 +7885,13 @@ impl Engine {
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
         let trace = Self::trace_bridge_enabled();
+        let closing = self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire));
+        // #846: ring の満杯で止まったままなら、 WAL に増えた分だけ読んで同じ所で止まる
+        if let Some(n) = self.resume_stalled_bridge(wal, from, closing) {
+            return n;
+        }
+        // #846: 読む前の WAL の位置 (止まった時に覚える。 読んだ後に取ると、 その間に載った record を 「読んだ」 事にする)
+        let wal_at = (wal.head(), wal.written_head());
         // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
         // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
         // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
@@ -7813,6 +7900,7 @@ impl Engine {
         // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
         // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
         let (records, committed_end, pending, stop) = wal.iter_committed_from_with_diag(from);
+        self.bridge_wal_records_read.fetch_add(records.len() as u64, Ordering::Relaxed);
         // #57: WAL に載らなかった record (満杯) は `_sync_ops` にも入らず、 差分 pull では二度と
         // 届かない。 その author の history floor を上げて、 それより前の cursor の puller を
         // bootstrap (live state の転写、 #140) に回す。
@@ -7832,90 +7920,27 @@ impl Engine {
         //
         // 閉じる時 (consumer の最後の bridge) は待たずに上げる (#449)。 落ちたことはメモリにしか無いので、
         // 待つと閉じた後に floor が残らず、 落ちた write は本体にあるのに相手に永久に届かない。
-        let closing = self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire));
         // #783: floor を上げるまで写さない record の位置 (`records` の中、 その record から後ろは次の周)
         let mut held_at: Option<usize> = None;
-        let due = {
-            // #451 (段階 1): WAL が覚えた落ちた record を持ち越しへ移すのは持ち越しの lock の下で (切れ目 (`take_durable_cut`) は
-            // この lock を持って両方を見るので、 移す途中の record を見逃さない)
-            let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
-            // #783: 取り出すのは WAL を読んだ (上の scan) 後。 読んだ record より前に落ちた record は、 ここで必ず見える (落ちた
-            // record は落ちた時に覚える)。 先に取り出すと、 取り出した後に落ちて、 その後に載った (小さくて残りに入った) record を
-            // 同じ周に読み、 落ちた事を知らずに写す
-            let fresh = wal.take_dropped_spans();
-            let had_fresh = !fresh.is_empty();
-            for (a, lo, hi) in fresh {
-                match p.0.iter_mut().find(|(x, _)| *x == a) {
-                    Some((_, m)) => *m = (*m).max(hi),
-                    None => p.0.push((a, hi)),
-                }
-                match p.2.iter_mut().find(|(x, _)| *x == a) {
-                    Some((_, m)) => *m = (*m).min(lo),
-                    None => p.2.push((a, lo)),
-                }
-            }
-            if p.0.is_empty() {
-                None
-            } else {
-                let now_ms = Self::unix_millis();
-                let (first, last) = p.1.get_or_insert((now_ms, now_ms));
-                if had_fresh {
-                    *last = now_ms;
-                }
-                let quiet = now_ms.saturating_sub(*last) >= WAL_DROP_EPISODE_QUIET_MS;
-                let overdue = now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS;
-                // #783: 落ちた record より後の record (同じ author の、 HLC が落ちた record の min より後) を、 floor を上げる前に
-                // 写さない。 写すと配られ、 受け手の cursor が落ちた record を越える: 直に pull する相手は後で上がった floor (今) で
-                // 取り直すが、 ホストの下の client は、 ホストが state で取り直した落ちた record を cursor の手前として二度と受けない。
-                // Commit も数える (受け手の cursor は Commit でも進む)。
-                //
-                // 写す物がそこにあるなら、 静かになるのを待たずに今 floor を上げる (止めて待つと、 bridge が読み切らない WAL は
-                // 畳めず、 満杯が続いて、 待つ間の書き込みが全部落ちる)。 ただし前に上げてから `WAL_DROP_FLOOR_MIN_GAP_MS` の間は
-                // 上げずに手前で止まる (満杯が続く間に毎周上げない)
-                held_at = records.iter().position(|(r, _)| p.2.iter().any(|(a, lo)| *a == r.author_peer && r.hlc > *lo));
-                let early = held_at.is_some()
-                    && now_ms.saturating_sub(self.wal_drop_floor_last_ms.load(Ordering::Relaxed)) >= WAL_DROP_FLOOR_MIN_GAP_MS;
-                if closing || quiet || early || overdue {
-                    // #451 (段階 1): 持ち越しから取り出さずに写す。 floor を本体に書き終えてから (下) 持ち越しの lock の下で消す:
-                    // 書いている間も持ち越しに残っているので、 切れ目 (`take_durable_cut`) はその間も候補を出さない (取り出してから
-                    // 書くと、 その間の切れ目が floor の無い落ちた write を印で覆い、 印が ring の書き出しで先に届くと相手に永久に届かない)。
-                    // 記録できなかった時は持ち越しに残ったまま (次の周にまた上げる)
-                    Some(p.0.clone())
-                } else {
-                    None
-                }
-            }
-        };
-        if let Some(dropped) = due {
-            let now = wal.mint_hlc();
-            let me = self.peer_id();
-            let floors: Vec<(u32, enchudb_oplog::Hlc)> =
-                dropped.iter().map(|&(a, h)| (a, if a == me { now.max(h) } else { h })).collect();
-            #[cfg(test)]
-            floor_write_hook::call(wal);
-            if self.record_reclaimed_floors(&floors) {
-                self.wal_drop_floor_bumps.fetch_add(1, Ordering::Relaxed);
-                let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
-                // 書いた分だけ消す (書いている間に同じ author がまた落ちて HLC が進んだ分は残す = 次の周にまた上げる)
-                p.0.retain(|e| !dropped.contains(e));
-                // min は、 書いた floor が覆った author の分を消す (残った author = 書いている間にまた落ちた分は、 min が
-                // 小さいまま残る = 次の周も手前で止まる側)
-                let left: Vec<u32> = p.0.iter().map(|(a, _)| *a).collect();
-                p.2.retain(|(a, _)| left.contains(a));
-                if p.0.is_empty() {
-                    p.1 = None;
-                }
-                self.wal_drop_floor_last_ms.store(Self::unix_millis(), Ordering::Relaxed);
-                held_at = None;
-            }
+        let due = self.wal_drop_floors_due(wal, closing, &mut |lows| {
+            held_at = records.iter().position(|(r, _)| lows.iter().any(|(a, lo)| *a == r.author_peer && r.hlc > *lo));
+            held_at.is_some()
+        });
+        if let Some(dropped) = due
+            && self.raise_wal_drop_floors(wal, &dropped)
+        {
+            held_at = None;
         }
         // #783: floor を上げなかった (待っている / 書けなかった) ので、 落ちた record より後の record は写さない
         // #828: 止めた record から後ろの鍵 (この周では写さない)
         let mut held_keys: Vec<GroupKey> = Vec::new();
+        // #846: 同じ鍵を、 並びも重なりもそのまま (止まった所の覚えに入れる)
+        let mut held_tail: Vec<GroupKey> = Vec::new();
         let records = match held_at {
             Some(i) => {
                 self.wal_drop_bridge_holds.fetch_add(1, Ordering::Relaxed);
-                held_keys = records[i..].iter().map(|(r, _)| (r.author_peer, r.hlc)).collect();
+                held_tail = records[i..].iter().map(|(r, _)| (r.author_peer, r.hlc)).collect();
+                held_keys = held_tail.clone();
                 held_keys.sort_unstable();
                 held_keys.dedup();
                 records.into_iter().take(i).collect::<Vec<_>>()
@@ -8156,24 +8181,44 @@ impl Engine {
             wire_payload.extend_from_slice(sb);
             // payload の ring 上の場所は **row を取る前に**確保する (取れなければ row も作らずに待つ = 行の枠が
             // 埋まった時と同じ backpressure)。 大きすぎる payload は辞書の従来経路へ。
-            #[cfg(not(target_arch = "wasm32"))]
-            let ring_slot = match payload_ring.filter(|(r, _)| r.accepts(wire_payload.len())) {
-                Some((r, at_hid)) => match r.reserve(wire_payload.len(), || self.sync_ring_extremes(r).1) {
-                    Some(off) => Some((r, at_hid, off)),
-                    None => {
-                        stopped_full(at);
-                        return self.sync_ops_backpressure(from, done_end, count, "payload ring");
+            //
+            // #846: 置けなかったら ring の印 (生きている行の数, 枠) を取って、 もう一度だけ試す。 それでも置けなければ止まり、
+            // 印と一緒に止まった所を覚える (印を取る前に空いた分は 2 度目が拾い、 取った後に空いた分は印が変わる = 次の周が
+            // 見逃さない)
+            let mut ring_mark: Option<(u32, u32)> = None;
+            let (ring_slot, row_eid) = loop {
+                #[cfg(not(target_arch = "wasm32"))]
+                let slot = match payload_ring.filter(|(r, _)| r.accepts(wire_payload.len())) {
+                    Some((r, at_hid)) => r
+                        .reserve(wire_payload.len(), || self.sync_ring_extremes(r).1)
+                        .map(|off| Some((r, at_hid, off)))
+                        .ok_or("payload ring"),
+                    None => Ok(None),
+                };
+                #[cfg(target_arch = "wasm32")]
+                let slot: Result<(), &'static str> = Ok(());
+                let what = match slot.and_then(|slot| self.entity_in("_sync_ops").map(|e| (slot, e)).map_err(|_| "_sync_ops ring")) {
+                    Ok(placed) => break placed,
+                    Err(what) => what,
+                };
+                if ring_mark.is_none() {
+                    #[cfg(test)]
+                    stall_mark_hook::call(wal);
+                    ring_mark = self.sync_ring_mark();
+                    if ring_mark.is_some() {
+                        continue;
                     }
-                },
-                None => None,
-            };
-            let row_eid = match self.entity_in("_sync_ops") {
-                Ok(e) => e,
-                Err(_) => {
-                    stopped_full(at);
-                    return self.sync_ops_backpressure(from, done_end, count, "_sync_ops ring");
                 }
+                stopped_full(at);
+                let n = self.sync_ops_backpressure(from, done_end, count, what);
+                if let Some(ring) = ring_mark {
+                    let rest = records[at..].iter().map(|(r, _)| (r.author_peer, r.hlc)).chain(held_tail.iter().copied());
+                    self.note_bridge_stall(done_end.unwrap_or(from), ring, what, wal_at, committed_end, rest, pending, stop.as_str());
+                }
+                return n;
             };
+            #[cfg(target_arch = "wasm32")]
+            let () = ring_slot;
             count += 1;
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
             // #451 (段階 1): 置く前の切れ目より後の自分の record の行 = その切れ目の印 S はこの行の手前まで
@@ -8295,6 +8340,245 @@ impl Engine {
             );
         }
         count
+    }
+
+    /// #57 / #783: WAL に載らなかった record のために、 今 floor を上げる分 (書き手, 落ちた版数の max)。 上げない周は `None`。
+    ///
+    /// `held` は、 落ちた record の書き手ごとの版数の min を受けて、 それより後の record (同じ書き手の、 版数が min より後)
+    /// が、 これから写す中にあるかを返す (持ち越しの lock の下で呼ぶ。 持ち越しが空なら呼ばない)。 呼ぶのは WAL を読んだ後
+    /// (#783: 読んだ record より前に落ちた record を必ず見るため)。
+    fn wal_drop_floors_due(
+        &self,
+        wal: &enchudb_oplog::oplog::OpLog,
+        closing: bool,
+        held: &mut dyn FnMut(&[GroupKey]) -> bool,
+    ) -> Option<Vec<GroupKey>> {
+        use std::sync::atomic::Ordering;
+        // #451 (段階 1): WAL が覚えた落ちた record を持ち越しへ移すのは持ち越しの lock の下で (切れ目 (`take_durable_cut`) は
+        // この lock を持って両方を見るので、 移す途中の record を見逃さない)
+        let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+        // #783: 取り出すのは WAL を読んだ (上の scan) 後。 読んだ record より前に落ちた record は、 ここで必ず見える (落ちた
+        // record は落ちた時に覚える)。 先に取り出すと、 取り出した後に落ちて、 その後に載った (小さくて残りに入った) record を
+        // 同じ周に読み、 落ちた事を知らずに写す
+        let fresh = wal.take_dropped_spans();
+        let had_fresh = !fresh.is_empty();
+        for (a, lo, hi) in fresh {
+            match p.0.iter_mut().find(|(x, _)| *x == a) {
+                Some((_, m)) => *m = (*m).max(hi),
+                None => p.0.push((a, hi)),
+            }
+            match p.2.iter_mut().find(|(x, _)| *x == a) {
+                Some((_, m)) => *m = (*m).min(lo),
+                None => p.2.push((a, lo)),
+            }
+        }
+        if p.0.is_empty() {
+            None
+        } else {
+            let now_ms = Self::unix_millis();
+            let (first, last) = p.1.get_or_insert((now_ms, now_ms));
+            if had_fresh {
+                *last = now_ms;
+            }
+            let quiet = now_ms.saturating_sub(*last) >= WAL_DROP_EPISODE_QUIET_MS;
+            let overdue = now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS;
+            // #783: 落ちた record より後の record (同じ author の、 HLC が落ちた record の min より後) を、 floor を上げる前に
+            // 写さない。 写すと配られ、 受け手の cursor が落ちた record を越える: 直に pull する相手は後で上がった floor (今) で
+            // 取り直すが、 ホストの下の client は、 ホストが state で取り直した落ちた record を cursor の手前として二度と受けない。
+            // Commit も数える (受け手の cursor は Commit でも進む)。
+            //
+            // 写す物がそこにあるなら、 静かになるのを待たずに今 floor を上げる (止めて待つと、 bridge が読み切らない WAL は
+            // 畳めず、 満杯が続いて、 待つ間の書き込みが全部落ちる)。 ただし前に上げてから `WAL_DROP_FLOOR_MIN_GAP_MS` の間は
+            // 上げずに手前で止まる (満杯が続く間に毎周上げない)
+            let early = held(&p.2)
+                && now_ms.saturating_sub(self.wal_drop_floor_last_ms.load(Ordering::Relaxed)) >= WAL_DROP_FLOOR_MIN_GAP_MS;
+            if closing || quiet || early || overdue {
+                // #451 (段階 1): 持ち越しから取り出さずに写す。 floor を本体に書き終えてから (下) 持ち越しの lock の下で消す:
+                // 書いている間も持ち越しに残っているので、 切れ目 (`take_durable_cut`) はその間も候補を出さない (取り出してから
+                // 書くと、 その間の切れ目が floor の無い落ちた write を印で覆い、 印が ring の書き出しで先に届くと相手に永久に届かない)。
+                // 記録できなかった時は持ち越しに残ったまま (次の周にまた上げる)
+                Some(p.0.clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// #57 / #783: [`Self::wal_drop_floors_due`] が出した分の floor を上げる。 記録できたら true (持ち越しから消す)。
+    fn raise_wal_drop_floors(&self, wal: &enchudb_oplog::oplog::OpLog, dropped: &[(u32, enchudb_oplog::Hlc)]) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = wal.mint_hlc();
+        let me = self.peer_id();
+        let floors: Vec<(u32, enchudb_oplog::Hlc)> =
+            dropped.iter().map(|&(a, h)| (a, if a == me { now.max(h) } else { h })).collect();
+        #[cfg(test)]
+        floor_write_hook::call(wal);
+        if self.record_reclaimed_floors(&floors) {
+            self.wal_drop_floor_bumps.fetch_add(1, Ordering::Relaxed);
+            let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+            // 書いた分だけ消す (書いている間に同じ author がまた落ちて HLC が進んだ分は残す = 次の周にまた上げる)
+            p.0.retain(|e| !dropped.contains(e));
+            // min は、 書いた floor が覆った author の分を消す (残った author = 書いている間にまた落ちた分は、 min が
+            // 小さいまま残る = 次の周も手前で止まる側)
+            let left: Vec<u32> = p.0.iter().map(|(a, _)| *a).collect();
+            p.2.retain(|(a, _)| left.contains(a));
+            if p.0.is_empty() {
+                p.1 = None;
+            }
+            self.wal_drop_floor_last_ms.store(Self::unix_millis(), Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// #846: `_sync_ops` の ring の印 (生きている行の数, 枠)。 行を足すのは bridge だけなので、 `transfer_lock` を持つ間に印が
+    /// 同じ = 1 行も消えていない (枠も足されていない)。
+    fn sync_ring_mark(&self) -> Option<(u32, u32)> {
+        self.table_eid_usage("_sync_ops").map(|u| (u.live, u.capacity))
+    }
+
+    /// #846: bridge が ring の満杯で止まった所を覚える ([`BridgeStall`])。 `rest` = cursor の record から後ろの、 まだ写して
+    /// いない record の鍵 (並びのまま)。 `settle_sync_ops` の後に呼ぶ (ring を読んで置き直した [`RingNewest`] で鍵を絞る)。
+    #[allow(clippy::too_many_arguments)]
+    fn note_bridge_stall(
+        &self,
+        from: u64,
+        ring: (u32, u32),
+        what: &'static str,
+        wal_at: (u64, u64),
+        scanned_end: u64,
+        mut rest: impl Iterator<Item = GroupKey>,
+        pending: usize,
+        stop: &'static str,
+    ) {
+        use std::sync::atomic::Ordering;
+        let Some(first) = rest.next() else { return };
+        let mut stall =
+            BridgeStall { from, ring, what, wal_at, scanned_end, first, keys: Vec::new(), author_max: Vec::new(), pending, stop };
+        {
+            let newest = self.ring_newest.lock().unwrap_or_else(|p| p.into_inner());
+            stall.note(first, &newest);
+            for key in rest {
+                stall.note(key, &newest);
+            }
+        }
+        *self.bridge_stall.lock().unwrap_or_else(|p| p.into_inner()) = Some(stall);
+        self.bridge_stalled_from.store(from, Ordering::Release);
+    }
+
+    /// #846: bridge が ring の満杯で止まったまま (cursor も ring も止まった時のまま) なら、 WAL に増えた分だけを読んで、
+    /// 止まった周がする事 (落ちた record の floor #57 / #783、 配ってよい所 #828、 診断) をして `Some(0)` を返す。 覚えが無い /
+    /// 使えない (cursor が動いた、 行が消えた、 枠が足された) なら `None` (呼び手が cursor から読む)。
+    ///
+    /// 止まった周を cursor から読み直した時と違うのは 1 つだけ: #783 の待ちで止めた record の鍵を、 ring に入り切らない組の
+    /// 見積もり (`settle_sync_ops` の `more`) で重なりごと数える (読み直す道は、 止めた所から後ろの鍵を 1 つずつに畳んでから
+    /// 数える = 少なく見積もる。 待ちが明けた周に同じ数になる)。
+    fn resume_stalled_bridge(&self, wal: &enchudb_oplog::oplog::OpLog, from: u64, closing: bool) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        // 覚えは取り出して使い、 終わりに戻す (floor を書く間 lock を持たない)。 触るのは `transfer_lock` の下だけ
+        let mut m = self.bridge_stall.lock().unwrap_or_else(|p| p.into_inner()).take()?;
+        // 続きを読む位置の区画が畳まれていたら (cursor の後ろの区画だけが畳まれる事は無いはずだが、 そこから読むと残った区画を
+        // 頭から読む) 覚えを捨てて cursor から読む。 cursor の方は見ない: 開き直した後の cursor は 「頭から」 (周 0 の位置) で、
+        // cursor が同じ間、 そこから読める record は増えるだけ (bridge が読み切っていない区画は畳まれない)
+        if m.from != from || self.sync_ring_mark() != Some(m.ring) || !wal.holds(m.scanned_end) {
+            self.bridge_stalled_from.store(u64::MAX, Ordering::Release);
+            return None;
+        }
+        // WAL に増えた record (前に読んだ後に載った分 / 閉じた分) だけ読む
+        let wal_at = (wal.head(), wal.written_head());
+        if wal_at != m.wal_at {
+            let (records, committed_end, pending, stop) = wal.iter_committed_from_with_diag(m.scanned_end);
+            self.bridge_wal_records_read.fetch_add(records.len() as u64, Ordering::Relaxed);
+            {
+                let newest = self.ring_newest.lock().unwrap_or_else(|p| p.into_inner());
+                for (r, _) in &records {
+                    m.note((r.author_peer, r.hlc), &newest);
+                }
+            }
+            m.wal_at = wal_at;
+            m.scanned_end = committed_end;
+            m.pending = pending;
+            m.stop = stop.as_str();
+        }
+        // #783: 落ちた record より後の record が残っているか (cursor の record がそうなら、 1 つも写さずに floor を待つ周)
+        let (mut first_held, mut held) = (false, false);
+        let due = self.wal_drop_floors_due(wal, closing, &mut |lows| {
+            let after = |key: &GroupKey| lows.iter().any(|(a, lo)| *a == key.0 && key.1 > *lo);
+            first_held = std::iter::once(&m.first).any(after);
+            held = first_held || m.author_max.iter().any(after);
+            held
+        });
+        if let Some(dropped) = due
+            && self.raise_wal_drop_floors(wal, &dropped)
+        {
+            (first_held, held) = (false, false);
+        }
+        if held {
+            self.wal_drop_bridge_holds.fetch_add(1, Ordering::Relaxed);
+        }
+        if Self::trace_bridge_enabled() {
+            eprintln!(
+                "[bridge] stalled from={from} scanned_end={} head={} cp={} keys={} pending={} stop={} held={held}",
+                m.scanned_end,
+                wal.head(),
+                wal.checkpoint(),
+                m.keys.len(),
+                m.pending,
+                m.stop,
+            );
+        }
+        self.bridge_last_from.store(from, Ordering::Relaxed);
+        self.bridge_last_committed_end.store(m.scanned_end, Ordering::Relaxed);
+        *self.bridge_last_scan_stop.lock().unwrap_or_else(|p| p.into_inner()) = m.stop;
+        self.bridge_pending_records.store(m.pending as u64, Ordering::Relaxed);
+        if first_held {
+            self.settle_sync_ops(m.keys.iter().copied(), false);
+        } else {
+            self.bridge_empty_scans.store(0, Ordering::Relaxed);
+            self.bridge_stall_warned.store(false, Ordering::Relaxed);
+            self.bridge_stall_since_ms.store(0, Ordering::Relaxed);
+            self.settle_sync_ops(m.keys.iter().copied(), true);
+            self.sync_ops_backpressure(from, None, 0, m.what);
+        }
+        *self.bridge_stall.lock().unwrap_or_else(|p| p.into_inner()) = Some(m);
+        Some(0)
+    }
+
+    /// #846: bridge が ring の満杯で止まったままで、 WAL を畳めない (畳むには bridge が次に畳む区画の終わりまで読み終えて
+    /// いること。 止まった cursor はその手前で、 ring が空くまで進まない)。 `wal_at` = true なら、 加えて、 止まった後に WAL に
+    /// record が増えていない事も見る。 lock を待たない見積もり (bridge が走っている最中は false)。
+    fn bridge_stall_holds(&self, wal: &enchudb_oplog::oplog::OpLog, wal_at: bool) -> bool {
+        use std::sync::atomic::Ordering;
+        let from = self.bridge_stalled_from.load(Ordering::Acquire);
+        if from == u64::MAX || from != self.sync_ops_offset.load(Ordering::Acquire) || from >= wal.fold_end() {
+            return false;
+        }
+        let Ok(g) = self.bridge_stall.try_lock() else { return false };
+        g.as_ref().is_some_and(|m| {
+            m.from == from
+                && (!wal_at || m.wal_at == (wal.head(), wal.written_head()))
+                && self.sync_ring_mark() == Some(m.ring)
+        })
+    }
+
+    /// #846: consumer が時間で見直す物が無い: bridge が ring の満杯で止まったまま、 WAL に増えた record も、 書き出していない
+    /// 物も、 floor を待つ落ちた record も無い。 ring が空く (行が消える = [`Self::purge_sync_ops_row`] が起こす、 枠が足される) /
+    /// WAL に record が載る・落ちる (append の hook が起こす) まで、 何周しても同じ。 その間 consumer は 100 ms ごとでなく、
+    /// 何も書いていない sync の DB と同じ 1 秒ごとに起きる。
+    fn bridge_parked(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
+        use std::sync::atomic::Ordering;
+        wal.head() == wal.checkpoint()
+            && !self.durable_mark_flush_pending.load(Ordering::Acquire)
+            && self.sync_bridged.load(Ordering::Acquire) <= self.sync_bridged_durable.load(Ordering::Acquire)
+            && !wal.has_dropped()
+            && self.wal_drop_pending.try_lock().is_ok_and(|p| p.0.is_empty())
+            && self.bridge_stall_holds(wal, true)
+    }
+
+    /// #846: bridge が WAL から読んだ (decode した) record の数の累計 (観測用)。 ring の満杯で止まったままの bridge は、
+    /// WAL に record が増えない限り増やさない (前は周のたびに cursor から先を全部読み直した)。
+    pub fn bridge_wal_records_read(&self) -> u64 {
+        self.bridge_wal_records_read.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// #828: bridge の周の終わりに、 配ってよい `_sync_ops` の行の終わり ([`Self::sync_settled_lsn`]) を置く。
@@ -8617,6 +8901,10 @@ impl Engine {
         // committed group が残っている間（= ring 満杯の backpressure 中）は、 従来
         // どおり畳まない。
         if wal.append_dead() {
+            // #846: bridge が ring の満杯でこの cursor に止まっている = そこに commit 済みの record がある (WAL を読まずに分かる)
+            if self.bridge_stalled_from.load(std::sync::atomic::Ordering::Acquire) == offset {
+                return false;
+            }
             let (records, _) = wal.iter_committed_from_with_offsets(offset);
             return records.is_empty();
         }
@@ -9503,6 +9791,12 @@ impl Engine {
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
                 // #843: 行が消えた (止まった周の覚えた答えは使えない)
                 self.sync_ops_purges.fetch_add(1, std::sync::atomic::Ordering::Release);
+                // #846: ring の満杯で止まった bridge を待たせない (consumer は止まっている間 1 秒ごとにしか起きない)
+                if self.bridge_stalled_from.load(std::sync::atomic::Ordering::Acquire) != u64::MAX
+                    && let Some(w) = self.consumer_waker()
+                {
+                    w.wake();
+                }
             }
             // `_sync_ops` の slot を引けない (表が無い / 枠の外) 行は purge しない (#561: 前は `delete` に落とし、 内部の行の lock を
             // 握ったまま WAL の空きを待つ唯一の道だった。 引けない行は ring の行でないので、 free list にも戻せない)
@@ -22095,15 +22389,25 @@ impl Engine {
                     };
                     // 空と見た WAL (寝る印を立てた後にもう一度見る)
                     let mut idle_wal = None;
+                    // #846: bridge が ring の満杯で止まったままで、 見直す物が無い WAL (起こされるまで 1 秒ごと)
+                    let mut parked_wal = None;
+                    // #846: 空きを待つ書き手は居るが、 今は畳めないと分かっている (10 ms の間は試さない)。 前は、 その間寝ずに
+                    // 回り続けた (満杯の WAL に 1 回書くたびに最大 10 ms)
+                    let room_wait = engine.wal_room_wanted.load(Ordering::Acquire) && engine.wal_room_failed_recently();
                     let timeout = match oplog_for_thread.as_ref() {
                         None => None,
                         Some(wal) => {
-                            let behind = wal_behind(wal) || engine.wal_room_wanted.load(Ordering::Acquire);
-                            if !behind {
+                            let wanted = engine.wal_room_wanted.load(Ordering::Acquire);
+                            if !wanted && wal_behind(wal) && engine.sync_tables_enabled() && engine.bridge_parked(wal) {
+                                parked_wal = Some(wal);
+                            }
+                            let behind = (wal_behind(wal) && parked_wal.is_none()) || wanted;
+                            if !behind && parked_wal.is_none() {
                                 idle_wal = Some(wal);
                             }
                             if behind {
-                                Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
+                                let tick = fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1));
+                                Some(if room_wait { tick.min(Duration::from_millis(10)) } else { tick })
                             } else if engine.sync_tables_enabled() {
                                 // sync の bridge (相手の ack で `_sync_ops` が空くのを待つ等) は時間で見直す物が残りうるので、
                                 // 1 秒ごとには起きる (changefeed の配信は通知係がする)
@@ -22121,7 +22425,9 @@ impl Engine {
                     }
                     waker.sleep(timeout, || {
                         !flag_for_thread.load(Ordering::Acquire)
-                            && !engine.wal_room_wanted.load(Ordering::Acquire)
+                            && !(engine.wal_room_wanted.load(Ordering::Acquire) && !room_wait)
+                            // #846: 止まったままと見てから印を立てるまでに、 ring が空いた / WAL に record が載った・落ちた
+                            && !parked_wal.is_some_and(|wal| !engine.bridge_parked(wal))
                             // #555: 空と見てから印を立てるまでに書かれた record を見落とさない (その書き手の `wake_if_deep` は
                             // 印を見ずに素通りした)。 書き出しを待つ短い眠り (WAL が空でない時) は見直さない (毎 append で戻ってしまう)
                             && !idle_wal.is_some_and(|wal| wal_behind(wal))
@@ -22204,6 +22510,12 @@ impl Engine {
             return WalRoom::Transient; // 畳むものが無い (空いている)
         }
         let direct = !self.sync_tables_enabled();
+        // #846: bridge が ring の満杯で止まったままなら、 書き出しても畳めない (ring が空くまで)。 Commit / 書き出し / bridge を
+        // 回さずに 「畳めない状態」 と返す (書き出しは周期の tick がする)。 前は、 空きが 1/4 を切ったままの WAL のために、
+        // 何も書いていなくても毎周これを全部回した
+        if !direct && self.bridge_stall_holds(wal, false) {
+            return WalRoom::Blocked;
+        }
         // sync の DB は、 書き手が積み続けている間に走ると畳めないことがある (頼まれてから動き出すまでに空きができていた、 前の
         // 満杯の時の頼みが残っていた)。 閉じの Commit の後に書き手が積むと末尾の group が閉じず bridge が読めない、 書き出しの後に
         // 積むと head が checkpoint より先に進む。 data の record は閉じの Commit 1 つ分の空きを残してしか場所を取らないので、
@@ -23760,6 +24072,146 @@ mod ring_newest_tests {
         assert!(!n.is_newer_than_every_row(at(now + (1 << 32), 3)), "下位 32 bit が同じ鍵");
         n.unknown = true;
         assert!(!n.is_newer_than_every_row(at(now + 1, 0)), "版数の分からない行がある間は使わない");
+    }
+}
+
+/// #846: ring の満杯で止まった bridge の覚え ([`BridgeStall`]) が、 空いた ring を見逃さない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod bridge_stall_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// ring を満杯にして止めた engine と、 書いた行。
+    fn stalled(tag: &str) -> (std::sync::Arc<Engine>, u64, Tmp) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("{}/enchudb-issue846-unit-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_table("t", 8).unwrap();
+        eng.define_himo_in("t", "n", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        eng.set_peer_id(1);
+        let e = eng.entity_in("t").unwrap();
+        (eng, e, Tmp(path))
+    }
+
+    fn usage(eng: &Engine) -> TableEidUsage {
+        eng.table_eid_usage("_sync_ops").unwrap()
+    }
+
+    /// ring のいちばん古い行を消す。
+    fn purge_oldest(eng: &Engine) {
+        let cols = eng.sync_payload_cols().unwrap();
+        let (lsn, eid) = eng
+            .entities_with_himo(cols.lsn)
+            .into_iter()
+            .filter_map(|e| eng.get_by_id32(e, cols.lsn).map(|l| (l, e)))
+            .min()
+            .expect("前提: ring に行がある");
+        assert!(eng.purge_sync_ops_row(eid, cols.lsn, lsn), "前提: 行を消した");
+    }
+
+    /// 置けなかった後・ring の印を取る前に行が消えても、 その空きを見逃さない (印を取った後にもう一度試す)。
+    ///
+    /// falsify: 印を取った後に試し直さないと、 空きが 1 行あるままの ring を 「止まった時のまま」 と覚え、 次に行が消えるまで
+    /// 1 行も写さない。
+    #[test]
+    fn a_row_freed_before_the_mark_is_taken_is_not_missed() {
+        let (eng, e, _tmp) = stalled("mark");
+        let ring = usage(&eng).capacity;
+        let wal = eng.oplog().unwrap().clone();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _no_bridge = eng.transfer_lock_for_fold();
+            for i in 0..ring + 64 {
+                eng.tie_to(e, "t.n", i);
+            }
+            eng.oplog_commit();
+            // 最初に置けなかった周の、 印を取る直前に 1 行消える
+            let (eng2, fired2) = (eng.clone(), fired.clone());
+            stall_mark_hook::set(&wal, move |_| {
+                purge_oldest(&eng2);
+                fired2.store(true, std::sync::atomic::Ordering::Release);
+            });
+        }
+        let t0 = std::time::Instant::now();
+        while !fired.load(std::sync::atomic::Ordering::Acquire) {
+            eng.transfer_oplog_to_sync_ops();
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "前提: bridge が満杯で止まる");
+        }
+        for _ in 0..20 {
+            eng.transfer_oplog_to_sync_ops();
+        }
+        let u = usage(&eng);
+        assert_eq!(u.live, u.capacity, "印を取る前に空いた 1 行を使わずに止まった (空き {} 行)", u.free);
+    }
+
+    /// cursor が動いたら (fold が頭に戻した / 追い越しの直し) 覚えを使わず、 cursor から読む。
+    ///
+    /// falsify: cursor を比べないと、 頭に戻った cursor から読み直さない (前の位置の覚えで止まったまま)。
+    #[test]
+    fn a_moved_cursor_drops_the_memo() {
+        let (eng, e, _tmp) = stalled("cursor");
+        let ring = usage(&eng).capacity;
+        {
+            let _no_bridge = eng.transfer_lock_for_fold();
+            for i in 0..2 * ring {
+                eng.tie_to(e, "t.n", i);
+            }
+            eng.oplog_commit();
+        }
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        let _no_bridge = eng.transfer_lock.lock().unwrap();
+        let stalled_at = eng.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
+        assert!(stalled_at > enchudb_oplog::oplog::HEADER_SIZE as u64, "前提: bridge は途中まで読んで止まった");
+        assert_eq!(eng.bridge_stalled_from.load(std::sync::atomic::Ordering::Acquire), stalled_at, "前提: 止まった所を覚えた");
+        eng.sync_ops_offset.store(enchudb_oplog::oplog::HEADER_SIZE as u64, std::sync::atomic::Ordering::Release);
+        let read = eng.bridge_wal_records_read();
+        drop(_no_bridge);
+        eng.transfer_oplog_to_sync_ops();
+        let grew = eng.bridge_wal_records_read() - read;
+        assert!(grew >= u64::from(2 * ring), "cursor が頭に戻ったのに、 前の位置の覚えで止まって読み直さなかった (読んだ {grew} 件)");
+    }
+
+    /// 止まった後に行が消えたら、 次の周が続きを写す。 枠を足した時も。
+    ///
+    /// falsify: ring の印を比べない (行の数 / 枠) と、 1 行も写さない。
+    #[test]
+    fn a_stalled_bridge_moves_on_when_a_row_is_freed_or_the_ring_grows() {
+        let (eng, e, _tmp) = stalled("free");
+        let ring = usage(&eng).capacity;
+        {
+            let _no_bridge = eng.transfer_lock_for_fold();
+            for i in 0..ring + 64 {
+                eng.tie_to(e, "t.n", i);
+            }
+            eng.oplog_commit();
+        }
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        assert_eq!(usage(&eng).free, 0, "前提: ring が満杯");
+        let read = eng.bridge_wal_records_read();
+        assert_eq!(eng.transfer_oplog_to_sync_ops(), 0);
+        assert_eq!(eng.bridge_wal_records_read(), read, "前提: 止まったままの周は WAL を読まない");
+
+        purge_oldest(&eng);
+        let mut wrote = 0;
+        for _ in 0..20 {
+            wrote += eng.transfer_oplog_to_sync_ops();
+        }
+        assert_eq!(usage(&eng).free, 0, "行が消えたのに、 止まった bridge が続きを写さなかった (写した {wrote} 行)");
+
+        let lsn = eng.current_sync_lsn();
+        eng.grow_table("_sync_ops", 16).unwrap();
+        for _ in 0..20 {
+            eng.transfer_oplog_to_sync_ops();
+        }
+        assert!(eng.current_sync_lsn() >= lsn + 16, "枠を足したのに、 止まった bridge が続きを写さなかった");
     }
 }
 

@@ -2820,6 +2820,20 @@ impl OpLog {
         self.fold_target_locked().map(|(_, through)| through)
     }
 
+    /// #846: 次に畳む区画 (古い区画に record があればその区画、 無ければ今の区画) の record の終わり ([`wal_pos`])。 読み手が
+    /// ここまで読み終えるまで、 どの区画も畳めない。 lock を取らない見積もり。
+    pub fn fold_end(&self) -> u64 {
+        let ai = self.hot.active.load(Ordering::Acquire);
+        if self.two.load(Ordering::Acquire) {
+            let o = &self.hot.halves[ai ^ 1];
+            if !o.is_empty() {
+                return wal_pos(o.lap(), o.head.load(Ordering::Acquire));
+            }
+        }
+        let a = &self.hot.halves[ai];
+        wal_pos(a.lap(), a.head.load(Ordering::Acquire))
+    }
+
     /// 位置 `pos` ([`wal_pos`]) の周の区画がまだあるか。 無い = その区画は畳まれた後 (畳むと新しい周を置く) で、 その位置から
     /// 読むと残った区画を頭から読む。
     pub fn holds(&self, pos: u64) -> bool {
@@ -3106,7 +3120,16 @@ impl OpLog {
         if author == self.peer_id() {
             self.dropped_gen.fetch_add(1, Ordering::Release);
         }
+        drop(g);
+        // #846: 落ちた record も、 載った record と同じく知らせる (engine の consumer は、 落ちた record の floor を上げるために
+        // 起きる。 深く寝ている時だけ起こす hook なので、 ふだんは atomic を 1 回読むだけ)
+        self.appended();
         hlc
+    }
+
+    /// #846: 覚えたまま、 まだ取り出していない落ちた record があるか ([`OpLog::take_dropped_spans`] が空にする)。
+    pub fn has_dropped(&self) -> bool {
+        !self.dropped.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
     }
 
     /// #451 (段階 1): 自分の落ちた record を覚えた回数 (切れ目と置く時で比べる)。
@@ -5049,6 +5072,35 @@ mod tests {
             let _ = std::fs::remove_dir_all(x);
             let _ = std::fs::remove_file(x);
         }
+    }
+
+    /// #846: 載らなかった record も、 載った record と同じく hook で知らせる (engine の consumer は、 bridge が止まっている間
+    /// 1 秒ごとにしか起きない。 落ちた record の floor を上げる周を、 次の 1 秒まで待たせない)。 [`OpLog::has_dropped`] は
+    /// 取り出すまで true。
+    ///
+    /// falsify: `note_dropped_minting` が hook を呼ばないと、 落ちた append の後に数が増えない。
+    #[test]
+    fn a_dropped_record_calls_the_append_hook() {
+        let p = tmp("dropped_hook");
+        let wal = OpLog::create(&p, 4096).unwrap();
+        wal.set_peer_id(1);
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        wal.set_append_hook(Box::new(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+        }));
+        while wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+        while wal.append(Op::Commit).is_ok() {}
+        let _ = wal.take_dropped();
+        assert!(!wal.has_dropped());
+        let before = calls.load(Ordering::Relaxed);
+        assert!(wal.append(Op::Tie { eid: 1, himo_id: 0, value: 2 }).is_err(), "前提: 満杯で載らない");
+        assert!(wal.has_dropped(), "落ちた record を覚えていない");
+        assert!(calls.load(Ordering::Relaxed) > before, "落ちた record を hook で知らせなかった");
+        assert!(!wal.take_dropped().is_empty());
+        assert!(!wal.has_dropped(), "取り出した後も覚えたまま");
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// #57: 載らなかった record の author を覚える (bridge が history floor を上げる材料)。
