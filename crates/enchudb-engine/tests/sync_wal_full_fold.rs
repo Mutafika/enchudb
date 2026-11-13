@@ -126,8 +126,32 @@ fn round_in(wal: usize, tag: &str, sync: bool, writers: u64, writes: u64, reclai
     let limit = Duration::from_secs(30);
     while !hs.iter().all(|h| h.is_finished()) {
         if eng.wal_room_wait_timeouts() > 0 {
+            // 診断 (#843 の調べ: coverage の job で 1 回、 理由の分からない時間切れが出た)。 時間切れの後も書き手は回したまま 2 秒
+            // 見る: 空け作りが進む (畳んだ回数が増える) なら 1 回きりの遅い書き出し、 consumer が起きているのに畳めないなら
+            // 畳めない状態、 起きた回数も止まっているなら互いに待つ形
+            let snap = |e: &Engine| {
+                let s = e.stats();
+                format!(
+                    "畳んだ {} 回 / consumer が起きた {} 回 / WAL の head {:#x} checkpoint {:#x} / bridge の位置 {:#x} / 落ちた {} 件 / \
+                     bridge が止めた {} 周 / floor を上げた {} 回",
+                    e.wal_room_folds(),
+                    e.consumer_wakeups(),
+                    s.oplog_head,
+                    s.oplog_checkpoint,
+                    e.sync_ops_bridge_offset(),
+                    e.wal_dropped_records(),
+                    e.wal_drop_bridge_holds(),
+                    e.wal_drop_floor_bumps(),
+                )
+            };
+            let at_timeout = snap(&eng);
+            std::thread::sleep(Duration::from_secs(2));
+            let later = snap(&eng);
             stop.store(true, Ordering::Relaxed);
-            panic!("{tag}: 空きを待つ書き手が待ちの上限 (5 秒) まで待った (WAL が満杯の間、 空きを作る係が待っている書き手を待っている)");
+            panic!(
+                "{tag}: 空きを待つ書き手が待ちの上限 (5 秒) まで待った (WAL が満杯の間、 空きを作る係が待っている書き手を待っている)\n  \
+                 見つけた時: {at_timeout}\n  2 秒後: {later}"
+            );
         }
         let started = reclaim_since.load(Ordering::Acquire);
         if started != 0 {

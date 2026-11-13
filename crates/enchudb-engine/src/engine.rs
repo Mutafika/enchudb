@@ -52,6 +52,65 @@ pub enum EntityValueOwned {
 /// 全部入っていないと、 後から載った分が `hlc > cursor` を通らない。
 type GroupKey = (enchudb_oplog::PeerId, enchudb_oplog::Hlc);
 
+/// [`Engine::open_groups_on_ring`] の答え: (組の最初の lsn の最小, 鍵の列, まだ写していないその鍵の record の数)。
+type OpenGroups = Option<(u32, Vec<GroupKey>, u64)>;
+
+/// #843: `_sync_ops` の ring に載った事のある行の版数の、 いちばん新しい所の覚え (`transfer_lock` の下でだけ触る)。
+///
+/// [`Engine::open_groups_on_ring`] は、 まだ写していない record と同じ鍵 (書き手, 版数) の行を ring から探す。 鍵が合う行は
+/// 版数が同じ = 版数の時刻の下位 32 bit と logical が同じ。 なので 「ring の行のどれよりも (時刻の下位 32 bit, logical) が
+/// 新しい鍵」 は、 行を読まなくても合う行が無いと分かる。 自分の時計で書いた record はいつもこの形 (時計は進む一方で、 中継した
+/// record の版数も時計に混ぜる) なので、 ring が満杯で止まっている間に書かれた record のために ring を読み直さなくてよい。
+///
+/// 時刻の下位 32 bit は 49.7 日で 1 周するので、 大小でなく `anchor` からの距離で比べる。 距離が同じ = 下位 32 bit が同じ、 は
+/// 周によらず成り立つので、 「どの行よりも距離が大きい鍵に合う行は無い」 は時計のずれ・古い行・1 周した行があっても正しい
+/// (そういう行があると最大が大きくなって、 近道が効かなくなる = ring を読むだけ)。 `anchor` は読んだ時の今 (壁の時計と、 問いの
+/// 鍵のいちばん新しい時刻の、 新しい方) から 2^28 ms (3.1 日) 先: 今から 46 日前〜3.1 日先の行が、 時刻の順に並ぶ。 鍵が
+/// そこを越えたら ring を読み直して `anchor` を置き直す。
+///
+/// 行が消える (reclaim / purge) 分には覚えを直さない (最大が大きいまま = 近道が効きにくい側)。
+struct RingNewest {
+    /// ring を読んで覚えを作ったか (開いた後の最初の問いが読む)。
+    seeded: bool,
+    anchor: u32,
+    /// ring に載った事のある行の (距離, logical) の最大。 行が無ければ None。
+    newest: Option<(u32, u32)>,
+    /// 版数を読めない行がある (時刻の列の cell が無く payload も読めない)。 その行の版数が分からないので近道は使わない。
+    unknown: bool,
+    /// 最後に ring を読んだ問いと答え: (鍵の列 (整列済み、 重なりごと), その時の `next_sync_lsn`, その時の purge の回数, 答え)。
+    /// ring に行が足されず 1 行も消えていなければ、 同じ問いの答えは同じ。 鍵は 1 つ 20 byte で、 数は WAL にあるまだ写していない
+    /// record の数まで (開き直した後に WAL を頭から写し直している間がいちばん多い。 次に ring を読んだ時に置き換わる)。
+    last: Option<(Vec<GroupKey>, u32, u64, OpenGroups)>,
+}
+
+impl RingNewest {
+    fn new() -> Self {
+        Self { seeded: false, anchor: 0, newest: None, unknown: false, last: None }
+    }
+
+    /// 今 `now_ms` に読み直す時の `anchor` (今から 2^28 ms 先)。
+    fn anchor_for(now_ms: u64) -> u32 {
+        (now_ms as u32).wrapping_add(1 << 28)
+    }
+
+    fn at(anchor: u32, hlc: enchudb_oplog::Hlc) -> (u32, u32) {
+        ((hlc.wall as u32).wrapping_sub(anchor), hlc.logical)
+    }
+
+    /// 版数 `hlc` の行を ring に載せた。
+    fn note(&mut self, hlc: enchudb_oplog::Hlc) {
+        let at = Self::at(self.anchor, hlc);
+        if self.newest.is_none_or(|n| at > n) {
+            self.newest = Some(at);
+        }
+    }
+
+    /// 版数 `hlc` の行は ring に無いと、 行を読まずに言えるか。
+    fn is_newer_than_every_row(&self, hlc: enchudb_oplog::Hlc) -> bool {
+        self.seeded && !self.unknown && self.newest.is_none_or(|n| Self::at(self.anchor, hlc) > n)
+    }
+}
+
 /// table の eid 枠の使用状況。 `Engine::table_eid_usage` の戻り値。
 ///
 /// 数えるのは**今ある枠**だけ。 枠を使い切ると `entity_in` は、 どの table にも割り当てていない eid 空間
@@ -5665,6 +5724,12 @@ pub struct Engine {
     sync_settled_lsn: std::sync::atomic::AtomicU32,
     /// #828: 開いてから bridge が 1 周して [`Self::sync_settled_lsn`] を置いたか (置く前の読み手は自分で 1 周させる)。
     sync_settled_known: std::sync::atomic::AtomicBool,
+    /// #843: ring の行の版数のいちばん新しい所 ([`RingNewest`]、 `transfer_lock` の下でだけ触る)。
+    ring_newest: std::sync::Mutex<RingNewest>,
+    /// #843: `_sync_ops` の行を消した回数 ([`Self::purge_sync_ops_row`])。 [`RingNewest::last`] が 「行が消えていない」 を見る。
+    sync_ops_purges: std::sync::atomic::AtomicU64,
+    /// #843: [`Self::open_groups_on_ring`] が ring の行をなめた回数 ([`Self::sync_ring_scans`])。
+    sync_ring_scans: std::sync::atomic::AtomicU64,
     /// 0.8.15: `try_persist_tables` 内の warning emit を rate-limit するための
     /// 最後の emit timestamp (millis since UNIX_EPOCH)。 ENOSPC 等で連続失敗
     /// すると consumer thread が毎 batch eprintln → ターミナル不能なので 1 秒
@@ -6119,6 +6184,9 @@ impl Engine {
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             sync_settled_lsn: std::sync::atomic::AtomicU32::new(u32::MAX),
             sync_settled_known: std::sync::atomic::AtomicBool::new(false),
+            ring_newest: std::sync::Mutex::new(RingNewest::new()),
+            sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
+            sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicU64::new(0)
@@ -7410,6 +7478,9 @@ impl Engine {
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             sync_settled_lsn: std::sync::atomic::AtomicU32::new(u32::MAX),
             sync_settled_known: std::sync::atomic::AtomicBool::new(false),
+            ring_newest: std::sync::Mutex::new(RingNewest::new()),
+            sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
+            sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
@@ -8172,6 +8243,8 @@ impl Engine {
             // が成立する。 engine 内の `set_cell` (値 → HLC の順) と同じ規則で、
             // 逆順にすると 「識別子だけ新しい」 窓ができる、 も同じ。
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
+            // #843: ring の行のいちばん新しい版数を覚える (止まった周が ring を読み直さないため)
+            self.ring_newest.lock().unwrap_or_else(|p| p.into_inner()).note(rec.hlc);
             self.sync_bridged.fetch_add(1, Ordering::Release);
             done_end = Some(*rec_end);
         }
@@ -8270,21 +8343,45 @@ impl Engine {
     /// 65 個以上の別の鍵の record が挟まると (state を載せている間の自分のアプリの書き込み。 gate / `state_relay` は配る側しか
     /// 止めない) 組の頭を見失い、 割れた組の前半を配った (#830)。 行を見れば、 何個挟まっても、 開き直した後でも同じ答えになる。
     ///
-    /// 値段: `remaining` が空 (止まらずに写し終えた周 = ふつうの周) は何も読まない。 止まった周 (ring の満杯 / #783 の待ち) だけ、
-    /// ring の行を 1 回なめる: 行ごとに列 3 つ (lsn / 書き手 / 版数の時刻の下位 32 bit) を読み、 `remaining` のどれかと合う行だけ
-    /// payload を開いて版数の全部を比べる。
-    fn open_groups_on_ring(&self, remaining: impl Iterator<Item = GroupKey>) -> Option<(u32, Vec<GroupKey>, u64)> {
-        // (鍵, remaining の中の数, ring の上の最初の lsn)
-        let mut want: Vec<(GroupKey, u64, u32)> = Vec::new();
-        let mut keys: Vec<GroupKey> = remaining.collect();
+    /// 値段: `remaining` が空 (止まらずに写し終えた周 = ふつうの周) は何も読まない。 止まった周 (ring の満杯 / #783 の待ち) も、
+    /// ふつうは読まない (#843): ring のどの行よりも版数が新しい鍵 ([`RingNewest`]) は合う行が無いので外し、 残った鍵が前に読んだ
+    /// 問いと同じで ring が変わっていなければ (行が足されず 1 行も消えていない) 前の答えを返す。 ring の行をなめるのは、 開いた後の
+    /// 最初の止まった周と、 ring にある版数以前の鍵 (state の組の続き、 中継した record、 開き直した後に WAL を頭から写し直して
+    /// いる間の record) が新しく出た周だけ: 行ごとに版数の時刻の下位 32 bit の列を読み、 残った鍵の時刻の幅に入る行だけ書き手の
+    /// 列と合わせて絞り、 残った鍵のどれかと合う行だけ payload を開いて版数の全部を比べる。
+    /// 前は止まった周のたびになめていて、 ring が満杯のまま (ack の来ない相手) の DB は、 写す record のあるたびに ring の行の
+    /// 数だけ読んだ (100 万行で 1 回 28〜32 ms、 `transfer_lock` を持ったまま)。
+    fn open_groups_on_ring(&self, remaining: impl Iterator<Item = GroupKey>) -> OpenGroups {
+        use std::sync::atomic::Ordering;
+        let mut newest = self.ring_newest.lock().unwrap_or_else(|p| p.into_inner());
+        // 問いの鍵のいちばん新しい時刻 (ring を読み直す時の `anchor` の元)
+        let mut latest = 0u64;
+        // ring のどの行よりも新しい鍵に合う行は無いので、 並べる前に外す (止まっている間に書かれた record の鍵はここで消える)
+        let mut keys: Vec<GroupKey> = remaining
+            .filter(|(_, h)| {
+                latest = latest.max(h.wall);
+                !newest.is_newer_than_every_row(*h)
+            })
+            .collect();
         if keys.is_empty() {
             return None;
         }
         keys.sort_unstable();
-        for key in keys {
+        // 行が足されたか (bridge だけが足す、 `transfer_lock` の下) / 消えたか。 消えた回数は読む前に取る (読んでいる間に消えた分は
+        // 次の問いが読み直す)
+        let ring_at = (self.next_sync_lsn.load(Ordering::Acquire), self.sync_ops_purges.load(Ordering::Acquire));
+        if let Some((asked, lsn, purges, answer)) = &newest.last
+            && (*lsn, *purges) == ring_at
+            && *asked == keys
+        {
+            return answer.clone();
+        }
+        // (鍵, remaining の中の数, ring の上の最初の lsn)
+        let mut want: Vec<(GroupKey, u64, u32)> = Vec::new();
+        for key in &keys {
             match want.last_mut() {
-                Some((k, n, _)) if *k == key => *n += 1,
-                _ => want.push((key, 1, u32::MAX)),
+                Some((k, n, _)) if k == key => *n += 1,
+                _ => want.push((*key, 1, u32::MAX)),
             }
         }
         let cols = self.sync_payload_cols()?;
@@ -8296,10 +8393,47 @@ impl Engine {
         let mut narrow: Vec<(u32, u32)> = want.iter().map(|((a, h), _, _)| (*a, h.wall as u32)).collect();
         narrow.sort_unstable();
         narrow.dedup();
+        self.sync_ring_scans.fetch_add(1, Ordering::Relaxed);
+        // #843: なめるついでに、 ring の行の版数のいちばん新しい所を覚え直す。 `top` = 距離が最大の行 (logical は payload に
+        // しか無いので、 その行だけ後で開く)
+        // 「今」 は、 壁の時計と問いの鍵の新しい方: 自分の時計は相手の版数を混ぜて壁の時計より先に進む事がある (その時の
+        // 自分の record の時刻は先のまま)。 壁の時計だけで決めると、 3.1 日より先に進んだ時計の鍵がいつも 1 周して見える
+        let anchor = RingNewest::anchor_for(Self::unix_millis().max(latest));
+        // 問いの鍵の時刻の幅 (距離で)。 幅の外の行は、 書き手の列も二分探しも見ずに飛ばす (ring の行のほとんどは、 まだ写して
+        // いない record より古い)
+        let asked = narrow.iter().map(|(_, w)| w.wrapping_sub(anchor));
+        let (asked_lo, asked_hi) = (asked.clone().min().unwrap_or(0), asked.max().unwrap_or(0));
+        let mut top: Option<(u32, Vec<u64>)> = None;
+        let (mut seen, mut unknown): (Option<(u32, u32)>, bool) = (None, false);
         for eid in self.entities_with_himo(cols.lsn) {
-            let Some(lsn) = self.get_by_id32(eid, cols.lsn) else { continue };
-            if let Some((p, w)) = narrow_cols
-                && let Some(pair) = self.get_by_id32(eid, p).zip(self.get_by_id32(eid, w))
+            let wall_lo = narrow_cols.and_then(|(_, w)| self.get_by_id32(eid, w));
+            match wall_lo {
+                Some(w) => {
+                    let d = w.wrapping_sub(anchor);
+                    match &mut top {
+                        Some((best, rows)) if *best == d => rows.push(eid),
+                        Some((best, _)) if *best > d => {}
+                        _ => top = Some((d, vec![eid])),
+                    }
+                    if d < asked_lo || d > asked_hi {
+                        continue;
+                    }
+                }
+                // 時刻の列の cell が無い行: payload から版数を読む (読めなければ、 版数の分からない行。 読んでいる間に消えた行
+                // (lsn の cell も無い) は数えない)
+                None => match self.sync_op_payload(eid, &cols).and_then(|p| enchudb_oplog::oplog::decode_sync_ops_payload(&p)) {
+                    Some(rec) => {
+                        let at = RingNewest::at(anchor, rec.hlc);
+                        if seen.is_none_or(|n| at > n) {
+                            seen = Some(at);
+                        }
+                    }
+                    None if self.get_by_id32(eid, cols.lsn).is_none() => continue,
+                    None => unknown = true,
+                },
+            }
+            if let Some((p, _)) = narrow_cols
+                && let Some(pair) = self.get_by_id32(eid, p).zip(wall_lo)
                 && narrow.binary_search(&pair).is_err()
             {
                 continue;
@@ -8311,14 +8445,46 @@ impl Engine {
             if matches!(rec.op, enchudb_oplog::oplog::DecodedOp::Commit) {
                 continue;
             }
-            if let Ok(i) = want.binary_search_by_key(&(rec.author_peer, rec.hlc), |(k, _, _)| *k) {
+            if let Ok(i) = want.binary_search_by_key(&(rec.author_peer, rec.hlc), |(k, _, _)| *k)
+                && let Some(lsn) = self.get_by_id32(eid, cols.lsn)
+            {
                 want[i].2 = want[i].2.min(lsn);
             }
         }
+        if let Some((d, rows)) = top {
+            // 距離が最大の行の logical の最大。 読めない行 / 列と payload の時刻が合わない行があれば、 その距離の鍵には近道を
+            // 使わない (logical を最大にする)
+            let mut logical = 0u32;
+            for eid in rows {
+                match self.sync_op_payload(eid, &cols).and_then(|p| enchudb_oplog::oplog::decode_sync_ops_payload(&p)) {
+                    Some(rec) if (rec.hlc.wall as u32).wrapping_sub(anchor) == d => logical = logical.max(rec.hlc.logical),
+                    _ => logical = u32::MAX,
+                }
+            }
+            if seen.is_none_or(|n| (d, logical) > n) {
+                seen = Some((d, logical));
+            }
+        }
+        newest.seeded = true;
+        newest.anchor = anchor;
+        newest.newest = seen;
+        newest.unknown = unknown;
         want.retain(|(_, _, first)| *first != u32::MAX);
-        let from = want.iter().map(|(_, _, first)| *first).min()?;
-        let more = want.iter().map(|(_, n, _)| *n).sum();
-        Some((from, want.into_iter().map(|(k, _, _)| k).collect(), more))
+        let answer = want.iter().map(|(_, _, first)| *first).min().map(|from| {
+            let more = want.iter().map(|(_, n, _)| *n).sum();
+            (from, want.into_iter().map(|(k, _, _)| k).collect(), more)
+        });
+        // 覚える問いは、 置き直した覚えで 「どの行よりも新しい」 鍵を除いた形 (次の周の問いはその形で来る。 除いた鍵に合う行は
+        // 無いので答えは同じ)
+        keys.retain(|(_, h)| !newest.is_newer_than_every_row(*h));
+        newest.last = Some((keys, ring_at.0, ring_at.1, answer.clone()));
+        answer
+    }
+
+    /// #843: bridge が止まった周に、 組の頭を探して `_sync_ops` の ring の行をなめた回数 (観測用)。 ring が満杯のままの DB でも、
+    /// 開いた後の最初の止まった周と、 ring にある版数以前の鍵が新しく出た周にしか増えない。
+    pub fn sync_ring_scans(&self) -> u64 {
+        self.sync_ring_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// transfer の cursor 前進。 **入口で読んだ `from` からの CAS** で行う。
@@ -9335,6 +9501,8 @@ impl Engine {
                 }
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
+                // #843: 行が消えた (止まった周の覚えた答えは使えない)
+                self.sync_ops_purges.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
             // `_sync_ops` の slot を引けない (表が無い / 枠の外) 行は purge しない (#561: 前は `delete` に落とし、 内部の行の lock を
             // 握ったまま WAL の空きを待つ唯一の道だった。 引けない行は ring の行でないので、 free list にも戻せない)
@@ -23402,6 +23570,198 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+/// #843: 止まった周が ring を読み直さない近道 ([`RingNewest`]) と、 覚えた答え。
+#[cfg(test)]
+mod ring_newest_tests {
+    use super::*;
+    use crate::transport::WireRecord;
+    use enchudb_oplog::Hlc;
+    use enchudb_oplog::oplog::DecodedOp;
+
+    const AUTHOR: u32 = 9;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn engine(tag: &str) -> (std::sync::Arc<Engine>, Tmp) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("{}/enchudb-issue843-unit-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        (eng, Tmp(path))
+    }
+
+    fn at(wall: u64, logical: u32) -> Hlc {
+        Hlc { wall, logical, peer: AUTHOR }
+    }
+
+    /// 版数 `hlc` の record (中継の形) を WAL に載せて ring まで写す。
+    fn bridge(eng: &Engine, hlcs: &[Hlc]) {
+        for (i, h) in hlcs.iter().enumerate() {
+            let rec = WireRecord::unsigned(*h, AUTHOR, DecodedOp::Vocab { vid: i as u32, bytes: b"w".to_vec() });
+            assert!(eng.relay_record(&rec), "前提: record を WAL に載せた");
+        }
+        eng.oplog_commit();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+    }
+
+    /// ring の行のうち、 鍵 (AUTHOR, `hlc`) の行の lsn の最小。
+    fn first_lsn(eng: &Engine, hlc: Hlc) -> Option<u32> {
+        let cols = eng.sync_payload_cols().unwrap();
+        eng.entities_with_himo(cols.lsn)
+            .into_iter()
+            .filter(|e| {
+                eng.sync_op_payload(*e, &cols)
+                    .and_then(|p| enchudb_oplog::oplog::decode_sync_ops_payload(&p))
+                    .is_some_and(|r| r.author_peer == AUTHOR && r.hlc == hlc && !matches!(r.op, DecodedOp::Commit))
+            })
+            .filter_map(|e| eng.get_by_id32(e, cols.lsn))
+            .min()
+    }
+
+    fn ask(eng: &Engine, hlcs: &[Hlc]) -> Option<u32> {
+        eng.open_groups_on_ring(hlcs.iter().map(|h| (AUTHOR, *h))).map(|(from, _, _)| from)
+    }
+
+    /// ring のどの行よりも新しい鍵は ring を読まずに 「無い」、 ring にある版数以前の鍵は読んで正しく答える。 同じ問いは、 ring が
+    /// 変わらない間は読み直さない。
+    ///
+    /// 行の版数は今より 30 秒先に置く: 閉じの Commit (自分の時計、 中継した版数を混ぜた後) が同じ ms の次の logical になり、
+    /// ring のいちばん新しい行が (w, 5) と決まる。
+    ///
+    /// falsify: (1) なめた時にいちばん新しい ms の行の logical を読まない (0 のまま) と、 ring にある鍵 (w, 4) を 「無い」 と答える。
+    /// (2) 覚えた答えを問いの鍵を比べずに返すと、 最後の問いが前の問いの答え (無い) を返す。 比べの `>` と `>=` の違いは
+    /// `keys_past_the_anchor_fall_back_to_reading` が見る (ここでは、 いちばん新しい行が Commit なので出ない)。
+    #[test]
+    fn keys_newer_than_every_row_do_not_read_the_ring() {
+        let (eng, _tmp) = engine("newer");
+        let w = Engine::unix_millis() + 30_000;
+        bridge(&eng, &[at(w, 0), at(w, 1), at(w, 2), at(w, 3), at(w, 4)]);
+        let _no_bridge = eng.transfer_lock_for_fold();
+        let scans = || eng.sync_ring_scans();
+        let s0 = scans();
+        assert!(first_lsn(&eng, at(w, 2)).is_some() && first_lsn(&eng, at(w, 4)).is_some(), "前提: 行が ring にある");
+        assert_eq!(ask(&eng, &[at(w, 2)]), first_lsn(&eng, at(w, 2)), "ring にある鍵");
+        assert_eq!(scans(), s0 + 1, "開いた後の最初の問いは ring を読む");
+        assert_eq!(ask(&eng, &[at(w, 50)]), None, "同じ ms の、 どの行よりも新しい鍵");
+        assert_eq!(ask(&eng, &[at(w + 5, 0)]), None, "後の ms の鍵");
+        assert_eq!(scans(), s0 + 1, "ring のどの行よりも新しい鍵に ring を読んだ");
+        assert_eq!(ask(&eng, &[at(w, 4)]), first_lsn(&eng, at(w, 4)), "いちばん新しい ms の、 ring にある鍵は読んで答える");
+        assert_eq!(scans(), s0 + 2);
+        assert_eq!(ask(&eng, &[at(w, 4), at(w + 5, 0)]), first_lsn(&eng, at(w, 4)), "新しい鍵が混ざっても、 残りの鍵の答えは同じ");
+        assert_eq!(scans(), s0 + 2, "新しい鍵を除いた問いが前と同じなのに読み直した");
+        assert_eq!(ask(&eng, &[at(w - 5, 0)]), None, "ring に無い古い鍵は読んで 「無い」");
+        assert_eq!(scans(), s0 + 3);
+        assert_eq!(ask(&eng, &[at(w - 5, 0)]), None);
+        assert_eq!(ask(&eng, &[at(w - 5, 0), at(w + 9, 0)]), None);
+        assert_eq!(scans(), s0 + 3, "同じ問いで、 ring が変わっていないのに読み直した");
+        assert_eq!(ask(&eng, &[at(w, 2)]), first_lsn(&eng, at(w, 2)), "違う問いに、 前の問いの答えを返した");
+    }
+
+    /// bridge が後から載せた行も覚えに入る (載せた後は、 その行の鍵を 「どの行よりも新しい」 と言わない)。
+    ///
+    /// falsify: bridge の `note` を外すと、 後から載せた行の鍵を 「無い」 と答える。 覚えた答えを 「行が足されていない」 を見ずに
+    /// 返すと、 最後の問いが前の答え (無い) を返す。
+    #[test]
+    fn rows_bridged_after_the_first_read_are_remembered() {
+        let (eng, _tmp) = engine("note");
+        let w = Engine::unix_millis() + 30_000;
+        bridge(&eng, &[at(w, 0)]);
+        {
+            let _no_bridge = eng.transfer_lock_for_fold();
+            assert_eq!(ask(&eng, &[at(w, 0)]), first_lsn(&eng, at(w, 0)));
+            assert_eq!(ask(&eng, &[at(w + 10, 3)]), None, "前提: まだ載っていない");
+        }
+        bridge(&eng, &[at(w + 10, 3)]);
+        let _no_bridge = eng.transfer_lock_for_fold();
+        let want = first_lsn(&eng, at(w + 10, 3));
+        assert!(want.is_some(), "前提: 後から載せた行が ring にある");
+        assert_eq!(ask(&eng, &[at(w + 10, 3)]), want, "後から載せた行の鍵を 「無い」 と答えた");
+        assert_eq!(ask(&eng, &[at(w + 10, 50)]), None);
+        // 覚えた答え (無い) は、 行が足されたら使わない: 古い版数の record (中継) が後から載る
+        assert_eq!(ask(&eng, &[at(w - 7, 0)]), None, "前提: まだ載っていない");
+        drop(_no_bridge);
+        bridge(&eng, &[at(w - 7, 0)]);
+        let _no_bridge = eng.transfer_lock_for_fold();
+        let want = first_lsn(&eng, at(w - 7, 0));
+        assert!(want.is_some(), "前提: 古い版数の行が ring に載った");
+        assert_eq!(ask(&eng, &[at(w - 7, 0)]), want, "行が足された後に、 前の答え (無い) を返した");
+        // 時刻の離れた 2 つの鍵を 1 回で問う (なめる時は問いの時刻の幅の外の行を飛ばす。 幅は全部の鍵から)
+        let both = eng.open_groups_on_ring([at(w - 7, 0), at(w + 10, 3)].into_iter().map(|h| (AUTHOR, h)));
+        assert_eq!(both.map(|(_, keys, more)| (keys.len(), more)), Some((2, 2)), "2 つの鍵のどちらかの行を見落とした");
+    }
+
+    /// 自分の時計が壁の時計よりずっと先に進んでいても (先の時刻の版数を中継した後)、 その先の鍵に近道が効く。
+    ///
+    /// falsify: `anchor` を壁の時計だけで決めると、 10 日先の行が 1 周して小さく見え、 前からある行 (今の時刻) がいちばん新しい
+    /// 事になって、 先の鍵のたびに ring を読む。
+    #[test]
+    fn a_clock_far_ahead_of_the_wall_clock_still_takes_the_shortcut() {
+        let (eng, _tmp) = engine("ahead");
+        let now = Engine::unix_millis();
+        let w = now + 10 * 24 * 3600 * 1000;
+        bridge(&eng, &[at(now, 0)]);
+        bridge(&eng, &[at(w, 0)]);
+        let _no_bridge = eng.transfer_lock_for_fold();
+        assert_eq!(ask(&eng, &[at(w, 0)]), first_lsn(&eng, at(w, 0)));
+        assert!(first_lsn(&eng, at(w, 0)).is_some(), "前提: 行が ring にある");
+        let scans = eng.sync_ring_scans();
+        assert_eq!(ask(&eng, &[at(w + 5, 0)]), None);
+        assert_eq!(ask(&eng, &[at(w, 50)]), None);
+        assert_eq!(eng.sync_ring_scans(), scans, "時計が先に進んだ DB で、 新しい鍵のたびに ring を読んだ");
+        assert_eq!(ask(&eng, &[at(now, 0)]), first_lsn(&eng, at(now, 0)), "前からある行の鍵は読んで答える");
+    }
+
+    /// 覚えた答えは、 行が消えたら使わない。
+    ///
+    /// falsify: `purge_sync_ops_row` が消した回数を数えないと、 消えた行の lsn を答える。
+    #[test]
+    fn a_remembered_answer_is_dropped_when_a_row_is_purged() {
+        let (eng, _tmp) = engine("purge");
+        let w = Engine::unix_millis();
+        bridge(&eng, &[at(w, 0), at(w, 1), at(w, 2)]);
+        let _no_bridge = eng.transfer_lock_for_fold();
+        let lsn = first_lsn(&eng, at(w, 1)).expect("前提: 行がある");
+        assert_eq!(ask(&eng, &[at(w, 1)]), Some(lsn));
+        let cols = eng.sync_payload_cols().unwrap();
+        let eid = eng.entities_with_himo(cols.lsn).into_iter().find(|e| eng.get_by_id32(*e, cols.lsn) == Some(lsn)).unwrap();
+        assert!(eng.purge_sync_ops_row(eid, cols.lsn, lsn), "前提: 行を消した");
+        assert_eq!(ask(&eng, &[at(w, 1)]), None, "消えた行を、 覚えた答えから返した");
+    }
+
+    /// 時刻の下位 32 bit の距離: 読んだ時の今から 3.1 日より先の鍵 (1 周して小さく見える) と、 下位 32 bit が同じ鍵は、 近道を
+    /// 使わない側 (ring を読む) に倒れる。
+    #[test]
+    fn keys_past_the_anchor_fall_back_to_reading() {
+        let now = 1_800_000_000_000u64;
+        let mut n = RingNewest::new();
+        assert!(!n.is_newer_than_every_row(at(now, 0)), "読む前は近道を使わない");
+        n.seeded = true;
+        n.anchor = RingNewest::anchor_for(now);
+        assert!(n.is_newer_than_every_row(at(now, 0)), "行の無い ring");
+        n.note(at(now - 1000, 9));
+        n.note(at(now, 3));
+        n.note(at(now - 5, 7));
+        assert!(n.is_newer_than_every_row(at(now, 4)));
+        assert!(n.is_newer_than_every_row(at(now + 1, 0)));
+        assert!(!n.is_newer_than_every_row(at(now, 3)));
+        assert!(!n.is_newer_than_every_row(at(now, 2)));
+        assert!(!n.is_newer_than_every_row(at(now - 1000, 9)));
+        assert!(n.is_newer_than_every_row(at(now + (1 << 28) - 1, 0)), "3.1 日先の手前まで");
+        assert!(!n.is_newer_than_every_row(at(now + (1 << 28), 0)), "そこを越えた鍵は 1 周して小さく見える = ring を読む");
+        assert!(!n.is_newer_than_every_row(at(now + (1 << 32), 3)), "下位 32 bit が同じ鍵");
+        n.unknown = true;
+        assert!(!n.is_newer_than_every_row(at(now + 1, 0)), "版数の分からない行がある間は使わない");
+    }
+}
 
 #[cfg(test)]
 mod sync_ops_purge_tests {
