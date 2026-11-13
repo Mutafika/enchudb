@@ -512,10 +512,11 @@ impl SegmentSet {
 
     /// `pick` が選んだ segment を並べて msync する (#656: 書き出しの門を閉じている間を短くする。 遅いディスクでは msync 1 回の
     /// 待ちが ms 単位で、 1 本ずつ書くと閉じている間が segment の数だけ伸びる)。 書くものの無い segment は飛ばし、 2 つ
-    /// 以上の時だけ thread を立てる。 印を通さない store (header / entity) は選ばないこと (印が無いので飛ばす)。
+    /// 以上の時だけ thread を立てる。 別の書き出しが msync している最中の segment は飛ばさない (`SegmentMap::flush_pending`:
+    /// 印は無いが、 その msync が終わるまで 「書き出した」 と言えない。 `flush_dirty` が終わるのを待つ)。 印を通さない store (header / entity) は選ばないこと (印が無いので飛ばす)。
     pub fn flush_parallel(&self, all: bool, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
         let busy: Vec<(SegmentKind, Arc<SegmentMap>)> =
-            self.all().into_iter().filter(|(k, s)| pick(*k) && (all || s.has_dirty())).collect();
+            self.all().into_iter().filter(|(k, s)| pick(*k) && (all || s.flush_pending())).collect();
         Self::flush_segments(&busy, all)
     }
 
