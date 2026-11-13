@@ -119,6 +119,10 @@ const INITIAL_COMMIT: usize = 4096;
 /// [`SegmentSet::flush_all_spread`] が並べる thread の数 (呼んだ thread を含む)。
 const FLUSH_ALL_WORKERS: usize = 8;
 
+/// [`SegmentSet::flush_all_spread`] が thread を立てる数に数えない segment の大きさ (commit 済みがこれ以下。 16 KiB の page で
+/// 2 枚)。 page の大きさを OS に聞かない定数にしてある (Windows の `segment_map` には `runtime_page_size` が無い)。
+const FLUSH_ALL_SMALL: usize = 32 * 1024;
+
 /// himo / ver segment の遅延 slot (request23 D2)。
 ///
 /// `map: None` = まだ mmap していない。 存在と長さは `open` が stat で確かめ済みで、
@@ -519,12 +523,11 @@ impl SegmentSet {
     /// 全域の msync は、 汚れた page が無くても segment 1 つごとに時間がかかる (Mac の実測: 20 万行の列 / 版数の列 1 本
     /// 70〜180 µs、 1 page の segment は 1〜2 µs)。 きれいに閉じなかった後の最初の書き出し (#813) は全部の segment を全域で
     /// 書き出すので、 列の数だけこれが並ぶ。 file ごとの msync は互いに待たないので、 thread が 1 つずつ取って書く。 thread の
-    /// 数は 2 page より大きい segment の数まで (小さい segment しか無ければ、 呼んだ thread だけで書く)。 どれかが失敗したら
+    /// 数は [`FLUSH_ALL_SMALL`] より大きい segment の数まで (小さい segment しか無ければ、 呼んだ thread だけで書く)。 どれかが失敗したら
     /// Err (残りの書き出しも試みる。 呼び手は 「書き出せなかった」 として扱う)。
     pub fn flush_all_spread(&self, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
         let segs: Vec<(SegmentKind, Arc<SegmentMap>)> = self.all().into_iter().filter(|(k, _)| pick(*k)).collect();
-        let small = 2 * crate::segment_map::runtime_page_size();
-        let workers = segs.iter().filter(|(_, s)| s.committed() > small).count().clamp(1, FLUSH_ALL_WORKERS);
+        let workers = segs.iter().filter(|(_, s)| s.committed() > FLUSH_ALL_SMALL).count().clamp(1, FLUSH_ALL_WORKERS);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let work = || -> io::Result<()> {
             let mut res = Ok(());
