@@ -138,7 +138,7 @@ pub struct Syncer {
     /// 写し終えた後
     state_relay_owner: std::sync::Mutex<Option<std::thread::ThreadId>>,
     /// ホスト (全員が経由する DB の peer) として動くか ([`Syncer::set_host`])。
-    host: std::sync::atomic::AtomicBool,
+    host: Arc<std::sync::atomic::AtomicBool>,
     /// #698 (ホストだけ): 中継に載せた record のうち、 その link の cursor がまだ越えていない物 (`{link: {(author, HLC)}}`)。
     /// cursor が進まずに同じ record が届き直した時 (reject で止まった batch / 書き出しの失敗)、 LWW で負けた record を
     /// 2 度載せないために見る。 cursor が越えたら外す (cursor より前の record は当てる前に落ちるので届かない)。 memory だけ
@@ -368,7 +368,7 @@ impl Syncer {
             suppressed_records: std::sync::atomic::AtomicU64::new(0),
             state_relay: std::sync::RwLock::new(()),
             state_relay_owner: std::sync::Mutex::new(None),
-            host: std::sync::atomic::AtomicBool::new(false),
+            host: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_held: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
@@ -644,6 +644,15 @@ impl Syncer {
                     authors.push(a);
                 }
             }
+            // #783: 行の写像を持たない書き手 (他の peer の行に書くだけで、 自分の行を作っていない) も、 record を受けていれば
+            // 配布元として名乗る。 その書き手の state は 「他の行への、 その書き手の時計の版数の書き込み」 で、 名乗らないと、
+            // その書き手の floor (遅れて載った state / 回収) で抜けを言われた下の受け手が取り直せない
+            let guard = self.last_pulled.lock().unwrap();
+            for a in guard.values().flat_map(|m| m.keys()) {
+                if *a != self_peer && !authors.contains(a) {
+                    authors.push(*a);
+                }
+            }
         }
         let fresh: Vec<PeerId> = {
             let mut g = self.served_authors.lock().unwrap();
@@ -662,6 +671,7 @@ impl Syncer {
             let warned_incomplete = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let last_pulled = self.last_pulled.clone();
             let forget_seen = self.forget_seen.clone();
+            let host = self.host.clone();
             self.transport.register_state_provider_for(
                 author,
                 self_peer,
@@ -704,7 +714,12 @@ impl Syncer {
                              missing until they are written again — see #236 / #711"
                         );
                     }
-                    if !is_self && records.is_empty() {
+                    // #783: ホストは、 record を受けた書き手 (cursor がある) の state が空でも配る。 ホストはその書き手の
+                    // record を cursor まで全部受けていて、 配布元はホストだけ (譲る先が無い)。 空 = その書き手の書いた cell /
+                    // untie / 削除が、 今は 1 つも残っていない (全部他の peer が書き換えた)。 配らないと、 その書き手の floor
+                    // で抜けを言われた下の受け手が、 取り直せずに抜けを言われ続ける
+                    let host_has_all = received.is_some() && host.load(std::sync::atomic::Ordering::Acquire);
+                    if !is_self && records.is_empty() && !host_has_all {
                         // 何も持っていない replica は None を返して次の候補に譲る。
                         // 空 batch でも `Some` を返すと、 caller は「state を受け取った
                         // = 回復した」と見なして truncation を解除してしまう。
