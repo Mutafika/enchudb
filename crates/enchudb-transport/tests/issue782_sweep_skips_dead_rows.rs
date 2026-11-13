@@ -276,9 +276,14 @@ fn a_row_readded_under_a_deleted_name_survives_a_state_resync() {
 
     let batch = push_state(&w.host, c1);
     assert!(batch.complete && tomb < batch.as_of);
-    let of_row = |r: &enchudb::transport::WireRecord| matches!(&r.op, DecodedOp::Tie { eid, .. } | DecodedOp::Untie { eid, .. } | DecodedOp::Delete { eid } | DecodedOp::TieLeaf { eid, .. } if *eid == row);
-    assert!(!batch.records.iter().any(of_row), "前提: c1 の state に、 消した行の record は無い (ホストの掃除の対象)");
-    assert_eq!(ring_deletes(&w.host_eng), before, "掃除が、 もう消えている行の Delete をホストの ring に載せた");
+    // #784: c1 の state には、 消した行の Delete (元の削除の版数) だけがある。 ホストはその削除をもう同じ版数で受けている
+    let of_row: Vec<_> = batch
+        .records
+        .iter()
+        .filter(|r| matches!(&r.op, DecodedOp::Tie { eid, .. } | DecodedOp::Untie { eid, .. } | DecodedOp::Delete { eid } | DecodedOp::TieLeaf { eid, .. } if *eid == row))
+        .collect();
+    assert!(of_row.len() == 1 && matches!(of_row[0].op, DecodedOp::Delete { .. }) && of_row[0].hlc == tomb, "前提: c1 の state の、 消した行の record は元の版数の Delete だけ: {of_row:?}");
+    assert_eq!(ring_deletes(&w.host_eng), before, "もう消えている行の Delete を、 ホストの ring に載せ直した");
     all(&[c1, c2, c3]);
     assert_eq!(w.vs(7), [Some(77); 4], "c1 の state の取り直しで、 c2 が足し直した行 7 が消えた [c1, host, c2, c3]");
     assert_eq!(w.vs(2), [Some(20); 4], "c1 の他の行はそのまま");
@@ -312,7 +317,8 @@ fn control_an_unpublished_delete_of_a_live_row_is_still_swept() {
     assert_eq!(w.rows(2), [false, true, true, true], "前提: 行 2 は c1 でだけ消えている");
     let n = ring_deletes(&w.host_eng).len();
     push_state(&w.host, c1);
-    assert_eq!(ring_deletes(&w.host_eng).len(), n + 1, "前提: ホストの掃除が行 2 を消した (ホストの Delete が 1 つ)");
+    // #784: 消すのは掃除 (ホストの今の時刻の Delete) でなく、 state が運ぶ c1 の Delete
+    assert_eq!(ring_deletes(&w.host_eng).len(), n + 1, "前提: ホストの ring に行 2 の Delete が 1 つ載った");
     all(&[c1, c2, c3]);
     assert_eq!(w.rows(2), [false; 4], "c1 が消した自分の行 2 が、 state の取り直しの後も残る");
     // もう一度取り直しても、 消し直さない

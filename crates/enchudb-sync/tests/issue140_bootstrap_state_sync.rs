@@ -212,9 +212,12 @@ fn ghost_rows_are_swept_on_bootstrap() {
     assert!(out.history_truncated, "前提: B が truncated になること: {out:?}");
     assert!(read_note(&eng_b, 3).is_some(), "この時点では B に亡霊が居る");
 
-    // bootstrap → 亡霊が sweep される
+    // bootstrap → 亡霊が消える。 #784: A の state は自分の行の削除を Delete の record で運ぶ (A の削除の版数で消える) ので、
+    // 掃除 (state に現れない行を今の時刻で消す) は走らない。 掃除が要る形 (削除の record を持たない state) は
+    // `enchudb-transport/tests/issue784_state_own_deletes.rs` の `a_state_without_own_deletes_is_still_swept`
     let boot = sync_b.bootstrap_pull(1).expect("serve_state 済みなので Some");
-    assert_eq!(boot.swept, 1, "note 3 の 1 行だけが sweep されること: {boot:?}");
+    assert_eq!(boot.swept, 0, "note 3 は state の Delete で消える (掃除は走らない): {boot:?}");
+    assert_eq!(eng_b.tombstone_hlc(eng_b.translated_locals_of(1).iter().find(|(f, _)| *f == victim as u32).unwrap().1 as u64), eng_a.tombstone_hlc(victim), "B の行の削除の版数は A の削除の版数");
     assert!(
         read_note(&eng_b, 3).is_none(),
         "#140: 削除済み行が bootstrap 後も B に残っている (亡霊)"
