@@ -1272,6 +1272,10 @@ pub struct OpLog {
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
     dropped: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
+    /// #783: 同じ落ちた record の、 author ごとの HLC の **min** (`dropped` の lock の下でだけ触る。 [`OpLog::take_dropped_spans`])。
+    /// bridge が 「落ちた record より後の record」 を見分けるのに使う (max だけでは、 最初の落ちと最後の落ちの間に載った record が
+    /// 分からない)。
+    dropped_first: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
     /// #451 (段階 1): 自分 (`peer_id`) の落ちた record を覚えた回数 (`dropped` の lock の下で上げる)。
     dropped_gen: std::sync::atomic::AtomicU64,
     /// `quiet_without_mark` が WAL を読んで自分の中身のある record が無かった author + 1 (0 = まだ読んでいない)。 前の process が
@@ -1643,6 +1647,7 @@ impl OpLog {
             append_hook: std::sync::OnceLock::new(),
             switch_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
+            dropped_first: std::sync::Mutex::new(Vec::new()),
             dropped_gen: std::sync::atomic::AtomicU64::new(0),
             quiet_scanned: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
@@ -3091,6 +3096,13 @@ impl OpLog {
             Some((_, h)) => *h = (*h).max(hlc),
             None => g.push((author, hlc)),
         }
+        {
+            let mut f = self.dropped_first.lock().unwrap_or_else(|p| p.into_inner());
+            match f.iter_mut().find(|(a, _)| *a == author) {
+                Some((_, h)) => *h = (*h).min(hlc),
+                None => f.push((author, hlc)),
+            }
+        }
         if author == self.peer_id() {
             self.dropped_gen.fetch_add(1, Ordering::Release);
         }
@@ -3170,7 +3182,18 @@ impl OpLog {
     /// 載らなかった record は `_sync_ops` にも入らないので、 差分 pull では二度と届かない。
     /// engine の bridge がこれを見て、 その author の history floor を上げる。
     pub fn take_dropped(&self) -> Vec<(PeerId, Hlc)> {
-        std::mem::take(&mut *self.dropped.lock().unwrap_or_else(|p| p.into_inner()))
+        self.take_dropped_spans().into_iter().map(|(a, _, max)| (a, max)).collect()
+    }
+
+    /// #783: [`OpLog::take_dropped`] の、 author ごとに落ちた HLC の (min, max) を返す版。 その author の record で HLC が min より
+    /// 後の物は、 落ちた record より後に書かれた = 受け手の cursor がそれを受けると、 落ちた record を越える。
+    pub fn take_dropped_spans(&self) -> Vec<(PeerId, Hlc, Hlc)> {
+        let mut g = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        let first = std::mem::take(&mut *self.dropped_first.lock().unwrap_or_else(|p| p.into_inner()));
+        std::mem::take(&mut *g)
+            .into_iter()
+            .map(|(a, max)| (a, first.iter().find(|(x, _)| *x == a).map_or(max, |(_, h)| *h), max))
+            .collect()
     }
 
     /// #451: ring にある record を全部 (Commit で閉じた group と、 閉じていない末尾) 返す。 読むだけ (clock を戻さない)。
