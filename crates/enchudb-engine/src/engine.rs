@@ -9511,6 +9511,14 @@ impl Engine {
         Some(out)
     }
 
+    /// #783: 書き手 `author` の history floor を `floor` に上げる (下げない)。 ホストが、 取り直した state で 「自分の
+    /// `cursor[author]` 以下の版数の record」 を初めて受けて載せた時に呼ぶ: その record は、 下の受け手の cursor の手前に
+    /// 載ったので差分では配られない。 floor を上げれば、 下の受け手は抜けを知って author の state を取り直す。
+    /// 書けなければ false。
+    pub fn raise_history_floor(&self, author: enchudb_oplog::PeerId, floor: enchudb_oplog::Hlc) -> bool {
+        self.sync_tables_enabled() && self.record_reclaimed_floors(&[(author, floor)])
+    }
+
     /// #191/#216: reclaimed floor を author 別に単調 max で merge する (下がる
     /// ことは無い)。 himo は lazy に ensure する (fix 前 DB の reopen でも育つ)。
     /// legacy scalar が残っていれば無帰属 sentinel (`u32::MAX`) entry として

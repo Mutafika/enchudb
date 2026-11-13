@@ -104,6 +104,8 @@ pub struct Syncer {
     /// 「単調増加しているのに bootstrap 成功が無い」= 回復経路が塞がっている
     /// (state provider 不在等) の運用 signal。
     truncated_pulls: std::sync::atomic::AtomicU64,
+    /// #783: ホストが、 取り直した state の遅れて載った record のために、 書き手の floor を上げた回数 (観測用)。
+    late_state_floors: std::sync::atomic::AtomicU64,
     /// #216: 「truncated なのに transport が state を運べない (fetch_state = None)」
     /// の一度だけ警告 — この構成では truncation が回復経路の無い行き止まりになる。
     warned_no_state_provider: std::sync::atomic::AtomicBool,
@@ -358,6 +360,7 @@ impl Syncer {
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
             truncated_pulls: std::sync::atomic::AtomicU64::new(0),
+            late_state_floors: std::sync::atomic::AtomicU64::new(0),
             warned_no_state_provider: std::sync::atomic::AtomicBool::new(false),
             served_authors: std::sync::Mutex::new(None),
             forget_seen: Arc::new(std::sync::Mutex::new(Hlc::ZERO)),
@@ -827,6 +830,7 @@ impl Syncer {
         // 同じ版数で並ぶ)、 指す Tie を載せなければ state の最後に as_of (版数の無い cell が state で持つのと同じ版数)。
         // どちらも as_of 以下なので、 受け手の cursor は as_of を越えない。 語の写像は版数によらず、 state の record は書き手が
         // 署名していない合成なので、 付け替えても同じ意味
+        let mut late_relay = false;
         if gossip {
             let mut relayed = false;
             // 当たった Vocab のうち、 まだ載せていない物: (書き手, 番号) → `records` の中の位置
@@ -851,6 +855,14 @@ impl Syncer {
                 }
             }
             order.sort_by_key(|&i| records[i].hlc);
+            // #783: author 自身の record で、 版数が取り直す前の cursor 以下の物を、 今初めて載せる (差分で受けていれば
+            // 当たらない = ここに居ない)。 下の受け手の `cursor[author]` はもうその版数を越えているかもしれない
+            late_relay = host
+                && cursor_before > Hlc::ZERO
+                && order.iter().any(|&i| {
+                    let r = &records[i];
+                    r.author_peer == author && r.hlc <= cursor_before && !matches!(r.op, DecodedOp::Vocab { .. })
+                });
             for i in order {
                 let r = &records[i];
                 if (!withheld.is_empty() || !known.is_empty())
@@ -954,6 +966,17 @@ impl Syncer {
             // #227: relay なら下流の消化で丸めてから ack する。
             let cursors = self.cap_ack_by_downstream(cursors);
             self.transport.record_pull_ack_multi(link, self_peer, &cursors);
+        }
+        // #783 (ホストだけ): 取り直した state が、 自分の `cursor[author]` 以下の版数の record を載せた (書き手が WAL に載せられずに
+        // 落として、 その後の record を先に配っていた、 など)。 下の受け手は書き手ごとの cursor より後しか受けないので、 その
+        // record は ring に載っても配られない。 author の floor を今の cursor (= as_of) に上げて、 下の受け手に抜けを知らせる
+        // (受け手は、 このホストの持つ author の state を取り直す)。 上げるのは cursor を進めた後 (受け手が取り直す state の
+        // as_of = この cursor が、 floor に届いているように)
+        if late_relay {
+            let cur = self.last_pulled.lock().unwrap().get(&link).and_then(|m| m.get(&author)).copied().unwrap_or(Hlc::ZERO);
+            if self.engine.raise_history_floor(author, cur) {
+                self.late_state_floors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         // #226: relay が bootstrap で新しい author を取り込んだ → その author の
         // 配布元としても名乗る (opt-in 済みなら)。
@@ -1408,6 +1431,12 @@ impl Syncer {
     /// (state provider 不在、 または app が bootstrap を呼んでいない)。
     pub fn truncated_pulls(&self) -> u64 {
         self.truncated_pulls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #783: ホストが、 取り直した state の中の 「自分の cursor 以下の版数の、 初めて受けた record」 のために、 その書き手の
+    /// floor を上げた回数。 上げるたびに、 下の受け手は全員その書き手の state を取り直す。
+    pub fn late_state_floors(&self) -> u64 {
+        self.late_state_floors.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 適用した state を durable にする。 失敗したら `false` (= cursor を進めない)。
