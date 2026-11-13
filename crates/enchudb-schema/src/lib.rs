@@ -648,6 +648,13 @@ impl Database {
     /// `ManuallyDrop` 経由でフィールドを steal、 Database の Drop は走らない。
     fn into_parts(self) -> Result<(Engine, Vec<Arc<TableInner>>), SchemaError> {
         use std::mem::ManuallyDrop;
+        // #833: 裏の thread (consumer) を持つ engine は `Arc` から取り出せない (thread は `Arc` の中の住所を指している)。
+        // `Arc::try_unwrap(Arc<Database>)` で戻した concurrent の `Database` に `finish_*` を呼ぶとここに来る
+        if self.eng.has_background_threads() {
+            return Err(SchemaError::Internal(
+                "Database already runs with an oplog (finish_with_oplog / open_with_oplog) — finish_* is for the build phase".into()
+            ));
+        }
         let mut me = ManuallyDrop::new(self);
         // 1 度 flush して mmap を sync (concurrent 化前の最終状態を確定)
         if let Some(eng_mut) = Arc::get_mut(&mut me.eng) {
