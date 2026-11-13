@@ -1180,6 +1180,11 @@ const WAL_DROP_FLOOR_MAX_DELAY_MS: u64 = 5_000;
 /// consumer を起こして bridge を回すと、 落ちと落ちの間に毎回 「終わった」 になり floor を上げ続けた。
 const WAL_DROP_EPISODE_QUIET_MS: u64 = 100;
 
+/// #783: 落ちた record より後の record を写す前に floor を上げる (静かになるのを待たない) のは、 前に上げてからこれだけ経った時だけ
+/// (ms)。 経っていなければ、 bridge は落ちた record より後の record の手前で止まって待つ (静かになるか、 この間隔か、
+/// `WAL_DROP_FLOOR_MAX_DELAY_MS` まで)。 満杯が続く間に毎周上げると、 全 peer が pull のたびに全状態を取り直す。
+const WAL_DROP_FLOOR_MIN_GAP_MS: u64 = 1_000;
+
 /// `Engine::wal_fold_off` の bit: 書き手が区画を移った時の畳み (#667) を試験で切った。
 const WAL_FOLD_OFF_SWITCH: u8 = 1;
 /// `Engine::wal_fold_off` の bit: consumer の周期の書き出しの後の畳み (#676) を試験で切った。
@@ -5564,7 +5569,14 @@ pub struct Engine {
     /// #57: まだ floor に入れていない、 WAL に載らなかった record (author, 落ちた HLC の max) と、
     /// 最初に落ちた時刻 / 最後に落ちたのを見た時刻 (unix ms)。 満杯の episode が終わったら (最後に落ちてから
     /// `WAL_DROP_EPISODE_QUIET_MS` 落ちなかったら) まとめて floor に入れる。
-    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<(u64, u64)>)>,
+    ///
+    /// #783: 3 つ目は同じ record の author ごとの HLC の min (bridge が、 落ちた record より後の record を見分ける)。
+    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<(u64, u64)>, Vec<(u32, enchudb_oplog::Hlc)>)>,
+    /// #783: 最後に、 落ちた record のために floor を上げた時刻 (unix ms、 0 = まだ)。 落ちた record より後の record を写す前に
+    /// floor を上げる時の間隔 (`WAL_DROP_FLOOR_MIN_GAP_MS`) を見る。
+    wal_drop_floor_last_ms: std::sync::atomic::AtomicU64,
+    /// #783: floor が上がるのを待って、 bridge が落ちた record より後の record を写さずに止まった回数 (観測用)。
+    wal_drop_bridge_holds: std::sync::atomic::AtomicU64,
     /// #268: Commit marker の append が失敗した回数。 失敗すると直前の record 群は
     /// **閉じられない group** として残り、 bridge からも recovery からも見えなくなる。
     wal_commit_failures: std::sync::atomic::AtomicU64,
@@ -6043,7 +6055,9 @@ impl Engine {
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
-            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None, Vec::new())),
+            wal_drop_floor_last_ms: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_bridge_holds: std::sync::atomic::AtomicU64::new(0),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -7322,7 +7336,9 @@ impl Engine {
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
-            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None, Vec::new())),
+            wal_drop_floor_last_ms: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_bridge_holds: std::sync::atomic::AtomicU64::new(0),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -7634,6 +7650,16 @@ impl Engine {
         let _guard = self.transfer_lock.lock().unwrap();
         self.prune_former_addresses();
 
+        let from = self.sync_ops_offset.load(Ordering::Acquire);
+        let trace = Self::trace_bridge_enabled();
+        // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
+        // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
+        // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
+        // #152: record ごとの終端 offset 付きで読む。 満杯で打ち切ったとき、
+        // 「処理し切った最後の record の終端」まで cursor を進める (partial advance)
+        // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
+        // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
+        let (records, committed_end, pending, stop) = wal.iter_committed_from_with_diag(from);
         // #57: WAL に載らなかった record (満杯) は `_sync_ops` にも入らず、 差分 pull では二度と
         // 届かない。 その author の history floor を上げて、 それより前の cursor の puller を
         // bootstrap (live state の転写、 #140) に回す。
@@ -7654,16 +7680,25 @@ impl Engine {
         // 閉じる時 (consumer の最後の bridge) は待たずに上げる (#449)。 落ちたことはメモリにしか無いので、
         // 待つと閉じた後に floor が残らず、 落ちた write は本体にあるのに相手に永久に届かない。
         let closing = self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire));
+        // #783: floor を上げるまで写さない record の位置 (`records` の中、 その record から後ろは次の周)
+        let mut held_at: Option<usize> = None;
         let due = {
             // #451 (段階 1): WAL が覚えた落ちた record を持ち越しへ移すのは持ち越しの lock の下で (切れ目 (`take_durable_cut`) は
             // この lock を持って両方を見るので、 移す途中の record を見逃さない)
             let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
-            let fresh = wal.take_dropped();
+            // #783: 取り出すのは WAL を読んだ (上の scan) 後。 読んだ record より前に落ちた record は、 ここで必ず見える (落ちた
+            // record は落ちた時に覚える)。 先に取り出すと、 取り出した後に落ちて、 その後に載った (小さくて残りに入った) record を
+            // 同じ周に読み、 落ちた事を知らずに写す
+            let fresh = wal.take_dropped_spans();
             let had_fresh = !fresh.is_empty();
-            for (a, h) in fresh {
+            for (a, lo, hi) in fresh {
                 match p.0.iter_mut().find(|(x, _)| *x == a) {
-                    Some((_, m)) => *m = (*m).max(h),
-                    None => p.0.push((a, h)),
+                    Some((_, m)) => *m = (*m).max(hi),
+                    None => p.0.push((a, hi)),
+                }
+                match p.2.iter_mut().find(|(x, _)| *x == a) {
+                    Some((_, m)) => *m = (*m).min(lo),
+                    None => p.2.push((a, lo)),
                 }
             }
             if p.0.is_empty() {
@@ -7675,7 +7710,19 @@ impl Engine {
                     *last = now_ms;
                 }
                 let quiet = now_ms.saturating_sub(*last) >= WAL_DROP_EPISODE_QUIET_MS;
-                if closing || quiet || now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
+                let overdue = now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS;
+                // #783: 落ちた record より後の record (同じ author の、 HLC が落ちた record の min より後) を、 floor を上げる前に
+                // 写さない。 写すと配られ、 受け手の cursor が落ちた record を越える: 直に pull する相手は後で上がった floor (今) で
+                // 取り直すが、 ホストの下の client は、 ホストが state で取り直した落ちた record を cursor の手前として二度と受けない。
+                // Commit も数える (受け手の cursor は Commit でも進む)。
+                //
+                // 写す物がそこにあるなら、 静かになるのを待たずに今 floor を上げる (止めて待つと、 bridge が読み切らない WAL は
+                // 畳めず、 満杯が続いて、 待つ間の書き込みが全部落ちる)。 ただし前に上げてから `WAL_DROP_FLOOR_MIN_GAP_MS` の間は
+                // 上げずに手前で止まる (満杯が続く間に毎周上げない)
+                held_at = records.iter().position(|(r, _)| p.2.iter().any(|(a, lo)| *a == r.author_peer && r.hlc > *lo));
+                let early = held_at.is_some()
+                    && now_ms.saturating_sub(self.wal_drop_floor_last_ms.load(Ordering::Relaxed)) >= WAL_DROP_FLOOR_MIN_GAP_MS;
+                if closing || quiet || early || overdue {
                     // #451 (段階 1): 持ち越しから取り出さずに写す。 floor を本体に書き終えてから (下) 持ち越しの lock の下で消す:
                     // 書いている間も持ち越しに残っているので、 切れ目 (`take_durable_cut`) はその間も候補を出さない (取り出してから
                     // 書くと、 その間の切れ目が floor の無い落ちた write を印で覆い、 印が ring の書き出しで先に届くと相手に永久に届かない)。
@@ -7698,22 +7745,27 @@ impl Engine {
                 let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
                 // 書いた分だけ消す (書いている間に同じ author がまた落ちて HLC が進んだ分は残す = 次の周にまた上げる)
                 p.0.retain(|e| !dropped.contains(e));
+                // min は、 書いた floor が覆った author の分を消す (残った author = 書いている間にまた落ちた分は、 min が
+                // 小さいまま残る = 次の周も手前で止まる側)
+                let left: Vec<u32> = p.0.iter().map(|(a, _)| *a).collect();
+                p.2.retain(|(a, _)| left.contains(a));
                 if p.0.is_empty() {
                     p.1 = None;
                 }
+                self.wal_drop_floor_last_ms.store(Self::unix_millis(), Ordering::Relaxed);
+                held_at = None;
             }
         }
+        // #783: floor を上げなかった (待っている / 書けなかった) ので、 落ちた record より後の record は写さない
+        let records = match held_at {
+            Some(i) => {
+                self.wal_drop_bridge_holds.fetch_add(1, Ordering::Relaxed);
+                records.into_iter().take(i).collect::<Vec<_>>()
+            }
+            None => records,
+        };
+        let held = held_at.is_some();
 
-        let from = self.sync_ops_offset.load(Ordering::Acquire);
-        let trace = Self::trace_bridge_enabled();
-        // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
-        // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
-        // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
-        // #152: record ごとの終端 offset 付きで読む。 満杯で打ち切ったとき、
-        // 「処理し切った最後の record の終端」まで cursor を進める (partial advance)
-        // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
-        // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
-        let (records, committed_end, pending, stop) = wal.iter_committed_from_with_diag(from);
         if trace {
             eprintln!(
                 "[bridge] scan from={from} committed_end={committed_end} head={} cp={} \
@@ -7737,6 +7789,10 @@ impl Engine {
             .store(pending as u64, Ordering::Relaxed);
 
         if records.is_empty() {
+            // #783: 先頭の record から止めている時は進めない (止めた record を越える)
+            if held {
+                return 0;
+            }
             let empties = self.bridge_empty_scans.fetch_add(1, Ordering::Relaxed) + 1;
             self.warn_if_bridge_stalled(from, wal.head(), wal.checkpoint(), empties, pending, stop);
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
@@ -8023,7 +8079,14 @@ impl Engine {
         // committed_end は最後の Commit record の直後なので、 最終 record の終端
         // (done_end) より必ず先に居る。
         if trace {
-            eprintln!("[bridge] done inserted={count} offset:={committed_end}");
+            eprintln!("[bridge] done inserted={count} offset:={committed_end} held={held}");
+        }
+        if held {
+            // #783: 止めた record の手前まで (`sync_ops_backpressure` と同じ、 処理し切った record の終端)
+            if let Some(end) = done_end {
+                self.advance_sync_ops_cursor(from, end);
+            }
+            return count;
         }
         self.advance_sync_ops_cursor(from, committed_end);
         // 満杯が解消して完走した — 次の満杯では再び warn する
@@ -8363,8 +8426,15 @@ impl Engine {
     ///
     /// 上げるのは bridge (`transfer_oplog_to_sync_ops`) が満杯の episode の終わり (新しく落ちなかった周) を
     /// 見た時、 最初に落ちてから 5 秒経った時、 または閉じる時 (#449)。
+    ///
+    /// #783: 落ちた record より後の record を写す周には、 写す前に上げる (前に上げてから 1 秒の間は、 上げずに手前で止まる)。
     pub fn wal_drop_floor_bumps(&self) -> u64 {
         self.wal_drop_floor_bumps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #783: floor が上がるのを待って、 bridge が落ちた record より後の record を写さずに止まった回数。
+    pub fn wal_drop_bridge_holds(&self) -> u64 {
+        self.wal_drop_bridge_holds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// #451: この Engine を開いた時に、 本体にあって oplog / `_sync_ops` に無かった自分の write を作り直した
