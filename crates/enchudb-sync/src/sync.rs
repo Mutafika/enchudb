@@ -801,6 +801,32 @@ impl Syncer {
         };
         let mut relay_accepted: Vec<(usize, bool)> = Vec::new();
         let outcome = self.apply_records_impl(records, gossip.then_some(&mut relay_accepted));
+        // #802 (ホストだけ): **当たらなかった**が載せる record = 前の state が as_of より後として当てて、 載せなかった物 (#753、
+        // 差分に任せた)。 その差分が届く前にもう一度取り直すと、 同じ record は同じ版数でもう当たっているので当たらず、 「当たった
+        // 物だけ載せる」 では載らない。 cursor は今回の as_of (その record より後) に進むので、 差分でも二度と受けない = ホストと
+        // 書き手にだけある書き込みになった。
+        //
+        // 見分け: author 自身の record (書き手も版数の時計も author) で、 版数が **取り直す前の** `cursor[link][author]` より後、
+        // cell の版数がその record の版数と同じ。 cursor より後の author の record をホストが持つ道は、 前の state が当てた、
+        // だけ (差分で受けた record は cursor 以下)。 as_of より後の物は今回も載せない (下の条件、 次の差分か次の state)。
+        // cursor の無い author (初めての state / cursor の置き場の無いホストを開き直した後) では見ない: cursor が無いと
+        // 「差分で受けて載せてある」 物と見分けられず、 state の全部を載せ直す。 Delete は #784 の `settled` が同じ事を見ている
+        // (同じ版数でも 「当たった」 と返る)
+        let unrelayed = |r: &WireRecord| {
+            if !host || cursor_before == Hlc::ZERO || r.author_peer != author || r.hlc.peer != author || r.hlc <= cursor_before {
+                return false;
+            }
+            let (eid, himo) = match &r.op {
+                DecodedOp::Tie { eid, himo_id, .. } | DecodedOp::TieRef { eid, himo_id, .. } | DecodedOp::Untie { eid, himo_id } => {
+                    (*eid, Some(*himo_id))
+                }
+                DecodedOp::TieNamed { eid, himo_name, .. } | DecodedOp::TieLeaf { eid, himo_name, .. } => {
+                    (*eid, self.engine.himo_id(himo_name).and_then(|h| u16::try_from(h).ok()))
+                }
+                _ => return false,
+            };
+            himo.zip(self.engine.resolve_remote_eid_existing(eid)).is_some_and(|(h, local)| self.engine.cell_hlc(local, h) == r.hlc)
+        };
 
         // #209: relay が bootstrap で取った state も原型のまま relay stream へ —
         // これで新規 relay も author の複製 + 配布点として立ち上がれる。
@@ -846,7 +872,7 @@ impl Syncer {
                 let r = &records[i];
                 if let DecodedOp::Vocab { vid, .. } = &r.op {
                     if applied { &mut withheld } else { &mut known }.insert((r.author_peer, *vid), i);
-                } else if applied && !settled.contains(&i) && !(host && r.hlc > batch.as_of) {
+                } else if (applied || unrelayed(r)) && !settled.contains(&i) && !(host && r.hlc > batch.as_of) {
                     order.push(i);
                 }
             }
