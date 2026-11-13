@@ -140,8 +140,63 @@ pub struct Syncer {
     relay_held: std::sync::Mutex<
         std::collections::HashMap<PeerId, std::collections::HashSet<(PeerId, Hlc)>>,
     >,
+    /// #795 (ホストだけ): 登録済みの語の Vocab を、 最後に state を配った後にもう載せたか ([`KnownVocabRelayed`])。 state の
+    /// 配布元 (`refresh_state_providers` の closure) と共有する。 memory だけ (開き直すと空 = 載せる側に倒れる)
+    known_vocab_relayed: Arc<std::sync::Mutex<KnownVocabRelayed>>,
+    /// #795 (ホストだけ): record を当てて、 載せるかを決めて、 cursor を進めるまで (read、 `pull_once`) と、 state を配る印を
+    /// 立てて state を作る間 (write、 state の配布元) を分ける。 分けないと、 「載せない」 と決めた後・cursor を進める前に state が
+    /// 作られ、 その state の `as_of` が、 Vocab を載せなかった Tie より手前になる (その Tie は差分で Vocab なしで届く)
+    known_vocab_gate: Arc<std::sync::RwLock<()>>,
     // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
     // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
+}
+
+/// #795: ホストが、 登録済みの語の Vocab (同じ書き手・番号・語を前に当てた) を中継に載せ直したかの覚え。
+///
+/// 書き手は Tag を書くたびに Vocab + Tie を出す。 #780 から、 ホストは登録済みの Vocab も毎回載せていた (語の種類の少ない列では
+/// 書き込み 1 回につき ring の行が 1 つ増え、 下流が受ける量も同じだけ増えた)。 載せ直すのは、 **その語の Vocab を受けずに
+/// 後の Tie を受ける client が居うる時だけ**でよい。 そういう client ができるのは、 state で取り直した時だけ: 取り直した client の
+/// cursor は state の `as_of` へ飛び、 それより前の Vocab を ring から受けない (state が運ぶ語は、 今 cell にある語だけ)。 差分だけで
+/// 追っている client は、 ring の Vocab を Tie より先に受ける (書き手ごとに HLC の昇順)。 回収された Vocab を受け損ねた client は、
+/// 抜けを知らされて state で取り直す。
+///
+/// そこで、 state を配るたびに世代 (`epoch`) を進め、 (書き手, 番号) ごとに 「登録済みの Vocab を載せた世代」 を覚える。
+/// 登録済みの Vocab は、 今の世代でもう載せていれば載せない。 = 語ごとに、 最初の 1 回 (当たった Vocab、 今までどおり必ず
+/// 載せる) と、 state を配るごとに高々 1 回。 #780 の形 (取り直した後に、 state に無かった語をもう一度使う) では、 取り直しで
+/// 世代が進んでいるので、 次のその語の Vocab は載る。
+///
+/// 覚えは memory だけで、 大きさは [`KNOWN_VOCAB_RELAYED_MAX`] まで (越えたら全部忘れる)。 忘れた語・開き直した後は 「載せて
+/// いない」 = 載せる側に倒れる。 覚えるのは 2 回目に見た語から (1 回しか使わない語 = 行ごとに違う値は覚えない)。
+#[derive(Default)]
+struct KnownVocabRelayed {
+    /// state を配った回数 (配る前に進める)
+    epoch: u64,
+    /// (書き手, その書き手の番号) → 登録済みの Vocab を載せた世代
+    at: std::collections::HashMap<(PeerId, u32), u64>,
+}
+
+/// [`KnownVocabRelayed`] が覚える語の数の上限 (1 語 24 B ほど)。
+const KNOWN_VOCAB_RELAYED_MAX: usize = 65_536;
+
+impl KnownVocabRelayed {
+    /// この語の登録済みの Vocab を、 今の世代でもう載せたか。
+    fn relayed(&self, key: (PeerId, u32)) -> bool {
+        self.at.get(&key) == Some(&self.epoch)
+    }
+
+    fn note(&mut self, key: (PeerId, u32)) {
+        if self.at.len() >= KNOWN_VOCAB_RELAYED_MAX && !self.at.contains_key(&key) {
+            self.at.clear();
+        }
+        self.at.insert(key, self.epoch);
+    }
+
+    /// その番号の語が変わった (当たった Vocab = 新しい写像)。 前の語の覚えは捨てる。
+    fn forget(&mut self, key: (PeerId, u32)) {
+        if !self.at.is_empty() {
+            self.at.remove(&key);
+        }
+    }
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -346,6 +401,8 @@ impl Syncer {
             state_relay_owner: std::sync::Mutex::new(None),
             host: std::sync::atomic::AtomicBool::new(false),
             relay_held: std::sync::Mutex::new(std::collections::HashMap::new()),
+            known_vocab_relayed: Arc::new(std::sync::Mutex::new(KnownVocabRelayed::default())),
+            known_vocab_gate: Arc::new(std::sync::RwLock::new(())),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
         //
@@ -637,11 +694,17 @@ impl Syncer {
             // provider は transport から何度も呼ばれるので flag は provider ごとに持つ。
             let warned_incomplete = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let last_pulled = self.last_pulled.clone();
+            let (known_vocab, known_vocab_gate) = (self.known_vocab_relayed.clone(), self.known_vocab_gate.clone());
             self.transport.register_state_provider_for(
                 author,
                 self_peer,
                 Arc::new(move || {
                     let eng = engine.upgrade()?;
+                    // #795: state を配る = 受け手の cursor が、 ring の Vocab を受けずに先へ飛ぶ。 以後に載せる Tie の語は、 登録
+                    // 済みでも Vocab をもう一度載せる (世代を進める)。 当てている最中の pull (載せるかを決めた後・cursor を
+                    // 進める前) が終わるのを待ってから進め、 state を作り終えるまで次の pull を待たせる
+                    let _known_vocab_gate = known_vocab_gate.write().unwrap_or_else(|p| p.into_inner());
+                    known_vocab.lock().unwrap_or_else(|p| p.into_inner()).epoch += 1;
                     let before = eng.state_records_dropped();
                     // #710: replica の state の `as_of` は、 **author 自身の record をどこまで受けたか** (自分の cursor)。 受け手は
                     // `cursor[author] = as_of` にして、 以後その author の record を as_of より後だけ受ける。 engine の `as_of`
@@ -1119,6 +1182,10 @@ impl Syncer {
         }
         let new_author_on_reclaimed_link = !new_authors.is_empty();
         let gossip = self.engine.gossip_remote_apply();
+        // #795: ホストは、 当てて・載せるかを決めて・cursor を進めるまで、 state の配布元と並ばない (`known_vocab_gate`)
+        let known_vocab_gate = (gossip && self.is_host())
+            .then(|| self.known_vocab_gate.clone());
+        let known_vocab_guard = known_vocab_gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         let mut relay_accepted: Vec<(usize, bool)> = Vec::new();
         let mut outcome =
             self.apply_records_impl(&records, gossip.then_some(&mut relay_accepted));
@@ -1143,7 +1210,9 @@ impl Syncer {
         // cursor が進まずに届き直した時に 2 度載せない (`relay_held`)。 当たった record は今までどおり必ず載せる。
         // 容量で断った record の後ろの同じ書き手の record は、 そもそも当てていない (#754、 `apply_records_impl`)
         //
-        // #780: 登録済みの Vocab (当たらなかった)。 ホストは他の当たらなかった record と同じに載せる (受けた record の全部)。
+        // #780: 登録済みの Vocab (当たらなかった)。 ホストは他の当たらなかった record と同じに載せる。 ただし #795: 最後に state を
+        // 配った後にその語の登録済みの Vocab をもう載せていれば載せない (`KnownVocabRelayed`。 載せ直しが要るのは、 state で
+        // 取り直して ring の Vocab を受けずに先へ飛んだ client が居うる時だけ)。
         // ホストでない中継は、 **載せる Tie が指す物だけ**を、 その Tie の前に載せる (当たった Tie 1 つにつき高々 1 つ = 閉路の
         // 反響は今までどおり Tie の LWW で止まる)。 中継の流れでも、 Tag の Tie の前には必ずその語の Vocab がある
         let host = gossip && self.is_host();
@@ -1153,6 +1222,7 @@ impl Syncer {
             let held = held.entry(from).or_default();
             // ホストでない中継: まだ載せていない登録済みの Vocab。 (書き手, 番号) → `records` の中の位置
             let mut known: std::collections::HashMap<(PeerId, u32), usize> = std::collections::HashMap::new();
+            let mut known_vocab = host.then(|| self.known_vocab_relayed.lock().unwrap_or_else(|p| p.into_inner()));
             for &(i, applied) in &relay_accepted {
                 let r = &records[i];
                 let key = (r.author_peer, r.hlc);
@@ -1163,6 +1233,18 @@ impl Syncer {
                     continue;
                 }
                 if !applied && held.contains(&key) {
+                    continue;
+                }
+                // #795: ホストは、 登録済みの語の Vocab を、 最後に state を配った後にもう載せていれば載せない
+                // ([`KnownVocabRelayed`])。 当たった Vocab (初めての語 / 番号の語が変わった) は必ず載せる
+                let vocab_key = match &r.op {
+                    DecodedOp::Vocab { vid, .. } if host => Some((r.author_peer, *vid)),
+                    _ => None,
+                };
+                if !applied
+                    && let Some(k) = vocab_key
+                    && known_vocab.as_ref().is_some_and(|m| m.relayed(k))
+                {
                     continue;
                 }
                 if !known.is_empty()
@@ -1176,6 +1258,9 @@ impl Syncer {
                     relayed += 1;
                     if host {
                         held.insert(key);
+                    }
+                    if let (Some(k), Some(m)) = (vocab_key, known_vocab.as_mut()) {
+                        if applied { m.forget(k) } else { m.note(k) }
                     }
                 }
             }
@@ -1248,6 +1333,8 @@ impl Syncer {
                 }
             }
         }
+        // #795: cursor を進めた。 ここから先は state の配布元と並んでよい
+        drop(known_vocab_guard);
         if advanced {
             self.save_cursors();
         }
@@ -1805,7 +1892,7 @@ impl Syncer {
     /// #780: 登録済みの Vocab (同じ書き手・番号・語を前に当てた) も `(index, false)` で集める。 前は 「前に載せた」 として
     /// 集めなかった = ある語の Vocab は中継の流れに最初の 1 回しか載らず、 その 1 回が ring から回収された後に来て中継の state
     /// (今 cell にある語だけ) で取り直した受け手は、 書き手が前に使った語をもう一度使った時に Tie だけを受けて翻訳できなかった。
-    /// 載せ方は呼び手: ホストは他の当たらなかった record と同じに載せる。 ホストでない中継は、 載せる Tie が指す物だけを
+    /// 載せ方は呼び手: ホストは他の当たらなかった record と同じに載せる (#795: 最後に state を配った後にもう載せた語は除く)。 ホストでない中継は、 載せる Tie が指す物だけを
     /// その Tie の前に載せる ([`Syncer::vocab_of`])。
     ///
     /// #754 (中継だけ = `relay_accepted` が Some): **容量で**断った record より後 (HLC) の、 同じ書き手の record は、 この batch
