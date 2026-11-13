@@ -150,6 +150,18 @@ impl EidTranslator {
         self.translated_locals.read().unwrap().get(&local).copied()
     }
 
+    /// 逆写像のある local (= 他の peer の行) に bit を立てた並び (local 64 個で 1 語、 いちばん大きい local まで)。
+    /// 行の数だけ [`reverse`](Self::reverse) を引く走査 (state を作る走査) が、 逆写像の無い事を lock と hash なしで見る。
+    /// 呼んだ時点の写し。
+    pub fn translated_local_bits(&self) -> Vec<u64> {
+        let rev = self.translated_locals.read().unwrap();
+        let mut bits = vec![0u64; rev.keys().max().map_or(0, |&m| (m as usize >> 6) + 1)];
+        for &l in rev.keys() {
+            bits[l as usize >> 6] |= 1 << (l & 63);
+        }
+        bits
+    }
+
     /// 写像を登録 (上書き)。 recovery 復元時にも使う。 同 key の上書きで local が
     /// 変わる場合は stale な逆写像 entry を掃除する。
     pub fn insert(&self, author_peer: PeerId, foreign_local: u32, local: u32) {

@@ -9950,14 +9950,49 @@ impl Engine {
         };
         let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| mk_by(author, op, hlc);
 
+        // #838 / #839: 「この state に出さない行」 の cell を、 cell ごとの hash の引きと版数の読みの準備なしで外す。
+        // 走査は列ごとに全部の行を通るので、 他の書き手の行が多い DB (ホスト / ホストを置く形の client) では外す cell が
+        // ほとんど。 前は外す cell 1 つごとに、 逆写像 (lock + hash) か `foreign` の hash を引き、 版数の読みで layout の
+        // lock と commit の確認を通っていた (cell 1 つ 8〜15 ns、 client 10 人のホストで 1 人分に +2 ms)。
+        //
+        // - `foreign_bits`: 走査の始まりに逆写像のあった local (replica 版は `author` の行だけ) に bit。 replica 版では
+        //   `foreign` (同じ時点の写し) の鍵そのものなので、 bit が無ければ `foreign` にも無い。 self 版では、 bit のある行の
+        //   cell を版数だけで外す所にしか使わない (下)。 bit の無い行は今まで通り逆写像を引く = 走査の間に届いた他の peer の
+        //   行を自分の行として出すことは無い
+        // - `version`: `version_of` と同じ値。 列と 「版数の列があるか」 を列ごとに 1 回だけ引き、 commit 済みの cell は
+        //   そのまま読む (済んでいなければ `version_of` = 今までの道)
+        let foreign_bits: Vec<u64> = if is_self {
+            self.eid_translator.translated_local_bits()
+        } else {
+            let mut bits = vec![0u64; foreign.keys().max().map_or(0, |&m| (m as usize >> 6) + 1)];
+            for &l in foreign.keys() {
+                bits[l as usize >> 6] |= 1 << (l & 63);
+            }
+            bits
+        };
+        let in_foreign = |local: u32| foreign_bits.get(local as usize >> 6).is_some_and(|w| w >> (local & 63) & 1 != 0);
+        let has_cell_version = self.has_cell_version();
+        let max_entities = self.max_entities();
+
         for hid in 0..self.himos.len() {
             if self.himo_is_in_reserved_table(hid) {
                 continue;
             }
             let himo_id = hid as u16;
             let vt = self.value_types[hid];
+            let ver_col = if has_cell_version { self.ver_col(himo_id) } else { None };
+            let version = |local: u32| match ver_col {
+                Some(col) if local < max_entities && col.is_committed_for(local) => hlc_from_cell(col.get(local)),
+                _ => self.version_of(local, himo_id),
+            };
             for eid in self.entities_with_himo(himo_id) {
                 let local = enchudb_oplog::eid_local(eid);
+                // #839: self 版は、 他の peer の行のうち自分の時計の版数の cell だけを出す (下の `foreign_row`)。 走査の始まりに
+                // 他の peer の行だった行の、 版数が自分の時計でない cell は、 逆写像も値も引かずにここで外す (下まで進んでも
+                // `foreign_row && hlc.peer != self_peer` で外れる cell)
+                if is_self && in_foreign(local) && version(local).peer != self_peer {
+                    continue;
+                }
                 // 出力する eid。 self 版は自分が author した行はそのまま。 replica 版は
                 // author の translated local だけを **原 eid に戻して**配る (#226)。
                 //
@@ -9976,10 +10011,10 @@ impl Engine {
                         }
                         None => eid,
                     }
-                } else if let Some(&foreign_local) = foreign.get(&local) {
+                } else if let Some(&foreign_local) = in_foreign(local).then(|| foreign.get(&local)).flatten() {
                     enchudb_oplog::make_eid(author, foreign_local)
                 } else {
-                    let at = self.version_of(local, himo_id);
+                    let at = version(local);
                     if at.peer != author || at == enchudb_oplog::Hlc::ZERO {
                         continue;
                     }
@@ -9990,8 +10025,7 @@ impl Engine {
                 let (wide, mut hlc) = if other_row {
                     // 値と版数を行の読みで揃える (間に別の peer の書き込みが入ると、 その peer の値に author の版数を付けた
                     // record になる)。 author の時計の cell だけなので、 握る回数は author が他の行に書いた cell の数
-                    let (wide, at) =
-                        self.row_locks.read(local, || (self.get_by_id(eid, himo_id), self.version_of(local, himo_id)));
+                    let (wide, at) = self.row_locks.read(local, || (self.get_by_id(eid, himo_id), version(local)));
                     let Some(wide) = wide else { continue };
                     if at.peer != author || at == enchudb_oplog::Hlc::ZERO {
                         continue;
@@ -9999,7 +10033,7 @@ impl Engine {
                     (wide, at)
                 } else {
                     let Some(wide) = self.get_by_id(eid, himo_id) else { continue };
-                    (wide, self.version_of(local, himo_id))
+                    (wide, version(local))
                 };
                 // Number64 以外の列は u32 (vid / local eid / leaf offset)
                 let value = wide as u32;
