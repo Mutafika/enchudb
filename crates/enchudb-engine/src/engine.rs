@@ -15363,7 +15363,9 @@ impl Engine {
     ) -> bool {
         let map = self.peer_vocab_map.read().unwrap();
         if let Some(&local_vid) = map.get(&(author_peer, remote_vid)) {
-            return self.vocab.get(local_vid) == bytes;
+            // #808: 世代の合わない番号 (語が回収されて場所が別の語に渡った、 #381) は一致しない。 `get` は &[] を返すので、
+            // 空文字の語だけ 「登録済み」 になり、 Vocab が当て直されず、 続く Tie が古い番号に訳されて書けなかった
+            return self.vocab.get_checked(local_vid) == Some(bytes);
         }
         false
     }
@@ -24517,6 +24519,52 @@ mod tests {
         assert_eq!(eng.vocab.ref_count(got), Some(0), "再生の後は押さえを返す");
         drop(eng);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #808: 回収する辞書 (#381) で、 相手の番号の写像の先が回収された後は、 空文字の語でも 「登録済み」 と言わないこと。
+    ///
+    /// `has_remote_vocab` は写像の先の語を `Vocabulary::get` で読んで比べていた。 `get` は世代の合わない番号に `&[]` を返すので、
+    /// 空文字の語だけ、 回収された番号の写像が 「合っている」 になり、 受け側は Vocab を当て直さず、 続く Tie が古い番号に
+    /// 訳されて `StaleValue` で書けなかった。 対照: 空でない語は同じ手順で当て直される。
+    #[test]
+    fn issue808_has_remote_vocab_rejects_a_reclaimed_mapping_of_the_empty_word() {
+        for word in [&b"x"[..], &b""[..]] {
+            let dir = tmp(if word.is_empty() { "remote_vocab_empty" } else { "remote_vocab_x" });
+            let mut eng = Engine::create_growable_opts(
+                &dir,
+                GrowableOptions { max_entities: 10_000, vocab_reclaim: true, ..Default::default() },
+            )
+            .unwrap();
+            eng.define_himo("tg", ValueType::Tag, 0);
+            let hid = eng.himo_id("tg").unwrap() as u16;
+            let (e, other) = (eng.entity().unwrap(), eng.entity().unwrap());
+            let (author, rv) = (7u32, 5u32);
+            // 受信の手順 (`Syncer::apply_one` / `replay_relayed_op`): Vocab は登録済みでなければ当て、 Tie は番号を訳して書く
+            let receive = |eng: &Engine| -> Result<(), TieRejected> {
+                if !eng.has_remote_vocab(author, rv, word) {
+                    eng.remote_vocab_apply(author, rv, word);
+                }
+                let v = eng.try_translate_remote_vid(author, hid, u64::from(rv)).expect("写像がある");
+                eng.try_tie_to_by_id(e, hid, v)
+            };
+            receive(&eng).unwrap();
+            assert_eq!(eng.get_text_owned(e, "tg").as_deref(), Some(word), "前提: 1 回目は読める ({word:?})");
+            let first = eng.get(e, "tg").unwrap() as u32;
+            // その語を持つ cell を全部外して書き出し、 別の語にその場所を取らせる
+            eng.untie(e, "tg");
+            eng.flush().unwrap();
+            let claims = eng.vocab.reclaim_stats().1;
+            eng.try_tie_text_to_by_id(other, hid, "another-word").unwrap();
+            assert_eq!(eng.vocab.reclaim_stats().1, claims + 1, "前提: 別の語が場所を使い回した ({word:?})");
+            assert_eq!(eng.vocab.get_checked(first), None, "前提: 写像の先の番号は古い世代になった ({word:?})");
+            let registered = eng.has_remote_vocab(author, rv, word);
+            // 同じ (author, 番号, 語) をもう一度受ける: 当て直されて、 続く Tie が読める
+            assert_eq!(receive(&eng), Ok(()), "同じ語の Tie が古い番号に訳されて書けない ({word:?})");
+            assert!(!registered, "回収された番号への写像を 「登録済み」 と言った ({word:?})");
+            assert_eq!(eng.get_text_owned(e, "tg").as_deref(), Some(word), "受け直した語が読めない ({word:?})");
+            drop(eng);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// 0.34: 裏の thread の仕事は WAL の書き出しだけ (書き込みは `*_async` も呼んだ thread がその場で書く) なので、 WAL の
