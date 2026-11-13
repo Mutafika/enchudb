@@ -287,7 +287,7 @@ fn foreign_records_the_link_already_reclaimed_are_still_applied_from_the_state_a
         ring.iter().any(|r| r.hlc == hp && r.author_peer == P && matches!(r.op, DecodedOp::Tie { .. })),
         "R の ring: state から当てた t の書き換えは載せる"
     );
-    // D が受けるのは v だけ確かめる (t の Vocab と Tie は同じ版数で載り、 `InMemoryTransport` の pull が同じ版数の 2 つ目を落とす = 別件)
+    // D が受けるのは v だけ確かめる (t の Vocab と Tie は同じ版数で載り、 `InMemoryTransport` の pull が同じ版数の 2 つ目を落とす = #827)
     assert!(!m.sd.pull_once(R).history_truncated, "前提: D は抜けを言われない");
     assert_eq!(v(&m.d, 1), Some(77), "D の行 1 の v");
 }
