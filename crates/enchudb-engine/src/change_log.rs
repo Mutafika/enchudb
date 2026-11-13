@@ -703,8 +703,26 @@ impl ChangeLog {
             && let Some(pool) = crc_pool()
         {
             use rayon::prelude::*;
-            pool.install(|| (0..range.len()).into_par_iter().for_each_init(|| Vec::with_capacity(256), |buf, k| one(buf, k)));
-            return;
+            let all = || pool.install(|| (0..range.len()).into_par_iter().for_each_init(|| Vec::with_capacity(256), |buf, k| one(buf, k)));
+            // #811: 呼んだ thread が rayon の worker (アプリが自分の pool / global pool の上から `oplog_sync()` を呼んだ) だと、
+            // `install` は待つ間にその worker の pool の他の job を同じ stack で走らせる (`in_worker_cross`)。 ここは呼び手が
+            // `change_emit` を握っているので、 拾った job が engine の changefeed の API を呼ぶと同じ thread が取り直して止まる。
+            // rayon の外の thread から頼み (その thread は pool の返事を block して待つ)、 この thread は join で待つ (何も拾わない)
+            if rayon::current_thread_index().is_none() {
+                all();
+                return;
+            }
+            let asked = std::thread::scope(|s| {
+                std::thread::Builder::new()
+                    .name("enchudb-cflog-ask".into())
+                    .spawn_scoped(s, all)
+                    .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                    .is_ok()
+            });
+            if asked {
+                return;
+            }
+            // thread を立てられなかった: 並べずに写す
         }
         let mut buf = Vec::new();
         for k in 0..range.len() {

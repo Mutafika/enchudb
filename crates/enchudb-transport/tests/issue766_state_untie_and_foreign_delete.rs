@@ -367,7 +367,8 @@ fn only_unties_and_deletes_made_by_the_client_are_in_its_state() {
     let unties: Vec<u64> = batch.records.iter().filter_map(|r| match &r.op { DecodedOp::Untie { eid, .. } => Some(*eid), _ => None }).collect();
     assert_eq!(unties, Vec::<u64>::new(), "c2 が外した cell・書き直された cell・消えた行の cell の Untie は入らない");
     let deletes: Vec<u64> = batch.records.iter().filter_map(|r| match &r.op { DecodedOp::Delete { eid } => Some(*eid), _ => None }).collect();
-    assert_eq!(deletes, vec![world5], "Delete は c1 が消した c2 の行 5 だけ (c2 が消した行 4・c1 が消した自分の行 6 は入らない)");
+    // #784: c1 が消した自分の行 6 の Delete も入る (削除の版数の順)
+    assert_eq!(deletes, vec![world5, make_eid(1, eid_local(row6))], "Delete は c1 が消した c2 の行 5 と自分の行 6 (c2 が消した行 4 は入らない)");
 
     all(&[c1, c2, c3]);
     assert_eq!(w.vs(1), [None; 4]);
@@ -406,12 +407,14 @@ fn an_untie_or_delete_of_another_clients_row_does_not_shield_a_deleted_row_from_
     assert!(batch.records.iter().any(|r| matches!(&r.op, DecodedOp::Untie { eid, .. } if *eid == world_a)), "前提: state に c2 の行 6 宛ての Untie がある (番号は c1 の消した行 5 と同じ)");
     assert!(batch.records.iter().any(|r| matches!(&r.op, DecodedOp::Delete { eid } if *eid == world_b)), "前提: state に c2 の行 8 宛ての Delete がある (番号は c1 の消した行 7 と同じ)");
     let mine = [make_eid(1, eid_local(mine_a)), make_eid(1, eid_local(mine_b))];
+    // #784: c1 の消した自分の行は、 Delete の record だけが state にある (掃除でなく、 その Delete で消える。 Delete の無い state の
+    // 掃除で番号を取り違えない事は `issue784_state_own_deletes.rs` の `a_state_without_own_deletes_is_still_swept`)
     assert!(
         !batch.records.iter().any(|r| match &r.op {
-            DecodedOp::Tie { eid, .. } | DecodedOp::Untie { eid, .. } | DecodedOp::Delete { eid } | DecodedOp::TieLeaf { eid, .. } => mine.contains(eid),
+            DecodedOp::Tie { eid, .. } | DecodedOp::Untie { eid, .. } | DecodedOp::TieLeaf { eid, .. } => mine.contains(eid),
             _ => false,
         }),
-        "前提: state に c1 の消した行 5 / 7 宛ての record は無い"
+        "前提: state に c1 の消した行 5 / 7 宛ての値の record は無い"
     );
 
     all(&[c1, c2, c3]);

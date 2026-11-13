@@ -4169,6 +4169,17 @@ impl LeafScale {
     pub fn cap_bytes(self) -> u64 { cap_bytes_for_shift(self.off_shift()) }
 }
 
+/// WAL の再生 1 回の間持ち回る、 辞書の状態。
+#[derive(Default)]
+struct ReplayVocab {
+    /// 再生で辞書に入れ直した語の番号の写像 (record の番号 → 今の番号、 #431)。
+    vids: std::collections::HashMap<u32, u32>,
+    /// 回収する辞書 (#381) で、 再生した自分の Vocab の record の語を押さえている参照 (record 1 つにつき 1 つ)。
+    /// 落ちた後は参照数を列から数え直すので、 cell がディスクに届かなかった語は参照 0 = すぐ使い回せる。 押さえないと、
+    /// 後ろの Vocab の入れ直しがその場所を取り、 その語を指す Tie の番号が古い世代になって書けない。
+    pinned: Vec<u32>,
+}
+
 /// #118: growable backing の全 layout knob を 1 struct でまとめて指定する。
 ///
 /// 個別 variant (`create_growable_with_capacity` / `_with_options` / `_with_leaf`) は
@@ -9595,9 +9606,13 @@ impl Engine {
     ///   消えた行の cell は出さない。 版数の列の無い DB (sync の表を持たない) では出さない
     /// - 他の peer の行の削除 (#766): **自分の時計の削除の版数**を持つ、 消えた他の peer の行を `Delete` (宛名は行の世界番号、
     ///   版数は削除の版数) で出す。 slot を使い回して写像の外れた行は、 退避してある削除の版数から。 他の peer が消した行
-    ///   (その peer の record が運ぶ) と、 自分の行の削除 (state に現れない行は受け手の掃除が消す) は出さない。 前は
-    ///   どちらも運ばず、 ホストが state を取り直すと、 まだ出していなかった untie と他の peer の行の削除がどこにも
-    ///   配られなかった
+    ///   (その peer の record が運ぶ) は出さない。 前はどちらも運ばず、 ホストが state を取り直すと、 まだ出していなかった
+    ///   untie と他の peer の行の削除がどこにも配られなかった
+    /// - 自分の行の削除 (#784 / #800): **自分の時計の削除の版数**が slot に残っている、 消えた自分の行を `Delete` (宛名は自分の
+    ///   世界番号、 版数は削除の版数) で出す。 前は出さず、 state に現れない行を受け手の掃除が **今の時刻** で消していた:
+    ///   名前で束ねた行は掃除が見つけられずに残り (#784)、 消した後に同じ名前で足した行は掃除の削除の方が新しくて消えた
+    ///   (#800)。 slot を使い回した行は削除の版数が残っていない (`clear_cell_versions`) ので出せない = 今までどおり受け手の
+    ///   掃除が消す。 出す数は 「払い出した slot のうち、 消えていてまだ使い回していない物」 まで
     /// - **含まないもの** (v1): 署名 (signature = zeros — require_signature な受信側
     ///   では使えない)、 content blob、 他の peer が外した cell・消した行の記録
     ///
@@ -9889,6 +9904,8 @@ impl Engine {
     ///   前の住人の版数は消してある (`clear_cell_versions`) ので、 生きている行の版数はその行の物
     /// - Delete: 翻訳した行 (他の peer の行) のうち、 消えていて (`slot_is_dead`) 削除の版数が自分の時計の物。 slot を
     ///   使い回して写像が外れた行は退避表 (`foreign_tombs`) から。 生きている行は、 削除の版数が残っていても出さない
+    /// - Delete (自分の行、 #784 / #800): 削除の版数の列をなめ、 消えていて削除の版数が自分の時計の、 自分の行の slot。
+    ///   slot を使い回すと版数は消える (出せない行は受け手の掃除が消す)
     fn state_unties_and_foreign_deletes(
         &self,
         self_peer: enchudb_oplog::PeerId,
@@ -9942,6 +9959,22 @@ impl Engine {
             // 写像のある行は上で見た (払い出す時に退避表の版数を slot に書き戻してある)
             if owner != self_peer && mine(tomb) && self.eid_translator.get(owner, owner_local).is_none() {
                 deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
+            }
+        }
+        // #784 / #800: 自分の行の削除。 削除の版数の列をなめ、 消えていて版数が自分の時計の slot。 宛名は bridge が差分で出す時と
+        // 同じ引き方 (`bridge_address`): 他の peer の行なら上の 2 つが出している (ここでは出さない)
+        if let Some(count) = self.tomb_col.as_ref().map(|c| c.count().min(self.max_entities())) {
+            let local_only = self.local_only_ranges();
+            for local in 0..count {
+                let tomb = self.tombstone_hlc_local(local);
+                if !mine(tomb)
+                    || self.entities.is_live(local)
+                    || local_only.iter().any(|&(lo, hi)| local >= lo && local < hi)
+                    || self.bridge_address(local, tomb).is_some()
+                {
+                    continue;
+                }
+                deletes.push((tomb, enchudb_oplog::make_eid(self_peer, local)));
             }
         }
         deletes.sort_unstable();
@@ -15196,6 +15229,24 @@ impl Engine {
         }
     }
 
+    /// #784: 宛名 `foreign_eid` (author の世界番号) の削除を、 もう同じ版数 `hlc` で記録してあるか: 写像のある行は、 消えていて
+    /// 削除の版数が `hlc`。 写像の無い行は、 退避表の削除の版数が `hlc`。 state を取り直した中継が、 同じ削除を載せ直さないために見る。
+    pub fn remote_delete_is_recorded(&self, foreign_eid: enchudb_oplog::EntityId, hlc: enchudb_oplog::Hlc) -> bool {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            return false;
+        }
+        match self.resolve_remote_eid_existing(foreign_eid) {
+            Some(local_eid) => {
+                let local = enchudb_oplog::eid_local(local_eid);
+                self.slot_is_dead(local) && self.tombstone_version_of(local) == hlc
+            }
+            None => {
+                self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid))
+                    == Some(hlc)
+            }
+        }
+    }
+
     /// #490: リモート peer から届いた Delete を、 翻訳する前の eid (author の世界番号) のまま当てる。
     ///
     /// 写像がある (= この entity の作成を受け取っている) なら [`Engine::remote_delete_apply`] と同じ。
@@ -20161,10 +20212,11 @@ impl Engine {
             let records = w.recover_with_tail();
             // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
             w.drop_records_after_a_hole();
-            let mut vids = std::collections::HashMap::new();
+            let mut replay = ReplayVocab::default();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
+            eng.finish_replay_vocab(&mut replay);
             // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
             eng.relog_unlogged_writes(&w);
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
@@ -20462,13 +20514,13 @@ impl Engine {
     ///   - table.next_local が 0 のまま → 次 alloc が既存 eid と衝突
     /// になる。 消費側の CLI との連携で表面化したので 0.8.1 patch で根治。
     ///
-    /// `vids` = 再生で辞書に入れ直した語の番号の写像 (record の番号 → 今の番号、 #431)。 1 回の再生の間持ち回る。
+    /// `replay` = 1 回の再生の間持ち回る辞書の状態 ([`ReplayVocab`])。 再生の後に `finish_replay_vocab` を呼ぶこと。
     fn apply_oplog_op(
         &mut self,
         op: &enchudb_oplog::oplog::DecodedOp,
         hlc: enchudb_oplog::Hlc,
         author: enchudb_oplog::PeerId,
-        vids: &mut std::collections::HashMap<u32, u32>,
+        replay: &mut ReplayVocab,
     ) {
         use enchudb_oplog::oplog::DecodedOp;
         // #209: relay (gossip) が verbatim で積んだ foreign-author record は、
@@ -20486,7 +20538,7 @@ impl Engine {
                 let local = enchudb_oplog::eid_local(*eid);
                 if hid < self.himos.len() {
                     // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
-                    let value = match vids.get(&(*value as u32)) {
+                    let value = match replay.vids.get(&(*value as u32)) {
                         Some(&v) if self.uses_vocab(hid) => u64::from(v),
                         _ => *value,
                     };
@@ -20536,7 +20588,7 @@ impl Engine {
                 let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
                     // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
-                    let value = match vids.get(&(*value as u32)) {
+                    let value = match replay.vids.get(&(*value as u32)) {
                         Some(&v) if self.uses_vocab(hid as usize) => u64::from(v),
                         _ => *value,
                     };
@@ -20568,11 +20620,32 @@ impl Engine {
                 // 本体の書き出しの前に落ちると、 oplog には Vocab と Tie があるのに辞書には語が無く、 再生した Tie の番号の
                 // 先が空になった (後で別の語がその番号に入るとその語を読む)。 語を辞書に入れ (在れば同じ番号)、 番号が
                 // 変わったら後の Tie を引き直す写像に置く。 他の peer から受信した Vocab は apply_one 側
-                let now = self.vocab.get_or_insert(bytes);
+                //
+                // 回収する辞書 (#381) では、 語を押さえて取る (再生が終わるまで、 `finish_replay_vocab` が返す)。 落ちた後は
+                // 参照数を列から数え直すので、 cell がディスクに届かなかった語は参照 0 で、 すぐ使える待ち行列に居る。
+                // 押さえないと、 この語の Tie より前に並んだ別の語の Vocab (他の書き手の分) の入れ直しがその場所を取り、
+                // Tie の番号が古い世代になって書けなかった (#806)
+                let now = match self.vocab.try_get_or_insert_pinned(bytes) {
+                    Ok(now) => {
+                        if self.vocab.reclaim_enabled() {
+                            replay.pinned.push(now);
+                        }
+                        now
+                    }
+                    Err(_) => u32::MAX,
+                };
                 if now != *vid {
-                    vids.insert(*vid, now);
+                    replay.vids.insert(*vid, now);
                 }
             }
+        }
+    }
+
+    /// 再生が終わった: 再生の間押さえていた語 ([`ReplayVocab::pinned`]) を返す。 Tie の当たった語は cell の参照が残り、
+    /// 当たらなかった語は参照 0 に戻る (回収の待ちへ)。
+    fn finish_replay_vocab(&self, replay: &mut ReplayVocab) {
+        for vid in replay.pinned.drain(..) {
+            self.vocab.release(vid);
         }
     }
 
@@ -20734,10 +20807,11 @@ impl Engine {
             let records = w.recover_with_tail();
             // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
             w.drop_records_after_a_hole();
-            let mut vids = std::collections::HashMap::new();
+            let mut replay = ReplayVocab::default();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
+            eng.finish_replay_vocab(&mut replay);
             // #451: open_concurrent_with_oplog と同じ
             eng.relog_unlogged_writes(&w);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
@@ -21837,6 +21911,11 @@ impl Engine {
     /// 3. 残りの中身を指す列を 1 本ずつ: 門を閉じる → (閉じる前に門を通った書き手が居れば) 中身をもう一度 → 列 → 開く
     /// 4. 残り (header / entity / 中身を指さない列 …)
     ///
+    /// #801: 書き出しは並んで走る (consumer の周期 / `oplog_sync` の呼び手 / 書き手の `body_msync`)。 返った時 「呼ぶ前に印を
+    /// 付けた page は全部届いた」 を守るため、 書くものの無い segment を飛ばす所は `SegmentMap::flush_pending` で見る
+    /// (`has_dirty` は、 別の書き出しが msync している最中の segment で false。 飛ばすと、 その msync が失敗するか届く前に
+    /// 電源が落ちた時、 こちらは Ok を返した後 = 語の場所の使い回し・書き出しの済んだ語の境目・checkpoint が先に進む)。
+    ///
     /// 2 / 3 で届く cell は門を閉じる前に書かれたもので、 書き手は中身を書いてから門に入る (入ると列に印を立てる) ので、
     /// その中身は列の前の中身の書き出しで届いている。 書き手が待つのは自分の列の門が閉じている間だけ (#656: 前は 1 つの門を
     /// 中身を指す列の全部の msync の間閉じていて、 Tag 列が 16 本の表の書き手は書き出しのたびに 16 回の msync を待った)。
@@ -21904,14 +21983,15 @@ impl Engine {
             }
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::GateClosed);
-            let fresh: Vec<_> = fresh.into_iter().filter(|(_, seg)| all || seg.has_dirty()).collect();
+            let fresh: Vec<_> = fresh.into_iter().filter(|(_, seg)| all || seg.flush_pending()).collect();
             SegmentSet::flush_segments(&fresh, all)?;
         }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::Opened);
         for (k, seg) in &rest {
-            // 書いた範囲の無い列は msync しない = 閉じなくてよい (同じ組の列の書き手を止めない)
-            if !all && !seg.has_dirty() {
+            // 書いた範囲の無い列は msync しない = 閉じなくてよい (同じ組の列の書き手を止めない)。 並んだ書き出しが msync して
+            // いる最中の列は印が無いが飛ばさない (その msync が届く前に 「全部書き出した」 と返ることになる)
+            if !all && !seg.flush_pending() {
                 continue;
             }
             let _closed = self.publish_gate.close([column(*k)]);
@@ -24391,15 +24471,69 @@ mod tests {
         let hid = eng.himo_id("tg").unwrap() as u16;
         let e = eng.entity().unwrap();
         let hlc = eng.mint_local_hlc();
-        let mut vids = std::collections::HashMap::new();
+        let mut vids = ReplayVocab::default();
         eng.apply_oplog_op(&DecodedOp::Vocab { vid: 1000, bytes: b"replayed".to_vec() }, hlc, 0, &mut vids);
         eng.apply_oplog_op(&DecodedOp::Tie { eid: e, himo_id: hid, value: 1000 }, hlc, 0, &mut vids);
         assert_eq!(eng.get_text_owned(e, "tg").as_deref(), Some(&b"replayed"[..]), "Tie を入れ直した語の番号に引き直していない");
         // 辞書に在る語は同じ番号 (写像に置かない)
         let known = eng.vocab.get_or_insert(b"known");
-        let mut vids = std::collections::HashMap::new();
+        let mut vids = ReplayVocab::default();
         eng.apply_oplog_op(&DecodedOp::Vocab { vid: known, bytes: b"known".to_vec() }, hlc, 0, &mut vids);
-        assert!(vids.is_empty(), "辞書に在る語まで写像に置いた: {vids:?}");
+        assert!(vids.vids.is_empty(), "辞書に在る語まで写像に置いた: {:?}", vids.vids);
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #806: 回収する辞書 (#381) の再生: 自分の Vocab の record が指す語は、 後ろの Tie が当たるまで使い回されないこと。
+    ///
+    /// 落ちた後に開くと参照数を列から数え直し、 参照 0 の場所は全部すぐ使える待ち行列に入る。 語 b の中身は disk に届き、
+    /// b を指す cell は届かなかった時、 b は参照 0 で待ち行列に居る。 WAL が `Vocab b` `Vocab c` `Tie(Y = b)` `Tie(Z = c)` の順
+    /// (書き手 2 本) なら、 `Vocab c` の入れ直しが b の場所を取り (世代 +1)、 `Tie(Y = b)` の番号は古い世代になって書けなかった。
+    #[test]
+    fn issue806_replay_keeps_a_vocab_records_word_until_its_tie_lands() {
+        use enchudb_oplog::oplog::DecodedOp;
+        let dir = tmp("replay_vocab_reclaim");
+        let mut eng = Engine::create_growable_opts(
+            &dir,
+            GrowableOptions { max_entities: 10_000, vocab_reclaim: true, ..Default::default() },
+        )
+        .unwrap();
+        eng.define_himo("tg", ValueType::Tag, 0);
+        let hid = eng.himo_id("tg").unwrap() as u16;
+        let (e0, y, z) = (eng.entity().unwrap(), eng.entity().unwrap(), eng.entity().unwrap());
+        // 語 b を参照 0 にして、 すぐ使える待ち行列に置く (書き出しの後 = 落ちた後の数え直しの後と同じ状態)
+        eng.try_tie_text_to_by_id(e0, hid, "bbbb").unwrap();
+        let vid_b = eng.get(e0, "tg").unwrap();
+        eng.untie(e0, "tg");
+        eng.flush().unwrap();
+        assert_eq!(eng.vocab.ref_count(vid_b as u32), Some(0), "前提: b は参照 0");
+        assert_eq!(eng.vocab.reclaim_stats().0, 1, "前提: 待ち行列に b の場所だけ");
+        let claims = eng.vocab.reclaim_stats().1;
+        // c の record の番号 = 前の session が取った新しい場所 (disk に届かなかった)
+        let vid_c = u64::from(eng.vocab.count());
+        let hlc = eng.mint_local_hlc();
+        let mut vids = ReplayVocab::default();
+        eng.apply_oplog_op(&DecodedOp::Vocab { vid: vid_b as u32, bytes: b"bbbb".to_vec() }, hlc, 0, &mut vids);
+        eng.apply_oplog_op(&DecodedOp::Vocab { vid: vid_c as u32, bytes: b"cccc".to_vec() }, hlc, 0, &mut vids);
+        eng.apply_oplog_op(&DecodedOp::Tie { eid: y, himo_id: hid, value: vid_b }, hlc, 0, &mut vids);
+        eng.apply_oplog_op(&DecodedOp::Tie { eid: z, himo_id: hid, value: vid_c }, hlc, 0, &mut vids);
+        eng.finish_replay_vocab(&mut vids);
+        assert_eq!(eng.get_text_owned(z, "tg").as_deref(), Some(&b"cccc"[..]), "c の Tie");
+        assert_eq!(
+            eng.get_text_owned(y, "tg").as_deref(),
+            Some(&b"bbbb"[..]),
+            "Vocab b の record の語の場所を、 後ろの Vocab c が取った (Tie(Y = b) が古い番号になって消えた)"
+        );
+        assert_eq!(eng.vocab.reclaim_stats().1, claims, "再生の間に b の場所を使い回した");
+        // 押さえは再生の間だけ: 参照は cell の数に戻る (Tie の来なかった語は待ち行列に戻る)
+        assert_eq!(eng.vocab.ref_count(vid_b as u32), Some(1), "b の参照は cell 1 つぶん");
+        let orphan = eng.vocab.count();
+        let mut vids = ReplayVocab::default();
+        eng.apply_oplog_op(&DecodedOp::Vocab { vid: orphan, bytes: b"no-tie".to_vec() }, hlc, 0, &mut vids);
+        let got = eng.vocab.lookup(b"no-tie").unwrap();
+        assert_eq!(eng.vocab.ref_count(got), Some(1), "再生の間は押さえている");
+        eng.finish_replay_vocab(&mut vids);
+        assert_eq!(eng.vocab.ref_count(got), Some(0), "再生の後は押さえを返す");
         drop(eng);
         let _ = std::fs::remove_dir_all(&dir);
     }
