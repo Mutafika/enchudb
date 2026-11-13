@@ -1126,6 +1126,13 @@ impl Syncer {
         Some(kept)
     }
 
+    /// #830: 中継が載せうる record (`relay_accepted` = 当てようとした record) の中に、 同じ (書き手, 版数) の物が 2 つ以上あるか。
+    fn has_same_version_group(records: &[WireRecord], relay_accepted: &[(usize, bool)]) -> bool {
+        let mut keys: Vec<(PeerId, Hlc)> = relay_accepted.iter().map(|&(i, _)| (records[i].author_peer, records[i].hlc)).collect();
+        keys.sort_unstable();
+        keys.windows(2).any(|w| w[0] == w[1])
+    }
+
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。
     /// request4: `pull_as(self_peer, from, since)` 経由で broadcast log +
     /// (from, self_peer) targeted log を両方拾う。 partial sync 対応 transport
@@ -1301,6 +1308,13 @@ impl Syncer {
         // 反響は今までどおり Tie の LWW で止まる)。 中継の流れでも、 Tag の Tie の前には必ずその語の Vocab がある
         let host = gossip && self.is_host();
         let mut relayed = 0usize;
+        // #830: ホストでない中継が、 同じ (書き手, 版数) の record を 2 つ以上載せる batch (上流が state で載せた組: Tag の cell の
+        // Vocab と Tie、 版数の無い cell の `as_of`) は、 載せて ring に写し終えるまで自分の ring を配らない (state の道
+        // `bootstrap_pull_via` と同じ、 #762)。 1 つずつ載せている間に WAL が書き出されて (consumer の周期 / 他の thread の
+        // `oplog_sync`) 組の前半だけが ring に写り、 そこを配ると、 受け手の `cursor[書き手]` がその版数に進んで、 後から載る
+        // 後半が `hlc > cursor` を通らなかった。 組の無い batch (ふつうの差分) は止めない (書き手ごとに版数の昇順で載る)
+        let relaying = (gossip && !host && Self::has_same_version_group(&records, &relay_accepted))
+            .then(|| self.state_relay.write().unwrap_or_else(|p| p.into_inner()));
         if gossip {
             let mut held = self.relay_held.lock().unwrap();
             let held = held.entry(from).or_default();
@@ -1333,6 +1347,13 @@ impl Syncer {
                 }
             }
         }
+        // #830: 載せた組を ring に写し終えてから、 配るのを通す
+        if relaying.is_some() && relayed > 0 {
+            *self.state_relay_owner.lock().unwrap() = Some(std::thread::current().id());
+            let _ = self.engine.oplog_sync();
+            *self.state_relay_owner.lock().unwrap() = None;
+        }
+        drop(relaying);
 
         // **cursor は、 それが消費した state より先に durable になってはいけない。**
         //
