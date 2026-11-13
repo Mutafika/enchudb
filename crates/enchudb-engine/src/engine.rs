@@ -9589,6 +9589,14 @@ impl Engine {
         Some(out)
     }
 
+    /// #783: 書き手 `author` の history floor を `floor` に上げる (下げない)。 ホストが、 取り直した state で 「自分の
+    /// `cursor[author]` 以下の版数の record」 を初めて受けて載せた時に呼ぶ: その record は、 下の受け手の cursor の手前に
+    /// 載ったので差分では配られない。 floor を上げれば、 下の受け手は抜けを知って author の state を取り直す。
+    /// 書けなければ false。
+    pub fn raise_history_floor(&self, author: enchudb_oplog::PeerId, floor: enchudb_oplog::Hlc) -> bool {
+        self.sync_tables_enabled() && self.record_reclaimed_floors(&[(author, floor)])
+    }
+
     /// #191/#216: reclaimed floor を author 別に単調 max で merge する (下がる
     /// ことは無い)。 himo は lazy に ensure する (fix 前 DB の reopen でも育つ)。
     /// legacy scalar が残っていれば無帰属 sentinel (`u32::MAX`) entry として
@@ -9702,8 +9710,19 @@ impl Engine {
     ///
     /// `author == peer_id()` なら `state_records` と同一。 それ以外は:
     ///
-    /// - 対象は `translated_locals_of(author)` の local のみ。 eid は原 eid
+    /// - author の行 = `translated_locals_of(author)` の local。 eid は原 eid
     ///   (`make_eid(author, foreign_local)`)、 `author_peer` は `author`。
+    /// - **author の時計の版数を持つ物は、 author の行の外の物も全部** (#783、 self 版の #761 / #766 / #784 と同じ中身を、
+    ///   replica が持つ分だけ): author の行でない行 (自分の行 / 第三者の行) の、 版数が author の時計の cell (値と版数は
+    ///   行の読みで揃える)、 生きている行の、 版数が author の時計で値の無い cell (`Untie`、 author の行も)、 削除の版数が
+    ///   author の時計の消えた行 (`Delete`、 author の行も。 slot を使い回して写像の外れた行は退避表から)。 書き手は
+    ///   `author`、 宛名は行の世界番号 (逆写像、 自分の行なら自分の番号) = author が差分で出した record と同じ形。
+    ///   前は author の行の値のある cell だけで、 ホストが author の floor を上げて (遅れて載った state / 回収) 下の受け手が
+    ///   取り直しても、 author の untie・削除・他の行への書き込みは届かなかった。 自分の行の slot を使い回した後の
+    ///   削除 (版数が残らない) と、 忘れてよい線より前の、 退避表の削除は出せない。 author の行を別の peer が書き換えた cell
+    ///   (下の Tag の項、 #711) は author の行の側、 author が別の peer の行に書いた cell はこちら = 同じ cell が 1 つの
+    ///   batch に 2 回出ることは無い (cell の版数は 1 つ)。 削除は線 (`forget_deletes_before`) で絞らない: 遅れて載った削除は
+    ///   線より前の版数でありうる (下の受け手はまだ受けていない)
     /// - HLC は cell の版数をそのまま。 remote apply は `set_cell(.., hlc)` 経由で
     ///   **author の HLC を版数に書いている**ので、 relayed cell の版数 = 原 HLC。
     ///   版数不明 (ZERO) の cell は **配らない** — foreign author の cell に自分の
@@ -9738,7 +9757,7 @@ impl Engine {
     /// | 版数が `Hlc::ZERO` | foreign cell に自分の clock を stamp する権利が無い |
     /// | Tag の vid を逆引きできない | author の vid 空間にも、 書いた peer (版数の peer) の vid 空間にも戻せない (#711) |
     /// | Ref の target を `reverse` できない | 元 entity を導けない |
-    /// | Ref の値が translated local でない | author の行が自分の entity を指すことはない |
+    /// | Ref の値が translated local でない | author の行が自分の entity を指すことはない (author の行でない行からの ref は、 自分の行を指す `TieRef` で出す) |
     ///
     /// 落とした件数は [`Engine::state_records_dropped`] に載る。 **基本の relay 経路
     /// では 0 件** (`replica_state_matches_author_state` が author 本人の wire 形との
@@ -9775,9 +9794,6 @@ impl Engine {
         } else {
             self.translated_locals_of(author).into_iter().map(|(f, l)| (l, f)).collect()
         };
-        if !is_self && foreign.is_empty() {
-            return (Vec::new(), enchudb_oplog::Hlc::ZERO);
-        }
         // Tag: local vid -> author の remote vid (逆引き)。
         let vid_back: std::collections::HashMap<u32, u32> =
             if is_self { std::collections::HashMap::new() } else { self.remote_vid_reverse_of(author) };
@@ -9816,6 +9832,10 @@ impl Engine {
                 // #761: self 版は、 他の peer の行 (translated local) のうち **自分の時計の版数の cell** も出す (下の
                 // `foreign_row`)。 宛名は行の世界番号 = bridge が差分で出す時と同じ形。
                 let mut foreign_row = false;
+                // #783: replica 版は、 author の行でない行 (自分の行 / 第三者の行) のうち **author の時計の版数の cell** も出す
+                // (下の `other_row`)。 書き手は author、 宛名はその行の世界番号 (自分の行なら自分の番号) = author が差分で出した
+                // record と同じ形。 版数を先に見る (author の行でない行のほとんどはここで外れる)
+                let mut other_row = false;
                 let out_eid = if is_self {
                     match self.eid_translator.reverse(local) {
                         Some((owner, owner_local)) => {
@@ -9824,14 +9844,33 @@ impl Engine {
                         }
                         None => eid,
                     }
-                } else {
-                    let Some(&foreign_local) = foreign.get(&local) else { continue };
+                } else if let Some(&foreign_local) = foreign.get(&local) {
                     enchudb_oplog::make_eid(author, foreign_local)
+                } else {
+                    let at = self.version_of(local, himo_id);
+                    if at.peer != author || at == enchudb_oplog::Hlc::ZERO {
+                        continue;
+                    }
+                    other_row = true;
+                    let (owner, owner_local) = self.eid_translator.reverse(local).unwrap_or((self_peer, local));
+                    enchudb_oplog::make_eid(owner, owner_local)
                 };
-                let Some(wide) = self.get_by_id(eid, himo_id) else { continue };
+                let (wide, mut hlc) = if other_row {
+                    // 値と版数を行の読みで揃える (間に別の peer の書き込みが入ると、 その peer の値に author の版数を付けた
+                    // record になる)。 author の時計の cell だけなので、 握る回数は author が他の行に書いた cell の数
+                    let (wide, at) =
+                        self.row_locks.read(local, || (self.get_by_id(eid, himo_id), self.version_of(local, himo_id)));
+                    let Some(wide) = wide else { continue };
+                    if at.peer != author || at == enchudb_oplog::Hlc::ZERO {
+                        continue;
+                    }
+                    (wide, at)
+                } else {
+                    let Some(wide) = self.get_by_id(eid, himo_id) else { continue };
+                    (wide, self.version_of(local, himo_id))
+                };
                 // Number64 以外の列は u32 (vid / local eid / leaf offset)
                 let value = wide as u32;
-                let mut hlc = self.version_of(local, himo_id);
                 // #761: 他の peer の行は、 自分が書いた cell (版数が自分の時計) だけ。 他の peer が書いた cell は、 その peer の
                 // record / state が運ぶ。 版数不明 (ZERO) の cell は誰が書いたか分からないので出さない (replica 版と同じ)
                 if foreign_row && hlc.peer != self_peer {
@@ -9888,6 +9927,17 @@ impl Engine {
                             }
                         } else if is_self {
                             records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: value as u64 }, hlc));
+                        } else if other_row {
+                            // #783: author が、 author の行でない行から、 この replica 自身の行を指した ref。 author が出した
+                            // record は世界番号同乗の TieRef (指す先 = この replica の行)
+                            records.push(mk(
+                                DecodedOp::TieRef {
+                                    eid: out_eid,
+                                    himo_id,
+                                    target: enchudb_oplog::make_eid(self_peer, value),
+                                },
+                                hlc,
+                            ));
                         } else {
                             // replica: author の行が「自分が author した entity」を
                             // 指すことはない (それは翻訳先を持つ)。 導けないので skip。
@@ -9946,9 +9996,8 @@ impl Engine {
                 }
             }
         }
-        if is_self {
-            self.state_unties_and_foreign_deletes(self_peer, &mut records);
-        }
+        // #783: replica 版も、 author の時計の版数の untie / 削除を author の record の形で出す (author の行も、 他の行も)
+        self.state_unties_and_foreign_deletes(author, &mut records);
         if dropped > 0 {
             // #236: 呼び出し側は差分を見て 「この batch は cell 単位で欠けている」 を
             // 判定する (`Syncer::refresh_state_providers` の provider が前後で読む)。
@@ -9969,6 +10018,10 @@ impl Engine {
     /// どちらも差分 (bridge) で出す時と同じ形: 書き手は自分、 宛名は行の世界番号 (他の peer の行は逆写像)、 版数は
     /// 書いた時の版数。 **自分の時計の版数の物だけ** — 他の peer の untie / 削除は、 その peer の record が運ぶ。
     ///
+    /// #783: `by` が自分でなければ replica 版 (`state_records_for(by)`): 下の 「自分」 を 「`by`」 と読む (版数が `by` の時計の物を、
+    /// `by` の record として)。 宛名の引き方は同じ (この DB の逆写像、 無ければこの DB の行)。 `by` の行の削除も 「他の peer の行の
+    /// 削除」 の側で出る (この DB から見れば `by` も他の peer)。
+    ///
     /// - Untie: 版数の列をなめ、 生きている行の、 値が無くて版数が自分の時計の cell。 値と版数は行の lock の読みで
     ///   揃えて読む (間に書き込みが入ると、 値は前・版数は後を掴んで、 書いた cell を外す record になる)。 slot を使い回す時に
     ///   前の住人の版数は消してある (`clear_cell_versions`) ので、 生きている行の版数はその行の物
@@ -9978,19 +10031,20 @@ impl Engine {
     ///   slot を使い回すと版数は消える (出せない行は受け手の掃除が消す)
     fn state_unties_and_foreign_deletes(
         &self,
-        self_peer: enchudb_oplog::PeerId,
+        by: enchudb_oplog::PeerId,
         records: &mut Vec<crate::transport::WireRecord>,
     ) {
         use enchudb_oplog::oplog::DecodedOp;
+        let self_peer = self.peer_id();
         let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
             hlc,
-            author_peer: self_peer,
+            author_peer: by,
             op,
             signature: [0u8; 64],
             pubkey_fp: [0u8; 8],
             signed_bytes: Vec::new(),
         };
-        let mine = |h: enchudb_oplog::Hlc| h != enchudb_oplog::Hlc::ZERO && h.peer == self_peer;
+        let mine = |h: enchudb_oplog::Hlc| h != enchudb_oplog::Hlc::ZERO && h.peer == by;
         if self.has_cell_version() {
             for hid in 0..self.himos.len() {
                 if self.himo_is_in_reserved_table(hid) {
