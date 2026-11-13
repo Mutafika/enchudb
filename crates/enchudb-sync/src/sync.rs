@@ -1014,8 +1014,19 @@ impl Syncer {
     /// 受け手の `cursor[author]` が `as_of` を越え、 同じ間に書かれて state に入らなかった (走査の済んだ cell の) record が、
     /// 後で差分で届いて載っても cursor の手前で落ちる (#753 の形 1 の、 中継の版)。
     ///
-    /// 他の peer の時計の版数の record (書き手の行を別の peer が書き換えた cell) は、 差分で届くとは限らないので今までどおり
-    /// 当てて載せる (その版数が `as_of` より後なら、 同じ越えが残る)。
+    /// #825 / #786: **別の peer k の時計の版数**の record (書き手の行を k が書き換えた cell。 `author_peer` は書き手か、 Tag の
+    /// 書き手の語彙に無い語なら k = #711) も、 k の元の record が `link` の差分で届く時は外す。 当てて載せると、 自分は k の record を
+    /// そこまで受けていないのに、 下の受け手の cursor がその版数まで進む:
+    /// - `author_peer` が k の record → 下の `cursor[k]` が進み、 k がそれより前に書いて自分にまだ届いていない record が、 後で
+    ///   差分で届いて載っても落ちる。 外すのは、 版数が自分の `cursor[link][k]` より後の物
+    /// - `author_peer` が書き手の record → 下の `cursor[author]` が進む。 外すのは、 版数が取り直した後の `cursor[link][author]`
+    ///   より後の物 (それ以下なら、 書き手の record はもうそこまで載せてある)
+    ///
+    /// 「差分で届く」 と見るのは、 `link` から k の record を受けたことがあり (`cursor[link][k]` がある)、 版数がその cursor より後で、
+    /// `link` が広告する k の floor (回収した record の最大) より後の時。 k の元の record は、 k 自身の順 (HLC の昇順) で届いて
+    /// 当たって載る。 それ以外 (`link` が k の record を運ばない / もう回収した / cursor がもう越えている) は、 state の他に届く道が
+    /// 無いので今までどおり当てて載せる (`author_peer` が書き手で版数が cursor より後なら、 #786 の越えが残る)。 自分の時計の
+    /// 版数の record (自分が書いた cell) は外さない
     ///
     /// 外した Vocab を、 残した Tie が指す時 (同じ語を持つ古い cell。 Vocab は state の中で語ごとに 1 回、 最初に出た cell の
     /// 版数で出る) は、 その Vocab を Tie の版数に付け替えて Tie の前に残す (語の写像は版数によらない。 state の record は
@@ -1030,30 +1041,45 @@ impl Syncer {
         if !relay {
             return None;
         }
-        let cursor = {
-            let guard = self.last_pulled.lock().unwrap();
-            guard.get(&link).and_then(|m| m.get(&author)).copied().unwrap_or(Hlc::ZERO)
+        let cursors: std::collections::HashMap<PeerId, Hlc> =
+            self.last_pulled.lock().unwrap().get(&link).cloned().unwrap_or_default();
+        let resume = cursors.get(&author).copied().unwrap_or(Hlc::ZERO).max(batch.as_of);
+        let self_peer = self.engine.peer_id();
+        // `link` が広告する、 回収した record の最大 (書き手ごと。 書き手の分からない下限は全員に効く)
+        let floors = self.transport.history_floor_multi(link);
+        let scalar_floor = self.transport.history_floor(link);
+        let floor_of = |k: PeerId| match &floors {
+            Some(f) => f.iter().filter(|(a, _)| *a == k || *a == u32::MAX).map(|(_, h)| *h).max().unwrap_or(Hlc::ZERO),
+            None => scalar_floor.unwrap_or(Hlc::ZERO),
         };
-        let resume = cursor.max(batch.as_of);
-        let left = |r: &WireRecord| r.author_peer == author && r.hlc.peer == author && r.hlc > resume;
+        let left = |r: &WireRecord| {
+            let k = r.hlc.peer;
+            if k == author {
+                return r.author_peer == author && r.hlc > resume;
+            }
+            if k == self_peer || !(r.author_peer == k || (r.author_peer == author && r.hlc > resume)) {
+                return false;
+            }
+            cursors.get(&k).is_some_and(|c| r.hlc > *c) && r.hlc > floor_of(k)
+        };
         if !batch.records.iter().any(left) {
             return None;
         }
         let mut kept: Vec<WireRecord> = Vec::with_capacity(batch.records.len());
-        // 外した Vocab (vid → record)
-        let mut vocab: std::collections::HashMap<u32, &WireRecord> = std::collections::HashMap::new();
+        // 外した Vocab ((書き手, vid) → record)
+        let mut vocab: std::collections::HashMap<(PeerId, u32), &WireRecord> = std::collections::HashMap::new();
         for r in &batch.records {
             if left(r) {
                 if let DecodedOp::Vocab { vid, .. } = &r.op {
-                    vocab.insert(*vid, r);
+                    vocab.insert((r.author_peer, *vid), r);
                 }
                 continue;
             }
-            if r.author_peer == author
+            if !vocab.is_empty()
                 && let DecodedOp::Tie { himo_id, value, .. } = &r.op
                 && self.engine.value_type_at(*himo_id as usize) == Some(enchudb_engine::ValueType::Tag)
                 && let Ok(vid) = u32::try_from(*value)
-                && let Some(v) = vocab.remove(&vid)
+                && let Some(v) = vocab.remove(&(r.author_peer, vid))
             {
                 kept.push(WireRecord { hlc: r.hlc, ..v.clone() });
             }
