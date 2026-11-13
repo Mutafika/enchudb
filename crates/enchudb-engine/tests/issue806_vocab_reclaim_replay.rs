@@ -194,10 +194,8 @@ fn once(attempt: usize) -> Option<(usize, Vec<String>)> {
     }
     for (i, &z) in zs.iter().enumerate() {
         // c の Tie が WAL に在るかは見ない: 在る行だけ値が在る。 在る値は c(i) であること
-        if let Some(got) = text(z) {
-            if got != c(i) {
-                wrong.push(format!("Z{i}: {got:?}"));
-            }
+        if let Some(got) = text(z).filter(|got| *got != c(i)) {
+            wrong.push(format!("Z{i}: {got:?}"));
         }
     }
     drop(back);
