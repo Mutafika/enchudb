@@ -586,13 +586,26 @@ impl HostInner {
 
     /// client `by` の ack (ホストの流れを当てた位置) を受ける。 `by` 自身の record は `by` に配らないので、 その分は 「ホストが
     /// `by` から受けた所まで `by` は持っている」 を足す (足さないと `by` の record の行がホストの ring から回収されない)。
+    ///
+    /// #798: 外した / 外した後に戻ってきた client の ack は数えない。 数えると消化の位置が置き直って回収の数に戻り
+    /// (`forget_sync_peer` の逆)、 その client は取り直して別の peer id に移る = もう来ないのに、 「戻ってきた」 client は二度と
+    /// 外れないので、 回収がその位置で止まる。 その client が受け続けるなら、 回収された分は floor で抜けを知って取り直す。
     fn ack_from(&self, by: PeerId, mut cursors: Vec<(PeerId, Hlc)>) {
+        if self.is_stale(by) {
+            return;
+        }
         if let Some(own) = self.syncer.cursors_of(by).into_iter().find(|(a, _)| *a == by) {
             merge_max(&mut cursors, &[own]);
         }
         merge_max(self.loopback.acks_from_clients.lock().unwrap().entry(by).or_default(), &cursors);
         // 回収は ring が半分埋まってから (`absorb_pull_acks`)。 F は ring に残る record を越えないので、 削除の記録を忘れるのも回収の後
         self.syncer.reclaim_beat();
+        // 上の確かめの後に `recompute` が by を外した時: 外す側は印を置いてから数から外すので、 ここで印が見えたら外し直す
+        // (見えなければ、 外す側が数から外すのはこの後)
+        if self.is_stale(by) {
+            self.loopback.acks_from_clients.lock().unwrap().remove(&by);
+            self.engine.forget_sync_peer(by);
+        }
     }
 }
 
@@ -635,6 +648,12 @@ impl HttpHost {
         }
         syncer.set_host(true);
         syncer.serve_state();
+        // #798: 前の版が、 外した後に戻ってきた client を回収の数に戻したまま保存している時
+        if lines_path.is_some() {
+            for (id, _) in lines.clients.iter().filter(|(_, c)| c.dropped || c.returned) {
+                engine.forget_sync_peer(*id);
+            }
+        }
         let inner = Arc::new(HostInner {
             engine,
             syncer,

@@ -933,10 +933,30 @@ impl SegmentMap {
         }
     }
 
-    /// `mark_dirty` の印が付いているか (#656: 書き出しを並べる時に、 書くものの無い segment に thread を立てない)。
+    /// `mark_dirty` の印が付いているか。 書き出す segment を選ぶ時は [`Self::flush_pending`] を使うこと (別の flush が
+    /// 書き出している最中の segment は印が無い)。
     pub fn has_dirty(&self) -> bool {
         let d = self.dirty.load(Ordering::Acquire);
         d & DIRTY_LAST_MASK >= d >> 32
+    }
+
+    /// #801: 書き出す分が残っているか: 印が付いている、 または別の [`Self::flush_dirty`] がこの segment を書き出している最中
+    /// (その flush は印を取り出してから msync するので、 その間 [`Self::has_dirty`] は false。 失敗すれば印は戻る)。
+    ///
+    /// 書き出す segment を選ぶ側はこちらで見る。 `has_dirty()` で選んで飛ばすと、 並んだ書き出しが msync している最中の
+    /// segment を 「書くものが無い」 と見て、 その msync が届く (か失敗する) 前に 「全部書き出した」 と返る。 true なら
+    /// `flush_dirty` を呼ぶ (前の flush が終わるのを待ち、 失敗して戻った印があれば書き出す)。 false は 「呼ぶ前に印を
+    /// 付けた page は全部書き出してある」。
+    pub fn flush_pending(&self) -> bool {
+        match self.flush_lock.try_lock() {
+            // 書き出している flush は無い = 印が全部 (失敗した flush は lock を放す前に印を戻す)
+            Ok(_none_in_flight) => self.has_dirty(),
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let _none_in_flight = p.into_inner();
+                self.has_dirty()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => true,
+        }
     }
 
     /// 直近 `mark_dirty` の範囲だけ msync して reset。
@@ -1092,6 +1112,65 @@ mod tests {
         clear_flush_hook(&p);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         assert!(!returned_early, "後から来た flush_dirty が、 前の flush の msync が終わる前に返った");
+    }
+
+    /// #801 並んだ書き出しが segment を選ぶ時: 別の flush が msync している最中の segment は印が無い (`has_dirty()` は false) が、
+    /// `flush_pending()` は true。 その flush が失敗すると印が戻るので、 `flush_pending()` で選んだ側は自分で書き出す。
+    /// 前は `has_dirty()` で選んでいて、 msync の最中の segment を飛ばし、 前の flush が失敗しても (電源が落ちても)
+    /// 「全部書き出した」 と返った。
+    #[test]
+    fn flush_pending_sees_the_flush_in_flight() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        let p = dir("flush_pending").join("seg");
+        let seg = std::sync::Arc::new(SegmentMap::create(&p, 4 * MB, 4 * MB).unwrap());
+        assert!(!seg.flush_pending(), "書いていない segment");
+        unsafe { *seg.base() = 1 };
+        seg.mark_dirty(0, 1);
+        assert!(seg.flush_pending());
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (inside_tx, go_rx) = (Mutex::new(inside_tx), Mutex::new(go_rx));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            // 1 回目 (前の flush) は msync の直前で止まってから失敗する。 2 回目からは通す
+            set_flush_hook(&p, move || {
+                if calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                    return Ok(());
+                }
+                let _ = inside_tx.lock().unwrap().send(());
+                let _ = go_rx.lock().unwrap().recv();
+                Err(io::Error::other("模した書き出しの失敗"))
+            });
+        }
+        let first = {
+            let seg = seg.clone();
+            std::thread::spawn(move || seg.flush_dirty())
+        };
+        inside_rx.recv().unwrap();
+        // 前提: 前の flush は印を取り出した後 = 印だけを見ると 「書くものが無い」
+        assert!(!seg.has_dirty(), "前の flush が印を取り出していない (試験の前提)");
+        assert!(seg.flush_pending(), "msync の最中の segment を、 書き出す分が無いと見た");
+        let (picked_tx, picked_rx) = mpsc::channel::<bool>();
+        let second = {
+            let seg = seg.clone();
+            std::thread::spawn(move || {
+                // 書き出しが segment を選ぶ形 (`Engine::write_out_body`)
+                let picked = seg.flush_pending();
+                picked_tx.send(picked).unwrap();
+                if picked { seg.flush_dirty() } else { Ok(()) }
+            })
+        };
+        assert!(picked_rx.recv().unwrap());
+        go_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        second.join().unwrap().unwrap();
+        clear_flush_hook(&p);
+        assert_eq!(calls.load(Ordering::Acquire), 2, "前の flush が失敗した範囲を、 後の flush が書き出していない");
+        assert_eq!(seg.dirty.load(Ordering::Acquire), DIRTY_NONE);
+        assert!(!seg.flush_pending());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     /// #421: 書き出しに失敗した範囲は印に戻る。 旧実装は取り出した範囲を捨てたので、 次の flush が

@@ -111,6 +111,9 @@ pub struct Syncer {
     /// 登録した author 一覧。 relay は pull のたびに新しい author を持ちうるので、
     /// opt-in 済みなら差分を自動で登録し直す (app 側の儀式を増やさない)。
     served_authors: std::sync::Mutex<Option<std::collections::HashSet<PeerId>>>,
+    /// #784: ホストから受けた 「忘れてよい線」 の最大 (memory だけ)。 自分の state に入れる自分の行の削除を、 この線より後の物に絞る
+    /// ([`own_state_records`])。
+    forget_seen: Arc<std::sync::Mutex<Hlc>>,
     /// #219: `SubscriptionFilter` が **target 別に落とした record** の author 別
     /// 最大 HLC (`{target: {author: hlc}}`)。 落とした record は puller の cursor が
     /// 飛び越えるので差分 pull では二度と届かない — その事実を publisher 側で
@@ -334,6 +337,23 @@ impl ApplyResult {
     }
 }
 
+/// #784: 自分の state ([`Engine::state_records`]) から、 `forget` (ホストが配った 「忘れてよい線」) より前の、 自分の行の削除を
+/// 外した物。 線より前の自分の record は全部ホストに当たっている (線の約束、 `HOST_PLAN.md`) = その削除はホストがもう受けて
+/// いるので、 state で運ばなくてよい (消した行の数だけ state が大きくなるのを、 線の後の分に抑える)。 線の約束が破れていても、
+/// state に現れずホストで生きている行は、 今までどおりホストの掃除が消す。 線を知らなければ (`ZERO`) 何も外さない。
+fn own_state_records(engine: &Engine, forget: Hlc) -> (Vec<WireRecord>, Hlc) {
+    let me = engine.peer_id();
+    let (mut records, as_of) = engine.state_records();
+    if forget > Hlc::ZERO {
+        records.retain(|r| {
+            !(r.hlc < forget
+                && r.author_peer == me
+                && matches!(&r.op, DecodedOp::Delete { eid } if enchudb_oplog::eid_peer(*eid) == me))
+        });
+    }
+    (records, as_of)
+}
+
 impl Syncer {
     /// WAL 無しの Engine で Syncer を作ると panic する。
     ///
@@ -395,6 +415,7 @@ impl Syncer {
             truncated_pulls: std::sync::atomic::AtomicU64::new(0),
             warned_no_state_provider: std::sync::atomic::AtomicBool::new(false),
             served_authors: std::sync::Mutex::new(None),
+            forget_seen: Arc::new(std::sync::Mutex::new(Hlc::ZERO)),
             suppressed_since: std::sync::Mutex::new(std::collections::HashMap::new()),
             suppressed_records: std::sync::atomic::AtomicU64::new(0),
             state_relay: std::sync::RwLock::new(()),
@@ -695,6 +716,7 @@ impl Syncer {
             let warned_incomplete = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let last_pulled = self.last_pulled.clone();
             let (known_vocab, known_vocab_gate) = (self.known_vocab_relayed.clone(), self.known_vocab_gate.clone());
+            let forget_seen = self.forget_seen.clone();
             self.transport.register_state_provider_for(
                 author,
                 self_peer,
@@ -717,7 +739,11 @@ impl Syncer {
                             g.values().filter_map(|m| m.get(&author)).copied().max()
                         })
                         .flatten();
-                    let (records, as_of) = eng.state_records_for(author);
+                    let (records, as_of) = if is_self {
+                        own_state_records(&eng, *forget_seen.lock().unwrap())
+                    } else {
+                        eng.state_records_for(author)
+                    };
                     // cursor の無い author (自分の cursor を通らずに入った行) は今までどおり
                     let as_of = received.unwrap_or(as_of);
                     let dropped = eng.state_records_dropped().saturating_sub(before);
@@ -753,6 +779,12 @@ impl Syncer {
                 }),
             );
         }
+    }
+
+    /// 自分の state (`serve_state` が自分の分として配る物と同じ中身、 `complete: true`)。 観測・試験用。
+    pub fn own_state(&self) -> enchudb_engine::transport::StateBatch {
+        let (records, as_of) = own_state_records(&self.engine, *self.forget_seen.lock().unwrap());
+        enchudb_engine::transport::StateBatch { records, as_of, complete: true }
     }
 
     /// #140: truncation からの復旧経路 — author の live state を取得して適用する。
@@ -806,6 +838,30 @@ impl Syncer {
         let relaying = (gossip && !host).then(|| self.state_relay.write().unwrap_or_else(|p| p.into_inner()));
         let later = self.records_left_to_the_diff(link, author, &batch, gossip && !host);
         let records: &[WireRecord] = later.as_deref().unwrap_or(&batch.records);
+        // #784: もう同じ版数で記録してある、 author 自身の削除は、 当て直しても載せない。 Delete は同じ版数でも 「当たった」 と返る
+        // (本体の除去をやり直すため、 `apply_delete_in`) ので、 見ないと、 書き手の state に入っている自分の行の削除を、
+        // 取り直すたびに全部載せ直す。
+        //
+        // 載せないのは、 版数が **取り直す前の** `cursor[link][author]` 以下の物だけ = 記録した時に載せてある: cursor 以下の
+        // author の record は、 差分で受けた (受けた / 当たった時に載せた) か、 前の state で as_of 以下として当てて載せた。 cursor
+        // より後で記録済みの削除は、 前の state が as_of より後として当てて **載せなかった** 物 (#753、 差分に任せた) で、 その差分が
+        // 届く前にもう一度取り直すと、 cursor がその版数を越えて差分では二度と届かない = ここで載せる
+        let cursor_before =
+            self.last_pulled.lock().unwrap().get(&link).and_then(|m| m.get(&author)).copied().unwrap_or(Hlc::ZERO);
+        let settled: std::collections::HashSet<usize> = if gossip {
+            records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    r.author_peer == author
+                        && r.hlc <= cursor_before
+                        && matches!(&r.op, DecodedOp::Delete { eid } if self.engine.remote_delete_is_recorded(*eid, r.hlc))
+                })
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Default::default()
+        };
         let mut relay_accepted: Vec<(usize, bool)> = Vec::new();
         let outcome = self.apply_records_impl(records, gossip.then_some(&mut relay_accepted));
 
@@ -853,7 +909,7 @@ impl Syncer {
                 let r = &records[i];
                 if let DecodedOp::Vocab { vid, .. } = &r.op {
                     if applied { &mut withheld } else { &mut known }.insert((r.author_peer, *vid), i);
-                } else if applied && !(host && r.hlc > batch.as_of) {
+                } else if applied && !settled.contains(&i) && !(host && r.hlc > batch.as_of) {
                     order.push(i);
                 }
             }
@@ -910,6 +966,9 @@ impl Syncer {
                         // #766: author の state の Untie は author の生きている行の外した cell (自分の行なら数える = cell が
                         // 全部外れた行も、 生きていれば残す)、 Delete は author が消した他の peer の行。 他の peer の行宛ての
                         // Untie / Delete は上の理由で数えない
+                        //
+                        // #784 / #800: author が消した自分の行の Delete は数える = 上で author の削除の版数で消してあり、 掃除が
+                        // 今の時刻で消し直さない (今の時刻の削除は、 author の削除の後に同じ名前で足された行まで消す)
                         (enchudb_oplog::eid_peer(*eid) == author).then(|| enchudb_oplog::eid_local(*eid))
                     }
                     // #178: 行の state ではない (state 転写には現れない)
@@ -1140,6 +1199,10 @@ impl Syncer {
         if let Some(line) = self.transport.forget_horizon(from) {
             if let Some(wal) = self.engine.oplog_arc() {
                 wal.observe_hlc(line);
+            }
+            {
+                let mut seen = self.forget_seen.lock().unwrap();
+                *seen = (*seen).max(line);
             }
             if self.engine.forget_deletes_before(line) > 0 {
                 let _ = self.engine.persist_sync_state();
