@@ -563,9 +563,14 @@ impl HostInner {
         //
         // #753: state を載せている間は読まない (`POST /v2/state` が write で持つ)。 state の record は HLC の順に並ばないので、
         // 途中まで載った所を配ると、 受け手の cursor が、 まだ載っていない (版数の小さい) record を越える
+        //
+        // #828: gate は ring に写し終えるまで止めるが、 ring が満杯だと bridge は入る所まで写して止まる (#787)。 止まった所が
+        // 同じ (書き手, 版数) の組 (state の Tag の cell の Vocab と Tie、 版数の無い cell の `as_of`) の途中だと、 前半だけ受けた
+        // client の cursor がその版数に進み、 後から載る後半が `hlc > cursor` を通らない。 組がそろうまでその組は配らない
+        // (`Engine::settled_sync_ops`)
         let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
         self.engine
-            .pending_sync_ops(0)
+            .settled_sync_ops()
             .iter()
             .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
             .map(WireRecord::from)
