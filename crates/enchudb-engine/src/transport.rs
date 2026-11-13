@@ -60,6 +60,41 @@ impl From<Record> for WireRecord {
     }
 }
 
+/// 「同じ record」 の鍵: 版数 + 書き手 + op の中身。
+///
+/// 版数 (HLC) だけでは record は決まらない (#827)。 同じ版数の別の record が正しく並ぶ場面:
+///
+/// - state の Tag の cell: 語の record (Vocab) と値の record (Tie) が cell の版数で並ぶ (`Engine::state_records_for`)
+/// - 書き手自身の state: 版数の無い cell は全部 `as_of` で出る = 同じ版数の Tie が行の数だけ並ぶ
+/// - 中継が版数を付け替えて載せる Vocab (#769 / #780): 指す Tie の版数か `as_of`
+///
+/// 署名の欄は鍵に入れない: 同じ (版数, 書き手, op) を、 署名付きの原型と署名なしの合成 (state) の両方で受けても 1 件。
+fn record_key(r: &WireRecord) -> (Hlc, PeerId, &DecodedOp) {
+    (r.hlc, r.author_peer, &r.op)
+}
+
+/// `log` (版数の昇順) に `records` を足す。 もう `log` にある record と、 `records` の中で 2 度目の record は足さない
+/// (gossip の中継は ring の全部を毎回 publish する = 同じ record が何度も来る)。 同じかは [`record_key`] で見る (#827)。
+/// 足した後も版数の昇順で、 同じ版数の中は 「前から `log` にあった物 → 今回足した物 (`records` の順)」。
+pub fn merge_new_records(log: &mut Vec<WireRecord>, records: Vec<WireRecord>) {
+    let fresh: Vec<bool> = {
+        let mut seen: std::collections::HashSet<_> = log.iter().map(record_key).collect();
+        records.iter().map(|r| seen.insert(record_key(r))).collect()
+    };
+    log.extend(records.into_iter().zip(fresh).filter_map(|(r, f)| f.then_some(r)));
+    log.sort_by_key(|r| r.hlc);
+}
+
+/// 同じ record ([`record_key`]) の 2 つ目以降を落とす (並びは変えない)。
+pub fn dedup_records(records: &mut Vec<WireRecord>) {
+    let first: Vec<bool> = {
+        let mut seen = std::collections::HashSet::with_capacity(records.len());
+        records.iter().map(|r| seen.insert(record_key(r))).collect()
+    };
+    let mut first = first.into_iter();
+    records.retain(|_| first.next().unwrap_or(true));
+}
+
 impl WireRecord {
     /// テスト用: 未署名(署名 slot zero)で WireRecord を作る。
     /// 本番経路では OpLog::iter_committed() 経由で signed な record が来るべき。
@@ -799,28 +834,19 @@ impl Transport for InMemoryTransport {
             .collect()
     }
 
-    fn publish(&self, peer: PeerId, mut records: Vec<WireRecord>) {
+    fn publish(&self, peer: PeerId, records: Vec<WireRecord>) {
         if records.is_empty() { return; }
-        records.sort_by_key(|r| r.hlc);
         let mut guard = self.inner.lock().unwrap();
         let log = guard.entry(peer).or_insert_with(Vec::new);
-        // CRDT 不変式: (peer, hlc) で record は一意。 gossip 経路で同 hlc を
-        // 重複受信するため dedupe しないと publish のたびに log が増殖する。
-        let existing: std::collections::HashSet<Hlc> =
-            log.iter().map(|r| r.hlc).collect();
-        for r in records {
-            if !existing.contains(&r.hlc) {
-                log.push(r);
-            }
-        }
-        log.sort_by_key(|r| r.hlc);
+        // gossip 経路で同じ record を重複受信するため dedupe しないと publish のたびに log が増殖する。
+        // 同じかは版数だけでなく record の中身で見る (#827: 同じ版数の Vocab と Tie は別の record)
+        merge_new_records(log, records);
     }
 
     /// request4: `from` → `to` 専用 log に append。 broadcast 用 `inner` とは
     /// 別の領域なので、 `to` 以外の peer は pull で見えない。
-    fn publish_to(&self, from: PeerId, to: PeerId, mut records: Vec<WireRecord>) {
+    fn publish_to(&self, from: PeerId, to: PeerId, records: Vec<WireRecord>) {
         if records.is_empty() { return; }
-        records.sort_by_key(|r| r.hlc);
         // peer 一覧に to を register (= known_peers() で出るように)
         {
             let mut guard = self.inner.lock().unwrap();
@@ -829,14 +855,7 @@ impl Transport for InMemoryTransport {
         }
         let mut guard = self.targeted.lock().unwrap();
         let log = guard.entry((from, to)).or_insert_with(Vec::new);
-        let existing: std::collections::HashSet<Hlc> =
-            log.iter().map(|r| r.hlc).collect();
-        for r in records {
-            if !existing.contains(&r.hlc) {
-                log.push(r);
-            }
-        }
-        log.sort_by_key(|r| r.hlc);
+        merge_new_records(log, records);
     }
 
     /// request4: `to` peer 視点での pull。 broadcast log + (from, to) targeted log
@@ -855,8 +874,8 @@ impl Transport for InMemoryTransport {
             .filter(|r| r.hlc > since)
             .collect();
         merged.sort_by_key(|r| r.hlc);
-        // dedupe by HLC (broadcast と targeted に同 record があった場合)
-        merged.dedup_by_key(|r| r.hlc);
+        // broadcast と targeted に同じ record があった場合に 1 つにする (同じ版数の別の record は残す、 #827)
+        dedup_records(&mut merged);
         merged
     }
 
@@ -894,7 +913,7 @@ impl Transport for InMemoryTransport {
             .filter(|r| r.hlc > cursor_of(r.author_peer))
             .collect();
         merged.sort_by_key(|r| r.hlc);
-        merged.dedup_by_key(|r| r.hlc);
+        dedup_records(&mut merged);
         merged
     }
 

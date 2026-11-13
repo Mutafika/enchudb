@@ -1014,7 +1014,7 @@ impl<'a> Op<'a> {
 }
 
 /// デコード後の op(読み戻し用、所有型)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DecodedOp {
     Tie { eid: u64, himo_id: u16, value: u64 },
     Untie { eid: u64, himo_id: u16 },

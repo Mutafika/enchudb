@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use enchudb::transport::{decode_batch, encode_batch, Transport, WireRecord};
+use enchudb::transport::{decode_batch, encode_batch, merge_new_records, Transport, WireRecord};
 use enchudb_oplog::{Hlc, PeerId};
 
 // ─────────────────────────────────────────────────────────────
@@ -403,24 +403,17 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
             let params = parse_query(query);
             let peer: PeerId = params.get("peer").and_then(|s| s.parse().ok()).unwrap_or(0);
             match decode_batch(&body) {
-                Ok(mut records) => {
+                Ok(records) => {
                     if records.is_empty() {
                         return send_response(&mut stream, 200, b"");
                     }
-                    records.sort_by_key(|r| r.hlc);
                     let mut guard = storage.lock().unwrap();
                     let room_log = guard.entry(room_id.to_string()).or_insert_with(HashMap::new);
                     let log = room_log.entry(peer).or_insert_with(Vec::new);
-                    // CRDT 不変式: (peer, hlc) で record は一意。 gossip 経由で同 hlc が
-                    // 二度送られる事があるため dedupe しないと relay の log が無限増殖する。
-                    let existing: std::collections::HashSet<enchudb_oplog::Hlc> =
-                        log.iter().map(|r| r.hlc).collect();
-                    for r in records {
-                        if !existing.contains(&r.hlc) {
-                            log.push(r);
-                        }
-                    }
-                    log.sort_by_key(|r| r.hlc);
+                    // gossip 経由で同じ record が二度送られる事があるため dedupe しないと relay の log が無限増殖する。
+                    // 同じかは版数だけでなく record の中身で見る (#827: 同じ版数の Vocab と Tie は別の record。 版数だけで
+                    // 見ると、 Vocab だけ先に publish された後の Tie が入らない)
+                    merge_new_records(log, records);
                     send_response(&mut stream, 200, b"")
                 }
                 Err(e) => {
