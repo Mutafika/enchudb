@@ -435,11 +435,18 @@ fn a_group_cut_apart_before_the_host_closes_is_still_whole_for_a_client_after_re
     }
     let missing: Vec<u32> = SEED.filter(|k| c3.v(*k) != Some(*k as u64)).collect();
     assert!(missing.is_empty(), "c3 で v が食い違う行 {} (先頭 {:?})", missing.len(), &missing[..missing.len().min(5)]);
-    assert!(c3.booted.borrow().is_empty(), "c3 は差分だけで受けた (取り直していない)");
+    // 差分で受けるか state で取り直すかは、 閉じる前にホストの WAL が畳まれていたかで決まる (どちらも正しい答え):
+    // - 畳まれていた: 開き直した後の WAL は組の続きだけ。 前の record を c3 が受けて ack すれば ring が空き、 組がそろって差分で届く
+    // - 畳まれていなかった: bridge の位置は memory なので、 開き直すと WAL を頭から写し直す。 もう配った c2 の record の行が
+    //   もう 1 回 ring を埋め、 ack していない組の前半の行が回収の列の頭を塞ぐので、 写し直した行は回収されない = 組は
+    //   載り切らない。 ホストは floor を上げ、 c3 は state で取り直す。 写し直しを待っている c2 の record も 「ring に行があって
+    //   続きが WAL にある鍵」 なので、 c3 がまだ受けていなければ c2 の分も取り直しになる
+    // 前は 「取り直していない」 を assert していた (試験の誤り: 畳まれていたかは consumer の周期との順で決まり、 並べて回すと
+    // 240 回のうち 39 回は畳まれていなかった)。 写し直しの形を必ず踏む試験は engine の `issue828_settled_after_reopen.rs`
+    let booted = c3.booted.borrow().clone();
+    assert!(booted.iter().all(|a| *a == 1 || *a == 2), "c3 が取り直すのは、 ring に record のある書き手 (c1 / c2) だけ ({booted:?})");
 }
 
-/// ホストでない中継 (A → R → D、 `InMemoryTransport`)。 R の ring を R 自身の record でほぼ埋めておき、 R が A の state
-/// (版数の無い cell = 同じ版数の Tie 600 本) で取り直す。 R の publish は、 ring の端で割れた組を出さない。
 #[test]
 fn a_relay_does_not_publish_a_group_cut_apart_at_the_edge_of_its_ring() {
     const SEED: std::ops::Range<u32> = 1_000..1_300;

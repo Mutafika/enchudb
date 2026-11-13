@@ -331,6 +331,11 @@ impl WsPushClient {
     /// 受け取った record を apply しても、 それ自体は author への消化証明にならない
     /// (**delivery ≠ apply**)。 cursor 前進と ack は従来どおり `Syncer::pull_once`
     /// の仕事で、 **push は pull を置き換えず pull の頻度を下げる**もの。
+    ///
+    /// **`since` には `Syncer::cursors_of(link)` (pull が進めた位置) を渡す** (#830)。 push で受けた record の版数から
+    /// 自分で作らないこと: push は commit の batch ごとで、 同じ (書き手, 版数) の record の組 (state を通った Tag の cell の
+    /// Vocab と Tie など) が 2 つの batch に分かれうる。 前半を受けてその版数を覚え、 つなぎ直すと、 後半は
+    /// `hlc > since` を通らない。 pull の位置は組がそろった所にしか進まない。
     pub fn connect_and_run_multi<F>(
         url: &str,
         from: PeerId,
