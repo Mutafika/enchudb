@@ -14,7 +14,6 @@ use std::time::Duration;
 use enchudb::ValueType;
 use enchudb::engine::Engine;
 use enchudb::sync::Syncer;
-use enchudb::transport::{InMemoryTransport, Transport};
 use enchudb_oplog::{Hlc, PeerId};
 use enchudb_transport::host::{HttpHost, HttpHostTransport};
 
