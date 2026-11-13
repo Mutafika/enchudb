@@ -12825,13 +12825,20 @@ impl Engine {
     /// 名前 = 前の名前の持ち主) があれば、 年表に載せて 1 つに畳む (同じ時刻に同じ名前 = 同じデッキ。 作成を先に受けた peer では、
     /// 束ねた時に同じ行になっている)。 前は、 後の改名の時刻をその行の作成と見て 「改名の後に前の名前で作られた別のデッキ」 と
     /// したまま、 本当の作成が届いても畳み直さなかった。
-    fn note_name_of(&self, local: u32, id: (u32, u32), himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
+    ///
+    /// `just_written`: 呼び手が今この書き込みを cell に当てた (自分の書き込み、 [`Self::note_local_name`])。 当てた書き込みは
+    /// 名前の cell より古くない (cell の版数はこの `hlc`) ので、 #751 の判定は要らない。 #793: 判定は cell の版数を読む
+    /// (`version_of`: 版数の列の commit の確かめ + cell)。 書き手 8 本の insert が名前を書くたびにこの読みを通ると、 sync の表の
+    /// ある DB で合計が 5〜9% 落ちた (書き手 1 本では出ない。 版数の読みだけを残した build は遅いまま、 行の生存の読みだけを
+    /// 残した build は戻る、 と測って決めた)。 受けた record ([`Self::note_name_write`]) は今まで通り判定する。
+    fn note_name_of(&self, local: u32, id: (u32, u32), himo: u16, value: u64, hlc: enchudb_oplog::Hlc, just_written: bool) {
         use std::sync::atomic::Ordering;
         let current = self.himos.get(himo as usize).and_then(|h| h.get_value(local));
         let differs = current.is_some_and(|c| c != value) && self.entities.is_live(local);
         let has = !self.pk_former_empty.load(Ordering::Acquire) && self.pk_former.read().unwrap().has_timeline(local);
         // #751: 今の名前を、 名前の cell より前から持っていたと分かり、 その時刻にその名前だった別の行がある
-        let held_earlier = !differs
+        let held_earlier = !just_written
+            && !differs
             && current == Some(value)
             && self.entities.is_live(local)
             && hlc < self.version_of(local, himo)
@@ -12910,14 +12917,15 @@ impl Engine {
     ) {
         if self.is_remembered_pk_himo(himo) {
             let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
-            self.note_name_of(enchudb_oplog::eid_local(local_eid), id, himo, value, hlc);
+            self.note_name_of(enchudb_oplog::eid_local(local_eid), id, himo, value, hlc, false);
         }
     }
 
-    /// 自分の名前の書き込みを、 改名した行 `local` の名前の年表に載せる (宛名は書き込みの宛名の identity)。
+    /// 自分の名前の書き込みを、 改名した行 `local` の名前の年表に載せる (宛名は書き込みの宛名の identity)。 cell に当てた後
+    /// (`set_cell_in` が true を返した後) に、 当てた版数 `hlc` で呼ぶこと。
     fn note_local_name(&self, local: u32, himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
         if self.is_remembered_pk_himo(himo) {
-            self.note_name_of(local, self.native_identity(local), himo, value, hlc);
+            self.note_name_of(local, self.native_identity(local), himo, value, hlc, true);
         }
     }
 
