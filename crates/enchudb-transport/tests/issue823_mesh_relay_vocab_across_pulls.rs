@@ -186,13 +186,17 @@ impl Mesh {
         self.r.oplog_sync().unwrap();
         self.sr.publish_since(Hlc::ZERO);
     }
+    /// R の ring の、 語 x の Vocab の数。 載せた record が ring に写るのは `oplog_sync` (か consumer の周期) なので、 写してから読む
+    /// (pull の直後に読むと、 consumer が写し終える前の ring を見うる)。
     fn vocab_x_in_r(&self) -> usize {
+        self.r.oplog_sync().unwrap();
         ring(&self.r).iter().filter(|r| is_vocab(r, b"x")).count()
     }
     /// R の ring で、 行 `k` の t の Tie (最後の物) より前に語 x の Vocab があるか。
     fn vocab_precedes_tie_in_r(&self, k: u32) -> bool {
         let row = self.a.pull_raw("notes.k", k)[0];
         let t_himo = self.a.himo_id("notes.t").unwrap() as u16;
+        self.r.oplog_sync().unwrap();
         let ring = ring(&self.r);
         let tie = ring
             .iter()
