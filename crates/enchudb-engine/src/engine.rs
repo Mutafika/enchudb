@@ -128,6 +128,9 @@ struct ChangeNotifier {
     /// engine の外に置く。
     deliver_lock: parking_lot::Mutex<()>,
     gate: parking_lot::Mutex<NotifierGate>,
+    /// #833: 裏の thread (consumer / WAL の空きの待ち手 / 通知係) が指している engine の住所 (`Arc` の中、 0 = 裏の thread は無い)。
+    /// engine の外 (ここ) に置くのは、 `Arc` から取り出された engine が自分の今の住所と比べるため ([`Engine::moved_out_of_arc`])。
+    pinned_at: std::sync::atomic::AtomicUsize,
     /// 門が `Exited` になった (通知係が終わった) ことを Drop に知らせる。
     exited: parking_lot::Condvar,
     /// listener の callback が返った回数と、 通知係が門を通った回数。 Drop はこれが動かない間を 「止まっている」 と見る。
@@ -5286,6 +5289,24 @@ struct AnswerEntry {
     handle: crate::live::AnswerHandle,
 }
 
+/// #833: `Arc` から取り出された engine を見つけた時の知らせ。
+const MOVED_OUT_OF_ARC: &str = "enchudb: this Engine was moved out of its Arc (Arc::try_unwrap / Arc::into_inner) while its background \
+threads (WAL consumer / change notifier) still point at the old address. Keep the Arc<Engine> returned by Engine::create / open / \
+concurrentize_with_oplog and drop it instead of unwrapping it";
+
+/// 組み込み DB の本体。
+///
+/// # `Arc<Engine>` から取り出さない (#833)
+///
+/// WAL 付きの並行の形 ([`Engine::create`] / [`Engine::open`] / [`Engine::concurrentize_with_oplog`] など、 `Arc<Engine>` を返すもの) は
+/// 裏の thread (WAL の書き出し係 = consumer、 changefeed の通知係) を持ち、 thread は `Arc` の中の engine の住所を指す。
+/// **`Arc::try_unwrap` / `Arc::into_inner` で engine を取り出さないこと**: 取り出すと engine が別の住所へ動き、 裏の thread は
+/// 放された memory を読む (SIGSEGV、 または黙って壊れる)。 閉じるのは `drop(arc)` (最後の 1 つを落とすと、 書き出して thread を
+/// 止める)。 `&mut Engine` が要る build phase は `create_standalone` / `open_standalone` で済ませてから
+/// `concurrentize_with_oplog` に渡す。
+///
+/// debug build は、 取り出した engine の API を呼ぶと panic する。 どちらの build も、 取り出した engine を落とす時に知らせを
+/// 出して abort する (裏の thread を安全に止める手が無い)。 根の直し (裏の thread が engine の住所によらない形) は #833。
 pub struct Engine {
     /// #59: 「想定内だが続行不能」 な事象の種別ごとの発生回数。 panic の代替。
     faults: std::sync::Arc<[std::sync::atomic::AtomicU64; FaultKind::COUNT]>,
@@ -5703,6 +5724,8 @@ impl Engine {
 
     /// `create` は WAL 有効 + `Arc<Self>` 返し。
     /// 旧挙動は `create_standalone` で取れる。
+    ///
+    /// 返った `Arc` から engine を取り出さないこと (`Arc::try_unwrap` / `Arc::into_inner`、 [`Engine`] の doc、 #833)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &str) -> io::Result<std::sync::Arc<Self>> {
         Self::create_concurrent_with_oplog(path, 16 * 1024 * 1024)
@@ -6357,6 +6380,8 @@ impl Engine {
 
     /// `open` は WAL 有効 + `Arc<Self>` 返し。
     /// 旧挙動は `open_standalone` で取れる。
+    ///
+    /// 返った `Arc` から engine を取り出さないこと (`Arc::try_unwrap` / `Arc::into_inner`、 [`Engine`] の doc、 #833)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &str) -> io::Result<std::sync::Arc<Self>> {
         Self::open_concurrent_with_oplog(path, 16 * 1024 * 1024)
@@ -7479,6 +7504,32 @@ impl Engine {
         }
         if self.is_replica.load(std::sync::atomic::Ordering::Acquire) {
             panic!("Engine is in replica mode; writes must go through Syncer (remote_*_apply)");
+        }
+        self.debug_check_in_place();
+    }
+
+    /// #833: 裏の thread (consumer / WAL の空きの待ち手 / 通知係) を持つ engine が、 thread の指している住所 (`Arc` の中) から
+    /// 動かされたか。 `Arc::try_unwrap` / `Arc::into_inner` で取り出すと動く (`Arc::get_mut` / `drop` は動かさない)。
+    /// 裏の thread は前の住所 (放された memory) を読み続けるので、 動いた後は何をしても未定義。
+    #[inline]
+    fn moved_out_of_arc(&self) -> bool {
+        let at = self.notifier.pinned_at.load(std::sync::atomic::Ordering::Relaxed);
+        at != 0 && at != self as *const Engine as usize
+    }
+
+    /// #833: 裏の thread (WAL の書き出し係 = consumer / changefeed の通知係) を持つ形か (WAL 付きの並行の形)。 true の engine は
+    /// `Arc` の中から動かせない ([`Engine`] の doc)。
+    pub fn has_background_threads(&self) -> bool {
+        self.notifier.pinned_at.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// #833: debug build だけ。 `Arc` から取り出された engine の API を呼んだら panic する (書き込み / 読み / commit /
+    /// 書き出しの入口で見る)。 release build は見ない (書き込みの道に load 1 つを足さない)。 どちらの build も Drop は見る。
+    #[inline(always)]
+    fn debug_check_in_place(&self) {
+        #[cfg(debug_assertions)]
+        if self.moved_out_of_arc() {
+            panic!("{MOVED_OUT_OF_ARC}");
         }
     }
 
@@ -16671,6 +16722,7 @@ impl Engine {
     /// WAL 有効時のみ意味あり: Commit marker を WAL に append する。
     /// v4: undo ログ廃止に伴い、 rollback API も廃止 (詳細は CLAUDE.md / lib.rs)。
     pub fn commit(&self) {
+        self.debug_check_in_place();
         if let Some(wal) = self.oplog.as_ref() {
             // #268: 失敗は数えて警告する (戻り値が無いので伝播はできない)。
             let _ = self.append_commit_marker(wal);
@@ -17327,6 +17379,7 @@ impl Engine {
 
     /// entity の紐の値。 列の幅によらず u64 (u32 の列の値もそのまま広げて返す)。
     pub fn get(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<u64> {
+        self.debug_check_in_place();
         let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
@@ -17336,6 +17389,7 @@ impl Engine {
     /// `get` の bindings 版。 schema 等で `himo_id` を起動時に pre-resolve した hot path 用。
     /// 名前 lookup (= himo_names の線形検索) が無くなるので point lookup が最速。
     pub fn get_by_id(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u64> {
+        self.debug_check_in_place();
         let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         let eid = enchudb_oplog::eid_local(eid);
         self.himos.get(hid as usize)?.get_value(eid)
@@ -19234,6 +19288,7 @@ impl Engine {
     /// と同じ形。 前は頭を付けずに local の番号を返していた — #32 / issue12 と同じ抜け)。
     /// 値は u32 / u64 / 負でない整数 (負の数は 0 件)。
     pub fn pull_raw(&self, himo: &str, value: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
+        self.debug_check_in_place();
         match (self.himo_id(himo), value.cell_value()) {
             (Some(idx), Some(v)) => {
                 let peer = self.peer_id();
@@ -21100,8 +21155,13 @@ impl Engine {
     ///
     /// 既存 `.wal` ファイルがあれば recover してから consumer 起動。
     /// (build phase で flush 済みなら本体は最新、 WAL は空のまま start)
+    ///
+    /// 返った `Arc` から engine を取り出さないこと (`Arc::try_unwrap` / `Arc::into_inner`、 [`Engine`] の doc、 #833)。
+    /// 取り出した engine をもう一度ここに渡すと panic する。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn concurrentize_with_oplog(mut eng: Self, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        // #833: 裏の thread を持つ engine を値で受けた = `Arc` から取り出されている
+        assert!(!eng.moved_out_of_arc(), "{MOVED_OUT_OF_ARC}");
         let path = eng.path.clone();
         let oplog_path = oplog_path_for(&path);
         // 古い .crc は WAL 活動後に stale になるので削除 (open_concurrent_with_oplog と同じ扱い)
@@ -21534,6 +21594,9 @@ impl Engine {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
+        // #833: 裏の thread を持つ engine を値で受けた = `Arc` から取り出されている (thread は前の住所を指したまま)
+        assert!(!eng.moved_out_of_arc(), "{MOVED_OUT_OF_ARC}");
+
         // 書き手の lock (`.db.lock`、 書き手の process は 1 つ) を持つ engine は、 WAL の flock を開いている間 1 回だけ取る
         // (record ごとの flock の lock / unlock = system call 2 回を省く)。 取れなければ今までどおり record ごとに取る
         #[cfg(not(target_arch = "wasm32"))]
@@ -21578,6 +21641,8 @@ impl Engine {
 
         let engine_ptr: *const Engine = Arc::as_ptr(&arc);
         let engine_addr = engine_ptr as usize;
+        // #833: 裏の thread が指す住所を覚える (`Arc` から取り出して動かした engine を見つける)
+        arc.notifier.pinned_at.store(engine_addr, std::sync::atomic::Ordering::Release);
         // #388: WAL が満杯にぶつかった書き手は落とさず、 consumer が畳むのを待つ。 Engine の Drop が外す
         // (OpLog は Engine より長く生きうるので、 外した後は今までどおりすぐ落とす)
         #[cfg(not(target_arch = "wasm32"))]
@@ -22354,6 +22419,7 @@ impl Engine {
     /// `wal_commit_failures()` で数えられる。
     pub fn oplog_sync(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
+        self.debug_check_in_place();
         self.flush_writes();
         if let Some(wal) = self.oplog.as_ref() {
             // #268: 失敗を握り潰さない。 ここで Commit が打てていないと、 直前に
@@ -23228,6 +23294,13 @@ struct SyncPayloadCols {
 impl Drop for Engine {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
+        // #833: `Arc` から取り出されて動いた engine。 裏の thread は前の住所 (放された memory) を指していて、 止める合図を
+        // 出しても最後の書き出しをその住所でする。 安全に止める手が無いので、 ここで process を止める (WAL に載った分は次の open が
+        // 再生する)。 先へ進むと、 thread が生きたまま mmap が外れる
+        if self.moved_out_of_arc() {
+            eprintln!("{MOVED_OUT_OF_ARC}\n[enchudb] aborting: the background threads cannot be stopped safely");
+            std::process::abort();
+        }
         // #388: 待ち手は engine を指すので先に外す (OpLog は Engine より長く生きうる)
         if let Some(wal) = self.oplog.as_ref() {
             wal.set_room_waiter(None);
