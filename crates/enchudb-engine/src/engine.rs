@@ -5418,6 +5418,10 @@ pub struct Engine {
     /// #656: 開いてから中身 (辞書 / Leaf) の全域を 1 度書き出したか。 前の session が書き出さずに残した page には印が無いので、
     /// それまでは辞書の境目 (`Vocabulary::durable_mark`) を進められない
     content_settled: std::sync::atomic::AtomicBool,
+    /// #813: きれいに閉じなかった後に開いてから、 本体の書き出しが 1 回最後まで成功したか (`write_out_body`)。 それまでの
+    /// 書き出しは列も全域: 前の process が落ちて (OS は生きている) page cache に残した page には印が無く、 印のある範囲だけの
+    /// msync では届かない。 きれいに閉じた後 / 作ったばかりの DB では見ない
+    columns_settled: std::sync::atomic::AtomicBool,
     /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// request18: `sync_tables_enabled()` の cache。 本体は `has_reserved_table`
@@ -5989,6 +5993,7 @@ impl Engine {
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
+            columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -7268,6 +7273,7 @@ impl Engine {
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
+            columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -8536,7 +8542,9 @@ impl Engine {
         use std::sync::atomic::Ordering;
         let Some(ring) = self.sync_payload_ring.get() else { return Ok(()) };
         let pending = self.durable_mark_flush_pending.swap(false, Ordering::AcqRel);
-        let r = ring.flush();
+        // #813: きれいに閉じなかった後に開いてから最初の書き出しは全域 (`write_out_body` と同じ。 行より先に payload)
+        let catch_up = self.himo_reg.rebuilt_on_load && !self.columns_settled.load(Ordering::Acquire);
+        let r = if catch_up { ring.flush_all() } else { ring.flush() };
         if r.is_err() && pending {
             self.durable_mark_flush_pending.store(true, Ordering::Release);
         }
@@ -21938,6 +21946,13 @@ impl Engine {
         };
         // 開いてから最初の書き出しは中身の全域 (前の session が書き出さずに残した page には印が無い。 書き出しの済んだ語の
         // 境目は、 その page も届いた後でないと進められない)
+        // #813: きれいに閉じなかった後に開いてから最初の書き出しは、 中身だけでなく列・版数・残りも全域。 前の process が
+        // 書き出さずに落ちた page は page cache に在って (開いた process はその値を読む)、 この process の印は付いていない。
+        // 版数の列のある DB では再生も同じ HLC・同じ値の cell を書き直さない (#705) ので、 印のある範囲だけ書き出して
+        // checkpoint を進めると、 OS が書き戻す前の電源断で、 WAL に載っていた前の session の書き込みが消えた (語を回収する
+        // DB では、 ディスクの cell がまだ指している語の場所が 「参照 0」 で使い回され、 前の値も読めなかった)
+        let catch_up = !all && self.himo_reg.rebuilt_on_load && !self.columns_settled.load(Ordering::Acquire);
+        let all = all || catch_up;
         let settled = self.content_settled.load(Ordering::Acquire);
         write_content(all || !settled)?;
         if !settled {
@@ -21996,7 +22011,11 @@ impl Engine {
         set.flush_where(all, |k| !content(k) && !points(k) && !version(k))?;
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeVersions);
-        set.flush_where(all, version)
+        set.flush_where(all, version)?;
+        if all {
+            self.columns_settled.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// #656: 書き手が書き出しの門で待った回数 (Tag / Leaf の cell を書こうとして、 その列の門が閉じていた)。 当たっているかを
