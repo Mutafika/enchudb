@@ -1180,6 +1180,11 @@ const WAL_DROP_FLOOR_MAX_DELAY_MS: u64 = 5_000;
 /// consumer を起こして bridge を回すと、 落ちと落ちの間に毎回 「終わった」 になり floor を上げ続けた。
 const WAL_DROP_EPISODE_QUIET_MS: u64 = 100;
 
+/// #783: 落ちた record より後の record を写す前に floor を上げる (静かになるのを待たない) のは、 前に上げてからこれだけ経った時だけ
+/// (ms)。 経っていなければ、 bridge は落ちた record より後の record の手前で止まって待つ (静かになるか、 この間隔か、
+/// `WAL_DROP_FLOOR_MAX_DELAY_MS` まで)。 満杯が続く間に毎周上げると、 全 peer が pull のたびに全状態を取り直す。
+const WAL_DROP_FLOOR_MIN_GAP_MS: u64 = 1_000;
+
 /// `Engine::wal_fold_off` の bit: 書き手が区画を移った時の畳み (#667) を試験で切った。
 const WAL_FOLD_OFF_SWITCH: u8 = 1;
 /// `Engine::wal_fold_off` の bit: consumer の周期の書き出しの後の畳み (#676) を試験で切った。
@@ -5418,6 +5423,10 @@ pub struct Engine {
     /// #656: 開いてから中身 (辞書 / Leaf) の全域を 1 度書き出したか。 前の session が書き出さずに残した page には印が無いので、
     /// それまでは辞書の境目 (`Vocabulary::durable_mark`) を進められない
     content_settled: std::sync::atomic::AtomicBool,
+    /// #813: きれいに閉じなかった後に開いてから、 本体の書き出しが 1 回最後まで成功したか (`write_out_body`)。 それまでの
+    /// 書き出しは列も全域: 前の process が落ちて (OS は生きている) page cache に残した page には印が無く、 印のある範囲だけの
+    /// msync では届かない。 きれいに閉じた後 / 作ったばかりの DB では見ない
+    columns_settled: std::sync::atomic::AtomicBool,
     /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// request18: `sync_tables_enabled()` の cache。 本体は `has_reserved_table`
@@ -5575,7 +5584,14 @@ pub struct Engine {
     /// #57: まだ floor に入れていない、 WAL に載らなかった record (author, 落ちた HLC の max) と、
     /// 最初に落ちた時刻 / 最後に落ちたのを見た時刻 (unix ms)。 満杯の episode が終わったら (最後に落ちてから
     /// `WAL_DROP_EPISODE_QUIET_MS` 落ちなかったら) まとめて floor に入れる。
-    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<(u64, u64)>)>,
+    ///
+    /// #783: 3 つ目は同じ record の author ごとの HLC の min (bridge が、 落ちた record より後の record を見分ける)。
+    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<(u64, u64)>, Vec<(u32, enchudb_oplog::Hlc)>)>,
+    /// #783: 最後に、 落ちた record のために floor を上げた時刻 (unix ms、 0 = まだ)。 落ちた record より後の record を写す前に
+    /// floor を上げる時の間隔 (`WAL_DROP_FLOOR_MIN_GAP_MS`) を見る。
+    wal_drop_floor_last_ms: std::sync::atomic::AtomicU64,
+    /// #783: floor が上がるのを待って、 bridge が落ちた record より後の record を写さずに止まった回数 (観測用)。
+    wal_drop_bridge_holds: std::sync::atomic::AtomicU64,
     /// #268: Commit marker の append が失敗した回数。 失敗すると直前の record 群は
     /// **閉じられない group** として残り、 bridge からも recovery からも見えなくなる。
     wal_commit_failures: std::sync::atomic::AtomicU64,
@@ -5989,6 +6005,7 @@ impl Engine {
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
+            columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -6054,7 +6071,9 @@ impl Engine {
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
-            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None, Vec::new())),
+            wal_drop_floor_last_ms: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_bridge_holds: std::sync::atomic::AtomicU64::new(0),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -7268,6 +7287,7 @@ impl Engine {
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
+            columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -7333,7 +7353,9 @@ impl Engine {
             durable_mark_flush_pending: std::sync::atomic::AtomicBool::new(false),
             durable_cuts: std::sync::Mutex::new(Vec::new()),
             durable_cuts_open: std::sync::atomic::AtomicUsize::new(0),
-            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None, Vec::new())),
+            wal_drop_floor_last_ms: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_bridge_holds: std::sync::atomic::AtomicU64::new(0),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -7645,6 +7667,16 @@ impl Engine {
         let _guard = self.transfer_lock.lock().unwrap();
         self.prune_former_addresses();
 
+        let from = self.sync_ops_offset.load(Ordering::Acquire);
+        let trace = Self::trace_bridge_enabled();
+        // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
+        // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
+        // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
+        // #152: record ごとの終端 offset 付きで読む。 満杯で打ち切ったとき、
+        // 「処理し切った最後の record の終端」まで cursor を進める (partial advance)
+        // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
+        // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
+        let (records, committed_end, pending, stop) = wal.iter_committed_from_with_diag(from);
         // #57: WAL に載らなかった record (満杯) は `_sync_ops` にも入らず、 差分 pull では二度と
         // 届かない。 その author の history floor を上げて、 それより前の cursor の puller を
         // bootstrap (live state の転写、 #140) に回す。
@@ -7665,16 +7697,25 @@ impl Engine {
         // 閉じる時 (consumer の最後の bridge) は待たずに上げる (#449)。 落ちたことはメモリにしか無いので、
         // 待つと閉じた後に floor が残らず、 落ちた write は本体にあるのに相手に永久に届かない。
         let closing = self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire));
+        // #783: floor を上げるまで写さない record の位置 (`records` の中、 その record から後ろは次の周)
+        let mut held_at: Option<usize> = None;
         let due = {
             // #451 (段階 1): WAL が覚えた落ちた record を持ち越しへ移すのは持ち越しの lock の下で (切れ目 (`take_durable_cut`) は
             // この lock を持って両方を見るので、 移す途中の record を見逃さない)
             let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
-            let fresh = wal.take_dropped();
+            // #783: 取り出すのは WAL を読んだ (上の scan) 後。 読んだ record より前に落ちた record は、 ここで必ず見える (落ちた
+            // record は落ちた時に覚える)。 先に取り出すと、 取り出した後に落ちて、 その後に載った (小さくて残りに入った) record を
+            // 同じ周に読み、 落ちた事を知らずに写す
+            let fresh = wal.take_dropped_spans();
             let had_fresh = !fresh.is_empty();
-            for (a, h) in fresh {
+            for (a, lo, hi) in fresh {
                 match p.0.iter_mut().find(|(x, _)| *x == a) {
-                    Some((_, m)) => *m = (*m).max(h),
-                    None => p.0.push((a, h)),
+                    Some((_, m)) => *m = (*m).max(hi),
+                    None => p.0.push((a, hi)),
+                }
+                match p.2.iter_mut().find(|(x, _)| *x == a) {
+                    Some((_, m)) => *m = (*m).min(lo),
+                    None => p.2.push((a, lo)),
                 }
             }
             if p.0.is_empty() {
@@ -7686,7 +7727,19 @@ impl Engine {
                     *last = now_ms;
                 }
                 let quiet = now_ms.saturating_sub(*last) >= WAL_DROP_EPISODE_QUIET_MS;
-                if closing || quiet || now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
+                let overdue = now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS;
+                // #783: 落ちた record より後の record (同じ author の、 HLC が落ちた record の min より後) を、 floor を上げる前に
+                // 写さない。 写すと配られ、 受け手の cursor が落ちた record を越える: 直に pull する相手は後で上がった floor (今) で
+                // 取り直すが、 ホストの下の client は、 ホストが state で取り直した落ちた record を cursor の手前として二度と受けない。
+                // Commit も数える (受け手の cursor は Commit でも進む)。
+                //
+                // 写す物がそこにあるなら、 静かになるのを待たずに今 floor を上げる (止めて待つと、 bridge が読み切らない WAL は
+                // 畳めず、 満杯が続いて、 待つ間の書き込みが全部落ちる)。 ただし前に上げてから `WAL_DROP_FLOOR_MIN_GAP_MS` の間は
+                // 上げずに手前で止まる (満杯が続く間に毎周上げない)
+                held_at = records.iter().position(|(r, _)| p.2.iter().any(|(a, lo)| *a == r.author_peer && r.hlc > *lo));
+                let early = held_at.is_some()
+                    && now_ms.saturating_sub(self.wal_drop_floor_last_ms.load(Ordering::Relaxed)) >= WAL_DROP_FLOOR_MIN_GAP_MS;
+                if closing || quiet || early || overdue {
                     // #451 (段階 1): 持ち越しから取り出さずに写す。 floor を本体に書き終えてから (下) 持ち越しの lock の下で消す:
                     // 書いている間も持ち越しに残っているので、 切れ目 (`take_durable_cut`) はその間も候補を出さない (取り出してから
                     // 書くと、 その間の切れ目が floor の無い落ちた write を印で覆い、 印が ring の書き出しで先に届くと相手に永久に届かない)。
@@ -7709,22 +7762,27 @@ impl Engine {
                 let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
                 // 書いた分だけ消す (書いている間に同じ author がまた落ちて HLC が進んだ分は残す = 次の周にまた上げる)
                 p.0.retain(|e| !dropped.contains(e));
+                // min は、 書いた floor が覆った author の分を消す (残った author = 書いている間にまた落ちた分は、 min が
+                // 小さいまま残る = 次の周も手前で止まる側)
+                let left: Vec<u32> = p.0.iter().map(|(a, _)| *a).collect();
+                p.2.retain(|(a, _)| left.contains(a));
                 if p.0.is_empty() {
                     p.1 = None;
                 }
+                self.wal_drop_floor_last_ms.store(Self::unix_millis(), Ordering::Relaxed);
+                held_at = None;
             }
         }
+        // #783: floor を上げなかった (待っている / 書けなかった) ので、 落ちた record より後の record は写さない
+        let records = match held_at {
+            Some(i) => {
+                self.wal_drop_bridge_holds.fetch_add(1, Ordering::Relaxed);
+                records.into_iter().take(i).collect::<Vec<_>>()
+            }
+            None => records,
+        };
+        let held = held_at.is_some();
 
-        let from = self.sync_ops_offset.load(Ordering::Acquire);
-        let trace = Self::trace_bridge_enabled();
-        // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
-        // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
-        // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
-        // #152: record ごとの終端 offset 付きで読む。 満杯で打ち切ったとき、
-        // 「処理し切った最後の record の終端」まで cursor を進める (partial advance)
-        // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
-        // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
-        let (records, committed_end, pending, stop) = wal.iter_committed_from_with_diag(from);
         if trace {
             eprintln!(
                 "[bridge] scan from={from} committed_end={committed_end} head={} cp={} \
@@ -7748,6 +7806,10 @@ impl Engine {
             .store(pending as u64, Ordering::Relaxed);
 
         if records.is_empty() {
+            // #783: 先頭の record から止めている時は進めない (止めた record を越える)
+            if held {
+                return 0;
+            }
             let empties = self.bridge_empty_scans.fetch_add(1, Ordering::Relaxed) + 1;
             self.warn_if_bridge_stalled(from, wal.head(), wal.checkpoint(), empties, pending, stop);
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
@@ -8034,7 +8096,14 @@ impl Engine {
         // committed_end は最後の Commit record の直後なので、 最終 record の終端
         // (done_end) より必ず先に居る。
         if trace {
-            eprintln!("[bridge] done inserted={count} offset:={committed_end}");
+            eprintln!("[bridge] done inserted={count} offset:={committed_end} held={held}");
+        }
+        if held {
+            // #783: 止めた record の手前まで (`sync_ops_backpressure` と同じ、 処理し切った record の終端)
+            if let Some(end) = done_end {
+                self.advance_sync_ops_cursor(from, end);
+            }
+            return count;
         }
         self.advance_sync_ops_cursor(from, committed_end);
         // 満杯が解消して完走した — 次の満杯では再び warn する
@@ -8374,8 +8443,15 @@ impl Engine {
     ///
     /// 上げるのは bridge (`transfer_oplog_to_sync_ops`) が満杯の episode の終わり (新しく落ちなかった周) を
     /// 見た時、 最初に落ちてから 5 秒経った時、 または閉じる時 (#449)。
+    ///
+    /// #783: 落ちた record より後の record を写す周には、 写す前に上げる (前に上げてから 1 秒の間は、 上げずに手前で止まる)。
     pub fn wal_drop_floor_bumps(&self) -> u64 {
         self.wal_drop_floor_bumps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #783: floor が上がるのを待って、 bridge が落ちた record より後の record を写さずに止まった回数。
+    pub fn wal_drop_bridge_holds(&self) -> u64 {
+        self.wal_drop_bridge_holds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// #451: この Engine を開いた時に、 本体にあって oplog / `_sync_ops` に無かった自分の write を作り直した
@@ -8536,7 +8612,9 @@ impl Engine {
         use std::sync::atomic::Ordering;
         let Some(ring) = self.sync_payload_ring.get() else { return Ok(()) };
         let pending = self.durable_mark_flush_pending.swap(false, Ordering::AcqRel);
-        let r = ring.flush();
+        // #813: きれいに閉じなかった後に開いてから最初の書き出しは全域 (`write_out_body` と同じ。 行より先に payload)
+        let catch_up = self.himo_reg.rebuilt_on_load && !self.columns_settled.load(Ordering::Acquire);
+        let r = if catch_up { ring.flush_all() } else { ring.flush() };
         if r.is_err() && pending {
             self.durable_mark_flush_pending.store(true, Ordering::Release);
         }
@@ -9928,8 +10006,18 @@ impl Engine {
                 }
                 let himo_id = hid as u16;
                 let Some(col) = self.ver_col(himo_id) else { continue };
+                let vals = &self.himos[hid];
                 for local in 0..col.count().min(self.max_entities()) {
-                    // 版数を先に見る (ほとんどの slot はここで外れる)
+                    // #794: 値のある cell は、 行を握らずにここで落とす (列の 1 語を読むだけ)。 前は版数が自分の時計の cell
+                    // ごとに行の読み (`row_locks.read`) まで進み、 外した cell の無い DB でも cell の数だけ払った (state を
+                    // 作る時間が 1.4 倍)。 握らずに見てよい理由: `as_of` 以下の版数の書き込みは、 走査の前に全部 cell に
+                    // 着いている (`wait_for_writers`)。 走査の間に値が見えたなら、 走査の始まりに値があった (外した cell でない)
+                    // か、 その後の書き込み (版数 > as_of、 差分が運ぶ) が置いた値。 どちらでも、 この state に入れる untie は無い。
+                    // 値が無く見えた cell だけ、 下で行を握って値と版数を揃えて読む (今まで通り)
+                    if vals.get_value(local).is_some() {
+                        continue;
+                    }
+                    // 版数を見る (値の無い slot のほとんどはここで外れる)
                     if !mine(self.cell_hlc_local(local, himo_id)) || !self.entities.is_live(local) {
                         continue;
                     }
@@ -12825,13 +12913,20 @@ impl Engine {
     /// 名前 = 前の名前の持ち主) があれば、 年表に載せて 1 つに畳む (同じ時刻に同じ名前 = 同じデッキ。 作成を先に受けた peer では、
     /// 束ねた時に同じ行になっている)。 前は、 後の改名の時刻をその行の作成と見て 「改名の後に前の名前で作られた別のデッキ」 と
     /// したまま、 本当の作成が届いても畳み直さなかった。
-    fn note_name_of(&self, local: u32, id: (u32, u32), himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
+    ///
+    /// `just_written`: 呼び手が今この書き込みを cell に当てた (自分の書き込み、 [`Self::note_local_name`])。 当てた書き込みは
+    /// 名前の cell より古くない (cell の版数はこの `hlc`) ので、 #751 の判定は要らない。 #793: 判定は cell の版数を読む
+    /// (`version_of`: 版数の列の commit の確かめ + cell)。 書き手 8 本の insert が名前を書くたびにこの読みを通ると、 sync の表の
+    /// ある DB で合計が 5〜9% 落ちた (書き手 1 本では出ない。 版数の読みだけを残した build は遅いまま、 行の生存の読みだけを
+    /// 残した build は戻る、 と測って決めた)。 受けた record ([`Self::note_name_write`]) は今まで通り判定する。
+    fn note_name_of(&self, local: u32, id: (u32, u32), himo: u16, value: u64, hlc: enchudb_oplog::Hlc, just_written: bool) {
         use std::sync::atomic::Ordering;
         let current = self.himos.get(himo as usize).and_then(|h| h.get_value(local));
         let differs = current.is_some_and(|c| c != value) && self.entities.is_live(local);
         let has = !self.pk_former_empty.load(Ordering::Acquire) && self.pk_former.read().unwrap().has_timeline(local);
         // #751: 今の名前を、 名前の cell より前から持っていたと分かり、 その時刻にその名前だった別の行がある
-        let held_earlier = !differs
+        let held_earlier = !just_written
+            && !differs
             && current == Some(value)
             && self.entities.is_live(local)
             && hlc < self.version_of(local, himo)
@@ -12910,14 +13005,15 @@ impl Engine {
     ) {
         if self.is_remembered_pk_himo(himo) {
             let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
-            self.note_name_of(enchudb_oplog::eid_local(local_eid), id, himo, value, hlc);
+            self.note_name_of(enchudb_oplog::eid_local(local_eid), id, himo, value, hlc, false);
         }
     }
 
-    /// 自分の名前の書き込みを、 改名した行 `local` の名前の年表に載せる (宛名は書き込みの宛名の identity)。
+    /// 自分の名前の書き込みを、 改名した行 `local` の名前の年表に載せる (宛名は書き込みの宛名の identity)。 cell に当てた後
+    /// (`set_cell_in` が true を返した後) に、 当てた版数 `hlc` で呼ぶこと。
     fn note_local_name(&self, local: u32, himo: u16, value: u64, hlc: enchudb_oplog::Hlc) {
         if self.is_remembered_pk_himo(himo) {
-            self.note_name_of(local, self.native_identity(local), himo, value, hlc);
+            self.note_name_of(local, self.native_identity(local), himo, value, hlc, true);
         }
     }
 
@@ -21946,6 +22042,13 @@ impl Engine {
         };
         // 開いてから最初の書き出しは中身の全域 (前の session が書き出さずに残した page には印が無い。 書き出しの済んだ語の
         // 境目は、 その page も届いた後でないと進められない)
+        // #813: きれいに閉じなかった後に開いてから最初の書き出しは、 中身だけでなく列・版数・残りも全域。 前の process が
+        // 書き出さずに落ちた page は page cache に在って (開いた process はその値を読む)、 この process の印は付いていない。
+        // 版数の列のある DB では再生も同じ HLC・同じ値の cell を書き直さない (#705) ので、 印のある範囲だけ書き出して
+        // checkpoint を進めると、 OS が書き戻す前の電源断で、 WAL に載っていた前の session の書き込みが消えた (語を回収する
+        // DB では、 ディスクの cell がまだ指している語の場所が 「参照 0」 で使い回され、 前の値も読めなかった)
+        let catch_up = !all && self.himo_reg.rebuilt_on_load && !self.columns_settled.load(Ordering::Acquire);
+        let all = all || catch_up;
         let settled = self.content_settled.load(Ordering::Acquire);
         write_content(all || !settled)?;
         if !settled {
@@ -22004,7 +22107,11 @@ impl Engine {
         set.flush_where(all, |k| !content(k) && !points(k) && !version(k))?;
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeVersions);
-        set.flush_where(all, version)
+        set.flush_where(all, version)?;
+        if all {
+            self.columns_settled.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// #656: 書き手が書き出しの門で待った回数 (Tag / Leaf の cell を書こうとして、 その列の門が閉じていた)。 当たっているかを

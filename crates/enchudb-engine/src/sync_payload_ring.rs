@@ -312,6 +312,12 @@ impl PayloadRing {
         self._map.flush_dirty()
     }
 
+    /// commit 済みの全域を書き出す (きれいに閉じなかった後に開いてから最初の書き出し: 前の process が書き出さずに残した page
+    /// には印が無い)。
+    pub fn flush_all(&self) -> io::Result<()> {
+        self._map.flush_all()
+    }
+
     /// 配り済みの印 (#451 段階 1)。 無い (0.35 以前の binary が作った ring / 一度も置いていない) か壊れていれば `None`。
     pub fn durable_mark(&self) -> Option<DurableMark> {
         let _c = self.cursor.lock().unwrap();

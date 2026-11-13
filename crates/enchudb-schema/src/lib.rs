@@ -2208,17 +2208,22 @@ impl<'a> RowBuilder<'a> {
                 eng.rebuild();
                 // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
                 // 他テーブルと衝突しない → marker cond は不要。
-                while let Some(found) = eng.query_by_id64(&[(pk_col.himo_id, pk_raw)]).into_iter().next() {
-                    if !self.replace_on_pk {
-                        return Err(SchemaError::DuplicatePk);
+                let named = [(pk_col.himo_id, pk_raw)];
+                if self.replace_on_pk {
+                    // 当たる道 (既にある行への upsert、 #792): 最初に引いた行を握って確かめるだけ。 外れた時の引き直しは
+                    // 別の関数 (`relookup_named_row`) に出してある
+                    if let Some(found) = eng.query_by_id64(&named).into_iter().next() {
+                        let row = eng.write_row(found);
+                        if eng.is_live(found) && eng.get_by_id(found, pk_col.himo_id) == Some(pk_raw) {
+                            target = Some((found, row));
+                        } else {
+                            drop(row);
+                            target = relookup_named_row(eng, &named, found, &self.table.name_locks.relookups);
+                        }
                     }
-                    let row = eng.write_row(found);
-                    if eng.is_live(found) && eng.get_by_id(found, pk_col.himo_id) == Some(pk_raw) {
-                        target = Some((found, row));
-                        break;
-                    }
-                    drop(row);
-                    self.table.name_locks.relookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if eng.query_by_id64(&named).into_iter().any(|e| eng.is_live(e)) {
+                    // insert は、 その名前の生きた行がある時だけ断る (消えた行に残った名前の cell は 「無い」)
+                    return Err(SchemaError::DuplicatePk);
                 }
             }
         }
@@ -2276,6 +2281,41 @@ impl<'a> RowBuilder<'a> {
             }
         }
         Ok(eid)
+    }
+}
+
+/// #701 / #797: upsert が名前で引いた行 `first` を握ってみたら、 消えていた / 別の名前になっていた。 引き直して、 生きていて
+/// その名前の行を握って返す (無ければ None = 呼び手が新しい行を足す)。 呼び手は名前の lock を握っている。
+///
+/// 引き直しには出口がある: 確かめで外れた行は覚えて、 次に引いた時は飛ばす。 消えた行に名前の cell が残っている DB (0.37.4
+/// 以前は消えた行への update が通って cell が残った) では、 名前で引く読みが生存を見ずにその行を返し続ける。 前は同じ行を握っては
+/// 外れるのを、 名前の lock を握ったまま回り続けた (#797)。 外れた行がもう一度この名前の行になるには、 この名前の lock
+/// (呼び手が握っている) が要る = 覚えた行を飛ばしてよい。 消えた行は 「無い」: 生きた行が他に無ければ None。
+#[cold]
+#[inline(never)]
+fn relookup_named_row<'e>(
+    eng: &'e Engine,
+    named: &[(u16, u64); 1],
+    first: EntityId,
+    relookups: &std::sync::atomic::AtomicU64,
+) -> Option<(EntityId, enchudb_engine::row_lock::RowWrite<'e>)> {
+    relookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut rejected = vec![first];
+    'lookup: loop {
+        for found in eng.query_by_id64(named) {
+            if rejected.contains(&found) {
+                continue;
+            }
+            let row = eng.write_row(found);
+            if eng.is_live(found) && eng.get_by_id(found, named[0].0) == Some(named[0].1) {
+                return Some((found, row));
+            }
+            drop(row);
+            relookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rejected.push(found);
+            continue 'lookup;
+        }
+        return None;
     }
 }
 
@@ -7156,7 +7196,8 @@ impl<'a> EntityUpdate<'a> {
             if raw != u64::MAX {
                 eng.rebuild();
                 let me = enchudb_oplog::eid_local(self.eid);
-                if eng.query_by_id64(&[(pc.himo_id, raw)]).into_iter().any(|e| enchudb_oplog::eid_local(e) != me) {
+                // 消えた行に残った名前の cell は名前を持っている内に入れない (upsert / insert と同じ)
+                if eng.query_by_id64(&[(pc.himo_id, raw)]).into_iter().any(|e| enchudb_oplog::eid_local(e) != me && eng.is_live(e)) {
                     return Err(SchemaError::DuplicatePk);
                 }
             }
