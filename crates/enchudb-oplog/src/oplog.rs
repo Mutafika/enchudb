@@ -7959,7 +7959,8 @@ mod tests {
 
     /// #850 の後 (#873 のレビュー): 1 区画の空け作り (append を止めたまま) は、 頼まれて積まれただけで頼んだ書き手がまだ受け取って
     /// いない位置 (置き場の `served`) では待たない (その書き手は止めている lock を待って寝ていることがある)。 受け取った位置 (印) は
-    /// 当て終えるのを待って畳む。
+    /// 当て終えるのを待つ (待ち切れるかは thread の運なので見ない。 CI の 2 core で、 待つ間に書き手が当て終えなかったことがある)。
+    /// 当て終えた後は畳む。
     #[test]
     fn a_one_half_fold_waits_only_for_positions_a_writer_took() {
         let p = tmp("one_half_served_only");
@@ -8003,9 +8004,11 @@ mod tests {
         took_rx.recv().unwrap();
         let out = wal.checkpoint_and_reset(|_| true, |_| true);
         writer.join().unwrap();
+        // 待つ間に当て終えていれば畳んだ。 当て終える前に待ち切れていれば、 当て終えた後の空け作りが畳む
+        let folded = out.1 || wal.checkpoint_and_reset(|_| true, |_| true).1;
         let _ = std::fs::remove_file(&p);
-        assert!(wal.one_half_waits.load(Ordering::Relaxed) > waits, "前提: 受け取った位置で待った");
-        assert_eq!(out, (true, true), "当て終えるのを待って畳む");
+        assert!(wal.one_half_waits.load(Ordering::Relaxed) > waits, "受け取った位置で、 当て終えるのを待たなかった");
+        assert!(folded, "当て終えた後に畳まない");
     }
 
     /// #850: 空け作り (`checkpoint_and_reset`) は、 当てていない record の手前までしか checkpoint を進めず、 畳まない。 当て終えた
