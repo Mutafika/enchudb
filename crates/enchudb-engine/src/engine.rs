@@ -24570,6 +24570,14 @@ impl Engine {
         self.vocab.rebuilt_on_load
     }
 
+    /// 観測用 — この Engine の open 時に紐名の辞書の clean の印が倒れていたか (= 前の session をきれいに閉じなかった)。 #451 の作り直し
+    /// (WAL 付きの open) と #880 の単独の open の往復がこの印で決まる。 単独の open が返した sync の DB の engine は、 往復を済ませて
+    /// いるので false。
+    #[doc(hidden)]
+    pub fn himo_index_rebuilt_on_load(&self) -> bool {
+        self.himo_reg.rebuilt_on_load
+    }
+
     /// region CRC を計算して `.crc` sidecar に永続化する。
     /// flush() とは別の opt-in API。512MB+ の vocab 走査を含むので秒オーダー。
     /// コールドバックアップを封緘するユースケース向け。
