@@ -576,7 +576,8 @@ fn an_old_eid_is_not_forwarded_by_the_fold_alias_of_the_row_that_reused_its_slot
 
 /// きれいに閉じなかった後に開くと、 gen.seg の表と page の印を世代の byte から立て直す。 印と世代の byte は gen.seg の別の page なので、
 /// 電源断で世代の byte だけ届いた像がありうる。 印が無いと出口 (`pull_raw` / `find`) が世代を読まず、 使い回した行に前の住人の eid を
-/// 渡した。 像は checkpoint を進めた後の写し (再生する record が無い = 再生は印を立て直さない)。
+/// 渡した。 像は開いたままの DB (WAL 付き) の写しで、 checkpoint を進めた後に WAL を外す (再生する record が無い。 再生は上げる世代で
+/// 印も立てるので、 再生があると立て直しを確かめられない)。
 #[test]
 fn generation_marks_are_rebuilt_after_an_unclean_close() {
     let made = tmp_path("marks");
@@ -592,10 +593,13 @@ fn generation_marks_are_rebuilt_after_an_unclean_close() {
         let c = eng.entity_in("notes").unwrap();
         assert_eq!(slot(c), slot(a), "前提: 使い回す");
         eng.tie_to(c, "notes.note", 3u32);
-        eng.oplog_sync().unwrap(); // checkpoint を進める (再生する record を残さない)
+        eng.oplog_sync().unwrap(); // 本体を書き出して checkpoint を進める
+        let hold = eng.hold_consumer();
         copy_dir(std::path::Path::new(&made), std::path::Path::new(&image));
+        drop(hold);
         (a, c)
     };
+    std::fs::remove_file(std::path::Path::new(&image).join("oplog")).unwrap();
     wipe_generation_marks(&image, None);
     let eng = Engine::open_concurrent_with_oplog(&image, WAL).unwrap();
     assert_eq!(eng.pull_raw("notes.note", 3u32), vec![new], "印の無い像で、 出口が使い回した行に前の住人の eid を渡した");

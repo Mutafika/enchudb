@@ -352,6 +352,35 @@ impl GenReader<'_> {
             _ => slot,
         }
     }
+
+    /// 場所の並び → eid (出口の写し)。 256 個ずつ、 その範囲の page に印が 1 つも無ければ世代を読まずに写す (使い回しの無い所は
+    /// 1 個ずつの印の読みも無い = master と同じ形の loop)。 範囲が広い (並んでいない) 塊は 1 個ずつ。
+    pub(crate) fn eids(&self, peer: u32, slots: &[u32]) -> Vec<u64> {
+        let plain = |s: u32| enchudb_oplog::make_eid(peer, s);
+        let Some(r) = self.region.filter(|_| self.bits != 0) else {
+            return slots.iter().map(|&s| plain(s)).collect();
+        };
+        let mut out = Vec::with_capacity(slots.len());
+        for chunk in slots.chunks(256) {
+            let (lo, hi) = chunk.iter().fold((u32::MAX, 0u32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
+            if !any_page_marked(r, lo, hi) {
+                out.extend(chunk.iter().map(|&s| plain(s)));
+            } else {
+                out.extend(chunk.iter().map(|&s| plain((read_gen(r, s) << self.bits) | s)));
+            }
+        }
+        out
+    }
+}
+
+/// 場所 `lo..=hi` の page のどれかに印があるか (page が 64 を越える広い範囲は 「ある」 と答える = 1 個ずつ読む)。
+#[inline]
+fn any_page_marked(r: &Region, lo: u32, hi: u32) -> bool {
+    let (p0, p1) = (lo >> PAGE_SHIFT, hi >> PAGE_SHIFT);
+    if p1 >= PAGES || p1 - p0 > 64 {
+        return true;
+    }
+    (p0..=p1).any(|p| r.as_atomic_u8(OFF_PAGES + (p / 8) as usize).load(Ordering::Acquire) & (1 << (p % 8)) != 0)
 }
 
 #[cfg(test)]

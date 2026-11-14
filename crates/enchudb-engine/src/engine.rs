@@ -15863,8 +15863,8 @@ impl Engine {
         if !self.exit_reads_generations(hid.and_then(|h| self.himo_table_get(h))) {
             return slots.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect();
         }
-        let gens = self.generations().reader();
-        slots.into_iter().map(|l| enchudb_oplog::make_eid(peer, gens.local(l))).collect()
+        let slots: Vec<u32> = slots.into_iter().collect();
+        self.generations().reader().eids(peer, &slots)
     }
 
     /// #731: きれいに閉じなかった後に開いた時、 gen.seg の表と page の印を世代の byte から立て直す (`Generations::heal_marks`)。
