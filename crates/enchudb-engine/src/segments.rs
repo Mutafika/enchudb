@@ -54,6 +54,8 @@ pub enum SegmentKind {
     ContentData,
     LeafData,
     Tomb,
+    /// #731: 場所ごとの世代 (1 B / 場所、 `crate::generation`)。 最初に場所を使い回した時に作る (file version 15)。
+    Gen,
     Himo(u32),
     Ver(u32),
 }
@@ -87,6 +89,7 @@ impl SegmentKind {
             SegmentKind::ContentData => "content.data.seg".into(),
             SegmentKind::LeafData => "leaf.data.seg".into(),
             SegmentKind::Tomb => "tomb.seg".into(),
+            SegmentKind::Gen => "gen.seg".into(),
             SegmentKind::Himo(h) => format!("himo/{h:04}.seg").into(),
             SegmentKind::Ver(h) => format!("ver/{h:04}.seg").into(),
         }
@@ -146,6 +149,8 @@ pub struct SegmentSet {
     /// `set_space_margin` の現在値。 遅延 open した segment にも同じ余裕を効かせる。
     space_margin: AtomicU64,
     tomb: RwLock<Option<Arc<SegmentMap>>>,
+    /// #731: 世代の segment (`gen.seg`、 file version 15 の DB だけ)。
+    generation: RwLock<Option<Arc<SegmentMap>>>,
     /// 直前に書いた manifest の中身。 segment 長は grow でしか動かないので、 同じなら
     /// 書き直さない (`body_msync` は sync 経路から毎回呼ばれる)。 Mutex は 「同時に
     /// 2 本が manifest を書く」 のを止める役も兼ねる。
@@ -214,6 +219,7 @@ impl SegmentSet {
             readonly: false,
             space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
+            generation: RwLock::new(None),
             last_manifest: Mutex::new(None),
             manifest_written_at: Mutex::new(None),
         };
@@ -300,6 +306,7 @@ impl SegmentSet {
             readonly,
             space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
+            generation: RwLock::new(None),
             last_manifest: Mutex::new(known),
             manifest_written_at: Mutex::new(None),
         })
@@ -331,6 +338,7 @@ impl SegmentSet {
             SegmentKind::Himo(h) => self.lazy_slot(&self.himo, kind, h),
             SegmentKind::Ver(h) => self.lazy_slot(&self.ver, kind, h),
             SegmentKind::Tomb => self.tomb.read().unwrap().clone(),
+            SegmentKind::Gen => self.generation.read().unwrap().clone(),
             other => self.fixed.get(&other).cloned(),
         }
     }
@@ -451,6 +459,26 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// #731: `gen.seg` を作る (無ければ) / 開く。 前の残り (v15 に移る途中で落ちた像) があれば開くだけで、 中身を 0 に戻すのは
+    /// 呼び手 (`Engine` の v15 に移る手順)。 消して作り直さない (manifest が前の長さを覚えていると、 落ちた後に開けない)。
+    pub fn ensure_gen(&self, size: usize) -> io::Result<()> {
+        let mut g = self.generation.write().unwrap();
+        if g.is_none() {
+            *g = Some(self.create_or_open(SegmentKind::Gen, size)?);
+        }
+        Ok(())
+    }
+
+    /// #731: 開いた DB の `gen.seg` を開く (header が世代を持つと言う DB だけ)。
+    pub fn open_gen(&self, size: usize) -> io::Result<()> {
+        let p = Self::path_of(&self.dir, SegmentKind::Gen);
+        let seg = SegmentMap::open(&p, size, self.readonly).map_err(|e| {
+            io::Error::new(e.kind(), format!("segment {} ({}): {}", SegmentKind::Gen.name(), p.display(), e))
+        })?;
+        *self.generation.write().unwrap() = Some(Arc::new(seg));
+        Ok(())
+    }
+
     pub fn ensure_tomb(&self, size: usize) -> io::Result<()> {
         let mut t = self.tomb.write().unwrap();
         if t.is_some() {
@@ -486,6 +514,9 @@ impl SegmentSet {
         }
         if let Some(t) = self.tomb.read().unwrap().as_ref() {
             out.push((SegmentKind::Tomb, t.clone()));
+        }
+        if let Some(g) = self.generation.read().unwrap().as_ref() {
+            out.push((SegmentKind::Gen, g.clone()));
         }
         out
     }
@@ -662,6 +693,9 @@ impl SegmentSet {
         }
         if let Some(t) = self.tomb.read().unwrap().as_ref() {
             push(SegmentKind::Tomb, Some(t), 0)?;
+        }
+        if let Some(g) = self.generation.read().unwrap().as_ref() {
+            push(SegmentKind::Gen, Some(g), 0)?;
         }
         lens.sort();
         // 書く必要があるか (= 前回から伸びたか) を lock 内で判定する。 sync 経路は

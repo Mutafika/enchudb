@@ -237,7 +237,9 @@ fn reused_eid_after_the_table_is_full_is_not_newest() {
     // 枠を使い切る前の削除 + 追加は末尾に足す (上の test)。 使い切った後は、 空いた eid を使い直す
     eng.delete(rows[2]);
     let reborn = add(&eng, "posts", ts, 999);
-    assert_eq!(reborn, rows[2], "枠を使い切った table が、 空いた eid を使い直さなかった (test の前提)");
+    // #731: 場所を使い直す (eid は世代が違う)
+    assert_eq!(eng.eid_slot(reborn), eng.eid_slot(rows[2]), "枠を使い切った table が、 空いた場所を使い直さなかった (test の前提)");
+    assert_ne!(reborn, rows[2], "使い直した場所に消えた行の eid を渡した");
 
     let got = eng.recent_by_id(ts, cap as usize);
     assert_eq!(got.len(), cap as usize);

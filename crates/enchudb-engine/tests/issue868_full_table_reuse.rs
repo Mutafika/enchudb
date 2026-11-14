@@ -63,7 +63,9 @@ fn churning_a_full_table_does_not_scan_the_table() {
             let old = rows.pop_front().unwrap();
             eng.delete(old);
             let e = insert(&eng, CAP + i);
-            assert_eq!(e, old, "sync={sync}: 消した行の slot を使い回していない (表は満杯)");
+            // #731: 使い回した場所の eid は世代が違う (場所で見る)
+            assert_eq!(eng.eid_slot(e), eng.eid_slot(old), "sync={sync}: 消した行の slot を使い回していない (表は満杯)");
+            assert_ne!(e, old, "sync={sync}: 使い回した場所に消えた行の eid を渡した");
             rows.push_back(e);
         }
         let scanned = eng.free_slot_scans() - scans;

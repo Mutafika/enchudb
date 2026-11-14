@@ -133,11 +133,11 @@ fn num(v: Value) -> Option<i64> {
 
 /// 列 `cd` への等値の値 → engine の値。 列の値域に入らない / 型が合わなければ None (Tag は vocab を引く
 /// 呼び側で)。
-fn eq_raw(cd: &ColumnInner, v: &Value) -> Option<u64> {
+fn eq_raw(eng: &Engine, cd: &ColumnInner, v: &Value) -> Option<u64> {
     match (cd.ty, v) {
         (ColumnType::Number, Value::Number(n)) if *n >= 0 && (*n as u64) < u32::MAX as u64 => Some(*n as u64),
         (ColumnType::BigInt, Value::Number(n)) => big_raw(*n),
-        (ColumnType::Ref, Value::Ref(eid)) => Some(enchudb_oplog::eid_local(*eid) as u64),
+        (ColumnType::Ref, Value::Ref(eid)) => Some(eng.ref_value(*eid)),
         _ => None,
     }
 }
@@ -2122,7 +2122,7 @@ impl<'a> Table<'a> {
         let cd = self.inner.col(col).filter(|c| c.ty == ColumnType::Number)?;
         let ext = self.eid_extents();
         let inside = |e: EntityId| {
-            let l = enchudb_oplog::eid_local(e);
+            let l = self.db.eng.eid_slot(e); // #731: 枠と比べるのは場所
             ext.iter().any(|&(lo, hi)| lo <= l && l < hi)
         };
         Some(self.db.eng.first_by_id(cd.himo_id, 0, u64::MAX, desc, inside).map(|(v, _)| v as u32))
@@ -2435,7 +2435,7 @@ impl LiveCounts {
         match self.ty {
             ColumnType::Number => Value::Number(v as i64),
             ColumnType::BigInt => Value::Number(big_val(v)),
-            ColumnType::Ref => Value::Ref(enchudb_oplog::make_eid(self.eng.peer_id(), v as u32)),
+            ColumnType::Ref => Value::Ref(self.eng.ref_eid(v)),
             ColumnType::Tag | ColumnType::Leaf => Value::Text(String::from_utf8_lossy(self.eng.vocab_text(v as u32)).into_owned()),
         }
     }
@@ -2444,7 +2444,7 @@ impl LiveCounts {
         match (self.ty, v) {
             (ColumnType::Number, Value::Number(n)) => u32::try_from(*n).ok().map(u64::from),
             (ColumnType::BigInt, Value::Number(n)) => big_raw(*n),
-            (ColumnType::Ref, Value::Ref(e)) => Some(enchudb_oplog::eid_local(*e) as u64),
+            (ColumnType::Ref, Value::Ref(e)) => Some(self.eng.ref_value(*e)),
             (ColumnType::Tag, Value::Text(t)) => self.eng.vocab_id(t).map(u64::from),
             _ => None,
         }
@@ -3029,13 +3029,12 @@ impl<'a> JoinQuery<'a> {
     pub fn find(self) -> Result<Vec<(EntityId, EntityId)>, SchemaError> {
         let eng = self.left.db.arc_engine();
         let Some(plan) = self.plan()? else { return Ok(Vec::new()) };
-        let peer = eng.peer_id();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         // entity の鍵 (ref の道をたどった先の列の値)
         let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
             let mut cur = e;
             for &p in path {
-                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+                cur = eng.ref_eid(eng.get_by_id(cur, p)?);
             }
             eng.get_by_id(cur, h)
         };
@@ -3044,7 +3043,7 @@ impl<'a> JoinQuery<'a> {
             JoinPlan::Ref { preds, via, .. } => {
                 for a in eng.find_by(preds).map_err(io)? {
                     if let Some(k) = key(a, &[], via) {
-                        out.push((a, enchudb_oplog::make_eid(peer, k as u32)));
+                        out.push((a, eng.ref_eid(k)));
                     }
                 }
             }
@@ -3292,7 +3291,6 @@ impl LiveJoin {
         match &self.inner {
             JoinLive::Empty => {}
             JoinLive::Ref { left, right, via } => {
-                let peer = self.eng.peer_id();
                 let (kd, dr) = (left.poll(&self.eng), right.poll(&self.eng));
                 // 作り直した右の row (消した row の eid が別の row になった): 左の row は同じ鍵で集合に居続けるので
                 // 鍵付きの購読の差分に出ないが、 組の右は別物 → 居続けた組も出て入り直す
@@ -3301,7 +3299,7 @@ impl LiveJoin {
                 if !reborn.is_empty() {
                     let moved: std::collections::BTreeSet<EntityId> = kd.removed.iter().chain(kd.added.iter()).map(|x| x.0).collect();
                     for b in reborn {
-                        let k = enchudb_oplog::eid_local(b);
+                        let k = self.eng.eid_slot(b);
                         for a in self.eng.query_by_id(&[(*via, k)]) {
                             if !moved.contains(&a) && left.reported_key(a) == Some(k as u64) {
                                 d.removed.push((a, b));
@@ -3310,7 +3308,7 @@ impl LiveJoin {
                         }
                     }
                 }
-                let pair = |(a, k): (EntityId, u64)| (a, enchudb_oplog::make_eid(peer, k as u32));
+                let pair = |(a, k): (EntityId, u64)| (a, self.eng.ref_eid(k));
                 d.removed.extend(kd.removed.into_iter().map(pair));
                 d.added.extend(kd.added.into_iter().map(pair));
             }
@@ -3641,11 +3639,10 @@ impl<'a> MultiJoin<'a> {
         let eng = self.comps[0].db.arc_engine();
         let Some((preds, steps)) = self.plan()? else { return Ok(Vec::new()) };
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
-        let peer = eng.peer_id();
         let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
             let mut cur = e;
             for &p in path {
-                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+                cur = eng.ref_eid(eng.get_by_id(cur, p)?);
             }
             eng.get_by_id(cur, h)
         };
@@ -3658,7 +3655,7 @@ impl<'a> MultiJoin<'a> {
             let mut by_key: std::collections::BTreeMap<u64, Vec<EntityId>> = std::collections::BTreeMap::new();
             for &c in &rows[k + 1] {
                 let kk = match st.child_key {
-                    None => Some(enchudb_oplog::eid_local(c) as u64),
+                    None => Some(eng.ref_value(c)),
                     Some(h) => key(c, &[], h),
                 };
                 if let Some(kk) = kk {
@@ -4003,7 +4000,7 @@ impl LiveStep {
         let dc: Keyed<EntityId> = match &self.child {
             ChildStream::Rows(q) => {
                 let d = q.poll(eng);
-                let key = |e: EntityId| enchudb_oplog::eid_local(e) as u64;
+                let key = |e: EntityId| eng.ref_value(e);
                 let rs: BTreeSet<EntityId> = d.removed.iter().copied().collect();
                 Keyed {
                     reentered: d.added.iter().copied().filter(|e| rs.contains(e)).collect(),
@@ -4165,11 +4162,10 @@ impl<'a> LagQuery<'a> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let Some((preds, part, (opath, oh))) = self.plan()? else { return Ok(Vec::new()) };
-        let peer = eng.peer_id();
         let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
             let mut cur = e;
             for &p in path {
-                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+                cur = eng.ref_eid(eng.get_by_id(cur, p)?);
             }
             eng.get_by_id(cur, h)
         };
@@ -4360,10 +4356,10 @@ impl<'a> UnderQuery<'a> {
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let up = self.up;
         let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
-        let peer = eng.peer_id();
-        let local = |e: EntityId| enchudb_oplog::eid_local(e);
-        let col_parent = |x: u32| eng.get_by_id(enchudb_oplog::make_eid(peer, x), via).map(|p| p as u32);
-        let refs = HierRef { parent: &col_parent };
+        let local = |e: EntityId| eng.eid_slot(e);
+        let col_parent = |x: u32| eng.get_by_id(eng.slot_eid(x), via).map(|p| eng.eid_slot(eng.ref_eid(p)));
+        let slot_of = |e: EntityId| eng.eid_slot(e);
+        let refs = HierRef { parent: &col_parent, slot: &slot_of };
         let mut memo = Some(std::collections::BTreeMap::new());
         let mut h = Hier::new(up);
         if let Hier::Up(ab) = &mut h {
@@ -4386,7 +4382,7 @@ impl<'a> UnderQuery<'a> {
             .map_err(io)?
             .into_iter()
             .filter(|&e| h.find_answer(local(e), &refs, &mut memo))
-            .map(|e| enchudb_oplog::make_eid(peer, local(e)))
+            
             .collect();
         out.sort_unstable();
         Ok(out)
@@ -4404,7 +4400,7 @@ impl<'a> UnderQuery<'a> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let up = self.up;
-        let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up), filt: Default::default(), reported: Default::default() });
+        let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up), filt: Default::default(), reported: Default::default(), reported_eid: Default::default() });
         let Some((f, sd, a, via)) = self.plan()? else {
             return Ok(LiveUnder { eng, live: None, state });
         };
@@ -4423,6 +4419,8 @@ impl<'a> UnderQuery<'a> {
 /// 書き込みごとに維持される (試した版: 社員 100 万で RSS +45 MB、 1 万件まとめ -4%)。 子は当てた差分から持つ。
 struct HierRef<'e> {
     parent: &'e dyn Fn(u32) -> Option<u32>,
+    /// #731: eid / Ref の値 → 場所 (世代を外す)。
+    slot: &'e dyn Fn(EntityId) -> u32,
 }
 
 impl HierRef<'_> {
@@ -4835,7 +4833,7 @@ impl Hier {
     /// 親の付け替えと seed の出入りを当てて、 答えが変わりうる row を返す。
     fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta, h: &HierRef) -> Vec<u32> {
         use std::collections::BTreeSet;
-        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let local = |e: EntityId| (h.slot)(e);
         // 外れた ref (付け替えは added で上書き)
         let mut readded: Vec<EntityId> = dp.added.iter().map(|x| x.0).collect();
         readded.sort_unstable();
@@ -4845,10 +4843,10 @@ impl Hier {
                 // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
                 let mut roots: BTreeSet<u32> = dp.removed.iter().chain(dp.added.iter()).map(|(e, _)| local(*e)).collect();
                 for &(e, p) in &dp.removed {
-                    tree.children.remove(p as u32, local(e));
+                    tree.children.remove((h.slot)(p), local(e));
                 }
                 for &(e, p) in &dp.added {
-                    tree.children.insert(p as u32, local(e));
+                    tree.children.insert((h.slot)(p), local(e));
                 }
                 for &e in &ds.removed {
                     tree.seed.remove(local(e));
@@ -4870,7 +4868,7 @@ impl Hier {
                         a.parent.remove(c);
                     }
                     for &(e, p) in &dp.added {
-                        a.parent.insert(local(e), p as u32);
+                        a.parent.insert(local(e), (h.slot)(p));
                     }
                     for &e in &ds.removed {
                         a.seed.remove(&local(e));
@@ -4887,7 +4885,7 @@ impl Hier {
                     a.reparent(c, None, &mut touched);
                 }
                 for &(e, p) in &dp.added {
-                    a.reparent(local(e), Some(p as u32), &mut touched);
+                    a.reparent(local(e), Some((h.slot)(p)), &mut touched);
                 }
                 for &e in &ds.removed {
                     a.set_seed(local(e), false, &mut touched);
@@ -4908,6 +4906,8 @@ struct UnderState {
     filt: RowSet,
     /// 最後に渡した row。
     reported: RowSet,
+    /// #731: 最後に渡した row のうち、 世代の付いた eid で渡した物 (場所 → eid)。 removed には渡した eid を出す
+    reported_eid: std::collections::BTreeMap<u32, EntityId>,
 }
 
 /// [`UnderQuery::subscribe`] の戻り値。 階層の配下 (または上) の row の出入りを購読する。
@@ -4924,17 +4924,17 @@ impl LiveUnder {
         use std::collections::BTreeSet;
         let Some((parents, seeds, filter)) = &self.live else { return LiveDelta::default() };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let UnderState { hier, filt, reported } = &mut *st;
-        let peer = self.eng.peer_id();
-        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let UnderState { hier, filt, reported, reported_eid } = &mut *st;
+        let local = |e: EntityId| self.eng.eid_slot(e);
         let (dp, ds, df) = (parents.poll(&self.eng), seeds.poll(&self.eng), filter.poll(&self.eng));
         // 入り直した row (eid の使い回し) は別物: 答えが同じでも出て入り直す
         let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
         let mut touched = parents.with_reported(|get| {
-            let parent = |x: u32| get(enchudb_oplog::make_eid(peer, x)).map(|p| p as u32);
-            hier.apply(&dp, &ds, &HierRef { parent: &parent })
+            let parent = |x: u32| get(self.eng.slot_eid(x)).map(|p| self.eng.eid_slot(self.eng.ref_eid(p)));
+            let slot_of = |e: EntityId| self.eng.eid_slot(e);
+            hier.apply(&dp, &ds, &HierRef { parent: &parent, slot: &slot_of })
         });
         for &e in &df.removed {
             filt.remove(local(e));
@@ -4951,19 +4951,31 @@ impl LiveUnder {
         for x in touched {
             let now = hier.answer(x) && filt.contains(x);
             let was = reported.contains(x);
-            let e = enchudb_oplog::make_eid(peer, x);
+            // #731: 渡した eid と今の eid (場所を使い回していれば世代が違う = 出て入り直した)
+            let e = self.eng.slot_eid(x);
+            let base = enchudb_oplog::make_eid(self.eng.peer_id(), x);
+            let old = if was { reported_eid.get(&x).copied().unwrap_or(base) } else { e };
             match (was, now) {
                 (false, true) => {
                     reported.insert(x);
+                    if e != base {
+                        reported_eid.insert(x, e);
+                    }
                     d.added.push(e);
                 }
                 (true, false) => {
                     reported.remove(x);
-                    d.removed.push(e);
+                    reported_eid.remove(&x);
+                    d.removed.push(old);
                 }
-                (true, true) if reborn.contains(&x) => {
-                    d.removed.push(e);
+                (true, true) if reborn.contains(&x) || old != e => {
+                    d.removed.push(old);
                     d.added.push(e);
+                    if e != base {
+                        reported_eid.insert(x, e);
+                    } else {
+                        reported_eid.remove(&x);
+                    }
                 }
                 _ => {}
             }
@@ -5029,8 +5041,7 @@ impl<'a> ReachQuery<'a> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let Some(p) = self.plan()? else { return Ok(Vec::new()) };
-        let peer = eng.peer_id();
-        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let local = |e: EntityId| eng.eid_slot(e);
         let mut add = Vec::new();
         for e in eng.find_by(p.edges).map_err(io)? {
             if let (Some(s), Some(d)) = (eng.get_by_id(e, p.src), eng.get_by_id(e, p.dst)) {
@@ -5041,7 +5052,7 @@ impl<'a> ReachQuery<'a> {
         let mut g = Graph::default();
         g.update(&[], &add, &[], &seeds);
         let mut out: Vec<EntityId> =
-            eng.find_by(p.filter).map_err(io)?.into_iter().filter(|&e| g.reached(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
+            eng.find_by(p.filter).map_err(io)?.into_iter().filter(|&e| g.reached(local(e))).collect();
         out.sort_unstable();
         Ok(out)
     }
@@ -5423,6 +5434,8 @@ struct ReachState {
     filt: RowSet,
     /// 最後に渡した row。
     reported: RowSet,
+    /// #731: 最後に渡した row のうち、 世代の付いた eid で渡した物 (場所 → eid)。 removed には渡した eid を出す
+    reported_eid: std::collections::BTreeMap<u32, EntityId>,
 }
 
 /// [`ReachQuery::subscribe`] の戻り値。 辺の table をたどって届く row の出入りを購読する。
@@ -5438,9 +5451,8 @@ impl LiveReach {
         use std::collections::BTreeSet;
         let Some(lv) = &self.live else { return LiveDelta::default() };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let ReachState { graph, filt, reported } = &mut *st;
-        let peer = self.eng.peer_id();
-        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let ReachState { graph, filt, reported, reported_eid } = &mut *st;
+        let local = |e: EntityId| self.eng.eid_slot(e);
         let (dsrc, ddst, ds, df) = (lv.src.poll(&self.eng), lv.dst.poll(&self.eng), lv.seeds.poll(&self.eng), lv.filter.poll(&self.eng));
         // 辺の row の (始点, 終点) の前後。 後 = 鍵付きの購読が渡し済みの鍵、 前 = 差分の removed か、 動いていなければ後と同じ
         let mut rows: Vec<EntityId> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
@@ -5482,19 +5494,31 @@ impl LiveReach {
         for x in touched {
             let now = graph.reached(x) && filt.contains(x);
             let was = reported.contains(x);
-            let e = enchudb_oplog::make_eid(peer, x);
+            // #731: 渡した eid と今の eid (場所を使い回していれば世代が違う = 出て入り直した)
+            let e = self.eng.slot_eid(x);
+            let base = enchudb_oplog::make_eid(self.eng.peer_id(), x);
+            let old = if was { reported_eid.get(&x).copied().unwrap_or(base) } else { e };
             match (was, now) {
                 (false, true) => {
                     reported.insert(x);
+                    if e != base {
+                        reported_eid.insert(x, e);
+                    }
                     d.added.push(e);
                 }
                 (true, false) => {
                     reported.remove(x);
-                    d.removed.push(e);
+                    reported_eid.remove(&x);
+                    d.removed.push(old);
                 }
-                (true, true) if reborn.contains(&x) => {
-                    d.removed.push(e);
+                (true, true) if reborn.contains(&x) || old != e => {
+                    d.removed.push(old);
                     d.added.push(e);
+                    if e != base {
+                        reported_eid.insert(x, e);
+                    } else {
+                        reported_eid.remove(&x);
+                    }
                 }
                 _ => {}
             }
@@ -5874,7 +5898,7 @@ impl<'a> Query<'a> {
             Some((path, cd)) => {
                 let p = match (cd.ty, v) {
                     (ColumnType::Tag, Value::Text(s)) => Some(Predicate::EqText(cd.himo_id, s)),
-                    (_, v) => eq_raw(&cd, &v).map(|raw| Predicate::Eq(cd.himo_id, raw)),
+                    (_, v) => eq_raw(&self.db.eng, &cd, &v).map(|raw| Predicate::Eq(cd.himo_id, raw)),
                 };
                 match p {
                     Some(p) => self.push_at(path, p),
@@ -5951,7 +5975,7 @@ impl<'a> Query<'a> {
 
     pub fn where_ref(mut self, col: &str, target: EntityId) -> Self {
         if let Some((path, cd)) = self.resolve_col(col) {
-            self.push_at(path, Predicate::Eq(cd.himo_id, enchudb_oplog::eid_local(target) as u64));
+            self.push_at(path, Predicate::Eq(cd.himo_id, self.db.eng.ref_value(target)));
         }
         self
     }
@@ -5976,7 +6000,7 @@ impl<'a> Query<'a> {
         };
         let inner = match (cd.ty, v) {
             (ColumnType::Tag, Value::Text(s)) => Some(Predicate::EqText(cd.himo_id, s)),
-            (_, v) => eq_raw(&cd, &v).map(|raw| Predicate::Eq(cd.himo_id, raw)),
+            (_, v) => eq_raw(&self.db.eng, &cd, &v).map(|raw| Predicate::Eq(cd.himo_id, raw)),
         };
         self.push_at(path.clone(), Predicate::Present(cd.himo_id));
         if let Some(p) = inner {
@@ -6453,7 +6477,7 @@ impl<'a> Query<'a> {
                 }
                 let v = eng.get_by_id(cur, himo)?;
                 let v = if desc { u64::MAX - v } else { v };
-                Some(((v, enchudb_oplog::eid_local(e)), e))
+                Some(((v, eng.eid_slot(e)), e)) // #731: 同じ値は場所の順 (engine の並びと同じ)
             })
             .collect();
         keyed.sort_unstable_by_key(|x| x.0);
@@ -7135,7 +7159,7 @@ impl<'a> EntityRef<'a> {
             // entity (翻訳済み foreign 含む = 自 prefix) を指すので自 peer_id で復元する。
             ColumnType::Ref => eng
                 .get(self.eid, &cd.himo_name)
-                .map(|v| Value::Ref(enchudb_oplog::make_eid(eng.peer_id(), v as u32))),
+                .map(|v| Value::Ref(eng.ref_eid(v))),
             // #119: 借用返しの `get_text` は writer 稼働中に seqlock verify を通らず torn
             // bytes を掴む (= from_utf8 が失敗して silent に None を返す)。 元々即コピーして
             // いるので、 verify 付きの owned 版に寄せてもコピー回数は変わらない。
@@ -7202,9 +7226,9 @@ impl<'a> EntityUpdate<'a> {
             let raw = value_to_raw_for_query(eng, pc, v)?;
             if raw != u64::MAX {
                 eng.rebuild();
-                let me = enchudb_oplog::eid_local(self.eid);
+                let me = eng.eid_slot(self.eid);
                 // 消えた行に残った名前の cell は名前を持っている内に入れない (upsert / insert と同じ)
-                if eng.query_by_id64(&[(pc.himo_id, raw)]).into_iter().any(|e| enchudb_oplog::eid_local(e) != me && eng.is_live(e)) {
+                if eng.query_by_id64(&[(pc.himo_id, raw)]).into_iter().any(|e| eng.eid_slot(e) != me && eng.is_live(e)) {
                     return Err(SchemaError::DuplicatePk);
                 }
             }
@@ -7260,7 +7284,7 @@ fn value_to_raw_for_query(eng: &Engine, cd: &ColumnInner, v: &Value) -> Result<u
         // Leaf は dedupe しないので等値クエリは原理的に成立しない (毎回別 vid)。
         // 念のため `u64::MAX` を返してクエリ結果 0 件にする。
         (ColumnType::Leaf, Value::Text(_)) => Ok(u64::MAX),
-        (ColumnType::Ref, Value::Ref(eid)) => Ok(enchudb_oplog::eid_local(*eid) as u64),
+        (ColumnType::Ref, Value::Ref(eid)) => Ok(eng.ref_value(*eid)),
         (t, v) => Err(SchemaError::TypeMismatch(format!("{t:?} vs {v:?}"))),
     }
 }

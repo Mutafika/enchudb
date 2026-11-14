@@ -2513,3 +2513,69 @@ fn a_ring_row_whose_live_bit_did_not_reach_disk_is_not_handed_out_twice() {
     assert!(ghost_images > 0, "前提: {SEEDS} 枚の像のどれかに、 cell は届いて生きている印の届いていない ring の行がある");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// #731: 最初の使い回しで file version 15 に移る途中の電源断。 移る手順は `gen.seg` (v14 の間に消した場所の世代 1) を書き出して
+/// から header (場所の bit と version 15) を書き出す。
+///
+/// - `gen.seg` だけ届いた像 (header を書く直前): v14 のまま開け、 世代を持たない。 そこで使い回すと v15 に移り直し、 使い回した
+///   場所は消えた行と違う eid になる (前の残りの `gen.seg` を 0 から作り直す)
+/// - 移った後の像: v15 で開け、 消えた行の eid は 「消えた行」 (v14 の間に消した場所も世代 1)
+#[test]
+fn moving_to_eid_generations_writes_the_generations_before_the_header() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("gen_move");
+    let live = root.join("live");
+    let (before, after) = (root.join("before"), root.join("after"));
+    let version = |dir: &Path| {
+        let h = std::fs::read(dir.join("header.seg")).unwrap();
+        u32::from_le_bytes(h[4..8].try_into().unwrap())
+    };
+    crashsim::start();
+    let (a, b) = {
+        let mut eng = Engine::create_with_capacity(live.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, "t.v", 1u32);
+        let b = eng.entity_in("t").unwrap();
+        eng.tie_to(b, "t.v", 2u32);
+        eng.delete(a); // v14 の間に消す
+        eng.flush().unwrap();
+        let (l, img) = (live.clone(), before.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::GenerationsBeforeHeader {
+                crashsim::capture(&l, &img, Mode::Lost).unwrap();
+            }
+        })));
+        let c = eng.entity_in("t").unwrap(); // 満杯の表で a の場所を使い回す = v15 に移る
+        write_out_hook::set(None);
+        assert_ne!(c, a, "前提: 使い回した場所は別の eid");
+        crashsim::capture(&live, &after, Mode::Lost).unwrap();
+        (a, b)
+    };
+    crashsim::stop();
+    assert!(before.join("gen.seg").is_file(), "前提: header の前に gen.seg が届いている像");
+    assert!(version(&before) < 15, "header の前の像が v15 になっている ({})", version(&before));
+    {
+        let eng = Engine::open_standalone(before.to_str().unwrap()).unwrap();
+        assert_eq!(eng.slot_bits(), 0, "v14 の像で世代を読んだ");
+        assert_eq!(eng.get(b, "t.v"), Some(2));
+        assert!(!eng.is_live(a));
+        let c = eng.entity_in("t").unwrap();
+        assert_eq!(eng.eid_slot(c), eng.eid_slot(a), "前提: もう一度 a の場所を使い回す");
+        assert_ne!(c, a, "移り直した後の使い回しが消えた行の eid を渡した");
+        assert_eq!(eng.get(a, "t.v"), None);
+    }
+    assert_eq!(version(&after), 15, "移った後の像が v15 でない");
+    {
+        let eng = Engine::open_standalone(after.to_str().unwrap()).unwrap();
+        assert_eq!(eng.slot_bits(), 24);
+        assert_eq!(eng.get(b, "t.v"), Some(2), "世代 0 の生きている行が読めない");
+        assert!(!eng.is_live(a), "v14 の間に消した行の eid が生きている");
+        assert_eq!(eng.get(a, "t.v"), None);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

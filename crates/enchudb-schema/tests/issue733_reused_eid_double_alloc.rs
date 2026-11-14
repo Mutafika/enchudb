@@ -91,11 +91,14 @@ fn concurrent_inserts_into_a_full_table_never_get_the_same_eid() {
             });
         }
     });
-    let distinct = seen.lock().unwrap().len() as i64;
+    // #731: 使い回した場所の eid は世代が違うので、 場所の種類で見る
+    let distinct = seen.lock().unwrap().iter().map(|&e| (e as u32) & ((1 << 24) - 1)).collect::<std::collections::BTreeSet<u32>>().len() as i64;
     // 試験の前提: 表は伸びずに穴を使い回した (伸びていたら枯渇の道 = 空きの一覧の作り直しを通っていない)
+    // 1 つの場所は 255 回 (世代 0..=254) 使い回せる。 使い切った場所は二度と渡さないので、 その分だけ枠が伸びる
+    let eids = seen.lock().unwrap().len() as i64;
     assert!(
-        distinct <= (CAP as i64) * 4,
-        "試験の前提: eid を使い回していない ({distinct} 種類の eid、 枠 {CAP})"
+        distinct <= (CAP as i64) * 4 + eids / 254,
+        "試験の前提: 場所を使い回していない ({distinct} 種類の場所、 eid {eids} 種類、 枠 {CAP})"
     );
     assert_eq!(doubled.load(Ordering::Relaxed), 0, "同じ eid が 2 本の insert に払い出された");
     assert_eq!(mixed.load(Ordering::Relaxed), 0, "自分の行に他の insert の列が混ざった");

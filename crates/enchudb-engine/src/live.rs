@@ -637,10 +637,32 @@ pub(crate) trait CellReader {
     fn pull_range(&self, himo_id: u16, lo: u64, hi: u64) -> Vec<u32>;
     /// `pull(himo_id, value)` の件数 (O(1))。
     fn pull_len(&self, himo_id: u16, value: u64) -> usize;
-    /// Ref の列の値 (= 指している local eid)。 u32 に収まらない値は ref として読めない (None)。
+    /// Ref の列の値が指している場所。 u32 に収まらない値は ref として読めない (None)。 #731: engine は値の世代を照合する (消えた
+    /// 行 / 場所を使い回す前の行を指す ref は None = ref が無いのと同じ)。
     #[inline]
     fn ref_cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
         self.cell(himo_id, eid).and_then(|v| u32::try_from(v).ok())
+    }
+    /// #731: 場所 `e` の今の住人を指す Ref の列の値 (via で逆に引く時の値)。 engine は 今の世代 | 場所。
+    #[inline]
+    fn ref_val(&self, e: u32) -> u64 {
+        e as u64
+    }
+    /// #731: 場所 `e` を指す Ref の値を持つ entity を `out` の後ろに足す。 **どの世代の値も** (消えた行を指したままの ref も):
+    /// 場所 `e` の行が変わった (消えた / 使い回された) 時に、 上の節へ伝える道が使う (前の世代を指す ref は ref が無いのと同じに
+    /// 変わる)。 読み (今の住人の配下) は [`Self::ref_val`] で引く。
+    fn pull_ref_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
+        self.pull_into(via, self.ref_val(e), out);
+    }
+    /// [`Self::pull_ref_into`] の Vec 版。
+    fn pull_ref(&self, via: u16, e: u32) -> Vec<u32> {
+        let mut v = Vec::new();
+        self.pull_ref_into(via, e, &mut v);
+        v
+    }
+    /// #731: 場所 `e` を前の世代で指す ref がありうるか (並びの索引の速い道は今の世代の値しか引かない)。
+    fn ref_reused(&self, _e: u32) -> bool {
+        false
     }
     /// ref 紐 `via` を紐 `key` の帯で分けた並びの索引 ([`crate::order_index::OrderIndex`]) があるか。
     fn has_order(&self, _via: u16, _key: u16) -> bool {
@@ -2222,6 +2244,8 @@ struct Member {
     tuples: Vec<Vec<u64>>,
     /// 最後の poll で呼び手に渡した集合 (= 呼び手が積分済みの集合)。
     reported: Bits,
+    /// #731: 渡した eid の世代 (0 は持たない)。
+    reported_gen: GenMap,
     /// 今の集合 (最後の settle までの答え = 根の記録から引いた答えと同じ)。 束 × 購読 ([`LiveQuery::members_in`]) に初めて使った時に
     /// 根の記録から作り、 以後は根の記録が動いて出入りした時と初回の報告の時に立て直す ([`Settled::apply_root_cached`])。 使わない
     /// 購読と、 集計・鍵付き・上位 k の member は持たない (`None`)。
@@ -2312,6 +2336,8 @@ const KEYED: u32 = u32::MAX;
 #[derive(Default)]
 struct KeyedState {
     reported: ValWords,
+    /// #731: 渡した eid の世代 (0 は持たない)。
+    reported_gen: GenMap,
 }
 
 /// 集計の購読 1 本ぶんの報告状態。 件数そのものは根の鍵が持ち (同じ鍵の購読で共有)、 ここは
@@ -2375,17 +2401,17 @@ impl Member {
     }
 
     /// changed を消費して差分を返し、 報告済みの集合を進める。 `root` = 根の答え。 渡した差分は記録にも残す (`log` が on の時)。
-    fn drain(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: u32) -> LiveDelta {
+    fn drain(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: Exit<'_>) -> LiveDelta {
         self.queued = false;
         let probe = Member::probe(&self.root_keys, self.range, self.topk.map(|t| (t, self.order_desc)));
-        let d = drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(e, root(e)), peer);
+        let d = drain_marks(&mut self.changed, &mut self.left, &mut self.reported, &mut self.reported_gen, |e| probe(e, root(e)), peer);
         self.log.record_delta(&d);
         d
     }
 
     /// 鍵付きの購読: changed を消費して `(eid, 鍵)` の差分を返す。 `root` = 根の答え (値 = 鍵)。 `left` に居る eid
     /// は、 報告済みで今も居ても 「出て入り直した」 (鍵が同じでも removed + added)。
-    fn drain_keyed(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: u32) -> KeyedDelta {
+    fn drain_keyed(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: Exit<'_>) -> KeyedDelta {
         self.queued = false;
         let mut delta = KeyedDelta::default();
         let probe = Member::probe(&self.root_keys, self.range, None);
@@ -2399,24 +2425,38 @@ impl Member {
             while li < left_set.len() && left_set[li] < eid {
                 li += 1;
             }
-            let left = left_set.get(li) == Some(&eid);
+            // #731: 渡した世代と今の世代 (場所を使い回していれば違う = 出て入り直した)
+            let g_was = if was.is_some() { ks.reported_gen.get(&eid).copied().unwrap_or(0) } else { 0 };
+            let g_now = if now.is_some() { peer.gen_now(eid) } else { 0 };
+            let left = left_set.get(li) == Some(&eid) || (was.is_some() && now.is_some() && g_was != g_now);
             if was == now && !left {
                 continue;
             }
-            let e = enchudb_oplog::make_eid(peer, eid);
+            let (old, new) = (peer.eid_at(eid, g_was), peer.eid_at(eid, g_now));
             if let Some(w) = was {
-                delta.removed.push((e, w));
+                delta.removed.push((old, w));
             }
             if let Some(n) = now {
-                delta.added.push((e, n));
+                delta.added.push((new, n));
             }
             if left && was.is_some() && now.is_some() {
-                delta.reentered.push(e);
+                delta.reentered.push(new);
             }
             ks.reported.put(eid, now.map_or(0, |n| n + 1));
+            if g_now != 0 {
+                ks.reported_gen.insert(eid, g_now);
+            } else if g_was != 0 {
+                ks.reported_gen.remove(&eid);
+            }
         }
         self.left.clear();
         self.changed.clear();
+        // #731: 差分は eid の昇順 (世代の付いた eid の順は場所の順と違いうる)
+        if peer.reorders() {
+            delta.added.sort_unstable_by_key(|x| x.0);
+            delta.removed.sort_unstable_by_key(|x| x.0);
+            delta.reentered.sort_unstable();
+        }
         delta
     }
 
@@ -2439,9 +2479,92 @@ fn order_val(v: u64, desc: bool) -> u64 {
     if desc { u64::MAX - v } else { v }
 }
 
+/// #731: 差分・集合の出口。 `Raw` = 中で使う形 (場所のまま。 `Or` の購読の枝の差分)、 `App` = アプリに渡す形 (peer と世代を付ける)。
+#[derive(Clone, Copy)]
+pub(crate) enum Exit<'a> {
+    Raw,
+    App { peer: u32, gens: &'a crate::generation::Generations },
+}
+
+/// 場所ごとの、 最後に渡した eid の世代 (0 は持たない)。 removed にはアプリに渡した eid を出す (場所を使い回した後に poll しても)。
+pub(crate) type GenMap = std::collections::BTreeMap<u32, u32>;
+
+impl Exit<'_> {
+    /// 世代の付いた eid を出しうる (出口で並べ直す) か。
+    #[inline]
+    fn reorders(self) -> bool {
+        matches!(self, Exit::App { gens, .. } if gens.active())
+    }
+
+    /// 場所の今の住人の eid。
+    #[inline]
+    pub(crate) fn eid(self, slot: u32) -> EntityId {
+        match self {
+            Exit::Raw => slot as EntityId,
+            Exit::App { peer, gens } => enchudb_oplog::make_eid(peer, gens.local(slot)),
+        }
+    }
+
+    /// 場所の今の世代 (`Raw` は 0)。
+    #[inline]
+    fn gen_now(self, slot: u32) -> u32 {
+        match self {
+            Exit::Raw => 0,
+            Exit::App { gens, .. } => gens.get(slot),
+        }
+    }
+
+    /// 世代 `g` の、 場所 `slot` の eid。
+    #[inline]
+    fn eid_at(self, slot: u32, g: u32) -> EntityId {
+        match self {
+            Exit::Raw => slot as EntityId,
+            Exit::App { peer, gens } => match gens.bits() {
+                0 | 32.. => enchudb_oplog::make_eid(peer, slot),
+                b => enchudb_oplog::make_eid(peer, (g << b) | slot),
+            },
+        }
+    }
+
+    /// eid → (場所, 世代) (照合しない)。
+    #[inline]
+    pub(crate) fn split(self, eid: EntityId) -> (u32, u32) {
+        match self {
+            Exit::Raw => (enchudb_oplog::eid_local(eid), 0),
+            Exit::App { gens, .. } => gens.split(enchudb_oplog::eid_local(eid)),
+        }
+    }
+
+    /// 最後の poll で渡した集合 (`reported` と渡した世代 `rg`) に `eid` が居るか。
+    #[inline]
+    fn reported(self, reported: &Bits, rg: &GenMap, eid: EntityId) -> bool {
+        let (slot, g) = self.split(eid);
+        reported.get(slot) && rg.get(&slot).copied().unwrap_or(0) == g
+    }
+
+    /// アプリの eid → 場所 (世代が違えば None = 消えた行)。 `Raw` は local をそのまま。
+    #[inline]
+    pub(crate) fn slot(self, eid: EntityId) -> Option<u32> {
+        match self {
+            Exit::Raw => Some(enchudb_oplog::eid_local(eid)),
+            Exit::App { gens, .. } => {
+                let (slot, g) = gens.split(enchudb_oplog::eid_local(eid));
+                (!gens.active() || gens.get(slot) == g).then_some(slot)
+            }
+        }
+    }
+}
+
 /// changed を消費して差分を返し、 報告済みの集合を進める (member と `Or` の購読で共通)。
 /// `now(e)` = 今集合に居るか。 `left` に居る eid は、 報告済みで今も居ても 「出て入り直した」。
-fn drain_marks(changed: &mut Marks, left: &mut Marks, reported: &mut Bits, now: impl Fn(u32) -> bool, peer: u32) -> LiveDelta {
+fn drain_marks(
+    changed: &mut Marks,
+    left: &mut Marks,
+    reported: &mut Bits,
+    reported_gen: &mut GenMap,
+    now: impl Fn(u32) -> bool,
+    peer: Exit<'_>,
+) -> LiveDelta {
     let mut delta = LiveDelta::default();
     if changed.is_empty() {
         return delta;
@@ -2455,21 +2578,34 @@ fn drain_marks(changed: &mut Marks, left: &mut Marks, reported: &mut Bits, now: 
         while li < left_set.len() && left_set[li] < eid {
             li += 1;
         }
-        let left = left_set.get(li) == Some(&eid);
-        let e = enchudb_oplog::make_eid(peer, eid);
+        // #731: 渡した世代と今の世代 (場所を使い回していれば違う = 出て入り直した)
+        let g_was = if was { reported_gen.get(&eid).copied().unwrap_or(0) } else { 0 };
+        let g_now = if now { peer.gen_now(eid) } else { 0 };
+        let left = left_set.get(li) == Some(&eid) || (was && now && g_was != g_now);
+        let (old, new) = (peer.eid_at(eid, g_was), peer.eid_at(eid, g_now));
         match (was, now) {
-            (false, true) => delta.added.push(e),
-            (true, false) => delta.removed.push(e),
+            (false, true) => delta.added.push(new),
+            (true, false) => delta.removed.push(old),
             (true, true) if left => {
-                delta.removed.push(e);
-                delta.added.push(e);
+                delta.removed.push(old);
+                delta.added.push(new);
             }
             _ => {}
         }
         reported.put(eid, now);
+        if g_now != 0 {
+            reported_gen.insert(eid, g_now);
+        } else if g_was != 0 {
+            reported_gen.remove(&eid);
+        }
     }
     left.clear();
     changed.clear();
+    // #731: 差分は eid の昇順 (世代の付いた eid の順は場所の順と違いうる)
+    if peer.reorders() {
+        delta.added.sort_unstable();
+        delta.removed.sort_unstable();
+    }
     delta
 }
 
@@ -3865,6 +4001,7 @@ impl Family {
             range_on: false,
             tuples: Vec::new(),
             reported: Bits::default(),
+            reported_gen: GenMap::new(),
             now: None,
             left: Marks::default(),
             changed: Marks::default(),
@@ -4113,9 +4250,11 @@ impl Family {
             let arc = root_arc.filter(|&(key, ..)| self.nodes[n].parent == 0 && r.has_order(via, key));
             let mut up: Vec<u32> = Vec::new();
             for &e in &ents {
-                let from_order = arc.is_some_and(|(key, lo, hi)| r.order_arc_into(via, key, e, lo, hi, false, &mut up).is_some());
+                // #731: 使い回した場所は前の世代を指す ref も伝える (索引の速い道は今の世代だけ)
+                let from_order = !r.ref_reused(e)
+                    && arc.is_some_and(|(key, lo, hi)| r.order_arc_into(via, key, e, lo, hi, false, &mut up).is_some());
                 if !from_order {
-                    r.pull_into(via, e as u64, &mut up);
+                    r.pull_ref_into(via, e, &mut up);
                 }
             }
             up.sort_unstable();
@@ -4140,7 +4279,7 @@ impl Family {
             let via = self.nodes[n].via;
             let mut up: Vec<u32> = Vec::new();
             for &e in &ents {
-                r.pull_into(via, e as u64, &mut up);
+                r.pull_ref_into(via, e, &mut up);
             }
             up.sort_unstable();
             up.dedup();
@@ -4431,6 +4570,11 @@ impl Family {
                 }
             }
         }
+        // #731: 解放された entity (行が消えた場所)。 根でない節でも、 その場所を指していた ref は前の世代を指す ref (= ref が無い) に
+        // 変わるので、 答えが変わらなくても親へ伝える (下の `changed`)
+        let mut freed_sorted = freed.clone();
+        freed_sorted.sort_unstable();
+        freed_sorted.dedup();
         for e in freed {
             // 報告済みの根が解放された = 呼び手の持つ eid は別物になりうる。 今の鍵と違う
             // member の報告済みは、 鍵が変わった時点で left + changed を積まれている
@@ -4558,7 +4702,7 @@ impl Family {
                     // 記録が不明で今は偽: 真と読んだことが無ければ、 この entity の真に頼る根は居ない (親の答えは変わらない)
                     (None, None) => seen[n].get(e),
                     _ => true,
-                };
+                } || (!freed_sorted.is_empty() && freed_sorted.binary_search(&e).is_ok());
                 if now.is_some() {
                     seen[n].put(e, true);
                 } else if always || force || changed {
@@ -4573,14 +4717,15 @@ impl Family {
                 }
                 if always || force || changed {
                     let up = match order_range {
-                        Some((key, lo, hi)) if parent == 0 && single_child == Some(n) => {
+                        // #731: 使い回した場所は前の世代を指す ref も伝える (索引の速い道は今の世代だけ)
+                        Some((key, lo, hi)) if parent == 0 && single_child == Some(n) && !r.ref_reused(e) => {
                             let mut up = Vec::new();
                             match r.order_arc_into(via, key, e, lo, hi, false, &mut up) {
                                 Some(_) => up,
-                                None => r.pull(via, e as u64),
+                                None => r.pull_ref(via, e),
                             }
                         }
-                        _ => r.pull(via, e as u64),
+                        _ => r.pull_ref(via, e),
                     };
                     if parent == 0 && single_child == Some(n) {
                         via_child.push((now, e, up));
@@ -4679,6 +4824,8 @@ pub(crate) struct LiveRegistry {
     next_group: AtomicU64,
     /// poll が返す EntityId の peer prefix (`Engine::set_peer_id` が追従させる)。
     peer: AtomicU32,
+    /// #731: 場所ごとの世代 (engine と共有)。 差分・集合の出口で eid に世代を付ける。
+    gens: Arc<crate::generation::Generations>,
     /// #381: 外した購読が押さえていた辞書の番号。 engine が `take_unpins` で取り出して返す。
     unpins: Mutex<Vec<u32>>,
     /// 並びの索引 (`Engine::declare_order`)。 via の紐 1 本に 1 つまで、 全部で [`MAX_ORDERS`] まで。 枠は足すだけ (外す時は
@@ -4725,8 +4872,15 @@ impl LiveRegistry {
         out
     }
 
+    #[cfg(test)]
     pub(crate) fn new(peer: u32) -> Self {
+        Self::new_with(peer, Arc::new(crate::generation::Generations::off()))
+    }
+
+    /// #731: engine の場所ごとの世代 (`gens`) を見る registry (出口で eid に世代を付ける)。
+    pub(crate) fn new_with(peer: u32, gens: Arc<crate::generation::Generations>) -> Self {
         Self {
+            gens,
             active: AtomicUsize::new(0),
             snap: epoch::Atomic::null(),
             edit: Mutex::new(()),
@@ -4793,6 +4947,12 @@ impl LiveRegistry {
     #[inline]
     pub(crate) fn orders_on(&self, himo: u16) -> impl Iterator<Item = &crate::order_index::OrderIndex> {
         self.orders().filter(move |o| o.via == himo || o.key == himo)
+    }
+
+    /// #731: アプリに渡す出口 (peer と場所の世代)。
+    #[inline]
+    pub(crate) fn exit(&self) -> Exit<'_> {
+        Exit::App { peer: self.peer.load(Ordering::Acquire), gens: &self.gens }
     }
 
     pub(crate) fn set_peer(&self, peer: u32) {
@@ -5053,7 +5213,7 @@ impl LiveRegistry {
     /// group `gid` の購読のうち、 前回から出入りのあったものの差分 (`(id, 差分)`、 id 昇順)。 他の
     /// group / どこにも入っていない購読の差分は取り出さずに残す。
     pub(crate) fn poll_group(&self, r: &impl CellReader, gid: u64) -> Vec<(u64, LiveDelta)> {
-        let peer = self.peer.load(Ordering::Acquire);
+        let peer = self.exit();
         let fams = self.families();
         let mut out = Vec::new();
         // `Or` の枝の差分 (呼び手でなく枝の購読に積む — Or の購読がどの group でも枝は積んでおく)
@@ -5082,7 +5242,7 @@ impl LiveRegistry {
                     ready.push(slot);
                     continue;
                 }
-                let d = m.drain(|e| view_at(recs, vals, opart, *order_view, e), if union.is_some() { 0 } else { peer });
+                let d = m.drain(|e| view_at(recs, vals, opart, *order_view, e), if union.is_some() { Exit::Raw } else { peer });
                 match union {
                     Some((Some(u), i)) if !d.is_empty() => branch.push((u, i, d)),
                     Some(_) => {}
@@ -5175,6 +5335,8 @@ struct UnionState {
     /// どれかの枝に居る entity の数。
     size: usize,
     reported: Bits,
+    /// #731: 渡した eid の世代 (0 は持たない)。
+    reported_gen: GenMap,
     left: Marks,
     changed: Marks,
     /// `LiveRegistry::ready_unions` に載っているか。
@@ -5189,6 +5351,7 @@ impl UnionState {
             branches: (0..n).map(|_| Bits::default()).collect(),
             size: 0,
             reported: Bits::default(),
+            reported_gen: GenMap::new(),
             left: Marks::default(),
             changed: Marks::default(),
             queued: false,
@@ -5235,10 +5398,17 @@ impl UnionState {
         }
     }
 
-    fn drain(&mut self, peer: u32) -> LiveDelta {
+    fn drain(&mut self, peer: Exit<'_>) -> LiveDelta {
         self.queued = false;
         let branches = &self.branches;
-        let d = drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| branches.iter().any(|b| b.get(e)), peer);
+        let d = drain_marks(
+            &mut self.changed,
+            &mut self.left,
+            &mut self.reported,
+            &mut self.reported_gen,
+            |e| branches.iter().any(|b| b.get(e)),
+            peer,
+        );
         self.log.record_delta(&d);
         d
     }
@@ -5262,7 +5432,7 @@ impl Union {
             f.settle(r, &mut g);
             let Settled { recs, vals, members, opart, order_view, .. } = &mut *g;
             if let Some(m) = members[*slot].as_mut() {
-                ds.push((i, m.drain(|e| view_at(recs, vals, opart, *order_view, e), 0)));
+                ds.push((i, m.drain(|e| view_at(recs, vals, opart, *order_view, e), Exit::Raw)));
             }
         }
         let mut st = self.state.lock();
@@ -5356,7 +5526,7 @@ impl LiveQuery {
     pub fn poll_since(&self, eng: &crate::engine::Engine, pos: u64) -> Result<(LiveDelta, u64), Truncated> {
         self.check_engine(eng);
         let cap = eng.answer_log_limit();
-        let peer = self.registry.peer.load(Ordering::Acquire);
+        let peer = self.registry.exit();
         match &self.kind {
             Kind::One { family, slot } => {
                 let mut guard = family.settled.lock();
@@ -5381,7 +5551,7 @@ impl LiveQuery {
     pub fn snapshot(&self, eng: &crate::engine::Engine) -> (Vec<EntityId>, u64) {
         self.check_engine(eng);
         let cap = eng.answer_log_limit();
-        let peer = self.registry.peer.load(Ordering::Acquire);
+        let peer = self.registry.exit();
         match &self.kind {
             Kind::One { family, slot } => {
                 let mut s = family.settled.lock();
@@ -5395,16 +5565,14 @@ impl LiveQuery {
                 };
                 let Some(m) = s.members[*slot].as_ref() else { return (Vec::new(), version) };
                 let out = if m.topk.is_some() {
-                    let mut out: Vec<EntityId> = Self::ranked_in(&s, m).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+                    let mut out: Vec<EntityId> = Self::ranked_in(&s, m).into_iter().map(|e| peer.eid(e)).collect();
                     out.sort_unstable();
                     out
                 } else {
-                    s.recs[0]
-                        .with_keys(&m.root_keys)
-                        .into_iter()
-                        .filter(|&e| m.has(e, s.root(e)))
-                        .map(|e| enchudb_oplog::make_eid(peer, e))
-                        .collect()
+                    let mut out: Vec<EntityId> =
+                        s.recs[0].with_keys(&m.root_keys).into_iter().filter(|&e| m.has(e, s.root(e))).map(|e| peer.eid(e)).collect();
+                    out.sort_unstable(); // #731
+                    out
                 };
                 (out, version)
             }
@@ -5412,7 +5580,8 @@ impl LiveQuery {
                 let mut st = u.settle(eng);
                 st.log.enable(cap);
                 let _ = st.drain(peer);
-                let out = st.members().into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+                let mut out: Vec<EntityId> = st.members().into_iter().map(|e| peer.eid(e)).collect();
+                out.sort_unstable(); // #731
                 (out, st.log.version)
             }
         }
@@ -5431,7 +5600,7 @@ impl LiveQuery {
     }
 
     pub(crate) fn poll_with(&self, r: &impl CellReader) -> LiveDelta {
-        let peer = self.registry.peer.load(Ordering::Acquire);
+        let peer = self.registry.exit();
         match &self.kind {
             Kind::One { family, slot } => {
                 let mut guard = family.settled.lock();
@@ -5449,7 +5618,7 @@ impl LiveQuery {
     /// [`TouchedLiveQuery::poll`] の中身: group の差分と、 見直しの節に積まれた根の entity (local、 昇順・重複なし)。
     pub(crate) fn poll_touched(&self, eng: &crate::engine::Engine) -> (LiveDelta, Vec<u32>) {
         self.check_engine(eng);
-        let peer = self.registry.peer.load(Ordering::Acquire);
+        let peer = self.registry.exit();
         let Kind::One { family, slot } = &self.kind else {
             return (LiveDelta::default(), Vec::new());
         };
@@ -5510,7 +5679,7 @@ impl LiveQuery {
     /// 上位 k 件の購読: 今の集合を並びの順に (先頭が 1 位)。 他の購読は `members` と同じ (eid 昇順)。
     pub fn ranked(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
         self.check_engine(eng);
-        let peer = self.registry.peer.load(Ordering::Acquire);
+        let peer = self.registry.exit();
         let Kind::One { family, slot } = &self.kind else { return self.members(eng) };
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
@@ -5519,7 +5688,7 @@ impl LiveQuery {
             drop(s);
             return self.members(eng);
         }
-        Self::ranked_in(&s, m).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+        Self::ranked_in(&s, m).into_iter().map(|e| peer.eid(e)).collect()
     }
 
     fn ranked_in(s: &Settled, m: &Member) -> Vec<u32> {
@@ -5540,7 +5709,7 @@ impl LiveQuery {
     /// `eid` が現在の結果に含まれるか。
     pub fn contains(&self, eng: &crate::engine::Engine, eid: EntityId) -> bool {
         self.check_engine(eng);
-        let e = enchudb_oplog::eid_local(eid);
+        let Some(e) = self.registry.exit().slot(eid) else { return false };
         let (family, slot) = match &self.kind {
             Kind::One { family, slot } => (family, *slot),
             Kind::Any(u) => return self.settle_union(u, eng).has(e),
@@ -5557,7 +5726,8 @@ impl LiveQuery {
         let Kind::One { family, slot } = &self.kind else { return vec![false; eids.len()] };
         let s = family.settled.lock();
         let Some(m) = s.members[*slot].as_ref() else { return vec![false; eids.len()] };
-        eids.iter().map(|&e| m.reported.get(enchudb_oplog::eid_local(e))).collect()
+        let x = self.registry.exit();
+        eids.iter().map(|&e| x.reported(&m.reported, &m.reported_gen, e)).collect()
     }
 
     /// 複数の eid について [`contains`](Self::contains) (lock と settle は 1 回)。
@@ -5567,18 +5737,15 @@ impl LiveQuery {
             Kind::One { family, slot } => (family, *slot),
             Kind::Any(u) => {
                 let st = self.settle_union(u, eng);
-                return eids.iter().map(|&eid| st.has(enchudb_oplog::eid_local(eid))).collect();
+                let x = self.registry.exit();
+                return eids.iter().map(|&eid| x.slot(eid).is_some_and(|e| st.has(e))).collect();
             }
         };
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
         let Some(m) = s.members[slot].as_ref() else { return vec![false; eids.len()] };
-        eids.iter()
-            .map(|&eid| {
-                let e = enchudb_oplog::eid_local(eid);
-                m.has(e, s.view(e))
-            })
-            .collect()
+        let x = self.registry.exit();
+        eids.iter().map(|&eid| x.slot(eid).is_some_and(|e| m.has(e, s.view(e)))).collect()
     }
 
     /// `deck` (タグや値で引いた束など、 呼び手が引いた eid の列) のうち、 今の結果に入るもの (`deck` の順のまま、 eid の形も
@@ -5594,7 +5761,8 @@ impl LiveQuery {
             Kind::One { family, slot } => (family, *slot),
             Kind::Any(u) => {
                 let st = self.settle_union(u, eng);
-                return deck.iter().copied().filter(|&eid| st.has(enchudb_oplog::eid_local(eid))).collect();
+                let x = self.registry.exit();
+                return deck.iter().copied().filter(|&eid| x.slot(eid).is_some_and(|e| st.has(e))).collect();
             }
         };
         let mut guard = family.settled.lock();
@@ -5612,7 +5780,8 @@ impl LiveQuery {
                 }
                 b
             });
-            return deck.iter().copied().filter(|&eid| now.get(enchudb_oplog::eid_local(eid))).collect();
+            let x = self.registry.exit();
+            return deck.iter().copied().filter(|&eid| x.slot(eid).is_some_and(|e| now.get(e))).collect();
         }
         let s = &mut *guard;
         let Some(m) = s.members[slot].as_mut() else { return Vec::new() };
@@ -5622,10 +5791,11 @@ impl LiveQuery {
         let changed = &m.changed.list;
         let probe = Member::probe(&m.root_keys, m.range, m.topk.map(|t| (t, m.order_desc)));
         let (recs, vals, opart, ov) = (&s.recs, &s.vals, &s.opart, s.order_view);
+        let x = self.registry.exit();
         deck.iter()
             .copied()
             .filter(|&eid| {
-                let e = enchudb_oplog::eid_local(eid);
+                let Some(e) = x.slot(eid) else { return false };
                 if !changed.is_empty() && changed.binary_search(&e).is_ok() {
                     probe(e, view_at(recs, vals, opart, ov, e))
                 } else {
@@ -5638,28 +5808,28 @@ impl LiveQuery {
     /// 現在の結果全体 (eid 昇順)。 poll の状態は変えない。
     pub fn members(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
         self.check_engine(eng);
-        let peer = self.registry.peer.load(Ordering::Acquire);
+        let peer = self.registry.exit();
         let (family, slot) = match &self.kind {
             Kind::One { family, slot } => (family, *slot),
             Kind::Any(u) => {
                 let st = self.settle_union(u, eng);
-                return st.members().into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+                let mut out: Vec<EntityId> = st.members().into_iter().map(|e| peer.eid(e)).collect();
+                out.sort_unstable(); // #731: 世代の付いた eid の順 (場所の順と違いうる)
+                return out;
             }
         };
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
         let Some(m) = s.members[slot].as_ref() else { return Vec::new() };
         if m.topk.is_some() {
-            let mut out: Vec<EntityId> = Self::ranked_in(&s, m).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+            let mut out: Vec<EntityId> = Self::ranked_in(&s, m).into_iter().map(|e| peer.eid(e)).collect();
             out.sort_unstable();
             return out;
         }
-        s.recs[0]
-            .with_keys(&m.root_keys)
-            .into_iter()
-            .filter(|&e| m.has(e, s.root(e)))
-            .map(|e| enchudb_oplog::make_eid(peer, e))
-            .collect()
+        let mut out: Vec<EntityId> =
+            s.recs[0].with_keys(&m.root_keys).into_iter().filter(|&e| m.has(e, s.root(e))).map(|e| peer.eid(e)).collect();
+        out.sort_unstable(); // #731: 世代の付いた eid の順 (場所の順と違いうる)
+        out
     }
 }
 
@@ -5967,7 +6137,7 @@ impl LiveKeyed {
     }
 
     pub(crate) fn poll_with(&self, r: &impl CellReader) -> KeyedDelta {
-        let peer = self.registry.peer.load(Ordering::Acquire);
+        let peer = self.registry.exit();
         let mut guard = self.family.settled.lock();
         self.family.settle(r, &mut guard);
         let Settled { recs, vals, members, .. } = &mut *guard;
@@ -5981,14 +6151,24 @@ impl LiveKeyed {
     pub fn reported_key(&self, eid: EntityId) -> Option<u64> {
         let guard = self.family.settled.lock();
         let m = guard.members[self.slot].as_ref()?;
-        m.keyed.as_ref()?.reported.get(enchudb_oplog::eid_local(eid)).checked_sub(1)
+        let ks = m.keyed.as_ref()?;
+        let x = self.registry.exit();
+        let (slot, g) = x.split(eid);
+        if ks.reported_gen.get(&slot).copied().unwrap_or(0) != g {
+            return None;
+        }
+        ks.reported.get(slot).checked_sub(1)
     }
 
     /// 渡し済みの鍵を引く関数を `f` に渡す (その間ロックを持つ)。 引く回数が多く、 まとめて渡せない時用 (親をたどる等)。
     pub fn with_reported<R>(&self, f: impl FnOnce(&dyn Fn(EntityId) -> Option<u64>) -> R) -> R {
         let guard = self.family.settled.lock();
         let ks = guard.members[self.slot].as_ref().and_then(|m| m.keyed.as_ref());
-        let get = |e: EntityId| ks.and_then(|k| k.reported.get(enchudb_oplog::eid_local(e)).checked_sub(1));
+        let x = self.registry.exit();
+        let get = |e: EntityId| {
+            let (slot, g) = x.split(e);
+            ks.filter(|k| k.reported_gen.get(&slot).copied().unwrap_or(0) == g).and_then(|k| k.reported.get(slot).checked_sub(1))
+        };
         f(&get)
     }
 
@@ -5996,7 +6176,16 @@ impl LiveKeyed {
     pub fn reported_keys(&self, eids: &[EntityId]) -> Vec<Option<u64>> {
         let guard = self.family.settled.lock();
         let Some(ks) = guard.members[self.slot].as_ref().and_then(|m| m.keyed.as_ref()) else { return vec![None; eids.len()] };
-        eids.iter().map(|&e| ks.reported.get(enchudb_oplog::eid_local(e)).checked_sub(1)).collect()
+        let x = self.registry.exit();
+        eids.iter()
+            .map(|&e| {
+                let (slot, g) = x.split(e);
+                if ks.reported_gen.get(&slot).copied().unwrap_or(0) != g {
+                    return None;
+                }
+                ks.reported.get(slot).checked_sub(1)
+            })
+            .collect()
     }
 
     /// engine 内で一意な購読 id。
@@ -6199,7 +6388,7 @@ impl GroupedLiveQuery {
         if !self.inner.contains(eng, group) {
             return Vec::new();
         }
-        let mut out = self.members_one(eng, enchudb_oplog::eid_local(group));
+        let mut out = self.members_one(eng, self.inner.registry.exit().split(group).0);
         sort_members(&mut out);
         self.eids_of(&out)
     }
@@ -6224,7 +6413,7 @@ impl GroupedLiveQuery {
                     return Vec::new();
                 }
                 buf.clear();
-                self.members_into(eng, enchudb_oplog::eid_local(g), &tests, ord, &mut buf);
+                self.members_into(eng, self.inner.registry.exit().split(g).0, &tests, ord, &mut buf);
                 sort_members(&mut buf);
                 self.eids_of(&buf)
             })
@@ -6236,14 +6425,14 @@ impl GroupedLiveQuery {
         if !self.inner.contains(eng, group) {
             return 0;
         }
-        self.count_one(eng, enchudb_oplog::eid_local(group))
+        self.count_one(eng, self.inner.registry.exit().split(group).0)
     }
 
     /// group `g` (local eid) の members の数 (group が居るかは見ない)。 根への条件が並びの索引の範囲 1 本だけで帯と
     /// ちょうど合えば、 帯の件数の和 (O(帯の数))。
     fn count_one(&self, eng: &crate::engine::Engine, g: u32) -> usize {
         if self.filter.is_empty() {
-            return CellReader::pull_len(eng, self.via, g as u64);
+            return CellReader::pull_len(eng, self.via, CellReader::ref_val(eng, g));
         }
         if let Some(n) = self.order_count(eng, g, self.order_range(eng)) {
             return n;
@@ -6260,7 +6449,7 @@ impl GroupedLiveQuery {
         self.inner
             .members(eng)
             .iter()
-            .map(|&g| self.count_of(eng, enchudb_oplog::eid_local(g), &tests, ord, &mut buf))
+            .map(|&g| self.count_of(eng, self.inner.registry.exit().split(g).0, &tests, ord, &mut buf))
             .sum()
     }
 
@@ -6270,7 +6459,7 @@ impl GroupedLiveQuery {
         let ord = self.order_range(eng);
         let mut out = Vec::new();
         for g in self.inner.members(eng) {
-            self.members_into(eng, enchudb_oplog::eid_local(g), &tests, ord, &mut out);
+            self.members_into(eng, self.inner.registry.exit().split(g).0, &tests, ord, &mut out);
         }
         out.sort_unstable();
         // 1 entity の ref は 1 つなので、 止まっている時は重ならない。 並行の付け替えで 2 つの group の一覧に
@@ -6320,7 +6509,7 @@ impl GroupedLiveQuery {
             }
         }
         let mut out = Vec::new();
-        CellReader::pull_into(eng, self.via, g as u64, &mut out);
+        CellReader::pull_into(eng, self.via, CellReader::ref_val(eng, g), &mut out);
         if !self.filter.is_empty() {
             out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
         }
@@ -6350,7 +6539,7 @@ impl GroupedLiveQuery {
             None => false,
         };
         if !from_order {
-            CellReader::pull_into(eng, self.via, g as u64, out);
+            CellReader::pull_into(eng, self.via, CellReader::ref_val(eng, g), out);
         }
         if tests.len() <= usize::from(skip.is_some()) {
             return;
@@ -6376,7 +6565,7 @@ impl GroupedLiveQuery {
         buf: &mut Vec<u32>,
     ) -> usize {
         if tests.is_empty() {
-            return CellReader::pull_len(eng, self.via, g as u64);
+            return CellReader::pull_len(eng, self.via, CellReader::ref_val(eng, g));
         }
         if let Some(n) = self.order_count(eng, g, ord) {
             return n;
@@ -6387,8 +6576,8 @@ impl GroupedLiveQuery {
     }
 
     fn eids_of(&self, local: &[u32]) -> Vec<EntityId> {
-        let peer = self.inner.registry.peer.load(Ordering::Acquire);
-        local.iter().map(|&e| enchudb_oplog::make_eid(peer, e)).collect()
+        let peer = self.inner.registry.exit();
+        local.iter().map(|&e| peer.eid(e)).collect()
     }
 
     /// 未 poll の group の変化がありうるか。
@@ -6455,10 +6644,10 @@ impl TouchedLiveQuery {
     /// 根の entity `eid` が答えに居るなら、 その group (ref の 1 段目の先)。 ref と根への条件は今の値、 group が居るかは
     /// 最後の poll で渡した集合で決める (型の doc)。 居なければ None (削除された entity も None)。
     pub fn group_of(&self, eng: &crate::engine::Engine, eid: EntityId) -> Option<EntityId> {
-        let e = enchudb_oplog::eid_local(eid);
+        let e = self.g.inner.registry.exit().slot(eid)?;
         let g = CellReader::ref_cell(eng, self.g.via, e)?;
-        let peer = self.g.inner.registry.peer.load(Ordering::Acquire);
-        let ge = enchudb_oplog::make_eid(peer, g);
+        let peer = self.g.inner.registry.exit();
+        let ge = peer.eid(g);
         (self.g.inner.reported_many(eng, &[ge])[0] && self.g.root_holds(eng, e)).then_some(ge)
     }
 
@@ -6487,7 +6676,7 @@ impl TouchedLiveQuery {
         if !self.g.inner.reported_many(eng, &[group])[0] {
             return 0;
         }
-        self.g.count_one(eng, enchudb_oplog::eid_local(group))
+        self.g.count_one(eng, self.g.inner.registry.exit().split(group).0)
     }
 
     /// [`GroupedLiveQuery::count`] と同じ。

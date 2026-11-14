@@ -222,7 +222,8 @@ fn run(path: &str) {
                     nb = nb.set("boss", Value::Ref(b));
                 }
                 emps[i] = nb.commit().unwrap();
-                if emps[i] == e {
+                // #731: 場所を使い回した (eid は世代が違う)。 既定の DB の場所は下 24 bit
+                if emps[i] as u32 & 0xFF_FFFF == e as u32 & 0xFF_FFFF {
                     reborn.insert(e);
                     reborn_seen += 1;
                 }

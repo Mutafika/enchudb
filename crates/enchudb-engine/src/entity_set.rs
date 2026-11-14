@@ -256,6 +256,13 @@ impl EntitySet {
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
     }
 
+    /// #731: 生きている印を下ろし、 空きの山には積まない (世代を使い切った場所 = 二度と渡さない)。
+    pub fn free_without_reuse(&self, eid: u32) {
+        if self.set_bit(eid, false) {
+            self.live_count_atomic().fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     /// rollback用: 削除されたentityを復活させる。
     pub fn revive(&self, eid: u32) {
         if eid >= self.max_entities() { return; }

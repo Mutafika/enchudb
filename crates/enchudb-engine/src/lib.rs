@@ -78,6 +78,8 @@ pub mod hlc_store;
 pub mod eid_translator;
 // #560: `.eidmap` の追記 (`eidmap.log`)。
 pub(crate) mod eidmap_log;
+/// #731: eid の local = 世代 | 場所。
+pub(crate) mod generation;
 // #513: 消した主キーの記録 (主キーが同じなら同じ行)。
 pub(crate) mod pk_former;
 pub(crate) mod pk_tombs;

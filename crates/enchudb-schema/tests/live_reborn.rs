@@ -68,7 +68,9 @@ fn reborn_rows_leave_and_reenter_pairs_and_tuples() {
     // 左の row の作り直し: 同じ eid・同じ相手
     u.entity(alice).delete().unwrap();
     let bob = u.insert().set("id", 2i64).set("city", "Tokyo").set("company", Value::Ref(ant)).commit().unwrap();
-    assert_eq!(bob, alice, "前提: 枠が埋まっていれば消した eid が使い回される");
+    // #731: 場所は使い回し、 eid は世代が違う
+    assert_eq!(bob as u32 & ((1 << 24) - 1), alice as u32 & ((1 << 24) - 1), "前提: 枠が埋まっていれば消した場所が使い回される");
+    assert_ne!(bob, alice);
     let d = by_ref.poll();
     assert_eq!((d.removed, d.added), (vec![(alice, ant)], vec![(bob, ant)]), "ref の組");
     let d = tokyo.poll();
@@ -81,21 +83,23 @@ fn reborn_rows_leave_and_reenter_pairs_and_tuples() {
     // 右 (と真ん中) の row の作り直し
     c.entity(ant).delete().unwrap();
     let ant2 = c.insert().set("id", 2i64).set("city", "Tokyo").commit().unwrap();
-    assert_eq!(ant2, ant, "前提: 枠が埋まっていれば消した eid が使い回される");
+    // #731: 場所は使い回し、 eid は世代が違う。 消えた ant を指したままの ref (bob / carol) は ant2 を指さない (ref が無いのと同じ)
+    assert_eq!(ant2 as u32 & ((1 << 24) - 1), ant as u32 & ((1 << 24) - 1), "前提: 枠が埋まっていれば消した場所が使い回される");
+    assert_ne!(ant2, ant);
     u.entity(dave).set("company", Value::Ref(ant2)).commit().unwrap();
     let d = by_ref.poll();
     assert_eq!(
         (sorted(d.removed), sorted(d.added)),
-        (vec![(bob, ant), (carol, ant)], vec![(bob, ant2), (carol, ant2), (dave, ant2)]),
-        "ref の組 (右): 居続けた組は出て入り直す、 dave は入るだけ"
+        (vec![(bob, ant), (carol, ant)], vec![(dave, ant2)]),
+        "ref の組 (右): 消えた会社を指す組は出る、 dave は入る"
     );
     let d = tokyo.poll();
-    assert_eq!((sorted(d.removed), sorted(d.added)), (vec![(bob, ant)], vec![(bob, ant2), (dave, ant2)]), "ref の組 (右、 Tokyo): carol は入らない");
+    assert_eq!((sorted(d.removed), sorted(d.added)), (vec![(bob, ant)], vec![(dave, ant2)]), "ref の組 (右、 Tokyo): carol は入らない");
     assert_eq!(by_val.poll(), Default::default(), "値の組は会社に関係しない (dave は最初から Tokyo の店と組)");
     let d = tri.poll();
     assert_eq!(
         (sorted(d.removed), sorted(d.added)),
-        (vec![vec![bob, ant, shop], vec![carol, ant, shop]], vec![vec![bob, ant2, shop], vec![carol, ant2, shop], vec![dave, ant2, shop]]),
+        (vec![vec![bob, ant, shop], vec![carol, ant, shop]], vec![vec![dave, ant2, shop]]),
         "3 table の組 (真ん中)"
     );
     drop((by_ref, tokyo, by_val, tri, c, u, s));
