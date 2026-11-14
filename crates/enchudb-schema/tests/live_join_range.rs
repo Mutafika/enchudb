@@ -234,7 +234,8 @@ fn run(path: &str) {
                     new_event(&mut rng, next_id)
                 };
                 next_id += 1;
-                if events[ai] == a {
+                // #731: 場所を使い回した (eid は世代が違う)。 既定の DB の場所は下 24 bit
+                if events[ai] as u32 & 0xFF_FFFF == a as u32 & 0xFF_FFFF {
                     reborn.insert(a);
                     reborn_seen += 1;
                 }
@@ -257,7 +258,8 @@ fn run(path: &str) {
                         new_session(&mut rng, next_id)
                     };
                     next_id += 1;
-                    if sessions[bi] == b {
+                    // #731: 場所を使い回した (eid は世代が違う)。 既定の DB の場所は下 24 bit
+                    if sessions[bi] as u32 & 0xFF_FFFF == b as u32 & 0xFF_FFFF {
                         reborn.insert(b);
                         reborn_seen += 1;
                     }

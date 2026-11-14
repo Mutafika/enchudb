@@ -176,9 +176,11 @@ fn an_upsert_does_not_write_into_a_reused_eid_of_another_name() {
             drop(row);
             (h.join().unwrap(), y)
         });
-        if y != e {
+        // #731: 場所を使い回した行の eid は世代が違う (既定の DB の場所は下 24 bit)
+        if y as u32 & 0xFF_FFFF != e as u32 & 0xFF_FFFF {
             continue; // 使い回されなかった (この回は数えない)
         }
+        assert_ne!(y, e, "使い回した場所の行に、 消えた行と同じ eid を渡した");
         reused += 1;
         if t.upsert_relookups() == 0 {
             // B が引く前に消えた (窓を踏んでいない)。 それでも Y の行に値は付かない

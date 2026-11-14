@@ -443,7 +443,8 @@ fn bigint_live_aggregates_match_oracle() {
                 .iter()
                 .copied()
                 .filter(|&e| keep(e))
-                .filter_map(|e| num(ev.entity(e).get("amount")).map(|a| (if desc { -(a as i128) } else { a as i128 }, enchudb_oplog::eid_local(e) as u64, e)))
+                // #731: 同じ値は場所の順 (使い回した行の eid は世代が違う = u64 の順と場所の順が違う)
+                .filter_map(|e| num(ev.entity(e).get("amount")).map(|a| (if desc { -(a as i128) } else { a as i128 }, db.engine().eid_slot(e) as u64, e)))
                 .collect();
             v.sort_unstable();
             v.into_iter().take(6).map(|x| x.2).collect()

@@ -398,14 +398,16 @@ fn a_reused_slot_drops_its_former_names() {
     b.upsert("z", "b");
     r.pull(1);
     assert_eq!(r.rows(), vec![], "前提: A の行は消えた");
-    let a_slot = r.db.engine().resolve_remote_eid_existing(a.row_of_any()).map(enchudb::eid_local);
+    // #731: 場所で比べる (使い回した行の eid は世代が違う。 既定の DB の場所は下 24 bit)
+    let slot = |e: u64| enchudb::eid_local(e) & 0xFF_FFFF;
+    let a_slot = r.db.engine().resolve_remote_eid_existing(a.row_of_any()).map(slot);
     assert!(a_slot.is_some(), "前提: R に A の行の写像がある");
     let t = r.db.get_table(T).unwrap();
     let mut mine = Vec::new();
     for k in ["p", "q", "s", "w"] {
         mine.push(t.insert().set("key", k).set("title", "own").commit().unwrap());
     }
-    assert_eq!(mine.last().map(|e| enchudb::eid_local(*e)), a_slot, "前提: R の 4 行目 (w) が A の行の slot を使い回す ({mine:?})");
+    assert_eq!(mine.last().map(|e| slot(*e)), a_slot, "前提: R の 4 行目 (w) が A の行の slot を使い回す ({mine:?})");
     r.pull(2);
     let rows = r.rows();
     let text = |s: &str| Some(Value::Text(s.into()));
