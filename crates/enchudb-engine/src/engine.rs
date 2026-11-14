@@ -736,6 +736,24 @@ fn tables_path_for(path: &str) -> std::path::PathBuf {
     crate::db_files::path_for(path, crate::db_files::TABLES)
 }
 
+/// #847: `tables` の sidecar に置く `next_local`。 開き直した時に 「ここから先は払い出していない」 と読む値なので、 実際の
+/// 値以上であればよい (小さいと、 払い出し済みの eid をもう一度払い出す)。
+///
+/// - 枠を越えた分は枠に丸める。 満杯の table への `entity_in` は失敗するたびに `next_local` を 1 進める (戻さない) ので、
+///   そのまま置くと、 満杯の間 sidecar が失敗のたびに変わる。 枠以上の値は開き直した時どれも同じ意味 (払い出し切った)
+/// - sync の ring (`_sync_ops`) はいつも枠を置く。 ring は bridge が record を写すたびに 1 行払い出すので、 実際の値を
+///   置くと書き出しのたびに sidecar が変わり、 作り直す (tmp + fsync + rename。 file system が混むと、 これ 1 回で秒単位に
+///   止まった)。 枠を置いた ring は、 開き直した後 「払い出し切った ring」 として、 生きていない slot を拾って払い出す
+///   ([`Engine::rebuild_free_locals`]。 1 周した ring が開き直した後にしている事と同じ)。 ring 以外の table は実際の値
+///   (飛ばした eid は戻らない)
+fn persisted_next_local(t: &TableDef) -> u32 {
+    let capacity = t.capacity();
+    if is_sync_ring_table(&t.name) {
+        return capacity;
+    }
+    t.next_local.load(std::sync::atomic::Ordering::Relaxed).min(capacity)
+}
+
 /// β-light step 7: tables Vec を binary encode。
 ///
 /// layout:
@@ -779,7 +797,7 @@ fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16], an
         out.extend_from_slice(name_bytes);
         out.extend_from_slice(&t.eid_range_lo.to_le_bytes());
         out.extend_from_slice(&t.eid_range_hi.to_le_bytes());
-        out.extend_from_slice(&t.next_local.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        out.extend_from_slice(&persisted_next_local(t).to_le_bytes());
         let himo_ids = t.himo_ids.read().unwrap();
         out.extend_from_slice(&(himo_ids.len() as u32).to_le_bytes());
         for &h in himo_ids.iter() {
@@ -1109,19 +1127,6 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
         }
     }
     Ok((tables, orders, marks, answers))
-}
-
-/// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。 `orders` は並びの索引の宣言 (`DIA1`)。
-#[cfg(not(target_arch = "wasm32"))]
-fn persist_tables_to_sidecar(
-    db_path: &str,
-    tables: &[TableDef],
-    orders: &[OrderDecl],
-    marks: &[u16],
-    answers: &[AnswerDecl],
-) -> io::Result<()> {
-    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders, marks, answers))
-        .map(|_| ())
 }
 
 /// 0.8.15 (issue #52): persist 失敗で残った `.tables.tmp` を open 時に明示削除。
@@ -5302,6 +5307,9 @@ pub fn is_reserved_table_name(name: &str) -> bool {
     name.starts_with('_')
 }
 
+/// #847: [`Engine::rebuild_free_locals`] が sync の ring の穴を 1 回に拾う数。
+const SYNC_RING_REBUILD_BATCH: usize = 4096;
+
 /// sync の未配送 record を置く ring の table か。 この table だけ、 枠を自動では足さない (#368)。
 #[inline]
 fn is_sync_ring_table(name: &str) -> bool {
@@ -5756,6 +5764,10 @@ pub struct Engine {
     /// false に戻して 1 度だけ explicit に `persist_tables()` を呼ぶ。
     /// macOS APFS で N table 宣言時の N×fsync (= 1 fsync 5-7ms) を 1 回に圧縮。
     defer_tables_persist: std::sync::atomic::AtomicBool,
+    /// #847: `tables` の sidecar に最後に置いた中身 ([`Self::persist_tables_file`])。 同じ中身なら file に触らない。
+    tables_persisted: std::sync::Mutex<Option<Vec<u8>>>,
+    /// #847: sync の ring の穴を次に探し始める所 ([`Self::rebuild_free_locals`]、 `free_locals` の lock の下でだけ触る)。
+    sync_ring_rebuild_from: std::sync::atomic::AtomicU32,
     /// #190: sidecar persist (`.tables` / `.eidmap` / `.vocabmap`) の直列化 lock。
     /// tmp 名が sidecar ごとに固定なので、 同一 sidecar を 2 thread (consumer の
     /// `try_persist_tables` と pull 側の `persist_sync_state`) が同時に書くと
@@ -6197,6 +6209,8 @@ impl Engine {
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            tables_persisted: std::sync::Mutex::new(None),
+            sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -7486,6 +7500,8 @@ impl Engine {
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            tables_persisted: std::sync::Mutex::new(None),
+            sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -10632,6 +10648,28 @@ impl Engine {
         self.sync_op_payload(eid, &self.sync_payload_cols()?)
     }
 
+    /// #847: sync の DB を書き手として並行の形にする時に、 まだ無ければ payload の ring (`sync.payload.seg`) と、 その場所を置く列
+    /// (`_sync_ops.payload_at`) を作っておく。
+    ///
+    /// 前は最初の bridge が作っていた。 最初の bridge は、 作ったばかりの DB では満杯の WAL を空ける 1 回目の中で走る:
+    /// version を刻む (header の書き出し)、 ring を別の名前で作って書き出して rename して directory を書き出す (#441)、 列を足して
+    /// `tables` を作り直す、 が、 空きを待つ書き手を止めたまま続いた (file system が混むと、 これだけで秒単位。 待つ書き手が
+    /// 待ちの上限に当たる形の多くがこの 1 回目だった)。 ここなら誰も待っていない。
+    ///
+    /// ring がもう在る DB は何もしない (開くのは今まで通り最初の bridge。 開く時に ring の行をなめないため)。 ring を持てない
+    /// DB (readonly / packed) は今まで通り辞書。 version を v14 に上げるのが、 最初の bridge でなく、 sync の表を持つ DB を
+    /// WAL 付きの書き手として開いた時になる。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prepare_sync_bridge(&self) {
+        let Backing::Segments(set) = &self.backing else { return };
+        if !self.sync_tables_enabled() || self.is_readonly() || set.dir().join(crate::sync_payload_ring::FILE).exists() {
+            return;
+        }
+        if self.payload_ring(true).is_some() {
+            let _ = self.ensure_himo_dynamic_in("_sync_ops", "payload_at", ValueType::Number, 0);
+        }
+    }
+
     /// payload の循環バッファ。 在れば開き、 `create` なら無い時に作る (version を v14 に上げる)。 readonly /
     /// packed / 開けなかった時は `None` (payload は辞書の従来経路)。
     #[cfg(not(target_arch = "wasm32"))]
@@ -10959,6 +10997,11 @@ impl Engine {
     /// 戻り値: 穴が 1 つでも見つかったか。 lock を持ったまま scan するので、 並行する
     /// 枯渇 thread は再構築完了を待ってから free list を pop する（同じ穴の二重払い出し
     /// を防ぐ）。 range 全体の線形 scan だが、 呼ばれるのは枯渇時のみで hot path 外。
+    ///
+    /// #847: sync の ring (`_sync_ops`) は、 穴を [`SYNC_RING_REBUILD_BATCH`] 個見つけた所で止め、 次はその続きから探す
+    /// (1 周して戻る)。 ring は開き直した後いつもここから払い出す (sidecar の `next_local` は枠、 [`persisted_next_local`])
+    /// ので、 全部の穴を集めると、 空に近い 100 万行の ring で 100 万個 (4 MB) の list を作って枠を全部なめた。 list が空の時に
+    /// しか来ないので、 途中で止めても同じ slot を 2 度拾わない (拾った slot は払い出されて生きているか、 list に残っている)。
     fn rebuild_free_locals(&self, tid: usize) -> bool {
         use std::sync::atomic::Ordering;
         let table = &self.tables[tid];
@@ -10967,18 +11010,36 @@ impl Engine {
             return true; // 別 thread が再構築済み
         }
         let allocated = table.next_local.load(Ordering::Acquire).min(table.capacity());
-        let mut local = 0u32;
-        'outer: for (lo, hi) in table.extents() {
-            for global in lo..hi {
-                if local >= allocated {
-                    break 'outer;
+        let ring = is_sync_ring_table(&table.name);
+        // 探し始める所 (ring は前に止めた続き)。 [from, allocated) → [0, from) の順に見る
+        let from = if ring { self.sync_ring_rebuild_from.load(Ordering::Relaxed).min(allocated) } else { 0 };
+        let mut stopped_at = None;
+        'scan: for (first, end) in [(from, allocated), (0, from)] {
+            let mut local = 0u32;
+            for (lo, hi) in table.extents() {
+                let len = hi - lo;
+                if local >= end {
+                    break;
                 }
-                // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
-                if !self.entities.is_live(global) && !self.is_folded_own_slot(global) {
-                    fl.push(local);
+                if local + len > first {
+                    for l in first.max(local)..end.min(local + len) {
+                        let global = lo + (l - local);
+                        // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
+                        if !self.entities.is_live(global) && !self.is_folded_own_slot(global) {
+                            fl.push(l);
+                            if ring && fl.len() >= SYNC_RING_REBUILD_BATCH {
+                                stopped_at = Some(l + 1);
+                                break 'scan;
+                            }
+                        }
+                    }
                 }
-                local += 1;
+                local += len;
             }
+        }
+        if ring {
+            // 全部見た時は同じ所からでよい (次に来るのは list を使い切った後)
+            self.sync_ring_rebuild_from.store(stopped_at.unwrap_or(from), Ordering::Relaxed);
         }
         let found = !fl.is_empty();
         if found {
@@ -11042,7 +11103,7 @@ impl Engine {
         // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw())?;
+        self.persist_tables_file()?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。 #560: 変わった分だけ追記
         self.persist_eidmap()?;
         // #178: 別名も同じ trigger で
@@ -11358,6 +11419,24 @@ impl Engine {
         &self.path
     }
 
+    /// β-light step 7: tables を sidecar に atomic 書き換え (tmp → fsync → rename)。 `orders` は並びの索引の宣言 (`DIA1`)。
+    /// 呼び手は `sidecar_persist_lock` を握っている。
+    ///
+    /// #847: 中身が、 この engine が最後に置いた (または file と同じと確かめた) 中身と同じなら、 file に触らない。 前は
+    /// 書き出しのたびに file を開いて読み比べていた (`write_atomic_if_changed`。 file system が混むと、 開くだけで待たされる)。
+    /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_tables_file(&self) -> io::Result<()> {
+        let bytes = serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw());
+        let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
+        if last.as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        crate::db_files::write_atomic_if_changed(&tables_path_for(&self.path), &bytes)?;
+        *last = Some(bytes);
+        Ok(())
+    }
+
     /// β-light step 7: 現 tables Vec を sidecar に保存する (best effort)。
     /// memory-only (from_bytes) や wasm では no-op。 path が空なら skip。
     /// 0.8.2: `defer_tables_persist` が立ってる時 (schema crate の build phase)
@@ -11374,7 +11453,7 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw()) {
+                if let Err(e) = self.persist_tables_file() {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
@@ -21823,6 +21902,9 @@ impl Engine {
         // changefeed の記録は consumer が畳む前に WAL の続きの位置を合わせる
         #[cfg(not(target_arch = "wasm32"))]
         eng.attach_change_log();
+        // #847: sync の DB の最初の bridge の仕度を、 書き手が来る前に済ませる
+        #[cfg(not(target_arch = "wasm32"))]
+        eng.prepare_sync_bridge();
         // #732: 並行の形にする前 (standalone / schema の build phase) に付けた listener は、 付けた時に WAL が無かったので
         // cursor を head に合わせていない (0 のまま)。 今 WAL に在る record は全部それより前 (前の session がきれいに閉じずに
         // 残した分。 standalone の間の書き込みは WAL に載らない) なので、 ここで head に合わせる (`add_change_listener` の
@@ -22463,8 +22545,9 @@ impl Engine {
                 self.vocab.durable_end(vocab_token);
                 self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
                 self.sync_bridged_durable_pos.fetch_max(bridged_pos, std::sync::atomic::Ordering::AcqRel);
-                // 「この時点の segment 長」 を記録する。 次の open で切り詰めを検出できる。
-                set.write_manifest()
+                // 「この時点の segment 長」 を記録する。 次の open で切り詰めを検出できる。 #847: 続けて書き出す間は間隔を空ける
+                // (伸びている最中の DB は書き出しのたびに作り直していた)。 `flush` / 閉じる時は必ず書く
+                set.write_manifest_paced()
             }
             Backing::Memory(_) => {
                 // ディスクが無いので、 bridge した行はいつでも畳める (#440)
@@ -23570,6 +23653,107 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+/// #847: `tables` の sidecar に置く `next_local` ([`persisted_next_local`]) と、 ring の穴を拾う所。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod persisted_next_local_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-issue847-unit-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 置く値は実際の値以上 (小さいと、 開き直した後に払い出し済みの slot をもう一度払い出す)・枠以下。 ring はいつも枠。
+    /// ring でない table は枠までそのまま、 越えた分は枠。
+    #[test]
+    fn the_persisted_value_never_falls_below_the_real_one() {
+        let tmp = tmp("value");
+        let mut eng = Engine::create_with_capacity(&tmp.0, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let ring = eng.tables.iter().find(|t| t.name == "_sync_ops").unwrap();
+        let capacity = ring.capacity();
+        for n in [0, 1, capacity / 2, capacity - 1, capacity, capacity + 1, u32::MAX] {
+            ring.next_local.store(n, std::sync::atomic::Ordering::Release);
+            assert_eq!(persisted_next_local(ring), capacity, "ring はいつも枠を置く (実際の値 {n})");
+        }
+        let t = eng.tables.iter().find(|t| t.name == "t").unwrap();
+        for n in [0, 1, 7, 99, 100] {
+            t.next_local.store(n, std::sync::atomic::Ordering::Release);
+            assert_eq!(persisted_next_local(t), n, "ring でない table は実際の値");
+        }
+        for n in [101, 150, u32::MAX] {
+            t.next_local.store(n, std::sync::atomic::Ordering::Release);
+            assert_eq!(persisted_next_local(t), t.capacity(), "枠を越えた分は枠に丸める");
+        }
+        // sidecar を読み直しても同じ値
+        ring.next_local.store(1, std::sync::atomic::Ordering::Release);
+        t.next_local.store(42, std::sync::atomic::Ordering::Release);
+        let (tables, _, _, _) = deserialize_tables(&serialize_tables(&eng.tables, &[], &[], &[])).unwrap();
+        let read = |name: &str| tables.iter().find(|t| t.name == name).unwrap().next_local.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(read("_sync_ops"), capacity);
+        assert_eq!(read("t"), 42);
+        ring.next_local.store(0, std::sync::atomic::Ordering::Release);
+        t.next_local.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 開き直した ring (sidecar の `next_local` は枠) は、 生きていない slot を少しずつ拾って払い出す: 1 回に拾うのは
+    /// `SYNC_RING_REBUILD_BATCH` 個まで、 続きから探し、 1 周して前の方の穴も拾う。 同じ slot を 2 度払い出さず、 枠の数だけ
+    /// 払い出したら尽きる。
+    ///
+    /// falsify: 拾う数に上限を置かないと、 100 万行の ring で list が 100 万個になる。 続きを覚えないと (いつも頭から)
+    /// 拾えるが、 頭の生きた行を毎回なめ直す (この試験は数を見るだけなので通る)。 1 周して戻らないと、 続きより前の穴を拾えず
+    /// 尽きたと答える。
+    #[test]
+    fn a_reopened_ring_picks_up_free_slots_in_batches() {
+        let tmp = tmp("batch");
+        let mut eng = Engine::create_with_capacity(&tmp.0, 1 << 17).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+        let table = &eng.tables[tid];
+        let capacity = table.capacity();
+        assert!(capacity as usize > 8 * SYNC_RING_REBUILD_BATCH, "前提: ring が 1 回に拾う数よりずっと大きい (枠 {capacity})");
+        // 開き直した形: 払い出し切った事にする
+        table.next_local.store(capacity, std::sync::atomic::Ordering::Release);
+        let listed = || table.free_locals.lock().unwrap().len();
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..3 * SYNC_RING_REBUILD_BATCH + 7 {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            assert!(seen.insert(e), "同じ slot を 2 度払い出した ({i} 個目)");
+            assert!(listed() <= SYNC_RING_REBUILD_BATCH, "穴の list が 1 回に拾う数を越えた ({})", listed());
+        }
+        // 前の方 (続きより手前) の行を消すと、 1 周して拾う
+        let first: Vec<u64> = seen.iter().copied().take(3).collect();
+        for e in &first {
+            eng.entities.free(enchudb_oplog::eid_local(*e));
+        }
+        table.free_locals.lock().unwrap().clear();
+        table.free_locals_nonempty.store(false, std::sync::atomic::Ordering::Release);
+        let live = |eng: &Engine| eng.table_eid_usage("_sync_ops").unwrap().live;
+        let before = live(&eng);
+        let mut again = Vec::new();
+        while let Ok(e) = eng.entity_in("_sync_ops") {
+            again.push(e);
+            assert!(listed() <= SYNC_RING_REBUILD_BATCH);
+        }
+        assert_eq!(live(&eng), capacity, "枠の数だけ払い出す前に尽きた (前の方の穴を拾っていない)");
+        assert_eq!(again.len() as u32, capacity - before, "払い出した数が空きの数と違う");
+        for e in &first {
+            assert!(again.contains(e), "消した前の方の slot を拾い直さなかった");
+        }
+        let all: std::collections::BTreeSet<u64> = seen.iter().copied().chain(again.iter().copied()).collect();
+        assert_eq!(all.len() as u32, capacity, "生きている行の数と、 払い出した eid の数が合わない (同じ slot を 2 度払い出した)");
+    }
+}
 
 /// #843: 止まった周が ring を読み直さない近道 ([`RingNewest`]) と、 覚えた答え。
 #[cfg(test)]
