@@ -778,8 +778,143 @@ fn the_replay_after_the_reconcile_keeps_the_reused_rows_generation() {
         let eng = Engine::open_concurrent_with_oplog(&img2, WAL).unwrap();
         assert_eq!(eng.generation_repairs(), (1, 0), "前提: 突き合わせが削除を完了させた");
         assert!(!eng.is_live(c), "WAL にある削除を再生しなかった");
+        // 再生した Delete も 「死んでいる」 印を立てる: 再生の後の本体は突き合わせで直す所が無い (もう一度落ちても世代を無駄にしない)
+        let img3 = format!("{made}-img3");
+        let _c3 = Cleanup(img3.clone());
+        eng.oplog_sync().unwrap();
+        let hold = eng.hold_consumer();
+        copy_dir(std::path::Path::new(&img2), std::path::Path::new(&img3));
+        drop(hold);
+        std::fs::remove_file(std::path::Path::new(&img3).join("oplog")).unwrap();
+        let again = Engine::open_concurrent_with_oplog(&img3, WAL).unwrap();
+        assert_eq!(again.generation_repairs(), (0, 0), "再生の後の本体で gen.seg と生きている印が食い違う");
         let e = eng.entity_in("notes").unwrap();
         assert_eq!(slot(e), slot(c));
         assert!(e != c && e != a, "再生した削除の場所を、 消えた行の eid で使い回した");
     }
+}
+
+/// 写しを開いて (WAL を外す = 突き合わせだけ)、 行 `e` が生きていて列 `col` が `v` か。
+fn survives_unclean_reopen(db: &str, e: u64, col: &str, v: u64) {
+    let img = format!("{db}-reopen");
+    let _c = Cleanup(img.clone());
+    copy_dir(std::path::Path::new(db), std::path::Path::new(&img));
+    std::fs::remove_file(std::path::Path::new(&img).join("oplog")).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&img, WAL).unwrap();
+    assert_eq!(eng.generation_repairs(), (0, 0), "使い回した後の本体で gen.seg と生きている印が食い違う");
+    assert!(eng.is_live(e), "使い回した行 {e:#x} が、 きれいに閉じなかった後に消えた (死んでいる印が残っていた)");
+    assert_eq!(eng.get(e, col), Some(v));
+}
+
+/// 使い回す道は、 生きている印を立てる前に 「死んでいる」 印を落とす (残すと、 きれいに閉じなかった後の突き合わせが 「削除の途中」 と
+/// 読んで、 生きている行を消す)。 道ごと: anonymous の free stack (`entity()`)、 払い出し位置 (落ちた後に `tables` が古く、 払い出し
+/// 位置が消した場所の手前に戻った形)。 表の空きの一覧からの取り出しは `generation_marks_are_rebuilt_after_an_unclean_close` が見る。
+#[test]
+fn every_reuse_path_drops_the_dead_mark_before_the_live_bit() {
+    // anonymous の free stack
+    let anon = tmp_path("revive-anon");
+    let _c1 = Cleanup(anon.clone());
+    {
+        let mut eng = Engine::create_with_capacity(&anon, 4).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, WAL).unwrap();
+        let rows: Vec<u64> = (0..4u32)
+            .map(|i| {
+                let e = eng.entity().unwrap();
+                eng.tie_to(e, "v", i);
+                e
+            })
+            .collect();
+        eng.delete(rows[1]);
+        let a = eng.entity().unwrap();
+        assert_eq!(slot(a), slot(rows[1]), "前提: free stack から使い回す");
+        eng.delete(a); // v15 で消す = 死んでいる印
+        let b = eng.entity().unwrap();
+        assert_eq!(slot(b), slot(a), "前提: もう一度使い回す");
+        eng.tie_to(b, "v", 9u32);
+        eng.oplog_sync().unwrap();
+        let _hold = eng.hold_consumer();
+        survives_unclean_reopen(&anon, b, "v", 9);
+    }
+    // 払い出し位置 (`tables` を書けないまま消して、 WAL の無い像で開く = 払い出し位置が消した場所の手前)
+    let made = tmp_path("revive-pos");
+    let image = format!("{made}-image");
+    let (_c2, _c3) = (Cleanup(made.clone()), Cleanup(image.clone()));
+    let x = {
+        let eng = create_concurrent(&made, false, 100);
+        reuse_once(&eng);
+        let hold = eng.hold_consumer();
+        let a = eng.entity_in("notes").unwrap();
+        eng.tie_to(a, "notes.note", 1u32);
+        block_tables(&made, true);
+        let x = eng.entity_in("notes").unwrap();
+        eng.tie_to(x, "notes.note", 2u32);
+        eng.delete(x);
+        eng.oplog_sync().unwrap();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&image));
+        drop(hold);
+        block_tables(&made, false);
+        x
+    };
+    let _ = std::fs::remove_dir(std::path::Path::new(&image).join("tables.tmp"));
+    std::fs::remove_file(std::path::Path::new(&image).join("oplog")).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&image, WAL).unwrap();
+    let y = eng.entity_in("notes").unwrap();
+    assert_eq!(slot(y), slot(x), "前提: 払い出し位置が消した場所の手前に戻った");
+    assert_ne!(y, x, "消した場所を、 払い出し位置の道で消えた行の eid で渡した");
+    eng.tie_to(y, "notes.note", 3u32);
+    eng.oplog_sync().unwrap();
+    let _hold = eng.hold_consumer();
+    survives_unclean_reopen(&image, y, "notes.note", 3);
+}
+
+/// PR #885 の読み直し I: bridge の local-only の判定 (`transfer_oplog_to_sync_ops` の `is_internal_eid`) と changefeed の判定
+/// (`keep_for_changefeed`) は、 自分の record (peer 0 も) だけを見る。 中継した他の peer の record の番号は相手の番号で、 世代を外す
+/// のも自分の S なので、 相手の 2^24 以上の番号 (相手の 「世代 | 場所」、 max_entities の大きい相手の場所) が、 こちらの予約の表
+/// (`_sync_ops` の ring) の範囲に写って中継から外れた。 相手の番号は、 下の 24 bit がこちらの ring の先頭に当たる世代 1 の番号。
+#[test]
+fn a_relayed_record_with_a_large_number_is_not_taken_for_a_local_only_row() {
+    use enchudb_engine::changefeed::ChangeListener;
+    use enchudb_engine::transport::WireRecord;
+    use enchudb_oplog::oplog::{decode_sync_ops_payload, DecodedOp};
+    struct Seen(std::sync::Mutex<Vec<u64>>);
+    impl ChangeListener for Seen {
+        fn on_changes(&self, records: &[WireRecord]) {
+            for r in records {
+                if let DecodedOp::Tie { eid, .. } = r.op {
+                    self.0.lock().unwrap().push(eid);
+                }
+            }
+        }
+    }
+    let path = tmp_path("relay-local-only");
+    let _c = Cleanup(path.clone());
+    let eng = create_concurrent(&path, true, 2);
+    eng.set_peer_id(2);
+    reuse_once(&eng);
+    assert_eq!(eng.slot_bits(), 24, "前提: v15 (場所の bit 24)");
+    let (ring_lo, ring_hi) = eng.table_eid_range("_sync_ops").unwrap();
+    assert!(ring_lo < ring_hi && ring_hi <= 1 << 24, "前提: ring の範囲 {ring_lo}..{ring_hi}");
+    let foreign = enchudb_oplog::make_eid(7, (1 << 24) | ring_lo);
+    let seen = std::sync::Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
+    eng.add_change_listener(seen.clone());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let rec = WireRecord::unsigned(hlc(now, 7), 7, DecodedOp::Tie { eid: foreign, himo_id: 0, value: 42 });
+    assert!(eng.relay_record(&rec), "前提: 相手の record を WAL に載せた");
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    eng.transfer_oplog_to_sync_ops();
+    let relayed: Vec<u64> = eng
+        .pending_sync_ops(0)
+        .iter()
+        .filter_map(|p| decode_sync_ops_payload(p))
+        .filter(|r| r.author_peer == 7)
+        .filter_map(|r| match r.op {
+            DecodedOp::Tie { eid, .. } => Some(eid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(relayed, vec![foreign], "相手の record ({foreign:#x}) を自分の local-only の行と読んで中継しなかった");
+    assert!(seen.0.lock().unwrap().contains(&foreign), "相手の record を自分の local-only の行と読んで changefeed に渡さなかった");
 }
