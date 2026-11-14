@@ -49,11 +49,21 @@ pub(crate) struct Generations {
     /// 場所は、 なめる時には死んでいる (なめる側が上げる)。 印を見た書き手は自分で上げる。 揃えの model は
     /// `tests/loom_eid_generation_move.rs`
     gate: AtomicU64,
+    /// v15 に移る手順 (`Engine::move_to_generations`) を 1 本に並べる。
+    pub(crate) move_lock: std::sync::Mutex<()>,
+    /// WAL の再生中 (`Engine::apply_oplog_op`)。 消す道が場所の世代を上げない (再生が record の世代で上げる)。
+    pub(crate) replaying: std::sync::atomic::AtomicBool,
 }
 
 impl Generations {
     pub(crate) fn off() -> Self {
-        Self { bits: AtomicU32::new(0), region: std::sync::OnceLock::new(), gate: AtomicU64::new(0) }
+        Self {
+            bits: AtomicU32::new(0),
+            region: std::sync::OnceLock::new(),
+            gate: AtomicU64::new(0),
+            move_lock: std::sync::Mutex::new(()),
+            replaying: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// 開いた DB の `gen.seg` (header に場所の bit が焼いてある)。 中身の header が合わなければ Err。

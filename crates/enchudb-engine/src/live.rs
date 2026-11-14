@@ -4979,6 +4979,12 @@ impl LiveRegistry {
         self.orders().filter(move |o| o.via == himo || o.key == himo)
     }
 
+    /// #731: 場所ごとの世代 (engine と共有)。
+    #[inline]
+    pub(crate) fn gens(&self) -> &crate::generation::Generations {
+        &self.gens
+    }
+
     /// #731: アプリに渡す出口 (peer と場所の世代)。
     #[inline]
     pub(crate) fn exit(&self) -> Exit<'_> {
