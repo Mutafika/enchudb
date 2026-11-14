@@ -844,6 +844,17 @@ fn persisted_next_local(t: &TableDef) -> u32 {
 /// 並びの索引の宣言 (`orders`、 [`Engine::declare_order`]) は `DIA1` block として一番後ろに足す (`PKS1` / `EXT1` を
 /// 知っている古いバイナリは、 それを読んでから知らない magic の所で止まる)。
 fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16], answers: &[AnswerDecl]) -> Vec<u8> {
+    serialize_tables_with(tables, orders, marks, answers, None)
+}
+
+/// [`serialize_tables`] の、 表 `pending.0` に枠 `pending.1` を足した形 (#881: 足す枠を `extra` に見せる前に書く)。
+fn serialize_tables_with(
+    tables: &[TableDef],
+    orders: &[OrderDecl],
+    marks: &[u16],
+    answers: &[AnswerDecl],
+    pending: Option<(usize, (u32, u32))>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -890,8 +901,11 @@ fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16], an
         .iter()
         .enumerate()
         .filter_map(|(i, t)| {
-            let e = t.extra.read().unwrap();
-            if e.is_empty() { None } else { Some((i as u32, e.clone())) }
+            let mut e = t.extra.read().unwrap().clone();
+            if let Some((_, ext)) = pending.filter(|(tid, _)| *tid == i) {
+                e.push(ext);
+            }
+            if e.is_empty() { None } else { Some((i as u32, e)) }
         })
         .collect();
     if !ext.is_empty() {
@@ -2319,6 +2333,54 @@ mod settle_call_hook {
     }
 }
 
+/// test 用の割り込み点: `entity_in` が払い出し位置から取った slot に生きている印を立てる前 (#883)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod claim_gap_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `entity_in` が空きの一覧から取り出した slot に生きている印を立てる前 (#883)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod pop_claim_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 畳んだ自分の行を戻す 2 段 (生きている印を立てる / 別名を外す) の間 (#882)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod revive_gap_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: changefeed の record を記録 (`pump_change_log`) / 溜め (`move_changes_to_backlog`) に写し始める所 (#662)。
 /// 畳む時の写しが書き手を止めないこと (`append_lock` の外で写す) を、 写している間に別の thread が WAL に積めるかで確かめるため。
 /// 置いた WAL で 1 回だけ呼ぶ (続けて呼ばせるには、 呼ばれた中で置き直す)。
@@ -2961,6 +3023,124 @@ mod wal_reject_tests {
 /// 2 本目を走らせる。 行を握ったまま積んで当てる今の形なら 2 本目は 1 本目が当て終えるまで待つ。 前の形 (積んでから握る) だと 2 本目が
 /// 先に当て、 版数の無い DB では cell が WAL の最後の record と違う値で残り、 版数のある DB では 1 本目が `OlderThanCell` で弾かれた
 /// (`same_cell_wal_order.rs` は確率的で、 直す前に 1 round 約 5 %)。
+/// #882 / #883: 同じ slot を 2 回払い出す窓 2 つを、 割り込み点で決まって踏む。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod slot_claim_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Taken = Arc<Mutex<Option<Result<enchudb_oplog::EntityId, String>>>>;
+
+    /// 枠 4 の表 `t` を持つ、 版数の無い WAL 付きの engine。
+    fn engine(tag: &str) -> (String, Arc<Engine>) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-slotclaim-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("t", 4).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        (path, Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap())
+    }
+
+    fn cleanup(path: &str, eng: Arc<Engine>) {
+        drop(eng);
+        let _ = crate::db_files::remove_db(path);
+        let _ = std::fs::remove_file(oplog_path_for(path));
+    }
+
+    /// 割り込み点で別の thread の `entity_in` を回す (結果を `taken` に置く)。
+    fn other_insert(eng: &Arc<Engine>, taken: &Taken) -> impl FnOnce(&enchudb_oplog::oplog::OpLog) + Send + 'static {
+        let (eng, taken) = (eng.clone(), taken.clone());
+        move |_| {
+            let r = std::thread::spawn(move || eng.entity_in("t")).join().unwrap();
+            *taken.lock().unwrap() = Some(r);
+        }
+    }
+
+    /// #883: 払い出し位置から最後の slot を取って生きている印を立てる前に、 枯渇を見た別の書き手が全部なめでその slot を穴として
+    /// 拾って払い出しても、 同じ eid を 2 つの行に払い出さない (前は両方が同じ slot を返した)。
+    #[test]
+    fn the_last_slot_taken_from_next_local_is_not_given_out_twice() {
+        let (path, eng) = engine("claim");
+        for _ in 0..3 {
+            eng.entity_in("t").unwrap();
+        }
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let taken: Taken = Arc::default();
+        claim_gap_hook::set(&wal, other_insert(&eng, &taken));
+        let mine = eng.entity_in("t").unwrap();
+        let theirs = taken.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        cleanup(&path, eng);
+        let theirs = theirs.expect("前提: 別の書き手も払い出された");
+        assert_ne!(mine, theirs, "最後の slot {mine:#x} を 2 つの行に払い出した");
+    }
+
+    /// #883 の逆の並び: 全部なめで穴として拾った slot を取り出した書き手 (Y) が印を立てる前に、 払い出し位置からその slot を取った
+    /// 書き手 (X) が先に印を立てても、 Y は同じ slot を返さない (前は取り出す時に 「生きていない」 を確かめてから立て、 結果を見なかった)。
+    #[test]
+    fn a_popped_slot_claimed_first_from_next_local_is_not_given_out_twice() {
+        use std::sync::mpsc::channel;
+        let (path, eng) = engine("pop");
+        for _ in 0..3 {
+            eng.entity_in("t").unwrap();
+        }
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (x_at, x_at_rx) = channel::<()>();
+        let (x_go, x_go_rx) = channel::<()>();
+        let (y_at, y_at_rx) = channel::<()>();
+        let (y_go, y_go_rx) = channel::<()>();
+        // X: 払い出し位置から最後の slot を取り、 印を立てる前で止まる
+        claim_gap_hook::set(&wal, move |_| {
+            x_at.send(()).unwrap();
+            x_go_rx.recv().unwrap();
+        });
+        // Y: 全部なめで同じ slot を穴として拾って取り出し、 印を立てる前で止まる
+        pop_claim_hook::set(&wal, move |_| {
+            y_at.send(()).unwrap();
+            y_go_rx.recv().unwrap();
+        });
+        let ex = eng.clone();
+        let x = std::thread::spawn(move || ex.entity_in("t"));
+        x_at_rx.recv().unwrap();
+        let ey = eng.clone();
+        let y = std::thread::spawn(move || ey.entity_in("t"));
+        y_at_rx.recv().unwrap();
+        // X が先に印を立てる
+        x_go.send(()).unwrap();
+        let mine = x.join().unwrap();
+        y_go.send(()).unwrap();
+        let theirs = y.join().unwrap();
+        cleanup(&path, eng);
+        let (mine, theirs) = (mine.expect("前提: X は払い出された"), theirs.expect("前提: Y は払い出された"));
+        assert_ne!(mine, theirs, "最後の slot {mine:#x} を 2 つの行に払い出した");
+    }
+
+    /// #882: 畳んだ自分の行を戻している最中 (生きている印 / 別名を外す の間) に、 枯渇した表へ別の書き手が足しても、 戻している
+    /// slot を払い出さない (前は 別名を外す → 生きている印 の順で、 間の一瞬に消した行の一覧から拾って払い出した)。
+    #[test]
+    fn a_folded_slot_being_revived_is_not_given_out() {
+        let (path, eng) = engine("revive");
+        let rows: Vec<_> = (0..4).map(|_| eng.entity_in("t").unwrap()).collect();
+        let here = enchudb_oplog::eid_local(rows[0]);
+        let x = enchudb_oplog::eid_local(rows[1]);
+        let self_peer = eng.peer_id();
+        // 畳む時と同じ順: 自分の行 x を here の別名にしてから、 x を落とす (表は満杯なので x は消した行の一覧に載る)
+        eng.eid_translator.alias(self_peer, x, here);
+        eng.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
+        eng.remove_entity_body(x, enchudb_oplog::Hlc::ZERO);
+        assert!(eng.is_folded_own_slot(x) && !eng.entities.is_live(x), "前提: x は畳んだ自分の行");
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let taken: Taken = Arc::default();
+        revive_gap_hook::set(&wal, other_insert(&eng, &taken));
+        let revived = eng.revive_folded_own(&[((self_peer, x), enchudb_oplog::Hlc::ZERO)], here);
+        let theirs = taken.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        cleanup(&path, eng);
+        assert_eq!(revived, Some(x));
+        assert_ne!(theirs.ok().map(enchudb_oplog::eid_local), Some(x), "戻している slot {x} を新しい行に払い出した");
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod cell_wal_order_tests {
     use super::*;
@@ -12052,13 +12232,23 @@ impl Engine {
         let reused_global = if table.free_locals_nonempty.load(Ordering::Acquire) {
             let mut fl = table.free_locals.lock().unwrap();
             // #868: 生きている slot と畳んだ自分の行の slot (#612) は飛ばす (消した行の一覧と全部なめが同じ穴を両方から積み、 片方で
-            // 使い回された後 / 一覧に積んだ後に畳んだ形)。 生きている印は下の `allocate_at` と同じくこの lock の下で読む
+            // 使い回された後 / 一覧に積んだ後に畳んだ形)。
+            // #882: 畳んだかを先に読む (畳んだ行を戻す道は 生きている印 → 別名を外す の順。 逆に読むと、 戻している最中の slot を
+            // 「生きていない」 「畳んでいない」 と続けて読みうる)。
+            // #883: 生きているかは、 印を立てて (`allocate_at` が前から立っていたかを返す) 決める。 払い出し位置から最後の slot を
+            // 取って印を立てる前の書き手が居ると、 全部なめはその slot を穴として積む。 先に立てた方が取り、 後の方は次を見る。
+            // 立てるのはこの lock の下 (#733: 放してから立てると、 別の thread の全部なめが同じ slot を穴として拾い直した)
             let mut global = None;
             while let Some(local) = fl.pop() {
-                if let Some(g) = table.global_of(local)
-                    && !self.entities.is_live(g)
-                    && !self.is_folded_own_slot(g)
-                {
+                let Some(g) = table.global_of(local) else { continue };
+                if self.is_folded_own_slot(g) {
+                    continue;
+                }
+                #[cfg(test)]
+                if let Some(wal) = self.oplog.as_ref() {
+                    pop_claim_hook::call(wal);
+                }
+                if !self.entities.allocate_at(g) {
                     global = Some(g);
                     break;
                 }
@@ -12071,14 +12261,10 @@ impl Engine {
                 if !table.is_reserved() {
                     self.remember_former_address(global, true);
                 }
-                // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす
-                // (`clear_cell_versions` の doc 参照)。
+                // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす (`clear_cell_versions` の doc 参照)。 印を立てた
+                // 後 = この slot は自分の物 (前は落としてから立てていて、 #883 の形では、 先に印を立てて書き始めた別の書き手の版数を
+                // 落としうる)。 lock の順は `free_locals` → `EntitySet` の中、 の一方向のまま (`purge_sync_ops_row` の doc)
                 self.clear_cell_versions(global);
-                // #733: live の印は `free_locals` を握ったまま立てる。 放してから立てると、 その間に枯渇した別の thread の
-                // `rebuild_free_locals` が、 まだ live でないこの slot を穴として拾い直し、 同じ eid を 2 本に払い出した (2 つの
-                // 行が 1 つに混ざる)。 rebuild は同じ lock の下で liveness をなめるので、 ここを待った後は live を見る。
-                // lock の順は `free_locals` → `EntitySet` の中、 の一方向のまま (`purge_sync_ops_row` の doc)
-                self.entities.allocate_at(global);
             }
             global
         } else {
@@ -12115,11 +12301,18 @@ impl Engine {
                 }
                 // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
                 match self.grow_table_extent_for(tid, cur) {
-                    Some(g) => g,
-                    None => {
+                    Ok(g) => g,
+                    Err(why) => {
                         // #868: 進めた分を戻す (断り続ける表で払い出し位置が伸び続けない)。 戻せるのは、 後から誰も進めていない時
                         // だけ: 自分より後の位置を取った thread が居れば、 その thread が戻すまで払い出し位置は cur + 1 より先
                         let _ = table.next_local.compare_exchange(cur + 1, cur, Ordering::AcqRel, Ordering::Relaxed);
+                        // #881: 足す枠を `tables` に置けなかった (足していない)
+                        if let Some(e) = why {
+                            return Err(format!(
+                                "table '{table_name}' is full and the tables sidecar could not be written ({e}) — \
+                                 the extent is not added (#881)"
+                            ));
+                        }
                         if is_sync_ring_table(&table.name) {
                             // #368: ring は自動では足さない。 entity cap を伸ばしても空かない
                             return Err(format!(
@@ -12141,8 +12334,15 @@ impl Engine {
             }
         };
 
-        // EntitySet で live mark + next_eid 前進 (CAS safe)
-        self.entities.allocate_at(global);
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            claim_gap_hook::call(wal);
+        }
+        // EntitySet で live mark + next_eid 前進 (CAS safe)。 #883: 前から立っていたら、 全部なめがこの slot を穴として拾って
+        // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す
+        if self.entities.allocate_at(global) {
+            return self.entity_in(table_name);
+        }
 
         let peer = self.peer_id.load(Ordering::Acquire);
         Ok(enchudb_oplog::make_eid(peer, global))
@@ -12179,7 +12379,7 @@ impl Engine {
             dead.sort_unstable();
             dead.dedup();
             fl.extend(dead.into_iter().filter(|&l| {
-                table.global_of(l).is_some_and(|g| !self.entities.is_live(g) && !self.is_folded_own_slot(g))
+                table.global_of(l).is_some_and(|g| !self.is_folded_own_slot(g) && !self.entities.is_live(g))
             }));
             if !fl.is_empty() {
                 table.free_locals_nonempty.store(true, Ordering::Release);
@@ -12203,7 +12403,8 @@ impl Engine {
                     for l in first.max(local)..end.min(local + len) {
                         let global = lo + (l - local);
                         // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
-                        if !self.entities.is_live(global) && !self.is_folded_own_slot(global) {
+                        // #882: 畳んだかを先に読む (`entity_in` の取り出しと同じ)
+                        if !self.is_folded_own_slot(global) && !self.entities.is_live(global) {
                             if ring_lsn.is_some_and(|h| self.himos[h].get_value(global).is_some()) {
                                 self.drop_cells_of_dead_ring_slot(global);
                             }
@@ -12625,9 +12826,21 @@ impl Engine {
     /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_tables_file(&self) -> io::Result<()> {
+        self.persist_tables_file_with(None)
+    }
+
+    /// [`Self::persist_tables_file`] の、 表 `pending.0` にまだ見せていない枠 `pending.1` を足して書く形 (#881)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_tables_file_with(&self, pending: Option<(usize, (u32, u32))>) -> io::Result<()> {
         // #857: 置く値を先に控える (並んだ払い出しで、 直列化が読む値はこれ以上)
         let placed: Vec<u32> = self.tables.iter().map(persisted_next_local).collect();
-        let bytes = serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw());
+        let bytes = serialize_tables_with(
+            &self.tables,
+            &self.order_decls_raw(),
+            &self.marks_decls_raw(),
+            &self.answer_decls_raw(),
+            pending,
+        );
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
             crate::db_files::write_atomic_if_changed(&tables_path_for(&self.path), &bytes)?;
@@ -12885,7 +13098,9 @@ impl Engine {
             return Ok(self.tables[tid].capacity());
         }
         let _g = self.table_grow_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let got = self.push_table_extent_locked(tid, extra);
+        let got = self
+            .push_table_extent_locked(tid, extra)
+            .map_err(|e| format!("table '{name}': could not write the tables sidecar ({e}) — the extent is not added (#881)"))?;
         if got == 0 {
             return Err(format!(
                 "table '{}': no free eid space (entity cap {} — Engine::grow_entity_cap)",
@@ -12910,44 +13125,69 @@ impl Engine {
     /// 待つ作り (`enable_sync_tables` が大きさを決める、 最大 1 M 行)。 自動で足すと、 ack が来ない間
     /// どの table にも割り当てていない eid 空間を全部取るまで止まらず、 user の table が足せなくなる
     /// (同じ 1 行を書き換え続けるだけで起きた)。 大きくしたい時は [`Engine::grow_table`] を明示的に呼ぶ。
-    fn grow_table_extent_for(&self, tid: usize, local: u32) -> Option<u32> {
+    ///
+    /// 戻り値: 足せた枠の global、 `Err(None)` は空き eid 空間が無い、 `Err(Some(e))` は `tables` を書けなかった (#881、 足さない)。
+    fn grow_table_extent_for(&self, tid: usize, local: u32) -> Result<u32, Option<io::Error>> {
         let table = &self.tables[tid];
         if table.is_open_ended() || is_sync_ring_table(&table.name) {
-            return None;
+            return Err(None);
         }
         let _g = self.table_grow_lock.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(g) = table.global_of(local) {
-            return Some(g); // 別 thread が足した
+            return Ok(g); // 別 thread が足した
         }
         // 既定は先頭 range と同じ大きさ、 最低でも `local` が入る分
         let first = table.eid_range_hi - table.eid_range_lo;
         let need = local.saturating_sub(table.capacity()).saturating_add(1);
-        let got = self.push_table_extent_locked(tid, first.max(need).max(1));
+        let got = self.push_table_extent_locked(tid, first.max(need).max(1)).map_err(Some)?;
         if got < need {
-            return None;
+            return Err(None);
         }
-        table.global_of(local)
+        table.global_of(local).ok_or(None)
     }
 
     /// `table_grow_lock` 下で呼ぶ。 末尾の空き eid 空間から最大 `want` 個の extent を
-    /// 足し、 実際に足せた数を返す (空きが無ければ 0、 sidecar は persist)。
-    fn push_table_extent_locked(&self, tid: usize, want: u32) -> u32 {
+    /// 足し、 実際に足せた数を返す (空きが無ければ 0)。
+    ///
+    /// #881: 足す枠を `tables` の sidecar に置いてから `extra` に見せる (`sidecar_persist_lock` を持ったまま)。 置けなければ足さずに
+    /// Err (書き手は断られる)。 前は見せてから置き、 置けなかった失敗を捨てていた: 足した枠に行を書いて落ちると、 開いた時に
+    /// その枠が無く (再生はどの表にも当たらない)、 次に枠を足す時に同じ範囲を切って、 生きている行の eid をもう一度払い出した。
+    /// 置くのは見せる前なので、 見えた枠はいつも sidecar にある。 置いた後に書く sidecar は全部 (同じ lock の下で) この枠を含む
+    fn push_table_extent_locked(&self, tid: usize, want: u32) -> io::Result<u32> {
         let new_lo = self.tables.iter().map(|t| t.last_hi()).max().unwrap_or(0);
         if new_lo == u32::MAX {
-            return 0; // anonymous が open-ended (= named table 無し) — ここには来ない
+            return Ok(0); // anonymous が open-ended (= named table 無し) — ここには来ない
         }
         let avail = self.max_entities().saturating_sub(new_lo);
         let size = want.min(avail);
         if size == 0 {
-            return 0;
+            return Ok(0);
         }
-        self.tables[tid].extra.write().unwrap().push((new_lo, new_lo + size));
+        let ext = (new_lo, new_lo + size);
+        #[cfg(not(target_arch = "wasm32"))]
+        let persisted = if self.path.is_empty() || self.defer_tables_persist.load(std::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            let guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(e) = self.persist_tables_file_with(Some((tid, ext))) {
+                self.warn_persist_failure_rate_limited(&e);
+                return Err(e);
+            }
+            Some(guard)
+        };
+        self.tables[tid].extra.write().unwrap().push(ext);
         // 内部の表の行は別の stripe を使う。 足した範囲の eid を払い出す前に教える
         if is_engine_internal_table(&self.tables[tid].name) {
-            self.row_locks.add_internal_range(new_lo, new_lo + size);
+            self.row_locks.add_internal_range(ext.0, ext.1);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if persisted.is_some() {
+            drop(persisted);
+            return Ok(size);
+        }
+        // path の無い engine / build phase (defer): 今までどおり (書けるなら書く)
         self.try_persist_tables();
-        size
+        Ok(size)
     }
 
     /// table の eid 枠の使用状況 (未定義 table は `None`)。
@@ -16124,8 +16364,15 @@ impl Engine {
             .iter()
             .filter(|&&((p, l), _)| p == self_peer && l != here && self.eid_translator.get(p, l) == Some(here))
             .max_by_key(|&&(id, created)| (created, id))?;
-        self.eid_translator.unalias(self_peer, x);
+        // #882: 生きている印を立ててから別名を外す。 逆の順では間の一瞬 x が 「生きていない・畳んでいない」 に見え、 x が消した
+        // 行の一覧に残っていると、 別の thread の `entity_in` が x を新しい行に払い出した (戻した行と 1 slot に重なる)。
+        // 読む側 (`entity_in` の取り出し / `rebuild_free_locals`) は畳んだかを先に読む
         self.entities.ensure_live(x);
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            revive_gap_hook::call(wal);
+        }
+        self.eid_translator.unalias(self_peer, x);
         Some(x)
     }
 
