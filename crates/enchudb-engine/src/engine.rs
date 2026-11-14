@@ -3987,6 +3987,121 @@ mod apply_liveness_tests {
         assert_eq!(retried, 0, "{tag}: 間を空けずに試し直した");
     }
 
+    /// 紐を長く止める側 (ここでは円柱を組む最初の読み) が、 門の中で WAL の空きを待つ書き手を待つ間、 CPU を回さない (少し回った後は
+    /// 眠る)。 前は yield で回り続けた (上限は書き手の空きの待ち = 5 秒、 #873 の 2 回目のレビュー)。 A を積んだ後・当てる前で止めて
+    /// WAL を畳めなくし、 B を y の門の中で空きを待たせてから、 y を初めて引く。 300 ms 後に A を放す。
+    #[test]
+    fn a_stopper_waiting_for_a_writer_short_of_wal_room_sleeps() {
+        let p = path("stopsleep");
+        let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
+        let (eng, x, y, _) = open(eng, false);
+        let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        cell_append_hook::set(&wal, move |_| {
+            in_tx.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, x, 1u32))
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が積んだ後・当てる前で止まった");
+        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let b = {
+            let (eng, b_done) = (eng.clone(), b_done.clone());
+            std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
+        };
+        // B が空きを待ち始める (書いた数が 50 ms 増えない) まで
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut last = u32::MAX;
+        while Instant::now() < until {
+            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
+            if now == last {
+                break;
+            }
+            last = now;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(last < B_WRITES && !eng.himos[y as usize].cylinder_built(), "前提: B が空きを待ち、 y の円柱はまだ無い ({last} 件)");
+        let waits = crate::write_gate::PATIENT_WAITS.load(std::sync::atomic::Ordering::Relaxed);
+        let reader = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                let _ = eng.himos[y as usize].slice_len(0);
+                t.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        release.send(()).unwrap();
+        let took = reader.join().unwrap();
+        let waits = crate::write_gate::PATIENT_WAITS.load(std::sync::atomic::Ordering::Relaxed) - waits;
+        let a = a.join().unwrap();
+        let (rejected, _) = b.join().unwrap();
+        let y_now = eng.get_by_id(e2, y);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        eprintln!("[stopper] 円柱を組む読みの待ち {took:?} / 待ちの回数 {waits}");
+        assert_eq!((a, rejected, y_now), (Ok(()), 0, Some(u64::from(B_WRITES - 1))), "A / B の書き込み");
+        assert!(took >= Duration::from_millis(250), "前提: 読み手は門の中で空きを待つ B を待った ({took:?})");
+        // 眠れば 300 ms で数百回 (yield で回ると 10^5 を越える)
+        assert!(waits < 20_000, "止める側が回り続けた (300 ms に {waits} 回)");
+    }
+
+    /// 当てている途中の書き手の手前で切っても、 書き出しに失敗した空け作りは 「当てている途中」 (`WalRoom::Applying`) と返さない
+    /// (書き出せない間は畳めない = 待つ書き手は諦めてよい)。 前は切った回数だけを見て `Applying` と返し、 待つ書き手が上限 (5 秒) まで
+    /// 待った (#873 の 2 回目のレビュー)。 結果は、 A の居ない同じ空け作り (書き出しに失敗) と同じ。
+    #[test]
+    fn a_failed_write_out_cut_by_an_applying_writer_is_not_applying() {
+        for sync_db in [false, true] {
+            std::thread::spawn(move || failed_cut_room_case(sync_db)).join().unwrap();
+        }
+    }
+
+    fn failed_cut_room_case(sync_db: bool) {
+        let tag = format!("sync {sync_db}");
+        let p = path(&format!("failcut{}", sync_db as u8));
+        let eng = if sync_db { Engine::create_with_cell_version(&p, 4096).unwrap() } else { Engine::create_without_cell_version(&p, 4096).unwrap() };
+        let (eng, x, y, _) = open(eng, sync_db);
+        let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        eng.try_tie_to_by_id(e1, x, 1u32).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let held = eng.hold_consumer();
+        write_out_fault::set(&wal, true);
+        // A の居ない、 書き出しに失敗する空け作り
+        eng.try_tie_to_by_id(e2, y, 1u32).unwrap();
+        let alone = eng.make_wal_room(&wal);
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        cell_append_hook::set(&wal, move |_| {
+            in_tx.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, x, 2u32))
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が積んだ後・当てる前で止まった");
+        let cuts = wal.applying_cuts();
+        let room = eng.make_wal_room(&wal);
+        let cut = wal.applying_cuts() > cuts;
+        release.send(()).unwrap();
+        let a = a.join().unwrap();
+        write_out_fault::set(&wal, false);
+        drop(held);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        assert_eq!(a, Ok(()), "{tag}: 書き手 A");
+        assert!(cut, "{tag}: 前提: A の手前で切った");
+        assert_ne!(alone, WalRoom::Applying, "{tag}: 前提");
+        assert_eq!(room, alone, "{tag}: 書き出しに失敗した空け作りを、 当てている途中の書き手で切ったと返した");
+        if !sync_db {
+            assert_eq!(room, WalRoom::Blocked, "{tag}");
+        }
+    }
+
     /// 当てている途中の書き手の手前で切った空け作りの後、 次に試すまでの間 (`APPLYING_CUT_PACE`) も、 空きを待つ書き手が居る間の
     /// consumer は寝る (待つ書き手が 200 µs ごとに起こす分だけ起きる)。 前は、 その間寝ずに回った (#873 の 2 回目のレビュー)。
     /// A を積んだ後・当てる前で止め、 B に WAL を埋めさせて空きを待たせた間の 200 ms に、 consumer の周の数を見る。
@@ -24368,9 +24483,12 @@ impl Engine {
         let (mut closed, mut appended_after) = (false, false);
         // #850: 回の間に当てている途中の書き手の手前で checkpoint を切ったかは、 `OpLog::applying_cuts` が増えたかで見る (回の終わりに
         // 「今、 当てている途中の書き手が居るか」 を見直すのでは足りない: 切った後・畳めなかった後にその書き手が当て終えると、 居ない
-        // ように見えて 「畳めない状態」 と数える)
+        // ように見えて 「畳めない状態」 と数える)。 数えるのは書き出しが成功した回だけ (`wrote`): 切った後の書き出しに失敗したなら
+        // 畳めない状態 (#873 の 2 回目のレビュー: 前は失敗した回も 「当てている途中」 と返し、 待つ書き手が上限まで待った)
         for _ in 0..rounds {
             let cuts = wal.applying_cuts();
+            // この回の最後の書き出しが成功したか
+            let wrote = std::cell::Cell::new(false);
             // 開いている group を閉じる。 満杯 (Commit 1 つも入らない) なら打たない — 本体に書き出してから畳むので復旧には
             // 要らない。 見た後で、 書き手の thread が直接打つ Commit (`commit` / `oplog_commit`) が残りを埋めることがある (見て
             // から打つまでの間)。 その時の append は待ち手に回るが、 待ち手は consumer 自身 = 畳んでいる最中 (`wal_room_busy`)
@@ -24409,6 +24527,7 @@ impl Engine {
                             self.written_out_pos.fetch_max(head, Ordering::AcqRel);
                         }
                         let ok = synced && self.tables_cover_checkpoint();
+                        wrote.set(ok);
                         if ok {
                             self.durable_lsn.store(durable_lsn, Ordering::Release);
                             // #662: 畳む前に lock の外で、 書き出した所 (head) まで写す (lock の下は畳む区画の終わりまでの残りだけ)。
@@ -24442,7 +24561,7 @@ impl Engine {
             if direct {
                 // listener が追いついていない / 書き出せない (append を止めたまま試した)。 #850: 当てている途中の書き手が居て
                 // 畳めなかっただけなら、 畳めない状態ではない (待っている書き手を諦めさせない)
-                return if wal.applying_cuts() != cuts { WalRoom::Applying } else { WalRoom::Blocked };
+                return if wrote.get() && wal.applying_cuts() != cuts { WalRoom::Applying } else { WalRoom::Blocked };
             }
             #[cfg(test)]
             room_fold_hook::call(wal);
@@ -24462,7 +24581,7 @@ impl Engine {
             // 当て終えれば畳める (満杯で Commit も入らない時も) = 畳めない状態ではない。 ここで 「畳めない」 と返すと、 空きを待つ
             // 書き手が諦めて record を落とす (当てている途中の thread が CPU を外されている間、 ずっと)。 やり直しても当て終える
             // までは同じ所で切るので、 回さずに返す (consumer が間を空けて試し直す)
-            if wal.applying_cuts() != cuts {
+            if wrote.get() && wal.applying_cuts() != cuts {
                 return WalRoom::Applying;
             }
             if wal.append_dead() || (self.bridge_pending_records() == 0 && !appended_after) {

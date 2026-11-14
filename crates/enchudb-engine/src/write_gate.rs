@@ -26,12 +26,18 @@
 //! thread ごとに選ぶこと (書き手どうしが 1 本の cache line を取り合わない)。 loom model:
 //! `tests/loom_lazy_cylinder_build.rs` / `tests/loom_order_index_build.rs` / `tests/loom_live_subscribe.rs`。
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// shard の数 (書き手の thread ごとに 1 つ。 これより多い thread は shard を分け合う)。
 const SHARDS: usize = 16;
 /// shard の最上位 bit = 閉じている。 残りの bit = 中に居る書き手の数。
 const CLOSED: u32 = 1 << 31;
+
+/// test 用: [`WriteGate::close_patiently`] が回った後に待った回数 (process 全体)。
+#[cfg(test)]
+pub(crate) static PATIENT_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// 128 B に揃えて shard ごとに cache line を分ける。
 #[derive(Default)]
@@ -81,6 +87,27 @@ impl WriteGate {
     /// 門を閉じ、 中に居る書き手が出るのを待つ。 `write_lock` の下で呼ぶ (閉じる側は 1 本)。 返った後は、 門の中で書いた
     /// cell が全部見え、 新しく来る書き手は `write_lock` の道に回る。
     pub(crate) fn close(&self) {
+        self.close_then(|_| std::thread::yield_now());
+    }
+
+    /// [`Self::close`] の、 中の書き手が長く居ることのある版 ([`IntentGate::hold`]: 中の書き手は WAL の空きを待つことがある)。
+    /// 少し回った後は眠る (間は 20 µs から倍々、 上限 1.28 ms)。 前は空きを待つ書き手が出るまで (上限 5 秒) yield で回った (#873 の
+    /// 2 回目のレビュー)。
+    fn close_patiently(&self) {
+        self.close_then(|n| {
+            #[cfg(test)]
+            PATIENT_WAITS.fetch_add(1, Ordering::Relaxed);
+            if n < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(20u64 << (n - 64).min(6)));
+            }
+        });
+    }
+
+    /// 閉じて、 中が空くまで待つ。 `wait(n)` は 64 回回った後の n 回目の待ち。
+    #[inline]
+    fn close_then(&self, mut wait: impl FnMut(u32)) {
         for s in self.shards.iter() {
             s.0.fetch_or(CLOSED, Ordering::AcqRel);
         }
@@ -90,10 +117,10 @@ impl WriteGate {
             while s.0.load(Ordering::Acquire) & !CLOSED != 0 {
                 if spins < 64 {
                     std::hint::spin_loop();
-                    spins += 1;
                 } else {
-                    std::thread::yield_now();
+                    wait(spins - 64);
                 }
+                spins = spins.saturating_add(1);
             }
         }
     }
@@ -186,7 +213,7 @@ impl IntentGate {
         #[cfg(debug_assertions)]
         assert!(!held::contains(self), "IntentGate::hold: この thread はこの紐の書き込みの途中 (自分を待って止まる)");
         let closer = self.closer.lock();
-        self.gate.close();
+        self.gate.close_patiently();
         IntentHold { gate: self, _closer: closer }
     }
 }
