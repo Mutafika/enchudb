@@ -44,7 +44,7 @@
 //! ```text
 //! [周の印: 8B]          (file v3、 #608) payload の後ろ。 [lap: 4B LE][lap ^ LAP_SALT ^ bind_word(crc32): 4B LE]。 record を
 //!                       書いた時の ring の周 (file header の lap) を、 その record の crc32 (上の欄) に結ぶ (file v5、 #851。
-//!                       bind_word は crc32 が 0 の時だけ決めた定数、 他は crc32)。 署名 / CRC の外 (中継した record にも
+//!                       bind_word = max(crc32, 1))。 署名 / CRC の外 (中継した record にも
 //!                       自分の ring の周を付ける)。 scan は header の周と違う record、 印が中身に合わない record で止まる =
 //!                       畳んだ後に page に残っている前の周の record を読まない。 v3 / v4 の形の印は
 //!                       [lap][lap ^ LAP_SALT] (中身に結ばない)。 区画の header の版が 4 の区画でだけ通す
@@ -110,7 +110,7 @@
 //! page の境目をまたぐ / 書き出しの写しの途中に書き手が入る)。 再生はその古い record を当て、 版数の列の無い DB では書き出しの
 //! 返った値が前の周の値に戻った。
 //!
-//! v5 は印の 2 語目に record の CRC を混ぜる (`lap ^ LAP_SALT ^ bind_word(crc32)`。 `bind_word` は CRC が 0 の時だけ決めた定数 =
+//! v5 は印の 2 語目に record の CRC を混ぜる (`lap ^ LAP_SALT ^ bind_word(crc32)`。 `bind_word` = `max(crc32, 1)` = 0 にならない =
 //! 結んだ印が旧い形と同じ bytes にならない)。 配置と大きさは v4 と同じで、 違うのは header の版だけ:
 //!
 //! - **file の版は A の header の版**: 5 = v5 (2 区画にできない小さい WAL は 1 区画の形で 6 = [`OPLOG_FILE_VERSION_ONE_HALF`])。
@@ -549,14 +549,12 @@ fn write_lap_trailer(t: &mut [u8], lap: u32, bind: u32) {
     t[4..8].copy_from_slice(&(lap ^ LAP_SALT ^ bind).to_le_bytes());
 }
 
-/// CRC が 0 の record の印に混ぜる値 (0 を混ぜると、 結んだ印が結ばない旧い形と同じ bytes になる)。
-const BIND_ZERO_CRC: u32 = 0x5EED_B1D5;
-
-/// 周の印に混ぜる、 record の CRC から作る語 (v5)。 0 にならない: CRC が 0 の record (bytes のままの中継は、 相手がそういう
-/// record を作れる) の結んだ印が、 旧い形 `lap ^ LAP_SALT` と同じにならないように。
+/// 周の印に混ぜる、 record の CRC から作る語 (v5): CRC が 0 の時だけ 1、 他は CRC そのまま。 0 にならない: 0 を混ぜると、
+/// 結んだ印が結ばない旧い形 `lap ^ LAP_SALT` と同じ bytes になる (bytes のままの中継は、 相手が CRC = 0 の record を作れる)。
+/// 形は `max(1)`: 「0 なら決めた定数」 の選びは、 書き手 1 本の append を 34 → 40 ns にした (同じ結果を出す他の書き方も)。
 #[inline(always)]
 fn bind_word(crc: u32) -> u32 {
-    if crc == 0 { BIND_ZERO_CRC } else { crc }
+    crc.max(1)
 }
 
 /// 周の印の 2 語目 `check` が、 周 `rec_lap`・CRC `crc` の record の印として合うか。 `strict` (その区画の今の周は結んだ形だけ、
