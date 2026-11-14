@@ -1400,6 +1400,85 @@ pub struct OpLog {
     combine: CombineHint,
     /// 置き場の頼みとして積んだ record の数。 `append_lock` の下でだけ進める ([`OpLog::combined_appends`])。
     combined: AtomicU64,
+    /// #850: [`OpLog::applying`] の印を置いたことのある置き場の番号の最大 + 1 と、 置き場の無い thread の印
+    /// ([`InflightHint`]、 書かれるのはまれ)。
+    inflight: InflightHint,
+    /// 試験: 1 区画の空け作りが、 当てている途中の書き手を待って譲った回数
+    #[cfg(test)]
+    one_half_waits: AtomicU64,
+}
+
+/// #850: [`OpLog::applying`] の印の置き場と、 [`OpLog::applied_through`] が見る範囲。 先頭の line (`marks` の番地 / `hw`) は書き手が
+/// 書き込みのたびに読む (書かれるのは thread が初めて書く時だけ)。
+#[repr(align(128))]
+struct InflightHint {
+    /// thread ごとの印 (番号は [`combine_slot_index`] と同じ、 [`COMBINE_SLOTS`] 個)。 まとめ書きの置き場 ([`CombineSlot`]) とは別の
+    /// line (置き場の line は lock を持つ書き手が見回りで読む)
+    marks: Box<[InflightMark]>,
+    /// 印を置いたことのある置き場の番号の最大 + 1 (上げるだけ)
+    hw: std::sync::atomic::AtomicU32,
+    /// [`OpLog::applied_through`] が、 当てていない record の手前で切った回数 ([`OpLog::applying_cuts`])。 書き出す側が書くので、
+    /// 書き手が書き込みのたびに読む `marks` / `hw` とは別の line に置く
+    cuts: InflightMark,
+    /// 置き場の無い thread の cell ([`InflightExtra`])。 書き手が書き込みのたびに読む `marks` / `hw` とは別の line に置く (#873 の
+    /// レビュー: 同じ line だと、 置き場の無い thread が借りるたびに全部の書き手の line を奪う)
+    extra: InflightExtra,
+}
+
+/// #850: 置き場の無い thread (同時に生きている書き手の thread が [`COMBINE_SLOTS`] を越えた分) の cell の数。 thread の番号から
+/// 決めた所から FREE の cell を CAS で借りる (lock なし)。 これも全部借りられている時だけ、 lock の下の溢れ cell を借りる。
+const EXTRA_MARKS: usize = 192;
+
+/// #850: 置き場の無い thread が借りる cell。
+#[repr(align(128))]
+struct InflightExtra {
+    /// 固定の cell を誰かが一度でも借りたか (立てたら倒さない)。 立っていれば [`OpLog::applied_through`] は固定の cell を全部読む
+    /// (読むのは書き出す側だけ。 借りる側は借りた後・積む前に立てるので、 その record の位置まで読んだ書き出しの側は立ったのを見る)
+    used: std::sync::atomic::AtomicBool,
+    /// 固定の cell ([`EXTRA_MARKS`] 個、 cache line 1 本ずつ)。 FREE を CAS で ARMED にした thread が借り、 返す時に FREE に戻す。
+    /// 前は全部の cell を lock の下で借りて返し、 書き手 80 本 (16 本が置き場なし) で書き込みが master の 0.81〜0.86 倍だった
+    cells: Box<[InflightMark]>,
+    /// 溢れ: 今借りられている数 (0 なら [`OpLog::applied_through`] は lock を取らない)。 借りる thread が lock の下で上げ、 返す時
+    /// (cell を FREE に戻した後) に Release で下げる
+    spill_live: std::sync::atomic::AtomicU32,
+    /// 溢れの cell。 lock の下で FREE を ARMED にした thread が借りる。 cell は OpLog が生きている間そのまま (借りた thread は lock の
+    /// 外で cell を指し続けるので、 Vec が伸びても動かない Box に置く)
+    #[allow(clippy::vec_box)]
+    spill: std::sync::Mutex<Vec<Box<AtomicU64>>>,
+}
+
+impl InflightExtra {
+    fn new() -> Self {
+        Self {
+            used: std::sync::atomic::AtomicBool::new(false),
+            cells: (0..EXTRA_MARKS).map(|_| InflightMark(AtomicU64::new(INFLIGHT_FREE))).collect(),
+            spill_live: std::sync::atomic::AtomicU32::new(0),
+            spill: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 借りている cell の位置の最小 (と `through` の小さい方)。
+    fn through(&self, mut through: u64) -> u64 {
+        if self.used.load(Ordering::Acquire) {
+            for c in self.cells.iter() {
+                let at = c.0.load(Ordering::Acquire);
+                if at < INFLIGHT_FREE {
+                    through = through.min(at);
+                }
+            }
+        }
+        // 借りる側は数を上げてから積むので、 `pos` までに積んだ thread が借りている間、 数は 0 でない (0 を見たなら、 その thread は
+        // 当てて返した後)。 0 でなければ lock を取って cell を読む (借りる側は lock の下で cell を借りる)
+        if self.spill_live.load(Ordering::Acquire) > 0 {
+            for c in self.spill.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+                let at = c.load(Ordering::Acquire);
+                if at < INFLIGHT_FREE {
+                    through = through.min(at);
+                }
+            }
+        }
+        through
+    }
 }
 
 /// #388: [`OpLog::set_room_waiter`] の待ち手。 引数は載せたい byte 数、 戻り値は空いたか。 append_lock を持たずに呼ぶ。
@@ -1440,6 +1519,10 @@ struct CombineSlot {
     state: std::sync::atomic::AtomicU32,
     req: std::cell::UnsafeCell<std::mem::MaybeUninit<SlotReq<'static>>>,
     result: std::cell::UnsafeCell<Option<io::Result<(u64, Hlc)>>>,
+    /// #850: 頼まれて積んだ、 当てる書き込みの record の位置 ([`OpLog::applying`] の印の、 まとめ書きの分)。 積んだ書き手が置き
+    /// (この line をもう持っている)、 頼んだ書き手が結果を受け取る時に自分の印 ([`InflightMark`]) へ移して外す。 印を thread ごとの
+    /// 別の line に置くのは、 この line は lock を持つ書き手が見回りで読むので、 当て終えた時に書くともう一度取りに行くから
+    served: AtomicU64,
 }
 
 const _: () = assert!(std::mem::size_of::<CombineSlot>() == 128);
@@ -1451,10 +1534,15 @@ impl CombineSlot {
                 state: std::sync::atomic::AtomicU32::new(SLOT_EMPTY),
                 req: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
                 result: std::cell::UnsafeCell::new(None),
+                served: AtomicU64::new(INFLIGHT_IDLE),
             })
             .collect()
     }
 }
+
+/// #850: thread 1 本の印 (cache line 1 本。 書くのはその thread だけ、 読むのは書き出す側)。 [`OpLog::applying`]
+#[repr(align(128))]
+struct InflightMark(AtomicU64);
 
 /// まとめ書きの置き場を見るかの手がかり (cache line 1 本、 書かれるのはまれ)。
 #[repr(align(128))]
@@ -1468,6 +1556,64 @@ struct CombineHint {
     wanted: std::sync::atomic::AtomicBool,
 }
 
+/// #850: 印の値: 当てている途中の書き込みが無い。
+const INFLIGHT_IDLE: u64 = u64::MAX;
+/// #850: 印の値: 置き場の無い thread が cell を借りたが、 位置を持たない (checkpoint を止めない。 積む前・載らなかった append の後)。
+const INFLIGHT_ARMED: u64 = u64::MAX - 1;
+/// #850: 置き場の無い thread 用の cell ([`InflightHint::extra`]) の値: 誰も借りていない。 位置は全部これより小さい。
+const INFLIGHT_FREE: u64 = u64::MAX - 2;
+
+/// #850: 「WAL に積んでから本体 (cell) に当て終えるまで」 の印 ([`OpLog::applying`])。 落とすと 「当て終えた」。
+///
+/// 書き出し (consumer の周期 / `oplog_sync` / 空け作り) は、 覆う位置を取ってから WAL を fsync し、 本体を msync して checkpoint を
+/// 進める。 その位置までの record のうち、 書き手が積んだだけでまだ cell に当てていない物は、 msync した本体に入っていない。 前は
+/// checkpoint がその record を越え (畳まれもし)、 そこで落ちると再生は checkpoint から後なので、 その record は本体に当たらなかった
+/// (changefeed の記録・`_sync_ops` には載っている = 相手 / listener に渡って、 自分の本体に無い)。
+///
+/// 書き出す側は [`OpLog::applied_through`] で、 覆う位置を 「位置を持つ印の最小」 までに切る (待たない。 待つと、 満杯の WAL の
+/// 空きを待つ書き手・`append_lock` を待つ書き手と互いに待つ)。 印が位置を持つのは、 record を積む時から当て終えるまで。
+///
+/// 作るだけでは何もしない (thread の番号も引かない)。 `append_*_applying` が積む時に、 その thread の印を取って位置を置く
+/// (番号は pending の shard と同じ 1 回の引きで済ませる)。
+pub struct Applying<'a> {
+    wal: &'a OpLog,
+    /// 積んだ時に取った印 (積む前・入れ子の内側は None)
+    at: std::cell::Cell<MarkAt<'a>>,
+    /// 別の thread へ渡さない (印は thread ごと: 渡した先で落とすと、 その thread の印を外す / 置き場の番号が合わない)
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// [`Applying`] が取った印。
+#[derive(Clone, Copy)]
+enum MarkAt<'a> {
+    None,
+    /// 置き場のある thread: 印 ([`InflightHint::marks`] の 1 つ)。 頼まれた書き手が積んだ時の位置は、 結果を受け取る時に置き場
+    /// ([`CombineSlot::served`]) からこの印へ移してある
+    Slot(&'a AtomicU64),
+    /// 置き場の無い thread: 借りた固定の cell
+    Extra(&'a AtomicU64),
+    /// 置き場の無い thread: 固定の cell が全部借りられていた時に借りた溢れの cell
+    Spill(&'a AtomicU64),
+}
+
+impl Drop for Applying<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // Release (書き出す側は Acquire で読む): 外れたのを見た書き出しの側には、 その前に当てた cell が見える。 Relaxed にすると、
+        // 外れた印と、 当てる前の cell の組を読みうる (loom の `loom_wal_applied_through` が見つける)
+        match self.at.get() {
+            MarkAt::None => {}
+            MarkAt::Slot(mark) => mark.store(INFLIGHT_IDLE, Ordering::Release),
+            MarkAt::Extra(c) => c.store(INFLIGHT_FREE, Ordering::Release),
+            MarkAt::Spill(c) => {
+                c.store(INFLIGHT_FREE, Ordering::Release);
+                // Release: 数が下がったのを (Acquire で) 見た書き出しの側には、 当てた cell が見える
+                self.wal.inflight.extra.spill_live.fetch_sub(1, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// 1 record の頼み (`append_lock` の下で積む中身)。 置き場には `'static` として置く: 頼んだ書き手は DONE を見るまで戻らない。
 struct SlotReq<'a> {
     op: Op<'a>,
@@ -1477,6 +1623,8 @@ struct SlotReq<'a> {
     /// 中継の header (大きい) と事前採番の HLC は、 頼んだ書き手の stack を指す
     relay: Option<&'a RelayedHeader>,
     hlc_override: Option<&'a Hlc>,
+    /// #850: 当てる書き込みの record か ([`Applying`] の中)。 積んだ書き手が、 位置をこの置き場の `served` に置く
+    track: bool,
 }
 
 /// `pending_writes` の thread ごとの分 (cache line 1 本)。
@@ -1514,6 +1662,8 @@ fn combine_slot_index() -> Option<usize> {
     struct Index(u32);
     impl Drop for Index {
         fn drop(&mut self) {
+            // 番号を返す前に、 安い方の控えを消す (この後この thread が書くなら置き場なしの扱い。 返した番号は別の thread が使う)
+            INFLIGHT_SLOT_INDEX.with(|f| f.set(u32::MAX));
             FREE.lock().unwrap_or_else(|e| e.into_inner()).push(self.0);
         }
     }
@@ -1523,6 +1673,33 @@ fn combine_slot_index() -> Option<usize> {
         );
     }
     MINE.try_with(|i| i.0 as usize).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static INFLIGHT_SLOT_INDEX: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// [`combine_slot_index`] と同じ番号を、 書き込みのたびに安く読む (中身が定数で始まり Drop の無い thread-local。
+/// `combine_slot_index` は Drop のある thread-local で、 毎回 「まだ生きているか」 を見る)。 番号を取れない時 (thread の終わりの
+/// 片付けの最中) と、 番号が [`COMBINE_SLOTS`] 以上の時は置き場なし (`usize::MAX` か番号そのもの)。 pending の shard と #850 の
+/// 印が使う (append 1 回で 1 回引く)。
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn thread_slot_index() -> usize {
+    INFLIGHT_SLOT_INDEX.with(|f| {
+        let i = f.get();
+        if i != u32::MAX {
+            return i as usize;
+        }
+        match combine_slot_index() {
+            Some(i) => {
+                f.set(i as u32);
+                i
+            }
+            None => usize::MAX,
+        }
+    })
 }
 
 /// `pending_writes` を RAII で減算するガード。
@@ -1547,12 +1724,16 @@ impl OpLog {
     /// `pending_writes` を `n` 増やし、 drop 時に同量減らす RAII ガードを返す。
     fn pending_guard(&self, n: u32) -> PendingGuard<'_> {
         #[cfg(not(target_arch = "wasm32"))]
-        let counter = match combine_slot_index().filter(|&i| i < COMBINE_SLOTS) {
-            Some(i) => &self.pending_shards[i].0,
-            None => &self.pending_writes,
-        };
+        let i = thread_slot_index();
         #[cfg(target_arch = "wasm32")]
-        let counter = &self.pending_writes;
+        let i = usize::MAX;
+        self.pending_guard_at(i, n)
+    }
+
+    /// [`Self::pending_guard`] の、 thread の番号 ([`thread_slot_index`]) を引いた後の版。
+    #[inline]
+    fn pending_guard_at(&self, i: usize, n: u32) -> PendingGuard<'_> {
+        let counter = if i < COMBINE_SLOTS { &self.pending_shards[i].0 } else { &self.pending_writes };
         counter.fetch_add(n, Ordering::AcqRel);
         PendingGuard { counter, n }
     }
@@ -1740,7 +1921,15 @@ impl OpLog {
             signing: std::sync::atomic::AtomicBool::new(false),
             append_lock: LockLine(crate::wal_lock::WalLock::new(())),
             combine_slots: CombineSlot::new_slots(),
+            inflight: InflightHint {
+                marks: (0..COMBINE_SLOTS).map(|_| InflightMark(AtomicU64::new(INFLIGHT_IDLE))).collect(),
+                hw: std::sync::atomic::AtomicU32::new(0),
+                cuts: InflightMark(AtomicU64::new(0)),
+                extra: InflightExtra::new(),
+            },
             combine: CombineHint { hw: std::sync::atomic::AtomicU32::new(0), wanted: std::sync::atomic::AtomicBool::new(false) },
+            #[cfg(test)]
+            one_half_waits: AtomicU64::new(0),
             combined: AtomicU64::new(0),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
@@ -2619,7 +2808,7 @@ impl OpLog {
         // request17-A3: Some なら採番せず与えられた HLC を載せる (`mint_hlc` 済み)。
         hlc_override: Option<Hlc>,
     ) -> io::Result<(u64, Hlc)> {
-        self.append_inner_noting(op, payload_size, record_size, relay, hlc_override)
+        self.append_inner_noting(op, payload_size, record_size, relay, hlc_override, None)
             .map_err(|(e, _)| e)
     }
 
@@ -2631,13 +2820,15 @@ impl OpLog {
         record_size: usize,
         relay: Option<RelayedHeader>,
         hlc_override: Option<Hlc>,
+        // #850: 当てる書き込みの印 ([`Applying`] が取った cell)。 積む時に record の位置を置く
+        mark: Option<&AtomicU64>,
     ) -> Result<(u64, Hlc), (io::Error, Hlc)> {
         let is_commit = matches!(op, Op::Commit);
-        let mut r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit);
+        let mut r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit, mark);
         let reserve = if is_commit { 0 } else { self.commit_room.load(Ordering::Relaxed) };
         // 空いた後に他の書き手が先に埋めたら、 また待つ (#552: 前は 1 回しか書き直さず、 畳めているのに落とした)
         while r.as_ref().is_err_and(|e| self.wait_for_room(e, record_size as u64 + reserve)) {
-            r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit);
+            r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit, mark);
         }
         if r.is_ok() {
             self.appended();
@@ -2667,7 +2858,159 @@ impl OpLog {
         let payload_size = op.payload_size();
         let record_size = record_size_hint(payload_size);
         let _guard = self.pending_guard(1);
-        self.append_inner_noting(op, payload_size, record_size, None, None)
+        self.append_inner_noting(op, payload_size, record_size, None, None, None)
+    }
+
+    /// #850: [`Self::append_or_dropped`] の、 本体に当てる書き込みの版。 積む時に record の位置を `scope` の印に置く (呼び手は
+    /// 本体に当て終えてから `scope` を落とす)。
+    pub fn append_or_dropped_applying(&self, op: Op<'_>, scope: &Applying<'_>) -> Result<(u64, Hlc), (io::Error, Hlc)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let i = thread_slot_index();
+        #[cfg(target_arch = "wasm32")]
+        let i = usize::MAX;
+        self.append_applying_at(i, op, scope)
+    }
+
+    /// #850: [`Self::append_with_hlc`] の、 本体に当てる書き込みの版 ([`Self::append_or_dropped_applying`] と同じ)。
+    pub fn append_with_hlc_applying(&self, op: Op<'_>, scope: &Applying<'_>) -> io::Result<(u64, Hlc)> {
+        self.append_or_dropped_applying(op, scope).map_err(|(e, _)| e)
+    }
+
+    /// 本体に当てる書き込みの append (thread の番号 `i` を引いた後)。 印を取ってから積む。
+    #[inline]
+    fn append_applying_at(&self, i: usize, op: Op<'_>, scope: &Applying<'_>) -> Result<(u64, Hlc), (io::Error, Hlc)> {
+        let payload_size = op.payload_size();
+        let record_size = record_size_hint(payload_size);
+        debug_assert!(std::ptr::eq(self, scope.wal), "別の OpLog の Applying");
+        let _guard = self.pending_guard_at(i, 1);
+        let mark = OpLog::claim_mark(i, scope);
+        self.append_inner_noting(op, payload_size, record_size, None, None, mark)
+    }
+
+    /// `scope` の印を取る (thread の番号 `i`)。 取った cell を返す。 入れ子 (この thread の印をもう外側が持っている) なら None
+    /// (外側の位置が手前にあるので、 内側の record も覆わない)。
+    #[inline]
+    fn claim_mark<'a>(i: usize, scope: &Applying<'a>) -> Option<&'a AtomicU64> {
+        let wal = scope.wal;
+        debug_assert!(matches!(scope.at.get(), MarkAt::None), "Applying で 2 件積んだ");
+        if !matches!(scope.at.get(), MarkAt::None) {
+            return None;
+        }
+        if i < COMBINE_SLOTS {
+            let c = &wal.inflight.marks[i].0;
+            // 入れ子 (外側が持っている): 外側に任せる
+            if c.load(Ordering::Relaxed) != INFLIGHT_IDLE {
+                return None;
+            }
+            if i as u32 >= wal.inflight.hw.load(Ordering::Relaxed) {
+                wal.inflight.hw.fetch_max(i as u32 + 1, Ordering::AcqRel);
+            }
+            scope.at.set(MarkAt::Slot(c));
+            return Some(c);
+        }
+        let at = wal.borrow_extra_mark(i);
+        scope.at.set(at);
+        match at {
+            MarkAt::Extra(c) | MarkAt::Spill(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// #850: これから WAL に 1 件積んで本体に当てる書き込みの印。 返った物を `append_*_applying` に渡し、 **本体に当て終えたら
+    /// 落とす**。 印が位置を持つのは積む時から (積む前に待っている間は位置を持たない = checkpoint を止めない)、 落とすまで
+    /// [`Self::applied_through`] に見える。 1 つの印で積むのは 1 件。
+    #[inline]
+    pub fn applying(&self) -> Applying<'_> {
+        Applying { wal: self, at: std::cell::Cell::new(MarkAt::None), _not_send: std::marker::PhantomData }
+    }
+
+    /// 置き場の無い thread (番号 `i`) の印: 空いている固定の cell (FREE) を、 番号から決めた所から CAS で借りる。 全部借りられて
+    /// いれば溢れの cell を lock の下で借りる。 落とすと FREE に戻る。 置き場の無い thread は頼まずに自分で積むので、 位置はこの
+    /// cell にだけ置かれる。
+    #[inline]
+    fn borrow_extra_mark(&self, i: usize) -> MarkAt<'_> {
+        let x = &self.inflight.extra;
+        let start = i.wrapping_sub(COMBINE_SLOTS) % EXTRA_MARKS;
+        for k in 0..EXTRA_MARKS {
+            let c = &x.cells[(start + k) % EXTRA_MARKS].0;
+            if c.load(Ordering::Relaxed) == INFLIGHT_FREE
+                && c.compare_exchange(INFLIGHT_FREE, INFLIGHT_ARMED, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            {
+                // 積む (位置を置いて `written` を Release で進める) より前に立てる: その位置まで読んだ書き出しの側は立ったのを見る
+                if !x.used.load(Ordering::Relaxed) {
+                    x.used.store(true, Ordering::Release);
+                }
+                return MarkAt::Extra(c);
+            }
+        }
+        MarkAt::Spill(self.borrow_spill_mark())
+    }
+
+    /// 固定の cell が全部借りられている時 (同時に生きている書き手の thread が [`COMBINE_SLOTS`] + [`EXTRA_MARKS`] を越えた分):
+    /// 溢れの cell を lock の下で借りる (無ければ足す)。
+    #[cold]
+    fn borrow_spill_mark(&self) -> &AtomicU64 {
+        let mut g = self.inflight.extra.spill.lock().unwrap_or_else(|p| p.into_inner());
+        let at = match g.iter().position(|c| c.load(Ordering::Relaxed) == INFLIGHT_FREE) {
+            Some(at) => at,
+            None => {
+                g.push(Box::new(AtomicU64::new(INFLIGHT_FREE)));
+                g.len() - 1
+            }
+        };
+        g[at].store(INFLIGHT_ARMED, Ordering::Release);
+        // 積む (位置を置いて `written` を Release で進める) より前に上げる: その位置まで読んだ書き出しの側は、 上がった数を見る
+        self.inflight.extra.spill_live.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: cell は Box の中で、 `extra` から外さない (Vec が伸びても Box の番地は動かない)。 OpLog (`'_`) より長く借りない
+        unsafe { &*(&*g[at] as *const AtomicU64) }
+    }
+
+    /// #850: `pos` と、 「WAL に積んで、 まだ本体に当て終えていない record」 ([`Self::applying`]) の位置の最小、 の小さい方。
+    /// checkpoint を進める側は、 覆う位置 (`written_head()`) を取った後・本体を書き出す前にこれを通し、 返った位置までしか
+    /// 進めない。 返った位置より前の record は、 呼んだ時点で全部本体に当たっている (= この後の本体の書き出しに入る):
+    ///
+    /// - 位置 `pos` までに書き終えた record の印は、 `written` を進める前に位置を持つ (自分で積んでも頼まれた書き手が積んでも、
+    ///   `append_locked` が record の場所を取った後・`put_head` の前に置く)。 `pos` を読んだ後に印を見るので、 その record の位置
+    ///   (か、 当て終えて外した後) が必ず見える
+    /// - 待たない。 まだ積んでいない書き手 (`append_lock` / 満杯の WAL の空きを待っている) の印は位置を持たないので数えない
+    pub fn applied_through(&self, pos: u64) -> u64 {
+        let mut through = pos;
+        let n = (self.inflight.hw.load(Ordering::Acquire) as usize).min(COMBINE_SLOTS);
+        for (m, s) in self.inflight.marks[..n].iter().zip(&self.combine_slots[..n]) {
+            // 頼まれた書き手が積んだ分 (IDLE でなければ位置) を、 印より先に読む: 頼んだ書き手は結果を受け取る時に、 位置を印へ
+            // 置いてから置き場を外す。 外れた置き場を (Acquire で) 読んだら、 印の位置が見える
+            through = through.min(s.served.load(Ordering::Acquire));
+            let at = m.0.load(Ordering::Acquire);
+            if at < INFLIGHT_FREE {
+                through = through.min(at);
+            }
+        }
+        // 置き場の無い thread の cell
+        through = self.inflight.extra.through(through);
+        if through != pos {
+            self.inflight.cuts.0.fetch_add(1, Ordering::Relaxed);
+        }
+        through
+    }
+
+    /// [`Self::applied_through`] の、 書き手が自分の印に受け取った位置だけを見る版 (頼まれて積まれただけで、 まだ受け取っていない
+    /// 位置 = 置き場の `served` は見ない。 切った回数も数えない)。 1 区画の空け作りが、 当て終えるのを待つ書き手を選ぶのに使う。
+    fn applied_through_taken(&self, pos: u64) -> u64 {
+        let mut through = pos;
+        let n = (self.inflight.hw.load(Ordering::Acquire) as usize).min(COMBINE_SLOTS);
+        for m in &self.inflight.marks[..n] {
+            let at = m.0.load(Ordering::Acquire);
+            if at < INFLIGHT_FREE {
+                through = through.min(at);
+            }
+        }
+        self.inflight.extra.through(through)
+    }
+
+    /// #850: [`Self::applied_through`] が、 当てていない record の手前で切った回数。 空きを作る側が、 畳めなかった試しの間に
+    /// これが増えていれば 「当てている途中の書き手が居たから畳めなかった」 (= 当て終えれば畳める) と見る。
+    pub fn applying_cuts(&self) -> u64 {
+        self.inflight.cuts.0.load(Ordering::Relaxed)
     }
 
     /// op と中継の header は参照で受ける (#506: 値で受けると、 取り合いの道に参照を渡すだけで、 呼び手が append のたびに写しを
@@ -2682,6 +3025,8 @@ impl OpLog {
         hlc_override: Option<Hlc>,
         // group を閉じる record か (= 閉じの Commit の分の空きを残さなくてよい、 `alloc`)
         closes_group: bool,
+        // #850: 当てる書き込みの印 (自分で積む時に、 record の位置を置く)
+        mark: Option<&AtomicU64>,
     ) -> io::Result<(u64, Hlc)> {
         // テスト専用 fault injection: pending_writes の RAII ガード (issue #58②) が
         // panic-unwind 経路でも均衡することを deterministic に検証するため、 ここで
@@ -2711,12 +3056,14 @@ impl OpLog {
         // 頼み (`SlotReq`) は取り合った時だけ作る (1 本の道で頼みを struct に詰めて参照で渡すと 36 → 49 ns)
         let _in_proc = match self.append_lock.try_lock() {
             Some(g) => g,
-            None => match self.lock_or_request(op, payload_size, closes_group, relay, hlc_override) {
+            None => match self.lock_or_request(op, payload_size, closes_group, relay, hlc_override, mark) {
                 Ok(g) => g,
                 Err(appended) => return appended,
             },
         };
-        let r = self.append_locked(op, payload_size, closes_group, relay, hlc_override);
+        // #850: 自分で積む: 積んだ record の位置を印に置く (`append_locked` の中、 `written` を進める前)。 載らなかった append は
+        // 位置を置かない (空きを待つ間、 checkpoint を止めない)
+        let r = self.append_locked(op, payload_size, closes_group, relay, hlc_override, mark);
         self.serve_slots();
         r
     }
@@ -2739,21 +3086,31 @@ impl OpLog {
         closes_group: bool,
         relay: Option<&RelayedHeader>,
         hlc_override: Option<Hlc>,
+        // #850: 当てる書き込みの印 (頼まれた書き手が、 積んだ位置を置き場の `served` に置き、 結果を受け取る時にこの印へ移す)
+        mark: Option<&AtomicU64>,
     ) -> Result<WalGuard<'a>, io::Result<(u64, Hlc)>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(i) = combine_slot_index().filter(|&i| i < COMBINE_SLOTS) {
             return self.append_by_request(
                 i,
-                SlotReq { op: op.clone(), payload_size, closes_group, relay, hlc_override: hlc_override.as_ref() },
+                SlotReq {
+                    op: op.clone(),
+                    payload_size,
+                    closes_group,
+                    relay,
+                    hlc_override: hlc_override.as_ref(),
+                    track: mark.is_some(),
+                },
+                mark,
             );
         }
-        let _ = (op, payload_size, closes_group, relay, hlc_override);
+        let _ = (op, payload_size, closes_group, relay, hlc_override, mark);
         Ok(self.append_lock.lock())
     }
 
     /// まとめ書き: 頼みを置き場 `i` (この thread の) に置き、 lock を持つ書き手に積んでもらう ([`OpLog::lock_or_request`])。
     #[cfg(not(target_arch = "wasm32"))]
-    fn append_by_request(&self, i: usize, req: SlotReq<'_>) -> Result<WalGuard<'_>, io::Result<(u64, Hlc)>> {
+    fn append_by_request(&self, i: usize, req: SlotReq<'_>, mark: Option<&AtomicU64>) -> Result<WalGuard<'_>, io::Result<(u64, Hlc)>> {
         let slot = &self.combine_slots[i];
         debug_assert_eq!(slot.state.load(Ordering::Relaxed), SLOT_EMPTY);
         // SAFETY: 置き場の持ち主はこの thread だけで、 EMPTY の間は誰も読まない。 頼みの借用は、 DONE を見るか頼みを下げるまで
@@ -2775,6 +3132,16 @@ impl OpLog {
                 // SAFETY: DONE の後は、 積んだ書き手は置き場に触らない
                 let r = unsafe { (*slot.result.get()).take() }.expect("まとめ書きの結果が無い");
                 slot.state.store(SLOT_EMPTY, Ordering::Relaxed);
+                // #850: 積んだ書き手が置き場に置いた位置を、 自分の印へ移す (この line は今この thread が持っている。 当て終えた時に
+                // 置き場を書くと、 その間に見回りが読んだ line をもう一度取りに行く)。 印を先に置いてから置き場を外す (どちらも
+                // Release)。 書き出す側は置き場を先に読み、 外れたのを見たら印の位置が見える (`applied_through`)
+                if let Some(m) = mark {
+                    let at = slot.served.load(Ordering::Relaxed);
+                    if at != INFLIGHT_IDLE {
+                        m.store(at, Ordering::Release);
+                        slot.served.store(INFLIGHT_IDLE, Ordering::Release);
+                    }
+                }
                 r
             })
         };
@@ -2847,7 +3214,14 @@ impl OpLog {
                 });
                 // SAFETY: PENDING の頼みは、 DONE にするまで頼んだ書き手が書き換えない (その書き手は DONE を見るまで戻らない)
                 let req = unsafe { (*slot.req.get()).assume_init_ref() };
-                let out = self.append_locked(&req.op, req.payload_size, req.closes_group, req.relay, req.hlc_override.copied());
+                let out = self.append_locked(
+                    &req.op,
+                    req.payload_size,
+                    req.closes_group,
+                    req.relay,
+                    req.hlc_override.copied(),
+                    req.track.then_some(&slot.served),
+                );
                 served += 1;
                 guard.finish(out);
             }
@@ -2873,6 +3247,8 @@ impl OpLog {
         closes_group: bool,
         relay: Option<&RelayedHeader>,
         hlc_override: Option<Hlc>,
+        // #850: 当てる書き込みの record の位置を置く先 (自分で積む時は書き手の印、 頼まれて積む時は頼んだ書き手の置き場の `served`)
+        mark: Option<&AtomicU64>,
     ) -> io::Result<(u64, Hlc)> {
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
@@ -2950,6 +3326,14 @@ impl OpLog {
             write_lap_trailer(&mut mmap[t..t + trailer], lap, bind_word(crc) & self.bind_mask());
         }
 
+        // #850: 当てる書き込みの record なら、 その位置を印に置く。 `written` を進める (`put_head`、 Release) より前なので、 進んだ
+        // `written` を Acquire で読んだ書き出しの側には、 この位置が必ず見える。 この store も Release: 同じ書き手の前の書き込みを
+        // 当てて印を外した後に置く値なので、 これを読んだ側に前の書き込みの cell も見える (Relaxed だと見えない組がある、 loom の
+        // `a_relaxed_second_write_position_lets_the_cut_pass`。 頼まれて積む時、 頼んだ書き手の前の書き込みは、 頼みを置く Release →
+        // 見回りの Acquire でこの thread に見えている)
+        if let Some(c) = mark {
+            c.store(wal_pos(lap, offset), Ordering::Release);
+        }
         // 区画の header の head も更新
         self.put_head(half, base, offset + record_size as u64);
 
@@ -3184,7 +3568,8 @@ impl OpLog {
     /// #388: checkpoint を head まで進め、 畳めれば 1 区画畳む。 `sync(head)` は head までの record の効果を本体に書き出す
     /// (oplog の fsync + 本体の msync) 役で、 false なら何も進めない。 戻り値は (checkpoint を進めたか、 畳んだか)。 `fold_safe`
     /// は `try_reset_if` と同じ (lock の下で、 checkpoint を進めた後に呼ぶ)。 `sync` / `fold_safe` から この OpLog の append 系を
-    /// 呼んではならない。
+    /// 呼んではならない。 `sync` に渡す head は、 積んだだけでまだ本体に当てていない record ([`Self::applying`]) の手前で切ってある
+    /// (#850)。
     ///
     /// - 2 区画の形: 書き出しの間も append を止めない。 古い区画には誰も書き足さないので、 書き出した後に古い区画を畳める
     ///   (今の区画に書き足した分は次の書き出しに入る)
@@ -3198,7 +3583,9 @@ impl OpLog {
             // 届かず畳めない (空きを待つ書き手が 「畳めない」 を見て諦めた)。 移っていたら新しい区画の head まで書き出し直す
             let mut advanced = false;
             for _ in 0..3 {
-                let head = self.written_head();
+                // #850: 積んだだけでまだ本体に当てていない record の手前まで (その record は次の回 / 次の書き出しで覆う)
+                let written = self.written_head();
+                let head = self.applied_through(written);
                 if self.is_empty() || !sync(head) {
                     return (advanced, false);
                 }
@@ -3207,7 +3594,9 @@ impl OpLog {
                 if self.try_reset_if(&mut fold_safe) {
                     return (true, true);
                 }
-                if wal_pos_lap(head) == self.lap() {
+                // 当てている途中の書き手の手前で切った回は、 書き出し直しても (その書き手が当て終えるまで) 同じ所で切る: やり直さない
+                // (#873 のレビュー: 当てる書き手が長く待つ間、 1 回の呼び出しで同じ head を 3 回書き出していた)
+                if head != written || wal_pos_lap(head) == self.lap() {
                     break;
                 }
             }
@@ -3215,11 +3604,30 @@ impl OpLog {
         }
         let out = {
             let _in_proc = self.append_lock.lock();
-            let head = self.head();
+            let end = self.head();
+            // #850: 積んだだけでまだ本体に当てていない record の手前まで。 append は止めてあるので、 当てている途中の書き手が
+            // 当て終えるのを少し待つ (当てるのに `append_lock` は要らない。 空きを待つ書き手はまだ何も積んでいない = 印が位置を
+            // 持たないので数えない = 互いに待たない)。 待つのは、 位置を自分の印に受け取った書き手だけ: 頼まれて積まれただけの位置
+            // (置き場の `served`) の持ち主は、 この lock を待って寝ていることがある (受け取るのは起きた後) ので待たない (#873 の
+            // レビュー: 待つと、 その書き手は lock を、 こちらは当て終えるのを待ち合う)。 待ち切れなければ手前まで進めて、 畳まずに
+            // 返る (呼び手がやり直す)
+            let mut head = self.applied_through(end);
+            for _ in 0..4096 {
+                if head == end || self.applied_through_taken(end) == end {
+                    break;
+                }
+                #[cfg(test)]
+                self.one_half_waits.fetch_add(1, Ordering::Relaxed);
+                std::thread::yield_now();
+                head = self.applied_through(end);
+            }
             if self.is_empty() || !sync(head) {
                 return (false, false);
             }
             self.advance_checkpoint_locked(head);
+            if head != end {
+                return (true, false);
+            }
             let Some((i, through)) = self.fold_target_locked() else { return (true, false) };
             if !fold_safe(through) {
                 return (true, false);
@@ -7291,5 +7699,356 @@ mod tests {
         assert!(calls >= 2, "移った後の head まで書き出し直した");
         assert!(wal.hot.halves[1].is_empty() && !wal.hot.halves[0].is_empty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// #850: 印 ([`OpLog::applying`]) で積んだ record の手前で `applied_through` が切る。 積む前 (印だけ) は切らない、 落とすと
+    /// 切らない、 載らなかった append は位置を残さない。
+    #[test]
+    fn applied_through_stops_before_a_record_that_is_not_applied_yet() {
+        let p = tmp("applied_through");
+        let wal = OpLog::create(&p, 1 << 20).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        let start = wal.written_head();
+        let scope = wal.applying();
+        wal.append(Op::Commit).unwrap();
+        let start2 = wal.written_head();
+        assert_eq!(wal.applied_through(start2), start2, "積む前の印は切らない (印の後に積まれた他の record も越える)");
+        wal.append_with_hlc_applying(Op::Tie { eid: 1, himo_id: 0, value: 2 }, &scope).unwrap();
+        wal.append(Op::Commit).unwrap();
+        let end = wal.written_head();
+        assert!(end > start2 && start2 > start);
+        assert_eq!(wal.applied_through(end), start2, "当てていない record の手前で切る");
+        assert_eq!(wal.applied_through(start), start, "手前の位置はそのまま");
+        assert_eq!(wal.applying_cuts(), 1, "切った回数");
+        drop(scope);
+        assert_eq!(wal.applied_through(end), end, "当て終えたら切らない");
+        // 載らなかった append は位置を残さない
+        let scope = wal.applying();
+        let big = vec![0u8; 2 << 20];
+        let too_big = Op::TieLeaf { eid: 1, himo_name: "t.l", himo_kind: 0, bytes: &big };
+        assert!(wal.append_with_hlc_applying(too_big, &scope).is_err(), "前提: WAL より大きい record は載らない");
+        wal.append(Op::Commit).unwrap();
+        assert_eq!(wal.applied_through(wal.written_head()), wal.written_head());
+        drop(scope);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #850: `append_lock` を待つ書き手の印は、 待つ間は切らない (まだ何も積んでいない)。 頼まれた書き手が積んだら、 その record の
+    /// 手前で切る (頼まれた書き手が位置を置く)。 待つ間に自分で lock を取って積んだ時も同じ。
+    #[test]
+    fn a_writer_waiting_for_the_append_lock_does_not_hold_the_checkpoint_back() {
+        for served in [true, false] {
+            let p = tmp(&format!("applied_through_wait_{served}"));
+            let wal = OpLog::create(&p, 1 << 20).unwrap();
+            let wal = &wal;
+            let (armed_tx, armed_rx) = std::sync::mpsc::channel::<bool>();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+            // 見た物は書き手を放してから確かめる (途中で panic すると、 待っている書き手の thread を待ち続ける)
+            let mut seen: Vec<(&str, u64, u64)> = Vec::new();
+            let mut combined = None;
+            std::thread::scope(|s| {
+                let w = s.spawn(move || {
+                    let scope = wal.applying();
+                    // 置き場のある thread か (並んで走る試験の thread が多いと、 置き場を取れないことがある。 その時は頼まずに lock を待つ)
+                    armed_tx.send(combine_slot_index().is_some_and(|i| i < COMBINE_SLOTS)).unwrap();
+                    go_rx.recv().unwrap();
+                    wal.append_with_hlc_applying(Op::Tie { eid: 1, himo_id: 0, value: 7 }, &scope).unwrap();
+                    done_tx.send(()).unwrap();
+                    drop_rx.recv().unwrap();
+                    drop(scope);
+                });
+                let has_slot = armed_rx.recv().unwrap();
+                wal.append(Op::Tie { eid: 2, himo_id: 0, value: 1 }).unwrap();
+                wal.append(Op::Commit).unwrap();
+                let start = wal.written_head();
+                let held = wal.append_lock.lock();
+                go_tx.send(()).unwrap();
+                if has_slot {
+                    wait_pending(wal, 1);
+                    seen.push(("lock を待つ書き手の印は切らない", wal.applied_through(start), start));
+                }
+                if served && has_slot {
+                    wal.serve_slots();
+                    combined = Some(wal.combined_appends());
+                    seen.push(("頼まれて積んだ record の手前で切る", wal.applied_through(wal.written_head()), start));
+                }
+                drop(held);
+                done_rx.recv().unwrap();
+                let end = wal.written_head();
+                seen.push(("前提: 書き手の record が載った", (end > start) as u64, 1));
+                seen.push(("積んだ record の手前で切る", wal.applied_through(end), start));
+                drop_tx.send(()).unwrap();
+                w.join().unwrap();
+            });
+            for (what, got, want) in seen {
+                assert_eq!(got, want, "served {served}: {what}");
+            }
+            if let Some(n) = combined {
+                assert_eq!(n, 1, "前提: 頼まれて積んだ");
+            }
+            assert_eq!(wal.applied_through(wal.written_head()), wal.written_head(), "当て終えたら切らない (頼まれて積んだ分も外れる)");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// #850: 頼まれた書き手が置き場 (`CombineSlot::served`) に置いた位置も、 頼んだ書き手が結果を受け取って自分の印へ移す前から
+    /// `applied_through` が見る (その間に書き出しが走ると、 置き場だけが位置を持つ)。 まとめ書きの道の、 積んでから受け取るまでの
+    /// 窓を、 lock を持った試験の thread が置き場へ直に積んで作る。
+    #[test]
+    fn applied_through_sees_a_position_left_in_a_combine_slot() {
+        let p = tmp("applied_through_served");
+        let wal = OpLog::create(&p, 1 << 20).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 0 }).unwrap();
+        let start = wal.written_head();
+        wal.inflight.hw.fetch_max(1, Ordering::AcqRel);
+        let served = &wal.combine_slots[0].served;
+        {
+            let _held = wal.append_lock.lock();
+            let op = Op::Tie { eid: 1, himo_id: 0, value: 1 };
+            wal.append_locked(&op, op.payload_size(), false, None, None, Some(served)).unwrap();
+        }
+        wal.append(Op::Commit).unwrap();
+        assert!(wal.written_head() > start, "前提: 載った");
+        assert_eq!(wal.applied_through(wal.written_head()), start, "置き場に残った位置の手前で切る");
+        served.store(INFLIGHT_IDLE, Ordering::Release);
+        assert_eq!(wal.applied_through(wal.written_head()), wal.written_head());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #850: 満杯の WAL の空きを待つ書き手の印は、 待つ間は切らない (空きを作る側の checkpoint が全部を覆えて、 畳める)。 空いて
+    /// 積み直した後は、 その record の手前で切る。
+    #[test]
+    fn a_writer_waiting_for_wal_room_does_not_hold_the_checkpoint_back() {
+        let p = tmp("applied_through_room");
+        let wal = std::sync::Arc::new(OpLog::create(&p, 16 * 1024).unwrap());
+        assert!(!wal.two_halves(), "前提: 1 区画の WAL");
+        let folded = std::sync::Arc::new(AtomicU64::new(0));
+        {
+            let (weak, folded) = (std::sync::Arc::downgrade(&wal), folded.clone());
+            wal.set_room_waiter(Some(std::sync::Arc::new(move |_| {
+                let wal = weak.upgrade().unwrap();
+                // 空きを作る側: 待っている書き手の印に止められずに、 全部を覆って畳める
+                let (_, did_fold) = wal.checkpoint_and_reset(|_| true, |_| true);
+                folded.fetch_add(did_fold as u64, Ordering::Relaxed);
+                did_fold
+            })));
+        }
+        let scope = wal.applying();
+        // 印を置いた後に、 別の thread が満杯まで埋める (印なし)
+        {
+            let wal = wal.clone();
+            std::thread::spawn(move || {
+                let mut n = 1u64;
+                while wal.free_bytes() >= 2 * wal.record_size_of(16) as u64 + wal.record_size_of(0) as u64 {
+                    wal.append(Op::Tie { eid: 1, himo_id: 0, value: n }).unwrap();
+                    n += 1;
+                }
+                wal.append(Op::Commit).unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+        assert!(wal.free_bytes() < wal.record_size_of(16) as u64 + wal.record_size_of(0) as u64, "前提: もう 1 件は載らない");
+        // 載らない → 空きを待つ (印は位置を持たない) → 畳める → 載る
+        let appended = wal.append_with_hlc_applying(Op::Tie { eid: 2, himo_id: 0, value: 9 }, &scope);
+        let (lap, through, end) = (wal.lap(), wal.applied_through(wal.written_head()), wal.written_head());
+        drop(scope);
+        wal.set_room_waiter(None);
+        let _ = std::fs::remove_file(&p);
+        assert!(appended.is_ok(), "空きを待つ書き手の印が、 空きを作る側を止めた ({appended:?})");
+        assert_eq!(folded.load(Ordering::Relaxed), 1, "前提: 空きを待って 1 回畳んだ");
+        assert_eq!(through, wal_pos(lap, HEADER_SIZE as u64), "畳んだ後に積んだ record の手前で切る (終わり {end:#x})");
+    }
+
+    /// #850: 置き場の無い thread (同時に生きている書き手の thread が [`COMBINE_SLOTS`] を越えた分) の印も `applied_through` が見る。
+    /// thread を置き場の数より多く立てると、 並んで走る他の試験の thread が置き場を取れなくなる (まとめ書きの試験が頼みを
+    /// 置けない) ので、 番号の無い thread の道 (`append_applying_at` に置き場より大きい番号) を直に呼ぶ。
+    #[test]
+    fn applied_through_sees_threads_without_a_combine_slot() {
+        let p = tmp("applied_through_extra");
+        let wal = OpLog::create(&p, 1 << 20).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 0 }).unwrap();
+        let start = wal.written_head();
+        let scope = wal.applying();
+        wal.append_applying_at(COMBINE_SLOTS + 3, Op::Tie { eid: 1, himo_id: 0, value: 1 }, &scope).unwrap();
+        assert!(wal.inflight.extra.used.load(Ordering::Acquire), "前提: 固定の cell を借りた");
+        assert!(matches!(scope.at.get(), MarkAt::Extra(_)), "前提: lock なしの固定の cell");
+        assert_eq!(wal.applied_through(wal.written_head()), start, "置き場の無い thread の record の手前で切る");
+        // 別の印で借りても (同じ番号の別の thread)、 位置を持つのは積んだ方だけ。 積む前に載らなかった印は位置を持たない
+        let other = wal.applying();
+        let big = vec![0u8; 2 << 20];
+        let too_big = Op::TieLeaf { eid: 1, himo_name: "t.l", himo_kind: 0, bytes: &big };
+        assert!(wal.append_applying_at(COMBINE_SLOTS + 3, too_big, &other).is_err(), "前提: WAL より大きい record は載らない");
+        assert!(matches!(other.at.get(), MarkAt::Extra(_)), "前提: 2 つ目の固定の cell を借りた");
+        assert_eq!(wal.applied_through(wal.written_head()), start);
+        drop(other);
+        drop(scope);
+        assert_eq!(wal.applied_through(wal.written_head()), wal.written_head());
+        assert!(wal.inflight.extra.cells.iter().all(|c| c.0.load(Ordering::Acquire) == INFLIGHT_FREE), "返すと FREE に戻る");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #850: 固定の cell が全部借りられている時は溢れの cell を借り、 `applied_through` はそれも見る。 返すと溢れの数が 0 に戻り、
+    /// 書き出す側は lock を取らない。
+    #[test]
+    fn applied_through_sees_threads_that_spill_past_the_fixed_cells() {
+        let p = tmp("applied_through_spill");
+        let wal = OpLog::create(&p, 1 << 20).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 0 }).unwrap();
+        let start = wal.written_head();
+        // 固定の cell を全部借りる (位置は持たない)
+        let held: Vec<Applying<'_>> = (0..EXTRA_MARKS).map(|_| wal.applying()).collect();
+        for (k, h) in held.iter().enumerate() {
+            assert!(OpLog::claim_mark(COMBINE_SLOTS + k, h).is_some());
+        }
+        let scope = wal.applying();
+        wal.append_applying_at(COMBINE_SLOTS, Op::Tie { eid: 1, himo_id: 0, value: 1 }, &scope).unwrap();
+        assert!(matches!(scope.at.get(), MarkAt::Spill(_)), "前提: 溢れの cell を借りた");
+        assert_eq!(wal.inflight.extra.spill_live.load(Ordering::Acquire), 1);
+        assert_eq!(wal.applied_through(wal.written_head()), start, "溢れの cell の record の手前で切る");
+        drop(scope);
+        drop(held);
+        assert_eq!(wal.inflight.extra.spill_live.load(Ordering::Acquire), 0, "返すと数が下がる (書き出す側は lock を取らない)");
+        assert_eq!(wal.applied_through(wal.written_head()), wal.written_head());
+        // 返した溢れの cell は次に溢れた時に使い回す
+        let held: Vec<Applying<'_>> = (0..EXTRA_MARKS).map(|_| wal.applying()).collect();
+        for (k, h) in held.iter().enumerate() {
+            assert!(OpLog::claim_mark(COMBINE_SLOTS + k, h).is_some());
+        }
+        let again = wal.applying();
+        assert!(OpLog::claim_mark(COMBINE_SLOTS, &again).is_some());
+        assert_eq!(wal.inflight.extra.spill.lock().unwrap().len(), 1, "空いた溢れの cell を使い回す");
+        drop(again);
+        drop(held);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #850 の後 (#873 のレビュー): 2 区画の空け作りが当てている途中の書き手の手前で切った時は、 書き出しを 1 回だけして返る。 前は、
+    /// 書き手が次の区画へ移っていると (切った位置の周が今の周と違う) 書き出し直しを 3 回まで繰り返した (当て終えるまで同じ所で切る)。
+    #[test]
+    fn a_cut_write_out_is_not_repeated_after_writers_moved_to_the_other_half() {
+        let p = tmp("cut_write_out_once");
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        assert!(wal.two_halves(), "前提: 2 区画の WAL");
+        let scope = wal.applying();
+        wal.append_with_hlc_applying(Op::Tie { eid: 1, himo_id: 0, value: 1 }, &scope).unwrap();
+        let cut = wal.applied_through(wal.written_head());
+        let lap = wal.lap();
+        let mut n = 0u64;
+        while wal.lap() == lap {
+            wal.append(Op::Tie { eid: 2, himo_id: 0, value: n }).unwrap();
+            n += 1;
+        }
+        wal.append(Op::Commit).unwrap();
+        assert!(wal_pos_lap(cut) != wal.lap(), "前提: 書き手は次の区画へ移った");
+        let mut synced = Vec::new();
+        let out = wal.checkpoint_and_reset(
+            |head| {
+                synced.push(head);
+                true
+            },
+            |_| true,
+        );
+        drop(scope);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(out, (true, false), "手前まで進めて、 畳まない");
+        assert_eq!(synced.len(), 1, "同じ所で切る書き出しを繰り返した ({synced:?})");
+    }
+
+    /// #850 の後 (#873 のレビュー): 1 区画の空け作り (append を止めたまま) は、 頼まれて積まれただけで頼んだ書き手がまだ受け取って
+    /// いない位置 (置き場の `served`) では待たない (その書き手は止めている lock を待って寝ていることがある)。 受け取った位置 (印) は
+    /// 当て終えるのを待つ (待ち切れるかは thread の運なので見ない。 CI の 2 core で、 待つ間に書き手が当て終えなかったことがある)。
+    /// 当て終えた後は畳む。
+    #[test]
+    fn a_one_half_fold_waits_only_for_positions_a_writer_took() {
+        let p = tmp("one_half_served_only");
+        let wal = std::sync::Arc::new(OpLog::create(&p, 16 * 1024).unwrap());
+        assert!(!wal.two_halves(), "前提: 1 区画の WAL");
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 0 }).unwrap();
+        let start = wal.written_head();
+        // 頼まれて積まれただけの位置 (受け取る前)
+        wal.inflight.hw.fetch_max(1, Ordering::AcqRel);
+        let served = &wal.combine_slots[0].served;
+        {
+            let _held = wal.append_lock.lock();
+            let op = Op::Tie { eid: 1, himo_id: 0, value: 1 };
+            wal.append_locked(&op, op.payload_size(), false, None, None, Some(served)).unwrap();
+        }
+        wal.append(Op::Commit).unwrap();
+        let waits = wal.one_half_waits.load(Ordering::Relaxed);
+        let out = wal.checkpoint_and_reset(|_| true, |_| true);
+        let (waited, checkpoint) = (wal.one_half_waits.load(Ordering::Relaxed) - waits, wal.checkpoint());
+        served.store(INFLIGHT_IDLE, Ordering::Release);
+        assert_eq!(out, (true, false), "手前まで進めて、 畳まない");
+        assert_eq!(checkpoint, start, "受け取る前の位置の手前で切る");
+        assert_eq!(waited, 0, "受け取る前の位置で、 当て終えるのを待った");
+        // 受け取った位置 (別の thread の印) は、 当て終えるのを待ってから畳む
+        let waits = wal.one_half_waits.load(Ordering::Relaxed);
+        let (took_tx, took_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let wal = wal.clone();
+            std::thread::spawn(move || {
+                let scope = wal.applying();
+                wal.append_with_hlc_applying(Op::Tie { eid: 1, himo_id: 0, value: 2 }, &scope).unwrap();
+                wal.append(Op::Commit).unwrap();
+                took_tx.send(()).unwrap();
+                // 空け作りが待ち始めたら当て終える
+                while wal.one_half_waits.load(Ordering::Relaxed) == waits {
+                    std::thread::yield_now();
+                }
+                drop(scope);
+            })
+        };
+        took_rx.recv().unwrap();
+        let out = wal.checkpoint_and_reset(|_| true, |_| true);
+        writer.join().unwrap();
+        // 待つ間に当て終えていれば畳んだ。 当て終える前に待ち切れていれば、 当て終えた後の空け作りが畳む
+        let folded = out.1 || wal.checkpoint_and_reset(|_| true, |_| true).1;
+        let _ = std::fs::remove_file(&p);
+        assert!(wal.one_half_waits.load(Ordering::Relaxed) > waits, "受け取った位置で、 当て終えるのを待たなかった");
+        assert!(folded, "当て終えた後に畳まない");
+    }
+
+    /// #850: 空け作り (`checkpoint_and_reset`) は、 当てていない record の手前までしか checkpoint を進めず、 畳まない。 当て終えた
+    /// 後は畳む。 1 区画の形 (append を止めたまま) と 2 区画の形の両方。
+    #[test]
+    fn checkpoint_and_reset_stops_before_a_record_that_is_not_applied_yet() {
+        for (tag, cap, two) in [("one", 16 * 1024, false), ("two", 64 * 1024, true)] {
+            let p = tmp(&format!("cp_reset_applying_{tag}"));
+            let wal = OpLog::create(&p, cap).unwrap();
+            assert_eq!(wal.two_halves(), two, "前提: WAL の形");
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+            wal.append(Op::Commit).unwrap();
+            let start = wal.written_head();
+            let scope = wal.applying();
+            wal.append_with_hlc_applying(Op::Tie { eid: 1, himo_id: 0, value: 2 }, &scope).unwrap();
+            wal.append(Op::Commit).unwrap();
+            let mut synced = Vec::new();
+            let out = wal.checkpoint_and_reset(
+                |head| {
+                    synced.push(head);
+                    true
+                },
+                |_| true,
+            );
+            assert_eq!(out, (true, false), "{tag}: 手前まで進めて、 畳まない");
+            assert!(synced.iter().all(|h| *h == start), "{tag}: 書き出す位置は当てていない record の手前 ({synced:?})");
+            assert_eq!(wal.checkpoint(), start, "{tag}: checkpoint は当てていない record を越えない");
+            let replayed: Vec<u64> = wal
+                .recover_with_tail()
+                .iter()
+                .filter_map(|r| match r.op {
+                    DecodedOp::Tie { value, .. } => Some(value),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replayed, vec![2], "{tag}: 落ちたら、 当てていない record (だけ) を再生する");
+            drop(scope);
+            let out = wal.checkpoint_and_reset(|_| true, |_| true);
+            assert_eq!(out, (true, true), "{tag}: 当て終えたら畳む");
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }
