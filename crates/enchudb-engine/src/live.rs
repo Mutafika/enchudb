@@ -660,6 +660,8 @@ pub(crate) trait CellReader {
         self.pull_ref_into(via, e, &mut v);
         v
     }
+    /// #731: 場所 `e` を **前の世代で** 指す Ref の値を持つ entity を `out` の後ろに足す (今の世代は含まない)。
+    fn pull_ref_stale_into(&self, _via: u16, _e: u32, _out: &mut Vec<u32>) {}
     /// #731: 場所 `e` を前の世代で指す ref がありうるか (並びの索引の速い道は今の世代の値しか引かない)。
     fn ref_reused(&self, _e: u32) -> bool {
         false
@@ -4716,22 +4718,26 @@ impl Family {
                     }
                 }
                 if always || force || changed {
+                    // 今の住人を指す ref (今の世代の値) で引いた親は、 子の答えが `now` と分かっている
                     let up = match order_range {
-                        // #731: 使い回した場所は前の世代を指す ref も伝える (索引の速い道は今の世代だけ)
-                        Some((key, lo, hi)) if parent == 0 && single_child == Some(n) && !r.ref_reused(e) => {
+                        Some((key, lo, hi)) if parent == 0 && single_child == Some(n) => {
                             let mut up = Vec::new();
                             match r.order_arc_into(via, key, e, lo, hi, false, &mut up) {
                                 Some(_) => up,
-                                None => r.pull_ref(via, e),
+                                None => r.pull(via, r.ref_val(e)),
                             }
                         }
-                        _ => r.pull_ref(via, e),
+                        _ => r.pull(via, r.ref_val(e)),
                     };
+                    // #731: 前の世代を指す ref (消えた行を指したまま) の親は、 ref が無いのと同じに変わる = 子の答えを使わず評価し直す
+                    let mut stale = Vec::new();
+                    r.pull_ref_stale_into(via, e, &mut stale);
                     if parent == 0 && single_child == Some(n) {
                         via_child.push((now, e, up));
                     } else {
                         work[parent].extend(up);
                     }
+                    work[parent].extend(stale);
                 }
             }
         }

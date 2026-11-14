@@ -14,7 +14,11 @@
 //! - 予約の表 (`_` で始まる、 `_sync_ops` の ring など) は世代を持たない (0 のまま使い回す)
 
 use crate::region::Region;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// [`Generations::gate`] の 「消す時に上げる」 印 (最上位 bit)。 下位 32 bit = 印を見ずに消している書き手の数。
+const GATE_ON: u64 = 1 << 63;
+const GATE_COUNT: u64 = u32::MAX as u64;
 
 /// `gen.seg` の先頭の header の長さ。 [`MAGIC`] / 場所の bit / 表ごとの印 (TableId は u16 = 8 KiB)。
 pub(crate) const GEN_HEADER: usize = 16 * 1024;
@@ -39,11 +43,17 @@ pub(crate) struct Generations {
     /// 場所の bit `S`。 0 = 世代を持たない DB (local = 場所)。
     bits: AtomicU32,
     region: std::sync::OnceLock<Region>,
+    /// v15 に移る手順と消す道の揃え (1 語): 最上位 bit = 「消す時に上げる」 (v15)、 下位 = 印の立つ前に入って、 上げずに消している
+    /// 書き手の数。 消す道は入る時の RMW で印を読み (`enter_free`)、 生きている印を下ろしてから出る (`exit_free`)。 移る側は印を
+    /// 立てた (RMW) 後、 数が 0 になるのを待ってから死んだ場所をなめる (`wait_frees`)。 同じ語の RMW の順で、 印を見ずに消した書き手の
+    /// 場所は、 なめる時には死んでいる (なめる側が上げる)。 印を見た書き手は自分で上げる。 揃えの model は
+    /// `tests/loom_eid_generation_move.rs`
+    gate: AtomicU64,
 }
 
 impl Generations {
     pub(crate) fn off() -> Self {
-        Self { bits: AtomicU32::new(0), region: std::sync::OnceLock::new() }
+        Self { bits: AtomicU32::new(0), region: std::sync::OnceLock::new(), gate: AtomicU64::new(0) }
     }
 
     /// 開いた DB の `gen.seg` (header に場所の bit が焼いてある)。 中身の header が合わなければ Err。
@@ -58,6 +68,7 @@ impl Generations {
         }
         let _ = self.region.set(region);
         self.bits.store(bits, Ordering::Release);
+        self.gate.fetch_or(GATE_ON, Ordering::AcqRel);
         Ok(())
     }
 
@@ -76,9 +87,34 @@ impl Generations {
         Ok(())
     }
 
-    /// 照合を始める (`prepare` の後)。
+    /// 照合と 「消す時に上げる」 を始める (`prepare` の後)。 この後 [`Self::wait_frees`] を待ってから死んだ場所をなめる。
     pub(crate) fn start(&self, bits: u32) {
         self.bits.store(bits, Ordering::Release);
+        self.gate.fetch_or(GATE_ON, Ordering::AcqRel);
+    }
+
+    /// 消す道の入口: (消す時に上げるか, 出る時に [`Self::exit_free`] を呼ぶか)。 v15 は読むだけ。
+    #[inline]
+    pub(crate) fn enter_free(&self) -> (bool, bool) {
+        if self.gate.load(Ordering::Acquire) & GATE_ON != 0 {
+            return (true, false);
+        }
+        let v = self.gate.fetch_add(1, Ordering::AcqRel);
+        (v & GATE_ON != 0, true)
+    }
+
+    /// 消す道の出口 (生きている印を下ろした後)。
+    #[inline]
+    pub(crate) fn exit_free(&self) {
+        self.gate.fetch_sub(1, Ordering::Release);
+    }
+
+    /// 印の立つ前に入った消す書き手が全部出るのを待つ (移る手順、 印を立てた後)。 中の書き手は lock を待たない短い道
+    /// (生きている印を下ろすだけ) なので回って待つ。
+    pub(crate) fn wait_frees(&self) {
+        while self.gate.load(Ordering::Acquire) & GATE_COUNT != 0 {
+            std::thread::yield_now();
+        }
     }
 
     /// 場所の bit。 0 = 世代を持たない。

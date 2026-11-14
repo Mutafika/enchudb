@@ -13830,13 +13830,12 @@ impl Engine {
     /// (removed にアプリが持つ eid を出す)。
     fn live_free(&self, local: u32, row_gen: Option<u32>) {
         let was_live = self.entities.is_live(local);
-        let gen_of_row = row_gen.unwrap_or_else(|| self.generations.get(local));
         let replaying = self.replaying.load(std::sync::atomic::Ordering::Relaxed);
-        let bumped = self.generations.active()
-            && (row_gen.is_some() || was_live)
-            && !replaying
-            && self.slot_is_generational(local);
-        if bumped {
+        // v15 に移る手順 (`move_to_generations`) と揃える: 入口の RMW で 「消す時に上げる」 を読み、 上げない時は生きている印を
+        // 下ろしてから出る (移る側は、 印を見ずに入った書き手が出るのを待ってから死んだ場所をなめる、 `Generations::gate`)
+        let (on, entered) = self.generations.enter_free();
+        let gen_of_row = row_gen.unwrap_or_else(|| self.generations.get(local));
+        if on && (row_gen.is_some() || was_live) && !replaying && self.slot_is_generational(local) {
             self.raise_generation(local, gen_of_row + 1);
         }
         if self.generations.retired(local) {
@@ -13844,14 +13843,8 @@ impl Engine {
         } else {
             self.entities.free(local);
         }
-        // v15 に移る手順 (`move_to_generations`) と重なった削除: 印を立てる前に 「消す時に上げない」 と読んだのに、 移る手順の穴埋めが
-        // まだ生きている印を見た = どちらも上げない形を塞ぐ。 生きている印を下ろした後に印を見直す (移る側は印を立てた後に生きて
-        // いる印をなめる)。 SeqCst の fence でどちらかが相手の書き込みを見る (両方上げても同じ 1)
-        if !bumped && was_live && !replaying {
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            if self.generations.active() && self.slot_is_generational(local) {
-                self.raise_generation(local, gen_of_row + 1);
-            }
+        if entered {
+            self.generations.exit_free();
         }
         self.live.freed(local);
         // #868: 枯渇した表が、 枠の全部をなめずにこの穴を拾えるように覚える
@@ -15499,9 +15492,9 @@ impl Engine {
     ///
     /// 1. `gen.seg` を作り (前の残りは 0 に戻す)、 場所の bit `S` を決める
     /// 2. 照合と 「消す時に上げる」 を始める ([`crate::generation::Generations::start`])
-    /// 3. SeqCst の fence。 2. を見ずに消している書き手とは、 消す側が生きている印を下ろした後に 2. を見直して揃える (`live_free`)。
-    ///    行の lock は待たない (行を握ったまま `entity_in` を呼ぶ書き手が居る)。 2. を見ずに書いている書き手は、 死んだ場所に書いても
-    ///    使い回す時に落とす (`drop_leftover_cells`、 行の lock の下)
+    /// 3. 2. を見ずに入った消す書き手が出るのを待つ (`Generations::wait_frees`、 1 語の RMW の揃え)。 行の lock は待たない (行を
+    ///    握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 2. を見ずに書いている書き手は、 死んだ場所に書いても使い回す
+    ///    時に落とす (`drop_leftover_cells`、 行の lock の下)
     /// 4. v14 の間に消した場所 (世代を持つ表の払い出し済みの範囲の死んだ場所) を全部 1 にする。 死んだ場所の値 = 次の住人の世代
     /// 5. `gen.seg` を書き出してから header (S と version 15) を書き出す。 header が届いた像には 4. も届いている。 header が届かな
     ///    かった像は v14 のまま開き、 `gen.seg` は読まない (次に移る時に 0 から作り直す)
@@ -15529,9 +15522,9 @@ impl Engine {
         set.ensure_gen(crate::generation::segment_len(reserve))?;
         self.generations.prepare(set.region(SegmentKind::Gen), bits)?;
         // 2. / 3. 行の lock は待たない (行を握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 照合は書き込みの道が
-        // 行の lock の下で見る (使い回しはこの後)。 消す道とは fence で揃える (`live_free`)
+        // 行の lock の下で見る (使い回しはこの後)。 消す道とは 1 語の RMW で揃える (`Generations::gate`、 `live_free`)
         self.generations.start(bits);
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        self.generations.wait_frees();
         // 4.
         for (tid, t) in self.tables.iter().enumerate() {
             if t.is_reserved() {
@@ -24610,6 +24603,16 @@ impl crate::live::CellReader for Engine {
         // 世代 0 から今の世代まで (使い回しの無い場所は 1 回)
         let top = self.generations.get(e).min(self.generations.retired_mark());
         for g in 0..=top {
+            crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
+        }
+    }
+    fn pull_ref_stale_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
+        let b = self.generations.bits();
+        if b == 0 || b >= 32 {
+            return;
+        }
+        let top = self.generations.get(e).min(self.generations.retired_mark());
+        for g in 0..top {
             crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
         }
     }

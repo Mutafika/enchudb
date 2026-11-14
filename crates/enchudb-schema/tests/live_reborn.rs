@@ -90,7 +90,7 @@ fn reborn_rows_leave_and_reenter_pairs_and_tuples() {
     let d = by_ref.poll();
     assert_eq!(
         (sorted(d.removed), sorted(d.added)),
-        (vec![(bob, ant), (carol, ant)], vec![(dave, ant2)]),
+        (sorted(vec![(bob, ant), (carol, ant)]), vec![(dave, ant2)]),
         "ref の組 (右): 消えた会社を指す組は出る、 dave は入る"
     );
     let d = tokyo.poll();
@@ -99,7 +99,7 @@ fn reborn_rows_leave_and_reenter_pairs_and_tuples() {
     let d = tri.poll();
     assert_eq!(
         (sorted(d.removed), sorted(d.added)),
-        (vec![vec![bob, ant, shop], vec![carol, ant, shop]], vec![vec![dave, ant2, shop]]),
+        (sorted(vec![vec![bob, ant, shop], vec![carol, ant, shop]]), vec![vec![dave, ant2, shop]]),
         "3 table の組 (真ん中)"
     );
     drop((by_ref, tokyo, by_val, tri, c, u, s));
