@@ -84,16 +84,20 @@ fn fold_waits_until_bridged_rows_are_written_out() {
     eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+    // consumer の周期 (100 ms ごとの Commit・書き出し・bridge・畳み) を、 書く前から聞き終えるまで止める (#862)。 前は 「すぐに
+    // 聞く」 で、 負荷の下で周期が間に入り、 bridge した行を書き出して (1 つ目の assert) / Commit を足して bridge が head に届かず
+    // (2 つ目の assert) 落ちた
+    let hold = eng.hold_consumer();
     for i in 0..10u32 {
         let e = eng.entity_in("notes").unwrap();
         eng.tie_to(e, "notes.note", i);
     }
-    // oplog_sync は本体の書き出しの後に bridge するので、 返った時点で写した行は書き出されていない。 consumer の周期
-    // (100 ms) が間に書き出すと成り立たないので、 すぐに聞く
+    // oplog_sync は本体の書き出しの後に bridge するので、 返った時点で写した行は書き出されていない
     eng.oplog_sync().unwrap();
     assert!(!eng.wal_fold_safe(), "bridge した行を書き出す前に畳んでよいと言った");
     eng.body_msync().unwrap();
     assert!(eng.wal_fold_safe(), "bridge した行を書き出した後も畳めない");
+    drop(hold);
     drop(eng);
     let _ = std::fs::remove_dir_all(&path);
 }

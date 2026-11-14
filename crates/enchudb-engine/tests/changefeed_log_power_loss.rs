@@ -23,7 +23,7 @@
 
 use enchudb_engine::changefeed::ChangeListener;
 use enchudb_engine::transport::WireRecord;
-use enchudb_engine::{Engine, ValueType};
+use enchudb_engine::{Engine, FaultKind, TieRejected, ValueType};
 use enchudb_oplog::crashsim::{self, Mode};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -136,14 +136,24 @@ fn run(tag: &str, wal_cap: usize) {
     eng.enable_change_log(LOG_CAP).unwrap();
     let acked = Arc::new(AtomicU64::new(0)); // oplog_sync が返った値の数
     let done = Arc::new(AtomicBool::new(false));
+    // 書き手は、 断られた書き込み (満杯の WAL の空きを待ちの上限まで待っても空かなかった、 #388 / #553) を同じ値で書き直す
+    // (#859: 前は結果を見ず、 断られた値が記録にも本体にも無いのを 「値が続いていない」 と読んだ)。 戻り値は断られた回数
     let writer = {
         let (eng, acked, done) = (eng.clone(), acked.clone(), done.clone());
         std::thread::spawn(move || {
             let ts = eng.himo_id("ts").unwrap() as u16;
             let a = eng.entity().unwrap();
             let mut v = 0u64;
+            let mut rejected = 0u64;
             while !done.load(Ordering::Acquire) && v < 4_000_000 {
-                eng.tie_to_by_id(a, ts, v);
+                match eng.try_tie_to_by_id(a, ts, v) {
+                    Ok(()) => {}
+                    Err(TieRejected::Fault(FaultKind::WalSpace)) => {
+                        rejected += 1;
+                        continue;
+                    }
+                    Err(e) => panic!("書き込みが {e} で断られた (値 {v})"),
+                }
                 v += 1;
                 if v.is_multiple_of(50) {
                     eng.oplog_commit();
@@ -154,6 +164,7 @@ fn run(tag: &str, wal_cap: usize) {
                 }
             }
             eng.oplog_sync().unwrap();
+            rejected
         })
     };
     // 書いている最中にも記録へ写す (listener の通知係と同じ道)。 書き出す前の record を写すと、 落ちた像では記録にだけ残る
@@ -196,9 +207,17 @@ fn run(tag: &str, wal_cap: usize) {
         images.push((img, mode, at));
     }
     done.store(true, Ordering::Release);
-    writer.join().unwrap();
+    let rejected = writer.join().unwrap();
     poller.join().unwrap();
     let folds = eng.wal_room_folds();
+    // 断られた書き込みは、 待ちの上限 (5 秒) まで待っても空かなかった物だけ (書き出しが止まった回)。 それ以外で断られたら、 畳めて
+    // いるのに諦めた = engine の誤り (#859 の 2 つ目の問い)
+    let timeouts = eng.wal_room_wait_timeouts();
+    assert!(
+        rejected <= timeouts,
+        "書き込みが {rejected} 回断られたが、 待ちの上限に当たったのは {timeouts} 回 (書き出しの失敗 {} 回)",
+        eng.fault_count(FaultKind::DiskSpace)
+    );
     crashsim::stop();
     drop(eng);
 
@@ -247,7 +266,8 @@ fn run(tag: &str, wal_cap: usize) {
     let wrapped = stats.iter().filter(|s| s.1 > 0).count();
     let with_acked = stats.iter().filter(|s| s.3 > 0).count();
     eprintln!(
-        "[{tag}] 像 {} 枚、 WAL を畳んだ回数 {folds}、 記録が一周していた像 {wrapped} 枚、 書き出しの返った後の像 {with_acked} 枚",
+        "[{tag}] 像 {} 枚、 WAL を畳んだ回数 {folds}、 記録が一周していた像 {wrapped} 枚、 書き出しの返った後の像 {with_acked} 枚、 \
+         断られて書き直した書き込み {rejected} 回",
         images.len()
     );
     for s in &stats {
