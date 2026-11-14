@@ -189,7 +189,7 @@ pub struct TableEidUsage {
     pub allocated: u32,
     /// いま生きている行数。
     pub live: u32,
-    /// 今ある枠にあと何行入るか (= `capacity - live`)。 削除で空いた slot は
+    /// 今ある枠にあと何行入るか (= `capacity - live - 引退した場所`、 #731: 世代を使い切った場所は二度と渡さない)。 削除で空いた slot は
     /// `entity_in` が free list 経由で再利用するのでここに戻る。 0 でも、 空き eid 空間が
     /// 残っていれば次の `entity_in` で枠が足される。
     pub free: u32,
@@ -2060,6 +2060,9 @@ pub mod write_out_hook {
         WrittenOut,
         /// #731: v15 に移る時、 `gen.seg` を書き出した後 (header に場所の bit と version 15 を書く前)
         GenerationsBeforeHeader,
+        /// #731: 本体の書き出しで、 生きている印 (entities) を書き出した後、 場所の世代 (`gen.seg`) を書き出す前 (消す書き手を
+        /// 止めている間)
+        BeforeGenerations,
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
@@ -2213,6 +2216,40 @@ mod claim_gap_hook {
 /// test 用の割り込み点: `entity_in` が空きの一覧から取り出した slot に生きている印を立てる前 (#883)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod pop_claim_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 紐の動的な定義 (Number64) が header の version を読んで、 書き戻す前 (#731 の読み直し G)。 置いた WAL で
+/// 1 回だけ呼ぶ。
+#[cfg(test)]
+mod wide_version_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: anonymous の `entity()` が空きの山から場所を取り出して印を立てた直後 (#731 の読み直し I)。 置いた WAL で
+/// 1 回だけ呼ぶ。
+#[cfg(test)]
+mod anon_reuse_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -2935,6 +2972,76 @@ mod slot_claim_tests {
         cleanup(&path, eng);
         let theirs = theirs.expect("前提: 別の書き手も払い出された");
         assert_ne!(mine, theirs, "最後の slot {mine:#x} を 2 つの行に払い出した");
+    }
+
+    /// #731 の読み直し G: Number64 の紐の動的な定義が header の version を読んで書き戻すまでの間に、 別の thread の最初の使い回しが
+    /// v15 に移っても、 header の version は 15 のまま (前は定義の側が読んだ古い version を書き戻し、 場所の bit が焼いてあるのに
+    /// version の古い header が残った)。
+    #[test]
+    fn a_dynamic_wide_column_does_not_write_back_an_older_version_over_the_move_to_v15() {
+        use std::sync::mpsc::channel;
+        let (path, eng) = engine("widever");
+        let rows: Vec<_> = (0..4).map(|_| eng.entity_in("t").unwrap()).collect();
+        eng.delete(rows[0]);
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (at, at_rx) = channel::<()>();
+        let (go, go_rx) = channel::<()>();
+        wide_version_hook::set(&wal, move |_| {
+            at.send(()).unwrap();
+            go_rx.recv().unwrap();
+        });
+        let ed = eng.clone();
+        let def = std::thread::spawn(move || ed.ensure_himo_dynamic("w", ValueType::Number64, 0));
+        at_rx.recv().unwrap();
+        // 定義が version を読んだ後に、 最初の使い回し (v15 に移る) を走らせる。 移る側が header の lock で待つなら、 待たせたまま
+        // 定義を進める
+        let em = eng.clone();
+        let (done, done_rx) = channel::<()>();
+        let mover = std::thread::spawn(move || {
+            let e = em.entity_in("t");
+            done.send(()).unwrap();
+            e
+        });
+        let _ = done_rx.recv_timeout(std::time::Duration::from_millis(300));
+        go.send(()).unwrap();
+        def.join().unwrap();
+        let reused = mover.join().unwrap().unwrap();
+        assert_ne!(reused, rows[0], "前提: 使い回した場所は別の eid");
+        let buf = eng.backing.header_mut(HEADER_SIZE);
+        let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
+        let bits = u32::from_le_bytes(buf[H_SLOT_BITS..H_SLOT_BITS + 4].try_into().unwrap());
+        assert_eq!(bits, 24, "前提: 場所の bit を焼いた");
+        assert_eq!(version, FILE_VERSION_GEN, "場所の bit を焼いた header の version が下がった");
+        cleanup(&path, eng);
+    }
+
+    /// #731 の読み直し I: anonymous の `entity()` の最初の使い回し (v15 に移る) で、 空きの山から取り出して印を立てた場所が、 世代を
+    /// 上げる前に消えた行の eid (世代 0) で生きている窓が無い (前は印を立ててから移っていた。 その間の古い eid の delete は新しい行に
+    /// 当たる)。
+    #[test]
+    fn an_anonymous_reuse_never_shows_the_slot_live_under_the_deleted_eid() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-anonreuse-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 2).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let _b = eng.entity().unwrap();
+        eng.delete(a);
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (e2, seen2) = (eng.clone(), seen.clone());
+        anon_reuse_hook::set(&wal, move |_| {
+            *seen2.lock().unwrap() = Some(e2.is_live(a));
+        });
+        let c = eng.entity().unwrap();
+        assert_eq!(eng.slot_unchecked(c), eng.slot_unchecked(a), "前提: 使い回した");
+        assert_ne!(c, a);
+        assert_eq!(*seen.lock().unwrap(), Some(false), "取り出した場所が消えた行の eid で生きて見えた");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 
     /// #883 の逆の並び: 全部なめで穴として拾った slot を取り出した書き手 (Y) が印を立てる前に、 払い出し位置からその slot を取った
@@ -6912,6 +7019,8 @@ impl Engine {
         }
         // request18: table 定義が確定したので hot path 用 cache を張り直す。
         eng.refresh_sync_tables_flag();
+        // #731: 世代の印を立て直す (きれいに閉じなかった後だけ)
+        eng.heal_generation_marks(readonly);
         // #385: 辞書の参照数を数え直す (要る時だけ)。 table が決まった後、 oplog の回復で書く前
         eng.finish_vocab_refs_at_open();
         // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を再構成 (free-list は非永続)。
@@ -8378,7 +8487,13 @@ impl Engine {
         // 配らない」 local-only table として使える。 判定は名前だけなので sidecar の
         // format 変更は無く、 reopen を跨いでそのまま効く。
         let local_only_ranges = self.local_only_ranges();
+        // 自分の行の record だけ (中継した他の peer の record の番号は相手の番号 = こちらの場所の範囲と比べない。 #731: 世代を外す
+        // のも自分の S なので、 相手の大きい番号がこちらの local-only の範囲に写りうる)。 peer 0 は peer を決める前に書いた自分の record
+        let own_peer = self.peer_id();
         let is_internal_eid = |eid: u64| -> bool {
+            if !matches!(enchudb_oplog::eid_peer(eid), 0) && enchudb_oplog::eid_peer(eid) != own_peer {
+                return false;
+            }
             let local = self.slot_unchecked(eid);
             local_only_ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
         };
@@ -11562,7 +11677,9 @@ impl Engine {
             // #731: 世代を持たない DB で表の場所を使い回す時は、 先に v15 に移り終える (使い回した行を世代の違う eid にする)。
             // `free_locals` を握る前に (移る手順は消す書き手を待つ)。 見るのは 「移り終えた」: 照合を始めただけ (`active`) で通すと、
             // 移る途中の別の thread が上げる前の場所を拾う (#731 の試験を 8 本並べて 24 回に 1 回、 消えた行と同じ eid を渡した)
-            if !table.is_reserved() && !self.generations().moved() {
+            // 移れない DB (packed を開いた Memory backing / wasm) は今まで通り世代なしで使い回す (#731 はその DB に残る。 位置の道へ
+            // 落とすと、 消して足す表がいつか満杯で断られる)
+            if !table.is_reserved() && !self.generations().moved() && self.can_move_to_generations() {
                 self.move_to_generations().map_err(|e| format!("table '{table_name}': {e}"))?;
             }
             let mut fl = table.free_locals.lock().unwrap();
@@ -12551,7 +12668,22 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Acquire)
             .min(capacity);
         let live = t.extents().into_iter().map(|(lo, hi)| self.entities.live_count_in(lo, hi)).sum::<u32>();
-        Some(TableEidUsage { capacity, allocated, live, free: capacity.saturating_sub(live) })
+        // #731: 世代を使い切った場所 (引退、 二度と渡さない) は空きに数えない。 数えるのは使い回しのある表だけ (払い出し済みの範囲の
+        // 死んだ場所をなめる)
+        let retired = match self.tables.iter().position(|x| std::ptr::eq(x, t)) {
+            Some(tid) if self.generations().active() && !t.is_reserved() && self.generations().table_has(tid as TableId) => {
+                let mut left = allocated;
+                let mut n = 0u32;
+                for (lo, hi) in t.extents() {
+                    let take = left.min(hi - lo);
+                    n += (lo..lo + take).filter(|&g| !self.entities.is_live(g) && self.generations().retired(g)).count() as u32;
+                    left -= take;
+                }
+                n
+            }
+            _ => 0,
+        };
+        Some(TableEidUsage { capacity, allocated, live, free: capacity.saturating_sub(live).saturating_sub(retired) })
     }
 
     /// まだどの table にも割り当てていない eid 空間 (= これから `define_table` で
@@ -12819,8 +12951,9 @@ impl Engine {
             match self.himos[hid].get_value(s) {
                 Some(_) if ver == enchudb_oplog::Hlc::ZERO && self.himos[hid].get_value(d).is_some() => {}
                 Some(_) if self.leaf_for(hid).is_some() => {
-                    let from = enchudb_oplog::make_eid(self_peer, s);
-                    let Some(bytes) = self.get_text_owned(from, &self.himo_names[hid]) else { continue };
+                    // #731: 中の道は場所で読む (アプリの入口 `get_text_owned` は世代を照合する。 使い回した場所の行は世代 0 の eid で
+                    // 引けない)
+                    let Some(bytes) = self.text_owned_by_id(hid, s) else { continue };
                     moved += usize::from(self.remote_tieleaf_apply(to, h, &bytes, ver).applied());
                 }
                 Some(v) => moved += usize::from(self.remote_tie_apply_result(to, h, v, ver).applied()),
@@ -13091,6 +13224,17 @@ impl Engine {
                     .to_string(),
             );
         }
+        // #731: 上限に達した後の払い出しは空きの山から使い回す = 先に v15 に移る (払い出してから移ると、 世代を上げるまでの間、
+        // 使い回した場所が消えた行と同じ eid (世代 0) で生きている。 その間に古い eid の delete が来ると新しい行に当たる)。 間に
+        // 別の thread が上限に届かせた時は下の道 (払い出した後に移る) に落ちる
+        if !self.generations().moved()
+            && self.can_move_to_generations()
+            && self.entities.next_eid() >= self.entities.max_entities()
+            && self.entities.count() < self.entities.max_entities()
+            && let Err(e) = self.move_to_generations()
+        {
+            return Err(format!("entity(): {e}"));
+        }
         // 上限到達後の `allocate` は free stack から slot を再利用する。
         // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
         let Some((local, reused)) = self.entities.allocate_tracked() else {
@@ -13105,10 +13249,15 @@ impl Engine {
                 self.entities.max_entities(),
             ));
         };
+        #[cfg(test)]
+        if reused && let Some(wal) = self.oplog.as_ref() {
+            anon_reuse_hook::call(wal);
+        }
         if reused {
             // #731: 最初の使い回しで v15 に移る。 この場所はもう生きている印が立っている (移る時の穴埋めが見ない) ので、 世代 0
             // (v14 の間に消えた場所) なら自分で上げる。 移り終えたかに関わらず見る (取り出した後に別の thread が移り終えた形でも)
             if !self.generations().moved()
+                && self.can_move_to_generations()
                 && let Err(e) = self.move_to_generations()
             {
                 self.live_free(local, None);
@@ -13257,13 +13406,14 @@ impl Engine {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "grow_entity_cap: packed (in-memory) backing"));
         }
         let mut layout = self.layout.write().unwrap();
-        // #731: 場所の bit を焼いた DB (v15) の場所は 2^S まで
-        if layout.gen_bits != 0 && layout.gen_bits < 32 && new_cap as u64 > 1u64 << layout.gen_bits {
+        // #731: 場所の bit を焼いた DB (v15) の場所は 2^S まで。 v15 に移る途中 (照合は始めたが header にまだ焼いていない) も同じ
+        let gen_bits = if layout.gen_bits != 0 { layout.gen_bits as u32 } else { self.generations().bits() };
+        if gen_bits != 0 && gen_bits < 32 && new_cap as u64 > 1u64 << gen_bits {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "grow_entity_cap: {new_cap} exceeds 2^{} slots (fixed when the DB first reused a slot, eid generations)",
-                    layout.gen_bits
+                    gen_bits
                 ),
             ));
         }
@@ -14084,7 +14234,14 @@ impl Engine {
         // 下ろしてから出る (移る側は、 印を見ずに入った書き手が出るのを待ってから死んだ場所をなめる、 `Generations::gate`)
         let (on, entered) = self.generations().enter_free();
         let gen_of_row = row_gen.unwrap_or_else(|| self.generations().get(local));
-        if on && (row_gen.is_some() || was_live) && !replaying && self.slot_is_generational(local) {
+        // 畳んだ自分の行 (#612、 別名は畳む手順が先に張る) の場所は上げない: 使い回さないので次の住人は居ない。 上げると、 その行の eid
+        // の転送 (`app_slot`) と #775 で生き返らせた行の eid が 「消えた行」 になる
+        if on
+            && (row_gen.is_some() || was_live)
+            && !replaying
+            && self.slot_is_generational(local)
+            && !self.is_folded_own_slot(local)
+        {
             self.raise_generation(local, gen_of_row + 1);
         }
         if self.generations().retired(local) {
@@ -14095,7 +14252,8 @@ impl Engine {
         if entered {
             self.generations().exit_free();
         }
-        self.live.freed(local);
+        // 購読には消えた行の世代を渡す (見直しの購読の `touched` がアプリの持つ eid を出す)
+        self.live.freed(local, self.generations().active().then_some(gen_of_row));
         // #868: 枯渇した表が、 枠の全部をなめずにこの穴を拾えるように覚える
         self.note_dead_slot(local);
     }
@@ -15579,7 +15737,28 @@ impl Engine {
         {
             return eid;
         }
-        // #731: 別名は場所で引く (世代を外す)。 残す行は今の世代の eid で返す
+        // #731: 別名は場所で引く (世代を外す)。 残す行は今の世代の eid で返す。 世代の違う eid (その場所の前の住人 = 消えた行) は
+        // 転送しない (アプリの入口と同じ、 `app_slot`)
+        let (slot, g) = self.generations().split(enchudb_oplog::eid_local(eid));
+        if self.generations().active() && self.generations().get(slot) != g {
+            return eid;
+        }
+        let to = self.forward_local_slow(slot);
+        if to == slot {
+            return eid;
+        }
+        enchudb_oplog::make_eid(enchudb_oplog::eid_peer(eid), self.generations().local(to))
+    }
+
+    /// #612 の wire 版: 相手から届いた自分の世界番号 (段 1〜3 は世代なし = 場所) を、 畳んだ自分の行なら残す行の eid に。 世代は
+    /// 見ない (wire の番号には世代が無い。 段 4 で世代込みにして照合する)。 返す eid は中の道で使う (場所だけ読まれる)。
+    #[inline]
+    fn forward_world_eid(&self, eid: enchudb_oplog::EntityId) -> enchudb_oplog::EntityId {
+        if !self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed)
+            || enchudb_oplog::eid_peer(eid) != self.peer_id()
+        {
+            return eid;
+        }
         let slot = self.slot_unchecked(eid);
         let to = self.forward_local_slow(slot);
         if to == slot {
@@ -15596,13 +15775,15 @@ impl Engine {
     #[inline]
     pub(crate) fn app_slot(&self, eid: enchudb_oplog::EntityId) -> Option<u32> {
         let (slot, g) = self.generations().split(enchudb_oplog::eid_local(eid));
-        if self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed) && enchudb_oplog::eid_peer(eid) == self.peer_id() {
-            let to = self.forward_local_slow(slot);
-            if to != slot {
-                return Some(to);
-            }
+        // 照合を先に: 別名 (#612) は畳んだ行の場所に張るので、 その場所の前の住人 (消えた行、 世代が違う) の eid は転送しない
+        // (畳む時は場所の世代を上げない = 畳んだ行の世代のまま)
+        if self.generations().active() && self.generations().get(slot) != g {
+            return None;
         }
-        (!self.generations().active() || self.generations().get(slot) == g).then_some(slot)
+        if self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed) && enchudb_oplog::eid_peer(eid) == self.peer_id() {
+            return Some(self.forward_local_slow(slot));
+        }
+        Some(slot)
     }
 
     /// 行 `slot` の lock の下で、 `eid` がまだその場所の住人か ([`Self::app_slot`] を lock の外で引いた後)。
@@ -15639,6 +15820,20 @@ impl Engine {
         enchudb_oplog::make_eid(self.peer_id.load(std::sync::atomic::Ordering::Acquire), self.generations().local(slot))
     }
 
+    /// 場所 `slot` に最後に居た行 (生きていれば今の住人、 死んでいれば消えた行) の local (世代 | 場所)。 中の道で、 場所から 「その行」
+    /// を指す値を作る所 (相手から届いた Ref の先、 作り直す Delete の record)。 v15 では消す時に世代を上げる (死んだ場所の値 = 次の
+    /// 住人の世代) ので、 死んだ場所は 今 − 1。 畳んだ自分の行の場所 (#612) は上げないので今のまま。 今の世代を付けると、 その場所を
+    /// 次に使い回した行を指す。
+    pub(crate) fn last_local_of_slot(&self, slot: u32) -> u32 {
+        let g = self.generations();
+        let now = g.get(slot);
+        let row_gen = if now > 0 && !self.entities.is_live(slot) && !self.is_folded_own_slot(slot) { now - 1 } else { now };
+        match g.bits() {
+            0 | 32.. => slot,
+            b => (row_gen << b) | slot,
+        }
+    }
+
     /// 中の道: eid の世代を外して場所に (照合しない)。 WAL の record の eid (再生)、 中で作った eid。
     #[inline]
     pub(crate) fn slot_unchecked(&self, eid: enchudb_oplog::EntityId) -> u32 {
@@ -15657,16 +15852,28 @@ impl Engine {
     fn exit_of(&self, hid: Option<usize>) -> impl Fn(u32) -> enchudb_oplog::EntityId + '_ {
         let peer = self.peer_id();
         let read = self.exit_reads_generations(hid.and_then(|h| self.himo_table_get(h)));
-        move |slot| enchudb_oplog::make_eid(peer, if read { self.generations().local(slot) } else { slot })
+        let gens = self.generations().reader();
+        move |slot| enchudb_oplog::make_eid(peer, if read { gens.local(slot) } else { slot })
     }
 
-    /// 紐 `hid` の行の場所の並び → eid (出口)。 使い回しの無い表は世代を読まない。
+    /// 紐 `hid` の行の場所の並び → eid (出口)。 使い回しの無い表は世代を読まない。 表の分からない出口 (`find_by` / `query` /
+    /// `entities`) と、 使い回しのある表でも、 世代 > 0 の場所の無い page (2^13 場所) は世代を読まない (`GenReader`)。
     fn eids_of_slots_in(&self, hid: Option<usize>, slots: impl IntoIterator<Item = u32>) -> Vec<enchudb_oplog::EntityId> {
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         if !self.exit_reads_generations(hid.and_then(|h| self.himo_table_get(h))) {
             return slots.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect();
         }
-        slots.into_iter().map(|l| enchudb_oplog::make_eid(peer, self.generations().local(l))).collect()
+        let gens = self.generations().reader();
+        slots.into_iter().map(|l| enchudb_oplog::make_eid(peer, gens.local(l))).collect()
+    }
+
+    /// #731: きれいに閉じなかった後に開いた時、 gen.seg の表と page の印を世代の byte から立て直す (`Generations::heal_marks`)。
+    /// table の定義が決まった後、 WAL の再生の前 (再生が上げる世代は印も立てる)。 readonly は書けないので立て直さない。
+    fn heal_generation_marks(&self, readonly: bool) {
+        if readonly || !self.generations().active() || !self.himo_reg.rebuilt_on_load {
+            return;
+        }
+        self.generations().heal_marks(|slot| self.table_of_slot(slot).map(|t| t as TableId));
     }
 
     /// 場所 `slot` を持つ表 (名前のある表を先に、 無ければ anonymous)。
@@ -15716,9 +15923,22 @@ impl Engine {
         self.slot_unchecked(eid)
     }
 
+    /// 場所に行が生きているか (live の出口で使う、 照合しない)。
+    #[inline]
+    pub(crate) fn slot_is_live(&self, slot: u32) -> bool {
+        self.entities.is_live(slot)
+    }
+
     /// #731: 場所の今の住人の eid (今の世代)。
     pub fn slot_eid(&self, slot: u32) -> enchudb_oplog::EntityId {
         self.eid_of_slot(slot)
+    }
+
+    /// #731: 中の道 (sync の当て込み・翻訳した行の eid) の 「行が生きているか」。 eid の世代を見ない (場所で見る)。 翻訳した行の eid
+    /// (`resolve_remote_eid` などが返す) は世代 0 で、 使い回した場所に載った行ではアプリの入口 [`Self::is_live`] が偽を返す。
+    #[doc(hidden)]
+    pub fn is_live_unchecked(&self, eid: enchudb_oplog::EntityId) -> bool {
+        self.entities.is_live(self.slot_unchecked(eid))
     }
 
     /// #731: Ref の cell の値 (世代 | 場所) → 指す行の eid。 消えた行を指す ref は、 その行の eid (入口で 「消えた行」) のまま。
@@ -15777,27 +15997,28 @@ impl Engine {
         if self.generations().moved() {
             return Ok(());
         }
-        if self.generations().active() {
-            // 前に移る途中で失敗した (header を書き出せなかった等)。 使い回さずに断る
-            return Err(io::Error::other("an earlier move to eid generations (file version 15) did not finish"));
-        }
         let Backing::Segments(set) = &self.backing else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "reusing a slot needs eid generations (file version 15), which a packed (in-memory) DB cannot add",
             ));
         };
-        let (bits, reserve, header_size) = {
+        if !self.generations().active() {
+            // 1. 場所の bit は layout の lock (読み) の下で決めて照合を始める: `grow_entity_cap` (layout の書き) が間で枠を 2^S の
+            // 先へ伸ばさない (始めた後は `grow_entity_cap` が照合の bit で断る)
             let l = self.layout.read().unwrap();
-            (crate::generation::slot_bits_for(l.max_entities), l.reserve_entities, l.header_size)
-        };
-        // 1.
-        set.ensure_gen(crate::generation::segment_len(reserve))?;
-        self.generations().prepare(set.region(SegmentKind::Gen), bits)?;
-        // 2. / 3. 行の lock は待たない (行を握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 照合は書き込みの道が
-        // 行の lock の下で見る (使い回しはこの後)。 消す道とは 1 語の RMW で揃える (`Generations::gate`、 `live_free`)
-        self.generations().start(bits);
+            let bits = crate::generation::slot_bits_for(l.max_entities);
+            set.ensure_gen(crate::generation::segment_len(l.reserve_entities))?;
+            self.generations().prepare(set.region(SegmentKind::Gen), bits)?;
+            // 2. 行の lock は待たない (行を握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 照合は書き込みの道が
+            // 行の lock の下で見る (使い回しはこの後)。 消す道とは 1 語の RMW で揃える (`Generations::gate`、 `live_free`)
+            self.generations().start(bits);
+        }
+        // 3.
         self.generations().wait_frees();
+        let bits = self.generations().bits();
+        // 前に移る途中で失敗した (4. / 5. の書き出し) 時は、 照合と 「消す時に上げる」 は始まっている = 4. からやり直す (死んだ
+        // 場所の世代 0 を 1 にするのは何度でも同じ、 始めた後に消した場所は消す時に上げてある)
         // 4.
         for (tid, t) in self.tables.iter().enumerate() {
             if t.is_reserved() {
@@ -15822,6 +16043,8 @@ impl Engine {
             for (lo, hi) in ranges {
                 for slot in lo..hi {
                     if !self.entities.is_live(slot) && self.generations().get(slot) == 0 && !self.is_folded_own_slot(slot) {
+                        // 見直しの購読に、 消えた行の世代 (0) を覚えさせてから上げる (`touched` にアプリの持つ eid を出す)
+                        self.live.note_gen(slot, 0);
                         self.raise_generation(slot, 1);
                     }
                 }
@@ -15833,16 +16056,20 @@ impl Engine {
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::GenerationsBeforeHeader);
         {
-            let buf = self.backing.header_mut(header_size);
+            // header の他の書き手と並べる: 紐の動的な定義 (`himo_def_lock`、 Number64 で version を書き戻す) と `grow_entity_cap`
+            // (layout の書き)。 並べないと、 定義の側が読んだ古い version (14) を移った後に書き戻す / CRC を互いに書き潰す
+            let _def = self.himo_def_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut layout = self.layout.write().unwrap();
+            let buf = self.backing.header_mut(layout.header_size);
             buf[H_SLOT_BITS..H_SLOT_BITS + 4].copy_from_slice(&bits.to_le_bytes());
             let cur = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
             if cur < FILE_VERSION_GEN {
                 buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_GEN.to_le_bytes());
             }
             write_header_crc(buf);
+            self.backing.flush_header(layout.header_size)?;
+            layout.gen_bits = bits as u8;
         }
-        self.backing.flush_header(header_size)?;
-        self.layout.write().unwrap().gen_bits = bits as u8;
         self.generations().finish_move();
         Ok(())
     }
@@ -15850,6 +16077,16 @@ impl Engine {
     #[cfg(target_arch = "wasm32")]
     fn move_to_generations(&self) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "eid generations are not supported on wasm"))
+    }
+
+    /// v15 (世代を持つ DB) に移れるか: segment の DB だけ (packed を開いた Memory backing と wasm は `gen.seg` を足せない)。
+    /// 移れない DB は場所を今まで通り世代なしで使い回す (#731 はその DB に残る)。
+    #[inline]
+    fn can_move_to_generations(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return matches!(self.backing, Backing::Segments(_));
+        #[cfg(target_arch = "wasm32")]
+        false
     }
 
     /// #779: slot `local` の住人 (`reused`) か逆写像が変わる直前に、 今の宛名を覚える ([`FormerAddresses`])。 sync の表の無い DB と
@@ -16008,7 +16245,7 @@ impl Engine {
         let self_peer = self.peer_id.load(Ordering::Acquire);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         if owner == self_peer {
-            return Some(self.forward_eid(foreign_eid)); // identity: 自分が産んだ entity (#612: 畳んだ行は残す行へ)
+            return Some(self.forward_world_eid(foreign_eid)); // identity: 自分が産んだ entity (#612: 畳んだ行は残す行へ)
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
@@ -16040,7 +16277,7 @@ impl Engine {
         let self_peer = self.peer_id.load(Ordering::Acquire);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         if owner == self_peer {
-            return Some(self.forward_eid(foreign_eid));
+            return Some(self.forward_world_eid(foreign_eid));
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         self.eid_translator
@@ -16093,7 +16330,7 @@ impl Engine {
         if author_peer == self_peer {
             // identity: 自分が author (#612: 畳んだ行は残す行へ)
             let slot = self.forward_local(self.generations().split(foreign_value).0);
-            return Some(self.generations().local(slot));
+            return Some(self.last_local_of_slot(slot));
         }
         // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
         // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
@@ -16106,7 +16343,8 @@ impl Engine {
                 self.restore_foreign_tombstone(author_peer, foreign_value, local);
                 Some(local)
             })
-            .map(|slot| self.generations().local(slot))
+            // 死んだ場所 (相手の削除を先に当てた / 作成より先に削除が届いた) は消えた行の世代 (次の住人を指さない)
+            .map(|slot| self.last_local_of_slot(slot))
     }
 
     /// #9: Ref himo の target table (fk_refs で引く) に fresh な local eid を払い出す。
@@ -16670,14 +16908,13 @@ impl Engine {
     /// 版数がある) は `Gone`。
     fn cards_of_cells(&self, local: u32) -> Vec<(u16, crate::pk_former::Card, enchudb_oplog::Hlc)> {
         use crate::pk_former::Card;
-        let self_peer = self.peer_id();
         let mut out = Vec::new();
         for hid in 0..self.himos.len() {
             let h = hid as u16;
             let ver = self.version_of(local, h);
             let card = match self.himos[hid].get_value(local) {
                 Some(_) if self.leaf_for(hid).is_some() => {
-                    match self.get_text_owned(enchudb_oplog::make_eid(self_peer, local), &self.himo_names[hid]) {
+                    match self.text_owned_by_id(hid, local) {
                         Some(b) => Card::Bytes(b.into()),
                         None => continue,
                     }
@@ -16939,7 +17176,16 @@ impl Engine {
                 // #612: 畳んだ自分の行は、 元の slot を消えた slot にする (別名を外して削除の版数を載せる)
                 if peer == self_peer {
                     if self.is_folded_own_slot(fl) {
+                        // #731: 別名を外した場所は 「消えた行」 で使い回せる = 消す道と同じく世代を上げる (畳む時は上げていない)。
+                        // 移る手順と揃える (別名を外すのを消す道の門の中で)
+                        let (on, entered) = self.generations().enter_free();
                         self.eid_translator.unalias(peer, fl);
+                        if on && self.slot_is_generational(fl) {
+                            self.raise_generation(fl, self.generations().get(fl) + 1);
+                        }
+                        if entered {
+                            self.generations().exit_free();
+                        }
                         self.set_tombstone_local(fl, t);
                     }
                     continue;
@@ -17058,8 +17304,7 @@ impl Engine {
             }
             match self.himos[hid].get_value(from) {
                 Some(_) if self.leaf_for(hid).is_some() => {
-                    let src = enchudb_oplog::make_eid(self_peer, from);
-                    if let Some(bytes) = self.get_text_owned(src, &self.himo_names[hid]) {
+                    if let Some(bytes) = self.text_owned_by_id(hid, from) {
                         self.remote_tieleaf_apply(to_eid, h, &bytes, ver);
                     }
                 }
@@ -18586,7 +18831,12 @@ impl Engine {
         if ranges.is_empty() {
             return recs;
         }
+        // 自分の行の record だけ (`transfer_oplog_to_sync_ops` の local-only の判定と同じ)
+        let own_peer = self.peer_id();
         let local_only = |eid: u64| {
+            if !matches!(enchudb_oplog::eid_peer(eid), 0) && enchudb_oplog::eid_peer(eid) != own_peer {
+                return false;
+            }
             let local = self.slot_unchecked(eid);
             ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
         };
@@ -21977,6 +22227,10 @@ impl Engine {
             // v11: 64 bit 列を持つ DB は旧 binary に開かせない (型 byte 4 を u32 の Number と誤読する)
             // v12 (#381) は v11 の上位なので下げない
             let cur = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                wide_version_hook::call(wal);
+            }
             buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_WIDE.max(cur).to_le_bytes());
         }
         // header CRC を再計算(himo_count が変わったため)
@@ -22314,7 +22568,9 @@ impl Engine {
             deletes.sort_unstable();
             cells.sort_unstable();
             for (h, local) in &deletes {
-                if wal.append_at_hlc(Op::Delete { eid: enchudb_oplog::make_eid(me, *local) }, *h).is_err() {
+                // #731: 消えた行の世代 (WAL の record は世代込み、 再生は世代 + 1 まで上げる)
+                let row = enchudb_oplog::make_eid(me, self.last_local_of_slot(*local));
+                if wal.append_at_hlc(Op::Delete { eid: row }, *h).is_err() {
                     fallback = true;
                     break;
                 }
@@ -24031,7 +24287,18 @@ impl Engine {
         let version = |k: SegmentKind| matches!(k, SegmentKind::Ver(_) | SegmentKind::Tomb);
         // #841: きれいに閉じなかった後の最初の書き出し (`catch_up`) は、 印の無い segment も全部、 全域で書き出す。 全域の msync は
         // 汚れた page が無くても segment 1 つごとに時間がかかるので、 段の中で並べる (段の順は同じ: 版数は列の後)
-        let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k);
+        // #731 (F1): 生きている印 (entities) と場所の世代 (`gen.seg`) は、 消す書き手を止めて一緒に書き出す (残りの先頭)。 消す道は
+        // 「世代を上げる → 生きている印を下ろす」 なので、 2 つの書き出しの間に消すと 「生きている、 世代は上がった」 像が届く
+        // (消した record は cut の後で失われる = 生きている行の eid が変わる)。 逆の並びでも 「死んでいる、 世代は上がっていない」
+        // (使い回した行が消えた行と同じ eid) になる。 世代を持たない DB は止めない
+        let live_and_generations = |k: SegmentKind| matches!(k, SegmentKind::Entities | SegmentKind::Gen);
+        self.generations().freeze(|| -> io::Result<()> {
+            set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Entities))?;
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
+            set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))
+        })?;
+        let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k);
         if catch_up {
             set.flush_all_spread(rest)?;
         } else {

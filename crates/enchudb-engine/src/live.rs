@@ -2233,6 +2233,9 @@ struct Pending {
     nodes: Vec<PendingMarks>,
     /// 解放された entity (slot 再利用で別 entity になりうる)。
     freed: PendingMarks,
+    /// #731: 見直しの節を持つ family (`notice`) だけ: 解放された場所と、 消えた行の世代 (世代を持つ DB の時)。 `touched` にアプリが
+    /// 持つ eid (消えた行の世代) を出すため (`Member::touched_first`)。
+    freed_gens: Vec<(u32, u32)>,
 }
 
 /// 節の答え: (鍵 id, 範囲の穴の値)。 値は根と範囲の穴の節を結ぶ道の上の節だけが持つ (他は 0)。
@@ -2285,6 +2288,9 @@ struct Member {
     pins: Vec<u32>,
     /// 見直しの節を持つ family の member ([`TouchedLiveQuery`]) なら、 最後の poll 以降に根の紐が書かれた根の entity。
     touched: Option<Marks>,
+    /// #731: 見直しの節を持つ member の、 最後の poll 以降に消えた行の場所 → その中でいちばん古い行の世代。 poll の `touched` に、
+    /// アプリが持つ eid (消えた行の世代) から今の住人までを出す (場所を使い回した後に poll しても)。
+    touched_first: GenMap,
     /// 渡した差分の記録 (版付き。 [`LiveQuery::poll_since`])。 `drain` のたびに積む (on の時だけ)。
     log: DeltaLog<LiveDelta>,
 }
@@ -3930,7 +3936,7 @@ impl Family {
             pending: (0..SHARDS)
                 .map(|_| {
                     let nodes = (0..n + usize::from(!notice.is_empty())).map(|_| PendingMarks::default()).collect();
-                    Shard(Mutex::new(Pending { nodes, freed: PendingMarks::default() }))
+                    Shard(Mutex::new(Pending { nodes, freed: PendingMarks::default(), freed_gens: Vec::new() }))
                 })
                 .collect(),
             dirty: AtomicU32::new(0),
@@ -3962,9 +3968,26 @@ impl Family {
     }
 
     #[inline]
-    fn mark_freed(&self, eid: u32) {
+    fn mark_freed(&self, eid: u32, row_gen: Option<u32>) {
         let i = shard_index();
-        self.pending[i].0.lock().freed.add(eid);
+        {
+            let mut p = self.pending[i].0.lock();
+            p.freed.add(eid);
+            if let Some(g) = row_gen.filter(|_| self.notice) {
+                p.freed_gens.push((eid, g));
+            }
+        }
+        self.set_dirty(i);
+    }
+
+    /// #731: 見直しの節を持つ family に、 場所 `eid` の行の世代 `row_gen` を覚えさせる (解放の印は付けない。 v15 に移る時に、 v14 の間に
+    /// 消えた場所の世代を上げる前に呼ぶ)。
+    fn note_gen(&self, eid: u32, row_gen: u32) {
+        if !self.notice {
+            return;
+        }
+        let i = shard_index();
+        self.pending[i].0.lock().freed_gens.push((eid, row_gen));
         self.set_dirty(i);
     }
 
@@ -4025,6 +4048,7 @@ impl Family {
             group: 0,
             pins: Vec::new(),
             touched: self.notice.then(Marks::default),
+            touched_first: GenMap::new(),
             log: DeltaLog::off(),
         };
         let slot = match s.members.iter().position(Option::is_none) {
@@ -4553,6 +4577,7 @@ impl Family {
         }
         let mut freed = Vec::new();
         let mut touched = Vec::new();
+        let mut freed_gens: Vec<(u32, u32)> = Vec::new();
         // bit に移った印 (印が多い時) は shard の鍵の下では持ち替えるだけにして、 読み出すのは鍵を離してから (鍵の下で
         // 読むと、 その shard の書き手が行の鍵を持ったまま次の印で待つ)。 受け手: 節 0..n、 見直しの節 n、 解放 n + 1
         let n = self.nodes.len();
@@ -4575,6 +4600,7 @@ impl Family {
             }
             let (mut list, bits) = p.freed.take_raw();
             freed.append(&mut list);
+            freed_gens.append(&mut p.freed_gens);
             late.extend(bits.map(|b| (n + 1, b)));
         }
         for (k, b) in late {
@@ -4592,6 +4618,15 @@ impl Family {
                 if let Some(t) = m.touched.as_mut() {
                     for &e in &touched {
                         t.add(e);
+                    }
+                }
+            }
+        }
+        if !freed_gens.is_empty() {
+            for m in s.members.iter_mut().flatten() {
+                if m.touched.is_some() {
+                    for &(e, g) in &freed_gens {
+                        m.touched_first.entry(e).and_modify(|x| *x = (*x).min(g)).or_insert(g);
                     }
                 }
             }
@@ -5046,14 +5081,29 @@ impl LiveRegistry {
     }
 
     /// entity の slot を解放した **後** に呼ぶ (slot 再利用の検出用)。
+    ///
+    /// `row_gen` = 消えた行の世代 (世代を持つ DB の時)。 見直しの購読 ([`TouchedLiveQuery`]) が `touched` にアプリの持つ eid を出すのに使う。
     #[inline]
-    pub(crate) fn freed(&self, eid: u32) {
+    pub(crate) fn freed(&self, eid: u32, row_gen: Option<u32>) {
         if self.active.load(Ordering::Acquire) == 0 {
             return;
         }
         self.with_snap(|s| {
             for f in &s.families {
-                f.mark_freed(eid);
+                f.mark_freed(eid, row_gen);
+            }
+        });
+    }
+
+    /// #731: v15 に移る時、 v14 の間に消えた場所 `eid` の世代を上げる前に呼ぶ (その場所の消えた行の世代 = `row_gen`)。 見直しの購読だけが
+    /// 覚える (解放の印は v14 の間に付けてある)。
+    pub(crate) fn note_gen(&self, eid: u32, row_gen: u32) {
+        if self.active.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.with_snap(|s| {
+            for f in &s.families {
+                f.note_gen(eid, row_gen);
             }
         });
     }
@@ -5652,7 +5702,7 @@ impl LiveQuery {
     }
 
     /// [`TouchedLiveQuery::poll`] の中身: group の差分と、 見直しの節に積まれた根の entity (local、 昇順・重複なし)。
-    pub(crate) fn poll_touched(&self, eng: &crate::engine::Engine) -> (LiveDelta, Vec<u32>) {
+    pub(crate) fn poll_touched(&self, eng: &crate::engine::Engine) -> (LiveDelta, Vec<EntityId>) {
         self.check_engine(eng);
         let peer = self.registry.exit();
         let Kind::One { family, slot } = &self.kind else {
@@ -5665,7 +5715,8 @@ impl LiveQuery {
             Some(m) => {
                 let d = m.drain(|e| view_at(recs, vals, opart, *order_view, e), peer);
                 let t = m.touched.as_mut().map(Marks::take).unwrap_or_default();
-                (d, t)
+                let first = std::mem::take(&mut m.touched_first);
+                (d, touched_eids(eng, peer, &t, &first))
             }
             None => (LiveDelta::default(), Vec::new()),
         }
@@ -6633,6 +6684,34 @@ impl std::fmt::Debug for GroupedLiveQuery {
     }
 }
 
+/// #731: 見直しの購読の `touched` の eid。 場所ごとに、 最後の poll 以降に消えた行の世代 (`first`) から今の住人の世代までを出す
+/// (アプリは前の poll / `members` で受けた eid を持つ。 消して使い回した後でも、 その eid を外せる)。 死んだ場所の今の世代は次の住人
+/// なので出さない (v15 に移る前に消えた場所は、 移る時に [`Registry::note_gen`] で世代 0 を覚える)。 余分な eid は `group_of` が None
+/// を返すだけ (アプリは持っていない eid を外す)。
+fn touched_eids(eng: &crate::engine::Engine, peer: Exit<'_>, slots: &[u32], first: &GenMap) -> Vec<EntityId> {
+    if !peer.reorders() {
+        return slots.iter().map(|&e| peer.eid(e)).collect();
+    }
+    let mut out = Vec::with_capacity(slots.len());
+    for &e in slots {
+        let now = peer.gen_now(e);
+        let live = eng.slot_is_live(e);
+        match first.get(&e) {
+            Some(&f) if f < now => {
+                for g in f..=now {
+                    if g < now || live {
+                        out.push(peer.eid_at(e, g));
+                    }
+                }
+            }
+            // 消えた記録が無い: 生きていれば今の住人、 死んでいれば前の poll より前に消えた行 (世代 今 − 1)
+            _ if live || now == 0 => out.push(peer.eid_at(e, now)),
+            _ => out.push(peer.eid_at(e, now - 1)),
+        }
+    }
+    out
+}
+
 /// 根への条件が 1 列で決まるなら、 その紐 (`subscribe_touched` が見直しの節を張る紐)。 中身を数える条件 (`Exists` 系) は
 /// 別の entity の紐を読むので、 根の entity に印を付けても見直す場所にならない (None)。
 pub(crate) fn root_leaf_himo(p: &LivePred) -> Option<u16> {
@@ -6673,8 +6752,8 @@ impl TouchedLiveQuery {
 
     /// 前回 poll からの group の差分と、 見直すべき根の entity (初回は登録時点の全 group が `added`)。
     pub fn poll(&self, eng: &crate::engine::Engine) -> TouchedDelta {
-        let (d, t) = self.g.inner.poll_touched(eng);
-        TouchedDelta { added: d.added, removed: d.removed, touched: self.g.eids_of(&t) }
+        let (d, touched) = self.g.inner.poll_touched(eng);
+        TouchedDelta { added: d.added, removed: d.removed, touched }
     }
 
     /// 根の entity `eid` が答えに居るなら、 その group (ref の 1 段目の先)。 ref と根への条件は今の値、 group が居るかは
@@ -7546,7 +7625,7 @@ mod tests {
         assert!(empty(&k.family, k.slot), "鍵付きの鍵の変化の後");
         // 解放 (鍵付きにも left が立つ)
         write(&reg, &f, 0, 1, None);
-        reg.freed(1);
+        reg.freed(1, None);
         write(&reg, &f, 0, 1, Some(30));
         assert_eq!(k.poll_with(&f).reentered, vec![1]);
         assert!(empty(&k.family, k.slot), "鍵付きの出て入り直した後");
@@ -7561,7 +7640,7 @@ mod tests {
         write(&reg, &f, 0, 1, Some(30));
         assert_eq!(q.poll_with(&f).added, vec![1]);
         write(&reg, &f, 0, 1, None);
-        reg.freed(1);
+        reg.freed(1, None);
         write(&reg, &f, 0, 1, Some(30));
         assert_eq!(q.poll_with(&f), LiveDelta { added: vec![1], removed: vec![1] });
     }
@@ -8190,7 +8269,7 @@ mod tests {
         write(&reg, &f, 0, 3, Some(1));
         assert_eq!(q.poll_with(&f).added, vec![3]);
         write(&reg, &f, 0, 3, None);
-        reg.freed(3);
+        reg.freed(3, None);
         write(&reg, &f, 0, 3, Some(1));
         assert_eq!(q.poll_with(&f), LiveDelta { added: vec![3], removed: vec![3] });
         drop(q);

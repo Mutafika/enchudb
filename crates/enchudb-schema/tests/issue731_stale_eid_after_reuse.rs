@@ -182,6 +182,9 @@ fn churn_never_repeats_an_eid() {
     }
     let u = db.engine().table_eid_usage("t").unwrap();
     assert_eq!(u.live, CAP);
+    // 空きは、 まだ払い出していない場所だけ (払い出し済みの死んだ場所は全部引退 = 引退していない場所は枠を足す前に使い回す)。
+    // 引退した場所 (二度と渡さない) は空きに数えない (CLAUDE.md の 「満杯 = remaining_eid_capacity() == 0 かつ free == 0」)
+    assert_eq!(u.free, u.capacity - u.allocated, "引退した場所を空きに数えた ({u:?})");
     // 1 つの場所は 255 回 (世代 0..=254) 使える。 5000 回なら場所は 8 + 5000 / 254 + 1 個ほど
     assert!(u.capacity <= CAP + (ROUNDS as u32) / 254 + 8, "枠 {} (世代を使い切る前に場所を捨てた)", u.capacity);
 }
@@ -214,6 +217,9 @@ fn an_exhausted_db_refuses_rather_than_repeating_an_eid() {
     let r = refused.expect("全部の場所の世代を使い切ったら断る");
     assert!(r >= 8 * 254, "{r} 回目で断った (表の 8 場所だけでも 8 × 254 回は使い回せる)");
     assert_eq!(t.all().count().unwrap(), CAP as usize - 1, "断った insert は行を残さない");
+    // 満杯の見分け (CLAUDE.md): 残りの eid 空間 0 かつ空き 0
+    let u = db.engine().table_eid_usage("t").unwrap();
+    assert_eq!((db.engine().remaining_eid_capacity(), u.free), (0, 0), "断った表の空きが 0 でない ({u:?})");
 }
 
 /// issue の再現 (前の形): 古い eid への update は、 場所を使い回した行に書かない。
@@ -289,4 +295,64 @@ fn a_ref_to_a_deleted_row_reads_as_a_ref_to_an_empty_row() {
     // 新しい会社を指せば普通の ref
     u.entity(u0).set("company", Value::Ref(n)).commit().unwrap();
     check(&mut seen, [&[u1], &[u0], &[u2]], "使い回した会社を指し直した後");
+}
+
+/// 読み直し E: 見直しの購読 (`subscribe_touched`) の `touched` は、 アプリが `members_many` で受けた eid を出す。 前は今の世代の eid
+/// を出したので、 社員を消すと (世代 + 1) の eid、 poll の前に場所を使い回すと新しい住人の eid だけが出て、 アプリは持っている eid を
+/// 外せなかった。 v14 の DB で消して、 最初の使い回しで v15 に移る形 (移る時に上げる場所) と、 v15 の DB で消す形の両方。
+#[test]
+fn touched_reports_the_eid_the_app_holds_after_a_delete_and_a_reuse() {
+    for v15_first in [false, true] {
+        let path = tmp_path("touched");
+        let _c = Cleanup(path.clone());
+        let mut db = Database::create(&path).unwrap();
+        db.table("companies").number("id").tag("city").primary_key("id").build().unwrap();
+        db.table("users").number("id").ref_to("company", "companies").primary_key("id").with_capacity(2).build().unwrap();
+        db.table("spare").number("id").primary_key("id").with_capacity(1).build().unwrap();
+        let companies = db.get_table("companies").unwrap();
+        let users = db.get_table("users").unwrap();
+        if v15_first {
+            // 別の表で先に使い回す (v15 に移る)
+            let spare = db.get_table("spare").unwrap();
+            let s = spare.insert().set("id", 1i64).commit().unwrap();
+            spare.entity(s).delete().unwrap();
+            let s2 = spare.insert().set("id", 2i64).commit().unwrap();
+            assert_eq!(slot(s), slot(s2), "前提: 使い回した");
+            assert_ne!(s, s2, "前提: v15");
+        }
+        let c = companies.insert().set("id", 1i64).set("city", "Tokyo").commit().unwrap();
+        let a = users.insert().set("id", 1i64).set("company", Value::Ref(c)).commit().unwrap();
+        let b = users.insert().set("id", 2i64).set("company", Value::Ref(c)).commit().unwrap();
+        let t = users.where_eq("company.city", "Tokyo").subscribe_touched().unwrap();
+        let d = t.poll();
+        assert_eq!(d.added, vec![c]);
+        let mut held: std::collections::BTreeSet<u64> = t.members_many(&d.added).into_iter().flatten().collect();
+        assert_eq!(held, [a, b].into_iter().collect(), "前提");
+
+        // 消して、 poll の前にその場所を使い回す (表は枠 2 で満杯)
+        users.entity(a).delete().unwrap();
+        let x = users.insert().set("id", 3i64).set("company", Value::Ref(c)).commit().unwrap();
+        assert_eq!(slot(x), slot(a), "前提: 消えた場所を使い回した");
+        assert_ne!(x, a);
+        let d = t.poll();
+        assert!(d.touched.contains(&a), "v15_first={v15_first}: touched に、 アプリが持つ消えた行の eid が無い: {:?}", d.touched);
+        assert!(d.touched.contains(&x), "v15_first={v15_first}: touched に新しい住人が無い");
+        // アプリの持ち方 (型の doc): touched を group_of で引き直す
+        for e in d.touched {
+            match t.group_of(e) {
+                Some(_) => {
+                    held.insert(e);
+                }
+                None => {
+                    held.remove(&e);
+                }
+            }
+        }
+        assert_eq!(held, [b, x].into_iter().collect(), "v15_first={v15_first}: アプリの表が今の答えと違う");
+
+        // 消すだけ (使い回さない)
+        users.entity(b).delete().unwrap();
+        let d = t.poll();
+        assert!(d.touched.contains(&b), "v15_first={v15_first}: 消した行の eid が touched に無い: {:?}", d.touched);
+    }
 }

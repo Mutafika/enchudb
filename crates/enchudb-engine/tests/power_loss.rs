@@ -2579,3 +2579,141 @@ fn moving_to_eid_generations_writes_the_generations_before_the_header() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// #731 (PR #885 の読み直し F1): 本体の書き出しは生きている印 (entities) を先に、 場所の世代 (`gen.seg`) を後に書き出す (間に列)。
+/// その間に行を消すと 「生きている印は残り、 世代は上がった」 像になる (消す道は 世代を上げる → 印を下ろす)。 消した record は
+/// 書き出しの cut の後 = 電源断で失われる。 開くと行は生きているのに、 アプリの eid (と、 その行を指す Ref) は 「消えた行」 になる。
+#[test]
+fn a_delete_between_the_live_bits_and_the_generations_does_not_change_a_surviving_rows_eid() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("gen_torn");
+    let live = root.join("live");
+    let img = root.join("img");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let (r, keep) = {
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        // v15 にする (枠 2 の表で消して足す)
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, "t.v", 1u32);
+        let keep = eng.entity_in("t").unwrap();
+        eng.tie_to(keep, "t.v", 2u32);
+        eng.delete(a);
+        let r = eng.entity_in("t").unwrap();
+        eng.tie_to(r, "t.v", 3u32);
+        assert_ne!(r, a, "前提: v15");
+        eng.oplog_sync().unwrap();
+        let _hold = eng.hold_consumer();
+        let (e2, done) = (eng.clone(), Arc::new(AtomicBool::new(false)));
+        let done2 = done.clone();
+        // 生きている印を書き出した後・世代を書き出す前に、 別の thread で消す (止められていれば待たせたまま書き出しを進める)
+        let deleter: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let deleter2 = deleter.clone();
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGenerations && !done2.swap(true, Ordering::SeqCst) {
+                let (e3, (tx, rx)) = (e2.clone(), std::sync::mpsc::channel::<()>());
+                *deleter2.lock().unwrap() = Some(std::thread::spawn(move || {
+                    e3.delete(r);
+                    let _ = tx.send(());
+                }));
+                let _ = rx.recv_timeout(std::time::Duration::from_millis(300));
+            }
+        })));
+        eng.tie_to(keep, "t.v", 4u32); // 書き出す物を作る
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
+        deleter.lock().unwrap().take().unwrap().join().unwrap();
+        crashsim::capture(&live, &img, Mode::Lost).unwrap();
+        (r, keep)
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.get(keep, "t.v"), Some(4), "前提: 書き出した値は届いている");
+    // 場所が生きていれば、 その eid は r のまま (消した record は届かない像。 列の cell の一部が消えた像はありうる = 前からの、 書き出しと
+    // 重なった削除の形)
+    let s = eng.eid_slot(r);
+    let now = eng.slot_eid(s);
+    assert!(!eng.is_live(now) || now == r, "消した record の届かなかった像で、 生きている行の eid が変わった ({r:#x} → {now:#x}、 世代だけ届いた)");
+    assert!(eng.is_live(r), "前提: 消した record は届いていない (行は生きている)");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #731 (PR #885 の読み直し F2): 本体にあって oplog に無い削除を作り直す (#451) Delete の record は、 消えた行の世代込みの eid
+/// (WAL の record は世代込み)。 前は世代 0 の番号で作り直していた (使い回した場所の行を消した record が、 前の住人の番号になる)。
+#[test]
+fn a_relogged_delete_carries_the_generation_of_the_deleted_row() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for attempt in 0..5 {
+        let root = scratch(&format!("relog_gen{attempt}"));
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        crashsim::start();
+        let db = live.join("db");
+        let eng = {
+            let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+            eng.define_table("notes", 2).unwrap();
+            eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+            eng.persist_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+            eng.set_peer_id(1);
+            eng
+        };
+        let a = eng.entity_in("notes").unwrap();
+        eng.tie_to(a, "notes.note", 1u32);
+        let b = eng.entity_in("notes").unwrap();
+        eng.tie_to(b, "notes.note", 2u32);
+        eng.delete(a);
+        let e = eng.entity_in("notes").unwrap();
+        eng.tie_to(e, "notes.note", 5u32);
+        assert_ne!(e, a, "前提: 使い回した場所は世代の違う eid");
+        eng.oplog_sync().unwrap();
+        let held = with_stalled_sync(&eng, || eng.delete(e));
+        let img = root.join("img");
+        let captured = crashsim::capture(&live, &img, Mode::Lost);
+        crashsim::stop();
+        drop(held);
+        let deleted_at = eng.tombstone_hlc(e);
+        drop(eng);
+        captured.unwrap();
+        let idb = img.join("db");
+        let in_oplog = OpLog::open(&idb.join("oplog")).unwrap().records_with_tail().iter().any(|r| r.hlc == deleted_at);
+        if in_oplog {
+            eprintln!("[relog_gen] 撮り直す ({attempt} 回目): consumer の書き出しが先に oplog を届かせた");
+            let _ = std::fs::remove_dir_all(&root);
+            continue;
+        }
+        let eng = Engine::open_concurrent_with_oplog(idb.to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert!(!eng.is_live(e), "前提: 本体には削除が届いている");
+        assert!(eng.unlogged_writes_relogged() >= 1, "前提: 削除を作り直した");
+        let relogged: Vec<u64> = eng
+            .audit(&enchudb_engine::AuditFilter::default())
+            .into_iter()
+            .filter(|r| r.hlc == deleted_at)
+            .filter_map(|r| match r.op {
+                DecodedOp::Delete { eid } => Some(eid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(relogged.len(), 1, "前提: 作り直した Delete が 1 つ");
+        assert_eq!(eid_local(relogged[0]), eid_local(e), "作り直した Delete が、 消えた行の世代込みの eid でない");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    panic!("5 回とも consumer が先に oplog を届かせた");
+}

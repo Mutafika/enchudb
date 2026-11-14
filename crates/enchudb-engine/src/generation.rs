@@ -16,15 +16,28 @@
 use crate::region::Region;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// [`Generations::gate`] の 「消す時に上げる」 印 (最上位 bit)。 下位 32 bit = 印を見ずに消している書き手の数。
+/// [`Generations::gate`] の 「消す時に上げる」 印 (最上位 bit)。 下位 32 bit = 消している書き手 (`enter_free` 〜 `exit_free`) の数。
 const GATE_ON: u64 = 1 << 63;
+/// 本体の書き出しが生きている印 (entities) と場所の世代 (`gen.seg`) を書き出している間 (F1)。 消す書き手は入らずに待つ。
+const GATE_FREEZE: u64 = 1 << 62;
 const GATE_COUNT: u64 = u32::MAX as u64;
 
-/// `gen.seg` の先頭の header の長さ。 [`MAGIC`] / 場所の bit / 表ごとの印 (TableId は u16 = 8 KiB)。
+/// `gen.seg` の先頭の header の長さ。 [`MAGIC`] / 場所の bit / 表ごとの印 (TableId は u16 = 8 KiB) / page ごとの印。
 pub(crate) const GEN_HEADER: usize = 16 * 1024;
 const MAGIC: [u8; 4] = *b"GEN1";
 const OFF_BITS: usize = 4;
 const OFF_TABLES: usize = 64;
+/// page (2^[`PAGE_SHIFT`] 場所) ごとの 「世代 > 0 の場所がある」 印。 header の残り (8128 B = 65024 page = 2^29 場所まで)。 印の
+/// 無い page の場所は世代を読まない (出口・照合で、 使い回しの無い所は gen.seg の 1 B / 場所 を読まない)。 印の範囲の外の場所は
+/// いつも読む。
+const OFF_PAGES: usize = OFF_TABLES + 8 * 1024;
+const PAGE_SHIFT: u32 = 13;
+const PAGES: u32 = ((GEN_HEADER - OFF_PAGES) * 8) as u32;
+
+/// [`Generations::gate`] を他の欄と別の cache line に置く (v14 では消すたびに 2 回 RMW する語。 `get` のたびに読む `bits` / `region`
+/// と同じ line にあると、 消す書き手が読み手の line を奪う)。
+#[repr(align(128))]
+struct Gate(AtomicU64);
 /// 場所の bit の下限 (既定の `max_entities` 2^24 の DB の場所を全部表せる)。
 pub(crate) const MIN_SLOT_BITS: u32 = 24;
 
@@ -48,9 +61,11 @@ pub(crate) struct Generations {
     /// 立てた (RMW) 後、 数が 0 になるのを待ってから死んだ場所をなめる (`wait_frees`)。 同じ語の RMW の順で、 印を見ずに消した書き手の
     /// 場所は、 なめる時には死んでいる (なめる側が上げる)。 印を見た書き手は自分で上げる。 揃えの model は
     /// `tests/loom_eid_generation_move.rs`
-    gate: AtomicU64,
+    gate: Gate,
     /// v15 に移る手順 (`Engine::move_to_generations`) を 1 本に並べる。
     pub(crate) move_lock: std::sync::Mutex<()>,
+    /// 本体の書き出しの 「生きている印と世代を一緒に書き出す」 段 ([`Self::freeze`]) を 1 本に並べる (書き出しは重なる)。
+    freeze_lock: std::sync::Mutex<()>,
     /// WAL の再生中 (`Engine::apply_oplog_op`)。 消す道が場所の世代を上げない (再生が record の世代で上げる)。
     pub(crate) replaying: std::sync::atomic::AtomicBool,
     /// v15 に移り終えた (`Engine::move_to_generations` の最後 / v15 の DB を開いた時)。 `active` (照合を始めた) とは別: 移る途中
@@ -63,8 +78,9 @@ impl Generations {
         Self {
             bits: AtomicU32::new(0),
             region: std::sync::OnceLock::new(),
-            gate: AtomicU64::new(0),
+            gate: Gate(AtomicU64::new(0)),
             move_lock: std::sync::Mutex::new(()),
+            freeze_lock: std::sync::Mutex::new(()),
             replaying: std::sync::atomic::AtomicBool::new(false),
             moved: std::sync::atomic::AtomicBool::new(false),
         }
@@ -82,7 +98,7 @@ impl Generations {
         }
         let _ = self.region.set(region);
         self.bits.store(bits, Ordering::Release);
-        self.gate.fetch_or(GATE_ON, Ordering::AcqRel);
+        self.gate.0.fetch_or(GATE_ON, Ordering::AcqRel);
         self.moved.store(true, Ordering::Release);
         Ok(())
     }
@@ -116,29 +132,51 @@ impl Generations {
     /// 照合と 「消す時に上げる」 を始める (`prepare` の後)。 この後 [`Self::wait_frees`] を待ってから死んだ場所をなめる。
     pub(crate) fn start(&self, bits: u32) {
         self.bits.store(bits, Ordering::Release);
-        self.gate.fetch_or(GATE_ON, Ordering::AcqRel);
+        self.gate.0.fetch_or(GATE_ON, Ordering::AcqRel);
     }
 
-    /// 消す道の入口: (消す時に上げるか, 出る時に [`Self::exit_free`] を呼ぶか)。 v15 は読むだけ。
+    /// 消す道の入口: (消す時に上げるか, 出る時に [`Self::exit_free`] を呼ぶか)。 世代を持つ DB (v15) では、 本体の書き出しが
+    /// 生きている印と世代を書き出している間 ([`Self::freeze`]) は入らずに待つ (F1: 間で消すと、 生きている印は消す前・世代は消した
+    /// 後の像が disk に届く)。 世代を持たない DB (v14) は待たない (世代を上げないので像は揃っている)。
     #[inline]
     pub(crate) fn enter_free(&self) -> (bool, bool) {
-        if self.gate.load(Ordering::Acquire) & GATE_ON != 0 {
-            return (true, false);
+        loop {
+            let v = self.gate.0.fetch_add(1, Ordering::AcqRel);
+            if v & GATE_FREEZE == 0 || v & GATE_ON == 0 {
+                return (v & GATE_ON != 0, true);
+            }
+            self.gate.0.fetch_sub(1, Ordering::AcqRel);
+            while self.gate.0.load(Ordering::Acquire) & GATE_FREEZE != 0 {
+                std::thread::yield_now();
+            }
         }
-        let v = self.gate.fetch_add(1, Ordering::AcqRel);
-        (v & GATE_ON != 0, true)
+    }
+
+    /// 本体の書き出しの 「生きている印 (entities) と世代 (`gen.seg`) を書き出す」 段 `f` を、 消す書き手を止めて走らせる。 中に居る
+    /// 書き手が出るのを待ってから書き出す = 書き出す 2 つの像は、 どの削除についても 「両方前」 か 「両方後」。 世代を持たない DB は
+    /// 止めない。
+    pub(crate) fn freeze<R>(&self, f: impl FnOnce() -> R) -> R {
+        if !self.active() {
+            return f();
+        }
+        let _one = self.freeze_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.gate.0.fetch_or(GATE_FREEZE, Ordering::AcqRel);
+        self.wait_frees();
+        let r = f();
+        self.gate.0.fetch_and(!GATE_FREEZE, Ordering::AcqRel);
+        r
     }
 
     /// 消す道の出口 (生きている印を下ろした後)。
     #[inline]
     pub(crate) fn exit_free(&self) {
-        self.gate.fetch_sub(1, Ordering::Release);
+        self.gate.0.fetch_sub(1, Ordering::Release);
     }
 
     /// 印の立つ前に入った消す書き手が全部出るのを待つ (移る手順、 印を立てた後)。 中の書き手は lock を待たない短い道
     /// (生きている印を下ろすだけ) なので回って待つ。
     pub(crate) fn wait_frees(&self) {
-        while self.gate.load(Ordering::Acquire) & GATE_COUNT != 0 {
+        while self.gate.0.load(Ordering::Acquire) & GATE_COUNT != 0 {
             std::thread::yield_now();
         }
     }
@@ -167,19 +205,61 @@ impl Generations {
     #[inline]
     pub(crate) fn get(&self, slot: u32) -> u32 {
         let Some(r) = self.region.get() else { return 0 };
-        let off = GEN_HEADER + slot as usize;
-        if off >= r.len() {
-            return 0;
-        }
-        r.as_atomic_u8(off).load(Ordering::Acquire) as u32
+        read_gen(r, slot)
     }
 
     /// 場所 → 今の世代の local。
     #[inline]
     pub(crate) fn local(&self, slot: u32) -> u32 {
+        self.reader().local(slot)
+    }
+
+    /// 場所 → local の写しを、 場所の bit と region を 1 回だけ読んで作る (出口の loop の外で)。
+    #[inline]
+    pub(crate) fn reader(&self) -> GenReader<'_> {
         match self.bits() {
-            0 | 32.. => slot,
-            b => (self.get(slot) << b) | slot,
+            0 | 32.. => GenReader { bits: 0, region: None },
+            b => GenReader { bits: b, region: self.region.get() },
+        }
+    }
+
+    /// page の印 (場所 `slot` の page に世代 > 0 の場所がある)。 印の範囲の外はいつも true。
+    #[inline]
+    pub(crate) fn page_has(&self, slot: u32) -> bool {
+        self.region.get().is_none_or(|r| page_marked(r, slot))
+    }
+
+    fn mark_page(&self, r: &Region, slot: u32) {
+        let p = slot >> PAGE_SHIFT;
+        if p >= PAGES {
+            return;
+        }
+        let off = OFF_PAGES + (p / 8) as usize;
+        let bit = 1u8 << (p % 8);
+        if r.as_atomic_u8(off).load(Ordering::Acquire) & bit == 0 {
+            r.as_atomic_u8(off).fetch_or(bit, Ordering::AcqRel);
+            r.mark_dirty(off, 1);
+        }
+    }
+
+    /// きれいに閉じなかった後に開いた時: 表と page の印を、 場所ごとの世代から立て直す。 印と世代の byte は gen.seg の別の page なので、
+    /// 電源断で世代の byte だけ届いた像がありうる (印が無いと、 出口がその場所の世代を読まず、 使い回した行に前の住人の eid を渡す)。
+    /// 印は立てるだけ (余分な印は読む手間が増えるだけ)。 `table_of` = 場所の表。
+    pub(crate) fn heal_marks(&self, table_of: impl Fn(u32) -> Option<u16>) {
+        let Some(r) = self.region.get() else { return };
+        let len = r.committed_len();
+        if len <= GEN_HEADER {
+            return;
+        }
+        let s = r.slice();
+        for (i, &g) in s[GEN_HEADER..len].iter().enumerate() {
+            if g != 0 {
+                let slot = i as u32;
+                self.mark_page(r, slot);
+                if let Some(t) = table_of(slot) {
+                    self.mark_table(t);
+                }
+            }
         }
     }
 
@@ -213,6 +293,8 @@ impl Generations {
             return Ok(false);
         }
         r.ensure_committed(off + 1)?;
+        // page の印を先に (印の無い page の場所は世代を読まない。 印 → 世代 の順なら、 印を読まずに 0 と答えた読みは上げる前の読み)
+        self.mark_page(r, slot);
         r.as_atomic_u8(off).fetch_max(g as u8, Ordering::AcqRel);
         r.mark_dirty(off, 1);
         Ok(true)
@@ -233,6 +315,41 @@ impl Generations {
         if r.as_atomic_u8(off).load(Ordering::Acquire) & bit == 0 {
             r.as_atomic_u8(off).fetch_or(bit, Ordering::AcqRel);
             r.mark_dirty(off, 1);
+        }
+    }
+}
+
+#[inline]
+fn page_marked(r: &Region, slot: u32) -> bool {
+    let p = slot >> PAGE_SHIFT;
+    p >= PAGES || r.as_atomic_u8(OFF_PAGES + (p / 8) as usize).load(Ordering::Acquire) & (1 << (p % 8)) != 0
+}
+
+#[inline]
+fn read_gen(r: &Region, slot: u32) -> u32 {
+    if !page_marked(r, slot) {
+        return 0;
+    }
+    let off = GEN_HEADER + slot as usize;
+    if off >= r.len() {
+        return 0;
+    }
+    r.as_atomic_u8(off).load(Ordering::Acquire) as u32
+}
+
+/// 場所 → 今の世代の local の写し ([`Generations::reader`])。 場所の bit と region を 1 回読んだ後は、 page の印と世代の byte だけ読む。
+#[derive(Clone, Copy)]
+pub(crate) struct GenReader<'a> {
+    bits: u32,
+    region: Option<&'a Region>,
+}
+
+impl GenReader<'_> {
+    #[inline]
+    pub(crate) fn local(&self, slot: u32) -> u32 {
+        match self.region {
+            Some(r) if self.bits != 0 => (read_gen(r, slot) << self.bits) | slot,
+            _ => slot,
         }
     }
 }
@@ -267,5 +384,26 @@ mod tests {
         assert!(!g.raise(3, 1).unwrap(), "同じ世代には上げない");
         assert!(g.raise(3, 300).unwrap());
         assert!(g.retired(3), "使える世代を越えたら引退");
+    }
+
+    #[test]
+    fn a_page_without_a_raised_slot_reads_generation_zero_without_its_byte() {
+        let mut v = vec![0u8; GEN_HEADER + (3 << PAGE_SHIFT)];
+        let g = Generations::off();
+        let r = unsafe { Region::new(v.as_mut_ptr(), v.len()) };
+        g.prepare(r, 24).unwrap();
+        g.start(24);
+        let far = (2 << PAGE_SHIFT) + 5;
+        assert!(g.raise(far, 1).unwrap());
+        assert!(g.page_has(far) && !g.page_has(5), "上げた場所の page だけに印");
+        // 印の無い page の byte は読まない (書き込みは試験のため直接)
+        unsafe { *v.as_mut_ptr().add(GEN_HEADER + 5) = 7 };
+        assert_eq!(g.get(5), 0, "印の無い page の世代の byte を読んだ");
+        assert_eq!(g.local(far), (1 << 24) | far);
+        // 印を消した像 (電源断で世代の byte だけ届いた) は heal_marks で立て直す
+        unsafe { *v.as_mut_ptr().add(OFF_PAGES + 0) = 0 };
+        g.heal_marks(|_| None);
+        assert!(g.page_has(5), "世代の byte から page の印を立て直さない");
+        assert_eq!(g.get(5), 7);
     }
 }
