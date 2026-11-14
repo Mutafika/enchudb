@@ -918,3 +918,54 @@ fn a_relayed_record_with_a_large_number_is_not_taken_for_a_local_only_row() {
     assert_eq!(relayed, vec![foreign], "相手の record ({foreign:#x}) を自分の local-only の行と読んで中継しなかった");
     assert!(seen.0.lock().unwrap().contains(&foreign), "相手の record を自分の local-only の行と読んで changefeed に渡さなかった");
 }
+
+/// #880 (#892) の後: 単独の open (`open_standalone`) は、 WAL に再生する record がある時 / sync の DB がきれいに閉じていない時に、
+/// WAL 付きの open で往復してから開き直す。 往復でも gen.seg と生きている印の突き合わせ (F1) が回る: 像は 「gen.seg は削除の後、
+/// 生きている印は削除の前」 (削除は `tables` を書いて checkpoint を越えた)、 WAL には関係の無い record だけ (再生が削除をやり直さない)。 突き合わせが
+/// 回らないと、 消した行の場所が 「次の世代で生きている」 (中身の無い行) になる。
+fn reconcile_through_standalone_open(sync: bool) {
+    let made = tmp_path(&format!("standalone-{sync}"));
+    let (before, after, img) = (format!("{made}-before"), format!("{made}-after"), format!("{made}-img"));
+    let _c = [&made, &before, &after, &img].map(|p| Cleanup(p.clone()));
+    let (a, b, c) = {
+        let eng = create_concurrent(&made, sync, 2);
+        let a = eng.entity_in("notes").unwrap();
+        eng.tie_to(a, "notes.note", 1u32);
+        let b = eng.entity_in("notes").unwrap();
+        eng.tie_to(b, "notes.note", 2u32);
+        eng.delete(a);
+        let c = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(c), slot(a), "前提: v15 に移って使い回す");
+        eng.tie_to(c, "notes.note", 3u32);
+        eng.oplog_sync().unwrap();
+        let hold = eng.hold_consumer();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&before));
+        eng.delete(c);
+        // 削除の record を checkpoint の手前に (#870 は消した行が `tables` より先にある間 checkpoint を止める = 再生が削除をやり直す)
+        eng.persist_tables().unwrap();
+        eng.oplog_sync().unwrap();
+        eng.tie_to(b, "notes.note", 7u32); // 再生する record (削除とは関係の無い行)
+        eng.oplog_commit();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&after));
+        drop(hold);
+        (a, b, c)
+    };
+    mix_entities(&after, &before, &img);
+    let eng = Engine::open_standalone(&img).unwrap();
+    assert_eq!(eng.get(b, "notes.note"), Some(7), "前提: 往復の open が WAL を再生した");
+    assert!(!eng.is_live(c));
+    assert!(!eng.is_live(eng.slot_eid(slot(c))), "往復の open で突き合わせが回らず、 消した行の場所が生きている (sync = {sync})");
+    let n = eng.entity_in("notes").unwrap();
+    assert_eq!(slot(n), slot(c), "前提: 消した場所を使い回す");
+    assert!(n != c && n != a);
+}
+
+#[test]
+fn a_standalone_open_that_replays_the_wal_first_still_reconciles_generations() {
+    reconcile_through_standalone_open(false);
+}
+
+#[test]
+fn a_standalone_open_of_an_unclean_sync_db_still_reconciles_generations() {
+    reconcile_through_standalone_open(true);
+}
