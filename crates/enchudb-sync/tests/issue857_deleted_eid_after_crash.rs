@@ -5,8 +5,10 @@
 //! 生きている行の最大 + 1 までしか戻らない (X は生きていない)。 次に足した行が X の eid になる。
 //! sync の DB では、 Delete(X) を受けた相手が、 消えた slot 宛ての書き込みを版数によらず捨てる = 新しい行が相手に現れない。
 //!
-//! 直し: sidecar の `next_local` より先の行を消した後の `oplog_sync()` は、 checkpoint を進める前に `tables` を書く。 版数の列の
-//! ある DB (sync の DB) は、 開く時に tombstone のある local も払い出し済みと数える (0.37.4 以前が残した像)。
+//! 直し: sidecar の `next_local` より先の行を (版数なしで) 消した後の `oplog_sync()` は checkpoint を進めない (その行の record が
+//! WAL に残り、 落ちた後に再生されて `next_local` を進める。 進めるのは `tables` を書いてから進める consumer の周期)。 Delete の
+//! 再生も `next_local` を進める。 版数の列のある DB (sync の DB) は、 開く時に tombstone のある local も払い出し済みと数える
+//! (0.37.4 以前が残した像)。 `oplog_sync` で `tables` を書く形は 1 回 0.1 ms → 5 ms になるので取らなかった。
 #![cfg(unix)]
 
 use enchudb_engine::engine::Engine;
@@ -89,7 +91,7 @@ fn set_next_local(db: &str, table: &str, value: u32) {
 
 /// sync しない DB / sync の DB のどちらでも、 開き直した後に足した行は、 消した行の eid にならない。
 ///
-/// falsify: `oplog_sync` が `tables` を書かないと、 sync しない DB で消した行の eid が出る (sync の DB は開く時の tombstone で
+/// falsify: `oplog_sync` が checkpoint を止めないと、 sync しない DB で消した行の eid が出る (sync の DB は開く時の tombstone で
 /// 防ぐ)。 開く時に tombstone を数える所も外すと sync の DB でも出る。
 #[test]
 fn a_deleted_eid_is_not_handed_out_again_after_a_crash() {
