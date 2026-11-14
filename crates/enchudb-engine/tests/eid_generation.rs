@@ -293,13 +293,14 @@ fn a_rewound_allocation_does_not_repeat_a_deleted_eid_v14_plain() {
     rewind_case(false, false);
 }
 
-/// gen.seg の header (表の印 64.. / page の印) と、 場所 `slot` の世代の byte (`Some` の時) を消す。
+/// gen.seg の header (表の印 64.. / page の印) と、 場所 `slot` の 2 B (世代 + 「死んでいる」 印、 `Some` の時) を消す。
 fn wipe_generation_marks(db: &str, slot: Option<u32>) {
     let p = std::path::Path::new(db).join("gen.seg");
     let mut b = std::fs::read(&p).unwrap();
     b[64..16 * 1024].fill(0);
     if let Some(s) = slot {
-        b[16 * 1024 + s as usize] = 0;
+        let off = 16 * 1024 + 2 * s as usize;
+        b[off..off + 2].fill(0);
     }
     std::fs::write(&p, b).unwrap();
 }
@@ -647,4 +648,138 @@ fn a_folded_own_slot_released_by_a_split_gets_a_new_generation_before_reuse() {
     assert_eq!(slot(z), slot(x), "前提: 消えた slot に戻った X の場所を使い回した");
     assert_ne!(z, x, "別名を外した場所を、 畳んだ行と同じ eid で使い回した");
     assert_eq!(eng.get(x, "notes.note"), None);
+}
+
+/// 像 `base` の写しに、 像 `entities_from` の生きている印 (`entities.seg`) を置く。 2 つの segment の片方の page だけ先に disk に
+/// 届いた電源断の像 (本体の書き出しは 2 つを別々に書き出し、 OS も page を勝手な順で先に書き出す)。
+fn mix_entities(base: &str, entities_from: &str, out: &str) {
+    copy_dir(std::path::Path::new(base), std::path::Path::new(out));
+    std::fs::copy(
+        std::path::Path::new(entities_from).join("entities.seg"),
+        std::path::Path::new(out).join("entities.seg"),
+    )
+    .unwrap();
+}
+
+/// PR #885 の読み直し F1 (案 (a)): 消す道は gen.seg に 「世代 + 1、 死んでいる」 を 1 回の store で書いてから生きている印を下ろし、
+/// 使い回しは印を落としてから生きている印を立てる。 本体の書き出しは止めないので、 片方だけ届いた像がある。 開く時の突き合わせは
+/// **死が勝つ** (どちらかが死んでいれば削除を完了させる):
+///
+/// - gen.seg だけ届いた削除 (死んでいる、 生きている印は残る) → 削除を完了: 消えた eid は生きていない、 次の使い回しは新しい eid
+/// - entities だけ届いた削除 (生きていない、 gen.seg は消す前) → 削除を完了: 同じ
+/// - 使い回しの生きている印だけ届いた (gen.seg は前の削除の 「次の世代、 死んでいる」) → 使い回しは無かった: 消えた行の eid が
+///   生き返らない。 「gen.seg だけ死 = 削除が届いていない → 世代を戻す」 にすると、 ここで消えた行の eid が生きている行になる
+///
+/// 像は WAL を外す (record が届かなかった形。 再生があると再生がやり直すので突き合わせを確かめられない)。
+#[test]
+fn a_torn_delete_or_reuse_never_brings_a_deleted_eid_back() {
+    let made = tmp_path("torn");
+    let (before, after, reused) = (format!("{made}-before"), format!("{made}-after"), format!("{made}-reused"));
+    let (x, y, z) = (format!("{made}-x"), format!("{made}-y"), format!("{made}-z"));
+    let _c = [&made, &before, &after, &reused, &x, &y, &z].map(|p| Cleanup(p.clone()));
+    let (a, c, d) = {
+        let eng = create_concurrent(&made, false, 2);
+        let a = eng.entity_in("notes").unwrap();
+        eng.tie_to(a, "notes.note", 1u32);
+        let b = eng.entity_in("notes").unwrap();
+        eng.tie_to(b, "notes.note", 2u32);
+        eng.delete(a);
+        let c = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(c), slot(a), "前提: v15 に移って使い回す");
+        eng.tie_to(c, "notes.note", 3u32);
+        eng.oplog_sync().unwrap();
+        let hold = eng.hold_consumer();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&before));
+        eng.delete(c);
+        eng.oplog_sync().unwrap();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&after));
+        let d = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(d), slot(c), "前提: もう一度使い回す");
+        eng.tie_to(d, "notes.note", 4u32);
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&reused));
+        drop(hold);
+        (a, c, d)
+    };
+    for img in [&before, &after, &reused] {
+        std::fs::remove_file(std::path::Path::new(img).join("oplog")).unwrap();
+    }
+    let reuse_and_check = |db: &str, gone: &[u64]| {
+        let eng = Engine::open_concurrent_with_oplog(db, WAL).unwrap();
+        let repairs = eng.generation_repairs();
+        for &e in gone {
+            assert!(!eng.is_live(e), "{db}: 消えた eid {e:#x} が生きている");
+            assert_eq!(eng.get(e, "notes.note"), None);
+        }
+        assert_eq!(eng.pull_raw("notes.note", 3u32), Vec::<u64>::new(), "{db}: 消した行の cell が引ける");
+        let n = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(n), slot(c), "前提: 消した場所を使い回す");
+        assert!(!gone.contains(&n) && n != a, "{db}: 使い回しが消えた行の eid ({n:#x}) を渡した");
+        repairs
+    };
+    // gen.seg は消した後、 生きている印は消す前
+    mix_entities(&after, &before, &x);
+    assert_eq!(reuse_and_check(&x, &[c]), (1, 0), "前提: 死んでいる印のある生きている場所が 1 つ");
+    // 生きている印は消した後、 gen.seg は消す前
+    mix_entities(&before, &after, &y);
+    assert_eq!(reuse_and_check(&y, &[c]), (0, 1), "前提: 生きていないのに死んでいる印の無い場所が 1 つ");
+    // 使い回しの生きている印は届いた、 gen.seg は使い回す前 (前の削除の 「次の世代、 死んでいる」)
+    mix_entities(&after, &reused, &z);
+    assert_eq!(reuse_and_check(&z, &[c, d]), (1, 0), "前提: 死んでいる印のある生きている場所が 1 つ");
+}
+
+/// F1 (案 (a)) と WAL の再生: 突き合わせは再生の前に回る。 使い回しの 「死んでいる印を落とした」 store だけ届き、 生きている印は
+/// 届かなかった像は、 突き合わせが削除の完了に寄せる (世代 + 1)。 使い回した行の record が WAL にあれば、 再生がその行の世代に戻す
+/// (`replay_slot`: 場所が 「record の行の次の世代、 死んでいる」 なら戻す)。 戻さないと、 生かした行が次の世代の eid になる。
+/// 削除の 「印と世代」 だけ届いた像 (突き合わせが削除を完了させる) も、 再生が同じ削除をやり直す (冪等)。
+#[test]
+fn the_replay_after_the_reconcile_keeps_the_reused_rows_generation() {
+    let made = tmp_path("torn-wal");
+    let (deleted, reused, img) = (format!("{made}-deleted"), format!("{made}-reused"), format!("{made}-img"));
+    let (live_c, img2) = (format!("{made}-live"), format!("{made}-img2"));
+    let _c = [&made, &deleted, &reused, &img, &live_c, &img2].map(|p| Cleanup(p.clone()));
+    let (a, c, d) = {
+        let eng = create_concurrent(&made, false, 2);
+        let a = eng.entity_in("notes").unwrap();
+        eng.tie_to(a, "notes.note", 1u32);
+        let b = eng.entity_in("notes").unwrap();
+        eng.tie_to(b, "notes.note", 2u32);
+        eng.delete(a);
+        let c = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(c), slot(a), "前提: v15 に移って使い回す");
+        eng.tie_to(c, "notes.note", 3u32);
+        eng.oplog_sync().unwrap(); // ここまでは本体に届き、 checkpoint を越えた
+        let hold = eng.hold_consumer();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&live_c));
+        eng.delete(c);
+        eng.oplog_commit();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&deleted));
+        let d = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(d), slot(c), "前提: もう一度使い回す");
+        eng.tie_to(d, "notes.note", 4u32);
+        eng.oplog_commit();
+        copy_dir(std::path::Path::new(&made), std::path::Path::new(&reused));
+        drop(hold);
+        (a, c, d)
+    };
+    // 使い回しの gen.seg (印を落とした) と WAL、 生きている印は使い回す前 (消した後)
+    mix_entities(&reused, &deleted, &img);
+    {
+        let eng = Engine::open_concurrent_with_oplog(&img, WAL).unwrap();
+        assert_eq!(eng.generation_repairs(), (0, 1), "前提: 突き合わせが使い回しの像を削除の完了に寄せた");
+        assert_eq!(eng.get(d, "notes.note"), Some(4), "再生した使い回しの行の eid ({d:#x}) が読めない");
+        assert!(eng.is_live(d));
+        assert_eq!(eng.pull_raw("notes.note", 4u32), vec![d]);
+        assert_eq!(eng.get(c, "notes.note"), None);
+        assert_eq!(eng.get(a, "notes.note"), None);
+    }
+    // 削除の gen.seg (死んでいる) と WAL、 生きている印は消す前
+    mix_entities(&deleted, &live_c, &img2);
+    {
+        let eng = Engine::open_concurrent_with_oplog(&img2, WAL).unwrap();
+        assert_eq!(eng.generation_repairs(), (1, 0), "前提: 突き合わせが削除を完了させた");
+        assert!(!eng.is_live(c), "WAL にある削除を再生しなかった");
+        let e = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(e), slot(c));
+        assert!(e != c && e != a, "再生した削除の場所を、 消えた行の eid で使い回した");
+    }
 }

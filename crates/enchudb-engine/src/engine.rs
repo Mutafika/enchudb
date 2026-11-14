@@ -7068,8 +7068,6 @@ impl Engine {
         }
         // request18: table 定義が確定したので hot path 用 cache を張り直す。
         eng.refresh_sync_tables_flag();
-        // #731: 世代の印を立て直す (きれいに閉じなかった後だけ)
-        eng.heal_generation_marks(readonly);
         // #385: 辞書の参照数を数え直す (要る時だけ)。 table が決まった後、 oplog の回復で書く前
         eng.finish_vocab_refs_at_open();
         // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を再構成 (free-list は非永続)。
@@ -7236,6 +7234,9 @@ impl Engine {
         eng.reconcile_next_local_from_bitmap();
         // #856: sync の ring は、 sidecar の値によらず 「払い出し切った ring」 として開く (0.37.4 以前の sidecar は実際の値)
         eng.exhaust_sync_ring();
+        // #731: gen.seg と生きている印を突き合わせる (きれいに閉じなかった後だけ)。 表・別名 (#612 の畳んだ自分の行)・払い出し位置
+        // の後、 WAL の再生の前
+        eng.reconcile_generations(readonly);
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
         // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
@@ -11751,7 +11752,9 @@ impl Engine {
                 if let Some(wal) = self.oplog.as_ref() {
                     pop_claim_hook::call(wal);
                 }
-                // #731: 印を立てる RMW (AcqRel) が、 消す側の印を下ろす RMW を読むので、 消す側がその前に上げた場所の世代も見える
+                // #731: 印を立てる RMW (AcqRel) が、 消す側の印を下ろす RMW を読むので、 消す側がその前に上げた場所の世代も見える。
+                // 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`、 取れなかった時は取った側も落とす)
+                self.generations().revive(g);
                 if !self.entities.allocate_at(g) {
                     global = Some(g);
                     break;
@@ -11853,7 +11856,9 @@ impl Engine {
             claim_gap_hook::call(wal);
         }
         // EntitySet で live mark + next_eid 前進 (CAS safe)。 #883: 前から立っていたら、 全部なめがこの slot を穴として拾って
-        // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す
+        // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す。
+        // #731: 落ちた後に払い出し位置が消した場所の手前に戻った時は、 その場所に 「死んでいる」 印がある (生かす前に落とす)
+        self.generations().revive(global);
         if self.entities.allocate_at(global) {
             return self.entity_in(table_name);
         }
@@ -13092,7 +13097,7 @@ impl Engine {
             self.emit_alias_record(prior, foreign_eid);
         }
         // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
-        self.entities.ensure_live(local);
+        self.ensure_live_slot(local);
         Self::advance_table_next_local_for(&self.tables, local);
         // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
         // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
@@ -13298,7 +13303,8 @@ impl Engine {
         }
         // 上限到達後の `allocate` は free stack から slot を再利用する。
         // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
-        let Some((local, reused)) = self.entities.allocate_tracked() else {
+        // #731: 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`)
+        let Some((local, reused)) = self.entities.allocate_tracked_with(|slot| self.generations().revive(slot)) else {
             self.record_fault(
                 FaultKind::EntitySpace,
                 "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
@@ -13328,7 +13334,8 @@ impl Engine {
                 self.raise_generation(local, 1);
             }
             if self.generations().retired(local) {
-                // 世代を使い切った場所は渡さない (空きの山から外したまま、 次を取る)
+                // 世代を使い切った場所は渡さない (空きの山から外したまま、 次を取る)。 生かす前に落とした 「死んでいる」 印を戻す
+                self.kill_generation(local, self.generations().retired_mark());
                 self.entities.free_without_reuse(local);
                 return self.entity();
             }
@@ -14293,26 +14300,26 @@ impl Engine {
         let replaying = self.generations().replaying.load(std::sync::atomic::Ordering::Relaxed);
         // v15 に移る手順 (`move_to_generations`) と揃える: 入口の RMW で 「消す時に上げる」 を読み、 上げない時は生きている印を
         // 下ろしてから出る (移る側は、 印を見ずに入った書き手が出るのを待ってから死んだ場所をなめる、 `Generations::gate`)
-        let (on, entered) = self.generations().enter_free();
+        let on = self.generations().enter_free();
         let gen_of_row = row_gen.unwrap_or_else(|| self.generations().get(local));
         // 畳んだ自分の行 (#612、 別名は畳む手順が先に張る) の場所は上げない: 使い回さないので次の住人は居ない。 上げると、 その行の eid
         // の転送 (`app_slot`) と #775 で生き返らせた行の eid が 「消えた行」 になる
+        // F1: 世代と 「死んでいる」 印を 1 回の store で書いてから生きている印を下ろす (本体の書き出しは止めない。 2 つの segment の
+        // 片方だけ届いた像は、 開く時の突き合わせ `reconcile_generations` が 「消す前」 か 「消した後」 に揃える)
         if on
             && (row_gen.is_some() || was_live)
             && !replaying
             && self.slot_is_generational(local)
             && !self.is_folded_own_slot(local)
         {
-            self.raise_generation(local, gen_of_row + 1);
+            self.kill_generation(local, gen_of_row + 1);
         }
         if self.generations().retired(local) {
             self.entities.free_without_reuse(local);
         } else {
             self.entities.free(local);
         }
-        if entered {
-            self.generations().exit_free();
-        }
+        self.generations().exit_free();
         // 購読には消えた行の世代を渡す (見直しの購読の `touched` がアプリの持つ eid を出す)
         self.live.freed(local, self.generations().active().then_some(gen_of_row));
         // #868: 枯渇した表が、 枠の全部をなめずにこの穴を拾えるように覚える
@@ -15888,7 +15895,9 @@ impl Engine {
     pub(crate) fn last_local_of_slot(&self, slot: u32) -> u32 {
         let g = self.generations();
         let now = g.get(slot);
-        let row_gen = if now > 0 && !self.entities.is_live(slot) && !self.is_folded_own_slot(slot) { now - 1 } else { now };
+        // 「死んでいる」 印 (消す道が世代と一緒に立てる) は、 生きている印を下ろす前の一瞬も消えた行を指す
+        let dead = g.is_dead(slot) || (!self.entities.is_live(slot) && !self.is_folded_own_slot(slot));
+        let row_gen = if now > 0 && dead { now - 1 } else { now };
         match g.bits() {
             0 | 32.. => slot,
             b => (row_gen << b) | slot,
@@ -15928,13 +15937,113 @@ impl Engine {
         self.generations().reader().eids(peer, &slots)
     }
 
-    /// #731: きれいに閉じなかった後に開いた時、 gen.seg の表と page の印を世代の byte から立て直す (`Generations::heal_marks`)。
-    /// table の定義が決まった後、 WAL の再生の前 (再生が上げる世代は印も立てる)。 readonly は書けないので立て直さない。
-    fn heal_generation_marks(&self, readonly: bool) {
+    /// #731 (F1): きれいに閉じなかった後に開いた時、 gen.seg (場所ごとの世代と 「死んでいる」 印) と生きている印 (entities) を
+    /// 突き合わせる。 2 つは別の segment で、 本体の書き出しは消す書き手を止めずに続けて書き出す (OS も page を先に書き出す) ので、
+    /// 消す道 (印と世代 → 生きている印) と使い回し (印を落とす → 生きている印) の片方だけが届いた像がある。 **死が勝つ**:
+    ///
+    /// 1. gen.seg の全部をなめて、 世代 > 0 の場所の page / 表の印を立て直す (印と世代は別の page)。 「死んでいる」 印があるのに生きて
+    ///    いる場所 (削除の 印と世代 だけ届いた / 使い回しの生きている印だけ届いた) は、 削除を完了させる (行の cell を落とし、 世代を
+    ///    もう 1 つ上げて生きている印を下ろす)。 「削除が届いていない」 と読んで世代を戻すと、 使い回しの像で消えた行の eid が生きている
+    ///    行になる (generation.rs の module doc)
+    /// 2. 世代を持つ表の払い出し済みの範囲で、 生きていないのに 「死んでいる」 印の無い場所 = 削除の生きている印だけ届いた (または
+    ///    使い回しの、 印を落とした store だけ届いた) → 削除を完了させる (世代を上げて印を立て、 残った cell を落とす)。 使い回しの像を
+    ///    完了に寄せると世代が 1 つ無駄になるだけ。 畳んだ自分の行の場所 (#612、 消す時に上げない) は飛ばす。 払い出し位置 (`tables` と
+    ///    生きている印から戻した値) より先も、 世代 > 0 の場所 (使い回した事がある = 払い出した事がある) は同じに見る。 世代 0 で払い出し
+    ///    位置より先の場所は、 払い出した事があるかを知る手が無い (`tables` が古いまま落ちて、 最後の行の削除が生きている印だけ届いた形。
+    ///    #857 / #870 の残り)
+    ///
+    /// 失うのは WAL に届いていない (cut の後の) 操作だけ。 **WAL の再生の前** に回す: 再生は record ごとに場所を正しい状態に動かす
+    /// (Delete は消して上げる = 冪等、 行を生かす record は場所の世代がその行より新しければ戻す = ここで完了に寄せた使い回し /
+    /// 届いていなかった削除を、 WAL にある分だけ戻す、 `replay_slot`)。 後に回すと、 再生が生かした場所に残った印を読み違える形を
+    /// 再生の側で全部消す必要がある。 readonly は書けないので回さない。 表の定義・別名 (`eidalias`)・払い出し位置の後。
+    fn reconcile_generations(&self, readonly: bool) {
         if readonly || !self.generations().active() || !self.himo_reg.rebuilt_on_load {
             return;
         }
-        self.generations().heal_marks(|slot| self.table_of_slot(slot).map(|t| t as TableId));
+        let gens = self.generations();
+        // 1.
+        let mut last: Option<usize> = None;
+        let dead_but_live = gens.heal(
+            |slot| self.entities.is_live(slot),
+            |slot| {
+                let i = match last {
+                    Some(i) if self.tables[i].contains(slot) => i,
+                    _ => self.table_of_slot(slot)?,
+                };
+                last = Some(i);
+                Some(i as TableId)
+            },
+        );
+        for &slot in &dead_but_live {
+            if let Some(t) = self.table_of_slot(slot) {
+                self.drop_leftover_cells(slot, t);
+            }
+            // 世代をもう 1 つ上げる: 生きている印が使い回しの物なら、 今の世代の eid はアプリに渡っている (落ちた後に同じ eid で
+            // 別の行を渡さない)。 削除の途中の像なら 1 つ無駄にするだけ。 購読には今 − 1 (消えた行の世代、 削除の途中の像) を渡す
+            let now = gens.get(slot);
+            self.kill_generation(slot, now + 1);
+            self.live_free(slot, Some(now.saturating_sub(1)));
+        }
+        gens.note_repaired(0, dead_but_live.len() as u32);
+        // 2.
+        let mut completed = 0;
+        for tid in 0..self.tables.len() {
+            if self.tables[tid].is_reserved() {
+                continue;
+            }
+            let handed: Vec<(u32, u32)> = self.handed_out_ranges(tid);
+            let extents =
+                if tid == ANONYMOUS_TABLE as usize { handed.clone() } else { self.tables[tid].extents() };
+            for (lo, hi) in extents {
+                let end = handed.iter().find(|&&(l, _)| l == lo).map_or(lo, |&(_, h)| h);
+                let mut slot = lo;
+                while slot < hi {
+                    // 払い出し位置より先は、 世代 > 0 の場所のある page だけ見る
+                    if slot >= end && !gens.may_have_generation(slot) {
+                        slot = gens.next_page_start(slot).min(hi);
+                        continue;
+                    }
+                    if !self.entities.is_live(slot)
+                        && !gens.is_dead(slot)
+                        && (slot < end || gens.get(slot) > 0)
+                        && !self.is_folded_own_slot(slot)
+                    {
+                        self.kill_generation(slot, gens.get(slot) + 1);
+                        self.drop_leftover_cells(slot, tid);
+                        completed += 1;
+                    }
+                    slot += 1;
+                }
+            }
+        }
+        gens.note_repaired(1, completed);
+    }
+
+    /// #731: 開いた時の突き合わせ (`reconcile_generations`) で削除を完了させた場所の数 (gen.seg だけ死んでいた, entities だけ死んで
+    /// いた)。 試験用。
+    #[doc(hidden)]
+    pub fn generation_repairs(&self) -> (u32, u32) {
+        self.generations().repaired()
+    }
+
+    /// 表 `tid` の払い出し済みの範囲 (場所の `[lo, hi)` の並び)。 名前のある表は払い出し位置までの extent、 anonymous は `next_eid` まで。
+    fn handed_out_ranges(&self, tid: usize) -> Vec<(u32, u32)> {
+        let t = &self.tables[tid];
+        if tid == ANONYMOUS_TABLE as usize {
+            let hi = t.eid_range_hi.min(self.entities.next_eid());
+            return vec![(t.eid_range_lo, hi.max(t.eid_range_lo))];
+        }
+        let mut left = t.next_local.load(std::sync::atomic::Ordering::Acquire).min(t.capacity());
+        let mut out = Vec::new();
+        for (lo, hi) in t.extents() {
+            let take = left.min(hi - lo);
+            if take == 0 {
+                break;
+            }
+            out.push((lo, lo + take));
+            left -= take;
+        }
+        out
     }
 
     /// 場所 `slot` を持つ表 (名前のある表を先に、 無ければ anonymous)。
@@ -15950,7 +16059,7 @@ impl Engine {
         self.table_of_slot(slot).is_none_or(|i| !self.tables[i].is_reserved())
     }
 
-    /// 場所の世代を `g` 以上に上げる (表の印も立てる)。 書けなければ (ディスクの空き) fault に積む。
+    /// 場所の世代を `g` 以上に上げる (表の印も立てる、 「死んでいる」 印は変えない)。 書けなければ (ディスクの空き) fault に積む。
     fn raise_generation(&self, slot: u32, g: u32) {
         if g == 0 || !self.generations().active() {
             return;
@@ -15961,6 +16070,27 @@ impl Engine {
         if self.generations().raise(slot, g).is_err() {
             self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 場所の世代を上げられない");
         }
+    }
+
+    /// 場所の行が消える: 世代を `g` 以上にし、 「死んでいる」 印を立てる (1 回の store、 表の印も立てる)。 生きている印を下ろす前に呼ぶ。
+    /// 書けなければ (ディスクの空き) fault に積む。
+    fn kill_generation(&self, slot: u32, g: u32) {
+        if !self.generations().active() {
+            return;
+        }
+        if let Some(t) = self.table_of_slot(slot) {
+            self.generations().mark_table(t as TableId);
+        }
+        if self.generations().kill(slot, g).is_err() {
+            self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 場所の世代を上げられない");
+        }
+    }
+
+    /// 場所を生かす (生きている印を立てる、 既に生きていれば何もしない)。 「死んでいる」 印を先に落とす (`Generations::revive` の doc)。
+    #[inline]
+    fn ensure_live_slot(&self, slot: u32) {
+        self.generations().revive(slot);
+        self.entities.ensure_live(slot);
     }
 
     /// 使い回す場所に残った cell を落とす (表 `tid` の紐だけ、 行の lock の下)。 消えた行の古い eid が、 消した後・使い回す前に
@@ -16050,7 +16180,6 @@ impl Engine {
     ///    かった像は v14 のまま開き、 `gen.seg` は読まない (次に移る時に 0 から作り直す)
     #[cfg(not(target_arch = "wasm32"))]
     fn move_to_generations(&self) -> io::Result<()> {
-        use std::sync::atomic::Ordering;
         if self.generations().moved() {
             return Ok(());
         }
@@ -16085,28 +16214,12 @@ impl Engine {
             if t.is_reserved() {
                 continue;
             }
-            let ranges: Vec<(u32, u32)> = if tid == ANONYMOUS_TABLE as usize {
-                let hi = t.eid_range_hi.min(self.entities.next_eid());
-                vec![(t.eid_range_lo, hi)]
-            } else {
-                let mut left = t.next_local.load(Ordering::Acquire).min(t.capacity());
-                let mut out = Vec::new();
-                for (lo, hi) in t.extents() {
-                    let take = left.min(hi - lo);
-                    if take == 0 {
-                        break;
-                    }
-                    out.push((lo, lo + take));
-                    left -= take;
-                }
-                out
-            };
-            for (lo, hi) in ranges {
+            for (lo, hi) in self.handed_out_ranges(tid) {
                 for slot in lo..hi {
                     if !self.entities.is_live(slot) && self.generations().get(slot) == 0 && !self.is_folded_own_slot(slot) {
                         // 見直しの購読に、 消えた行の世代 (0) を覚えさせてから上げる (`touched` にアプリの持つ eid を出す)
                         self.live.note_gen(slot, 0);
-                        self.raise_generation(slot, 1);
+                        self.kill_generation(slot, 1);
                     }
                 }
             }
@@ -16245,7 +16358,7 @@ impl Engine {
         // #882: 生きている印を立ててから別名を外す。 逆の順では間の一瞬 x が 「生きていない・畳んでいない」 に見え、 x が消した
         // 行の一覧に残っていると、 別の thread の `entity_in` が x を新しい行に払い出した (戻した行と 1 slot に重なる)。
         // 読む側 (`entity_in` の取り出し / `rebuild_free_locals`) は畳んだかを先に読む
-        self.entities.ensure_live(x);
+        self.ensure_live_slot(x);
         #[cfg(test)]
         if let Some(wal) = self.oplog.as_ref() {
             revive_gap_hook::call(wal);
@@ -16736,7 +16849,7 @@ impl Engine {
         if self.ensure_cell_room(hid, local).is_err() {
             return RemoteApply::RejectedCapacity;
         }
-        self.entities.ensure_live(local);
+        self.ensure_live_slot(local);
         // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない
         let _row = self.row_locks.write(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
@@ -16807,7 +16920,7 @@ impl Engine {
             return RemoteApply::Stale;
         }
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
-        self.entities.ensure_live(local);
+        self.ensure_live_slot(local);
         // issue #47 fix: foreign local が我々の table eid_range 内に落ちた場合、
         // 次の `entity_in` が同 local を払出して live entity を上書きしないよう
         // `next_local` を `local + 1` まで前進させる。 これは `apply_oplog_op`
@@ -17239,14 +17352,12 @@ impl Engine {
                     if self.is_folded_own_slot(fl) {
                         // #731: 別名を外した場所は 「消えた行」 で使い回せる = 消す道と同じく世代を上げる (畳む時は上げていない)。
                         // 移る手順と揃える (別名を外すのを消す道の門の中で)
-                        let (on, entered) = self.generations().enter_free();
+                        let on = self.generations().enter_free();
                         self.eid_translator.unalias(peer, fl);
                         if on && self.slot_is_generational(fl) {
-                            self.raise_generation(fl, self.generations().get(fl) + 1);
+                            self.kill_generation(fl, self.generations().get(fl) + 1);
                         }
-                        if entered {
-                            self.generations().exit_free();
-                        }
+                        self.generations().exit_free();
                         self.set_tombstone_local(fl, t);
                     }
                     continue;
@@ -17461,7 +17572,7 @@ impl Engine {
         if self.slot_is_dead(local) || self.tombstone_blocks(eid, hlc) {
             return RemoteApply::Stale;
         }
-        self.entities.ensure_live(local);
+        self.ensure_live_slot(local);
         if !self.contents.set(local, key, data) {
             // #59: content data 領域が満杯。 panic せず拒否 + 計上。
             self.record_fault(
@@ -22756,13 +22867,23 @@ impl Engine {
 
     /// #731: 再生する自分の record の eid → 場所。 record の世代が場所の世代より新しければ (書き出す前に落ちて上げた世代が
     /// 届いていない、 念のため) 前の住人の cell を落としてから上げる。
-    fn replay_slot(&self, eid: enchudb_oplog::EntityId) -> u32 {
-        let (slot, g) = self.generations().split(enchudb_oplog::eid_local(eid));
-        if g > self.generations().get(slot) {
+    ///
+    /// `makes_live` (行を生かす record = Tie / TieNamed / TieLeaf / Content): 場所の世代が record の行より新しければ、 場所を
+    /// 「record の行の世代、 生きている」 に戻す (`Generations::restore`)。 新しい世代は WAL に届いていない (本体が WAL より先に
+    /// 届いた削除・使い回し、 または開く時の突き合わせ `reconcile_generations` が削除の完了に寄せた形): 届いていれば、 その前の
+    /// Delete も届いていて、 この record は checkpoint の手前 (再生しない)。 WAL に続く Delete があれば再生がもう一度消す。 戻さないと、
+    /// 生かした行が新しい世代の eid になる (アプリの持つ eid と食い違う)。 「死んでいる」 印は呼び手が生かす時にも落とす
+    fn replay_slot(&self, eid: enchudb_oplog::EntityId, makes_live: bool) -> u32 {
+        let gens = self.generations();
+        let (slot, g) = gens.split(enchudb_oplog::eid_local(eid));
+        let now = gens.get(slot);
+        if g > now {
             if let Some(t) = self.table_of_slot(slot) {
                 self.drop_leftover_cells(slot, t);
             }
             self.raise_generation(slot, g);
+        } else if makes_live && g < now && self.slot_is_generational(slot) {
+            gens.restore(slot, g);
         }
         slot
     }
@@ -22787,7 +22908,7 @@ impl Engine {
         match op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let hid = *himo_id as usize;
-                let local = self.replay_slot(*eid);
+                let local = self.replay_slot(*eid, true);
                 if hid < self.himos.len() {
                     // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
                     let value = match replay.vids.get(&(*value as u32)) {
@@ -22802,12 +22923,12 @@ impl Engine {
                     self.set_cell_local(local, *himo_id, value, hlc);
                 }
                 // eid 空間の整合 (live bitmap / next_local) は適用可否に依らず進める。
-                self.entities.ensure_live(local);
+                self.ensure_live_slot(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
             DecodedOp::Untie { eid, himo_id } => {
                 let hid = *himo_id as usize;
-                let local = self.replay_slot(*eid);
+                let local = self.replay_slot(*eid, false);
                 if hid < self.himos.len() {
                     self.clear_cell_local(local, *himo_id, hlc);
                 }
@@ -22816,13 +22937,14 @@ impl Engine {
                 // replay は冪等でなければならない — 同じ record を二度食っても
                 // 本体が落ちる (`apply_delete_local`)。 旧実装は同値 HLC を
                 // `set_tombstone_local` で弾いて本体を残していた。
-                let local = self.replay_slot(*eid);
+                let local = self.replay_slot(*eid, false);
                 self.apply_delete_local(local, hlc);
-                // #731: 消えた行の世代の次へ (v15)。 消す道の `live_free` は再生の間は上げない (本体の世代が先に届いていると、
-                // 今の世代 + 1 では行き過ぎる)
-                if self.generations().active() && self.slot_is_generational(local) {
+                // #731: 消えた行の世代の次へ (v15)、 「死んでいる」 印も。 消す道の `live_free` は再生の間は上げない (本体の世代が先に
+                // 届いていると、 今の世代 + 1 では行き過ぎる。 購読には消えた行の世代を渡すので、 上げるのは消した後)。 再生の途中で
+                // 落ちた像は、 次に開く時に同じ record をもう一度再生する (checkpoint は再生を書き出した後に進む)
+                if self.generations().active() && self.slot_is_generational(local) && !self.is_folded_own_slot(local) {
                     let g = self.generations().split(enchudb_oplog::eid_local(*eid)).1;
-                    self.raise_generation(local, g + 1);
+                    self.kill_generation(local, g + 1);
                 }
                 // #857: 消した行の eid も払い出し済み (Tie の record が checkpoint の手前に畳まれていても、 `next_local` を
                 // その手前に戻さない。 生きている印は下ろしたままなので、 生きている行の最大 + 1 (#117) には入らない)
@@ -22831,7 +22953,7 @@ impl Engine {
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
                 // Op::Content を emit しないので、 旧 DB の WAL 再生でのみ通る。
-                let local = self.replay_slot(*eid);
+                let local = self.replay_slot(*eid, true);
                 if !self.contents.set(local, key, data) {
                     // #59: content data 領域が満杯。 panic せず拒否 + 計上。
                     self.record_fault(
@@ -22840,12 +22962,12 @@ impl Engine {
                     );
                     return;
                 }
-                self.entities.ensure_live(local);
+                self.ensure_live_slot(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 名前で himo を解決 (無ければ定義) して set。
-                let local = self.replay_slot(*eid);
+                let local = self.replay_slot(*eid, true);
                 let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
                     // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
@@ -22855,7 +22977,7 @@ impl Engine {
                     };
                     self.set_cell_local(local, hid, value, hlc);
                 }
-                self.entities.ensure_live(local);
+                self.ensure_live_slot(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
@@ -22865,7 +22987,7 @@ impl Engine {
                 // 張り、 前の slot は空きに戻す (受信と同じ処理)。 版数のある DB は同じ HLC を弾くので二重にならない。
                 let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
-                    let slot = self.replay_slot(*eid);
+                    let slot = self.replay_slot(*eid, true);
                     let _ = self.remote_tieleaf_apply(enchudb_oplog::make_eid(enchudb_oplog::eid_peer(*eid), slot), hid, bytes, hlc);
                 }
             }
@@ -24377,17 +24499,14 @@ impl Engine {
         let version = |k: SegmentKind| matches!(k, SegmentKind::Ver(_) | SegmentKind::Tomb);
         // #841: きれいに閉じなかった後の最初の書き出し (`catch_up`) は、 印の無い segment も全部、 全域で書き出す。 全域の msync は
         // 汚れた page が無くても segment 1 つごとに時間がかかるので、 段の中で並べる (段の順は同じ: 版数は列の後)
-        // #731 (F1): 生きている印 (entities) と場所の世代 (`gen.seg`) は、 消す書き手を止めて一緒に書き出す (残りの先頭)。 消す道は
-        // 「世代を上げる → 生きている印を下ろす」 なので、 2 つの書き出しの間に消すと 「生きている、 世代は上がった」 像が届く
-        // (消した record は cut の後で失われる = 生きている行の eid が変わる)。 逆の並びでも 「死んでいる、 世代は上がっていない」
-        // (使い回した行が消えた行と同じ eid) になる。 世代を持たない DB は止めない
+        // #731 (F1): 生きている印 (entities) と場所の世代 (`gen.seg`) は残りの先頭に続けて書き出す。 消す書き手は止めない: 2 つの
+        // 書き出しの間に消すと 「生きている、 世代は上がって死んでいる印」 の像が届き、 OS が page を先に書き出せば逆の像も届く。 どちらも
+        // 開く時の突き合わせ (`reconcile_generations`、 gen.seg の 「死んでいる」 印と生きている印) が 「消す前」 か 「消した後」 に揃える
         let live_and_generations = |k: SegmentKind| matches!(k, SegmentKind::Entities | SegmentKind::Gen);
-        self.generations().freeze(|| -> io::Result<()> {
-            set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Entities))?;
-            #[cfg(feature = "crashsim")]
-            write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
-            set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))
-        })?;
+        set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Entities))?;
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
+        set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))?;
         let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k);
         if catch_up {
             set.flush_all_spread(rest)?;

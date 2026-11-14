@@ -342,6 +342,17 @@ impl Region {
         unsafe { &*(self.ptr.add(offset) as *const std::sync::atomic::AtomicU64) }
     }
 
+    /// `as_atomic_u32` の 2 byte 版 (#731 の場所ごとの世代 + 「死んでいる」 印)。
+    ///
+    /// # Panics
+    /// - `offset + 2 > len` / address が 2 byte に揃っていない
+    #[inline(always)]
+    pub fn as_atomic_u16(&self, offset: usize) -> &std::sync::atomic::AtomicU16 {
+        assert!(offset + 2 <= self.len, "atomic_u16 out of range: {} + 2 > {}", offset, self.len);
+        assert!((self.ptr as usize + offset).is_multiple_of(2), "atomic_u16 address not 2-byte aligned");
+        unsafe { &*(self.ptr.add(offset) as *const std::sync::atomic::AtomicU16) }
+    }
+
     /// mmap 上の 1 byte を `AtomicU8` として参照する (`as_atomic_u32` の u8 版)。
     /// u8 なので alignment 制約なし。 vocabulary index slot の flag (0/1/2 の CAS
     /// lock) を `&self` から atomic に触るのに使う。

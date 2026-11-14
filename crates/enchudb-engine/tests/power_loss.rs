@@ -2580,9 +2580,12 @@ fn moving_to_eid_generations_writes_the_generations_before_the_header() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// #731 (PR #885 の読み直し F1): 本体の書き出しは生きている印 (entities) を先に、 場所の世代 (`gen.seg`) を後に書き出す (間に列)。
+/// #731 (PR #885 の読み直し F1): 本体の書き出しは生きている印 (entities) を先に、 場所の世代 (`gen.seg`) を後に書き出す。
 /// その間に行を消すと 「生きている印は残り、 世代は上がった」 像になる (消す道は 世代を上げる → 印を下ろす)。 消した record は
-/// 書き出しの cut の後 = 電源断で失われる。 開くと行は生きているのに、 アプリの eid (と、 その行を指す Ref) は 「消えた行」 になる。
+/// 書き出しの cut の後 = 電源断で失われる。 前は開くと行は生きているのに、 アプリの eid (と、 その行を指す Ref) が 「消えた行」 になった。
+/// 直し (案 (a)): 消す道は世代と一緒に 「死んでいる」 印を立て、 開く時の突き合わせが 「死んでいる印のある生きている場所」 の削除を
+/// 完了させる (死が勝つ。 消した record は届いていないが、 本体に届いた削除を全部当てる = 「消した後」 の像)。 書き出しは消す書き手を
+/// 止めない (前の直し `Generations::freeze` は、 消す 1 回の最大の待ちが msync に比例して伸びた)。
 #[test]
 fn a_delete_between_the_live_bits_and_the_generations_does_not_change_a_surviving_rows_eid() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -2615,7 +2618,8 @@ fn a_delete_between_the_live_bits_and_the_generations_does_not_change_a_survivin
         let _hold = eng.hold_consumer();
         let (e2, done) = (eng.clone(), Arc::new(AtomicBool::new(false)));
         let done2 = done.clone();
-        // 生きている印を書き出した後・世代を書き出す前に、 別の thread で消す (止められていれば待たせたまま書き出しを進める)
+        // 生きている印を書き出した後・世代を書き出す前に、 別の thread で消す (消す書き手は書き出しを待たない。 待つなら 300 ms で
+        // 書き出しを進め、 下の前提 (突き合わせが戻した場所が 1 つ) で落ちる)
         let deleter: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
         let deleter2 = deleter.clone();
         write_out_hook::set(Some(Arc::new(move |p: Phase| {
@@ -2639,12 +2643,88 @@ fn a_delete_between_the_live_bits_and_the_generations_does_not_change_a_survivin
     crashsim::stop();
     let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.get(keep, "t.v"), Some(4), "前提: 書き出した値は届いている");
-    // 場所が生きていれば、 その eid は r のまま (消した record は届かない像。 列の cell の一部が消えた像はありうる = 前からの、 書き出しと
-    // 重なった削除の形)
+    assert_eq!(eng.generation_repairs().0, 1, "前提: 世代と死んでいる印だけ届いた (生きている印は消す前の) 場所が 1 つ");
+    // 場所が生きていれば、 その eid は r のまま (前は 「生きている、 世代だけ上がった」 で、 生きている行の eid が変わった)。 突き合わせは
+    // 削除を完了させる。 checkpoint が #870 で止まっていれば r の Tie を再生して r の世代に戻す (消した record は届いていない = WAL では
+    // r は生きている)。 どちらでも、 場所を使い回す行は r と違う eid
     let s = eng.eid_slot(r);
     let now = eng.slot_eid(s);
     assert!(!eng.is_live(now) || now == r, "消した record の届かなかった像で、 生きている行の eid が変わった ({r:#x} → {now:#x}、 世代だけ届いた)");
-    assert!(eng.is_live(r), "前提: 消した record は届いていない (行は生きている)");
+    if !eng.is_live(r) {
+        let n = eng.entity_in("t").unwrap();
+        assert_eq!(eng.eid_slot(n), s, "前提: 消した場所を使い回す");
+        assert_ne!(n, r, "削除を完了させた場所を、 消えた行の eid で使い回した");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #731 F1 (案 (a)) の突き合わせの規則: 削除が書き出し済みの場所 (「次の世代 g + 1、 死んでいる」) を、 本体の書き出しの途中
+/// (生きている印を書き出す前) に使い回して落ちる。 像は 「生きている印は使い回しの後 (生きている)、 gen.seg は前の書き出し
+/// (g + 1、 死んでいる)」 で、 使い回しの record は cut の後 = 届かない。 「gen.seg だけ死 = 削除が届いていない → 世代を戻す」
+/// と読むと、 消えた行 (世代 g、 削除は checkpoint を越えた) の eid が生きている行になる。 死が勝つ規則は場所を死なせる。
+#[test]
+fn a_reuse_torn_between_the_live_bits_and_the_generations_does_not_bring_back_a_deleted_eid() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("gen_torn_reuse");
+    let live = root.join("live");
+    let img = root.join("img");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let (r, n) = {
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, "t.v", 1u32);
+        let keep = eng.entity_in("t").unwrap();
+        eng.tie_to(keep, "t.v", 2u32);
+        eng.delete(a);
+        let r = eng.entity_in("t").unwrap(); // v15 に移って a の場所を使い回す (世代 1)
+        eng.tie_to(r, "t.v", 3u32);
+        assert_ne!(r, a, "前提: v15");
+        eng.delete(r); // 場所は 「世代 2、 死んでいる」
+        eng.oplog_sync().unwrap(); // r の削除は書き出し済み (checkpoint を越えた)
+        let _hold = eng.hold_consumer();
+        let (e2, made) = (eng.clone(), Arc::new(std::sync::Mutex::new(None)));
+        let made2 = made.clone();
+        let (l, img2) = (live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::Opened && made2.lock().unwrap().is_none() {
+                // 生きている印を書き出す前に使い回す (record は cut の後)
+                let n = e2.entity_in("t").unwrap();
+                e2.tie_to(n, "t.v", 5u32);
+                *made2.lock().unwrap() = Some(n);
+            }
+            if p == Phase::BeforeGenerations {
+                crashsim::capture(&l, &img2, Mode::Lost).unwrap();
+            }
+        })));
+        eng.tie_to(keep, "t.v", 4u32); // 書き出す物を作る
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        let n = made.lock().unwrap().expect("前提: 書き出しの途中で使い回した");
+        assert_eq!(eng.eid_slot(n), eng.eid_slot(r), "前提: r の場所を使い回した");
+        (r, n)
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.generation_repairs(), (1, 0), "前提: 生きている印は使い回しの後、 gen.seg は死んでいる像");
+    assert!(!eng.is_live(r), "削除の書き出し済みの行 {r:#x} の eid が、 落ちた後に生きている");
+    assert!(!eng.is_live(n), "前提: 使い回しの record は届いていない");
+    let s = eng.eid_slot(r);
+    assert!(!eng.is_live(eng.slot_eid(s)), "使い回しの record の届かなかった場所が生きている");
+    // 次の使い回しは、 削除の届いた r とも a とも違う。 届かなかった使い回しの eid (n) は、 再生が r の record で場所を r の世代に
+    // 戻すともう一度出うる (位置から払い出した行の record が届かなかった時と同じ = 落ちる前にアプリへ渡った、 WAL に届いていない eid)
+    let m = eng.entity_in("t").unwrap();
+    assert_eq!(eng.eid_slot(m), s, "前提: 同じ場所を使い回す");
+    assert_ne!(m, r, "落ちた後の使い回しが削除の届いた行の eid ({m:#x}) を渡した");
     let _ = std::fs::remove_dir_all(&root);
 }
 

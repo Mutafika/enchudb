@@ -6,30 +6,55 @@
 //! - 場所の bit `S` = max(24, max_entities の bit 数) を、 最初に場所を使い回す時に header (`H_SLOT_BITS`) に焼く。 世代の
 //!   bit `G` = 32 − S。 世代は 0..=2^G − 2。 2^G − 1 は 「引退した場所」 の印 (世代を使い切った場所は二度と渡さない)。
 //!   いちばん上の世代を使わないので、 local の最大は 2^32 − 2^S − 1 で、 cell の空の印 (u32::MAX) や写像の番兵に届かない
-//! - 世代は場所ごとに 1 B (`gen.seg` = 先頭 [`GEN_HEADER`] byte の header + 1 B / 場所)。 header には表ごとの 「世代 > 0 の場所が
-//!   ある」 印 (出口で、 使い回しの無い表は世代を読まない)
+//! - 場所ごとに 2 B (`gen.seg` = 先頭 [`GEN_HEADER`] byte の header + 2 B / 場所): 下の byte = 世代、 上の byte の bit 0 = 「死んで
+//!   いる」 印 ([`DEAD`])。 header には表ごとの 「世代 > 0 の場所がある」 印 (出口で、 使い回しの無い表は世代を読まない) と page
+//!   ごとの印
 //! - 上げる時: 世代を持たない DB (file version 14 以下) は最初の使い回しで v15 に移る ([`crate::engine::Engine`] の
-//!   `move_to_generations`)。 その時に、 世代を持つ表の死んだ場所 (v14 の間に消した場所) を全部 1 にする。 v15 では行を消す時に
-//!   上げる (死んだ場所の値 = 次の住人の世代)。 使い回す時・位置から払い出す時は今の値で渡す
+//!   `move_to_generations`)。 その時に、 世代を持つ表の死んだ場所 (v14 の間に消した場所) を全部 「世代 1、 死んでいる」 にする。
+//!   v15 では行を消す時に上げる (死んだ場所の値 = 次の住人の世代)。 使い回す時・位置から払い出す時は今の値で渡す
 //! - 予約の表 (`_` で始まる、 `_sync_ops` の ring など) は世代を持たない (0 のまま使い回す)
+//!
+//! ## 生きている印 (entities) と世代 (gen.seg) は別の segment (PR #885 の読み直し F1)
+//!
+//! 本体の書き出しは 2 つを別々に書き出し、 OS も page を勝手な順で先に書き出す。 電源断の像では、 消す道の 2 つの書き込み (世代を
+//! 上げる / 生きている印を下ろす) の片方だけが届きうる。 消す書き手を止めずに像を揃えるため、 世代と同じ 2 B に 「死んでいる」 印を置く:
+//!
+//! - 消す: 印と世代 (+1) を **1 回の store** で書いてから ([`Generations::kill`])、 生きている印を下ろす
+//! - 使い回す / 位置から払い出す / 再生や受信で生かす: 印を落としてから ([`Generations::revive`]) 生きている印を立てる
+//! - きれいに閉じなかった後に開いた時 (`Engine::reconcile_generations`、 WAL の再生の前): **死が勝つ**。 gen.seg だけ死んでいる
+//!   (生きている印は残る) 場所も、 entities だけ死んでいる (印なし) 場所も、 削除を完了させる (cell を落として生きている印を下ろす /
+//!   世代を上げて印を立てる)。 生き返らせる向きは無いので、 どの像でも消えた行の eid は戻らない。 「gen.seg だけ死 = 削除が届いていない
+//!   → 世代を戻す」 にすると、 使い回しの像 (生きている印は使い回しの後、 gen.seg は前の削除の 「g + 1、 死んでいる」 のまま) を
+//!   削除の途中と読み違え、 消えた行 (g) の eid を生きている行にする。 本体の書き出しは entities → gen.seg の順なので、 間で使い回して
+//!   落ちれば OS の先行書き出しなしで出る (`tests/power_loss.rs` の F1 の試験)。 完了させる時は世代をもう 1 つ上げる (生きている
+//!   印が使い回しの物なら、 その世代の eid はアプリに渡っている)。 失うのは WAL に届いていない操作だけ (届いていれば再生がやり直す:
+//!   Delete は冪等、 行を生かす record は場所をその行の世代に戻す [`Generations::restore`])
+//! - 順の model は `tests/loom_eid_generation_move.rs`
+//!
+//! 前の形 (本体の書き出しが 2 つを書き出す間、 消す書き手を止める) は、 消す 1 回の最大の待ちが msync に比例して伸びた
+//! (msync 50 ms で 363〜366 ms)。
 
 use crate::region::Region;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 /// [`Generations::gate`] の 「消す時に上げる」 印 (最上位 bit)。 下位 32 bit = 消している書き手 (`enter_free` 〜 `exit_free`) の数。
 const GATE_ON: u64 = 1 << 63;
-/// 本体の書き出しが生きている印 (entities) と場所の世代 (`gen.seg`) を書き出している間 (F1)。 消す書き手は入らずに待つ。
-const GATE_FREEZE: u64 = 1 << 62;
 const GATE_COUNT: u64 = u32::MAX as u64;
+
+/// 場所ごとの 2 B の 「死んでいる」 印 (上の byte の bit 0)。 下の byte が世代。
+const DEAD: u16 = 1 << 8;
+const GEN_MASK: u16 = 0xFF;
 
 /// `gen.seg` の先頭の header の長さ。 [`MAGIC`] / 場所の bit / 表ごとの印 (TableId は u16 = 8 KiB) / page ごとの印。
 pub(crate) const GEN_HEADER: usize = 16 * 1024;
-const MAGIC: [u8; 4] = *b"GEN1";
+/// 場所ごとの値が 2 B (世代 + 「死んでいる」 印) の形。 1 B だった形 (`GEN1`、 release していない) は読まない。
+const MAGIC: [u8; 4] = *b"GEN2";
 const OFF_BITS: usize = 4;
 const OFF_TABLES: usize = 64;
 /// page (2^[`PAGE_SHIFT`] 場所) ごとの 「世代 > 0 の場所がある」 印。 header の残り (8128 B = 65024 page = 2^29 場所まで)。 印の
-/// 無い page の場所は世代を読まない (出口・照合で、 使い回しの無い所は gen.seg の 1 B / 場所 を読まない)。 印の範囲の外の場所は
-/// いつも読む。
+/// 無い page の場所は世代を読まない (出口・照合で、 使い回しの無い所は gen.seg の 2 B / 場所 を読まない)。 印の範囲の外の場所は
+/// いつも読む。 「死んでいる」 印は世代 > 0 と一緒にしか立たない (`kill` は page の印を先に立てる) ので、 印の無い page には死んでいる
+/// 印も無い。
 const OFF_PAGES: usize = OFF_TABLES + 8 * 1024;
 const PAGE_SHIFT: u32 = 13;
 const PAGES: u32 = ((GEN_HEADER - OFF_PAGES) * 8) as u32;
@@ -47,9 +72,15 @@ pub(crate) fn slot_bits_for(max_entities: u32) -> u32 {
     need.max(MIN_SLOT_BITS)
 }
 
-/// `gen.seg` の大きさ (header + 1 B / 場所)。
+/// `gen.seg` の大きさ (header + 2 B / 場所)。
 pub(crate) fn segment_len(entities: u32) -> usize {
-    GEN_HEADER + entities as usize
+    GEN_HEADER + 2 * entities as usize
+}
+
+/// 場所の 2 B の位置。
+#[inline]
+fn slot_off(slot: u32) -> usize {
+    GEN_HEADER + 2 * slot as usize
 }
 
 pub(crate) struct Generations {
@@ -64,13 +95,13 @@ pub(crate) struct Generations {
     gate: Gate,
     /// v15 に移る手順 (`Engine::move_to_generations`) を 1 本に並べる。
     pub(crate) move_lock: std::sync::Mutex<()>,
-    /// 本体の書き出しの 「生きている印と世代を一緒に書き出す」 段 ([`Self::freeze`]) を 1 本に並べる (書き出しは重なる)。
-    freeze_lock: std::sync::Mutex<()>,
     /// WAL の再生中 (`Engine::apply_oplog_op`)。 消す道が場所の世代を上げない (再生が record の世代で上げる)。
     pub(crate) replaying: std::sync::atomic::AtomicBool,
     /// v15 に移り終えた (`Engine::move_to_generations` の最後 / v15 の DB を開いた時)。 `active` (照合を始めた) とは別: 移る途中
     /// (照合は始めたが、 v14 の間に消した場所をまだ上げていない) に使い回しを始めると、 世代 0 の場所を前と同じ eid で渡す。
     moved: std::sync::atomic::AtomicBool,
+    /// きれいに閉じなかった後に開いた時に削除を完了させた場所の数 (観測・試験用): 0 = gen.seg だけ死んでいた、 1 = entities だけ。
+    repaired: [AtomicU32; 2],
 }
 
 impl Generations {
@@ -80,9 +111,9 @@ impl Generations {
             region: std::sync::OnceLock::new(),
             gate: Gate(AtomicU64::new(0)),
             move_lock: std::sync::Mutex::new(()),
-            freeze_lock: std::sync::Mutex::new(()),
             replaying: std::sync::atomic::AtomicBool::new(false),
             moved: std::sync::atomic::AtomicBool::new(false),
+            repaired: [AtomicU32::new(0), AtomicU32::new(0)],
         }
     }
 
@@ -135,36 +166,10 @@ impl Generations {
         self.gate.0.fetch_or(GATE_ON, Ordering::AcqRel);
     }
 
-    /// 消す道の入口: (消す時に上げるか, 出る時に [`Self::exit_free`] を呼ぶか)。 世代を持つ DB (v15) では、 本体の書き出しが
-    /// 生きている印と世代を書き出している間 ([`Self::freeze`]) は入らずに待つ (F1: 間で消すと、 生きている印は消す前・世代は消した
-    /// 後の像が disk に届く)。 世代を持たない DB (v14) は待たない (世代を上げないので像は揃っている)。
+    /// 消す道の入口: 消す時に上げるか (v15 か)。 出る時に [`Self::exit_free`] を必ず呼ぶ。
     #[inline]
-    pub(crate) fn enter_free(&self) -> (bool, bool) {
-        loop {
-            let v = self.gate.0.fetch_add(1, Ordering::AcqRel);
-            if v & GATE_FREEZE == 0 || v & GATE_ON == 0 {
-                return (v & GATE_ON != 0, true);
-            }
-            self.gate.0.fetch_sub(1, Ordering::AcqRel);
-            while self.gate.0.load(Ordering::Acquire) & GATE_FREEZE != 0 {
-                std::thread::yield_now();
-            }
-        }
-    }
-
-    /// 本体の書き出しの 「生きている印 (entities) と世代 (`gen.seg`) を書き出す」 段 `f` を、 消す書き手を止めて走らせる。 中に居る
-    /// 書き手が出るのを待ってから書き出す = 書き出す 2 つの像は、 どの削除についても 「両方前」 か 「両方後」。 世代を持たない DB は
-    /// 止めない。
-    pub(crate) fn freeze<R>(&self, f: impl FnOnce() -> R) -> R {
-        if !self.active() {
-            return f();
-        }
-        let _one = self.freeze_lock.lock().unwrap_or_else(|p| p.into_inner());
-        self.gate.0.fetch_or(GATE_FREEZE, Ordering::AcqRel);
-        self.wait_frees();
-        let r = f();
-        self.gate.0.fetch_and(!GATE_FREEZE, Ordering::AcqRel);
-        r
+    pub(crate) fn enter_free(&self) -> bool {
+        self.gate.0.fetch_add(1, Ordering::AcqRel) & GATE_ON != 0
     }
 
     /// 消す道の出口 (生きている印を下ろした後)。
@@ -208,6 +213,13 @@ impl Generations {
         read_gen(r, slot)
     }
 
+    /// 場所に 「死んでいる」 印が立っているか (消す道が世代と一緒に立て、 使い回す時に落とす)。
+    #[inline]
+    pub(crate) fn is_dead(&self, slot: u32) -> bool {
+        let Some(r) = self.region.get() else { return false };
+        read_raw(r, slot) & DEAD != 0
+    }
+
     /// 場所 → 今の世代の local。
     #[inline]
     pub(crate) fn local(&self, slot: u32) -> u32 {
@@ -230,6 +242,18 @@ impl Generations {
         self.region.get().is_none_or(|r| page_marked(r, slot))
     }
 
+    /// 場所 `slot` に世代 > 0 がありうるか (page の印、 世代を持たない DB は false)。 開く時の突き合わせが印の無い page を飛ばす。
+    #[inline]
+    pub(crate) fn may_have_generation(&self, slot: u32) -> bool {
+        self.region.get().is_some_and(|r| page_marked(r, slot))
+    }
+
+    /// 場所 `slot` の次の page の先頭の場所。
+    #[inline]
+    pub(crate) fn next_page_start(&self, slot: u32) -> u32 {
+        ((((slot >> PAGE_SHIFT) as u64) + 1) << PAGE_SHIFT).min(u32::MAX as u64) as u32
+    }
+
     fn mark_page(&self, r: &Region, slot: u32) {
         let p = slot >> PAGE_SHIFT;
         if p >= PAGES {
@@ -243,25 +267,42 @@ impl Generations {
         }
     }
 
-    /// きれいに閉じなかった後に開いた時: 表と page の印を、 場所ごとの世代から立て直す。 印と世代の byte は gen.seg の別の page なので、
-    /// 電源断で世代の byte だけ届いた像がありうる (印が無いと、 出口がその場所の世代を読まず、 使い回した行に前の住人の eid を渡す)。
-    /// 印は立てるだけ (余分な印は読む手間が増えるだけ)。 `table_of` = 場所の表。
-    pub(crate) fn heal_marks(&self, table_of: impl Fn(u32) -> Option<u16>) {
-        let Some(r) = self.region.get() else { return };
-        let len = r.committed_len();
+    /// きれいに閉じなかった後に開いた時の 1 つ目のなめ (gen.seg の commit 済みの全部): 世代 > 0 の場所の page と表の印を立て直し、
+    /// 「死んでいる」 印が立っているのに生きている場所を返す (呼び手が削除を完了させる)。 印と世代は gen.seg の別の page なので、 世代
+    /// だけ届いた像がありうる (印が無いと、 出口がその場所の世代を読まず、 使い回した行に前の住人の eid を渡す)。 印は立てるだけ (余分な
+    /// 印は読む手間が増えるだけ)。 `table_of` = 場所の表、 `is_live` = 生きている印。 開く道 (1 本の thread) からだけ呼ぶ。
+    pub(crate) fn heal(&self, is_live: impl Fn(u32) -> bool, mut table_of: impl FnMut(u32) -> Option<u16>) -> Vec<u32> {
+        let Some(r) = self.region.get() else { return Vec::new() };
+        let len = r.committed_len().min(r.len());
         if len <= GEN_HEADER {
-            return;
+            return Vec::new();
         }
-        let s = r.slice();
-        for (i, &g) in s[GEN_HEADER..len].iter().enumerate() {
-            if g != 0 {
-                let slot = i as u32;
-                self.mark_page(r, slot);
-                if let Some(t) = table_of(slot) {
-                    self.mark_table(t);
-                }
+        let mut dead_but_live = Vec::new();
+        let n = ((len - GEN_HEADER) / 2) as u32;
+        for slot in 0..n {
+            let v = r.as_atomic_u16(slot_off(slot)).load(Ordering::Relaxed);
+            if v == 0 {
+                continue;
+            }
+            self.mark_page(r, slot);
+            if let Some(t) = table_of(slot) {
+                self.mark_table(t);
+            }
+            if v & DEAD != 0 && is_live(slot) {
+                dead_but_live.push(slot);
             }
         }
+        dead_but_live
+    }
+
+    /// 開いた時に削除を完了させた場所を数える (観測・試験用)。 `which` 0 = gen.seg だけ死んでいた、 1 = entities だけ死んでいた。
+    pub(crate) fn note_repaired(&self, which: usize, n: u32) {
+        self.repaired[which].fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// きれいに閉じなかった後に開いた時に削除を完了させた場所の数 (gen.seg だけ死んでいた, entities だけ死んでいた)。
+    pub(crate) fn repaired(&self) -> (u32, u32) {
+        (self.repaired[0].load(Ordering::Relaxed), self.repaired[1].load(Ordering::Relaxed))
     }
 
     /// 使える世代の最大 (2^G − 2)。 G ≤ 1 の DB は 0 = 使い回さない。
@@ -285,20 +326,91 @@ impl Generations {
         self.active() && self.get(slot) > self.max_gen()
     }
 
-    /// 場所の世代を `g` 以上にする (`g` が使える世代を越えれば引退の印)。 上げたか。 書けなければ (ディスクの空き) Err。
-    pub(crate) fn raise(&self, slot: u32, g: u32) -> std::io::Result<bool> {
-        let Some(r) = self.region.get() else { return Ok(false) };
-        let g = g.min(self.retired_mark());
-        let off = GEN_HEADER + slot as usize;
-        if off >= r.len() || self.get(slot) >= g {
-            return Ok(false);
+    /// 場所の 2 B を書く準備 (commit を伸ばし、 page の印を先に立てる)。 書く場所の atomic。 範囲の外は None。
+    fn cell_for_write<'r>(&self, r: &'r Region, slot: u32) -> std::io::Result<Option<&'r AtomicU16>> {
+        let off = slot_off(slot);
+        if off + 2 > r.len() {
+            return Ok(None);
         }
-        r.ensure_committed(off + 1)?;
+        // page の場所を全部 commit する (印の立った page の場所は、 commit を確かめずに読む = `read_raw`)
+        let page_end = slot_off(((slot >> PAGE_SHIFT) + 1) << PAGE_SHIFT).min(r.len());
+        r.ensure_committed(page_end.max(off + 2))?;
         // page の印を先に (印の無い page の場所は世代を読まない。 印 → 世代 の順なら、 印を読まずに 0 と答えた読みは上げる前の読み)
         self.mark_page(r, slot);
-        r.as_atomic_u8(off).fetch_max(g as u8, Ordering::AcqRel);
-        r.mark_dirty(off, 1);
-        Ok(true)
+        Ok(Some(r.as_atomic_u16(off)))
+    }
+
+    /// 場所の世代を `g` 以上にする (`g` が使える世代を越えれば引退の印)。 「死んでいる」 印は変えない。 上げたか。 書けなければ
+    /// (ディスクの空き) Err。
+    pub(crate) fn raise(&self, slot: u32, g: u32) -> std::io::Result<bool> {
+        let Some(r) = self.region.get() else { return Ok(false) };
+        let g = g.min(self.retired_mark()) as u16;
+        if self.get(slot) >= g as u32 {
+            return Ok(false);
+        }
+        let Some(c) = self.cell_for_write(r, slot)? else { return Ok(false) };
+        let raised = c
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| (v & GEN_MASK < g).then_some((v & !GEN_MASK) | g))
+            .is_ok();
+        if raised {
+            r.mark_dirty(slot_off(slot), 2);
+        }
+        Ok(raised)
+    }
+
+    /// 行が消える: 世代を `g` 以上にし、 「死んでいる」 印を立てる (1 回の store)。 消す道はこの後に生きている印を下ろす。 書けなければ
+    /// (ディスクの空き) Err。
+    pub(crate) fn kill(&self, slot: u32, g: u32) -> std::io::Result<()> {
+        let Some(r) = self.region.get() else { return Ok(()) };
+        let g = g.min(self.retired_mark()) as u16;
+        let Some(c) = self.cell_for_write(r, slot)? else { return Ok(()) };
+        let _ = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            let new = (v & !GEN_MASK) | (v & GEN_MASK).max(g) | DEAD;
+            (new != v).then_some(new)
+        });
+        r.mark_dirty(slot_off(slot), 2);
+        Ok(())
+    }
+
+    /// 場所を生かす前に 「死んでいる」 印を落とす (世代は変えない)。 生きている印を立てる前に呼ぶ (逆の順の像 = 生きている・死んで
+    /// いる は、 開く時に削除が届いていないと読まれて世代が戻り、 新しい行が消えた行の eid になる)。
+    #[inline]
+    pub(crate) fn revive(&self, slot: u32) {
+        let Some(r) = self.region.get() else { return };
+        if !page_marked(r, slot) {
+            return;
+        }
+        let off = slot_off(slot);
+        if off + 2 > r.len() || !r.is_committed(off + 2) {
+            return;
+        }
+        let c = r.as_atomic_u16(off);
+        if c.load(Ordering::Acquire) & DEAD != 0 {
+            c.fetch_and(!DEAD, Ordering::AcqRel);
+            r.mark_dirty(off, 2);
+        }
+    }
+
+    /// WAL の再生が行 (世代 `g`) を生かす record を当てる時、 場所の世代が `g` より新しい (本体が WAL より先 = その後の削除や使い回しは
+    /// WAL に届いていない) なら、 場所を 「世代 `g`、 生きている」 に戻す (`Engine::replay_slot`)。 新しい世代の行は WAL に届いていない
+    /// (届いていれば、 その前の Delete(g) も届いて、 この record は checkpoint の手前 = 再生しない)。 戻したか。
+    pub(crate) fn restore(&self, slot: u32, g: u32) -> bool {
+        let Some(r) = self.region.get() else { return false };
+        let off = slot_off(slot);
+        if off + 2 > r.len() || !r.is_committed(off + 2) {
+            return false;
+        }
+        let g = g.min(self.retired_mark()) as u16;
+        let done = r
+            .as_atomic_u16(off)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v & GEN_MASK > g).then_some((v & !(GEN_MASK | DEAD)) | g)
+            })
+            .is_ok();
+        if done {
+            r.mark_dirty(off, 2);
+        }
+        done
     }
 
     /// 表 `tid` に世代 > 0 の場所があるか (出口で世代を読むか)。
@@ -326,16 +438,23 @@ fn page_marked(r: &Region, slot: u32) -> bool {
     p >= PAGES || r.as_atomic_u8(OFF_PAGES + (p / 8) as usize).load(Ordering::Acquire) & (1 << (p % 8)) != 0
 }
 
+/// 場所の 2 B (印の無い page / 範囲の外は 0)。
 #[inline]
-fn read_gen(r: &Region, slot: u32) -> u32 {
+fn read_raw(r: &Region, slot: u32) -> u16 {
     if !page_marked(r, slot) {
         return 0;
     }
-    let off = GEN_HEADER + slot as usize;
-    if off >= r.len() {
+    let off = slot_off(slot);
+    // 印の範囲の外の場所 (2^29 以上、 page の印が無い = commit を page ごとに揃えていない) は commit を確かめる
+    if off + 2 > r.len() || (slot >> PAGE_SHIFT >= PAGES && !r.is_committed(off + 2)) {
         return 0;
     }
-    r.as_atomic_u8(off).load(Ordering::Acquire) as u32
+    r.as_atomic_u16(off).load(Ordering::Acquire)
+}
+
+#[inline]
+fn read_gen(r: &Region, slot: u32) -> u32 {
+    (read_raw(r, slot) & GEN_MASK) as u32
 }
 
 /// 場所 → 今の世代の local の写し ([`Generations::reader`])。 場所の bit と region を 1 回読んだ後は、 page の印と世代の byte だけ読む。
@@ -388,6 +507,15 @@ fn any_page_marked(r: &Region, lo: u32, hi: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// 試験用の region (u16 の atomic が揃う並びの buffer)。
+    fn buffer(bytes: usize) -> Vec<u64> {
+        vec![0u64; bytes.div_ceil(8)]
+    }
+
+    fn region(v: &mut [u64]) -> Region {
+        unsafe { Region::new(v.as_mut_ptr() as *mut u8, v.len() * 8) }
+    }
+
     #[test]
     fn slot_bits_cover_max_entities() {
         assert_eq!(slot_bits_for(1), 24);
@@ -399,10 +527,9 @@ mod tests {
 
     #[test]
     fn the_top_local_stays_below_the_sentinels() {
-        let mut v = vec![0u8; GEN_HEADER + 16];
+        let mut v = buffer(segment_len(16));
         let g = Generations::off();
-        let r = unsafe { Region::new(v.as_mut_ptr(), v.len()) };
-        g.prepare(r, 24).unwrap();
+        g.prepare(region(&mut v), 24).unwrap();
         g.start(24);
         assert_eq!(g.max_gen(), 254);
         assert_eq!(g.retired_mark(), 255);
@@ -416,24 +543,60 @@ mod tests {
         assert!(g.retired(3), "使える世代を越えたら引退");
     }
 
+    /// 消す (印と世代を 1 回で) → 使い回す (印だけ落とす) → 再生が古い行を生かす (その世代に戻す)。
+    #[test]
+    fn kill_revive_and_restore_move_the_mark_with_the_generation() {
+        let mut v = buffer(segment_len(16));
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24).unwrap();
+        g.start(24);
+        g.kill(5, 1).unwrap();
+        assert_eq!((g.get(5), g.is_dead(5)), (1, true), "消す時は世代と印を一緒に");
+        g.revive(5);
+        assert_eq!((g.get(5), g.is_dead(5)), (1, false), "使い回す時は印だけ落とす");
+        g.kill(5, 3).unwrap();
+        assert!(!g.restore(5, 3), "同じ世代には戻さない");
+        assert!(g.restore(5, 2));
+        assert_eq!((g.get(5), g.is_dead(5)), (2, false), "再生した行の世代に戻して生かす");
+        g.kill(5, 1).unwrap();
+        assert_eq!((g.get(5), g.is_dead(5)), (2, true), "世代は下げない (印だけ立てる)");
+        g.kill(7, 300).unwrap();
+        assert!(g.retired(7) && g.is_dead(7), "使い切った場所は引退の印 + 死んでいる");
+    }
+
     #[test]
     fn a_page_without_a_raised_slot_reads_generation_zero_without_its_byte() {
-        let mut v = vec![0u8; GEN_HEADER + (3 << PAGE_SHIFT)];
+        let mut v = buffer(segment_len(3 << PAGE_SHIFT));
         let g = Generations::off();
-        let r = unsafe { Region::new(v.as_mut_ptr(), v.len()) };
-        g.prepare(r, 24).unwrap();
+        g.prepare(region(&mut v), 24).unwrap();
         g.start(24);
         let far = (2 << PAGE_SHIFT) + 5;
         assert!(g.raise(far, 1).unwrap());
         assert!(g.page_has(far) && !g.page_has(5), "上げた場所の page だけに印");
-        // 印の無い page の byte は読まない (書き込みは試験のため直接)
-        unsafe { *v.as_mut_ptr().add(GEN_HEADER + 5) = 7 };
+        // 印の無い page の値は読まない (書き込みは試験のため直接)
+        let base = v.as_mut_ptr() as *mut u8;
+        unsafe { *base.add(slot_off(5)) = 7 };
         assert_eq!(g.get(5), 0, "印の無い page の世代の byte を読んだ");
         assert_eq!(g.local(far), (1 << 24) | far);
-        // 印を消した像 (電源断で世代の byte だけ届いた) は heal_marks で立て直す
-        unsafe { *v.as_mut_ptr().add(OFF_PAGES + 0) = 0 };
-        g.heal_marks(|_| None);
+        // 印を消した像 (電源断で世代の byte だけ届いた) は heal で立て直す
+        unsafe { *base.add(OFF_PAGES) = 0 };
+        g.heal(|_| false, |_| None);
         assert!(g.page_has(5), "世代の byte から page の印を立て直さない");
         assert_eq!(g.get(5), 7);
+    }
+
+    /// 開く時の突き合わせの 1 つ目: 死んでいる印のある生きている場所 (削除の 印と世代 だけ届いた像 / 使い回しの生きている印だけ届いた像)
+    /// を返す (呼び手が削除を完了させる)。 死んでいる場所は返さない。
+    #[test]
+    fn heal_reports_a_live_slot_with_the_dead_mark() {
+        let mut v = buffer(segment_len(16));
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24).unwrap();
+        g.start(24);
+        g.raise(3, 2).unwrap();
+        g.kill(3, 3).unwrap(); // 世代 2 の行を消す → 3 + 死んでいる (生きている印は下ろす前)
+        g.kill(4, 2).unwrap(); // 世代 1 の行を消した (生きている印も下りた)
+        assert_eq!(g.heal(|s| s == 3, |_| None), vec![3]);
+        assert_eq!((g.get(3), g.is_dead(3)), (3, true), "heal は世代を変えない");
     }
 }

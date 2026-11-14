@@ -192,9 +192,15 @@ impl EntitySet {
     /// (`Engine::clear_cell_versions`)。 monotonic 払い出し (= 新品 slot) では
     /// 消す物が無いので、 hot path に消去コストを持ち込まないための戻り値。
     pub fn allocate_tracked(&self) -> Option<(u32, bool)> {
+        self.allocate_tracked_with(|_| {})
+    }
+
+    /// `allocate_tracked` + 生きている印を立てる直前に `before(slot)` を呼ぶ (#731: 場所の 「死んでいる」 印を先に落とす)。
+    pub fn allocate_tracked_with(&self, before: impl Fn(u32)) -> Option<(u32, bool)> {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
         let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
         if eid < self.max_entities() {
+            before(eid);
             self.set_bit(eid, true);
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
             // issue6 (perf 退化対策): writer hot path から mark_dirty を撤廃。
@@ -204,14 +210,14 @@ impl EntitySet {
         }
         // 上限到達 → fetch_addを巻き戻してfree stackから再利用
         self.next_eid_atomic().fetch_sub(1, Ordering::Relaxed);
-        self.allocate_from_free_stack().map(|eid| (eid, true))
+        self.allocate_from_free_stack(before).map(|eid| (eid, true))
     }
 
     /// free stack から pop。上限到達時のみ呼ばれる。
     /// #77-H7: `free_lock` で push と直列化 (旧 CAS pop は push 側の
     /// 「slot 書き → count 書き」非 atomic 複合と混ざると、 eid 未書き込みの
     /// slot を読み得た)。
-    fn allocate_from_free_stack(&self) -> Option<u32> {
+    fn allocate_from_free_stack(&self, before: impl Fn(u32)) -> Option<u32> {
         let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mm = self.region.slice();
         let free_count_off = self.free_offset;
@@ -224,6 +230,7 @@ impl EntitySet {
         let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
         let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
         self.region.write_at(free_count_off, &(fc - 1).to_le_bytes());
+        before(eid);
         self.set_bit(eid, true);
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
