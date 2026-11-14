@@ -6715,6 +6715,8 @@ impl Engine {
         // oplog recover 済 entity は apply_oplog_op が別途 advance するので二重でも
         // monotone (max) なため問題ない。
         eng.reconcile_next_local_from_bitmap();
+        // #856: sync の ring は、 sidecar の値によらず 「払い出し切った ring」 として開く (0.37.4 以前の sidecar は実際の値)
+        eng.exhaust_sync_ring();
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
         // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
@@ -21409,6 +21411,20 @@ impl Engine {
     /// に残る「範囲内 max live eid + 1」まで next_local を前進させ、 生きた eid の
     /// 再払出を防ぐ。 `next_local` は RAM の AtomicU32 (mmap 非依存) なので readonly
     /// open でも安全 (disk は触らない)。 anonymous / reserved も含め全 table を見る。
+    /// #856: 開いた sync の ring (`_sync_ops`) の `next_local` を枠まで進める = 以後の払い出しは、 生きていない slot を拾い、
+    /// 前の住人の版数と tombstone を落としてから渡す道 ([`Self::rebuild_free_locals`] → `clear_cell_versions`) だけを通る。
+    ///
+    /// ring の行は相手の ack で消える (tombstone が立つ)。 sidecar の `next_local` が古い (bridge の行は WAL に載らず、 行を
+    /// 置いた後に `tables` を書き直す周が無い) まま落ちると、 開いた `next_local` は生きている行の最大 + 1 までしか戻らず、
+    /// 次の bridge が tombstone の付いた slot を、 版数を落とさない道 (`fetch_add`) で払い出した。 その行は、 もう一度
+    /// 開いた時に 「途中で切れた削除」 と読まれて消えた = まだ配っていない record が黙って消える。 今の sidecar はいつも枠を
+    /// 置く ([`persisted_next_local`]) が、 0.37.4 以前が残した sidecar は実際の値なので、 開く側でも進める。
+    fn exhaust_sync_ring(&self) {
+        for t in self.tables.iter().filter(|t| is_sync_ring_table(&t.name)) {
+            t.next_local.fetch_max(t.capacity(), std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
     fn reconcile_next_local_from_bitmap(&self) {
         for i in 0..self.tables.len() {
             // extent は払出順なので後ろから見て最初に live が居る所が最大 local
