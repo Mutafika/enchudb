@@ -773,6 +773,10 @@ pub struct StateBatch {
 #[derive(Default, Clone)]
 pub struct InMemoryTransport {
     inner: Arc<Mutex<HashMap<PeerId, Vec<WireRecord>>>>,
+    /// `known_peers()` が返す peer: [`Self::register_peer`] で登録した peer と、 `publish_to` の両端 (#831)。 broadcast の
+    /// `publish` をしただけの peer は入れない — 入れると、 publish したのが自分だけの transport で、 2 回目からの
+    /// `Syncer::publish_since` が peer ごとの道に入り、 宛先が無くて何も出さなかった
+    registered: Arc<Mutex<std::collections::BTreeSet<PeerId>>>,
     /// (from, to) → records — partial sync 用 targeted log
     targeted: Arc<Mutex<HashMap<(PeerId, PeerId), Vec<WireRecord>>>>,
     /// #140: peer → 広告された履歴の下限 (これ以下は publisher 側で reclaim 済み)。
@@ -798,6 +802,7 @@ impl InMemoryTransport {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            registered: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             targeted: Arc::new(Mutex::new(HashMap::new())),
             floors: Arc::new(Mutex::new(HashMap::new())),
             floors_multi: Arc::new(Mutex::new(HashMap::new())),
@@ -812,12 +817,12 @@ impl InMemoryTransport {
         self.inner.lock().unwrap().get(&from).map(|v| v.len()).unwrap_or(0)
     }
 
-    /// テスト用に peer を登録 (= `known_peers()` に出すため)。
-    /// publish 経由でも自動登録されるが、 まだ 1 度も publish してない peer を
-    /// `Syncer::publish_since` の per-peer 経路に含めたい場合に使う。
+    /// テスト用に peer を登録 (= `known_peers()` に出すため)。 `Syncer::publish_since` は、 登録した peer が居れば peer ごとの道
+    /// (`publish_to`、 `SubscriptionFilter` が効く) で配り、 居なければ broadcast で配る。 broadcast の `publish` は登録しない
+    /// (#831)。 `publish_to` はその両端を登録する。
     pub fn register_peer(&self, peer: PeerId) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.entry(peer).or_insert_with(Vec::new);
+        self.inner.lock().unwrap().entry(peer).or_default();
+        self.registered.lock().unwrap().insert(peer);
     }
 }
 
@@ -847,11 +852,12 @@ impl Transport for InMemoryTransport {
     /// 別の領域なので、 `to` 以外の peer は pull で見えない。
     fn publish_to(&self, from: PeerId, to: PeerId, records: Vec<WireRecord>) {
         if records.is_empty() { return; }
-        // peer 一覧に to を register (= known_peers() で出るように)
+        // peer 一覧に両端を register (= known_peers() で出るように)
         {
             let mut guard = self.inner.lock().unwrap();
             guard.entry(from).or_insert_with(Vec::new);
             guard.entry(to).or_insert_with(Vec::new);
+            self.registered.lock().unwrap().extend([from, to]);
         }
         let mut guard = self.targeted.lock().unwrap();
         let log = guard.entry((from, to)).or_insert_with(Vec::new);
@@ -880,8 +886,7 @@ impl Transport for InMemoryTransport {
     }
 
     fn known_peers(&self) -> Vec<PeerId> {
-        let guard = self.inner.lock().unwrap();
-        guard.keys().copied().collect()
+        self.registered.lock().unwrap().iter().copied().collect()
     }
 
     /// #216: author 別 filter — record の `author_peer` ごとに cursor を引き、
@@ -1096,6 +1101,23 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0].op, DecodedOp::Tie { eid: 2, .. }));
         assert!(matches!(out[1].op, DecodedOp::Tie { eid: 3, .. }));
+    }
+
+    /// #831: broadcast の `publish` をしただけの peer は `known_peers` に出ない (出ると、 publish したのが自分だけの transport で
+    /// 2 回目からの `Syncer::publish_since` が peer ごとの道に入り、 宛先が無くて何も出さなかった)。 出るのは `register_peer` で
+    /// 登録した peer と `publish_to` の両端。 どちらでも pull は今までどおり読める。
+    #[test]
+    fn a_broadcast_publish_does_not_make_the_publisher_a_known_peer() {
+        let t = InMemoryTransport::new();
+        t.publish(4, vec![rec(100, 4, 1, 10)]);
+        assert!(t.known_peers().is_empty(), "broadcast しただけの peer が known_peers に出た: {:?}", t.known_peers());
+        assert_eq!(t.pull(4, Hlc::ZERO).len(), 1);
+        t.register_peer(5);
+        assert_eq!(t.known_peers(), vec![5]);
+        t.publish_to(4, 6, vec![rec(200, 4, 2, 20)]);
+        assert_eq!(t.known_peers(), vec![4, 5, 6]);
+        assert_eq!(t.pull_as(6, 4, Hlc::ZERO).len(), 2, "宛先 6 は broadcast と自分宛ての両方を受ける");
+        assert_eq!(t.pull_as(5, 4, Hlc::ZERO).len(), 1, "5 は 6 宛てを受けない");
     }
 
     #[test]

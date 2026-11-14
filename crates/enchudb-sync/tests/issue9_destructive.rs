@@ -456,11 +456,15 @@ fn foreign_delete_tombstone_survives_reopen() {
     cleanup(&path_b);
 }
 
-/// #76 (0.9.0): レプリカ (translated foreign entity) への self-authored write は
-/// bridge されない (single-writer guard)。 旧挙動では B のローカル編集が
-/// 「B の新規 entity」として全 peer に配信され、 A/C 上で断片化していた。
+/// #76: レプリカ (translated foreign entity) への自分の書き込みは、 相手の上で断片 (B の新しい entity) にならない。
+///
+/// 0.9.0〜0.10 は 「bridge しない」 guard で防いでいた。 0.11 から、 bridge が宛名を元の entity の世界番号に書き戻して配る
+/// (write-back、 `writeback_reverse_eidmap.rs`)。 この試験は 0.9.0 の 「配らない」 を見る形のまま残っていて、 guard が無く
+/// なった後も通っていた (#831): 同じ `InMemoryTransport` に A が先に publish していると、 B の `publish_since` は A 宛ての
+/// 道 (`publish_to`) に入り、 試験が読む broadcast の log (`pull(2, ..)`) には何も載らなかった = 何も見ていなかった。
+/// 今の約束 (配る・元の entity に着く・断片を作らない) を見る形にした。
 #[test]
-fn replica_writeback_is_not_propagated() {
+fn replica_writeback_reaches_the_authors_entity_without_a_fragment() {
     let path_a = tmp_path("wb_a");
     let path_b = tmp_path("wb_b");
 
@@ -489,26 +493,30 @@ fn replica_writeback_is_not_propagated() {
         .resolve_remote_eid_existing(e_a)
         .expect("A の entity が B に写像される");
 
-    // B がレプリカをローカル編集 → guard により bridge されないはず
+    // B がレプリカをローカル編集 → 元の entity 宛てに配る
     eng_b.tie_to(local_b, "notes.note", 99);
     eng_b.flush_writes(); // 背景 consumer の適用を待つ決定的な barrier (sleep 依存を排除)
     eng_b.oplog_commit();
     eng_b.transfer_oplog_to_sync_ops();
     let published = syncer_b.publish_since(Hlc::ZERO);
-    let leaked: Vec<_> = transport
+    let written_back: Vec<_> = transport
         .pull(2, Hlc::ZERO)
         .into_iter()
         .filter(|r| r.author_peer == 2)
         .collect();
-    assert!(
-        leaked.is_empty(),
-        "レプリカへの write-back が bridge された ({} records, published={}) — \
-         他 peer で entity 断片化する (#76)",
-        leaked.len(),
-        published,
+    assert_eq!(
+        (written_back.len(), published),
+        (1, 1),
+        "レプリカへの write-back は 1 件配る (0.11 から。 配らないと A に届かない)"
     );
 
-    // ローカルには反映されている (local-only edit)
+    // A が受ける → 元の entity に着き、 断片 (B の entity の写し) を作らない
+    assert!(syncer_a.apply_records(&written_back).applied > 0, "A が B の write-back を当てない");
+    assert_eq!(eng_a.get(e_a, "notes.note"), Some(99), "B の write-back が A の元の entity に着いていない");
+    assert_eq!(eng_a.pull_raw("notes.note", 99), vec![e_a], "A で note = 99 の entity が元の 1 つでない (断片化、 #76)");
+    assert!(eng_a.eid_translator().is_empty(), "A に翻訳の entry ができた (B の entity として受けた = 断片化、 #76)");
+
+    // ローカルにも反映されている
     assert_eq!(eng_b.get(local_b, "notes.note"), Some(99));
 
     drop(syncer_a);
