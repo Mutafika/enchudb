@@ -132,6 +132,24 @@ fn define_schema(eng: &mut Engine) {
     }
 }
 
+/// sync する DB の書き手が、 行を積む前に WAL の空きを待つ (状態で待つ。 上限は前提の誤りを知らせるだけ)。
+///
+/// sync する DB は、 満杯の WAL を consumer が畳めないと分かった時 / 5 秒待って空かなかった時に、 書き込みを WAL に載せずに
+/// 落として相手に取り直させる (#57)。 この試験が見るのは 「書き出しが返った書き込みが全部配る分にある」 で、 1 件も落ちない事が
+/// 前提 — 前は 「consumer が書き手の待ちの上限より速く畳む」 に頼っていて、 load の高い機械で前提の assert が落ちた (#735)。
+/// 書き手が自分で空きを待てば、 engine の待ち (と、 その諦め) に入らない。 区画を移る・古い区画を畳む・bridge が区画を
+/// またいで読むのは変わらない (`wal_switches() >= 10` の assert はそのまま)。
+fn wait_for_wal_room(eng: &Engine) {
+    /// 1 行 (Tie 3 つ) と、 並んで積まれる Commit の分より十分大きい空き
+    const ROOM: u64 = 16 * 1024;
+    let wal = eng.oplog().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while wal.free_bytes() < ROOM {
+        assert!(std::time::Instant::now() < until, "前提: WAL が 120 秒空かない (consumer が古い区画を畳まない)");
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
 /// 書き手。 batch を書いて durable にするたびに `acked` を進める。
 fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
     match kind {
@@ -185,6 +203,9 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
             for b in 0..BATCHES {
                 for k in 0..BATCH {
                     let i = b * BATCH + k;
+                    if kind.sync() {
+                        wait_for_wal_room(&eng);
+                    }
                     let e = eng.entity_in("t").unwrap();
                     assert_eq!(e, u64::from(i), "eid が連番でない");
                     for (h, &hid) in hids.iter().enumerate() {

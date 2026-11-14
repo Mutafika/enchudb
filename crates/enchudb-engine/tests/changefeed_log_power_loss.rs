@@ -166,9 +166,29 @@ fn run(tag: &str, wal_cap: usize) {
             }
         })
     };
+    // 像は 4 ms おきに撮るが、 前提の像 (書き出しの返った後の像が半分以上、 記録が一周した像が 1 枚以上) は状態で待って作る:
+    // 1/4 から後は最初の `oplog_sync` が返った後に、 半分から後は記録が一周し、 その後に `oplog_sync` が 2 回返った後に撮る
+    // (一周した記録が、 書き出した page だけの像にも入る)。 前は書き手の速さに頼っていて、 fsync の遅い機械では 60 枚を
+    // 撮り終えるまでに記録が一周せず、 前提の assert が落ちた (#735)。 速い機械では待たない。 上限は前提の誤りを知らせるだけ
+    // (越えたら待たずに撮り、 下の前提の assert が落ちる)
+    let wait = |what: &dyn Fn() -> bool| {
+        let until = Instant::now() + Duration::from_secs(120);
+        while !what() && Instant::now() < until && !writer.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let mut wrapped_at = None;
     let mut images = Vec::new();
     for k in 0..IMAGES {
         std::thread::sleep(Duration::from_millis(4));
+        if k >= IMAGES / 4 {
+            wait(&|| acked.load(Ordering::Acquire) > 0);
+        }
+        if k >= IMAGES / 2 {
+            wait(&|| eng.change_log_range().is_some_and(|(first, _)| first > 0));
+            let seen = *wrapped_at.get_or_insert_with(|| acked.load(Ordering::Acquire));
+            wait(&|| acked.load(Ordering::Acquire) >= seen + 20_000);
+        }
         let at = acked.load(Ordering::Acquire);
         let img = root.join(format!("img{k:03}"));
         let mode = if k % 2 == 0 { Mode::Lost } else { Mode::Mixed { seed: k as u64 * 7919 + 1 } };
