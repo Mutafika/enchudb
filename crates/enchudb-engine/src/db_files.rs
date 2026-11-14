@@ -249,6 +249,33 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
     Ok(true)
 }
 
+/// #884: `tables` の rename を disk へ送る (親の directory を素の `fsync`)。 他の sidecar は今のまま (呼ばない): checkpoint を進める
+/// 前提にしているのは `tables` だけ (#857 / #870 / #881: 消した行・足した枠が sidecar にある間だけ WAL を畳んでよい)。 電源断で rename
+/// が戻る file system (ext4 / xfs は rename の永続に directory の fsync が要る) では、 置いたはずの `tables` が前の中身に戻り、 その前提が
+/// 崩れる。
+///
+/// macOS も F_FULLFSYNC (`File::sync_all`) にしない (1 回 5 ms 前後、 素の fsync は数 µs)。 順の根拠: 呼び手 (`persist_tables_file_with`)
+/// はこれを `tables` を置いた直後・checkpoint を進める前に呼ぶ。 checkpoint は WAL の header にあり、 それを disk へ送るのは WAL の
+/// 書き出し (`OpLog::fsync` = msync(MS_SYNC)、 どの OS でも素の書き出しで F_FULLFSYNC にしない) か OS の書き戻しで、 どちらも
+/// checkpoint を進めた後 = この fsync より後に始まる。 = rename は header より先に drive へ送られる (WAL の record と header の順が
+/// 頼っているのと同じ層の順。 drive の cache の中の順は、 WAL 自体も保証していない)。 Windows は directory を開けないので何もしない
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn sync_tables_dir(tables: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = tables.parent() {
+        use std::os::fd::AsRawFd;
+        enchudb_oplog::io_point("tables.dir_sync")?;
+        let f = std::fs::File::open(dir)?;
+        // SAFETY: 開いている file の fd を渡すだけ
+        if unsafe { libc::fsync(f.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tables;
+    Ok(())
+}
+
 /// #513: sidecar に追記して書き出す (`pktombs`)。 file が無ければ Err (追記は、 先にまとめて書いた file にだけ足す)。
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn append_synced(sidecar: &Path, bytes: &[u8]) -> io::Result<()> {
