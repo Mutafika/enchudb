@@ -395,6 +395,20 @@ fn a_file_whose_b_header_says_5_under_an_a_header_of_4_keeps_the_records_of_b() 
     assert_eq!(mark_of_next_tie(&wal, &p, 1, 208), Mark::Plain, "v4 の file には結ばない形で書く");
     assert_eq!(half_versions(&std::fs::read(&p).unwrap()), (4, 4), "B の版は 4 に戻す (結ばない形の record が入る)");
     assert_eq!(values(&wal.recover_with_tail()), (200..=208).collect::<Vec<_>>());
+    // 4 に戻した B の header が disk に届く前に落ちた像: B の header だけ開く前の bytes (版 5、 head は書き足す前)。
+    // もう一度同じに開ける (書き足した 208 は header の head の先 = 届かなかった record)
+    wal.append(Op::Commit).unwrap();
+    wal.fsync().unwrap();
+    drop(wal);
+    let mut again = std::fs::read(&p).unwrap();
+    again[HALF..HALF + HEADER].copy_from_slice(&image[HALF..HALF + HEADER]);
+    assert_eq!(half_versions(&again), (4, 5));
+    std::fs::write(&p, &again).unwrap();
+    let wal = OpLog::open(&p).unwrap();
+    assert_eq!(wal.file_version(), OPLOG_FILE_VERSION_V4);
+    assert_eq!(values(&wal.recover_with_tail()), (200..=207).collect::<Vec<_>>(), "B の header が戻る前の像で、 値が続かない");
+    wal.drop_records_after_a_hole();
+    assert_eq!(mark_of_next_tie(&wal, &p, 0, 300), Mark::Plain, "この session は空の A へ移って、 結ばない形で書く");
 }
 
 /// 0.36.2 が書いた v3 の file (1 区画、 区画の半分を越えて record がある) を disk から開く。 読めて、 最初に畳む時に 2 区画の
@@ -582,6 +596,105 @@ mod power_loss {
         let w = OpLog::open(&img.join("oplog")).unwrap();
         assert_eq!(w.file_version(), OPLOG_FILE_VERSION_V4);
         assert_replays_through("stitched", &values(&w.recover_with_tail()), 200, Some(220));
+        drop(wal);
+    }
+
+    /// #864: 大きい v3 の 1 区画を畳んで 2 区画にする時、 B の header (畳む前の record の並びの真ん中) を書くのは、 畳んだ A の
+    /// header が disk に届いた後。 先に B の header の page だけ届くと、 A の header は前の周 (head = 畳む前の終わり、 checkpoint =
+    /// 1 回前の書き出しの位置) のままで、 再生が checkpoint から潰れた所までを当て直す = 書き出しの返った値が途中の値に戻る。
+    ///
+    /// 1 区画の v3 の file (record は区画の半分を越える、 checkpoint は頭のまま、 値 300 まで書き出し済み) を開き、 全部を本体に
+    /// 当てた事にして畳む。 畳みの中の書き出しごとに (写した直後 = 書き出しの前) 像を撮り、 「B の header の page だけ OS が先に
+    /// 書いていた」 形にして開く。
+    ///
+    /// file は作って header を v3 の 1 区画の形に書き換える (0.36.2 の fixture は使わない: あの並びでは B の header の 32 byte が
+    /// record の署名の欄 (署名なしの record では 0 で、 CRC の外) に収まり、 潰れても再生が止まらない)。 Tie だけを並べると、
+    /// B の header は record の payload にかかる。
+    #[test]
+    fn a_split_writes_the_b_header_after_the_folded_header_is_durable() {
+        let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = Scratch::new("images-split");
+        let live = root.0.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let p = live.join("oplog");
+        let cap = 64 * 1024usize;
+        drop(OpLog::create(&p, cap).unwrap());
+        {
+            // 0.36 が作った形: 版 3、 header の capacity は file 全体、 B の header は無い
+            let mut file = std::fs::read(&p).unwrap();
+            file[4..8].copy_from_slice(&3u32.to_le_bytes());
+            file[24..28].copy_from_slice(&(cap as u32).to_le_bytes());
+            file[cap / 2..cap / 2 + HEADER].fill(0);
+            std::fs::write(&p, &file).unwrap();
+        }
+        crashsim::start();
+        crashsim::file_synced(&p);
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!((wal.file_version(), wal.two_halves()), (OPLOG_FILE_VERSION_V3, false));
+        let acked = 300;
+        for v in 1..=acked {
+            tie(&wal, v);
+        }
+        wal.append(Op::Commit).unwrap();
+        wal.fsync().unwrap(); // ← 300 まで書き出しが返った。 disk の checkpoint は頭
+        assert_eq!(values(&wal.recover_with_tail()).last(), Some(&acked));
+        let mid = 32 * 1024; // B の header の場所
+        assert!(wal_pos_offset(wal.head()) as usize > mid + HEADER, "前提: record が区画の半分を越えている");
+        // 全部を本体に当てて書き出した (checkpoint は memory で head、 disk の checkpoint は 1 回前 = 頭のまま)
+        wal.advance_checkpoint(wal.head());
+        let ps = unsafe {
+            unsafe extern "C" {
+                fn getpagesize() -> i32;
+            }
+            getpagesize() as usize
+        };
+        let images = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let (images, live, root, p) = (images.clone(), live.clone(), root.0.clone(), p.clone());
+            // hook は process に 1 つ: 並んで走る他の試験の書き出しでは何もしない
+            let me = std::thread::current().id();
+            crashsim::set_after_copy_hook(Some(std::sync::Arc::new(move |_| {
+                if std::thread::current().id() != me {
+                    return;
+                }
+                let mut images = images.lock().unwrap();
+                let dir = root.join(format!("split-{}", images.len()));
+                crashsim::capture(&live, &dir, Mode::Lost).unwrap();
+                // B の header の page だけ、 OS が先に書いていた
+                let now = std::fs::read(&p).unwrap();
+                let mut image = std::fs::read(dir.join("oplog")).unwrap();
+                image[mid..mid + ps].copy_from_slice(&now[mid..mid + ps]);
+                std::fs::write(dir.join("oplog"), &image).unwrap();
+                images.push((dir, &now[mid..mid + 4] == b"EWAL"));
+            })));
+        }
+        assert!(wal.try_reset(), "前提: 畳める");
+        crashsim::set_after_copy_hook(None);
+        crashsim::stop();
+        assert!(wal.two_halves(), "前提: 2 区画になった");
+        let images = images.lock().unwrap();
+        assert!(images.iter().any(|(_, b_header)| *b_header), "前提: B の header を書いた後の書き出しの像がある");
+        for (i, (dir, b_header)) in images.iter().enumerate() {
+            let w = OpLog::open(&dir.join("oplog")).unwrap_or_else(|e| panic!("像 {i} を開けない: {e}"));
+            let vals = values(&w.recover_with_tail());
+            let image = std::fs::read(dir.join("oplog")).unwrap();
+            eprintln!(
+                "[split] 像 {i}: B の header {b_header}、 A の header 版 {} 周 {} head {} checkpoint {}、 再生 {} 件 (最後 {:?})",
+                r32(&image, 4),
+                r32(&image, 28),
+                r64(&image, 8),
+                r64(&image, 16),
+                vals.len(),
+                vals.last()
+            );
+            assert!(
+                vals.is_empty() || vals.last() == Some(&acked),
+                "像 {i} (B の header {}): 再生が書き出しの返った {acked} より古い値 {:?} で終わる ({} 件) = 本体の値が前に戻る",
+                if *b_header { "あり" } else { "なし" },
+                vals.last(),
+                vals.len()
+            );
+        }
         drop(wal);
     }
 
