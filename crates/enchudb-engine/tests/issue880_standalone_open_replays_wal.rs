@@ -413,7 +413,7 @@ fn a_standalone_open_refuses_when_the_round_trip_cannot_close_cleanly() {
     let opens: Vec<u64> = sites.iter().filter(|(_, s)| s == "oplog.open").map(|(n, _)| *n).collect();
     assert!(opens.len() >= 3, "前提: 単独の open が WAL を 3 回開く (往復の前の見直し・往復・往復の後の見直し): {opens:?}");
     let window = opens[1] + 1..opens[2];
-    let (mut refused, mut opened_unclean, mut other) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut refused, mut opened_unclean, mut other, mut floored) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for n in window.clone() {
         let img = root.join(format!("n{n}"));
         copy(&u.db, &img);
@@ -428,10 +428,12 @@ fn a_standalone_open_refuses_when_the_round_trip_cannot_close_cleanly() {
         } else {
             other.push((n, line.clone()));
         }
-        assert_nothing_lost(&img, &u, &format!("点 {n} ({fired:?}、 {line})"));
+        if let Delivery::Floor(f) = assert_nothing_lost(&img, &u, &format!("点 {n} ({fired:?}、 {line})")) {
+            floored.push((n, f));
+        }
         std::fs::remove_dir_all(&img).unwrap();
     }
-    println!("[still] 窓 {window:?}: 断った {} / それ以外 {other:?}", refused.len());
+    println!("[still] 窓 {window:?}: 断った {} / floor で覆った {floored:?} / それ以外 {other:?}", refused.len());
     assert!(
         opened_unclean.is_empty(),
         "往復が clean の印を立てられなかったのに、 単独の open が開いた (閉じると印が立つ): {opened_unclean:?}"
