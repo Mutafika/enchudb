@@ -12925,11 +12925,18 @@ impl Engine {
         );
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
-            crate::db_files::write_atomic_if_changed(&tables_path_for(&self.path), &bytes)?;
+            let path = tables_path_for(&self.path);
+            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)
+            if crate::db_files::write_atomic_if_changed(&path, &bytes)? {
+                crate::db_files::sync_tables_dir(&path)?;
+            }
             *last = Some(bytes);
         }
         for (t, n) in self.tables.iter().zip(placed) {
-            t.persisted_next.fetch_max(n, std::sync::atomic::Ordering::AcqRel);
+            // #884: 置いた値そのものにする (下がる時もある: `clear_local_only_tables` が `next_local` を 0 に戻した後)。 前は
+            // fetch_max で、 下げた後も disk の値より大きく残り、 その表で sidecar より先の行を消しても #857 の止めが掛からなかった。
+            // 書く側は `sidecar_persist_lock` で 1 本に並ぶので、 置く順と覚える順は同じ
+            t.persisted_next.store(n, std::sync::atomic::Ordering::Release);
         }
         Ok(())
     }
@@ -25258,7 +25265,9 @@ impl Engine {
         // β-light step 7: tables sidecar の最新化 (next_local 含む)。
         // schema 変更 (define_*) でも persist してるが、 entity_in による
         // next_local 増加は persist してないので flush 時にまとめて persist する。
-        self.try_persist_tables();
+        // #884: 書けなかったら Err (前は捨てて Ok を返した)。 build phase の defer (`Database::create` の後) でも書く: flush は
+        // 呼び手が求めた書き出しで、 書かないと、 足して消して flush した後に落ちた時に消した行の eid をもう一度払い出す
+        self.persist_tables()?;
 
         for ds in &self.himos { ds.sync(); }
         self.vocab.sync();
