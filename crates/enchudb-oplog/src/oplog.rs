@@ -1291,6 +1291,8 @@ pub struct OpLog {
     room_waiter: std::sync::RwLock<Option<RoomWaiter>>,
     /// #391: append が載った後に呼ぶ (engine が consumer を起こす — 書き出しの tick を回すため)。
     append_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// #846: record が落ちた時の hook ([`OpLog::set_drop_hook`])。
+    drop_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// #667: 区画を移った時に呼ぶ処理 ([`Self::set_switch_hook`])。
     switch_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// #506 まとめ書き: `append_lock` を取れなかった書き手が頼みを置く場所 (書き手の thread ごとに 1 つ、 [`combine_slot_index`])。
@@ -1498,6 +1500,13 @@ impl OpLog {
         let _ = self.append_hook.set(hook);
     }
 
+    /// #846: record が載らずに落ちた ([`OpLog::take_dropped_spans`] に覚えた) たびに呼ぶ処理を置く (1 回だけ、 2 回目以降は
+    /// 無視)。 **`append_lock` の下でも外でも呼ぶ** (畳む時に孤児の group を落とす所は lock の下)。 置く処理は lock を取らず、
+    /// この WAL を呼ばない事 (engine は consumer を起こすだけ)。
+    pub fn set_drop_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.drop_hook.set(hook);
+    }
+
     /// #667: 書き手が区画を移るたびに呼ぶ処理を置く (1 回だけ、 2 回目以降は無視)。 `append_lock` の下で呼ぶ (区画を移るのは
     /// 区画 1 つ分を書くごと)。 engine は consumer を起こし、 待たずに古い区画を書き出して畳ませる。
     pub fn set_switch_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
@@ -1645,6 +1654,7 @@ impl OpLog {
             stale_synced_head: [AtomicU64::new(0), AtomicU64::new(0)],
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
+            drop_hook: std::sync::OnceLock::new(),
             switch_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
             dropped_first: std::sync::Mutex::new(Vec::new()),
@@ -3121,9 +3131,12 @@ impl OpLog {
             self.dropped_gen.fetch_add(1, Ordering::Release);
         }
         drop(g);
-        // #846: 落ちた record も、 載った record と同じく知らせる (engine の consumer は、 落ちた record の floor を上げるために
-        // 起きる。 深く寝ている時だけ起こす hook なので、 ふだんは atomic を 1 回読むだけ)
-        self.appended();
+        // #846: 落ちた record を知らせる (engine の consumer は、 落ちた record の floor を上げるために起きる)。 ここは
+        // `append_lock` の下の事がある (畳む時の孤児の group #450、 まとめ書き) ので、 append の hook (lock を持たずに呼ぶ
+        // 約束) とは別の hook
+        if let Some(h) = self.drop_hook.get() {
+            h();
+        }
         hlc
     }
 
@@ -5074,29 +5087,34 @@ mod tests {
         }
     }
 
-    /// #846: 載らなかった record も、 載った record と同じく hook で知らせる (engine の consumer は、 bridge が止まっている間
-    /// 1 秒ごとにしか起きない。 落ちた record の floor を上げる周を、 次の 1 秒まで待たせない)。 [`OpLog::has_dropped`] は
-    /// 取り出すまで true。
+    /// #846: 載らなかった record は、 落ちた時の hook で知らせる (engine の consumer は、 bridge が止まっている間
+    /// 1 秒ごとにしか起きない。 落ちた record の floor を上げる周を、 次の 1 秒まで待たせない)。 append の hook (lock を
+    /// 持たずに呼ぶ約束) は呼ばない。 [`OpLog::has_dropped`] は取り出すまで true。
     ///
     /// falsify: `note_dropped_minting` が hook を呼ばないと、 落ちた append の後に数が増えない。
     #[test]
-    fn a_dropped_record_calls_the_append_hook() {
+    fn a_dropped_record_calls_the_drop_hook() {
         let p = tmp("dropped_hook");
         let wal = OpLog::create(&p, 4096).unwrap();
         wal.set_peer_id(1);
         let calls = std::sync::Arc::new(AtomicU64::new(0));
-        let c = calls.clone();
-        wal.set_append_hook(Box::new(move || {
+        let appends = std::sync::Arc::new(AtomicU64::new(0));
+        let (c, a) = (calls.clone(), appends.clone());
+        wal.set_drop_hook(Box::new(move || {
             c.fetch_add(1, Ordering::Relaxed);
+        }));
+        wal.set_append_hook(Box::new(move || {
+            a.fetch_add(1, Ordering::Relaxed);
         }));
         while wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
         while wal.append(Op::Commit).is_ok() {}
         let _ = wal.take_dropped();
         assert!(!wal.has_dropped());
-        let before = calls.load(Ordering::Relaxed);
+        let (before, appended) = (calls.load(Ordering::Relaxed), appends.load(Ordering::Relaxed));
         assert!(wal.append(Op::Tie { eid: 1, himo_id: 0, value: 2 }).is_err(), "前提: 満杯で載らない");
         assert!(wal.has_dropped(), "落ちた record を覚えていない");
         assert!(calls.load(Ordering::Relaxed) > before, "落ちた record を hook で知らせなかった");
+        assert_eq!(appends.load(Ordering::Relaxed), appended, "落ちた record で append の hook を呼んだ");
         assert!(!wal.take_dropped().is_empty());
         assert!(!wal.has_dropped(), "取り出した後も覚えたまま");
         let _ = std::fs::remove_dir_all(&p);

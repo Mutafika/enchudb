@@ -147,6 +147,11 @@ struct BridgeStall {
     /// 診断: 最後の読みの、 閉じていない record の数と、 読みが止まった理由。
     pending: usize,
     stop: &'static str,
+    /// 今の `keys` で、 満杯で止まった周として配ってよい所を置き終えた ([`Engine::settle_sync_ops`] の `full` = true が
+    /// やり残しなしで返った)。 `keys` が変わった時と、 #783 の待ちで止まった周 (`full` = false で置く) の後は false。 true の
+    /// 間は置き直さない (`keys` が多い時 = ring の最新より古い版数の中継の record が WAL に何万件もある時、 置き直すたびに
+    /// 全部の鍵を並べて比べる: 20 万件で 1 周 2.2 ms だった)。
+    settled: bool,
 }
 
 impl BridgeStall {
@@ -158,6 +163,7 @@ impl BridgeStall {
         }
         if !newest.is_newer_than_every_row(key.1) {
             self.keys.push(key);
+            self.settled = false;
         }
     }
 }
@@ -8476,7 +8482,7 @@ impl Engine {
         use std::sync::atomic::Ordering;
         let Some(first) = rest.next() else { return };
         let mut stall =
-            BridgeStall { from, ring, what, wal_at, scanned_end, first, keys: Vec::new(), author_max: Vec::new(), pending, stop };
+            BridgeStall { from, ring, what, wal_at, scanned_end, first, keys: Vec::new(), author_max: Vec::new(), pending, stop, settled: false };
         {
             let newest = self.ring_newest.lock().unwrap_or_else(|p| p.into_inner());
             stall.note(first, &newest);
@@ -8484,6 +8490,8 @@ impl Engine {
                 stall.note(key, &newest);
             }
         }
+        // 並べて持つ (`open_groups_on_ring` は問いの鍵を並べる。 並んだ列ならそれが 1 回なめるだけで済む)
+        stall.keys.sort_unstable();
         *self.bridge_stall.lock().unwrap_or_else(|p| p.into_inner()) = Some(stall);
         self.bridge_stalled_from.store(from, Ordering::Release);
     }
@@ -8516,6 +8524,9 @@ impl Engine {
                 for (r, _) in &records {
                     m.note((r.author_peer, r.hlc), &newest);
                 }
+            }
+            if !m.settled {
+                m.keys.sort_unstable();
             }
             m.wal_at = wal_at;
             m.scanned_end = committed_end;
@@ -8553,13 +8564,20 @@ impl Engine {
         self.bridge_last_committed_end.store(m.scanned_end, Ordering::Relaxed);
         *self.bridge_last_scan_stop.lock().unwrap_or_else(|p| p.into_inner()) = m.stop;
         self.bridge_pending_records.store(m.pending as u64, Ordering::Relaxed);
-        if first_held {
-            self.settle_sync_ops(m.keys.iter().copied(), false);
-        } else {
+        let full = !first_held;
+        if full {
             self.bridge_empty_scans.store(0, Ordering::Relaxed);
             self.bridge_stall_warned.store(false, Ordering::Relaxed);
             self.bridge_stall_since_ms.store(0, Ordering::Relaxed);
-            self.settle_sync_ops(m.keys.iter().copied(), true);
+        }
+        // 配ってよい所: 鍵も ring も、 満杯で止まった周として前に置いた時のままなら、 置き直さない
+        if !full {
+            self.settle_sync_ops(m.keys.iter().copied(), false);
+            m.settled = false;
+        } else {
+            if !m.settled {
+                m.settled = self.settle_sync_ops(m.keys.iter().copied(), true);
+            }
             self.sync_ops_backpressure(from, None, 0, m.what);
         }
         *self.bridge_stall.lock().unwrap_or_else(|p| p.into_inner()) = Some(m);
@@ -8619,18 +8637,21 @@ impl Engine {
     /// 多い、 または ring に残っている行が途中の組とその後ろだけ): 受け手は組の行を受けないので ack で空かず、 待っても組は
     /// そろわない。 その鍵の書き手の floor を組の版数に上げて、 受け手を state の取り直しに回す (取り直すと cursor が組の版数
     /// 以上になり、 ack で行が空いて、 残りは cursor の手前として読み捨てられる)。 組の行は配らないまま。
-    fn settle_sync_ops(&self, remaining: impl Iterator<Item = GroupKey>, full: bool) {
+    ///
+    /// 戻り値: やり残しが無いか (floor を上げようとして記録できなかった時だけ false = 次の周にもう一度)。 同じ鍵・同じ ring・
+    /// 同じ `full` なら、 true を返した後にもう一度呼んでも何も変わらない (#846: 止まった bridge は、 変わるまで呼び直さない)。
+    fn settle_sync_ops(&self, remaining: impl Iterator<Item = GroupKey>, full: bool) -> bool {
         use std::sync::atomic::Ordering;
         let last = self.next_sync_lsn.load(Ordering::Acquire).saturating_sub(1);
         let open = self.open_groups_on_ring(remaining);
         let settled = open.as_ref().map_or(last, |(from, _, _)| from.saturating_sub(1));
         self.sync_settled_lsn.store(settled, Ordering::Release);
         self.sync_settled_known.store(true, Ordering::Release);
-        let Some((from, keys, more)) = open.filter(|_| full) else { return };
-        let Some(usage) = self.table_eid_usage("_sync_ops") else { return };
+        let Some((from, keys, more)) = open.filter(|_| full) else { return true };
+        let Some(usage) = self.table_eid_usage("_sync_ops") else { return true };
         let on_ring = u64::from(last.saturating_sub(from)) + 1;
         if u64::from(usage.live) > on_ring && on_ring + more <= u64::from(usage.capacity) {
-            return;
+            return true;
         }
         let mut floors: Vec<(u32, enchudb_oplog::Hlc)> = Vec::new();
         for (a, h) in keys {
@@ -8639,7 +8660,7 @@ impl Engine {
                 None => floors.push((a, h)),
             }
         }
-        self.record_reclaimed_floors(&floors);
+        self.record_reclaimed_floors(&floors)
     }
 
     /// #828 / #830: まだ写していない record の鍵 `remaining` のどれかと同じ鍵の、 ring にもう載っている行: (その最初の lsn の
@@ -11874,6 +11895,13 @@ impl Engine {
                 name,
                 self.max_entities(),
             ));
+        }
+        // #846: ring の枠を足した。 ring の満杯で止まった bridge を待たせない (行を消した時と同じ)
+        if is_sync_ring_table(name)
+            && self.bridge_stalled_from.load(std::sync::atomic::Ordering::Acquire) != u64::MAX
+            && let Some(w) = self.consumer_waker()
+        {
+            w.wake();
         }
         Ok(self.tables[tid].capacity())
     }
@@ -22176,6 +22204,10 @@ impl Engine {
         if let Some(wal) = oplog.as_ref() {
             let w = waker.clone();
             wal.set_append_hook(Box::new(move || w.wake_if_deep()));
+            // #846: 落ちた record でも起こす (止まった bridge の間 consumer は 1 秒ごとにしか起きない。 落ちた record の floor を
+            // 上げる周を待たせない)。 `append_lock` の下からも呼ばれるので、 atomic を読んで unpark するだけ (lock を取らない)
+            let w = waker.clone();
+            wal.set_drop_hook(Box::new(move || w.wake_if_deep()));
             // #667: 書き手が区画を移ったら起こす (tick を待たずに古い区画を書き出して畳む)
             let w = waker.clone();
             wal.set_switch_hook(Box::new(move || w.wake()));

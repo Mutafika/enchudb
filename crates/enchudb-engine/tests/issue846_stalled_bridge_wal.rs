@@ -413,3 +413,33 @@ fn the_consumer_sleeps_while_stalled_and_wakes_when_a_row_is_reclaimed() {
     }
     assert!(quick, "行を消しても consumer が起きず、 続きを写すのが次の周期まで遅れた (3 回とも 500 ms 以上、 最長 {slowest:?})");
 }
+
+/// ring の枠を足した時 (`grow_table`) も、 止まったままの consumer は次の 1 秒を待たずに起きて続きを写す。
+///
+/// falsify: 枠を足した時に consumer を起こさないと、 続きを写すのが次の 1 秒の周期になる (下の 3 回とも遅れる)。
+#[test]
+fn the_consumer_wakes_when_the_ring_grows() {
+    let path = tmp_path("grow");
+    let _cleanup = Cleanup(path.clone());
+    let eng = create(&path);
+    let e = eng.entity_in("notes").unwrap();
+    fill(&eng, e, 0, 4 * 1024);
+    eng.oplog_sync().unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut quick = false;
+    let mut slowest = Duration::ZERO;
+    for _ in 0..3 {
+        until("止まった bridge が続きを写し切らない", Duration::from_secs(30), || ring_full(&eng));
+        std::thread::sleep(Duration::from_millis(300));
+        let w = eng.consumer_wakeups();
+        until("consumer が起きない", Duration::from_secs(30), || eng.consumer_wakeups() > w);
+        std::thread::sleep(Duration::from_millis(50));
+        let lsn = eng.current_sync_lsn();
+        let t0 = Instant::now();
+        eng.grow_table("_sync_ops", 64).expect("前提: ring の枠を足せる");
+        until("ring の枠を足したのに、 bridge が続きを写さない", Duration::from_secs(30), || eng.current_sync_lsn() > lsn);
+        slowest = slowest.max(t0.elapsed());
+        quick |= t0.elapsed() < Duration::from_millis(500);
+    }
+    assert!(quick, "枠を足しても consumer が起きず、 続きを写すのが次の周期まで遅れた (3 回とも 500 ms 以上、 最長 {slowest:?})");
+}
