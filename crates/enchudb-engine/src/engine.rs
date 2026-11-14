@@ -11328,7 +11328,12 @@ impl Engine {
                 // 「transfer が row を挿せない → 変更が sync から**無言で欠落**」として
                 // 実機発現した (ring ~25K 全 reclaim 後の reopen で bridge 全停止)。
                 // 枯渇時に一度 EntitySet の liveness から穴を再構築して自己修復する。
-                if self.rebuild_free_locals(tid) {
+                //
+                // #863: sync の DB の user の表は、 先に枠を足し、 足せない時だけ穴を拾う (消した自分の行の slot は拾わない、
+                // `rebuild_free_locals`)。 消した行の削除は相手に配られ、 相手はその世界番号宛ての書き込みを版数によらず捨てる
+                // (削除優先) ので、 同じ slot に足した行は相手に現れず、 黙って食い違った
+                let keep_deleted = self.keeps_deleted_slots(tid);
+                if !keep_deleted && self.rebuild_free_locals(tid) {
                     // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
                     // 再構築後も枯渇なら fl が空のままなので次は grow / Err に落ちる。
                     return self.entity_in(table_name);
@@ -11336,6 +11341,7 @@ impl Engine {
                 // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
                 match self.grow_table_extent_for(tid, cur) {
                     Some(g) => g,
+                    None if keep_deleted && self.rebuild_free_locals(tid) => return self.entity_in(table_name),
                     None => {
                         // 払出した分を rollback (= overflow 状態を維持しないため厳密には
                         // 必要だが、 単調 monotone な next_local なので少々超過しても
@@ -11347,6 +11353,15 @@ impl Engine {
                                  frees it, Engine::grow_table enlarges it)",
                                 table_name,
                                 table.capacity(),
+                            ));
+                        }
+                        if keep_deleted {
+                            return Err(format!(
+                                "table '{}' eid range exhausted ({} eids reserved, entity cap {}; a sync DB does not \
+                                 reuse the eid of a deleted row, #863 — Engine::grow_entity_cap to add room)",
+                                table_name,
+                                table.capacity(),
+                                self.max_entities(),
                             ));
                         }
                         return Err(format!(
@@ -11390,6 +11405,7 @@ impl Engine {
         }
         let allocated = table.next_local.load(Ordering::Acquire).min(table.capacity());
         let ring = is_sync_ring_table(&table.name);
+        let keep_deleted = self.keeps_deleted_slots(tid);
         // 探し始める所 (ring は前に止めた続き)。 [from, allocated) → [0, from) の順に見る
         let from = if ring { self.sync_ring_rebuild_from.load(Ordering::Relaxed).min(allocated) } else { 0 };
         // #858: ring の、 生きていないのに lsn の列に居る slot (下の `drop_cells_of_dead_ring_slot`)
@@ -11406,7 +11422,11 @@ impl Engine {
                     for l in first.max(local)..end.min(local + len) {
                         let global = lo + (l - local);
                         // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
-                        if !self.entities.is_live(global) && !self.is_folded_own_slot(global) {
+                        // #863: sync の DB の user の表は、 消した自分の行の slot を使い回さない
+                        if !self.entities.is_live(global)
+                            && !self.is_folded_own_slot(global)
+                            && !(keep_deleted && self.is_deleted_own_slot(global))
+                        {
                             if ring_lsn.is_some_and(|h| self.himos[h].get_value(global).is_some()) {
                                 self.drop_cells_of_dead_ring_slot(global);
                             }
@@ -11449,6 +11469,22 @@ impl Engine {
                 self.remove_cell_freeing_leaf(local, hid);
             }
         }
+    }
+
+    /// #863: 表 `tid` が、 消した自分の行の slot を使い回さない表か: sync の DB の user の表 (`_` で始まらない表)。
+    ///
+    /// 自分の行を消した Delete は、 その行の世界番号 (自分の peer, slot) で相手に配られる。 相手はその世界番号宛ての書き込みを、
+    /// 版数によらず捨てる (削除優先、 `slot_is_dead`)。 同じ slot に足した新しい行は同じ世界番号で配られるので、 相手に現れない。
+    /// 内部の表 (`_sync_ops` の ring など) は配らないので使い回してよい。
+    fn keeps_deleted_slots(&self, tid: usize) -> bool {
+        self.sync_tables_enabled() && !self.tables[tid].is_reserved()
+    }
+
+    /// #863: slot `global` は、 消した自分の行の跡か (tombstone があり、 相手の行を翻訳して置いた slot でない)。 相手の行を
+    /// 置いた slot は、 その行の世界番号が相手の物なので、 使い回して自分の行を置いても相手から見て別の行 (`clear_cell_versions`
+    /// が翻訳写像と tombstone を退避する、 #166)。
+    fn is_deleted_own_slot(&self, global: u32) -> bool {
+        self.tombstone_version_of(global) != enchudb_oplog::Hlc::ZERO && !self.eid_translator.is_translated_local(global)
     }
 
     /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。
