@@ -6171,6 +6171,44 @@ mod tests {
         assert_eq!(wal.recover_with_tail().len(), 1);
         wal.append(Op::Tie { eid: 1, himo_id: 0, value: 3 }).unwrap();
         assert_eq!(marks_bound(&wal, 0), vec![true, true, true], "開き直した後も結んで書く");
+        // 開き直した 1 区画の v5 も、 結ばない形の印を通さない
+        assert_eq!(wal.iter_from_with_tail_diag_for_test().0, 2, "前提: Tie 2 件 (Commit は数えない)");
+        let t = wal.hot.halves[0].written.load(Ordering::Acquire) as usize - LAP_TRAILER;
+        let lap = wal.lap();
+        write_lap_trailer(&mut wal.mmap_mut_slice()[t..t + LAP_TRAILER], lap, 0);
+        let (out, _, _, stop) = wal.iter_from_with_tail_diag_for_test();
+        assert_eq!((out, stop), (1, ScanStop::BadLap), "開き直した 1 区画の v5 が、 結ばない形の印を通した");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 大きい v3 の file を 2 区画にした畳みで、 版の書き出しに失敗したら、 2 区画の v4 のまま (A も B も版 4)。 B の版だけ 5 に
+    /// なっていると、 0.37.x はその B を 「読めない header」 と見て空に書き直す。
+    #[test]
+    fn a_split_whose_bind_failed_leaves_both_halves_v4() {
+        let p = tmp("bound-split-bind-fail");
+        let cap = 64 * 1024u64;
+        let half = (cap / 2) as usize;
+        {
+            let wal = OpLog::create(&p, cap as usize).unwrap();
+            let m = wal.mmap_mut_slice();
+            m[4..8].copy_from_slice(&OPLOG_FILE_VERSION_V3.to_le_bytes());
+            m[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(cap as u32).to_le_bytes());
+            m[half..half + HEADER_SIZE].fill(0);
+            wal.fsync().unwrap();
+        }
+        let wal = OpLog::open(&p).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        wal.append(Op::Commit).unwrap();
+        wal.advance_checkpoint(wal.head());
+        wal.fail_bind_sync.store(true, Ordering::Release);
+        assert!(wal.try_reset());
+        assert_eq!((wal.file_version(), wal.two_halves(), half_versions(&wal)), (OPLOG_FILE_VERSION_V4, true, (4, 4)));
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 2 }).unwrap();
+        wal.append(Op::Commit).unwrap();
+        assert_eq!(marks_bound(&wal, 0), vec![false, false]);
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
+        assert_eq!((wal.file_version(), half_versions(&wal)), (OPLOG_FILE_VERSION, (5, 5)));
         let _ = std::fs::remove_file(&p);
     }
 

@@ -292,11 +292,21 @@ fn folding_b_in_place_binds_when_a_is_empty() {
     assert_eq!(wal.file_version(), OPLOG_FILE_VERSION);
     assert_eq!(half_versions(&std::fs::read(&p).unwrap()), (5, 5));
     assert_eq!(mark_of_next_tie(&wal, &p, 1, 200), Mark::Bound);
+    tie(&wal, 201);
+    let end = HALF + wal_pos_offset(wal.head()) as usize;
     wal.fsync().unwrap();
     drop(wal);
     let wal = OpLog::open(&p).unwrap();
     assert_eq!(wal.file_version(), OPLOG_FILE_VERSION);
-    assert_eq!(values(&wal.recover_with_tail()), vec![200]);
+    assert_eq!(values(&wal.recover_with_tail()), vec![200, 201]);
+    drop(wal);
+    // 開き直した後も、 B (header の版 5) は結ばない形の印を通さない
+    let mut image = std::fs::read(&p).unwrap();
+    let lap = r32(&image, end - 8);
+    image[end - 4..end].copy_from_slice(&(lap ^ LAP_SALT).to_le_bytes());
+    std::fs::write(&p, &image).unwrap();
+    let wal = OpLog::open(&p).unwrap();
+    assert_eq!(values(&wal.recover_with_tail()), vec![200], "開き直した B が、 結ばない形の印を通した");
 }
 
 /// B を畳む時に A が書き足し中 (A に結ばない形の record が居る) なら、 まだ v5 にしない: A の header の版 5 は 「A の今の周は
