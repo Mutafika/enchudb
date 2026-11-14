@@ -11184,7 +11184,7 @@ impl Engine {
                 let hlc = self.oplog.as_ref().map_or(enchudb_oplog::Hlc::ZERO, |wal| wal.mint_hlc());
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
-                let applied = self.apply_delete_in(row.as_ref(), row_local, hlc);
+                let applied = self.apply_delete_in(row.as_ref(), row_local, hlc, None);
                 drop(row);
                 if !applied {
                     self.warn_local_write_rejected(row_local, u16::MAX, hlc);
@@ -14596,10 +14596,12 @@ impl Engine {
 
     /// [`Self::local_apply`] の、 行 `local` の削除の版: 値のある紐の全部に入る。 1 つでも止められていれば、 入った分を出て待ち、
     /// 入り直す (入ったまま待つと、 2 本の紐を順に止める側 (並びの索引) と互いに待つ)。 行の lock を握って呼ぶ (値のある紐が
-    /// 当てるまで変わらない)。
-    fn local_apply_row(&self, local: u32) -> LocalApply<'_> {
-        let Some(wal) = self.oplog.as_ref() else { return LocalApply::off(self) };
-        let hids: Vec<usize> = (0..self.himos.len()).filter(|&h| self.himos[h].get_value(local).is_some()).collect();
+    /// 当てるまで変わらない)。 値のある紐の並び (WAL が無ければ None) も返す: 消す所 (`remove_entity_body_of`) は同じ並びを使い、
+    /// 紐を全部なめ直さない (#873 の 2 回目のレビュー)。
+    fn local_apply_row(&self, local: u32) -> (LocalApply<'_>, Option<Vec<usize>>) {
+        let Some(wal) = self.oplog.as_ref() else { return (LocalApply::off(self), None) };
+        let mut hids: Vec<usize> = Vec::with_capacity(self.himos.len());
+        hids.extend((0..self.himos.len()).filter(|&h| self.himos[h].get_value(local).is_some()));
         let passes = 'retry: loop {
             let mut passes = Vec::with_capacity(hids.len());
             for &h in &hids {
@@ -14614,7 +14616,7 @@ impl Engine {
             }
             break passes;
         };
-        LocalApply::new(self, wal, Intents::Many(passes))
+        (LocalApply::new(self, wal, Intents::Many(passes)), Some(hids))
     }
 
     /// #553 / #554: WAL に載らなかった書き込みを断る (呼び手は本体に当てない)。 計上して返す。
@@ -16217,11 +16219,19 @@ impl Engine {
     /// 再配送 (この冪等化) と open 時の sweep (`finish_interrupted_deletes`) の
     /// 両方で埋まる。
     fn apply_delete_local(&self, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
-        self.apply_delete_in(None, local, hlc)
+        self.apply_delete_in(None, local, hlc, None)
     }
 
     /// `apply_delete_local` の、 行 `local` の lock を握っている呼び手も呼べる形 (`set_cell_in` と同じ)。
-    fn apply_delete_in(&self, row: Option<&crate::row_lock::RowWrite<'_>>, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
+    ///
+    /// `valued`: 行の lock の下で数えた、 値のある紐の並び (自分の削除、 `local_apply_row`)。 None なら紐を全部なめる。
+    fn apply_delete_in(
+        &self,
+        row: Option<&crate::row_lock::RowWrite<'_>>,
+        local: u32,
+        hlc: enchudb_oplog::Hlc,
+        valued: Option<&[usize]>,
+    ) -> bool {
         let _own = row.is_none().then(|| self.row_locks.write(local));
         debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
         let tomb = self.tombstone_version_of(local);
@@ -16240,7 +16250,7 @@ impl Engine {
         // 削除優先 (ユーザの決め、 2026-10-21): 削除より新しい cell も消し、 行を死なせる (消した行の eid 宛ての書き込みは、 削除より
         // 新しくても捨てる。 受け取った書き込みは `slot_is_dead` で弾く)。 前は削除より新しい cell を残し (#514)、 名前の無い塊が
         // 生きた (#547)
-        self.remove_entity_body(local, enchudb_oplog::Hlc::ZERO);
+        self.remove_entity_body_of(local, enchudb_oplog::Hlc::ZERO, valued);
         // #720: 消えた行のカードは落とす (束ねた identity ごとの値は、 生きた行を切り離す時にだけ使う。 持ち続けると `pkformer` が
         // 消した行の Leaf の中身ごと残る)。 前の名前・束ねた identity・名前の年表は残す (消えた行にも束ねる / 削除の時刻を上げる)
         self.drop_cards_of_dead_slot(local);
@@ -16528,17 +16538,26 @@ impl Engine {
     /// 行を握って消す (#349): 他の cell の書き手と同じく、 `read_row` に消している途中の行を見せない。
     /// `apply_delete_local` から来た時は入れ子で素通り。
     fn remove_entity_body(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        self.remove_entity_body_of(local, hlc, None);
+    }
+
+    /// [`Self::remove_entity_body`] の、 値のある紐の並び (`valued`、 行の lock の下で数えた物) を渡せる版。 None なら紐を全部なめる。
+    fn remove_entity_body_of(&self, local: u32, hlc: enchudb_oplog::Hlc, valued: Option<&[usize]>) {
         let _row = self.row_locks.write(local);
         let mut survivor = false;
-        for hid in 0..self.himos.len() {
+        let mut each = |hid: usize| {
             if self.himos[hid].get_value(local).is_none() {
-                continue;
+                return;
             }
             if hlc != enchudb_oplog::Hlc::ZERO && self.version_of(local, hid as u16) > hlc {
                 survivor = true;
-                continue;
+                return;
             }
             self.remove_cell_freeing_leaf(local, hid);
+        };
+        match valued {
+            Some(v) => v.iter().copied().for_each(&mut each),
+            None => (0..self.himos.len()).for_each(&mut each),
         }
         if !survivor {
             self.live_free(local);
@@ -19038,7 +19057,7 @@ impl Engine {
         // 行を握ってから積む (`append_local_op` の doc)
         let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
-        let applying = self.local_apply_row(eid);
+        let (applying, valued) = self.local_apply_row(eid);
         // #877: 版数の無い DB は、 消す行を WAL に積む前に数える (#857 の止め)。 積んだ後・`apply_delete_in` の中で数える前に
         // 並んだ `oplog_sync` が checkpoint を Delete の後ろへ進めると、 その行の Tie も Delete も再生されず、 落ちた後に
         // `next_local` が消した行の手前に戻った。 先に数えて積めなかった (断った) 時は、 止めが次に `tables` を置くまで延びるだけ。
@@ -19050,7 +19069,7 @@ impl Engine {
             return;
         };
         self.at_apply_point(true);
-        let applied = self.apply_delete_in(row.as_ref(), eid, hlc);
+        let applied = self.apply_delete_in(row.as_ref(), eid, hlc, valued.as_deref());
         drop(applying);
         drop(row);
         if applied {
