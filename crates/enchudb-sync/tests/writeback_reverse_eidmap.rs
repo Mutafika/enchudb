@@ -242,23 +242,19 @@ fn lww_concurrent_same_card_converges() {
     std::thread::sleep(Duration::from_millis(50));
     eng_a.tie_to(e_a, "notes.note", 300);
     settle(&eng_a);
-    // InMemoryTransport は一度 publish すると自 peer が known_peers に載り、
-    // 2 回目の publish_since が per-peer 経路 (自分以外に peer なし = 0 件) に
-    // 乗ってしまうため、 round ごとに fresh transport を使う (既存 sync test の流儀)。
-    let t_a2: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
-    let syncer_a2 = Syncer::new(eng_a.clone(), t_a2.clone());
-    assert!(syncer_a2.publish_since(Hlc::ZERO) > 0);
-    let records_a2 = t_a2.pull(1, Hlc::ZERO);
-    let syncer_b_in2 = Syncer::new(eng_b.clone(), t_a2.clone());
-    assert!(syncer_b_in2.apply_records(&records_a2).applied > 0);
+    // A の 2 回目の publish は、 1 回目と同じ transport / 同じ Syncer で (#831: 前は、 publish したのが自分だけの
+    // `InMemoryTransport` で 2 回目からの `publish_since` が何も出さず、 round ごとに新しい transport を作って避けていた)
+    assert!(syncer_a.publish_since(Hlc::ZERO) > 0, "同じ transport への 2 回目の publish が何も出さない");
+    let records_a2 = t_a.pull(1, Hlc::ZERO);
+    assert!(syncer_b_in.apply_records(&records_a2).applied > 0);
     assert_eq!(
         eng_b.get(t_world, "notes.note"),
         Some(300),
         "even-newer write (A) must win LWW on B — 同時書き込みは時間が解決する"
     );
 
-    drop(syncer_a); drop(syncer_a2); drop(syncer_a_in); drop(syncer_b_in);
-    drop(syncer_b_in2); drop(syncer_b_out);
+    drop(syncer_a); drop(syncer_a_in); drop(syncer_b_in);
+    drop(syncer_b_out);
     drop(eng_a); drop(eng_b);
     cleanup(&path_a); cleanup(&path_b);
 }

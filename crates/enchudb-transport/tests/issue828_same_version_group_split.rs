@@ -466,12 +466,8 @@ fn a_relay_does_not_publish_a_group_cut_apart_at_the_edge_of_its_ring() {
     let link: Arc<dyn Transport> = down.clone();
     let sr = Syncer::new(r.clone(), link.clone());
     let sd = Syncer::new(d.clone(), link);
-    // D も publish する (`InMemoryTransport` の `known_peers` は publish した peer。 R だけだと、 R の 2 回目からの publish は
-    // 宛先が無くて何も出さない)
-    let e = d.entity_in("notes").unwrap();
-    d.tie_to(e, "notes.k", 9u32);
-    d.oplog_sync().unwrap();
-    assert!(sd.publish_since(Hlc::ZERO) > 0, "前提: D が transport に居る");
+    // D は受けるだけで、 何も publish しない (#831: 前は、 publish したのが R だけだと R の 2 回目からの publish が何も出さず、
+    // D に 1 行書かせて避けていた)
     // R の record で R の ring をほぼ埋める (D は受けていないので回収されない)
     for k in 10_000..13_900u32 {
         let e = r.entity_in("notes").unwrap();
