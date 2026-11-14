@@ -56,9 +56,15 @@ fn db(path: &str, peer: PeerId) -> Arc<Engine> {
     e
 }
 
-/// 書き手 `threads` 本が、 それぞれ自分の行だけを書き続ける横で state を `builds` 回作る。 戻り値: state が落とした書き込み
-/// (版数 h < as_of なのに、 state のその cell の版数が h より前) の数と、 見た書き込みの数。
-fn stress(eng: &Arc<Engine>, threads: usize, rows_each: usize, writes_each: u32) -> (usize, usize, usize) {
+/// 書き手 `threads` 本が、 それぞれ自分の行だけを書き続ける横で state を作り続ける。 戻り値: state が落とした書き込み
+/// (版数 h < as_of なのに、 state のその cell の版数が h より前) の数、 見た書き込みの数、 作った state の数、 そのうち書き手が
+/// 動いている最中に作った state (どの書き手にも、 as_of より前の書き込みと後の書き込みがある) の数。
+///
+/// 書き手は回数でなく状態で止める: 全員が書き始めてから state を作り始め、 state を `builds` 回以上作り、 かつ全員が
+/// `writes_each` 回以上書くまで作り続け、 その後に全員がもう 1 回書いてから止める。 前は書き手が決まった回数 (4000 回) で
+/// 終わり、 「その間に state を 2 回以上作れた」 を前提にしていて、 書き手の方が先に終わる機械 (CI の Linux: 12.8 万件を書く間に
+/// state 1 回) では前提の assert で落ちた。
+fn stress(eng: &Arc<Engine>, threads: usize, rows_each: usize, builds: usize, writes_each: u32) -> (usize, usize, usize, usize) {
     let v = eng.himo_id("notes.v").unwrap() as u16;
     let mut rows: Vec<Vec<u64>> = Vec::new();
     let mut k = 0u32;
@@ -75,27 +81,40 @@ fn stress(eng: &Arc<Engine>, threads: usize, rows_each: usize, writes_each: u32)
     }
     eng.oplog_commit();
     let stop = Arc::new(AtomicBool::new(false));
+    // 書き手ごとの、 書いた回数 (書き始めた / state の後にも書いた、 を見る)
+    let wrote: Arc<Vec<std::sync::atomic::AtomicU32>> = Arc::new((0..threads).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
     let writers: Vec<_> = rows
         .iter()
         .cloned()
-        .map(|mine| {
-            let (eng, stop) = (eng.clone(), stop.clone());
+        .enumerate()
+        .map(|(t, mine)| {
+            let (eng, stop, wrote) = (eng.clone(), stop.clone(), wrote.clone());
             std::thread::spawn(move || {
                 let mut log: Vec<(u64, Hlc)> = Vec::new();
                 let mut i = 0u32;
-                while !stop.load(Ordering::Acquire) && i < writes_each {
+                while !stop.load(Ordering::Acquire) {
                     let row = mine[i as usize % mine.len()];
                     i += 1;
                     eng.try_tie_to_by_id(row, v, i).unwrap();
                     // この行を書くのはこの thread だけ = 今の版数は今の書き込みの版数
                     log.push((row, eng.cell_hlc(row, v)));
+                    wrote[t].store(i, Ordering::Release);
                 }
                 log
             })
         })
         .collect();
+    // 全員が `from` より先まで書くのを待つ (上限は前提の誤りを知らせるだけ)
+    let all_wrote_past = |from: &[u32]| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while wrote.iter().zip(from).any(|(w, f)| w.load(Ordering::Acquire) <= *f) {
+            assert!(std::time::Instant::now() < until, "前提: 書き手が 120 秒進まない");
+            std::thread::yield_now();
+        }
+    };
+    all_wrote_past(&vec![0; threads]);
     let mut states: Vec<(HashMap<u64, Hlc>, Hlc)> = Vec::new();
-    while writers.iter().any(|w| !w.is_finished()) {
+    while states.len() < builds || wrote.iter().any(|w| w.load(Ordering::Acquire) < writes_each) {
         let (records, as_of) = eng.state_records();
         let cells: HashMap<u64, Hlc> = records
             .iter()
@@ -106,8 +125,21 @@ fn stress(eng: &Arc<Engine>, threads: usize, rows_each: usize, writes_each: u32)
             .collect();
         states.push((cells, as_of));
     }
+    // 最後の state の後にも、 全員がもう 1 回書いてから止める
+    let after: Vec<u32> = wrote.iter().map(|w| w.load(Ordering::Acquire)).collect();
+    all_wrote_past(&after);
     stop.store(true, Ordering::Release);
     let logs: Vec<Vec<(u64, Hlc)>> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    // 書き手が動いている最中に作った state: どの書き手にも、 as_of より前の書き込みと後の書き込みがある
+    let amid = states
+        .iter()
+        .filter(|(_, as_of)| {
+            logs.iter().all(|log| {
+                let cut = log.partition_point(|(_, h)| h < as_of);
+                cut > 0 && cut < log.len()
+            })
+        })
+        .count();
     let mut missed = 0;
     let mut seen = 0;
     for log in &logs {
@@ -126,7 +158,7 @@ fn stress(eng: &Arc<Engine>, threads: usize, rows_each: usize, writes_each: u32)
             }
         }
     }
-    (missed, seen, states.len())
+    (missed, seen, states.len(), amid)
 }
 
 /// 書き手 32 本が自分の行を書き続ける横で state を作る。 as_of より前の版数の書き込みは、 全部 state に入っている。
@@ -137,9 +169,10 @@ fn stress(eng: &Arc<Engine>, threads: usize, rows_each: usize, writes_each: u32)
 fn a_state_holds_every_write_stamped_before_its_as_of() {
     let dir = Dir::new("stress");
     let eng = db(&dir.db(1), 1);
-    let (missed, seen, builds) = stress(&eng, 32, 2, 4000);
-    println!("[stress] 書き込み {seen} 件 / state {builds} 回 / 抜け {missed} 件");
-    assert!(builds >= 2, "前提: 書き手が動いている間に state を作った ({builds} 回)");
+    const BUILDS: usize = 4;
+    let (missed, seen, builds, amid) = stress(&eng, 32, 2, BUILDS, 4000);
+    println!("[stress] 書き込み {seen} 件 / state {builds} 回 (書き手が動いている最中 {amid} 回) / 抜け {missed} 件");
+    assert!(builds >= BUILDS && amid == builds, "前提: 書き手が動いている間に state を作った ({builds} 回、 最中 {amid} 回)");
     assert_eq!(missed, 0, "as_of より前の版数の書き込みが state から抜けた (state {builds} 回、 書き込み {seen} 件)");
 }
 
