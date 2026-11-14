@@ -276,8 +276,10 @@ fn a_folded_own_slot_stays_reserved_after_the_kept_slot_is_reused() {
     for i in 5..10 {
         made.push(c.upsert(&format!("k{i}"), "n"));
     }
-    assert!(made.contains(&kept), "前提: 枠が尽きて、 消した残す行の slot {kept:x} を使い回す: {made:x?}");
-    assert!(!made.contains(&folded), "畳まれた行の slot {folded:x} を使い回した: {made:x?}");
+    // #731: 場所で比べる (使い回した行の eid は世代が違う。 既定の DB の場所は下 24 bit)
+    let slot = |e: u64| e as u32 & 0xFF_FFFF;
+    assert!(made.iter().any(|&e| slot(e) == slot(kept)), "前提: 枠が尽きて、 消した残す行の slot {kept:x} を使い回す: {made:x?}");
+    assert!(!made.iter().any(|&e| slot(e) == slot(folded)), "畳まれた行の slot {folded:x} を使い回した: {made:x?}");
     // A は削除も改名も知らないまま、 C の 2 行の写しに書く
     for key in ["k1", "k0"] {
         let e = a.row_of(key);
