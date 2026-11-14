@@ -156,5 +156,6 @@ fn a_sync_db_does_not_hand_out_a_previous_lap_record_again() {
     // (author, HLC) で落とす)。 像の古い record を読むと、 値 1 の record だけ更に 1 回多い
     let (ones, twos) = (handed(&eng, 1), handed(&eng, 2));
     eprintln!("配る分: 値 1 の record {ones} 回、 値 2 の record {twos} 回");
+    assert!(twos >= 1, "前提: 値 2 の record は配る分に居る");
     assert_eq!(ones, twos, "前の周の record (値 1) をもう 1 回配る分に積んだ");
 }
