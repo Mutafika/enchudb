@@ -163,12 +163,35 @@ fn set(eng: &Engine, j: &mut Journal, e: u64, h: &str) {
     };
 }
 
-/// 結果を返さない操作 (untie / delete): 断られたかは fault の数で見る (`tie_*` と同じ約束 — 書き込みを断った時は fault を
-/// 数える)。
-fn fault_checked(eng: &Engine, f: impl FnOnce()) -> Result<(), String> {
+/// 結果を返さない操作 (untie / delete): 当たったかは、 返った後の cell を読んで決める (書き手は 1 本なので、 返った直後の
+/// cell はこの操作の結果)。 `himos` の cell が全部空なら当たった。
+///
+/// 断られたかを fault の数の増えで決めない (#844): fault の数は engine 全体の物で、 背景の consumer の書き出しの失敗
+/// (`sync_for_checkpoint` の `FaultKind::DiskSpace`) も同じ数を上げる。 削除を呼んでいる間に consumer の msync が失敗すると、
+/// 当たった削除を 「断られた」 と日誌に書き、 確かめる側が 「消えているはずがない」 と落ちた。
+///
+/// fault の数は約束の片側にだけ使う: 断った (cell が残った) のに数が増えていなければ、 黙って断った = `broken` の行を残し、
+/// 確かめる側が失敗にする (`tie_*` と同じ約束 — 書き込みを断った時は fault を数える)。 一部の cell だけ消えた削除
+/// (#534: 途中まで消さない) は 「失敗」 と書くので、 確かめる側が消えた cell を 「在ってよい値でない」 と見つける。
+///
+/// 操作の前には読まない: 開き直した後の最初の読みは列の segment を開き、 そこに故障が当たると読みは panic する
+/// (書き込みは断るだけ)。 操作の後なら、 列は操作が開いたか、 断られた後の開き直し。
+fn applied_checked(eng: &Engine, j: &mut Journal, what: &str, e: u64, himos: &[&str], f: impl FnOnce()) {
+    j.seq += 1;
+    let seq = j.seq;
+    j.line(&format!("op {seq} {what}"));
     let before = eng.fault_total();
     f();
-    if eng.fault_total() > before { Err(format!("fault (total {before} → {})", eng.fault_total())) } else { Ok(()) }
+    let after = eng.fault_total();
+    let left: Vec<&str> = himos.iter().copied().filter(|h| read_val(eng, e, h).is_some()).collect();
+    if left.is_empty() {
+        j.line(&format!("done {seq}"));
+        return;
+    }
+    j.line(&format!("fail {seq} 残った列 {left:?} (fault {before} → {after})"));
+    if after == before {
+        j.line(&format!("broken 「{what}」 を断ったのに fault を数えていない"));
+    }
 }
 
 fn new_entity(eng: &Engine, j: &mut Journal) -> Option<u64> {
@@ -225,7 +248,7 @@ fn write_flush(mut eng: Engine, db: &str, j: &mut Journal) {
         }
     }
     if let Some(&e) = es.get(3) {
-        j.op(&format!("unset {e} g"), || fault_checked(&eng, || eng.untie(e, "t.g")));
+        applied_checked(&eng, j, &format!("unset {e} g"), e, &["g"], || eng.untie(e, "t.g"));
     }
     flush(&mut eng, j);
     // 閉じて開き直す (開く時の I/O: header・manifest・sidecar の読み込み)
@@ -233,7 +256,7 @@ fn write_flush(mut eng: Engine, db: &str, j: &mut Journal) {
     let Some(mut eng) = j.op("reopen", || Engine::open_standalone(db)) else { return };
     // batch 3: delete、 新しい entity (eid を使い回しうる)、 封緘 (flush + .crc)
     if let Some(&e) = es.get(1) {
-        j.op(&format!("del {e}"), || fault_checked(&eng, || eng.delete(e)));
+        applied_checked(&eng, j, &format!("del {e}"), e, &ALL_HIMOS, || eng.delete(e));
     }
     if let Some(e) = new_entity(&eng, j) {
         for (h, _) in HIMOS {
@@ -270,7 +293,7 @@ fn write_oplog(eng: std::sync::Arc<Engine>, db: &str, j: &mut Journal) {
         }
     }
     if let Some(&e) = es.get(3) {
-        j.op(&format!("unset {e} g"), || fault_checked(&eng, || eng.untie_async(e, "t.g")));
+        applied_checked(&eng, j, &format!("unset {e} g"), e, &["g"], || eng.untie_async(e, "t.g"));
     }
     eng.oplog_commit();
     sync(&eng, j);
@@ -278,7 +301,7 @@ fn write_oplog(eng: std::sync::Arc<Engine>, db: &str, j: &mut Journal) {
     drop(eng);
     let Some(eng) = j.op("reopen", || Engine::open_concurrent_with_oplog(db, OPLOG_CAP)) else { return };
     if let Some(&e) = es.get(1) {
-        j.op(&format!("del {e}"), || fault_checked(&eng, || eng.delete_async(e)));
+        applied_checked(&eng, j, &format!("del {e}"), e, &ALL_HIMOS, || eng.delete_async(e));
     }
     if let Some(e) = new_entity(&eng, j) {
         for (h, _) in HIMOS {
@@ -334,6 +357,8 @@ struct Model {
     /// 書き出しが返った所 (ops の長さ)
     acked_at: usize,
     m_defined_before_ack: bool,
+    /// 書き手が見つけた約束の破れ (`applied_checked` の `broken` の行)
+    broken: Vec<String>,
 }
 
 fn read_model(journal: &Path) -> Model {
@@ -345,6 +370,7 @@ fn read_model(journal: &Path) -> Model {
         let w: Vec<&str> = line.split(' ').collect();
         match w[0] {
             "created" => m.created = true,
+            "broken" => m.broken.push(line["broken ".len()..].to_string()),
             "schema" => schema = true,
             "ack" => {
                 m.acked_at = m.ops.len();
@@ -450,7 +476,7 @@ fn verify_child(kind: Kind, db: &str, journal: &Path) -> String {
         }
         Err(e) => return format!("開けない: {e}"),
     };
-    let mut errs = Vec::new();
+    let mut errs = m.broken.clone();
     if m.schema_acked {
         if !eng.list_tables().iter().any(|t| t.1 == "t") {
             errs.push("書き出しの返った table t が無い".to_string());
@@ -607,6 +633,8 @@ fn run(kind: Kind, mode: &str) {
     let picks = pick(&sites);
     let mut failures: Vec<(String, String, String)> = Vec::new();
     let mut fired = 0usize;
+    let keep = std::env::var("ENCHU_FAULT_MATRIX_KEEP").is_ok();
+    let mut kept = false;
     for (n, site) in &picks {
         let dir = root.join(format!("n{n}"));
         let live = dir.join("live");
@@ -651,6 +679,7 @@ fn run(kind: Kind, mode: &str) {
             (JOURNAL_ENV, journal.to_str().unwrap().into()),
         ]);
         let vout = String::from_utf8_lossy(&v.stdout);
+        let before = failures.len();
         match vout.lines().find(|l| l.starts_with("FM_RESULT ")) {
             Some("FM_RESULT ok") => {}
             Some(l) => failures.push((label, hit_site, l["FM_RESULT fail ".len().min(l.len())..].to_string())),
@@ -660,9 +689,18 @@ fn run(kind: Kind, mode: &str) {
                 failures.push((label, hit_site, format!("確かめる子が {:?} で終わった: {}", v.status, tail.into_iter().rev().collect::<Vec<_>>().join(" | "))));
             }
         }
+        // 失敗した回の DB と日誌を残す (`ENCHU_FAULT_MATRIX_KEEP=1`。 確かめる子が開いて書いた後の形。 日誌は書き手の物)
+        if failures.len() > before && keep {
+            let _ = std::fs::write(dir.join("writer.stderr"), stderr.as_bytes());
+            eprintln!("  残した: {}", dir.display());
+            kept = true;
+            continue;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
-    let _ = std::fs::remove_dir_all(&root);
+    if !kept {
+        let _ = std::fs::remove_dir_all(&root);
+    }
     let mut used = vec![0usize; KNOWN.len()];
     let mut unknown = Vec::new();
     for (label, site, msg) in &failures {
