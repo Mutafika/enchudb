@@ -285,21 +285,6 @@ impl EntitySet {
         }
     }
 
-    /// [`Self::is_live`] の Acquire 版。 消えた (印が下りた) のを見たら、 消す側が印を下ろす前に書いた物 (#731: 場所の世代を上げた
-    /// 事) も見える。 使い回す場所を選ぶ所で使う (`is_live` は atomic でない読みなので、 下りたのを見ても上げた世代が見えない事が
-    /// ある = 消えた行と同じ eid を払い出して、 その行への書き込みが 「消えた行」 で断られた。 #733 の試験を 8 本並べて 32 回に 1 回)。
-    #[inline]
-    pub fn is_live_acquire(&self, eid: u32) -> bool {
-        if eid >= self.max_entities() { return false; }
-        let byte_off = self.bitset_offset + (eid / 8) as usize;
-        if !self.region.is_committed(byte_off + 1) {
-            return false;
-        }
-        let mm = self.region.slice();
-        let byte = unsafe { &*(mm.as_ptr().add(byte_off) as *const std::sync::atomic::AtomicU8) };
-        byte.load(Ordering::Acquire) & (1u8 << (eid % 8)) != 0
-    }
-
     #[inline]
     pub fn is_live(&self, eid: u32) -> bool {
         if eid >= self.max_entities() { return false; }
@@ -423,13 +408,16 @@ impl EntitySet {
     /// 安全に共存できる (重複 eid を返さない)。 ただし呼び出し側で eid 範囲を
     /// 分離する責務を持つ — 例えば table A の range が [0, 1M), B の range が
     /// [1M, 2M) のように互いに disjoint であれば、 並行 allocate_at は安全。
-    pub fn allocate_at(&self, eid: u32) {
+    ///
+    /// #883: 戻り値は、 前から生きていたか (true なら別の呼び手が先に立てた = この slot はあちらの物)。
+    pub fn allocate_at(&self, eid: u32) -> bool {
         assert!(
             eid < self.max_entities(),
             "allocate_at: eid {} exceeds max_entities {}",
             eid, self.max_entities(),
         );
-        if !self.set_bit(eid, true) {
+        let was_live = self.set_bit(eid, true);
+        if !was_live {
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         }
         // next_eid を max(current, eid + 1) まで進める (CAS で torn write 防止)
@@ -445,6 +433,7 @@ impl EntitySet {
                 Err(v) => cur = v,
             }
         }
+        was_live
     }
 
     /// 生きている eid を昇順に `f` へ渡す (#385)。 bitset を 64 個単位で読み、 空の word は丸ごと飛ばす
