@@ -177,6 +177,30 @@ fn the_file_moves_to_v15_only_when_a_slot_is_reused() {
     assert!(eng.pull_raw("full.x", 1u32).is_empty());
 }
 
+/// 世代を持つ前 (v14) は、 消えた行の古い eid への書き込みを断れない (死んだ場所に cell が残る)。 その場所を使い回した行には、
+/// その cell が残らない (使い回す時に落とす)。
+#[test]
+fn a_cell_written_through_a_dead_eid_before_v15_is_not_inherited_by_the_row_that_reuses_the_slot() {
+    let path = tmp_path("leftover");
+    let _c = Cleanup(path.clone());
+    let eng = create_standalone(&path, 2);
+    let a = eng.entity_in("notes").unwrap();
+    eng.tie_to(a, "notes.note", 1u32);
+    let b = eng.entity_in("notes").unwrap();
+    eng.tie_to(b, "notes.note", 2u32);
+    eng.delete(b);
+    eng.tie_to(b, "notes.note", 99u32);
+    assert_eq!(eng.slot_bits(), 0, "前提: まだ世代を持たない");
+    assert_eq!(eng.get(b, "notes.note"), Some(99), "前提: 消えた行の eid への書き込みが死んだ場所に残った");
+    let c = eng.entity_in("notes").unwrap();
+    assert_eq!(slot(c), slot(b), "前提: 消えた場所を使い回した");
+    assert_ne!(c, b);
+    assert_eq!(eng.get(c, "notes.note"), None, "消えた行の eid で書いた cell が、 場所を使い回した行に残った");
+    assert!(eng.pull_raw("notes.note", 99u32).is_empty(), "消えた行の eid で書いた cell が引ける");
+    eng.tie_to(c, "notes.note", 3u32);
+    assert_eq!(eng.get(c, "notes.note"), Some(3));
+}
+
 /// v14 の間に消した場所も、 v15 に移った後に使い回すと新しい世代になる (移る時の穴埋め)。
 #[test]
 fn a_slot_freed_before_the_move_to_v15_gets_a_new_generation() {

@@ -11435,8 +11435,8 @@ impl Engine {
         if let Some(global) = reused_global {
             // #731: 消えた行の古い eid が、 消した後・使い回す前に死んだ場所へ書いた cell を落とす (v15 の DB では世代違いで断るので、
             // 残るのは v14 の間に書かれた分と、 v15 に移る途中で書き終えた分だけ)。 行の lock を待つので `free_locals` を放してから
-            // (行を握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が、 `free_locals` を待っている事がある。 issue701 の試験で
-            // 互いを待って止まった)。 eid は返す前なので、 新しい行に書く書き手はまだ居ない
+            // (行を握ったまま `entity_in` を呼ぶ書き手 = `write_row` を握ったまま insert する書き手が、 `free_locals` を待っている事が
+            // ある。 issue701 の試験で互いを待って止まった)。 eid は返す前なので、 新しい行に書く書き手はまだ居ない
             if !table.is_reserved() {
                 self.drop_leftover_cells(global, tid);
             }
