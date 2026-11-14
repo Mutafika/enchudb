@@ -234,3 +234,59 @@ fn a_stale_eid_does_not_write_into_the_row_that_reused_its_slot() {
     assert_eq!(t.entity(new).get_many(&["id", "a"]), vec![Some(Value::Number(100)), Some(Value::Number(1000))]);
     assert_eq!(t.where_eq("id", 100i64).count().unwrap(), 1);
 }
+
+/// 消えた行を指したままの ref は、 その場所を使い回した行を指さない。 読みは 「中身の無い行を指す ref」 のまま (世代を持つ前の
+/// DB で消した行を指す ref と同じ): `company.city is null` は真、 `company.city = X` は偽、 `company is null` は偽。 find と購読の
+/// どちらも、 世代を持つ前 (v14) に消した行・場所を使い回した後・世代を持った後 (v15) に消した行で同じ。
+#[test]
+fn a_ref_to_a_deleted_row_reads_as_a_ref_to_an_empty_row() {
+    use std::collections::BTreeSet;
+    let path = tmp_path("ref");
+    let _c = Cleanup(path.clone());
+    let mut db = Database::create(&path).unwrap();
+    db.table("companies").number("id").tag("city").primary_key("id").with_capacity(4).build().unwrap();
+    db.table("users").number("id").ref_to("company", "companies").primary_key("id").build().unwrap();
+    let c = db.get_table("companies").unwrap();
+    let u = db.get_table("users").unwrap();
+    let cs: Vec<u64> = (0..4i64).map(|i| c.insert().set("id", i).set("city", "Tokyo").commit().unwrap()).collect();
+    let u0 = u.insert().set("id", 0i64).set("company", Value::Ref(cs[1])).commit().unwrap();
+    let u1 = u.insert().set("id", 1i64).set("company", Value::Ref(cs[2])).commit().unwrap();
+    let u2 = u.insert().set("id", 2i64).commit().unwrap();
+    let null_city = || u.all().where_null("company.city");
+    let tokyo = || u.where_eq("company.city", "Tokyo");
+    let null_co = || u.all().where_null("company");
+    let subs = [null_city().subscribe().unwrap(), tokyo().subscribe().unwrap(), null_co().subscribe().unwrap()];
+    let mut seen: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); 3];
+    let check = |seen: &mut Vec<BTreeSet<u64>>, want: [&[u64]; 3], when: &str| {
+        let finds = [null_city().find().unwrap(), tokyo().find().unwrap(), null_co().find().unwrap()];
+        for (i, s) in subs.iter().enumerate() {
+            let d = s.poll();
+            for e in d.removed {
+                assert!(seen[i].remove(&e), "{when}: [{i}] removed に渡していない eid");
+            }
+            seen[i].extend(d.added);
+            let w: BTreeSet<u64> = want[i].iter().copied().collect();
+            assert_eq!(seen[i], w, "{when}: [{i}] 購読 (0 = company.city is null, 1 = company.city = Tokyo, 2 = company is null)");
+            assert_eq!(finds[i].iter().copied().collect::<BTreeSet<u64>>(), w, "{when}: [{i}] find");
+        }
+    };
+    check(&mut seen, [&[], &[u0, u1], &[u2]], "最初");
+    // 世代を持つ前 (使い回しの無い DB) に消した会社を指す ref
+    c.entity(cs[1]).delete().unwrap();
+    assert_eq!(db.engine().slot_bits(), 0, "前提: まだ使い回していない");
+    assert_eq!(u.entity(u0).get("company"), Some(Value::Ref(cs[1])), "消えた会社を指したまま");
+    check(&mut seen, [&[u0], &[u1], &[u2]], "消した後");
+    // 満杯の会社の表に足す = 消えた会社の場所を使い回す (Tokyo の会社)
+    let n = c.insert().set("id", 9i64).set("city", "Tokyo").commit().unwrap();
+    assert_eq!(slot(n), slot(cs[1]), "前提: 消えた会社の場所を使い回した");
+    assert_ne!(n, cs[1]);
+    assert!(db.engine().slot_bits() > 0, "前提: 世代を持つ DB (v15) になった");
+    assert_eq!(u.where_ref("company", n).find().unwrap(), Vec::<u64>::new(), "消えた会社を指す ref が、 場所を使い回した会社を指した");
+    check(&mut seen, [&[u0], &[u1], &[u2]], "場所を使い回した後");
+    // 世代を持った後に消した会社を指す ref (使い回しの前)
+    c.entity(cs[2]).delete().unwrap();
+    check(&mut seen, [&[u0, u1], &[], &[u2]], "v15 で消した後");
+    // 新しい会社を指せば普通の ref
+    u.entity(u0).set("company", Value::Ref(n)).commit().unwrap();
+    check(&mut seen, [&[u1], &[u0], &[u2]], "使い回した会社を指し直した後");
+}

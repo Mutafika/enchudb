@@ -638,10 +638,17 @@ pub(crate) trait CellReader {
     /// `pull(himo_id, value)` の件数 (O(1))。
     fn pull_len(&self, himo_id: u16, value: u64) -> usize;
     /// Ref の列の値が指している場所。 u32 に収まらない値は ref として読めない (None)。 #731: engine は値の世代を照合する (消えた
-    /// 行 / 場所を使い回す前の行を指す ref は None = ref が無いのと同じ)。
+    /// 行 / 場所を使い回す前の行を指す ref は None。 その ref の先の条件は [`Self::ref_target`] で 「中身の無い行」 として決める)。
     #[inline]
     fn ref_cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
         self.cell(himo_id, eid).and_then(|v| u32::try_from(v).ok())
+    }
+    /// #731: Ref の列の値の先。 `None` = ref が無い、 `Some(Some(場所))` = 今の住人、 `Some(None)` = 消えた行 (前の世代) を指す
+    /// ref。 消えた行を指す ref は、 中身の無い行を指す ref と同じに読む (master の 「消した行を指したままの ref」 と同じ:
+    /// `company.city is null` は真、 `company.city = X` は偽)。 世代を持たない DB は消えた行も場所のまま (中身は消してある)。
+    #[inline]
+    fn ref_target(&self, himo_id: u16, eid: u32) -> Option<Option<u32>> {
+        self.ref_cell(himo_id, eid).map(Some)
     }
     /// #731: 場所 `e` の今の住人を指す Ref の列の値 (via で逆に引く時の値)。 engine は 今の世代 | 場所。
     #[inline]
@@ -649,16 +656,10 @@ pub(crate) trait CellReader {
         e as u64
     }
     /// #731: 場所 `e` を指す Ref の値を持つ entity を `out` の後ろに足す。 **どの世代の値も** (消えた行を指したままの ref も):
-    /// 場所 `e` の行が変わった (消えた / 使い回された) 時に、 上の節へ伝える道が使う (前の世代を指す ref は ref が無いのと同じに
-    /// 変わる)。 読み (今の住人の配下) は [`Self::ref_val`] で引く。
+    /// 場所 `e` の行が変わった (消えた / 使い回された) 時に、 上の節へ伝える道が使う (前の世代を指す ref は中身の無い行を指す
+    /// ref に変わる)。 読み (今の住人の配下) は [`Self::ref_val`] で引く。
     fn pull_ref_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
         self.pull_into(via, self.ref_val(e), out);
-    }
-    /// [`Self::pull_ref_into`] の Vec 版。
-    fn pull_ref(&self, via: u16, e: u32) -> Vec<u32> {
-        let mut v = Vec::new();
-        self.pull_ref_into(via, e, &mut v);
-        v
     }
     /// #731: 場所 `e` を **前の世代で** 指す Ref の値を持つ entity を `out` の後ろに足す (今の世代は含まない)。
     fn pull_ref_stale_into(&self, _via: u16, _e: u32, _out: &mut Vec<u32>) {}
@@ -1895,6 +1896,14 @@ impl Pred {
             Pred::Not(p) => !p.matches(r, ex, eid),
             Pred::Exists { idx, mine: None, .. } => ex[*idx].has(eid as u64),
             Pred::Exists { idx, mine: Some(m), .. } => r.cell(*m, eid).is_some_and(|v| ex[*idx].has(v)),
+        }
+    }
+
+    /// #731: 中身の無い行 (消えた行) で真か ([`Family::eval_void`])。 否定だけが真になりうる。
+    fn matches_void(&self) -> bool {
+        match self {
+            Pred::Not(p) => !p.matches_void(),
+            _ => false,
         }
     }
 }
@@ -4106,9 +4115,8 @@ impl Family {
         for &c in &node.children {
             let (id, cv) = match known {
                 Some((kc, ans)) if kc == c => ans,
-                _ => {
-                    let t = r.ref_cell(self.nodes[c].via, e)?;
-                    match rec_at(&s.recs, &s.vals, c, t) {
+                _ => match r.ref_target(self.nodes[c].via, e)? {
+                    Some(t) => match rec_at(&s.recs, &s.vals, c, t) {
                         Some(ans) => ans,
                         None => {
                             let ans = self.eval(r, s, c, t);
@@ -4118,8 +4126,10 @@ impl Family {
                             }
                             ans
                         }
-                    }
-                }
+                    },
+                    // #731: 消えた行 (前の世代) を指す ref = 中身の無い行を指す ref。 答えは変わらない (記録も印も要らない)
+                    None => self.eval_void(s, c),
+                },
             }?;
             if self.on_path[c] {
                 v = cv;
@@ -4130,6 +4140,20 @@ impl Family {
             }
         }
         s.tables[n].find(buf).map(|id| (id, v))
+    }
+
+    /// #731: 節 `n` の答えを、 中身の無い行 (消えた行) で決める。 消えた行 (前の世代) を指す ref の先 = 世代を持たない DB の
+    /// 「消した行を指したままの ref」 の先 (中身は消してある) と同じ答え: 値の要る条件 (穴・範囲・Present / Eq など) と ref の先
+    /// (子の節) は偽、 否定は真。 `Exists` (指している row がある) は偽 (消えた行を指す row は数えない)。
+    fn eval_void(&self, s: &Settled, n: usize) -> Option<Ans> {
+        let node = &self.nodes[n];
+        if node.range.is_some() || !node.holes.is_empty() || !node.children.is_empty() {
+            return None;
+        }
+        if !node.local.iter().all(Pred::matches_void) {
+            return None;
+        }
+        s.tables[n].find(&[]).map(|id| (id, 0))
     }
 
     /// member の鍵の射影を各節の表に載せ、 根の鍵 id を返す。
@@ -4572,8 +4596,8 @@ impl Family {
                 }
             }
         }
-        // #731: 解放された entity (行が消えた場所)。 根でない節でも、 その場所を指していた ref は前の世代を指す ref (= ref が無い) に
-        // 変わるので、 答えが変わらなくても親へ伝える (下の `changed`)
+        // #731: 解放された entity (行が消えた場所)。 根でない節でも、 その場所を指していた ref は前の世代を指す ref (= 中身の無い行を
+        // 指す ref、 `Family::eval_void`) に変わるので、 答えが変わらなくても親へ伝える (下の `changed`)
         let mut freed_sorted = freed.clone();
         freed_sorted.sort_unstable();
         freed_sorted.dedup();
@@ -4729,7 +4753,7 @@ impl Family {
                         }
                         _ => r.pull(via, r.ref_val(e)),
                     };
-                    // #731: 前の世代を指す ref (消えた行を指したまま) の親は、 ref が無いのと同じに変わる = 子の答えを使わず評価し直す
+                    // #731: 前の世代を指す ref (消えた行を指したまま) の親は、 中身の無い行を指す ref に変わる = 子の答えを使わず評価し直す
                     let mut stale = Vec::new();
                     r.pull_ref_stale_into(via, e, &mut stale);
                     if parent == 0 && single_child == Some(n) {

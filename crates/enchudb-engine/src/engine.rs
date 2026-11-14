@@ -11388,8 +11388,8 @@ impl Engine {
         // fast path: free_locals_nonempty が false (= user table の常態) なら
         // mutex を取らずに通常 alloc に進む。 1M insert hot path で mutex
         // overhead (= 約 50 ns/op) を消す最適化。
-        // #731: 世代を持たない DB で表の場所を使い回す時は、 先に v15 に移る (使い回した行を世代の違う eid にする)。 移る手順は
-        // 行の lock を一巡して待つので、 `free_locals` を握る前に (lock の順を増やさない)
+        // #731: 世代を持たない DB で表の場所を使い回す時は、 先に v15 に移る (使い回した行を世代の違う eid にする)。 `free_locals` を
+        // 握る前に (移る手順は消す書き手を待つ)
         if !table.is_reserved()
             && !self.generations.active()
             && table.free_locals_nonempty.load(Ordering::Acquire)
@@ -11422,11 +11422,6 @@ impl Engine {
                 // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす
                 // (`clear_cell_versions` の doc 参照)。
                 self.clear_cell_versions(global);
-                // #731: 消えた行の古い eid が、 消した後・使い回す前に死んだ場所へ書いた cell を落とす (v15 の DB では世代違いで断るので、
-                // 残るのは v14 の間に書かれた分だけ)
-                if !table.is_reserved() {
-                    self.drop_leftover_cells(global, tid);
-                }
                 // #733: live の印は `free_locals` を握ったまま立てる。 放してから立てると、 その間に枯渇した別の thread の
                 // `rebuild_free_locals` が、 まだ live でないこの slot を穴として拾い直し、 同じ eid を 2 本に払い出した (2 つの
                 // 行が 1 つに混ざる)。 rebuild は同じ lock の下で liveness をなめるので、 ここを待った後は live を見る。
@@ -11438,6 +11433,13 @@ impl Engine {
             None
         };
         if let Some(global) = reused_global {
+            // #731: 消えた行の古い eid が、 消した後・使い回す前に死んだ場所へ書いた cell を落とす (v15 の DB では世代違いで断るので、
+            // 残るのは v14 の間に書かれた分と、 v15 に移る途中で書き終えた分だけ)。 行の lock を待つので `free_locals` を放してから
+            // (行を握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が、 `free_locals` を待っている事がある。 issue701 の試験で
+            // 互いを待って止まった)。 eid は返す前なので、 新しい行に書く書き手はまだ居ない
+            if !table.is_reserved() {
+                self.drop_leftover_cells(global, tid);
+            }
             return Ok(self.eid_of_slot(global));
         }
 
@@ -15486,6 +15488,18 @@ impl Engine {
     #[doc(hidden)]
     pub fn slot_bits(&self) -> u32 {
         self.generations.bits()
+    }
+
+    /// #731: 世代 0 の local (= 場所) の上限 2^S (まだ世代を持たない DB は、 持つ時に焼く `S`)。 これ以上の local は場所を
+    /// 使い回した行 (世代 > 0)。 schema の配下 / 到達の状態が、 世代の付いた local をページでなく木に置く境目 (世代ごとに別の
+    /// ページに散るので)。 値は速さにだけ効く: `S` は `max_entities` と共にしか大きくならず、 世代の付いた local は必ずこれ以上。
+    #[doc(hidden)]
+    pub fn dense_local_limit(&self) -> u32 {
+        let b = match self.generations.bits() {
+            0 => crate::generation::slot_bits_for(self.layout.read().unwrap().max_entities),
+            b => b,
+        };
+        if b >= 32 { u32::MAX } else { 1 << b }
     }
 
     /// 最初の使い回しの前に、 file version 15 (世代を持つ DB) に移る。 1 回だけ。
@@ -24587,9 +24601,13 @@ impl crate::live::CellReader for Engine {
     /// #731: Ref の値は 世代 | 場所。 世代が場所の今の世代と違えば (消えた行を指す ref) 読めない
     #[inline]
     fn ref_cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
+        crate::live::CellReader::ref_target(self, himo_id, eid)?
+    }
+    #[inline]
+    fn ref_target(&self, himo_id: u16, eid: u32) -> Option<Option<u32>> {
         let v = u32::try_from(crate::live::CellReader::cell(self, himo_id, eid)?).ok()?;
         let (slot, g) = self.generations.split(v);
-        (!self.generations.active() || self.generations.get(slot) == g).then_some(slot)
+        Some((!self.generations.active() || self.generations.get(slot) == g).then_some(slot))
     }
     #[inline]
     fn ref_val(&self, e: u32) -> u64 {

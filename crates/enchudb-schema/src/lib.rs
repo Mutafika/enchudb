@@ -3299,7 +3299,8 @@ impl LiveJoin {
                 if !reborn.is_empty() {
                     let moved: std::collections::BTreeSet<EntityId> = kd.removed.iter().chain(kd.added.iter()).map(|x| x.0).collect();
                     for b in reborn {
-                        let k = self.eng.eid_slot(b);
+                        // #731: b を指す Ref の値 (世代 | 場所)
+                        let k = self.eng.ref_value(b) as u32;
                         for a in self.eng.query_by_id(&[(*via, k)]) {
                             if !moved.contains(&a) && left.reported_key(a) == Some(k as u64) {
                                 d.removed.push((a, b));
@@ -4356,12 +4357,14 @@ impl<'a> UnderQuery<'a> {
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let up = self.up;
         let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
-        let local = |e: EntityId| eng.eid_slot(e);
-        let col_parent = |x: u32| eng.get_by_id(eng.slot_eid(x), via).map(|p| eng.eid_slot(eng.ref_eid(p)));
-        let slot_of = |e: EntityId| eng.eid_slot(e);
-        let refs = HierRef { parent: &col_parent, slot: &slot_of };
+        // #731: row は local (世代 | 場所)。 場所を使い回した行と消えた前の行は別の row (消えた行を指す ref の親は、 消えた行 =
+        // seed でも配下でもなく親も無い。 前の master の 「消えた行を指す ref」 と同じ)
+        let peer = eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let col_parent = |x: u32| eng.get_by_id(enchudb_oplog::make_eid(peer, x), via).map(|p| p as u32);
+        let refs = HierRef { parent: &col_parent };
         let mut memo = Some(std::collections::BTreeMap::new());
-        let mut h = Hier::new(up);
+        let mut h = Hier::new(up, eng.dense_local_limit());
         if let Hier::Up(ab) = &mut h {
             // 上向きは子から数を積むので、 親の表を組み立てる (下向きは親を engine から読む)
             for e in eng.find_by(a).map_err(io)? {
@@ -4382,7 +4385,7 @@ impl<'a> UnderQuery<'a> {
             .map_err(io)?
             .into_iter()
             .filter(|&e| h.find_answer(local(e), &refs, &mut memo))
-            
+            .map(|e| enchudb_oplog::make_eid(peer, local(e)))
             .collect();
         out.sort_unstable();
         Ok(out)
@@ -4400,7 +4403,8 @@ impl<'a> UnderQuery<'a> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let up = self.up;
-        let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up), filt: Default::default(), reported: Default::default(), reported_eid: Default::default() });
+        let dense = eng.dense_local_limit();
+        let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up, dense), filt: RowSet::new(dense), reported: RowSet::new(dense) });
         let Some((f, sd, a, via)) = self.plan()? else {
             return Ok(LiveUnder { eng, live: None, state });
         };
@@ -4419,8 +4423,6 @@ impl<'a> UnderQuery<'a> {
 /// 書き込みごとに維持される (試した版: 社員 100 万で RSS +45 MB、 1 万件まとめ -4%)。 子は当てた差分から持つ。
 struct HierRef<'e> {
     parent: &'e dyn Fn(u32) -> Option<u32>,
-    /// #731: eid / Ref の値 → 場所 (世代を外す)。
-    slot: &'e dyn Fn(EntityId) -> u32,
 }
 
 impl HierRef<'_> {
@@ -4430,7 +4432,6 @@ impl HierRef<'_> {
 }
 
 /// 下向きの seed と配下の答え。 row は local eid。 親は持たず鍵付きの購読から引く ([`HierRef`])、 子は当てた差分から持つ。
-#[derive(Default)]
 struct Tree {
     /// (親, 子)
     children: Adj<u32>,
@@ -4440,6 +4441,10 @@ struct Tree {
 }
 
 impl Tree {
+    fn new(dense: u32) -> Self {
+        Tree { children: Adj::new(dense), seed: RowSet::new(dense), under: RowSet::new(dense) }
+    }
+
     /// r の答え (親をたどって seed に着くか) を、 この poll で既に決めた答え (`memo`) を使って決める。 たどった道の row の
     /// 答えも `memo` に残す — 根が多い poll (最初の poll は全 row が根) でも、 どの row も 1 回しかたどらない (row ごとに
     /// 上までたどると row 数 × 深さ: 深さ 10 万の一本道で最初の poll が返らなかった)。 輪 (seed を含まない) の row は偽。
@@ -4540,7 +4545,6 @@ impl Tree {
 /// 輪が真になるのは (1) 伝える途中で、 この回に真にした row (か伝え始めた row) に戻った時、 (2) 下に seed の居る row を
 /// 自分の下へ付け替えた時 (新しい親の側は既に真なので、 伝えるのが途中で止まる)。 (1) は伝える道で見つかり、 (2) だけ新しい
 /// 親から上へたどる (深さに比例)。 下に seed の居ない row の付け替え (ほとんど) は親の表を 1 回書くだけ。
-#[derive(Default)]
 struct Above {
     parent: RowMap,
     seed: std::collections::BTreeSet<u32>,
@@ -4584,6 +4588,17 @@ impl Trail {
 }
 
 impl Above {
+    fn new(dense: u32) -> Self {
+        Above {
+            parent: RowMap::new(dense),
+            seed: Default::default(),
+            cnt: RowMap::new(dense),
+            cyc_of: Default::default(),
+            cyc_sum: Default::default(),
+            next_cyc: 0,
+        }
+    }
+
     fn cnt(&self, x: u32) -> u64 {
         self.cnt.get(x).map_or(0, u64::from)
     }
@@ -4801,8 +4816,9 @@ enum Hier {
 }
 
 impl Hier {
-    fn new(up: bool) -> Hier {
-        if up { Hier::Up(Above::default()) } else { Hier::Down(Tree::default()) }
+    /// `dense` = ページに置く local の上限 ([`Engine::dense_local_limit`])。
+    fn new(up: bool, dense: u32) -> Hier {
+        if up { Hier::Up(Above::new(dense)) } else { Hier::Down(Tree::new(dense)) }
     }
 
     fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
@@ -4833,7 +4849,7 @@ impl Hier {
     /// 親の付け替えと seed の出入りを当てて、 答えが変わりうる row を返す。
     fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta, h: &HierRef) -> Vec<u32> {
         use std::collections::BTreeSet;
-        let local = |e: EntityId| (h.slot)(e);
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
         // 外れた ref (付け替えは added で上書き)
         let mut readded: Vec<EntityId> = dp.added.iter().map(|x| x.0).collect();
         readded.sort_unstable();
@@ -4843,10 +4859,10 @@ impl Hier {
                 // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
                 let mut roots: BTreeSet<u32> = dp.removed.iter().chain(dp.added.iter()).map(|(e, _)| local(*e)).collect();
                 for &(e, p) in &dp.removed {
-                    tree.children.remove((h.slot)(p), local(e));
+                    tree.children.remove(p as u32, local(e));
                 }
                 for &(e, p) in &dp.added {
-                    tree.children.insert((h.slot)(p), local(e));
+                    tree.children.insert(p as u32, local(e));
                 }
                 for &e in &ds.removed {
                     tree.seed.remove(local(e));
@@ -4868,7 +4884,7 @@ impl Hier {
                         a.parent.remove(c);
                     }
                     for &(e, p) in &dp.added {
-                        a.parent.insert(local(e), (h.slot)(p));
+                        a.parent.insert(local(e), p as u32);
                     }
                     for &e in &ds.removed {
                         a.seed.remove(&local(e));
@@ -4885,7 +4901,7 @@ impl Hier {
                     a.reparent(c, None, &mut touched);
                 }
                 for &(e, p) in &dp.added {
-                    a.reparent(local(e), Some((h.slot)(p)), &mut touched);
+                    a.reparent(local(e), Some(p as u32), &mut touched);
                 }
                 for &e in &ds.removed {
                     a.set_seed(local(e), false, &mut touched);
@@ -4906,8 +4922,6 @@ struct UnderState {
     filt: RowSet,
     /// 最後に渡した row。
     reported: RowSet,
-    /// #731: 最後に渡した row のうち、 世代の付いた eid で渡した物 (場所 → eid)。 removed には渡した eid を出す
-    reported_eid: std::collections::BTreeMap<u32, EntityId>,
 }
 
 /// [`UnderQuery::subscribe`] の戻り値。 階層の配下 (または上) の row の出入りを購読する。
@@ -4924,17 +4938,17 @@ impl LiveUnder {
         use std::collections::BTreeSet;
         let Some((parents, seeds, filter)) = &self.live else { return LiveDelta::default() };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let UnderState { hier, filt, reported, reported_eid } = &mut *st;
-        let local = |e: EntityId| self.eng.eid_slot(e);
+        let UnderState { hier, filt, reported } = &mut *st;
+        let peer = self.eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
         let (dp, ds, df) = (parents.poll(&self.eng), seeds.poll(&self.eng), filter.poll(&self.eng));
         // 入り直した row (eid の使い回し) は別物: 答えが同じでも出て入り直す
         let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
         let mut touched = parents.with_reported(|get| {
-            let parent = |x: u32| get(self.eng.slot_eid(x)).map(|p| self.eng.eid_slot(self.eng.ref_eid(p)));
-            let slot_of = |e: EntityId| self.eng.eid_slot(e);
-            hier.apply(&dp, &ds, &HierRef { parent: &parent, slot: &slot_of })
+            let parent = |x: u32| get(enchudb_oplog::make_eid(peer, x)).map(|p| p as u32);
+            hier.apply(&dp, &ds, &HierRef { parent: &parent })
         });
         for &e in &df.removed {
             filt.remove(local(e));
@@ -4951,31 +4965,19 @@ impl LiveUnder {
         for x in touched {
             let now = hier.answer(x) && filt.contains(x);
             let was = reported.contains(x);
-            // #731: 渡した eid と今の eid (場所を使い回していれば世代が違う = 出て入り直した)
-            let e = self.eng.slot_eid(x);
-            let base = enchudb_oplog::make_eid(self.eng.peer_id(), x);
-            let old = if was { reported_eid.get(&x).copied().unwrap_or(base) } else { e };
+            let e = enchudb_oplog::make_eid(peer, x);
             match (was, now) {
                 (false, true) => {
                     reported.insert(x);
-                    if e != base {
-                        reported_eid.insert(x, e);
-                    }
                     d.added.push(e);
                 }
                 (true, false) => {
                     reported.remove(x);
-                    reported_eid.remove(&x);
-                    d.removed.push(old);
+                    d.removed.push(e);
                 }
-                (true, true) if reborn.contains(&x) || old != e => {
-                    d.removed.push(old);
+                (true, true) if reborn.contains(&x) => {
+                    d.removed.push(e);
                     d.added.push(e);
-                    if e != base {
-                        reported_eid.insert(x, e);
-                    } else {
-                        reported_eid.remove(&x);
-                    }
                 }
                 _ => {}
             }
@@ -5041,7 +5043,9 @@ impl<'a> ReachQuery<'a> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let Some(p) = self.plan()? else { return Ok(Vec::new()) };
-        let local = |e: EntityId| eng.eid_slot(e);
+        // #731: row は local (世代 | 場所)。 消えた行と、 その場所を使い回した行は別の row (辺は消えた行を指したまま)
+        let peer = eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
         let mut add = Vec::new();
         for e in eng.find_by(p.edges).map_err(io)? {
             if let (Some(s), Some(d)) = (eng.get_by_id(e, p.src), eng.get_by_id(e, p.dst)) {
@@ -5049,10 +5053,10 @@ impl<'a> ReachQuery<'a> {
             }
         }
         let seeds: Vec<u32> = eng.find_by(p.seeds).map_err(io)?.into_iter().map(local).collect();
-        let mut g = Graph::default();
+        let mut g = Graph::new(eng.dense_local_limit());
         g.update(&[], &add, &[], &seeds);
         let mut out: Vec<EntityId> =
-            eng.find_by(p.filter).map_err(io)?.into_iter().filter(|&e| g.reached(local(e))).collect();
+            eng.find_by(p.filter).map_err(io)?.into_iter().filter(|&e| g.reached(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
         out.sort_unstable();
         Ok(out)
     }
@@ -5067,7 +5071,7 @@ impl<'a> ReachQuery<'a> {
     pub fn subscribe(self) -> Result<LiveReach, SchemaError> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
-        let state = std::sync::Mutex::new(ReachState::default());
+        let state = std::sync::Mutex::new(ReachState::new(eng.dense_local_limit()));
         let Some(p) = self.plan()? else { return Ok(LiveReach { eng, live: None, state }) };
         let src = eng.subscribe_keyed(p.edges.clone(), Vec::new(), p.src).map_err(io)?;
         let dst = eng.subscribe_keyed(p.edges, Vec::new(), p.dst).map_err(io)?;
@@ -5089,7 +5093,6 @@ impl<'a> ReachQuery<'a> {
 /// row のうち届く支えを持つもの・足した辺の先・入った seed の先から幅優先に広げる。
 ///
 /// 支えられている row の一覧は持たない: 支えは辺の始点なので、 x が支える row = x から出る辺の先で支えが x のもの。
-#[derive(Default)]
 struct Graph {
     /// 始点 → (終点, 辺の row)
     out: Adj,
@@ -5102,9 +5105,14 @@ struct Graph {
 
 /// local eid → u32 の表。 4096 row ずつのページで、 触ったページだけ持つ。 到達の支えは 1 回の poll で 10 万 row 規模を
 /// 書き換え、 BTreeMap の出し入れがプロファイルの上位だった (row は table の範囲の local eid なので、 ページは詰まる)。
-#[derive(Default)]
+///
+/// #731: 場所を使い回した行の local (世代 | 場所、 `dense` 以上) はページでなく木 (`over`) に置く。 世代の付いた local は世代ごとに
+/// 別のページに散る (同じ場所のページの行が世代の数のページに分かれる) ので、 ページに置くと使い回しの多い表でページが行の数の
+/// 何十倍にもなる。 [`RowSet`] / [`Adj`] も同じ。
 struct RowMap {
     pages: Vec<Option<Box<[u32]>>>,
+    over: std::collections::BTreeMap<u32, u32>,
+    dense: u32,
     len: usize,
 }
 
@@ -5113,11 +5121,19 @@ impl RowMap {
     const NONE: u32 = u32::MAX;
     const BITS: u32 = 12;
 
+    /// `dense` = ページに置く local の上限 ([`Engine::dense_local_limit`])。
+    fn new(dense: u32) -> Self {
+        RowMap { pages: Vec::new(), over: std::collections::BTreeMap::new(), dense, len: 0 }
+    }
+
     fn slot(x: u32) -> (usize, usize) {
         ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
     }
 
     fn get(&self, x: u32) -> Option<u32> {
+        if x >= self.dense {
+            return self.over.get(&x).copied();
+        }
         let (p, i) = Self::slot(x);
         let v = self.pages.get(p)?.as_ref()?[i];
         (v != Self::NONE).then_some(v)
@@ -5129,6 +5145,13 @@ impl RowMap {
 
     fn insert(&mut self, x: u32, v: u32) -> Option<u32> {
         debug_assert!(v != Self::NONE);
+        if x >= self.dense {
+            let old = self.over.insert(x, v);
+            if old.is_none() {
+                self.len += 1;
+            }
+            return old;
+        }
         let (p, i) = Self::slot(x);
         if self.pages.len() <= p {
             self.pages.resize_with(p + 1, || None);
@@ -5144,6 +5167,11 @@ impl RowMap {
     }
 
     fn remove(&mut self, x: u32) -> Option<u32> {
+        if x >= self.dense {
+            let old = self.over.remove(&x)?;
+            self.len -= 1;
+            return Some(old);
+        }
         let (p, i) = Self::slot(x);
         let page = self.pages.get_mut(p)?.as_mut()?;
         let old = std::mem::replace(&mut page[i], Self::NONE);
@@ -5157,29 +5185,32 @@ impl RowMap {
         self.len
     }
 
-    /// 値の在る row (昇順)。 ページを全部なめる (組み直し用)。
+    /// 値の在る row (昇順)。 ページを全部なめる (組み直し用)。 木の row (`dense` 以上) はページの row より後。
     fn keys(&self) -> impl Iterator<Item = u32> + '_ {
-        self.pages.iter().enumerate().filter_map(|(p, q)| q.as_ref().map(|q| (p, q))).flat_map(|(p, q)| {
-            q.iter().enumerate().filter(|&(_, &v)| v != Self::NONE).map(move |(i, _)| ((p as u32) << Self::BITS) | i as u32)
-        })
+        self.pages
+            .iter()
+            .enumerate()
+            .filter_map(|(p, q)| q.as_ref().map(|q| (p, q)))
+            .flat_map(|(p, q)| {
+                q.iter().enumerate().filter(|&(_, &v)| v != Self::NONE).map(move |(i, _)| ((p as u32) << Self::BITS) | i as u32)
+            })
+            .chain(self.over.keys().copied())
     }
 
     fn clear(&mut self) {
         self.pages.clear();
+        self.over.clear();
         self.len = 0;
     }
 }
 
 /// local eid → (相手, 辺の row) の昇順の並び (4096 row ずつのページ)。 到達の辺の索引: 届く row を広げるたびに出る辺を
-/// 引くので、 BTreeSet の (始点, 終点, 辺) の範囲引きより、 row の並びを 1 回引く方が速い。
+/// 引くので、 BTreeSet の (始点, 終点, 辺) の範囲引きより、 row の並びを 1 回引く方が速い。 `dense` 以上の local は木
+/// ([`RowMap`] の #731)。
 struct Adj<T = (u32, u32)> {
     pages: Vec<Option<Box<[Vec<T>]>>>,
-}
-
-impl<T> Default for Adj<T> {
-    fn default() -> Self {
-        Adj { pages: Vec::new() }
-    }
+    over: std::collections::BTreeMap<u32, Vec<T>>,
+    dense: u32,
 }
 
 impl Adj<(u32, u32)> {
@@ -5194,11 +5225,18 @@ impl Adj<(u32, u32)> {
 impl<T: Ord + Copy> Adj<T> {
     const BITS: u32 = 12;
 
+    fn new(dense: u32) -> Self {
+        Adj { pages: Vec::new(), over: std::collections::BTreeMap::new(), dense }
+    }
+
     fn slot(x: u32) -> (usize, usize) {
         ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
     }
 
     fn get(&self, x: u32) -> &[T] {
+        if x >= self.dense {
+            return self.over.get(&x).map_or(&[], |v| v.as_slice());
+        }
         let (p, i) = Self::slot(x);
         match self.pages.get(p).and_then(|q| q.as_ref()) {
             Some(q) => &q[i],
@@ -5207,11 +5245,15 @@ impl<T: Ord + Copy> Adj<T> {
     }
 
     fn insert(&mut self, x: u32, e: T) -> bool {
-        let (p, i) = Self::slot(x);
-        if self.pages.len() <= p {
-            self.pages.resize_with(p + 1, || None);
-        }
-        let v = &mut self.pages[p].get_or_insert_with(|| (0..1 << Self::BITS).map(|_| Vec::new()).collect())[i];
+        let v = if x >= self.dense {
+            self.over.entry(x).or_default()
+        } else {
+            let (p, i) = Self::slot(x);
+            if self.pages.len() <= p {
+                self.pages.resize_with(p + 1, || None);
+            }
+            &mut self.pages[p].get_or_insert_with(|| (0..1 << Self::BITS).map(|_| Vec::new()).collect())[i]
+        };
         match v.binary_search(&e) {
             Ok(_) => false,
             Err(j) => {
@@ -5226,6 +5268,15 @@ impl<T: Ord + Copy> Adj<T> {
     }
 
     fn remove(&mut self, x: u32, e: T) -> bool {
+        if x >= self.dense {
+            let Some(v) = self.over.get_mut(&x) else { return false };
+            let Ok(j) = v.binary_search(&e) else { return false };
+            v.remove(j);
+            if v.is_empty() {
+                self.over.remove(&x);
+            }
+            return true;
+        }
         let (p, i) = Self::slot(x);
         let Some(v) = self.pages.get_mut(p).and_then(|q| q.as_mut()).map(|q| &mut q[i]) else { return false };
         match v.binary_search(&e) {
@@ -5243,25 +5294,37 @@ impl<T: Ord + Copy> Adj<T> {
 
 /// local eid の集合 (4096 row ずつのビットのページ、 触ったページだけ持つ)。 購読の 「条件を満たす row」 は table の
 /// 全 row になりうる (100 万 row で BTreeSet は数十 MB、 ビットなら 128 KB) し、 poll ごとに出入りした row の数だけ引く。
-#[derive(Default)]
+/// `dense` 以上の local は木 ([`RowMap`] の #731)。
 struct RowSet {
     pages: Vec<Option<Box<[u64]>>>,
+    over: std::collections::BTreeSet<u32>,
+    dense: u32,
 }
 
 impl RowSet {
     const BITS: u32 = 12;
+
+    fn new(dense: u32) -> Self {
+        RowSet { pages: Vec::new(), over: std::collections::BTreeSet::new(), dense }
+    }
 
     fn slot(x: u32) -> (usize, usize, u64) {
         ((x >> Self::BITS) as usize, ((x >> 6) & ((1 << (Self::BITS - 6)) - 1)) as usize, 1 << (x & 63))
     }
 
     fn contains(&self, x: u32) -> bool {
+        if x >= self.dense {
+            return self.over.contains(&x);
+        }
         let (p, w, b) = Self::slot(x);
         self.pages.get(p).and_then(|q| q.as_ref()).is_some_and(|q| q[w] & b != 0)
     }
 
     /// 無かったら true。
     fn insert(&mut self, x: u32) -> bool {
+        if x >= self.dense {
+            return self.over.insert(x);
+        }
         let (p, w, b) = Self::slot(x);
         if self.pages.len() <= p {
             self.pages.resize_with(p + 1, || None);
@@ -5274,6 +5337,9 @@ impl RowSet {
 
     /// 在ったら true。
     fn remove(&mut self, x: u32) -> bool {
+        if x >= self.dense {
+            return self.over.remove(&x);
+        }
         let (p, w, b) = Self::slot(x);
         match self.pages.get_mut(p).and_then(|q| q.as_mut()) {
             Some(q) => {
@@ -5287,6 +5353,10 @@ impl RowSet {
 }
 
 impl Graph {
+    fn new(dense: u32) -> Self {
+        Graph { out: Adj::new(dense), inn: Adj::new(dense), seed: Default::default(), sup: RowMap::new(dense) }
+    }
+
     fn outs(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
         self.out.get(x).iter().map(|t| t.0)
     }
@@ -5427,15 +5497,18 @@ struct ReachLive {
 }
 
 /// 到達の購読の状態。
-#[derive(Default)]
 struct ReachState {
     graph: Graph,
     /// この query の条件を満たす row。
     filt: RowSet,
     /// 最後に渡した row。
     reported: RowSet,
-    /// #731: 最後に渡した row のうち、 世代の付いた eid で渡した物 (場所 → eid)。 removed には渡した eid を出す
-    reported_eid: std::collections::BTreeMap<u32, EntityId>,
+}
+
+impl ReachState {
+    fn new(dense: u32) -> Self {
+        ReachState { graph: Graph::new(dense), filt: RowSet::new(dense), reported: RowSet::new(dense) }
+    }
 }
 
 /// [`ReachQuery::subscribe`] の戻り値。 辺の table をたどって届く row の出入りを購読する。
@@ -5451,8 +5524,9 @@ impl LiveReach {
         use std::collections::BTreeSet;
         let Some(lv) = &self.live else { return LiveDelta::default() };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let ReachState { graph, filt, reported, reported_eid } = &mut *st;
-        let local = |e: EntityId| self.eng.eid_slot(e);
+        let ReachState { graph, filt, reported } = &mut *st;
+        let peer = self.eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
         let (dsrc, ddst, ds, df) = (lv.src.poll(&self.eng), lv.dst.poll(&self.eng), lv.seeds.poll(&self.eng), lv.filter.poll(&self.eng));
         // 辺の row の (始点, 終点) の前後。 後 = 鍵付きの購読が渡し済みの鍵、 前 = 差分の removed か、 動いていなければ後と同じ
         let mut rows: Vec<EntityId> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
@@ -5494,31 +5568,19 @@ impl LiveReach {
         for x in touched {
             let now = graph.reached(x) && filt.contains(x);
             let was = reported.contains(x);
-            // #731: 渡した eid と今の eid (場所を使い回していれば世代が違う = 出て入り直した)
-            let e = self.eng.slot_eid(x);
-            let base = enchudb_oplog::make_eid(self.eng.peer_id(), x);
-            let old = if was { reported_eid.get(&x).copied().unwrap_or(base) } else { e };
+            let e = enchudb_oplog::make_eid(peer, x);
             match (was, now) {
                 (false, true) => {
                     reported.insert(x);
-                    if e != base {
-                        reported_eid.insert(x, e);
-                    }
                     d.added.push(e);
                 }
                 (true, false) => {
                     reported.remove(x);
-                    reported_eid.remove(&x);
-                    d.removed.push(old);
+                    d.removed.push(e);
                 }
-                (true, true) if reborn.contains(&x) || old != e => {
-                    d.removed.push(old);
+                (true, true) if reborn.contains(&x) => {
+                    d.removed.push(e);
                     d.added.push(e);
-                    if e != base {
-                        reported_eid.insert(x, e);
-                    } else {
-                        reported_eid.remove(&x);
-                    }
                 }
                 _ => {}
             }
