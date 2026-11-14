@@ -6114,6 +6114,9 @@ pub struct Engine {
     sync_ring_rebuild_from: std::sync::atomic::AtomicU32,
     /// #868: 枯渇した表の穴を探して枠をなめた回数 ([`Self::free_slot_scans`])。
     free_slot_scans: std::sync::atomic::AtomicU64,
+    /// #879: 書き出しが返った WAL の位置 (fsync + 本体の書き出しが済んだ所、 [`wal_pos`])。 #857 / #870 の止めで checkpoint が
+    /// 止まっていても進む。 changefeed の記録へ写す上限は checkpoint とこれの大きい方 ([`Self::change_log_upto`])。
+    written_out_pos: std::sync::atomic::AtomicU64,
     /// #190: sidecar persist (`.tables` / `.eidmap` / `.vocabmap`) の直列化 lock。
     /// tmp 名が sidecar ごとに固定なので、 同一 sidecar を 2 thread (consumer の
     /// `try_persist_tables` と pull 側の `persist_sync_state`) が同時に書くと
@@ -6561,6 +6564,7 @@ impl Engine {
             tables_persisted: std::sync::Mutex::new(None),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
+            written_out_pos: std::sync::atomic::AtomicU64::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -7858,6 +7862,7 @@ impl Engine {
             tables_persisted: std::sync::Mutex::new(None),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
+            written_out_pos: std::sync::atomic::AtomicU64::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -17962,7 +17967,7 @@ impl Engine {
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(wal) = self.oplog.as_ref() {
-                let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+                let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
             }
             c.readers.push((listener.clone(), log.range().1));
             self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
@@ -18052,12 +18057,22 @@ impl Engine {
         Ok(())
     }
 
+    /// #879: changefeed の記録へ写してよい WAL の位置 (書き出しの返った所)。 checkpoint と、 checkpoint を止めた書き出し
+    /// (#857 / #870: 消した行が `tables` の sidecar より先にある間) が返った位置の大きい方。 どちらまでの record も WAL の fsync と
+    /// 本体の書き出しが済んでいる (落ちても、 止めた分は開く時に再生して本体に同じ効果が残る。 開いた後の続きは記録の最後の record
+    /// を WAL から探す (`change_log_resume_offset`) ので、 checkpoint の先まで写していても二重に写さない)。 前は checkpoint までで、
+    /// 止めた `oplog_sync` は新しい record を listener に配らなかった。 位置は周 << 32 | 区画の中なので、 畳んだ周の古い位置は
+    /// 今の checkpoint より小さい
+    fn change_log_upto(&self, wal: &enchudb_oplog::oplog::OpLog) -> u64 {
+        wal.checkpoint().max(self.written_out_pos.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// changefeed の記録に残っている番号の範囲 `(最古, 次)`。 記録が無ければ None。 listener に渡した番号はこの範囲で受け直せる。
     pub fn change_log_range(&self) -> Option<(u64, u64)> {
         let log = self.change_log.get()?;
         if let Some(wal) = self.oplog.as_ref() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+            let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
         }
         Some(log.range())
     }
@@ -18076,7 +18091,7 @@ impl Engine {
         };
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(wal) = self.oplog.as_ref() {
-            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+            let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
         }
         let (first, next) = log.range();
         if pos < first || pos > next {
@@ -18111,7 +18126,7 @@ impl Engine {
                 // 前の session の record は渡らず、 付けた後の commit だけが渡る)
                 let early = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
                 if let (false, Some(log)) = (early.is_empty(), self.change_log.get()) {
-                    let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+                    let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
                     let at = log.range().1;
                     for l in early {
                         if !c.readers.iter().any(|(r, _)| std::sync::Arc::ptr_eq(r, &l)) {
@@ -22380,7 +22395,7 @@ impl Engine {
         // 記録がある時は記録に写す (渡すのは listener ごとの位置から)
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false) {
+            if let Err(e) = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false) {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
@@ -22547,7 +22562,7 @@ impl Engine {
         // #667: 記録がある時は、 畳めるかによらず書き出した所まで写す (畳む時にまとめて写すと、 区画 1 つ分を写し終えるまで全力の
         // 書き手が空きを待った)
         if let Some(log) = self.change_log.get() {
-            moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false).unwrap_or(0);
+            moved += self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false).unwrap_or(0);
         }
         // 先に lock の外で見積もる (畳める区画が無い / bridge が読み終えていないなら append_lock を取らない)。 畳めそうなら、 配って
         // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
@@ -22873,6 +22888,11 @@ impl Engine {
                                 // #317: 書き出しに失敗したら checkpoint を進めない (進めると oplog が畳まれ、
                                 // 書き出せなかった本体を復旧する record も消える)
                                 let synced = engine.sync_for_checkpoint(wal);
+                                if synced {
+                                    // #879: 書き出しが返った所 (checkpoint を止めても記録へ写してよい)。 checkpoint に渡すのと同じ
+                                    // `durable_head` (#873 で切った位置になる時も一緒に切られる)
+                                    engine.written_out_pos.fetch_max(durable_head, Ordering::AcqRel);
+                                }
                                 // 0.8.1: 周期 fsync でも tables sidecar を persist。
                                 // checkpoint を前進させる前に必ず sidecar を固める
                                 // (= 直後に process kill されても次 open で sidecar
@@ -22975,6 +22995,9 @@ impl Engine {
                             let committed = engine.append_commit_marker(wal).is_ok();
                             let durable_head = wal.written_head(); // #77-H3: msync 前に snapshot
                             let synced = engine.sync_for_checkpoint(wal); // #317
+                            if synced {
+                                engine.written_out_pos.fetch_max(durable_head, Ordering::AcqRel); // #879
+                            }
                             // 0.8.1: shutdown 時に tables sidecar を強制 persist。
                             // 旧 behavior では body_msync のみで `next_local` が
                             // sidecar に書かれず、 short-lived CLI (1 コマンド 1 process の CLI 等)
@@ -23207,7 +23230,12 @@ impl Engine {
                         // #870: `tables` がここまでの行を覆わなければ進めない (周期と同じ。 畳めない = 待っている書き手は断られる)。
                         // 上の `try_persist_tables` は `head` を読む前なので、 書き出しの間に書き手が足して消した行は覆わない
                         // (2 区画の形は書き出しの間も書ける)。 その時は書き出しの後に置き直す
-                        let ok = self.sync_for_checkpoint(wal) && self.tables_cover_checkpoint();
+                        let synced = self.sync_for_checkpoint(wal);
+                        if synced {
+                            // #879: `checkpoint_and_reset` が checkpoint に渡すのと同じ `head` (#873 で切った位置になる時も同じ)
+                            self.written_out_pos.fetch_max(head, Ordering::AcqRel);
+                        }
+                        let ok = synced && self.tables_cover_checkpoint();
                         if ok {
                             self.durable_lsn.store(durable_lsn, Ordering::Release);
                             // #662: 畳む前に lock の外で、 書き出した所 (head) まで写す (lock の下は畳む区画の終わりまでの残りだけ)。
@@ -23650,6 +23678,9 @@ impl Engine {
                 }
                 return Err(e);
             }
+            // #879: 書き出しが返った (下で checkpoint を止めても、 ここまでは changefeed の記録へ写してよい)。 置くのは checkpoint に
+            // 渡す値と同じ `durable_head` (#850 / #873 で覆う位置を当てていない書き手の手前で切る時も、 同じ式で切られる)
+            self.written_out_pos.fetch_max(durable_head, Ordering::AcqRel);
             // #857: sidecar の `next_local` より先の行を (版数なしで) 消していたら、 checkpoint を進めない。 進めた後に落ちると、
             // その行の Tie も Delete も再生されず、 開いた `next_local` が消した行の手前に戻る。 進めるのは `tables` を書いてから
             // 進める consumer の周期 (100 ms 以内) に任せる。 書いた分は WAL の fsync と本体の書き出しで届いている
