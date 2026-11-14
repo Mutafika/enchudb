@@ -1352,10 +1352,16 @@ thread_local! {
     /// #850: consumer の thread の、 空け作りの間 (`Engine::make_wal_room_paced`): (次に試してよい時刻, 続けて
     /// `WalRoom::Applying` だった回数)。
     static APPLYING_CUT_PACE: std::cell::Cell<(Option<std::time::Instant>, u32)> = const { std::cell::Cell::new((None, 0)) };
-    /// この thread が自分の書き込みを WAL に積んでから当て終えるまでの間か ([`LocalApply`] の入れ子の深さ)。 その間は辞書の
-    /// 書き出し (`settle_retired_words`、 msync) を当てた後に回す。
+    /// この thread が自分の書き込みを WAL に積んでから当て終えるまでの間か ([`LocalApply`] の入れ子の深さ、 下の bit
+    /// [`LOCAL_APPLY_DEPTH`])。 その間は辞書と Leaf の旧 slot の書き出し (`settle_retired_words` / `settle_retired_leaves`、
+    /// msync) を当てた後に回す。 Leaf の書き出しが要ると分かったら [`LEAF_SETTLE_AFTER_APPLY`] を立てる。
     static IN_LOCAL_APPLY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+/// `IN_LOCAL_APPLY` の bit: 当てる間に Leaf の旧 slot が書き出しの目安を越えた (`LocalApply` を落とす時に書き出す)。
+const LEAF_SETTLE_AFTER_APPLY: u32 = 1 << 31;
+/// `IN_LOCAL_APPLY` の、 入れ子の深さの bit。
+const LOCAL_APPLY_DEPTH: u32 = LEAF_SETTLE_AFTER_APPLY - 1;
 
 /// [`LocalApply`] が入った門 ([`crate::write_gate::IntentGate`])。 持つだけ (drop で出る)。
 enum Intents<'a> {
@@ -1371,9 +1377,10 @@ enum Intents<'a> {
 ///   索引を作る / 列を数える) が居れば終わるのを待ち、 落とすまで始めさせない。 積んだ後に当てる所でそれらを待つと、 印が
 ///   checkpoint を止めたまま WAL を畳めず、 満杯で全部の書き手が待ち、 待ち切れずに record を落とす / 書き込みを断った (#873 の
 ///   レビュー)
-/// - 辞書の書き出し (`settle_retired_words` の msync) は、 当てる間には呼ばず、 落とす時 (印を外した後) に回す (同じ理由)
+/// - 辞書と Leaf の旧 slot の書き出し (`settle_retired_words` / `settle_retired_leaves` の msync) は、 当てる間には呼ばず、
+///   落とす時 (印を外した後) に回す (同じ理由。 Leaf は untie / delete が旧 slot を返す所、 #873 の 2 回目のレビュー)
 ///
-/// 落とすと、 印を外して門を出てから、 辞書の書き出しが要れば書き出す。 当て終える前に落とさないこと。
+/// 落とすと、 印を外して門を出てから、 辞書 / Leaf の書き出しが要れば書き出す。 当て終える前に落とさないこと。
 pub(crate) struct LocalApply<'a> {
     eng: &'a Engine,
     mark: WalApplying<'a>,
@@ -1409,14 +1416,23 @@ impl Drop for LocalApply<'_> {
         drop(self.mark.take());
         drop(std::mem::replace(&mut self.intents, Intents::None));
         if self.counted {
+            // いちばん外の LocalApply なら Some(当てる間に Leaf の書き出しを回したか)
             let outer = IN_LOCAL_APPLY.with(|d| {
                 let n = d.get() - 1;
-                d.set(n);
-                n
+                if n & LOCAL_APPLY_DEPTH == 0 {
+                    d.set(0);
+                    Some(n & LEAF_SETTLE_AFTER_APPLY != 0)
+                } else {
+                    d.set(n);
+                    None
+                }
             });
-            // 当てる間に回した辞書の書き出し (印を外した後なので、 msync が長くても checkpoint を止めない)
-            if outer == 0 {
+            // 当てる間に回した辞書 / Leaf の書き出し (印を外した後なので、 msync が長くても checkpoint を止めない)
+            if let Some(leaf) = outer {
                 self.eng.settle_retired_words();
+                if leaf {
+                    self.eng.settle_retired_leaves_after_apply();
+                }
             }
         }
     }
@@ -2328,6 +2344,21 @@ mod settle_call_hook {
 
     pub(super) fn call() {
         if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    thread_local! {
+        static LEAF: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Leaf の旧 slot の書き出し (`settle_retired_leaves`) を呼ぶ所。
+    pub(super) fn set_leaf(f: impl FnOnce() + 'static) {
+        LEAF.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call_leaf() {
+        if let Some(f) = LEAF.with(|h| h.borrow_mut().take()) {
             f();
         }
     }
@@ -3610,6 +3641,8 @@ mod apply_liveness_tests {
         Guard,
         /// 円柱を組む (最初に引いた読み手、 `ensure_cylinder_built`)
         Build,
+        /// 組んだ円柱を組み直す (`compact_himo` = `HimoStore::compact_now`、 #873 の 2 回目のレビュー)
+        Compact,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3621,12 +3654,12 @@ mod apply_liveness_tests {
 
     /// 列 x の書き手を長く止める側が持つ間に、 A が x へ書き (行を消し)、 B が y に WAL の数倍を書く。 直す前は A が積んだ後に
     /// `write_lock` を待ち、 その record の手前で checkpoint が止まって、 B は止める側が放すまで空きを待った (6 秒持つと、 sync の DB は
-    /// record を落とし、 sync の無い DB は書き込みを断った)。 組み合わせ (止める側 2 × A の書き込み 2 × sync の有無 2) は 4 つずつ
+    /// record を落とし、 sync の無い DB は書き込みを断った)。 組み合わせ (止める側 3 × A の書き込み 2 × sync の有無 2) は 4 つずつ
     /// 並べて回す。 見るのは、 止める側が放す時までに B が書いた数 (時間では見ない: 負荷の下では、 A と関係なく書き出しが 1 秒近く
     /// かかる回がある)。
     #[test]
     fn a_writer_held_by_a_long_column_holder_does_not_hold_the_wal() {
-        let cases: Vec<_> = [Holder::Guard, Holder::Build]
+        let cases: Vec<_> = [Holder::Guard, Holder::Build, Holder::Compact]
             .into_iter()
             .flat_map(|h| [AWrite::Tie, AWrite::Delete].into_iter().map(move |w| (h, w)))
             .flat_map(|(h, w)| [false, true].into_iter().map(move |s| (h, w, s)))
@@ -3675,6 +3708,16 @@ mod apply_liveness_tests {
                             seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
                         });
                         let _ = eng.himos[x as usize].slice_len(5);
+                    }
+                    Holder::Compact => {
+                        let _ = eng.himos[x as usize].slice_len(5);
+                        assert!(eng.himos[x as usize].cylinder_built(), "前提: 組んだ円柱");
+                        crate::himo_store::hook::set("compact_now", move || {
+                            held_tx.send(()).unwrap();
+                            std::thread::sleep(hold);
+                            seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                        });
+                        eng.himos[x as usize].compact_now();
                     }
                 }
                 at_release.load(std::sync::atomic::Ordering::Relaxed)
@@ -3768,6 +3811,74 @@ mod apply_liveness_tests {
             "B は A の辞書の書き出しが終わるまで待たされた (終わる時までに {before_end} 件、 最大の待ち {worst:?})"
         );
         assert_eq!((text.as_deref(), y_now), (Some(&b"bbbb"[..]), Some(5999)), "両方の書き込みが当たっている");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LeafFree {
+        Untie,
+        Delete,
+    }
+
+    /// A が Leaf の値を外した (行を消した) 時の旧 slot の書き出し (`settle_retired_leaves`、 msync) が長くても、 B は待たされない。
+    /// 直す前は、 A が当てる途中 (WAL の印を持ち、 紐の門の中) にこれを呼んだ (#873 の 2 回目のレビュー、 辞書の形と同じ)。 旧 slot は
+    /// 1 つで書き出しの目安 (4 MiB) を越える大きさ (WAL より大きいので並行の形にする前に書く)、 書き出しの長さは割り込み点で作る。
+    #[test]
+    fn a_slow_leaf_settle_does_not_hold_the_wal() {
+        let running: Vec<_> =
+            [LeafFree::Untie, LeafFree::Delete].into_iter().map(|w| std::thread::spawn(move || leaf_settle_case(w))).collect();
+        let failed = running.into_iter().map(|c| c.join()).filter(Result::is_err).count();
+        assert_eq!(failed, 0, "{failed} case が落ちた (上の panic を見る)");
+    }
+
+    fn leaf_settle_case(free: LeafFree) {
+        let p = path(&format!("leafsettle-{free:?}"));
+        let mut eng = Engine::create_without_cell_version(&p, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        let y = eng.define_himo_in("t", "y", ValueType::Number, 0).unwrap() as u16;
+        let z = eng.define_himo_in("t", "z", ValueType::Leaf, 0).unwrap() as u16;
+        let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        eng.try_tie_text_to_by_id(e1, z, &"a".repeat(4 * 1024 * 1024 + 1)).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 64 * 1024).unwrap();
+        assert!(eng.oplog.as_ref().unwrap().two_halves(), "前提: 2 区画の WAL");
+        let hold = hold();
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let a = {
+            let (eng, b_done) = (eng.clone(), b_done.clone());
+            std::thread::spawn(move || {
+                // 書き出しが終わる時までに B が書いた数
+                let at_end = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let seen = at_end.clone();
+                settle_call_hook::set_leaf(move || {
+                    in_tx.send(()).unwrap();
+                    std::thread::sleep(hold);
+                    seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                });
+                match free {
+                    LeafFree::Untie => eng.untie_by_id(e1, z),
+                    LeafFree::Delete => eng.delete(e1),
+                }
+                at_end.load(std::sync::atomic::Ordering::Relaxed)
+            })
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が Leaf の旧 slot の書き出しを呼んだ");
+        let (rejected, worst) = write_many(&eng, e2, y, B_WRITES, &b_done);
+        let before_end = a.join().unwrap();
+        let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
+        let (z_now, y_now) = (eng.get_text_owned(e1, "t.z"), eng.get_by_id(e2, y));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        eprintln!(
+            "[leaf] {free:?}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A の書き出しが終わる時までに書いた {before_end} 件"
+        );
+        assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "{free:?}: B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
+        assert!(
+            before_end >= B_BEFORE_RELEASE,
+            "{free:?}: B は A の Leaf の書き出しが終わるまで待たされた (終わる時までに {before_end} 件、 最大の待ち {worst:?})"
+        );
+        assert_eq!((z_now, y_now), (None, Some(5999)), "{free:?}: 両方の書き込みが当たっている");
     }
 
     /// consumer の周期が当てている途中の書き手の手前で切ったせいで古い区画を畳めなかった後は、 次の周期を早める (1 ms から倍々、
@@ -3874,6 +3985,60 @@ mod apply_liveness_tests {
         assert_eq!(tried, 1, "{tag}: 1 回の空け作りで、 同じ所で切る書き出しを繰り返した");
         assert!(!first && !second, "{tag}: 前提: 畳めない");
         assert_eq!(retried, 0, "{tag}: 間を空けずに試し直した");
+    }
+
+    /// 当てている途中の書き手の手前で切った空け作りの後、 次に試すまでの間 (`APPLYING_CUT_PACE`) も、 空きを待つ書き手が居る間の
+    /// consumer は寝る (待つ書き手が 200 µs ごとに起こす分だけ起きる)。 前は、 その間寝ずに回った (#873 の 2 回目のレビュー)。
+    /// A を積んだ後・当てる前で止め、 B に WAL を埋めさせて空きを待たせた間の 200 ms に、 consumer の周の数を見る。
+    #[test]
+    fn the_consumer_sleeps_while_backing_off_from_an_applying_writer() {
+        let p = path("pacesleep");
+        let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
+        let (eng, x, y, _) = open(eng, false);
+        let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        cell_append_hook::set(&wal, move |_| {
+            in_tx.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, x, 1u32))
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が積んだ後・当てる前で止まった");
+        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let b = {
+            let (eng, b_done) = (eng.clone(), b_done.clone());
+            std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
+        };
+        // B が空きを待ち始める (書いた数が 50 ms 増えない) まで
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut last = u32::MAX;
+        while Instant::now() < until {
+            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
+            if now == last {
+                break;
+            }
+            last = now;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let cut = wal.applying_cuts() > 0;
+        let woke = eng.consumer_wakeups();
+        std::thread::sleep(Duration::from_millis(200));
+        let woke = eng.consumer_wakeups() - woke;
+        let still = b_done.load(std::sync::atomic::Ordering::Acquire) < B_WRITES;
+        release.send(()).unwrap();
+        let a = a.join().unwrap();
+        let (rejected, _) = b.join().unwrap();
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        eprintln!("[pace] B が待ち始めた所 {last} 件 / 200 ms の consumer の周 {woke}");
+        assert!(cut && still, "前提: A の手前で切って畳めず、 B が空きを待った ({last} 件)");
+        assert_eq!((a, rejected), (Ok(()), 0), "A / B の書き込み");
+        // 寝ていれば、 待つ書き手が起こす分 (200 µs ごと = 1000 回) まで。 回ると 10^5 を越える
+        assert!(woke < 5_000, "consumer が寝ずに回った (200 ms に {woke} 周)");
     }
 }
 
@@ -14796,7 +14961,7 @@ impl Engine {
     /// 回す (`LocalApply` を落とす時に呼ぶ)。 msync は長いことがあり、 その間 WAL の印が checkpoint を止める (#873 のレビュー)。
     #[inline]
     fn settle_retired_words_after_apply(&self) {
-        if IN_LOCAL_APPLY.with(|d| d.get()) == 0 {
+        if IN_LOCAL_APPLY.with(|d| d.get()) & LOCAL_APPLY_DEPTH == 0 {
             self.settle_retired_words();
         }
     }
@@ -16800,7 +16965,30 @@ impl Engine {
         }
         let waiting = leaf.retire(off);
         if leaf.settle_due(waiting) {
-            self.settle_retired_leaves(leaf);
+            // 自分の書き込みを当てる間 (WAL の印を持ち、 紐の門の中) なら、 書き出しは `LocalApply` を落とす時に回す (msync は
+            // 秒単位のことがあり、 その間 印が checkpoint を止める。 #873 の 2 回目のレビュー、 辞書の書き出しと同じ)
+            let deferred = IN_LOCAL_APPLY.with(|d| {
+                let v = d.get();
+                let inside = v & LOCAL_APPLY_DEPTH != 0;
+                if inside {
+                    d.set(v | LEAF_SETTLE_AFTER_APPLY);
+                }
+                inside
+            });
+            if !deferred {
+                self.settle_retired_leaves(leaf);
+            }
+        }
+    }
+
+    /// [`Self::retire_leaf_slot`] が当てる間に回した書き出し (`LocalApply` を落とす時)。 その間に consumer の書き出しが空けていれば
+    /// 書き出さない。
+    #[cold]
+    fn settle_retired_leaves_after_apply(&self) {
+        if let Some(leaf) = self.leaf.as_ref() {
+            if leaf.settle_due(leaf.retired().1) {
+                self.settle_retired_leaves(leaf);
+            }
         }
     }
 
@@ -16808,6 +16996,8 @@ impl Engine {
     /// ごとに書き出すので普段は届かない。 consumer の無い書き手 (standalone / `&self` の `tie_*_to` だけの書き手) が
     /// flush せずに書き換え続けた時の上限。 書き出すのは 1 本の thread だけ (他の thread は待たずに続ける)。
     fn settle_retired_leaves(&self, leaf: &LeafStore) {
+        #[cfg(test)]
+        settle_call_hook::call_leaf();
         let Some(_one) = leaf.begin_settle() else { return };
         let ok = self.body_msync().is_ok();
         leaf.settle_finished(ok);
@@ -24025,8 +24215,13 @@ impl Engine {
                     // #846: bridge が ring の満杯で止まったままで、 見直す物が無い WAL (起こされるまで 1 秒ごと)
                     let mut parked_wal = None;
                     // #846: 空きを待つ書き手は居るが、 今は畳めないと分かっている (10 ms の間は試さない)。 前は、 その間寝ずに
-                    // 回り続けた (満杯の WAL に 1 回書くたびに最大 10 ms)
-                    let room_wait = engine.wal_room_wanted.load(Ordering::Acquire) && engine.wal_room_failed_recently();
+                    // 回り続けた (満杯の WAL に 1 回書くたびに最大 10 ms)。 #850: 当てている途中の書き手の手前で切った空け作りの後、
+                    // 次に試すまでの間 (`APPLYING_CUT_PACE`) も同じ (前は、 その間寝ずに回った、 #873 の 2 回目のレビュー)
+                    let pace_left = APPLYING_CUT_PACE
+                        .with(|p| p.get().0)
+                        .and_then(|until| until.checked_duration_since(std::time::Instant::now()));
+                    let room_wait = engine.wal_room_wanted.load(Ordering::Acquire)
+                        && (pace_left.is_some() || engine.wal_room_failed_recently());
                     let timeout = match oplog_for_thread.as_ref() {
                         None => None,
                         Some(wal) => {
@@ -24040,7 +24235,11 @@ impl Engine {
                             }
                             if behind {
                                 let tick = fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1));
-                                Some(if room_wait { tick.min(Duration::from_millis(10)) } else { tick })
+                                Some(if room_wait {
+                                    tick.min(Duration::from_millis(10)).min(pace_left.unwrap_or(Duration::MAX))
+                                } else {
+                                    tick
+                                })
                             } else if engine.sync_tables_enabled() {
                                 // sync の bridge (相手の ack で `_sync_ops` が空くのを待つ等) は時間で見直す物が残りうるので、
                                 // 1 秒ごとには起きる (changefeed の配信は通知係がする)

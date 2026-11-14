@@ -1056,12 +1056,19 @@ impl HimoStore {
         // #270: 未 build なら掃除する stale が無いので **組まずに返す**。 ここで
         // `ensure_cylinder_built` を呼ぶと、 掃除 API が index を丸ごと確保した上で
         // 「stale ゼロ」を確認するだけになる (遅延構築は定義上 stale-free)。
+        if !self.cyl_built.load(Ordering::Acquire) {
+            return;
+        }
+        // 組み直す間、 WAL に積んで当てる書き手を積む前に止める (`ensure_cylinder_built` と同じ。 積んだ後に鍵 / `write_lock` を
+        // 待たせると、 その record の手前で checkpoint が止まる、 #873 の 2 回目のレビュー)。 `write_lock` の前に
+        let _intent = self.intent.hold();
         let w = self.write_lock.lock();
         let Some(cyl) = self.cyl_live(&w) else {
             return;
         };
         // 鍵で書く書き手も止める (全部の bucket を組み直す)
         let _all = self.vlocks().lock_all();
+        hook::at("compact_now");
         let col = self.col();
         if cyl.sparse_churned() {
             cyl.compact_sparse(|v, eid| stored_at(col, eid) == v + 1);
