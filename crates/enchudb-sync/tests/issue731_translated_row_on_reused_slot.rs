@@ -91,3 +91,84 @@ fn the_state_sweep_deletes_a_translated_row_on_a_reused_slot() {
     assert_eq!(eng_b.pull_raw("notes.note", 1u32).len(), 1, "A の行は state で届く");
     assert_eq!(eng_b.get(b2, "notes.note"), Some(11), "自分の行は残る");
 }
+
+fn make_named(path: &str, peer: PeerId, cap: u32) -> Arc<Engine> {
+    let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
+    eng.define_table("notes", cap).unwrap();
+    eng.define_himo_in("notes", "k", ValueType::Tag, 0).unwrap();
+    eng.define_himo_in("notes", "title", ValueType::Number, 0).unwrap();
+    let k = eng.himo_id("notes.k").unwrap() as u16;
+    eng.set_table_pk("notes", k).unwrap();
+    eng.enable_sync_tables().unwrap();
+    let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+    eng.set_peer_id(peer);
+    eng
+}
+
+fn rows_named(eng: &Engine, name: &str) -> Vec<u64> {
+    eng.vocab_id(name).map(|v| eng.pull_raw("notes.k", v)).unwrap_or_default()
+}
+
+/// 読み直し B3 (#614 の削除優先): A が k1 を作って消す。 C は A の削除を知らずに k1 を作り (削除より前 = A の行と同じデッキ)、 B は
+/// C の k1 を受けて削除の後に k2 に改名する。 R は A の作成と削除、 B の改名、 C の作成の順に受ける。 C の作成 (削除より前の名前の
+/// 書き込み、 改名に負ける) で、 C の行が消えたデッキの一員と分かって消す。 R で C の行が、 消えた行の場所を使い回して載っている
+/// (世代 1 以上) と、 前は世代 0 の eid で 「生きているか」 をアプリの入口で見て偽 = 消さなかった。
+#[test]
+fn a_late_create_deletes_a_translated_row_on_a_reused_slot() {
+    let paths: Vec<String> = ["a", "b", "c", "r"].iter().map(|t| tmp_path(&format!("b3{t}"))).collect();
+    let _c = Cleanup(paths.clone());
+    let mem = Arc::new(InMemoryTransport::new());
+    for p in 1..=4 {
+        mem.register_peer(p);
+    }
+    let transport: Arc<dyn Transport> = mem.clone();
+    let (a, b, c) = (make_named(&paths[0], 1, 100), make_named(&paths[1], 2, 100), make_named(&paths[2], 3, 100));
+    let r = make_named(&paths[3], 4, 3);
+    let (sa, sb, sc, sr) = (
+        Syncer::new(a.clone(), transport.clone()),
+        Syncer::new(b.clone(), transport.clone()),
+        Syncer::new(c.clone(), transport.clone()),
+        Syncer::new(r.clone(), transport.clone()),
+    );
+    let publish = |e: &Arc<Engine>, s: &Syncer| {
+        e.oplog_commit();
+        e.oplog_sync().unwrap();
+        s.publish_since(Hlc::ZERO);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    };
+    // R: 自分の表 (枠 3) を埋めて 2 行消す (翻訳した行は消えた場所を使い回す)
+    let mine: Vec<u64> = (0..3u32)
+        .map(|i| {
+            let e = r.entity_in("notes").unwrap();
+            r.tie_to(e, "notes.title", 100 + i);
+            e
+        })
+        .collect();
+    r.delete(mine[0]);
+    r.delete(mine[1]);
+    let row_a = a.entity_in("notes").unwrap();
+    a.tie_text_to(row_a, "notes.k", "k1");
+    a.tie_to(row_a, "notes.title", 0u32);
+    publish(&a, &sa);
+    let row_c = c.entity_in("notes").unwrap();
+    c.tie_text_to(row_c, "notes.k", "k1");
+    c.tie_to(row_c, "notes.title", 1u32);
+    publish(&c, &sc);
+    sb.pull_once(3);
+    a.delete(row_a);
+    publish(&a, &sa);
+    let at_b = rows_named(&b, "k1");
+    assert_eq!(at_b.len(), 1, "前提: B は C の k1 を持つ");
+    b.tie_text_to(at_b[0], "notes.k", "k2");
+    publish(&b, &sb);
+    sr.pull_once(1);
+    sr.pull_once(2);
+    let renamed = rows_named(&r, "k2");
+    assert_eq!(renamed.len(), 1, "前提: R は B の改名で C の行を先に作る");
+    assert!(enchudb_oplog::eid_local(renamed[0]) >> 24 >= 1, "前提: C の行は消えた場所を使い回した (世代 1 以上): {:#x}", renamed[0]);
+    sr.pull_once(3);
+    assert!(
+        rows_named(&r, "k2").is_empty() && rows_named(&r, "k1").is_empty(),
+        "消えたデッキの一員と分かった翻訳した行 (使い回した場所) を消さなかった"
+    );
+}

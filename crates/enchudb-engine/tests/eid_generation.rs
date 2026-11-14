@@ -606,3 +606,45 @@ fn generation_marks_are_rebuilt_after_an_unclean_close() {
     assert_eq!(eng.get(new, "notes.note"), Some(3));
     assert_eq!(eng.get(old, "notes.note"), None);
 }
+
+/// 読み直し D2 の続き: 畳んだ自分の行 (#612) の場所は世代を上げない (使い回さない)。 その場所を 「消えた行」 にして使い回せるように
+/// する所 (#581 の切り離し: 削除より前に作られた自分の identity の場所を消えた slot にする) では上げる。 上げないと、 その場所を
+/// 使い回した行が畳んだ行と同じ eid になる。
+#[test]
+fn a_folded_own_slot_released_by_a_split_gets_a_new_generation_before_reuse() {
+    let path = tmp_path("splitraise");
+    let _c = Cleanup(path.clone());
+    let eng = {
+        let mut eng = Engine::create_with_cell_version(&path, 65_536).unwrap();
+        eng.define_table("owners", 1).unwrap();
+        eng.define_himo_in("owners", "name", ValueType::Number, 0).unwrap();
+        eng.define_table("notes", 2).unwrap();
+        eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+        let k = eng.himo_id("notes.note").unwrap() as u16;
+        eng.set_table_pk("notes", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, WAL).unwrap();
+        eng.set_peer_id(1);
+        eng
+    };
+    reuse_once_in(&eng, "owners", "owners.name");
+    let k = eng.himo_id("notes.note").unwrap() as u16;
+    let x = eng.entity_in("notes").unwrap();
+    eng.tie_to(x, "notes.note", 5u32);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let y = eng.entity_in("notes").unwrap();
+    eng.tie_to(y, "notes.note", 5u32);
+    let (tx, ty) = (eng.cell_hlc(x, k), eng.cell_hlc(y, k));
+    assert!(tx.wall + 1 < ty.wall, "前提: X は Y より前に作った ({tx:?} / {ty:?})");
+    assert!(eng.fold_rows_with_same_pk(y, k, 5, None) >= 1, "前提: 同じ名前の自分の行を畳んだ");
+    let survivor = eng.pull_raw("notes.note", 5u32);
+    assert_eq!(survivor, vec![y], "前提: 後に作った Y が残る (X の場所は畳んだ自分の行)");
+    // X の作成と Y の作成の間の削除: Y は削除の後に作られた別のデッキ = 残り、 X の identity は消えた slot に戻る
+    let t = enchudb_oplog::Hlc { wall: tx.wall + 1, logical: 0, peer: 2 };
+    eng.remote_delete_apply(y, t);
+    assert!(eng.is_live(y), "前提: 削除の後に作られた Y は残る");
+    let z = eng.entity_in("notes").unwrap();
+    assert_eq!(slot(z), slot(x), "前提: 消えた slot に戻った X の場所を使い回した");
+    assert_ne!(z, x, "別名を外した場所を、 畳んだ行と同じ eid で使い回した");
+    assert_eq!(eng.get(x, "notes.note"), None);
+}
