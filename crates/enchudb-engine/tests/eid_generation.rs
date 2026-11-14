@@ -59,18 +59,6 @@ fn has_gen_segment(db: &str) -> bool {
     std::path::Path::new(db).join("gen.seg").is_file()
 }
 
-/// `tables` の sidecar の、 表 `table` の `next_local` を `value` に書き換える (`persist_tables` が失敗し続けた後に落ちた像:
-/// sidecar は消した行を足す前のまま)。 表ごとの並びは 名前の長さ (u32) / 名前 / eid の範囲 (u32 × 2) / `next_local` (u32)。
-fn set_next_local(db: &str, table: &str, value: u32) {
-    let path = std::path::Path::new(db).join("tables");
-    let mut bytes = std::fs::read(&path).unwrap();
-    let mut name = (table.len() as u32).to_le_bytes().to_vec();
-    name.extend_from_slice(table.as_bytes());
-    let at = bytes.windows(name.len()).position(|w| w == name.as_slice()).expect("sidecar に表がある") + name.len() + 8;
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    std::fs::write(&path, bytes).unwrap();
-}
-
 /// 表 `notes` (枠 `cap`、 列 `note`) と、 使い回しを起こすための表 `full` (枠 1) を持つ DB。
 fn create_standalone(path: &str, cap: u32) -> Engine {
     let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
@@ -208,28 +196,52 @@ fn a_slot_freed_before_the_move_to_v15_gets_a_new_generation() {
     assert_eq!(eng.get(a, "notes.note"), None);
 }
 
-/// 落ちた後に払い出し位置が消した場所の手前に戻った像 (`persist_tables` が失敗し続けた後に落ちた = `tables` の sidecar が古い)
-/// でも、 消した行の eid をもう一度渡さない。
+/// `tables` の sidecar を書けなくする / 戻す (`tables` は tmp を作って rename する。 tmp の置き場に directory を置くと、 他の書き出し =
+/// WAL / 本体は書けるまま `tables` だけ書けない。 #870 の試験と同じ作り方)。
+fn block_tables(db: &str, on: bool) {
+    let tmp = std::path::Path::new(db).join("tables.tmp");
+    if on { std::fs::create_dir(&tmp).unwrap() } else { std::fs::remove_dir(&tmp).unwrap() }
+}
+
+/// `tables` の sidecar の、 表 `table` の `next_local` (表ごとの並びは 名前の長さ (u32) / 名前 / eid の範囲 (u32 × 2) / `next_local` (u32))。
+fn sidecar_next_local(db: &str, table: &str) -> u32 {
+    let bytes = std::fs::read(std::path::Path::new(db).join("tables")).unwrap();
+    let mut name = (table.len() as u32).to_le_bytes().to_vec();
+    name.extend_from_slice(table.as_bytes());
+    let at = bytes.windows(name.len()).position(|w| w == name.as_slice()).expect("sidecar に表がある") + name.len() + 8;
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+/// `tables` を書けない間に行を足して消し、 閉じた像 (`tables` の sidecar は消した行を足す前のまま = 開いた払い出し位置が消した場所の
+/// 手前に戻りうる) を開いても、 消した行の eid をもう一度渡さない。 v15 は世代で、 v14 は #870 (消した行が sidecar より先にある間は
+/// checkpoint を進めない = WAL の再生が払い出し位置を戻す) で。
 fn rewind_case(sync: bool, v15: bool) {
     let made = tmp_path(&format!("rewind-{sync}-{v15}"));
-    let _c = Cleanup(made.clone());
+    let image = format!("{made}-image");
+    let (_c1, _c2) = (Cleanup(made.clone()), Cleanup(image.clone()));
     let (a, x) = {
         let eng = create_concurrent(&made, sync, 100);
         if v15 {
             reuse_once(&eng);
         }
+        // 足して消すまで consumer を止める (間に `tables` を書かれると、 消した行が sidecar より先にならない)
+        let hold = eng.hold_consumer();
         let a = eng.entity_in("notes").unwrap();
         eng.tie_to(a, "notes.note", 1u32);
+        block_tables(&made, true);
         let x = eng.entity_in("notes").unwrap();
         eng.tie_to(x, "notes.note", 2u32);
         eng.delete(x);
         eng.oplog_sync().unwrap();
+        drop(hold);
         (a, x)
-    }; // きれいに閉じる (WAL は畳まれる)
+    }; // `tables` を書けないまま閉じる
     assert_eq!(file_version(&made) == 15, v15, "前提: version");
-    // sidecar の notes の next_local を a だけの所 (1) に戻す
-    set_next_local(&made, "notes", 1);
-    let eng = Engine::open_concurrent_with_oplog(&made, WAL).unwrap();
+    assert!(sidecar_next_local(&made, "notes") <= 1, "前提: sidecar は消した行を足す前のまま (払い出し位置が消した場所の手前)");
+    copy_dir(std::path::Path::new(&made), std::path::Path::new(&image));
+    block_tables(&made, false);
+    let _ = std::fs::remove_dir(std::path::Path::new(&image).join("tables.tmp"));
+    let eng = Engine::open_concurrent_with_oplog(&image, WAL).unwrap();
     eng.set_peer_id(1);
     assert_eq!(eng.get(a, "notes.note"), Some(1), "前提: 残した行は読める");
     let y = eng.entity_in("notes").unwrap();
@@ -253,7 +265,6 @@ fn a_rewound_allocation_does_not_repeat_a_deleted_eid_v14_sync() {
 }
 
 #[test]
-#[ignore = "#870"]
 fn a_rewound_allocation_does_not_repeat_a_deleted_eid_v14_plain() {
     rewind_case(false, false);
 }
