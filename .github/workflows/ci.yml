@@ -175,6 +175,11 @@ jobs:
       - name: power loss simulation, unclean reopen (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test issue813_unclean_open_writes_out_previous_session --release
 
+      # #880: 単独の open (`open_standalone` = schema の `Database::open`) は、 WAL 付きで書いて落ちた DB の WAL を再生し、 きれいに
+      # 閉じなかった sync の DB は #451 の作り直しを済ませてから開く (電源断の像と、 往復の閉じを I/O の故障で止める子 process)
+      - name: power loss simulation, standalone open (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test issue880_standalone_open_replays_wal --release
+
       # #98 ③④: I/O の点ごとの故障 (I/O エラー / process の死 / 電源断 × flush / oplog の書き手)。 同じ crashsim feature の
       # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
       - name: fault injection / crash matrix (crashsim)
