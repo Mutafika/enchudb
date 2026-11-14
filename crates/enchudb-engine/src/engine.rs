@@ -11820,8 +11820,12 @@ impl Engine {
     }
 
     /// #857: 版数なしで消した行のどれかが、 `tables` の sidecar の `next_local` より先にある ([`Self::note_freed_slot`])。
+    /// sidecar を持たない engine (path の無い memory / wasm) は止めない (落ちた後に開き直す物が無い。 `persisted_next` も進まない)。
     fn checkpoint_held_for_freed_slots(&self) -> bool {
         use std::sync::atomic::Ordering;
+        if self.path.is_empty() || cfg!(target_arch = "wasm32") {
+            return false;
+        }
         self.tables.iter().any(|t| t.freed_end.load(Ordering::Acquire) > t.persisted_next.load(Ordering::Acquire))
     }
 
