@@ -2967,8 +2967,9 @@ fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid(
             _ => None,
         })
         .collect();
-    // a の Delete は前の session の record (WAL を畳んでいない)。 r の Delete は作り直した物
-    assert_eq!(deletes, vec![a, r], "作り直した Delete が無い / 消えた行の世代込みの eid でない ({deletes:x?})");
+    // a の Delete は前の session の record (WAL が畳まれていれば無い)。 r の Delete は作り直した物
+    let relogged: Vec<u64> = deletes.iter().copied().filter(|&d| d != a).collect();
+    assert_eq!(relogged, vec![r], "作り直した Delete が無い / 消えた行の世代込みの eid でない ({deletes:x?})");
     let world = enchudb_oplog::make_eid(1, eng.eid_slot(r));
     let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
     assert!(!eng.remote_tie_apply(world, hid, 9u32, later), "消えた行への相手の書き込みで行が生き返った");
