@@ -4046,8 +4046,8 @@ mod apply_liveness_tests {
         eprintln!("[stopper] 円柱を組む読みの待ち {took:?} / 待ちの回数 {waits}");
         assert_eq!((a, rejected, y_now), (Ok(()), 0, Some(u64::from(B_WRITES - 1))), "A / B の書き込み");
         assert!(took >= Duration::from_millis(250), "前提: 読み手は門の中で空きを待つ B を待った ({took:?})");
-        // 眠れば 300 ms で数百回 (yield で回ると 10^5 を越える)
-        assert!(waits < 20_000, "止める側が回り続けた (300 ms に {waits} 回)");
+        // 眠れば 300 ms で数百回 (yield で回ると 3 万回ほど)
+        assert!(waits < 3_000, "止める側が回り続けた (300 ms に {waits} 回)");
     }
 
     /// 当てている途中の書き手の手前で切っても、 書き出しに失敗した空け作りは 「当てている途中」 (`WalRoom::Applying`) と返さない
