@@ -844,6 +844,17 @@ fn persisted_next_local(t: &TableDef) -> u32 {
 /// 並びの索引の宣言 (`orders`、 [`Engine::declare_order`]) は `DIA1` block として一番後ろに足す (`PKS1` / `EXT1` を
 /// 知っている古いバイナリは、 それを読んでから知らない magic の所で止まる)。
 fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16], answers: &[AnswerDecl]) -> Vec<u8> {
+    serialize_tables_with(tables, orders, marks, answers, None)
+}
+
+/// [`serialize_tables`] の、 表 `pending.0` に枠 `pending.1` を足した形 (#881: 足す枠を `extra` に見せる前に書く)。
+fn serialize_tables_with(
+    tables: &[TableDef],
+    orders: &[OrderDecl],
+    marks: &[u16],
+    answers: &[AnswerDecl],
+    pending: Option<(usize, (u32, u32))>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -890,8 +901,11 @@ fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16], an
         .iter()
         .enumerate()
         .filter_map(|(i, t)| {
-            let e = t.extra.read().unwrap();
-            if e.is_empty() { None } else { Some((i as u32, e.clone())) }
+            let mut e = t.extra.read().unwrap().clone();
+            if let Some((_, ext)) = pending.filter(|(tid, _)| *tid == i) {
+                e.push(ext);
+            }
+            if e.is_empty() { None } else { Some((i as u32, e)) }
         })
         .collect();
     if !ext.is_empty() {
@@ -11382,11 +11396,18 @@ impl Engine {
                 }
                 // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
                 match self.grow_table_extent_for(tid, cur) {
-                    Some(g) => g,
-                    None => {
+                    Ok(g) => g,
+                    Err(why) => {
                         // #868: 進めた分を戻す (断り続ける表で払い出し位置が伸び続けない)。 戻せるのは、 後から誰も進めていない時
                         // だけ: 自分より後の位置を取った thread が居れば、 その thread が戻すまで払い出し位置は cur + 1 より先
                         let _ = table.next_local.compare_exchange(cur + 1, cur, Ordering::AcqRel, Ordering::Relaxed);
+                        // #881: 足す枠を `tables` に置けなかった (足していない)
+                        if let Some(e) = why {
+                            return Err(format!(
+                                "table '{table_name}' is full and the tables sidecar could not be written ({e}) — \
+                                 the extent is not added (#881)"
+                            ));
+                        }
                         if is_sync_ring_table(&table.name) {
                             // #368: ring は自動では足さない。 entity cap を伸ばしても空かない
                             return Err(format!(
@@ -11892,9 +11913,21 @@ impl Engine {
     /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_tables_file(&self) -> io::Result<()> {
+        self.persist_tables_file_with(None)
+    }
+
+    /// [`Self::persist_tables_file`] の、 表 `pending.0` にまだ見せていない枠 `pending.1` を足して書く形 (#881)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_tables_file_with(&self, pending: Option<(usize, (u32, u32))>) -> io::Result<()> {
         // #857: 置く値を先に控える (並んだ払い出しで、 直列化が読む値はこれ以上)
         let placed: Vec<u32> = self.tables.iter().map(persisted_next_local).collect();
-        let bytes = serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw());
+        let bytes = serialize_tables_with(
+            &self.tables,
+            &self.order_decls_raw(),
+            &self.marks_decls_raw(),
+            &self.answer_decls_raw(),
+            pending,
+        );
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
             crate::db_files::write_atomic_if_changed(&tables_path_for(&self.path), &bytes)?;
@@ -12152,7 +12185,9 @@ impl Engine {
             return Ok(self.tables[tid].capacity());
         }
         let _g = self.table_grow_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let got = self.push_table_extent_locked(tid, extra);
+        let got = self
+            .push_table_extent_locked(tid, extra)
+            .map_err(|e| format!("table '{name}': could not write the tables sidecar ({e}) — the extent is not added (#881)"))?;
         if got == 0 {
             return Err(format!(
                 "table '{}': no free eid space (entity cap {} — Engine::grow_entity_cap)",
@@ -12177,44 +12212,69 @@ impl Engine {
     /// 待つ作り (`enable_sync_tables` が大きさを決める、 最大 1 M 行)。 自動で足すと、 ack が来ない間
     /// どの table にも割り当てていない eid 空間を全部取るまで止まらず、 user の table が足せなくなる
     /// (同じ 1 行を書き換え続けるだけで起きた)。 大きくしたい時は [`Engine::grow_table`] を明示的に呼ぶ。
-    fn grow_table_extent_for(&self, tid: usize, local: u32) -> Option<u32> {
+    ///
+    /// 戻り値: 足せた枠の global、 `Err(None)` は空き eid 空間が無い、 `Err(Some(e))` は `tables` を書けなかった (#881、 足さない)。
+    fn grow_table_extent_for(&self, tid: usize, local: u32) -> Result<u32, Option<io::Error>> {
         let table = &self.tables[tid];
         if table.is_open_ended() || is_sync_ring_table(&table.name) {
-            return None;
+            return Err(None);
         }
         let _g = self.table_grow_lock.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(g) = table.global_of(local) {
-            return Some(g); // 別 thread が足した
+            return Ok(g); // 別 thread が足した
         }
         // 既定は先頭 range と同じ大きさ、 最低でも `local` が入る分
         let first = table.eid_range_hi - table.eid_range_lo;
         let need = local.saturating_sub(table.capacity()).saturating_add(1);
-        let got = self.push_table_extent_locked(tid, first.max(need).max(1));
+        let got = self.push_table_extent_locked(tid, first.max(need).max(1)).map_err(Some)?;
         if got < need {
-            return None;
+            return Err(None);
         }
-        table.global_of(local)
+        table.global_of(local).ok_or(None)
     }
 
     /// `table_grow_lock` 下で呼ぶ。 末尾の空き eid 空間から最大 `want` 個の extent を
-    /// 足し、 実際に足せた数を返す (空きが無ければ 0、 sidecar は persist)。
-    fn push_table_extent_locked(&self, tid: usize, want: u32) -> u32 {
+    /// 足し、 実際に足せた数を返す (空きが無ければ 0)。
+    ///
+    /// #881: 足す枠を `tables` の sidecar に置いてから `extra` に見せる (`sidecar_persist_lock` を持ったまま)。 置けなければ足さずに
+    /// Err (書き手は断られる)。 前は見せてから置き、 置けなかった失敗を捨てていた: 足した枠に行を書いて落ちると、 開いた時に
+    /// その枠が無く (再生はどの表にも当たらない)、 次に枠を足す時に同じ範囲を切って、 生きている行の eid をもう一度払い出した。
+    /// 置くのは見せる前なので、 見えた枠はいつも sidecar にある。 置いた後に書く sidecar は全部 (同じ lock の下で) この枠を含む
+    fn push_table_extent_locked(&self, tid: usize, want: u32) -> io::Result<u32> {
         let new_lo = self.tables.iter().map(|t| t.last_hi()).max().unwrap_or(0);
         if new_lo == u32::MAX {
-            return 0; // anonymous が open-ended (= named table 無し) — ここには来ない
+            return Ok(0); // anonymous が open-ended (= named table 無し) — ここには来ない
         }
         let avail = self.max_entities().saturating_sub(new_lo);
         let size = want.min(avail);
         if size == 0 {
-            return 0;
+            return Ok(0);
         }
-        self.tables[tid].extra.write().unwrap().push((new_lo, new_lo + size));
+        let ext = (new_lo, new_lo + size);
+        #[cfg(not(target_arch = "wasm32"))]
+        let persisted = if self.path.is_empty() || self.defer_tables_persist.load(std::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            let guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(e) = self.persist_tables_file_with(Some((tid, ext))) {
+                self.warn_persist_failure_rate_limited(&e);
+                return Err(e);
+            }
+            Some(guard)
+        };
+        self.tables[tid].extra.write().unwrap().push(ext);
         // 内部の表の行は別の stripe を使う。 足した範囲の eid を払い出す前に教える
         if is_engine_internal_table(&self.tables[tid].name) {
-            self.row_locks.add_internal_range(new_lo, new_lo + size);
+            self.row_locks.add_internal_range(ext.0, ext.1);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if persisted.is_some() {
+            drop(persisted);
+            return Ok(size);
+        }
+        // path の無い engine / build phase (defer): 今までどおり (書けるなら書く)
         self.try_persist_tables();
-        size
+        Ok(size)
     }
 
     /// table の eid 枠の使用状況 (未定義 table は `None`)。
