@@ -9852,11 +9852,9 @@ impl Engine {
                         let ref_local = u32::try_from(*value).ok().filter(|_| self.himo_is_ref(*himo_id));
                         let ref_slot = ref_local.map(|l| self.generations().split(l).0);
                         // #779: 指す先の宛名も、 書いた時の住人の物 (`bridge_address`)
+                        // #731 (段 4): 自分の行を指す ref は素の Tie のまま (値 = 世代 | 場所 = その行の wire の世界番号の local)
                         if let Some((owner, owner_local)) = ref_slot.and_then(|l| self.bridge_address(l, rec.hlc)) {
                             tie_ref = Some((enchudb_oplog::make_eid(owner, owner_local), *eid));
-                        } else if let Some(slot) = ref_slot.filter(|&l| Some(l) != ref_local) {
-                            // #731 (段 1〜3): 世代の付いた自分の行を指す ref は、 wire の自分の世界番号 (世代なし) を同乗させる
-                            tie_ref = Some((enchudb_oplog::make_eid(self_peer, slot), *eid));
                         }
                         false
                     }
@@ -9889,17 +9887,12 @@ impl Engine {
                 };
                 let row_local = row_eid.map(|e| self.slot_unchecked(e));
                 // 行 eid 自体が translated foreign なら世界番号へ書き戻す (0.11 #76)。 #779: 書いた時の住人の宛名
-                let row_world = row_local
-                    .and_then(|local| {
-                        self.bridge_address(local, rec.hlc)
-                            .map(|(owner, owner_local)| enchudb_oplog::make_eid(owner, owner_local))
-                    })
-                    // #731 (段 1): WAL の record の eid は世代込みだが、 wire の自分の世界番号はまだ世代なし (段 4 で世代込みに変える)
-                    .or_else(|| {
-                        row_eid.zip(row_local).filter(|&(e, l)| enchudb_oplog::eid_local(e) != l).map(|(e, l)| {
-                            enchudb_oplog::make_eid(enchudb_oplog::eid_peer(e), l)
-                        })
-                    });
+                // #731 (段 4): 自分の行は WAL の record の eid のまま = 書いた時の 世代 | 場所 (wire の自分の世界番号)。 場所を使い回した
+                // 後に bridge が読んでも、 消えた行宛ての record は消えた行の番号で出る (相手は削除優先で捨てる)
+                let row_world = row_local.and_then(|local| {
+                    self.bridge_address(local, rec.hlc)
+                        .map(|(owner, owner_local)| enchudb_oplog::make_eid(owner, owner_local))
+                });
                 if let Some((target_world, orig_eid)) = tie_ref {
                     let new_eid = row_world.unwrap_or(orig_eid);
                     let kp_guard = self.keypair.read().unwrap();
@@ -12304,8 +12297,9 @@ impl Engine {
                             foreign_row = true;
                             enchudb_oplog::make_eid(owner, owner_local)
                         }
-                        // #731 (段 1): wire の自分の世界番号は世代なし (`eid` は出口の世代込み)
-                        None => enchudb_oplog::make_eid(self_peer, local),
+                        // #731 (段 4): wire の自分の世界番号は世代込み = 出口の `eid` (走査の間に場所を使い回されたら、 下の
+                        // `get_by_id` が世代の照合で外す)
+                        None => eid,
                     }
                 } else if let Some(&foreign_local) = in_foreign(local).then(|| foreign.get(&local)).flatten() {
                     enchudb_oplog::make_eid(author, foreign_local)
@@ -12315,8 +12309,8 @@ impl Engine {
                         continue;
                     }
                     other_row = true;
-                    let (owner, owner_local) = self.eid_translator.reverse(local).unwrap_or((self_peer, local));
-                    enchudb_oplog::make_eid(owner, owner_local)
+                    // #731 (段 4): この replica 自身の行は世代込みの世界番号 (出口の `eid`)
+                    self.eid_translator.reverse(local).map_or(eid, |(owner, owner_local)| enchudb_oplog::make_eid(owner, owner_local))
                 };
                 let (wide, mut hlc) = if other_row {
                     // 値と版数を行の読みで揃える (間に別の peer の書き込みが入ると、 その peer の値に author の版数を付けた
@@ -12353,15 +12347,21 @@ impl Engine {
                         records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: wide }, hlc));
                     }
                     ValueType::Ref => {
-                        // #731 (段 1〜3): Ref の値は 世代 | 場所、 wire の自分の世界番号は世代なし = 場所で出す
-                        let value = self.generations().split(value).0;
+                        // #731 (段 4): Ref の値は 世代 | 場所 = 自分の行なら wire の世界番号の local のまま出す。 翻訳の写像は場所で
+                        // 引く。 場所の最後の住人を指していない ref (消えた行を指したまま場所を使い回した後) は、 前の住人が自分の行か
+                        // 翻訳した行か分からない (写像は今の住人の物) ので出さない (前は今の住人を指して出していた)
+                        let target_slot = self.generations().split(value).0;
+                        if self.last_local_of_slot(target_slot) != value {
+                            dropped += 1; // #236
+                            continue;
+                        }
                         // bridge と同じ規則: translated foreign target は世界番号
                         // 同乗の TieRef、 自 entity target は素の Tie (受信側が
                         // author key で翻訳する)。 replica 版では「author 自身の
                         // entity への ref」も translated local なので、 owner が
                         // author なら素の Tie に戻す (= author 本人が出す形と同じ)。
-                        if self.eid_translator.is_translated_local(value) {
-                            match self.eid_translator.reverse(value) {
+                        if self.eid_translator.is_translated_local(target_slot) {
+                            match self.eid_translator.reverse(target_slot) {
                                 Some((owner, owner_local)) if owner == author && !is_self => {
                                     records.push(mk(
                                         DecodedOp::Tie {
@@ -12537,7 +12537,9 @@ impl Engine {
                     if !empty || !mine(hlc) || !self.entities.is_live(local) {
                         continue;
                     }
-                    let (owner, owner_local) = self.eid_translator.reverse(local).unwrap_or((self_peer, local));
+                    // #731 (段 4): 自分の行の世界番号は世代込み (生きている行 = 今の世代)
+                    let (owner, owner_local) =
+                        self.eid_translator.reverse(local).unwrap_or_else(|| (self_peer, self.own_world_local(local)));
                     let eid = enchudb_oplog::make_eid(owner, owner_local);
                     records.push(mk(DecodedOp::Untie { eid, himo_id }, hlc));
                 }
@@ -12572,7 +12574,8 @@ impl Engine {
                 {
                     continue;
                 }
-                deletes.push((tomb, enchudb_oplog::make_eid(self_peer, local)));
+                // #731 (段 4): 消えた行の世界番号 (世代込み、 死んだ場所は消えた行の世代)
+                deletes.push((tomb, enchudb_oplog::make_eid(self_peer, self.own_world_local(local))));
             }
         }
         deletes.sort_unstable();
@@ -14134,7 +14137,8 @@ impl Engine {
         let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         let local_of = |w: enchudb_oplog::EntityId| -> Option<u32> {
             if enchudb_oplog::eid_peer(w) == self_peer {
-                let l = self.slot_unchecked(w);
+                // #731 (段 4): 自分の世界番号は世代込み。 もう無い行 (場所を使い回した前の住人) の番号は今の住人に当てない
+                let l = self.own_world_slot(enchudb_oplog::eid_local(w))?;
                 return self.entities.is_live(l).then_some(l);
             }
             self.eid_translator.get(enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w))
@@ -14319,10 +14323,11 @@ impl Engine {
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         let target_local = self.slot_unchecked(local_eid);
         // #178: 束ねる前に、 この行に書いた record の宛名 (逆写像があればその世界番号、 無ければ自分の世界番号)
-        let prior = self
-            .eid_translator
-            .reverse(target_local)
-            .map_or(enchudb_oplog::make_eid(self_peer, target_local), |(p, l)| enchudb_oplog::make_eid(p, l));
+        // #731 (段 4): 自分の世界番号は世代込み
+        let prior = self.eid_translator.reverse(target_local).map_or_else(
+            || enchudb_oplog::make_eid(self_peer, self.own_world_local(target_local)),
+            |(p, l)| enchudb_oplog::make_eid(p, l),
+        );
         // #613: 前向きの写像だけを張る (別名、 `EidTranslator::alias`)。 行の逆写像 (この行に書いた record の宛名) は行の元の
         // identity のまま。 前は束ねた identity に替えていたので、 束ねた後の書き込みが、 その identity の作成を受けていない受け手で
         // 別の行になった。 元の identity の作成は同じ書き手の流れの前にあるので、 受け手は必ず先に受けている
@@ -16039,7 +16044,7 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
     ) {
         if self.is_remembered_pk_himo(himo) {
-            let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+            let id = self.identity_of_world(foreign_eid); // #731 (段 4): 自分の世界番号は世代を外す
             self.note_name_of(self.slot_unchecked(local_eid), id, himo, value, hlc, false);
         }
     }
@@ -17186,21 +17191,56 @@ impl Engine {
         enchudb_oplog::make_eid(enchudb_oplog::eid_peer(eid), self.generations().local(to))
     }
 
-    /// #612 の wire 版: 相手から届いた自分の世界番号 (段 1〜3 は世代なし = 場所) を、 畳んだ自分の行なら残す行の eid に。 世代は
-    /// 見ない (wire の番号には世代が無い。 段 4 で世代込みにして照合する)。 返す eid は中の道で使う (場所だけ読まれる)。
+    /// #731 (段 4): 相手から届いた自分の世界番号の local (世代 | 場所) → 場所。 その番号が場所 `slot` に最後に居た行 (生きていれば
+    /// 今の住人、 死んでいれば消えた行、 畳んだ自分の行 (#612) は畳んだ行) の番号の時だけ `Some`。 違えば `None` = その場所の前の
+    /// 住人 (消えた行、 場所を使い回した後) か、 まだ居ない行。 相手はその番号の行の削除を受けていて (削除優先)、 こちらでもその行は
+    /// 無い。 世代を持たない DB (v14) は番号 = 場所。
+    ///
+    /// wire の自分の世界番号は bridge / state / 別名が世代込みで出す (アプリの eid と同じ形)。 0.37.4 の peer は番号を写像の鍵として
+    /// だけ使うので、 出した形のまま返ってくる。 v14 の間に出した番号 (世代 0) は、 v15 に移る時に死んでいた場所 (世代を 1 上げる)
+    /// なら消えた行として外れ、 生きていた場所なら今の住人に当たる。
     #[inline]
-    fn forward_world_eid(&self, eid: enchudb_oplog::EntityId) -> enchudb_oplog::EntityId {
-        if !self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed)
-            || enchudb_oplog::eid_peer(eid) != self.peer_id()
-        {
-            return eid;
+    fn own_world_slot(&self, local: u32) -> Option<u32> {
+        let g = self.generations();
+        if !g.active() {
+            return Some(local);
         }
-        let slot = self.slot_unchecked(eid);
-        let to = self.forward_local_slow(slot);
-        if to == slot {
-            return eid;
+        let slot = g.split(local).0;
+        (self.last_local_of_slot(slot) == local).then_some(slot)
+    }
+
+    /// #612 の wire 版 + #731 (段 4): 相手から届いた自分の世界番号を、 中の道の eid (自分の peer, 場所。 世代なし) に。 畳んだ自分の行
+    /// なら残す行の場所へ。 その番号の行がもう無い ([`Self::own_world_slot`] が `None`) なら `None`。 返す eid は中の道で使う
+    /// (場所だけ読まれる。 翻訳した行の eid と同じ形)。
+    #[inline]
+    fn own_world_to_internal(&self, eid: enchudb_oplog::EntityId) -> Option<enchudb_oplog::EntityId> {
+        let slot = self.own_world_slot(enchudb_oplog::eid_local(eid))?;
+        Some(enchudb_oplog::make_eid(enchudb_oplog::eid_peer(eid), self.forward_local(slot)))
+    }
+
+    /// #731 (段 4): 相手から届いた record の宛名 `eid` が、 もう無い自分の行 (消して場所を使い回した前の住人など) の世界番号か。
+    /// sync の当ては、 その record を古い書き込み (削除優先で捨てる) として扱う。 他の peer の行の番号は false。
+    pub fn is_gone_own_eid(&self, eid: enchudb_oplog::EntityId) -> bool {
+        enchudb_oplog::eid_peer(eid) == self.peer_id() && self.own_world_slot(enchudb_oplog::eid_local(eid)).is_none()
+    }
+
+    /// #731 (段 4): 相手から届いた record の宛名 `eid` の identity (名前の年表・束ねた identity のカードの鍵)。 自分の行の identity は
+    /// (自分の peer, 場所) ([`Self::native_identity`]、 畳んだ自分の行の別名と同じく場所で持つ)。 wire の自分の世界番号は世代込み
+    /// なので、 世代を外して揃える。 他の peer の行は番号のまま。
+    #[inline]
+    fn identity_of_world(&self, eid: enchudb_oplog::EntityId) -> (u32, u32) {
+        let peer = enchudb_oplog::eid_peer(eid);
+        if peer == self.peer_id() {
+            (peer, self.slot_unchecked(eid))
+        } else {
+            (peer, enchudb_oplog::eid_local(eid))
         }
-        enchudb_oplog::make_eid(enchudb_oplog::eid_peer(eid), self.generations().local(to))
+    }
+
+    /// #731 (段 4): 自分の行 (場所 `slot`) の wire の世界番号の local (今の世代 | 場所。 死んだ場所は消えた行の番号)。
+    #[inline]
+    fn own_world_local(&self, slot: u32) -> u32 {
+        self.last_local_of_slot(slot)
     }
 
     // ──── #731: eid の local = 世代 | 場所 (`crate::generation`) ────
@@ -17903,7 +17943,8 @@ impl Engine {
         let self_peer = self.peer_id.load(Ordering::Acquire);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         if owner == self_peer {
-            return Some(self.forward_world_eid(foreign_eid)); // identity: 自分が産んだ entity (#612: 畳んだ行は残す行へ)
+            // identity: 自分が産んだ entity (#612: 畳んだ行は残す行へ。 #731: もう無い行の番号は None)
+            return self.own_world_to_internal(foreign_eid);
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
@@ -17935,7 +17976,7 @@ impl Engine {
         let self_peer = self.peer_id.load(Ordering::Acquire);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         if owner == self_peer {
-            return Some(self.forward_world_eid(foreign_eid));
+            return self.own_world_to_internal(foreign_eid);
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         self.eid_translator
@@ -17984,11 +18025,15 @@ impl Engine {
     ) -> Option<u32> {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
-        // #731: 返すのは Ref の cell に置く値 = 指す場所の今の世代 | 場所 (段 1〜3 の wire の自分の世界番号は世代なし)
+        // #731: 返すのは Ref の cell に置く値 = 指す行の 世代 | 場所。 段 4: wire の自分の世界番号は世代込み
         if author_peer == self_peer {
             // identity: 自分が author (#612: 畳んだ行は残す行へ)
-            let slot = self.forward_local(self.generations().split(foreign_value).0);
-            return Some(self.last_local_of_slot(slot));
+            return Some(match self.own_world_slot(foreign_value) {
+                Some(slot) => self.last_local_of_slot(self.forward_local(slot)),
+                // もう無い行 (場所を使い回した前の住人) を指す ref: その番号のまま置く = 消えた行を指す ref (読みは中身の無い行、
+                // 今の住人を指さない)
+                None => foreign_value,
+            });
         }
         // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
         // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
@@ -18507,7 +18552,7 @@ impl Engine {
         let local = self.slot_unchecked(existing);
         let native = self.native_identity(local);
         let born = self.born_of(local, native);
-        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        let id = self.identity_of_world(foreign_eid); // #731 (段 4): 自分の世界番号は世代を外す
         // 最初に束ねる時は、 今の cell を元の identity のカードとして写す (束ねた後の cell は LWW で混ざる)
         let first = self.pk_former.read().unwrap().bound_of(local).is_empty();
         let native_cards = if first { self.cards_of_cells(local) } else { Vec::new() };
@@ -18654,7 +18699,7 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
     ) {
         use crate::pk_former::Card;
-        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        let id = self.identity_of_world(foreign_eid); // #731 (段 4): 自分の世界番号は世代を外す
         self.note_card(self.slot_unchecked(local_eid), id, himo, || value.map_or(Card::Gone, Card::Value), hlc);
     }
 
@@ -18667,7 +18712,7 @@ impl Engine {
         bytes: &[u8],
         hlc: enchudb_oplog::Hlc,
     ) {
-        let id = (enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid));
+        let id = self.identity_of_world(foreign_eid); // #731 (段 4): 自分の世界番号は世代を外す
         self.note_card(self.slot_unchecked(local_eid), id, himo, || crate::pk_former::Card::Bytes(bytes.into()), hlc);
     }
 
@@ -18698,7 +18743,7 @@ impl Engine {
         if !self.is_bound_slot(local) || !self.entities.is_live(local) {
             return None;
         }
-        let target_id = (enchudb_oplog::eid_peer(target), enchudb_oplog::eid_local(target));
+        let target_id = self.identity_of_world(target); // #731 (段 4)
         let old = match self.pk_former.read().unwrap().card_of(local, target_id, himo) {
             Some((Card::Value(v), h)) if *v != value && h < t => *v,
             _ => return None,
@@ -19000,7 +19045,8 @@ impl Engine {
     /// #784: 宛名 `foreign_eid` (author の世界番号) の削除を、 もう同じ版数 `hlc` で記録してあるか: 写像のある行は、 消えていて
     /// 削除の版数が `hlc`。 写像の無い行は、 退避表の削除の版数が `hlc`。 state を取り直した中継が、 同じ削除を載せ直さないために見る。
     pub fn remote_delete_is_recorded(&self, foreign_eid: enchudb_oplog::EntityId, hlc: enchudb_oplog::Hlc) -> bool {
-        if hlc == enchudb_oplog::Hlc::ZERO {
+        if hlc == enchudb_oplog::Hlc::ZERO || self.is_gone_own_eid(foreign_eid) {
+            // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除の版数は残していない
             return false;
         }
         match self.resolve_remote_eid_existing(foreign_eid) {
@@ -19045,6 +19091,10 @@ impl Engine {
         }
         self.observe_remote_hlc(hlc);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
+        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除。 その行は消えている (退避表は他の peer の行の物)
+        if owner == self.peer_id.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         let before = self.foreign_tombstone_of(owner, foreign_local);
         match self
