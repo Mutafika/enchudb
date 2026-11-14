@@ -42,9 +42,11 @@
 //! ヘッダ固定部: 2+1+1+4+8 + 8+4+4 + 4 + 4 + 64 + 8 = **112B / record**
 //!
 //! ```text
-//! [周の印: 8B]          (file v3、 #608) payload の後ろ。 [lap: 4B LE][lap ^ LAP_SALT: 4B LE]。 record を書いた時の ring の
-//!                       周 (file header の lap)。 署名 / CRC の外 (中継した record にも自分の ring の周を付ける)。 scan は
-//!                       header の周と違う record で止まる = 畳んだ後に page に残っている前の周の record を読まない
+//! [周の印: 8B]          (file v3、 #608) payload の後ろ。 [lap: 4B LE][lap ^ LAP_SALT ^ crc32: 4B LE]。 record を書いた時の
+//!                       ring の周 (file header の lap) を、 その record の crc32 (上の欄) に結ぶ (file v5、 #851)。 署名 / CRC の
+//!                       外 (中継した record にも自分の ring の周を付ける)。 scan は header の周と違う record、 印が中身に
+//!                       合わない record で止まる = 畳んだ後に page に残っている前の周の record を読まない。
+//!                       v3 / v4 の file の印は [lap][lap ^ LAP_SALT] (中身に結ばない)。 読みは両方を通す
 //! ```
 //!
 //! Tie payload(v2):    [eid: 8B][himo_id: 2B][_pad: 2B][value: 4B]  = 16B
@@ -61,7 +63,7 @@
 //! ```text
 //! [File header 32B]
 //!   [magic: 4B "EWAL"]   = 歴史的経緯で wire 不変。
-//!   [version: 4B LE]     = 3 (2 も読める)
+//!   [version: 4B LE]     = 5 (2 区画) / 6 (1 区画)。 2〜4 も読める (下の節)
 //!   [head: 8B LE]        writer が atomic 前進
 //!   [checkpoint: 8B LE]  consumer が前進(ここまで本体に適用済み)
 //!   [capacity: 4B LE]    buffer size (v3。 ring は 4 GiB 未満)
@@ -84,7 +86,7 @@
 //! [区画 B の header 32B][区画 B の record ...]    half から 2 * half (half = capacity / 2 を HALF_ALIGN に切り下げ)
 //! ```
 //!
-//! - 区画の header は v3 と同じ形 (version = 4、 head / checkpoint は区画の頭からの offset、 capacity は区画の大きさ、 lap)
+//! - 区画の header は v3 と同じ形 (version = 4。 v5 は 5、 head / checkpoint は区画の頭からの offset、 capacity は区画の大きさ、 lap)
 //! - 書き手は今の区画 (active) に書き足し、 載らなくなったら、 もう一方が空なら開いている group を Commit で閉じてそちらへ
 //!   移る (切り替え)。 移った後の古い区画には誰も書き足さないので、 書き出し (fsync + 本体の msync) を append を止めずに
 //!   済ませて畳める。 書き手が待つのは、 もう一方をまだ畳めていないのに今の区画も埋まった時だけ
@@ -95,9 +97,26 @@
 //!   区画は畳まれた後 (読み手はもう一方を頭から読む)。 v2 の file (周 0) の位置は offset そのもの
 //! - 1 件の record は 1 区画に収まること (区画より大きい record は断る)
 //!
-//! v3 の file は 1 区画の形のまま読み書きし、 最初に畳む時に v4 になる (B の header を書いて fsync → A の capacity → version の
-//! 順。 どの途中の像も v3 か v4 として開ける)。 2 区画にできない小さい WAL (`2 * HALF_ALIGN` 未満) は v3 の 1 区画の形で作る。
+//! v3 の file は 1 区画の形のまま読み書きし、 最初に畳む時に 2 区画になる (B の header を書いて fsync → A の capacity → version の
+//! 順。 どの途中の像も v3 か 2 区画の形として開ける)。 2 区画にできない小さい WAL (`2 * HALF_ALIGN` 未満) は 1 区画の形で作る。
 //! v4 の file は 0.36 以前の binary では開けない — 下げるには、 きれいに閉じてから `{db}/oplog` を消す。
+//!
+//! # 周の印を中身に結ぶ (file v5、 #851)
+//!
+//! v3 / v4 の周の印 `[lap][lap ^ LAP_SALT]` は record の中身と無関係で、 「前の周の record の header + payload」 の後ろに
+//! 「今の周の印」 が付いた組を、 今の周の record として読んだ (CRC は中身だけを覆い、 印は周だけを見る)。 今の周が、 前の周の
+//! record と同じ位置・同じ長さの record を書いた時に、 中身のある page / sector だけ前のまま disk に残るとその組になる (record が
+//! page の境目をまたぐ / 書き出しの写しの途中に書き手が入る)。 再生はその古い record を当て、 版数の列の無い DB では書き出しの
+//! 返った値が前の周の値に戻った。
+//!
+//! v5 は印の 2 語目に record の CRC を混ぜる (`lap ^ LAP_SALT ^ crc32`)。 配置と大きさは v4 と同じ (header の版だけが違う):
+//!
+//! - 新しく作る WAL は v5 (2 区画にできない小さい WAL は 1 区画の形で、 版の数は 6 = [`OPLOG_FILE_VERSION_ONE_HALF`])
+//! - v4 / v3 / v2 の file は読めて、 最初に畳む時に v5 になる (`bind_locked`: A の header の版を書き換えて、 以後の record を
+//!   結んだ形で書く)。 区画に残る旧い形の record はそのまま読む (読みは両方の形を通す、 `lap_check_ok`)
+//! - v5 の file は 0.37.x 以前の binary では開けない (`WAL version 5 unsupported`)。 下げるには、 きれいに閉じてから
+//!   `{db}/oplog` を消す
+//! - file の版は A の header が決める。 v4 から変わった file の B の header の版は、 A の版が disk に届くまで 4 のまま
 //!
 //! # 周の印が守る約束と、 header より先 / 後に届く page (#608 / #706 / #707)
 //!
@@ -129,12 +148,18 @@ use crate::wal_lock::WalGuard;
 use crate::{Hlc, PeerId};
 
 const FILE_MAGIC: &[u8; 4] = b"EWAL";
-/// 書く file の版。 v4 (0.37): file を 2 つの区画に分けて交互に使う (module doc の 「2 つの区画」)。
-pub const OPLOG_FILE_VERSION: u32 = 4;
+/// 書く file の版。 v5 (#851): v4 と同じ 2 区画の形で、 record の周の印を record の中身に結ぶ (module doc の 「周の印を中身に
+/// 結ぶ」)。 0.37.x 以前の binary では開けない。
+pub const OPLOG_FILE_VERSION: u32 = 5;
+/// v5 の 1 区画の形 (2 区画にできない小さい WAL。 header は v3 と同じ形で、 周の印を中身に結ぶ)。 0.37.x 以前では開けない。
+pub const OPLOG_FILE_VERSION_ONE_HALF: u32 = 6;
+/// 2 区画の旧版 (0.37): 周の印が中身に結ばれていない (#851)。 読めて、 最初に畳む時に v5 になる。
+pub const OPLOG_FILE_VERSION_V4: u32 = 4;
 /// 1 区画の版 (#608): header の capacity を u32 にして空いた 4 byte に ring の周 (lap) を置き、 record ごとに周の印
-/// ([`LAP_TRAILER`]) を付ける。 読めて、 最初に畳む時に v4 になる。 2 区画にできない小さい WAL もこの形で作る。
+/// ([`LAP_TRAILER`]) を付ける (中身に結ばない旧い形)。 読めて、 最初に畳む時に v5 (小さい WAL は 1 区画の v5 =
+/// [`OPLOG_FILE_VERSION_ONE_HALF`]) になる。
 pub const OPLOG_FILE_VERSION_V3: u32 = 3;
-/// 読める旧版 (周の印なし、 capacity は u64)。 最初に畳む時に v3 → v4 になる。
+/// 読める旧版 (周の印なし、 capacity は u64)。 最初に畳む時に v5 になる。
 pub const OPLOG_FILE_VERSION_V2: u32 = 2;
 pub const HEADER_SIZE: usize = 32;
 /// v4 の区画の大きさの単位 (区画の境を page にそろえる。 Apple Silicon の page は 16 KiB)。 区画がこれより小さくなる WAL は
@@ -182,7 +207,7 @@ fn next_lap(l: u32) -> u32 {
 /// 1 つの区画 (v3 / v2 の file と小さい WAL は file 全体で 1 区画)。 head / written / checkpoint は区画の頭 (`base`) からの offset。
 /// 位置と大きさは 4 GiB 未満 (WAL は 4 GiB 未満) なので 32 bit (2 区画と採番の欄を 1 本の cache line に置くため、 [`Hot`])。
 struct Half {
-    /// 区画の header の位置 (file の中の byte offset)。 v3 → v4 で B ができる時に置く (`append_lock` の下)
+    /// 区画の header の位置 (file の中の byte offset)。 1 区画から 2 区画になる時に置く (`append_lock` の下)
     base: std::sync::atomic::AtomicU32,
     /// 区画の大きさ (header 込み)。 0 = 使わない区画 (1 区画の形の B)
     size: std::sync::atomic::AtomicU32,
@@ -323,10 +348,12 @@ struct Layout {
     two: bool,
     next_lap: u32,
     trailer: usize,
+    /// 周の印を record の中身に結んで書く file か (v5、 #851)
+    bound: bool,
 }
 
-/// 新しい WAL の header を書いて形を返す。 2 区画にできれば v4 (A を周 1 で使い始め、 B は周 0 = まだ使っていない)、
-/// できなければ v3 の 1 区画。
+/// 新しい WAL の header を書いて形を返す。 2 区画にできれば v5 (A を周 1 で使い始め、 B は周 0 = まだ使っていない)、
+/// できなければ 1 区画の v5 ([`OPLOG_FILE_VERSION_ONE_HALF`])。
 fn fresh_layout(mmap: &mut [u8], capacity: u64) -> Layout {
     let hs = HEADER_SIZE as u64;
     match half_size_for(capacity) {
@@ -339,22 +366,24 @@ fn fresh_layout(mmap: &mut [u8], capacity: u64) -> Layout {
                 two: true,
                 next_lap: 2,
                 trailer: LAP_TRAILER,
+                bound: true,
             }
         }
         None => {
-            write_half_header(mmap, 0, OPLOG_FILE_VERSION_V3, capacity, hs, hs, 1);
+            write_half_header(mmap, 0, OPLOG_FILE_VERSION_ONE_HALF, capacity, hs, hs, 1);
             Layout {
                 halves: [Half::new(0, capacity, hs, hs, 1), Half::new(0, 0, hs, hs, 0)],
                 active: 0,
                 two: false,
                 next_lap: 2,
                 trailer: LAP_TRAILER,
+                bound: true,
             }
         }
     }
 }
 
-/// 開く時に header を読んで形を決める。 v4 の B の header が読めない (v3 → v4 の途中の像で B がまだ無い、 は B を先に書いて
+/// 開く時に header を読んで形を決める。 2 区画の file の B の header が読めない (1 区画から 2 区画になる途中の像で B がまだ無い、 は B を先に書いて
 /// fsync するので起きないが、 壊れた file) なら、 B はまだ使っていない区画として header を書き直す。
 fn read_layout(mmap: &mut [u8]) -> io::Result<Layout> {
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
@@ -383,10 +412,10 @@ fn read_layout(mmap: &mut [u8]) -> io::Result<Layout> {
         ))
     };
     match version {
-        OPLOG_FILE_VERSION_V2 | OPLOG_FILE_VERSION_V3 => {
+        OPLOG_FILE_VERSION_V2 | OPLOG_FILE_VERSION_V3 | OPLOG_FILE_VERSION_ONE_HALF => {
             let (head, checkpoint) = (r64(mmap, 8), r64(mmap, 16));
-            // v3: capacity は u32 で、 その後ろが周 (#608)。 v2: capacity は u64、 周の印なし (最初に畳む時に v3 へ)
-            let (capacity, lap, trailer) = if version == OPLOG_FILE_VERSION_V3 {
+            // v3 / 1 区画の v5: capacity は u32 で、 その後ろが周 (#608)。 v2: capacity は u64、 周の印なし (最初に畳む時に v3 へ)
+            let (capacity, lap, trailer) = if version != OPLOG_FILE_VERSION_V2 {
                 (r32(mmap, OFF_CAPACITY) as u64, r32(mmap, OFF_LAP), LAP_TRAILER)
             } else {
                 (r64(mmap, 24), 0, 0)
@@ -409,9 +438,10 @@ fn read_layout(mmap: &mut [u8]) -> io::Result<Layout> {
                 two: false,
                 next_lap: lap.wrapping_add(LAP_SKIP_ON_OPEN).max(1),
                 trailer,
+                bound: version == OPLOG_FILE_VERSION_ONE_HALF,
             })
         }
-        OPLOG_FILE_VERSION => {
+        OPLOG_FILE_VERSION | OPLOG_FILE_VERSION_V4 => {
             let h = r32(mmap, OFF_CAPACITY) as u64;
             if h < HALF_ALIGN {
                 return Err(bad(format!("WAL header corrupt: half size {h} is below {HALF_ALIGN}")));
@@ -423,8 +453,11 @@ fn read_layout(mmap: &mut [u8]) -> io::Result<Layout> {
             in_range("head", a_head, h)?;
             in_range("checkpoint", a_cp, h)?;
             let b = h as usize;
+            // file の版は A の header が決める。 v4 → v5 は A の版だけを先に書き換えるので (`bind_locked`)、 v5 の file の B の
+            // 版は 4 のままでありうる (B の版は、 A の版が disk に届いた後に書き直す)。 v4 の file の B は 4 だけ
+            let b_ver = r32(mmap, b + 4);
             let b_ok = &mmap[b..b + 4] == FILE_MAGIC
-                && r32(mmap, b + 4) == OPLOG_FILE_VERSION
+                && (b_ver == version || (version == OPLOG_FILE_VERSION && b_ver == OPLOG_FILE_VERSION_V4))
                 && r32(mmap, b + OFF_CAPACITY) as u64 == h;
             let (b_head, b_cp, b_lap) = if b_ok {
                 let (bh, bc) = (r64(mmap, b + 8), r64(mmap, b + 16));
@@ -432,7 +465,7 @@ fn read_layout(mmap: &mut [u8]) -> io::Result<Layout> {
                 in_range("checkpoint", bc, h)?;
                 (bh, bc, r32(mmap, b + OFF_LAP))
             } else {
-                write_half_header(mmap, b, OPLOG_FILE_VERSION, h, hs, hs, 0);
+                write_half_header(mmap, b, version, h, hs, hs, 0);
                 (hs, hs, 0)
             };
             // record のある区画のうち周の新しい方 (どちらも空 / どちらにもあるなら周の新しい方)
@@ -448,10 +481,11 @@ fn read_layout(mmap: &mut [u8]) -> io::Result<Layout> {
                 two: true,
                 next_lap: top.wrapping_add(LAP_SKIP_ON_OPEN).max(1),
                 trailer: LAP_TRAILER,
+                bound: version == OPLOG_FILE_VERSION,
             })
         }
         v => Err(bad(format!(
-            "WAL version {v} unsupported (expected {OPLOG_FILE_VERSION}, {OPLOG_FILE_VERSION_V3} or {OPLOG_FILE_VERSION_V2})"
+            "WAL version {v} unsupported (expected {OPLOG_FILE_VERSION_V2} to {OPLOG_FILE_VERSION_ONE_HALF})"
         ))),
     }
 }
@@ -480,11 +514,24 @@ pub struct DurableCutPoint {
     pub own_data: u64,
 }
 
-/// 周の印を書く。
+/// 周の印を書く。 `bind` = record の CRC (v5、 #851: 印を中身に結ぶ)、 結ばない file (v4 以前の形のまま) は 0。
 #[inline]
-fn write_lap_trailer(t: &mut [u8], lap: u32) {
+fn write_lap_trailer(t: &mut [u8], lap: u32, bind: u32) {
     t[0..4].copy_from_slice(&lap.to_le_bytes());
-    t[4..8].copy_from_slice(&(lap ^ LAP_SALT).to_le_bytes());
+    t[4..8].copy_from_slice(&(lap ^ LAP_SALT ^ bind).to_le_bytes());
+}
+
+/// 周の印の 2 語目 `check` が、 周 `rec_lap`・CRC `crc` の record の印として合うか。 中身に結んだ形 (v5) か、 結ばない旧い形
+/// (v3 / v4 の file に残る record) のどちらか。
+///
+/// 旧い形も通してよい理由 (#851): 塞ぐのは 「前の周の中身 + 今の周の印」 の組で、 その印は今の周の書き手が書いた物。 v5 の
+/// 書き手は必ず結んだ形で書くので、 その印は今の record の CRC に結ばれている = 前の周の中身 (別の CRC) とは、 結んだ形としても
+/// 旧い形としても合わない (今の record の CRC が 0 の時と、 2 つの CRC が同じ時だけ合う = 2^-32)。 旧い形の印が今の周の数を
+/// 持つのは、 v4 以前の形で書いていた間 (v5 に変わる前のその周) の record だけ。
+#[inline]
+fn lap_check_ok(check: u32, rec_lap: u32, crc: u32) -> bool {
+    let plain = rec_lap ^ LAP_SALT;
+    check == plain ^ crc || check == plain
 }
 
 /// 1 record の大きさの見積もり (header + payload + 周の印)。 `append_lock` の外で使う (空きの待ちなど)。 v2 の file (最初に
@@ -1211,7 +1258,7 @@ pub struct OpLog {
     buf: Vec<u8>,
     /// 区画 2 つと採番の欄 (1 本の cache line)
     hot: Hot,
-    /// 2 区画の形か (v4)。 v3 → v4 で立てる (`append_lock` の下)
+    /// 2 区画の形か (v4 / v5)。 1 区画から 2 区画になる時に立てる (`append_lock` の下)
     two: std::sync::atomic::AtomicBool,
     /// 次に区画に置く周 (畳む / 切り替えで移る時に取る)。 `append_lock` の下で進める
     next_lap: std::sync::atomic::AtomicU32,
@@ -1284,8 +1331,14 @@ pub struct OpLog {
     /// #178: scan が読み飛ばした record の累計 (知らない版が書いた [`op_type::SKIPPABLE`] の op。 同じ record を読み直すと
     /// また数える)。 [`OpLog::skipped_ops`]。
     skipped_ops: AtomicU64,
-    /// #608: record ごとの周の印の大きさ: v3 / v4 の file は [`LAP_TRAILER`]、 v2 (最初に畳むまで) は 0。 `append_lock` の下で変える。
+    /// #608: record ごとの周の印の大きさ: v3 以降の file は [`LAP_TRAILER`]、 v2 (最初に畳むまで) は 0。 `append_lock` の下で変える。
     trailer: std::sync::atomic::AtomicUsize,
+    /// #851: 周の印を record の中身 (CRC) に結んで書くか (v5 の file)。 v4 以前の file は、 最初に畳む時に header の版を書き換えて
+    /// から立てる (`bind_locked`、 `append_lock` の下)。 一度立てたら倒さない。
+    bound: std::sync::atomic::AtomicBool,
+    /// #851: v5 の版を書いた A の header が disk に届いたか (全体の fsync が返った)。 届いた後で B の header の版も 5 に直す
+    /// (`bind_locked`。 先に B だけ 5 で届くと、 0.37.x は 「B の header が読めない」 と見て B を空に書き直す)。
+    bound_synced: std::sync::atomic::AtomicBool,
     /// #388: append が満杯にぶつかった時に呼ぶ待ち手 (engine が consumer に畳ませて、 空くまで待つ)。 true を返したら
     /// 1 回だけ書き直す。 None なら今までどおりすぐ落とす。
     room_waiter: std::sync::RwLock<Option<RoomWaiter>>,
@@ -1547,8 +1600,8 @@ impl OpLog {
         size > self.hot.halves[0].size().saturating_sub(HEADER_SIZE as u64)
     }
 
-    /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。 2 区画にできる大きさ (`2 * HALF_ALIGN` 以上) なら v4、 できなければ
-    /// v3 の 1 区画。
+    /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。 2 区画にできる大きさ (`2 * HALF_ALIGN` 以上) なら v5、 できなければ
+    /// 1 区画の v5 (版の数は 6)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &Path, capacity: usize) -> io::Result<Self> {
         crate::io_point("oplog.create")?;
@@ -1593,7 +1646,8 @@ impl OpLog {
         Ok(head.iter().all(|&b| b == 0))
     }
 
-    /// 既存 WAL を開く。 v4 (2 区画)、 v3 (1 区画、 周の印あり)、 v2 (周の印なし。 最初に畳む時に v3 → v4 になる) を読む。
+    /// 既存 WAL を開く。 v5 (周の印を中身に結ぶ。 1 区画の形は版の数 6)、 v4 (2 区画)、 v3 (1 区画、 周の印あり)、 v2 (周の印なし) を読む。
+    /// v4 以前は最初に畳む時に v5 になる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &Path) -> io::Result<Self> {
         crate::io_point("oplog.open")?;
@@ -1652,6 +1706,8 @@ impl OpLog {
             quiet_scanned: std::sync::atomic::AtomicU64::new(0),
             skipped_ops: AtomicU64::new(0),
             trailer: std::sync::atomic::AtomicUsize::new(l.trailer),
+            bound: std::sync::atomic::AtomicBool::new(l.bound),
+            bound_synced: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1716,18 +1772,57 @@ impl OpLog {
         self.hot.halves[self.hot.active.load(Ordering::Acquire)].lap()
     }
 
-    /// file の版 (header): 2 区画の v4、 1 区画の v3、 周の印の無い v2 (最初に畳む時に v3 → v4 になる)。
+    /// file の版 (header): 2 区画の v5 (周の印を中身に結ぶ) / v4 (結ばない、 0.37 の file。 最初に畳む時に v5)、 1 区画の
+    /// v5 ([`OPLOG_FILE_VERSION_ONE_HALF`]) / v3、 周の印の無い v2 (v3 以前は最初に畳む時に v5 になる)。
     pub fn file_version(&self) -> u32 {
+        let bound = self.bound.load(Ordering::Acquire);
         if self.trailer.load(Ordering::Acquire) == 0 {
             OPLOG_FILE_VERSION_V2
         } else if self.two.load(Ordering::Acquire) {
-            OPLOG_FILE_VERSION
+            if bound { OPLOG_FILE_VERSION } else { OPLOG_FILE_VERSION_V4 }
+        } else if bound {
+            OPLOG_FILE_VERSION_ONE_HALF
         } else {
             OPLOG_FILE_VERSION_V3
         }
     }
 
-    /// 2 区画の形 (v4) か。
+    /// 周の印に混ぜる CRC の mask (`append_lock` の下): 中身に結ぶ file (v5) は全 bit、 まだ v4 以前の形の file は 0
+    /// (0.37.x が読める形のまま書く)。
+    #[inline(always)]
+    fn bind_mask(&self) -> u32 {
+        (self.bound.load(Ordering::Relaxed) as u32).wrapping_neg()
+    }
+
+    /// #851: v4 以前の形の file を v5 にする (`append_lock` の下、 区画を畳んだ時)。 header の版を書き換えるだけで、 file の配置は
+    /// 変わらない: 2 区画の形は A の版 (= file の版) を 5 に、 1 区画の形 (2 区画にできない小さい WAL) は 6 に。 以後の record は
+    /// 周の印を中身に結んで書く。 区画に残っている v4 の形の record は、 読みが両方の形を通すのでそのまま読める (`lap_check_ok`)。
+    ///
+    /// 途中の像: 版の 4 byte は 1 回の store で、 header の page に乗る。
+    /// - 版が届いていない像 (v4 のまま) に、 結んだ形の record が居る事はある (record の page が先に届いた)。 0.37.x はそれを
+    ///   書きかけの印と読んでそこで止まる = 届かなかった record と同じ扱い。 その record は書き出しが返っていない: 返る書き出し
+    ///   (全体の fsync) は header の page も届ける
+    /// - B の header の版はここでは書かない。 A より先に B の 5 だけ届くと、 0.37.x は v4 の file の B を 「読めない header」 と
+    ///   見て空に書き直す (B に残る、 書き出しの返った record を黙って捨てる)。 A の版が届いた後 (`bound_synced`) の畳みで直す
+    fn bind_locked(&self) {
+        if self.trailer.load(Ordering::Acquire) == 0 {
+            return; // v2 のまま (周を置けなかった): 印が無い
+        }
+        let two = self.two.load(Ordering::Acquire);
+        let mmap = self.mmap_mut_slice();
+        if !self.bound.load(Ordering::Relaxed) {
+            let v = if two { OPLOG_FILE_VERSION } else { OPLOG_FILE_VERSION_ONE_HALF };
+            mmap[4..8].copy_from_slice(&v.to_le_bytes());
+            self.bound.store(true, Ordering::Release);
+        } else if two && self.bound_synced.load(Ordering::Acquire) {
+            let b = self.hot.halves[1].base() + 4;
+            if mmap[b..b + 4] != OPLOG_FILE_VERSION.to_le_bytes() {
+                mmap[b..b + 4].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
+            }
+        }
+    }
+
+    /// 2 区画の形 (v4 / v5) か。
     pub fn two_halves(&self) -> bool {
         self.two.load(Ordering::Acquire)
     }
@@ -2045,7 +2140,7 @@ impl OpLog {
         header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&pubkey_fp);
         if trailer != 0 {
             let t = at + REC_HEADER_SIZE;
-            write_lap_trailer(&mut mmap[t..t + trailer], lap);
+            write_lap_trailer(&mut mmap[t..t + trailer], lap, crc & self.bind_mask());
         }
         self.put_head(h, base, off + size);
     }
@@ -2255,7 +2350,7 @@ impl OpLog {
             header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&pubkey_fp);
             if trailer != 0 {
                 let t = payload_offset + payload_size;
-                write_lap_trailer(&mut mmap[t..t + trailer], lap);
+                write_lap_trailer(&mut mmap[t..t + trailer], lap, crc & self.bind_mask());
             }
 
             lsns.push(lsn);
@@ -2374,8 +2469,11 @@ impl OpLog {
         mmap[off + REC_HEADER_SIZE..off + REC_HEADER_SIZE + payload_len]
             .copy_from_slice(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]);
         if trailer != 0 {
+            // 印は自分の ring の物を付ける (中継した record の bytes の外)。 結ぶ相手は record が持つ CRC (上で確かめた。 v2 の
+            // record は payload だけの CRC = header の欄までは結ばれない、 #58 の前の record の弱さのまま)
             let t = off + REC_HEADER_SIZE + payload_len;
-            write_lap_trailer(&mut mmap[t..t + trailer], lap);
+            let crc = u32::from_le_bytes(sb[36..40].try_into().unwrap());
+            write_lap_trailer(&mut mmap[t..t + trailer], lap, crc & self.bind_mask());
         }
         // 区画の header の head も更新
         self.put_head(half, base, offset + record_size as u64);
@@ -2744,7 +2842,7 @@ impl OpLog {
         header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&pubkey_fp);
         if trailer != 0 {
             let t = payload_offset + payload_size;
-            write_lap_trailer(&mut mmap[t..t + trailer], lap);
+            write_lap_trailer(&mut mmap[t..t + trailer], lap, crc & self.bind_mask());
         }
 
         // 区画の header の head も更新
@@ -2848,7 +2946,7 @@ impl OpLog {
 
     /// 区画 `i` を頭に戻す (`append_lock` を持った呼び手から、 その区画の head == checkpoint を確かめた後)。 新しい周を置くので、
     /// 前の周の record は読まれない。 古い区画を畳んだ後は、 次に切り替えで移る時に周を置き直さない (今の区画より新しい周)。
-    /// 1 区画の形 (v3 / v2) は、 畳んだ後に 2 区画にできれば v4 にする (`split_locked`)。
+    /// 1 区画の形 (v3 / v2) は、 畳んだ後に 2 区画にできれば 2 区画にする (`split_locked`)。 v4 以前の形はここで v5 になる (`bind_locked`、 #851)。
     ///
     /// #707: 畳んだ区画は、 この header が disk に届くまで閉じる (`fold_pending` に置いた周、 `Half::limit` = 0)。 呼び手は
     /// `append_lock` を放してから [`Self::settle_folds`] を呼ぶ (または全体を fsync する)。 届く前に新しい周の record で前の周の
@@ -2881,6 +2979,7 @@ impl OpLog {
         h.limit.store(0, Ordering::Release);
         self.fold_pending[i].store(h.lap(), Ordering::Release);
         self.split_locked();
+        self.bind_locked();
         true
     }
 
@@ -2917,9 +3016,9 @@ impl OpLog {
         }
     }
 
-    /// v3 の 1 区画を v4 の 2 区画にする (`append_lock` の下、 区画を畳んだ直後 = 空の時)。 B の header を書いて fsync してから、
-    /// A の capacity → version の順に書く: 途中のどの像も、 v3 (capacity が file 全体か半分、 空) か v4 として開ける。 fsync に
-    /// 失敗したら 1 区画のまま (B の header は v3 の区画の中の空き)。
+    /// v3 の 1 区画を 2 区画 (v5) にする (`append_lock` の下、 区画を畳んだ直後 = 空の時)。 B の header を書いて fsync してから、
+    /// A の capacity → version の順に書く: 途中のどの像も、 v3 (capacity が file 全体か半分、 空) か v5 として開ける。 fsync に
+    /// 失敗したら 1 区画のまま (B の header は v3 の区画の中の空き。 この後の `bind_locked` が 1 区画の v5 にする)。
     fn split_locked(&self) {
         if self.two.load(Ordering::Acquire) || self.trailer.load(Ordering::Acquire) == 0 {
             return;
@@ -2937,6 +3036,7 @@ impl OpLog {
         }
         mmap[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(hs as u32).to_le_bytes());
         mmap[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
+        // (#851: 周の印を中身に結んで書き始めるのは、 この後の `bind_locked`)
         // A は畳んだ直後 = 閉じたまま (`fold_pending`)。 B は header を上の fsync で届けた、 まだ使っていない区画
         a.set_size(hs as u32, false);
         b.base.store(hs as u32, Ordering::Release);
@@ -3248,7 +3348,8 @@ impl OpLog {
                     let t = &mmap[payload_end..next_off];
                     let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
                     let check = u32::from_le_bytes(t[4..8].try_into().unwrap());
-                    if check != rec_lap ^ LAP_SALT || rec_lap != lap {
+                    let crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
+                    if !lap_check_ok(check, rec_lap, crc) || rec_lap != lap {
                         return;
                     }
                 }
@@ -3364,6 +3465,8 @@ impl OpLog {
         let stale_heads = [0, 1].map(|i| {
             self.stale_tail[i].load(Ordering::Acquire).then(|| self.hot.halves[i].written.load(Ordering::Acquire))
         });
+        // #851: 書き出す前に v5 の版が header に載っていれば、 この書き出しが届ける
+        let bound = self.bound.load(Ordering::Acquire);
         #[cfg(all(feature = "crashsim", unix))]
         let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, 0, &self.mmap));
         crate::io_point("oplog.fsync")?;
@@ -3379,6 +3482,9 @@ impl OpLog {
             if let Some(h) = stale_heads[i] {
                 self.stale_synced_head[i].fetch_max(h, Ordering::AcqRel);
             }
+        }
+        if bound {
+            self.bound_synced.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -3783,8 +3889,11 @@ impl OpLog {
                     let t = &mmap[payload_end..next_off];
                     let rec_lap = u32::from_le_bytes(t[0..4].try_into().unwrap());
                     let check = u32::from_le_bytes(t[4..8].try_into().unwrap());
-                    if check != rec_lap ^ LAP_SALT {
-                        stop = ScanStop::BadLap; // 書きかけの印 (torn)
+                    // #851: 印は record の中身 (CRC) に結んである。 前の周の中身の後ろに今の周の印だけが届いた像 (同じ位置・
+                    // 同じ長さの record を今の周が書き、 中身の page / sector が前のまま残った) は、 中身の CRC も印の周も
+                    // 合うので、 結び目で見分ける
+                    if !lap_check_ok(check, rec_lap, stored_crc) {
+                        stop = ScanStop::BadLap; // 書きかけの印 (torn) / 別の record の印
                         break 'parts;
                     }
                     if rec_lap != lap {
@@ -4184,6 +4293,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// `at` の record の中身 (CRC) を書き換えた test が、 周の印を今の CRC に結び直す (v5、 #851: 印は CRC に結んである)。
+    fn rebind_lap_mark(bytes: &mut [u8], at: usize) {
+        let len = u32::from_le_bytes(bytes[at + OFF_LEN..at + OFF_LEN + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(bytes[at + OFF_CRC..at + OFF_CRC + 4].try_into().unwrap());
+        let t = at + REC_HEADER_SIZE + len;
+        let lap = u32::from_le_bytes(bytes[t..t + 4].try_into().unwrap());
+        write_lap_trailer(&mut bytes[t..t + LAP_TRAILER], lap, crc);
     }
 
     /// ホストの形: 切れ目の後に Commit と中継しか積んでいなければ 「中身のある自分の record は積んでいない」 (時計を今まで進め、
@@ -5014,6 +5132,7 @@ mod tests {
             sb.extend_from_slice(&payload);
             let sig = kp.sign(&sb);
             m[h + OFF_SIGNATURE..h + OFF_SIGNATURE + 64].copy_from_slice(&sig);
+            rebind_lap_mark(m, h);
         }
         wal.append(Op::Tie { eid: 2, himo_id: 0, value: 8 }).unwrap(); // こちらは v3
         wal.append(Op::Commit).unwrap();
@@ -5314,6 +5433,7 @@ mod tests {
             let crc = new_record_crc(op_byte, len, lsn, hlc, author, &payload);
             bytes[at + OFF_OP] = op_byte;
             bytes[at + OFF_CRC..at + OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+            rebind_lap_mark(&mut bytes, at);
             std::fs::write(&p, &bytes).unwrap();
 
             let wal = OpLog::open(&p).unwrap();
@@ -5537,11 +5657,14 @@ mod tests {
                 u32::from_le_bytes(m[OFF_LAP..OFF_LAP + 4].try_into().unwrap()),
             )
         };
+        // (周, 2 語目から record の CRC を除いた物): v5 の印は `lap ^ LAP_SALT ^ crc`
         let first_trailer = |w: &OpLog| {
             let m = w.mmap_slice();
             let len = u32::from_le_bytes(m[HEADER_SIZE + OFF_LEN..HEADER_SIZE + OFF_LEN + 4].try_into().unwrap()) as usize;
+            let crc = u32::from_le_bytes(m[HEADER_SIZE + OFF_CRC..HEADER_SIZE + OFF_CRC + 4].try_into().unwrap());
+            assert_ne!(crc, 0);
             let t = HEADER_SIZE + REC_HEADER_SIZE + len;
-            (u32::from_le_bytes(m[t..t + 4].try_into().unwrap()), u32::from_le_bytes(m[t + 4..t + 8].try_into().unwrap()))
+            (u32::from_le_bytes(m[t..t + 4].try_into().unwrap()), u32::from_le_bytes(m[t + 4..t + 8].try_into().unwrap()) ^ crc)
         };
         assert_eq!(header(&wal), (OPLOG_FILE_VERSION, 32 * 1024, 1), "2 区画 (A の header の capacity は区画の大きさ)");
         wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
@@ -5616,7 +5739,6 @@ mod tests {
     /// 残り、 印のある後半だけ届いた像。 前の周の中身は CRC が合い、 印は今の周なので、 印が中身に結ばれていなければ続きとして読める。
     /// `torn` = 戻す record の番号 (0 始まり)。 真ん中 (後ろに今の周の record が続く) と最後の両方。
     #[test]
-    #[ignore = "#851: 周の印が record の中身に結ばれていない (直しは file の形の変更が要る)"]
     fn previous_lap_content_under_a_current_lap_mark_stops_the_scan() {
         let rec = REC_HEADER_SIZE + 16 + LAP_TRAILER;
         for torn in [2usize, 5] {
@@ -5655,8 +5777,119 @@ mod tests {
                 .collect();
             let want: Vec<u64> = (100..100 + torn as u64).collect();
             assert_eq!(values, want, "torn = {torn}: 前の周の中身 (値 {torn}) を今の周の record として読んだ");
+            // header だけ読む道 (開く時の照合) も同じ所で止まる
+            let mut seen = 0;
+            wal.visit_record_headers_with_tail(None, |_, _| seen += 1);
+            assert_eq!(seen, torn, "torn = {torn}: header だけ読む道が前の周の中身を通した");
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    /// 区画 `i` の頭から書き終えた所までの record の印が、 中身 (CRC) に結んだ形か (record ごと)。
+    fn marks_bound(wal: &OpLog, i: usize) -> Vec<bool> {
+        let h = &wal.hot.halves[i];
+        let (base, end) = (h.base(), h.written.load(Ordering::Acquire) as usize);
+        let m = wal.mmap_slice();
+        let r32 = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+        let (mut off, mut out) = (HEADER_SIZE, Vec::new());
+        while off < end {
+            let at = base + off;
+            let t = at + REC_HEADER_SIZE + r32(at + OFF_LEN) as usize;
+            let (crc, lap, check) = (r32(at + OFF_CRC), r32(t), r32(t + 4));
+            assert_eq!(lap, h.lap(), "印の周");
+            assert_ne!(crc, 0);
+            assert!(check == lap ^ LAP_SALT || check == lap ^ LAP_SALT ^ crc, "印がどちらの形でもない");
+            out.push(check == lap ^ LAP_SALT ^ crc);
+            off = t + LAP_TRAILER - base;
+        }
+        out
+    }
+
+    /// #851: record を積む道の全部 (1 件 / 束 / 中継の組み直し / 中継の bytes のまま (record v3 と v2) / 区画を移る時の閉じの
+    /// Commit) が、 周の印を record の CRC に結んで書く。 どれか 1 つでも結ばないと、 その道の record だけ穴が残る。
+    #[test]
+    fn every_append_path_binds_the_lap_mark_to_the_record() {
+        let p = tmp("bound-paths");
+        let src_p = tmp("bound-paths-src");
+        // 中継する record を作る (相手の WAL)。 2 件目は record v2 の形 (CRC は payload だけ) に書き換える
+        let src = OpLog::create(&src_p, 64 * 1024).unwrap();
+        src.set_peer_id(7);
+        src.append(Op::Tie { eid: 70, himo_id: 0, value: 1 }).unwrap();
+        src.append(Op::Tie { eid: 71, himo_id: 0, value: 2 }).unwrap();
+        src.append(Op::Commit).unwrap();
+        {
+            let m = src.mmap_mut_slice();
+            let h = HEADER_SIZE + REC_HEADER_SIZE + 16 + LAP_TRAILER;
+            let payload = m[h + REC_HEADER_SIZE..h + REC_HEADER_SIZE + 16].to_vec();
+            m[h + OFF_VERSION] = REC_VERSION_V2;
+            m[h + OFF_CRC..h + OFF_CRC + 4].copy_from_slice(&fnv1a(&payload).to_le_bytes());
+            rebind_lap_mark(m, h);
+        }
+        let relayed = src.iter_committed();
+        assert_eq!((relayed.len(), relayed[1].signed_bytes[OFF_VERSION]), (2, REC_VERSION_V2));
+
+        let wal = OpLog::create(&p, 64 * 1024).unwrap();
+        wal.set_peer_id(1);
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        wal.append_many(&[OwnedOp::Tie { eid: 2, himo_id: 0, value: 2 }, OwnedOp::Untie { eid: 2, himo_id: 1 }, OwnedOp::Commit]).unwrap();
+        wal.append_relayed(
+            Op::Tie { eid: 3, himo_id: 0, value: 3 },
+            RelayedHeader { hlc: relayed[0].hlc, author: 7, signature: ZERO_SIGNATURE, pubkey_fp: ZERO_PUBKEY_FP },
+        )
+        .unwrap();
+        for r in &relayed {
+            wal.append_relayed_verbatim(&r.signed_bytes, &r.signature, &r.pubkey_fp).unwrap();
+        }
+        let before_fill = marks_bound(&wal, 0).len();
+        assert_eq!(before_fill, 7);
+        // 区画を埋めて移る: 開いている group を閉じる Commit (`close_group_for_switch`) が A の最後に入る
+        let mut i = 0u64;
+        while wal.switches() == 0 {
+            wal.append(Op::Tie { eid: 9, himo_id: 0, value: i }).unwrap();
+            i += 1;
+        }
+        let a = marks_bound(&wal, 0);
+        {
+            let m = wal.mmap_slice();
+            let last = wal.hot.halves[0].written.load(Ordering::Acquire) as usize - REC_HEADER_SIZE - LAP_TRAILER;
+            assert_eq!(m[last + OFF_OP], op_type::COMMIT, "前提: A の最後は移る時の閉じの Commit");
+        }
+        assert!(a.iter().all(|&b| b), "結んでいない印: {:?}", a.iter().position(|&b| !b));
+        assert_eq!(marks_bound(&wal, 1), vec![true]);
+        // 読みは全部通す (中継の v2 の record も)
+        assert_eq!(wal.records_with_tail().len(), a.len() - 2 + 1);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&src_p);
+    }
+
+    /// 2 区画にできない小さい v3 の file (0.37 が作った形) は、 最初に畳む時に 1 区画の v5 (版の数は 6) になる。
+    #[test]
+    fn a_small_v3_file_binds_its_marks_from_the_first_fold() {
+        let p = tmp("bound-small");
+        {
+            let wal = OpLog::create(&p, 16 * 1024).unwrap();
+            wal.mmap_mut_slice()[4..8].copy_from_slice(&OPLOG_FILE_VERSION_V3.to_le_bytes());
+            wal.fsync().unwrap();
+        }
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!((wal.file_version(), wal.two_halves()), (OPLOG_FILE_VERSION_V3, false));
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        wal.append(Op::Commit).unwrap();
+        assert_eq!(marks_bound(&wal, 0), vec![false, false], "v3 のうちは 0.37 が読める印");
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
+        assert_eq!((wal.file_version(), wal.two_halves()), (OPLOG_FILE_VERSION_ONE_HALF, false));
+        assert_eq!(u32::from_le_bytes(wal.mmap_slice()[4..8].try_into().unwrap()), OPLOG_FILE_VERSION_ONE_HALF);
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 2 }).unwrap();
+        wal.append(Op::Commit).unwrap();
+        assert_eq!(marks_bound(&wal, 0), vec![true, true]);
+        drop(wal);
+        let wal = OpLog::open(&p).unwrap();
+        assert_eq!(wal.file_version(), OPLOG_FILE_VERSION_ONE_HALF);
+        assert_eq!(wal.recover_with_tail().len(), 1);
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 3 }).unwrap();
+        assert_eq!(marks_bound(&wal, 0), vec![true, true, true], "開き直した後も結んで書く");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// v2 (周の印なし) の file は読めて、 最初に畳む時に v3 になる (header の version / capacity / 周、 以後の record に印)。
@@ -6076,6 +6309,7 @@ mod tests {
         let crc = new_record_crc(op_byte, len, lsn, hlc, author, &payload);
         bytes[at + OFF_OP] = op_byte;
         bytes[at + OFF_CRC..at + OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        rebind_lap_mark(&mut bytes, at);
         std::fs::write(&p, &bytes).unwrap();
 
         let wal = OpLog::open(&p).unwrap();
@@ -6236,6 +6470,7 @@ mod tests {
                 m[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&(cap as u32).to_le_bytes());
                 m[half..half + HEADER_SIZE].fill(0);
             }
+            wal.bound.store(false, Ordering::Release); // v3 の印は中身に結ばない
             wal.two.store(false, Ordering::Release);
             wal.hot.halves[0].set_size(cap as u32, true);
             wal.hot.halves[1].set_size(0, true);
@@ -6262,6 +6497,12 @@ mod tests {
             assert_eq!((r32(half + 4), r32(half + OFF_CAPACITY) as u64), (OPLOG_FILE_VERSION, cap / 2));
             assert_eq!(u64::from_le_bytes(m[half + 8..half + 16].try_into().unwrap()), HEADER_SIZE as u64);
         }
+        // v5 になった後の record は印を中身に結ぶ (#851)
+        append_group(&wal, &mut v);
+        let marks = marks_bound(&wal, 0);
+        assert!(!marks.is_empty() && marks.iter().all(|&b| b), "v3 から変わった後の record の印: {marks:?}");
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
         // A を埋めて B (前の周の record が残っている) へ移る
         let start = v;
         while wal.switches() == 0 {
@@ -6277,15 +6518,22 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// 2 区画にできない小さい WAL は v3 の 1 区画で作る (今までと同じ形)。
+    /// 2 区画にできない小さい WAL は 1 区画で作る (v3 と同じ配置。 周の印を中身に結ぶので版の数は 6)。 畳んでも 1 区画のまま。
     #[test]
-    fn a_wal_too_small_for_two_halves_stays_one_v3_half() {
+    fn a_wal_too_small_for_two_halves_stays_one_half() {
         let p = tmp("halves-small");
         let wal = OpLog::create(&p, 16 * 1024).unwrap();
-        assert_eq!((wal.file_version(), wal.two_halves(), wal.capacity()), (OPLOG_FILE_VERSION_V3, false, 16 * 1024));
+        assert_eq!((wal.file_version(), wal.two_halves(), wal.capacity()), (OPLOG_FILE_VERSION_ONE_HALF, false, 16 * 1024));
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        wal.append(Op::Commit).unwrap();
+        wal.advance_checkpoint(wal.head());
+        assert!(wal.try_reset());
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 2 }).unwrap();
+        wal.append(Op::Commit).unwrap();
         drop(wal);
         let wal = OpLog::open(&p).unwrap();
-        assert_eq!((wal.file_version(), wal.two_halves()), (OPLOG_FILE_VERSION_V3, false));
+        assert_eq!((wal.file_version(), wal.two_halves()), (OPLOG_FILE_VERSION_ONE_HALF, false));
+        assert_eq!(wal.recover_with_tail().len(), 1);
         let _ = std::fs::remove_file(&p);
     }
 
