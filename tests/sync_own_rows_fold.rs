@@ -204,7 +204,11 @@ fn a_folded_own_slot_is_not_reused_when_the_table_is_full() {
     for i in 5..9 {
         made.push(c.upsert(&format!("k{i}"), "n"));
     }
-    assert!(!made.contains(&folded), "畳まれた行の slot {folded:x} を新しい行に使い回した: {made:x?}");
+    // #731: 場所で比べる (使い回した行の eid は世代が違う。 既定の DB の場所は下 24 bit)
+    assert!(
+        !made.iter().any(|&e| e as u32 & 0xFF_FFFF == folded as u32 & 0xFF_FFFF),
+        "畳まれた行の slot {folded:x} を新しい行に使い回した: {made:x?}"
+    );
     b.pull(3);
     for i in 5..9 {
         assert_eq!(b.rows_named(&format!("k{i}")).len(), 1);
