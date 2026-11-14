@@ -17225,10 +17225,10 @@ impl Engine {
     /// 書き出さない。
     #[cold]
     fn settle_retired_leaves_after_apply(&self) {
-        if let Some(leaf) = self.leaf.as_ref() {
-            if leaf.settle_due(leaf.retired().1) {
-                self.settle_retired_leaves(leaf);
-            }
+        if let Some(leaf) = self.leaf.as_ref()
+            && leaf.settle_due(leaf.retired().1)
+        {
+            self.settle_retired_leaves(leaf);
         }
     }
 
