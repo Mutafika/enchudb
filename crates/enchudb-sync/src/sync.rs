@@ -976,7 +976,9 @@ impl Syncer {
                 // 新しい Delete で消し直していて、 その行の名前の削除の時刻が上がり (#551)、 前の削除の後に同じ名前で足し直された
                 // 行 (新しいデッキ) が、 掃除の Delete を受けた peer で消えた。 削除の版数の無い slot (まだ何も当たっていない
                 // 写像) は今までどおり消す (版数を置いて、 後から届く古い書き込みで行ができないようにする)
-                let row = local as u64;
+                // #731: 翻訳した行の場所の今の住人の eid で (アプリの入口の `is_live` / `delete` は世代を照合する。 世代 0 の eid では
+                // 使い回した場所に載った行を生きていないと読み、 消さずに数えだけ進めた)
+                let row = self.engine.slot_eid(local);
                 if !self.engine.is_live(row) && self.engine.tombstone_hlc(row) != Hlc::ZERO {
                     continue;
                 }
@@ -2225,7 +2227,7 @@ impl Syncer {
                     // 書き込みを順に受けた peer では、 作成を当てた時か束ねた時に消している)
                     if let Some(t) = self.engine.name_deleted_at(*himo_id, PkValue::Local(value))
                         && t > rec.hlc
-                        && self.engine.is_live(local_eid)
+                        && self.engine.is_live_unchecked(local_eid)
                     {
                         self.engine.remote_delete_apply(local_eid, t);
                     }

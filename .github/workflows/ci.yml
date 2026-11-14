@@ -160,6 +160,11 @@ jobs:
       - name: loom model check (WAL の 2 区画の終端を読む順)
         run: cargo test -p enchudb-engine --test loom_wal_halves --release
 
+      # #731: 世代を持つ DB (file version 15) に移る手順 (「消す時に上げる」 の印を立ててから死んだ場所をなめる) と、 行を消す道の
+      # 揃え (1 語の RMW)。 揃えを外した対照 (should_panic) は窓を見つける
+      - name: loom model check (eid の世代、 v15 に移る手順と消す道)
+        run: cargo test -p enchudb-engine --test loom_eid_generation_move --release
+
       # #850: 書き出す側が覆う位置を、 WAL に積んだだけでまだ本体に当てていない record の手前で切る。 印を record の位置に
       # 置き換えるのは `written` を進める前、 書き出す側は `written` を読んでから印を読む。 順を逆にした形・Relaxed の形・印を
       # 見ない形 (直す前) の対照で、 loom が窓を見つけることも見る。

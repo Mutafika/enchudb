@@ -63,7 +63,8 @@ impl Ravn {
     /// Ref の cell の値 (local の番号) を、 この peer の頭の付いた eid にする (#556: `reverse_follow` / `pull_raw` と同じ形。
     /// 前は頭なしで返し、 `bfs` が輪で戻った始点を別の entity と見た)。
     fn ref_target(&self, val: u64) -> enchudb_oplog::EntityId {
-        enchudb_oplog::make_eid(self.engine.peer_id(), val as u32)
+        // #731: Ref の cell の値 → 指す行の eid (`Engine::ref_eid`)
+        self.engine.ref_eid(val)
     }
 
     pub fn follow(&self, start: &[enchudb_oplog::EntityId], steps: &[&str]) -> Vec<enchudb_oplog::EntityId> {
@@ -86,7 +87,8 @@ impl Ravn {
         for &e in start {
             // pull_raw は "himo に値 e を持つ全 entity" を返す(EntityId)。
             // tie_ref は target_eid を u32 値として格納するので、u64 eid の local 部分で引く。
-            let pulled = self.engine.pull_raw(himo, enchudb_oplog::eid_local(e));
+            // #731: eid → Ref の cell に置く値 (`Engine::ref_value`)
+            let pulled = self.engine.pull_raw(himo, self.engine.ref_value(e));
             out.extend(pulled);
         }
         out.sort_unstable();
