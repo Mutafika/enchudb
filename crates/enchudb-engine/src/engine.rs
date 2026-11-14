@@ -1302,10 +1302,31 @@ const WAL_DROP_EPISODE_QUIET_MS: u64 = 100;
 /// `WAL_DROP_FLOOR_MAX_DELAY_MS` まで)。 満杯が続く間に毎周上げると、 全 peer が pull のたびに全状態を取り直す。
 const WAL_DROP_FLOOR_MIN_GAP_MS: u64 = 1_000;
 
+/// [`Engine::hold_consumer`] の guard。 落とすと consumer の周期の仕事が戻る。
+#[doc(hidden)]
+pub struct ConsumerHold<'a> {
+    engine: &'a Engine,
+}
+
+impl Drop for ConsumerHold<'_> {
+    fn drop(&mut self) {
+        self.engine.wal_fold_off.fetch_and(!CONSUMER_HELD, std::sync::atomic::Ordering::AcqRel);
+        if let Some(w) = self.engine.consumer_waker() {
+            w.wake();
+        }
+    }
+}
+
 /// `Engine::wal_fold_off` の bit: 書き手が区画を移った時の畳み (#667) を試験で切った。
 const WAL_FOLD_OFF_SWITCH: u8 = 1;
 /// `Engine::wal_fold_off` の bit: consumer の周期の書き出しの後の畳み (#676) を試験で切った。
 const WAL_FOLD_OFF_TICK: u8 = 2;
+/// `Engine::wal_fold_off` の bit: 試験が consumer の周期の仕事を止めている ([`Engine::hold_consumer`])。
+const CONSUMER_HELD: u8 = 4;
+/// `Engine::wal_fold_off` の bit: consumer が周期の仕事 (空け作り・Commit・書き出し・畳み) の途中。 consumer は周期の頭で
+/// この bit を立てる `fetch_or` の戻りで [`CONSUMER_HELD`] を見る (止める側は `CONSUMER_HELD` を立てる `fetch_or` の後、 この
+/// bit が下りるのを待つ。 同じ 1 語への 2 つの RMW なので、 どちらが先でも 「止めた後に周期の仕事が始まる」 順は無い)。
+const CONSUMER_IN_TICK: u8 = 8;
 
 /// #451 (段階 1): 配り済みの印の候補 = 切れ目 (`Engine::take_durable_cut`)。 置く時 (`Engine::end_durable_cut`) に S を決める。
 struct DurableCut {
@@ -5549,7 +5570,8 @@ pub struct Engine {
     wal_room_wait_timeouts: std::sync::atomic::AtomicU64,
     /// 試験で切った consumer の畳み (bit、 既定 0 = 全部畳む)。 [`WAL_FOLD_OFF_SWITCH`] = 書き手が区画を移った時に待たずに古い区画を
     /// 畳む (#667、 [`Self::set_wal_fold_on_switch`])、 [`WAL_FOLD_OFF_TICK`] = 周期の書き出しの後に畳む (#676、
-    /// [`Self::set_wal_fold_on_tick`])。 1 byte のまま (欄を足すと並びが変わる)
+    /// [`Self::set_wal_fold_on_tick`])。 [`CONSUMER_HELD`] / [`CONSUMER_IN_TICK`] = 試験が consumer の周期の仕事を止める
+    /// ([`Self::hold_consumer`])。 1 byte のまま (欄を足すと並びが変わる)
     wal_fold_off: std::sync::atomic::AtomicU8,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
@@ -22198,9 +22220,12 @@ impl Engine {
                     if let Some(wal) = oplog_for_thread.as_ref() {
                         consumer_tick_hook::call(wal);
                     }
+                    // 試験が止めている間 (`hold_consumer`) は、 この周の仕事 (空け作り・Commit・書き出し・畳み) を全部飛ばす
+                    let held = engine.wal_fold_off.fetch_or(CONSUMER_IN_TICK, Ordering::AcqRel) & CONSUMER_HELD != 0;
                     // #388: 満杯にぶつかった書き手が待っている / ring の空きが 1/4 を切った → 書き出して畳む (`make_wal_room`
                     // の doc: 書き込みの途中で本体にまだ当たっていない record は、 その書き込みが返る前に当たる)
-                    if let Some(wal) = oplog_for_thread.as_ref()
+                    if !held
+                        && let Some(wal) = oplog_for_thread.as_ref()
                         && (engine.wal_room_wanted.load(Ordering::Acquire)
                             || wal.free_bytes() < wal.capacity() / 4)
                     {
@@ -22210,7 +22235,9 @@ impl Engine {
                     // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &
                     // head が checkpoint より進んでいる時のみ実行。
                     // 順序厳守: auto-Commit → WAL fsync → body msync → checkpoint 前進。
-                    if let Some(wal) = oplog_for_thread.as_ref() {
+                    if !held
+                        && let Some(wal) = oplog_for_thread.as_ref()
+                    {
                         let fold_off = engine.wal_fold_off.load(Ordering::Relaxed);
                         let switched = fold_off & WAL_FOLD_OFF_SWITCH == 0 && wal.switches() != seen_switches;
                         if last_fsync.elapsed() >= fsync_interval || switched {
@@ -22319,6 +22346,7 @@ impl Engine {
                             last_fsync = Instant::now();
                         }
                     }
+                    engine.wal_fold_off.fetch_and(!CONSUMER_IN_TICK, Ordering::AcqRel);
 
                     if flag_for_thread.load(Ordering::Acquire) {
                         // shutdown 時の最終 Commit + 順序付き同期
@@ -22695,6 +22723,22 @@ impl Engine {
     #[doc(hidden)]
     pub fn set_wal_fold_on_tick(&self, on: bool) {
         self.set_wal_fold_off(WAL_FOLD_OFF_TICK, !on);
+    }
+
+    /// 試験: consumer の周期の仕事 (満杯の空け作り・100 ms ごとの Commit・書き出し・bridge・畳み) を、 返った guard を落とすまで
+    /// 止める。 返った時、 途中だった周は終わっている = guard を持つ間、 consumer は WAL に何も積まず、 畳まない。 WAL の残りを
+    /// byte の数で作る試験が、 準備の途中に consumer の Commit が入らないようにするのに使う (前は 「入ったら作り直す」 を回数で
+    /// 繰り返していて、 準備が 100 ms より長くかかる負荷では毎回入った、 #735)。
+    ///
+    /// 持ったまま、 consumer を待つ事 (満杯の WAL の空きを待つ書き込み / engine を落とす) をしない。 入れ子にしない。
+    #[doc(hidden)]
+    pub fn hold_consumer(&self) -> ConsumerHold<'_> {
+        use std::sync::atomic::Ordering;
+        self.wal_fold_off.fetch_or(CONSUMER_HELD, Ordering::AcqRel);
+        while self.wal_fold_off.load(Ordering::Acquire) & CONSUMER_IN_TICK != 0 {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        ConsumerHold { engine: self }
     }
 
     fn set_wal_fold_off(&self, bit: u8, off: bool) {

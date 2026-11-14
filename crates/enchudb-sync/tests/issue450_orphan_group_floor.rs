@@ -51,20 +51,15 @@ const COMMIT: u64 = 120;
 /// 準備の残り。 Tie は載り、 その後の閉じの Commit は入らない (残り 50 B)
 const ROOM: u64 = TIE + 50;
 
-/// 準備 (WAL の残りを [`ROOM`] にして孤児の group を作る) の途中に、 裏の consumer が WAL に Commit を 1 つ打つことが
-/// ある。 満杯に近い WAL を空けに来る段 (#388) は、 畳む lock (準備の間この test が持つ) を試す前に Commit を打つ (100 ms
-/// ごとの Commit も同じ)。 入ると残りがちょうど Commit 1 つ分ずれて前提を作れないので、 その時だけ作り直す (他のずれは前提の
-/// 誤りとして落とす)。
+/// 準備 (WAL の残りを [`ROOM`] にして孤児の group を作る) の間は、 裏の consumer の周期の仕事を止める
+/// (`Engine::hold_consumer`)。 満杯に近い WAL を空けに来る段 (#388) は、 畳む lock (準備の間この test が持つ) を試す前に
+/// Commit を打ち、 100 ms ごとの Commit も同じ。 入ると残りがちょうど Commit 1 つ分ずれて前提を作れない。 前は 「入ったら
+/// 作り直す」 を 5 回まで繰り返していて、 準備が 100 ms より長くかかる負荷 (load 20) では 5 回とも入った (#735)。
 ///
 /// 1 区画 (v3) の形の WAL で見る (2 区画にできない大きさ)。 2 区画の形では孤児にならない (↓ の test)。
 #[test]
 fn a_folded_orphan_group_reaches_the_peer() {
-    for attempt in 0..5 {
-        if folded_orphan_group_reaches_the_peer(attempt, false) {
-            return;
-        }
-    }
-    panic!("5 回とも準備の途中で consumer の Commit が WAL に入り、 前提を作れなかった");
+    folded_orphan_group_reaches_the_peer(false);
 }
 
 /// 0.37 の 2 区画の形: 今の区画に閉じの Commit が入らなくても、 次の Commit がもう一方の区画に入って group を閉じる (切り替えは
@@ -72,16 +67,11 @@ fn a_folded_orphan_group_reaches_the_peer() {
 /// (floor は上げない)。
 #[test]
 fn an_unclosed_group_is_closed_in_the_other_half_and_reaches_the_peer() {
-    for attempt in 0..5 {
-        if folded_orphan_group_reaches_the_peer(attempt, true) {
-            return;
-        }
-    }
-    panic!("5 回とも準備の途中で consumer の Commit が WAL に入り、 前提を作れなかった");
+    folded_orphan_group_reaches_the_peer(true);
 }
 
-/// 1 回分。 準備の途中に consumer の Commit が入ったら false (作り直す)。 `two` = 2 区画の形の WAL。
-fn folded_orphan_group_reaches_the_peer(attempt: u32, two: bool) -> bool {
+/// `two` = 2 区画の形の WAL。
+fn folded_orphan_group_reaches_the_peer(two: bool) {
     let (pa, pb) = (tmp_path("a"), tmp_path("b"));
     let mem = Arc::new(InMemoryTransport::new());
     mem.register_peer(1);
@@ -111,12 +101,11 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32, two: bool) -> bool {
     // group (閉じの Commit が入らない満杯) は普通の書き込みでは作れない。 前の版の binary が書いた WAL と同じく、 残さない形にして作る
     wal.set_room_waiter(None);
     wal.keep_commit_room_for_test(false);
-    // consumer の Commit が 1 つ入ったか: 残りがちょうど Commit 1 つ分ずれる (c を測る間に入れば ROOM + COMMIT、 埋めた後なら
-    // ROOM − COMMIT、 Tie の前なら Tie が載らずに ROOM − COMMIT)
     assert_eq!(wal.record_size_of(0) as u64, COMMIT, "前提: Commit の大きさ");
     assert_eq!(wal.record_size_of(16) as u64, TIE, "前提: Tie の大きさ");
-    let raced = |free: u64| free.abs_diff(ROOM) == COMMIT;
     let orphan_hlc = {
+        // 準備の間、 consumer は WAL に何も積まない (途中だった周は、 返った時には終わっている)
+        let _no_consumer = eng_a.hold_consumer();
         let _no_fold = eng_a.transfer_lock_for_fold();
         assert_eq!(wal.two_halves(), two, "前提: WAL の形");
         if two {
@@ -140,30 +129,14 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32, two: bool) -> bool {
         let e1 = eng_a.entity_in("notes").unwrap();
         eng_a.tie_text_to(e1, "notes.body", &"p".repeat(pad as usize));
         eng_a.oplog_commit();
-        let free = wal.free_bytes();
-        if raced(free) {
-            None
-        } else {
-            assert_eq!(free, ROOM, "前提: 残り {ROOM} B");
-            // Tie は載り、 残り 50 B に閉じの Commit は入らない
-            let orphan = eng_a.entity_in("notes").unwrap();
-            let head = wal.head();
-            eng_a.tie_to(orphan, "notes.note", 7);
-            if raced(wal.free_bytes()) {
-                None
-            } else {
-                assert_eq!(wal.head(), head + TIE, "前提: WAL に載る");
-                assert!(wal.append_dead(), "前提: 閉じの Commit が入らない");
-                Some(eng_a.cell_hlc(orphan, hid))
-            }
-        }
-    };
-    let Some(orphan_hlc) = orphan_hlc else {
-        eprintln!("[issue450] 作り直す ({attempt} 回目): 準備の途中で consumer の Commit が WAL に入った");
-        drop((sync_a, sync_b, wal, eng_a, eng_b));
-        cleanup(&pa);
-        cleanup(&pb);
-        return false;
+        assert_eq!(wal.free_bytes(), ROOM, "前提: 残り {ROOM} B");
+        // Tie は載り、 残り 50 B に閉じの Commit は入らない
+        let orphan = eng_a.entity_in("notes").unwrap();
+        let head = wal.head();
+        eng_a.tie_to(orphan, "notes.note", 7);
+        assert_eq!(wal.head(), head + TIE, "前提: WAL に載る");
+        assert!(wal.append_dead(), "前提: 閉じの Commit が入らない");
+        eng_a.cell_hlc(orphan, hid)
     };
     // 死区間では Err を返さない
     eng_a.oplog_sync().unwrap();
@@ -187,7 +160,7 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32, two: bool) -> bool {
         drop((sync_a, sync_b, wal, eng_a, eng_b));
         cleanup(&pa);
         cleanup(&pb);
-        return true;
+        return;
     }
     // consumer が死区間の例外で畳み、 孤児の group の write を覆う floor を上げる (落ちが止んで 100 ms 後)
     let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -212,5 +185,4 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32, two: bool) -> bool {
     drop((sync_a, sync_b, wal, eng_a, eng_b));
     cleanup(&pa);
     cleanup(&pb);
-    true
 }
