@@ -106,11 +106,7 @@ fn group_with_own_writes_between(tag: &str, between: std::ops::Range<u32>) {
     let link: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let sr = Syncer::new(r.clone(), link.clone());
     let sd = Syncer::new(d.clone(), link);
-    // D も publish する (`InMemoryTransport` の `known_peers` は publish した peer、 #831)
-    let e = d.entity_in("notes").unwrap();
-    d.tie_to(e, "notes.k", 9u32);
-    d.oplog_sync().unwrap();
-    assert!(sd.publish_since(Hlc::ZERO) > 0, "前提: D が transport に居る");
+    // D は受けるだけで、 何も publish しない (#831)
     // R の record で R の ring をほぼ埋める (D は受けていないので回収されない)
     let mine = r.entity_in("notes").unwrap();
     r.tie_to(mine, "notes.k", 10_000u32);
@@ -224,13 +220,7 @@ fn a_relay_does_not_publish_a_group_it_is_still_relaying_from_a_diff() {
         let sr1 = Syncer::new(r1.clone(), mesh.clone());
         let sr2 = Syncer::new(r2.clone(), mesh.clone());
         let sd = Syncer::new(d.clone(), mesh);
-        // R2 と D も publish する (`InMemoryTransport` の `known_peers` は publish した peer、 #831)
-        for (e, s, k) in [(&r2, &sr2, 8u32), (&d, &sd, 9u32)] {
-            let row = e.entity_in("notes").unwrap();
-            e.tie_to(row, "notes.k", k);
-            e.oplog_sync().unwrap();
-            assert!(s.publish_since(Hlc::ZERO) > 0, "前提: transport に居る");
-        }
+        // R2 と D は、 自分の行を書かない (#831)
         let as_of = sr1_up.bootstrap_pull_via(A, A).expect("A の state").as_of;
         r1.oplog_sync().unwrap();
         let group = |e: &Engine| ring(e).iter().filter(|key| **key == (A, as_of)).count();
