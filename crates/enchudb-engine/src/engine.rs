@@ -15524,8 +15524,8 @@ impl Engine {
     ///
     /// 1. `gen.seg` を作り (前の残りは 0 に戻す)、 場所の bit `S` を決める
     /// 2. 照合と 「消す時に上げる」 を始める ([`crate::generation::Generations::start`])
-    /// 3. 2. を見ずに入った消す書き手が出るのを待つ (`Generations::wait_frees`、 1 語の RMW の揃え)。 行の lock は待たない (行を
-    ///    握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 2. を見ずに書いている書き手は、 死んだ場所に書いても使い回す
+    /// 3. 手順 2 を見ずに入った消す書き手が出るのを待つ (`Generations::wait_frees`、 1 語の RMW の揃え)。 行の lock は待たない (行を
+    ///    握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 手順 2 を見ずに書いている書き手は、 死んだ場所に書いても使い回す
     ///    時に落とす (`drop_leftover_cells`、 行の lock の下)
     /// 4. v14 の間に消した場所 (世代を持つ表の払い出し済みの範囲の死んだ場所) を全部 1 にする。 死んだ場所の値 = 次の住人の世代
     /// 5. `gen.seg` を書き出してから header (S と version 15) を書き出す。 header が届いた像には 4. も届いている。 header が届かな
@@ -18712,7 +18712,7 @@ impl Engine {
         let ex = self.exit_of(Some(hid as usize)); // #731: 今の世代を付ける
         hs.entities_with_value()
             .into_iter()
-            .map(|e| ex(e))
+            .map(&ex)
             .collect()
     }
 
@@ -20214,7 +20214,7 @@ impl Engine {
         let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let (Some(min), Some(max)) = (min.cell_value(), max.cell_value()) else { return vec![] };
         let ex = self.exit_of(Some(idx)); // #731: 今の世代を付ける
-        self.himos[idx].pull_range(min, max).into_iter().map(|e| ex(e)).collect()
+        self.himos[idx].pull_range(min, max).into_iter().map(&ex).collect()
     }
 
     /// 値が `lo..=hi` (engine の u64、 両端を含む) の entity。 eid は peer の頭付き ([`query_by_id64`](Self::query_by_id64) と
@@ -20224,7 +20224,7 @@ impl Engine {
     pub fn pull_range_by_id(&self, hid: u16, lo: u64, hi: u64) -> Vec<enchudb_oplog::EntityId> {
         let Some(hs) = self.himos.get(hid as usize) else { return Vec::new() };
         let ex = self.exit_of(Some(hid as usize)); // #731: 今の世代を付ける
-        hs.pull_range_unordered(lo, hi).into_iter().map(|e| ex(e)).collect()
+        hs.pull_range_unordered(lo, hi).into_iter().map(&ex).collect()
     }
 
     /// 紐の列の長さ (値を書いたことのある一番大きい local eid + 1)。 列をなめる読み ([`entities_with_himo`](Self::entities_with_himo)
@@ -20307,7 +20307,7 @@ impl Engine {
         let ex = self.exit_of(Some(hid as usize)); // #731: 今の世代を付ける
         let mut found = None;
         hs.walk_values(lo, hi, desc, |v, eids| {
-            match eids.map(|e| ex(e)).find(|&id| keep(id)) {
+            match eids.map(&ex).find(|&id| keep(id)) {
                 Some(id) => {
                     found = Some((v, id));
                     std::ops::ControlFlow::Break(())
@@ -20575,7 +20575,7 @@ impl Engine {
         match (self.himo_id(himo), value.cell_value()) {
             (Some(idx), Some(v)) => {
                 let ex = self.exit_of(Some(idx)); // #731: 今の世代を付ける
-                self.himos[idx].pull(v).into_iter().map(|e| ex(e)).collect()
+                self.himos[idx].pull(v).into_iter().map(&ex).collect()
             }
             _ => Vec::new(),
         }
@@ -20626,14 +20626,14 @@ impl Engine {
         // issue12: 旧 `e as EntityId` は #32 と同型 (peer prefix 抜け)。
         // query_by_id / entities_with_himo と同じ make_eid(peer, e) で揃える。
         let ex = self.exit_of(Some(idx)); // #731: 今の世代を付ける
-        out.into_iter().map(|e| ex(e)).collect()
+        out.into_iter().map(&ex).collect()
     }
 
     /// 紐の名前と値の組の AND に当てはまる entity。 eid は peer の頭付き ([`query_by_id`](Self::query_by_id) と同じ形。 前は頭を
     /// 付けずに local の番号を返していた — #32 / issue12 と同じ抜け)。
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<enchudb_oplog::EntityId> {
         let ex = self.exit_of(None); // #731: 今の世代を付ける
-        self.query_u32(strings).into_iter().map(|e| ex(e)).collect()
+        self.query_u32(strings).into_iter().map(&ex).collect()
     }
 
     /// live query (クエリ購読) を登録する。 条件 (`preds`、 同一 entity の AND) に当てはまる
@@ -21431,7 +21431,7 @@ impl Engine {
         let ex = self.exit_of(None); // #731: 今の世代を付ける
         Ok(crate::live::find_once(self, branches)
             .into_iter()
-            .map(|e| ex(e))
+            .map(&ex)
             .collect())
     }
 
@@ -21500,7 +21500,7 @@ impl Engine {
         let ex = self.exit_of(idx_conds.first().map(|c| c.0)); // #731: 今の世代を付ける
         self.query_resolved(&idx_conds)
             .into_iter()
-            .map(|e| ex(e))
+            .map(&ex)
             .collect()
     }
 
