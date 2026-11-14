@@ -18707,11 +18707,8 @@ impl Engine {
     /// 列挙するための代表 column 経由で使う想定。
     pub fn entities_with_himo(&self, hid: u16) -> Vec<enchudb_oplog::EntityId> {
         let Some(hs) = self.himos.get(hid as usize) else { return Vec::new(); };
-        let ex = self.exit_of(Some(hid as usize)); // #731: 今の世代を付ける
-        hs.entities_with_value()
-            .into_iter()
-            .map(&ex)
-            .collect()
+        // #731: 今の世代を付ける (使い回しの無い表は世代を読まない。 1 要素ごとに分けると写しが vector にならない)
+        self.eids_of_slots_in(Some(hid as usize), hs.entities_with_value())
     }
 
     /// 列 `himo_id` に値のある row を、 **新しい順** (その列の table が eid を払い出した逆順) に最大 `n` 件 (#21)。
@@ -20211,8 +20208,7 @@ impl Engine {
     pub fn pull_range(&self, himo: &str, min: impl CellValue, max: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
         let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let (Some(min), Some(max)) = (min.cell_value(), max.cell_value()) else { return vec![] };
-        let ex = self.exit_of(Some(idx)); // #731: 今の世代を付ける
-        self.himos[idx].pull_range(min, max).into_iter().map(&ex).collect()
+        self.eids_of_slots_in(Some(idx), self.himos[idx].pull_range(min, max)) // #731: 今の世代を付ける
     }
 
     /// 値が `lo..=hi` (engine の u64、 両端を含む) の entity。 eid は peer の頭付き ([`query_by_id64`](Self::query_by_id64) と
@@ -20221,8 +20217,7 @@ impl Engine {
     /// 未知の紐は空。
     pub fn pull_range_by_id(&self, hid: u16, lo: u64, hi: u64) -> Vec<enchudb_oplog::EntityId> {
         let Some(hs) = self.himos.get(hid as usize) else { return Vec::new() };
-        let ex = self.exit_of(Some(hid as usize)); // #731: 今の世代を付ける
-        hs.pull_range_unordered(lo, hi).into_iter().map(&ex).collect()
+        self.eids_of_slots_in(Some(hid as usize), hs.pull_range_unordered(lo, hi)) // #731: 今の世代を付ける
     }
 
     /// 紐の列の長さ (値を書いたことのある一番大きい local eid + 1)。 列をなめる読み ([`entities_with_himo`](Self::entities_with_himo)
@@ -20572,8 +20567,7 @@ impl Engine {
         self.debug_check_in_place();
         match (self.himo_id(himo), value.cell_value()) {
             (Some(idx), Some(v)) => {
-                let ex = self.exit_of(Some(idx)); // #731: 今の世代を付ける
-                self.himos[idx].pull(v).into_iter().map(&ex).collect()
+                self.eids_of_slots_in(Some(idx), self.himos[idx].pull(v)) // #731: 今の世代を付ける
             }
             _ => Vec::new(),
         }
@@ -20623,15 +20617,13 @@ impl Engine {
         out.dedup();
         // issue12: 旧 `e as EntityId` は #32 と同型 (peer prefix 抜け)。
         // query_by_id / entities_with_himo と同じ make_eid(peer, e) で揃える。
-        let ex = self.exit_of(Some(idx)); // #731: 今の世代を付ける
-        out.into_iter().map(&ex).collect()
+        self.eids_of_slots_in(Some(idx), out) // #731: 今の世代を付ける
     }
 
     /// 紐の名前と値の組の AND に当てはまる entity。 eid は peer の頭付き ([`query_by_id`](Self::query_by_id) と同じ形。 前は頭を
     /// 付けずに local の番号を返していた — #32 / issue12 と同じ抜け)。
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<enchudb_oplog::EntityId> {
-        let ex = self.exit_of(None); // #731: 今の世代を付ける
-        self.query_u32(strings).into_iter().map(&ex).collect()
+        self.eids_of_slots_in(None, self.query_u32(strings)) // #731: 今の世代を付ける
     }
 
     /// live query (クエリ購読) を登録する。 条件 (`preds`、 同一 entity の AND) に当てはまる
@@ -21426,11 +21418,7 @@ impl Engine {
         self.validate_live_preds(&preds)?;
         let branches = crate::live::dnf(preds)
             .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidInput, m))?;
-        let ex = self.exit_of(None); // #731: 今の世代を付ける
-        Ok(crate::live::find_once(self, branches)
-            .into_iter()
-            .map(&ex)
-            .collect())
+        Ok(self.eids_of_slots_in(None, crate::live::find_once(self, branches))) // #731: 今の世代を付ける
     }
 
     fn validate_live_preds(&self, preds: &[crate::live::LivePred]) -> std::io::Result<()> {
@@ -21495,11 +21483,7 @@ impl Engine {
         // 0.8.4 issue #32: 旧 `e as EntityId` は u32 → u64 widen で peer prefix が
         // 0 のまま残り、 schema 層の `where_eq().find_one()` 等が壊れた eid を返してた。
         // `entities_with_himo` と同じ make_eid(peer, e) で peer prefix を付ける。
-        let ex = self.exit_of(idx_conds.first().map(|c| c.0)); // #731: 今の世代を付ける
-        self.query_resolved(&idx_conds)
-            .into_iter()
-            .map(&ex)
-            .collect()
+        self.eids_of_slots_in(idx_conds.first().map(|c| c.0), self.query_resolved(&idx_conds)) // #731: 今の世代を付ける
     }
 
     /// 内部版: u32 eid の Vec を返す。互換性のため残す。
