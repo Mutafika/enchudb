@@ -238,3 +238,54 @@ fn a_torn_reuse_never_heals_to_the_deleted_rows_generation() {
 fn reverting_heal_brings_the_deleted_rows_generation_back() {
     run_torn_reuse(Rule::Revert);
 }
+
+/// ## 3. 払い出しと移る手順 (PR #885 の読み直し 3a)
+///
+/// 払い出しの道 A: (死の印を落とす = 印の無い page では何もしない) → 生きている印を立てる → `settle_claim` (移り終える前は gate を
+/// RMW で読み、 「消す時に上げる」 が立っていれば移り終えるのを待つ → 死の印があれば落とす) → 場所の今の世代で eid を作る。 移る側 M:
+/// 印を立てる → 死んだ場所のうち世代 0 を 「世代 1、 死」 にする → 移り終えた印。 守る性質: **A の場所は死の印を持たず、 A が作った
+/// eid の世代が場所の世代と同じ**。 gate を読まない形 (`a_claim_without_the_gate_...`) は、 M が A の生きている印を読む前・A が死の印を
+/// 見た後に殺す窓を loom が見つける。
+fn run_claim(fenced: bool) {
+    loom::model(move || {
+        let m = Arc::new(Model::new(false, 0));
+        let moved = Arc::new(AtomicBool::new(false));
+        let mv = {
+            let (m, moved) = (m.clone(), moved.clone());
+            thread::spawn(move || {
+                m.gate.fetch_or(ON, Ordering::AcqRel);
+                if !m.live.load(Ordering::Acquire) && m.cell.load(Ordering::Acquire) == 0 {
+                    m.kill(1);
+                }
+                moved.store(true, Ordering::Release);
+            })
+        };
+        m.live.store(true, Ordering::Release); // allocate_at (RMW の代わり)
+        if fenced && !moved.load(Ordering::Acquire) && m.gate.fetch_add(0, Ordering::AcqRel) & ON != 0 {
+            while !moved.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        }
+        if m.cell.load(Ordering::Acquire) & DEAD != 0 {
+            m.cell.fetch_and(!DEAD, Ordering::AcqRel);
+        }
+        let handed = m.generation();
+        mv.join().unwrap();
+        let cell = m.cell.load(Ordering::Acquire);
+        assert!(
+            cell & DEAD == 0 && cell & GEN == handed,
+            "払い出した場所が死の印を持つ / 渡した世代 {handed} が場所 {cell:#x} と違う"
+        );
+    });
+}
+
+#[test]
+fn a_claim_overlapping_the_move_keeps_its_slot_and_eid() {
+    run_claim(true);
+}
+
+#[test]
+#[should_panic(expected = "払い出した場所が死の印を持つ")]
+fn a_claim_without_the_gate_can_be_killed_by_the_move() {
+    run_claim(false);
+}

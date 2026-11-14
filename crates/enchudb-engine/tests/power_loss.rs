@@ -2797,3 +2797,180 @@ fn a_relogged_delete_carries_the_generation_of_the_deleted_row() {
     }
     panic!("5 回とも consumer が先に oplog を届かせた");
 }
+
+/// 書き出しの段 `when` で、 別の thread で `eid` を消す (待たせない。 300 ms で書き出しを進める)。 段 `shot` で像を撮る。
+fn delete_during_write_out(eng: &Arc<Engine>, eid: u64, when: Phase, shot: Phase, live: &Path, img: &Path) -> Arc<AtomicBool> {
+    let (e2, done, (l, i)) = (eng.clone(), Arc::new(AtomicBool::new(false)), (live.to_path_buf(), img.to_path_buf()));
+    let (done2, shot_once) = (done.clone(), AtomicBool::new(false));
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == when && !done2.swap(true, Ordering::SeqCst) {
+            let (e3, (tx, rx)) = (e2.clone(), std::sync::mpsc::channel::<()>());
+            std::thread::spawn(move || {
+                e3.delete(eid);
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(300));
+        }
+        // 撮るのは消した書き出しの段で 1 回だけ (`flush_clean` は本体を 2 回書き出す。 2 回目で撮ると揃った像になる)
+        if p == shot && done2.load(Ordering::SeqCst) && !shot_once.swap(true, Ordering::SeqCst) {
+            let _ = crashsim::capture(&l, &i, Mode::Lost);
+        }
+    })));
+    done
+}
+
+/// PR #885 の読み直し 1: 突き合わせが削除を完了させる時に cell を落とすと、 再生がその行を生かし直した時 (行の Tie が WAL にある =
+/// 削除の record は届いていない) に、 書き出しの返った列が消える。 行 r の Tag 列は書き出し済み、 Number 列の Tie は checkpoint の後。
+/// 書き出しの entities → gen.seg の間に r を消し、 版数の段の前で落ちる。 開くと r は再生で生き返る: その時 Tag 列も残っている事。
+#[test]
+fn a_row_brought_back_by_the_replay_keeps_its_written_out_columns() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("gen_keep_cells");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let r = {
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "c", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Tag, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, "t.c", 1u32);
+        let keep = eng.entity_in("t").unwrap();
+        eng.tie_to(keep, "t.c", 2u32);
+        eng.delete(a);
+        let r = eng.entity_in("t").unwrap(); // v15
+        assert_ne!(r, a, "前提: v15");
+        eng.tie_text_to(r, "t.a", "kept");
+        eng.persist_tables().unwrap(); // #870 の止めを外して checkpoint を進める
+        eng.oplog_sync().unwrap(); // Tag 列は書き出し済み
+        let _hold = eng.hold_consumer();
+        eng.tie_to(r, "t.c", 5u32); // checkpoint の後の Tie (再生で r を生かし直す)
+        let done = delete_during_write_out(&eng, r, Phase::BeforeGenerations, Phase::BeforeVersions, &live, &img);
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
+        r
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.generation_repairs().0, 1, "前提: gen.seg だけ死の場所を突き合わせが完了させた");
+    assert!(eng.is_live(r), "前提: 再生が r を生かし直した (削除の record は届いていない)");
+    assert_eq!(eng.get(r, "t.c"), Some(5));
+    assert_eq!(eng.get_text_owned(r, "t.a").as_deref(), Some(&b"kept"[..]), "再生で生き返った行の、 書き出しの返った列が消えた");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 読み直し 2: WAL の無い engine (`concurrentize` = schema の `finish_concurrent`) は、 session の途中の `flush_clean` でも紐名の辞書の
+/// clean の印が立つ。 その後の書き出しの entities → gen.seg の間に消して落ちた像は、 開く時に 「きれいに閉じた」 と読まれて突き合わせが
+/// 走らなかった (生きている行が次の世代 + 死の印 = 行の eid が変わる)。 gen.seg の header の 「clean の後に kill / revive した」 印で
+/// 突き合わせる。
+#[test]
+fn a_db_without_a_wal_reconciles_a_delete_after_a_clean_flush() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("gen_nowal");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let r = {
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize(eng);
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, "t.v", 1u32);
+        let keep = eng.entity_in("t").unwrap();
+        eng.tie_to(keep, "t.v", 2u32);
+        eng.delete(a);
+        let r = eng.entity_in("t").unwrap(); // v15
+        assert_ne!(r, a, "前提: v15");
+        eng.tie_to(r, "t.v", 3u32);
+        eng.flush_clean().unwrap(); // 紐名の辞書の clean の印が立つ
+        eng.tie_to(keep, "t.v", 4u32);
+        let done = delete_during_write_out(&eng, r, Phase::BeforeGenerations, Phase::BeforeVersions, &live, &img);
+        eng.flush_clean().unwrap();
+        write_out_hook::set(None);
+        assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
+        r
+    };
+    crashsim::stop();
+    let eng = Engine::open_standalone(img.join("db").to_str().unwrap()).unwrap();
+    let s = eng.eid_slot(r);
+    let now = eng.slot_eid(s);
+    assert_eq!(eng.generation_repairs(), (1, 0), "前提: gen.seg だけ死の場所 (生きている印は消す前) を突き合わせが完了させた");
+    assert!(!eng.is_live(now) || now == r, "WAL の無い DB で、 生きている行の eid が変わった ({r:#x} → {now:#x}、 突き合わせが走らない)");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 読み直し Q1 / 4: gen.seg だけ死の場所を突き合わせが完了させ、 tombstone は書き出しの版数の段の前で落ちて届いていない (sync の DB)。
+/// tombstone を新しい HLC で置き、 #451 が Delete を作り直す (相手に配る)。 その Delete の eid は消えた行の世代込み (突き合わせは世代を
+/// 2 つ上げるので、 今 − 1 ではない)。 消えた行への相手の書き込みは弾く (前は `slot_is_dead` が偽で、 新しい世代で生き返った)。
+#[test]
+fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("gen_tomb");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let (a, r, hid) = {
+        let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+        eng.define_table("notes", 2).unwrap();
+        let hid = eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap() as u16;
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        let a = eng.entity_in("notes").unwrap();
+        eng.tie_to(a, "notes.note", 1u32);
+        let keep = eng.entity_in("notes").unwrap();
+        eng.tie_to(keep, "notes.note", 2u32);
+        eng.delete(a);
+        let r = eng.entity_in("notes").unwrap(); // v15
+        eng.tie_to(r, "notes.note", 5u32);
+        eng.persist_tables().unwrap();
+        eng.oplog_sync().unwrap();
+        let _hold = eng.hold_consumer();
+        eng.tie_to(keep, "notes.note", 7u32);
+        let done = delete_during_write_out(&eng, r, Phase::BeforeGenerations, Phase::BeforeVersions, &live, &img);
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
+        (a, r, hid)
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.generation_repairs().0, 1, "前提: gen.seg だけ死の場所を突き合わせが完了させた");
+    assert!(!eng.is_live(r), "前提: r の Tie は checkpoint の手前 (再生で生き返らない)");
+    let deletes: Vec<u64> = eng
+        .audit(&enchudb_engine::AuditFilter::default())
+        .into_iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } => Some(eid),
+            _ => None,
+        })
+        .collect();
+    // a の Delete は前の session の record (WAL を畳んでいない)。 r の Delete は作り直した物
+    assert_eq!(deletes, vec![a, r], "作り直した Delete が無い / 消えた行の世代込みの eid でない ({deletes:x?})");
+    let world = enchudb_oplog::make_eid(1, eng.eid_slot(r));
+    let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
+    assert!(!eng.remote_tie_apply(world, hid, 9u32, later), "消えた行への相手の書き込みで行が生き返った");
+    let _ = std::fs::remove_dir_all(&root);
+}

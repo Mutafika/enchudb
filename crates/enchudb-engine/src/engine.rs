@@ -2917,6 +2917,68 @@ mod wal_reject_tests {
     }
 }
 
+/// #731 (PR #885 の読み直し 3): 払い出し / 生かす道と死の印。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod eid_gen_claim_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// 枠 4 の表 `t` と枠 1 の表 `u` (使い回しで v15 に移る) を持つ v14 の engine。
+    fn engine(tag: &str) -> (String, Arc<Engine>) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-genclaim-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("t", 4).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        eng.define_table("u", 1).unwrap();
+        eng.define_himo_in("u", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        (path, Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap())
+    }
+
+    /// PR #885 の読み直し 3a: 払い出し位置から取った場所に生きている印を立てる前 (死の印は落とした後) に、 v15 に移る手順が死んだ
+    /// 場所をなめると、 その場所は 「世代 1、 死んでいる」 になる。 その後に生きている印を立てた行は、 死の印を持ったまま (きれいに
+    /// 閉じなかった後の突き合わせが消す) か、 渡した eid の世代が場所と違う。 払い出しの道は印を立てた後に移る手順と揃える。
+    #[test]
+    fn a_claim_overlapping_the_move_to_v15_has_no_dead_mark_and_keeps_its_eid() {
+        let (path, eng) = engine("move");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x); // u の場所を空ける (次の u の insert が使い回し = v15 に移る)
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let e2 = eng.clone();
+        claim_gap_hook::set(&wal, move |_| {
+            // 払い出し位置から t の場所を取った後・生きている印を立てる前に、 別の thread で v15 に移る
+            std::thread::spawn(move || e2.entity_in("u").unwrap()).join().unwrap();
+        });
+        let y = eng.entity_in("t").unwrap();
+        let slot = eng.slot_unchecked(y);
+        assert!(eng.generations().moved(), "前提: 間で v15 に移った");
+        assert!(!eng.generations().is_dead(slot), "生きている場所に死の印が残った");
+        assert!(eng.is_live(y), "渡した eid {y:#x} の世代が場所と違う");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// 読み直し 3b: 生きている場所の死の印 (消す書き手の kill と生きている印を下ろす間) を、 生かす道 (`ensure_live_slot`、 受信の当て込み /
+    /// 空きの一覧の古い項目) が落とさない。 落とすと 「次の世代、 印なし、 生きている」 の像が書き出しに入りうる。
+    #[test]
+    fn reviving_a_live_slot_keeps_its_dead_mark() {
+        let (path, eng) = engine("revive");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x);
+        let r = eng.entity_in("u").unwrap(); // v15
+        let slot = eng.slot_unchecked(r);
+        eng.kill_generation(slot, eng.generations().get(slot) + 1); // 消す書き手が kill した所 (生きている印はまだ)
+        eng.ensure_live_slot(slot);
+        assert!(eng.generations().is_dead(slot), "生きている場所の死の印を落とした");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
 /// #882 / #883: 同じ slot を 2 回払い出す窓 2 つを、 割り込み点で決まって踏む。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod slot_claim_tests {
@@ -11860,8 +11922,9 @@ impl Engine {
                 }
                 // #731: 印を立てる RMW (AcqRel) が、 消す側の印を下ろす RMW を読むので、 消す側がその前に上げた場所の世代も見える。
                 // 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`、 取れなかった時は取った側も落とす)
-                self.generations().revive(g);
+                self.revive_slot(g);
                 if !self.entities.allocate_at(g) {
+                    self.settle_claim(g);
                     global = Some(g);
                     break;
                 }
@@ -11957,17 +12020,18 @@ impl Engine {
         if self.generations().retired(global) {
             return self.entity_in(table_name);
         }
+        // #731: 落ちた後に払い出し位置が消した場所の手前に戻った時は、 その場所に 「死んでいる」 印がある (生かす前に落とす)
+        self.revive_slot(global);
         #[cfg(test)]
         if let Some(wal) = self.oplog.as_ref() {
             claim_gap_hook::call(wal);
         }
         // EntitySet で live mark + next_eid 前進 (CAS safe)。 #883: 前から立っていたら、 全部なめがこの slot を穴として拾って
-        // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す。
-        // #731: 落ちた後に払い出し位置が消した場所の手前に戻った時は、 その場所に 「死んでいる」 印がある (生かす前に落とす)
-        self.generations().revive(global);
+        // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す
         if self.entities.allocate_at(global) {
             return self.entity_in(table_name);
         }
+        self.settle_claim(global);
         Ok(self.eid_of_slot(global)) // #731: 今の世代を付ける
     }
 
@@ -13410,7 +13474,7 @@ impl Engine {
         // 上限到達後の `allocate` は free stack から slot を再利用する。
         // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
         // #731: 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`)
-        let Some((local, reused)) = self.entities.allocate_tracked_with(|slot| self.generations().revive(slot)) else {
+        let Some((local, reused)) = self.entities.allocate_tracked_with(|slot| self.revive_slot(slot)) else {
             self.record_fault(
                 FaultKind::EntitySpace,
                 "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
@@ -13450,6 +13514,7 @@ impl Engine {
             self.clear_cell_versions(local);
             self.drop_leftover_cells(local, ANONYMOUS_TABLE as usize);
         }
+        self.settle_claim(local);
         Ok(self.eid_of_slot(local))
     }
 
@@ -14406,7 +14471,9 @@ impl Engine {
         let replaying = self.generations().replaying.load(std::sync::atomic::Ordering::Relaxed);
         // v15 に移る手順 (`move_to_generations`) と揃える: 入口の RMW で 「消す時に上げる」 を読み、 上げない時は生きている印を
         // 下ろしてから出る (移る側は、 印を見ずに入った書き手が出るのを待ってから死んだ場所をなめる、 `Generations::gate`)
-        let on = self.generations().enter_free();
+        // 移り終えた後は数えない (Q6: 書き手全部が gate の 1 語を 2 回 RMW していた)。 移り終えた = 「消す時に上げる」
+        let counted = !self.generations().moved();
+        let on = if counted { self.generations().enter_free() } else { true };
         let gen_of_row = row_gen.unwrap_or_else(|| self.generations().get(local));
         // 畳んだ自分の行 (#612、 別名は畳む手順が先に張る) の場所は上げない: 使い回さないので次の住人は居ない。 上げると、 その行の eid
         // の転送 (`app_slot`) と #775 で生き返らせた行の eid が 「消えた行」 になる
@@ -14425,7 +14492,9 @@ impl Engine {
         } else {
             self.entities.free(local);
         }
-        self.generations().exit_free();
+        if counted {
+            self.generations().exit_free();
+        }
         // 購読には消えた行の世代を渡す (見直しの購読の `touched` がアプリの持つ eid を出す)
         self.live.freed(local, self.generations().active().then_some(gen_of_row));
         // #868: 枯渇した表が、 枠の全部をなめずにこの穴を拾えるように覚える
@@ -16003,7 +16072,12 @@ impl Engine {
         let now = g.get(slot);
         // 「死んでいる」 印 (消す道が世代と一緒に立てる) は、 生きている印を下ろす前の一瞬も消えた行を指す
         let dead = g.is_dead(slot) || (!self.entities.is_live(slot) && !self.is_folded_own_slot(slot));
-        let row_gen = if now > 0 && dead { now - 1 } else { now };
+        // 開く時の突き合わせで完了させた削除は、 覚えた 「消えた行の世代」 (世代を 2 つ上げた形がある)
+        let row_gen = match g.relog_gen(slot).filter(|_| dead) {
+            Some(r) => r,
+            None if now > 0 && dead => now - 1,
+            None => now,
+        };
         match g.bits() {
             0 | 32.. => slot,
             b => (row_gen << b) | slot,
@@ -16063,10 +16137,11 @@ impl Engine {
     /// 届いていなかった削除を、 WAL にある分だけ戻す、 `replay_slot`)。 後に回すと、 再生が生かした場所に残った印を読み違える形を
     /// 再生の側で全部消す必要がある。 readonly は書けないので回さない。 表の定義・別名 (`eidalias`)・払い出し位置の後。
     fn reconcile_generations(&self, readonly: bool) {
-        if readonly || !self.generations().active() || !self.himo_reg.rebuilt_on_load {
+        let gens = self.generations();
+        // WAL の無い engine は session の途中の flush でも紐名の辞書の clean の印が立つ: gen.seg の header の印でも見る (読み直し 2)
+        if readonly || !gens.active() || !(self.himo_reg.rebuilt_on_load || gens.session_dirty()) {
             return;
         }
-        let gens = self.generations();
         // 1.
         let mut last: Option<usize> = None;
         let dead_but_live = gens.heal(
@@ -16081,14 +16156,13 @@ impl Engine {
             },
         );
         for &slot in &dead_but_live {
-            if let Some(t) = self.table_of_slot(slot) {
-                self.drop_leftover_cells(slot, t);
-            }
             // 世代をもう 1 つ上げる: 生きている印が使い回しの物なら、 今の世代の eid はアプリに渡っている (落ちた後に同じ eid で
-            // 別の行を渡さない)。 削除の途中の像なら 1 つ無駄にするだけ。 購読には今 − 1 (消えた行の世代、 削除の途中の像) を渡す
+            // 別の行を渡さない)。 削除の途中の像なら 1 つ無駄にするだけ。 購読には今 − 1 (消えた行の世代、 削除の途中の像) を渡す。
+            // cell はここでは落とさない (再生がその行を生かし直すと、 書き出しの返った列が消える = 読み直し 1)。 `finish_reconcile`
             let now = gens.get(slot);
             self.kill_generation(slot, now + 1);
             self.live_free(slot, Some(now.saturating_sub(1)));
+            gens.note_pending(slot, now.saturating_sub(1), true);
         }
         gens.note_repaired(0, dead_but_live.len() as u32);
         // 2.
@@ -16114,8 +16188,9 @@ impl Engine {
                         && (slot < end || gens.get(slot) > 0)
                         && !self.is_folded_own_slot(slot)
                     {
-                        self.kill_generation(slot, gens.get(slot) + 1);
-                        self.drop_leftover_cells(slot, tid);
+                        let row = gens.get(slot);
+                        self.kill_generation(slot, row + 1);
+                        gens.note_pending(slot, row, false);
                         completed += 1;
                     }
                     slot += 1;
@@ -16123,6 +16198,57 @@ impl Engine {
             }
         }
         gens.note_repaired(1, completed);
+        // 再生する record が WAL に無ければ、 ここで仕上げる (あれば WAL 付きの open が再生の後に仕上げる)
+        #[cfg(not(target_arch = "wasm32"))]
+        if gens.has_pending() && !matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_))) {
+            self.finish_reconcile(None);
+        }
+    }
+
+    /// #731 (PR #885 の読み直し 1 / 4 / Q1): 開く時の突き合わせで削除を完了させた場所の仕上げ (WAL の再生の後、 #451 の作り直しの前)。
+    /// 再生がその行を生かし直した場所 (`replay_slot` の `restore`) は触らない。 まだ死んでいる場所は:
+    /// - 残った cell を落とす (突き合わせでは落とさない: 落としてから再生が行を生かすと、 書き出しの返った列が消えた)
+    /// - 「消えた行の世代」 を覚える (#451 の作り直しの Delete の宛名。 gen.seg だけ死の完了は世代を 2 つ上げるので、 今 − 1 ではない)
+    /// - gen.seg だけ死の完了で消えた行の tombstone が無い (書き出しの tombstone の段の前に落ちた = 場所の tombstone が行の cell の版数
+    ///   より古い) sync の DB は、 新しい HLC で tombstone を置く:
+    ///   #451 が Delete を作り直して相手に配り、 消えた行への相手の書き込みを `slot_is_dead` が弾く (削除優先なので、 新しい HLC でも
+    ///   消した後の書き込みを余分に消す事は無い)。 `wal` = 版数を採る WAL (無い open は tombstone を置かない = 配らない DB)
+    pub(crate) fn finish_reconcile(&self, wal: Option<&enchudb_oplog::oplog::OpLog>) {
+        let gens = self.generations();
+        let pending = gens.take_pending();
+        if pending.is_empty() {
+            return;
+        }
+        for (slot, row_gen, gen_only) in pending {
+            if self.entities.is_live(slot) {
+                continue;
+            }
+            // 消えた行の削除の tombstone が届いていない = 場所の tombstone (前の住人の物 / 無し) が行の cell の版数より古い
+            let tomb_missing = wal.is_some() && gen_only && self.sync_tables_enabled() && self.has_cell_version() && {
+                let newest_cell = self.tables[self.table_of_slot(slot).unwrap_or(ANONYMOUS_TABLE as usize)]
+                    .himo_ids
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|&h| self.cell_hlc_local(slot, h as u16))
+                    .max()
+                    .unwrap_or(enchudb_oplog::Hlc::ZERO);
+                self.tombstone_version_of(slot) <= newest_cell
+            };
+            if let Some(t) = self.table_of_slot(slot) {
+                self.drop_leftover_cells(slot, t);
+            }
+            // WAL の無い仕上げ (再生する record が無い open) は、 後で WAL 付きで開き直す時 (#892 の往復 / `concurrentize_with_oplog`)
+            // のために覚えたままにする (tombstone と作り直しの宛名は WAL が要る)
+            if wal.is_none() {
+                gens.note_pending(slot, row_gen, gen_only);
+                continue;
+            }
+            gens.note_relog_gen(slot, row_gen);
+            if tomb_missing {
+                gens.note_missing_tombstone(slot);
+            }
+        }
     }
 
     /// #731: 開いた時の突き合わせ (`reconcile_generations`) で削除を完了させた場所の数 (gen.seg だけ死んでいた, entities だけ死んで
@@ -16187,6 +16313,7 @@ impl Engine {
         if let Some(t) = self.table_of_slot(slot) {
             self.generations().mark_table(t as TableId);
         }
+        self.mark_gen_session_dirty();
         if self.generations().kill(slot, g).is_err() {
             self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 場所の世代を上げられない");
         }
@@ -16195,8 +16322,65 @@ impl Engine {
     /// 場所を生かす (生きている印を立てる、 既に生きていれば何もしない)。 「死んでいる」 印を先に落とす (`Generations::revive` の doc)。
     #[inline]
     fn ensure_live_slot(&self, slot: u32) {
-        self.generations().revive(slot);
+        self.revive_slot(slot);
         self.entities.ensure_live(slot);
+    }
+
+    /// 生かす前に 「死んでいる」 印を落とす。 生きている場所の印は落とさない (PR #885 の読み直し 3b: 生きている場所の印は、 消す書き手の
+    /// kill と生きている印を下ろす間 = 落とすと 「次の世代、 印なし、 生きている」 の像が F1 の元の形で届く)。
+    #[inline]
+    fn revive_slot(&self, slot: u32) {
+        let gens = self.generations();
+        if gens.is_dead(slot) && !self.entities.is_live(slot) {
+            self.mark_gen_session_dirty();
+            gens.revive(slot);
+        }
+    }
+
+    /// 払い出しの道で生きている印を立てた後 (eid を作る前): 移る手順と重なったなら、 移り終えるのを待って死の印を落とす
+    /// (`Generations::claim_overlaps_move`、 PR #885 の読み直し 3a)。 この場所は自分の物 (eid を返す前) なので、 消す書き手は居ない。
+    #[inline]
+    fn settle_claim(&self, slot: u32) {
+        let gens = self.generations();
+        if gens.claim_overlaps_move() {
+            drop(gens.move_lock.lock().unwrap_or_else(|p| p.into_inner()));
+        }
+        // 移る手順が印を立てる前に読んだ (生きていない) この場所に死の印を立てた形 (移り終えた後に来てもここで落とす)
+        if gens.is_dead(slot) {
+            self.mark_gen_session_dirty();
+            gens.revive(slot);
+        }
+    }
+
+    /// #731 (PR #885 の読み直し 2): gen.seg の header の 「きれいに閉じた後に kill / revive した」 印を、 最初の kill / revive の前に
+    /// 立てて header を書き出す。 WAL の無い engine は session の途中の flush でも紐名の辞書の clean の印が立つので、 その後の
+    /// kill / revive の像を、 開く時にこの印で突き合わせる。 立っている間は atomic の load 1 回。
+    fn mark_gen_session_dirty(&self) {
+        let gens = self.generations();
+        if !gens.active() || gens.session_dirty() {
+            return;
+        }
+        let _l = gens.dirty_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if gens.session_dirty() {
+            return;
+        }
+        gens.write_dirty_flag(true);
+        if self.backing.flush_kind(SegmentKind::Gen, 0, crate::generation::GEN_HEADER).is_err() {
+            self.record_fault(FaultKind::DiskSpace, "gen.seg の header を書き出せない — 汚れた session の印が届かない");
+        }
+        gens.set_session_dirty(true);
+    }
+
+    /// #731: clean にする書き出しの前に、 gen.seg の 「きれいに閉じた後に kill / revive した」 印を倒す (倒した後の kill / revive は
+    /// 立て直して書き出す。 倒す前の kill / revive はこの後の書き出しに入る)。
+    fn clear_gen_session_dirty(&self) {
+        let gens = self.generations();
+        if !gens.active() {
+            return;
+        }
+        let _l = gens.dirty_lock.lock().unwrap_or_else(|p| p.into_inner());
+        gens.write_dirty_flag(false);
+        gens.set_session_dirty(false);
     }
 
     /// 使い回す場所に残った cell を落とす (表 `tid` の紐だけ、 行の lock の下)。 消えた行の古い eid が、 消した後・使い回す前に
@@ -16322,7 +16506,8 @@ impl Engine {
             }
             for (lo, hi) in self.handed_out_ranges(tid) {
                 for slot in lo..hi {
-                    if !self.entities.is_live(slot) && self.generations().get(slot) == 0 && !self.is_folded_own_slot(slot) {
+                    // 畳んだかを先に読む (#882: 畳んだ行を戻す道は 生きている印 → 別名を外す の順)
+                    if !self.is_folded_own_slot(slot) && !self.entities.is_live(slot) && self.generations().get(slot) == 0 {
                         // 見直しの購読に、 消えた行の世代 (0) を覚えさせてから上げる (`touched` にアプリの持つ eid を出す)
                         self.live.note_gen(slot, 0);
                         self.kill_generation(slot, 1);
@@ -22631,8 +22816,11 @@ impl Engine {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
             eng.finish_replay_vocab(&mut replay);
+            // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
+            eng.finish_reconcile(Some(&w));
             // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
             let relogged = eng.relog_unlogged_writes(&w);
+            eng.generations().forget_relog_gens();
             let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
             // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
@@ -22653,7 +22841,10 @@ impl Engine {
         } else {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            if eng.relog_unlogged_writes(&w) && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            eng.finish_reconcile(Some(&w));
+            let relogged = eng.relog_unlogged_writes(&w);
+            eng.generations().forget_relog_gens();
+            if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -22811,6 +23002,13 @@ impl Engine {
             .unwrap_or(Hlc::ZERO);
         // 相手の cursor (自分の author) はこれを越えない (印の W は配った record 以上)
         let reached = known.iter().copied().max().unwrap_or(Hlc::ZERO).max(floor).max(w);
+        // #731 (PR #885 の読み直し Q1): 開く時の突き合わせが完了させた削除で tombstone が届いていない場所に、 配った版数より後の新しい
+        // HLC で tombstone を置く (下の削除のなめが作り直して配る)
+        for slot in self.generations().take_missing_tombstones() {
+            wal.set_peer_id(me);
+            wal.observe_hlc(reached);
+            self.set_tombstone_local(slot, wal.mint_hlc());
+        }
         let lower = floor.max(w);
         let unlogged = |h: Hlc| h != Hlc::ZERO && h.peer == me && h > lower && !known.contains(&h);
         let mut cells: Vec<(Hlc, u32, usize)> = Vec::new();
@@ -23321,8 +23519,10 @@ impl Engine {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
             eng.finish_replay_vocab(&mut replay);
-            // #451: open_concurrent_with_oplog と同じ
+            // #731 / #451: open_concurrent_with_oplog と同じ
+            eng.finish_reconcile(Some(&w));
             let relogged = eng.relog_unlogged_writes(&w);
+            eng.generations().forget_relog_gens();
             let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
@@ -23339,7 +23539,10 @@ impl Engine {
         } else {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            if eng.relog_unlogged_writes(&w) && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            eng.finish_reconcile(Some(&w));
+            let relogged = eng.relog_unlogged_writes(&w);
+            eng.generations().forget_relog_gens();
+            if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -25332,6 +25535,10 @@ impl Engine {
         let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
         let bridged_pos = self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
         self.flush_payload_ring()?;
+        // #731: 紐名の辞書の clean の印を立てる書き出しは、 gen.seg の 「clean の後に kill / revive した」 印を先に倒す
+        if closing || self.oplog.is_none() {
+            self.clear_gen_session_dirty();
+        }
         self.write_out_body(true)?;
         if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
             leaf.durable_end(t);

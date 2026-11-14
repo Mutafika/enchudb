@@ -50,6 +50,10 @@ pub(crate) const GEN_HEADER: usize = 16 * 1024;
 /// 場所ごとの値が 2 B (世代 + 「死んでいる」 印) の形。 1 B だった形 (`GEN1`、 release していない) は読まない。
 const MAGIC: [u8; 4] = *b"GEN2";
 const OFF_BITS: usize = 4;
+/// 「きれいに閉じた後に kill / revive した」 印 (1 B)。 紐名の辞書の clean の印は WAL の無い engine では session の途中の flush でも
+/// 立つ (`sync_and_mark_clean_with`) ので、 その後の kill / revive の像を開く時に突き合わせるための印。 最初の kill / revive の前に
+/// 立てて header を書き出し (`Engine::mark_gen_session_dirty`)、 clean にする書き出しの前に倒す。
+const OFF_DIRTY: usize = 8;
 const OFF_TABLES: usize = 64;
 /// page (2^[`PAGE_SHIFT`] 場所) ごとの 「世代 > 0 の場所がある」 印。 header の残り (8128 B = 65024 page = 2^29 場所まで)。 印の
 /// 無い page の場所は世代を読まない (出口・照合で、 使い回しの無い所は gen.seg の 2 B / 場所 を読まない)。 印の範囲の外の場所は
@@ -102,6 +106,16 @@ pub(crate) struct Generations {
     moved: std::sync::atomic::AtomicBool,
     /// きれいに閉じなかった後に開いた時に削除を完了させた場所の数 (観測・試験用): 0 = gen.seg だけ死んでいた、 1 = entities だけ。
     repaired: [AtomicU32; 2],
+    /// header の [`OFF_DIRTY`] が立っている (この session で立てた / 開いた時に立っていた)。 立てるのは `dirty_lock` の下。
+    session_dirty: std::sync::atomic::AtomicBool,
+    pub(crate) dirty_lock: std::sync::Mutex<()>,
+    /// 開く時の突き合わせで削除を完了させた場所 (場所, 消えた行の世代, gen.seg だけ死だったか)。 cell を落とすのは再生の後も死んで
+    /// いる場所だけ (`Engine::finish_reconcile`)。
+    pending: std::sync::Mutex<Vec<(u32, u32, bool)>>,
+    /// 再生の後も死んでいる完了させた場所の 「消えた行の世代」 (#451 の作り直しの Delete が使う、 作り直しの後に忘れる)。
+    relog_gens: std::sync::Mutex<std::collections::BTreeMap<u32, u32>>,
+    has_relog_gens: std::sync::atomic::AtomicBool,
+    missing_tombs: std::sync::Mutex<Vec<u32>>,
 }
 
 impl Generations {
@@ -114,6 +128,12 @@ impl Generations {
             replaying: std::sync::atomic::AtomicBool::new(false),
             moved: std::sync::atomic::AtomicBool::new(false),
             repaired: [AtomicU32::new(0), AtomicU32::new(0)],
+            session_dirty: std::sync::atomic::AtomicBool::new(false),
+            dirty_lock: std::sync::Mutex::new(()),
+            pending: std::sync::Mutex::new(Vec::new()),
+            relog_gens: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            has_relog_gens: std::sync::atomic::AtomicBool::new(false),
+            missing_tombs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -127,11 +147,72 @@ impl Generations {
         if stored != bits {
             return Err(format!("gen.seg: slot bits {stored} do not match the header ({bits})"));
         }
+        let dirty = s[OFF_DIRTY] != 0;
         let _ = self.region.set(region);
+        self.session_dirty.store(dirty, Ordering::Release);
         self.bits.store(bits, Ordering::Release);
         self.gate.0.fetch_or(GATE_ON, Ordering::AcqRel);
         self.moved.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// header の 「きれいに閉じた後に kill / revive した」 印が立っているか (開いた時の値 / この session で立てた)。
+    #[inline]
+    pub(crate) fn session_dirty(&self) -> bool {
+        self.session_dirty.load(Ordering::Acquire)
+    }
+
+    /// header の印を書く (`dirty_lock` の下で呼ぶ)。 立てる時は呼び手が header を書き出してから [`Self::set_session_dirty`]。
+    pub(crate) fn write_dirty_flag(&self, on: bool) {
+        if let Some(r) = self.region.get() {
+            r.as_atomic_u8(OFF_DIRTY).store(on as u8, Ordering::Release);
+            r.mark_dirty(OFF_DIRTY, 1);
+        }
+    }
+
+    pub(crate) fn set_session_dirty(&self, on: bool) {
+        self.session_dirty.store(on, Ordering::Release);
+    }
+
+    /// 開く時の突き合わせで削除を完了させた場所を覚える (cell は再生の後に落とす)。
+    pub(crate) fn note_pending(&self, slot: u32, row_gen: u32, gen_only: bool) {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).push((slot, row_gen, gen_only));
+    }
+
+    pub(crate) fn take_pending(&self) -> Vec<(u32, u32, bool)> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
+    /// #451 の作り直しが使う 「消えた行の世代」 を覚える / 引く / 忘れる。
+    pub(crate) fn note_relog_gen(&self, slot: u32, row_gen: u32) {
+        self.relog_gens.lock().unwrap_or_else(|p| p.into_inner()).insert(slot, row_gen);
+        self.has_relog_gens.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn relog_gen(&self, slot: u32) -> Option<u32> {
+        if !self.has_relog_gens.load(Ordering::Acquire) {
+            return None;
+        }
+        self.relog_gens.lock().unwrap_or_else(|p| p.into_inner()).get(&slot).copied()
+    }
+
+    /// 開く時に完了させた削除で、 消えた行の tombstone が届いていない場所 (#451 の作り直しが新しい HLC で置く)。
+    pub(crate) fn note_missing_tombstone(&self, slot: u32) {
+        self.missing_tombs.lock().unwrap_or_else(|p| p.into_inner()).push(slot);
+    }
+
+    pub(crate) fn take_missing_tombstones(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.missing_tombs.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub(crate) fn forget_relog_gens(&self) {
+        self.has_relog_gens.store(false, Ordering::Release);
+        self.relog_gens.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// v15 に移り終えたか ([`Self::finish_move`] / [`Self::attach`] の後)。
@@ -166,10 +247,20 @@ impl Generations {
         self.gate.0.fetch_or(GATE_ON, Ordering::AcqRel);
     }
 
-    /// 消す道の入口: 消す時に上げるか (v15 か)。 出る時に [`Self::exit_free`] を必ず呼ぶ。
+    /// 消す道の入口: 消す時に上げるか (v15 か)。 出る時に [`Self::exit_free`] を必ず呼ぶ。 移り終えた後は呼ばない (数を待つ移る手順は
+    /// もう無い。 書き手全部が 1 語を取り合わない)。
     #[inline]
     pub(crate) fn enter_free(&self) -> bool {
         self.gate.0.fetch_add(1, Ordering::AcqRel) & GATE_ON != 0
+    }
+
+    /// 払い出しの道 (生きている印を立てた後) と移る手順の揃え (PR #885 の読み直し 3a): 移り終える前は、 gate の 1 語を RMW で読む。
+    /// 「消す時に上げる」 の印が立っていれば移る途中 (または移りかけて失敗した) = 移る側の死んだ場所のなめが、 生きている印を立てる前の
+    /// この場所に死の印を立てたかもしれない → 呼び手は `move_lock` を待ってから死の印を落とす。 印が無ければ、 移る側の印を立てる RMW
+    /// はこの RMW の後 = 移る側のなめはこの場所を生きていると読む。
+    #[inline]
+    pub(crate) fn claim_overlaps_move(&self) -> bool {
+        !self.moved() && self.gate.0.fetch_add(0, Ordering::AcqRel) & GATE_ON != 0
     }
 
     /// 消す道の出口 (生きている印を下ろした後)。
