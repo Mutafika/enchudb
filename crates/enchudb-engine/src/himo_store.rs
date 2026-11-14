@@ -20,7 +20,7 @@ use crate::column::Column;
 use crate::lockfree_cylinder::{LockFreeCylinder, Part};
 use crate::region::Region;
 use crate::value_locks::{HeldAll, ValueLocks};
-use crate::write_gate::WriteGate;
+use crate::write_gate::{IntentGate, IntentHold, IntentPass, WriteGate};
 
 /// column region の取得元 (request23 D2)。
 ///
@@ -123,7 +123,7 @@ cell_value_signed!(i32, i64, isize);
 /// test 用の割り込み点: 名前の一致した 1 回だけ、 登録した処理をこの thread で走らせる (`lockfree_cylinder` と同じ形)。
 /// 門の中の書き手と、 門を閉じる側の窓を、 thread の運に頼らず踏むため。 test 以外では何もしない。
 #[cfg(test)]
-mod hook {
+pub(crate) mod hook {
     use std::cell::RefCell;
 
     type Hook = (&'static str, Box<dyn FnOnce()>);
@@ -199,6 +199,9 @@ pub struct HimoStore {
     present: PresentCount,
     /// 位置の印を持つと宣言されたか ([`declare_marks`](Self::declare_marks)、 engine の `MRK1`)。 円柱を組む時に見る。
     marks: AtomicBool,
+    /// WAL に積んで本体に当てる自分の書き込みが積む前に通る門 ([`IntentGate`])。 この紐を長く止める側 (円柱を組む、 `write_guard`)
+    /// は `write_lock` を取る前に閉じる。
+    intent: IntentGate,
 }
 
 /// 古い entry のある bucket (値 `value`) の eid の列 `eids` から、 今の値がちょうど `value` の entity を 1 回ずつ `out` に足す。
@@ -494,6 +497,9 @@ pub(crate) struct WriteGuard<'a> {
     /// 組んだ紐なら全部の鍵 (鍵で書く書き手を止める)。
     _all: Option<HeldAll<'a>>,
     _lock: MutexGuard<'a, ()>,
+    /// 長く持つ guard (`write_guard`) は、 WAL に積んで当てる書き手の門も閉じている ([`IntentGate`])。 最後に開ける (上の lock と
+    /// 鍵を放した後)
+    _intent: Option<IntentHold<'a>>,
 }
 
 impl Drop for WriteGuard<'_> {
@@ -526,6 +532,7 @@ impl HimoStore {
             vlocks: OnceLock::new(),
             present: PresentCount::new(true),
             marks: AtomicBool::new(false),
+            intent: IntentGate::new(),
         }
     }
 
@@ -549,6 +556,7 @@ impl HimoStore {
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
             marks: AtomicBool::new(false),
+            intent: IntentGate::new(),
         })
     }
 
@@ -576,6 +584,7 @@ impl HimoStore {
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
             marks: AtomicBool::new(false),
+            intent: IntentGate::new(),
         }
     }
 
@@ -683,6 +692,9 @@ impl HimoStore {
         if self.cyl_built.load(Ordering::Acquire) {
             return;
         }
+        // 列をなめる間、 WAL に積んで当てる書き手を、 積む前に止める (積んだ後に `write_lock` を待たせると、 その record の手前で
+        // checkpoint が止まり、 WAL を畳めない)。 `write_lock` の前に (中の書き手が当てる間に `write_lock` を待つことがある)
+        let _intent = self.intent.hold();
         let _g = self.write_lock.lock();
         // double-check（build 中に競合した別 thread が先に置いた可能性）
         if self.cyl_built.load(Ordering::Acquire) {
@@ -691,6 +703,7 @@ impl HimoStore {
         // 門の中で書いている書き手 (write_lock を取らない) が出るのを待ってから scan する。 以後は開けない
         // (組んだ cylinder は値ごとの鍵で手入れする、 `set_indexed`)
         self.gate.close();
+        hook::at("building_cylinder");
         // 鍵は flag を立てる前に (flag を Acquire で見た書き手は鍵を見る)
         self.vlocks.get_or_init(ValueLocks::new);
         let col = self.col();
@@ -884,19 +897,50 @@ impl HimoStore {
     /// 門を閉じて中の書き手が出るのを待つ。 cylinder を組んだ紐なら全部の鍵も取る (鍵で書く書き手が出るのを待つ)。
     /// 持っている間、 この紐の書き手は全部待つ。 drop で門を開け直す (cylinder を組んでいれば閉じたまま) — 開けた後に
     /// 入る書き手 (鍵を取った書き手) は、 持っている間に置いたもの (作った索引) を見る。
+    ///
+    /// 持つ間は長い (列をなめる) ので、 WAL に積んで当てる書き手は積む前に止める ([`IntentGate`]、 `write_lock` の前に閉じる)。
     pub(crate) fn write_guard(&self) -> WriteGuard<'_> {
+        let intent = self.intent.hold();
+        let mut g = self.write_guard_inner();
+        g._intent = Some(intent);
+        g
+    }
+
+    fn write_guard_inner(&self) -> WriteGuard<'_> {
         let lock = self.write_lock.lock();
         self.gate.close();
         // 組む側も write_lock を取るので、 持っている間に組んだかどうかは変わらない
         let all = self.cyl_live(&lock).map(|_| self.vlocks().lock_all());
-        WriteGuard { store: self, _all: all, _lock: lock }
+        WriteGuard { store: self, _all: all, _lock: lock, _intent: None }
     }
 
     /// 書き手を 1 度止めて放すだけ ([`write_guard`](Self::write_guard) を取って離す)。 これより前に write_lock を離した
     /// 書き込みと、 門を出た書き込みは全て見え、 これより後の書き込みは、 これより前に置いたもの (購読の route) を見る
     /// (live query の登録 barrier、 `crate::live` module doc)。
+    ///
+    /// 短いので、 WAL に積んで当てる書き手の門 ([`IntentGate`]) は閉じない (当てている書き手が少し待つだけ。 閉じると、 中の
+    /// 書き手が WAL の空きを待つ間、 購読の登録が待つ)。
     pub fn write_barrier(&self) {
-        drop(self.write_guard());
+        drop(self.write_guard_inner());
+    }
+
+    /// #850 の後: WAL に積んで本体に当てる自分の書き込みが、 **積む前に** 入る ([`IntentGate`])。 この紐を長く止める側が居れば
+    /// 終わるまで待つ。 持っている間 (当て終えるまで) 止める側は始まらない。 当てる前に drop しないこと。
+    #[inline]
+    pub(crate) fn write_intent(&self) -> IntentPass<'_> {
+        self.intent.enter()
+    }
+
+    /// [`write_intent`](Self::write_intent) の待たない版 (いくつもの紐に入る書き手用。 入れなければ入った分を出て
+    /// [`wait_write_intent`](Self::wait_write_intent))。
+    #[inline]
+    pub(crate) fn try_write_intent(&self) -> Option<IntentPass<'_>> {
+        self.intent.try_enter()
+    }
+
+    /// この紐を止めている側が終わるのを待つ。
+    pub(crate) fn wait_write_intent(&self) {
+        self.intent.wait();
     }
 
     /// 門が閉じているか (test 用)。

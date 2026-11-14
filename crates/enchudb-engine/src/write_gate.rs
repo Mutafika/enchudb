@@ -126,6 +126,125 @@ impl Drop for Pass<'_> {
     }
 }
 
+/// #850 の後 (#873 のレビュー): WAL に積んで本体に当てる自分の書き込み (engine の `LocalApply`) が、 積む前に通る門。
+///
+/// 書き手は WAL に積んでから cell に当て終えるまで印 (`OpLog::applying`) を持ち、 書き出しは checkpoint をその手前で切る。 その間に
+/// 書き手が長く待つと (同じ紐の円柱を組む・並びの索引を作る・列を数える側が `write_lock` を持って列をなめる間)、 WAL のその区画を
+/// 畳めず、 満杯になると全部の書き手が空きを待って、 待ち切れずに record を落とす / 書き込みを断る。 そこで、 紐を長く止める側
+/// ([`IntentGate::hold`]) は `write_lock` を取る **前に** この門を閉じ、 中に居る書き手 (積む前から当て終えるまで) が出るのを待つ。
+/// 閉じている間に来た書き手は、 積む前に (印を持たずに) 止める側が終わるのを待つ ([`IntentGate::enter`])。 中に居る書き手は、
+/// 当てる間に止める側を待たない (止める側はまだ `write_lock` も門も鍵も取っていない)。
+///
+/// 止める側は閉じてから中が空くのを待つので、 中の書き手が WAL の空きを待っていれば、 その間待つ (積む前の書き手は印を持たない
+/// ので、 空きは作られる)。 短い barrier (購読の登録の `write_barrier`) は閉じない (今まで通り、 当てている書き手が少し待つ)。
+pub(crate) struct IntentGate {
+    gate: WriteGate,
+    /// 止める側が持つ間持つ (止める側は 1 本ずつ、 閉じられた書き手はこれを待つ)
+    closer: parking_lot::Mutex<()>,
+}
+
+impl Default for IntentGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IntentGate {
+    pub(crate) fn new() -> Self {
+        Self { gate: WriteGate::new(), closer: parking_lot::Mutex::new(()) }
+    }
+
+    /// 入る。 閉じていれば、 止める側が終わるのを待ってから入り直す。
+    #[inline]
+    pub(crate) fn enter(&self) -> IntentPass<'_> {
+        loop {
+            if let Some(p) = self.try_enter() {
+                return p;
+            }
+            self.wait();
+        }
+    }
+
+    /// 開いていれば入る (待たない)。 いくつもの門に入る書き手 (delete) は、 1 つでも閉じていれば入った分を出てから待つ
+    /// ([`Self::wait`]、 入ったまま待つと、 止める側が 2 本の紐を順に止める間に互いに待つ)。
+    #[inline]
+    pub(crate) fn try_enter(&self) -> Option<IntentPass<'_>> {
+        let pass = self.gate.try_enter()?;
+        #[cfg(debug_assertions)]
+        held::push(self);
+        Some(IntentPass { _pass: pass, #[cfg(debug_assertions)] gate: self })
+    }
+
+    /// 止める側が終わるのを待つ (止める側は閉じている間ずっと `closer` を持つ)。
+    pub(crate) fn wait(&self) {
+        drop(self.closer.lock());
+    }
+
+    /// 閉じて、 中の書き手が出るのを待つ。 drop で開ける。 `write_lock` を取る前に呼ぶ (中の書き手が当てる間に `write_lock` を
+    /// 待つことがある)。 この門に入ったままの thread が呼ぶと止まる (debug build は panic)。
+    pub(crate) fn hold(&self) -> IntentHold<'_> {
+        #[cfg(debug_assertions)]
+        assert!(!held::contains(self), "IntentGate::hold: この thread はこの紐の書き込みの途中 (自分を待って止まる)");
+        let closer = self.closer.lock();
+        self.gate.close();
+        IntentHold { gate: self, _closer: closer }
+    }
+}
+
+/// [`IntentGate`] の中に居る間持つ。
+pub(crate) struct IntentPass<'a> {
+    _pass: Pass<'a>,
+    #[cfg(debug_assertions)]
+    gate: &'a IntentGate,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for IntentPass<'_> {
+    fn drop(&mut self) {
+        held::remove(self.gate);
+    }
+}
+
+/// [`IntentGate::hold`] の間持つ。 drop で開ける (その後 `closer` を放す = 待っている書き手が入る)。
+pub(crate) struct IntentHold<'a> {
+    gate: &'a IntentGate,
+    _closer: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl Drop for IntentHold<'_> {
+    fn drop(&mut self) {
+        self.gate.gate.open();
+    }
+}
+
+/// debug build: この thread が入っている門 (止める側を自分で待つ形を panic にする)。
+#[cfg(debug_assertions)]
+mod held {
+    use super::IntentGate;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HELD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn push(g: &IntentGate) {
+        let _ = HELD.try_with(|h| h.borrow_mut().push(g as *const _ as usize));
+    }
+
+    pub(super) fn remove(g: &IntentGate) {
+        let _ = HELD.try_with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some(i) = h.iter().rposition(|&p| p == g as *const _ as usize) {
+                h.swap_remove(i);
+            }
+        });
+    }
+
+    pub(super) fn contains(g: &IntentGate) -> bool {
+        HELD.try_with(|h| h.borrow().contains(&(g as *const _ as usize))).unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +286,34 @@ mod tests {
         assert!(!gate.is_closed());
         let p = gate.try_enter();
         assert!(p.is_some(), "開けた門に入れない");
+    }
+
+    /// 止める側 (`hold`) は中の書き手が出るまで返らず、 持っている間に来た書き手は待ち、 放すと入る。
+    #[test]
+    fn intent_hold_waits_for_writers_inside_and_holds_new_ones() {
+        let gate = Arc::new(IntentGate::new());
+        let inside = gate.enter();
+        let held = Arc::new(AtomicBool::new(false));
+        let h = {
+            let (gate, held) = (gate.clone(), held.clone());
+            std::thread::spawn(move || {
+                let hold = gate.hold();
+                held.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                drop(hold);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!held.load(Ordering::SeqCst), "中に書き手が居るのに止め始めた");
+        drop(inside);
+        while !held.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(gate.try_enter().is_none(), "止めている間に入れた");
+        let t = std::time::Instant::now();
+        let p = gate.enter();
+        assert!(t.elapsed() >= Duration::from_millis(30), "止めている間に待たずに入った");
+        drop(p);
+        h.join().unwrap();
     }
 }
