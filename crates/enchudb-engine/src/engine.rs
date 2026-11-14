@@ -1357,8 +1357,26 @@ thread_local! {
     static APPLYING_CUT_PACE: std::cell::Cell<(Option<std::time::Instant>, u32)> = const { std::cell::Cell::new((None, 0)) };
     /// この thread が自分の書き込みを WAL に積んでから当て終えるまでの間か ([`LocalApply`] の入れ子の深さ、 下の bit
     /// [`LOCAL_APPLY_DEPTH`])。 その間は辞書と Leaf の旧 slot の書き出し (`settle_retired_words` / `settle_retired_leaves`、
-    /// msync) を当てた後に回す。 Leaf の書き出しが要ると分かったら [`LEAF_SETTLE_AFTER_APPLY`] を立てる。
-    static IN_LOCAL_APPLY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// msync) を当てた後に回す。 Leaf の書き出しが要ると分かったら [`LEAF_SETTLE_AFTER_APPLY`] を立てる。 いちばん外の
+    /// `LocalApply` が入った門も置く (#896、 [`GatesStepOut`])。
+    static IN_LOCAL_APPLY: std::cell::Cell<LocalApplyTls> = const { std::cell::Cell::new(LocalApplyTls::EMPTY) };
+}
+
+/// [`IN_LOCAL_APPLY`] の中身。
+#[derive(Clone, Copy)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "門を出る道 (`GatesStepOut`) は WAL の空きを待つ所だけ"))]
+struct LocalApplyTls {
+    /// 入れ子の深さ (下の bit [`LOCAL_APPLY_DEPTH`]) と [`LEAF_SETTLE_AFTER_APPLY`]
+    bits: u32,
+    /// いちばん外の [`LocalApply`] が入った門: 1 本の紐の書き込みは門 1 つ (`one`)、 行の削除は入った印の並び (`many` = `Vec` の
+    /// 中身。 `LocalApply` が動いても動かない)。 WAL の空きを待つ間だけ出る ([`GatesStepOut`])
+    one: *const crate::write_gate::IntentGate,
+    many: *const crate::write_gate::IntentPass<'static>,
+    many_len: usize,
+}
+
+impl LocalApplyTls {
+    const EMPTY: Self = Self { bits: 0, one: std::ptr::null(), many: std::ptr::null(), many_len: 0 };
 }
 
 /// `IN_LOCAL_APPLY` の bit: 当てる間に Leaf の旧 slot が書き出しの目安を越えた (`LocalApply` を落とす時に書き出す)。
@@ -1395,7 +1413,18 @@ pub(crate) struct LocalApply<'a> {
 impl<'a> LocalApply<'a> {
     #[inline]
     fn new(eng: &'a Engine, wal: &'a enchudb_oplog::oplog::OpLog, intents: Intents<'a>) -> Self {
-        IN_LOCAL_APPLY.with(|d| d.set(d.get() + 1));
+        IN_LOCAL_APPLY.with(|d| {
+            let mut t = d.get();
+            if t.bits & LOCAL_APPLY_DEPTH == 0 {
+                (t.one, t.many, t.many_len) = match &intents {
+                    Intents::None => (std::ptr::null(), std::ptr::null(), 0),
+                    Intents::One(p) => (p.gate() as *const _, std::ptr::null(), 0),
+                    Intents::Many(v) => (std::ptr::null(), v.as_ptr().cast(), v.len()),
+                };
+            }
+            t.bits += 1;
+            d.set(t);
+        });
         Self { eng, mark: Some(wal.applying()), intents, counted: true }
     }
 
@@ -1421,12 +1450,14 @@ impl Drop for LocalApply<'_> {
         if self.counted {
             // いちばん外の LocalApply なら Some(当てる間に Leaf の書き出しを回したか)
             let outer = IN_LOCAL_APPLY.with(|d| {
-                let n = d.get() - 1;
+                let mut t = d.get();
+                let n = t.bits - 1;
                 if n & LOCAL_APPLY_DEPTH == 0 {
-                    d.set(0);
+                    d.set(LocalApplyTls::EMPTY);
                     Some(n & LEAF_SETTLE_AFTER_APPLY != 0)
                 } else {
-                    d.set(n);
+                    t.bits = n;
+                    d.set(t);
                     None
                 }
             });
@@ -1437,6 +1468,67 @@ impl Drop for LocalApply<'_> {
                     self.eng.settle_retired_leaves_after_apply();
                 }
             }
+        }
+    }
+}
+
+/// #896: 自分の書き込み ([`LocalApply`]) が、 印の付いた record を積もうとして WAL の空きを待つ間だけ、 入った門を出る。 落とすと
+/// 入り直す (閉じていれば、 出た門を全部出たまま止める側が終わるのを待ってから、 全部に入り直す)。
+#[cfg(not(target_arch = "wasm32"))]
+///
+/// 前は門の中で空きを待ち (上限 5 秒)、 その紐を長く止める側 (円柱を組む最初の読み / 最初の count / 並びの索引を作る / 購読の
+/// 登録) が門を閉じてその間ずっと待った (master は待たなかった)。 出てよいのは、 その書き手がまだ何も積んでいない (印が位置を
+/// 持たない) から: 止める側が先に始めても、 入り直す時に (積む前に) 待つ。 行の lock は持ったまま (行の lock → 門の順、 #503 の
+/// 「同じ cell の書き手は WAL の順に当てる」 も変わらない)。 入れ子の内側 (深さ 2 以上) では出ない。
+struct GatesStepOut {
+    gates: Vec<*const crate::write_gate::IntentGate>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GatesStepOut {
+    /// この thread のいちばん外の `LocalApply` が入った門を出る。 入っていなければ None。
+    fn step_out() -> Option<Self> {
+        let t = IN_LOCAL_APPLY.with(|d| d.get());
+        if t.bits & LOCAL_APPLY_DEPTH != 1 {
+            return None;
+        }
+        let gates: Vec<*const crate::write_gate::IntentGate> = if !t.one.is_null() {
+            vec![t.one]
+        } else if !t.many.is_null() {
+            // SAFETY: `many` は今この thread で生きている `LocalApply` の `Vec<IntentPass>` の中身 (その append の中から呼ぶ。 落とす
+            // 時に `IN_LOCAL_APPLY` を空にする)。 読むのは門の住所だけ
+            let passes = unsafe { std::slice::from_raw_parts(t.many, t.many_len) };
+            passes.iter().map(|p| p.gate() as *const _).collect()
+        } else {
+            Vec::new()
+        };
+        if gates.is_empty() {
+            return None;
+        }
+        for &g in &gates {
+            // SAFETY: 門は engine の紐 (`HimoStore`) の中。 `LocalApply` が engine を借りている間 (= この呼び出しの間) は生きている
+            unsafe { &*g }.step_out();
+        }
+        Some(Self { gates })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for GatesStepOut {
+    fn drop(&mut self) {
+        'retry: loop {
+            for (i, &g) in self.gates.iter().enumerate() {
+                // SAFETY: 上と同じ
+                let gate = unsafe { &*g };
+                if !gate.try_step_in() {
+                    for &h in &self.gates[..i] {
+                        unsafe { &*h }.step_out();
+                    }
+                    gate.wait();
+                    continue 'retry;
+                }
+            }
+            return;
         }
     }
 }
@@ -4197,15 +4289,41 @@ mod apply_liveness_tests {
         assert_eq!(retried, 0, "{tag}: 間を空けずに試し直した");
     }
 
-    /// 紐を長く止める側 (ここでは円柱を組む最初の読み) が、 門の中で WAL の空きを待つ書き手を待つ間、 CPU を回さない (少し回った後は
-    /// 眠る)。 前は yield で回り続けた (上限は書き手の空きの待ち = 5 秒、 #873 の 2 回目のレビュー)。 A を積んだ後・当てる前で止めて
-    /// WAL を畳めなくし、 B を y の門の中で空きを待たせてから、 y を初めて引く。 300 ms 後に A を放す。
+    #[derive(Clone, Copy, Debug)]
+    enum Stopper {
+        /// 円柱を組む最初の読み (`ensure_cylinder_built`)
+        Build,
+        /// `write_guard` (最初の count / 並びの索引を作る時と同じ)
+        Guard,
+        /// 購読の登録 (y の円柱を組む)
+        Subscribe,
+    }
+
+    /// WAL が満杯で、 書き手が門の中で空きを待っている間でも、 その紐を長く止める側は待たない (#896)。 前は止める側が門を閉じ、 空きを
+    /// 待つ書き手 (上限 5 秒) が出るまで待った (master は待たなかった)。 A を積んだ後・当てる前で止めて WAL を畳めなくし、 B (y への
+    /// tie) と C (y に値のある行の削除) に空きを待たせてから、 y を止める側を走らせる。 止める側が A を放す前に終わるかを見る
+    /// (直す前は、 A を放して空きができるまで終わらない)。
     #[test]
-    fn a_stopper_waiting_for_a_writer_short_of_wal_room_sleeps() {
-        let p = path("stopsleep");
+    fn a_stopper_does_not_wait_for_writers_short_of_wal_room() {
+        let running: Vec<_> = [Stopper::Build, Stopper::Guard, Stopper::Subscribe]
+            .into_iter()
+            .map(|k| std::thread::spawn(move || stopper_case(k)))
+            .collect();
+        let failed = running.into_iter().map(|c| c.join()).filter(Result::is_err).count();
+        assert_eq!(failed, 0, "{failed} case が落ちた (上の panic を見る)");
+    }
+
+    fn stopper_case(kind: Stopper) {
+        let p = path(&format!("stopper-{kind:?}"));
         let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
         let (eng, x, y, _) = open(eng, false);
         let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        // C が消す行 (y に値がある)。 Delete の record は Tie より小さく、 B が空きを待ち始めた時の残りに入ることがあるので、 C が空きを
+        // 待つまで消し続ける
+        let rows: Vec<u64> = (0..64).map(|_| eng.entity_in("t").unwrap()).collect();
+        for &e in &rows {
+            eng.try_tie_to_by_id(e, y, 7u32).unwrap();
+        }
         let wal = eng.oplog.as_ref().unwrap().clone();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
         let (release, parked) = std::sync::mpsc::channel::<()>();
@@ -4223,41 +4341,125 @@ mod apply_liveness_tests {
             let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
         };
-        // B が空きを待ち始める (書いた数が 50 ms 増えない) まで
-        let until = Instant::now() + Duration::from_secs(20);
-        let mut last = u32::MAX;
-        while Instant::now() < until {
-            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
-            if now == last {
-                break;
+        // 書いた数が 50 ms 増えなくなるまで (空きを待ち始めた)
+        let stall = |done: &std::sync::atomic::AtomicU32| {
+            let until = Instant::now() + Duration::from_secs(20);
+            let mut last = u32::MAX;
+            while Instant::now() < until {
+                let now = done.load(std::sync::atomic::Ordering::Acquire);
+                if now == last {
+                    break;
+                }
+                last = now;
+                std::thread::sleep(Duration::from_millis(50));
             }
-            last = now;
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(last < B_WRITES && !eng.himos[y as usize].cylinder_built(), "前提: B が空きを待ち、 y の円柱はまだ無い ({last} 件)");
-        let waits = crate::write_gate::PATIENT_WAITS.load(std::sync::atomic::Ordering::Relaxed);
-        let reader = {
+            last
+        };
+        let last = stall(&b_done);
+        let c_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c = {
+            let (eng, rows, c_done) = (eng.clone(), rows.clone(), c_done.clone());
+            std::thread::spawn(move || {
+                for (i, &e) in rows.iter().enumerate() {
+                    eng.delete(e);
+                    c_done.store(i as u32 + 1, std::sync::atomic::Ordering::Release);
+                }
+            })
+        };
+        let c_last = stall(&c_done);
+        let built = eng.himos[y as usize].cylinder_built();
+        let waiting = last < B_WRITES && (c_last as usize) < rows.len() && !built;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopper = {
             let eng = eng.clone();
             std::thread::spawn(move || {
                 let t = Instant::now();
-                let _ = eng.himos[y as usize].slice_len(0);
-                t.elapsed()
+                match kind {
+                    Stopper::Build => drop(eng.himos[y as usize].slice_len(0)),
+                    Stopper::Guard => drop(eng.himos[y as usize].write_guard()),
+                    Stopper::Subscribe => {
+                        drop(eng.subscribe(vec![crate::live::LivePred::Eq { himo_id: y, value: 7 }]).unwrap());
+                    }
+                }
+                let _ = done_tx.send(t.elapsed());
             })
         };
-        std::thread::sleep(Duration::from_millis(300));
+        // 空きを待つ書き手の上限 (5 秒) より短く待つ
+        let before_release = done_rx.recv_timeout(Duration::from_secs(3)).ok();
         release.send(()).unwrap();
-        let took = reader.join().unwrap();
-        let waits = crate::write_gate::PATIENT_WAITS.load(std::sync::atomic::Ordering::Relaxed) - waits;
+        stopper.join().unwrap();
         let a = a.join().unwrap();
         let (rejected, _) = b.join().unwrap();
-        let y_now = eng.get_by_id(e2, y);
+        c.join().unwrap();
+        let (y2, y3) = (eng.get_by_id(e2, y), rows.iter().filter(|&&e| eng.get_by_id(e, y).is_some()).count());
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
-        eprintln!("[stopper] 円柱を組む読みの待ち {took:?} / 待ちの回数 {waits}");
-        assert_eq!((a, rejected, y_now), (Ok(()), 0, Some(u64::from(B_WRITES - 1))), "A / B の書き込み");
-        assert!(took >= Duration::from_millis(250), "前提: 読み手は門の中で空きを待つ B を待った ({took:?})");
-        // 眠れば 300 ms で数百回 (yield で回ると 3 万回ほど)
-        assert!(waits < 3_000, "止める側が回り続けた (300 ms に {waits} 回)");
+        eprintln!("[stopper] {kind:?}: B が待ち始めた所 {last} 件 / A を放す前に終わった {before_release:?}");
+        assert!(waiting, "{kind:?}: 前提: B と C が空きを待ち、 y の円柱はまだ無い (B {last} 件、 C {c_last} 行、 円柱 {built})");
+        assert!(before_release.is_some(), "{kind:?}: 止める側が、 門の中で WAL の空きを待つ書き手を待った");
+        assert_eq!((a, rejected, y2, y3), (Ok(()), 0, Some(u64::from(B_WRITES - 1)), 0), "{kind:?}: A / B / C の書き込み");
+    }
+
+    /// #896: 門を出て空きを待つ書き手は、 空いた時に止める側が門を持っていれば、 出たまま止める側を待ってから入り直す (積む前 = 印に
+    /// 位置が無い)。 A を積んだ後・当てる前で止めて B (y への tie) に空きを待たせ、 y の `write_guard` を取ってから A を放す (空きが
+    /// できる)。 guard を持つ間 (1.5 秒)、 B は進まず、 D (別の行の x への tie) は WAL の数倍を書ける (B が門を待たずに入って積むと、
+    /// B の印が checkpoint を止めて D も止まる)。 放した後は B / D とも全部当たる。
+    #[test]
+    fn a_writer_stepping_in_waits_for_a_holder_before_appending() {
+        let p = path("stepin");
+        let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
+        let (eng, x, y, _) = open(eng, false);
+        let (e1, e2, e4) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        cell_append_hook::set(&wal, move |_| {
+            in_tx.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, x, 1u32))
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が積んだ後・当てる前で止まった");
+        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let b = {
+            let (eng, b_done) = (eng.clone(), b_done.clone());
+            std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut stalled = u32::MAX;
+        while Instant::now() < until {
+            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
+            if now == stalled {
+                break;
+            }
+            stalled = now;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let guard = eng.himos[y as usize].write_guard();
+        release.send(()).unwrap();
+        let a = a.join().unwrap();
+        let d_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let d = {
+            let (eng, d_done) = (eng.clone(), d_done.clone());
+            std::thread::spawn(move || write_many(&eng, e4, x, B_WRITES, &d_done))
+        };
+        std::thread::sleep(hold());
+        let (b_held, d_held) = (b_done.load(std::sync::atomic::Ordering::Acquire), d_done.load(std::sync::atomic::Ordering::Acquire));
+        drop(guard);
+        let ((b_rejected, _), (d_rejected, _)) = (b.join().unwrap(), d.join().unwrap());
+        let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
+        let (y2, x4) = (eng.get_by_id(e2, y), eng.get_by_id(e4, x));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        eprintln!("[stepin] B は {stalled} 件で空きを待ち、 guard を持つ間に {b_held} 件 / D は guard を持つ間に {d_held} 件");
+        assert!(stalled < B_WRITES, "前提: B が空きを待った");
+        assert_eq!(a, Ok(()), "書き手 A");
+        assert!(b_held <= stalled + 1, "B が止める側を待たずに進んだ ({stalled} → {b_held} 件)");
+        assert!(d_held >= B_BEFORE_RELEASE, "D が止まった (guard を持つ間に {d_held} 件): B が門を待たずに積んで印を持った");
+        assert_eq!((b_rejected, d_rejected, dropped, timeouts), (0, 0, 0, 0), "断られた / 落とした / 待ち切れ");
+        assert_eq!((y2, x4), (Some(u64::from(B_WRITES - 1)), Some(u64::from(B_WRITES - 1))), "B / D の値");
     }
 
     /// 当てている途中の書き手の手前で切っても、 書き出しに失敗した空け作りは 「当てている途中」 (`WalRoom::Applying`) と返さない
@@ -15574,7 +15776,7 @@ impl Engine {
     /// 回す (`LocalApply` を落とす時に呼ぶ)。 msync は長いことがあり、 その間 WAL の印が checkpoint を止める (#873 のレビュー)。
     #[inline]
     fn settle_retired_words_after_apply(&self) {
-        if IN_LOCAL_APPLY.with(|d| d.get()) & LOCAL_APPLY_DEPTH == 0 {
+        if IN_LOCAL_APPLY.with(|d| d.get().bits) & LOCAL_APPLY_DEPTH == 0 {
             self.settle_retired_words();
         }
     }
@@ -18206,10 +18408,11 @@ impl Engine {
             // 自分の書き込みを当てる間 (WAL の印を持ち、 紐の門の中) なら、 書き出しは `LocalApply` を落とす時に回す (msync は
             // 秒単位のことがあり、 その間 印が checkpoint を止める。 #873 の 2 回目のレビュー、 辞書の書き出しと同じ)
             let deferred = IN_LOCAL_APPLY.with(|d| {
-                let v = d.get();
-                let inside = v & LOCAL_APPLY_DEPTH != 0;
+                let mut t = d.get();
+                let inside = t.bits & LOCAL_APPLY_DEPTH != 0;
                 if inside {
-                    d.set(v | LEAF_SETTLE_AFTER_APPLY);
+                    t.bits |= LEAF_SETTLE_AFTER_APPLY;
+                    d.set(t);
                 }
                 inside
             });
@@ -25251,10 +25454,10 @@ impl Engine {
         // (OpLog は Engine より長く生きうるので、 外した後は今までどおりすぐ落とす)
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(wal) = oplog.as_ref() {
-            wal.set_room_waiter(Some(Arc::new(move |size| {
+            wal.set_room_waiter(Some(Arc::new(move |size, applying| {
                 // SAFETY: Engine の Drop が待ち手を外すまで engine は生きている
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
-                engine.wait_for_wal_room(size)
+                engine.wait_for_wal_room(size, applying)
             })));
         }
         // #391: WAL に書いた (書き込み / Commit marker / 中継) 時に consumer を起こす (書き出しの tick を回す)。
@@ -25824,13 +26027,18 @@ impl Engine {
     ///   だったら (sync の bridge が配り終えていない等。 畳んだ空きを他の書き手が先に埋めた試し (#552) と、 試している間に
     ///   書き手が積み続けて畳めなかった試し (#512) は数えない) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
     #[cfg(not(target_arch = "wasm32"))]
-    fn wait_for_wal_room(&self, size: u64) -> bool {
+    ///
+    /// `applying` = 載せたいのが自分の書き込みの印の付いた record (まだ位置を持たない)。 その時は待つ間だけ書き手の門を出る
+    /// ([`GatesStepOut`]、 #896)。
+    fn wait_for_wal_room(&self, size: u64, applying: bool) -> bool {
         use std::sync::atomic::Ordering;
         let Some(wal) = self.oplog.as_ref() else { return false };
         if self.consumer_thread.get() == Some(&std::thread::current().id()) {
             self.make_wal_room_paced(wal);
             return wal.free_bytes() >= size;
         }
+        // 待つ間は門の外 (返る前に入り直す。 落とす順は変数の逆なので、 下の待ちが全部済んでから)
+        let _out = if applying { GatesStepOut::step_out() } else { None };
         let first_blocked = self.wal_room_blocked.load(Ordering::Acquire) + 1;
         // 頼んだ時に試している最中の 1 回は頼みを見ていないかもしれないので、 その次の 1 回まで待つ
         let blocked = || self.wal_room_blocked.load(Ordering::Acquire) > first_blocked;
