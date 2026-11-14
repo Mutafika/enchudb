@@ -2917,10 +2917,6 @@ mod wal_reject_tests {
     }
 }
 
-/// #563 / #505: 同じ cell の 2 本の書き手で、 WAL に積む順と cell に当てる順がずれない。 1 本目が積んだ後・当てる前 (割り込み点) に
-/// 2 本目を走らせる。 行を握ったまま積んで当てる今の形なら 2 本目は 1 本目が当て終えるまで待つ。 前の形 (積んでから握る) だと 2 本目が
-/// 先に当て、 版数の無い DB では cell が WAL の最後の record と違う値で残り、 版数のある DB では 1 本目が `OlderThanCell` で弾かれた
-/// (`same_cell_wal_order.rs` は確率的で、 直す前に 1 round 約 5 %)。
 /// #882 / #883: 同じ slot を 2 回払い出す窓 2 つを、 割り込み点で決まって踏む。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod slot_claim_tests {
@@ -3109,6 +3105,55 @@ mod slot_claim_tests {
     }
 }
 
+/// #877: 消す行を WAL に積んだ後・数える前に並んだ `oplog_sync` が checkpoint を進めない (割り込み点 `cell_append_hook`)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod freed_count_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_delete_appended_but_not_counted_holds_oplog_sync() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-freedcount-{}-{nanos}.db", std::process::id());
+        let image = format!("{path}.image");
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("t", 100).unwrap();
+        let a = eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        // consumer の周期は `tables` を書くので止める (行 x を sidecar より先に置いたまま)
+        let hold = eng.hold_consumer();
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to_by_id(x, a, 7u32);
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let synced: Arc<std::sync::Mutex<Option<std::io::Result<()>>>> = Arc::default();
+        let (eng2, synced2) = (eng.clone(), synced.clone());
+        // Delete を積んだ直後 (数える前) に、 並んだ書き手の `oplog_sync` が走る
+        cell_append_hook::set(&wal, move |_| {
+            *synced2.lock().unwrap() = Some(eng2.oplog_sync());
+        });
+        eng.delete(x);
+        synced.lock().unwrap().take().expect("前提: 割り込み点を通った").unwrap();
+        // この瞬間に落ちた像 (WAL と本体は書き出し済み、 `tables` は x を足す前の物)
+        assert!(std::process::Command::new("cp").arg("-R").arg(&path).arg(&image).status().unwrap().success());
+        drop(hold);
+        drop((wal, eng));
+        let reopened = Engine::open_concurrent_with_oplog(&image, 1 << 20).unwrap();
+        let y = reopened.entity_in("t").unwrap();
+        drop(reopened);
+        for p in [&path, &image] {
+            let _ = crate::db_files::remove_db(p);
+            let _ = std::fs::remove_file(oplog_path_for(p));
+        }
+        assert_ne!(y, x, "落ちた後に、 消した行の eid {x:#x} をもう一度払い出した");
+    }
+}
+
+/// #563 / #505: 同じ cell の 2 本の書き手で、 WAL に積む順と cell に当てる順がずれない。 1 本目が積んだ後・当てる前 (割り込み点) に
+/// 2 本目を走らせる。 行を握ったまま積んで当てる今の形なら 2 本目は 1 本目が当て終えるまで待つ。 前の形 (積んでから握る) だと 2 本目が
+/// 先に当て、 版数の無い DB では cell が WAL の最後の record と違う値で残り、 版数のある DB では 1 本目が `OlderThanCell` で弾かれた
+/// (`same_cell_wal_order.rs` は確率的で、 直す前に 1 round 約 5 %)。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod cell_wal_order_tests {
     use super::*;
@@ -6253,6 +6298,9 @@ pub struct Engine {
     sync_ring_rebuild_from: std::sync::atomic::AtomicU32,
     /// #868: 枯渇した表の穴を探して枠をなめた回数 ([`Self::free_slot_scans`])。
     free_slot_scans: std::sync::atomic::AtomicU64,
+    /// #879: 書き出しが返った WAL の位置 (fsync + 本体の書き出しが済んだ所、 [`wal_pos`])。 #857 / #870 の止めで checkpoint が
+    /// 止まっていても進む。 changefeed の記録へ写す上限は checkpoint とこれの大きい方 ([`Self::change_log_upto`])。
+    written_out_pos: std::sync::atomic::AtomicU64,
     /// #190: sidecar persist (`.tables` / `.eidmap` / `.vocabmap`) の直列化 lock。
     /// tmp 名が sidecar ごとに固定なので、 同一 sidecar を 2 thread (consumer の
     /// `try_persist_tables` と pull 側の `persist_sync_state`) が同時に書くと
@@ -6701,6 +6749,7 @@ impl Engine {
             tables_persisted: std::sync::Mutex::new(None),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
+            written_out_pos: std::sync::atomic::AtomicU64::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -8016,6 +8065,7 @@ impl Engine {
             tables_persisted: std::sync::Mutex::new(None),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
+            written_out_pos: std::sync::atomic::AtomicU64::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -12307,11 +12357,18 @@ impl Engine {
         );
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
-            crate::db_files::write_atomic_if_changed(&tables_path_for(&self.path), &bytes)?;
+            let path = tables_path_for(&self.path);
+            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)
+            if crate::db_files::write_atomic_if_changed(&path, &bytes)? {
+                crate::db_files::sync_tables_dir(&path)?;
+            }
             *last = Some(bytes);
         }
         for (t, n) in self.tables.iter().zip(placed) {
-            t.persisted_next.fetch_max(n, std::sync::atomic::Ordering::AcqRel);
+            // #884: 置いた値そのものにする (下がる時もある: `clear_local_only_tables` が `next_local` を 0 に戻した後)。 前は
+            // fetch_max で、 下げた後も disk の値より大きく残り、 その表で sidecar より先の行を消しても #857 の止めが掛からなかった。
+            // 書く側は `sidecar_persist_lock` で 1 本に並ぶので、 置く順と覚える順は同じ
+            t.persisted_next.store(n, std::sync::atomic::Ordering::Release);
         }
         Ok(())
     }
@@ -12336,7 +12393,11 @@ impl Engine {
         }
         for t in self.tables.iter() {
             if let Some(idx) = t.local_of(local) {
-                t.freed_end.fetch_max(idx.saturating_add(1), Ordering::AcqRel);
+                // #878: anonymous の表は数えない (`entity()` は `EntitySet` から払い出し、 `next_local` も `tables` も使わない。
+                // 数えると `persisted_next` が 0 のままなので、 anonymous だけの DB では `oplog_sync` が checkpoint を止め続けた)
+                if !t.name.is_empty() {
+                    t.freed_end.fetch_max(idx.saturating_add(1), Ordering::AcqRel);
+                }
                 return;
             }
         }
@@ -18471,6 +18532,12 @@ impl Engine {
         let Some(row) = self.lock_app_row(app, eid) else { return };
         let row = Some(row);
         let oplog_eid = self.oplog_eid(eid);
+        // #877: 版数の無い DB は、 消す行を WAL に積む前に数える (#857 の止め)。 積んだ後・`apply_delete_in` の中で数える前に
+        // 並んだ `oplog_sync` が checkpoint を Delete の後ろへ進めると、 その行の Tie も Delete も再生されず、 落ちた後に
+        // `next_local` が消した行の手前に戻った。 先に数えて積めなかった (断った) 時は、 止めが次に `tables` を置くまで延びるだけ
+        if !self.has_cell_version() {
+            self.note_freed_slot(eid, enchudb_oplog::Hlc::ZERO);
+        }
         let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }) else {
             return;
         };
@@ -18634,7 +18701,7 @@ impl Engine {
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(wal) = self.oplog.as_ref() {
-                let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+                let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
             }
             c.readers.push((listener.clone(), log.range().1));
             self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
@@ -18724,12 +18791,22 @@ impl Engine {
         Ok(())
     }
 
+    /// #879: changefeed の記録へ写してよい WAL の位置 (書き出しの返った所)。 checkpoint と、 checkpoint を止めた書き出し
+    /// (#857 / #870: 消した行が `tables` の sidecar より先にある間) が返った位置の大きい方。 どちらまでの record も WAL の fsync と
+    /// 本体の書き出しが済んでいる (落ちても、 止めた分は開く時に再生して本体に同じ効果が残る。 開いた後の続きは記録の最後の record
+    /// を WAL から探す (`change_log_resume_offset`) ので、 checkpoint の先まで写していても二重に写さない)。 前は checkpoint までで、
+    /// 止めた `oplog_sync` は新しい record を listener に配らなかった。 位置は周 << 32 | 区画の中なので、 畳んだ周の古い位置は
+    /// 今の checkpoint より小さい
+    fn change_log_upto(&self, wal: &enchudb_oplog::oplog::OpLog) -> u64 {
+        wal.checkpoint().max(self.written_out_pos.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// changefeed の記録に残っている番号の範囲 `(最古, 次)`。 記録が無ければ None。 listener に渡した番号はこの範囲で受け直せる。
     pub fn change_log_range(&self) -> Option<(u64, u64)> {
         let log = self.change_log.get()?;
         if let Some(wal) = self.oplog.as_ref() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+            let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
         }
         Some(log.range())
     }
@@ -18748,7 +18825,7 @@ impl Engine {
         };
         let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(wal) = self.oplog.as_ref() {
-            let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+            let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
         }
         let (first, next) = log.range();
         if pos < first || pos > next {
@@ -18783,7 +18860,7 @@ impl Engine {
                 // 前の session の record は渡らず、 付けた後の commit だけが渡る)
                 let early = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
                 if let (false, Some(log)) = (early.is_empty(), self.change_log.get()) {
-                    let _ = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false);
+                    let _ = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false);
                     let at = log.range().1;
                     for l in early {
                         if !c.readers.iter().any(|(r, _)| std::sync::Arc::ptr_eq(r, &l)) {
@@ -23087,7 +23164,7 @@ impl Engine {
         // 記録がある時は記録に写す (渡すのは listener ごとの位置から)
         if let Some(log) = self.change_log.get() {
             let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false) {
+            if let Err(e) = self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false) {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
@@ -23254,7 +23331,7 @@ impl Engine {
         // #667: 記録がある時は、 畳めるかによらず書き出した所まで写す (畳む時にまとめて写すと、 区画 1 つ分を写し終えるまで全力の
         // 書き手が空きを待った)
         if let Some(log) = self.change_log.get() {
-            moved += self.pump_change_log(wal, log, &mut c, wal.checkpoint(), false).unwrap_or(0);
+            moved += self.pump_change_log(wal, log, &mut c, self.change_log_upto(wal), false).unwrap_or(0);
         }
         // 先に lock の外で見積もる (畳める区画が無い / bridge が読み終えていないなら append_lock を取らない)。 畳めそうなら、 配って
         // いない record を lock の外で先に移す (#662: lock の下は畳む区画の終わりまで届いたかを見るだけ)
@@ -23580,6 +23657,11 @@ impl Engine {
                                 // #317: 書き出しに失敗したら checkpoint を進めない (進めると oplog が畳まれ、
                                 // 書き出せなかった本体を復旧する record も消える)
                                 let synced = engine.sync_for_checkpoint(wal);
+                                if synced {
+                                    // #879: 書き出しが返った所 (checkpoint を止めても記録へ写してよい)。 checkpoint に渡すのと同じ
+                                    // `durable_head` (#873 で切った位置になる時も一緒に切られる)
+                                    engine.written_out_pos.fetch_max(durable_head, Ordering::AcqRel);
+                                }
                                 // 0.8.1: 周期 fsync でも tables sidecar を persist。
                                 // checkpoint を前進させる前に必ず sidecar を固める
                                 // (= 直後に process kill されても次 open で sidecar
@@ -23682,6 +23764,9 @@ impl Engine {
                             let committed = engine.append_commit_marker(wal).is_ok();
                             let durable_head = wal.written_head(); // #77-H3: msync 前に snapshot
                             let synced = engine.sync_for_checkpoint(wal); // #317
+                            if synced {
+                                engine.written_out_pos.fetch_max(durable_head, Ordering::AcqRel); // #879
+                            }
                             // 0.8.1: shutdown 時に tables sidecar を強制 persist。
                             // 旧 behavior では body_msync のみで `next_local` が
                             // sidecar に書かれず、 short-lived CLI (1 コマンド 1 process の CLI 等)
@@ -23914,7 +23999,12 @@ impl Engine {
                         // #870: `tables` がここまでの行を覆わなければ進めない (周期と同じ。 畳めない = 待っている書き手は断られる)。
                         // 上の `try_persist_tables` は `head` を読む前なので、 書き出しの間に書き手が足して消した行は覆わない
                         // (2 区画の形は書き出しの間も書ける)。 その時は書き出しの後に置き直す
-                        let ok = self.sync_for_checkpoint(wal) && self.tables_cover_checkpoint();
+                        let synced = self.sync_for_checkpoint(wal);
+                        if synced {
+                            // #879: `checkpoint_and_reset` が checkpoint に渡すのと同じ `head` (#873 で切った位置になる時も同じ)
+                            self.written_out_pos.fetch_max(head, Ordering::AcqRel);
+                        }
+                        let ok = synced && self.tables_cover_checkpoint();
                         if ok {
                             self.durable_lsn.store(durable_lsn, Ordering::Release);
                             // #662: 畳む前に lock の外で、 書き出した所 (head) まで写す (lock の下は畳む区画の終わりまでの残りだけ)。
@@ -24368,6 +24458,9 @@ impl Engine {
                 }
                 return Err(e);
             }
+            // #879: 書き出しが返った (下で checkpoint を止めても、 ここまでは changefeed の記録へ写してよい)。 置くのは checkpoint に
+            // 渡す値と同じ `durable_head` (#850 / #873 で覆う位置を当てていない書き手の手前で切る時も、 同じ式で切られる)
+            self.written_out_pos.fetch_max(durable_head, Ordering::AcqRel);
             // #857: sidecar の `next_local` より先の行を (版数なしで) 消していたら、 checkpoint を進めない。 進めた後に落ちると、
             // その行の Tie も Delete も再生されず、 開いた `next_local` が消した行の手前に戻る。 進めるのは `tables` を書いてから
             // 進める consumer の周期 (100 ms 以内) に任せる。 書いた分は WAL の fsync と本体の書き出しで届いている
@@ -24968,7 +25061,9 @@ impl Engine {
         // β-light step 7: tables sidecar の最新化 (next_local 含む)。
         // schema 変更 (define_*) でも persist してるが、 entity_in による
         // next_local 増加は persist してないので flush 時にまとめて persist する。
-        self.try_persist_tables();
+        // #884: 書けなかったら Err (前は捨てて Ok を返した)。 build phase の defer (`Database::create` の後) でも書く: flush は
+        // 呼び手が求めた書き出しで、 書かないと、 足して消して flush した後に落ちた時に消した行の eid をもう一度払い出す
+        self.persist_tables()?;
 
         for ds in &self.himos { ds.sync(); }
         self.vocab.sync();
