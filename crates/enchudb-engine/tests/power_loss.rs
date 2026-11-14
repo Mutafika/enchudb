@@ -2412,3 +2412,104 @@ fn a_write_known_only_from_the_wal_after_the_mark_is_not_relogged() {
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// #858: `_sync_ops` の行の cell (lsn を含む) は届いたのに、 生きている印 (`entities.seg`) が届かなかった像。 本体の書き出しは
+/// 生きている印 → lsn の列 の順なので、 書き出しの順だけでは残らない。 残るのは、 OS が書き出し (msync) の前に lsn の列の
+/// page だけを先に書いた時 (`Mixed` の像)。 開いた後、 その slot は 「生きていないのに lsn の列に居る行」 で、 払い出しの
+/// 穴拾い (`rebuild_free_locals`) が穴として拾い、 ack の後の回収 (`purge_sync_ops_row`) も行として消して free list に
+/// 戻す = 同じ slot が 2 度 free list に載り、 2 つの record が同じ slot に置かれて片方が消える。
+#[test]
+fn a_ring_row_whose_live_bit_did_not_reach_disk_is_not_handed_out_twice() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("ghost_row");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    // 1 枚の像が 「印の無い行」 を持つ率は Mac で 1/16 前後 (lsn の列の cell の page と列の header の page が今の中身、 生きている
+    // 印の page が書き出し済みの中身、 の組)。 160 枚で 1 枚も無い率は (15/16)^160 ≈ 3e-5
+    const SEEDS: u64 = 160;
+    crashsim::start();
+    let eng = notes_engine(&db, OPLOG_CAP);
+    let e = eng.entity_in("notes").unwrap();
+    {
+        // consumer の周期の書き出しを止める (書き出すのは下の `oplog_sync` だけ)
+        let _hold = eng.hold_consumer();
+        for v in 1..=5u32 {
+            eng.tie_to(e, "notes.note", v);
+        }
+        // 書き出し → bridge: ring の行はこの書き出しの後に置かれる = まだ書き出していない (page cache にだけある)
+        eng.oplog_sync().unwrap();
+        for seed in 0..SEEDS {
+            crashsim::capture(&live, &root.join(format!("img{seed}")), Mode::Mixed { seed }).unwrap();
+        }
+    }
+    crashsim::stop();
+    drop(eng);
+
+    let mut ghost_images = 0;
+    for seed in 0..SEEDS {
+        let img = root.join(format!("img{seed}"));
+        let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let ghosts = eng.entities_with_himo(lsn_hid).into_iter().filter(|r| !eng.is_live(*r)).count();
+        if ghosts == 0 {
+            drop(eng);
+            let _ = std::fs::remove_dir_all(&img);
+            continue;
+        }
+        ghost_images += 1;
+        // 開いた後の流れ: 写し直し → 相手が全部受けて ack → 回収 → 新しい record を写す。 新しい record は 1 つも欠けない
+        let _hold = eng.hold_consumer();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        let old: Vec<u64> = eng
+            .pending_sync_ops(0)
+            .iter()
+            .filter_map(|p| decode_sync_ops_payload(p))
+            .filter_map(|r| match r.op {
+                DecodedOp::Tie { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect();
+        for v in 1..=5u64 {
+            assert!(old.contains(&v), "seed {seed}: 落ちる前に書いた record {v} が、 開いた後の ring に無い ({old:?})");
+        }
+        eng.ack_sync(77, eng.current_sync_lsn() + 1).unwrap();
+        eng.reclaim_sync_ops();
+        // 穴拾いが 1 回に拾う数 (4096) より多く書く: 2 度載った slot の 2 つ目は、 先に拾った穴を使い切った後に出てくる
+        let wrote: Vec<u64> = (100..6_100u64).collect();
+        for v in &wrote {
+            eng.tie_to(e, "notes.note", *v as u32);
+            if v % 500 == 0 {
+                eng.oplog_sync().unwrap();
+            }
+        }
+        eng.oplog_sync().unwrap();
+        let on_ring: Vec<u64> = eng
+            .pending_sync_ops(0)
+            .iter()
+            .filter_map(|p| decode_sync_ops_payload(p))
+            .filter_map(|r| match r.op {
+                DecodedOp::Tie { value, .. } if value >= 100 => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(on_ring, wrote, "seed {seed} (印の無い行 {ghosts} 個): 開いた後に書いた record が ring から欠けた / 重なった");
+        let rows = eng.entities_with_himo(lsn_hid);
+        let mut lsns: Vec<u64> = rows.iter().filter_map(|r| eng.get_by_id(*r, lsn_hid)).collect();
+        let n = lsns.len();
+        lsns.sort_unstable();
+        lsns.dedup();
+        assert_eq!(lsns.len(), n, "seed {seed}: ring の 2 つの行が同じ lsn を持っている");
+        assert!(rows.iter().all(|r| eng.is_live(*r)), "seed {seed}: 生きている印の無い行が ring に残っている");
+        drop(_hold);
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&img);
+    }
+    eprintln!("#858: 印の無い行のある像 {ghost_images} / {SEEDS}");
+    assert!(ghost_images > 0, "前提: {SEEDS} 枚の像のどれかに、 cell は届いて生きている印の届いていない ring の行がある");
+    let _ = std::fs::remove_dir_all(&root);
+}

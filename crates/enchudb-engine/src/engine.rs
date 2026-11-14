@@ -11352,6 +11352,8 @@ impl Engine {
         let ring = is_sync_ring_table(&table.name);
         // 探し始める所 (ring は前に止めた続き)。 [from, allocated) → [0, from) の順に見る
         let from = if ring { self.sync_ring_rebuild_from.load(Ordering::Relaxed).min(allocated) } else { 0 };
+        // #858: ring の、 生きていないのに lsn の列に居る slot (下の `drop_cells_of_dead_ring_slot`)
+        let ring_lsn = if ring { self.himo_id("_sync_ops.lsn") } else { None };
         let mut stopped_at = None;
         'scan: for (first, end) in [(from, allocated), (0, from)] {
             let mut local = 0u32;
@@ -11365,6 +11367,9 @@ impl Engine {
                         let global = lo + (l - local);
                         // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
                         if !self.entities.is_live(global) && !self.is_folded_own_slot(global) {
+                            if ring_lsn.is_some_and(|h| self.himos[h].get_value(global).is_some()) {
+                                self.drop_cells_of_dead_ring_slot(global);
+                            }
                             fl.push(l);
                             if ring && fl.len() >= SYNC_RING_REBUILD_BATCH {
                                 stopped_at = Some(l + 1);
@@ -11387,6 +11392,23 @@ impl Engine {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         found
+    }
+
+    /// #858: 生きていない ring の slot に残っている cell を落とす (穴として拾う時、 `free_locals` の lock の下)。
+    ///
+    /// 行の cell (lsn を含む) は届いたのに生きている印が届かなかった像を開くと、 その slot は 「生きていないのに lsn の列に
+    /// 居る行」 になる (書き出しは 生きている印 → lsn の列 の順なので、 OS が lsn の列の page を先に書いた時だけ)。 cell を
+    /// 残したまま穴として拾うと、 ack の後の回収 (`purge_sync_ops_row`) がその slot を行として消して free list にもう一度
+    /// 載せ、 同じ slot を 2 回払い出す = 2 つの record が同じ slot に置かれ、 片方が sync から黙って消える。 落としてよい:
+    /// 生きている印の届いていない行は書き出しが済んでおらず、 その record は WAL に残っていて、 開いた後に写し直される。
+    /// lock の順は purge と同じ (`free_locals` → 行)。
+    fn drop_cells_of_dead_ring_slot(&self, local: u32) {
+        let _row = self.row_locks.write(local);
+        for hid in 0..self.himos.len() {
+            if self.himos[hid].get_value(local).is_some() {
+                self.remove_cell_freeing_leaf(local, hid);
+            }
+        }
     }
 
     /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。
