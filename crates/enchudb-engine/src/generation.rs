@@ -223,8 +223,9 @@ impl Generations {
         }
     }
 
-    /// page の印 (場所 `slot` の page に世代 > 0 の場所がある)。 印の範囲の外はいつも true。
-    #[inline]
+    /// page の印 (場所 `slot` の page に世代 > 0 の場所がある)。 印の範囲の外はいつも true。 (読みの道は `read_gen` / `GenReader`
+    /// が同じ印を直接見る。 これは試験用)
+    #[cfg(test)]
     pub(crate) fn page_has(&self, slot: u32) -> bool {
         self.region.get().is_none_or(|r| page_marked(r, slot))
     }
