@@ -83,7 +83,7 @@ fn reborn_rows_leave_and_reenter_pairs_and_tuples() {
     // 右 (と真ん中) の row の作り直し
     c.entity(ant).delete().unwrap();
     let ant2 = c.insert().set("id", 2i64).set("city", "Tokyo").commit().unwrap();
-    // #731: 場所は使い回し、 eid は世代が違う。 消えた ant を指したままの ref (bob / carol) は ant2 を指さない (ref が無いのと同じ)
+    // #731: 場所は使い回し、 eid は世代が違う。 消えた ant を指したままの ref (bob / carol) は ant2 を指さない (消えた会社 = 中身の無い行を指す)
     assert_eq!(ant2 as u32 & ((1 << 24) - 1), ant as u32 & ((1 << 24) - 1), "前提: 枠が埋まっていれば消した場所が使い回される");
     assert_ne!(ant2, ant);
     u.entity(dave).set("company", Value::Ref(ant2)).commit().unwrap();

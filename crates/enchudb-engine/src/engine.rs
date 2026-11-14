@@ -15523,7 +15523,7 @@ impl Engine {
     /// 1. `gen.seg` を作り (前の残りは 0 に戻す)、 場所の bit `S` を決める
     /// 2. 照合と 「消す時に上げる」 を始める ([`crate::generation::Generations::start`])
     /// 3. 手順 2 を見ずに入った消す書き手が出るのを待つ (`Generations::wait_frees`、 1 語の RMW の揃え)。 行の lock は待たない (行を
-    ///    握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 手順 2 を見ずに書いている書き手は、 死んだ場所に書いても使い回す
+    ///    握ったまま `entity_in` を呼ぶ書き手 = `write_row` を握ったまま insert する書き手が居る)。 手順 2 を見ずに書いている書き手は、 死んだ場所に書いても使い回す
     ///    時に落とす (`drop_leftover_cells`、 行の lock の下)
     /// 4. v14 の間に消した場所 (世代を持つ表の払い出し済みの範囲の死んだ場所) を全部 1 にする。 死んだ場所の値 = 次の住人の世代
     /// 5. `gen.seg` を書き出してから header (S と version 15) を書き出す。 header が届いた像には 4. も届いている。 header が届かな
