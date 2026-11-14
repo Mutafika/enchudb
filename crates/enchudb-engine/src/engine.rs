@@ -4143,8 +4143,13 @@ mod apply_liveness_tests {
         let p = path(&format!("stopper-{kind:?}"));
         let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
         let (eng, x, y, _) = open(eng, false);
-        let (e1, e2, e3) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
-        eng.try_tie_to_by_id(e3, y, 7u32).unwrap();
+        let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        // C が消す行 (y に値がある)。 Delete の record は Tie より小さく、 B が空きを待ち始めた時の残りに入ることがあるので、 C が空きを
+        // 待つまで消し続ける
+        let rows: Vec<u64> = (0..64).map(|_| eng.entity_in("t").unwrap()).collect();
+        for &e in &rows {
+            eng.try_tie_to_by_id(e, y, 7u32).unwrap();
+        }
         let wal = eng.oplog.as_ref().unwrap().clone();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
         let (release, parked) = std::sync::mpsc::channel::<()>();
@@ -4162,23 +4167,34 @@ mod apply_liveness_tests {
             let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
         };
-        // B が空きを待ち始める (書いた数が 50 ms 増えない) まで
-        let until = Instant::now() + Duration::from_secs(20);
-        let mut last = u32::MAX;
-        while Instant::now() < until {
-            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
-            if now == last {
-                break;
+        // 書いた数が 50 ms 増えなくなるまで (空きを待ち始めた)
+        let stall = |done: &std::sync::atomic::AtomicU32| {
+            let until = Instant::now() + Duration::from_secs(20);
+            let mut last = u32::MAX;
+            while Instant::now() < until {
+                let now = done.load(std::sync::atomic::Ordering::Acquire);
+                if now == last {
+                    break;
+                }
+                last = now;
+                std::thread::sleep(Duration::from_millis(50));
             }
-            last = now;
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let c = {
-            let eng = eng.clone();
-            std::thread::spawn(move || eng.delete(e3))
+            last
         };
-        std::thread::sleep(Duration::from_millis(50));
-        let waiting = last < B_WRITES && !c.is_finished() && !eng.himos[y as usize].cylinder_built();
+        let last = stall(&b_done);
+        let c_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c = {
+            let (eng, rows, c_done) = (eng.clone(), rows.clone(), c_done.clone());
+            std::thread::spawn(move || {
+                for (i, &e) in rows.iter().enumerate() {
+                    eng.delete(e);
+                    c_done.store(i as u32 + 1, std::sync::atomic::Ordering::Release);
+                }
+            })
+        };
+        let c_last = stall(&c_done);
+        let built = eng.himos[y as usize].cylinder_built();
+        let waiting = last < B_WRITES && (c_last as usize) < rows.len() && !built;
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let stopper = {
             let eng = eng.clone();
@@ -4201,13 +4217,13 @@ mod apply_liveness_tests {
         let a = a.join().unwrap();
         let (rejected, _) = b.join().unwrap();
         c.join().unwrap();
-        let (y2, y3) = (eng.get_by_id(e2, y), eng.get_by_id(e3, y));
+        let (y2, y3) = (eng.get_by_id(e2, y), rows.iter().filter(|&&e| eng.get_by_id(e, y).is_some()).count());
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
         eprintln!("[stopper] {kind:?}: B が待ち始めた所 {last} 件 / A を放す前に終わった {before_release:?}");
-        assert!(waiting, "{kind:?}: 前提: B と C が空きを待ち、 y の円柱はまだ無い ({last} 件)");
+        assert!(waiting, "{kind:?}: 前提: B と C が空きを待ち、 y の円柱はまだ無い (B {last} 件、 C {c_last} 行、 円柱 {built})");
         assert!(before_release.is_some(), "{kind:?}: 止める側が、 門の中で WAL の空きを待つ書き手を待った");
-        assert_eq!((a, rejected, y2, y3), (Ok(()), 0, Some(u64::from(B_WRITES - 1)), None), "{kind:?}: A / B / C の書き込み");
+        assert_eq!((a, rejected, y2, y3), (Ok(()), 0, Some(u64::from(B_WRITES - 1)), 0), "{kind:?}: A / B / C の書き込み");
     }
 
     /// 当てている途中の書き手の手前で切っても、 書き出しに失敗した空け作りは 「当てている途中」 (`WalRoom::Applying`) と返さない
