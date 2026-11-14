@@ -5611,6 +5611,54 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// #851 の像を手で作る: 前の周の record と同じ位置・同じ長さに今の周の record を書いた後、 その record の header + payload だけ
+    /// 前の周の bytes に戻す (印は今の周のまま)。 = record の前半の page (か sector) が、 今の周の record を書く前の中身で disk に
+    /// 残り、 印のある後半だけ届いた像。 前の周の中身は CRC が合い、 印は今の周なので、 印が中身に結ばれていなければ続きとして読める。
+    /// `torn` = 戻す record の番号 (0 始まり)。 真ん中 (後ろに今の周の record が続く) と最後の両方。
+    #[test]
+    #[ignore = "#851: 周の印が record の中身に結ばれていない (直しは file の形の変更が要る)"]
+    fn previous_lap_content_under_a_current_lap_mark_stops_the_scan() {
+        let rec = REC_HEADER_SIZE + 16 + LAP_TRAILER;
+        for torn in [2usize, 5] {
+            let p = tmp(&format!("lap-torn-{torn}"));
+            let wal = OpLog::create(&p, 64 * 1024).unwrap();
+            for i in 0..6u64 {
+                wal.append(Op::Tie { eid: 1, himo_id: 0, value: i }).unwrap();
+            }
+            wal.append(Op::Commit).unwrap();
+            let at = HEADER_SIZE + torn * rec;
+            let old: Vec<u8> = wal.mmap_slice()[at..at + REC_HEADER_SIZE + 16].to_vec();
+            wal.advance_checkpoint(wal.head());
+            assert!(wal.try_reset());
+            for i in 100..106u64 {
+                wal.append(Op::Tie { eid: 1, himo_id: 0, value: i }).unwrap();
+            }
+            wal.append(Op::Commit).unwrap();
+            let lap = wal.lap();
+            {
+                let m = wal.mmap_mut_slice();
+                assert_ne!(&m[at..at + REC_HEADER_SIZE + 16], &old[..], "前提: 今の周の record が同じ位置にある");
+                m[at..at + REC_HEADER_SIZE + 16].copy_from_slice(&old);
+                let t = at + REC_HEADER_SIZE + 16;
+                assert_eq!(u32::from_le_bytes(m[t..t + 4].try_into().unwrap()), lap, "前提: 印は今の周");
+            }
+            wal.fsync().unwrap();
+            drop(wal);
+            let wal = OpLog::open(&p).unwrap();
+            let values: Vec<u64> = wal
+                .recover_with_tail()
+                .iter()
+                .map(|r| match r.op {
+                    DecodedOp::Tie { value, .. } => value,
+                    ref o => panic!("Tie 以外: {o:?}"),
+                })
+                .collect();
+            let want: Vec<u64> = (100..100 + torn as u64).collect();
+            assert_eq!(values, want, "torn = {torn}: 前の周の中身 (値 {torn}) を今の周の record として読んだ");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
     /// v2 (周の印なし) の file は読めて、 最初に畳む時に v3 になる (header の version / capacity / 周、 以後の record に印)。
     /// 畳む前の record は印なしで読み、 畳んだ後の record は印つきで読む。
     #[test]
