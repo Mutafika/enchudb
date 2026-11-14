@@ -11378,22 +11378,21 @@ impl Engine {
         // fast path: free_locals_nonempty が false (= user table の常態) なら
         // mutex を取らずに通常 alloc に進む。 1M insert hot path で mutex
         // overhead (= 約 50 ns/op) を消す最適化。
-        // #731: 世代を持たない DB で表の場所を使い回す時は、 先に v15 に移る (使い回した行を世代の違う eid にする)。 `free_locals` を
-        // 握る前に (移る手順は消す書き手を待つ)
-        if !table.is_reserved()
-            && !self.generations().active()
-            && table.free_locals_nonempty.load(Ordering::Acquire)
-        {
-            self.move_to_generations().map_err(|e| format!("table '{table_name}': {e}"))?;
-        }
         let reused_global = if table.free_locals_nonempty.load(Ordering::Acquire) {
+            // #731: 世代を持たない DB で表の場所を使い回す時は、 先に v15 に移り終える (使い回した行を世代の違う eid にする)。
+            // `free_locals` を握る前に (移る手順は消す書き手を待つ)。 見るのは 「移り終えた」: 照合を始めただけ (`active`) で通すと、
+            // 移る途中の別の thread が上げる前の場所を拾う (#731 の試験を 8 本並べて 24 回に 1 回、 消えた行と同じ eid を渡した)
+            if !table.is_reserved() && !self.generations().moved() {
+                self.move_to_generations().map_err(|e| format!("table '{table_name}': {e}"))?;
+            }
             let mut fl = table.free_locals.lock().unwrap();
             // #868: 生きている slot と畳んだ自分の行の slot (#612) は飛ばす (消した行の一覧と全部なめが同じ穴を両方から積み、 片方で
             // 使い回された後 / 一覧に積んだ後に畳んだ形)。 生きている印は下の `allocate_at` と同じくこの lock の下で読む
             let mut global = None;
             while let Some(local) = fl.pop() {
+                // #731: 生きている印は Acquire で読む (消す側が印を下ろす前に上げた世代が見えるように、 `EntitySet::is_live_acquire`)
                 if let Some(g) = table.global_of(local)
-                    && !self.entities.is_live(g)
+                    && !self.entities.is_live_acquire(g)
                     && !self.is_folded_own_slot(g)
                     && !self.generations().retired(g)
                 {
@@ -12868,15 +12867,16 @@ impl Engine {
             ));
         };
         if reused {
-            // #731: 最初の使い回しで v15 に移る。 この場所はもう生きている印が立っている (移る時の穴埋めが見ない) ので自分で上げる
-            if !self.generations().active() {
-                if let Err(e) = self.move_to_generations() {
-                    self.live_free(local, None);
-                    return Err(format!("entity(): {e}"));
-                }
-                if self.generations().get(local) == 0 {
-                    self.raise_generation(local, 1);
-                }
+            // #731: 最初の使い回しで v15 に移る。 この場所はもう生きている印が立っている (移る時の穴埋めが見ない) ので、 世代 0
+            // (v14 の間に消えた場所) なら自分で上げる。 移り終えたかに関わらず見る (取り出した後に別の thread が移り終えた形でも)
+            if !self.generations().moved()
+                && let Err(e) = self.move_to_generations()
+            {
+                self.live_free(local, None);
+                return Err(format!("entity(): {e}"));
+            }
+            if self.generations().get(local) == 0 {
+                self.raise_generation(local, 1);
             }
             if self.generations().retired(local) {
                 // 世代を使い切った場所は渡さない (空きの山から外したまま、 次を取る)
@@ -15531,12 +15531,16 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     fn move_to_generations(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
-        if self.generations().active() {
+        if self.generations().moved() {
             return Ok(());
         }
         let _g = self.generations().move_lock.lock().unwrap_or_else(|p| p.into_inner());
-        if self.generations().active() {
+        if self.generations().moved() {
             return Ok(());
+        }
+        if self.generations().active() {
+            // 前に移る途中で失敗した (header を書き出せなかった等)。 使い回さずに断る
+            return Err(io::Error::other("an earlier move to eid generations (file version 15) did not finish"));
         }
         let Backing::Segments(set) = &self.backing else {
             return Err(io::Error::new(
@@ -15600,6 +15604,7 @@ impl Engine {
         }
         self.backing.flush_header(header_size)?;
         self.layout.write().unwrap().gen_bits = bits as u8;
+        self.generations().finish_move();
         Ok(())
     }
 

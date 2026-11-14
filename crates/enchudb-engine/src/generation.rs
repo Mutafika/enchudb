@@ -53,6 +53,9 @@ pub(crate) struct Generations {
     pub(crate) move_lock: std::sync::Mutex<()>,
     /// WAL の再生中 (`Engine::apply_oplog_op`)。 消す道が場所の世代を上げない (再生が record の世代で上げる)。
     pub(crate) replaying: std::sync::atomic::AtomicBool,
+    /// v15 に移り終えた (`Engine::move_to_generations` の最後 / v15 の DB を開いた時)。 `active` (照合を始めた) とは別: 移る途中
+    /// (照合は始めたが、 v14 の間に消した場所をまだ上げていない) に使い回しを始めると、 世代 0 の場所を前と同じ eid で渡す。
+    moved: std::sync::atomic::AtomicBool,
 }
 
 impl Generations {
@@ -63,6 +66,7 @@ impl Generations {
             gate: AtomicU64::new(0),
             move_lock: std::sync::Mutex::new(()),
             replaying: std::sync::atomic::AtomicBool::new(false),
+            moved: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -79,7 +83,19 @@ impl Generations {
         let _ = self.region.set(region);
         self.bits.store(bits, Ordering::Release);
         self.gate.fetch_or(GATE_ON, Ordering::AcqRel);
+        self.moved.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// v15 に移り終えたか ([`Self::finish_move`] / [`Self::attach`] の後)。
+    #[inline]
+    pub(crate) fn moved(&self) -> bool {
+        self.moved.load(Ordering::Acquire)
+    }
+
+    /// v15 に移り終えた印 (v14 の間に消した場所を上げ、 header を書き出した後)。
+    pub(crate) fn finish_move(&self) {
+        self.moved.store(true, Ordering::Release);
     }
 
     /// v15 に移る時: `region` を 0 から初めて (前の残りは消す)、 header を書く。 まだ照合は始めない ([`Self::start`])。

@@ -285,6 +285,21 @@ impl EntitySet {
         }
     }
 
+    /// [`Self::is_live`] の Acquire 版。 消えた (印が下りた) のを見たら、 消す側が印を下ろす前に書いた物 (#731: 場所の世代を上げた
+    /// 事) も見える。 使い回す場所を選ぶ所で使う (`is_live` は atomic でない読みなので、 下りたのを見ても上げた世代が見えない事が
+    /// ある = 消えた行と同じ eid を払い出して、 その行への書き込みが 「消えた行」 で断られた。 #733 の試験を 8 本並べて 32 回に 1 回)。
+    #[inline]
+    pub fn is_live_acquire(&self, eid: u32) -> bool {
+        if eid >= self.max_entities() { return false; }
+        let byte_off = self.bitset_offset + (eid / 8) as usize;
+        if !self.region.is_committed(byte_off + 1) {
+            return false;
+        }
+        let mm = self.region.slice();
+        let byte = unsafe { &*(mm.as_ptr().add(byte_off) as *const std::sync::atomic::AtomicU8) };
+        byte.load(Ordering::Acquire) & (1u8 << (eid % 8)) != 0
+    }
+
     #[inline]
     pub fn is_live(&self, eid: u32) -> bool {
         if eid >= self.max_entities() { return false; }
