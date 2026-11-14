@@ -32,9 +32,14 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn make_engine(path: &str, peer: PeerId) -> Arc<Engine> {
+    make_engine_cap(path, peer, 1000)
+}
+
+/// 表 `files` の枠を `cap` にする (#731: 枠 1 の表で消して足すと、 場所を使い回した行は世代の違う番号になる)。
+fn make_engine_cap(path: &str, peer: PeerId, cap: u32) -> Arc<Engine> {
     let _ = std::fs::remove_dir_all(path);
     let mut eng = Engine::create_with_cell_version(path, 65_536).unwrap();
-    eng.define_table("files", 1000).unwrap();
+    eng.define_table("files", cap).unwrap();
     for c in ["key", "module", "path"] {
         eng.define_himo_in("files", c, ValueType::Number, 0).unwrap();
     }
@@ -92,9 +97,20 @@ fn cleanup(paths: &[String]) {
 }
 
 fn run(tag: &str, emit: bool) -> Peers {
+    run_with(tag, emit, false)
+}
+
+/// `reuse`: B の行を、 消した行の場所を使い回した行にする (#731 段 4: 世代の違う世界番号。 知らせの宛名もその番号)。
+fn run_with(tag: &str, emit: bool, reuse: bool) -> Peers {
     let paths: Vec<String> = ["a", "b", "c"].iter().map(|p| tmp_path(&format!("{tag}-{p}"))).collect();
-    let (a, b, c) = (make_engine(&paths[0], 1), make_engine(&paths[1], 2), make_engine(&paths[2], 3));
+    let b_cap = if reuse { 1 } else { 1000 };
+    let (a, b, c) = (make_engine(&paths[0], 1), make_engine_cap(&paths[1], 2, b_cap), make_engine(&paths[2], 3));
     b.set_emit_alias(emit);
+    if reuse {
+        let f = b.entity_in("files").unwrap();
+        b.tie_to(f, "files.module", 9);
+        b.delete(f);
+    }
 
     let ea = a.entity_in("files").unwrap();
     a.tie_to(ea, "files.key", 7);
@@ -103,6 +119,9 @@ fn run(tag: &str, emit: bool) -> Peers {
     std::thread::sleep(Duration::from_millis(5));
 
     let eb = b.entity_in("files").unwrap();
+    if reuse {
+        assert!(enchudb_oplog::eid_local(eb) >= 1 << 24, "前提: B の行は場所を使い回した行 (世代 1): {eb:#x}");
+    }
     b.tie_to(eb, "files.module", 2);
     b.tie_to(eb, "files.path", 3);
     let recs_b0 = records_of(&b, 2);
@@ -175,8 +194,19 @@ fn without_alias_the_key_folds_the_duplicate_rows() {
 /// 新しい行を作らない (主キーで束ねる道は通らない = 主キーの無い record なので)。
 #[test]
 fn alias_maps_the_unseen_identity_onto_the_existing_row() {
-    let p = run("unseen", true);
-    let d_path = tmp_path("unseen-d");
+    alias_maps_unseen(false);
+}
+
+/// #731 段 4: B の行が消した行の場所を使い回した行 (世代 1) でも、 知らせの宛名はその行の世界番号 (世代込み) = D が受けた行に当たる。
+#[test]
+fn alias_names_a_reused_row_by_its_generation() {
+    alias_maps_unseen(true);
+}
+
+fn alias_maps_unseen(reuse: bool) {
+    let tag = if reuse { "unseen-reuse" } else { "unseen" };
+    let p = run_with(tag, true, reuse);
+    let d_path = tmp_path(&format!("{tag}-d"));
     let d = make_engine(&d_path, 4);
     apply(&d, &p.recs_b2);
     assert_eq!(rows_with_key(&d), vec![(Some(2), Some(3))], "前提: D に B の行の写しが 1 行");

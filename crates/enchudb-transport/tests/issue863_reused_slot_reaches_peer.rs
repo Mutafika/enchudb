@@ -436,3 +436,59 @@ fn the_state_carries_the_reused_rows_number() {
     assert_eq!(c.pull_raw("notes.note", 123u32), on_c, "state の後の差分が C の同じ行に当たらない");
     assert_eq!(c.table_eid_usage("notes").unwrap().live, 4, "C の行の数");
 }
+
+/// state の形: 自分の行の宛名・自分の行を指す Ref の値・外した cell (Untie)・消えた行 (Delete) は世代込みの番号。 消えた行を指したまま
+/// 場所を使い回した ref は出さない (前の住人が自分の行か翻訳した行か分からない、 今の住人を指して出すと別の行を指す)。
+#[test]
+fn the_state_names_own_rows_with_their_generation() {
+    use enchudb_oplog::oplog::DecodedOp;
+    let dir = Dir::new("state-shape");
+    let mut eng = Engine::create_with_capacity(&dir.db(A), 4096).unwrap();
+    eng.define_table("notes", 4).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "memo", ValueType::Number, 0).unwrap();
+    eng.define_ref_in("notes", "next", "notes").unwrap();
+    eng.enable_sync_tables().unwrap();
+    let a = Engine::concurrentize_with_oplog(eng, OPLOG).unwrap();
+    a.set_peer_id(A);
+    let tr = Arc::new(InMemoryTransport::new());
+    tr.register_peer(A);
+    let t: Arc<dyn Transport> = tr.clone();
+    let sa = Syncer::new(a.clone(), t);
+    let rows: Vec<u64> = (0..4u32)
+        .map(|i| {
+            let e = a.entity_in("notes").unwrap();
+            a.tie_to(e, "notes.note", 10 + i);
+            e
+        })
+        .collect();
+    // rows[0] → rows[1] (この後消えて場所を使い回される)、 rows[2] → y (使い回した行)
+    a.tie_ref_to(rows[0], "notes.next", rows[1]);
+    let y = reuse_second_row(&a, &rows);
+    a.tie_ref_to(rows[2], "notes.next", y);
+    a.tie_to(y, "notes.memo", 7u32);
+    a.untie(y, "notes.memo");
+    // rows[3] を消して場所を使い回した z を、 さらに消す
+    a.delete(rows[3]);
+    let z = a.entity_in("notes").unwrap();
+    assert_eq!(a.eid_slot(z), a.eid_slot(rows[3]), "前提: 4 行目の場所を使い回した");
+    a.tie_to(z, "notes.note", 55u32);
+    a.delete(z);
+    settle(&a);
+    let (note, memo, next) = ["notes.note", "notes.memo", "notes.next"].map(|h| a.himo_id(h).unwrap() as u16).into();
+    let st = sa.own_state().records;
+    let has = |f: &dyn Fn(&DecodedOp) -> bool| st.iter().any(|r| f(&r.op));
+    assert!(has(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, value: 99 } if *eid == y && *himo_id == note)), "使い回した行の Tie の宛名");
+    assert!(
+        has(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, value } if *eid == rows[2] && *himo_id == next
+            && *value == enchudb_oplog::eid_local(y) as u64)),
+        "使い回した行を指す ref の値が世代込みでない"
+    );
+    assert!(
+        !has(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, .. } | DecodedOp::TieRef { eid, himo_id, .. } if *eid == rows[0] && *himo_id == next)),
+        "消えた行を指したまま場所を使い回した ref を出した"
+    );
+    assert!(has(&|op| matches!(op, DecodedOp::Untie { eid, himo_id } if *eid == y && *himo_id == memo)), "使い回した行の Untie の宛名");
+    assert!(has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == z)), "使い回して消えた行の Delete の宛名");
+    assert!(!has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == rows[3] || *eid == rows[1])), "前の住人の番号で Delete を出した");
+}

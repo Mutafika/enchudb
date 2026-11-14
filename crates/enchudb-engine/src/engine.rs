@@ -17203,7 +17203,8 @@ impl Engine {
     fn own_world_slot(&self, local: u32) -> Option<u32> {
         let g = self.generations();
         if !g.active() {
-            return Some(local);
+            // 世代を持たない DB に世代の付いた番号が来るのは、 v15 に移った後の DB を前の写しに戻した時だけ (その番号の行はこの DB に無い)
+            return (local < self.max_entities()).then_some(local);
         }
         let slot = g.split(local).0;
         (self.last_local_of_slot(slot) == local).then_some(slot)
