@@ -180,3 +180,70 @@ fn control_a_delete_that_waits_while_inside_deadlocks() {
 fn control_a_holder_that_takes_the_write_lock_first_deadlocks() {
     model(Shape { delete_backs_off: true, write_lock_first: true });
 }
+
+/// #896: WAL の空きを待つ書き手は門を出て、 空いたら入り直す。 入り直す時に閉じていれば、 出たまま `closer` を待ってから入る
+/// (`GatesStepOut`)。 `reenter_waits` = 正しい形、 false = 対照 (閉じていても入る)。
+fn step_out_model(reenter_waits: bool) {
+    let mut b = loom::model::Builder::new();
+    b.preemption_bound = Some(2);
+    b.check(move || {
+        let col = Arc::new(Column::new());
+        // WAL の空き (別の thread が空ける)
+        let room = Arc::new(loom::sync::atomic::AtomicBool::new(false));
+        // 書き手が門の中に居るか (止める側が 「中が 0」 を見て持つ間は false のはず)
+        let inside = Arc::new(loom::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (col, room, inside) = (col.clone(), room.clone(), inside.clone());
+            thread::spawn(move || {
+                col.enter();
+                inside.store(true, Ordering::SeqCst);
+                // 積もうとして満杯: 門を出て空きを待つ (何も積んでいない)
+                inside.store(false, Ordering::SeqCst);
+                col.exit();
+                while !room.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                // 入り直す
+                if reenter_waits {
+                    col.enter();
+                } else {
+                    col.gate.fetch_add(1, Ordering::Acquire);
+                }
+                inside.store(true, Ordering::SeqCst);
+                apply(&col);
+                inside.store(false, Ordering::SeqCst);
+                col.exit();
+            })
+        };
+        // 止める側 (円柱を組む): 閉じて中を待ち、 持つ間に書き手が中に居ない
+        let holder = {
+            let (col, inside) = (col.clone(), inside.clone());
+            thread::spawn(move || {
+                let _h = col.hold(false);
+                assert!(!inside.load(Ordering::SeqCst), "止める側が持つ間に書き手が門の中");
+                thread::yield_now();
+                assert!(!inside.load(Ordering::SeqCst), "止める側が持つ間に書き手が門の中");
+            })
+        };
+        let maker = {
+            let room = room.clone();
+            thread::spawn(move || room.store(true, Ordering::Release))
+        };
+        writer.join().unwrap();
+        holder.join().unwrap();
+        maker.join().unwrap();
+    });
+}
+
+/// #896: 空きを待つ間だけ門を出て入り直す形は止まらず、 止める側が持つ間に書き手は門に居ない。
+#[test]
+fn a_writer_stepping_out_for_wal_room_reenters_after_the_holder() {
+    step_out_model(true);
+}
+
+/// 対照: 入り直す時に閉じていても入ると、 止める側が持つ間に書き手が門の中に居る (loom が窓を見つける)。
+#[test]
+#[should_panic]
+fn control_a_writer_reentering_a_closed_gate_is_inside_while_held() {
+    step_out_model(false);
+}

@@ -199,7 +199,27 @@ impl IntentGate {
         let pass = self.gate.try_enter()?;
         #[cfg(debug_assertions)]
         held::push(self);
-        Some(IntentPass { _pass: pass, #[cfg(debug_assertions)] gate: self })
+        Some(IntentPass { _pass: pass, gate: self })
+    }
+
+    /// #896: この thread が入っている門を一時出る ([`Self::try_step_in`] で入り直す)。 中でまだ何も積んでいない間だけ呼ぶ (WAL の
+    /// 空きを待つ書き手: 積む record の印は位置を持たない)。 出ている間、 止める側は待たずに始められる。
+    pub(crate) fn step_out(&self) {
+        // Release: 入った時からの読み書きを、 中が空いたのを見た止める側に見せる (`Pass` の drop と同じ)
+        self.gate.shards[shard_index()].0.fetch_sub(1, Ordering::Release);
+    }
+
+    /// [`Self::step_out`] した門に入り直す。 閉じていれば入らずに false (呼び手は出た門を全部出てから [`Self::wait`] して
+    /// やり直す)。
+    pub(crate) fn try_step_in(&self) -> bool {
+        let s = &self.gate.shards[shard_index()].0;
+        // Acquire: 開けた側の Release と対 (`try_enter` と同じ)
+        if s.fetch_add(1, Ordering::Acquire) & CLOSED == 0 {
+            true
+        } else {
+            s.fetch_sub(1, Ordering::Relaxed);
+            false
+        }
     }
 
     /// 止める側が終わるのを待つ (止める側は閉じている間ずっと `closer` を持つ)。
@@ -221,8 +241,15 @@ impl IntentGate {
 /// [`IntentGate`] の中に居る間持つ。
 pub(crate) struct IntentPass<'a> {
     _pass: Pass<'a>,
-    #[cfg(debug_assertions)]
     gate: &'a IntentGate,
+}
+
+impl<'a> IntentPass<'a> {
+    /// 入った門。
+    #[inline]
+    pub(crate) fn gate(&self) -> &'a IntentGate {
+        self.gate
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -313,6 +340,31 @@ mod tests {
         assert!(!gate.is_closed());
         let p = gate.try_enter();
         assert!(p.is_some(), "開けた門に入れない");
+    }
+
+    /// 止める側 (`hold`) は、 中の書き手が長く居る間 (300 ms) CPU を回さない (少し回った後は眠る)。 前は yield で回り続けた (#873 の
+    /// 2 回目のレビュー。 yield で回る形は 300 ms に約 3 万回)。
+    #[test]
+    fn intent_hold_sleeps_while_a_writer_stays_inside() {
+        let gate = std::sync::Arc::new(IntentGate::new());
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let inside = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let _p = gate.enter();
+                in_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        };
+        in_rx.recv().unwrap();
+        let waits = PATIENT_WAITS.load(Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        drop(gate.hold());
+        let (took, waits) = (t.elapsed(), PATIENT_WAITS.load(Ordering::Relaxed) - waits);
+        inside.join().unwrap();
+        assert!(took >= Duration::from_millis(200), "前提: 止める側は中の書き手を待った ({took:?})");
+        // 眠れば 300 ms で数百回 (他の試験が同じ数を足しうるので上限は広め)
+        assert!(waits < 3_000, "止める側が回り続けた (300 ms に {waits} 回)");
     }
 
     /// 止める側 (`hold`) は中の書き手が出るまで返らず、 持っている間に来た書き手は待ち、 放すと入る。
