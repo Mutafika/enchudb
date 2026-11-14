@@ -153,8 +153,8 @@ fn a_deleted_row_is_not_reissued_after_closing_while_tables_cannot_be_written() 
 }
 
 /// 落ちた像を開いて再生した直後にもう一度落ちても (開いた engine も `tables` を書けない)、 消した行の eid を払い出さない。 前は開く時の
-/// 再生の後に checkpoint を進め、 2 度目の像では消した行の record が再生されなかった。 開き方は 2 通り (`open_concurrent_with_oplog` と、
-/// `open_standalone` の後の `concurrentize_with_oplog`。 再生の道が別)。
+/// 再生の後に checkpoint を進め、 2 度目の像では消した行の record が再生されなかった。 開き方は 2 通り: `open_concurrent_with_oplog` と、
+/// `open_standalone` (#880 の後は、 中で WAL 付きの open を通って再生してから開く。 `tables` を書けないと checkpoint を進められないので断る)。
 #[test]
 fn a_deleted_row_is_not_reissued_after_a_second_crash_right_after_opening() {
     for standalone in [false, true] {
@@ -164,11 +164,18 @@ fn a_deleted_row_is_not_reissued_after_a_second_crash_right_after_opening() {
         // 開いた engine も `tables` を書けない (= 開いてから最初に書くまでの間に落ちた形を、 時間でなく状態で作る)
         block_tables(&image, true);
         let path = image.to_str().unwrap();
-        let eng = if standalone {
-            Engine::concurrentize_with_oplog(Engine::open_standalone(path).unwrap(), 4 << 20).unwrap()
-        } else {
-            Engine::open_concurrent_with_oplog(path, 4 << 20).unwrap()
-        };
+        // #880: 単独の open は、 先に WAL 付きの open で再生して閉じる。 `tables` を書けないとその往復で checkpoint を進められない
+        // ので断る (消した行の record は WAL に残る = 2 度目の像も再生する)。 書けるように戻した後の open は消した行の eid を払い出さない
+        if standalone {
+            match Engine::open_standalone(path) {
+                Err(e) => assert!(e.to_string().contains("#880"), "断った理由: {e}"),
+                Ok(_) => panic!("`tables` を書けないのに単独で開いた (再生した Delete の record を残せない)"),
+            }
+            block_tables(&image, false);
+            assert_ne!(first_new_eid(&image), x, "standalone: 断った後に開き直して、 消した行の eid {x:#x} をもう一度払い出した");
+            continue;
+        }
+        let eng = Engine::open_concurrent_with_oplog(path, 4 << 20).unwrap();
         wait_one_tick_or_idle(&eng);
         assert_eq!(eng.fault_count(FaultKind::DiskSpace), 0, "前提: 本体の書き出しは成功している (書けないのは `tables` だけ)");
         let again = s.0.join("again");
