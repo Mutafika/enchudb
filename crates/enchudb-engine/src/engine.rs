@@ -4226,6 +4226,68 @@ mod apply_liveness_tests {
         assert_eq!((a, rejected, y2, y3), (Ok(()), 0, Some(u64::from(B_WRITES - 1)), 0), "{kind:?}: A / B / C の書き込み");
     }
 
+    /// #896: 門を出て空きを待つ書き手は、 空いた時に止める側が門を持っていれば、 出たまま止める側を待ってから入り直す (積む前 = 印に
+    /// 位置が無い)。 A を積んだ後・当てる前で止めて B (y への tie) に空きを待たせ、 y の `write_guard` を取ってから A を放す (空きが
+    /// できる)。 guard を持つ間 (1.5 秒)、 B は進まず、 D (別の行の x への tie) は WAL の数倍を書ける (B が門を待たずに入って積むと、
+    /// B の印が checkpoint を止めて D も止まる)。 放した後は B / D とも全部当たる。
+    #[test]
+    fn a_writer_stepping_in_waits_for_a_holder_before_appending() {
+        let p = path("stepin");
+        let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
+        let (eng, x, y, _) = open(eng, false);
+        let (e1, e2, e4) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        cell_append_hook::set(&wal, move |_| {
+            in_tx.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, x, 1u32))
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が積んだ後・当てる前で止まった");
+        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let b = {
+            let (eng, b_done) = (eng.clone(), b_done.clone());
+            std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut stalled = u32::MAX;
+        while Instant::now() < until {
+            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
+            if now == stalled {
+                break;
+            }
+            stalled = now;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let guard = eng.himos[y as usize].write_guard();
+        release.send(()).unwrap();
+        let a = a.join().unwrap();
+        let d_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let d = {
+            let (eng, d_done) = (eng.clone(), d_done.clone());
+            std::thread::spawn(move || write_many(&eng, e4, x, B_WRITES, &d_done))
+        };
+        std::thread::sleep(hold());
+        let (b_held, d_held) = (b_done.load(std::sync::atomic::Ordering::Acquire), d_done.load(std::sync::atomic::Ordering::Acquire));
+        drop(guard);
+        let ((b_rejected, _), (d_rejected, _)) = (b.join().unwrap(), d.join().unwrap());
+        let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
+        let (y2, x4) = (eng.get_by_id(e2, y), eng.get_by_id(e4, x));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        eprintln!("[stepin] B は {stalled} 件で空きを待ち、 guard を持つ間に {b_held} 件 / D は guard を持つ間に {d_held} 件");
+        assert!(stalled < B_WRITES, "前提: B が空きを待った");
+        assert_eq!(a, Ok(()), "書き手 A");
+        assert!(b_held <= stalled + 1, "B が止める側を待たずに進んだ ({stalled} → {b_held} 件)");
+        assert!(d_held >= B_BEFORE_RELEASE, "D が止まった (guard を持つ間に {d_held} 件): B が門を待たずに積んで印を持った");
+        assert_eq!((b_rejected, d_rejected, dropped, timeouts), (0, 0, 0, 0), "断られた / 落とした / 待ち切れ");
+        assert_eq!((y2, x4), (Some(u64::from(B_WRITES - 1)), Some(u64::from(B_WRITES - 1))), "B / D の値");
+    }
+
     /// 当てている途中の書き手の手前で切っても、 書き出しに失敗した空け作りは 「当てている途中」 (`WalRoom::Applying`) と返さない
     /// (書き出せない間は畳めない = 待つ書き手は諦めてよい)。 前は切った回数だけを見て `Applying` と返し、 待つ書き手が上限 (5 秒) まで
     /// 待った (#873 の 2 回目のレビュー)。 結果は、 A の居ない同じ空け作り (書き出しに失敗) と同じ。
