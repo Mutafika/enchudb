@@ -3019,10 +3019,6 @@ mod wal_reject_tests {
     }
 }
 
-/// #563 / #505: 同じ cell の 2 本の書き手で、 WAL に積む順と cell に当てる順がずれない。 1 本目が積んだ後・当てる前 (割り込み点) に
-/// 2 本目を走らせる。 行を握ったまま積んで当てる今の形なら 2 本目は 1 本目が当て終えるまで待つ。 前の形 (積んでから握る) だと 2 本目が
-/// 先に当て、 版数の無い DB では cell が WAL の最後の record と違う値で残り、 版数のある DB では 1 本目が `OlderThanCell` で弾かれた
-/// (`same_cell_wal_order.rs` は確率的で、 直す前に 1 round 約 5 %)。
 /// #882 / #883: 同じ slot を 2 回払い出す窓 2 つを、 割り込み点で決まって踏む。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod slot_claim_tests {
@@ -3141,6 +3137,55 @@ mod slot_claim_tests {
     }
 }
 
+/// #877: 消す行を WAL に積んだ後・数える前に並んだ `oplog_sync` が checkpoint を進めない (割り込み点 `cell_append_hook`)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod freed_count_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_delete_appended_but_not_counted_holds_oplog_sync() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-freedcount-{}-{nanos}.db", std::process::id());
+        let image = format!("{path}.image");
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("t", 100).unwrap();
+        let a = eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        // consumer の周期は `tables` を書くので止める (行 x を sidecar より先に置いたまま)
+        let hold = eng.hold_consumer();
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to_by_id(x, a, 7u32);
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let synced: Arc<std::sync::Mutex<Option<std::io::Result<()>>>> = Arc::default();
+        let (eng2, synced2) = (eng.clone(), synced.clone());
+        // Delete を積んだ直後 (数える前) に、 並んだ書き手の `oplog_sync` が走る
+        cell_append_hook::set(&wal, move |_| {
+            *synced2.lock().unwrap() = Some(eng2.oplog_sync());
+        });
+        eng.delete(x);
+        synced.lock().unwrap().take().expect("前提: 割り込み点を通った").unwrap();
+        // この瞬間に落ちた像 (WAL と本体は書き出し済み、 `tables` は x を足す前の物)
+        assert!(std::process::Command::new("cp").arg("-R").arg(&path).arg(&image).status().unwrap().success());
+        drop(hold);
+        drop((wal, eng));
+        let reopened = Engine::open_concurrent_with_oplog(&image, 1 << 20).unwrap();
+        let y = reopened.entity_in("t").unwrap();
+        drop(reopened);
+        for p in [&path, &image] {
+            let _ = crate::db_files::remove_db(p);
+            let _ = std::fs::remove_file(oplog_path_for(p));
+        }
+        assert_ne!(y, x, "落ちた後に、 消した行の eid {x:#x} をもう一度払い出した");
+    }
+}
+
+/// #563 / #505: 同じ cell の 2 本の書き手で、 WAL に積む順と cell に当てる順がずれない。 1 本目が積んだ後・当てる前 (割り込み点) に
+/// 2 本目を走らせる。 行を握ったまま積んで当てる今の形なら 2 本目は 1 本目が当て終えるまで待つ。 前の形 (積んでから握る) だと 2 本目が
+/// 先に当て、 版数の無い DB では cell が WAL の最後の record と違う値で残り、 版数のある DB では 1 本目が `OlderThanCell` で弾かれた
+/// (`same_cell_wal_order.rs` は確率的で、 直す前に 1 round 約 5 %)。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod cell_wal_order_tests {
     use super::*;
@@ -12872,7 +12917,11 @@ impl Engine {
         }
         for t in self.tables.iter() {
             if let Some(idx) = t.local_of(local) {
-                t.freed_end.fetch_max(idx.saturating_add(1), Ordering::AcqRel);
+                // #878: anonymous の表は数えない (`entity()` は `EntitySet` から払い出し、 `next_local` も `tables` も使わない。
+                // 数えると `persisted_next` が 0 のままなので、 anonymous だけの DB では `oplog_sync` が checkpoint を止め続けた)
+                if !t.name.is_empty() {
+                    t.freed_end.fetch_max(idx.saturating_add(1), Ordering::AcqRel);
+                }
                 return;
             }
         }
@@ -18641,6 +18690,13 @@ impl Engine {
         let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
         let applying = self.local_apply_row(eid);
+        // #877: 版数の無い DB は、 消す行を WAL に積む前に数える (#857 の止め)。 積んだ後・`apply_delete_in` の中で数える前に
+        // 並んだ `oplog_sync` が checkpoint を Delete の後ろへ進めると、 その行の Tie も Delete も再生されず、 落ちた後に
+        // `next_local` が消した行の手前に戻った。 先に数えて積めなかった (断った) 時は、 止めが次に `tables` を置くまで延びるだけ。
+        // 門 (`local_apply_row`) を待った後に数える (待つ間に止めを延ばさない)
+        if !self.has_cell_version() {
+            self.note_freed_slot(eid, enchudb_oplog::Hlc::ZERO);
+        }
         let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark()) else {
             return;
         };
