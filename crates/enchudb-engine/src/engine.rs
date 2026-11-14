@@ -1078,6 +1078,8 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
             eid_range_hi,
             fk_refs,
             next_local,
+            persisted_next: std::sync::atomic::AtomicU32::new(next_local_u32),
+            freed_end: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             extra: std::sync::RwLock::new(Vec::new()),
@@ -5280,6 +5282,12 @@ pub(crate) struct TableDef {
     /// (= Arc<Engine> 経由の concurrent mode) で row insert する path が
     /// CAS で並行 safe に払出できる。
     pub next_local: std::sync::atomic::AtomicU32,
+    /// #857: `tables` の sidecar に置いてある `next_local` (この値より前の local は、 落ちた後に開いても払い出し済みと
+    /// 分かる)。 開いた時は sidecar の値、 以後は置けた時に進める。
+    pub(crate) persisted_next: std::sync::atomic::AtomicU32,
+    /// #857: 版数なしで消した行の local の最大 + 1 ([`Engine::note_freed_slot`])。 [`Self::persisted_next`] より大きい間、
+    /// `oplog_sync` は checkpoint を進めない。
+    pub(crate) freed_end: std::sync::atomic::AtomicU32,
     /// 0.8.0: free list = reclaim で解放された local id の reservoir。
     /// `entity_in(table)` は free list が non-empty なら pop で再利用、
     /// 空なら通常通り `next_local.fetch_add(1)`。 `_sync_ops` の長期運用で
@@ -5317,6 +5325,8 @@ impl Clone for TableDef {
             next_local: std::sync::atomic::AtomicU32::new(
                 self.next_local.load(std::sync::atomic::Ordering::Relaxed)
             ),
+            persisted_next: std::sync::atomic::AtomicU32::new(self.persisted_next.load(std::sync::atomic::Ordering::Relaxed)),
+            freed_end: std::sync::atomic::AtomicU32::new(self.freed_end.load(std::sync::atomic::Ordering::Relaxed)),
             // free_locals は Arc なので share される (= clone は same reservoir を
             // 指す)。 これは TableDef::clone を「meta read 用 snapshot」 として
             // 使う既存 caller の semantic と整合 (= 並列 race しないように caller
@@ -5414,6 +5424,8 @@ impl TableDef {
             eid_range_hi: u32::MAX,
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
+            persisted_next: std::sync::atomic::AtomicU32::new(0),
+            freed_end: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
@@ -11248,6 +11260,8 @@ impl Engine {
             eid_range_hi: new_hi,
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
+            persisted_next: std::sync::atomic::AtomicU32::new(0),
+            freed_end: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
@@ -11828,14 +11842,53 @@ impl Engine {
     /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_tables_file(&self) -> io::Result<()> {
+        // #857: 置く値を先に控える (並んだ払い出しで、 直列化が読む値はこれ以上)
+        let placed: Vec<u32> = self.tables.iter().map(persisted_next_local).collect();
         let bytes = serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw(), &self.answer_decls_raw());
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
-        if last.as_deref() == Some(bytes.as_slice()) {
-            return Ok(());
+        if last.as_deref() != Some(bytes.as_slice()) {
+            crate::db_files::write_atomic_if_changed(&tables_path_for(&self.path), &bytes)?;
+            *last = Some(bytes);
         }
-        crate::db_files::write_atomic_if_changed(&tables_path_for(&self.path), &bytes)?;
-        *last = Some(bytes);
+        for (t, n) in self.tables.iter().zip(placed) {
+            t.persisted_next.fetch_max(n, std::sync::atomic::Ordering::AcqRel);
+        }
         Ok(())
+    }
+
+    /// #857: 行 `local` を消す (生きている印を下ろす前に呼ぶ)。 その表の 「消した行の local の最大 + 1」 を進める。
+    ///
+    /// 開く時の `next_local` は 「sidecar の値」 と 「生きている行の最大 + 1」 (#117) と 「再生した record」 の大きい方。 足して
+    /// 消した行は、 sidecar に届く前に Tie も Delete も checkpoint を越えると、 どれにも残らない = 落ちた後に同じ eid を
+    /// もう一度払い出す (sync の DB では、 削除を受けた相手がその eid 宛ての書き込みを版数によらず捨てる)。 consumer の周期の
+    /// 書き出しと空け作りは checkpoint の前にいつも `tables` を書くが、 `oplog_sync` は書かない。 なので `oplog_sync` は、
+    /// 消した行が sidecar より先にある間 checkpoint を進めない ([`Self::checkpoint_held_for_freed_slots`]): その行の record は
+    /// WAL に残り、 落ちた後に再生されて `next_local` を進める。 次の consumer の周期が `tables` を書いてから進める。
+    /// `oplog_sync` で `tables` を書く形は、 1 回が 0.1 ms → 5 ms になった (tmp + fsync + rename)。
+    ///
+    /// 版数の列のある DB (sync の DB) で版数つきの削除は、 tombstone が本体の書き出しで届き、 開く時にその local を払い出し
+    /// 済みと数える (`scan_interrupted_deletes`) ので、 ここでは数えない。
+    fn note_freed_slot(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        use std::sync::atomic::Ordering;
+        if hlc != enchudb_oplog::Hlc::ZERO && self.has_cell_version() {
+            return;
+        }
+        for t in self.tables.iter() {
+            if let Some(idx) = t.local_of(local) {
+                t.freed_end.fetch_max(idx.saturating_add(1), Ordering::AcqRel);
+                return;
+            }
+        }
+    }
+
+    /// #857: 版数なしで消した行のどれかが、 `tables` の sidecar の `next_local` より先にある ([`Self::note_freed_slot`])。
+    /// sidecar を持たない engine (path の無い memory / wasm) は止めない (落ちた後に開き直す物が無い。 `persisted_next` も進まない)。
+    fn checkpoint_held_for_freed_slots(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.path.is_empty() || cfg!(target_arch = "wasm32") {
+            return false;
+        }
+        self.tables.iter().any(|t| t.freed_end.load(Ordering::Acquire) > t.persisted_next.load(Ordering::Acquire))
     }
 
     /// β-light step 7: 現 tables Vec を sidecar に保存する (best effort)。
@@ -14656,6 +14709,8 @@ impl Engine {
         {
             return false; // 既に記録した削除より古い Delete — 巻き戻さない
         }
+        // #857: 生きている印を下ろす前に数える (下ろした印が書き出しに入った `oplog_sync` は、 必ずこの数を見る)
+        self.note_freed_slot(local, hlc);
         // monotone-max。 同値なら版数側は no-op になるが、 本体除去は必ず走らせる。
         self.set_tombstone_local(local, hlc);
         // #513: 主キーの cell を消す前に、 その主キーを覚える
@@ -14883,6 +14938,11 @@ impl Engine {
                 continue; // 削除されていない = 常態
             }
             let local = local as u32;
+            // #857: tombstone のある local は払い出し済み。 sidecar の `next_local` が古くても (0.37.4 以前が、 足して消した
+            // 行を sidecar に届ける前に落ちた像)、 その local をもう一度払い出さない
+            if repair {
+                Self::advance_table_next_local_for(&self.tables, local);
+            }
             if !self.entities.is_live(local) {
                 continue;
             }
@@ -21635,6 +21695,9 @@ impl Engine {
                 // `set_tombstone_local` で弾いて本体を残していた。
                 let local = enchudb_oplog::eid_local(*eid);
                 self.apply_delete_local(local, hlc);
+                // #857: 消した行の eid も払い出し済み (Tie の record が checkpoint の手前に畳まれていても、 `next_local` を
+                // その手前に戻さない。 生きている印は下ろしたままなので、 生きている行の最大 + 1 (#117) には入らない)
+                Self::advance_table_next_local_for(&self.tables, local);
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
@@ -23188,6 +23251,9 @@ impl Engine {
     /// 例外は WAL 満杯 (`append_dead`) で、 こちらは fold が畳んで回復する設計上の
     /// 経路なので従来どおり `Ok`。 落ちた分は `wal_dropped_records()` /
     /// `wal_commit_failures()` で数えられる。
+    ///
+    /// #857: 版数なしで消した行が `tables` の sidecar より先にある間は checkpoint を進めない (書いた分は届いている。 進めるのは
+    /// `tables` を書く consumer の周期)。
     pub fn oplog_sync(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         self.debug_check_in_place();
@@ -23217,8 +23283,12 @@ impl Engine {
                 }
                 return Err(e);
             }
+            // #857: sidecar の `next_local` より先の行を (版数なしで) 消していたら、 checkpoint を進めない。 進めた後に落ちると、
+            // その行の Tie も Delete も再生されず、 開いた `next_local` が消した行の手前に戻る。 進めるのは `tables` を書いてから
+            // 進める consumer の周期 (100 ms 以内) に任せる。 書いた分は WAL の fsync と本体の書き出しで届いている
+            let held = self.checkpoint_held_for_freed_slots();
             // #268: Commit 失敗時に checkpoint を進めない理由は consumer tick と同じ。
-            if commit_res.is_ok() || wal.append_dead() {
+            if (commit_res.is_ok() || wal.append_dead()) && !held {
                 wal.advance_checkpoint(durable_head);
             }
             self.durable_lsn.store(durable_lsn, Ordering::Release);
