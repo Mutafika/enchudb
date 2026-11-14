@@ -2112,6 +2112,42 @@ mod relay_hook {
     }
 }
 
+/// [`Engine::set_state_scan_hook`] の置き場 (engine の番地ごと)。 欄を engine に足さない (並びが変わる)。
+mod state_scan_hook {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    /// (engine の番地, 列, 呼ぶ物)
+    static HOOKS: Mutex<Vec<(usize, u16, Hook)>> = Mutex::new(Vec::new());
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn set(engine: &super::Engine, hook: Option<(u16, Hook)>) {
+        let at = engine as *const super::Engine as usize;
+        let mut v = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|(e, _, _)| *e != at);
+        if let Some((himo_id, f)) = hook {
+            v.push((at, himo_id, f));
+        }
+        ARMED.store(!v.is_empty(), Ordering::Release);
+    }
+
+    pub(super) fn before_column(engine: &super::Engine, himo_id: u16) {
+        if !ARMED.load(Ordering::Acquire) {
+            return;
+        }
+        let at = engine as *const super::Engine as usize;
+        let hit = {
+            let mut v = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(i) = v.iter().position(|(e, h, _)| *e == at && *h == himo_id) else { return };
+            let (_, _, f) = v.swap_remove(i);
+            ARMED.store(!v.is_empty(), Ordering::Release);
+            f
+        };
+        hit();
+    }
+}
+
 /// test 用の WAL の割り込み点の置き場 (#579)。 WAL (番地で見分ける) ごとに 1 つ置き、 置いた WAL で 1 回だけ呼ぶ。 前は process に
 /// 置き場が 1 つで、 同じ割り込み点を使う試験が並んで走ると、 後に置いた試験が先の試験の割り込み点を消した。
 #[cfg(test)]
@@ -10955,6 +10991,7 @@ impl Engine {
                 continue;
             }
             let himo_id = hid as u16;
+            state_scan_hook::before_column(self, himo_id);
             let vt = self.value_types[hid];
             let ver_col = if has_cell_version { self.ver_col(himo_id) } else { None };
             let version = |local: u32| match ver_col {
@@ -13492,6 +13529,15 @@ impl Engine {
     #[doc(hidden)]
     pub fn set_relay_hook(&self, after: u64, f: Box<dyn FnOnce() + Send>) {
         relay_hook::set(self, after, f);
+    }
+
+    /// 試験: この engine の state の合成 ([`Engine::state_records`] / [`Engine::state_records_for`]) が列 `himo_id` を走査する直前に、
+    /// 1 回だけ `f` を呼ぶ (`as_of` を採って書き手を待った後、 前の列の走査の後。 呼ぶ thread は合成している thread)。 合成の途中の
+    /// 書き込み (版数が `as_of` より後の cell) を、 thread の重なりに任せずに作る (#890)。 置き直すと前の物を置き換え、 None は外す。
+    /// 製品の道は列ごとに atomic を 1 回読むだけ。
+    #[doc(hidden)]
+    pub fn set_state_scan_hook(&self, hook: Option<(u16, Box<dyn FnOnce() + Send>)>) {
+        state_scan_hook::set(self, hook);
     }
 
     /// **pre-v9 DB の版数置き場**への参照 (legacy)。 v9 DB では空のまま
