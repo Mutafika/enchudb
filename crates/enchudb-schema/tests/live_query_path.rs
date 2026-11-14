@@ -1432,7 +1432,8 @@ fn run_top(path: &str) {
                 .iter()
                 .copied()
                 .filter(|&e| (s.cond)(e))
-                .filter_map(|e| (s.key)(e).map(|v| (if s.desc { -v } else { v }, (e & 0xFFFF_FFFF) as u32, e)))
+                // #731: 同じ値は場所の順 (使い回した行の eid は世代が違う)。 既定の DB の場所は下 24 bit
+                .filter_map(|e| (s.key)(e).map(|v| (if s.desc { -v } else { v }, (e as u32) & ((1 << 24) - 1), e)))
                 .collect();
             want.sort_unstable();
             want.truncate(s.k);

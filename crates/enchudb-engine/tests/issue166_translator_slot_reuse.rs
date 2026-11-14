@@ -78,7 +78,7 @@ fn take_over_slot(eng: &Engine, slot: u32) -> (enchudb_oplog::EntityId, Vec<ench
     let mut fillers = Vec::new();
     for _ in 0..8 {
         match eng.entity_in("t") {
-            Ok(e) if enchudb_oplog::eid_local(e) == slot => return (e, fillers),
+            Ok(e) if eng.eid_slot(e) == slot => return (e, fillers), // #731: 場所で見る (使い回した行の eid は世代が違う)
             Ok(e) => fillers.push(e),
             Err(e) => panic!("entity_in 失敗: {e} (fillers={})", fillers.len()),
         }

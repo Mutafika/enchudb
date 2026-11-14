@@ -138,7 +138,7 @@ fn reusing_the_merged_slot_drops_the_alias() {
     let mut reused = false;
     for _ in 0..600 {
         let e = eng.entity_in("files").unwrap();
-        if enchudb_oplog::eid_local(e) == enchudb_oplog::eid_local(dst) {
+        if eng.eid_slot(e) == eng.eid_slot(dst) { // #731: 場所で見る (使い回した行の eid は世代が違う)
             reused = true;
             break;
         }

@@ -258,7 +258,7 @@ impl<'a, D: Decoder> Ingest<'a, D> {
                 Some(v) => v as u64,
                 None => return Ok(None),
             },
-            (ColumnType::Ref, Value::Ref(e)) => enchudb_oplog::eid_local(*e) as u64,
+            (ColumnType::Ref, Value::Ref(e)) => eng.ref_value(*e), // #731: Ref の cell の値 (段 1 は場所)
             _ => {
                 let t = self.db.get_table(table).ok_or(format!("unknown table {table}"))?;
                 return t.where_eq(&m.pk.name, k.clone()).find_one().map_err(|e| format!("{e:?}"));

@@ -521,7 +521,8 @@ fn reused_slots_carry_no_delete() {
         assert!(made < 5000, "前提: 消した行の slot が使い回されない (使い回した {reused})");
         let e = c1.create_quick(1000 + made, made);
         made += 1;
-        if rows.contains(&e) {
+        // #731: 場所を使い回した行の eid は世代が違う (既定の DB の場所は下 24 bit)
+        if rows.iter().any(|r| (*r as u32) & 0xFF_FFFF == (e as u32) & 0xFF_FFFF) {
             reused += 1;
             let (records, _) = c1.eng.state_records();
             let left = own_deletes(&StateBatch { records, as_of: Hlc::ZERO, complete: true }, 1);

@@ -317,7 +317,10 @@ fn delete_reuse_id() {
     assert_eq!(db.get(target, "val"), None);
 
     let reused = db.entity().unwrap();
-    assert_eq!(reused, target, "free stack should return the freed ID");
+    // #731: 場所は使い回し、 eid は世代が違う (既定の DB の場所は下 24 bit)。 古い eid は 「消えた行」 のまま
+    assert_eq!(reused as u32 & 0xFF_FFFF, target as u32 & 0xFF_FFFF, "free stack should return the freed slot");
+    assert_ne!(reused, target, "the reused slot must get a new eid");
+    assert!(!db.is_live(target));
 
     // 再利用 ID には古い紐が残っていない
     assert_eq!(db.get(reused, "kind"), None, "stale kind on reused id");

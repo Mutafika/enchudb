@@ -272,7 +272,9 @@ fn reused_eid_with_the_same_key_leaves_and_reenters() {
     assert_eq!(q.poll(&eng).added, vec![(a, 3)]);
     eng.delete(a);
     let b = eng.entity().unwrap();
-    assert_eq!(b, a, "前提: 容量 1 なら削除した slot が再利用される");
+    // #731: 場所は使い回し、 eid は世代が違う
+    assert_eq!(eng.eid_slot(b), eng.eid_slot(a), "前提: 容量 1 なら削除した slot が再利用される");
+    assert_ne!(b, a);
     eng.tie(b, "u.city", 3u32);
     let d = q.poll(&eng);
     assert_eq!((d.removed, d.added, d.reentered), (vec![(a, 3)], vec![(b, 3)], vec![b]));

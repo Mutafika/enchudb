@@ -168,13 +168,18 @@ fn world(tag: &str) -> World {
     World { p1, p2, p3, p4, tr, dir }
 }
 
+/// #731: eid の場所 (使い回した行の eid は世代が違う。 既定の DB の場所は下 24 bit)。 translator の鍵も場所。
+fn slot(e: u64) -> u32 {
+    eid_local(e) & 0xFF_FFFF
+}
+
 /// P1 が P2 の行 `key` を消す (commit しない)。 消した slot と、 消す前の bridge の行の番号。
 fn delete_unbridged(p1: &Peer, key: i64) -> (u32, u32) {
     let at = bridged(p1);
     let e = p1.eid_of(key).expect("消す行がある");
-    assert_eq!(p1.db.engine().eid_translator().reverse(eid_local(e)).map(|x| x.0), Some(2), "前提: 消すのは P2 の行の写し");
+    assert_eq!(p1.db.engine().eid_translator().reverse(slot(e)).map(|x| x.0), Some(2), "前提: 消すのは P2 の行の写し");
     p1.db.get_table(T).unwrap().entity(e).delete().unwrap();
-    (eid_local(e), at)
+    (slot(e), at)
 }
 
 /// 消した他の peer の行の slot を、 自分の新しい行が使い回す。
@@ -184,7 +189,7 @@ fn a_delete_of_a_foreign_row_keeps_its_address_when_an_own_row_reuses_the_slot()
         let w = world(tag);
         let (slot, at) = delete_unbridged(&w.p1, 1);
         let e9 = w.p1.upsert(9, 90);
-        assert_eq!(eid_local(e9), slot, "前提: 新しい行が消した行の slot を使い回した");
+        assert_eq!(crate::slot(e9), slot, "前提: 新しい行が消した行の slot を使い回した");
         // commit の前の bridge (読めるのは閉じた group だけ) は、 覚えを外さない
         w.p1.db.engine().transfer_oplog_to_sync_ops();
         if bridged(&w.p1) != at {
@@ -214,7 +219,7 @@ fn a_delete_of_a_foreign_row_keeps_its_address_when_another_foreign_row_reuses_t
         }
         w.p1.sync.pull_once(4);
         let e7 = w.p1.eid_of(7).expect("P1 が P4 の行を受けた");
-        assert_eq!(eid_local(e7), slot, "前提: P4 の行が消した行の slot を使い回した");
+        assert_eq!(crate::slot(e7), slot, "前提: P4 の行が消した行の slot を使い回した");
         w.p1.publish();
         assert_forgotten(&w.p1);
         assert_eq!(w.p1.rows(), vec![r(2, 20), r(3, 30), r(4, 40), r(7, 70)]);
@@ -239,7 +244,7 @@ fn a_write_before_the_delete_keeps_its_address_when_the_slot_is_reused() {
         w.p1.db.get_table(T).unwrap().entity(e).delete().unwrap();
         // 新しい行は title を書かない (前の住人宛ての title が写れば残る)
         let e9 = w.p1.db.get_table(T).unwrap().upsert().set("key", 9i64).commit().unwrap();
-        assert_eq!(eid_local(e9), eid_local(e), "前提: 新しい行が消した行の slot を使い回した");
+        assert_eq!(slot(e9), slot(e), "前提: 新しい行が消した行の slot を使い回した");
         if bridged(&w.p1) != at {
             return None;
         }
@@ -319,13 +324,13 @@ fn a_delete_of_an_own_row_keeps_its_address_when_a_foreign_row_reuses_the_slot()
         assert_eq!(p3.rows(), vec![r(1, 10), r(2, 20), r(3, 30), r(4, 40), r(7, 70)]);
         let at = bridged(&p1);
         let e = p1.eid_of(1).unwrap();
-        assert_eq!(p1.db.engine().eid_translator().reverse(eid_local(e)), None, "前提: 消すのは自分の行");
+        assert_eq!(p1.db.engine().eid_translator().reverse(slot(e)), None, "前提: 消すのは自分の行");
         p1.db.get_table(T).unwrap().entity(e).delete().unwrap();
         if bridged(&p1) != at {
             return None;
         }
         p1.sync.pull_once(4);
-        assert_eq!(p1.eid_of(7).map(eid_local), Some(eid_local(e)), "前提: P4 の行が消した行の slot を使い回した");
+        assert_eq!(p1.eid_of(7).map(slot), Some(slot(e)), "前提: P4 の行が消した行の slot を使い回した");
         p1.publish();
         // 続く自分の record が無くても (受けた行は自分の record でない)、 bridge が追いつけば覚えを外す
         assert_forgotten(&p1);
@@ -346,13 +351,13 @@ fn records_keep_their_addresses_when_the_slot_changes_owner_twice() {
         let w = world(tag);
         let (slot, at) = delete_unbridged(&w.p1, 1);
         let e9 = w.p1.upsert(9, 90);
-        assert_eq!(eid_local(e9), slot, "前提: 自分の行 9 が消した行の slot を使い回した");
+        assert_eq!(crate::slot(e9), slot, "前提: 自分の行 9 が消した行の slot を使い回した");
         w.p1.db.get_table(T).unwrap().entity(e9).delete().unwrap();
         if bridged(&w.p1) != at {
             return None;
         }
         w.p1.sync.pull_once(4);
-        assert_eq!(w.p1.eid_of(7).map(eid_local), Some(slot), "前提: P4 の行が同じ slot をもう一度使い回した");
+        assert_eq!(w.p1.eid_of(7).map(crate::slot), Some(slot), "前提: P4 の行が同じ slot をもう一度使い回した");
         // P4 の行の写しも書き換える (3 人目の住人宛て)
         let e7 = w.p1.eid_of(7).unwrap();
         w.p1.db.get_table(T).unwrap().entity(e7).set("title", 71i64).commit().unwrap();
@@ -382,7 +387,7 @@ fn a_ref_keeps_pointing_at_the_row_it_was_written_for_when_the_target_slot_is_re
         w.p1.db.get_table(U).unwrap().insert().set("name", 100i64).set("of", Value::Ref(target)).commit().unwrap();
         w.p1.db.get_table(T).unwrap().entity(target).delete().unwrap();
         let e9 = w.p1.upsert(9, 90);
-        assert_eq!(eid_local(e9), eid_local(target), "前提: 新しい行が、 ref の指していた行の slot を使い回した");
+        assert_eq!(slot(e9), slot(target), "前提: 新しい行が、 ref の指していた行の slot を使い回した");
         if bridged(&w.p1) != at {
             return None;
         }
@@ -407,7 +412,7 @@ fn the_address_survives_a_clean_close_before_the_bridge() {
         let World { p1, p2, p3, p4, tr, dir } = world(tag);
         let (slot, at) = delete_unbridged(&p1, 1);
         let e9 = p1.upsert(9, 90);
-        assert_eq!(eid_local(e9), slot, "前提: 新しい行が消した行の slot を使い回した");
+        assert_eq!(crate::slot(e9), slot, "前提: 新しい行が消した行の slot を使い回した");
         if bridged(&p1) != at {
             return None;
         }

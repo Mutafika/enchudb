@@ -234,11 +234,13 @@ fn reused_slot_is_reported_as_leave_and_reenter() {
 
     eng.delete(e);
     let n = eng.entity().unwrap();
-    assert_eq!(n, e, "前提: 容量 1 なら削除した slot が再利用される");
+    // #731: 場所は使い回し、 eid は世代が違う。 removed は渡した eid、 added は新しい eid
+    assert_eq!(eng.eid_slot(n), eng.eid_slot(e), "前提: 容量 1 なら削除した slot が再利用される");
+    assert_ne!(n, e);
     eng.tie(n, "age", 30);
     let d = q.poll(&eng);
     assert_eq!(d.removed, vec![e]);
-    assert_eq!(d.added, vec![e]);
+    assert_eq!(d.added, vec![n]);
     drop(q);
     drop(eng);
     cleanup(&path);
@@ -545,10 +547,14 @@ fn unpolled_reuse_burst_reports_leave_and_reenter() {
             e
         })
         .collect();
-    assert_eq!(made, gone, "前提: 作り直しは消した slot を使う");
+    // #731: 場所は使い回し、 eid は世代が違う
+    let slots = |s: &BTreeSet<u64>| s.iter().map(|&e| eng.eid_slot(e)).collect::<BTreeSet<u32>>();
+    assert_eq!(slots(&made), slots(&gone), "前提: 作り直しは消した slot を使う");
+    assert!(made.is_disjoint(&gone), "使い回した場所に消えた行の eid を渡した");
     let d = q.poll(&eng);
-    assert_eq!(d.removed, gone.iter().copied().collect::<Vec<_>>(), "消した entity が出ていない");
-    assert_eq!(d.added, made.iter().copied().collect::<Vec<_>>(), "作った entity が入っていない");
+    let sorted = |v: Vec<u64>| v.into_iter().collect::<BTreeSet<u64>>();
+    assert_eq!(sorted(d.removed.clone()), gone, "消した entity が出ていない");
+    assert_eq!(sorted(d.added.clone()), made, "作った entity が入っていない");
     integrate(&mut seen, d);
     assert_eq!(seen.len(), all.len());
     drop(q);

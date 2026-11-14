@@ -191,7 +191,8 @@ fn run(path: &str) {
                 let i = users.iter().position(|&k| k == a).unwrap();
                 u.entity(a).delete().unwrap();
                 users[i] = u.insert().set("id", next_id).set("dept", rng.below(4) as i64).set("age", rng.below(50) as i64).commit().unwrap();
-                if users[i] == a {
+                // #731: 場所を使い回した (eid は世代が違う)。 既定の DB の場所は下 24 bit
+                if users[i] as u32 & 0xFF_FFFF == a as u32 & 0xFF_FFFF {
                     reborn.insert(a);
                     reborn_seen += 1;
                 }

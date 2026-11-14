@@ -127,11 +127,9 @@ fn a_full_table_still_accepts_deletes() {
         "満杯の table で削除が枠を返していない (詰んだら二度と戻れない)"
     );
     let reused = eng.entity_in("files").expect("枠が戻っているのに払い出せない");
-    assert_eq!(
-        enchudb_oplog::eid_local(reused),
-        enchudb_oplog::eid_local(rows[0]),
-        "返った slot が再利用されていない"
-    );
+    // #731: 使い回した場所の eid は世代が違う (場所で見る)
+    assert_eq!(eng.eid_slot(reused), eng.eid_slot(rows[0]), "返った slot が再利用されていない");
+    assert_ne!(reused, rows[0], "使い回した場所に消えた行の eid を渡した");
 
     cleanup(&path);
 }
