@@ -12146,7 +12146,8 @@ impl Engine {
     /// 書き出しと空け作りは checkpoint の前にいつも `tables` を書くが、 `oplog_sync` は書かない。 なので `oplog_sync` は、
     /// 消した行が sidecar より先にある間 checkpoint を進めない ([`Self::checkpoint_held_for_freed_slots`]): その行の record は
     /// WAL に残り、 落ちた後に再生されて `next_local` を進める。 次の consumer の周期が `tables` を書いてから進める。
-    /// `oplog_sync` で `tables` を書く形は、 1 回が 0.1 ms → 5 ms になった (tmp + fsync + rename)。
+    /// `oplog_sync` で `tables` を書く形は、 1 回が 0.1 ms → 5 ms になった (tmp + fsync + rename)。 #870: consumer の周期 / 空け作り /
+    /// 閉じる時 / 開く時の再生の後も、 `tables` を書けなかった (空き不足など) 間は同じく進めない (WAL が畳めず、 満杯なら書き手は断られる)。
     ///
     /// 版数の列のある DB (sync の DB) で版数つきの削除は、 tombstone が本体の書き出しで届き、 開く時にその local を払い出し
     /// 済みと数える (`scan_interrupted_deletes`) ので、 ここでは数えない。
@@ -12177,11 +12178,14 @@ impl Engine {
     /// memory-only (from_bytes) や wasm では no-op。 path が空なら skip。
     /// 0.8.2: `defer_tables_persist` が立ってる時 (schema crate の build phase)
     /// は no-op。 finish 時に explicit `persist_tables()` で 1 回 fsync する。
-    fn try_persist_tables(&self) {
+    ///
+    /// #870: 戻り値は `tables` を置けたか (置かなかった = defer / 書けなかった は false、 path の無い engine は true)。 置けたら、
+    /// 呼ぶ前に払い出した行は全部 sidecar の `next_local` より前 ([`Self::tables_cover_checkpoint`])。
+    fn try_persist_tables(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if self.defer_tables_persist.load(std::sync::atomic::Ordering::Acquire) {
-                return;
+                return false;
             }
             if !self.path.is_empty() {
                 // #190: persist_tables と同じ直列化 (consumer thread はこちらを通る)。
@@ -12189,14 +12193,18 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = self.persist_tables_file() {
-                    // best effort: panic せずログだけ。 user table の定義は
-                    // メモリには反映されてる、 次回 reopen で失われるだけ。
-                    // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
-                    // 失敗 → 同 warning がターミナル不能になる現象を回避するため、
-                    // 1 秒 1 行の rate-limit を入れる。
-                    self.warn_persist_failure_rate_limited(&e);
-                }
+                let tables_ok = match self.persist_tables_file() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        // best effort: panic せずログだけ。 user table の定義は
+                        // メモリには反映されてる、 次回 reopen で失われるだけ。
+                        // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
+                        // 失敗 → 同 warning がターミナル不能になる現象を回避するため、
+                        // 1 秒 1 行の rate-limit を入れる。
+                        self.warn_persist_failure_rate_limited(&e);
+                        false
+                    }
+                };
                 // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
                 // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
                 if let Err(e) = self.persist_eidmap() {
@@ -12218,8 +12226,18 @@ impl Engine {
                 if let Err(e) = self.persist_vocab_map_if_dirty() {
                     self.warn_persist_failure_rate_limited(&e);
                 }
+                return tables_ok;
             }
         }
+        true
+    }
+
+    /// #870: checkpoint を、 呼ぶ前に読んだ WAL の位置まで進めてよいか (`tables` の sidecar の `next_local` が、 そこまでの record の
+    /// 行を全部覆う)。 消した行が sidecar より先に無ければよい ([`Self::checkpoint_held_for_freed_slots`])。 先にあれば `tables` を
+    /// 今置く: 置けたら、 位置を読んだ後に置いたので、 その位置までの record の行 (払い出してから WAL に載せる) は全部前にある
+    /// (位置を読んだ後に足して消した行は sidecar より先に残りうるが、 その record は位置より後で、 今回は畳まない)。
+    fn tables_cover_checkpoint(&self) -> bool {
+        !self.checkpoint_held_for_freed_slots() || self.try_persist_tables()
     }
 
     /// #720: きれいに閉じる時に `pkformer` をまとめ直す (読まない旧 binary も `pkformer` だけで全部ある)。 best effort。
@@ -21703,7 +21721,13 @@ impl Engine {
             // 「一度 durable だった committed record」 が replay 対象外になり
             // 恒久消失した。
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+            if eng.persist_name_records().is_ok()
+                && eng.body_msync().is_ok()
+                && (wal_untouched || w.fsync().is_ok())
+                && !eng.checkpoint_held_for_freed_slots()
+            {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -22337,7 +22361,13 @@ impl Engine {
             let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+            if eng.persist_name_records().is_ok()
+                && eng.body_msync().is_ok()
+                && (wal_untouched || w.fsync().is_ok())
+                && !eng.checkpoint_held_for_freed_slots()
+            {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -22896,7 +22926,7 @@ impl Engine {
                                 // checkpoint を前進させる前に必ず sidecar を固める
                                 // (= 直後に process kill されても次 open で sidecar
                                 // の next_local が oplog の進行と整合する)。
-                                engine.try_persist_tables();
+                                let tables_ok = engine.try_persist_tables();
                                 // #268: Commit が打てなかったら checkpoint を進めない。
                                 // 進めると未 commit group が checkpoint の後ろに取り残され、
                                 // bridge からも recovery からも永久に見えなくなる (実機で
@@ -22905,7 +22935,12 @@ impl Engine {
                                 // 一過性要因なら自力で回復する。 例外は死区間
                                 // (append_dead = Commit 1 個すら入らない) で、 こちらは
                                 // 二度と閉じられないので従来どおり進めて fold に任せる。
-                                if (committed || wal.append_dead()) && synced {
+                                // #870: `tables` を書けなかった周期 (空き不足など) は、 消した行が sidecar より先にある間 checkpoint を
+                                // 進めない (`oplog_sync` の #857 と同じ判定)。 進めた後に落ちると、 その行の Tie も Delete も再生されず、
+                                // 開いた `next_local` が消した行の手前に戻って同じ eid を払い出す。 WAL は畳めず、 満杯になれば書き手は
+                                // 断られる (#553 / #388)。 書ければ次の周期で進む。 書けた時は、 `durable_head` を読んだ後に置いたので
+                                // そこまでの行は全部覆う (`tables_cover_checkpoint`)
+                                if (committed || wal.append_dead()) && synced && (tables_ok || !engine.checkpoint_held_for_freed_slots()) {
                                     wal.advance_checkpoint(durable_head);
                                 }
                                 durable_lsn_for_thread.store(durable_lsn, Ordering::Release);
@@ -22995,10 +23030,11 @@ impl Engine {
                             // で次 open 時に eid 衝突が出ていた。 graceful shutdown
                             // 経路では oplog checkpoint も進めてしまうので、 ここで
                             // sidecar を確実に固める必要がある。
-                            engine.try_persist_tables();
+                            let tables_ok = engine.try_persist_tables();
                             // #268: Commit が打てなかったら checkpoint は据え置く
                             // (理由は周期 fsync 側の同じ分岐を参照)。
-                            if (committed || wal.append_dead()) && synced {
+                            // #870: 周期と同じ (`tables` を書けなかったら、 消した行が sidecar より先にある間は進めない)
+                            if (committed || wal.append_dead()) && synced && (tables_ok || !engine.checkpoint_held_for_freed_slots()) {
                                 wal.advance_checkpoint(durable_head);
                             }
                             // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
@@ -23222,7 +23258,10 @@ impl Engine {
                 let (_, folded) = wal.checkpoint_and_reset(
                     |head| {
                         let durable_lsn = wal.next_lsn().saturating_sub(1);
-                        let ok = self.sync_for_checkpoint(wal);
+                        // #870: `tables` がここまでの行を覆わなければ進めない (周期と同じ。 畳めない = 待っている書き手は断られる)。
+                        // 上の `try_persist_tables` は `head` を読む前なので、 書き出しの間に書き手が足して消した行は覆わない
+                        // (2 区画の形は書き出しの間も書ける)。 その時は書き出しの後に置き直す
+                        let ok = self.sync_for_checkpoint(wal) && self.tables_cover_checkpoint();
                         if ok {
                             self.durable_lsn.store(durable_lsn, Ordering::Release);
                             // #662: 畳む前に lock の外で、 書き出した所 (head) まで写す (lock の下は畳む区画の終わりまでの残りだけ)。
