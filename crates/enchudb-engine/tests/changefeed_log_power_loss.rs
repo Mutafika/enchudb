@@ -280,6 +280,63 @@ fn run(tag: &str, wal_cap: usize) {
     assert!(failures.is_empty(), "{} 枚が合わない:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// #850: 書き手が WAL に積んだ後・cell に当てる前に `oplog_sync` が返り、 進めた checkpoint も disk に届いた所で電源が落ちた像。
+/// `oplog_sync` はその record を fsync しているので、 開くと再生されて本体に当たり、 記録にも 1 回だけ載る。 直す前は checkpoint が
+/// その record を越えていて、 再生されず、 本体は前の値のまま、 記録にだけその値が載っていた (上の 2 本が負荷の下で数 % 落ちた 「記録が本体に無い値まで
+/// 渡した」)。 ここは割り込み点 (`apply_point_hook`) で必ず踏む。
+#[test]
+fn a_record_appended_but_not_applied_yet_survives_power_loss_after_oplog_sync() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("applying");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog(db.to_str().unwrap(), 1 << 20).unwrap();
+    eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+    eng.enable_change_log(LOG_CAP).unwrap();
+    let ts = eng.himo_id("ts").unwrap() as u16;
+    let a = eng.entity().unwrap();
+    for v in 0..10u64 {
+        eng.tie_to_by_id(a, ts, v);
+    }
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    let img = root.join("img");
+    // (書き出しが返ったか, 像が撮れたか)
+    let at_point: Arc<Mutex<Option<(bool, bool)>>> = Arc::default();
+    {
+        let (eng, img, live, at_point) = (eng.clone(), img.clone(), live.clone(), at_point.clone());
+        enchudb_engine::engine::apply_point_hook::set(Some(Arc::new(move || {
+            if at_point.lock().unwrap().is_some() {
+                return;
+            }
+            // 書き出し 1 回 + WAL の header をもう 1 回届ける (checkpoint は fsync の後に進めるので、 進めた checkpoint が disk に
+            // 届くのは次の fsync。 consumer の次の周期 / 次の `oplog_sync` がそれをする)
+            let eng2 = eng.clone();
+            let h = std::thread::spawn(move || eng2.oplog_sync().and_then(|()| eng2.oplog().unwrap().fsync()));
+            let until = Instant::now() + Duration::from_secs(30);
+            while !h.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let returned = h.is_finished() && h.join().unwrap().is_ok();
+            let captured = crashsim::capture(&live, &img, Mode::Lost).is_ok();
+            *at_point.lock().unwrap() = Some((returned, captured));
+        })));
+    }
+    eng.tie_to_by_id(a, ts, 10u64);
+    enchudb_engine::engine::apply_point_hook::set(None);
+    crashsim::stop();
+    drop(eng);
+    let at_point = at_point.lock().unwrap().take();
+    assert_eq!(at_point, Some((true, true)), "前提: 積んだ後・当てる前に oplog_sync が返り、 像を撮った");
+    let (_, seen, value) = replay(img.join("db").to_str().unwrap()).unwrap();
+    let vals: Vec<u64> = seen.iter().filter_map(|(_, v)| *v).collect();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(value, Some(10), "oplog_sync が fsync した record が、 開いた後の本体に無い (記録の最後 {:?})", vals.last());
+    assert_eq!(vals, (0..=10).collect::<Vec<u64>>(), "記録は 0..=10 を 1 回ずつ");
+}
+
 /// 記録のある DB の WAL (`set_sync_on_reset`) は、 区画を畳んだ時に畳んだ区画の header の page だけを書き出す (#683)。 畳んだ印は
 /// 届き (開いても畳んだ区画の record を再生しない)、 書き手がもう一方の区画に積んだ書き出し前の record は書き出さない (前は WAL
 /// 全体を fsync し、 2 区画の形ではその分も書いて、 1 回 4〜5 ms 書き手を止めた)。
