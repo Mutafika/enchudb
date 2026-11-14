@@ -3584,8 +3584,14 @@ mod apply_liveness_tests {
         (eng, x, y, g)
     }
 
-    /// 書き手 B: 列 `y` に `n` 件書く。 (断られた数, 1 件の最大の待ち, 書き終えた時刻)
-    fn write_many(eng: &Engine, e: u64, y: u16, n: u32) -> (usize, Duration, Instant) {
+    /// 書き手 B が書く数 (WAL 64 KiB は Tie の record で約 1400 件 = 6000 件は WAL の 4 倍ほど)
+    const B_WRITES: u32 = 6000;
+    /// 止める側が放す時までに B が書き終えているべき数 (WAL 2 つ分を越える)。 直す前の形は、 A の record のある区画を畳めないので、
+    /// 2 区画を埋めた所 (WAL 1 つ分、 約 1400 件) で止まった
+    const B_BEFORE_RELEASE: u32 = 3000;
+
+    /// 書き手 B: 列 `y` に `n` 件書き、 書いた数を `done` に置く。 (断られた数, 1 件の最大の待ち)
+    fn write_many(eng: &Engine, e: u64, y: u16, n: u32, done: &std::sync::atomic::AtomicU32) -> (usize, Duration) {
         let (mut rejected, mut worst) = (0, Duration::ZERO);
         for i in 0..n {
             let t = Instant::now();
@@ -3593,8 +3599,9 @@ mod apply_liveness_tests {
                 rejected += 1;
             }
             worst = worst.max(t.elapsed());
+            done.store(i + 1, std::sync::atomic::Ordering::Release);
         }
-        (rejected, worst, Instant::now())
+        (rejected, worst)
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3614,17 +3621,22 @@ mod apply_liveness_tests {
 
     /// 列 x の書き手を長く止める側が持つ間に、 A が x へ書き (行を消し)、 B が y に WAL の数倍を書く。 直す前は A が積んだ後に
     /// `write_lock` を待ち、 その record の手前で checkpoint が止まって、 B は止める側が放すまで空きを待った (6 秒持つと、 sync の DB は
-    /// record を落とし、 sync の無い DB は書き込みを断った)。 組み合わせ (止める側 2 × A の書き込み 2 × sync の有無 2) は並べて回す。
+    /// record を落とし、 sync の無い DB は書き込みを断った)。 組み合わせ (止める側 2 × A の書き込み 2 × sync の有無 2) は 4 つずつ
+    /// 並べて回す。 見るのは、 止める側が放す時までに B が書いた数 (時間では見ない: 負荷の下では、 A と関係なく書き出しが 1 秒近く
+    /// かかる回がある)。
     #[test]
     fn a_writer_held_by_a_long_column_holder_does_not_hold_the_wal() {
         let cases: Vec<_> = [Holder::Guard, Holder::Build]
             .into_iter()
             .flat_map(|h| [AWrite::Tie, AWrite::Delete].into_iter().map(move |w| (h, w)))
             .flat_map(|(h, w)| [false, true].into_iter().map(move |s| (h, w, s)))
-            .map(|(h, w, s)| std::thread::spawn(move || held_writer_case(h, w, s)))
             .collect();
-        let failed: Vec<String> = cases.into_iter().filter_map(|c| c.join().err().map(|e| format!("{e:?}"))).collect();
-        assert!(failed.is_empty(), "{} case が落ちた (上の panic を見る)", failed.len());
+        let mut failed = 0;
+        for chunk in cases.chunks(4) {
+            let running: Vec<_> = chunk.iter().map(|&(h, w, s)| std::thread::spawn(move || held_writer_case(h, w, s))).collect();
+            failed += running.into_iter().map(|c| c.join()).filter(Result::is_err).count();
+        }
+        assert_eq!(failed, 0, "{failed} case が落ちた (上の panic を見る)");
     }
 
     fn held_writer_case(holder: Holder, write: AWrite, sync_db: bool) {
@@ -3641,25 +3653,31 @@ mod apply_liveness_tests {
         eng.try_tie_to_by_id(e1, x, 5u32).unwrap();
         let hold = hold();
         let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let holder_thread = {
-            let eng = eng.clone();
+            let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || {
+                // 放す時までに B が書いた数
+                let at_release = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let seen = at_release.clone();
                 match holder {
                     Holder::Guard => {
                         let g = eng.himos[x as usize].write_guard();
                         held_tx.send(()).unwrap();
                         std::thread::sleep(hold);
+                        seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
                         drop(g);
                     }
                     Holder::Build => {
                         crate::himo_store::hook::set("building_cylinder", move || {
                             held_tx.send(()).unwrap();
                             std::thread::sleep(hold);
+                            seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
                         });
                         let _ = eng.himos[x as usize].slice_len(5);
                     }
                 }
-                Instant::now()
+                at_release.load(std::sync::atomic::Ordering::Relaxed)
             })
         };
         held_rx.recv_timeout(Duration::from_secs(20)).expect("前提: 止める側が持った");
@@ -3679,21 +3697,23 @@ mod apply_liveness_tests {
         };
         // A が止める側で待つまで (直した形は積む前、 直す前の形は積んだ後)
         std::thread::sleep(Duration::from_millis(50));
-        let (rejected, worst, done) = write_many(&eng, e2, y, 6000);
-        let released = holder_thread.join().unwrap();
+        let (rejected, worst) = write_many(&eng, e2, y, B_WRITES, &b_done);
+        let before_release = holder_thread.join().unwrap();
         let (a_result, a_took) = a.join().unwrap();
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (x_now, y_now) = (eng.get_by_id(e1, x), eng.get_by_id(e2, y));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
         eprintln!(
-            "[held] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / 放す前に書き終えた {} / A の待ち {a_took:?}",
-            done < released
+            "[held] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / 放す時までに書いた {before_release} 件 / A の待ち {a_took:?}"
         );
         assert_eq!(a_result, Ok(()), "{tag}: 書き手 A");
         assert!(a_took >= hold / 2, "{tag}: 前提: A は止める側を待った ({a_took:?})");
         assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "{tag}: B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
-        assert!(done < released, "{tag}: B は止める側が放すまで待たされた (最大の待ち {worst:?})");
+        assert!(
+            before_release >= B_BEFORE_RELEASE,
+            "{tag}: B は止める側が放すまで待たされた (放す時までに {before_release} 件、 最大の待ち {worst:?})"
+        );
         let x_want = match write {
             AWrite::Tie => Some(1),
             AWrite::Delete => None,
@@ -3715,31 +3735,38 @@ mod apply_liveness_tests {
         eng.try_tie_text_to_by_id(e1, g, "aaaa").unwrap();
         let hold = hold();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let a = {
-            let eng = eng.clone();
+            let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || {
+                // 書き出しが終わる時までに B が書いた数
+                let at_end = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let seen = at_end.clone();
                 settle_call_hook::set(move || {
                     in_tx.send(()).unwrap();
                     std::thread::sleep(hold);
+                    seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
                 });
                 let r = eng.try_tie_text_to_by_id(e1, g, "bbbb");
-                (r, Instant::now())
+                (r, at_end.load(std::sync::atomic::Ordering::Relaxed))
             })
         };
         in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が辞書の書き出しを呼んだ");
-        let (rejected, worst, done) = write_many(&eng, e2, y, 6000);
-        let (a_result, a_done) = a.join().unwrap();
+        let (rejected, worst) = write_many(&eng, e2, y, B_WRITES, &b_done);
+        let (a_result, before_end) = a.join().unwrap();
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (text, y_now) = (eng.get_text_owned(e1, "t.g"), eng.get_by_id(e2, y));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
         eprintln!(
-            "[settle] B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A の書き出しの前に書き終えた {}",
-            done < a_done
+            "[settle] B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A の書き出しが終わる時までに書いた {before_end} 件"
         );
         assert_eq!(a_result, Ok(()), "書き手 A");
         assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
-        assert!(done < a_done, "B は A の辞書の書き出しが終わるまで待たされた (最大の待ち {worst:?})");
+        assert!(
+            before_end >= B_BEFORE_RELEASE,
+            "B は A の辞書の書き出しが終わるまで待たされた (終わる時までに {before_end} 件、 最大の待ち {worst:?})"
+        );
         assert_eq!((text.as_deref(), y_now), (Some(&b"bbbb"[..]), Some(5999)), "両方の書き込みが当たっている");
     }
 
@@ -3747,7 +3774,8 @@ mod apply_liveness_tests {
     /// 上限 10 ms): 書き手が当て終えたら、 周期 (100 ms) を待たずに畳む。 前は周期を待ち、 休まず書く書き手がその間に今の区画も
     /// 埋めて空きを待った (書き手 80 本 = CPU の数より多い時に、 書き込みが master の 0.81 倍)。
     ///
-    /// 時間では見ない (並べて回すと書き出し自体が数百 ms かかる): 止めている間に周期を早めた回数と、 放した後に畳めることを見る。
+    /// 時間では見ない (並べて回すと書き出し自体が数百 ms かかる): 止めている間に周期を早めた回数 (2 回まで待つ) と、 放した後に
+    /// 畳めることを見る。
     #[test]
     fn a_tick_cut_by_an_applying_writer_retries_soon() {
         let p = path("cutretry");
@@ -3774,9 +3802,13 @@ mod apply_liveness_tests {
             i += 1;
         }
         let old_pending = |wal: &enchudb_oplog::oplog::OpLog| enchudb_oplog::oplog::wal_pos_lap(wal.fold_end()) != wal.lap();
-        // 周期が何度か切って畳めない間 (直した形は間を詰めて試し直す)
+        // 周期が切って畳めない間に、 次の周期を早めるのを待つ (直した形は 1 ms から倍々で試し直す。 直す前の形は数えないので、
+        // 上限 20 秒まで待って落ちる)
         let retried = cut_retry_count::get(&wal);
-        std::thread::sleep(Duration::from_millis(300));
+        let until = Instant::now() + Duration::from_secs(20);
+        while cut_retry_count::get(&wal) - retried < 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let (held, retried) = (old_pending(&wal), cut_retry_count::get(&wal) - retried);
         let t = Instant::now();
         release.send(()).unwrap();
@@ -3787,7 +3819,7 @@ mod apply_liveness_tests {
         let a = a.join().unwrap();
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
-        eprintln!("[cut retry] 止めた 300 ms の間に周期を早めた回数 {retried} / 放してから畳むまで {took:?}");
+        eprintln!("[cut retry] 止めている間に周期を早めた回数 {retried} / 放してから畳むまで {took:?}");
         assert_eq!(a, Ok(()), "書き手 A");
         assert!(held, "前提: A が当てるまで古い区画は畳めない");
         assert!(retried >= 2, "古い区画を畳めなかった周期の後に、 次の周期を早めなかった ({retried} 回)");
