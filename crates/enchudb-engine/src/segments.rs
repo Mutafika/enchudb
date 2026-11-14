@@ -150,6 +150,8 @@ pub struct SegmentSet {
     /// 書き直さない (`body_msync` は sync 経路から毎回呼ばれる)。 Mutex は 「同時に
     /// 2 本が manifest を書く」 のを止める役も兼ねる。
     last_manifest: Mutex<Option<Vec<(String, u64)>>>,
+    /// #847: 最後に manifest を書いた時刻 ([`Self::write_manifest_paced`] が間隔を見る)。
+    manifest_written_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl SegmentSet {
@@ -213,6 +215,7 @@ impl SegmentSet {
             space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
             last_manifest: Mutex::new(None),
+            manifest_written_at: Mutex::new(None),
         };
         // create の最後に manifest を書く。 これで 「manifest が無い = create が完了して
         // いない」 と言い切れる (`Engine::probe` が Incomplete を返す根拠)。
@@ -298,6 +301,7 @@ impl SegmentSet {
             space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
             last_manifest: Mutex::new(known),
+            manifest_written_at: Mutex::new(None),
         })
     }
 
@@ -670,7 +674,22 @@ impl SegmentSet {
             io::Error::new(e.kind(), format!("segments manifest: {}: {e}", self.dir.display()))
         })?;
         *last = Some(lens);
+        *self.manifest_written_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
         Ok(())
+    }
+
+    /// #847: [`Self::write_manifest`] の、 続けて書く時に間隔 ([`MANIFEST_PACE`]) を空ける版。 開いたままの DB の書き出し
+    /// (consumer の周期 / `oplog_sync` / WAL の空け作り) が呼ぶ。
+    ///
+    /// manifest は segment の長さの下限 (segment は伸びるだけ) で、 fsync もしない手がかりなので、 少し古くてよい。 伸びている
+    /// 最中の DB (作ったばかり / 行を足し続けている) は書き出しのたびにどれかの segment が伸びていて、 そのたびに作り直して
+    /// いた (segment ごとの stat + tmp + rename。 file system が混むと 1 回で秒単位に止まり、 WAL の空きを待つ書き手が待ちの
+    /// 上限に当たった)。 間隔の中の伸びは次に書く時にまとめて入る。 きれいに閉じる時・`flush` は `write_manifest` で必ず書く。
+    pub fn write_manifest_paced(&self) -> io::Result<()> {
+        if self.manifest_written_at.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < MANIFEST_PACE) {
+            return Ok(());
+        }
+        self.write_manifest()
     }
 }
 
@@ -745,6 +764,9 @@ const MANIFEST_END: &str = "end";
 fn manifest_path(dir: &Path) -> PathBuf {
     dir.join(crate::db_files::SEGMENTS)
 }
+
+/// #847: 開いたままの DB の書き出しが manifest を作り直す間隔 ([`SegmentSet::write_manifest_paced`])。
+const MANIFEST_PACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn write_manifest_entries(dir: &Path, lens: &[(String, u64)]) -> io::Result<()> {
     let mut out = String::from(MANIFEST_V1);
