@@ -7860,14 +7860,119 @@ impl Engine {
     /// 現行の単独 Engine を開く(WAL 無し、&mut self で mutation)。
     /// 元は `Engine::open` の別名だったが、現在の `Engine::open` は WAL 付き
     /// `Arc<Self>` を返すため、明示的に単独 Engine が欲しい場合はこちらを使う。
+    ///
+    /// #880: WAL 付きで書いて落ちた DB (WAL に checkpoint より後の record が残る) は、 先に WAL 付きの open
+    /// ([`Self::open_concurrent_with_oplog`]) で再生・書き出し・checkpoint を進めて閉じてから、 単独で開き直す
+    /// ([`Self::replay_wal_before_standalone_open`])。 前は WAL を見ずに開き、 WAL にだけある値 (書き出しの前に落ちた
+    /// 書き込み) を黙って失い、 #857 の止めで残した Delete を再生せずに消した行の eid をもう一度払い出した。 きれいに閉じた DB
+    /// (WAL が空) は WAL の header を読むだけで今までどおり。
+    ///
+    /// sync する DB (版数の列と sync の表がある) をきれいに閉じずに落とした後は、 WAL に再生する record が無くても同じく往復する
+    /// ([`Self::relog_before_standalone_session`])。 単独で閉じると clean の印が立ち、 次の WAL 付きの open が本体にあって WAL に無い
+    /// write の作り直し (#451) を飛ばして、 その write が相手に配られないまま残るので。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
-        Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)
+        Self::replay_wal_before_standalone_open(path)?;
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)?;
+        eng.relog_before_standalone_session(path)
+    }
+
+    /// 開く時に #451 の作り直し ([`Self::relog_unlogged_writes`]) が走る DB か: 開いた時に紐名の辞書の clean の印が倒れていた
+    /// (きれいに閉じなかった) sync する DB (版数の列と sync の表がある)。 `relog_unlogged_writes` が配る分を作り直す条件と同じ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn relogs_unlogged_writes_on_open(&self) -> bool {
+        self.himo_reg.rebuilt_on_load && self.has_cell_version() && self.sync_tables_enabled()
+    }
+
+    /// #880 (#451): 単独で開いた `self` (`open_internal` の直後) が、 きれいに閉じなかった sync する DB なら、 印を立てずに捨て
+    /// (`abandoned`、 #533 の `abandon_open` と同じく Drop は何も書かない)、 WAL 付きの open で #451 の作り直しを走らせて閉じてから、
+    /// 単独で開き直す。 そのまま単独で閉じると Drop / `flush` が clean の印を立て、 次の WAL 付きの open が 「きれいに閉じた」 と読んで
+    /// 作り直しを飛ばす (本体に届いて WAL に無い write が相手に配られないまま残る)。
+    ///
+    /// 往復の後も WAL に再生する record が残るか、 印が倒れたまま (WAL 付きの open が閉じる時に印を立てられなかった) なら断る。
+    /// WAL の file が無い DB は往復しない: WAL 付きの open が WAL を作ることになり、 その大きさ (後で WAL 付きで開く時に渡す値) を
+    /// 単独の open は知らない。 WAL を通らない書き込みは版数を付けない (`Hlc::ZERO` = 作り直しの対象外) ので、 WAL の file が無いまま
+    /// 書いた write は作り直す物でもない。
+    /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn relog_before_standalone_session(self, path: &str) -> io::Result<Self> {
+        if !self.relogs_unlogged_writes_on_open() {
+            return Ok(self);
+        }
+        let Ok(meta) = std::fs::metadata(oplog_path_for(path)) else {
+            return Ok(self);
+        };
+        self.abandoned.store(true, std::sync::atomic::Ordering::Release);
+        drop(self);
+        drop(Self::open_concurrent_with_oplog(path, meta.len() as usize)?);
+        if Self::wal_records_to_replay(path)?.is_some() {
+            return Err(Self::wal_left_after_replay());
+        }
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)?;
+        if eng.relogs_unlogged_writes_on_open() {
+            eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::other(
+                "the DB is still marked as not cleanly closed after opening it with the WAL to relog the writes that are \
+                 not in the WAL (#451 / #880) — open it with open_concurrent_with_oplog and check the disk space",
+            ));
+        }
+        Ok(eng)
+    }
+
+    /// #880: `path` の WAL に再生していない record (checkpoint より後、 閉じていない末尾も含む = WAL 付きの open が当てる物) が
+    /// あれば、 WAL 付きの open で再生して閉じる (Drop が書き出して checkpoint を進め、 畳む)。 その後も残っていれば (書き出し /
+    /// `tables` を書けない、 #870) 断る。 書き手の lock は WAL 付きの open が取って Drop が放す。 放してから単独で開き直すまでの間に
+    /// 別の process が取れば、 単独の open は lock で断る (2 つの process が同時に開いた時と同じ)。 別の process の書き手が生きて
+    /// いる時は、 WAL 付きの open が lock で断る (前の単独の open が lock で断っていたのと同じ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn replay_wal_before_standalone_open(path: &str) -> io::Result<()> {
+        let Some(cap) = Self::wal_records_to_replay(path)? else { return Ok(()) };
+        drop(Self::open_concurrent_with_oplog(path, cap)?);
+        if Self::wal_records_to_replay(path)?.is_some() {
+            return Err(Self::wal_left_after_replay());
+        }
+        Ok(())
+    }
+
+    /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)。
+    /// WAL 自体を読めない (切り詰められた / 壊れた file) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を見ずに開く、
+    /// 警告だけ出す)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_records_to_replay(path: &str) -> io::Result<Option<usize>> {
+        let oplog_path = oplog_path_for(path);
+        if !oplog_path.exists() {
+            return Ok(None);
+        }
+        let w = match enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)
+            .and_then(|never| if never { Ok(None) } else { enchudb_oplog::oplog::OpLog::open(&oplog_path).map(Some) })
+        {
+            Ok(Some(w)) => w,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                eprintln!("[enchudb] warning: could not read the WAL ({e}) — opening without replaying it (#880)");
+                return Ok(None);
+            }
+        };
+        if w.is_empty() || w.recover_with_tail().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(w.capacity() as usize))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_left_after_replay() -> io::Error {
+        io::Error::other(
+            "the WAL still has records that are not written out after replaying it (#880) — \
+             open it with open_concurrent_with_oplog and check the disk space",
+        )
     }
 
     /// read-only open: writer lock を取らず、 書き込み API は error。
     /// 複数 process で同時に呼んで OK (writer と共存可能、 reader 同士も無制限)。
     /// 用途: GUI の表示専用 process、 監視ツール、 backup-reader 等。
+    ///
+    /// WAL は見ない (#880): 別の process の書き手が生きている時、 WAL の末尾はいつも本体に当てる前なので。 なので、 WAL 付きで
+    /// 書いて落ちた DB は、 書き手が開き直す (再生する) までは、 WAL にだけある値 (書き出しの前に落ちた書き込み) を見ない。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_readonly(path: &str) -> io::Result<Self> {
         let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false, /*readonly=*/ true)?;
@@ -7881,6 +7986,7 @@ impl Engine {
     /// に作って差し替える) のように、 **書き手が二度と開かない** DB 用。
     ///
     /// 開く時に書き手が居れば `ErrorKind::WouldBlock` (書き手と並べて読むなら `open_readonly` と `get_*_owned`)。
+    /// WAL は見ない (`open_readonly` と同じ、 #880): WAL 付きで書いて落ちた DB は、 書き手が開き直すまで WAL にだけある値を見ない。
     /// 開いた後に書き手が来ると、 借用が指す mmap を書き換えうる (#106) — debug build は借用の読みのたびに書き手が
     /// 居ないかを見て、 居れば panic する。 release build は開く時だけ見る。
     #[cfg(not(target_arch = "wasm32"))]
