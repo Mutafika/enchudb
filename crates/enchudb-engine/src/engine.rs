@@ -2055,6 +2055,46 @@ pub mod write_out_hook {
     }
 }
 
+/// [`Engine::set_relay_hook`] の置き場 (engine の番地ごと)。 欄を engine に足さない (並びが変わる)。
+mod relay_hook {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    /// (engine の番地, あと何件, 呼ぶ物)
+    static HOOKS: Mutex<Vec<(usize, u64, Hook)>> = Mutex::new(Vec::new());
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn set(engine: &super::Engine, after: u64, f: Hook) {
+        let at = engine as *const super::Engine as usize;
+        let mut v = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|(e, _, _)| *e != at);
+        v.push((at, after, f));
+        ARMED.store(true, Ordering::Release);
+    }
+
+    pub(super) fn after_relay(engine: &super::Engine) {
+        if !ARMED.load(Ordering::Acquire) {
+            return;
+        }
+        let at = engine as *const super::Engine as usize;
+        let hit = {
+            let mut v = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(i) = v.iter().position(|(e, _, _)| *e == at) else { return };
+            v[i].1 = v[i].1.saturating_sub(1);
+            if v[i].1 > 0 {
+                return;
+            }
+            let (_, _, f) = v.swap_remove(i);
+            if v.is_empty() {
+                ARMED.store(false, Ordering::Release);
+            }
+            f
+        };
+        hit();
+    }
+}
+
 /// test 用の WAL の割り込み点の置き場 (#579)。 WAL (番地で見分ける) ごとに 1 つ置き、 置いた WAL で 1 回だけ呼ぶ。 前は process に
 /// 置き場が 1 つで、 同じ割り込み点を使う試験が並んで走ると、 後に置いた試験が先の試験の割り込み点を消した。
 #[cfg(test)]
@@ -12908,6 +12948,7 @@ impl Engine {
         match r {
             Ok(_) => {
                 self.wal_append_recovered();
+                relay_hook::after_relay(self);
                 true
             }
             Err(e) => {
@@ -12915,6 +12956,14 @@ impl Engine {
                 false
             }
         }
+    }
+
+    /// 試験: この engine の中継 (`relay_record`) が、 今から数えて `after` 件 WAL に載せた直後に、 1 回だけ `f` を呼ぶ (載せた
+    /// record の後ろ、 次の record の前。 呼ぶ thread は中継している thread)。 載せている途中の WAL を、 thread の重なりに
+    /// 任せずに作る (#861)。 置き直すと前の物を置き換える。 製品の道は atomic を 1 回読むだけ。
+    #[doc(hidden)]
+    pub fn set_relay_hook(&self, after: u64, f: Box<dyn FnOnce() + Send>) {
+        relay_hook::set(self, after, f);
     }
 
     /// **pre-v9 DB の版数置き場**への参照 (legacy)。 v9 DB では空のまま

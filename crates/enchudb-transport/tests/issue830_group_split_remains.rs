@@ -181,17 +181,18 @@ fn a_group_whose_head_is_behind_a_few_own_writes_is_not_published_in_part() {
 }
 
 /// #830 (1): ホストでない中継が **差分で** 受けた同じ版数の組。 A → R1 (A の state を載せた = ring に同じ版数の Tie が並ぶ) →
-/// R2 (R1 から差分で受ける中継) → D。 R2 の `pull_once` が組を 1 つずつ WAL に載せている間に、 別の thread が R2 の WAL を
-/// 書き出して (`oplog_sync` = Commit + bridge) 配り、 D が受ける。 載せている途中の所を D が受けると、 D の `cursor[A]` が
-/// その版数に進み、 後から載った残りは `hlc > cursor` を通らない。
+/// R2 (R1 から差分で受ける中継) → D。 R2 の `pull_once` が組を 1 つずつ WAL に載せている間に、 R2 の WAL が書き出されて
+/// (`oplog_sync` = Commit + bridge) 組の前半が ring に写り、 そこを配って D が受けると、 D の `cursor[A]` がその版数に進み、
+/// 後から載った残りは `hlc > cursor` を通らない。
 ///
-/// 割り込む所は試験が作らない (thread の重なりに任せる): R2 の WAL を書き出し続ける thread (consumer の周期 / アプリの
-/// `oplog_sync` の役) と、 R2 の ring を配って D が受け続ける thread を、 R2 の `pull_once` と並べて回す。 重なったか (= 組が
-/// 途中まで R2 の ring に写ったか) は前提として確かめ、 重なるまで作り直す。 組は 40,000 本 (載せるのに数十 ms) なので、 ほぼ
-/// 1 回目で重なる。 直し (`pull_once` が `state_relay` を持つ) を外すと 12 回中 12 回落ちた。
+/// 割り込む所は試験が作る (#861): R2 が組の半分を載せた直後 (`Engine::set_relay_hook`、 載せている thread の中) に R2 の WAL を
+/// 書き出して ring に組の前半を写し、 配る thread に配らせて D に受けさせる。 配るのは、 直しがあれば R2 が組を載せ終えるまで
+/// 待つ (`state_relay`) ので、 載せる側は配る thread を上限まで待ってから続ける。 前は thread の重なりに任せていて、 Mac では
+/// 10 回のどれでも重ならない回が半分ほどあった (#861)。 直し (`pull_once` が `state_relay` を持つ) を外すと落ちる。
 #[test]
 fn a_relay_does_not_publish_a_group_it_is_still_relaying_from_a_diff() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
     const SEED: std::ops::Range<u32> = 1_000..21_000;
     /// `notes` の枠 (ring はその半分 = 組の 40,000 本が入る)
     const ROWS: u32 = 131_072;
@@ -199,85 +200,82 @@ fn a_relay_does_not_publish_a_group_it_is_still_relaying_from_a_diff() {
     const R1: PeerId = 3;
     const R2: PeerId = 4;
     const D: PeerId = 5;
-    let mut overlapped = 0;
-    let mut tried = 0;
-    while overlapped < 1 && tried < 10 {
-        tried += 1;
-        let dir = Dir::new(&format!("diff{tried}"));
-        let a = db_sized(&dir.db(A), A, SEED, ROWS);
-        let r1 = db_sized(&dir.db(R1), R1, 0..0, ROWS);
-        let r2 = db_sized(&dir.db(R2), R2, 0..0, ROWS);
-        let d = db_sized(&dir.db(D), D, 0..0, ROWS);
-        r1.set_gossip_remote_apply(true);
-        r2.set_gossip_remote_apply(true);
-        // A — R1
-        let up: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
-        let sa = Syncer::new(a.clone(), up.clone());
-        sa.serve_state();
-        let sr1_up = Syncer::new(r1.clone(), up);
-        // R1 — R2 — D (R2 は 1 つの `Syncer` で受けて配る = `state_relay` が効く形)
-        let mesh: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
-        let sr1 = Syncer::new(r1.clone(), mesh.clone());
-        let sr2 = Syncer::new(r2.clone(), mesh.clone());
-        let sd = Syncer::new(d.clone(), mesh);
-        // R2 と D は、 自分の行を書かない (#831)
-        let as_of = sr1_up.bootstrap_pull_via(A, A).expect("A の state").as_of;
-        r1.oplog_sync().unwrap();
-        let group = |e: &Engine| ring(e).iter().filter(|key| **key == (A, as_of)).count();
-        let whole = group(&r1);
-        assert_eq!(whole, 2 * SEED.len(), "前提: R1 の ring に、 A の同じ版数の Tie が全部載っている");
-        assert!(sr1.publish_since(Hlc::ZERO) >= whole, "前提: R1 が組を配った");
-        let stop = AtomicBool::new(false);
-        let saw_part = std::thread::scope(|scope| {
-            // 書き出す thread: R2 の WAL を閉じて ring に写す
-            let racer = scope.spawn(|| {
-                // 組の行が R2 の ring に初めて見えた時の数 (D が受けて ack すると行は回収されるので、 最初の 1 回だけ見る)
-                let mut first_seen = 0;
-                while !stop.load(Ordering::Acquire) {
-                    r2.oplog_sync().unwrap();
-                    if first_seen == 0 {
-                        first_seen = group(&r2);
-                    }
-                }
-                first_seen > 0 && first_seen < whole
-            });
-            // 配る thread: R2 の ring を配り、 D が受ける
-            scope.spawn(|| {
-                while !stop.load(Ordering::Acquire) {
-                    sr2.publish_since(Hlc::ZERO);
-                    sd.pull_once(R2);
-                }
-            });
-            // R2 が R1 から差分で受ける (当てて、 1 つずつ載せる)
-            let got = sr2.pull_once(R1);
-            assert!(!got.history_truncated && got.applied >= whole, "前提: R2 は組を差分で受けて全部当てた (当たった {})", got.applied);
-            stop.store(true, Ordering::Release);
-            racer.join().unwrap()
-        });
-        if !saw_part {
-            continue;
-        }
-        overlapped += 1;
-        let mut idle = 0;
-        loop {
-            r2.oplog_sync().unwrap();
-            sr2.publish_since(Hlc::ZERO);
-            let got = sd.pull_once(R2).received;
-            idle = if got == 0 { idle + 1 } else { 0 };
-            let missing = SEED.filter(|k| v(&d, *k) != Some(*k as u64)).count();
-            if missing == 0 || idle >= IDLE_ROUNDS {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let missing: Vec<u32> = SEED.filter(|k| v(&d, *k) != Some(*k as u64)).collect();
-        assert!(
-            missing.is_empty(),
-            "{tried} 回目: D で v が食い違う行 {} (先頭 {:?}、 行そのものが無い {})",
-            missing.len(),
-            &missing[..missing.len().min(5)],
-            SEED.filter(|k| d.pull_raw("notes.k", *k).is_empty()).count()
+    let dir = Dir::new("diff");
+    let a = db_sized(&dir.db(A), A, SEED, ROWS);
+    let r1 = db_sized(&dir.db(R1), R1, 0..0, ROWS);
+    let r2 = db_sized(&dir.db(R2), R2, 0..0, ROWS);
+    let d = db_sized(&dir.db(D), D, 0..0, ROWS);
+    r1.set_gossip_remote_apply(true);
+    r2.set_gossip_remote_apply(true);
+    // A — R1
+    let up: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let sa = Syncer::new(a.clone(), up.clone());
+    sa.serve_state();
+    let sr1_up = Syncer::new(r1.clone(), up);
+    // R1 — R2 — D (R2 は 1 つの `Syncer` で受けて配る = `state_relay` が効く形)
+    let mesh: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let sr1 = Syncer::new(r1.clone(), mesh.clone());
+    let sr2 = Syncer::new(r2.clone(), mesh.clone());
+    let sd = Syncer::new(d.clone(), mesh);
+    // R2 と D は、 自分の行を書かない (#831)
+    let as_of = sr1_up.bootstrap_pull_via(A, A).expect("A の state").as_of;
+    r1.oplog_sync().unwrap();
+    let group = |e: &Engine| ring(e).iter().filter(|key| **key == (A, as_of)).count();
+    let whole = group(&r1);
+    assert_eq!(whole, 2 * SEED.len(), "前提: R1 の ring に、 A の同じ版数の Tie が全部載っている");
+    assert!(sr1.publish_since(Hlc::ZERO) >= whole, "前提: R1 が組を配った");
+
+    // R2 が組の半分を載せた所: R2 の WAL を書き出して前半を ring に写し、 配る thread に合図して、 配り終えるのを待つ (上限つき)
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (sent_tx, sent_rx) = mpsc::channel::<()>();
+    let (part_tx, part_rx) = mpsc::channel::<usize>();
+    {
+        let r2c = r2.clone();
+        r2.set_relay_hook(
+            (whole / 2) as u64,
+            Box::new(move || {
+                r2c.oplog_sync().unwrap();
+                part_tx.send(ring(&r2c).iter().filter(|key| **key == (A, as_of)).count()).unwrap();
+                go_tx.send(()).unwrap();
+                // 直しがあれば配るのは載せ終えるまで待つので、 ここは上限で抜ける
+                let _ = sent_rx.recv_timeout(Duration::from_millis(500));
+            }),
         );
     }
-    assert!(overlapped > 0, "前提: {tried} 回のどれかで、 R2 が組を載せている途中の ring を配る thread が見た");
+    std::thread::scope(|scope| {
+        // 配る thread: 合図の後に R2 の ring を 1 回配り、 D が受ける
+        let (sr2, sd) = (&sr2, &sd);
+        scope.spawn(move || {
+            go_rx.recv().expect("R2 が組を載せている途中で止まらない");
+            sr2.publish_since(Hlc::ZERO);
+            sd.pull_once(R2);
+            let _ = sent_tx.send(());
+        });
+        // R2 が R1 から差分で受ける (当てて、 1 つずつ載せる)
+        let got = sr2.pull_once(R1);
+        assert!(!got.history_truncated && got.applied >= whole, "前提: R2 は組を差分で受けて全部当てた (当たった {})", got.applied);
+    });
+    let part = part_rx.recv().expect("前提: 割り込み点が呼ばれた");
+    assert!(part > 0 && part < whole, "前提: 組の前半だけが R2 の ring に写った所で配った (写った {part} / {whole})");
+
+    let mut idle = 0;
+    loop {
+        r2.oplog_sync().unwrap();
+        sr2.publish_since(Hlc::ZERO);
+        let got = sd.pull_once(R2).received;
+        idle = if got == 0 { idle + 1 } else { 0 };
+        let missing = SEED.filter(|k| v(&d, *k) != Some(*k as u64)).count();
+        if missing == 0 || idle >= IDLE_ROUNDS {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let missing: Vec<u32> = SEED.filter(|k| v(&d, *k) != Some(*k as u64)).collect();
+    assert!(
+        missing.is_empty(),
+        "D で v が食い違う行 {} (先頭 {:?}、 行そのものが無い {})",
+        missing.len(),
+        &missing[..missing.len().min(5)],
+        SEED.filter(|k| d.pull_raw("notes.k", *k).is_empty()).count()
+    );
 }
