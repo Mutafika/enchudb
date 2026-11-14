@@ -1082,7 +1082,6 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
             freed_end: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             extra: std::sync::RwLock::new(Vec::new()),
             pk_himo: None,
         });
@@ -5301,10 +5300,6 @@ pub(crate) struct TableDef {
     /// で空になったら false に戻す。 厳密な race は entity_in 内で mutex 取った
     /// あと再 check するので OK (= AtomicBool は fast path の hint)。
     pub free_locals_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// #868: 消した行の local ([`Engine::live_free`] が積む)。 表が枯渇して空きの一覧も空の時に、 枠の全部をなめる前にここから
-    /// 穴を拾う ([`Engine::rebuild_free_locals`])。 表に余地がある間は読まない (使い回すのは今までどおり枯渇した時だけ)。 開き直すと
-    /// 空 (前の session の穴は全部なめが拾う)。 [`DEAD_LOCALS_CAP`] を越えた分は積まない (覚えた分を使い切った後の全部なめが拾う)
-    pub(crate) dead_locals: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
     /// v10 Phase 3 (request20 案 B): 先頭 range (`eid_range_lo..hi`) の後に足した extent 群。
     /// `entity_in` が先頭を使い切ると空き eid 空間から切り足す (auto-grow)。 local id は
     /// 先頭 → extra の順に連結した offset (= `next_local` / `free_locals` はそのまま)。
@@ -5338,7 +5333,6 @@ impl Clone for TableDef {
             // 側で coordinate する想定)。
             free_locals: self.free_locals.clone(),
             free_locals_nonempty: self.free_locals_nonempty.clone(),
-            dead_locals: self.dead_locals.clone(),
             extra: std::sync::RwLock::new(self.extra.read().unwrap().clone()),
             pk_himo: self.pk_himo,
         }
@@ -5434,7 +5428,6 @@ impl TableDef {
             freed_end: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
             extra: std::sync::RwLock::new(Vec::new()),
             pk_himo: None,
@@ -5462,9 +5455,6 @@ pub fn is_reserved_table_name(name: &str) -> bool {
 
 /// #847: [`Engine::rebuild_free_locals`] が sync の ring の穴を 1 回に拾う数。
 const SYNC_RING_REBUILD_BATCH: usize = 4096;
-
-/// #868: 表ごとに覚える消した行の数の上限 (1 つ 4 B、 256 KiB)。 越えた分は、 覚えた分を使い切った後の全部なめが拾う。
-const DEAD_LOCALS_CAP: usize = 1 << 16;
 
 /// sync の未配送 record を置く ring の table か。 この table だけ、 枠を自動では足さない (#368)。
 #[inline]
@@ -5932,8 +5922,6 @@ pub struct Engine {
     tables_persisted: std::sync::Mutex<Option<Vec<u8>>>,
     /// #847: sync の ring の穴を次に探し始める所 ([`Self::rebuild_free_locals`]、 `free_locals` の lock の下でだけ触る)。
     sync_ring_rebuild_from: std::sync::atomic::AtomicU32,
-    /// #868: 枯渇した表の穴を探して枠をなめた回数 ([`Self::free_slot_scans`])。
-    free_slot_scans: std::sync::atomic::AtomicU64,
     /// #190: sidecar persist (`.tables` / `.eidmap` / `.vocabmap`) の直列化 lock。
     /// tmp 名が sidecar ごとに固定なので、 同一 sidecar を 2 thread (consumer の
     /// `try_persist_tables` と pull 側の `persist_sync_state`) が同時に書くと
@@ -6380,7 +6368,6 @@ impl Engine {
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
-            free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -7677,7 +7664,6 @@ impl Engine {
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
-            free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             eidmap_log: std::sync::Mutex::new(crate::eidmap_log::LogState::default()),
             eidmap_compact: std::sync::atomic::AtomicBool::new(false),
@@ -11278,7 +11264,6 @@ impl Engine {
             freed_end: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
             extra: std::sync::RwLock::new(Vec::new()),
             pk_himo: None,
@@ -11318,21 +11303,11 @@ impl Engine {
         // overhead (= 約 50 ns/op) を消す最適化。
         let reused_global = if table.free_locals_nonempty.load(Ordering::Acquire) {
             let mut fl = table.free_locals.lock().unwrap();
-            // #868: 生きている slot と畳んだ自分の行の slot (#612) は飛ばす (消した行の一覧と全部なめが同じ穴を両方から積み、 片方で
-            // 使い回された後 / 一覧に積んだ後に畳んだ形)。 生きている印は下の `allocate_at` と同じくこの lock の下で読む
-            let mut global = None;
-            while let Some(local) = fl.pop() {
-                if let Some(g) = table.global_of(local)
-                    && !self.entities.is_live(g)
-                    && !self.is_folded_own_slot(g)
-                {
-                    global = Some(g);
-                    break;
-                }
-            }
+            let popped = fl.pop();
             if fl.is_empty() {
                 table.free_locals_nonempty.store(false, Ordering::Release);
             }
+            let global = popped.and_then(|local| table.global_of(local));
             if let Some(global) = global {
                 // #779: 前の住人宛ての、 bridge の前の record の宛名を覚える (逆写像を外す前に。 配らない表は bridge しない)
                 if !table.is_reserved() {
@@ -11356,13 +11331,6 @@ impl Engine {
             return Ok(enchudb_oplog::make_eid(peer, global));
         }
 
-        // #868: 枯渇した表は、 払い出し位置を進める前に穴を探す (拾えたら空きの一覧から取り直す)。 前は穴を探す前に毎回 1 進めて
-        // いて、 満杯の表で 「消して足す」 を回すと払い出し位置が枠の先へ伸び続けた: 2^32 回で u32 が一周して生きている slot を
-        // もう一度払い出す。 その前でも、 穴の無い時に足す extent を伸びた分まで大きくした (回した回数の分の eid 空間を取る)
-        let exhausted = table.global_of(table.next_local.load(Ordering::Acquire)).is_none();
-        if exhausted && self.rebuild_free_locals(tid) {
-            return self.entity_in(table_name);
-        }
         // capacity check (= fetch_add 後の変換で extent の外なら枯渇)
         let cur = table.next_local.fetch_add(1, Ordering::AcqRel);
         let global = match table.global_of(cur) {
@@ -11374,8 +11342,7 @@ impl Engine {
                 // 「transfer が row を挿せない → 変更が sync から**無言で欠落**」として
                 // 実機発現した (ring ~25K 全 reclaim 後の reopen で bridge 全停止)。
                 // 枯渇時に一度 EntitySet の liveness から穴を再構築して自己修復する。
-                // 上で探した (枯渇を見た) 時は探し直さない
-                if !exhausted && self.rebuild_free_locals(tid) {
+                if self.rebuild_free_locals(tid) {
                     // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
                     // 再構築後も枯渇なら fl が空のままなので次は grow / Err に落ちる。
                     return self.entity_in(table_name);
@@ -11384,9 +11351,9 @@ impl Engine {
                 match self.grow_table_extent_for(tid, cur) {
                     Some(g) => g,
                     None => {
-                        // #868: 進めた分を戻す (断り続ける表で払い出し位置が伸び続けない)。 戻せるのは、 後から誰も進めていない時
-                        // だけ: 自分より後の位置を取った thread が居れば、 その thread が戻すまで払い出し位置は cur + 1 より先
-                        let _ = table.next_local.compare_exchange(cur + 1, cur, Ordering::AcqRel, Ordering::Relaxed);
+                        // 払出した分を rollback (= overflow 状態を維持しないため厳密には
+                        // 必要だが、 単調 monotone な next_local なので少々超過しても
+                        // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
                         if is_sync_ring_table(&table.name) {
                             // #368: ring は自動では足さない。 entity cap を伸ばしても空かない
                             return Err(format!(
@@ -11437,23 +11404,6 @@ impl Engine {
         }
         let allocated = table.next_local.load(Ordering::Acquire).min(table.capacity());
         let ring = is_sync_ring_table(&table.name);
-        // #868: 消した行の一覧から拾う (枠の全部をなめない)。 一覧は、 積んだ後に生き返った slot (全部なめが同じ穴を拾って使い回した、
-        // 畳んだ自分の行を戻した)、 同じ slot の 2 度目の削除 (重複)、 積んだ後に畳んだ自分の行の slot (#612) を含みうるので、 全部なめと
-        // 同じ条件で選び直す (取り出す `entity_in` も同じ条件で見る)。 ここに来るのは表が枯渇した時 = 一覧の local は全部払い出し済み。
-        // 拾えなければ全部なめる (開き直す前の穴と、 一覧の上限を越えた穴はそちらが拾う)
-        if !ring {
-            let mut dead = std::mem::take(&mut *table.dead_locals.lock().unwrap_or_else(|p| p.into_inner()));
-            dead.sort_unstable();
-            dead.dedup();
-            fl.extend(dead.into_iter().filter(|&l| {
-                table.global_of(l).is_some_and(|g| !self.entities.is_live(g) && !self.is_folded_own_slot(g))
-            }));
-            if !fl.is_empty() {
-                table.free_locals_nonempty.store(true, Ordering::Release);
-                return true;
-            }
-        }
-        self.free_slot_scans.fetch_add(1, Ordering::Relaxed);
         // 探し始める所 (ring は前に止めた続き)。 [from, allocated) → [0, from) の順に見る
         let from = if ring { self.sync_ring_rebuild_from.load(Ordering::Relaxed).min(allocated) } else { 0 };
         // #858: ring の、 生きていないのに lsn の列に居る slot (下の `drop_cells_of_dead_ring_slot`)
@@ -11914,7 +11864,8 @@ impl Engine {
     /// 書き出しと空け作りは checkpoint の前にいつも `tables` を書くが、 `oplog_sync` は書かない。 なので `oplog_sync` は、
     /// 消した行が sidecar より先にある間 checkpoint を進めない ([`Self::checkpoint_held_for_freed_slots`]): その行の record は
     /// WAL に残り、 落ちた後に再生されて `next_local` を進める。 次の consumer の周期が `tables` を書いてから進める。
-    /// `oplog_sync` で `tables` を書く形は、 1 回が 0.1 ms → 5 ms になった (tmp + fsync + rename)。
+    /// `oplog_sync` で `tables` を書く形は、 1 回が 0.1 ms → 5 ms になった (tmp + fsync + rename)。 #870: consumer の周期 / 空け作り /
+    /// 閉じる時 / 開く時の再生の後も、 `tables` を書けなかった (空き不足など) 間は同じく進めない (WAL が畳めず、 満杯なら書き手は断られる)。
     ///
     /// 版数の列のある DB (sync の DB) で版数つきの削除は、 tombstone が本体の書き出しで届き、 開く時にその local を払い出し
     /// 済みと数える (`scan_interrupted_deletes`) ので、 ここでは数えない。
@@ -11945,11 +11896,14 @@ impl Engine {
     /// memory-only (from_bytes) や wasm では no-op。 path が空なら skip。
     /// 0.8.2: `defer_tables_persist` が立ってる時 (schema crate の build phase)
     /// は no-op。 finish 時に explicit `persist_tables()` で 1 回 fsync する。
-    fn try_persist_tables(&self) {
+    ///
+    /// #870: 戻り値は `tables` を置けたか (置かなかった = defer / 書けなかった は false、 path の無い engine は true)。 置けたら、
+    /// 呼ぶ前に払い出した行は全部 sidecar の `next_local` より前 ([`Self::tables_cover_checkpoint`])。
+    fn try_persist_tables(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if self.defer_tables_persist.load(std::sync::atomic::Ordering::Acquire) {
-                return;
+                return false;
             }
             if !self.path.is_empty() {
                 // #190: persist_tables と同じ直列化 (consumer thread はこちらを通る)。
@@ -11957,14 +11911,18 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = self.persist_tables_file() {
-                    // best effort: panic せずログだけ。 user table の定義は
-                    // メモリには反映されてる、 次回 reopen で失われるだけ。
-                    // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
-                    // 失敗 → 同 warning がターミナル不能になる現象を回避するため、
-                    // 1 秒 1 行の rate-limit を入れる。
-                    self.warn_persist_failure_rate_limited(&e);
-                }
+                let tables_ok = match self.persist_tables_file() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        // best effort: panic せずログだけ。 user table の定義は
+                        // メモリには反映されてる、 次回 reopen で失われるだけ。
+                        // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
+                        // 失敗 → 同 warning がターミナル不能になる現象を回避するため、
+                        // 1 秒 1 行の rate-limit を入れる。
+                        self.warn_persist_failure_rate_limited(&e);
+                        false
+                    }
+                };
                 // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
                 // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
                 if let Err(e) = self.persist_eidmap() {
@@ -11986,8 +11944,18 @@ impl Engine {
                 if let Err(e) = self.persist_vocab_map_if_dirty() {
                     self.warn_persist_failure_rate_limited(&e);
                 }
+                return tables_ok;
             }
         }
+        true
+    }
+
+    /// #870: checkpoint を、 呼ぶ前に読んだ WAL の位置まで進めてよいか (`tables` の sidecar の `next_local` が、 そこまでの record の
+    /// 行を全部覆う)。 消した行が sidecar より先に無ければよい ([`Self::checkpoint_held_for_freed_slots`])。 先にあれば `tables` を
+    /// 今置く: 置けたら、 位置を読んだ後に置いたので、 その位置までの record の行 (払い出してから WAL に載せる) は全部前にある
+    /// (位置を読んだ後に足して消した行は sidecar より先に残りうるが、 その record は位置より後で、 今回は畳まない)。
+    fn tables_cover_checkpoint(&self) -> bool {
+        !self.checkpoint_held_for_freed_slots() || self.try_persist_tables()
     }
 
     /// #720: きれいに閉じる時に `pkformer` をまとめ直す (読まない旧 binary も `pkformer` だけで全部ある)。 best effort。
@@ -13712,31 +13680,6 @@ impl Engine {
     fn live_free(&self, local: u32) {
         self.entities.free(local);
         self.live.freed(local);
-        // #868: 枯渇した表が、 枠の全部をなめずにこの穴を拾えるように覚える
-        self.note_dead_slot(local);
-    }
-
-    /// #868: 生きている印を下ろした slot `global` を、 その表の消した行の一覧 (`TableDef::dead_locals`) に積む ([`Self::live_free`] から)。
-    /// 積むのは表が枯渇している時だけ (余地のある表の削除は lock を取らない。 書き手 8 本の削除で一覧の lock の取り合いが 1 回 +100 ns
-    /// ほどだった)。 余地のある間に消した穴は、 枯渇した時に一覧が空なら全部なめが拾う (前と同じ)。 sync の ring (`_sync_ops`、 purge が
-    /// 空きの一覧に直接戻す) と、 閉じていない anonymous の表は積まない。 一覧を読むのは、 表が枯渇して空きの一覧も空の時の
-    /// [`Self::rebuild_free_locals`] だけ = 使い回す時期は全部なめで拾う時と同じ (生きている印が下りた後、 表が枯渇した時)。 lock は
-    /// 一覧のだけ (`free_locals` → 一覧 の順。 一覧を持って他の lock を取らない)
-    fn note_dead_slot(&self, global: u32) {
-        for t in self.tables.iter() {
-            let Some(local) = t.local_of(global) else { continue };
-            if t.is_open_ended()
-                || is_sync_ring_table(&t.name)
-                || t.global_of(t.next_local.load(std::sync::atomic::Ordering::Acquire)).is_some()
-            {
-                return;
-            }
-            let mut dead = t.dead_locals.lock().unwrap_or_else(|p| p.into_inner());
-            if dead.len() < DEAD_LOCALS_CAP {
-                dead.push(local);
-            }
-            return;
-        }
     }
 
     /// `value` が紐 `hid` の幅に入るか。 入らなければ fault に積んで false (黙って切り詰めない)。
@@ -21409,7 +21352,13 @@ impl Engine {
             // 「一度 durable だった committed record」 が replay 対象外になり
             // 恒久消失した。
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+            if eng.persist_name_records().is_ok()
+                && eng.body_msync().is_ok()
+                && (wal_untouched || w.fsync().is_ok())
+                && !eng.checkpoint_held_for_freed_slots()
+            {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -22043,7 +21992,13 @@ impl Engine {
             let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+            if eng.persist_name_records().is_ok()
+                && eng.body_msync().is_ok()
+                && (wal_untouched || w.fsync().is_ok())
+                && !eng.checkpoint_held_for_freed_slots()
+            {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -22600,7 +22555,7 @@ impl Engine {
                                 // checkpoint を前進させる前に必ず sidecar を固める
                                 // (= 直後に process kill されても次 open で sidecar
                                 // の next_local が oplog の進行と整合する)。
-                                engine.try_persist_tables();
+                                let tables_ok = engine.try_persist_tables();
                                 // #268: Commit が打てなかったら checkpoint を進めない。
                                 // 進めると未 commit group が checkpoint の後ろに取り残され、
                                 // bridge からも recovery からも永久に見えなくなる (実機で
@@ -22609,7 +22564,12 @@ impl Engine {
                                 // 一過性要因なら自力で回復する。 例外は死区間
                                 // (append_dead = Commit 1 個すら入らない) で、 こちらは
                                 // 二度と閉じられないので従来どおり進めて fold に任せる。
-                                if (committed || wal.append_dead()) && synced {
+                                // #870: `tables` を書けなかった周期 (空き不足など) は、 消した行が sidecar より先にある間 checkpoint を
+                                // 進めない (`oplog_sync` の #857 と同じ判定)。 進めた後に落ちると、 その行の Tie も Delete も再生されず、
+                                // 開いた `next_local` が消した行の手前に戻って同じ eid を払い出す。 WAL は畳めず、 満杯になれば書き手は
+                                // 断られる (#553 / #388)。 書ければ次の周期で進む。 書けた時は、 `durable_head` を読んだ後に置いたので
+                                // そこまでの行は全部覆う (`tables_cover_checkpoint`)
+                                if (committed || wal.append_dead()) && synced && (tables_ok || !engine.checkpoint_held_for_freed_slots()) {
                                     wal.advance_checkpoint(durable_head);
                                 }
                                 durable_lsn_for_thread.store(durable_lsn, Ordering::Release);
@@ -22699,10 +22659,11 @@ impl Engine {
                             // で次 open 時に eid 衝突が出ていた。 graceful shutdown
                             // 経路では oplog checkpoint も進めてしまうので、 ここで
                             // sidecar を確実に固める必要がある。
-                            engine.try_persist_tables();
+                            let tables_ok = engine.try_persist_tables();
                             // #268: Commit が打てなかったら checkpoint は据え置く
                             // (理由は周期 fsync 側の同じ分岐を参照)。
-                            if (committed || wal.append_dead()) && synced {
+                            // #870: 周期と同じ (`tables` を書けなかったら、 消した行が sidecar より先にある間は進めない)
+                            if (committed || wal.append_dead()) && synced && (tables_ok || !engine.checkpoint_held_for_freed_slots()) {
                                 wal.advance_checkpoint(durable_head);
                             }
                             // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
@@ -22921,7 +22882,10 @@ impl Engine {
                 let (_, folded) = wal.checkpoint_and_reset(
                     |head| {
                         let durable_lsn = wal.next_lsn().saturating_sub(1);
-                        let ok = self.sync_for_checkpoint(wal);
+                        // #870: `tables` がここまでの行を覆わなければ進めない (周期と同じ。 畳めない = 待っている書き手は断られる)。
+                        // 上の `try_persist_tables` は `head` を読む前なので、 書き出しの間に書き手が足して消した行は覆わない
+                        // (2 区画の形は書き出しの間も書ける)。 その時は書き出しの後に置き直す
+                        let ok = self.sync_for_checkpoint(wal) && self.tables_cover_checkpoint();
                         if ok {
                             self.durable_lsn.store(durable_lsn, Ordering::Release);
                             // #662: 畳む前に lock の外で、 書き出した所 (head) まで写す (lock の下は畳む区画の終わりまでの残りだけ)。
@@ -23036,12 +23000,6 @@ impl Engine {
     #[inline]
     fn consumer_waker(&self) -> Option<&crate::consumer_waker::ConsumerWaker> {
         self.consumer_waker.as_deref()
-    }
-
-    /// #868: 枯渇した表の穴を探して枠をなめた回数 (観測・試験用)。 消した行の一覧から拾えた時は数えない。
-    #[doc(hidden)]
-    pub fn free_slot_scans(&self) -> u64 {
-        self.free_slot_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// #388: WAL が満杯の時に consumer が畳んで空いた回数 (書き手は待たされたが、 何も落ちていない)。 0.37 の 2 区画の形では、
