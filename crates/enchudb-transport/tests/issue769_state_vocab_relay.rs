@@ -74,28 +74,25 @@ fn client(eng: Arc<Engine>, url: &str) -> Client {
 }
 
 /// state の配布元が 「engine の state をそのまま」 (`Syncer::serve_state` が自分の分として登録する物と同じ中身) の client。 送った
-/// batch を控え (前提を確かめる)、 state を作っている間だけ印を立てる。
-fn recording_client(eng: Arc<Engine>, url: &str) -> (Client, Arc<Mutex<Vec<StateBatch>>>, Arc<AtomicBool>) {
+/// batch を控える (前提を確かめる)。
+fn recording_client(eng: Arc<Engine>, url: &str) -> (Client, Arc<Mutex<Vec<StateBatch>>>) {
     let t = Arc::new(HttpHostTransport::connect(url.to_string(), eng.peer_id()).unwrap());
     let s = Syncer::new(eng.clone(), t.clone());
     let sent: Arc<Mutex<Vec<StateBatch>>> = Arc::new(Mutex::new(Vec::new()));
-    let building = Arc::new(AtomicBool::new(false));
     {
-        let (weak, sent, building) = (Arc::downgrade(&eng), sent.clone(), building.clone());
+        let (weak, sent) = (Arc::downgrade(&eng), sent.clone());
         t.register_state_provider(
             eng.peer_id(),
             Arc::new(move || {
                 let eng = weak.upgrade()?;
-                building.store(true, Ordering::Release);
                 let (records, as_of) = eng.state_records();
-                building.store(false, Ordering::Release);
                 let batch = StateBatch { records, as_of, complete: true };
                 sent.lock().unwrap().push(batch.clone());
                 Some(batch)
             }),
         );
     }
-    (Client { eng, t, s }, sent, building)
+    (Client { eng, t, s }, sent)
 }
 
 impl Client {
@@ -161,8 +158,10 @@ struct Run {
 }
 
 /// c1 が行 2..=M を出さずに持ち (`shared` があれば全部の `t` にその語)、 「持っている record は配れない」 と言って publish する
-/// → ホストが state を求める。 `late` があれば、 c1 が state を作り始めた時に、 別の thread が行 2 の `t` にその語を書く (列 k / v
-/// の走査の間 = `t` の走査より前に着けば、 版数は as_of より後で state に入り、 行 2 は `t` で最初に走査する cell)。
+/// → ホストが state を求める。 `late` があれば、 c1 が state を作っている間 (as_of を採った後、 列 `t` を走査する直前。
+/// `Engine::set_state_scan_hook`) に行 2 の `t` にその語を書く (版数は as_of より後で state に入り、 行 2 は `t` で最初に走査する
+/// cell)。 #890: 前は別の thread が 「作り始めた」 印を見てから書き、 `t` の走査に間に合うかは時間任せだった (負荷の下で 6 回とも
+/// 間に合わず落ちた)。
 ///
 /// None: この publish でホストが state を求めなかった (呼び手がやり直す)。
 fn run(tag: &str, shared: Option<&str>, late: Option<&'static str>) -> Option<Run> {
@@ -170,7 +169,7 @@ fn run(tag: &str, shared: Option<&str>, late: Option<&'static str>) -> Option<Ru
     let host_eng = db(&dir.db(HOST), HOST);
     let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
     let url = format!("http://{}", host.addr());
-    let (c1, sent, building) = recording_client(db(&dir.db(1), 1), &url);
+    let (c1, sent) = recording_client(db(&dir.db(1), 1), &url);
     let c3 = client(db(&dir.db(3), 3), &url);
     c1.write(1, 1);
     c1.eng.oplog_commit();
@@ -198,31 +197,27 @@ fn run(tag: &str, shared: Option<&str>, late: Option<&'static str>) -> Option<Ru
         .unwrap();
     c1.t.set_history_floor_multi(1, &[(1, Hlc { wall: top.wall, logical: top.logical + 1, peer: 1 })]);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer = late.map(|word| {
-        let (eng, building, stop, first) = (c1.eng.clone(), building.clone(), stop.clone(), c1.row(2).unwrap());
-        std::thread::spawn(move || {
-            while !building.load(Ordering::Acquire) {
-                if stop.load(Ordering::Acquire) {
-                    return;
-                }
-                std::hint::spin_loop();
-            }
+    let t_himo = c1.eng.himo_id("notes.t").unwrap() as u16;
+    let wrote = Arc::new(AtomicBool::new(false));
+    if let Some(word) = late {
+        let (weak, first, wrote) = (Arc::downgrade(&c1.eng), c1.row(2).unwrap(), wrote.clone());
+        let write: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let Some(eng) = weak.upgrade() else { return };
             eng.tie_text_to(first, "notes.t", word);
             eng.oplog_commit();
-        })
-    });
-    c1.push();
-    stop.store(true, Ordering::Release);
-    if let Some(w) = writer {
-        w.join().unwrap();
+            wrote.store(true, Ordering::Release);
+        });
+        c1.eng.set_state_scan_hook(Some((t_himo, write)));
     }
+    c1.push();
+    c1.eng.set_state_scan_hook(None);
     let n_sent = sent.lock().unwrap().len();
     if n_sent == 0 {
         println!("[{tag}] この publish でホストは state を求めなかった");
         return None;
     }
     assert_eq!(n_sent, 1, "前提: c1 は state を 1 回だけ送った");
+    assert_eq!(wrote.load(Ordering::Acquire), late.is_some(), "前提: state の列 `t` の走査の前に書いた");
     let batch = sent.lock().unwrap()[0].clone();
 
     // c3 が state の中継を受ける
@@ -239,7 +234,7 @@ fn run(tag: &str, shared: Option<&str>, late: Option<&'static str>) -> Option<Ru
         bad_host: differing(&c1.eng, &host_eng),
         bad_c3: differing(&c1.eng, &c3.eng),
         with_text: (1..=M).filter(|k| text(&c1.eng, *k).is_some()).count(),
-        t_himo: c1.eng.himo_id("notes.t").unwrap() as u16,
+        t_himo,
     };
     drop((c1, c3, host));
     Some(out)
@@ -265,16 +260,15 @@ fn ties_of(batch: &StateBatch, t_himo: u16, vid: u32) -> Vec<Hlc> {
         .collect()
 }
 
-/// 書き手の thread が `t` の走査より前に書けた回 (state の Vocab の版数が as_of より後) を取る。 load で遅れた回はやり直す。
+/// state を作っている間の書き込みが語 `late` の最初の cell になった回 (state の Vocab の版数が as_of より後)。 ホストが state を
+/// 求めなかった回はやり直す。
 fn run_with_late_vocab(tag: &str, shared: Option<&str>, late: &'static str) -> Run {
-    for attempt in 0..6 {
-        let Some(r) = run(&format!("{tag}{attempt}"), shared, Some(late)) else { continue };
-        if vocab_of(&r.batch, late).is_some_and(|(_, h)| h > r.batch.as_of) {
-            return r;
-        }
-        println!("[{tag}{attempt}] 書き手が `t` の走査に間に合わなかった");
-    }
-    panic!("前提: 6 回とも、 state を作っている間の書き込みが語 {late:?} の最初の cell にならなかった");
+    let r = (0..6).find_map(|i| run(&format!("{tag}{i}"), shared, Some(late))).expect("前提: ホストが c1 の state を求めた");
+    assert!(
+        vocab_of(&r.batch, late).is_some_and(|(_, h)| h > r.batch.as_of),
+        "前提: state を作っている間の書き込みが語 {late:?} の最初の cell (Vocab の版数が as_of より後)"
+    );
+    r
 }
 
 /// 形 1 (issue の形): 行 2..=M が全部同じ語を持ち、 c1 が state を作っている間に行 2 の語を書き直す。 state の Vocab は行 2 の
