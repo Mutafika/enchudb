@@ -217,8 +217,8 @@ impl PrevSlots {
             return None;
         }
         let mut b = [0u8; RECORD];
-        for (i, w) in b.chunks_exact_mut(4).enumerate() {
-            w.copy_from_slice(&r.as_atomic_u32(off + 4 * i).load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        for i in (0..RECORD).step_by(4) {
+            b[i..i + 4].copy_from_slice(&r.as_atomic_u32(off + i).load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
         }
         PrevRecord::decode(&b)
     }
