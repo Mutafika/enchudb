@@ -56,6 +56,9 @@ pub enum SegmentKind {
     Tomb,
     /// #731: 場所ごとの世代 (1 B / 場所、 `crate::generation`)。 最初に場所を使い回した時に作る (file version 15)。
     Gen,
+    /// 場所を使い回した時の前の住人の記録 (32 B / 場所、 `crate::prev_slots`)。 file version 15 の DB だけ、 `gen.seg` と一緒に作る
+    /// (前の binary が作った v15 の DB は開く時に作る)。 packed には入れない
+    Prev,
     Himo(u32),
     Ver(u32),
 }
@@ -90,6 +93,7 @@ impl SegmentKind {
             SegmentKind::LeafData => "leaf.data.seg".into(),
             SegmentKind::Tomb => "tomb.seg".into(),
             SegmentKind::Gen => "gen.seg".into(),
+            SegmentKind::Prev => "prev.seg".into(),
             SegmentKind::Himo(h) => format!("himo/{h:04}.seg").into(),
             SegmentKind::Ver(h) => format!("ver/{h:04}.seg").into(),
         }
@@ -151,6 +155,8 @@ pub struct SegmentSet {
     tomb: RwLock<Option<Arc<SegmentMap>>>,
     /// #731: 世代の segment (`gen.seg`、 file version 15 の DB だけ)。
     generation: RwLock<Option<Arc<SegmentMap>>>,
+    /// 前の住人の記録の segment (`prev.seg`、 file version 15 の DB だけ)。
+    prev: RwLock<Option<Arc<SegmentMap>>>,
     /// 直前に書いた manifest の中身。 segment 長は grow でしか動かないので、 同じなら
     /// 書き直さない (`body_msync` は sync 経路から毎回呼ばれる)。 Mutex は 「同時に
     /// 2 本が manifest を書く」 のを止める役も兼ねる。
@@ -220,6 +226,7 @@ impl SegmentSet {
             space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
             generation: RwLock::new(None),
+            prev: RwLock::new(None),
             last_manifest: Mutex::new(None),
             manifest_written_at: Mutex::new(None),
         };
@@ -307,6 +314,7 @@ impl SegmentSet {
             space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
             generation: RwLock::new(None),
+            prev: RwLock::new(None),
             last_manifest: Mutex::new(known),
             manifest_written_at: Mutex::new(None),
         })
@@ -339,6 +347,7 @@ impl SegmentSet {
             SegmentKind::Ver(h) => self.lazy_slot(&self.ver, kind, h),
             SegmentKind::Tomb => self.tomb.read().unwrap().clone(),
             SegmentKind::Gen => self.generation.read().unwrap().clone(),
+            SegmentKind::Prev => self.prev.read().unwrap().clone(),
             other => self.fixed.get(&other).cloned(),
         }
     }
@@ -479,6 +488,32 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// `prev.seg` を作る (無ければ) / 開く (v15 に移る時)。 前の残りがあれば開くだけで、 中身を 0 に戻すのは呼び手
+    /// (`crate::prev_slots::PrevSlots::prepare`)。
+    pub fn ensure_prev(&self, size: usize) -> io::Result<()> {
+        let mut g = self.prev.write().unwrap();
+        if g.is_none() {
+            *g = Some(self.create_or_open(SegmentKind::Prev, size)?);
+        }
+        Ok(())
+    }
+
+    /// 開いた v15 の DB の `prev.seg` を開く。 無ければ、 `create` (書ける open) なら作る (前の binary が作った v15 の DB = 記録なし)、
+    /// でなければ開かない (Ok(false))。 開けた / 作れたら Ok(true)。
+    pub fn open_prev(&self, size: usize, create: bool) -> io::Result<bool> {
+        let p = Self::path_of(&self.dir, SegmentKind::Prev);
+        let seg = if p.exists() {
+            SegmentMap::open(&p, size, self.readonly)
+        } else if !create || self.readonly {
+            return Ok(false);
+        } else {
+            SegmentMap::create(&p, size, INITIAL_COMMIT.min(size))
+        }
+        .map_err(|e| io::Error::new(e.kind(), format!("segment {} ({}): {}", SegmentKind::Prev.name(), p.display(), e)))?;
+        *self.prev.write().unwrap() = Some(Arc::new(seg));
+        Ok(true)
+    }
+
     pub fn ensure_tomb(&self, size: usize) -> io::Result<()> {
         let mut t = self.tomb.write().unwrap();
         if t.is_some() {
@@ -517,6 +552,9 @@ impl SegmentSet {
         }
         if let Some(g) = self.generation.read().unwrap().as_ref() {
             out.push((SegmentKind::Gen, g.clone()));
+        }
+        if let Some(p) = self.prev.read().unwrap().as_ref() {
+            out.push((SegmentKind::Prev, p.clone()));
         }
         out
     }
@@ -696,6 +734,9 @@ impl SegmentSet {
         }
         if let Some(g) = self.generation.read().unwrap().as_ref() {
             push(SegmentKind::Gen, Some(g), 0)?;
+        }
+        if let Some(p) = self.prev.read().unwrap().as_ref() {
+            push(SegmentKind::Prev, Some(p), 0)?;
         }
         lens.sort();
         // 書く必要があるか (= 前回から伸びたか) を lock 内で判定する。 sync 経路は

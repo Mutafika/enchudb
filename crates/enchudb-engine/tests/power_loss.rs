@@ -3161,3 +3161,267 @@ fn a_local_delete_of_a_translated_row_whose_eidmap_reached_disk_before_the_body_
     assert!(rows.is_empty(), "前提: 再生が F を消した");
     assert_eq!(deletes, vec![world_f], "F の Delete が持ち主の世界番号 (C, f) 宛てに配られない ({deletes:x?})");
 }
+
+// ──── `prev.seg` (場所を使い回した時の前の住人の記録、 EID_REUSE_PLAN.md の 「決まった事 (2026-11-15 夜)」 = 案 C) ────
+
+/// `prev.seg` の試験の DB: sync する (cell の版数あり)、 表 t (枠 2、 名前 k = Number、 v = Number)、 peer A = 1。 1 度使い回して
+/// v15 にし、 名前 7 の X と名前 1 の行を置いて全部 (WAL・本体・sidecar) 書き出す。 consumer の周期を止めずに engine と X を渡す。
+fn full_named_table_engine(db: &Path) -> (Arc<Engine>, u64) {
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 2).unwrap();
+    eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+    let k = eng.himo_id("t.k").unwrap() as u16;
+    eng.set_table_pk("t", k).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let w = eng.entity_in("t").unwrap();
+    eng.tie_to(w, "t.k", 100u32);
+    let keep = eng.entity_in("t").unwrap();
+    eng.tie_to(keep, "t.k", 1u32);
+    eng.delete(w);
+    let x = eng.entity_in("t").unwrap();
+    assert_eq!(eng.eid_slot(x), eng.eid_slot(w), "前提: 使い回した (v15)");
+    eng.tie_to(x, "t.k", 7u32);
+    eng.tie_to(x, "t.v", 70u32);
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "前提: `.eidmap` は memory と同じ");
+    (eng, x)
+}
+
+/// X を消し、 sidecar (`tables` / `.eidmap` …) と WAL・本体を書き出して checkpoint を X の Delete の先へ進める (落ちた後の再生は
+/// X の Delete を当て直さない = X の削除は本体の tomb.seg にだけある)。 X の削除の版数を返す。
+fn delete_and_checkpoint(eng: &Engine, x: u64) -> Hlc {
+    eng.delete(x);
+    eng.oplog_commit();
+    let tomb = eng.tombstone_hlc(x);
+    assert_ne!(tomb, Hlc::ZERO, "前提: X の削除の版数");
+    eng.persist_sync_state().unwrap();
+    eng.oplog_sync().unwrap();
+    let s = eng.stats();
+    assert_eq!(s.oplog_checkpoint, s.oplog_head, "前提: checkpoint が X の Delete の先へ進んだ");
+    tomb
+}
+
+/// 名前 7 の行 Y を足す (X の場所を使い回す)。
+fn add_seven(eng: &Engine, v: u32) -> u64 {
+    let y = eng.entity_in("t").unwrap();
+    eng.tie_to(y, "t.k", 7u32);
+    eng.tie_to(y, "t.v", v);
+    eng.oplog_commit();
+    y
+}
+
+/// 像を開いて、 state の Delete (宛名, 版数) と 名前 7 の行の v を返す。
+fn open_and_read_state(img: &Path) -> (Vec<(u64, Hlc)>, Vec<u64>, u32) {
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let (records, _) = eng.state_records();
+    let deletes = records
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } => Some((eid, r.hlc)),
+            _ => None,
+        })
+        .collect();
+    let mut v: Vec<u64> = eng.pull_raw("t.k", 7u32).into_iter().filter_map(|e| eng.get(e, "t.v")).collect();
+    v.sort_unstable();
+    let restored = eng.prev_residents_restored();
+    (deletes, v, restored)
+}
+
+/// A のアプリが X を消して書き出した (checkpoint は X の Delete の先) 後、 同じ名前の Y で場所を使い回し、 `oplog_sync` (WAL・名前の
+/// 記録・本体を書き出す。 `.eidmap` は書かない) が返った後、 consumer の次の周期 (`.eidmap` に移した削除を書く) の前に電源が落ちる。
+/// 開いた A の state に X の Delete (X の番号と削除の版数) がある。
+///
+/// 前は使い回しが identity に移した X の削除が memory だけで、 本体には 0 にした tomb.seg が届き、 WAL の再生も (checkpoint の手前)
+/// 戻さないので、 X の削除がどこにも残らなかった (#914 の形: 取りこぼした peer が state で取り直すと Y を X に束ねて消す)。
+#[test]
+fn a_moved_delete_of_a_reused_slot_survives_power_loss_before_the_sidecar() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_own_after_sync");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, tomb) = {
+        let (eng, x) = full_named_table_engine(&live.join("db"));
+        let tomb = delete_and_checkpoint(&eng, x);
+        let _hold = eng.hold_consumer();
+        let y = add_seven(&eng, 77);
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
+        eng.oplog_sync().unwrap();
+        assert!(eng.eidmap_disk_diff().unwrap().is_some(), "前提: 移した X の削除は `.eidmap` に届いていない");
+        crashsim::capture(&live, &img, Mode::Lost).unwrap();
+        (x, tomb)
+    };
+    crashsim::stop();
+    let (deletes, v, restored) = open_and_read_state(&img);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(v, vec![77], "前提: 開いた像に Y がある");
+    assert!(deletes.contains(&(x, tomb)), "電源断の像の state に、 使い回した場所の前の住人 X の Delete が無い: {deletes:x?}");
+    assert_eq!(restored, 1, "`prev.seg` の記録から X の削除を戻していない");
+}
+
+/// X の削除を書き出した (checkpoint は X の Delete の先) 後、 本体の書き出しの途中 (`prev.seg` と生きている印を書き出した後・版数の
+/// 列の前) に A のアプリが X の場所を使い回す。 書き出しは使い回しが 0 にした tomb.seg も書き出すので、 書き出しが返った後の電源断の
+/// 像には 0 の tomb.seg が届く。 その記録 (書き出しの初めに `prev.seg` を書き出した後に書いた) も、 tomb.seg の前に門を閉じて書き出し
+/// 直すので届いている = 開いた A の state に X の Delete がある。
+///
+/// 書き出し直しが無いと、 0 の tomb.seg だけが届き X の削除がどこにも残らない (記録の無い master も同じ)。
+#[test]
+fn a_reuse_during_the_write_out_reaches_disk_with_its_record_before_the_cleared_tombstone() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_own_during_write_out");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, tomb) = {
+        let (eng, x) = full_named_table_engine(&live.join("db"));
+        let tomb = delete_and_checkpoint(&eng, x);
+        let _hold = eng.hold_consumer();
+        let reused: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+        let (e2, r2) = (eng.clone(), reused.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeVersions && r2.lock().unwrap().is_none() {
+                *r2.lock().unwrap() = Some(add_seven(&e2, 77));
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        let y = reused.lock().unwrap().expect("前提: 書き出しの途中で使い回した");
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
+        crashsim::capture(&live, &img, Mode::Lost).unwrap();
+        (x, tomb)
+    };
+    crashsim::stop();
+    let (deletes, _, restored) = open_and_read_state(&img);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(deletes.contains(&(x, tomb)), "書き出しの途中で使い回した場所の前の住人 X の Delete が state に無い: {deletes:x?}");
+    assert_eq!(restored, 1, "`prev.seg` の記録から X の削除を戻していない");
+}
+
+/// X の削除を書き出した (checkpoint は X の Delete の先) 後に X の場所を Y で使い回し、 本体の書き出しの途中で電源が落ちる:
+/// - 版数の列の前 (`BeforeVersions`): 生きている印 (Y が生きている) は届き、 tomb.seg には X の削除の版数が残る。 記録は書き出しの
+///   初め (生きている印の前) に届いている
+/// - tomb.seg の段の直前 (`BeforeTomb`): 門を閉じて記録を書き出し直した後
+///
+/// どちらの像でも、 開いた A で Y は生き、 state に X の Delete がある。 前は X の削除の版数が生きている Y の場所の tomb.seg に残るだけで、
+/// state に X の Delete が無かった。
+#[test]
+fn a_reuse_cut_before_the_tombstones_keeps_the_reused_row_and_the_delete() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for shot_at in [Phase::BeforeVersions, Phase::BeforeTomb] {
+        let root = scratch("prev_own_before_tomb");
+        let (live, img) = (root.join("live"), root.join("img"));
+        std::fs::create_dir_all(&live).unwrap();
+        crashsim::start();
+        let (x, tomb) = {
+            let (eng, x) = full_named_table_engine(&live.join("db"));
+            let tomb = delete_and_checkpoint(&eng, x);
+            let _hold = eng.hold_consumer();
+            let y = add_seven(&eng, 77);
+            assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
+            let shot = Arc::new(AtomicBool::new(false));
+            let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+            write_out_hook::set(Some(Arc::new(move |p: Phase| {
+                if p == shot_at && !s2.swap(true, Ordering::SeqCst) {
+                    let _ = crashsim::capture(&l, &i, Mode::Lost);
+                }
+            })));
+            eng.oplog_sync().unwrap();
+            write_out_hook::set(None);
+            assert!(shot.load(Ordering::SeqCst), "前提: {shot_at:?} で撮った");
+            (x, tomb)
+        };
+        crashsim::stop();
+        let (deletes, v, _) = open_and_read_state(&img);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(v, vec![77], "{shot_at:?}: 開いた像で使い回した Y が生きていない");
+        assert!(deletes.contains(&(x, tomb)), "{shot_at:?}: state に使い回した場所の前の住人 X の Delete が無い: {deletes:x?}");
+    }
+}
+
+/// #925 の電源断の形: A (枠 1 の表) が C の行 F を受けて写像を書き出した後、 A のアプリが F を消し (`.eidmap` の写像の面に削除の
+/// 版数は無い)、 Y で F の場所を使い回して `oplog_sync` が返った後、 consumer の次の周期 (外した写像を書く) の前に電源が落ちる。
+/// 開いた A で写像 (C, f) は戻らず、 A の state は Y を A の行として出し、 F の Delete を (C, f) 宛てに出す。
+///
+/// 前は #925 の推測 (面に削除の版数がある時だけ外す) が写像を戻し、 Y が C の行 F として扱われた。
+#[test]
+fn a_locally_deleted_translated_slot_reused_before_power_loss_stays_unmapped() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_translated");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    let tomb = {
+        let db = live.join("db");
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "c", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("t.c").unwrap() as u16;
+        let t = eng.resolve_remote_eid(world_f, hid).unwrap();
+        assert!(eng.remote_tie_apply_result(t, hid, 5u32, Hlc { wall: 1_000, logical: 0, peer: 3 }).applied());
+        eng.persist_sync_state().unwrap();
+        eng.oplog_sync().unwrap();
+        let f = eng.pull_raw("t.c", 5u32);
+        assert_eq!(f.len(), 1, "前提: A に F がある");
+        let _hold = eng.hold_consumer();
+        eng.delete(f[0]);
+        eng.oplog_commit();
+        let tomb = eng.tombstone_hlc(f[0]);
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to(y, "t.c", 9u32);
+        eng.oplog_commit();
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(f[0]), "前提: Y は F の場所を使い回した");
+        eng.oplog_sync().unwrap();
+        assert!(eng.eidmap_disk_diff().unwrap().is_some(), "前提: 外した写像は `.eidmap` に届いていない");
+        crashsim::capture(&live, &img, Mode::Lost).unwrap();
+        tomb
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let mapped = eng.resolve_remote_eid_existing(world_f);
+    let (records, _) = eng.state_records();
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    let y_rows: Vec<u64> = records
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Tie { eid, value: 9, .. } => Some(eid),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        y_rows.len() == 1 && enchudb_oplog::eid_peer(y_rows[0]) == 1,
+        "使い回した Y が A の行として state に出ない (C の行 F として出た?): {y_rows:x?}"
+    );
+    assert!(
+        records.iter().any(|r| matches!(r.op, DecodedOp::Delete { eid } if eid == world_f) && r.hlc == tomb),
+        "state に F の Delete ((C, f) 宛て) が無い"
+    );
+    assert_eq!(mapped, None, "開いた A で F の写像が戻った");
+}
