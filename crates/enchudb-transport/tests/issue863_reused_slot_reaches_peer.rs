@@ -544,6 +544,15 @@ fn refs_follow_the_generation_both_ways() {
     let got = target(&a, rows[0]).expect("B の ref が A に届かない");
     assert_ne!(got, y, "消えた行を指す ref が、 場所を使い回した行を指した");
     assert_eq!(got, rows[1], "消えた行を指す ref が、 消えた行の番号でない");
+    // 逆引き (#899: Ref の円柱は場所を鍵に、 entry に値の世代): 相手から届いた値でも、 y を指す行は y を指して書いた行だけ
+    let pointing = |e: &Engine, to: u64| {
+        let mut v = e.pull_raw("notes.next", enchudb_oplog::eid_local(to));
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(pointing(&a, y), vec![rows[2]], "A で y を指す行の逆引き");
+    assert_eq!(pointing(&a, rows[1]), vec![rows[0]], "A で消えた行を指す行の逆引き");
+    assert_eq!(pointing(&b, y_b[0]), vec![on_b(12)[0]], "B で y の写しを指す行の逆引き");
 }
 
 /// 別名 (#178) の知らせが A のもう無い行 (場所を使い回した前の住人) を名指しても、 使い回した行に相手の世界番号を結ばない。
