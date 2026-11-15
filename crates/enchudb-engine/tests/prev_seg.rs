@@ -106,6 +106,12 @@ fn a_reuse_records_the_former_own_row_only_in_a_synced_db() {
     let x = add(&plain, 7);
     let (y, _) = reuse(&plain, x, 8);
     assert_eq!(plain.prev_resident_of_slot(plain.eid_slot(y)), None, "sync しない DB が記録を書いた");
+    // review946c [I]: 記録を書かない DB には `prev.seg` を作らない (開き直しても)
+    assert!(!Path::new(&q).join("prev.seg").exists(), "sync しない v15 の DB に `prev.seg` を作った");
+    drop(plain);
+    let plain = open(&q);
+    assert_eq!(plain.get(y, "t.k"), Some(8));
+    assert!(!Path::new(&q).join("prev.seg").exists(), "sync しない v15 の DB を開いて `prev.seg` を作った");
 }
 
 /// 翻訳した行 (受けた他の peer の行) の場所を使い回すと、 前の住人の identity (相手の peer, 相手の番号) と削除の版数を書く。
@@ -321,6 +327,35 @@ fn the_replayed_delete_of_the_former_resident_does_not_delete_the_new_rows_name(
     assert_eq!(eng.deleted_name_version(hk, 8), None, "再生した X の Delete が Y の名前 8 を消した名前にした");
 }
 
+/// review946c [D]: M6 の続き。 X を消して Y で場所を使い回した後に、 pull の sidecar の書き出し (`persist_sync_state`) が周期を進めて
+/// 書き出し済みにし (WAL の checkpoint は X の Delete の手前のまま)、 Y を消して Z で場所をもう一度使い回して落ちる (kill)。 開く時に
+/// 戻す記録は 2 回目 (前の住人 Y) だけだが、 再生は X の Delete も Z の場所に当てない (log に残る 1 回目の記録で守る)。 前は守りが
+/// 書き出していない記録しか引かず、 X の Delete が Z の名前 9 を X の削除の版数で消した名前にした。
+#[test]
+fn a_replayed_delete_behind_a_persisted_reuse_does_not_delete_the_new_rows_name() {
+    let (p, img) = (tmp_path("m6-persisted"), tmp_path("m6-persisted-img"));
+    let _c = Cleanup(vec![p.clone(), img.clone()]);
+    let eng = create(&p, 1, true);
+    let hk = eng.himo_id("t.k").unwrap() as u16;
+    let x = add(&eng, 7);
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    let z = {
+        let _hold = eng.hold_consumer();
+        let (y, _) = reuse(&eng, x, 8);
+        eng.persist_sync_state().unwrap();
+        let (z, _) = reuse(&eng, y, 9);
+        copy_dir(Path::new(&p), Path::new(&img));
+        z
+    };
+    drop(eng);
+    let eng = open(&img);
+    assert_eq!(eng.prev_residents_restored(), 1, "前提: 開く時に戻すのは 2 回目 (書き出していない周期) の記録だけ");
+    assert_eq!(eng.get(z, "t.k"), Some(9), "前提: 開いた像で Z が生きている");
+    assert!(!eng.is_live(x), "前提: X は消えている");
+    assert_eq!(eng.deleted_name_version(hk, 9), None, "再生した X の Delete が Z の名前 9 を消した名前にした");
+}
+
 /// review946 の M13: #924 の Ref を出すのは、 前の住人 X の Delete が同じ state に入る時だけ (Delete の無い Ref は受け手に空の生きた行を
 /// 作る、 #921 の読み直し [1])。 Delete が入るのは、 削除の版数が author の時計か、 X が author の行の時 (#951)。 ホスト H が X の場所を
 /// 使い回した後の、 author の行 W (W.next → X) の replica 版の state:
@@ -487,12 +522,16 @@ fn an_idle_db_moves_the_reuse_records_to_the_sidecars() {
         assert_eq!(back.prev_residents_restored(), 1, "前提: 暇な周期の前の像は記録から戻す");
         assert!(state_deletes(&back).contains(&(x, tomb)), "前提: 戻した X の Delete が state に無い");
     }
-    // consumer の暇な周期 (100 ms) を何回か待って撮る
+    // consumer の暇な周期 (1 秒に 1 回まで) を待って撮る。 写す間は consumer を止める (review946c [J]: 写しの途中に暇な周期の
+    // 書き出しが走ると、 書き出し済みと言う `prev.seg` と書き出す前の `eidmap*` の混ざった像になった)
     let mut restored = u32::MAX;
-    for _ in 0..30 {
+    for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = std::fs::remove_dir_all(&after);
-        copy_dir(Path::new(&p), Path::new(&after));
+        {
+            let _hold = eng.hold_consumer();
+            copy_dir(Path::new(&p), Path::new(&after));
+        }
         let back = open(&after);
         restored = back.prev_residents_restored();
         if restored == 0 {

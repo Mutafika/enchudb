@@ -10514,6 +10514,10 @@ impl Engine {
         }
         // request18: table 定義が確定したので hot path 用 cache を張り直す。
         eng.refresh_sync_tables_flag();
+        // `prev.seg` の無い sync する v15 の DB (前の binary が作った) は作る (記録なし)
+        if !readonly && let Err(e) = eng.ensure_prev_seg() {
+            eprintln!("warning: prev.seg could not be created (reuse records are not kept): {e}");
+        }
         // #385: 辞書の参照数を数え直す (要る時だけ)。 table が決まった後、 oplog の回復で書く前
         eng.finish_vocab_refs_at_open();
         // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を再構成 (free-list は非永続)。
@@ -10553,6 +10557,11 @@ impl Engine {
         let unclean = eng.himo_reg.rebuilt_on_load || eng.generations().session_dirty();
         // review946c [A]: 書き出していない記録は `.eidmap` を読む前に読む (写像の見分けが、 配列で上書きされた記録も見る)
         let prev_records = if unclean { eng.load_prev_records() } else { Vec::new() };
+        let prev_by_slot = {
+            let mut v = prev_records.clone();
+            v.sort_unstable_by_key(|&(slot, r)| (slot, r.gone));
+            v
+        };
         match load_eidmap_from_sidecar(path) {
             Ok(Some((entries, log))) => {
                 *eng.eidmap_log.lock().unwrap_or_else(|p| p.into_inner()) = log;
@@ -10567,7 +10576,7 @@ impl Engine {
                     // 落ちる前に場所を使い回して外した写像 (`prev.seg` の記録の前の住人がこの identity): 戻さず、 記録の削除の版数を
                     // identity に退避する (下の #925 の推測より先に、 記録で決める。 面の削除の版数が無い = 削除を書き出す前の面でも
                     // 決まる)。 名前の記録は `pktombs` / `pkformer` を読んだ後に移す
-                    if let Some(t) = unclean.then(|| eng.prev_evicted(local, peer, foreign_local)).flatten() {
+                    if let Some(t) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
                         let tomb = tomb.max(t);
                         eng.remember_foreign_tombstone(peer, foreign_local, tomb);
                         stale_mappings.push((peer, foreign_local, local, tomb));
@@ -11425,12 +11434,15 @@ impl Engine {
             #[cfg(not(target_arch = "wasm32"))]
             if let Backing::Segments(set) = &backing {
                 set.open_gen(layout.segment_reserve(SegmentKind::Gen)).map_err(|e| e.to_string())?;
-                // 前の住人の記録 (`prev.seg`)。 無ければ作る (前の binary が作った v15 の DB = 記録なし)。 開けなくても開く (記録を
-                // 書かない = 落ちた時に使い回しの退避を失う前の形、 #914 の窓だけ残る)
-                match set.open_prev(layout.segment_reserve(SegmentKind::Prev), !readonly) {
+                // 前の住人の記録 (`prev.seg`)。 有れば開く。 無い時 (前の binary が作った v15 の DB / sync しない DB) は、 sync する DB
+                // なら表の定義を読んだ後に作る (`ensure_prev_seg`、 review946c [I])。 開けなくても開く (記録を書かない = 落ちた時に
+                // 使い回しの退避を失う前の形、 #914 の窓だけ残る)
+                match set.open_prev(layout.segment_reserve(SegmentKind::Prev), false) {
                     Ok(true) => {
                         // 0 から始めた header は書き出す (記録の page だけ届いて header の無い像を作らない、 review946 [10])
-                        if generations.prev.attach(set.region(SegmentKind::Prev), !readonly, u32::from(layout.gen_bits)) == Some(true)
+                        let flush = |off, len| set.flush_kind(SegmentKind::Prev, off, len);
+                        if generations.prev.attach(set.region(SegmentKind::Prev), !readonly, u32::from(layout.gen_bits), flush)
+                            == Some(true)
                             && let Err(e) = set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)
                         {
                             eprintln!("warning: prev.seg header could not be written out: {e}");
@@ -11818,6 +11830,10 @@ impl Engine {
             );
         }
         self.refresh_sync_tables_flag();
+        // v15 に移った後に sync を始めた DB は、 ここで `prev.seg` を作る (review946c [I]: 移る時は sync する DB にだけ作る)
+        if let Err(e) = self.ensure_prev_seg() {
+            eprintln!("[enchudb] warning: prev.seg could not be created on enable_sync_tables (reuse records are not kept): {e}");
+        }
 
         Ok(())
     }
@@ -15873,10 +15889,14 @@ impl Engine {
     /// が checkpoint を進めて暇になった DB は周期が進まなかった: 次の書き込みまで記録が書き出されないまま溜まり、 log の区画 (1 周期
     /// 21845 件) から溢れて (同じ場所を 2 回使い回した 1 回目が残らない)、 きれいに閉じなかった後の open は配列をなめて溜まった記録を
     /// 全部戻した (名前の無い表 20 万行の bench で開く時間 7 → 19 ms)。
-    fn persist_prev_if_pending(&self) {
-        if self.generations().prev.pending() {
+    ///
+    /// 書いたか (書き出していない記録があったか) を返す。
+    fn persist_prev_if_pending(&self) -> bool {
+        let pending = self.generations().prev.pending();
+        if pending {
             self.try_persist_tables();
         }
+        pending
     }
 
     /// `prev.seg`: 使い回しの退避の載る sidecar (`.eidmap` / `eidalias` / `pktombs` / `pkformer`) を全部書けた後、 header の書き出した
@@ -15888,7 +15908,7 @@ impl Engine {
     /// `eidalias` と、 `.eidmap` / `pktombs` / `pkformer` のまとめ直しは tmp + rename で、 rename が戻る電源断の像では header だけが
     /// 「書き出した」 と言い、 使い回しの前の sidecar のまま記録を戻さなかった。 fsync できなければ進めない (次の書き出しで覆う)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn prev_persist_end(&self, covered: Option<u32>) {
+    fn prev_persist_end(&self, covered: Option<u64>) {
         let Some(c) = covered else { return };
         if let Err(e) = crate::db_files::sync_dir_plain(std::path::Path::new(&self.path), "prev.dir_sync") {
             self.warn_persist_failure_rate_limited(&e);
@@ -19245,7 +19265,11 @@ impl Engine {
         };
         let recorded = record.is_some_and(|r| {
             let prev = &self.generations().prev;
-            let ok = prev.write(slot, &r);
+            let (ok, wake) = prev.put(slot, &r);
+            if wake && let Some(w) = self.consumer_waker() {
+                // 区画の 3/4: 次の周期を待たずに sidecar を書いて周期を進めさせる (区画が一杯になる前に)
+                w.wake();
+            }
             if !ok && prev.active() {
                 // review946 [12]: 書けない (commit を伸ばせない = 空き不足) 使い回しは記録なしで進む (落ちた時は前の形 = #914 の窓)
                 self.record_fault(FaultKind::DiskSpace, "prev.seg: the former resident of a reused slot was not recorded");
@@ -19305,14 +19329,20 @@ impl Engine {
     ///
     /// 場所の最後の行は page の印を見ずに読む (開く時の突き合わせ `reconcile_generations` が印を立て直す前に呼ぶ)。
     ///
-    /// review946c [A]: 見る記録は場所ごとの配列 (最後の使い回し) と、 開く時に読んだ書き出していない記録 (`.eidmap` を読む前に置く、
-    /// `PrevSlots::keep_for_replay`) の全部。 同じ場所を 1 つの周期で 2 回使い回すと (翻訳した行 F → 自分の行 Y → Z)、 配列は 2 回目
+    /// review946c [A]: 見る記録は場所ごとの配列 (最後の使い回し) と、 開く時に読んだ書き出していない記録 (`.eidmap` を読む前に読む、
+    /// `unpersisted` は (場所, 前の住人の行) の順) の全部。 同じ場所を 1 つの周期で 2 回使い回すと (翻訳した行 F → 自分の行 Y → Z)、 配列は 2 回目
     /// (前の住人 Y) に上書きされ、 前は配列だけを見て写像 (C, f) を今の住人 Z に戻した (F の削除の版数は面に無く #925 の推測も外さない)。
-    fn prev_evicted(&self, local: u32, peer: enchudb_oplog::PeerId, foreign_local: u32) -> Option<enchudb_oplog::Hlc> {
+    fn prev_evicted(
+        &self,
+        unpersisted: &[(u32, crate::prev_slots::PrevRecord)],
+        local: u32,
+        peer: enchudb_oplog::PeerId,
+        foreign_local: u32,
+    ) -> Option<enchudb_oplog::Hlc> {
         let gens = self.generations();
         let mut found: Option<crate::prev_slots::PrevRecord> = None;
         let mut last: Option<u32> = None;
-        gens.prev.for_each_record_at(local, |rec| {
+        gens.prev.for_each_record_at(unpersisted, local, |rec| {
             if rec.kind != crate::prev_slots::PrevKind::Translated || rec.peer != peer || rec.number != foreign_local {
                 return;
             }
@@ -19362,14 +19392,40 @@ impl Engine {
     /// 写像の見分け ([`Self::prev_evicted`])・退避を戻す所 ([`Self::restore_prev_residents`])・WAL の再生の守り (`replay_slot`)・
     /// 後始末のやり直し (`redo_reuse_eviction`)・bridge の宛名 ([`Self::bridge_row_address`]) が、 場所ごとの配列で上書きされた前の
     /// 住人 (同じ場所を 1 つの周期で 2 回使い回した 1 回目) も引く。
+    ///
+    /// 返すのは書き出していない周期の記録 (周期の順)。 再生の守りと bridge には、 log に残る記録の全部も置く (review946c [D]: pull の
+    /// sidecar の書き出しが WAL の checkpoint より先に周期を進めた像で、 書き出した周期の記録の前の住人宛ての record も再生する)。
     fn load_prev_records(&self) -> Vec<(u32, crate::prev_slots::PrevRecord)> {
         let gens = self.generations();
         if !gens.prev.active() || !gens.active() {
             return Vec::new();
         }
-        let records = gens.prev.unpersisted();
-        gens.prev.keep_for_replay(&records);
+        let (records, logged) = gens.prev.open_records();
+        gens.prev.keep_for_replay(&logged);
         records
+    }
+
+    /// sync する v15 の DB に `prev.seg` が無ければ作る (記録なし): 前の binary が作った v15 の DB を書ける open で開いた時 / v15 に
+    /// 移った後に sync を始めた時 (`enable_sync_tables`)。 sync しない DB には作らない (記録を書かない、 review946c [I])。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ensure_prev_seg(&self) -> io::Result<()> {
+        let gens = self.generations();
+        if !gens.active() || gens.prev.active() || !self.sync_tables_on() {
+            return Ok(());
+        }
+        let Backing::Segments(set) = &self.backing else { return Ok(()) };
+        if self.is_readonly() {
+            return Ok(());
+        }
+        let reserve = self.layout.read().unwrap().reserve_entities;
+        set.ensure_prev(crate::prev_slots::segment_len(reserve))?;
+        gens.prev.prepare(set.region(SegmentKind::Prev), gens.bits(), |off, len| set.flush_kind(SegmentKind::Prev, off, len))?;
+        set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn ensure_prev_seg(&self) -> io::Result<()> {
+        Ok(())
     }
 
     /// 場所 `local` の最後の行 (`last_local_of_slot` と同じ決め方を、 page の印を見ずに) と、 死んでいるか。 開く時の突き合わせ
@@ -21139,10 +21195,13 @@ impl Engine {
             set.ensure_gen(crate::generation::segment_len(l.reserve_entities))?;
             self.generations().prepare(set.region(SegmentKind::Gen), bits)?;
             // 前の住人の記録 (`prev.seg`) も作る (前の残りは 0 に戻す)。 header より先に届かなくてよい (header の合わない
-            // `prev.seg` は開く時に 0 から始める = 記録なし)
-            if !self.generations().prev.active() {
+            // `prev.seg` は開く時に 0 から始める = 記録なし)。 記録を書くのは sync する DB だけなので、 sync しない DB には作らない
+            // (review946c [I]。 後から sync を始めた DB は `enable_sync_tables` / 開く時に作る)
+            if !self.generations().prev.active() && self.sync_tables_on() {
                 set.ensure_prev(crate::prev_slots::segment_len(l.reserve_entities))?;
-                self.generations().prev.prepare(set.region(SegmentKind::Prev), bits)?;
+                self.generations().prev.prepare(set.region(SegmentKind::Prev), bits, |off, len| {
+                    set.flush_kind(SegmentKind::Prev, off, len)
+                })?;
                 // header は記録より先に disk へ (review946 [10])
                 set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)?;
             }
@@ -29260,6 +29319,8 @@ impl Engine {
                 // #850: 当てている途中の書き手の手前で切ったせいで古い区画を畳めなかった周期が続いた回の、 次の周期までの間
                 // (0 = 続いていない。 1 ms から倍々、 上限 10 ms = 空け作りの間と同じ)
                 let mut cut_retry = Duration::ZERO;
+                // `prev.seg`: 暇な周期に sidecar を書いて周期を進めた最後の時 (review946c [G]: 1 秒に 1 回まで)
+                let mut last_idle_prev: Option<Instant> = None;
 
                 loop {
                     engine.consumer_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -29287,7 +29348,10 @@ impl Engine {
                     {
                         let fold_off = engine.wal_fold_off.load(Ordering::Relaxed);
                         let switched = fold_off & WAL_FOLD_OFF_SWITCH == 0 && wal.switches() != seen_switches;
-                        if last_fsync.elapsed() >= fsync_interval || switched {
+                        // `prev.seg`: 書き手が log の区画の 3/4 を越えた (起こされた) = 次の周期を待たずに書き出して sidecar を書き、
+                        // 周期を進める (区画が一杯になる前に、 review946c の 3)
+                        let prev_urgent = engine.generations().prev.take_urgent();
+                        if last_fsync.elapsed() >= fsync_interval || switched || prev_urgent {
                             seen_switches = wal.switches();
                             // #850: この周期の書き出しを、 当てている途中の書き手の手前で切ったか
                             let mut tick_cut = false;
@@ -29357,8 +29421,14 @@ impl Engine {
                             } else {
                                 // #451 (段階 1): 書くものの無い周期に、 置いた印を ring だけ書き出す (暇になった後に kill されても印が残る)
                                 engine.flush_durable_mark_if_pending();
-                                // `prev.seg`: 書き出していない使い回しの記録が残っていれば sidecar を書いて周期を進める
-                                engine.persist_prev_if_pending();
+                                // `prev.seg`: 書き出していない使い回しの記録が残っていれば sidecar を書いて周期を進める。 1 秒に 1 回まで
+                                // (review946c [G]: 「使い回し → `oplog_sync()` → 暇」 を繰り返す DB で、 100 ms ごとに `eidmap.log` の
+                                // 追記 (macOS は F_FULLFSYNC) と header の書き出しを足さない。 区画の 3/4 を越えた時は待たない)
+                                if (prev_urgent || last_idle_prev.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)))
+                                    && engine.persist_prev_if_pending()
+                                {
+                                    last_idle_prev = Some(Instant::now());
+                                }
                             }
                             // ring buffer reset を試みる。head == checkpoint の
                             // ときだけ head/checkpoint を HEADER_SIZE に戻す。
