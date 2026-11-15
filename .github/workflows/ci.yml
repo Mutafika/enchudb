@@ -215,6 +215,10 @@ jobs:
       - name: tables dir fsync failure (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test issue902_tables_dir_sync_failure --release
 
+      # #884: `tables` の rename の後に directory を fsync し、 その後に checkpoint を進める順 (I/O の点の順で数える)
+      - name: tables dir fsync order (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test issue884_tables_dir_sync_order --release
+
       # #98 ③④: I/O の点ごとの故障 (I/O エラー / process の死 / 電源断 × flush / oplog の書き手)。 同じ crashsim feature の
       # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
       - name: fault injection / crash matrix (crashsim)
