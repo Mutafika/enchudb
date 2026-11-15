@@ -707,6 +707,18 @@ pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
     })
 }
 
+/// #949: [`decode_sync_ops_payload`] が受ける payload だけ (author, HLC) を返す。 受ける / 断るの判定は
+/// `decode_sync_ops_payload` と同じ (長さ・magic・版・op の中身まで読む) で、 `Record` を組み立てない (署名と signed bytes を
+/// 写さない)。 ring の walk (`_sync_ops` の行を lsn の順に読む ack / reclaim) が、 decode できない行を dead row として扱うのを
+/// 変えずに、 行ごとの写しを省く。
+pub fn sync_ops_payload_walk_key(payload: &[u8]) -> Option<(PeerId, Hlc)> {
+    if payload.len() < SYNC_OPS_PAYLOAD_PREFIX + SIGNED_PAYLOAD_HEADER_SIZE {
+        return None;
+    }
+    let (_, hlc, author_peer, _) = decode_signed(&payload[SYNC_OPS_PAYLOAD_PREFIX..])?;
+    Some((author_peer, hlc))
+}
+
 /// #568: 署名の対象の bytes (record の header 40 B ‖ payload) から HLC・author・op を読む。 受け手は、 署名を確かめた
 /// bytes と、 当てる中身 (wire の欄) が同じ record かをこれで見る。 読めない bytes は None。
 pub fn decode_signed_bytes(signed_bytes: &[u8]) -> Option<(Hlc, PeerId, DecodedOp)> {

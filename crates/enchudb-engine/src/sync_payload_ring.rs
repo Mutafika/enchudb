@@ -283,6 +283,18 @@ impl PayloadRing {
         (self.lsn_at(at).load(Ordering::Acquire) == lsn).then_some(bytes)
     }
 
+    /// #949: [`read`](Self::read) の写さない形: entry の中身を `f` に渡し、 渡した後もその場所が `lsn` の entry のままなら
+    /// `f` の答えを返す (`read(handle, lsn).map(|b| f(&b))` と同じ答え)。 `f` が見ている間に bridge がその場所を使い回すと
+    /// 中身は書きかけでありうるので、 `f` はどんな byte でも panic しないこと (答えは捨てる)。
+    pub fn read_with<R>(&self, handle: u32, lsn: u32, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let off = off_of(handle)?;
+        let len = self.entry_len_if(off, lsn)?;
+        let at = HEADER + off;
+        let r = f(&self.region.slice()[at + ENTRY_HEADER..at + ENTRY_HEADER + len]);
+        std::sync::atomic::fence(Ordering::Acquire);
+        (self.lsn_at(at).load(Ordering::Acquire) == lsn).then_some(r)
+    }
+
     /// handle の場所に `lsn` の entry が在るか (読めるか)。 #442: 行は届いたのに entry が届かなかった (電源断) 行を、
     /// 開いた時の位置合わせと満杯の数え直しで生きている entry と数えないため。
     pub fn holds(&self, handle: u32, lsn: u32) -> bool {
