@@ -1481,8 +1481,10 @@ impl InflightExtra {
     }
 }
 
-/// #388: [`OpLog::set_room_waiter`] の待ち手。 引数は載せたい byte 数、 戻り値は空いたか。 append_lock を持たずに呼ぶ。
-pub type RoomWaiter = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
+/// #388: [`OpLog::set_room_waiter`] の待ち手。 引数は載せたい byte 数と、 載せたいのが当てる書き込みの印の付いた record か
+/// (`append_*_applying` の 1 件。 印はまだ位置を持たない = その書き手は何も積んでいない、 #896)、 戻り値は空いたか。 append_lock を
+/// 持たずに呼ぶ。
+pub type RoomWaiter = std::sync::Arc<dyn Fn(u64, bool) -> bool + Send + Sync>;
 
 unsafe impl Send for OpLog {}
 unsafe impl Sync for OpLog {}
@@ -1811,7 +1813,7 @@ impl OpLog {
     /// - もう空いている (載らなかった後に他の thread が畳んだ): true。 前は入口で空きを見て 「満杯でない失敗」 と読み、
     ///   畳めているのに落としていた (書き手が多いと、 満杯にぶつかってから空きを見るまでの間に畳まれる)
     /// - 空いていない: 待ち手に頼む。 待ち手が空けたら true、 空かなければ警告を出して false
-    fn wait_for_room(&self, err: &io::Error, size: u64) -> bool {
+    fn wait_for_room(&self, err: &io::Error, size: u64, applying: bool) -> bool {
         if err.kind() != io::ErrorKind::OutOfMemory {
             return false;
         }
@@ -1823,7 +1825,7 @@ impl OpLog {
             return true;
         }
         let waiter = self.room_waiter.read().unwrap_or_else(|p| p.into_inner()).clone();
-        if waiter.is_some_and(|w| w(size)) {
+        if waiter.is_some_and(|w| w(size, applying)) {
             return true;
         }
         self.warn_wal_full();
@@ -2541,7 +2543,7 @@ impl OpLog {
         let _guard = self.pending_guard(records.len() as u32);
         let mut r = self.append_many_inner(records, &sizes, total, hlcs);
         let reserve = if records.last().is_some_and(|r| matches!(r.as_op(), Op::Commit)) { 0 } else { self.commit_room.load(Ordering::Relaxed) };
-        while r.as_ref().is_err_and(|e| self.wait_for_room(e, total as u64 + reserve)) {
+        while r.as_ref().is_err_and(|e| self.wait_for_room(e, total as u64 + reserve, false)) {
             r = self.append_many_inner(records, &sizes, total, hlcs);
         }
         if r.is_ok() {
@@ -2717,7 +2719,7 @@ impl OpLog {
         }
         let record_size = record_size_hint(payload_len);
         let mut r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
-        while r.as_ref().is_err_and(|e| self.wait_for_room(e, record_size as u64 + self.commit_room.load(Ordering::Relaxed))) {
+        while r.as_ref().is_err_and(|e| self.wait_for_room(e, record_size as u64 + self.commit_room.load(Ordering::Relaxed), false)) {
             r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
         }
         if r.is_ok() {
@@ -2827,7 +2829,7 @@ impl OpLog {
         let mut r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit, mark);
         let reserve = if is_commit { 0 } else { self.commit_room.load(Ordering::Relaxed) };
         // 空いた後に他の書き手が先に埋めたら、 また待つ (#552: 前は 1 回しか書き直さず、 畳めているのに落とした)
-        while r.as_ref().is_err_and(|e| self.wait_for_room(e, record_size as u64 + reserve)) {
+        while r.as_ref().is_err_and(|e| self.wait_for_room(e, record_size as u64 + reserve, mark.is_some())) {
             r = self.append_inner_raw(&op, payload_size, record_size, relay.as_ref(), hlc_override, is_commit, mark);
         }
         if r.is_ok() {
@@ -6188,8 +6190,8 @@ mod tests {
         // 載らなかった後に他の thread が畳んだ
         wal.checkpoint_and_reset(|_| true, |_| true);
         assert!(wal.free_bytes() >= size, "前提: 畳んで空いた");
-        assert!(wal.wait_for_room(&full, size), "空いているのに書き直さない (満杯でない失敗と読んだ)");
-        assert!(!wal.wait_for_room(&io::Error::other("injected"), size), "満杯でない失敗を書き直す");
+        assert!(wal.wait_for_room(&full, size, false), "空いているのに書き直さない (満杯でない失敗と読んだ)");
+        assert!(!wal.wait_for_room(&io::Error::other("injected"), size, false), "満杯でない失敗を書き直す");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -6222,7 +6224,7 @@ mod tests {
             let calls = Arc::new(AtomicU32::new(0));
             let filling = Arc::new(AtomicBool::new(false));
             let (weak, c, f) = (Arc::downgrade(&wal), calls.clone(), filling.clone());
-            wal.set_room_waiter(Some(Arc::new(move |size| {
+            wal.set_room_waiter(Some(Arc::new(move |size, _| {
                 // 他の書き手が埋めている最中の満杯は空けない (その書き手は落ちる)
                 if f.load(Ordering::Acquire) {
                     return false;
@@ -7827,7 +7829,7 @@ mod tests {
         let folded = std::sync::Arc::new(AtomicU64::new(0));
         {
             let (weak, folded) = (std::sync::Arc::downgrade(&wal), folded.clone());
-            wal.set_room_waiter(Some(std::sync::Arc::new(move |_| {
+            wal.set_room_waiter(Some(std::sync::Arc::new(move |_, _| {
                 let wal = weak.upgrade().unwrap();
                 // 空きを作る側: 待っている書き手の印に止められずに、 全部を覆って畳める
                 let (_, did_fold) = wal.checkpoint_and_reset(|_| true, |_| true);
