@@ -4353,7 +4353,7 @@ mod apply_liveness_tests {
         write_many_counted(eng, e, y, n, done, &std::sync::atomic::AtomicU32::new(0))
     }
 
-    /// [`write_many`] の、 断られた数も `rejected` に置く版 (止める側が、 B が断られたのを見て放す)。
+    /// [`write_many`] の、 断られるたびに `rejected_now` にも足す版 (止める側が、 B が断られたのを見て放す)。
     fn write_many_counted(
         eng: &Engine,
         e: u64,
