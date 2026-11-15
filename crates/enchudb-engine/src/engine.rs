@@ -13178,10 +13178,10 @@ impl Engine {
                         continue;
                     }
                     // #731 (段 4): 自分の行の世界番号は世代込み (生きている行 = 今の世代)
-                    // #917 (G): 宛名は cell を読む前に引き、 読んだ後に引き直して確かめる (間にその行が消えて場所が使い回されると、
-                    // 新しい行宛ての Untie になる)
-                    let address = || self.eid_translator.reverse(local).unwrap_or_else(|| (self_peer, self.own_world_local(local)));
-                    let (owner, owner_local) = address();
+                    // #917 (G): 宛名は cell を読む前に引き、 読んだ後に場所の最後の行が同じか確かめる (間にその行が消えて場所が
+                    // 使い回されると、 新しい行宛ての Untie になる。 使い回すと世代が変わる)
+                    let row = self.own_world_local(local);
+                    let (owner, owner_local) = self.eid_translator.reverse(local).unwrap_or((self_peer, row));
                     #[cfg(test)]
                     if let Some(wal) = self.oplog.as_ref() {
                         state_read_hook::call(wal);
@@ -13192,7 +13192,7 @@ impl Engine {
                     if !empty || !mine(hlc) || !self.entities.is_live(local) {
                         continue;
                     }
-                    if address() != (owner, owner_local) {
+                    if self.own_world_local(local) != row {
                         continue;
                     }
                     #[cfg(test)]
@@ -17938,7 +17938,11 @@ impl Engine {
 
     #[inline]
     fn remote_row_holds_slot(&self, slot: u32, row: Option<u32>) -> bool {
-        row.is_none_or(|r| !self.generations().active() || self.last_local_of_slot(slot) == r)
+        let Some(r) = row else { return true };
+        let gens = self.generations();
+        // 生きている今の行 (よくある形): 場所の今の世代の番号と同じ。 消すと世代が上がるので、 死んだ場所の今の世代の番号は消えた行の
+        // 番号と違う (下の引き方で見る)
+        !gens.active() || gens.local(slot) == r || self.last_local_of_slot(slot) == r
     }
 
     /// test 用の割り込み点: 受信の当て込み (`remote_*_apply`) が行の lock を取る直前 (#917)。
