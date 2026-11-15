@@ -8,12 +8,23 @@
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 /// queue cap を 64 に絞って、 8 writer × 200 ops を投げる。 旧 unbounded queue
 /// なら全部 push 通って終わる。 bounded 化後は cap 超え時に block するが、
 /// consumer 進捗で drain → push 成功するはず。 hang しなければ pass。
 #[test]
 fn small_queue_cap_does_not_hang() {
-    let path = "/tmp/test_queue_backpressure.db";
+    let path = tmp_path("test_queue_backpressure");
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
@@ -49,4 +60,6 @@ fn small_queue_cap_does_not_hang() {
             assert_eq!(eng.query_by_id(&[(marker_hid, w * 1000 + i)]).len(), 1, "writer {w} の {i} 番目が見えない");
         }
     }
+    drop(eng);
+    let _ = std::fs::remove_dir_all(path);
 }

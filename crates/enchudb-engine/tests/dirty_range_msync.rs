@@ -10,9 +10,20 @@
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 #[test]
 fn body_msync_handles_dirty_range_correctly() {
-    let path = "/tmp/test_dirty_range_msync.db";
+    let path = tmp_path("test_dirty_range_msync");
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
@@ -43,13 +54,15 @@ fn body_msync_handles_dirty_range_correctly() {
         // 連続呼び (= 2 回目は dirty range 空)
         eng.body_msync().expect("body_msync 2 (idempotent)");
     }
+    drop(eng);
+    let _ = std::fs::remove_dir_all(path);
 }
 
 /// `oplog_sync` 経由でも dirty range path が正しく動くこと。 schema 層の
 /// `flush_with_oplog` 系で実際にこのパスを通る。
 #[test]
 fn oplog_sync_with_dirty_range() {
-    let path = "/tmp/test_wal_sync_dirty.db";
+    let path = tmp_path("test_wal_sync_dirty");
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
@@ -71,4 +84,6 @@ fn oplog_sync_with_dirty_range() {
     }
     eng.oplog_sync().expect("oplog_sync");
     eng.oplog_sync().expect("oplog_sync idempotent");
+    drop(eng);
+    let _ = std::fs::remove_dir_all(path);
 }

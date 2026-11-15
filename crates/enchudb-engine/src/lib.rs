@@ -101,6 +101,41 @@ pub(crate) mod value_locks;
 pub(crate) mod consumer_waker;
 #[cfg(test)]
 mod tests_issue131;
+
+/// 試験の DB の path (`/tmp/{stem}_{pid}_{連番}_{時刻}.db`)。 並べて回した別の process の試験と取り合わない (#906)。
+/// 呼んだ thread (= 試験 1 本) が終わる時に消す。 名前が run ごとに変わるので、 試験の中で消さない helper
+/// (`query_lang` / `ravn` の setup など) の分が run のたびに積もらないように。 試験の中で消してもよい (2 度消すだけ)。
+#[cfg(test)]
+pub(crate) fn test_db_path(stem: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = format!("/tmp/{stem}_{}_{seq}_{nanos}.db", std::process::id());
+    TEST_DB_PATHS.with(|p| p.0.borrow_mut().push(path.clone()));
+    path
+}
+
+/// [`test_db_path`] が渡した path。 thread の終わりに消す (試験の engine は試験の関数が返る時に落ちている)。
+#[cfg(test)]
+struct TestDbPaths(std::cell::RefCell<Vec<String>>);
+
+#[cfg(test)]
+impl Drop for TestDbPaths {
+    fn drop(&mut self) {
+        for p in self.0.get_mut().drain(..) {
+            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DB_PATHS: TestDbPaths = const { TestDbPaths(std::cell::RefCell::new(Vec::new())) };
+}
 // Transport implementations moved to `enchu-transport` crate.
 pub mod acl;
 pub mod integrity;

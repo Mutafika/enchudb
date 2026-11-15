@@ -8,6 +8,17 @@
 
 use enchudb_engine::{Engine, ValueType};
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 fn fresh(path: &str) {
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".oplog", ".lock", ".tables", ".crc"] {
@@ -18,7 +29,7 @@ fn fresh(path: &str) {
 /// churn で値が移動しても cardinality は「live な値の数」を返す。
 #[test]
 fn cardinality_stays_exact_under_churn() {
-    let path = "/tmp/test_req12_cardinality.db";
+    let path = tmp_path("test_req12_cardinality");
     fresh(path);
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
@@ -53,7 +64,7 @@ fn cardinality_stays_exact_under_churn() {
 /// untie で live が減り、全滅した値は cardinality から消える。
 #[test]
 fn untie_updates_counts() {
-    let path = "/tmp/test_req12_untie.db";
+    let path = tmp_path("test_req12_untie");
     fresh(path);
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
@@ -86,7 +97,7 @@ fn untie_updates_counts() {
 /// verify + dedup で 1 件に潰れる。件数系も壊れない。
 #[test]
 fn retie_roundtrip_dedups() {
-    let path = "/tmp/test_req12_roundtrip.db";
+    let path = tmp_path("test_req12_roundtrip");
     fresh(path);
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
@@ -120,7 +131,7 @@ fn retie_roundtrip_dedups() {
 /// trigger 無効化 (COMPACT_MIN_LEN = usize::MAX) で落ちることは実証済み。
 #[test]
 fn compaction_bounds_backing_under_heavy_churn() {
-    let path = "/tmp/test_req12_compact_bound.db";
+    let path = tmp_path("test_req12_compact_bound");
     fresh(path);
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
@@ -155,7 +166,7 @@ fn compaction_bounds_backing_under_heavy_churn() {
 /// 明示 compaction API (`Engine::compact_himo`) の正しさと非破壊性。
 #[test]
 fn explicit_compact_himo() {
-    let path = "/tmp/test_req12_compact_api.db";
+    let path = tmp_path("test_req12_compact_api");
     fresh(path);
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
@@ -192,7 +203,7 @@ fn explicit_compact_himo() {
 /// 無傷の値の pull は churn の影響を受けず正しいまま (fast path の正しさ)。
 #[test]
 fn untouched_value_pull_correct_after_churn() {
-    let path = "/tmp/test_req12_untouched.db";
+    let path = tmp_path("test_req12_untouched");
     fresh(path);
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
@@ -235,7 +246,7 @@ fn untouched_value_pull_correct_after_churn() {
 /// g=5 の 3 匹をそのまま返していた (wrong result)。live 基準 pivot で解消。
 #[test]
 fn query_with_all_stale_bucket_returns_empty() {
-    let path = "/tmp/test_req12_planner_stale.db";
+    let path = tmp_path("test_req12_planner_stale");
     fresh(path);
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("g", ValueType::Number, 10);

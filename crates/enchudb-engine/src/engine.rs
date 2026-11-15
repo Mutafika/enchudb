@@ -28198,7 +28198,7 @@ mod cell_version_tests {
     use enchudb_oplog::Hlc;
 
     fn tmp(name: &str) -> String {
-        let path = format!("/tmp/enchu_v9cell_{name}.db");
+        let path = crate::test_db_path(&format!("enchu_v9cell_{name}"));
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         path
@@ -29025,7 +29025,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> String {
-        let path = format!("/tmp/enchu_v24_{name}.db");
+        let path = crate::test_db_path(&format!("enchu_v24_{name}"));
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         path
@@ -31589,7 +31589,7 @@ mod v10_dir_tests {
 
     /// 試験の DB の path。 前の run の残りを消してから返す。 試験の後に消すのは [`Cleanup`] (試験の終わりまで持つ)。
     fn tmp(name: &str) -> String {
-        let path = format!("/tmp/enchu_v10dir_{name}.db");
+        let path = crate::test_db_path(&format!("enchu_v10dir_{name}"));
         remove_all(&path);
         path
     }
