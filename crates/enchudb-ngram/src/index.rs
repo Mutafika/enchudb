@@ -334,6 +334,35 @@ impl Default for NgramIndex {
 mod tests {
     use super::*;
 
+    /// 試験の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+    fn tmp_path(stem: &str, ext: &str) -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = format!("/tmp/{stem}_{}_{seq}_{nanos}.{ext}", std::process::id());
+        TMP_PATHS.with(|p| p.0.borrow_mut().push(path.clone()));
+        path
+    }
+
+    /// [`tmp_path`] が渡した path。 試験の thread の終わりに消す (名前が run ごとに変わるので、 試験の中で消さない分が積もらないように)。
+    struct TmpPaths(std::cell::RefCell<Vec<String>>);
+
+    impl Drop for TmpPaths {
+        fn drop(&mut self) {
+            for p in self.0.get_mut().drain(..) {
+                let _ = std::fs::remove_dir_all(&p);
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    thread_local! {
+        static TMP_PATHS: TmpPaths = const { TmpPaths(std::cell::RefCell::new(Vec::new())) };
+    }
+
     #[test]
     fn index_and_candidates() {
         let mut idx = NgramIndex::new();
@@ -422,7 +451,7 @@ mod tests {
 
     #[test]
     fn save_and_open() {
-        let path = "/tmp/enchu_ngram_test_save.etxt";
+        let path = &tmp_path("enchu_ngram_test_save", "etxt");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
@@ -452,7 +481,7 @@ mod tests {
     #[test]
     fn save_and_open_wide_eid() {
         // peer_id を含む u64 eid でも round-trip する
-        let path = "/tmp/enchu_ngram_test_wide_eid.etxt";
+        let path = &tmp_path("enchu_ngram_test_wide_eid", "etxt");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
@@ -482,7 +511,7 @@ mod tests {
 
     #[test]
     fn postings_only_candidates_no_text() {
-        let path = "/tmp/enchu_ngram_postings_only.etxt";
+        let path = &tmp_path("enchu_ngram_postings_only", "etxt");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
@@ -543,7 +572,7 @@ mod tests {
 
     #[test]
     fn open_mut_round_trip() {
-        let path = "/tmp/enchu_ngram_test_open_mut.etxt";
+        let path = &tmp_path("enchu_ngram_test_open_mut", "etxt");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 

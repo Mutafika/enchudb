@@ -1276,6 +1276,13 @@ impl LockFreeCylinder {
         self.dense_at(k, i, &guard).map(|b| b.map_or(0, |b| b.live() as usize))
     }
 
+    /// [`dense_live_len`](Self::dense_live_len) の、 live を Acquire で読む版 ([`AppendBucket::live_acquire`])。
+    pub fn dense_live_len_acquire(&self, value: u64) -> Option<usize> {
+        let guard = epoch::pin();
+        let (k, i) = self.dense_slot(value)?;
+        self.dense_at(k, i, &guard).map(|b| b.map_or(0, |b| b.live_acquire() as usize))
+    }
+
     /// value の bucket に churn 痕があるか。write_lock 下 (単一 writer) では正確 —
     /// `compact_now` の clean-bucket skip 判定用。
     pub fn bucket_needs_verify(&self, value: u64) -> bool {

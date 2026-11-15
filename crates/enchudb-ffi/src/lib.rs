@@ -334,6 +334,35 @@ mod tests {
 
     fn cstr(s: &str) -> CString { CString::new(s).unwrap() }
 
+    /// 試験の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+    fn tmp_path(stem: &str, ext: &str) -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = format!("/tmp/{stem}_{}_{seq}_{nanos}.{ext}", std::process::id());
+        TMP_PATHS.with(|p| p.0.borrow_mut().push(path.clone()));
+        path
+    }
+
+    /// [`tmp_path`] が渡した path。 試験の thread の終わりに消す (名前が run ごとに変わるので、 試験の中で消さない分が積もらないように)。
+    struct TmpPaths(std::cell::RefCell<Vec<String>>);
+
+    impl Drop for TmpPaths {
+        fn drop(&mut self) {
+            for p in self.0.get_mut().drain(..) {
+                let _ = std::fs::remove_dir_all(&p);
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    thread_local! {
+        static TMP_PATHS: TmpPaths = const { TmpPaths(std::cell::RefCell::new(Vec::new())) };
+    }
+
     // ── issue #59: panic-guard regression ──
     //
     // engine 層が capacity 到達・破損 file・edge 値で panic したとき、 その panic が
@@ -365,7 +394,7 @@ mod tests {
     }
 
     fn fresh(name: &str) -> *mut enchudb_db {
-        let path = format!("/tmp/enchudb_ffi_{name}.db");
+        let path = tmp_path(&format!("enchudb_ffi_{name}"), "db");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let cpath = cstr(&path);

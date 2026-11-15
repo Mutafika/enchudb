@@ -4,13 +4,37 @@
 
 use enchudb_schema::Database;
 
+/// 試験の DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
 fn tmp(name: &str) -> String {
-    let p = format!("/tmp/enchudb_issue61_{name}.db");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let p = format!("/tmp/enchudb_issue61_{name}_{}_{seq}_{nanos}.db", std::process::id());
+    TMP_PATHS.with(|t| t.0.borrow_mut().push(p.clone()));
     let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{p}.schema"));
     let _ = std::fs::remove_file(format!("{p}.tables"));
     p
+}
+
+/// [`tmp`] が渡した path。 試験の thread の終わりに消す (名前が run ごとに変わるので、 試験の中で消さない分が積もらないように)。
+struct TmpPaths(std::cell::RefCell<Vec<String>>);
+
+impl Drop for TmpPaths {
+    fn drop(&mut self) {
+        for p in self.0.get_mut().drain(..) {
+            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+thread_local! {
+    static TMP_PATHS: TmpPaths = const { TmpPaths(std::cell::RefCell::new(Vec::new())) };
 }
 
 #[test]

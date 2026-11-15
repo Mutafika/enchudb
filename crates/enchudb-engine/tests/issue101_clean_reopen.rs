@@ -12,6 +12,17 @@
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 const CAP: usize = 8 * 1024 * 1024;
 
 fn fresh(path: &str) {
@@ -48,8 +59,8 @@ fn copy_db(src: &str, dst: &str) {
 /// graceful Drop → 次 open は rebuild skip。 crash (dirty copy) → rebuild が走る。
 #[test]
 fn graceful_close_skips_rebuild_crash_does_not() {
-    let path = "/tmp/test_issue101_clean.db";
-    let crashed = "/tmp/test_issue101_crashed.db";
+    let path = tmp_path("test_issue101_clean");
+    let crashed = tmp_path("test_issue101_crashed");
     fresh(path);
 
     // 1) 新規作成 + vocab 書き込み。 open 中に copy = crash 相当 (flag は 0 のまま)。
@@ -100,7 +111,7 @@ fn graceful_close_skips_rebuild_crash_does_not() {
 /// (消費側の CLI のような「commit 後に checkpoint」用途)。 次の insert で dirty に戻る。
 #[test]
 fn explicit_flush_clean_marks_clean() {
-    let path = "/tmp/test_issue101_explicit.db";
+    let path = tmp_path("test_issue101_explicit");
     fresh(path);
 
     let eng = Engine::create_concurrent_with_oplog(path, CAP).expect("create");
@@ -129,7 +140,7 @@ fn explicit_flush_clean_marks_clean() {
 /// readonly open では flush_clean / Drop とも何も書かない (真に非破壊 open、#56)。
 #[test]
 fn readonly_close_stays_nondestructive() {
-    let path = "/tmp/test_issue101_readonly.db";
+    let path = tmp_path("test_issue101_readonly");
     fresh(path);
 
     {

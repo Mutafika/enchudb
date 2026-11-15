@@ -1122,8 +1122,37 @@ fn deserialize_schema(s: &str) -> Result<Vec<TableDef>, SqlError> {
 mod tests {
     use super::*;
 
+    /// 試験の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+    fn tmp_path(stem: &str, ext: &str) -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = format!("/tmp/{stem}_{}_{seq}_{nanos}.{ext}", std::process::id());
+        TMP_PATHS.with(|p| p.0.borrow_mut().push(path.clone()));
+        path
+    }
+
+    /// [`tmp_path`] が渡した path。 試験の thread の終わりに消す (名前が run ごとに変わるので、 試験の中で消さない分が積もらないように)。
+    struct TmpPaths(std::cell::RefCell<Vec<String>>);
+
+    impl Drop for TmpPaths {
+        fn drop(&mut self) {
+            for p in self.0.get_mut().drain(..) {
+                let _ = std::fs::remove_dir_all(&p);
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    thread_local! {
+        static TMP_PATHS: TmpPaths = const { TmpPaths(std::cell::RefCell::new(Vec::new())) };
+    }
+
     fn fresh(name: &str) -> Database {
-        let path = format!("/tmp/enchudb_sql_{name}.db");
+        let path = tmp_path(&format!("enchudb_sql_{name}"), "db");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         Database::create(&path).unwrap()
@@ -1132,7 +1161,7 @@ mod tests {
     /// BIGINT: 負の数 / ms の時刻 / 値域の端が書けて、 等値 / 範囲 / 並び / 書き換え / 主キー / reopen で元の値。
     #[test]
     fn bigint_columns_hold_64_bit_values() {
-        let path = "/tmp/enchudb_sql_bigint.db";
+        let path = &tmp_path("enchudb_sql_bigint", "db");
         let _ = std::fs::remove_dir_all(path);
         let vals: [i64; 6] = [i64::MIN, -1_790_000_000_123, -1, 0, 1_790_000_000_123, i64::MAX - 1];
         {
@@ -1179,7 +1208,7 @@ mod tests {
     /// 主キー / 範囲 / 並び / reopen。
     #[test]
     fn integer_columns_of_new_tables_are_64_bit() {
-        let path = "/tmp/enchudb_sql_integer64.db";
+        let path = &tmp_path("enchudb_sql_integer64", "db");
         let _ = std::fs::remove_dir_all(path);
         {
             let mut db = Database::create(path).unwrap();
@@ -1210,7 +1239,7 @@ mod tests {
     /// 旧版で作った表の INTEGER 列 (u32) は、 reopen しても u32 のまま (保存済みの値を別の符号化で読まない)。
     #[test]
     fn integer_columns_of_old_tables_stay_u32() {
-        let path = "/tmp/enchudb_sql_integer_legacy.db";
+        let path = &tmp_path("enchudb_sql_integer_legacy", "db");
         let _ = std::fs::remove_dir_all(path);
         {
             // 旧版の CREATE TABLE と同じ状態: 型 INTEGER (u32) の表を保存し、 u32 の値を書く
@@ -1673,7 +1702,7 @@ mod tests {
 
     #[test]
     fn schema_persists_across_reopen() {
-        let path = "/tmp/enchudb_sql_persist_basic.db";
+        let path = &tmp_path("enchudb_sql_persist_basic", "db");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {
@@ -1703,7 +1732,7 @@ mod tests {
 
     #[test]
     fn multi_table_schema_persists() {
-        let path = "/tmp/enchudb_sql_persist_multi.db";
+        let path = &tmp_path("enchudb_sql_persist_multi", "db");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {
@@ -1779,7 +1808,7 @@ mod tests {
     #[test]
     fn open_existing_schema_data_visible_without_create_table() {
         // 消費側アプリ起動時のパターン: open するだけで既存 schema + データが見える
-        let path = "/tmp/enchudb_sql_persist_no_create.db";
+        let path = &tmp_path("enchudb_sql_persist_no_create", "db");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {
@@ -1840,7 +1869,7 @@ mod tests {
     #[test]
     fn leaf_persists_across_reopen() {
         // LEAF 列もスキーマ blob に含まれて永続化される。
-        let path = "/tmp/enchudb-sql-test-leaf-persist.db";
+        let path = &tmp_path("enchudb-sql-test-leaf-persist", "db");
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {

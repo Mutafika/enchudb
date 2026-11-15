@@ -14,6 +14,17 @@ use enchudb_engine::{Engine, ValueType};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 fn fresh(path: &str) {
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".oplog", ".lock"] {
@@ -31,7 +42,7 @@ fn define(eng: &Arc<Engine>, name: &str) -> u16 {
 /// (1) 並行 read が write と同時に走っても crash / 破損しない。
 #[test]
 fn concurrent_pull_during_writes() {
-    let path = "/tmp/test_issue95_concurrent.db";
+    let path = tmp_path("test_issue95_concurrent");
     fresh(path);
     let eng: Arc<Engine> =
         Engine::create_concurrent_with_oplog(path, 16 * 1024 * 1024).expect("create");
@@ -90,7 +101,7 @@ fn concurrent_pull_during_writes() {
 /// (2) 値更新の stale が Column verify で落ちる。
 #[test]
 fn update_stale_filtered_by_verify() {
-    let path = "/tmp/test_issue95_verify.db";
+    let path = tmp_path("test_issue95_verify");
     fresh(path);
     let eng: Arc<Engine> =
         Engine::create_concurrent_with_oplog(path, 8 * 1024 * 1024).expect("create");
@@ -126,7 +137,7 @@ fn update_stale_filtered_by_verify() {
 /// abort、確認済み）。
 #[test]
 fn concurrent_sync_writes_from_many_threads() {
-    let path = "/tmp/test_issue95_syncwrite.db";
+    let path = tmp_path("test_issue95_syncwrite");
     fresh(path);
     let eng: Arc<Engine> =
         Engine::create_concurrent_with_oplog(path, 32 * 1024 * 1024).expect("create");

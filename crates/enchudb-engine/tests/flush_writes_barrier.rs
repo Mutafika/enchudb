@@ -21,9 +21,20 @@
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 #[test]
 fn flush_writes_waits_for_all_ties_including_entity_created_path() {
-    let path = "/tmp/test_flush_barrier.db";
+    let path = tmp_path("test_flush_barrier");
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
@@ -71,6 +82,8 @@ fn flush_writes_waits_for_all_ties_including_entity_created_path() {
         "flush_writes barrier broken: expected {total_expected} entities visible, got {}",
         live.len()
     );
+    drop(eng);
+    let _ = std::fs::remove_dir_all(path);
 }
 
 /// 0.9.0 regression: `tie_async` → `oplog_sync` の直後、 その Tie が `_sync_ops`

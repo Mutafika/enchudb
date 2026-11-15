@@ -3280,6 +3280,57 @@ mod eid_gen_claim_tests {
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
+
+    /// #900: lock を取らない読み (`read_app` = get など) は、 照合の後・読んだ後の世代の読み直しの前に行が消えて場所が使い回されたら
+    /// None (使い回した行の値を古い eid に渡さない)。 照合の前に使い回された古い eid も None。
+    #[test]
+    fn a_read_whose_row_is_deleted_and_reused_meanwhile_returns_none() {
+        let (path, eng) = engine("readapp");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x);
+        let a = eng.entity_in("u").unwrap(); // 使い回し = v15
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        let hid = eng.himo_id("u.a").unwrap();
+        eng.tie_to_by_id(a, hid as u16, 7u32);
+        assert_eq!(eng.get(a, "u.a"), Some(7));
+        assert_eq!(eng.get(x, "u.a"), None, "照合の前に使い回された古い eid の読みが、 使い回した行の値を返した");
+        let got = eng.read_app(a, |slot| {
+            let v = eng.himos[hid].get_value(slot);
+            // 読んだ後・世代を読み直す前に、 a を消して同じ場所を使い回す (枠 1 の表)
+            eng.delete(a);
+            let b = eng.entity_in("u").unwrap();
+            assert_eq!(eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+            v
+        });
+        assert_eq!(got, None, "読んでいる間に消えて使い回された行の値を返した");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// #900: v14 の間に照合した読み (世代なし) の最中に v15 に移り、 その行が消えて場所が使い回されたら None。 読み直しは移った後の
+    /// 場所の bit で引き直す (照合の時に写した bit / region では、 世代 0 の読みと区別できない)。
+    #[test]
+    fn a_read_across_the_move_to_v15_whose_row_is_reused_returns_none() {
+        let (path, eng) = engine("readmove");
+        let a = eng.entity_in("u").unwrap();
+        let hid = eng.himo_id("u.a").unwrap();
+        eng.tie_to_by_id(a, hid as u16, 7u32);
+        assert!(!eng.generations().moved(), "前提: まだ v14");
+        let got = eng.read_app(a, |slot| {
+            let v = eng.himos[hid].get_value(slot);
+            // 読んだ後に a を消し、 同じ場所を使い回す (枠 1 の表の使い回し = v15 に移る)
+            eng.delete(a);
+            let b = eng.entity_in("u").unwrap();
+            assert!(eng.generations().moved(), "前提: 読みの間に v15 に移った");
+            assert_eq!(eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+            v
+        });
+        assert_eq!(got, None, "読みの間に v15 に移って使い回された行の値を返した");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
 }
 
 /// #882 / #883: 同じ slot を 2 回払い出す窓 2 つを、 割り込み点で決まって踏む。
@@ -4512,6 +4563,74 @@ mod apply_liveness_tests {
         if !sync_db {
             assert_eq!(room, WalRoom::Blocked, "{tag}");
         }
+    }
+
+    /// #898: 書き出しの間に消した行が `tables` の sidecar の `next_local` より先にある (#857 / #870 の印) 空け作りを、 当てている途中の
+    /// 書き手の手前で切る。 書き出しの後の `tables_cover_checkpoint` はその場で `tables` を置き直すので、 置ければ 「当てている途中」
+    /// (`Applying`、 待つ書き手は諦めない)、 置けなければ 「畳めない」 (`Blocked`、 #870 の止め: 次の周期も置けないので、 待つ書き手を
+    /// 上限まで待たせない)。 書き出しの間に消すのは、 書き出しの前に `tables` を置く (`try_persist_tables`) ので、 その前に消した行は
+    /// 書き出しの後の判定まで残らないため。 `tables` を書けない状態は `{db}/tables.tmp` に directory を置いて作る (#870 の試験と同じ)。
+    #[test]
+    fn a_room_attempt_cut_by_an_applying_writer_with_rows_freed_ahead_of_tables() {
+        for tables_ok in [true, false] {
+            std::thread::spawn(move || freed_cut_room_case(tables_ok)).join().unwrap();
+        }
+    }
+
+    fn freed_cut_room_case(tables_ok: bool) {
+        let tag = format!("tables {}", if tables_ok { "ok" } else { "blocked" });
+        let p = path(&format!("freedcut{}", tables_ok as u8));
+        let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
+        let (eng, x, y, _) = open(eng, false);
+        let e1 = eng.entity_in("t").unwrap();
+        eng.try_tie_to_by_id(e1, x, 1u32).unwrap();
+        eng.oplog_sync().unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let held = eng.hold_consumer();
+        let blocker = std::path::Path::new(&p).join("tables.tmp");
+        if !tables_ok {
+            std::fs::create_dir(&blocker).unwrap();
+        }
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        cell_append_hook::set(&wal, move |_| {
+            in_tx.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, x, 2u32))
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が積んだ後・当てる前で止まった");
+        // 書き出しの直前 (`tables` を置いた後) に行を足して消す
+        let freed: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
+        {
+            let (eng, freed) = (eng.clone(), freed.clone());
+            room_write_out_hook::set(&wal, move |_| {
+                let doomed = eng.entity_in("t").unwrap();
+                eng.try_tie_to_by_id(doomed, y, 1u32).unwrap();
+                eng.delete(doomed);
+                *freed.lock().unwrap() = Some(eng.checkpoint_held_for_freed_slots());
+            });
+        }
+        let cuts = wal.applying_cuts();
+        let room = eng.make_wal_room(&wal);
+        let cut = wal.applying_cuts() > cuts;
+        let (freed, still_held) = (freed.lock().unwrap().take(), eng.checkpoint_held_for_freed_slots());
+        release.send(()).unwrap();
+        let a = a.join().unwrap();
+        if !tables_ok {
+            std::fs::remove_dir(&blocker).unwrap();
+        }
+        drop(held);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        assert_eq!(a, Ok(()), "{tag}: 書き手 A");
+        assert!(cut, "{tag}: 前提: A の手前で切った");
+        assert_eq!(freed, Some(true), "{tag}: 前提: 書き出しの時、 消した行が sidecar より先にある");
+        assert_eq!(still_held, !tables_ok, "{tag}: 前提: 書き出しの後の判定が `tables` を置いた (置けない時は置かない)");
+        let want = if tables_ok { WalRoom::Applying } else { WalRoom::Blocked };
+        assert_eq!(room, want, "{tag}: 空け作りの結果");
     }
 
     /// 当てている途中の書き手の手前で切った空け作りの後、 次に試すまでの間 (`APPLYING_CUT_PACE`) も、 空きを待つ書き手が居る間の
@@ -7639,6 +7758,9 @@ pub struct Engine {
     defer_tables_persist: std::sync::atomic::AtomicBool,
     /// #847: `tables` の sidecar に最後に置いた中身 ([`Self::persist_tables_file`])。 同じ中身なら file に触らない。
     tables_persisted: std::sync::Mutex<Option<Vec<u8>>>,
+    /// #902: `tables` を置き換えた (rename した) 後、 親の directory の fsync がまだ済んでいない ([`Self::persist_tables_file`]、
+    /// `tables_persisted` の lock の下でだけ触る)。
+    tables_dir_unsynced: std::sync::atomic::AtomicBool,
     /// #847: sync の ring の穴を次に探し始める所 ([`Self::rebuild_free_locals`]、 `free_locals` の lock の下でだけ触る)。
     sync_ring_rebuild_from: std::sync::atomic::AtomicU32,
     /// #868: 枯渇した表の穴を探して枠をなめた回数 ([`Self::free_slot_scans`])。
@@ -7943,6 +8065,7 @@ impl Engine {
         };
 
         let generations = std::sync::Arc::new(crate::generation::Generations::off());
+        generations.raise_floor(max_entities);
         let eng = Self {
             path: path.to_string(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
@@ -8092,6 +8215,7 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
+            tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             written_out_pos: std::sync::atomic::AtomicU64::new(0),
@@ -9347,12 +9471,19 @@ impl Engine {
         // #731: 世代を持つ DB (v15) は `gen.seg` を開く。 header に場所の bit があるのに開けなければ開かない (世代が分からないと
         // 古い eid を見分けられない)
         let generations = std::sync::Arc::new(crate::generation::Generations::off());
+        generations.raise_floor(max_entities);
         if layout.gen_bits != 0 {
             #[cfg(not(target_arch = "wasm32"))]
             if let Backing::Segments(set) = &backing {
                 set.open_gen(layout.segment_reserve(SegmentKind::Gen)).map_err(|e| e.to_string())?;
             }
             generations.attach(backing.region(SegmentKind::Gen, &layout), u32::from(layout.gen_bits))?;
+        }
+        // #899: Ref の紐の円柱は場所の bit を読む (世代を持つ DB では鍵を場所にする)
+        for (h, &ht) in himos.iter().zip(value_types.iter()) {
+            if ht == ValueType::Ref {
+                h.attach_generations(generations.clone());
+            }
         }
         report("HimoStore::load × N", &mut t, &mut p);
 
@@ -9515,6 +9646,7 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
+            tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             written_out_pos: std::sync::atomic::AtomicU64::new(0),
@@ -13799,7 +13931,8 @@ impl Engine {
     ///
     /// #847: 中身が、 この engine が最後に置いた (または file と同じと確かめた) 中身と同じなら、 file に触らない。 前は
     /// 書き出しのたびに file を開いて読み比べていた (`write_atomic_if_changed`。 file system が混むと、 開くだけで待たされる)。
-    /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない。
+    /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない (置けなかった回は覚えた中身を
+    /// 捨てる、 #902)。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_tables_file(&self) -> io::Result<()> {
         self.persist_tables_file_with(None)
@@ -13819,10 +13952,20 @@ impl Engine {
         );
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
+            use std::sync::atomic::Ordering;
             let path = tables_path_for(&self.path);
-            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)
+            // #902: 置けなかったら覚えた中身を捨てる (置き換えの途中・後で失敗すると、 file は覚えた中身と違いうる。 覚えたままだと、 中身が
+            // 前に置いた形に戻った時に file に触らずに済ませ、 失敗した回の中身が file に残る)
+            *last = None;
+            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)。 #902: 送れる
+            // まで印を残し、 中身が file と同じ (前の回の rename は通った) でも送り直す。 前は、 送るのに失敗した後の回が 「中身は同じ」 で
+            // 送らずに置いたと返し、 checkpoint が rename の永続を待たずに進みえた
             if crate::db_files::write_atomic_if_changed(&path, &bytes)? {
+                self.tables_dir_unsynced.store(true, Ordering::Release);
+            }
+            if self.tables_dir_unsynced.load(Ordering::Acquire) {
                 crate::db_files::sync_tables_dir(&path)?;
+                self.tables_dir_unsynced.store(false, Ordering::Release);
             }
             *last = Some(bytes);
         }
@@ -14977,6 +15120,8 @@ impl Engine {
             write_header_crc(buf);
         }
         self.backing.flush_header(l.header_size)?;
+        // #899: 世代を持つ前の `S` の下限 (伸ばした枠の entity を指す ref を、 自分の entity でない値と見ない)
+        self.generations().raise_floor(new_cap);
         self.entity_cap.store(new_cap, std::sync::atomic::Ordering::Release);
         *layout = grown;
         Ok(new_cap)
@@ -17482,15 +17627,34 @@ impl Engine {
     /// 使い回された = None)。 lock を取らない読み (`get` など) 用。
     #[inline]
     fn read_app<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
-        let slot = self.app_slot(eid)?;
-        let r = f(slot);
-        if self.generations().active() {
+        // #900: [`Self::app_slot`] を 2 回呼ぶと、 場所の bit を 4 回・region を 2 回 (live の registry をたどって) 読み直していた
+        // (v15 の DB の get 1 回 331 命令 → この形で 277、 #885 の前は 204)。 bit と region を 1 回写して照合し、 読んだ後は照合した
+        // 場所の世代だけ読み直す。 照合 (読む前) は読み直しが兼ねるので結果は変わらないが、 別の行の cell を `f` に読ませないために残す
+        let gens = self.generations();
+        let r = gens.reader();
+        let (home, g) = r.split(enchudb_oplog::eid_local(eid));
+        if r.active() && r.current(home) != g {
+            return None;
+        }
+        // 畳んだ自分の行 (#612) は残す行の場所を読む (照合は畳んだ行の場所で、 `app_slot` と同じ順)
+        let forwarded = self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed)
+            && enchudb_oplog::eid_peer(eid) == self.peer_id();
+        let slot = if forwarded { self.forward_local_slow(home) } else { home };
+        let out = f(slot);
+        let bits = gens.bits();
+        if bits != 0 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            if self.app_slot(eid) != Some(slot) {
+            if forwarded || bits != r.bits() {
+                // 別名をたどった / 読みの間に v15 に移った: 前と同じく全部を引き直す
+                if self.app_slot(eid) != Some(slot) {
+                    return None;
+                }
+            } else if r.current(home) != g {
+                // region は一度置いたら変わらないので、 写した物で読み直す
                 return None;
             }
         }
-        r
+        out
     }
 
     /// 場所 → アプリに渡す eid (今の世代 | 場所)。
@@ -24155,6 +24319,10 @@ impl Engine {
             self.backing.region(SegmentKind::Himo(hid as u32), &*self.layout.read().unwrap()),
             ht, effective_mv, self.max_entities(), self.layout.read().unwrap().col_pad,
         );
+        // #899: Ref の紐の円柱は場所の bit を読む (世代を持つ DB では鍵を場所にする)
+        if ht == ValueType::Ref {
+            hs.attach_generations(self.live.gens_arc().clone());
+        }
 
         if self.layout.read().unwrap().has_cell_version() {
             let ver = ver_column_from_region(
@@ -27253,15 +27421,22 @@ impl crate::live::CellReader for Engine {
     fn ref_val(&self, e: u32) -> u64 {
         self.generations().local(e) as u64
     }
+    /// #899: Ref の紐の円柱は鍵が場所なので、 どの世代の値も bucket 1 つ (`HimoStore::pull_slot_into`)。 Ref でない紐 (番号を
+    /// 数で持つ via) は世代ごとの値を引く
     fn pull_ref_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
+        let Some(h) = self.himos.get(via as usize) else { return };
         let b = self.generations().bits();
         if b == 0 || b >= 32 {
-            return crate::live::CellReader::pull_into(self, via, e as u64, out);
+            return h.pull_into(u64::from(e), out);
+        }
+        // 鍵が場所でない Ref の紐 (値を鍵に決めた紐) は下の世代ごとの値を引く
+        if h.value_type == ValueType::Ref && h.pull_slot_into(e, None, out) {
+            return;
         }
         // 世代 0 から今の世代まで (使い回しの無い場所は 1 回)
         let top = self.generations().get(e).min(self.generations().retired_mark());
         for g in 0..=top {
-            crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
+            h.pull_into(u64::from((g << b) | e), out);
         }
     }
     fn pull_ref_stale_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
@@ -27269,9 +27444,14 @@ impl crate::live::CellReader for Engine {
         if b == 0 || b >= 32 {
             return;
         }
+        let Some(h) = self.himos.get(via as usize) else { return };
+        // 今の世代より前の値 (前の住人を指す ref)。 使い回しの無い場所 (今の世代 0) は無い
         let top = self.generations().get(e).min(self.generations().retired_mark());
+        if h.value_type == ValueType::Ref && h.pull_slot_into(e, Some(top), out) {
+            return;
+        }
         for g in 0..top {
-            crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
+            h.pull_into(u64::from((g << b) | e), out);
         }
     }
     #[inline]
@@ -28165,7 +28345,7 @@ mod cell_version_tests {
     use enchudb_oplog::Hlc;
 
     fn tmp(name: &str) -> String {
-        let path = format!("/tmp/enchu_v9cell_{name}.db");
+        let path = crate::test_db_path(&format!("enchu_v9cell_{name}"));
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         path
@@ -28992,7 +29172,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> String {
-        let path = format!("/tmp/enchu_v24_{name}.db");
+        let path = crate::test_db_path(&format!("enchu_v24_{name}"));
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         path
@@ -31556,7 +31736,7 @@ mod v10_dir_tests {
 
     /// 試験の DB の path。 前の run の残りを消してから返す。 試験の後に消すのは [`Cleanup`] (試験の終わりまで持つ)。
     fn tmp(name: &str) -> String {
-        let path = format!("/tmp/enchu_v10dir_{name}.db");
+        let path = crate::test_db_path(&format!("enchu_v10dir_{name}"));
         remove_all(&path);
         path
     }
@@ -32924,6 +33104,65 @@ mod eidmap_log_read_tests {
         let got: std::collections::BTreeSet<_> = deserialize_eidmap(&served).unwrap().into_iter().collect();
         assert_eq!(got, expect, "読む間のまとめ直しで log にだけあった写像を落とした");
         drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// PR #907 の読み直し C: 世代を持つ前に自分の entity でない値 (他の peer の eid の local、 2^24 以上) を指す ref を組んだ円柱に置いた
+/// Ref の紐は、 開き直すまで円柱の鍵を値のままにする。 その紐の 「場所を指す全部の世代 / 前の世代」 (live の上へ伝える道) は、 円柱の
+/// bucket 1 つで引けないので世代ごとの値を引く。
+#[cfg(test)]
+mod issue899_value_keyed_ref_tests {
+    use super::*;
+    use crate::live::CellReader;
+    use enchudb_oplog::{eid_local, make_eid};
+
+    #[test]
+    fn value_keyed_ref_pulls_every_generation_of_a_slot() {
+        let path = format!("{}/enchu-issue899-vk-{}", std::env::temp_dir().display(), std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        {
+            let mut e = Engine::create_with_capacity(&path, 1 << 16).unwrap();
+            e.define_table("c", 4).unwrap();
+            e.define_himo_in("c", "a", ValueType::Number, 0).unwrap();
+            e.define_table("u", 64).unwrap();
+            e.define_ref_in("u", "co", "c").unwrap();
+            let cs: Vec<_> = (0..4).map(|_| e.entity_in("c").unwrap()).collect();
+            let us: Vec<_> = (0..8).map(|_| e.entity_in("u").unwrap()).collect();
+            for (i, &u) in us.iter().enumerate() {
+                e.tie_ref_to(u, "u.co", cs[i % 4]);
+            }
+            // 他の peer の行を指す ref (local = 2^24 + 5)、 v14 の間に円柱を組む
+            let stranger = e.entity_in("u").unwrap();
+            e.tie_ref_to(stranger, "u.co", make_eid(2, (1 << 24) | 5));
+            let via = e.himo_id("u.co").unwrap() as u16;
+            assert_eq!(e.pull_raw("u.co", e.ref_value(cs[0])).len(), 2, "前提: 円柱を組んだ");
+            assert_eq!(e.slot_bits(), 0, "前提: 世代を持つ前");
+            // 会社 0 を消して足す (場所を使い回す = v15)。 前の社員 2 人は消えた会社を指したまま、 2 人を新しい会社へ
+            e.delete(cs[0]);
+            let reborn = e.entity_in("c").unwrap();
+            assert!(e.slot_bits() > 0, "前提: 世代を持つ DB");
+            let slot = eid_local(cs[0]);
+            assert_eq!(eid_local(reborn) & ((1 << e.slot_bits()) - 1), slot, "前提: 場所を使い回した");
+            let movers: Vec<_> = (0..2).map(|_| e.entity_in("u").unwrap()).collect();
+            for &u in &movers {
+                e.tie_ref_to(u, "u.co", reborn);
+            }
+            assert!(!e.himo_value_is_dense("u.co", e.ref_value(reborn)).unwrap_or(true), "前提: 値を鍵にした紐 (世代 1 の値は sparse)");
+            let local = |v: Vec<u32>| -> Vec<u32> {
+                let mut v = v;
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let mut all = Vec::new();
+            CellReader::pull_ref_into(&e, via, slot, &mut all);
+            let want: Vec<u32> = local([us[0], us[4], movers[0], movers[1]].iter().map(|&u| eid_local(u)).collect());
+            assert_eq!(local(all), want, "場所の全部の世代を指す社員");
+            let mut stale = Vec::new();
+            CellReader::pull_ref_stale_into(&e, via, slot, &mut stale);
+            assert_eq!(local(stale), local(vec![eid_local(us[0]), eid_local(us[4])]), "前の世代を指す社員");
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 }

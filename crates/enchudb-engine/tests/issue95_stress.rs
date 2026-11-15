@@ -15,6 +15,17 @@ use enchudb_engine::{Engine, ValueType};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 fn fresh(path: &str) {
     let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".oplog", ".lock"] {
@@ -34,7 +45,7 @@ const VALUES: u32 = 8;
 /// (1) churn storm: 更新の嵐で stale を積み、 quiesce 後に厳密一致を要求。
 #[test]
 fn churn_storm_exact() {
-    let path = "/tmp/test_issue95_churn.db";
+    let path = tmp_path("test_issue95_churn");
     fresh(path);
     // oplog は churn 全量（~820k ties）を drop なく載せられるサイズにする。
     let eng: Arc<Engine> =
@@ -134,7 +145,7 @@ fn churn_storm_exact() {
 /// (2) crash → reopen で Cylinder が column から rebuild され、 churn の stale が消える。
 #[test]
 fn crash_recovery_compacts() {
-    let path = "/tmp/test_issue95_crash.db";
+    let path = tmp_path("test_issue95_crash");
     fresh(path);
 
     let n = 5_000u32;
@@ -189,7 +200,7 @@ fn crash_recovery_compacts() {
 /// (3) dense 配列 realloc の多発 × 旧配列を掴む reader = epoch 解放の安全性。
 #[test]
 fn grow_under_read() {
-    let path = "/tmp/test_issue95_grow.db";
+    let path = tmp_path("test_issue95_grow");
     fresh(path);
     let eng: Arc<Engine> =
         Engine::create_concurrent_with_oplog(path, 32 * 1024 * 1024).expect("create");

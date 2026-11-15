@@ -284,11 +284,13 @@ impl AppendBucket {
     // Column 側の無同期読みは既知の別 issue #100。
 
     /// live +1。戻り値は増分前 (0 なら「live な値が初めて入った」= unique 判定)。 live を動かすのは bucket の書き手 1 本
-    /// (`push_in` と同じ) なので、 読んで書くだけ (不可分の足し算は要らない)。
+    /// (`push_in` と同じ) なので、 読んで書くだけ (不可分の足し算は要らない)。 store は Release: [`live_acquire`](Self::live_acquire)
+    /// で数を読んだ読み手は、 その数にした書き手 (と鍵で前に並んだ書き手) がその前に書いたものを見る (#899: Ref の紐の
+    /// `HimoStore::slice_len` が数を読んだ後に 「世代 > 0 の entry を置いた」 印を見る)。
     #[inline]
     pub fn live_inc(&self) -> u32 {
         let v = self.live.load(Ordering::Relaxed);
-        self.live.store(v + 1, Ordering::Relaxed);
+        self.live.store(v + 1, Ordering::Release);
         v
     }
 
@@ -299,7 +301,7 @@ impl AppendBucket {
         self.removed.store(true, Ordering::Release);
         let v = self.live.load(Ordering::Relaxed);
         let after = v.checked_sub(1)?;
-        self.live.store(after, Ordering::Relaxed);
+        self.live.store(after, Ordering::Release);
         Some(v)
     }
 
@@ -307,6 +309,12 @@ impl AppendBucket {
     #[inline]
     pub fn live(&self) -> u32 {
         self.live.load(Ordering::Relaxed)
+    }
+
+    /// [`live`](Self::live) の Acquire 版 (読んだ数にした書き手の前の書き込みを見る、 [`live_inc`](Self::live_inc))。
+    #[inline]
+    pub fn live_acquire(&self) -> u32 {
+        self.live.load(Ordering::Acquire)
     }
 
     /// この bucket の read が Column verify を要するか。
@@ -436,7 +444,7 @@ impl AppendBucket {
         unsafe {
             guard.defer_destroy(cur);
         }
-        self.live.store(live as u32, Ordering::Relaxed);
+        self.live.store(live as u32, Ordering::Release);
         self.set_writer_len(live);
         self.verified.store(u64::MAX, Ordering::Relaxed);
         self.rereads.store(0, Ordering::Relaxed);

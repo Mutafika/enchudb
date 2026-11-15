@@ -68,8 +68,14 @@ jobs:
         run: cargo test -p enchudb
 
   miri:
-    name: miri (unsafe UB)
+    # 段を 2 つの job に分けて並べる (1 本で順に回すと order_index 17 分 + 残り 13 分 = 31 分で CI 全体の長さを決めていた。
+    # 分けると最も長い job は test (stable) の 21 分)。 job を増やしすぎると無料枠の同時 job の上限 (20) で待つので 2 つまで
+    name: miri (unsafe UB, ${{ matrix.part }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [order_index, rest]
     # crossbeam-epoch 0.9 は Stacked Borrows 非互換なので Tree Borrows。
     # epoch 遅延解放の exit 時 garbage は ignore-leaks で除外。
     env:
@@ -81,17 +87,23 @@ jobs:
           # miri は sysroot を source から build するので rust-src が要る。
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-${{ matrix.part }}
       # lock-free プリミティブの unsafe (from_raw_parts / UnsafeCell / epoch) を UB 検証。
       - name: miri append_bucket
+        if: matrix.part == 'rest'
         run: cargo miri test -p enchudb-engine --lib append_bucket
       - name: miri lockfree_cylinder (dense)
+        if: matrix.part == 'rest'
         run: cargo miri test -p enchudb-engine --lib "lockfree_cylinder::tests::dense"
       # 並びの索引: 置き場の 3 段の表 (葉は CAS で置き、 drop まで動かさない) と bucket の Slot、 drop。
       - name: miri order_index
+        if: matrix.part == 'order_index'
         run: cargo miri test -p enchudb-engine --lib order_index
       # 名前は module の道まで書く (`value_locks` だけだと、 write_lock (parking_lot) を取り合う himo_store の test にも当たり、
       # Linux の Miri が parking_lot_core の futex の呼び方を UB と判定する。 0.32.0 の order_index の段と同じ問題)
       - name: miri value_locks (値の鍵と、 詰め直しの照合が並んだ書き手と data race にならないこと。 読み手の詰め直しも)
+        if: matrix.part == 'rest'
         run: cargo miri test -p enchudb-engine --lib -- value_locks::tests himo_store::tests::compaction_reads himo_store::tests::read_compaction_holds_the_value_lock
 
   loom:
@@ -123,6 +135,11 @@ jobs:
       # 取って離すだけだと門を通る書き手を取りこぼす (その対照が落ちることも見る)。 実コードの並行 test は窓を踏めない。
       - name: loom model check (live query の登録 barrier と門)
         run: cargo test -p enchudb-engine --test loom_live_subscribe --release
+
+      # #899: Ref の紐の円柱 (鍵 = 場所) の 「世代 > 0 の entry を置いた」 印。 読み手は bucket / live を読んだ後で印を見る
+      # (live の store は Release)。 Relaxed にした対照が落ちることも見る。
+      - name: loom model check (Ref の円柱の世代の印)
+        run: cargo test -p enchudb-engine --test loom_ref_gen_mark --release
 
       # #421: 書いた範囲 (dirty) の取り出しと同時の印 / 同時の flush。 lo / hi を別々に swap すると印が
       # 消え、 lock なしだと後の flush が前の flush の書き出しより先に返る (oplog_sync の後で checkpoint が先に進む)。
@@ -197,6 +214,15 @@ jobs:
       # 閉じなかった sync の DB は #451 の作り直しを済ませてから開く (電源断の像と、 往復の閉じを I/O の故障で止める子 process)
       - name: power loss simulation, standalone open (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test issue880_standalone_open_replays_wal --release
+
+      # #902: `tables` の rename の後の directory の fsync (#884) に失敗したら、 次の書き出しは中身が file と同じでも送り直してから
+      # 置いたと返し、 覚えた中身を捨てる (その点の I/O の故障を子 process で起こす)
+      - name: tables dir fsync failure (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test issue902_tables_dir_sync_failure --release
+
+      # #884: `tables` の rename の後に directory を fsync し、 その後に checkpoint を進める順 (I/O の点の順で数える)
+      - name: tables dir fsync order (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test issue884_tables_dir_sync_order --release
 
       # #98 ③④: I/O の点ごとの故障 (I/O エラー / process の死 / 電源断 × flush / oplog の書き手)。 同じ crashsim feature の
       # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
