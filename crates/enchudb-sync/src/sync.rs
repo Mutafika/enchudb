@@ -1885,8 +1885,9 @@ impl Syncer {
             }
         };
         let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { return None };
-        // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。
-        if self.engine.resolve_remote_eid_existing(*eid).is_some() {
+        // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。 自分の行も束ねない (#731 段 4: もう無い自分の行の
+        // 番号は写像を引けないが、 自分の行を名前で他の行に束ねることは無い)
+        if enchudb_oplog::eid_peer(*eid) == self.engine.peer_id() || self.engine.resolve_remote_eid_existing(*eid).is_some() {
             return None;
         }
         let own = rec.author_peer == enchudb_oplog::eid_peer(*eid);
@@ -2155,6 +2156,16 @@ impl Syncer {
         bound: Option<enchudb_oplog::EntityId>,
         dying: &std::collections::HashMap<enchudb_oplog::EntityId, Hlc>,
     ) -> ApplyResult {
+        // #731 (段 4): もう無い自分の行 (消して場所を使い回した前の住人) 宛ての record。 相手はその行の削除をまだ受けていない
+        // (書いた後に削除を受ける) だけで、 こちらではその行は消えている = 削除優先で捨てる (前の住人の場所が死んでいる時と同じ)。
+        // 宛名を引くと今の住人に当たるので、 引く前に外す
+        if let Some(eid) = Self::row_of(&rec.op).or(match &rec.op {
+            DecodedOp::Delete { eid } | DecodedOp::Content { eid, .. } => Some(*eid),
+            _ => None,
+        }) && self.engine.is_gone_own_eid(eid)
+        {
+            return ApplyResult::SkippedOlder;
+        }
         match &rec.op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 // #9: foreign eid を自分の eid 空間の local eid に翻訳 (初見なら払い出し)。
