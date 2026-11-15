@@ -2598,6 +2598,38 @@ mod revive_read_hook {
     }
 }
 
+/// test 用の割り込み点: `ensure_live_slot` が生きている印を自分で立てた後・死の印を揃える前 (#913)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod ensure_live_settle_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `ensure_live_slot` が死の印を落とした後・生きている印を立てる前 (#913)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod ensure_live_gap_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: 消す道 (`live_free`) が世代と死の印を書いた後・生きている印を下ろす前 (#901)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod free_gap_hook {
@@ -3308,12 +3340,15 @@ mod eid_gen_claim_tests {
         eng.kill_generation(slot, eng.generations().get(slot) + 1); // 消す書き手が kill した所 (生きている印はまだ)
         eng.ensure_live_slot(slot);
         assert!(eng.generations().is_dead(slot), "生きている場所の死の印を落とした");
+        eng.revive_slot(slot); // 払い出しの道 (空きの一覧の古い項目など) が使う形
+        assert!(eng.generations().is_dead(slot), "生きている場所の死の印を落とした (revive_slot)");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 
-    /// #901: 生かす道 (`ensure_live_slot` = 受信の当て込み / 束ね) が場所を 「死んでいる・生きていない」 と読んだ後・死の印を落とす前に、
+    /// #901: 生かす道 (`revive_slot` = 行の lock を握らない払い出しの道: 空きの一覧 / 払い出し位置 / `entity()` の空きの山。 受信・束ねの
+    /// `ensure_live_slot` は #913 で行の lock の下) が場所を 「死んでいる・生きていない」 と読んだ後・死の印を落とす前に、
     /// 別の書き手がその場所を使い回し、 その行を消す書き手が kill した (生きている印を下ろす前) 所で落とすと、 消す途中の場所が
     /// 「次の世代、 印なし、 生きている」 (F1 の元の像) になる。 その間に書き出した像は、 開く時に消えた行を次の世代の eid で生かす。
     #[test]
@@ -3347,7 +3382,7 @@ mod eid_gen_claim_tests {
             let killed = killed_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok();
             join_tx.send((h, killed)).unwrap();
         });
-        eng.ensure_live_slot(slot);
+        eng.revive_slot(slot);
         let (h, killed) = join_rx.recv().unwrap();
         // 消す書き手は kill の後・生きている印を下ろす前に居る
         let midway = killed && eng.entities.is_live(slot) && eng.generations().get(slot) == g + 1;
@@ -3361,8 +3396,125 @@ mod eid_gen_claim_tests {
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 
-    /// #901 の続き: 読んだ後に使い回しと削除が終わった (2 B が変わって CAS が外れた) 場所は、 読み直して印を落としてから生かす
-    /// (外れたまま生かすと 「生きている、 死んでいる」 = きれいに閉じなかった後の突き合わせが生かした行を消す)。
+    /// #913 の続き 2: 受信・束ねの道が生きている印を自分で立てた後・揃える前に、 その行を消す書き手が kill した (生きている印を下ろす
+    /// 前) 所で揃えると、 消す途中の場所の死の印を落とす (= F1 の元の像)。 揃えるのは行の lock の下 (消す書き手は行の lock を待つ)。
+    /// 消す書き手が kill の後に居る時は死の印があること。 消す書き手は行の lock を待たされるか、 kill の後まで割り込み点で待つ (時間で
+    /// 待たない)。
+    #[test]
+    fn settling_an_ensured_slot_keeps_the_dead_mark_of_a_delete_in_progress() {
+        let (path, eng) = engine("ensuresettle");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x);
+        let r = eng.entity_in("u").unwrap(); // 使い回し = v15
+        let slot = eng.slot_unchecked(r);
+        eng.delete(r);
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let blocked = tx.clone();
+        eng.row_locks.set_wait_hook(slot, move || {
+            let _ = blocked.send("blocked");
+        });
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        free_gap_hook::set(&wal, move |_| {
+            let _ = tx.send("killed");
+            let _ = go_rx.recv();
+        });
+        let (join_tx, join_rx) = std::sync::mpsc::channel();
+        let e2 = eng.clone();
+        ensure_live_settle_hook::set(&wal, move |_| {
+            // 生かした行を、 別の thread が今の世代の eid で消し始める
+            let h = std::thread::spawn(move || {
+                let e = e2.eid_of_slot(slot);
+                e2.delete(e);
+            });
+            let first = rx.recv().unwrap();
+            join_tx.send((h, first)).unwrap();
+        });
+        let _ = eng.bind_remote_eid(2, enchudb_oplog::make_eid(2, 7), r);
+        let (h, first) = join_rx.recv().unwrap();
+        // 消す書き手が kill の後・生きている印を下ろす前に居るなら、 死の印があること
+        let dead = eng.generations().is_dead(slot);
+        let _ = go_tx.send(());
+        h.join().unwrap();
+        let live_after = eng.entities.is_live(slot);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert!(first != "killed" || dead, "消す途中の場所の死の印を、 生かした後の揃えで落とした");
+        assert!(!live_after, "前提: 生かした行は消えた");
+    }
+
+    /// #913 の続き: 受信・束ねの道が印を落とした後・生きている印を立てる前に v15 に移る手順が死んだ場所をなめると、 その場所は
+    /// 「世代 1、 死んでいる」 になる。 生きている印を自分で立てた時は払い出しの道と同じく揃える (`settle_claim`、 3a)。
+    #[test]
+    fn an_ensure_live_overlapping_the_move_to_v15_has_no_dead_mark() {
+        let (path, eng) = engine("ensuremove");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x); // 次の u の insert が使い回し = v15 に移る
+        let y = eng.entity_in("t").unwrap();
+        let slot = eng.slot_unchecked(y);
+        eng.delete(y); // v14 の削除 (世代 0、 印なし)
+        assert!(!eng.generations().moved() && !eng.entities.is_live(slot), "前提: v14 の消えた行の場所");
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let e2 = eng.clone();
+        ensure_live_gap_hook::set(&wal, move |_| {
+            // 印を落とした後・生きている印を立てる前に、 別の thread で v15 に移る (死んだ場所のなめがこの場所を殺す)
+            std::thread::spawn(move || e2.entity_in("u").unwrap()).join().unwrap();
+        });
+        let _ = eng.bind_remote_eid(2, enchudb_oplog::make_eid(2, 7), y);
+        let moved = eng.generations().moved();
+        let (live, dead) = (eng.entities.is_live(slot), eng.generations().is_dead(slot));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert!(moved && live, "前提: 間で v15 に移り、 束ねた行を生かした");
+        assert!(!dead, "生かした場所に移る手順の死の印が残った");
+    }
+
+    /// #913: 受信・束ねの道 (`ensure_live_slot`、 ここでは名前で束ねる `bind_remote_eid` が消えた行を指した形) が死の印を落とした後・
+    /// 生きている印を立てる前に、 別の書き手がその場所を使い回して消し終えると、 生きている印が殺された場所に立つ (「生きている、
+    /// 死の印あり」 = きれいに閉じなかった後の突き合わせが、 生かした行を消す)。 消す書き手は行の lock を待たされるか (直した形)、
+    /// 消し終える (直す前) まで割り込み点で待つ (時間で待たない)。
+    #[test]
+    fn a_slot_reused_and_deleted_while_ensure_live_revives_it_has_consistent_marks() {
+        let (path, eng) = engine("ensurelive");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x);
+        let r = eng.entity_in("u").unwrap(); // 使い回し = v15
+        let slot = eng.slot_unchecked(r);
+        eng.delete(r);
+        assert!(eng.generations().is_dead(slot) && !eng.entities.is_live(slot), "前提: 消えた行の場所");
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let blocked = tx.clone();
+        eng.row_locks.set_wait_hook(slot, move || {
+            let _ = blocked.send("blocked");
+        });
+        let (join_tx, join_rx) = std::sync::mpsc::channel();
+        let e2 = eng.clone();
+        ensure_live_gap_hook::set(&wal, move |_| {
+            // 印を落とした後・生きている印を立てる前に、 別の thread が同じ場所を使い回して (空きの一覧から) 消す
+            let h = std::thread::spawn(move || {
+                let b = e2.entity_in("u").unwrap();
+                assert_eq!(e2.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+                e2.delete(b);
+                let _ = tx.send("deleted");
+            });
+            let first = rx.recv().unwrap();
+            join_tx.send((h, first)).unwrap();
+        });
+        let _ = eng.bind_remote_eid(2, enchudb_oplog::make_eid(2, 7), r);
+        let (h, first) = join_rx.recv().unwrap();
+        h.join().unwrap();
+        let (live, dead) = (eng.entities.is_live(slot), eng.generations().is_dead(slot));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert!(!(live && dead), "生きている印が死の印のある場所に立った (間の書き手: {first})");
+    }
+
+    /// #901 の続き: 読んだ後に使い回しと削除が終わった (2 B が変わって CAS が外れた) 場所は、 読み直して印を落とす (外れたまま
+    /// 払い出しの道が生きている印を立てると 「生きている、 死んでいる」 = きれいに閉じなかった後の突き合わせが払い出した行を消す)。
     #[test]
     fn a_stale_revive_rereads_after_a_finished_reuse_and_delete() {
         let (path, eng) = engine("rereadrevive");
@@ -3383,10 +3535,10 @@ mod eid_gen_claim_tests {
             .join()
             .unwrap();
         });
-        eng.ensure_live_slot(slot);
+        eng.revive_slot(slot);
         assert_eq!(eng.generations().get(slot), g + 1, "前提: 間で使い回した行が消えた");
-        assert!(eng.entities.is_live(slot), "前提: 生かした");
-        assert!(!eng.generations().is_dead(slot), "生かした場所に死の印が残った");
+        assert!(!eng.entities.is_live(slot), "前提: 消えたまま");
+        assert!(!eng.generations().is_dead(slot), "読み直さずに死の印を残した");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
@@ -18036,10 +18188,31 @@ impl Engine {
     }
 
     /// 場所を生かす (生きている印を立てる、 既に生きていれば何もしない)。 「死んでいる」 印を先に落とす (`Generations::revive` の doc)。
+    ///
+    /// #913: 行の lock の下で 「印を落とす → 生きている印を立てる → 立てたのが自分なら死の印を揃える (`settle_claim`)」。 消す道
+    /// (kill → 生きている印を下ろす) は行の lock の下なので、 印を落とした後・生きている印を立てる前に、 別の書き手が使い回してその行を
+    /// 消し終える事は無い (前は殺された場所に生きている印を立て、 「生きている、 死の印あり」 = きれいに閉じなかった後の突き合わせが
+    /// 生かした行を消す形になった)。 使い回しの払い出しは行の lock を取らないので間に入りうるが、 その時は払い出した側が生きている印を
+    /// 立てて揃える (こちらは立てないので揃えない)。 揃えるのは、 移る手順が間で死の印を立てた形 (払い出しの道と同じ 3a)。 生きている
+    /// 場所は lock を取らない (印を落とす事も立てる事も無い)。 行の lock は同じ thread なら握り直せる。
     #[inline]
     fn ensure_live_slot(&self, slot: u32) {
+        if self.entities.is_live(slot) {
+            return;
+        }
+        let _row = self.row_locks.write(slot);
         self.revive_slot(slot);
-        self.entities.ensure_live(slot);
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            ensure_live_gap_hook::call(wal);
+        }
+        if self.entities.ensure_live(slot) {
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                ensure_live_settle_hook::call(wal);
+            }
+            self.settle_claim(slot);
+        }
     }
 
     /// 生かす前に 「死んでいる」 印を落とす。 生きている場所の印は落とさない (PR #885 の読み直し 3b: 生きている場所の印は、 消す書き手の
@@ -18069,6 +18242,7 @@ impl Engine {
 
     /// 払い出しの道で生きている印を立てた後 (eid を作る前): 移る手順と重なったなら、 移り終えるのを待って死の印を落とす
     /// (`Generations::claim_overlaps_move`、 PR #885 の読み直し 3a)。 この場所は自分の物 (eid を返す前) なので、 消す書き手は居ない。
+    /// `ensure_live_slot` (受信・束ね) は生きている印を自分で立てた時に、 行の lock を握ったまま呼ぶ (消す書き手は行の lock を待つ、 #913)。
     #[inline]
     fn settle_claim(&self, slot: u32) {
         let gens = self.generations();
