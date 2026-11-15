@@ -847,19 +847,21 @@ impl HimoStore {
     /// #899: 場所の bit を読んで `f(bits)` を呼び、 呼んだ後で読み直して違えば (0 → S に移った) 新しい bit で呼び直す (PR #907 の
     /// 読み直し B: 移る前の bit で鍵を決めて写した bucket に、 移った後の書き手が世代 > 0 の entry を置いていると、 entry を entity
     /// と読む)。 写した entry を置いた書き手は `S` を見ている (書き手が bit を読む → bucket に置く (Release) → 読み手が写す
-    /// (Acquire) → 読み手が bit を読む、 の読み読みの整合) ので、 写した後の読みが 0 なら写した entry は全部世代 0。 bit は 1 回しか
-    /// 変わらないので呼び直しは高々 1 回。
+    /// (Acquire) → 読み手が bit を読む、 の読み読みの整合) ので、 写した後の読みが 0 なら写した entry は全部世代 0。 bit は 0 → S に
+    /// 高々 1 回しか変わらない (0 でない bit は変わらない = 読み直さない) ので、 呼び直しは高々 1 回。
     #[inline(always)]
     fn with_ref_bits<R>(&self, mut f: impl FnMut(u32) -> R) -> R {
         let mut bits = self.ref_bits();
         loop {
             hook::at("ref_bits_read");
             let r = f(bits);
-            let after = self.ref_bits();
-            if after == bits {
+            if bits != 0 {
                 return r;
             }
-            bits = after;
+            bits = self.ref_bits();
+            if bits == 0 {
+                return r;
+            }
         }
     }
 
