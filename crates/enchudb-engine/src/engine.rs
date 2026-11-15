@@ -12793,10 +12793,15 @@ impl Engine {
                     }
                     ValueType::Ref => {
                         // #731 (段 4): Ref の値は 世代 | 場所 = 自分の行なら wire の世界番号の local のまま出す。 翻訳の写像は場所で
-                        // 引く。 場所の最後の住人を指していない ref (消えた行を指したまま場所を使い回した後) は、 前の住人が自分の行か
-                        // 翻訳した行か分からない (写像は今の住人の物) ので出さない (前は今の住人を指して出していた)
+                        // 引く。 場所の最後の住人を指していない ref (消えた行を指したまま場所を使い回した後) は、 写像が今の住人の物なので
+                        // 写像では引かない (前は今の住人を指して出していた)。 #914: 前の住人が自分の行なら、 使い回す時にその削除を
+                        // identity (自分の peer, 値) に移してある (`keep_gone_own_delete`) = 自分の行を指す ref として出す (その Delete も
+                        // state に入るので、 受け手でも消えた行を指す。 出さないと受け手でだけ null)。 前の住人が翻訳した行 / 削除の
+                        // 版数の無い行なら出さない
                         let target_slot = self.generations().split(value).0;
-                        if self.generations().active() && self.last_local_of_slot(target_slot) != value {
+                        let stale = self.generations().active() && self.last_local_of_slot(target_slot) != value;
+                        let gone_own = stale && self.foreign_tombstone_of(self_peer, value).is_some();
+                        if stale && !gone_own {
                             dropped += 1; // #236
                             continue;
                         }
@@ -12805,7 +12810,7 @@ impl Engine {
                         // author key で翻訳する)。 replica 版では「author 自身の
                         // entity への ref」も translated local なので、 owner が
                         // author なら素の Tie に戻す (= author 本人が出す形と同じ)。
-                        if self.eid_translator.is_translated_local(target_slot) {
+                        if !gone_own && self.eid_translator.is_translated_local(target_slot) {
                             match self.eid_translator.reverse(target_slot) {
                                 Some((owner, owner_local)) if owner == author && !is_self => {
                                     records.push(mk(
@@ -12937,7 +12942,7 @@ impl Engine {
     /// - Delete: 翻訳した行 (他の peer の行) のうち、 消えていて (`slot_is_dead`) 削除の版数が自分の時計の物。 slot を
     ///   使い回して写像が外れた行は退避表 (`foreign_tombs`) から。 生きている行は、 削除の版数が残っていても出さない
     /// - Delete (自分の行、 #784 / #800): 削除の版数の列をなめ、 消えていて削除の版数が自分の時計の、 自分の行の slot。
-    ///   slot を使い回すと版数は消える (出せない行は受け手の掃除が消す)
+    ///   slot を使い回した行は、 使い回す時に移した退避表 (`keep_gone_own_delete`、 #914) から
     fn state_unties_and_foreign_deletes(
         &self,
         by: enchudb_oplog::PeerId,
@@ -13002,7 +13007,8 @@ impl Engine {
         }
         for (owner, owner_local, tomb) in self.orphan_foreign_tombstones() {
             // 写像のある行は上で見た (払い出す時に退避表の版数を slot に書き戻してある)
-            if owner != self_peer && mine(tomb) && self.eid_translator.get(owner, owner_local).is_none() {
+            // #914: 自分の peer の物は、 場所を使い回した自分の消えた行 (`keep_gone_own_delete`、 番号は世代込み)。 写像は持たない
+            if mine(tomb) && (owner == self_peer || self.eid_translator.get(owner, owner_local).is_none()) {
                 deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
             }
         }
@@ -13440,6 +13446,8 @@ impl Engine {
             // 取って印を立てる前の書き手が居ると、 全部なめはその slot を穴として積む。 先に立てた方が取り、 後の方は次を見る。
             // 立てるのはこの lock の下 (#733: 放してから立てると、 別の thread の全部なめが同じ slot を穴として拾い直した)
             let mut global = None;
+            // #914: 使い回す場所の前の住人 (消えた行) の番号。 生かす前に読む (生かすと場所の番号は新しい住人の物)
+            let mut gone = 0;
             while let Some(local) = fl.pop() {
                 let Some(g) = table.global_of(local) else { continue };
                 // #731: 世代を使い切った場所は二度と渡さない (印を立てる前に見る)
@@ -13450,6 +13458,7 @@ impl Engine {
                 if let Some(wal) = self.oplog.as_ref() {
                     pop_claim_hook::call(wal);
                 }
+                gone = self.last_local_of_slot(g);
                 // #731: 印を立てる RMW (AcqRel) が、 消す側の印を下ろす RMW を読むので、 消す側がその前に上げた場所の世代も見える。
                 // 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`、 取れなかった時は取った側も落とす)
                 self.revive_slot(g);
@@ -13466,6 +13475,8 @@ impl Engine {
                 // #779: 前の住人宛ての、 bridge の前の record の宛名を覚える (逆写像を外す前に。 配らない表は bridge しない)
                 if !table.is_reserved() {
                     self.remember_former_address(global, true);
+                    // #914: 前の住人が自分の消えた行なら、 その削除の版数と名前を identity に移す (版数は下で消える)
+                    self.keep_gone_own_delete(global, gone);
                 }
                 // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす (`clear_cell_versions` の doc 参照)。 印を立てた
                 // 後 = この slot は自分の物 (前は落としてから立てていて、 #883 の形では、 先に印を立てて書き始めた別の書き手の版数を
@@ -16692,7 +16703,9 @@ impl Engine {
     /// **別の** entity の tombstone に負けて適用されない。
     ///
     /// 前の住人の eid は slot が free list に入った時点で到達不能なので、 版数を
-    /// 落として困る読み手はいない。
+    /// 落として困る読み手はいない。 ただし削除の版数は、 前の住人の世界番号がまだ peer に
+    /// 居る間 (翻訳した行 = #166、 世代の違う番号で使い回した自分の行 = #914) 要るので、
+    /// 呼ぶ前に identity へ移す (`evict_translation_for_reuse` / `keep_gone_own_delete`)。
     ///
     /// v9 側で `count() <= local` の column は **その cell を一度も書いていない** =
     /// 中身は zero (= 版数不明) なので触らない。 growable backing の未コミット
@@ -16791,6 +16804,31 @@ impl Engine {
         for key in keys {
             self.eid_translator.mark_dirty(key);
         }
+    }
+
+    /// #914 / #915: 表の場所 `local` を使い回す時 (生きている印を立てた後、 [`Self::clear_cell_versions`] の前)、 前の住人が自分の
+    /// 消えた行 (番号 `gone` = 世代 | 場所) なら、 その削除の版数と名前を identity (自分の peer, `gone`) に移す (#166 / #545 で
+    /// 翻訳した行にしているのと同じ形、 置き場も同じ `foreign_tombs` と `PkFormer` の identity の名前)。
+    ///
+    /// 使い回した場所の新しい住人は世代の違う番号 (#731 段 4) なので、 消えた行はまだ別の世界番号として peer に居る。 版数を
+    /// 場所と一緒に消すと、 その削除がどこにも残らず、 (1) state に Delete が入らない (取りこぼした peer の掃除が今の時刻で
+    /// 消し、 名前で束ねた新しい行まで消える、 #914)、 (2) その行宛ての、 別の peer のより新しい削除・改名が名前の削除優先 (#551)
+    /// を通らない (#915)、 (3) その行を指す ref を state に出せない。 移した版数は state の自分の削除として出し
+    /// (`state_unties_and_foreign_deletes`)、 忘れてよい線で刈る (`forget_deletes_before`)。
+    ///
+    /// 翻訳した行 (逆写像がある) は `evict_translation_for_reuse` が移す。 新しい住人と番号が同じ (世代を持たない DB) なら移さない
+    /// (その番号は新しい住人の物)。 削除の版数の無い場所 (sync しない DB、 版数なしで消した行) も移さない。
+    fn keep_gone_own_delete(&self, local: u32, gone: u32) {
+        if !self.sync_tables_on() || gone == self.last_local_of_slot(local) || self.eid_translator.reverse(local).is_some() {
+            return;
+        }
+        let tomb = self.tombstone_version_of(local);
+        if tomb == enchudb_oplog::Hlc::ZERO {
+            return;
+        }
+        let self_peer = self.peer_id();
+        self.move_names_to_identities(local, &[(self_peer, gone)]);
+        self.remember_foreign_tombstone(self_peer, gone, tomb);
     }
 
     /// #545: 消えた行の slot `local` を使い回す前に、 その行の名前 (消えた時の名前と前の名前) を、 slot に写っていた identity に移す。
@@ -17138,7 +17176,8 @@ impl Engine {
         }
     }
 
-    /// 削除の版数が `h` より前の、 削除の記録を忘れる: 消した主キー (`pk_tombs`) と、 写像を外した後の相手の行の削除 (`foreign_tombs`)。
+    /// 削除の版数が `h` より前の、 削除の記録を忘れる: 消した主キー (`pk_tombs`) と、 写像を外した後の相手の行の削除 / 場所を
+    /// 使い回した自分の消えた行の削除 (`foreign_tombs`、 #914) と、 その identity に移した名前。
     /// 忘れた数 (0 でなければ `persist_sync_state` で書き直す)。 行の slot に残った削除の版数 (`slot_is_dead`) は触らない。
     ///
     /// 呼んでよいのは、 `h` より前の書き込みがもう届かないと分かった時だけ: 全部の書き手が `h` より前の自分の書き込みを出し終え、
@@ -17157,14 +17196,30 @@ impl Engine {
             }
         }
         if !self.foreign_tombs_empty.load(Ordering::Acquire) {
-            let mut g = self.foreign_tombs.write().unwrap();
-            let before = g.len();
-            g.retain(|_, t| *t >= h);
-            let n = before - g.len();
-            if n > 0 {
+            let mut forgotten: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
+            self.foreign_tombs.write().unwrap().retain(|&id, t| {
+                let keep = *t >= h;
+                if !keep {
+                    forgotten.push(id);
+                }
+                keep
+            });
+            if !forgotten.is_empty() {
                 // `eidmap.log` の退避の記録は消せないので、 次の書き出しで `eidmap` をまとめ直す
                 self.eidmap_compact.store(true, Ordering::Release);
-                gone += n;
+                gone += forgotten.len();
+                // #914: その identity に移した名前も外す (名前を使うのは、 退避した削除より新しい削除・名前の書き込みが届いた時だけ =
+                // 忘れた削除の identity にはもう届かない)。 自分の行の使い回しのたびに増えるので、 削除と一緒に刈る
+                if !self.pk_former_empty.load(Ordering::Acquire) {
+                    let mut f = self.pk_former.write().unwrap();
+                    let mut changed = false;
+                    for (peer, fl) in forgotten {
+                        changed |= f.forget_identity(peer, fl);
+                    }
+                    if changed {
+                        self.pk_former_dirty.store(true, Ordering::Release);
+                    }
+                }
             }
         }
         gone
@@ -19546,7 +19601,8 @@ impl Engine {
         if hlc == enchudb_oplog::Hlc::ZERO {
             return false;
         }
-        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の番号は写像が None、 退避表にも自分の peer の番号は載らない = false
+        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の番号は写像が None。 #914: 使い回す時に削除の版数を
+        // 退避表に移してある (`keep_gone_own_delete`) = 写像の無い行と同じ
         match self.resolve_remote_eid_existing(foreign_eid) {
             Some(local_eid) => {
                 let local = self.slot_unchecked(local_eid);
@@ -19557,6 +19613,52 @@ impl Engine {
                     == Some(hlc)
             }
         }
+    }
+
+    /// #915: もう無い自分の行 (番号 `gone` = 世代 | 場所、 場所を使い回した前の住人) 宛てに届いた削除。 使い回す時に移した削除の
+    /// 版数 (`keep_gone_own_delete`) より新しければ版数を上げ、 移した名前の削除の時刻も上げて、 その名前を今持つ行のうち `hlc`
+    /// より前にその名前になった行を消す (`remote_delete_apply` の 2 人目の削除と同じ = 削除を先に受けた peer と同じ答え、 #551)。
+    /// 移した版数が無い (世代を持たない DB で使い回した / 忘れてよい線で刈った) 番号は何もしない (前と同じ)。 戻り値は版数を上げたか
+    /// (同じ版数は false: もう記録してある削除)。
+    fn raise_gone_own_delete(&self, gone: u32, hlc: enchudb_oplog::Hlc) -> bool {
+        let self_peer = self.peer_id();
+        match self.foreign_tombstone_of(self_peer, gone) {
+            Some(t) if hlc > t => {}
+            _ => return false,
+        }
+        if !self.remember_foreign_tombstone(self_peer, gone, hlc) {
+            return false;
+        }
+        self.raise_identity_names(self_peer, gone, hlc);
+        true
+    }
+
+    /// #915: もう無い自分の行 `eid` (場所を使い回した前の住人) 宛てに届いた主キーの書き込み (改名)。 書き込みは捨てるが、 消えた行への
+    /// 改名と同じく (`name_given_to_dead_row`)、 名前は使い回す時に移した identity の名前に足し、 移した削除の版数で消した名前と
+    /// して覚え、 その名前を今持つ行のうち削除より前にその名前になった行を消す (#551)。 移した版数の無い番号・主キーでない列は
+    /// 何もしない。 戻り値は一緒に消した行の数。
+    pub fn name_given_to_gone_own_row(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+        let self_peer = self.peer_id();
+        let gone = enchudb_oplog::eid_local(eid);
+        if enchudb_oplog::eid_peer(eid) != self_peer || !self.is_remembered_pk_himo(himo) {
+            return 0;
+        }
+        let Some(tomb) = self.foreign_tombstone_of(self_peer, gone) else { return 0 };
+        let changed = self.with_pk_key(himo, PkValue::Local(value), |k| {
+            self.pk_former.write().unwrap().insert_identity(self_peer, gone, himo, k)
+        });
+        if changed == Some(true) {
+            self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+        {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            self.with_pk_key(himo, PkValue::Local(value), |k| {
+                self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
+            });
+        }
+        self.remove_rows_named(u32::MAX, himo, value, tomb)
     }
 
     /// #490: リモート peer から届いた Delete を、 翻訳する前の eid (author の世界番号) のまま当てる。
@@ -19576,7 +19678,8 @@ impl Engine {
     /// 作成が最後まで届かない entity (subscription filter で落ちる、 履歴の切り詰めの後) 宛ての Delete も退避表に残る
     /// (1 件 = `(peer, foreign_local)` → HLC)。
     ///
-    /// 戻り値は [`Engine::remote_delete_apply`] と同じ (`false` = 既に載っている削除より古いので不採用)。
+    /// 戻り値は [`Engine::remote_delete_apply`] と同じ (`false` = 既に載っている削除より古いので不採用)。 もう無い自分の行の
+    /// 削除は、 使い回す時に移した削除の版数を上げた時だけ `true` ([`Self::raise_gone_own_delete`]、 #915)。
     ///
     /// [`EidTranslator::if_unmapped`]: crate::eid_translator::EidTranslator::if_unmapped
     pub fn remote_delete_apply_foreign(
@@ -19589,9 +19692,10 @@ impl Engine {
         }
         self.observe_remote_hlc(hlc);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
-        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除。 その行は消えている (退避表は他の peer の行の物)
+        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除。 その行は消えている。 #915: 使い回す時に移した削除の
+        // 版数より新しければ、 名前の削除の時刻を上げる
         if owner == self.peer_id.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
+            return self.raise_gone_own_delete(enchudb_oplog::eid_local(foreign_eid), hlc);
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         let before = self.foreign_tombstone_of(owner, foreign_local);

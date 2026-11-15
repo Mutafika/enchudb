@@ -2159,11 +2159,26 @@ impl Syncer {
         // #731 (段 4): もう無い自分の行 (消して場所を使い回した前の住人) 宛ての record。 相手はその行の削除をまだ受けていない
         // (書いた後に削除を受ける) だけで、 こちらではその行は消えている = 削除優先で捨てる (前の住人の場所が死んでいる時と同じ)。
         // 宛名を引くと今の住人に当たるので、 引く前に外す
+        //
+        // #915: ただし削除と名前の書き込みは、 捨てる前に名前の削除優先 (#551) を通す (場所を使い回す時に、 その行の削除の版数と
+        // 名前を identity に移してある、 `Engine::keep_gone_own_delete`): より新しい削除は名前の削除の時刻を上げ、 名前の書き込みは
+        // 消えた行への改名と同じ扱い。 その行の削除を先に受けた peer と同じ答えにする
         if let Some(eid) = Self::row_of(&rec.op).or(match &rec.op {
             DecodedOp::Delete { eid } | DecodedOp::Content { eid, .. } => Some(*eid),
             _ => None,
         }) && self.engine.is_gone_own_eid(eid)
         {
+            match &rec.op {
+                DecodedOp::Delete { .. } => {
+                    return ApplyResult::from_lww(self.engine.remote_delete_apply_foreign(eid, rec.hlc));
+                }
+                DecodedOp::Tie { himo_id, value, .. } if self.engine.is_pk_himo(*himo_id) => {
+                    if let Some(v) = self.engine.try_translate_remote_vid(rec.author_peer, *himo_id, *value) {
+                        self.engine.name_given_to_gone_own_row(eid, *himo_id, v);
+                    }
+                }
+                _ => {}
+            }
             return ApplyResult::SkippedOlder;
         }
         match &rec.op {

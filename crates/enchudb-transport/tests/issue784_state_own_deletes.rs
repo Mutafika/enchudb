@@ -497,10 +497,11 @@ fn the_delete_is_in_the_state_after_a_reopen() {
     drop((c1, c2, host));
 }
 
-/// slot を使い回すと削除の版数は消える = state に Delete は出ない (数は増え続けない)。 その行は今までどおりホストの掃除か、
-/// 同じ番号の新しい行の書き込みで決まる。
+/// slot を使い回しても、 消えた行の Delete は消えた行の番号 (世代込み) と削除の版数のまま state に残る (#914: 使い回す時に
+/// identity へ移す。 前は使い回すと消え、 取り直した受け手の掃除が今の時刻で消し直していた)。 使い回した後の新しい行は
+/// 別の番号で届く。 数は消した行の数のまま (忘れてよい線で刈る、 `deletes_before_the_forget_line_are_left_out`)。
 #[test]
-fn reused_slots_carry_no_delete() {
+fn reused_slots_keep_the_delete_of_the_deleted_row() {
     let w = seeded("reuse");
     let (c1, c2, c3) = (&w.c1, &w.c2, &w.c3);
     let rows: Vec<u64> = (0..20).map(|i| c1.create(100 + i, i)).collect();
@@ -511,8 +512,9 @@ fn reused_slots_carry_no_delete() {
     c1.eng.oplog_commit();
     tick();
     let (records, _) = c1.eng.state_records();
-    let n = own_deletes(&StateBatch { records, as_of: Hlc::ZERO, complete: true }, 1).len();
-    assert_eq!(n, 20, "前提: 消した 20 行の Delete が state にある");
+    let mut before = own_deletes(&StateBatch { records, as_of: Hlc::ZERO, complete: true }, 1);
+    before.sort_unstable();
+    assert_eq!(before.len(), 20, "前提: 消した 20 行の Delete が state にある");
     // 表の枠 (4096) を使い切ると、 空いた slot を使い回す
     c1.eng.oplog_sync().unwrap();
     let mut reused = 0;
@@ -525,8 +527,9 @@ fn reused_slots_carry_no_delete() {
         if rows.iter().any(|r| (*r as u32) & 0xFF_FFFF == (e as u32) & 0xFF_FFFF) {
             reused += 1;
             let (records, _) = c1.eng.state_records();
-            let left = own_deletes(&StateBatch { records, as_of: Hlc::ZERO, complete: true }, 1);
-            assert_eq!(left.len(), 20 - reused, "使い回した slot の Delete が state に残った / 使い回していない slot の Delete が消えた");
+            let mut left = own_deletes(&StateBatch { records, as_of: Hlc::ZERO, complete: true }, 1);
+            left.sort_unstable();
+            assert_eq!(left, before, "使い回した slot の、 消えた行の Delete (番号と版数) が state で変わった (使い回し {reused})");
         }
     }
     c1.eng.oplog_commit();
