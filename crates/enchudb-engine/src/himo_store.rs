@@ -1785,14 +1785,12 @@ impl HimoStore {
         }
         hook::at("range_checked");
         let col = self.col();
-        let (is_ref, count) = (self.gens.get().is_some(), col.count());
+        let count = col.count();
         self.cyl.walk(lo, hi, desc, |v, raw, verify, marks| {
             // #899: 上で見た後に最初の世代 > 0 の entry が置かれた (鍵 = 場所 v の bucket に、 値 v でない entry が混ざる) 時は、
             // 世代 > 0 の entry を落として Column で確かめる (並んだ書き込みの途中の読み)
-            if is_ref {
-                if let std::borrow::Cow::Owned(kept) = self.drop_late_gen(raw, count) {
-                    return f(v, &mut BucketIter::new(&kept, Some((col, v + 1))));
-                }
+            if let std::borrow::Cow::Owned(kept) = self.drop_late_gen(raw, count) {
+                return f(v, &mut BucketIter::new(&kept, Some((col, v + 1))));
             }
             // 古い印がそろっていれば、 Column の確かめと出した eid の集合の代わりに印で飛ばす
             let mut iter = match (verify, marks) {
