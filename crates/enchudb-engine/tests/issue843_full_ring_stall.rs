@@ -55,6 +55,16 @@ fn rows(payloads: Vec<Vec<u8>>) -> Vec<(PeerId, Hlc)> {
         .collect()
 }
 
+/// #955: 配る側の本番の道 (`settled_sync_records`: `Syncer` の publish とホストの pull が読む) で配ってよい record の (書き手, 版数)
+/// (lsn の順、 Commit は除く)。
+fn settled(eng: &Engine) -> Vec<(PeerId, Hlc)> {
+    eng.settled_sync_records(|_, _| true)
+        .into_iter()
+        .filter(|r| !matches!(r.op, DecodedOp::Commit))
+        .map(|r| (r.author_peer, r.hlc))
+        .collect()
+}
+
 /// ring を満杯にして止める (書いている間は bridge も畳みも止める)。 返すのは ring の枠の数。
 fn fill(eng: &Engine, e: u64, extra: u32) -> u32 {
     let ring = eng.table_eid_usage("_sync_ops").unwrap().capacity;
@@ -93,7 +103,8 @@ fn a_full_ring_is_read_once_not_on_every_stalled_round() {
         eng.oplog_sync().unwrap();
         assert_eq!(eng.sync_ring_scans(), after_fill, "ring が満杯のまま書くたびに、 止まった周が ring の全行を読んだ");
         // 割れた組は無いので、 ring の行は全部配ってよい
-        assert_eq!(eng.settled_sync_ops().len(), eng.pending_sync_ops(0).len(), "割れた組が無いのに、 配らない行がある");
+        assert_eq!(eng.settled_sync_records(|_, _| true).len(), eng.pending_sync_ops(0).len(), "割れた組が無いのに、 配らない行がある");
+        assert_eq!(eng.settled_sync_ops().len(), eng.pending_sync_ops(0).len(), "割れた組が無いのに、 配らない行がある (前の読み)");
         assert_eq!(Arc::strong_count(&eng), 1);
     }
     let eng = Engine::open_concurrent_with_oplog(&path, WAL).unwrap();
@@ -117,7 +128,8 @@ fn a_full_ring_is_read_once_not_on_every_stalled_round() {
 /// ack で ring が空いて組が載り切ったら配る (または、 載り切らないなら書き手の floor を組の版数に上げる)。
 ///
 /// falsify: bridge が載せた行を覚えない (`RingNewest::note` を外す) と、 組の鍵が 「ring のどの行よりも新しい」 のままになり、
-/// 割れた組の前半を配る。
+/// 割れた組の前半を配る。 配る側の本番の道 (`settled_sync_records`) が配ってよい行の終わりを見ない時も (#955、 前の読み
+/// `settled_sync_ops` と両方で見る)。
 #[test]
 fn a_group_cut_apart_after_the_ring_was_read_is_still_held_back() {
     const GROUP: usize = 100;
@@ -140,7 +152,7 @@ fn a_group_cut_apart_after_the_ring_was_read_is_still_held_back() {
     // 覚えた 「いちばん新しい行」 より新しい)
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     let group_key = (AUTHOR, Hlc { wall: now + 60_000, logical: 0, peer: AUTHOR });
-    let on = |payloads: Vec<Vec<u8>>| rows(payloads).iter().filter(|k| **k == group_key).count();
+    let on = |rows: Vec<(PeerId, Hlc)>| rows.iter().filter(|k| **k == group_key).count();
     {
         let _no_bridge = eng.transfer_lock_for_fold();
         // 閉じの Commit も 1 行使う
@@ -154,9 +166,10 @@ fn a_group_cut_apart_after_the_ring_was_read_is_still_held_back() {
         eng.oplog_commit();
     }
     drain(&eng);
-    let first_half = on(eng.pending_sync_ops(0));
+    let first_half = on(rows(eng.pending_sync_ops(0)));
     assert!(first_half > 0 && first_half < GROUP, "前提: 組が ring の端で割れている (載った {first_half} / {GROUP} 本)");
-    assert_eq!(on(eng.settled_sync_ops()), 0, "割れた組の前半を配った");
+    assert_eq!(on(settled(&eng)), 0, "割れた組の前半を配った");
+    assert_eq!(on(rows(eng.settled_sync_ops())), 0, "割れた組の前半を配った (前の読み)");
 
     // 止まったまま書き続ける (新しい鍵が増える) 間も配らず、 ring も読み直さない
     let scans = eng.sync_ring_scans();
@@ -164,7 +177,8 @@ fn a_group_cut_apart_after_the_ring_was_read_is_still_held_back() {
         eng.tie_to(e, "notes.note", 4_000_000 + i);
         eng.oplog_commit();
         eng.transfer_oplog_to_sync_ops();
-        assert_eq!(on(eng.settled_sync_ops()), 0, "割れた組の前半を配った ({i} 回目)");
+        assert_eq!(on(settled(&eng)), 0, "割れた組の前半を配った ({i} 回目)");
+        assert_eq!(on(rows(eng.settled_sync_ops())), 0, "割れた組の前半を配った ({i} 回目、 前の読み)");
     }
     assert_eq!(eng.sync_ring_scans(), scans, "組が割れたまま止まっている間、 周のたびに ring を読んだ");
 
@@ -173,10 +187,13 @@ fn a_group_cut_apart_after_the_ring_was_read_is_still_held_back() {
     eng.ack_sync_up_to_cursors(PULLER, &[(ME, top)]).unwrap();
     eng.reclaim_sync_ops();
     drain(&eng);
-    let handed = on(eng.settled_sync_ops());
+    let handed = on(settled(&eng));
+    let handed_ops = on(rows(eng.settled_sync_ops()));
     let floor = eng.sync_reclaimed_floors().unwrap_or_default().into_iter().find(|(a, _)| *a == AUTHOR).map(|(_, h)| h);
-    assert!(
-        handed == GROUP || (handed == 0 && floor >= Some(group_key.1)),
-        "組は、 全部載ってから配るか、 配らずに書き手の floor を組の版数に上げる (配ってよい行に {handed} 本、 floor {floor:?})"
-    );
+    for (handed, how) in [(handed, "settled_sync_records"), (handed_ops, "settled_sync_ops")] {
+        assert!(
+            handed == GROUP || (handed == 0 && floor >= Some(group_key.1)),
+            "{how}: 組は、 全部載ってから配るか、 配らずに書き手の floor を組の版数に上げる (配ってよい行に {handed} 本、 floor {floor:?})"
+        );
+    }
 }

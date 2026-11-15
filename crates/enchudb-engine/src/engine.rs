@@ -6630,6 +6630,23 @@ mod floor_write_hook {
     }
 }
 
+/// #955 の test: 配る側の読み (`settled_sync_records`) が ring の行をなめて並べた後、 行を読む前の割り込み点 (その間に場所が
+/// 回収されて別の行に使い回された形を作る)。
+#[cfg(test)]
+mod settled_read_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// #451 (段階 1): 落ちた write の floor を本体に書いている間、 切れ目は候補を出さない (持ち越しから取り出してから書くと、 その間の
 /// 切れ目が floor の無い落ちた write を印で覆う = 隣のレビューで見つかった穴)。
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -15058,16 +15075,27 @@ impl Engine {
 
     /// #828: `_sync_ops` の行のうち **配ってよい物** の payload (lsn の順)。 ring が満杯で bridge が同じ (書き手, 版数) の組の
     /// 途中で止まっている時、 その組の行 (と、 その後ろの行) は入らない (組がそろった後に入る)。 受け手に配る側
-    /// (`Syncer` の publish、 ホストの口の pull) はこちらを読む。 [`Self::pending_sync_ops`] は ring にある行の全部。
+    /// (`Syncer` の publish、 ホストの口の pull) は [`Self::settled_sync_records`] を読む。 [`Self::pending_sync_ops`] は ring にある行の全部。
+    ///
+    /// #949 の後、 配る側の本番の道ではない。 `settled_sync_records` の答えを比べる試験の参照 (直す前の読み = 全部写して decode する)
+    /// なので、 `settled_sync_records` を使って書き直さない (書き直すと比べが同じ物どうしになる)。
     pub fn settled_sync_ops(&self) -> Vec<Vec<u8>> {
+        let settled = self.settled_lsn();
+        self.sync_ops_between(0, settled)
+    }
+
+    /// #828: 配ってよい `_sync_ops` の行の終わり (lsn、 [`Self::sync_settled_lsn`])。 [`Self::settled_sync_ops`] と
+    /// [`Self::settled_sync_records`] は、 行を読む前にこれを読み、 これより後の lsn の行は入れない (読んでいる間に bridge が組の途中
+    /// まで写しても見えない)。
+    ///
+    /// 開いた後、 bridge がまだ 1 周していなければ、 自分で 1 周させてから読む: 閉じる前に組の途中で止まっていたかは bridge が WAL を
+    /// 読んで決める (置く前の値 `u32::MAX` のまま読むと、 ring に残っている割れた組の前半を配る)。
+    fn settled_lsn(&self) -> u32 {
         use std::sync::atomic::Ordering;
-        // 開いた後、 bridge がまだ 1 周していない: 閉じる前に組の途中で止まっていたかは bridge が WAL を読んで決める
         if !self.sync_settled_known.load(Ordering::Acquire) {
             self.transfer_oplog_to_sync_ops();
         }
-        // 終わりを先に読む: この後に載った行は lsn が大きいので入らない (読んでいる間に bridge が組の途中まで写しても見えない)
-        let settled = self.sync_settled_lsn.load(Ordering::Acquire);
-        self.sync_ops_between(0, settled)
+        self.sync_settled_lsn.load(Ordering::Acquire)
     }
 
     /// #949: [`Self::settled_sync_ops`] の payload を `decode_sync_ops_payload` で record にし、 (書き手, 版数) が `keep` を満たす物
@@ -15077,27 +15105,32 @@ impl Engine {
     /// payload を写す前に header の (書き手, 版数) を ring の上で読んで `keep` で絞り、 残った行だけ写して decode する (前は配る側が
     /// 全部の行を写して decode してから版数で絞っていた: ring 60 万行で publish 1 回 30〜40 ms、 peer ごと)。 `keep` は (書き手, 版数)
     /// だけで決まるので、 同じ (書き手, 版数) の組 (#828 / #830) は全部入るか全部入らないか。
+    ///
+    /// `keep` は副作用を持たず、 panic しない事。 ring の entry を読んでいる間に呼ぶので、 同時に bridge がその場所を使い回すと、
+    /// 書きかけ / 次の record の (書き手, 版数) で呼ばれる事がある (その読みの答えは、 entry の lsn を確かめ直して捨てる)。 数える・
+    /// 最小を覚える等を `keep` の中でやると、 捨てた読みの値を拾う。
     pub fn settled_sync_records(
         &self,
         keep: impl Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
     ) -> Vec<crate::transport::WireRecord> {
-        use std::sync::atomic::Ordering;
-        if !self.sync_settled_known.load(Ordering::Acquire) {
-            self.transfer_oplog_to_sync_ops();
-        }
-        let settled = self.sync_settled_lsn.load(Ordering::Acquire);
+        let settled = self.settled_lsn();
         if !self.sync_tables_enabled() {
             return Vec::new();
         }
         let Some(cols) = self.sync_payload_cols() else { return Vec::new() };
         // (lsn, 場所) の順に読む: payload の ring も lsn の順なので写しが続く。 前は場所の順に読んでから lsn で安定に並べた = 同じ lsn
-        // の行 (無いはず) は場所の順で、 答えの並びは同じ。 1 語に詰めて並べる (組の比べより速い)
+        // の行 (無いはず) は場所の順で、 答えの並びは同じ。 1 語に詰めて並べる (組の比べより速い)。 lsn 0 の行は入れない (bridge は
+        // lsn を 1 から振る。 前の読み `sync_ops_between` も `0 < lsn`)
         let mut rows: Vec<u64> = self
-            .table_slots_with_value32(cols.lsn, |lsn| lsn <= settled)
+            .table_slots_with_value32(cols.lsn, |lsn| lsn != 0 && lsn <= settled)
             .into_iter()
             .map(|(lsn, slot)| (u64::from(lsn) << 32) | u64::from(slot))
             .collect();
         rows.sort_unstable();
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            settled_read_hook::call(wal);
+        }
         let mut out = Vec::with_capacity(rows.len());
         out.extend(rows.into_iter().filter_map(|k| self.sync_op_record_if(k as u32, (k >> 32) as u32, &cols, &keep)));
         // 絞って少なくなった時は、 行の数で取った場所を返す
@@ -32112,7 +32145,8 @@ mod settled_records_tests {
     }
 
     /// decode できない行: header の読めない行 (dead row)、 header は読めて op の壊れた行、 辞書の payload の列の読める行 (0.30 以前の
-    /// 形)。 直す前の読みは写した後の decode で落とす / 読む。 今の読みも同じ。
+    /// 形)。 直す前の読みは写した後の decode で落とす / 読む。 今の読みも同じ。 #955 (F1): lsn の値が 0 の辞書の行 (読める) は、
+    /// 直す前の読みと同じく入れない (falsify: `settled_sync_records` の `lsn != 0` を外すと比べが落ちる)。
     #[test]
     fn settled_records_drop_what_does_not_decode() {
         let path = tmp("dead");
@@ -32165,6 +32199,11 @@ mod settled_records_tests {
         cut.pop();
         put(top / 2 - 2, &cut);
         put(top / 2 - 3, &bytes);
+        // #955 (F1): lsn の値が 0 の行 (bridge は lsn を 1 から振るので、 u32 の一周か壊れた / 手で置いた行だけ)。 前の読みは入れない
+        let mut zero = bytes.clone();
+        let logical_at = enchudb_oplog::oplog::SYNC_OPS_PAYLOAD_PREFIX + 24;
+        zero[logical_at..logical_at + 4].copy_from_slice(&0xABCDu32.to_le_bytes());
+        put(0, &zero);
         assert!(
             enchudb_oplog::oplog::sync_ops_payload_author_hlc(&cut).is_some() && decode_sync_ops_payload(&cut).is_none(),
             "前提: header は読めて op の壊れた payload"
@@ -32172,7 +32211,146 @@ mod settled_records_tests {
         assert!(decode_sync_ops_payload(b"not a record").is_none());
         let settled = eng.settled_sync_ops();
         assert!(settled.iter().any(|p| p == &cut) && settled.iter().any(|p| p == b"not a record"), "前提: 配ってよい行に入る");
+        assert!(decode_sync_ops_payload(&zero).is_some_and(|r| r.hlc.logical == 0xABCD), "前提: lsn 0 の行の payload は読める");
+        assert!(!settled.iter().any(|p| p == &zero), "前提: lsn 0 の行は前の読みに入らない");
+        assert!(eng.pending_sync_ops(0).iter().all(|p| p != &zero), "前提: lsn 0 の行は ring の行の全部にも入らない");
         assert!(check(&eng, 1, "decode できない行") > 10, "前提: 一部だけ通す絞りがある");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// ring の枠のうち `fillers(枠)` 個を自分の Tie で埋め、 その後ろに組 (書き手 `group_key.0` の同じ版数の Vocab `group` 本、 中継した
+    /// state の形) を WAL に載せて、 bridge を回し切る。
+    fn split_group(path: &str, group_key: (PeerId, Hlc), group: usize, fillers: impl Fn(usize) -> usize) -> Arc<Engine> {
+        let mut eng = Engine::create_with_capacity(path, 1024).unwrap();
+        eng.define_table("notes", 8).unwrap();
+        eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let ring = eng.table_eid_usage("_sync_ops").unwrap().capacity as usize;
+        {
+            // 書いている間は bridge も畳みも止める
+            let _no_bridge = eng.transfer_lock_for_fold();
+            let e = eng.entity_in("notes").unwrap();
+            for i in 0..fillers(ring) as u32 {
+                eng.tie_to(e, "notes.note", i);
+            }
+            for vid in 0..group as u32 {
+                let rec = WireRecord::unsigned(group_key.1, group_key.0, DecodedOp::Vocab { vid, bytes: format!("g{vid}").into_bytes() });
+                assert!(eng.relay_record(&rec), "前提: 組の record を WAL に載せた");
+            }
+            eng.oplog_commit();
+        }
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        eng
+    }
+
+    /// payload のうち (書き手, 版数) が `k` の物の数。
+    fn on_ring(payloads: &[Vec<u8>], k: (PeerId, Hlc)) -> usize {
+        payloads.iter().filter_map(|p| decode_sync_ops_payload(p)).filter(|r| (r.author_peer, r.hlc) == k).count()
+    }
+
+    /// #955 (F4): 同じ (書き手, 版数) の組が ring の端で割れたまま閉じて開き直した直後、 bridge が 1 周する前に配る側の読みが来ても、
+    /// 組の前半を配らない (読みが bridge を 1 周させ、 配ってよい行の終わりを置いてから読む、 `settled_lsn`)。 `settled_sync_records`
+    /// と `settled_sync_ops` を、 それぞれ開き直した後の最初の読みとして見る。 consumer は開いた直後に止める (止める前に consumer の
+    /// 周が bridge を回した回は、 開き直して試し直す)。
+    ///
+    /// falsify: `settled_lsn` の 「まだ 1 周していなければ自分で 1 周させる」 を外すと、 置く前の値 (`u32::MAX`) で読んで組の前半を配る。
+    #[test]
+    fn the_first_read_after_reopen_does_not_hand_out_a_group_cut_apart() {
+        use std::sync::atomic::Ordering;
+        const GROUP: usize = 100;
+        let path = tmp("reopen-first");
+        let group = (9u32, Hlc { wall: 5_000, logical: 0, peer: 9 });
+        let first_half = {
+            let eng = split_group(&path, group, GROUP, |ring| ring - GROUP / 2);
+            assert_eq!(Arc::strong_count(&eng), 1);
+            on_ring(&eng.pending_sync_ops(0), group)
+        };
+        assert!(first_half > 0 && first_half < GROUP, "前提: 組が ring の端で割れている ({first_half} / {GROUP})");
+        for which in ["settled_sync_records", "settled_sync_ops"] {
+            let mut read = false;
+            for _ in 0..10 {
+                let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
+                eng.set_peer_id(1);
+                let hold = eng.hold_consumer();
+                if eng.sync_settled_known.load(Ordering::Acquire) {
+                    // 止める前に consumer の周が bridge を回した (負荷の高い時)
+                    drop(hold);
+                    continue;
+                }
+                let handed: Vec<(PeerId, Hlc)> = if which == "settled_sync_records" {
+                    eng.settled_sync_records(|_, _| true).into_iter().map(|r| (r.author_peer, r.hlc)).collect()
+                } else {
+                    eng.settled_sync_ops().iter().filter_map(|p| decode_sync_ops_payload(p)).map(|r| (r.author_peer, r.hlc)).collect()
+                };
+                assert!(eng.sync_settled_known.load(Ordering::Acquire), "前提: 読みが bridge を 1 周させた");
+                assert_eq!(on_ring(&eng.pending_sync_ops(0), group), first_half, "前提: 組は ring の上で割れたまま");
+                assert_eq!(handed.iter().filter(|k| **k == group).count(), 0, "{which}: 開き直した直後の最初の読みが、 割れた組の前半を配った");
+                drop(hold);
+                read = true;
+                break;
+            }
+            assert!(read, "{which}: 前提: consumer より先に読めた回がある (10 回開き直した)");
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// #955 (F5): 配る側の読みが ring の行をなめて並べた後、 行を読む前に、 その場所が回収されて別の行 (配ってよい行の終わりより後に
+    /// 載った、 割れた組の前半) に使い回されても、 その行を配らない。 読みは、 なめた時の lsn で ring の entry を確かめるので、
+    /// 使い回された場所は読まない。 読む前の割り込み点 (`settled_read_hook`) で決まった順に踏む: ring を自分の Tie でちょうど埋め、
+    /// その後ろの組 (WAL にある) が置けずに止まった所で読み始め、 割り込み点で前の 1 割を ack → 回収 → bridge が空いた場所に組の前半を置く。
+    ///
+    /// falsify: 読む時に lsn の列を読み直し、 その値で ring を引くと (#949 の前の読み)、 なめて絞った位置に組の前半の record を出す。
+    #[test]
+    fn a_slot_reused_between_the_scan_and_the_read_is_not_handed_out() {
+        const ME: PeerId = 1;
+        const GROUP: usize = 300;
+        let path = tmp("reuse");
+        let group = (9u32, Hlc { wall: 5_000, logical: 0, peer: 9 });
+        // 開き直さない (開き直すと bridge が WAL を頭から写し直し、 ring にある自分の行と同じ鍵が 「途中の組」 に見える)
+        let eng = split_group(&path, group, GROUP, |ring| ring);
+        let hold = eng.hold_consumer();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        let ring = eng.table_eid_usage("_sync_ops").unwrap();
+        assert_eq!(ring.live, ring.capacity, "前提: ring が満杯");
+        assert_eq!(on_ring(&eng.pending_sync_ops(0), group), 0, "前提: 組は ring に載っていない");
+        let before = full_copy(&eng, &|_, _| true);
+        assert_eq!(before.len(), ring.capacity as usize, "前提: ring の行は全部配ってよい");
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let scanned = eng.table_slots_with_value32(lsn_hid, |_| true);
+        let top = scanned.iter().map(|x| x.0).max().unwrap();
+        let mine: Vec<Hlc> = eng
+            .pending_sync_ops(0)
+            .iter()
+            .filter_map(|p| decode_sync_ops_payload(p))
+            .filter(|r| r.author_peer == ME)
+            .map(|r| r.hlc)
+            .collect();
+        let cut = mine[mine.len() / 10];
+        let other = Arc::clone(&eng);
+        settled_read_hook::set(eng.oplog().unwrap(), move |_| {
+            other.ack_sync_up_to_cursors(77, &[(ME, cut)]).unwrap();
+            assert!(other.reclaim_sync_ops() > 0, "前提: 割り込み点で回収した");
+            while other.transfer_oplog_to_sync_ops() > 0 {}
+        });
+        let got: Vec<Key> = eng.settled_sync_records(|_, _| true).iter().map(key).collect();
+        assert_eq!(Arc::strong_count(&eng), 1, "前提: 割り込み点が回った");
+        // 前提: なめた場所のいくつかに、 配ってよい行の終わりより後の行 (組の前半) が載った
+        let now = eng.table_slots_with_value32(lsn_hid, |_| true);
+        let reused = scanned.iter().filter(|(_, s)| now.iter().any(|(l, s2)| s2 == s && *l > top)).count();
+        let on_now = on_ring(&eng.pending_sync_ops(0), group);
+        assert!(reused > 0 && on_now > 0 && on_now < GROUP, "前提: なめた場所が組の前半に使い回された (場所 {reused}、 組 {on_now} 本)");
+        assert_eq!(
+            got.iter().filter(|k| (k.1, k.0) == group).count(),
+            0,
+            "なめた後に使い回された場所の、 割れた組の前半を配った"
+        );
+        let want = full_copy(&eng, &|_, _| true);
+        assert!(want.len() < before.len(), "前提: 読む前に回収した");
+        assert!(got == want, "読む前に回収された行を除いた答え (行 {}) と違う (行 {})", want.len(), got.len());
+        drop(hold);
         drop(eng);
         let _ = std::fs::remove_dir_all(&path);
     }
