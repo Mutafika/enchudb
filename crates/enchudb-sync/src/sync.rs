@@ -2207,10 +2207,22 @@ impl Syncer {
                 } else {
                     local_eid
                 };
+                // #917: 当てる行 (引いた後・行の lock の前にその行が消えて場所が使い回されたら、 engine が lock の下で外す)
+                let row = self.engine.remote_row_of(*eid, local_eid);
+                #[cfg(test)]
+                apply_hook::call();
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
-                let r = ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc));
+                let r = ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc));
+                // #917: その行がもう場所に居ない (引いた後に消えて使い回された) なら、 消えた行宛ての record。 自分の行なら入口の
+                // 照合の道をもう一度通す (引く前に消えていた時と同じ扱い。 入口で必ず返る = もう一度ここには来ない)
+                if r == ApplyResult::SkippedOlder && !self.engine.remote_row_holds(local_eid, row) {
+                    if self.engine.is_gone_own_eid(*eid) {
+                        return self.apply_one(store, rec, None, dying);
+                    }
+                    return ApplyResult::SkippedOlder;
+                }
                 // 当てた後に (LWW で負けても) 束ねた identity のカードと名前の年表に積む (最初の改名は、 当てる前のカードから
                 // 年表を作る)
                 self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value), rec.hlc);
@@ -2223,7 +2235,7 @@ impl Syncer {
                     // 消える行は畳まない (畳むと、 削除の後に作られた同じ名前の行まで巻き込む)
                     match self.engine.name_deleted_at(*himo_id, PkValue::Local(value)) {
                         Some(t) if t > rec.hlc => {
-                            self.engine.remote_delete_apply(local_eid, t);
+                            self.engine.remote_delete_apply_at(local_eid, row, t);
                         }
                         _ => {
                             self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value, dying.get(eid).copied());
@@ -2240,7 +2252,7 @@ impl Syncer {
                         && t > rec.hlc
                         && self.engine.is_live_unchecked(local_eid)
                     {
-                        self.engine.remote_delete_apply(local_eid, t);
+                        self.engine.remote_delete_apply_at(local_eid, row, t);
                     }
                 }
                 r
@@ -2264,8 +2276,13 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::Dropped,
                 };
+                // #917: Tie と同じ (当てる行を lock の下で確かめる)
+                let row = self.engine.remote_row_of(*eid, local_eid);
+                if !self.engine.remote_row_holds(local_eid, row) {
+                    return ApplyResult::SkippedOlder;
+                }
                 self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value as u64), rec.hlc);
-                ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc))
+                ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc))
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
@@ -2273,9 +2290,16 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
+                // #917: Tie と同じ (当てる行を lock の下で確かめる)
+                let row = self.engine.remote_row_of(*eid, local_eid);
+                if !self.engine.remote_row_holds(local_eid, row) {
+                    return ApplyResult::SkippedOlder;
+                }
                 // #9: 写像ができたので退避中の Content を drain。
                 self.engine.note_bound_write(local_eid, *eid, *himo_id, None, rec.hlc);
-                ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc))
+                #[cfg(test)]
+                apply_hook::call();
+                ApplyResult::from_lww(self.engine.remote_untie_apply_at(local_eid, row, *himo_id, rec.hlc))
             }
             DecodedOp::Delete { eid } => {
                 // #9: Delete は himo を持たず table を導けないので、 写像を払い出さない。
@@ -2307,8 +2331,13 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::DroppedVocab,
                 };
+                // #917: Tie と同じ (当てる行を lock の下で確かめる)
+                let row = self.engine.remote_row_of(*eid, local_eid);
+                if !self.engine.remote_row_holds(local_eid, row) {
+                    return ApplyResult::SkippedOlder;
+                }
                 self.engine.note_bound_write(local_eid, *eid, local_hid, Some(value), rec.hlc);
-                ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, local_hid, value, rec.hlc))
+                ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, local_hid, value, rec.hlc))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
@@ -2321,8 +2350,13 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
+                // #917: Tie と同じ (当てる行を lock の下で確かめる)
+                let row = self.engine.remote_row_of(*eid, local_eid);
+                if !self.engine.remote_row_holds(local_eid, row) {
+                    return ApplyResult::SkippedOlder;
+                }
                 self.engine.note_bound_leaf(local_eid, *eid, local_hid, bytes, rec.hlc);
-                ApplyResult::from(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc))
+                ApplyResult::from(self.engine.remote_tieleaf_apply_at(local_eid, row, local_hid, bytes, rec.hlc))
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -2373,12 +2407,85 @@ impl Syncer {
     }
 }
 
+/// test 用の割り込み点: 受信の当て込み (`apply_one`) が宛名を引いて当てる行を取った後・engine に当てる前 (#917)。 この thread で
+/// 1 回だけ呼ぶ。
+#[cfg(test)]
+mod apply_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use enchudb_engine::{ValueType};
     use enchudb_oplog::PeerId;
     use enchudb_engine::transport::InMemoryTransport;
+
+    /// #917 [D]: 受信の当て込みが自分の行 X 宛ての record を引いた後・行の lock の前に、 アプリが X を消して場所を Y が使い回す。
+    /// X 宛ての Tie / Untie は Y に当たらない (前は入口の照合だけで、 行の lock の下では tombstone しか見ず Y に書いた / 外した)。
+    ///
+    /// falsify: engine の `remote_*_apply_in` の、 行の lock の下の 「その行がまだ場所に居るか」 を外すと落ちる。
+    #[test]
+    fn a_received_write_does_not_hit_the_row_that_reused_the_slot_after_resolving() {
+        for untie in [false, true] {
+            let path = format!("/tmp/enchudb_sync_917_{}_{}_{}", untie, std::process::id(), line!());
+            let _ = std::fs::remove_dir_all(&path);
+            // 落とすと消す (engine と syncer より先に束ねる = 後に落ちる。 前提で落ちても残さない)
+            struct Rm(String);
+            impl Drop for Rm {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let _rm = Rm(path.clone());
+            let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+            eng.define_table("t", 1).unwrap();
+            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+            eng.define_himo_in("t", "w", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+            eng.set_peer_id(1);
+            let syncer = Syncer::new(eng.clone(), Arc::new(InMemoryTransport::new()));
+            let x = eng.entity_in("t").unwrap();
+            eng.tie_to(x, "t.v", 1u32);
+            eng.tie_to(x, "t.w", 1u32);
+            let v = eng.himo_id("t.v").unwrap() as u16;
+            let y = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let (e, yy) = (eng.clone(), y.clone());
+            apply_hook::set(move || {
+                e.delete(x);
+                let y = e.entity_in("t").unwrap();
+                e.tie_to(y, "t.v", 2u32);
+                e.tie_to(y, "t.w", 2u32);
+                yy.set(y);
+            });
+            let op = if untie { DecodedOp::Untie { eid: x, himo_id: v } } else { DecodedOp::Tie { eid: x, himo_id: v, value: 9 } };
+            // X の cell より新しい版数 (Y の書き込みより新しい = 版数では弾かれない)
+            let after = eng.cell_hlc(x, v).wall + 10_000_000;
+            let rec = WireRecord::unsigned(Hlc { wall: after, logical: 0, peer: 2 }, 2, op);
+            let out = syncer.apply_records(&[rec]);
+            let y = y.get();
+            assert_ne!(y, 0, "前提: 割り込み点を通った");
+            assert_eq!(y as u32 & ((1 << 24) - 1), x as u32 & ((1 << 24) - 1), "前提: Y は X の場所を使い回した");
+            assert_ne!(y, x, "前提: Y の世代は X より新しい");
+            assert_eq!(out.applied, 0, "消えた行宛ての record を当てた (untie = {untie}, {out:?})");
+            assert_eq!(eng.get(y, "t.v"), Some(2), "X 宛ての受信が、 場所を使い回した Y に当たった (untie = {untie})");
+        }
+    }
 
     /// 固定 path だと並列 test run (別 binary / 前回 run の残骸) と衝突するため pid を混ぜる
     fn test_path(name: &str) -> String {
