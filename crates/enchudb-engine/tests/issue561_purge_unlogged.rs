@@ -93,8 +93,11 @@ fn an_unclean_close_after_purges_keeps_the_floor() {
     let e = eng.entity_in("notes").unwrap();
     eng.tie_to(e, "notes.note", 999);
     eng.oplog_commit();
+    // 写し終えるまで consumer を止める (#944: 写す間に sidecar の置き換えの一時 file が消えて NotFound になった)
+    let hold = eng.hold_consumer();
     let floor_before = eng.sync_reclaimed_floors().unwrap_or_default();
     copy_dir(&path, &image);
+    drop(hold);
     drop(eng);
 
     let back = Engine::open_concurrent_with_oplog(&image, 16 << 20).unwrap();
@@ -117,8 +120,10 @@ fn an_unclean_close_right_after_purges_relogs_nothing() {
     let eng = writer(&path, 50);
     let purged = ack_all_and_reclaim(&eng);
     assert!(purged >= 50, "前提: 書いた行を消した ({purged})");
+    let hold = eng.hold_consumer(); // #944 (上と同じ)
     let floor_before = eng.sync_reclaimed_floors().unwrap_or_default();
     copy_dir(&path, &image);
+    drop(hold);
     drop(eng);
 
     let back = Engine::open_concurrent_with_oplog(&image, 16 << 20).unwrap();

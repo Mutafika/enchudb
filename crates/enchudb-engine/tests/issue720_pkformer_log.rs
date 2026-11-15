@@ -143,12 +143,15 @@ fn on_disk(path: &str) -> Vec<u8> {
 }
 
 /// 開いたままの DB の像を撮る (= 閉じる処理を通らない、 落ちた後の像)。 先に自分の書き込みの配り (`_sync_ops` への写し) を
-/// 済ませる (consumer が写している最中の列を写すと、 像の segment の長さが合わない)。 `pkformer` は書き出さない。
+/// 済ませる (consumer が写している最中の列を写すと、 像の segment の長さが合わない)。 `pkformer` は書き出さない。 写し終えるまで
+/// consumer を止める (#944: 写す間に周期の書き出しが進まない = 像は 1 つの時点の物)。
 fn image_of(eng: &Engine, from: &str, to: &str) {
+    let hold = eng.hold_consumer();
     eng.oplog_sync().unwrap();
     eng.transfer_oplog_to_sync_ops();
     eng.oplog_sync().unwrap();
     copy_dir(from, to);
+    drop(hold);
 }
 
 fn copy_dir(from: &str, to: &str) {
