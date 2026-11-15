@@ -140,6 +140,21 @@ impl Peer {
     }
 }
 
+/// `author` の state を、 他の peer が消した自分の行の Delete を運ばない形 (0.37.4 以前の author: 自分の時計の削除だけ) にする。
+fn old_author_state(tr: &Arc<InMemoryTransport>, author: &Peer) {
+    let me = author.eng.peer_id();
+    let weak = Arc::downgrade(&author.eng);
+    tr.register_state_provider(
+        me,
+        Arc::new(move || {
+            let eng = weak.upgrade()?;
+            let (mut records, as_of) = eng.state_records();
+            records.retain(|r| !matches!(&r.op, DecodedOp::Delete { eid } if enchudb_oplog::eid_peer(*eid) == me && r.hlc.peer != me));
+            Some(enchudb::transport::StateBatch { records, as_of, complete: true })
+        }),
+    );
+}
+
 /// 全員が全員から受けて配る (3 周)。
 fn all(ps: &[&Peer]) {
     for _ in 0..3 {
@@ -160,6 +175,10 @@ fn all(ps: &[&Peer]) {
 /// 入った C が、 B の流れを受ける前に A の state を A から直接取る。 Y は X の削除の後に作った = 4 台で生きる。
 ///
 /// 直す前: C の掃除が Ref の解決で作った空の行 (A, X) を今の時刻で消して配り、 A / B / P は名前 7 を上げて Y を消した (C でだけ生きる)。
+///
+/// A の state は、 他の peer が消した自分の行の Delete を運ばない形 (0.37.4 以前の author、 `old_author_state`) にする。 今の author は
+/// X の Delete を運ぶので、 C は X を B の削除の版数で消して掃除の対象にならない (`state_deletes_by_others.rs`)。 この試験は、 運ばない
+/// author に対する掃除の守り (何も当たっていない行を消さない) を見る。
 #[test]
 fn a_ref_target_from_a_direct_state_is_not_swept_with_a_new_delete() {
     let dir = Dir::new("other-delete");
@@ -188,8 +207,9 @@ fn a_ref_target_from_a_direct_state_is_not_swept_with_a_new_delete() {
     all(&[&a, &b, &p]);
     assert_eq!([a.v(7), b.v(7), p.v(7)], [vec![77], vec![77], vec![77]], "前提: Y が 3 台で生きる");
     assert_eq!(a.eng.get(w, "notes.next"), Some(enchudb_oplog::eid_local(x) as u64), "前提: A の W は消えた X を指したまま");
-    // 前提: A の state に W の ref (X) はあり、 X の Delete は無い (B の時計の削除は B が運ぶ)
-    let state = a.s.own_state();
+    // 前提: A の state に W の ref (X) はあり、 X の Delete は無い (0.37.4 以前の author の形: B の時計の削除は B が運ぶ)
+    old_author_state(&tr, &a);
+    let state = tr.fetch_state(A).expect("前提: A の state");
     assert!(state.complete, "前提: author の state");
     let next = a.eng.himo_id("notes.next").unwrap() as u16;
     assert!(
