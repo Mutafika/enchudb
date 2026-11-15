@@ -2570,38 +2570,45 @@ mod tests {
     /// 当てた。
     #[test]
     fn a_ref_write_to_a_deleted_row_does_not_hit_the_target_that_reused_its_slot() {
-        let path = format!("/tmp/enchudb_sync_refreuse_{}_{}", std::process::id(), line!());
-        let _ = std::fs::remove_dir_all(&path);
-        struct Rm(String);
-        impl Drop for Rm {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
+        // 素の Tie (Ref の値 = 書き手の行の番号) と、 的の世界番号を同乗させた TieRef の両方
+        for tie_ref in [false, true] {
+            let path = format!("/tmp/enchudb_sync_refreuse_{}_{}_{}", tie_ref, std::process::id(), line!());
+            let _ = std::fs::remove_dir_all(&path);
+            struct Rm(String);
+            impl Drop for Rm {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
             }
+            let _rm = Rm(path.clone());
+            let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+            eng.define_table("t", 1).unwrap();
+            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+            eng.define_ref_in("t", "next", "t").unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+            eng.set_peer_id(1);
+            let (v, next) = (eng.himo_id("t.v").unwrap() as u16, eng.himo_id("t.next").unwrap() as u16);
+            let syncer = Syncer::new(eng.clone(), Arc::new(InMemoryTransport::new()));
+            let f0 = enchudb_oplog::make_eid(3, 100);
+            let base = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let made = WireRecord::unsigned(Hlc { wall: base, logical: 0, peer: 3 }, 3, DecodedOp::Tie { eid: f0, himo_id: v, value: 1 });
+            let gone = WireRecord::unsigned(Hlc { wall: base + 1, logical: 0, peer: 3 }, 3, DecodedOp::Delete { eid: f0 });
+            let out = syncer.apply_records(&[made, gone]);
+            assert_eq!(out.applied, 2, "前提: F0 を作って消した ({out:?})");
+            let f0_slot = eng.eid_slot(eng.resolve_remote_eid_existing(f0).unwrap());
+            // B が (C の削除を知らずに) F0.next を B の行 T (番号 200、 まだ誰も知らない) に向けた
+            let op = if tie_ref {
+                DecodedOp::TieRef { eid: f0, himo_id: next, target: enchudb_oplog::make_eid(2, 200) }
+            } else {
+                DecodedOp::Tie { eid: f0, himo_id: next, value: 200 }
+            };
+            let out = syncer.apply_records(&[WireRecord::unsigned(Hlc { wall: base + 2, logical: 0, peer: 2 }, 2, op)]);
+            let t = eng.resolve_remote_eid_existing(enchudb_oplog::make_eid(2, 200)).expect("前提: T に場所を払い出した");
+            assert_eq!(eng.eid_slot(t), f0_slot, "前提: T は F0 の場所を使い回した (tie_ref = {tie_ref})");
+            assert_eq!(out.applied, 0, "消えた F0 宛ての書き込みを当てた (tie_ref = {tie_ref}, {out:?})");
+            assert_eq!(eng.get(t, "t.next"), None, "消えた F0 宛ての書き込みが、 F0 の場所を使い回した T に当たった (tie_ref = {tie_ref})");
         }
-        let _rm = Rm(path.clone());
-        let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
-        eng.define_table("t", 1).unwrap();
-        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
-        eng.define_ref_in("t", "next", "t").unwrap();
-        eng.enable_sync_tables().unwrap();
-        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
-        eng.set_peer_id(1);
-        let (v, next) = (eng.himo_id("t.v").unwrap() as u16, eng.himo_id("t.next").unwrap() as u16);
-        let syncer = Syncer::new(eng.clone(), Arc::new(InMemoryTransport::new()));
-        let f0 = enchudb_oplog::make_eid(3, 100);
-        let base = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        let made = WireRecord::unsigned(Hlc { wall: base, logical: 0, peer: 3 }, 3, DecodedOp::Tie { eid: f0, himo_id: v, value: 1 });
-        let gone = WireRecord::unsigned(Hlc { wall: base + 1, logical: 0, peer: 3 }, 3, DecodedOp::Delete { eid: f0 });
-        let out = syncer.apply_records(&[made, gone]);
-        assert_eq!(out.applied, 2, "前提: F0 を作って消した ({out:?})");
-        let f0_slot = eng.eid_slot(eng.resolve_remote_eid_existing(f0).unwrap());
-        // B が (C の削除を知らずに) F0.next を B の行 T (番号 200、 まだ誰も知らない) に向けた
-        let write = WireRecord::unsigned(Hlc { wall: base + 2, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: f0, himo_id: next, value: 200 });
-        let out = syncer.apply_records(&[write]);
-        let t = eng.resolve_remote_eid_existing(enchudb_oplog::make_eid(2, 200)).expect("前提: T に場所を払い出した");
-        assert_eq!(eng.eid_slot(t), f0_slot, "前提: T は F0 の場所を使い回した");
-        assert_eq!(out.applied, 0, "消えた F0 宛ての書き込みを当てた ({out:?})");
-        assert_eq!(eng.get(t, "t.next"), None, "消えた F0 宛ての書き込みが、 F0 の場所を使い回した T に当たった");
     }
 
     /// 固定 path だと並列 test run (別 binary / 前回 run の残骸) と衝突するため pid を混ぜる

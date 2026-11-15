@@ -146,7 +146,7 @@ impl RowLocks {
         }
     }
 
-    /// test 用: 行 `local` の stripe を握れずに待ち始めた書き手が、 待つ前に 1 回だけ `f` を呼ぶ。
+    /// test 用: 行 `local` の stripe を握れずに待ち始めた書き手 (と、 握れずに諦めた [`Self::try_write`]) が、 1 回だけ `f` を呼ぶ。
     #[cfg(test)]
     pub(crate) fn set_wait_hook(&self, local: u32, f: impl FnOnce() + Send + 'static) {
         *self.wait_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some((local, Box::new(f)));
@@ -223,6 +223,30 @@ impl RowLocks {
     /// 行 `local` を書く間握る。 drop で離す。
     pub fn write(&self, local: u32) -> RowWrite<'_> {
         self.lock(local, false)
+    }
+
+    /// 行 `local` を待たずに握る (#931)。 他の thread が握っている / 先に握りたい読み手が居れば None (待たない)。 この thread が
+    /// 握っている stripe は入れ子で握れる。 drop で離す。 別の lock を持ったまま行を握りたい所 (`entity_in` の使い回しの道は表の
+    /// `free_locals` を持っている) が、 行を握ったまま `free_locals` を待つ書き手と互いを待たないために使う。
+    pub fn try_write(&self, local: u32) -> Option<RowWrite<'_>> {
+        let i = self.stripe(local);
+        let me = me();
+        if self.held(i, me) {
+            return Some(RowWrite { locks: self, i: usize::MAX, _not_send: std::marker::PhantomData });
+        }
+        let s = &self.stripes[i].ver;
+        let v = s.load(Ordering::Acquire);
+        if v & 1 == 1
+            || self.stripes[i].urgent.load(Ordering::Relaxed) != 0
+            || s.compare_exchange(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_err()
+        {
+            #[cfg(test)]
+            self.call_wait_hook(i);
+            return None;
+        }
+        fence(Ordering::Release);
+        self.stripes[i].owner.store(me, Ordering::Relaxed);
+        Some(RowWrite { locks: self, i, _not_send: std::marker::PhantomData })
     }
 
     /// 読み手が揃った版を掴めなかった時に、 書き手より先に握る。 drop で離す。
