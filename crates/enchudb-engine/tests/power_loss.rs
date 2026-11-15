@@ -3484,48 +3484,54 @@ fn translated_image_state(img: &Path, world_f: u64) -> (Vec<u64>, bool, Vec<u64>
     (nine, f_dead, own_deletes, mapped)
 }
 
-/// 受けた行 F (C の削除も受けて書き出した) の場所を Y で使い回し、 本体の書き出しの `prev.seg` の後・生きている印の前に電源が落ちる
-/// (WAL に Y の record、 本体には記録だけ)。 開く時は記録の行が場所の最後の行 (使い回しが本体に届いていない) なので写像を戻し、
-/// 再生が Y を生かす所で写像を外す = 開いた A の state は Y を A の行として出し、 F は (C, f) の削除で消えたまま。
+/// 受けた行 F (C の削除も受けて書き出した) の場所を Y で使い回し、 本体の書き出しの途中で電源が落ちる (WAL に Y の record):
+/// - `prev.seg` の後・生きている印の前 (`PrevWrittenOut`、 本体には記録だけ): 開く時は記録の行が場所の最後の行 (使い回しが本体に
+///   届いていない) なので写像を戻し、 再生が Y を生かす所で写像を外す
+/// - 生きている印の後・世代の前 (`BeforeGenerations`、 Y の生きている印と F の死の印が届く): 開く時の突き合わせが場所の世代を上げて
+///   Y を殺し、 再生の Y の record は場所の世代より古い。 #916 の守り (場所に逆写像がある) の前に、 記録の行 (F) が Y のすぐ前の
+///   住人なので写像を外す (review946 [7])
 ///
-/// 前は写像が戻ったまま再生が Y を生かし、 Y が C の行 F として扱われた (#925 の形)。
+/// どちらも開いた A の state は Y を A の行として出し、 F は (C, f) の削除で消えたまま。 前は写像が戻ったまま再生が Y を生かし (#925 の形)、
+/// `BeforeGenerations` では #916 の守りが Y を捨てた。
 #[test]
 fn a_translated_reuse_cut_after_its_record_is_finished_by_the_replay() {
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = scratch("prev_translated_replay");
-    let (live, img) = (root.join("live"), root.join("img"));
-    std::fs::create_dir_all(&live).unwrap();
-    crashsim::start();
-    let world_f = enchudb_oplog::make_eid(3, 7);
-    {
-        let (eng, _) = received_and_deleted_row_engine(&live.join("db"), world_f);
-        let _hold = eng.hold_consumer();
-        let y = eng.entity_in("t").unwrap();
-        eng.tie_to(y, "t.c", 9u32);
-        eng.oplog_commit();
-        let shot = Arc::new(AtomicBool::new(false));
-        let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
-        write_out_hook::set(Some(Arc::new(move |p: Phase| {
-            if p == Phase::PrevWrittenOut && !s2.swap(true, Ordering::SeqCst) {
-                let _ = crashsim::capture(&l, &i, Mode::Lost);
-            }
-        })));
-        eng.oplog_sync().unwrap();
-        write_out_hook::set(None);
-        assert!(shot.load(Ordering::SeqCst), "前提: prev.seg の後で撮った");
+    for shot_at in [Phase::PrevWrittenOut, Phase::BeforeGenerations] {
+        let root = scratch("prev_translated_replay");
+        let (live, img) = (root.join("live"), root.join("img"));
+        std::fs::create_dir_all(&live).unwrap();
+        crashsim::start();
+        let world_f = enchudb_oplog::make_eid(3, 7);
+        {
+            let (eng, _) = received_and_deleted_row_engine(&live.join("db"), world_f);
+            let _hold = eng.hold_consumer();
+            let y = eng.entity_in("t").unwrap();
+            eng.tie_to(y, "t.c", 9u32);
+            eng.oplog_commit();
+            let shot = Arc::new(AtomicBool::new(false));
+            let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+            write_out_hook::set(Some(Arc::new(move |p: Phase| {
+                if p == shot_at && !s2.swap(true, Ordering::SeqCst) {
+                    let _ = crashsim::capture(&l, &i, Mode::Lost);
+                }
+            })));
+            eng.oplog_sync().unwrap();
+            write_out_hook::set(None);
+            assert!(shot.load(Ordering::SeqCst), "前提: {shot_at:?} で撮った");
+        }
+        crashsim::stop();
+        let (nine, f_deleted, _, mapped) = translated_image_state(&img, world_f);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            nine.len() == 1 && enchudb_oplog::eid_peer(nine[0]) == 1,
+            "{shot_at:?}: 再生が生かした Y が A の行として state に出ない (C の行 F として出た? / 捨てた?): {nine:x?}"
+        );
+        assert!(f_deleted, "{shot_at:?}: 消えた F に C の遅い書き込みが当たった (F の削除を失った)");
+        assert_eq!(mapped, None, "{shot_at:?}: Y を生かした後も F の写像が場所を指す");
     }
-    crashsim::stop();
-    let (nine, f_deleted, _, mapped) = translated_image_state(&img, world_f);
-    let _ = std::fs::remove_dir_all(&root);
-    assert!(
-        nine.len() == 1 && enchudb_oplog::eid_peer(nine[0]) == 1,
-        "再生が生かした Y が A の行として state に出ない (C の行 F として出た?): {nine:x?}"
-    );
-    assert!(f_deleted, "消えた F に C の遅い書き込みが当たった (F の削除を失った)");
-    assert_eq!(mapped, None, "Y を生かした後も F の写像が場所を指す");
 }
 
 /// 受けた行 F の場所を、 本体の書き出しの途中 (WAL の書き出しの後) で Y が使い回し、 `prev.seg` の後・生きている印の前に電源が
@@ -3571,4 +3577,192 @@ fn a_translated_reuse_record_without_its_new_row_keeps_the_mapping() {
     assert!(mapped.is_some(), "使い回しが本体に届いていない像で F の写像を外した");
     assert!(f_deleted, "消えた F に C の遅い書き込みが当たった (F の削除を失った)");
     assert!(own_deletes.is_empty(), "A の行の Delete (前の住人 F を A の行と読んだ幻) を出した: {own_deletes:x?}");
+}
+
+/// review946 [1]: 本体の書き出しの WAL の書き出しの後・`prev.seg` の前に A のアプリが X を消して Y で場所を使い回し、 `prev.seg` を
+/// 書き出した後 (生きている印の前) に電源が落ちる。 像は 「記録だけが届き、 X の削除 (WAL の Delete も本体も) は届いていない」。
+/// 開いた A で X は生きていて、 state に X の Delete は無い。
+///
+/// 前は開く時に本体を見ずに記録から (A, X) の削除を戻し、 生きている X の Tie と Delete を同じ state に出した (state で取り直した
+/// peer でだけ X が消える)。
+#[test]
+fn a_reuse_record_that_reached_disk_before_the_delete_keeps_the_row_alive() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_record_before_delete");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let x = {
+        let (eng, x) = full_named_table_engine(&live.join("db"));
+        let _hold = eng.hold_consumer();
+        // WAL に書き出す物を置く (書き出しが走る)
+        eng.tie_to(x, "t.v", 71u32);
+        eng.oplog_commit();
+        let reused: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+        let shot = Arc::new(AtomicBool::new(false));
+        let (e2, r2, s2, l, i) = (eng.clone(), reused.clone(), shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && r2.lock().unwrap().is_none() {
+                e2.delete(x);
+                e2.oplog_commit();
+                *r2.lock().unwrap() = Some(add_seven(&e2, 77));
+            }
+            if p == Phase::PrevWrittenOut && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        let y = reused.lock().unwrap().expect("前提: 書き出しの途中で使い回した");
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
+        assert!(shot.load(Ordering::SeqCst), "前提: prev.seg の後で撮った");
+        x
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let alive = eng.is_live(x) && eng.get(x, "t.v") == Some(71);
+    let deletes: Vec<u64> = eng
+        .state_records()
+        .0
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } => Some(eid),
+            _ => None,
+        })
+        .collect();
+    let restored = eng.prev_residents_restored();
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(alive, "前提: 像の X は生きている (削除は届いていない)");
+    assert!(!deletes.contains(&x), "生きている X の Delete を state に出した: {deletes:x?}");
+    assert_eq!(restored, 0, "削除の届いていない X を記録から戻した");
+}
+
+/// review946 [1] の続き: X を消して Y で使い回してから `oplog_sync` し (WAL に X の Delete と Y が届く)、 `prev.seg` を書き出した後・
+/// 生きている印の前に電源が落ちる (本体は X の削除の前、 記録あり)。 開く時は記録を戻さず (X は本体で生きている)、 再生が X の Delete の
+/// 後に Y を生かす所で使い回しの後始末をやり直す = Y は生き、 state に X の Delete がある。
+#[test]
+fn a_reuse_with_its_delete_in_the_wal_is_finished_by_the_replay() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_delete_in_wal");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, tomb, y) = {
+        let (eng, x) = full_named_table_engine(&live.join("db"));
+        let _hold = eng.hold_consumer();
+        eng.delete(x);
+        eng.oplog_commit();
+        let tomb = eng.tombstone_hlc(x);
+        let y = add_seven(&eng, 77);
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
+        let shot = Arc::new(AtomicBool::new(false));
+        let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::PrevWrittenOut && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(shot.load(Ordering::SeqCst), "前提: prev.seg の後で撮った");
+        (x, tomb, y)
+    };
+    crashsim::stop();
+    let (deletes, v, _) = open_and_read_state(&img);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(v, vec![77], "前提: 再生が Y を生かした");
+    assert!(deletes.contains(&(x, tomb)), "state に X の Delete が無い: {deletes:x?}");
+    assert!(!deletes.iter().any(|&(e, _)| e == y), "生きている Y の Delete を出した: {deletes:x?}");
+}
+
+/// review946 3 (ii): X の削除を書き出した (checkpoint は X の Delete の先) 後、 Y で場所を使い回して `oplog_sync` し、 WAL の書き出しの
+/// 後・`prev.seg` の前に電源が落ちる (使い回しは WAL にだけ届き、 記録は届かない)。 再生が Y を生かす所で、 本体の場所の削除 (X の
+/// 削除の版数) を前の住人 X (世代のすぐ前の行) に移す = Y は生き、 state に X の Delete がある。
+///
+/// 前は記録が無いと何もせず、 X の削除が生きている Y の場所に残り、 state に X の Delete が無かった (#914 の形)。
+#[test]
+fn a_reuse_only_in_the_wal_is_finished_by_the_replay() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_reuse_wal_only");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, tomb, y) = {
+        let (eng, x) = full_named_table_engine(&live.join("db"));
+        let tomb = delete_and_checkpoint(&eng, x);
+        let _hold = eng.hold_consumer();
+        let y = add_seven(&eng, 77);
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
+        let shot = Arc::new(AtomicBool::new(false));
+        let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(shot.load(Ordering::SeqCst), "前提: prev.seg の前で撮った");
+        (x, tomb, y)
+    };
+    crashsim::stop();
+    let (deletes, v, restored) = open_and_read_state(&img);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(v, vec![77], "前提: 再生が Y を生かした");
+    assert_eq!(restored, 0, "前提: 記録は届いていない");
+    assert!(deletes.contains(&(x, tomb)), "state に X の Delete が無い: {deletes:x?}");
+    assert!(!deletes.iter().any(|&(e, _)| e == y), "生きている Y の Delete を出した: {deletes:x?}");
+}
+
+/// review946 3 (ii) の翻訳した行: 受けた行 F (C の削除も受けて書き出した) の場所を Y で使い回して `oplog_sync` し、 WAL の書き出しの
+/// 後・`prev.seg` の前に電源が落ちる。 写像は戻る (記録が無く、 本体の場所は死んでいる) が、 再生が Y を生かす所で外す = Y は A の行、
+/// F は (C, f) の削除で消えたまま。
+#[test]
+fn a_translated_reuse_only_in_the_wal_is_finished_by_the_replay() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_translated_wal_only");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    {
+        let (eng, _) = received_and_deleted_row_engine(&live.join("db"), world_f);
+        let _hold = eng.hold_consumer();
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to(y, "t.c", 9u32);
+        eng.oplog_commit();
+        let shot = Arc::new(AtomicBool::new(false));
+        let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(shot.load(Ordering::SeqCst), "前提: prev.seg の前で撮った");
+    }
+    crashsim::stop();
+    let (nine, f_deleted, _, mapped) = translated_image_state(&img, world_f);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        nine.len() == 1 && enchudb_oplog::eid_peer(nine[0]) == 1,
+        "再生が生かした Y が A の行として state に出ない (C の行 F として出た?): {nine:x?}"
+    );
+    assert!(f_deleted, "消えた F に C の遅い書き込みが当たった (F の削除を失った)");
+    assert_eq!(mapped, None, "Y を生かした後も F の写像が場所を指す");
 }

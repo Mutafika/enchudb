@@ -250,3 +250,156 @@ fn a_replica_state_keeps_a_ref_to_a_translated_row_whose_slot_was_reused() {
         "前提: 同じ state に X の Delete がある"
     );
 }
+
+/// state の Delete (宛名, 版数)。
+fn state_deletes(eng: &Engine) -> Vec<(u64, Hlc)> {
+    let (records, _) = eng.state_records();
+    records
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } => Some((eid, r.hlc)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// review946 [2]: 使い回しの記録は場所を次に使い回すまで残る。 前は、 移した削除を sidecar に書き出した後に忘れてよい線
+/// (`forget_deletes_before`) がその削除を外すと、 きれいに閉じなかった次の open が 「書き出していない」 と見て記録から戻し、 場所の今の
+/// 住人 Y の別名 (名前で畳んだ B の行 b) を外して X の削除の版数で消えた identity にした (B の b 宛ての書き込みが Y に届かず、 state は
+/// b の Delete を出した)。 書き出した周期の記録は戻さない。
+#[test]
+fn a_delete_forgotten_after_its_sidecar_does_not_come_back_over_the_new_rows_alias() {
+    let (p, img) = (tmp_path("forget"), tmp_path("forget-img"));
+    let _c = Cleanup(vec![p.clone(), img.clone()]);
+    const B: u32 = 3;
+    let eng = create(&p, 2, true);
+    let hk = eng.himo_id("t.k").unwrap() as u16;
+    let x = add(&eng, 7);
+    // B の行 b を受ける (表は満杯)
+    let world_b = enchudb_oplog::make_eid(B, 9);
+    let b = eng.resolve_remote_eid(world_b, hk).unwrap();
+    assert!(eng.remote_tie_apply_result(b, hk, 8u32, Hlc { wall: 1_000, logical: 0, peer: B }).applied());
+    let (y, tomb) = reuse(&eng, x, 7);
+    eng.merge_entity_into(b, y).unwrap();
+    let slot_of = |e: &Engine| e.resolve_remote_eid_existing(world_b).map(|l| e.eid_slot(l));
+    assert_eq!(slot_of(&eng), Some(eng.eid_slot(y)), "前提: b は Y の場所の別名");
+    eng.persist_sync_state().unwrap();
+    assert!(eng.forget_deletes_before(Hlc { wall: tomb.wall + 1, logical: 0, peer: 0 }) >= 1, "前提: X の削除を忘れた");
+    eng.persist_sync_state().unwrap();
+    // kill の像
+    copy_dir(Path::new(&p), Path::new(&img));
+    drop(eng);
+    let eng = open(&img);
+    assert_eq!(eng.prev_residents_restored(), 0, "書き出して忘れた削除を記録から戻した");
+    assert_eq!(slot_of(&eng), Some(eng.eid_slot(y)), "今の住人 Y の別名 b が外れた");
+    let deletes = state_deletes(&eng);
+    assert!(!deletes.iter().any(|&(e, _)| e == world_b), "生きている Y の別名 b の Delete を state に出した: {deletes:x?}");
+}
+
+/// review946 の M6 (再生が記録の行宛ての record を当てる): X (名前 7) を書き出した後、 consumer を止めて X を消し、 名前 8 の Y で場所を
+/// 使い回して落ちる (kill)。 再生は X の Delete (場所はもう Y) を当てない。 当てると Y の場所を消して、 Y の名前 8 を X の削除の版数で
+/// 消した名前にした (Y を生かし直しても名前の削除は残り、 その後に届いた名前 8 の他の peer の行を消す)。
+#[test]
+fn the_replayed_delete_of_the_former_resident_does_not_delete_the_new_rows_name() {
+    let (p, img) = (tmp_path("m6"), tmp_path("m6-img"));
+    let _c = Cleanup(vec![p.clone(), img.clone()]);
+    let eng = create(&p, 1, true);
+    let hk = eng.himo_id("t.k").unwrap() as u16;
+    let x = add(&eng, 7);
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    let y = {
+        let _hold = eng.hold_consumer();
+        let (y, _) = reuse(&eng, x, 8);
+        copy_dir(Path::new(&p), Path::new(&img));
+        y
+    };
+    drop(eng);
+    let eng = open(&img);
+    assert_eq!(eng.get(y, "t.k"), Some(8), "前提: 開いた像で Y が生きている");
+    assert!(!eng.is_live(x), "前提: X は消えている");
+    assert_eq!(eng.deleted_name_version(hk, 8), None, "再生した X の Delete が Y の名前 8 を消した名前にした");
+}
+
+/// review946 の M13: #924 の Ref を出すのは、 記録の削除の版数が author の時計の時 (同じ state に X の Delete が入る時) だけ。 X を
+/// author でない peer が消した場所を使い回した後、 replica 版の state は X を指す W.next も X の Delete も出さない (Delete の無い Ref は
+/// 受け手に空の生きた行を作る、 #921 の読み直し [1])。
+#[test]
+fn a_replica_state_does_not_ref_a_translated_row_deleted_by_another_peer() {
+    let p = tmp_path("issue924-other");
+    let _c = Cleanup(vec![p.clone()]);
+    const AUTHOR: u32 = 2;
+    const OTHER: u32 = 4;
+    let h = {
+        let mut eng = Engine::create_with_capacity(&p, 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.define_ref_in("t", "next", "t").unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, WAL).unwrap();
+        eng.set_peer_id(9);
+        eng
+    };
+    let (hv, hn) = (h.himo_id("t.v").unwrap() as u16, h.himo_id("t.next").unwrap() as u16);
+    let at = |wall: u64| Hlc { wall, logical: 0, peer: AUTHOR };
+    let (x_world, w_world) = (enchudb_oplog::make_eid(AUTHOR, 5), enchudb_oplog::make_eid(AUTHOR, 6));
+    let hx = h.resolve_remote_eid(x_world, hv).unwrap();
+    assert!(h.remote_tie_apply_result(hx, hv, 50u32, at(1_000)).applied());
+    let hw = h.resolve_remote_eid(w_world, hv).unwrap();
+    assert!(h.remote_tie_apply_result(hw, hv, 60u32, at(1_001)).applied());
+    let to_x = h.resolve_remote_ref_value(AUTHOR, 5, hn).unwrap();
+    assert!(h.remote_tie_apply_result(hw, hn, to_x, at(1_002)).applied());
+    // X を消したのは author でない peer
+    let by_other = Hlc { wall: 2_000, logical: 0, peer: OTHER };
+    assert!(h.remote_delete_apply_foreign(x_world, by_other), "前提: 他の peer の削除が当たった");
+    let y = h.entity_in("t").unwrap();
+    h.tie_to(y, "t.v", 70u32);
+    assert_eq!(h.eid_slot(y), h.eid_slot(hx), "前提: H は X の場所を使い回した");
+    assert_eq!(h.prev_resident_of_slot(h.eid_slot(y)), Some((AUTHOR, 5, by_other, false)), "前提: 場所の記録は X");
+    let (records, _) = h.state_records_for(AUTHOR);
+    let next_of_w: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Tie { eid, himo_id, value } if eid == w_world && himo_id == hn => Some(value),
+            DecodedOp::TieRef { eid, himo_id, target } if eid == w_world && himo_id == hn => Some(target),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !records.iter().any(|r| matches!(r.op, DecodedOp::Delete { eid } if eid == x_world)),
+        "前提: author の state に他の peer の削除は入らない"
+    );
+    assert_eq!(next_of_w, Vec::<u64>::new(), "Delete の無い state に消えた X を指す W.next を出した ({next_of_w:x?})");
+}
+
+/// review946 3 (i): 同じ場所を 1 つの周期で 2 回使い回した (X1 → Y → Z) 後に落ちる (kill)。 場所ごとの記録は 2 回目 (前の住人 Y) に
+/// 上書きされるが、 log には 2 件とも残るので、 開いた state に X1 と Y の両方の Delete がある。 再生は X1 の Delete を Z の場所に当てない。
+/// 前は 1 回目の前の住人 X1 の削除が memory だけで失われ、 再生の X1 の Delete が Z の場所を一度消した。
+#[test]
+fn both_former_residents_of_a_slot_reused_twice_before_a_crash_come_back() {
+    let (p, img) = (tmp_path("twice"), tmp_path("twice-img"));
+    let _c = Cleanup(vec![p.clone(), img.clone()]);
+    let eng = create(&p, 1, true);
+    let hk = eng.himo_id("t.k").unwrap() as u16;
+    let x1 = add(&eng, 7);
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    let (y, t1, z, t2) = {
+        let _hold = eng.hold_consumer();
+        let (y, t1) = reuse(&eng, x1, 8);
+        let (z, t2) = reuse(&eng, y, 9);
+        copy_dir(Path::new(&p), Path::new(&img));
+        (y, t1, z, t2)
+    };
+    drop(eng);
+    let eng = open(&img);
+    assert_eq!(eng.get(z, "t.k"), Some(9), "前提: 開いた像で Z が生きている");
+    assert_eq!(eng.deleted_name_version(hk, 9), None, "再生した X1 の Delete が Z の名前 9 を消した名前にした");
+    let deletes = state_deletes(&eng);
+    assert!(deletes.contains(&(x1, t1)), "1 回目の前の住人 X1 の Delete が state に無い: {deletes:x?}");
+    assert!(deletes.contains(&(y, t2)), "2 回目の前の住人 Y の Delete が state に無い: {deletes:x?}");
+    assert!(!deletes.iter().any(|&(e, _)| e == z), "生きている Z の Delete を出した: {deletes:x?}");
+    assert_eq!(eng.prev_residents_restored(), 2);
+}
