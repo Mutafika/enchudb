@@ -2551,6 +2551,39 @@ mod remote_row_hook {
     }
 }
 
+/// test 用の割り込み点: 受信の Tie / TieLeaf / Untie が行の lock の下で 「消えた行か」 を見た後・照合の前 (#928 の読み直し [1a])。
+/// 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod remote_check_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `former_pk_holder` が番号を読んだ後・生きているかを見る前 (#928 の読み直し [2])。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod former_holder_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: 名前の削除優先 (`remove_rows_named`) が、 名前を持つ行を引いた後・行の lock を取る前 (読み直し [B4])。
 /// 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
@@ -15406,8 +15439,16 @@ impl Engine {
         if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value)) {
             let local = self.slot_unchecked(bound);
             // 削除優先: 消すのは、 その削除より前からある行だけ (削除の後に足し直した行は消さない)
-            if tomb > self.tombstone_version_of(local) && self.version_of(local, pk_himo) < tomb {
-                self.apply_delete_local(local, tomb);
+            // #928 の読み直し [4]: 行の lock の下で、 引いた行 (`local_eid` の番号) がまだその場所の行かと版数を確かめてから消す ([B4] と
+            // 同じ。 前は lock の外で版数を見て照合なしで消し、 引いた後に消して場所を使い回した新しい行を消した)
+            // 束ねた先が引いた行の場所でない (前から写像があった) 時は、 その場所の行を照合せずに見る (前と同じ)
+            let row = (local == self.slot_unchecked(local_eid)).then(|| enchudb_oplog::eid_local(local_eid));
+            let guard = self.row_locks.write(local);
+            if self.remote_row_holds_slot(local, row)
+                && tomb > self.tombstone_version_of(local)
+                && self.version_of(local, pk_himo) < tomb
+            {
+                self.apply_delete_in(Some(&guard), local, tomb, None);
             }
         }
         bound
@@ -17089,6 +17130,10 @@ impl Engine {
     /// 前に主キー `value` だった生きた行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 時刻 `created` に作られた行の
     /// 束ね先として引く。 名前の年表の上で、 その時刻以後にその名前だったことのある行だけ (同じ時刻に同じ名前 = 同じデッキ。 改名の
     /// 後にその名前で作った行は新しいデッキ。 削除優先と同じく時刻で決める)。 年表の無い行 (前の版の file) は時刻によらず返す。
+    ///
+    /// 返すのは行の eid (自分の peer, 番号 = 世代 | 場所、 `query_by_id64` と同じ形)。 番号は場所の最後の行 (生きていれば今の行、 その
+    /// 場所の前の持ち主が消えていれば消えた行) で、 消えた場所は返さない。 呼び手は場所で束ね、 その行を消す時は番号を
+    /// `remote_delete_apply_at` に渡す (引いた後に消して使い回された行に当てない)。
     pub fn former_pk_holder(
         &self,
         himo: u16,
@@ -17106,8 +17151,14 @@ impl Engine {
         let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         // 読み直し [B4]: 行の番号 (世代 | 場所、 `query_by_id64` の返す形と同じ) で返す。 呼び手 (sync の束ね) は、 引いた後にその行を
         // 消す時に、 行の lock の下でこの番号と場所の最後の行を比べる (前は場所だけを返し、 引いた後に使い回した新しい行を消した)。
-        // 世代は生きているかを見る前に読む (読んだ後に消して使い回されたら、 lock の下の比べで外れる)
-        let row = self.generations().local(slot);
+        // 番号は生きているかを見る前に、 場所の最後の行で読む (#928 の読み直し [2]: 今の世代で読むと、 前の持ち主が消えている場所では
+        // 次の住人の番号になり、 読んだ後に使い回された新しい行を 「前の持ち主」 として返した)。 読んだ後に消して使い回されたら、
+        // lock の下の比べで外れる
+        let row = self.last_local_of_slot(slot);
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            former_holder_hook::call(wal);
+        }
         // 削除優先: 消えた行には束ねない (消えた行に束ねると、 後から足した行まで死ぬ)
         self.entities.is_live(slot).then(|| enchudb_oplog::make_eid(self_peer, row))
     }
@@ -18359,6 +18410,14 @@ impl Engine {
     fn remote_row_hook(&self) {
         if let Some(wal) = self.oplog.as_ref() {
             remote_row_hook::call(wal);
+        }
+    }
+
+    /// test 用の割り込み点: 受信の Tie / TieLeaf / Untie が行の lock の下で 「消えた行か」 を見た後・照合の前 (#928 の読み直し [1a])。
+    #[cfg(test)]
+    fn remote_check_hook(&self) {
+        if let Some(wal) = self.oplog.as_ref() {
+            remote_check_hook::call(wal);
         }
     }
 
@@ -19672,10 +19731,17 @@ impl Engine {
         }
         // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない
         let _row = self.row_locks.write(local);
-        // #917: 行の lock の下で、 引いた行がまだその場所の行か (確かめた後・握る前に、 その行が消えて場所が使い回された)。
-        // 読み直し [B1]: 消えた行か (削除優先) も lock の下でもう一度 (上の確かめの後に消えて、 使い回されていない行)。 場所を生かすのは
-        // 書けた後 (前は lock の前に生かしてから確かめ、 間に消えた行の場所を空の生きた行にした)
-        if !self.remote_row_holds_slot(local, row) || self.slot_is_dead(local) {
+        // 読み直し [B1]: 消えた行か (削除優先) を lock の下でもう一度 (上の確かめの後に消えて、 使い回されていない行)。 場所を生かすのは
+        // 書けた後 (前は lock の前に生かしてから確かめ、 間に消えた行の場所を空の生きた行にした)。 #928 の読み直し [1a]: 先に見る。
+        // 行の lock は死んだ場所の使い回しを止めない (`entity_in` は行の lock を取らずに生かす) ので、 照合の後に見ると、 間に使い回した
+        // 新しい行を 「死んでいない」 と読んで当てる。 死んでいなければ住人は lock が止めるので、 下の照合は最後まで正しい
+        if self.slot_is_dead(local) {
+            return RemoteApply::Stale;
+        }
+        #[cfg(test)]
+        self.remote_check_hook();
+        // #917: 行の lock の下で、 引いた行がまだその場所の行か (確かめた後・握る前に、 その行が消えて場所が使い回された)
+        if !self.remote_row_holds_slot(local, row) {
             return RemoteApply::Stale;
         }
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
@@ -19774,11 +19840,14 @@ impl Engine {
         // 読み直し [B1]: 消えた行か (削除優先) も lock の下でもう一度見る。 上の確かめの後・lock の前にその行が消えた (使い回しは
         // まだ) 時、 場所の最後の行はその行のままなので照合は通り、 削除より新しい版数の書き込みは LWW も通る (前は死んだ場所に cell を
         // 書いて生かし、 誰も eid を持たない生きた行ができた)
+        // #928 の読み直し [1a]: 消えた行かを照合より先に見る (TieLeaf と同じ理由)
         let guard = self.row_locks.write(local);
-        if !self.remote_row_holds_slot(local, row)
-            || self.slot_is_dead(local)
-            || !self.set_cell_in(Some(&guard), local, himo_id, value, hlc)
-        {
+        if self.slot_is_dead(local) {
+            return RemoteApply::Stale;
+        }
+        #[cfg(test)]
+        self.remote_check_hook();
+        if !self.remote_row_holds_slot(local, row) || !self.set_cell_in(Some(&guard), local, himo_id, value, hlc) {
             return RemoteApply::Stale;
         }
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)。 行の lock を持ったまま (同じ thread は握り直せる):
@@ -19830,6 +19899,13 @@ impl Engine {
         #[cfg(test)]
         self.remote_row_hook();
         let guard = self.row_locks.write(local);
+        // #928 の読み直し [1a]: 消えた行への Untie も捨てる (削除優先、 Tie と同じ。 前は消えた行の cell に版数だけを書いた)。 照合より
+        // 先に見る (Tie と同じ理由)
+        if self.slot_is_dead(local) {
+            return false;
+        }
+        #[cfg(test)]
+        self.remote_check_hook();
         if !self.remote_row_holds_slot(local, row) || !self.clear_cell_in_freeing_leaf(Some(&guard), local, himo_id, hlc) {
             return false;
         }
@@ -34575,6 +34651,88 @@ mod remote_row_tests {
         assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
         assert_ne!(r, RemoteApply::Applied, "消えた行 X 宛ての TieLeaf を当てた");
         assert_eq!(eng.get_text_owned(y, "t.n").as_deref(), Some(&b"y"[..]), "X 宛ての TieLeaf が Y の Leaf を書き換えた");
+    }
+
+    /// #928 の読み直し [1a]: 受信の Tie / TieLeaf / Untie (自分の行 X 宛て、 版数 h) が lock の前の確かめを通った後に、 別の peer のより
+    /// 古い削除で X が消え (使い回しはまだ)、 受信が行の lock を握った後に、 アプリが X の場所を使い回す (`entity_in` は行の lock を取らない)。
+    /// 受信は当てない (消えた X 宛て = 削除優先、 使い回した M に値も版数も残さない)。
+    ///
+    /// `untie-dead` は使い回さない形 (消えた X の cell に版数だけを書かない、 削除優先)。
+    ///
+    /// falsify: lock の下の比べを照合 → `slot_is_dead` の順に戻すと (照合は 「場所の最後の行 = X」 で通り、 その後に使い回した M は死んで
+    /// いない)、 M に当てる。 Untie から `slot_is_dead` を外すと、 消えた X の cell に h の版数を書く (`untie-dead`)。
+    #[test]
+    fn a_received_write_does_not_hit_a_row_reused_while_it_holds_the_lock() {
+        for kind in ["tie", "leaf", "untie", "untie-dead"] {
+            let (_rm, eng) = engine(&format!("b1a{kind}"));
+            let x = generational_row(&eng);
+            let (v, n) = (eng.himo_id("t.v").unwrap() as u16, eng.himo_id("t.n").unwrap() as u16);
+            let h0 = eng.cell_hlc(x, v);
+            let del = enchudb_oplog::Hlc { wall: h0.wall + 1_000_000, logical: 0, peer: 3 };
+            let h = enchudb_oplog::Hlc { wall: h0.wall + 2_000_000, logical: 0, peer: 2 };
+            let killed: Arc<Mutex<Option<bool>>> = Arc::default();
+            let (e, k) = (eng.clone(), killed.clone());
+            remote_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                *k.lock().unwrap() = Some(e.remote_delete_apply(x, del));
+            });
+            let made: Arc<Mutex<Option<u64>>> = Arc::default();
+            if kind != "untie-dead" {
+                let (e, m) = (Arc::downgrade(&eng), made.clone());
+                remote_check_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                    let e = e.upgrade().unwrap();
+                    *m.lock().unwrap() = Some(e.entity_in("t").unwrap());
+                });
+            }
+            let row = eng.remote_row_of(x, x);
+            let applied = match kind {
+                "tie" => eng.remote_tie_apply_at(x, row, v, 9u32, h) == RemoteApply::Applied,
+                "leaf" => eng.remote_tieleaf_apply_at(x, row, n, b"new", h) == RemoteApply::Applied,
+                _ => eng.remote_untie_apply_at(x, row, v, h),
+            };
+            // 使われなかった割り込み点を外す (次の engine が同じ番地の WAL を持つ時に呼ばない)
+            remote_check_hook::set(eng.oplog.as_ref().unwrap(), |_| {});
+            assert_eq!(*killed.lock().unwrap(), Some(true), "前提: 割り込み点で X を消した ({kind})");
+            assert!(!applied, "消えた X 宛ての受信を当てた ({kind})");
+            if kind == "untie-dead" {
+                assert_ne!(eng.cell_hlc_local(slot(x), v), h, "消えた X の cell に Untie の版数を書いた");
+            }
+            if let Some(m) = *made.lock().unwrap() {
+                assert_eq!(slot(m), slot(x), "前提: M は X の場所を使い回した ({kind})");
+                let hid = if kind == "leaf" { n } else { v };
+                assert_ne!(eng.cell_hlc(m, hid), h, "X 宛ての受信の版数が、 使い回した M に残った ({kind})");
+            }
+        }
+    }
+
+    /// #928 の読み直し [2]: `former_pk_holder` が前の持ち主 L (名前 7 → 8 に改名して消えた行) の場所を引き、 番号を読んだ後・生きているかを
+    /// 見る前に、 アプリが L の場所を使い回す (M)。 返す番号は消えた L の物 = その番号で消す (束ねの 「一緒に消える」) と M に当たらない。
+    ///
+    /// falsify: 番号を場所の今の世代で読むと (前の形)、 死んだ場所の今の世代は次の住人の物なので M の番号を返し、 M が消える。
+    #[test]
+    fn a_former_holder_read_before_its_slot_is_reused_is_not_the_new_row() {
+        let (_rm, eng, k) = named("b2former", 1);
+        let x0 = eng.entity_in("t").unwrap();
+        eng.delete(x0);
+        let l = eng.entity_in("t").unwrap();
+        assert_ne!(l, x0, "前提: v15 (L は場所を使い回した行)");
+        eng.tie_to(l, "t.k", 7u32);
+        let named7 = eng.cell_hlc(l, k);
+        eng.tie_to(l, "t.k", 8u32);
+        eng.delete(l);
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(&eng), made.clone());
+        former_holder_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            *m.lock().unwrap() = Some(e.entity_in("t").unwrap());
+        });
+        let created = enchudb_oplog::Hlc { wall: named7.wall, logical: named7.logical, peer: 3 };
+        let holder = eng.former_pk_holder(k, PkValue::Local(7), created);
+        let m = made.lock().unwrap().expect("前提: 前の持ち主の場所を引いた (割り込み点を通った)");
+        assert_eq!(slot(m), slot(l), "前提: M は L の場所を使い回した");
+        let holder = holder.expect("前提: 使い回した場所は生きている");
+        let t = enchudb_oplog::Hlc { wall: named7.wall + 10_000_000_000, logical: 0, peer: 3 };
+        eng.remote_delete_apply_at(holder, enchudb_oplog::eid_local(holder), t);
+        assert!(eng.is_live(m), "前の持ち主として引いた番号で消したら、 その後に場所を使い回した M が消えた");
     }
 
     /// TieLeaf だけで届いた行も生きる (TieLeaf が場所を生かすのを、 lock の前から lock の下・書けた後へ移した守り)。

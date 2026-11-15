@@ -1965,6 +1965,8 @@ impl Syncer {
         // #513: 束ねた行にも、 その主キーの行を消した削除を当てる (削除の後に作り直された行に束ねる時、 削除より古い
         // 書き込みを残さない)
         // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)
+        #[cfg(test)]
+        apply_hook::call();
         self.engine.note_bound_identity(existing, *eid, rec.hlc);
         let bound = self.engine.bind_remote_eid_by_pk(rec.author_peer, *eid, existing, *himo_id, local_value);
         own.then_some(bound)
@@ -2151,6 +2153,13 @@ impl Syncer {
     // (旧 buffer の既知バグ: in-memory のみで cursor だけ永続前進 → 再起動で
     //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
+    /// #928 の読み直し [5]: 当てた結果 `r` の record の行 `row` (`remote_row_of`) に、 束ねた identity のカードを積むか。 LWW で負けても
+    /// 積む (Tie と同じ) が、 その行がもう場所に居ない (引いた後に消えて使い回された) 時は積まない。 場所に居るかの lock の外の比べは
+    /// 当たらなかった時だけ (当たったなら居た)。
+    fn lands_on(&self, r: ApplyResult, local_eid: enchudb_oplog::EntityId, row: u32) -> bool {
+        r != ApplyResult::SkippedOlder || self.engine.remote_row_holds(local_eid, row)
+    }
+
     /// `bound`: `bind_by_primary_key` が束ねた / 払い出した local eid (Tie だけ。 あれば写像を引き直さない)。
     /// `dying`: この batch で消える entity (削除優先、 名前で畳む時に、 消える行へ削除の後に作られた行を畳まない)。
     fn apply_one(
@@ -2300,8 +2309,12 @@ impl Syncer {
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 #[cfg(test)]
                 apply_hook::call();
-                self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value as u64), rec.hlc);
-                ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc))
+                let r = ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc));
+                // #928 の読み直し [5]: 束ねた identity のカードは当てた後に積む (Tie と同じ。 その行がもう場所に居なければ積まない)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value as u64), rec.hlc);
+                }
+                r
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
@@ -2313,9 +2326,12 @@ impl Syncer {
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 #[cfg(test)]
                 apply_hook::call();
-                // #9: 写像ができたので退避中の Content を drain。
-                self.engine.note_bound_write(local_eid, *eid, *himo_id, None, rec.hlc);
-                ApplyResult::from_lww(self.engine.remote_untie_apply_at(local_eid, row, *himo_id, rec.hlc))
+                let r = ApplyResult::from_lww(self.engine.remote_untie_apply_at(local_eid, row, *himo_id, rec.hlc));
+                // #928 の読み直し [5]: カードは当てた後に (TieRef と同じ)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_write(local_eid, *eid, *himo_id, None, rec.hlc);
+                }
+                r
             }
             DecodedOp::Delete { eid } => {
                 // #9: Delete は himo を持たず table を導けないので、 写像を払い出さない。
@@ -2351,8 +2367,12 @@ impl Syncer {
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 #[cfg(test)]
                 apply_hook::call();
-                self.engine.note_bound_write(local_eid, *eid, local_hid, Some(value), rec.hlc);
-                ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, local_hid, value, rec.hlc))
+                let r = ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, local_hid, value, rec.hlc));
+                // #928 の読み直し [5]: カードは当てた後に (TieRef と同じ)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_write(local_eid, *eid, local_hid, Some(value), rec.hlc);
+                }
+                r
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
@@ -2369,8 +2389,12 @@ impl Syncer {
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 #[cfg(test)]
                 apply_hook::call();
-                self.engine.note_bound_leaf(local_eid, *eid, local_hid, bytes, rec.hlc);
-                ApplyResult::from(self.engine.remote_tieleaf_apply_at(local_eid, row, local_hid, bytes, rec.hlc))
+                let r = ApplyResult::from(self.engine.remote_tieleaf_apply_at(local_eid, row, local_hid, bytes, rec.hlc));
+                // #928 の読み直し [5]: カードは当てた後に (TieRef と同じ)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_leaf(local_eid, *eid, local_hid, bytes, rec.hlc);
+                }
+                r
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -2624,6 +2648,36 @@ mod tests {
         syncer.apply_records(&[WireRecord::unsigned(deleted, 3, DecodedOp::Delete { eid: f })]);
         syncer.apply_records(&[WireRecord::unsigned(created, 3, DecodedOp::Tie { eid: f, himo_id: k, value: 7 })]);
         assert!(!eng.is_live(l), "作成より先に消えた F と同じ行 (前に名前 7 だった L) が消えなかった");
+    }
+
+    /// #928 の読み直し [4]: 名前で束ねる時 (`bind_remote_eid_by_pk`)、 束ねた行にその名前の削除 (#513) を当てる前に、 引いた行 L をアプリが
+    /// 消して (名前 7 の削除を覚える) 場所を M (名前なし) が使い回す。 M は消えない (L 宛ての削除を M に当てない)。
+    ///
+    /// falsify: 照合なしで消す (前の形) と、 M の名前の版数 (無し) が削除より古いので M が消える。
+    #[test]
+    fn binding_by_name_does_not_apply_the_names_deletion_to_the_row_that_reused_the_slot() {
+        let (_rm, eng, syncer) = reuse_engine("b4pk", true);
+        let k = eng.himo_id("t.k").unwrap() as u16;
+        let l = eng.entity_in("t").unwrap();
+        eng.tie_to(l, "t.k", 7u32);
+        let m = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let (e, mm) = (eng.clone(), m.clone());
+        apply_hook::set(move || {
+            e.delete(l);
+            let m = e.entity_in("t").unwrap();
+            e.tie_to(m, "t.v", 1u32);
+            mm.set(m);
+        });
+        // peer 3 の行 F (名前 7) の作成。 L の削除より後に作られた (名前の削除で F は消えない)
+        let created = Hlc { wall: now_ns() + 10_000_000_000, logical: 0, peer: 3 };
+        let f = enchudb_oplog::make_eid(3, 5);
+        syncer.apply_records(&[WireRecord::unsigned(created, 3, DecodedOp::Tie { eid: f, himo_id: k, value: 7 })]);
+        let m = m.get();
+        assert_ne!(m, 0, "前提: 割り込み点を通った");
+        assert_eq!(slot24(m), slot24(l), "前提: M は L の場所を使い回した");
+        assert_ne!(eng.deleted_primary_key_count(), 0, "前提: 名前 7 の削除を覚えている");
+        assert!(eng.is_live(m), "束ねた行への名前の削除 (#513) が、 L を引いた後に場所を使い回した M を消した");
+        assert_eq!(eng.get(m, "t.v"), Some(1));
     }
 
     /// 読み直し [B5] (#921 と #922 の組): peer 2 の、 自分の行 X 宛ての名前の書き込み (改名 8) を引いた後・行の lock の前に、 アプリが X を
