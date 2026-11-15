@@ -1949,7 +1949,11 @@ impl Syncer {
             }
             if dead_at.is_some() {
                 // その削除より前からある行は同じ行: 一緒に消える (先に束ねてから削除を受けた peer と同じ)
-                self.engine.remote_delete_apply(l, t);
+                // 読み直し [B4]: 引いた行の番号 (世代 | 場所、 `query_by_id64` / `former_pk_holder` の返す形) を渡し、 行の lock の下で
+                // 場所の最後の行と比べる (前は照合なしで消し、 引いた後に消して場所を使い回した新しい行を消した)
+                #[cfg(test)]
+                apply_hook::call();
+                self.engine.remote_delete_apply_at(l, enchudb_oplog::eid_local(l), t);
                 return reserve();
             }
         }
@@ -1961,6 +1965,8 @@ impl Syncer {
         // #513: 束ねた行にも、 その主キーの行を消した削除を当てる (削除の後に作り直された行に束ねる時、 削除より古い
         // 書き込みを残さない)
         // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)
+        #[cfg(test)]
+        apply_hook::call();
         self.engine.note_bound_identity(existing, *eid, rec.hlc);
         let bound = self.engine.bind_remote_eid_by_pk(rec.author_peer, *eid, existing, *himo_id, local_value);
         own.then_some(bound)
@@ -2147,6 +2153,13 @@ impl Syncer {
     // (旧 buffer の既知バグ: in-memory のみで cursor だけ永続前進 → 再起動で
     //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
+    /// #928 の読み直し [5]: 当てた結果 `r` の record の行 `row` (`remote_row_of`) に、 束ねた identity のカードを積むか。 LWW で負けても
+    /// 積む (Tie と同じ) が、 その行がもう場所に居ない (引いた後に消えて使い回された) 時は積まない。 場所に居るかの lock の外の比べは
+    /// 当たらなかった時だけ (当たったなら居た)。
+    fn lands_on(&self, r: ApplyResult, local_eid: enchudb_oplog::EntityId, row: u32) -> bool {
+        r != ApplyResult::SkippedOlder || self.engine.remote_row_holds(local_eid, row)
+    }
+
     /// `bound`: `bind_by_primary_key` が束ねた / 払い出した local eid (Tie だけ。 あれば写像を引き直さない)。
     /// `dying`: この batch で消える entity (削除優先、 名前で畳む時に、 消える行へ削除の後に作られた行を畳まない)。
     fn apply_one(
@@ -2299,11 +2312,16 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::Dropped,
                 };
-                if !self.engine.remote_row_holds(local_eid, row) {
-                    return ApplyResult::SkippedOlder;
+                // #917: 当てる行は上で引いた直後に取った物 (Ref の的の払い出しがその行の消えた場所を使い回しても、 的の行に当てない)。
+                // lock の下で確かめる。 引いた直後の lock の外の確かめは、 lock の下と同じ事を見るので置かない = 読み直し [P]
+                #[cfg(test)]
+                apply_hook::call();
+                let r = ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc));
+                // #928 の読み直し [5]: 束ねた identity のカードは当てた後に積む (Tie と同じ。 その行がもう場所に居なければ積まない)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value as u64), rec.hlc);
                 }
-                self.engine.note_bound_write(local_eid, *eid, *himo_id, Some(value as u64), rec.hlc);
-                ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc))
+                r
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
@@ -2311,16 +2329,16 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
-                // #917: Tie と同じ (当てる行を lock の下で確かめる)
+                // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
                 let row = self.engine.remote_row_of(*eid, local_eid);
-                if !self.engine.remote_row_holds(local_eid, row) {
-                    return ApplyResult::SkippedOlder;
-                }
-                // #9: 写像ができたので退避中の Content を drain。
-                self.engine.note_bound_write(local_eid, *eid, *himo_id, None, rec.hlc);
                 #[cfg(test)]
                 apply_hook::call();
-                ApplyResult::from_lww(self.engine.remote_untie_apply_at(local_eid, row, *himo_id, rec.hlc))
+                let r = ApplyResult::from_lww(self.engine.remote_untie_apply_at(local_eid, row, *himo_id, rec.hlc));
+                // #928 の読み直し [5]: カードは当てた後に (TieRef と同じ)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_write(local_eid, *eid, *himo_id, None, rec.hlc);
+                }
+                r
             }
             DecodedOp::Delete { eid } => {
                 // #9: Delete は himo を持たず table を導けないので、 写像を払い出さない。
@@ -2354,11 +2372,15 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::DroppedVocab,
                 };
-                if !self.engine.remote_row_holds(local_eid, row) {
-                    return ApplyResult::SkippedOlder;
+                // #917: 当てる行は上で引いた直後に取った物。 lock の下で確かめる (読み直し [P])
+                #[cfg(test)]
+                apply_hook::call();
+                let r = ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, local_hid, value, rec.hlc));
+                // #928 の読み直し [5]: カードは当てた後に (TieRef と同じ)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_write(local_eid, *eid, local_hid, Some(value), rec.hlc);
                 }
-                self.engine.note_bound_write(local_eid, *eid, local_hid, Some(value), rec.hlc);
-                ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, local_hid, value, rec.hlc))
+                r
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
@@ -2371,13 +2393,16 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
-                // #917: Tie と同じ (当てる行を lock の下で確かめる)
+                // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
                 let row = self.engine.remote_row_of(*eid, local_eid);
-                if !self.engine.remote_row_holds(local_eid, row) {
-                    return ApplyResult::SkippedOlder;
+                #[cfg(test)]
+                apply_hook::call();
+                let r = ApplyResult::from(self.engine.remote_tieleaf_apply_at(local_eid, row, local_hid, bytes, rec.hlc));
+                // #928 の読み直し [5]: カードは当てた後に (TieRef と同じ)
+                if self.lands_on(r, local_eid, row) {
+                    self.engine.note_bound_leaf(local_eid, *eid, local_hid, bytes, rec.hlc);
                 }
-                self.engine.note_bound_leaf(local_eid, *eid, local_hid, bytes, rec.hlc);
-                ApplyResult::from(self.engine.remote_tieleaf_apply_at(local_eid, row, local_hid, bytes, rec.hlc))
+                r
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -2428,8 +2453,8 @@ impl Syncer {
     }
 }
 
-/// test 用の割り込み点: 受信の当て込み (`apply_one`) が宛名を引いて当てる行を取った後・engine に当てる前 (#917)。 この thread で
-/// 1 回だけ呼ぶ。
+/// test 用の割り込み点: 受信の当て込み (`apply_one`) が宛名を引いて当てる行を取った後・engine に当てる前 (#917)、 名前で束ねる時
+/// (`bind_by_primary_key`) に消える行を引いた後・消す前 (読み直し [B4])。 この thread で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod apply_hook {
     use std::cell::RefCell;
@@ -2456,55 +2481,117 @@ mod tests {
     use enchudb_oplog::PeerId;
     use enchudb_engine::transport::InMemoryTransport;
 
-    /// #917 [D]: 受信の当て込みが自分の行 X 宛ての record を引いた後・行の lock の前に、 アプリが X を消して場所を Y が使い回す。
-    /// X 宛ての Tie / Untie は Y に当たらない (前は入口の照合だけで、 行の lock の下では tombstone しか見ず Y に書いた / 外した)。
+    /// 落とすと DB の directory を消す (engine と syncer より先に束ねる = 後に落ちる。 前提で落ちても残さない)。
+    struct Rm(String);
+    impl Drop for Rm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 枠 1 の表 t (列 v / w、 Leaf の n、 Ref の r、 `named` なら名前 k) と、 r の指す先の表 u の sync の DB (peer 1) と Syncer。
+    fn reuse_engine(tag: &str, named: bool) -> (Rm, Arc<Engine>, Syncer) {
+        let path = format!("/tmp/enchudb_sync_917_{tag}_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        let rm = Rm(path.clone());
+        let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        if named {
+            let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+            eng.set_table_pk("t", k).unwrap();
+        }
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("t", "w", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("t", "n", ValueType::Leaf, 0).unwrap();
+        eng.define_himo_in("t", "r", ValueType::Ref, 0).unwrap();
+        eng.define_table("u", 4).unwrap();
+        eng.define_himo_in("u", "a", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let syncer = Syncer::new(eng.clone(), Arc::new(InMemoryTransport::new()));
+        (rm, eng, syncer)
+    }
+
+    fn now_ns() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    fn slot24(eid: u64) -> u32 {
+        eid as u32 & ((1 << 24) - 1)
+    }
+
+    /// #917 [D]: 受信の当て込みが行 X 宛ての record を引いた後・行の lock の前に、 アプリが X を消して場所を Y が使い回す。 X 宛ての
+    /// Tie / Untie / TieNamed / TieLeaf / TieRef は Y に当たらない (前は入口の照合だけで、 行の lock の下では tombstone しか見ず Y に書いた /
+    /// 外した)。 X は自分の行 (宛名は自分の世界番号) と、 peer 2 から受けた翻訳した行 (読み直し [B5]: 番号は `remote_row_of` の
+    /// 「場所の最後の行」 の枝で取る) の両方。
     ///
-    /// falsify: engine の `remote_*_apply_in` の、 行の lock の下の 「その行がまだ場所に居るか」 を外すと落ちる。
+    /// falsify: engine の `remote_*_apply_in` の、 行の lock の下の 「その行がまだ場所に居るか」 を外す / sync が行を渡さない
+    /// (`_at` でない形) と落ちる。
     #[test]
     fn a_received_write_does_not_hit_the_row_that_reused_the_slot_after_resolving() {
-        for untie in [false, true] {
-            let path = format!("/tmp/enchudb_sync_917_{}_{}_{}", untie, std::process::id(), line!());
-            let _ = std::fs::remove_dir_all(&path);
-            // 落とすと消す (engine と syncer より先に束ねる = 後に落ちる。 前提で落ちても残さない)
-            struct Rm(String);
-            impl Drop for Rm {
-                fn drop(&mut self) {
-                    let _ = std::fs::remove_dir_all(&self.0);
-                }
+        for translated in [false, true] {
+            for kind in ["tie", "untie", "named", "leaf", "ref"] {
+                let (_rm, eng, syncer) = reuse_engine(&format!("{kind}_{translated}"), false);
+                let v = eng.himo_id("t.v").unwrap() as u16;
+                let (world, app_x) = if translated {
+                    // peer 2 の行 F を受ける (場所は表 t の 1 つだけの枠)
+                    let f = enchudb_oplog::make_eid(2, 100);
+                    let t0 = Hlc { wall: 1_000_000, logical: 0, peer: 2 };
+                    let w = eng.himo_id("t.w").unwrap() as u16;
+                    let out = syncer.apply_records(&[
+                        WireRecord::unsigned(t0, 2, DecodedOp::Tie { eid: f, himo_id: v, value: 1 }),
+                        WireRecord::unsigned(t0, 2, DecodedOp::Tie { eid: f, himo_id: w, value: 1 }),
+                        WireRecord::unsigned(
+                            t0,
+                            2,
+                            DecodedOp::TieLeaf { eid: f, himo_name: "t.n".into(), himo_kind: 3, bytes: b"f".to_vec() },
+                        ),
+                    ]);
+                    assert_eq!(out.applied, 3, "前提: F を受けた ({out:?})");
+                    let internal = eng.resolve_remote_eid_existing(f).unwrap();
+                    (f, eng.slot_eid(slot24(internal)))
+                } else {
+                    let x = eng.entity_in("t").unwrap();
+                    eng.tie_to(x, "t.v", 1u32);
+                    eng.tie_to(x, "t.w", 1u32);
+                    eng.tie_text_to(x, "t.n", "x");
+                    (x, x)
+                };
+                assert_eq!(eng.get(app_x, "t.v"), Some(1), "前提: X の値");
+                let (z1, z2) = (eng.entity_in("u").unwrap(), eng.entity_in("u").unwrap());
+                let y = std::rc::Rc::new(std::cell::Cell::new(0u64));
+                let (e, yy) = (eng.clone(), y.clone());
+                apply_hook::set(move || {
+                    e.delete(app_x);
+                    let y = e.entity_in("t").unwrap();
+                    e.tie_to(y, "t.v", 2u32);
+                    e.tie_to(y, "t.w", 2u32);
+                    e.tie_text_to(y, "t.n", "y");
+                    e.tie_ref_to(y, "t.r", z2);
+                    yy.set(y);
+                });
+                let r = eng.himo_id("t.r").unwrap() as u16;
+                let op = match kind {
+                    "tie" => DecodedOp::Tie { eid: world, himo_id: v, value: 9 },
+                    "untie" => DecodedOp::Untie { eid: world, himo_id: v },
+                    "named" => DecodedOp::TieNamed { eid: world, himo_name: "t.v".into(), himo_kind: 1, value: 9 },
+                    "ref" => DecodedOp::TieRef { eid: world, himo_id: r, target: z1 },
+                    _ => DecodedOp::TieLeaf { eid: world, himo_name: "t.n".into(), himo_kind: 3, bytes: b"z".to_vec() },
+                };
+                // Y の書き込みより新しい版数 (版数では弾かれない)
+                let after = now_ns() + 10_000_000_000;
+                let out = syncer.apply_records(&[WireRecord::unsigned(Hlc { wall: after, logical: 0, peer: 3 }, 3, op)]);
+                let y = y.get();
+                let case = format!("{kind}, translated = {translated}");
+                assert_ne!(y, 0, "前提: 割り込み点を通った ({case})");
+                assert_eq!(slot24(y), slot24(app_x), "前提: Y は X の場所を使い回した ({case})");
+                assert_ne!(y, app_x, "前提: Y の世代は X より新しい ({case})");
+                assert_eq!(out.applied, 0, "消えた行宛ての record を当てた ({case}, {out:?})");
+                assert_eq!(eng.get(y, "t.v"), Some(2), "X 宛ての受信が、 場所を使い回した Y に当たった ({case})");
+                assert_eq!(eng.get_text_owned(y, "t.n").as_deref(), Some(&b"y"[..]), "X 宛ての受信が Y の Leaf に当たった ({case})");
+                assert_eq!(eng.get(y, "t.r"), Some(eng.ref_value(z2)), "X 宛ての受信が Y の Ref に当たった ({case})");
             }
-            let _rm = Rm(path.clone());
-            let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
-            eng.define_table("t", 1).unwrap();
-            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
-            eng.define_himo_in("t", "w", ValueType::Number, 0).unwrap();
-            eng.enable_sync_tables().unwrap();
-            let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
-            eng.set_peer_id(1);
-            let syncer = Syncer::new(eng.clone(), Arc::new(InMemoryTransport::new()));
-            let x = eng.entity_in("t").unwrap();
-            eng.tie_to(x, "t.v", 1u32);
-            eng.tie_to(x, "t.w", 1u32);
-            let v = eng.himo_id("t.v").unwrap() as u16;
-            let y = std::rc::Rc::new(std::cell::Cell::new(0u64));
-            let (e, yy) = (eng.clone(), y.clone());
-            apply_hook::set(move || {
-                e.delete(x);
-                let y = e.entity_in("t").unwrap();
-                e.tie_to(y, "t.v", 2u32);
-                e.tie_to(y, "t.w", 2u32);
-                yy.set(y);
-            });
-            let op = if untie { DecodedOp::Untie { eid: x, himo_id: v } } else { DecodedOp::Tie { eid: x, himo_id: v, value: 9 } };
-            // X の cell より新しい版数 (Y の書き込みより新しい = 版数では弾かれない)
-            let after = eng.cell_hlc(x, v).wall + 10_000_000;
-            let rec = WireRecord::unsigned(Hlc { wall: after, logical: 0, peer: 2 }, 2, op);
-            let out = syncer.apply_records(&[rec]);
-            let y = y.get();
-            assert_ne!(y, 0, "前提: 割り込み点を通った");
-            assert_eq!(y as u32 & ((1 << 24) - 1), x as u32 & ((1 << 24) - 1), "前提: Y は X の場所を使い回した");
-            assert_ne!(y, x, "前提: Y の世代は X より新しい");
-            assert_eq!(out.applied, 0, "消えた行宛ての record を当てた (untie = {untie}, {out:?})");
-            assert_eq!(eng.get(y, "t.v"), Some(2), "X 宛ての受信が、 場所を使い回した Y に当たった (untie = {untie})");
         }
     }
 
@@ -2609,6 +2696,139 @@ mod tests {
             assert_eq!(out.applied, 0, "消えた F0 宛ての書き込みを当てた (tie_ref = {tie_ref}, {out:?})");
             assert_eq!(eng.get(t, "t.next"), None, "消えた F0 宛ての書き込みが、 F0 の場所を使い回した T に当たった (tie_ref = {tie_ref})");
         }
+    }
+
+    /// 読み直し [B4]: 名前で束ねる時 (`bind_by_primary_key`)、 作成より先に削除の届いた peer 3 の行 F (名前 7) の作成を受け、 名前 7 の
+    /// 自分の行 L (その削除より前からある = 同じ行) を一緒に消す。 L を引いた後・消す前に、 アプリが L を消して場所を M が使い回す。
+    /// M は消えない。
+    ///
+    /// falsify: 照合なしで消す (`remote_delete_apply(l, t)`、 前の形) と M が消える。
+    #[test]
+    fn binding_by_name_does_not_delete_the_row_that_reused_the_slot() {
+        let (_rm, eng, syncer) = reuse_engine("b4bind", true);
+        let k = eng.himo_id("t.k").unwrap() as u16;
+        let l = eng.entity_in("t").unwrap();
+        eng.tie_to(l, "t.k", 7u32);
+        let now = now_ns();
+        let f = enchudb_oplog::make_eid(3, 5);
+        // F の削除が作成より先に届く (写像が無い = 退避表に載る)
+        let deleted = Hlc { wall: now + 5_000_000_000, logical: 0, peer: 3 };
+        syncer.apply_records(&[WireRecord::unsigned(deleted, 3, DecodedOp::Delete { eid: f })]);
+        assert_eq!(eng.deleted_before_create(f), Some(deleted), "前提: F の削除が退避表にある");
+        let m = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let (e, mm) = (eng.clone(), m.clone());
+        apply_hook::set(move || {
+            e.delete(l);
+            let m = e.entity_in("t").unwrap();
+            e.tie_to(m, "t.v", 1u32);
+            mm.set(m);
+        });
+        let created = Hlc { wall: now + 4_000_000_000, logical: 0, peer: 3 };
+        syncer.apply_records(&[WireRecord::unsigned(created, 3, DecodedOp::Tie { eid: f, himo_id: k, value: 7 })]);
+        let m = m.get();
+        assert_ne!(m, 0, "前提: 割り込み点を通った");
+        assert_eq!(slot24(m), slot24(l), "前提: M は L の場所を使い回した");
+        assert!(eng.is_live(m), "名前で束ねる時の 「一緒に消える」 が、 L を引いた後に場所を使い回した M を消した");
+        assert_eq!(eng.get(m, "t.v"), Some(1));
+    }
+
+    /// 読み直し [B4] の守り: 名前で束ねる時の 「一緒に消える」 行が、 前の名前の持ち主 (`former_pk_holder`、 改名した行) で、 場所を使い回した
+    /// 行 (世代 1) の時も消える (`former_pk_holder` は番号を世代込みで返す。 場所だけを返すと、 lock の下の比べで 「もう居ない行」 と
+    /// 読まれて消えない)。
+    ///
+    /// falsify: `former_pk_holder` が場所だけ (世代 0) の eid を返すと、 改名した行 L が残る。
+    #[test]
+    fn binding_by_a_former_name_deletes_the_renamed_row_on_a_reused_slot() {
+        let (_rm, eng, syncer) = reuse_engine("b4former", true);
+        let k = eng.himo_id("t.k").unwrap() as u16;
+        let x0 = eng.entity_in("t").unwrap();
+        eng.delete(x0);
+        let l = eng.entity_in("t").unwrap();
+        assert_ne!(l >> 24 & 0xFF, 0, "前提: L は場所を使い回した行 (世代 > 0)");
+        eng.tie_to(l, "t.k", 7u32);
+        let named7 = eng.cell_hlc(l, k);
+        eng.tie_to(l, "t.k", 8u32);
+        // peer 3 の行 F は L が名前 7 だった間に作られ (改名の前)、 作成より先に削除が届く
+        let created = Hlc { wall: named7.wall, logical: named7.logical, peer: 3 };
+        assert!(
+            eng.former_pk_holder(k, PkValue::Local(7), created).is_some_and(|h| slot24(h) == slot24(l)),
+            "前提: 名前 7 の前の持ち主は L"
+        );
+        let f = enchudb_oplog::make_eid(3, 5);
+        let deleted = Hlc { wall: now_ns() + 5_000_000_000, logical: 0, peer: 3 };
+        syncer.apply_records(&[WireRecord::unsigned(deleted, 3, DecodedOp::Delete { eid: f })]);
+        syncer.apply_records(&[WireRecord::unsigned(created, 3, DecodedOp::Tie { eid: f, himo_id: k, value: 7 })]);
+        assert!(!eng.is_live(l), "作成より先に消えた F と同じ行 (前に名前 7 だった L) が消えなかった");
+    }
+
+    /// #928 の読み直し [4]: 名前で束ねる時 (`bind_remote_eid_by_pk`)、 束ねた行にその名前の削除 (#513) を当てる前に、 引いた行 L をアプリが
+    /// 消して (名前 7 の削除を覚える) 場所を M (名前なし) が使い回す。 M は消えない (L 宛ての削除を M に当てない)。
+    ///
+    /// falsify: 照合なしで消す (前の形) と、 M の名前の版数 (無し) が削除より古いので M が消える。
+    #[test]
+    fn binding_by_name_does_not_apply_the_names_deletion_to_the_row_that_reused_the_slot() {
+        let (_rm, eng, syncer) = reuse_engine("b4pk", true);
+        let k = eng.himo_id("t.k").unwrap() as u16;
+        let l = eng.entity_in("t").unwrap();
+        eng.tie_to(l, "t.k", 7u32);
+        let m = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let (e, mm) = (eng.clone(), m.clone());
+        apply_hook::set(move || {
+            e.delete(l);
+            let m = e.entity_in("t").unwrap();
+            e.tie_to(m, "t.v", 1u32);
+            mm.set(m);
+        });
+        // peer 3 の行 F (名前 7) の作成。 L の削除より後に作られた (名前の削除で F は消えない)
+        let created = Hlc { wall: now_ns() + 10_000_000_000, logical: 0, peer: 3 };
+        let f = enchudb_oplog::make_eid(3, 5);
+        syncer.apply_records(&[WireRecord::unsigned(created, 3, DecodedOp::Tie { eid: f, himo_id: k, value: 7 })]);
+        let m = m.get();
+        assert_ne!(m, 0, "前提: 割り込み点を通った");
+        assert_eq!(slot24(m), slot24(l), "前提: M は L の場所を使い回した");
+        assert_ne!(eng.deleted_primary_key_count(), 0, "前提: 名前 7 の削除を覚えている");
+        assert!(eng.is_live(m), "束ねた行への名前の削除 (#513) が、 L を引いた後に場所を使い回した M を消した");
+        assert_eq!(eng.get(m, "t.v"), Some(1));
+    }
+
+    /// 読み直し [B5] (#921 と #922 の組): peer 2 の、 自分の行 X 宛ての名前の書き込み (改名 8) を引いた後・行の lock の前に、 アプリが X を
+    /// 消して場所を Y が使い回す。 その書き込みは、 使い回しの後に届いた時 (入口で捨てる) と同じく消えた行への改名として扱い、 名前 8 も
+    /// X の削除の時刻に消した名前にする (`name_given_to_gone_own_row`)。
+    ///
+    /// falsify: `!holds` の枝で入口からもう一度通さずに捨てると、 名前 8 が消した名前にならない。
+    #[test]
+    fn a_name_write_to_a_row_reused_after_resolving_is_handled_like_at_the_entry() {
+        let (_rm, eng, syncer) = reuse_engine("b5name", true);
+        let k = eng.himo_id("t.k").unwrap() as u16;
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0u64, Hlc::ZERO)));
+        let (e, ss) = (eng.clone(), seen.clone());
+        apply_hook::set(move || {
+            e.delete(x);
+            let t = e.tombstone_hlc(x);
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.k", 1u32);
+            ss.set((y, t));
+        });
+        let after = now_ns() + 10_000_000_000;
+        let out = syncer.apply_records(&[WireRecord::unsigned(
+            Hlc { wall: after, logical: 0, peer: 2 },
+            2,
+            DecodedOp::Tie { eid: x, himo_id: k, value: 8 },
+        )]);
+        let (y, t_x) = seen.get();
+        assert_ne!(y, 0, "前提: 割り込み点を通った");
+        assert_eq!(slot24(y), slot24(x), "前提: Y は X の場所を使い回した");
+        assert_ne!(t_x, Hlc::ZERO, "前提: X の削除の版数");
+        assert_eq!(out.applied, 0, "消えた行への名前の書き込みを当てた ({out:?})");
+        assert_eq!(
+            eng.name_deleted_at(k, PkValue::Local(8)),
+            Some(t_x),
+            "引いた後に使い回された X への改名 8 を、 消えた行への改名として扱わなかった"
+        );
+        assert!(eng.is_live(y), "Y が消えた");
+        assert_eq!(eng.get(y, "t.k"), Some(1));
     }
 
     /// 固定 path だと並列 test run (別 binary / 前回 run の残骸) と衝突するため pid を混ぜる
