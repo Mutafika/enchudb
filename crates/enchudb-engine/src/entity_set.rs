@@ -280,16 +280,18 @@ impl EntitySet {
     }
 
     /// リモート peer から届いた eid を「存在する」ことにする。
-    /// 既に live なら no-op。next_eid / live_count / live bitmap を整合的に更新する。
-    pub fn ensure_live(&self, eid: u32) {
-        if eid >= self.max_entities() { return; }
-        if self.set_bit(eid, true) { return; } // 既に live
+    /// 既に live なら no-op。next_eid / live_count / live bitmap を整合的に更新する。 生きている印を立てたのがこの呼び出しか
+    /// (既に live / 範囲の外は false)。
+    pub fn ensure_live(&self, eid: u32) -> bool {
+        if eid >= self.max_entities() { return false; }
+        if self.set_bit(eid, true) { return false; } // 既に live
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         // next_eid は「これまで allocate した最大 +1」の概念。local を超えていたら進める。
         let cur = self.next_eid_atomic().load(Ordering::Acquire);
         if eid >= cur {
             self.next_eid_atomic().store(eid + 1, Ordering::Release);
         }
+        true
     }
 
     #[inline]
