@@ -1933,6 +1933,19 @@ impl HimoStore {
         }
     }
 
+    /// [`for_each_in`](Self::for_each_in) の cell を Acquire で読む形 (cell ごとに [`get_value32`](Self::get_value32) /
+    /// `get_by_id` と同じ読み)。 なめた値で答えを決める所が、 なめてから 1 行ずつ読み直さずに済む (#949)。
+    pub fn for_each_in_acquire(&self, lo: u32, hi: u32, mut f: impl FnMut(u32, u64)) {
+        let col = self.col();
+        let end = hi.min(col.count());
+        for eid in lo..end {
+            let s = stored_sync(col, eid);
+            if s != 0 {
+                f(eid, s - 1);
+            }
+        }
+    }
+
     /// 列の長さ (値を書いたことのある一番大きい eid + 1)。 [`entities_with_value`](Self::entities_with_value) がなめる数。
     pub fn column_len(&self) -> u32 {
         self.col().count()

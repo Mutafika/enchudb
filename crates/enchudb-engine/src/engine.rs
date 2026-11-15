@@ -2528,6 +2528,26 @@ mod walk_key_full_decode {
     }
 }
 
+/// test 用の数え: [`Engine::settled_sync_records`] が写して decode した payload の数 (この thread の分、 #949)。 絞りを通らない行を
+/// 写していないかを見る。
+#[cfg(test)]
+mod settled_decodes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DECODES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add_decode() {
+        DECODES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// 今までの数を返して 0 に戻す。
+    pub(super) fn take_decodes() -> u64 {
+        DECODES.with(|c| c.replace(0))
+    }
+}
+
 /// test 用の数え: [`Engine::table_rows_with_himo`] がなめた cell の数 (この thread の分、 #940)。
 #[cfg(test)]
 mod table_scan_cells {
@@ -14831,6 +14851,28 @@ impl Engine {
     pub fn min_sync_ops_lsn(&self) -> Option<u32> {
         if !self.sync_tables_enabled() { return None; }
         let lsn_hid = self.himo_id("_sync_ops.lsn")? as u16;
+        // #949: ring の表の枠を Acquire でなめて、 なめた値で決める (前は `table_rows_with_value32` でなめた後に生きている行を全部
+        // `get_by_id32` で読み直した。 読み直しも同じ cell の Acquire の読みで、 答えは同じ: 枠の中の値のある cell の最小)
+        let ring = self
+            .himos
+            .get(lsn_hid as usize)
+            .zip(self.himo_table_get(lsn_hid as usize).filter(|&t| t != ANONYMOUS_TABLE).and_then(|t| self.tables.get(t as usize)));
+        #[cfg(test)]
+        let ring = ring.filter(|_| !table_scan_cells::full_scan());
+        if let Some((hs, table)) = ring {
+            let mut min_lsn: Option<u32> = None;
+            for (lo, hi) in table.extents() {
+                #[cfg(test)]
+                table_scan_cells::add(hi.min(hs.column_len()).saturating_sub(lo));
+                hs.for_each_in_acquire(lo, hi, |_, v| {
+                    let v = v as u32;
+                    if min_lsn.is_none_or(|m| v < m) {
+                        min_lsn = Some(v);
+                    }
+                });
+            }
+            return min_lsn;
+        }
         let mut min_lsn: Option<u32> = None;
         // #947: ring の表の枠だけなめる
         for (l, _) in self.table_rows_with_value32(lsn_hid, |_| true) {
@@ -15026,6 +15068,80 @@ impl Engine {
         // 終わりを先に読む: この後に載った行は lsn が大きいので入らない (読んでいる間に bridge が組の途中まで写しても見えない)
         let settled = self.sync_settled_lsn.load(Ordering::Acquire);
         self.sync_ops_between(0, settled)
+    }
+
+    /// #949: [`Self::settled_sync_ops`] の payload を `decode_sync_ops_payload` で record にし、 (書き手, 版数) が `keep` を満たす物
+    /// (lsn の順)。 答えは `settled_sync_ops().iter().filter_map(decode_sync_ops_payload).filter(|r| keep(r.author_peer, r.hlc))
+    /// .map(WireRecord::from)` と同じ。
+    ///
+    /// payload を写す前に header の (書き手, 版数) を ring の上で読んで `keep` で絞り、 残った行だけ写して decode する (前は配る側が
+    /// 全部の行を写して decode してから版数で絞っていた: ring 60 万行で publish 1 回 30〜40 ms、 peer ごと)。 `keep` は (書き手, 版数)
+    /// だけで決まるので、 同じ (書き手, 版数) の組 (#828 / #830) は全部入るか全部入らないか。
+    pub fn settled_sync_records(
+        &self,
+        keep: impl Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
+    ) -> Vec<crate::transport::WireRecord> {
+        use std::sync::atomic::Ordering;
+        if !self.sync_settled_known.load(Ordering::Acquire) {
+            self.transfer_oplog_to_sync_ops();
+        }
+        let settled = self.sync_settled_lsn.load(Ordering::Acquire);
+        if !self.sync_tables_enabled() {
+            return Vec::new();
+        }
+        let Some(cols) = self.sync_payload_cols() else { return Vec::new() };
+        // (lsn, 場所) の順に読む: payload の ring も lsn の順なので写しが続く。 前は場所の順に読んでから lsn で安定に並べた = 同じ lsn
+        // の行 (無いはず) は場所の順で、 答えの並びは同じ。 1 語に詰めて並べる (組の比べより速い)
+        let mut rows: Vec<u64> = self
+            .table_slots_with_value32(cols.lsn, |lsn| lsn <= settled)
+            .into_iter()
+            .map(|(lsn, slot)| (u64::from(lsn) << 32) | u64::from(slot))
+            .collect();
+        rows.sort_unstable();
+        let mut out = Vec::with_capacity(rows.len());
+        out.extend(rows.into_iter().filter_map(|k| self.sync_op_record_if(k as u32, (k >> 32) as u32, &cols, &keep)));
+        // 絞って少なくなった時は、 行の数で取った場所を返す
+        if out.capacity() > 2 * out.len() + 1024 {
+            out.shrink_to_fit();
+        }
+        out
+    }
+
+    /// #949: 場所 `slot` の行 (lsn の列の値 `lsn`) の payload を `decode_sync_ops_payload` した record のうち、 (書き手, 版数) が `keep` を
+    /// 満たす物。 `sync_op_payload(eid, cols).and_then(|b| decode_sync_ops_payload(&b)).filter(|r| keep(..))` と同じ答えを、 `keep` を
+    /// 満たさない行は写さずに出す。 header を読めない payload は decode もできない (`sync_ops_payload_author_hlc` は
+    /// `decode_sync_ops_payload` の検査の前半と同じ。 読めた (書き手, 版数) は decode した record の欄と同じ byte)。
+    ///
+    /// lsn は行をなめた時の値を使う (`sync_op_payload` は lsn の列を読み直す)。 なめた後にその場所が回収されて別の行に使い回されると、
+    /// ring の entry の lsn が違うので読まない (読み直すと、 lsn で並べて絞った位置に別の record を出しうる)。
+    fn sync_op_record_if(
+        &self,
+        slot: u32,
+        lsn: u32,
+        cols: &SyncPayloadCols,
+        keep: &impl Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
+    ) -> Option<crate::transport::WireRecord> {
+        let pick = |b: &[u8]| {
+            let (author, hlc) = enchudb_oplog::oplog::sync_ops_payload_author_hlc(b)?;
+            if !keep(author, hlc) {
+                return None;
+            }
+            #[cfg(test)]
+            settled_decodes::add_decode();
+            enchudb_oplog::oplog::decode_sync_ops_payload(b).map(crate::transport::WireRecord::from)
+        };
+        // `get_by_id32` と同じ cell の読み (場所で引く)
+        let cell = |hid: u16| self.himos.get(hid as usize)?.get_value32(slot);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(at) = cols.at
+            && let Some(handle) = cell(at)
+        {
+            return self.payload_ring(false)?.read_with(handle, lsn, pick)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = lsn;
+        let vid = cell(cols.legacy?)?;
+        pick(self.vocab.get(vid))
     }
 
     /// `_sync_ops` の `since_lsn < lsn <= through_lsn` の行の payload (lsn の順)。
@@ -24161,6 +24277,36 @@ impl Engine {
             .collect()
     }
 
+    /// #949: u32 の列 `hid` の値が `keep` を満たす行を `(値, 場所)` で、 場所の昇順に。 紐の表の枠を Acquire の読み
+    /// ([`HimoStore::for_each_in_acquire`]) でなめ、 なめた値で決める。 [`Engine::table_rows_with_value32`] (なめた後に残った行を
+    /// `get_by_id32` で読み直す) と同じ答え (読み直しも同じ cell の Acquire の読み) を、 1 つの cell を 1 回の読みで出す。 ring の行を
+    /// 全部読む所 (`settled_sync_records`) で使う。 表に属さない紐は `table_rows_with_value32` の答えを場所にする (前提も同じ)。
+    fn table_slots_with_value32(&self, hid: u16, keep: impl Fn(u32) -> bool) -> Vec<(u32, u32)> {
+        let Some(hs) = self.himos.get(hid as usize) else { return Vec::new() };
+        let table = self
+            .himo_table_get(hid as usize)
+            .filter(|&t| t != ANONYMOUS_TABLE)
+            .and_then(|t| self.tables.get(t as usize));
+        #[cfg(test)]
+        let table = table.filter(|_| !table_scan_cells::full_scan());
+        let Some(table) = table else {
+            return self.table_rows_with_value32(hid, keep).into_iter().map(|(v, eid)| (v, self.slot_unchecked(eid))).collect();
+        };
+        let mut extents = table.extents();
+        extents.sort_unstable();
+        let mut out = Vec::new();
+        for (lo, hi) in extents {
+            #[cfg(test)]
+            table_scan_cells::add(hi.min(hs.column_len()).saturating_sub(lo));
+            hs.for_each_in_acquire(lo, hi, |slot, v| {
+                if keep(v as u32) {
+                    out.push((v as u32, slot));
+                }
+            });
+        }
+        out
+    }
+
     /// 列 `himo_id` に値のある row を、 **新しい順** (その列の table が eid を払い出した逆順) に最大 `n` 件 (#21)。
     ///
     /// 「直近 N 件」 用。 table の払い出し済みの末尾から逆にたどり、 `n` 件そろった所で止まる — コストは
@@ -31790,6 +31936,327 @@ mod walk_key_tests {
         assert_eq!(old, now, "ring の walk の答えが直す前の読みと違う");
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_dir_all(&copy);
+    }
+}
+
+/// #949: 配る側の読み (`settled_sync_records`) が、 直す前の読み (`settled_sync_ops` で全部の payload を写して decode してから
+/// 絞る) と同じ record を同じ並びで出す。 ring の行を 1 回の Acquire の読みでなめる 2 か所 (`table_slots_with_value32` /
+/// `min_sync_ops_lsn`) が、 直す前の読み (なめた後に `get_by_id32` で読み直す) と同じ答え。
+#[cfg(test)]
+mod settled_records_tests {
+    use super::*;
+    use crate::transport::WireRecord;
+    use enchudb_oplog::oplog::{decode_sync_ops_payload, DecodedOp};
+    use enchudb_oplog::{Hlc, PeerId};
+
+    fn tmp(tag: &str) -> String {
+        let path = format!("{}/enchudb-949p-{}-{}", std::env::temp_dir().display(), tag, std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    type Key = (Hlc, PeerId, [u8; 64], [u8; 8], Vec<u8>);
+
+    fn key(r: &WireRecord) -> Key {
+        (r.hlc, r.author_peer, r.signature, r.pubkey_fp, r.signed_bytes.clone())
+    }
+
+    /// 直す前の読み: 配ってよい行の payload を全部写して decode し、 (書き手, 版数) で絞る。
+    fn full_copy(eng: &Engine, keep: &dyn Fn(PeerId, Hlc) -> bool) -> Vec<Key> {
+        eng.settled_sync_ops()
+            .iter()
+            .filter_map(|p| decode_sync_ops_payload(p))
+            .filter(|r| keep(r.author_peer, r.hlc))
+            .map(|r| key(&WireRecord::from(r)))
+            .collect()
+    }
+
+    /// 版数で絞る形 (`Syncer` の publish) と、 書き手ごとの cursor で絞って 1 人を外す形 (ホストの pull) を、 ring にある版数の端と
+    /// その前後で比べる。 `broken` は header は読めて decode できない行の数 (今の読みが decode する数の上限に足す)。 比べた中で、
+    /// 答えが全部でも空でもない回の数を返す。
+    fn check(eng: &Engine, broken: u64, what: &str) -> usize {
+        let ring: Vec<(PeerId, Hlc)> =
+            eng.pending_sync_ops(0).iter().filter_map(|p| decode_sync_ops_payload(p)).map(|r| (r.author_peer, r.hlc)).collect();
+        let mut hlcs: Vec<Hlc> = ring.iter().map(|x| x.1).collect();
+        hlcs.sort();
+        hlcs.dedup();
+        assert!(hlcs.len() > 10, "{what}: 前提: ring に版数が並ぶ ({})", hlcs.len());
+        let mut cuts = vec![Hlc::ZERO, Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX }];
+        let step = (hlcs.len() / 10).max(1);
+        for h in hlcs.iter().step_by(step).chain([hlcs[0], hlcs[hlcs.len() - 1]].iter()) {
+            cuts.push(*h);
+            cuts.push(Hlc { logical: h.logical.wrapping_sub(1), ..*h });
+            cuts.push(Hlc { logical: h.logical + 1, ..*h });
+        }
+        let mut authors: Vec<PeerId> = ring.iter().map(|x| x.0).collect();
+        authors.sort_unstable();
+        authors.dedup();
+        authors.push(4321);
+        let all = full_copy(eng, &|_, _| true).len();
+        let mut partial = 0;
+        let mut run = |keep: &dyn Fn(PeerId, Hlc) -> bool, label: &str| {
+            let want = full_copy(eng, keep);
+            let _ = settled_decodes::take_decodes();
+            let got: Vec<Key> = eng.settled_sync_records(keep).iter().map(key).collect();
+            let decodes = settled_decodes::take_decodes();
+            assert_eq!(got.len(), want.len(), "{what}: {label}: 数");
+            assert!(got == want, "{what}: {label}: 直す前の読みと違う");
+            // 写して decode するのは絞りを通った行だけ
+            assert!(
+                decodes >= got.len() as u64 && decodes <= got.len() as u64 + broken,
+                "{what}: {label}: 絞りの前に decode した ({decodes} 回、 答え {} 件)",
+                got.len()
+            );
+            if !want.is_empty() && want.len() < all {
+                partial += 1;
+            }
+        };
+        run(&|_, _| true, "全部");
+        for &since in &cuts {
+            run(&|_, h| h > since, &format!("since {since:?}"));
+        }
+        for (i, &to) in authors.iter().enumerate() {
+            for k in 0..4 {
+                let cursors: Vec<(PeerId, Hlc)> =
+                    authors.iter().enumerate().map(|(j, &a)| (a, cuts[(i * 7 + j * 3 + k * 5) % cuts.len()])).collect();
+                let cursor = |a: PeerId| cursors.iter().find(|(p, _)| *p == a).map_or(Hlc::ZERO, |(_, h)| *h);
+                run(&|a, h| a != to && h > cursor(a), &format!("to {to} cursors {cursors:?}"));
+            }
+        }
+        partial
+    }
+
+    /// 書き手が 3 人 (自分の Tie と、 中継した 2 人の Vocab。 中継した版数は自分の版数より前と後に散る) の ring を満杯にし、 最後の
+    /// 同じ (書き手, 版数) の組を ring の端で割る (#828: 配ってよい行の終わりが ring の先頭より手前)。 前の行を ack して回収すると、
+    /// 空いた場所に組の続きが載る (lsn の順と場所の順がずれる)。 どの段でも、 どの絞りでも、 直す前の読みと同じ。
+    #[test]
+    fn settled_records_match_the_full_copy_on_a_split_group() {
+        const ME: PeerId = 1;
+        const GROUP: usize = 300;
+        let path = tmp("split");
+        let group = (9u32, Hlc { wall: 5_000, logical: 3, peer: 9 });
+        {
+            let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+            eng.define_table("notes", 8).unwrap();
+            eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+            eng.set_peer_id(ME);
+            let ring = eng.table_eid_usage("_sync_ops").unwrap().capacity as usize;
+            assert!(ring > 300, "前提: ring の枠 ({ring})");
+            // 組の前半 100 本だけ載る
+            let fillers = ring - 100;
+            {
+                let _no_bridge = eng.transfer_lock_for_fold();
+                let e = eng.entity_in("notes").unwrap();
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                for i in 0..fillers as u32 {
+                    if i % 5 == 0 {
+                        // 中継した record: 書き手 7 / 9、 版数は自分の時計の前 (小さい wall) と後 (大きい wall) に散らす
+                        let author = if i % 10 == 0 { 7 } else { 9 };
+                        let wall = if i % 3 == 0 { 1_000 + u64::from(i) } else { now + 1_000_000 + u64::from(i % 17) };
+                        let rec = WireRecord::unsigned(
+                            Hlc { wall, logical: i % 4, peer: author },
+                            author,
+                            DecodedOp::Vocab { vid: i, bytes: format!("r{i}").into_bytes() },
+                        );
+                        assert!(eng.relay_record(&rec), "前提: 中継した record を WAL に載せた");
+                    } else {
+                        eng.tie_to(e, "notes.note", i);
+                    }
+                }
+                for vid in 0..GROUP as u32 {
+                    let rec = WireRecord::unsigned(group.1, group.0, DecodedOp::Vocab { vid, bytes: format!("g{vid}").into_bytes() });
+                    assert!(eng.relay_record(&rec), "前提: 組の record を WAL に載せた");
+                }
+                eng.oplog_commit();
+            }
+            while eng.transfer_oplog_to_sync_ops() > 0 {}
+            let on = |rows: Vec<Vec<u8>>| {
+                rows.iter().filter_map(|p| decode_sync_ops_payload(p)).filter(|r| (r.author_peer, r.hlc) == group).count()
+            };
+            let first = on(eng.pending_sync_ops(0));
+            assert!(first > 0 && first < GROUP, "前提: 組が ring の端で割れている ({first} / {GROUP})");
+            assert_eq!(on(eng.settled_sync_ops()), 0, "前提: 割れた組は配ってよい行に入らない");
+            assert!(check(&eng, 0, "割れた組") > 10, "前提: 一部だけ通す絞りがある");
+
+            // 前の 1 割を ack して回収 → 空いた場所に組の続きが載る (lsn の順と場所の順がずれる)。 組の残りより少ないので、 組はまだ割れたまま
+            let mine: Vec<Hlc> = eng
+                .pending_sync_ops(0)
+                .iter()
+                .filter_map(|p| decode_sync_ops_payload(p))
+                .filter(|r| r.author_peer == ME)
+                .map(|r| r.hlc)
+                .collect();
+            let cut = mine[mine.len() / 10];
+            let all = Hlc { wall: u64::MAX, logical: 0, peer: 0 };
+            let _ = eng.ack_sync_up_to_cursors(77, &[(ME, cut), (7, all), (9, all)]);
+            assert!(eng.reclaim_sync_ops() > 0, "前提: 回収した");
+            while eng.transfer_oplog_to_sync_ops() > 0 {}
+            let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+            let mut rows = eng.table_slots_with_value32(lsn_hid, |_| true);
+            rows.sort_unstable();
+            assert!(rows.windows(2).any(|w| w[0].1 > w[1].1), "前提: lsn の順と場所の順がずれている");
+            assert!(on(eng.pending_sync_ops(0)) > first, "前提: 組の続きが空いた場所に載った");
+            let settled_now = eng.settled_sync_ops().len();
+            assert!(settled_now < eng.pending_sync_ops(0).len(), "前提: 配ってよい行の終わりが ring の先頭より手前");
+            check(&eng, 0, "回収して使い回した後");
+            assert_eq!(Arc::strong_count(&eng), 1);
+        }
+        // 開き直した後 (bridge は WAL を頭から写し直す)
+        let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(ME);
+        check(&eng, 0, "開き直した後");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// decode できない行: header の読めない行 (dead row)、 header は読めて op の壊れた行、 辞書の payload の列の読める行 (0.30 以前の
+    /// 形)。 直す前の読みは写した後の decode で落とす / 読む。 今の読みも同じ。
+    #[test]
+    fn settled_records_drop_what_does_not_decode() {
+        let path = tmp("dead");
+        {
+            let mut eng = Engine::create_with_capacity(&path, 1 << 16).unwrap();
+            eng.define_table("t", 1000).unwrap();
+            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+            eng.define_himo_in("t", "s", ValueType::Tag, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 8 << 20).unwrap();
+        eng.set_peer_id(1);
+        let v = eng.himo_id("t.v").unwrap() as u16;
+        let rows: Vec<_> = (0..20).map(|_| eng.entity_in("t").unwrap()).collect();
+        for i in 0..400u64 {
+            match i % 7 {
+                0 => eng.tie_text_async(rows[(i % 20) as usize], "t.s", &format!("w{i}")),
+                3 => {
+                    let rec = WireRecord::unsigned(
+                        Hlc { wall: 10 + i, logical: 0, peer: 5 },
+                        5,
+                        DecodedOp::Vocab { vid: i as u32, bytes: b"x".to_vec() },
+                    );
+                    assert!(eng.relay_record(&rec));
+                }
+                _ => eng.tie_to_by_id(rows[(i % 20) as usize], v, i + 1),
+            }
+        }
+        eng.oplog_commit();
+        eng.oplog_sync().unwrap();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        let top = eng.current_sync_lsn();
+        for p in 2..5u32 {
+            eng.ack_sync(p, top / 2).unwrap();
+        }
+        assert!(eng.reclaim_sync_ops() > 0, "前提: 回収した");
+        let cols = eng.sync_payload_cols().unwrap();
+        let legacy = cols.legacy.expect("前提: 辞書の payload の列");
+        let src = eng.table_rows_with_value32(cols.lsn, |l| l > top / 2).into_iter().min().map(|(_, e)| e).unwrap();
+        let bytes = eng.sync_op_payload(src, &cols).unwrap();
+        let put = |lsn: u32, payload: &[u8]| {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_bytes_to_by_id(e, legacy, payload);
+            eng.tie_to_by_id(e, cols.lsn, lsn);
+        };
+        // 回収で空いた lsn に置く
+        put(top / 2 - 1, b"not a record");
+        let mut cut = bytes.clone();
+        cut.pop();
+        put(top / 2 - 2, &cut);
+        put(top / 2 - 3, &bytes);
+        assert!(
+            enchudb_oplog::oplog::sync_ops_payload_author_hlc(&cut).is_some() && decode_sync_ops_payload(&cut).is_none(),
+            "前提: header は読めて op の壊れた payload"
+        );
+        assert!(decode_sync_ops_payload(b"not a record").is_none());
+        let settled = eng.settled_sync_ops();
+        assert!(settled.iter().any(|p| p == &cut) && settled.iter().any(|p| p == b"not a record"), "前提: 配ってよい行に入る");
+        assert!(check(&eng, 1, "decode できない行") > 10, "前提: 一部だけ通す絞りがある");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// ring の lsn の列を 1 回の Acquire の読みでなめる 2 か所が、 なめた後に読み直す形と同じ答え。 ring (枠 98) の前に大きな表、
+    /// 後ろに表 `u`、 ring に枠を足し (足した枠は `u` の後ろ = 離れる)、 途中の行を消して場所を使い回す。 最小の lsn は枠の最初と最後
+    /// の場所の行にも置いて確かめる。
+    #[test]
+    fn slot_scan_and_min_match_the_reread() {
+        let path = tmp("slots");
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 3900).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.define_table("u", 16).unwrap();
+        eng.grow_table("_sync_ops", 40).unwrap();
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let reread = |eng: &Engine, keep: &dyn Fn(u32) -> bool| -> Vec<(u32, u32)> {
+            let mut r: Vec<(u32, u32)> =
+                eng.table_rows_with_value32(lsn_hid, keep).into_iter().map(|(v, e)| (v, eng.slot_unchecked(e))).collect();
+            r.sort_by_key(|x| x.1);
+            r
+        };
+        let check = |eng: &Engine, what: &str| {
+            for (label, keep) in [
+                ("全部", Box::new(|_: u32| true) as Box<dyn Fn(u32) -> bool>),
+                ("> 50", Box::new(|l: u32| l > 50)),
+                ("<= 97", Box::new(|l: u32| l <= 97)),
+                ("1", Box::new(|l: u32| l == 1)),
+                ("なし", Box::new(|_: u32| false)),
+            ] {
+                assert_eq!(eng.table_slots_with_value32(lsn_hid, &*keep), reread(eng, &*keep), "{what}: {label}");
+            }
+            let want = reread(eng, &|_| true).iter().map(|x| x.0).min();
+            assert_eq!(eng.min_sync_ops_lsn(), want, "{what}: min_sync_ops_lsn");
+        };
+        check(&eng, "行なし");
+        let mut live = Vec::new();
+        let mut lsn = 100u32;
+        for _ in 0..128 {
+            lsn += 1;
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, lsn);
+            live.push((e, lsn));
+        }
+        check(&eng, "128 行");
+        for (e, l) in live.iter().filter(|(_, l)| l % 3 == 0 || (140..160).contains(l)) {
+            assert!(eng.purge_sync_ops_row(*e, lsn_hid, *l));
+        }
+        for _ in 0..30 {
+            lsn += 1;
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, lsn);
+        }
+        check(&eng, "使い回した後");
+        // 最小の lsn を枠の端の場所の行に置く
+        let ext = eng.tables.iter().find(|t| t.name == "_sync_ops").unwrap().extents();
+        assert_eq!(ext.len(), 2, "前提: ring の枠が 2 つ");
+        let rows = reread(&eng, &|_| true);
+        let last = rows.iter().map(|x| x.1).max().unwrap();
+        let mut edges = 0;
+        for at in [ext[0].0, ext[0].1 - 1, ext[1].0, last] {
+            let Some(&(old, _)) = rows.iter().find(|x| x.1 == at) else { continue };
+            let e = eng.slot_eid(at);
+            eng.tie_to_by_id(e, lsn_hid, 1);
+            check(&eng, &format!("場所 {at} に最小"));
+            assert_eq!(eng.min_sync_ops_lsn(), Some(1), "場所 {at} の最小");
+            eng.tie_to_by_id(e, lsn_hid, old);
+            edges += 1;
+        }
+        assert_eq!(edges, 4, "前提: 枠の端の場所に行がある ({ext:?}、 最後の行 {last})");
+        // なめる cell は ring の枠以下 (列を頭からなめると t の幅を越える)
+        let _ = table_scan_cells::take();
+        let _ = eng.min_sync_ops_lsn();
+        let cells = table_scan_cells::take();
+        assert!(cells > 0 && cells <= 138, "min_sync_ops_lsn: 表の枠の外をなめた / 枠でなめていない ({cells})");
+        let _ = eng.table_slots_with_value32(lsn_hid, |_| true);
+        let cells = table_scan_cells::take();
+        assert!(cells > 0 && cells <= 138, "table_slots_with_value32: 表の枠の外をなめた / 枠でなめていない ({cells})");
+        eng.flush().unwrap();
+        drop(eng);
+        let eng = Engine::open_standalone(&path).unwrap();
+        check(&eng, "開き直した後");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 

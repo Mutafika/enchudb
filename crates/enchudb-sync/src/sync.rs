@@ -1662,7 +1662,8 @@ impl Syncer {
     /// のいずれか単一経路で配信した数)。
     ///
     /// request4: transport が `known_peers()` を返すなら **per-peer 経路** (=
-    /// `publish_since_for_peer` を全 peer に対して呼ぶ) で配信。 known_peers が
+    /// `publish_since_for_peer` を全 peer に対して呼ぶのと同じ配り方。 #949: record を
+    /// 集めるのは 1 回で、 peer の間で使い回す) で配信。 known_peers が
     /// 空なら **broadcast 経路** (= 旧 `publish_since` の挙動) にフォールバック。
     /// = 既存 caller (broadcast 前提) は API 不変で動く。
     pub fn publish_since(&self, since: Hlc) -> usize {
@@ -1686,10 +1687,25 @@ impl Syncer {
             return count;
         }
         let self_peer = self.engine.peer_id();
+        let peers: Vec<PeerId> = peers.into_iter().filter(|&p| p != self_peer).collect(); // 自分には送らない
+        if peers.is_empty() {
+            return 0;
+        }
+        // #949: record を集めるのは beat に 1 回 (前は peer ごとに `publish_since_for_peer` が ring を読み直した)。 伝える → 集める →
+        // 広告する の順は `publish_since_for_peer` と同じ。 peer ごとの `SubscriptionFilter` と配らなかった分の記録 (#219) も同じ
+        self.note_published_through();
+        let mut records = self.collect_records_since(since);
+        self.advertise_history_floor();
+        let last = peers.len() - 1;
         let mut total = 0usize;
-        for p in peers {
-            if p == self_peer { continue; } // 自分には送らない
-            total += self.publish_since_for_peer(p, since);
+        for (i, &p) in peers.iter().enumerate() {
+            let filtered = if i == last {
+                self.pick_for_peer(p, records.drain(..).map(std::borrow::Cow::Owned))
+            } else {
+                self.pick_for_peer(p, records.iter().map(std::borrow::Cow::Borrowed))
+            };
+            total += filtered.len();
+            self.transport.publish_to(self_peer, p, filtered);
         }
         total
     }
@@ -1760,17 +1776,8 @@ impl Syncer {
         let mine = *self.state_relay_owner.lock().unwrap() == Some(std::thread::current().id());
         let _relaying = (!mine).then(|| self.state_relay.read().unwrap_or_else(|p| p.into_inner()));
         // #828: 同じ (書き手, 版数) の組が ring の端で割れている間、 その組は出さない
-        let payloads = self.engine.settled_sync_ops();
-        let mut out = Vec::with_capacity(payloads.len());
-        for p in &payloads {
-            let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(p) else {
-                continue;
-            };
-            if rec.hlc > since {
-                out.push(WireRecord::from(rec));
-            }
-        }
-        out
+        // #949: 版数で絞ってから写す (前は ring の全部の行を写して decode してから絞った)。 絞りは版数だけで決まるので組は割らない
+        self.engine.settled_sync_records(|_, hlc| hlc > since)
     }
 
     /// request4: `target_peer` 限定で publish。 `SubscriptionFilter::should_send`
@@ -1784,6 +1791,22 @@ impl Syncer {
     pub fn publish_since_for_peer(&self, target_peer: PeerId, since: Hlc) -> usize {
         let self_peer = self.engine.peer_id();
         self.note_published_through();
+        let collected = self.collect_records_since(since);
+        let filtered = self.pick_for_peer(target_peer, collected.into_iter().map(std::borrow::Cow::Owned));
+        // #57: 集めた後に広告する (`publish_since` の broadcast 経路と同じ理由)
+        self.advertise_history_floor();
+        let count = filtered.len();
+        self.transport.publish_to(self_peer, target_peer, filtered);
+        count
+    }
+
+    /// 集めた record のうち `target_peer` に配る物 (`SubscriptionFilter::should_send`、 並びはそのまま)。 配らなかった record は
+    /// 書き手ごとの最大版数を覚える (#219)。 `publish_since` は集めた record を peer の間で使い回す (最後の peer は写さずに渡す)。
+    fn pick_for_peer<'a>(
+        &self,
+        target_peer: PeerId,
+        records: impl IntoIterator<Item = std::borrow::Cow<'a, WireRecord>>,
+    ) -> Vec<WireRecord> {
         let filter = self.subscription_filter.read().unwrap().clone();
         // #219: 落とした record は **puller の cursor が飛び越える** (cursor は
         // 受け取った record の author 別 max HLC で進む) ので、 差分 pull では
@@ -1793,9 +1816,9 @@ impl Syncer {
         let mut suppressed: std::collections::HashMap<PeerId, Hlc> =
             std::collections::HashMap::new();
         let mut filtered: Vec<WireRecord> = Vec::new();
-        for r in self.collect_records_since(since) {
+        for r in records {
             if filter.should_send(target_peer, &r) {
-                filtered.push(r);
+                filtered.push(r.into_owned());
                 continue;
             }
             let e = suppressed.entry(r.author_peer).or_insert(Hlc::ZERO);
@@ -1815,11 +1838,7 @@ impl Syncer {
                 }
             }
         }
-        // #57: 集めた後に広告する (`publish_since` の broadcast 経路と同じ理由)
-        self.advertise_history_floor();
-        let count = filtered.len();
-        self.transport.publish_to(self_peer, target_peer, filtered);
-        count
+        filtered
     }
 
     /// #219: `SubscriptionFilter` が `target_peer` 向けに落とした record の
@@ -3440,6 +3459,143 @@ mod tests {
         drop(syncer);
         drop(eng);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// #949: publish が配る record (peer ごと、 `SubscriptionFilter` 込み、 並びも)・数・配らなかった記録 (#219) が、 直す前の集め方
+    /// (配ってよい行の payload を全部写して decode し、 版数で絞る。 peer ごとに集め直す) から作った参照と同じ。 ring の書き手は 3 人
+    /// (自分の Tie と Vocab、 中継した 2 人の Vocab。 中継した版数は自分の版数の前と後に散る)。 broadcast の道 (peer の居ない
+    /// transport) と、 peer 1 人 (自分だけ) / 複数の道、 `publish_since_for_peer`。
+    #[test]
+    fn publish_hands_out_what_the_full_copy_did() {
+        use std::sync::Mutex;
+        /// 受けた record を宛先ごとに覚える (broadcast は `u32::MAX`)
+        struct Rec {
+            peers: Vec<PeerId>,
+            got: Mutex<Vec<(PeerId, Vec<WireRecord>)>>,
+        }
+        impl Transport for Rec {
+            fn pull(&self, _from: PeerId, _since: Hlc) -> Vec<WireRecord> {
+                Vec::new()
+            }
+            fn publish(&self, _peer: PeerId, records: Vec<WireRecord>) {
+                self.got.lock().unwrap().push((u32::MAX, records));
+            }
+            fn publish_to(&self, _from: PeerId, to: PeerId, records: Vec<WireRecord>) {
+                self.got.lock().unwrap().push((to, records));
+            }
+            fn known_peers(&self) -> Vec<PeerId> {
+                self.peers.clone()
+            }
+        }
+        struct Pick;
+        impl SubscriptionFilter for Pick {
+            fn should_send(&self, to: PeerId, r: &WireRecord) -> bool {
+                match to {
+                    5 => true,
+                    6 => r.author_peer != 7,
+                    7 => r.hlc.logical.is_multiple_of(2),
+                    _ => false,
+                }
+            }
+        }
+        type Key = (Hlc, PeerId, [u8; 64], [u8; 8], Vec<u8>);
+        let key = |r: &WireRecord| -> Key { (r.hlc, r.author_peer, r.signature, r.pubkey_fp, r.signed_bytes.clone()) };
+
+        let path = test_path("949publish");
+        let _rm = Rm(path.clone());
+        let eng = new_eng(&path, 1);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let rows: Vec<_> = (0..20).map(|_| eng.entity_in("rows").unwrap()).collect();
+        for i in 0..300u32 {
+            let e = rows[(i % 20) as usize];
+            match i % 6 {
+                0 => eng.tie_text_async(e, "rows.name", &format!("w{i}")),
+                2 | 5 => {
+                    let author = if i % 4 == 0 { 7 } else { 9 };
+                    let wall = if i % 3 == 0 { 100 + u64::from(i) } else { now + 1_000_000 + u64::from(i % 13) };
+                    let rec = WireRecord::unsigned(
+                        Hlc { wall, logical: i % 5, peer: author },
+                        author,
+                        DecodedOp::Vocab { vid: i, bytes: format!("r{i}").into_bytes() },
+                    );
+                    assert!(eng.relay_record(&rec), "前提: 中継した record を WAL に載せた");
+                }
+                _ => eng.tie_async(e, "rows.val", i),
+            }
+        }
+        eng.oplog_commit();
+        eng.oplog_sync().unwrap();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        // 直す前の集め方
+        let old = |since: Hlc| -> Vec<WireRecord> {
+            eng.settled_sync_ops()
+                .iter()
+                .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
+                .filter(|r| r.hlc > since)
+                .map(WireRecord::from)
+                .collect()
+        };
+        let all = old(Hlc::ZERO);
+        let mut authors: Vec<PeerId> = all.iter().map(|r| r.author_peer).collect();
+        authors.sort_unstable();
+        authors.dedup();
+        assert_eq!(authors, vec![1, 7, 9], "前提: ring の書き手");
+        assert!(all.windows(2).any(|w| w[0].hlc > w[1].hlc), "前提: ring の並び (lsn) と版数の並びがずれている");
+        let mut hlcs: Vec<Hlc> = all.iter().map(|r| r.hlc).collect();
+        hlcs.sort();
+        let mut cuts = vec![Hlc::ZERO, Hlc { wall: u64::MAX, logical: 0, peer: 0 }];
+        cuts.extend(hlcs.iter().step_by(hlcs.len() / 8).copied());
+        cuts.push(hlcs[hlcs.len() - 1]);
+        let filter = Pick;
+        let mut partial = 0;
+        for &since in &cuts {
+            let want_all = old(since);
+            if !want_all.is_empty() && want_all.len() < all.len() {
+                partial += 1;
+            }
+            for peers in [vec![], vec![1], vec![1, 5], vec![5, 1, 6, 7, 8]] {
+                let tr = Arc::new(Rec { peers: peers.clone(), got: Mutex::new(Vec::new()) });
+                let syncer = Syncer::new(eng.clone(), tr.clone() as Arc<dyn Transport>);
+                syncer.set_subscription_filter(Arc::new(Pick));
+                let n = syncer.publish_since(since);
+                let got: Vec<(PeerId, Vec<Key>)> =
+                    tr.got.lock().unwrap().iter().map(|(p, v)| (*p, v.iter().map(key).collect())).collect();
+                // 参照: peer の居ない transport は broadcast (filter なし)、 居れば自分以外の peer ごとに filter
+                let mut want: Vec<(PeerId, Vec<Key>)> = Vec::new();
+                if peers.is_empty() {
+                    want.push((u32::MAX, want_all.iter().map(key).collect()));
+                } else {
+                    for &p in peers.iter().filter(|&&p| p != 1) {
+                        want.push((p, want_all.iter().filter(|r| filter.should_send(p, r)).map(key).collect()));
+                    }
+                }
+                assert!(got == want, "since {since:?} peers {peers:?}: 配った record が直す前と違う");
+                assert_eq!(n, want.iter().map(|(_, v)| v.len()).sum::<usize>(), "since {since:?} peers {peers:?}: 数");
+                for &p in peers.iter().filter(|&&p| p != 1) {
+                    let mut w: std::collections::BTreeMap<PeerId, Hlc> = std::collections::BTreeMap::new();
+                    for r in want_all.iter().filter(|r| !filter.should_send(p, r)) {
+                        let e = w.entry(r.author_peer).or_insert(Hlc::ZERO);
+                        *e = (*e).max(r.hlc);
+                    }
+                    let mut s = syncer.suppressed_since(p).unwrap_or_default();
+                    s.sort();
+                    assert_eq!(s, w.into_iter().collect::<Vec<_>>(), "since {since:?} peers {peers:?}: 配らなかった記録 (peer {p})");
+                }
+                // peer を名指しする道
+                let tr = Arc::new(Rec { peers: vec![], got: Mutex::new(Vec::new()) });
+                let syncer = Syncer::new(eng.clone(), tr.clone() as Arc<dyn Transport>);
+                syncer.set_subscription_filter(Arc::new(Pick));
+                assert_eq!(syncer.publish_since_for_peer(6, since), want_all.iter().filter(|r| filter.should_send(6, r)).count());
+                let got: Vec<(PeerId, Vec<Key>)> =
+                    tr.got.lock().unwrap().iter().map(|(p, v)| (*p, v.iter().map(key).collect())).collect();
+                assert!(
+                    got == vec![(6, want_all.iter().filter(|r| filter.should_send(6, r)).map(key).collect())],
+                    "since {since:?}: publish_since_for_peer"
+                );
+            }
+        }
+        assert!(partial >= 4, "前提: 一部だけ配る since がある ({partial})");
+        drop(eng);
     }
 
     /// publish_since_for_peer を直接呼んだ場合の動作確認。
