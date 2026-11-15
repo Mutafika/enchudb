@@ -512,6 +512,22 @@ pub trait Transport: Send + Sync {
         self.publish(from, records);
     }
 
+    /// #955: [`Self::publish_to`] の、 record を借りて受ける形。 `Syncer::publish_since` は宛先が 2 つ以上ある時、 最後の宛先の前の
+    /// 宛先にはこちらを呼ぶ (集めた record を宛先ごとに写さないため。 最後の宛先には `publish_to` で渡す)。 既定は写して `publish_to`
+    /// に渡す (今までと同じ)。 record を持たずに送るだけの transport (encode して送る等) は上書きすると写しが要らない。 上書きしても、
+    /// 受けた record の中身・並びは `publish_to` と同じに扱うこと。
+    fn publish_to_refs(&self, from: PeerId, to: PeerId, records: &[&WireRecord]) {
+        self.publish_to(from, to, records.iter().map(|r| (*r).clone()).collect());
+    }
+
+    /// #955: `from` が `to` へ送る record のうち、 [`Self::publish_to`] が送らずに捨てる位置 (書き手ごとの版数: その版数以下の
+    /// その書き手の record は送らない)。 `Syncer` は、 `SubscriptionFilter` が全部を通す時、 これを先に聞いてその位置以下の record を
+    /// 集めない (写して decode しない)。 返す位置は、 この後の `publish_to` が捨てる位置以下である事 (捨てる位置が下がらない transport
+    /// だけが返す)。 既定は `None` (聞かない)。 ホストの client の transport (`HttpHostTransport`) は、 ホストが受けた位置を返す。
+    fn publish_floor(&self, _from: PeerId, _to: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
+        None
+    }
+
     /// `to` peer 視点で `from` peer から HLC `since` 以降の records を pull
     /// (request4 partial sync 用)。 broadcast log + (from, to) targeted log を
     /// merge して返す想定。 default は `pull(from, since)` フォールバック (=

@@ -66,6 +66,13 @@ pub trait SubscriptionFilter: Send + Sync {
         let _ = (target_peer, record);
         true
     }
+
+    /// #955: どの宛先のどの record にも `should_send` が true を返すか。 true なら `Syncer` は `should_send` を呼ばずに全部を渡し、
+    /// transport が送らずに捨てる位置 (`Transport::publish_floor`) を先に聞いて、 その位置以下の record を集めない (落とす record が
+    /// 無いので、 配らなかった記録 #219 は変わらない)。 既定は false (呼んで確かめる)。 [`AllRecords`] は true。
+    fn sends_all(&self) -> bool {
+        false
+    }
 }
 
 /// 既定 filter — 全 record を全 peer に送る (= `Syncer` の旧来動作 = SaaS 用)。
@@ -74,7 +81,11 @@ pub trait SubscriptionFilter: Send + Sync {
 /// まで、 `publish_since_for_peer` は全 record を素通しで送る。
 pub struct AllRecords;
 
-impl SubscriptionFilter for AllRecords {}
+impl SubscriptionFilter for AllRecords {
+    fn sends_all(&self) -> bool {
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {
