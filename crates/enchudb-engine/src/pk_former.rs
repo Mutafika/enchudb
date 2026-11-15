@@ -403,6 +403,19 @@ impl PkFormer {
         true
     }
 
+    /// 名前 `(himo, key)` を前の名前として持つ行から外す (#921 の読み直し [5]: 場所を使い回した自分の消えた行への改名で、 その名前が
+    /// 消えた行の名前になった時。 場所を使い回していない peer は消えた行の slot に付け替える = [`Self::insert`] の 「後から改名した方に
+    /// する」 で外れる。 消えた行は slot を持たないので外すだけ)。 変えたら true。
+    pub(crate) fn release_key(&mut self, himo: u16, key: &[u8]) -> bool {
+        let k = (himo, Box::<[u8]>::from(key));
+        let Some(old) = self.by_key.remove(&k) else { return false };
+        if let Some(v) = self.by_slot.get_mut(&old) {
+            v.retain(|x| *x != k);
+        }
+        self.touch(old);
+        true
+    }
+
     /// identity `(peer, foreign_local)` に名前 `(himo, key)` を足す (消えた行の slot を使い回す時、 #545)。 変えたら true。
     pub(crate) fn insert_identity(&mut self, peer: u32, foreign_local: u32, himo: u16, key: &[u8]) -> bool {
         let names = self.by_identity.entry((peer, foreign_local)).or_default();

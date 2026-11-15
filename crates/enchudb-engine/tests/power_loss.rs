@@ -3049,3 +3049,115 @@ fn a_deleted_translated_row_keeps_its_tombstone_after_power_loss() {
         "state に受けた行 F の Delete が無い"
     );
 }
+
+/// review930 [1] の DB: sync する (cell の版数あり)、 表 t (枠 2、 c = Number)、 peer A = 1。 C (peer 3) の行 F (`world_f`) を受けて
+/// 写像と本体を書き出し、 consumer の周期を止めた engine と c の紐を渡す。
+fn received_row_engine(db: &Path, world_f: u64) -> (Arc<Engine>, u16) {
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 2).unwrap();
+    eng.define_himo_in("t", "c", ValueType::Number, 0).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let hid = eng.himo_id("t.c").unwrap() as u16;
+    let t = eng.resolve_remote_eid(world_f, hid).unwrap();
+    assert!(eng.remote_tie_apply_result(t, hid, 5u32, Hlc { wall: 1_000, logical: 0, peer: 3 }).applied());
+    eng.persist_sync_state().unwrap(); // 写像と本体を書き出す
+    eng.oplog_sync().unwrap();
+    assert_eq!(eng.pull_raw("t.c", 5u32).len(), 1, "前提: A に F がある");
+    (eng, hid)
+}
+
+/// review930 [1] (a): A が受けた行 F (C の行、 写像 (C,f)→場所 s) に C の削除を当てた後、 本体を書き出す前に `.eidmap` だけが disk に
+/// 届いた (本体を書き出さずに `.eidmap` を書く公開の `persist_tables()`。 WAL の空け作り `make_wal_room_inner`・新しい紐を足す受信
+/// `ensure_himo_dynamic_in` も同じ順) 像を開く。 写像の面には削除の版数があり、 場所 s は生きていて (F の cell は削除より古い)、 場所の
+/// 削除の版数は無い。
+///
+/// 前は #925 の見分けがこれを 「落ちる前に場所を使い回した」 と読んで写像を外し、 F は持ち主の居ない生きた行のまま残った (削除が
+/// 届き直しても退避表で止まる。 A の state は F を A の行として出した)。 今は、 場所の行が削除の後に作り直された時 (cell が全部削除より
+/// 新しい) だけ外す。 ここは写像と削除の版数を戻し、 開く時の sweep が F を消す。
+#[test]
+fn a_received_delete_whose_eidmap_reached_disk_before_the_body_still_removes_the_row() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("eidmap_before_body_received");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    {
+        let (eng, _) = received_row_engine(&live.join("db"), world_f);
+        let _hold = eng.hold_consumer();
+        assert!(
+            eng.remote_delete_apply_foreign(world_f, Hlc { wall: 2_000, logical: 0, peer: 3 }),
+            "前提: C の削除が当たった"
+        );
+        assert!(eng.pull_raw("t.c", 5u32).is_empty(), "前提: F は消えた");
+        // 本体を書き出さずに `.eidmap` を書く
+        eng.persist_tables().unwrap();
+        assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "前提: `.eidmap` に F の削除の版数が届いた");
+        crashsim::capture(&live, &img, Mode::Lost).unwrap();
+    }
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let rows = eng.pull_raw("t.c", 5u32);
+    let mapped = eng.resolve_remote_eid_existing(world_f);
+    let (records, _) = eng.state_records();
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(rows.is_empty(), "電源断の像で、 受けた削除の F が写像の無い生きた行として残った: {rows:x?}");
+    assert!(mapped.is_some(), "F の写像が戻らない (外した)");
+    assert!(
+        !records.iter().any(|r| matches!(r.op, DecodedOp::Tie { value: 5, .. })),
+        "A の state に F の値を持つ行がある"
+    );
+}
+
+/// review930 [1] (b): A のアプリが受けた行 F を消し、 WAL (Delete) と `.eidmap` (写像の面の削除の版数) だけが disk に届いた像を開く。
+/// 再生は F を消す。 前は #925 の見分けが写像を外していて、 bridge は Delete を自分の世界番号 (A, F の場所) で配った = 相手 (C も
+/// 他の peer も) は知らない A の行の削除として退避表に載せるだけで、 F は A でだけ消えた。 今は写像を戻し、 Delete は (C, f) 宛て。
+#[test]
+fn a_local_delete_of_a_translated_row_whose_eidmap_reached_disk_before_the_body_goes_to_its_owner() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("eidmap_before_body_local");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    {
+        let (eng, _) = received_row_engine(&live.join("db"), world_f);
+        let _hold = eng.hold_consumer();
+        let f = eng.pull_raw("t.c", 5u32);
+        eng.delete(f[0]);
+        assert!(eng.pull_raw("t.c", 5u32).is_empty(), "前提: F は消えた");
+        eng.oplog_commit();
+        // WAL だけ書き出す (本体は書き出さない) 後に、 本体を書き出さずに `.eidmap` を書く
+        eng.oplog_arc().unwrap().fsync().unwrap();
+        eng.persist_tables().unwrap();
+        assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "前提: `.eidmap` に F の削除の版数が届いた");
+        crashsim::capture(&live, &img, Mode::Lost).unwrap();
+    }
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let rows = eng.pull_raw("t.c", 5u32);
+    let deletes: Vec<u64> = distributed(&eng)
+        .into_iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } => Some(eid),
+            _ => None,
+        })
+        .collect();
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(rows.is_empty(), "前提: 再生が F を消した");
+    assert_eq!(deletes, vec![world_f], "F の Delete が持ち主の世界番号 (C, f) 宛てに配られない ({deletes:x?})");
+}

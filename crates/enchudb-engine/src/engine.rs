@@ -341,6 +341,12 @@ struct FormerAddresses {
 /// [`FormerAddresses`] の 1 つ: (宛名, 変わる時の WAL の位置, 宛名の行の世代)。
 type FormerAddress = ((enchudb_oplog::PeerId, u32), u64, u32);
 
+/// #925 の C2: `entity_in` の再利用の道が、 場所を生かす前に済ませた前の住人の後始末 (`Engine::prepare_reuse`)。
+struct ReusePrep {
+    /// 置いた前の宛名の覚えの鍵 (取れなかったら外す)
+    remembered: Option<(u32, enchudb_oplog::Hlc)>,
+}
+
 /// #779: [`FormerAddresses`] に覚える数の上限。 bridge が進めば外れるので、 越えるのは bridge が止まったまま slot を回し続けた時だけ。
 /// 越えた分は覚えない (その slot の前の住人宛ての record は、 前と同じく bridge する時の逆写像で出る)。
 const FORMER_ADDRESS_LIMIT: usize = 1 << 20;
@@ -2519,9 +2525,95 @@ mod claim_gap_hook {
     }
 }
 
-/// test 用の割り込み点: `entity_in` が空きの一覧から取り出した slot に生きている印を立てる前 (#883)。 置いた WAL で 1 回だけ呼ぶ。
+/// test 用の割り込み点: `entity_in` が空きの一覧から取り出した slot に生きている印を立てる前 (#883。 #925 から、 生きていないのを確かめた
+/// 後・前の住人の後始末の前)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod pop_claim_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `entity_in` が空きの一覧から取り出した場所の、 前の住人の後始末 (`prepare_reuse`) を済ませた後・場所を生かす前
+/// (#925 の C2)。 置いた WAL で 1 回だけ呼ぶ。 呼ぶのは表の `free_locals` と場所の行の lock を握ったまま (#931)。
+#[cfg(test)]
+mod reuse_prepared_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `entity_in` が空きの一覧から取り出した場所に生きている印を立てた直後 (場所を取った後・`entity_in` が返る前、
+/// #925 の C2)。 置いた WAL で 1 回だけ呼ぶ。 呼ぶのは表の `free_locals` と場所の行の lock を握ったまま (中で同じ表に `entity_in` しない)。
+#[cfg(test)]
+mod reuse_claim_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 受信の Delete が行の lock の下で 「引いた行がまだ場所に居る」 を確かめた後・消す前 (#931)。 置いた WAL で 1 回だけ
+/// 呼ぶ。 呼ぶのは行の lock を握ったまま。
+#[cfg(test)]
+mod delete_locked_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 削除 (受信の Delete・アプリの `delete`) が行の lock の下で消す行の名前を取って lock を放した後・その名前を持つ
+/// 行を消す前 (review930 [4])。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod names_taken_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 消えた行への改名 (`name_given_to_dead_row`) が行の lock の下で 「引いた行がまだ場所の行で、 消えている」 を
+/// 確かめた後・名前を足す前 (review930 [5])。 置いた WAL で 1 回だけ呼ぶ。 呼ぶのは行の lock を握ったまま。
+#[cfg(test)]
+mod dead_name_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -3675,7 +3767,8 @@ mod eid_gen_claim_tests {
     /// #913: 受信・束ねの道 (`ensure_live_slot`、 ここでは名前で束ねる `bind_remote_eid` が消えた行を指した形) が死の印を落とした後・
     /// 生きている印を立てる前に、 別の書き手がその場所を使い回して消し終えると、 生きている印が殺された場所に立つ (「生きている、
     /// 死の印あり」 = きれいに閉じなかった後の突き合わせが、 生かした行を消す)。 消す書き手は行の lock を待たされるか (直した形)、
-    /// 消し終える (直す前) まで割り込み点で待つ (時間で待たない)。
+    /// 消し終える (直す前) まで割り込み点で待つ (時間で待たない)。 #931 から使い回しの道も場所の行を握るので、 別の書き手の insert は
+    /// 握られた場所を飛ばして (待たされた印 = "blocked") 束ねた後に別の場所を取る (同じ場所を取った時だけ消す)。
     #[test]
     fn a_slot_reused_and_deleted_while_ensure_live_revives_it_has_consistent_marks() {
         let (path, eng) = engine("ensurelive");
@@ -3697,20 +3790,26 @@ mod eid_gen_claim_tests {
             // 印を落とした後・生きている印を立てる前に、 別の thread が同じ場所を使い回して (空きの一覧から) 消す
             let h = std::thread::spawn(move || {
                 let b = e2.entity_in("u").unwrap();
-                assert_eq!(e2.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
-                e2.delete(b);
+                let taken = e2.slot_unchecked(b);
+                if taken == slot {
+                    e2.delete(b);
+                }
                 let _ = tx.send("deleted");
+                taken
             });
             let first = rx.recv().unwrap();
             join_tx.send((h, first)).unwrap();
         });
         let _ = eng.bind_remote_eid(2, enchudb_oplog::make_eid(2, 7), r);
         let (h, first) = join_rx.recv().unwrap();
-        h.join().unwrap();
+        let taken = h.join().unwrap();
         let (live, dead) = (eng.entities.is_live(slot), eng.generations().is_dead(slot));
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
+        // review930 [3]: 間の insert は、 束ねが握る行で止められた (#913: 束ねは行を握って生かす、 #931: 使い回しは握られた場所を飛ばす)
+        assert_eq!(first, "blocked", "間の insert が、 束ねの握る行に止められずに同じ場所を使い回して消した");
+        assert_ne!(taken, slot, "間の insert が、 束ねの握る場所を取った");
         assert!(!(live && dead), "生きている印が死の印のある場所に立った (間の書き手: {first})");
     }
 
@@ -3999,6 +4098,493 @@ mod gone_own_delete_tests {
         assert!(t_a.is_some(), "前提: 取り出した削除の名前は載った");
         assert_ne!(t_w, enchudb_oplog::Hlc::ZERO, "前提: W の削除の版数");
         assert_eq!(got, Some(t_w), "載せている最中に積んだ削除の名前が、 印が下りて見えなくなった");
+    }
+}
+
+/// #925 の C2: `entity_in` の再利用の道で、 前の住人の後始末 (前の宛名の覚え・自分の消えた行の退避・翻訳した行の写像を外す) を
+/// 場所を生かす前に済ませる。 生かした後 (割り込み点 `reuse_claim_hook`) に届いた受信・走った bridge は、 後始末の済んだ形を見る。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod reuse_order_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// 翻訳した行を作った peer。
+    const C: u32 = 3;
+
+    /// 枠 `cap` の表 `t` (名前 `k`、 `v`) を持つ、 sync の表のある WAL 付きの engine (peer 1)。
+    fn engine(tag: &str, cap: u32) -> (String, Arc<Engine>, u16) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-reuseorder-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_table("t", cap).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        (path, eng, k)
+    }
+
+    fn cleanup(path: &str, eng: Arc<Engine>) {
+        drop(eng);
+        let _ = crate::db_files::remove_db(path);
+        let _ = std::fs::remove_file(oplog_path_for(path));
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn at(wall: u64, peer: u32) -> enchudb_oplog::Hlc {
+        enchudb_oplog::Hlc { wall, logical: 0, peer }
+    }
+
+    /// C の行 (番号 `f`、 名前 `name`) を受けて、 C の削除 (版数 `deleted`) も受ける。 中の eid を返す。
+    fn receive_deleted(eng: &Engine, k: u16, f: u32, name: u32, made: enchudb_oplog::Hlc, deleted: enchudb_oplog::Hlc) -> u64 {
+        let world = enchudb_oplog::make_eid(C, f);
+        let local = eng.resolve_remote_eid(world, k).expect("前提: C の行に場所を払い出した");
+        assert!(eng.remote_tie_apply(local, k, name, made), "前提: C の行の名前を当てた");
+        assert!(eng.remote_delete_apply_foreign(world, deleted), "前提: C の削除を当てた");
+        assert!(!eng.is_live_unchecked(local), "前提: C の行は消えた");
+        local
+    }
+
+    /// review921 の [3] の残り: 自分の消えた行 X (名前 7) の場所を使い回す書き手が場所を取った直後 (以前の 「場所を取る 〜 退避」 の
+    /// 窓) に届いた、 B の X 宛てのより新しい削除も、 移した削除の版数と名前 7 の削除の時刻を上げる (使い回しの後に届いた時と同じ)。
+    ///
+    /// 前は退避が場所を取った後だったので、 その窓の削除は入口 (`is_gone_own_eid` が真) から退避の無い番号の削除として何もせずに落ち、
+    /// 後から退避した版数は A の削除のままだった。
+    #[test]
+    fn a_newer_delete_right_after_the_claim_raises_the_moved_delete() {
+        let (path, eng, k) = engine("keep", 2);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        let z = eng.entity_in("t").unwrap();
+        eng.tie_to(z, "t.k", 1u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t_a = eng.tombstone_hlc(x);
+        assert_ne!(t_a, enchudb_oplog::Hlc::ZERO, "前提: X の削除の版数");
+        let t_b = at(t_a.wall + 1_000, 2);
+        let raised: Arc<Mutex<Option<bool>>> = Default::default();
+        {
+            let (e2, raised) = (eng.clone(), raised.clone());
+            reuse_claim_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                *raised.lock().unwrap() = Some(e2.remote_delete_apply_foreign(x, t_b));
+            });
+        }
+        let y = eng.entity_in("t").unwrap();
+        let raised = raised.lock().unwrap().expect("前提: 場所を取った直後の割り込み点を通った");
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(x), "前提: X の場所を使い回した");
+        eng.tie_to(y, "t.k", 7u32);
+        assert!(raised, "場所を取った直後に届いた X 宛ての、 より新しい削除が当たらなかった");
+        assert_eq!(eng.foreign_tombstone_of(1, enchudb_oplog::eid_local(x)), Some(t_b), "移した削除の版数を上げない");
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(7)), Some(t_b), "名前 7 の削除の時刻を上げない");
+        assert!(eng.is_live(y), "B の削除の後に作った Y が消えた");
+        assert!(eng.is_live(z), "他の行が消えた");
+        cleanup(&path, eng);
+    }
+
+    /// review919-922 の [B2]: 消えた翻訳した行 F0 (C の行) の場所を使い回す書き手が場所を取った直後に届いた、 F0 宛ての (別の peer の、
+    /// より新しい) 削除は、 使い回した新しい行 Y を消さない。 F0 の削除の版数を上げるだけ (使い回しの後に届いた時と同じ)。
+    ///
+    /// 前は写像 (C, f0) → 場所 を外すのが場所を取った後だったので、 その窓の削除は写像から場所を引き、 場所の最後の行 = Y を消した
+    /// (アプリの insert が死んだ行の eid を返した)。
+    #[test]
+    fn a_delete_of_the_translated_row_right_after_the_claim_does_not_remove_the_new_row() {
+        let (path, eng, k) = engine("evict", 1);
+        let base = now_ms();
+        let f0 = receive_deleted(&eng, k, 100, 5, at(base, C), at(base + 1, C));
+        let t_b = at(base + 2, 2);
+        let out: Arc<Mutex<Option<bool>>> = Default::default();
+        {
+            let (e2, out) = (eng.clone(), out.clone());
+            reuse_claim_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                *out.lock().unwrap() = Some(e2.remote_delete_apply_foreign(enchudb_oplog::make_eid(C, 100), t_b));
+            });
+        }
+        let y = eng.entity_in("t").unwrap();
+        out.lock().unwrap().expect("前提: 場所を取った直後の割り込み点を通った");
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(f0), "前提: F0 の場所を使い回した");
+        eng.tie_to(y, "t.v", 70u32);
+        assert!(eng.is_live(y), "場所を取った直後に届いた F0 宛ての削除が、 使い回した Y を消した");
+        assert_eq!(eng.get(y, "t.v"), Some(70));
+        assert_eq!(eng.foreign_tombstone_of(C, 100), Some(t_b), "F0 の削除の版数を上げない");
+        cleanup(&path, eng);
+    }
+
+    /// review919-922 の [A3]: 翻訳した行 F0 に自分が書いた record (まだ bridge していない) を、 F0 の場所を使い回す書き手が場所を取った
+    /// 直後に bridge が読んでも、 F0 の世界番号 (C, f0) 宛てに配る。
+    ///
+    /// 前は前の宛名を覚えるのが場所を取った後だったので、 その窓の bridge は場所の最後の行 (Y) と record の行の世代が違い、 覚えも無い
+    /// = 宛名の分からない書き込みとして配らなかった (#919 の前は自分の世界番号で出して相手に幻の行を作った)。
+    #[test]
+    fn the_bridge_right_after_the_claim_addresses_the_translated_row() {
+        let (path, eng, k) = engine("bridge", 1);
+        let hold = eng.hold_consumer();
+        let base = now_ms();
+        let world = enchudb_oplog::make_eid(C, 100);
+        let f0 = eng.resolve_remote_eid(world, k).expect("前提: C の行に場所を払い出した");
+        assert!(eng.remote_tie_apply(f0, k, 5u32, at(base, C)), "前提: C の行の名前を当てた");
+        // 自分が F0 に書く (bridge はまだ。 `oplog_sync` は bridge するので呼ばない)
+        eng.tie_to(f0, "t.v", 55u32);
+        eng.oplog_commit();
+        assert!(eng.pending_sync_ops(0).is_empty(), "前提: F0 に書いた record はまだ bridge していない");
+        assert!(eng.remote_delete_apply_foreign(world, at(base + 1, C)), "前提: C の削除を当てた");
+        {
+            let e2 = eng.clone();
+            reuse_claim_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                e2.transfer_oplog_to_sync_ops();
+            });
+        }
+        let y = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(f0), "前提: F0 の場所を使い回した");
+        let v = eng.himo_id("t.v").unwrap() as u16;
+        let bridged: Vec<_> = eng
+            .pending_sync_ops(0)
+            .iter()
+            .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
+            .filter_map(|r| match r.op {
+                enchudb_oplog::oplog::DecodedOp::Tie { eid, himo_id, value } if himo_id == v && r.author_peer == 1 => {
+                    Some((eid, value))
+                }
+                _ => None,
+            })
+            .collect();
+        drop(hold);
+        assert_eq!(bridged, vec![(world, 55)], "場所を取った直後の bridge が、 F0 に書いた record を F0 の世界番号で配らない");
+        cleanup(&path, eng);
+    }
+
+    /// review919-922 の [B3] (C2 の後に安全になった所): 受信が消えた翻訳した行 F0 宛ての (より新しい) 削除を引いた後・行の lock の前に、
+    /// F0 の場所が使い回されても、 その削除は写像の無い道 (使い回しの後に届いた時) と同じく F0 の削除の版数と、 F0 の名前の削除の時刻
+    /// を上げる。
+    ///
+    /// 前は行の lock の下で 「もう場所に居ない」 と分かると何もせずに false を返した (自分の行だけ入口の道に戻していた)。
+    #[test]
+    fn a_newer_delete_of_a_translated_row_reused_after_the_lookup_is_kept() {
+        let (path, eng, k) = engine("lookup", 1);
+        let base = now_ms();
+        let f0 = receive_deleted(&eng, k, 100, 5, at(base, C), at(base + 1, C));
+        let t_b = at(base + 2, 2);
+        let y: Arc<Mutex<Option<u64>>> = Default::default();
+        {
+            let (e2, y) = (eng.clone(), y.clone());
+            remote_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                *y.lock().unwrap() = Some(e2.entity_in("t").unwrap());
+            });
+        }
+        let kept = eng.remote_delete_apply_foreign(enchudb_oplog::make_eid(C, 100), t_b);
+        let y = y.lock().unwrap().expect("前提: 引いた後・行の lock の前に使い回した");
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(f0), "前提: F0 の場所を使い回した");
+        assert!(eng.is_live(y), "F0 宛ての削除が使い回した Y を消した");
+        assert!(kept, "引いた後に使い回された F0 宛ての、 より新しい削除が当たらなかった");
+        assert_eq!(eng.foreign_tombstone_of(C, 100), Some(t_b), "F0 の削除の版数を上げない");
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(5)), Some(t_b), "F0 の名前 5 の削除の時刻を上げない");
+        cleanup(&path, eng);
+    }
+
+    /// #931: 使い回しの後始末の後・場所を生かす前 (割り込み点 `reuse_prepared_hook`) に、 別の thread に届いた自分の消えた行 X 宛ての B の
+    /// より新しい削除は、 使い回しが場所の行を握っている間待ち、 その後に 「もう無い自分の行の削除」 として移した削除の版数と名前 7 の削除の
+    /// 時刻を上げる (使い回しの後に届いた時と同じ)。 待たずに場所の削除の版数だけを上げると、 その版数は使い回しが消し、 名前の記録も
+    /// 外れた後なので、 移した版数も名前の削除の時刻も A の削除のまま残った。
+    #[test]
+    fn a_newer_delete_during_the_cleanup_waits_for_the_claim_and_raises_the_moved_delete() {
+        use std::sync::mpsc::channel;
+        let (path, eng, k) = engine("settle", 2);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        let z = eng.entity_in("t").unwrap();
+        eng.tie_to(z, "t.k", 1u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t_a = eng.tombstone_hlc(x);
+        assert_ne!(t_a, enchudb_oplog::Hlc::ZERO, "前提: X の削除の版数");
+        let t_b = at(t_a.wall + 1_000, 2);
+        let slot = eng.slot_unchecked(x);
+        let deleter: Arc<Mutex<Option<std::thread::JoinHandle<bool>>>> = Default::default();
+        {
+            let (e2, d) = (eng.clone(), deleter.clone());
+            reuse_prepared_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                // 別の thread の削除が X の場所の行を握れずに待ち始めるまで進める
+                let (seen, seen_rx) = channel::<()>();
+                e2.row_locks.set_wait_hook(slot, move || {
+                    let _ = seen.send(());
+                });
+                let e3 = e2.clone();
+                let h = std::thread::spawn(move || e3.remote_delete_apply_foreign(x, t_b));
+                // 待たずに済んだ (使い回しが行を握っていない) 時は、 削除が先に当たる。 答えは下の assert が見る
+                let _ = seen_rx.recv_timeout(std::time::Duration::from_secs(5));
+                *d.lock().unwrap() = Some(h);
+            });
+        }
+        let y = eng.entity_in("t").unwrap();
+        let raised = deleter.lock().unwrap().take().expect("前提: 後始末の後の割り込み点を通った").join().unwrap();
+        assert_eq!(eng.slot_unchecked(y), slot, "前提: X の場所を使い回した");
+        assert!(raised, "後始末の間に届いた X 宛ての、 より新しい削除が当たらなかった");
+        eng.tie_to(y, "t.k", 7u32);
+        assert_eq!(eng.foreign_tombstone_of(1, enchudb_oplog::eid_local(x)), Some(t_b), "移した削除の版数を上げない");
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(7)), Some(t_b), "名前 7 の削除の時刻を上げない");
+        assert!(eng.is_live(y), "B の削除の後に作った Y が消えた");
+        assert!(eng.is_live(z), "他の行が消えた");
+        cleanup(&path, eng);
+    }
+
+    /// review928 の [3]: 前の名前 7 を持つ自分の行 L を消して場所を使い回す時、 場所を取った直後 (割り込み点 `reuse_claim_hook`) の
+    /// 「前に名前 7 だった生きた行」 (`former_pk_holder`、 束ね・改名が引く) は新しい行 M を返さない (L の名前は identity に移してある)。
+    ///
+    /// 前は場所ごとの名前の記録を外すのが場所を取った後だったので、 その間は M を前の持ち主として返し、 束ねが他の peer の行を M に
+    /// 束ねた / 改名が M と畳んだ。
+    #[test]
+    fn the_former_name_holder_is_not_the_new_row_right_after_the_claim() {
+        let (path, eng, k) = engine("former", 1);
+        let l = eng.entity_in("t").unwrap();
+        eng.tie_to(l, "t.k", 7u32);
+        eng.tie_to(l, "t.k", 8u32);
+        assert_eq!(eng.former_pk_holder(k, PkValue::Local(7), enchudb_oplog::Hlc::ZERO), Some(l), "前提: L は前に名前 7");
+        eng.delete(l);
+        eng.oplog_commit();
+        let seen: Arc<Mutex<Option<Option<u64>>>> = Default::default();
+        {
+            let (e2, seen) = (eng.clone(), seen.clone());
+            reuse_claim_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                *seen.lock().unwrap() = Some(e2.former_pk_holder(k, PkValue::Local(7), enchudb_oplog::Hlc::ZERO));
+            });
+        }
+        let m = eng.entity_in("t").unwrap();
+        let seen = seen.lock().unwrap().take().expect("前提: 場所を取った直後の割り込み点を通った");
+        assert_eq!(eng.slot_unchecked(m), eng.slot_unchecked(l), "前提: L の場所を使い回した");
+        assert_eq!(seen, None, "場所を取った直後に、 使い回した新しい行を名前 7 の前の持ち主として返した");
+        assert_eq!(eng.former_pk_holder(k, PkValue::Local(7), enchudb_oplog::Hlc::ZERO), None);
+        cleanup(&path, eng);
+    }
+
+    /// #931: 受信の Delete (消えた X 宛ての再配送) が X の場所の行の lock を握っている間 (割り込み点 `delete_locked_hook`) に、 別の thread の
+    /// insert が X の場所を使い回そうとしても、 Delete が新しい行を消さない。 insert は行を握れるまで待ち (その場所を飛ばして探し直す)、
+    /// 返った eid の行は生きていて、 場所の今の住人。
+    ///
+    /// 前は使い回しの道が行の lock を取らずに場所を生かし、 Delete が新しい行を消した。 insert は 「消えた新しい行」 の次の世代で eid を
+    /// 返し (書き込みは死んだ場所に通る)、 その eid は次にその場所を使い回す行の eid になった。
+    #[test]
+    fn a_delete_holding_the_dead_row_does_not_remove_the_insert_reusing_its_slot() {
+        use std::sync::mpsc::channel;
+        let (path, eng, k) = engine("relock", 1);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t = eng.tombstone_hlc(x);
+        assert_ne!(t, enchudb_oplog::Hlc::ZERO, "前提: X の削除の版数");
+        let slot = eng.slot_unchecked(x);
+        let inserter: Arc<Mutex<Option<std::thread::JoinHandle<u64>>>> = Default::default();
+        {
+            let (e2, ins) = (eng.clone(), inserter.clone());
+            delete_locked_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                // 別の thread の insert が、 X の場所の行 (の stripe) を握れずに待ち始めた / 諦めた所まで進めてから消す
+                let (seen, seen_rx) = channel::<()>();
+                e2.row_locks.set_wait_hook(slot, move || {
+                    let _ = seen.send(());
+                });
+                let e3 = e2.clone();
+                let h = std::thread::spawn(move || {
+                    let y = e3.entity_in("t").unwrap();
+                    e3.tie_to(y, "t.v", 70u32);
+                    y
+                });
+                seen_rx.recv().unwrap();
+                *ins.lock().unwrap() = Some(h);
+            });
+        }
+        // X の削除の再配送 (同じ版数)
+        eng.remote_delete_apply_foreign(x, t);
+        let y = inserter.lock().unwrap().take().expect("前提: 行の lock の下の割り込み点を通った").join().unwrap();
+        assert_eq!(eng.slot_unchecked(y), slot, "前提: X の場所を使い回した");
+        assert!(eng.is_live(y), "受信の Delete が、 行の lock を握っている間に場所を使い回した新しい行を消した");
+        assert_eq!(eng.get(y, "t.v"), Some(70));
+        assert_eq!(y, eng.slot_eid(slot), "返った eid が場所の今の住人でない");
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(7)), Some(t), "X の名前の削除の時刻が変わった");
+        cleanup(&path, eng);
+    }
+
+    /// #883 の形 (後始末の途中で場所を取れなかった): 空きの一覧から取り出した場所が生きていないのを確かめた後・後始末の前 (割り込み点
+    /// `pop_claim_hook`) に、 払い出し位置から同じ場所を取った受信 (C の行の払い出し) が先に生かして写像を載せても、 取れなかった方は
+    /// 写像を外さず (`remove_local_unless`)、 前の宛名の覚えも残さない (`abandon_reuse`)。
+    #[test]
+    fn a_reuse_that_loses_the_slot_after_its_cleanup_leaves_the_winner_alone() {
+        use std::sync::mpsc::channel;
+        let (path, eng, k) = engine("lose", 4);
+        for i in 0..3 {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.k", i as u32);
+        }
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (x_at, x_at_rx) = channel::<()>();
+        let (x_go, x_go_rx) = channel::<()>();
+        // X (受信): 払い出し位置から最後の場所を取り、 印を立てる前で止まる
+        claim_gap_hook::set(&wal, move |_| {
+            x_at.send(()).unwrap();
+            x_go_rx.recv().unwrap();
+        });
+        let world = enchudb_oplog::make_eid(C, 100);
+        let ex = eng.clone();
+        let x = std::thread::spawn(move || ex.resolve_remote_eid(world, k));
+        x_at_rx.recv().unwrap();
+        // Y (アプリ): 全部なめで同じ場所を穴として拾い、 生きていないのを確かめた所で X を最後まで進める
+        let x = Arc::new(Mutex::new(Some(x)));
+        let got: Arc<Mutex<Option<Option<u64>>>> = Default::default();
+        {
+            let (x, got) = (x.clone(), got.clone());
+            pop_claim_hook::set(&wal, move |_| {
+                x_go.send(()).unwrap();
+                let h = x.lock().unwrap().take().unwrap();
+                *got.lock().unwrap() = Some(h.join().unwrap());
+            });
+        }
+        let y = eng.entity_in("t").unwrap();
+        let theirs = got.lock().unwrap().take().expect("前提: 割り込み点を通った").expect("前提: X に場所を払い出した");
+        let slot = eng.slot_unchecked(theirs);
+        assert_ne!(eng.slot_unchecked(y), slot, "同じ場所を 2 つの行に払い出した");
+        assert_eq!(eng.resolve_remote_eid_existing(world), Some(theirs), "取れなかった後始末が、 先に取った X の写像を外した");
+        assert_eq!(eng.former_addresses_len(), 0, "取れなかった場所の前の宛名の覚えを残した");
+        cleanup(&path, eng);
+    }
+
+    /// review930 [5]: 消えた自分の行 X (名前 7) への遅れた改名 (名前 8、 `name_given_to_dead_row`) が 「X はまだ場所の行で消えている」
+    /// を見た後 (割り込み点 `dead_name_hook`) に、 別の thread の insert が X の場所を使い回そうとしても、 名前 8 は使い回した新しい行 Y
+    /// の前の名前にならない (`former_pk_holder` が Y を返さない)。 insert は改名が握る行を飛ばして待ち、 改名の後に場所を取って、 名前 8
+    /// を X の identity に移して場所から外す。
+    ///
+    /// 前は改名が行の lock を取らずに見てから名前を足したので、 見た後に使い回しが済むと、 名前 8 を Y の場所に付けた (束ね・改名の畳みが
+    /// Y に当たる。 前の版はこれを場所を取った後の 2 回目の外しで受けていたが、 足すのが外しの後になる形は残った)。
+    #[test]
+    fn a_rename_of_a_dead_row_racing_a_reuse_does_not_name_the_new_row() {
+        use std::sync::mpsc::channel;
+        let (path, eng, k) = engine("deadname", 1);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t = eng.tombstone_hlc(x);
+        assert_ne!(t, enchudb_oplog::Hlc::ZERO, "前提: X の削除の版数");
+        let slot = eng.slot_unchecked(x);
+        let row = eng.remote_row_of(x, x);
+        type Inserter = Option<(std::thread::JoinHandle<u64>, &'static str)>;
+        let inserter: Arc<Mutex<Inserter>> = Default::default();
+        {
+            let (e2, ins) = (eng.clone(), inserter.clone());
+            dead_name_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                // 別の thread の insert が X の場所を取ろうとして、 行を握れずに飛ばした (直した形) か、 取り終えた (直す前) かの先の方
+                let (tx, rx) = channel::<&'static str>();
+                let blocked = tx.clone();
+                e2.row_locks.set_wait_hook(slot, move || {
+                    let _ = blocked.send("blocked");
+                });
+                let e3 = e2.clone();
+                let h = std::thread::spawn(move || {
+                    let y = e3.entity_in("t").unwrap();
+                    let _ = tx.send("claimed");
+                    y
+                });
+                let first = rx.recv().unwrap();
+                *ins.lock().unwrap() = Some((h, first));
+            });
+        }
+        let named = eng.name_given_to_dead_row(x, row, k, 8);
+        let (h, first) = inserter.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        let y = h.join().unwrap();
+        assert_eq!(named, Some(0), "前提: X は消えた行のまま (名前 8 を足した)");
+        assert_eq!(eng.slot_unchecked(y), slot, "前提: Y は X の場所を使い回した");
+        assert_eq!(first, "blocked", "insert が、 改名の握る行に止められずに場所を使い回した");
+        assert_eq!(
+            eng.former_pk_holder(k, PkValue::Local(8), enchudb_oplog::Hlc::ZERO),
+            None,
+            "消えた X への改名の名前 8 が、 使い回した Y の前の名前になった"
+        );
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(8)), Some(t), "名前 8 が X の削除の時刻に消した名前にならない");
+        assert!(eng.is_live(y));
+        cleanup(&path, eng);
+    }
+
+    /// #513 / review930 [P]: 消えた行 X (名前 7) の場所を、 名前の無い行 Y が使い回してから消えても、 名前 7 の削除の時刻は X の削除のまま
+    /// (使い回しが場所の 「消えた時の名前」 の記録を外す。 外さないと、 名前の cell の無い Y を消した時に、 場所の記録から X の名前 7 を
+    /// 引いて Y の削除の時刻で消した名前にする)。
+    #[test]
+    fn a_reused_slot_does_not_keep_the_former_residents_deleted_name() {
+        let (path, eng, k) = engine("tombslot", 1);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t_x = eng.name_deleted_at(k, PkValue::Local(7));
+        assert!(t_x.is_some(), "前提: 名前 7 は X の削除で消した名前");
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to(y, "t.v", 70u32);
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(x), "前提: Y は X の場所を使い回した");
+        eng.delete(y);
+        eng.oplog_commit();
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(7)), t_x, "名前の無い Y の削除が、 前の住人 X の名前 7 を消した名前の時刻を上げた");
+        cleanup(&path, eng);
+    }
+
+    /// review930 [4] (受信の Delete): 自分の消えた行 X (名前 7) に B のより新しい削除 (2 人目の削除) が届き、 行の lock を放した後・名前 7 を
+    /// 持つ行を消す前 (割り込み点 `names_taken_hook`) に、 アプリの insert が X の場所を使い回す (名前を identity に移して場所から外す)。
+    /// それでも、 B の削除より前から名前 7 だった W は消える (#551、 使い回しの前に届いた時と同じ)。
+    ///
+    /// 前は lock を放した後に場所で名前を引いたので、 使い回しが外した後の空の記録を読み、 W はこの peer でだけ残った。
+    #[test]
+    fn a_second_delete_keeps_the_names_it_took_under_the_lock_across_a_reuse() {
+        let (path, eng, _k) = engine("namestaken", 2);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        let w = eng.entity_in("t").unwrap();
+        eng.tie_to(w, "t.k", 7u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t_a = eng.tombstone_hlc(x);
+        let t_b = at(t_a.wall + 1_000, 2);
+        let y: Arc<Mutex<Option<u64>>> = Default::default();
+        {
+            let (e2, y) = (eng.clone(), y.clone());
+            names_taken_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                *y.lock().unwrap() = Some(e2.entity_in("t").unwrap());
+            });
+        }
+        assert!(eng.remote_delete_apply_foreign(x, t_b), "前提: B の削除 (2 人目) が当たった");
+        let y = y.lock().unwrap().expect("前提: 名前を取った後に使い回した");
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(x), "前提: Y は X の場所を使い回した");
+        assert!(!eng.is_live(w), "B の削除より前から名前 7 だった W が残った (名前を lock を放した後に場所で引いた)");
+        assert!(eng.is_live(y), "使い回した Y が消えた");
+        cleanup(&path, eng);
+    }
+
+    /// review930 [4] (アプリの削除): 前の名前 5 を持つ自分の行 L (今は名前 6) をアプリが消し、 行の lock を放した後・前の名前を持つ行を
+    /// 消す前 (割り込み点 `names_taken_hook`) に、 別の insert が L の場所を使い回す。 それでも、 L の削除より前から名前 5 だった W
+    /// (改名の後に前の名前で作った行) は消える (使い回しの前に消した時と同じ)。
+    ///
+    /// 前は lock を放した後に場所で前の名前を引いたので、 使い回しが外した後の空の記録を読み、 W はこの peer でだけ残った。
+    #[test]
+    fn a_delete_keeps_the_former_names_it_took_under_the_lock_across_a_reuse() {
+        let (path, eng, k) = engine("formertaken", 2);
+        let l = eng.entity_in("t").unwrap();
+        eng.tie_to(l, "t.k", 5u32);
+        eng.tie_to(l, "t.k", 6u32);
+        assert_eq!(eng.former_pk_holder(k, PkValue::Local(5), enchudb_oplog::Hlc::ZERO), Some(l), "前提: L は前に名前 5");
+        let w = eng.entity_in("t").unwrap();
+        eng.tie_to(w, "t.k", 5u32);
+        let y: Arc<Mutex<Option<u64>>> = Default::default();
+        {
+            let (e2, y) = (eng.clone(), y.clone());
+            names_taken_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                *y.lock().unwrap() = Some(e2.entity_in("t").unwrap());
+            });
+        }
+        eng.delete(l);
+        let y = y.lock().unwrap().expect("前提: 名前を取った後に使い回した");
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(l), "前提: Y は L の場所を使い回した");
+        assert!(!eng.is_live(w), "L の削除より前から名前 5 だった W が残った (前の名前を lock を放した後に場所で引いた)");
+        assert!(eng.is_live(y), "使い回した Y が消えた");
+        cleanup(&path, eng);
     }
 }
 
@@ -9689,6 +10275,8 @@ impl Engine {
         // #9: eid 翻訳テーブルの sidecar 読み込み。 不在 (= sync してない / 旧 DB) なら
         // 空の translator で続行 (additive、 後方互換)。 破損は警告のみで空続行 (= 再
         // sync で mapping は張り直せる)。
+        // #925: 落ちる前に場所の使い回しが外した写像 (書き出す前に落ちて `.eidmap` から戻った物)。 読み込みの印を捨てた後に印を付け直す
+        let mut stale_mappings: Vec<(enchudb_oplog::PeerId, u32, u32, enchudb_oplog::Hlc)> = Vec::new();
         match load_eidmap_from_sidecar(path) {
             Ok(Some((entries, log))) => {
                 *eng.eidmap_log.lock().unwrap_or_else(|p| p.into_inner()) = log;
@@ -9698,6 +10286,31 @@ impl Engine {
                     // identity へ slot を払い出すとき書き戻される。
                     if local == NO_LOCAL_SLOT {
                         eng.remember_foreign_tombstone(peer, foreign_local, tomb);
+                        continue;
+                    }
+                    // #925: 写像の面は消えた行 (削除の版数がある。 翻訳した行の削除の版数は `set_tombstone_local` が印を付けて
+                    // 書き出す。 受け取った削除は pull が cursor を進める前に) なのに、 その場所が生きていて場所の削除の版数が無い =
+                    // 落ちる前に、 その場所を別の行が使い回した (使い回す時に版数を消し、 写像を外したのは consumer の次の書き出しの
+                    // 前に落ちた)。 消えた行は生き返らない (削除優先) ので、 生きている場所の行はその identity の行ではない。 写像は
+                    // 戻さず、 使い回す時と同じく削除の版数を identity に退避する (戻すと、 新しい行がその identity として扱われた:
+                    // bridge がその宛名で配り、 届き直した削除が新しい行を消した)。 名前の記録は `pktombs` / `pkformer` を読んだ後に
+                    // 移す (`move_stale_slot_names`)
+                    // (版数の列の無い DB は場所の削除の版数を memory にしか持たないので見分けない)
+                    // review930 [1]: 場所の行は削除の後に作り直された行であること (cell が 1 つ以上あり、 全部の cell の版数が削除の
+                    // 版数より新しい。 開く時の sweep の 「削除後に作り直された行」 と同じ決め方)。 `.eidmap` は本体より先に disk に
+                    // 届く道がある (WAL の空け作り `make_wal_room_inner`・新しい紐を足す `ensure_himo_dynamic_in`・`declare_*`・公開の
+                    // `persist_tables()` は本体を書き出さずに書く) ので、 電源断の像では 「写像の面は削除の版数あり・場所は生きていて
+                    // 場所の削除の版数なし」 が、 消える前の行 (cell は削除より古い) のまま残る。 その写像を外すと、 受けた削除なら
+                    // 持ち主の居ない生きた行、 自分が消した翻訳した行なら自分の世界番号で配る削除になった。 作り直された行でなければ
+                    // 今まで通り写像と削除の版数を戻し、 sweep が消し直す (cell の無い行も戻す = sweep が空の行を消す)
+                    if tomb != enchudb_oplog::Hlc::ZERO
+                        && eng.has_cell_version()
+                        && eng.entities.is_live(local)
+                        && eng.tombstone_version_of(local) == enchudb_oplog::Hlc::ZERO
+                        && eng.slot_rewritten_after(local, tomb)
+                    {
+                        eng.remember_foreign_tombstone(peer, foreign_local, tomb);
+                        stale_mappings.push((peer, foreign_local, local, tomb));
                         continue;
                     }
                     eng.eid_translator.insert(peer, foreign_local, local);
@@ -9748,6 +10361,10 @@ impl Engine {
         }
         // #560: 読み込みで付いた印は捨てる (`eidmap` + log から読んだ中身は disk と同じ)
         eng.eid_translator.clear_dirty();
+        // #925: 戻さなかった写像は disk と違う (次の書き出しで外す)
+        for &(peer, foreign_local, _, _) in &stale_mappings {
+            eng.eid_translator.mark_dirty((peer, foreign_local));
+        }
         // 主キーの前の名前。 壊れていたら警告して無しで続ける (今の名前でだけ束ねる = 前の版の動き)
         match load_pkformer_from_sidecar(path) {
             Ok(Some((former, _))) => {
@@ -9787,6 +10404,11 @@ impl Engine {
                 eprintln!("warning: failed to read pktombs sidecar (no deleted primary keys remembered): {}", e);
             }
             Err(e) => return Err(eng.abandon_open("pktombs", e)),
+        }
+
+        // review930 [2]: 開く時に戻さなかった写像 (#925) の場所の名前の記録を、 使い回す時と同じく identity に移して場所から外す
+        for (peer, foreign_local, local, tomb) in stale_mappings {
+            eng.move_stale_slot_names(peer, foreign_local, local, tomb);
         }
 
         // text 写像 (`(author_peer, remote_vid) → local_vid`) の sidecar 読み込み。
@@ -14373,7 +14995,7 @@ impl Engine {
         // fast path: free_locals_nonempty が false (= user table の常態) なら
         // mutex を取らずに通常 alloc に進む。 1M insert hot path で mutex
         // overhead (= 約 50 ns/op) を消す最適化。
-        let reused_global = if table.free_locals_nonempty.load(Ordering::Acquire) {
+        if table.free_locals_nonempty.load(Ordering::Acquire) {
             // #731: 世代を持たない DB で表の場所を使い回す時は、 先に v15 に移り終える (使い回した行を世代の違う eid にする)。
             // `free_locals` を握る前に (移る手順は消す書き手を待つ)。 見るのは 「移り終えた」: 照合を始めただけ (`active`) で通すと、
             // 移る途中の別の thread が上げる前の場所を拾う (#731 の試験を 8 本並べて 24 回に 1 回、 消えた行と同じ eid を渡した)
@@ -14382,65 +15004,112 @@ impl Engine {
             if !table.is_reserved() && !self.generations().moved() && self.can_move_to_generations() {
                 self.move_to_generations().map_err(|e| format!("table '{table_name}': {e}"))?;
             }
-            let mut fl = table.free_locals.lock().unwrap();
-            // #868: 生きている slot と畳んだ自分の行の slot (#612) は飛ばす (消した行の一覧と全部なめが同じ穴を両方から積み、 片方で
-            // 使い回された後 / 一覧に積んだ後に畳んだ形)。
-            // #882: 畳んだかを先に読む (畳んだ行を戻す道は 生きている印 → 別名を外す の順。 逆に読むと、 戻している最中の slot を
-            // 「生きていない」 「畳んでいない」 と続けて読みうる)。
-            // #883: 生きているかは、 印を立てて (`allocate_at` が前から立っていたかを返す) 決める。 払い出し位置から最後の slot を
-            // 取って印を立てる前の書き手が居ると、 全部なめはその slot を穴として積む。 先に立てた方が取り、 後の方は次を見る。
-            // 立てるのはこの lock の下 (#733: 放してから立てると、 別の thread の全部なめが同じ slot を穴として拾い直した)
-            let mut global = None;
-            // #914: 使い回す場所の前の住人 (消えた行) の番号。 生かす前に読む (生かすと場所の番号は新しい住人の物)
-            let mut gone = 0;
-            while let Some(local) = fl.pop() {
-                let Some(g) = table.global_of(local) else { continue };
-                // #731: 世代を使い切った場所は二度と渡さない (印を立てる前に見る)
-                if self.is_folded_own_slot(g) || self.generations().retired(g) {
-                    continue;
+            // review930 [P]: 名前の記録を持つ表か (`pk_himo_of_slot` と同じ決め方。 持たない表は使い回しで名前の記録を触らない)
+            let named = table.pk_himo.is_some() && !table.name.starts_with('_');
+            loop {
+                let mut fl = table.free_locals.lock().unwrap();
+                // #868: 生きている slot と畳んだ自分の行の slot (#612) は飛ばす (消した行の一覧と全部なめが同じ穴を両方から積み、 片方で
+                // 使い回された後 / 一覧に積んだ後に畳んだ形)。
+                // #882: 畳んだかを先に読む (畳んだ行を戻す道は 生きている印 → 別名を外す の順。 逆に読むと、 戻している最中の slot を
+                // 「生きていない」 「畳んでいない」 と続けて読みうる)。
+                // #883: 生きているかは、 印を立てて (`allocate_at` が前から立っていたかを返す) 決める。 払い出し位置から最後の slot を
+                // 取って印を立てる前の書き手が居ると、 全部なめはその slot を穴として積む。 先に立てた方が取り、 後の方は次を見る。
+                // 立てるのはこの lock の下 (#733: 放してから立てると、 別の thread の全部なめが同じ slot を穴として拾い直した)
+                let mut claimed = None;
+                // #931: 行を待たずに握れなかった場所 (一覧に戻す)
+                let mut busy: Vec<u32> = Vec::new();
+                while let Some(local) = fl.pop() {
+                    let Some(g) = table.global_of(local) else { continue };
+                    // #731: 世代を使い切った場所は二度と渡さない (印を立てる前に見る)
+                    if self.is_folded_own_slot(g) || self.generations().retired(g) {
+                        continue;
+                    }
+                    // #883: 払い出し位置から取った書き手が先に生かした場所は、 後始末の前に飛ばす (後始末の後に生かされた形は下の
+                    // `allocate_at` が見る)
+                    if self.entities.is_live(g) {
+                        continue;
+                    }
+                    // #931: ユーザの表は、 場所の行を待たずに握ってから生かす (後始末・生かす・確保・版数を落とすまで握る)。 消す道
+                    // (`apply_delete_in`) と受信の当て込みは行の lock の下で 「その場所の行」 を見て決めるので、 握らずに生かすと、 死んだ
+                    // 前の住人宛ての受信の Delete が握っている間に新しい行が生き、 その Delete に消された。 待たない (`free_locals` を
+                    // 持ったまま待つと、 行を握ったまま insert する書き手と互いを待つ)。 握れなければ飛ばして、 一覧に戻す
+                    let row = if table.is_reserved() {
+                        None
+                    } else {
+                        match self.row_locks.try_write(g) {
+                            Some(r) => Some(r),
+                            None => {
+                                busy.push(local);
+                                continue;
+                            }
+                        }
+                    };
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        pop_claim_hook::call(wal);
+                    }
+                    // #925 の C2: 前の住人の後始末 (前の宛名の覚え・自分の消えた行の退避・翻訳した行の写像を外す・場所ごとの名前の
+                    // 記録を外す) を、 場所を生かす前に済ませる (`prepare_reuse`)。 配らない表は bridge も束ねもしないので、 前と同じく
+                    // 場所を取った後に版数と一緒に落とす
+                    let prep = (!table.is_reserved()).then(|| self.prepare_reuse(g, named));
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        reuse_prepared_hook::call(wal);
+                    }
+                    // #731: 印を立てる RMW (AcqRel) が、 消す側の印を下ろす RMW を読むので、 消す側がその前に上げた場所の世代も見える。
+                    // 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`、 取れなかった時は取った側も落とす)
+                    self.revive_slot(g);
+                    if !self.entities.allocate_at(g) {
+                        self.settle_claim(g);
+                        // #931: 返す eid は生かした時の世代で作る (返す前に読み直さない。 行を握っているので消す道は入らないが、 守りとして)
+                        let eid = self.eid_of_slot(g);
+                        claimed = Some((g, prep, row, eid));
+                        break;
+                    }
+                    // 取れなかった (#883): 後始末の後に先に生かした書き手は、 前の住人の居ない新しい場所を払い出し位置から取った。 外した
+                    // 写像も移した削除も無い (`prepare_reuse` の doc)。 置いた覚えだけ外す
+                    if let Some(p) = prep {
+                        self.abandon_reuse(p);
+                    }
                 }
-                #[cfg(test)]
-                if let Some(wal) = self.oplog.as_ref() {
-                    pop_claim_hook::call(wal);
+                // 握れなかった場所しか無かった: 握っている書き手が離すのを待って探し直す (`free_locals` は放してから)
+                let retry = claimed.is_none() && !busy.is_empty();
+                fl.extend(busy);
+                if fl.is_empty() {
+                    table.free_locals_nonempty.store(false, Ordering::Release);
                 }
-                gone = self.last_local_of_slot(g);
-                // #731: 印を立てる RMW (AcqRel) が、 消す側の印を下ろす RMW を読むので、 消す側がその前に上げた場所の世代も見える。
-                // 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`、 取れなかった時は取った側も落とす)
-                self.revive_slot(g);
-                if !self.entities.allocate_at(g) {
-                    self.settle_claim(g);
-                    global = Some(g);
+                if let Some((global, prepared, row, eid)) = claimed {
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        reuse_claim_hook::call(wal);
+                    }
+                    // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす (`clear_cell_versions` の doc 参照)。 印を立てた
+                    // 後 = この slot は自分の物 (前は落としてから立てていて、 #883 の形では、 先に印を立てて書き始めた別の書き手の版数を
+                    // 落としうる)。 lock の順は `free_locals` → `EntitySet` の中、 の一方向のまま (`purge_sync_ops_row` の doc)
+                    match prepared {
+                        // 名前の記録は生かす前に外した (`prepare_reuse`。 その後に場所の名前の記録に足す道は無い = 消えた行への改名も
+                        // 行の lock の下で足す、 review930 [5])
+                        Some(_) => self.clear_slot_versions(global),
+                        None => self.clear_cell_versions(global),
+                    }
+                    drop(fl);
+                    // #731: 消えた行の古い eid が、 消した後・使い回す前に死んだ場所へ書いた cell を落とす (v15 の DB では世代違いで断る
+                    // ので、 残るのは v14 の間に書かれた分と、 v15 に移る途中で書き終えた分だけ)。 行の lock の下 (ユーザの表は上で握った
+                    // 行の入れ子)。 `free_locals` を放してから (行を握ったまま `entity_in` を呼ぶ書き手 = `write_row` を握ったまま insert
+                    // する書き手が、 `free_locals` を待っている事がある。 issue701 の試験で互いを待って止まった)。 eid は返す前なので、
+                    // 新しい行に書く書き手はまだ居ない
+                    if !table.is_reserved() {
+                        self.drop_leftover_cells(global, tid);
+                    }
+                    drop(row);
+                    return Ok(eid);
+                }
+                drop(fl);
+                if !retry {
                     break;
                 }
+                std::thread::yield_now();
             }
-            if fl.is_empty() {
-                table.free_locals_nonempty.store(false, Ordering::Release);
-            }
-            if let Some(global) = global {
-                // #779: 前の住人宛ての、 bridge の前の record の宛名を覚える (逆写像を外す前に。 配らない表は bridge しない)
-                if !table.is_reserved() {
-                    self.remember_former_address(global, true);
-                    // #914: 前の住人が自分の消えた行なら、 その削除の版数と名前を identity に移す (版数は下で消える)
-                    self.keep_gone_own_delete(global, gone);
-                }
-                // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす (`clear_cell_versions` の doc 参照)。 印を立てた
-                // 後 = この slot は自分の物 (前は落としてから立てていて、 #883 の形では、 先に印を立てて書き始めた別の書き手の版数を
-                // 落としうる)。 lock の順は `free_locals` → `EntitySet` の中、 の一方向のまま (`purge_sync_ops_row` の doc)
-                self.clear_cell_versions(global);
-            }
-            global
-        } else {
-            None
-        };
-        if let Some(global) = reused_global {
-            // #731: 消えた行の古い eid が、 消した後・使い回す前に死んだ場所へ書いた cell を落とす (v15 の DB では世代違いで断るので、
-            // 残るのは v14 の間に書かれた分と、 v15 に移る途中で書き終えた分だけ)。 行の lock を待つので `free_locals` を放してから
-            // (行を握ったまま `entity_in` を呼ぶ書き手 = `write_row` を握ったまま insert する書き手が、 `free_locals` を待っている事が
-            // ある。 issue701 の試験で互いを待って止まった)。 eid は返す前なので、 新しい行に書く書き手はまだ居ない
-            if !table.is_reserved() {
-                self.drop_leftover_cells(global, tid);
-            }
-            return Ok(self.eid_of_slot(global));
         }
 
         // #868: 枯渇した表は、 払い出し位置を進める前に穴を探す (拾えたら空きの一覧から取り直す)。 前は穴を探す前に毎回 1 進めて
@@ -14913,6 +15582,8 @@ impl Engine {
             }
         }
     }
+
+
 
     /// #560: 書き出した `eidmap` + `eidmap.log` を読み直した中身が、 memory の中身 (`eidmap_entries_with_tombstones`) と同じか。
     /// 印の付け忘れ (変えたのに log に載らない) を試験で拾う。 違えば (disk にだけある, memory にだけある) を返す。
@@ -17686,11 +18357,32 @@ impl Engine {
         // #166: 版数を消す **前** に翻訳写像を外す。 退避する tombstone は
         // まだ slot 上にあるので、 順序を逆にすると読めなくなる。
         self.evict_translation_for_reuse(local);
-        // #513: slot ごとの主キーの記録も外す (主キーごとの削除の版数は slot に載っていないので残る)
+        self.forget_slot_versions(local);
+    }
+
+    /// #513: slot ごとの主キーの記録 (消した名前 `pk_tombs` と前の名前・束ねた identity・名前の年表 `pk_former`) を外す (主キーごとの
+    /// 削除の版数は slot に載っていないので残る)。
+    fn forget_slot_names(&self, local: u32) {
         self.forget_pk_slot(local);
+        self.forget_slot_former(local);
+    }
+
+    /// slot `local` の前の名前・束ねた identity・名前の年表 (`pk_former`) を外す。
+    fn forget_slot_former(&self, local: u32) {
         if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) && self.pk_former.write().unwrap().forget_slot(local) {
             self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// [`Self::clear_cell_versions`] の、 写像を外した後の残り (slot ごとの名前の記録と版数を落とす)。 `entity_in` の再利用の道は
+    /// 写像を場所を生かす前に外す (`prepare_reuse`) ので、 場所を取った後はこちらだけ。
+    fn forget_slot_versions(&self, local: u32) {
+        self.forget_slot_names(local);
+        self.clear_slot_versions(local);
+    }
+
+    /// slot `local` の版数 (cell ごとの版数と削除の版数) を落とす ([`Self::forget_slot_versions`] の後半)。
+    fn clear_slot_versions(&self, local: u32) {
         if local >= self.max_entities() {
             return;
         }
@@ -17728,9 +18420,30 @@ impl Engine {
     ///
     /// #178: slot を指す別名 (同じ entity の 2 つ目の世界番号) も外し、 同じ削除版数を退避する (同じ entity なので)。
     fn evict_translation_for_reuse(&self, local: u32) {
-        let mut keys = self.eid_translator.remove_local(local);
-        if keys.is_empty() {
+        let keys = self.eid_translator.remove_local(local);
+        self.evict_removed_keys(local, keys);
+    }
+
+    /// 写像から外した `keys` (slot `local` を指していた) の削除の版数を退避する ([`Self::evict_translation_for_reuse`] の本体)。
+    fn evict_removed_keys(&self, local: u32, keys: Vec<(enchudb_oplog::PeerId, u32)>) {
+        let (keys, tomb) = self.split_removed_keys(local, keys);
+        if keys.is_empty() || tomb == enchudb_oplog::Hlc::ZERO {
             return;
+        }
+        self.move_names_to_identities(local, &keys);
+        self.retreat_removed_keys(&keys, tomb);
+    }
+
+    /// 写像から外した `keys` (slot `local` を指していた) のうち、 #612 の畳んだ自分の行 (自分の peer の世界番号) を片付け、 残り (退避
+    /// する他の peer の identity) と slot の削除の版数を返す。 版数が `ZERO` なら削除されずに slot だけ回った (= 到達不能になった) ので
+    /// 退避する物は無い。
+    fn split_removed_keys(
+        &self,
+        local: u32,
+        mut keys: Vec<(enchudb_oplog::PeerId, u32)>,
+    ) -> (Vec<(enchudb_oplog::PeerId, u32)>, enchudb_oplog::Hlc) {
+        if keys.is_empty() {
+            return (keys, enchudb_oplog::Hlc::ZERO);
         }
         let tomb = self.tombstone_version_of(local);
         // #612: 畳んだ自分の行 (自分の peer の世界番号) は、 その slot を自分自身の別名にして予約したまま (使い回さない) 削除の
@@ -17746,16 +18459,13 @@ impl Engine {
             }
             false
         });
-        if keys.is_empty() {
-            return;
-        }
-        if tomb == enchudb_oplog::Hlc::ZERO {
-            // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い。
-            return;
-        }
-        self.move_names_to_identities(local, &keys);
+        (keys, tomb)
+    }
+
+    /// 写像から外した他の peer の identity `keys` に削除の版数 `tomb` を退避する (#166、 monotone-max)。
+    fn retreat_removed_keys(&self, keys: &[(enchudb_oplog::PeerId, u32)], tomb: enchudb_oplog::Hlc) {
         let mut g = self.foreign_tombs.write().unwrap();
-        for &key in &keys {
+        for &key in keys {
             let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
             if *e < tomb {
                 *e = tomb; // monotone-max (同 identity が複数回 slot を回った場合)
@@ -17765,14 +18475,102 @@ impl Engine {
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // #560: 退避した削除の面が変わった (写像の面は `remove_local` が印を付けた)
-        for key in keys {
+        for &key in keys {
             self.eid_translator.mark_dirty(key);
         }
     }
 
-    /// #914 / #915: 表の場所 `local` を使い回す時 (生きている印を立てた後、 [`Self::clear_cell_versions`] の前)、 前の住人が自分の
-    /// 消えた行 (番号 `gone` = 世代 | 場所) なら、 その削除の版数と名前を identity (自分の peer, `gone`) に移す (#166 / #545 で
-    /// 翻訳した行にしているのと同じ形、 置き場も同じ `foreign_tombs` と `PkFormer` の identity の名前)。
+    /// #925 の C2: `entity_in` が空きの一覧から取り出した場所 `slot` (まだ生かしていない) の、 前の住人 (消えた行) の後始末。 場所を
+    /// 生かす前に済ませる: 生かした後に場所を引く受信 (`remote_row_of` は場所の最後の行 = 新しい住人を引く)・bridge
+    /// (`bridge_row_address`)・state は、 後始末の済んだ形 (前の宛名の覚え、 自分の消えた行の退避、 外した写像) だけを見る。 前は
+    /// 生かした後に済ませていて、 その間に届いた受信は翻訳した行の写像から新しい住人を消し (review919-922 の [B2])、 bridge は前の
+    /// 住人の宛名を引けず ([A3])、 自分の消えた行宛ての削除は退避の無い番号として落ちた (review921 の [3])。
+    ///
+    /// 1. 前の宛名を覚える (#779、 逆写像を外す前に)
+    /// 2. 前の住人が自分の消えた行なら、 その削除の版数と名前を identity に移す (#914 / #915、 [`Self::keep_gone_own_delete`])
+    /// 3. 前の住人が翻訳した行なら写像を外して削除の版数を退避する (#166 / #545)。 外した写像は consumer の次の書き出しまで
+    ///    memory だけ。 その前に落ちて戻った写像は、 開く時に 「写像の面は消えた行なのに場所が生きていて、 場所の削除の版数が
+    ///    無く、 場所の行は削除の後に作り直された」 で見分けて外す (#925、 `.eidmap` を読む所)
+    /// 4. 名前の記録: 2 / 3 の identity に場所の名前 (消えた時の名前と前の名前) を移し、 場所ごとの名前の記録 (`pk_tombs` の場所の
+    ///    記録、 `pk_former` の前の名前・束ね・年表) を外す (review928 の [3])。 `pk_tombs` と `pk_former` をそれぞれ 1 回の書き込みの
+    ///    lock で済ませる (`move_names_and_forget_slot`、 review930 [P])。 名前の無い表 (`named` が偽) は名前の記録を持たないので飛ばす。
+    ///    名前は版数の退避の前に移す (退避の後に届いた、 より新しい削除が identity の名前を上げる時に、 名前が移っている)
+    ///
+    /// 生かすまでの間に場所の名前の記録に足す道は無い: 消えた行への改名 (`name_given_to_dead_row`) は行の lock の下で足し (review930
+    /// [5])、 使い回しは場所の行を握っている (#931)。 束ね・カードは生きた行にしか積まない。
+    ///
+    /// 取れなかった時 (#883: 後始末の後に、 払い出し位置から同じ場所を取った書き手が先に生かした) の相手は、 前の住人の居ない新しい
+    /// 場所 (全部なめが払い出し位置の手前を穴として拾った) なので、 外す写像も移す削除も無い (写像は生かしてから載るので、 載った写像は
+    /// 外さない、 `remove_local_unless`)。 置いた覚えは呼び手が外す ([`Self::abandon_reuse`])。 例外は、 払い出し位置から取った書き手が
+    /// 退避表に削除のある identity の払い出しで、 生かした場所を殺してから写像を載せる形 (`remove_local_unless` の doc、 review930 [6]、 #938)。
+    fn prepare_reuse(&self, slot: u32, named: bool) -> ReusePrep {
+        // 前の住人 (消えた行) の番号。 生かす前の場所の最後の行
+        let gone = self.last_local_of_slot(slot);
+        let remembered = self.remember_former_address(slot, true);
+        // 2. 自分の消えた行 (逆写像を外す前に見る)
+        let own = self.keep_gone_own_delete(slot, gone);
+        // 3. 翻訳した行の写像を外す。 写像の lock の下で場所がもう生きていれば (払い出し位置から取った書き手が先に生かした、 #883)
+        // 何も外さない
+        let keys = self.eid_translator.remove_local_unless(slot, || self.entities.is_live(slot));
+        let (mut ids, tomb) = self.split_removed_keys(slot, keys);
+        if tomb == enchudb_oplog::Hlc::ZERO {
+            ids.clear(); // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い
+        }
+        let evicted = ids.len();
+        // 4. 名前の記録 (移してから外す)
+        if named {
+            if own.is_some() {
+                ids.push((self.peer_id(), gone));
+            }
+            self.move_names_and_forget_slot(slot, &ids);
+        }
+        if let Some(t) = own {
+            self.remember_foreign_tombstone(self.peer_id(), gone, t);
+        }
+        if evicted > 0 {
+            self.retreat_removed_keys(&ids[..evicted], tomb);
+        }
+        ReusePrep { remembered }
+    }
+
+    /// review930 [2]: 開く時に戻さなかった写像 (#925、 identity `(peer, foreign_local)` → 場所 `local`、 写像の面の削除の版数 `tomb`) の、
+    /// 場所の名前の記録を identity に移して場所から外す (使い回す時の `prepare_reuse` の 4 と同じ)。 落ちる前に使い回しが移して外した
+    /// のは memory だけで、 `pktombs` / `pkformer` に残る場所の記録は前の住人 (消えた翻訳した行) の物のまま = 外さないと新しい行の
+    /// 場所に付いたまま残り、 その identity 宛ての 2 人目の削除が名前の削除の時刻を上げず (identity に名前が無い)、
+    /// `former_pk_holder` が新しい行を返し、 新しい行を消した時に前の住人の名前を消した名前にした。
+    ///
+    /// 場所の記録が使い回しの前の物と言える時だけ移す: (1) identity に名前が無い (移しが書き出されていれば identity に名前があり、
+    /// 場所の記録も外れて書き出されている)、 (2) `pk_tombs` の場所の記録 (消えた時の名前) の版数が `tomb` 以下 (新しい行が後で消えた
+    /// 記録は `tomb` より新しい)。 消えた時の名前の無い行 (名前の cell が無いまま消えた) は見分けられないので移さない (前と同じ)。
+    fn move_stale_slot_names(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32, tomb: enchudb_oplog::Hlc) {
+        use std::sync::atomic::Ordering;
+        if self.pk_tombs_empty.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.pk_former_empty.load(Ordering::Acquire)
+            && self.pk_former.read().unwrap().names_of_identity(peer, foreign_local).next().is_some()
+        {
+            return;
+        }
+        let before_reuse = {
+            let g = self.pk_tombs.read().unwrap();
+            g.key_of_slot(local).and_then(|(h, k)| g.tomb_of(h, k)).is_some_and(|t| t <= tomb)
+        };
+        if before_reuse {
+            self.move_names_and_forget_slot(local, &[(peer, foreign_local)]);
+        }
+    }
+
+    /// [`Self::prepare_reuse`] の後に場所を取れなかった (#883): 置いた前の宛名の覚えを外す (その場所の今の住人は前の住人ではない)。
+    fn abandon_reuse(&self, prep: ReusePrep) {
+        if let Some(key) = prep.remembered {
+            self.former_addresses.lock().unwrap_or_else(|p| p.into_inner()).until.remove(&key);
+        }
+    }
+
+    /// #914 / #915: 表の場所 `local` を使い回す時 (生かす前、 [`Self::prepare_reuse`])、 前の住人が自分の消えた行 (番号 `gone` = 世代 |
+    /// 場所) なら、 その削除の版数を返す (呼び手が名前と一緒に identity (自分の peer, `gone`) に移す。 #166 / #545 で翻訳した行にして
+    /// いるのと同じ形、 置き場も同じ `foreign_tombs` と `PkFormer` の identity の名前)。
     ///
     /// 使い回した場所の新しい住人は世代の違う番号 (#731 段 4) なので、 消えた行はまだ別の世界番号として peer に居る。 版数を
     /// 場所と一緒に消すと、 その削除がどこにも残らず、 (1) state に Delete が入らない (取りこぼした peer の掃除が今の時刻で
@@ -17780,19 +18578,59 @@ impl Engine {
     /// を通らない (#915)、 (3) その行を指す ref を state に出せない。 移した版数は state の自分の削除として出し
     /// (`state_unties_and_foreign_deletes`)、 忘れてよい線で刈る (`forget_deletes_before`)。
     ///
-    /// 翻訳した行 (逆写像がある) は `evict_translation_for_reuse` が移す。 新しい住人と番号が同じ (世代を持たない DB) なら移さない
-    /// (その番号は新しい住人の物)。 削除の版数の無い場所 (sync しない DB、 版数なしで消した行) も移さない。
-    fn keep_gone_own_delete(&self, local: u32, gone: u32) {
-        if !self.sync_tables_on() || gone == self.last_local_of_slot(local) || self.eid_translator.reverse(local).is_some() {
-            return;
+    /// 翻訳した行 (逆写像がある) は写像を外す側が移す。 新しい住人と番号が同じ (世代を持たない DB) なら移さない (その番号は新しい
+    /// 住人の物)。 削除の版数の無い場所 (sync しない DB、 版数なしで消した行) も移さない。
+    ///
+    /// #925 の C2: 生かす前に呼ぶので、 新しい住人の番号は場所の今の世代の番号 (消す時に次の住人の世代に上げてある。 生かす前の
+    /// 場所の最後の行 = `gone` と比べると、 いつも同じになる)。 世代を持たない DB はどちらも場所なので同じ = 移さない。
+    fn keep_gone_own_delete(&self, local: u32, gone: u32) -> Option<enchudb_oplog::Hlc> {
+        if !self.sync_tables_on() || gone == self.generations().local(local) || self.eid_translator.reverse(local).is_some() {
+            return None;
         }
         let tomb = self.tombstone_version_of(local);
-        if tomb == enchudb_oplog::Hlc::ZERO {
+        (tomb != enchudb_oplog::Hlc::ZERO).then_some(tomb)
+    }
+
+    /// 場所 `local` (使い回す前の、 消えた行の場所) の名前 (消えた時の名前と前の名前) を `identities` (前の住人の identity、 空なら移さない)
+    /// に移してから、 場所ごとの名前の記録 (`pk_tombs` の場所の記録、 `pk_former` の前の名前・束ね・年表) を外す (#545 の移しと
+    /// review928 [3] の外し)。 `pk_tombs` と `pk_former` をそれぞれ 1 回の書き込みの lock で済ませる (review930 [P]: 前は移しの読みと
+    /// 外しの書き込みを別々に取った)。
+    fn move_names_and_forget_slot(&self, local: u32, identities: &[(enchudb_oplog::PeerId, u32)]) {
+        use std::sync::atomic::Ordering;
+        let mut names: Vec<(u16, Box<[u8]>)> = Vec::new();
+        if !self.pk_tombs_empty.load(Ordering::Acquire) || self.pk_pending_nonempty.load(Ordering::Acquire) {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            if !identities.is_empty() {
+                names.extend(g.key_of_slot(local).map(|(h, k)| (h, Box::from(k))));
+            }
+            if g.forget_slot(local) {
+                self.pk_tombs_dirty.store(true, Ordering::Release);
+            }
+        }
+        let former_on = !self.pk_former_empty.load(Ordering::Acquire);
+        if !former_on && names.is_empty() {
             return;
         }
-        let self_peer = self.peer_id();
-        self.move_names_to_identities(local, &[(self_peer, gone)]);
-        self.remember_foreign_tombstone(self_peer, gone, tomb);
+        let mut former = self.pk_former.write().unwrap();
+        let mut changed = false;
+        if !identities.is_empty() {
+            if former_on {
+                names.extend(former.names_of(local).map(|(h, k)| (h, Box::from(k))));
+            }
+            for &(peer, foreign_local) in identities {
+                for (h, k) in &names {
+                    changed |= former.insert_identity(peer, foreign_local, *h, k);
+                }
+            }
+        }
+        if former_on {
+            changed |= former.forget_slot(local);
+        }
+        if changed {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
     }
 
     /// #545: 消えた行の slot `local` を使い回す前に、 その行の名前 (消えた時の名前と前の名前) を、 slot に写っていた identity に移す。
@@ -17975,26 +18813,46 @@ impl Engine {
     /// その名前の行を消して名前を覚える (`remember_pk_tombstone`) ので、 届く順で消した名前の集まりを変えない。
     ///
     /// 今その名前を持つ生きた行のうち、 削除より前にその名前になった行は同じ行なので一緒に消す (改名を先に受けた peer では、
-    /// 改名で 1 つに畳んでから消している)。 戻り値は一緒に消した行の数。 消えた行でない・主キーでない時は何もしない。
-    pub fn name_given_to_dead_row(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+    /// 改名で 1 つに畳んでから消している)。 戻り値は一緒に消した行の数。 消えた行でない・主キーでない時は何もしない (`Some(0)`)。
+    ///
+    /// `row` は宛名を引いた直後に取った行 ([`Engine::remote_row_of`])。 行の lock の下で、 その行がまだ場所の最後の行で消えているかを
+    /// 確かめてから名前を足す (review930 [5]: 前は lock を取らずに 「消えているか」 を見て足し、 見た後に場所が使い回されると、 名前を
+    /// 新しい行の場所の前の名前にした = `former_pk_holder` が新しい行を返した。 使い回しは場所の行を握ってから後始末する (#931) ので、
+    /// lock の下で足した名前は後始末が identity に移して場所から外す)。 その行がもう場所に居なければ (当てた後に消えて場所が使い回
+    /// された) 何もせずに `None`: 呼び手は宛名を引き直す (引く前に使い回されていた時と同じ道。 自分の行は
+    /// [`Engine::name_given_to_gone_own_row`]、 翻訳した行は外れた写像の identity に払い出した死んだ場所)。
+    pub fn name_given_to_dead_row(&self, eid: enchudb_oplog::EntityId, row: u32, himo: u16, value: u64) -> Option<usize> {
         let local = self.slot_unchecked(eid);
-        if !self.is_remembered_pk_himo(himo) || !self.slot_is_dead(local) {
-            return 0;
+        if !self.is_remembered_pk_himo(himo) {
+            return Some(0);
         }
-        let tomb = self.tombstone_version_of(local);
-        let changed = self.with_pk_key(himo, PkValue::Local(value), |k| self.pk_former.write().unwrap().insert(himo, k, local));
-        if changed == Some(true) {
-            self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
-            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
-        }
-        {
+        let tomb = {
+            let _row = self.row_locks.write(local);
+            if !self.remote_row_holds_slot(local, Some(row)) {
+                return None;
+            }
+            if !self.slot_is_dead(local) {
+                return Some(0);
+            }
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                dead_name_hook::call(wal);
+            }
+            let tomb = self.tombstone_version_of(local);
+            let changed =
+                self.with_pk_key(himo, PkValue::Local(value), |k| self.pk_former.write().unwrap().insert(himo, k, local));
+            if changed == Some(true) {
+                self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+                self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+            }
             let mut g = self.pk_tombs.write().unwrap();
             self.drain_pk_pending(&mut g);
             self.with_pk_key(himo, PkValue::Local(value), |k| {
                 self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
             });
-        }
-        self.remove_rows_named(local, himo, value, tomb)
+            tomb
+        };
+        Some(self.remove_rows_named(local, himo, value, tomb))
     }
 
     /// 削除優先 (#551): 主キー `value` を今持つ、 行 `local` (`u32::MAX` = 除く行なし) でない生きた行のうち、 `tomb` より前にその名前になった行を `tomb` で消す
@@ -18024,16 +18882,14 @@ impl Engine {
         removed
     }
 
-    /// 削除優先 (#551) と改名の時刻: 消した行 `local` の前の名前を今持つ別の行のうち、 `tomb` より前にその名前になった行も消す。
-    /// 改名の後に前の名前で作られた行 (前の名前で束ねない = 別のデッキ) も、 前のデッキの削除より前に作られていれば一緒に消える:
+    /// 削除優先 (#551) と改名の時刻: 消した行 `local` の前の名前 (`names`) を今持つ別の行のうち、 `tomb` より前にその名前になった行も
+    /// 消す。 改名の後に前の名前で作られた行 (前の名前で束ねない = 別のデッキ) も、 前のデッキの削除より前に作られていれば一緒に消える:
     /// 改名より先に削除を受けた peer は、 改名を知らずにその名前の行を消している (後から改名を知っても生き返らせない)。 前の名前の
-    /// 無い行は何もしない。
-    fn remove_rows_holding_former_names(&self, local: u32, tomb: enchudb_oplog::Hlc) -> usize {
-        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
-            return 0;
-        }
-        let names: Vec<(u16, Box<[u8]>)> =
-            self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))).collect();
+    /// 無い行は何もしない。 2 人目の削除 (消えた行に別の author のより新しい削除が届いた) は、 消えた時の名前も (`names_of_dead_slot`)。
+    ///
+    /// 名前は行 `local` の lock の下で取る ([`Self::former_names_of_slot`]、 review930 [4]: 放した後に場所で引くと、 その間に場所が
+    /// 使い回されて名前の記録が外れ、 前の名前で消す行がこの peer でだけ残った。 使い回しは場所の行を握ってから外す (#931))。
+    fn remove_rows_holding_names(&self, local: u32, names: Vec<(u16, Box<[u8]>)>, tomb: enchudb_oplog::Hlc) -> usize {
         names
             .into_iter()
             .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
@@ -18041,19 +18897,26 @@ impl Engine {
             .sum()
     }
 
-    /// 削除優先 (#551): 消えた行 `local` の名前 (消えた時の名前と前の名前) について [`Self::remove_rows_named`]。
-    fn remove_rows_holding_names_of(&self, local: u32, tomb: enchudb_oplog::Hlc) -> usize {
-        self.flush_pk_pending();
-        let mut names: Vec<(u16, Box<[u8]>)> =
-            self.pk_tombs.read().unwrap().key_of_slot(local).map(|(h, k)| (h, Box::from(k))).into_iter().collect();
-        if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
-            names.extend(self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))));
+    /// 行 `local` の前の名前 (`pk_former`)。 呼び手は行の lock を握っている ([`Self::remove_rows_holding_names`])。 改名の無い DB は
+    /// atomic 1 回。
+    fn former_names_of_slot(&self, local: u32) -> Vec<(u16, Box<[u8]>)> {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
         }
+        self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))).collect()
+    }
+
+    /// 消えた行 `local` の名前 (消えた時の名前と前の名前)。 呼び手は行の lock を握っている ([`Self::remove_rows_holding_names`])。
+    /// 名前を覚えていない DB は atomic 2〜3 回。
+    fn names_of_dead_slot(&self, local: u32) -> Vec<(u16, Box<[u8]>)> {
+        use std::sync::atomic::Ordering;
+        let mut names = Vec::new();
+        if !self.pk_tombs_empty.load(Ordering::Acquire) || self.pk_pending_nonempty.load(Ordering::Acquire) {
+            self.flush_pk_pending();
+            names.extend(self.pk_tombs.read().unwrap().key_of_slot(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        names.extend(self.former_names_of_slot(local));
         names
-            .into_iter()
-            .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
-            .map(|(h, v)| self.remove_rows_named(local, h, v, tomb))
-            .sum()
     }
 
     /// #545: identity `(peer, foreign_local)` に移した名前 (`move_names_to_identities`) を `tomb` で消した名前にし、 その名前を今持つ
@@ -18477,6 +19340,27 @@ impl Engine {
     ///
     /// 生き残る cell が 1 つも無くなった entity だけ live 登録から外す。
     /// pre-v9 (版数 column が無い) DB では tombstone 版数自体が揮発なので何もしない。
+    /// 場所 `local` の行は、 削除 (版数 `tomb`) の後に作り直された行か: cell が 1 つ以上あり、 全部の cell の版数が `tomb` より新しい
+    /// (版数不明の cell は削除より前とみなす)。 [`Self::scan_interrupted_deletes`] が残す行と同じ決め方 (review930 [1]、 開く時に
+    /// `.eidmap` の写像の面の削除と場所の今の行を比べる所)。
+    fn slot_rewritten_after(&self, local: u32, tomb: enchudb_oplog::Hlc) -> bool {
+        let mut has_cell = false;
+        for hid in 0..self.himos.len() {
+            // 開けない列があれば見分けない (写像を戻す = 前の版の動き)
+            if self.himos[hid].ensure_loaded().is_err() {
+                return false;
+            }
+            if self.himos[hid].get_value(local).is_none() {
+                continue;
+            }
+            has_cell = true;
+            if !(self.version_of(local, hid as u16) > tomb) {
+                return false;
+            }
+        }
+        has_cell
+    }
+
     fn scan_interrupted_deletes(&self, repair: bool) -> usize {
         if !self.has_cell_version() {
             return 0;
@@ -19154,7 +20038,7 @@ impl Engine {
     /// #913: 行の lock の下で 「印を落とす → 生きている印を立てる → 立てたのが自分なら死の印を揃える (`settle_claim`)」。 消す道
     /// (kill → 生きている印を下ろす) は行の lock の下なので、 印を落とした後・生きている印を立てる前に、 別の書き手が使い回してその行を
     /// 消し終える事は無い (前は殺された場所に生きている印を立て、 「生きている、 死の印あり」 = きれいに閉じなかった後の突き合わせが
-    /// 生かした行を消す形になった)。 使い回しの払い出しは行の lock を取らないので間に入りうるが、 その時は払い出した側が生きている印を
+    /// 生かした行を消す形になった)。 使い回しの払い出しは配らない表 (`_sync_ops` など) では行の lock を取らないので間に入りうるが (ユーザの表は #931 から握る)、 その時は払い出した側が生きている印を
     /// 立てて揃える (こちらは立てないので揃えない)。 揃えるのは、 移る手順が間で死の印を立てた形 (払い出しの道と同じ 3a)。 生きている
     /// 場所は lock を取らない (印を落とす事も立てる事も無い)。 行の lock は同じ thread なら握り直せる。
     #[inline]
@@ -19421,17 +20305,18 @@ impl Engine {
     }
 
     /// #779: slot `local` の住人 (`reused`) か逆写像が変わる直前に、 今の宛名を覚える ([`FormerAddresses`])。 sync の表の無い DB と
-    /// WAL の無い DB (bridge しない) は何もしない。 `reused` でなければ、 逆写像のある slot だけ (逆写像が外れる時)。
-    fn remember_former_address(&self, local: u32, reused: bool) {
+    /// WAL の無い DB (bridge しない) は何もしない。 `reused` でなければ、 逆写像のある slot だけ (逆写像が外れる時)。 置いた覚えの
+    /// 鍵を返す (#925: 使い回しの道が場所を取れなかった時に外す)。
+    fn remember_former_address(&self, local: u32, reused: bool) -> Option<(u32, enchudb_oplog::Hlc)> {
         use std::sync::atomic::Ordering;
         if !self.sync_tables_on() {
-            return;
+            return None;
         }
-        let Some(wal) = self.oplog.as_ref() else { return };
+        let wal = self.oplog.as_ref()?;
         let world = match self.eid_translator.reverse(local) {
             Some(w) => w,
             None if reused => (self.peer_id(), local),
-            None => return,
+            None => return None,
         };
         let mut g = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
         if g.until.len() >= FORMER_ADDRESS_LIMIT {
@@ -19442,7 +20327,7 @@ impl Engine {
                      not advancing — records written to the previous owners before the bridge may go out under the wrong eid"
                 );
             }
-            return;
+            return None;
         }
         // #916: 宛名の行の世代。 使い回す時は、 場所はもう次の住人の世代 (消す時に上げた) なので、 死んでいた場所の
         // `last_local_of_slot` と同じ引き方。 逆写像が外れるだけ (畳む) の時は今の行
@@ -19456,6 +20341,7 @@ impl Engine {
         let until = wal.mint_hlc();
         g.until.insert((local, until), (world, wal.head(), row_gen));
         self.former_addresses_on.store(true, Ordering::Release);
+        Some((local, until))
     }
 
     /// #779: bridge が、 行 `local` (世代 | 場所) 宛ての、 版数 `hlc` の自分の record の宛名を引く (Ref の値なら、 その的の宛名)。
@@ -19495,14 +20381,20 @@ impl Engine {
     /// #916 (読み直し A2): bridge が自分の record の**行**の宛名を引く ([`Self::bridge_address`] と同じ引き方)。 `None` = 分からない:
     /// その行は場所の最後の行でなく (書いた後に消えて場所が使い回された)、 覚え ([`FormerAddresses`]) にも無い (開き直した後 / 上限を
     /// 越えた)。 前の住人が自分の行だったか他の peer の行だったかが残っていない。
+    ///
+    /// #925 (#919 の A2 の残り): 覚えが無くても、 その行が自分の行で、 場所を使い回す時に削除を identity (自分の peer, 世代 | 場所) に
+    /// 退避してあれば (`keep_gone_own_delete`、 `.eidmap` で開き直しを越える)、 自分の行と分かる = 自分の世界番号 (`Some(None)`)。
+    /// 退避するのは前の住人に逆写像が無い (自分の行の) 時だけなので、 他の peer の行を自分の世界番号で出さない。
     fn bridge_row_address(&self, local: u32, hlc: enchudb_oplog::Hlc) -> Option<Option<(enchudb_oplog::PeerId, u32)>> {
         use std::sync::atomic::Ordering;
         let gens = self.generations();
         let (slot, row_gen) = gens.split(local);
         let now = self.eid_translator.reverse(slot);
         let is_last_row = || row_gen == gens.split(self.last_local_of_slot(slot)).1;
+        // 覚えに無い、 場所の最後の行でない行: 自分の行の退避があれば自分の行
+        let own_gone = || self.foreign_tombstone_of(self.peer_id(), local).map(|_| None);
         if !self.former_addresses_on.load(Ordering::Acquire) {
-            return is_last_row().then_some(now);
+            return if is_last_row() { Some(now) } else { own_gone() };
         }
         let fa = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
         let last = enchudb_oplog::Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX };
@@ -19513,7 +20405,12 @@ impl Engine {
             None if is_last_row() => return Some(now),
             None => {}
         }
-        fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen).map(|(_, v)| address(v.0))
+        fa.until
+            .range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last))
+            .rev()
+            .find(|(_, v)| v.2 == row_gen)
+            .map(|(_, v)| address(v.0))
+            .or_else(own_gone)
     }
 
     /// #779: 覚えている 「slot の前の宛名」 の数 ([`FormerAddresses`]、 観測・試験用)。 bridge が追いつけば 0 に戻る。
@@ -20338,24 +21235,30 @@ impl Engine {
         // 新しい行を消した)
         // 読み直し [B1]: 2 人目の削除か (`raised`) も lock の下で読む (前は lock の外で読み、 読んだ後・lock の前にその行が消えると、
         // 2 人目の削除を 1 人目として扱って名前の削除優先 (#551) を通さなかった)
-        let raised = {
+        // 削除優先 (#551): 消えた行に別の author のより新しい削除が届いた (2 人が別々に消した) なら、 名前の削除の時刻が上がるので、
+        // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)。
+        // 1 人目の削除は前の名前だけ。 名前は行の lock の下で取る (review930 [4]: 放した後に場所で引くと、 その間に使い回しが名前を
+        // identity に移して場所から外し、 消す行がこの peer でだけ残った)
+        let names = {
             let guard = self.row_locks.write(local);
             if !self.remote_row_holds_slot(local, row) {
                 return false;
+            }
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                delete_locked_hook::call(wal);
             }
             let raised = self.slot_is_dead(local) && hlc > self.tombstone_version_of(local);
             if !self.apply_delete_in(Some(&guard), local, hlc, None) {
                 return false;
             }
-            raised
+            if raised { self.names_of_dead_slot(local) } else { self.former_names_of_slot(local) }
         };
-        // 削除優先 (#551): 消えた行に別の author のより新しい削除が届いた (2 人が別々に消した)。 名前の削除の時刻が上がるので、
-        // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)
-        if raised {
-            self.remove_rows_holding_names_of(local, hlc);
-        } else {
-            self.remove_rows_holding_former_names(local, hlc);
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            names_taken_hook::call(wal);
         }
+        self.remove_rows_holding_names(local, names, hlc);
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
@@ -20916,8 +21819,11 @@ impl Engine {
             return 0;
         }
         let Some(tomb) = self.foreign_tombstone_of(self_peer, gone) else { return 0 };
+        // #921 の読み直し [5]: その名前を前の名前として持っていた別の行から外す (使い回していない peer の `name_given_to_dead_row` は
+        // 消えた行の slot に付け替えて外す。 外さないと、 後からその名前で作られた行をこの peer でだけその行に束ねる)
         let changed = self.with_pk_key(himo, PkValue::Local(value), |k| {
-            self.pk_former.write().unwrap().insert_identity(self_peer, gone, himo, k)
+            let mut f = self.pk_former.write().unwrap();
+            f.insert_identity(self_peer, gone, himo, k) | f.release_key(himo, k)
         });
         if changed == Some(true) {
             self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
@@ -20960,11 +21866,13 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
         if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
-            // #917: 引いた行を、 行の lock の下でもう一度確かめる。 自分の行が引いた後に消えて場所が使い回されていれば、 もう無い
-            // 自分の行の削除として下の道へ (引く前に消えていた時と同じ扱い)
+            // #917: 引いた行を、 行の lock の下でもう一度確かめる。 引いた後にその行が消えて場所が使い回されていれば、 引く前に
+            // 消えていた時と同じ下の道へ: 自分の行はもう無い自分の行の削除、 他の peer の行は写像の無い行の削除 (#925 の [B3]:
+            // 使い回す道が写像を場所を生かす前に外すので、 使い回された場所の写像はもう無い。 前は何もせずに捨て、 引いた時刻で
+            // #545 の名前の削除の時刻を上げるかが変わった)
             let row = self.remote_row_of(foreign_eid, local_eid);
             let applied = self.remote_delete_apply_at(local_eid, row, hlc);
-            if applied || enchudb_oplog::eid_peer(foreign_eid) != self.peer_id() || self.remote_row_holds(local_eid, row) {
+            if applied || self.remote_row_holds(local_eid, row) {
                 return applied;
             }
         }
@@ -22122,9 +23030,15 @@ impl Engine {
         self.at_apply_point(true);
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc, valued.as_deref());
         drop(applying);
+        // 前の名前は行の lock の下で取る (review930 [4]、 `remove_rows_holding_names`)
+        let names = if applied { self.former_names_of_slot(eid) } else { Vec::new() };
         drop(row);
         if applied {
-            self.remove_rows_holding_former_names(eid, hlc);
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                names_taken_hook::call(wal);
+            }
+            self.remove_rows_holding_names(eid, names, hlc);
         } else {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
         }
@@ -27655,7 +28569,10 @@ impl Engine {
                 room_commit_hook::call(wal);
                 closed = self.append_commit_marker_with(wal, false).is_ok();
             }
-            // checkpoint を進める前に sidecar を固める (consumer の tick と同じ)
+            // checkpoint を進める前に sidecar を固める。 consumer の周期 (本体の書き出し → sidecar) と違い、 ここは本体の書き出し
+            // (下の `sync_for_checkpoint`、 秒単位になりうる) より前に書く = `.eidmap` (翻訳した行の削除の版数) が本体より先に disk
+            // に届く像がある。 開く時の #925 の見分けはその像でも写像を外さない (場所の行が削除の後に作り直された時だけ外す、
+            // review930 [1])。 `tables` の覆いは書き出しの後にも置き直す (`tables_cover_checkpoint`)
             self.try_persist_tables();
             #[cfg(test)]
             room_write_out_hook::call(wal);
@@ -34972,7 +35889,7 @@ mod remote_row_tests {
                 *m.lock().unwrap() = Some(y);
             });
             // X への名前 8 の書き込みが遅れて届いた (消えた行への改名): 名前 8 を、 X の削除より前から持つ行は一緒に消える
-            eng.name_given_to_dead_row(x, k, 8);
+            assert_eq!(eng.name_given_to_dead_row(x, eng.remote_row_of(x, x), k, 8).map(|_| ()), Some(()), "前提: X は消えた行のまま");
             let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
             assert_eq!(slot(y), slot(l), "前提: M は L の場所を使い回した");
             assert!(eng.is_live(y), "名前の削除優先が、 L を引いた後に場所を使い回した M を消した (other_name = {other_name})");
