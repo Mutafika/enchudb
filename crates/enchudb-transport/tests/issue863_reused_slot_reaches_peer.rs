@@ -443,14 +443,7 @@ fn the_state_carries_the_reused_rows_number() {
 fn the_state_names_own_rows_with_their_generation() {
     use enchudb_oplog::oplog::DecodedOp;
     let dir = Dir::new("state-shape");
-    let mut eng = Engine::create_with_capacity(&dir.db(A), 4096).unwrap();
-    eng.define_table("notes", 4).unwrap();
-    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
-    eng.define_himo_in("notes", "memo", ValueType::Number, 0).unwrap();
-    eng.define_ref_in("notes", "next", "notes").unwrap();
-    eng.enable_sync_tables().unwrap();
-    let a = Engine::concurrentize_with_oplog(eng, OPLOG).unwrap();
-    a.set_peer_id(A);
+    let a = ref_db(&dir.db(A), A);
     let tr = Arc::new(InMemoryTransport::new());
     tr.register_peer(A);
     let t: Arc<dyn Transport> = tr.clone();
@@ -491,4 +484,90 @@ fn the_state_names_own_rows_with_their_generation() {
     assert!(has(&|op| matches!(op, DecodedOp::Untie { eid, himo_id } if *eid == y && *himo_id == memo)), "使い回した行の Untie の宛名");
     assert!(has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == z)), "使い回して消えた行の Delete の宛名");
     assert!(!has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == rows[3] || *eid == rows[1])), "前の住人の番号で Delete を出した");
+}
+
+/// 表 `notes` (枠 4、 名前の無い表) に Number 2 本と、 同じ表を指す Ref `next`。
+fn ref_db(path: &str, peer: PeerId) -> Arc<Engine> {
+    let mut eng = Engine::create_with_capacity(path, 4096).unwrap();
+    eng.define_table("notes", 4).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "memo", ValueType::Number, 0).unwrap();
+    eng.define_ref_in("notes", "next", "notes").unwrap();
+    eng.enable_sync_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG).unwrap();
+    eng.set_peer_id(peer);
+    eng
+}
+
+/// Ref と使い回し: A が使い回した行 y を指す ref は、 B でも y の写しを指す (差分の道、 素の Tie の値 = 世代 | 場所)。 B が A の消えた行を
+/// 指して書いた ref は、 A では消えた行を指す ref (中身の無い行) のまま = 場所を使い回した y を指さない。
+#[test]
+fn refs_follow_the_generation_both_ways() {
+    let dir = Dir::new("refs");
+    let tr = Arc::new(InMemoryTransport::new());
+    tr.register_peer(A);
+    tr.register_peer(B);
+    let t: Arc<dyn Transport> = tr.clone();
+    let (a, b) = (ref_db(&dir.db(A), A), ref_db(&dir.db(B), B));
+    let (sa, sb) = (Syncer::new(a.clone(), t.clone()), Syncer::new(b.clone(), t));
+    let rows: Vec<u64> = (0..4u32)
+        .map(|i| {
+            let e = a.entity_in("notes").unwrap();
+            a.tie_to(e, "notes.note", 10 + i);
+            e
+        })
+        .collect();
+    settle(&a);
+    sa.publish_since(Hlc::ZERO);
+    sb.pull_once(A);
+    let on_b = |v: u32| b.pull_raw("notes.note", v);
+    let (r0_b, r1_b) = (on_b(10)[0], on_b(11)[0]);
+    // B が A の 2 行目 (この後 A で消える) を指す ref を書く (まだ配らない)
+    b.tie_ref_to(r0_b, "notes.next", r1_b);
+    settle(&b);
+    // A は 2 行目を消して場所を使い回し、 3 行目から y を指す
+    let y = reuse_second_row(&a, &rows);
+    a.tie_ref_to(rows[2], "notes.next", y);
+    settle(&a);
+    sa.publish_since(Hlc::ZERO);
+    for _ in 0..3 {
+        sb.pull_once(A);
+    }
+    let y_b = on_b(99);
+    assert_eq!(y_b.len(), 1, "前提: 使い回した行が B に現れた");
+    let target = |e: &Engine, row: u64| e.get(row, "notes.next").map(|v| enchudb_oplog::make_eid(e.peer_id(), v as u32));
+    assert_eq!(target(&b, on_b(12)[0]), Some(y_b[0]), "B で、 使い回した行を指す ref が y の写しを指さない");
+    // B の ref が A に届く: 消えた行 (前の住人) を指す ref
+    sb.publish_since(Hlc::ZERO);
+    sa.pull_once(B);
+    let got = target(&a, rows[0]).expect("B の ref が A に届かない");
+    assert_ne!(got, y, "消えた行を指す ref が、 場所を使い回した行を指した");
+    assert_eq!(got, rows[1], "消えた行を指す ref が、 消えた行の番号でない");
+}
+
+/// 別名 (#178) の知らせが A のもう無い行 (場所を使い回した前の住人) を名指しても、 使い回した行に相手の世界番号を結ばない。
+#[test]
+fn an_alias_naming_a_deleted_row_does_not_bind_the_reused_row() {
+    use enchudb::transport::WireRecord;
+    use enchudb_oplog::oplog::DecodedOp;
+    let dir = Dir::new("alias");
+    let tr = Arc::new(InMemoryTransport::new());
+    tr.register_peer(A);
+    tr.register_peer(B);
+    let (a, _b, sa, _sb, rows) = reused_pair(&dir, &tr);
+    let y = reuse_second_row(&a, &rows);
+    settle(&a);
+    let other = enchudb_oplog::make_eid(B, 7);
+    let at = |wall: u64| Hlc { wall, logical: 0, peer: B };
+    let note = a.himo_id("notes.note").unwrap() as u16;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    sa.apply_records(&[
+        WireRecord::unsigned(at(now + 1000), B, DecodedOp::Alias { eid: rows[1], same_as: other }),
+        WireRecord::unsigned(at(now + 2000), B, DecodedOp::Tie { eid: other, himo_id: note, value: 777 }),
+    ]);
+    assert_eq!(a.get(y, "notes.note"), Some(99), "相手の世界番号が使い回した行に結ばれた");
+    assert_eq!(a.pull_raw("notes.note", 777u32).len(), 1, "相手の行が別の行として現れない");
+    // もう無い行の削除は当たらない (退避表にも載せない)
+    assert!(!a.remote_delete_apply_foreign(rows[1], at(now + 3000)), "もう無い自分の行の削除を当てた");
+    assert!(a.is_live(y), "もう無い行の削除で使い回した行が消えた");
 }

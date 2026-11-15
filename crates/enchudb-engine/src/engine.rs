@@ -19249,10 +19249,10 @@ impl Engine {
     /// #784: 宛名 `foreign_eid` (author の世界番号) の削除を、 もう同じ版数 `hlc` で記録してあるか: 写像のある行は、 消えていて
     /// 削除の版数が `hlc`。 写像の無い行は、 退避表の削除の版数が `hlc`。 state を取り直した中継が、 同じ削除を載せ直さないために見る。
     pub fn remote_delete_is_recorded(&self, foreign_eid: enchudb_oplog::EntityId, hlc: enchudb_oplog::Hlc) -> bool {
-        if hlc == enchudb_oplog::Hlc::ZERO || self.is_gone_own_eid(foreign_eid) {
-            // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除の版数は残していない
+        if hlc == enchudb_oplog::Hlc::ZERO {
             return false;
         }
+        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の番号は写像が None、 退避表にも自分の peer の番号は載らない = false
         match self.resolve_remote_eid_existing(foreign_eid) {
             Some(local_eid) => {
                 let local = self.slot_unchecked(local_eid);
