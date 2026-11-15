@@ -3248,11 +3248,14 @@ mod tests {
                 match rnd(10) {
                     0 => hs.remove(e),
                     // 同じ場所の中で世代だけを変える (消えた行を指したままの ref を、 その場所を使い回した行へ指し直す)
-                    1..=3 => match hs.get_value(e) {
-                        Some(v) => hs.set(e, (v & ((1 << S) - 1)) | (rnd(4) << S)),
-                        None => hs.set(e, u64::from(slots[0])),
-                    },
-                    _ => hs.set(e, rnd(4) << S | u64::from(slots[rnd(slots.len() as u64) as usize])),
+                    1..=3 => {
+                        let v = match hs.get_value(e) {
+                            Some(v) => (v & ((1 << S) - 1)) | (rnd(4) << S),
+                            None => u64::from(slots[0]),
+                        };
+                        assert!(hs.set(e, v));
+                    }
+                    _ => assert!(hs.set(e, rnd(4) << S | u64::from(slots[rnd(slots.len() as u64) as usize]))),
                 }
             }
             check(&hs, &format!("round {round}"));

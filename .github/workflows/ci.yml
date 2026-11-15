@@ -124,6 +124,11 @@ jobs:
       - name: loom model check (live query の登録 barrier と門)
         run: cargo test -p enchudb-engine --test loom_live_subscribe --release
 
+      # #899: Ref の紐の円柱 (鍵 = 場所) の 「世代 > 0 の entry を置いた」 印。 読み手は bucket / live を読んだ後で印を見る
+      # (live の store は Release)。 Relaxed にした対照が落ちることも見る。
+      - name: loom model check (Ref の円柱の世代の印)
+        run: cargo test -p enchudb-engine --test loom_ref_gen_mark --release
+
       # #421: 書いた範囲 (dirty) の取り出しと同時の印 / 同時の flush。 lo / hi を別々に swap すると印が
       # 消え、 lock なしだと後の flush が前の flush の書き出しより先に返る (oplog_sync の後で checkpoint が先に進む)。
       - name: loom model check (flush_dirty の取り出し)

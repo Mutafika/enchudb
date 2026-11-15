@@ -17,8 +17,10 @@
 //!
 //! ## model の範囲
 //! bucket 1 つ (len と live)、 値の鍵 1 本 (Mutex)、 印 1 つ。 書き手 A は世代 1 の entry を置き、 書き手 B は (A の後でも前でも)
-//! 世代 0 の entry を置く。 読み手は live / len を読んでから印を読む。 対照: live の store / load を Relaxed にすると、 B の live を
-//! 読んだ読み手が印を見ない interleaving を loom が見つける (`relaxed_live_misses_the_mark`)。
+//! 世代 0 の entry を置く。 読み手 (別の thread) は live / len を読んでから印を読む。 対照: live の store / load を Relaxed にすると、
+//! B の live を読んだ読み手が印を見ない interleaving を loom が見つける (`relaxed_live_misses_the_mark`)。 読み手が 2 件とも数えた
+//! interleaving に届いたことも数えて確かめる (読み手を main に置いた最初の形は、 45 の interleaving の全部で読み手が 0 を読み、
+//! 約束の形も対照も何も確かめずに通っていた)。
 //!
 //! ## 実行
 //! ```sh
@@ -44,13 +46,13 @@ struct Model {
 }
 
 impl Model {
-    fn push(&self, gen: usize) {
-        if gen != 0 && !self.has_gen.load(Ordering::Acquire) {
+    fn push(&self, g: usize) {
+        if g != 0 && !self.has_gen.load(Ordering::Acquire) {
             self.has_gen.store(true, Ordering::Release);
         }
         let _g = self.lock.lock().unwrap();
         let l = self.len.load(Ordering::Relaxed);
-        self.gens[l].store(gen, Ordering::Relaxed);
+        self.gens[l].store(g, Ordering::Relaxed);
         self.len.store(l + 1, Ordering::Release);
         let v = self.live.load(Ordering::Relaxed);
         self.live.store(v + 1, self.live_order.0);
@@ -58,6 +60,9 @@ impl Model {
 }
 
 fn run(live_order: (Ordering, Ordering)) {
+    // 読み手が 2 件とも数えた interleaving を見た回数 (model が窓に届いている確認。 std の atomic = loom の外)
+    let both = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = both.clone();
     loom::model(move || {
         let m = Arc::new(Model {
             has_gen: AtomicBool::new(false),
@@ -67,30 +72,37 @@ fn run(live_order: (Ordering, Ordering)) {
             lock: Mutex::new(()),
             live_order,
         });
+        // 読み手は別の thread (main は書き手 B)。 数の読み: live を読んでから印。 2 件とも数えたなら、 世代 1 の entry も数えている。
+        // 値を引く読み: 写した entry に世代 1 があれば印を見る
+        let r = {
+            let m = m.clone();
+            loom::thread::spawn(move || {
+                let n = m.live.load(live_order.1);
+                let mark = m.has_gen.load(Ordering::Acquire);
+                if n == 2 {
+                    assert!(mark, "live を読んだのに世代 > 0 の印を見ない (数の読みが世代 1 の entity を世代 0 に数える)");
+                }
+                let l = m.len.load(Ordering::Acquire);
+                let copied: Vec<usize> = (0..l).map(|i| m.gens[i].load(Ordering::Relaxed)).collect();
+                let mark = m.has_gen.load(Ordering::Acquire);
+                if copied.contains(&1) {
+                    assert!(mark, "世代 1 の entry を写したのに印を見ない (entity として返す)");
+                }
+                n
+            })
+        };
         let a = {
             let m = m.clone();
             loom::thread::spawn(move || m.push(1))
         };
-        let b = {
-            let m = m.clone();
-            loom::thread::spawn(move || m.push(0))
-        };
-        // 数の読み: live を読んでから印。 2 件とも数えたなら、 世代 1 の entry も数えている
-        let n = m.live.load(live_order.1);
-        let mark = m.has_gen.load(Ordering::Acquire);
-        if n == 2 {
-            assert!(mark, "live を読んだのに世代 > 0 の印を見ない (数の読みが世代 1 の entity を世代 0 に数える)");
-        }
-        // 値を引く読み: 写した entry に世代 1 があれば印を見る
-        let l = m.len.load(Ordering::Acquire);
-        let copied: Vec<usize> = (0..l).map(|i| m.gens[i].load(Ordering::Relaxed)).collect();
-        let mark = m.has_gen.load(Ordering::Acquire);
-        if copied.contains(&1) {
-            assert!(mark, "世代 1 の entry を写したのに印を見ない (entity として返す)");
-        }
+        m.push(0);
         a.join().unwrap();
-        b.join().unwrap();
+        let n = r.join().unwrap();
+        if n == 2 {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     });
+    assert!(both.load(std::sync::atomic::Ordering::Relaxed) > 0, "前提: 読み手が 2 件とも数えた interleaving に届いていない");
 }
 
 /// 約束の形 (live の store は Release、 数の読みは Acquire) = 全 interleaving で印を見る。
