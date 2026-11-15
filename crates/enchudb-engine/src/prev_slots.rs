@@ -289,21 +289,29 @@ pub(crate) struct PrevSlots {
     epoch: AtomicU64,
     /// 行の番号 (世代 | 場所) の場所の bit (header と同じ。 配列の記録は世代だけを持つ)
     bits: AtomicU32,
-    /// 今の周期の区画に次に積む場所
-    head: AtomicU32,
-    /// 区画ごとの記録の周期の最大
-    half_max: [AtomicU64; 2],
+    /// 使い回しのたびに書く欄 ([`Hot`])
+    hot: Hot,
     /// 書き出した周期 (header と同じ)
     persisted: AtomicU64,
-    /// 書き手が今の区画の 3/4 を越えた (consumer が次の周期を待たずに sidecar を書いて周期を進める、 [`Self::take_urgent`])
-    urgent: AtomicBool,
     /// 開く時に記録から退避を戻した数 (観測・試験用)
     restored: AtomicU32,
-    /// log の区画が一杯で配列にだけ書いた数 (観測用)
-    log_full: AtomicU64,
     /// 開く時に読んだ記録 ((場所, 前の住人の行) の順。 log に残る全部と、 書き出していない周期の配列の件)。 WAL の再生・bridge が、
     /// 場所ごとの配列で上書きされた前の住人 (同じ場所を 2 回使い回した 1 回目) も引く ([`Self::record_of`])
     replay: std::sync::Mutex<Vec<(u32, PrevRecord)>>,
+}
+
+/// 使い回しのたびに書く欄。 128 B (Apple の cache line) に揃えて他の欄と line を分ける (review946c [K]: 揃える前は `head` が
+/// `Generations::region` (v15 の get / tie の全部が読む) と同じ 128 B に乗り、 使い回す書き手が他の書き手の世代の読みを外させた)。
+#[repr(align(128))]
+struct Hot {
+    /// 今の周期の区画に次に積む場所
+    head: AtomicU32,
+    /// 書き手が今の区画の 3/4 を越えた (consumer が次の周期を待たずに sidecar を書いて周期を進める、 [`PrevSlots::take_urgent`])
+    urgent: AtomicBool,
+    /// 区画ごとの記録の周期の最大
+    half_max: [AtomicU64; 2],
+    /// log の区画が一杯で配列にだけ書いた数 (観測用)
+    log_full: AtomicU64,
 }
 
 impl PrevSlots {
@@ -314,12 +322,14 @@ impl PrevSlots {
             epoch_gate: crate::publish_gate::PublishGate::new(),
             epoch: AtomicU64::new(1),
             bits: AtomicU32::new(0),
-            head: AtomicU32::new(0),
-            half_max: [AtomicU64::new(0), AtomicU64::new(0)],
+            hot: Hot {
+                head: AtomicU32::new(0),
+                urgent: AtomicBool::new(false),
+                half_max: [AtomicU64::new(0), AtomicU64::new(0)],
+                log_full: AtomicU64::new(0),
+            },
             persisted: AtomicU64::new(0),
-            urgent: AtomicBool::new(false),
             restored: AtomicU32::new(0),
-            log_full: AtomicU64::new(0),
             replay: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -367,7 +377,7 @@ impl PrevSlots {
 
     /// log の区画が一杯で配列にだけ書いた数 (観測用)。
     pub(crate) fn log_full(&self) -> u64 {
-        self.log_full.load(Ordering::Relaxed)
+        self.hot.log_full.load(Ordering::Relaxed)
     }
 
     /// 開いた v15 の DB の `prev.seg` (行の番号の場所の bit は `bits`)。 header が合わない (作った直後に落ちた / 前の binary の残り /
@@ -431,9 +441,9 @@ impl PrevSlots {
         let _ = self.region.set(region);
         self.bits.store(bits, Ordering::Relaxed);
         self.epoch.store(1, Ordering::Relaxed);
-        self.head.store(0, Ordering::Relaxed);
+        self.hot.head.store(0, Ordering::Relaxed);
         self.persisted.store(0, Ordering::Relaxed);
-        for m in &self.half_max {
+        for m in &self.hot.half_max {
             m.store(0, Ordering::Relaxed);
         }
         Ok(())
@@ -501,13 +511,13 @@ impl PrevSlots {
         for half in 0..2u32 {
             let (end, max) = Self::scan_half(r, half, |_, _, _, _| {});
             ends[half as usize] = end;
-            self.half_max[half as usize].store(max, Ordering::Relaxed);
+            self.hot.half_max[half as usize].store(max, Ordering::Relaxed);
             seen = seen.max(max);
         }
         let epoch = seen + 1;
         self.persisted.store(persisted, Ordering::Relaxed);
         self.epoch.store(epoch, Ordering::Relaxed);
-        self.head.store(ends[(epoch % 2) as usize], Ordering::Relaxed);
+        self.hot.head.store(ends[(epoch % 2) as usize], Ordering::Relaxed);
     }
 
     /// 記録のありうる場所の上限 (配列の commit 済みの範囲)。
@@ -546,26 +556,26 @@ impl PrevSlots {
         }
         let half = (epoch % 2) as u32;
         // 一杯の区画は読むだけ (一杯の後に書き手ごとに積む位置を取り合わない)
-        let i = if self.head.load(Ordering::Relaxed) < LOG_ENTRIES {
-            self.head.fetch_add(1, Ordering::Relaxed)
+        let i = if self.hot.head.load(Ordering::Relaxed) < LOG_ENTRIES {
+            self.hot.head.fetch_add(1, Ordering::Relaxed)
         } else {
             LOG_ENTRIES
         };
         let wake = i == LOG_URGENT;
         if wake {
             // 区画の 3/4 (この件数目を積んだ書き手は 1 本だけ): 呼び手が consumer を起こし、 次の周期を待たずに周期を進めさせる
-            self.urgent.store(true, Ordering::Relaxed);
+            self.hot.urgent.store(true, Ordering::Relaxed);
         }
         let in_log = i < LOG_ENTRIES && r.ensure_committed(log_off(half, i) + ENTRY).is_ok();
         if in_log {
             Self::put_words(r, log_off(half, i), &encode(slot, epoch, rec));
-            let m = &self.half_max[half as usize];
+            let m = &self.hot.half_max[half as usize];
             if m.load(Ordering::Relaxed) != epoch {
                 m.store(epoch, Ordering::Relaxed);
             }
         } else {
             // 観測用の数 (書き手が並ぶと数え落としうる。 一杯の後の書き込みごとに 1 語の RMW を取り合わない)
-            self.log_full.store(self.log_full.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            self.hot.log_full.store(self.hot.log_full.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
             // 開く時に配列もなめる (この周期を書き出す前に落ちた時)。 一杯の周期の残りの書き込みは読むだけ
             let w = self.header_u64(H_OVERFLOW);
             if in_array && w.load(Ordering::Relaxed) < epoch {
@@ -654,13 +664,13 @@ impl PrevSlots {
             return false;
         }
         let p = self.persisted.load(Ordering::Relaxed);
-        self.half_max.iter().any(|m| m.load(Ordering::Relaxed) > p) || self.header_u64(H_OVERFLOW).load(Ordering::Relaxed) > p
+        self.hot.half_max.iter().any(|m| m.load(Ordering::Relaxed) > p) || self.header_u64(H_OVERFLOW).load(Ordering::Relaxed) > p
     }
 
     /// 書き手が今の区画の 3/4 を越えたか (印を下ろす)。 consumer は、 次の周期を待たずに sidecar を書いて周期を進める (区画が一杯に
     /// なる前に。 一杯の周期の記録は配列にだけ = 同じ場所を 2 回使い回した 1 回目が残らない)。
     pub(crate) fn take_urgent(&self) -> bool {
-        self.urgent.load(Ordering::Relaxed) && self.urgent.swap(false, Ordering::Relaxed)
+        self.hot.urgent.load(Ordering::Relaxed) && self.hot.urgent.swap(false, Ordering::Relaxed)
     }
 
     /// sidecar (`.eidmap` / `eidalias` / `pktombs` / `pkformer`) を書き出す前 (呼び手は書き出しを 1 本に並べる lock を握っている)。
@@ -676,14 +686,14 @@ impl PrevSlots {
         let persisted = self.persisted.load(Ordering::Relaxed);
         let (cur, other) = ((epoch % 2) as usize, ((epoch + 1) % 2) as usize);
         let overflow = self.header_u64(H_OVERFLOW).load(Ordering::Relaxed);
-        let other_pending = self.half_max[other].load(Ordering::Relaxed) > persisted;
-        if !other_pending && self.half_max[cur].load(Ordering::Relaxed) <= persisted && overflow <= persisted {
+        let other_pending = self.hot.half_max[other].load(Ordering::Relaxed) > persisted;
+        if !other_pending && self.hot.half_max[cur].load(Ordering::Relaxed) <= persisted && overflow <= persisted {
             return None;
         }
         if other_pending {
             return Some(epoch - 1);
         }
-        self.head.store(0, Ordering::Relaxed);
+        self.hot.head.store(0, Ordering::Relaxed);
         self.epoch.store(epoch + 1, Ordering::Release);
         Some(epoch)
     }
@@ -891,7 +901,7 @@ mod tests {
         let again = PrevSlots::off();
         assert_eq!(again.attach(region(&mut buf), true, 24, no_flush), Some(false));
         assert_eq!(again.unpersisted(), want);
-        assert_eq!(again.head.load(Ordering::Relaxed), 4, "開き直した後に積む位置が穴の後ろの記録より前");
+        assert_eq!(again.hot.head.load(Ordering::Relaxed), 4, "開き直した後に積む位置が穴の後ろの記録より前");
         for s in [5u32, 6] {
             let e = own(s, 1, u64::from(s) * 10);
             assert!(again.write(s, &e));
