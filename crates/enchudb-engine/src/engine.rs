@@ -7707,6 +7707,9 @@ pub struct Engine {
     defer_tables_persist: std::sync::atomic::AtomicBool,
     /// #847: `tables` の sidecar に最後に置いた中身 ([`Self::persist_tables_file`])。 同じ中身なら file に触らない。
     tables_persisted: std::sync::Mutex<Option<Vec<u8>>>,
+    /// #902: `tables` を置き換えた (rename した) 後、 親の directory の fsync がまだ済んでいない ([`Self::persist_tables_file`]、
+    /// `tables_persisted` の lock の下でだけ触る)。
+    tables_dir_unsynced: std::sync::atomic::AtomicBool,
     /// #847: sync の ring の穴を次に探し始める所 ([`Self::rebuild_free_locals`]、 `free_locals` の lock の下でだけ触る)。
     sync_ring_rebuild_from: std::sync::atomic::AtomicU32,
     /// #868: 枯渇した表の穴を探して枠をなめた回数 ([`Self::free_slot_scans`])。
@@ -8160,6 +8163,7 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
+            tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             written_out_pos: std::sync::atomic::AtomicU64::new(0),
@@ -9583,6 +9587,7 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
+            tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             written_out_pos: std::sync::atomic::AtomicU64::new(0),
@@ -13864,7 +13869,8 @@ impl Engine {
     ///
     /// #847: 中身が、 この engine が最後に置いた (または file と同じと確かめた) 中身と同じなら、 file に触らない。 前は
     /// 書き出しのたびに file を開いて読み比べていた (`write_atomic_if_changed`。 file system が混むと、 開くだけで待たされる)。
-    /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない。
+    /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない (置けなかった回は覚えた中身を
+    /// 捨てる、 #902)。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_tables_file(&self) -> io::Result<()> {
         self.persist_tables_file_with(None)
@@ -13884,10 +13890,20 @@ impl Engine {
         );
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
+            use std::sync::atomic::Ordering;
             let path = tables_path_for(&self.path);
-            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)
+            // #902: 置けなかったら覚えた中身を捨てる (置き換えの途中・後で失敗すると、 file は覚えた中身と違いうる。 覚えたままだと、 中身が
+            // 前に置いた形に戻った時に file に触らずに済ませ、 失敗した回の中身が file に残る)
+            *last = None;
+            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)。 #902: 送れる
+            // まで印を残し、 中身が file と同じ (前の回の rename は通った) でも送り直す。 前は、 送るのに失敗した後の回が 「中身は同じ」 で
+            // 送らずに置いたと返し、 checkpoint が rename の永続を待たずに進みえた
             if crate::db_files::write_atomic_if_changed(&path, &bytes)? {
+                self.tables_dir_unsynced.store(true, Ordering::Release);
+            }
+            if self.tables_dir_unsynced.load(Ordering::Acquire) {
                 crate::db_files::sync_tables_dir(&path)?;
+                self.tables_dir_unsynced.store(false, Ordering::Release);
             }
             *last = Some(bytes);
         }
