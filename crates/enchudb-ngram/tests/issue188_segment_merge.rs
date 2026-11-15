@@ -6,11 +6,29 @@
 
 use enchudb_ngram::NgramIndex;
 
-/// テスト用の一時パス（衝突しないように名前で分ける）。
+/// テスト用の一時パス（衝突しないように名前で分ける）。 pid も入れて、 並べて回した別の process の試験と取り合わない (#906)。
 fn tmp(name: &str) -> String {
-    let dir = std::env::temp_dir().join("enchudb_issue188");
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(format!("{name}.etxt")).to_string_lossy().into_owned()
+    let p = std::env::temp_dir()
+        .join(format!("enchudb_issue188_{}_{name}.etxt", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    TMP_PATHS.with(|t| t.0.borrow_mut().push(p.clone()));
+    p
+}
+
+/// [`tmp`] が渡した path。 試験の thread の終わりに消す (名前が run ごとに変わるので積もらないように)。
+struct TmpPaths(std::cell::RefCell<Vec<String>>);
+
+impl Drop for TmpPaths {
+    fn drop(&mut self) {
+        for p in self.0.get_mut().drain(..) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+thread_local! {
+    static TMP_PATHS: TmpPaths = const { TmpPaths(std::cell::RefCell::new(Vec::new())) };
 }
 
 /// 条文っぽい日本語（bigram が十分散る長さ）。

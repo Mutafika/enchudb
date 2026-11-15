@@ -36,7 +36,6 @@ const HIMOS: &[(&str, Kind)] = &[
 const POOL: usize = 24; // 事前確保する entity 数
 const VMAX: u32 = 8; // Number の値域 0..VMAX（小さくして bucket 衝突 = stale を誘発）
 const STRINGS: &[&str] = &["p", "q", "r", "s"]; // Tag の小語彙（vid 再利用 = stale を誘発）
-const PATH: &str = "/tmp/test_engine_model_proptest.db";
 
 /// oracle が持つ値。Number は u32、Tag は文字列。
 #[derive(Debug, Clone, PartialEq)]
@@ -79,16 +78,40 @@ struct Model {
     dead: HashSet<usize>,                // delete された entity_idx（slot freed、以後 op skip）
 }
 
-fn fresh() {
-    let _ = std::fs::remove_dir_all(&PATH); // v10: DB は directory
-    for suf in ["", ".oplog", ".lock", ".tables"] {
-        let _ = std::fs::remove_file(format!("{PATH}{suf}"));
+/// 1 case の DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+/// drop で消す (case が落ちて途中で返った時も、 shrink の回の分も残さない)。 engine より先に作って後に落とすこと。
+struct TmpDb(String);
+
+impl TmpDb {
+    fn new() -> Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db = TmpDb(format!("/tmp/test_engine_model_proptest_{}_{seq}_{nanos}.db", std::process::id()));
+        db.fresh();
+        db
+    }
+
+    fn fresh(&self) {
+        let path = &self.0;
+        let _ = std::fs::remove_dir_all(path); // v10: DB は directory
+        for suf in ["", ".oplog", ".lock", ".tables"] {
+            let _ = std::fs::remove_file(format!("{path}{suf}"));
+        }
     }
 }
 
-fn build() -> (Engine, Vec<enchudb_oplog::EntityId>) {
-    fresh();
-    let mut eng = Engine::create_growable_with_capacity(PATH, POOL as u32 + 100).unwrap();
+impl Drop for TmpDb {
+    fn drop(&mut self) {
+        self.fresh();
+    }
+}
+
+fn build(path: &str) -> (Engine, Vec<enchudb_oplog::EntityId>) {
+    let mut eng = Engine::create_growable_with_capacity(path, POOL as u32 + 100).unwrap();
     for &(name, kind) in HIMOS {
         let vt = match kind {
             Kind::Num => ValueType::Number,
@@ -214,7 +237,8 @@ proptest! {
     /// ランダム op 列を engine + oracle に流し、毎 op 後に厳密一致を要求。
     #[test]
     fn engine_matches_oracle(ops in prop::collection::vec(op_strategy(), 1..40)) {
-        let (mut eng, eids) = build();
+        let db = TmpDb::new();
+        let (mut eng, eids) = build(&db.0);
         let mut model = Model::default();
 
         for op in ops {
@@ -246,13 +270,13 @@ proptest! {
                     // 経路を挟み、永続化 + 再構築の正当性も同時に検証する（Vocabulary 込み）。
                     eng.flush().unwrap();
                     drop(eng);
-                    eng = Engine::open_standalone(PATH).unwrap();
+                    eng = Engine::open_standalone(&db.0).unwrap();
                 }
             }
             verify(&eng, &eids, &model)?;
         }
         // 末尾で多条件 AND path も oracle 交差と照合。
         verify_queries(&eng, &eids, &model)?;
-        fresh();
+        drop(eng);
     }
 }

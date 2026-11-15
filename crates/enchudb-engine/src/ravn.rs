@@ -355,7 +355,7 @@ mod tests {
     use crate::{Engine, ValueType};
 
     fn setup(name: &str) -> (Arc<Engine>, Ravn) {
-        let path = format!("/tmp/enchu_ravn_{name}.db");
+        let path = crate::test_db_path(&format!("enchu_ravn_{name}"));
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let mut eng = Engine::create_standalone(&path).unwrap();
@@ -452,7 +452,7 @@ mod tests {
     /// #556: peer の頭のある DB で、 `follow` は `reverse_follow` と同じ頭付きの eid を返し、 `bfs` は輪で始点に戻らない。
     #[test]
     fn follow_keeps_the_peer_head_and_bfs_stops_on_a_cycle() {
-        let path = "/tmp/enchu_ravn_peer_head.db";
+        let path = &crate::test_db_path("enchu_ravn_peer_head");
         let _ = std::fs::remove_dir_all(path);
         let _ = std::fs::remove_file(path);
         let mut eng = Engine::create_standalone(path).unwrap();

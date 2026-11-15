@@ -18,6 +18,17 @@ use enchudb_oplog::eid_local;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// 試験ごとの DB の path。 pid / 連番 / 時刻を入れて、 並べて回した別の process の試験と取り合わない (#906)。
+fn tmp_path(tag: &str) -> &'static str {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("/tmp/{tag}_{}_{seq}_{nanos}.db", std::process::id()).leak()
+}
+
 const VMAX: u32 = 50;
 const OPLOG_CAP: usize = 64 * 1024 * 1024;
 
@@ -116,13 +127,13 @@ fn assert_graceful_reopen(path: &str, written: &HashMap<u32, u32>, ctx: &str) ->
 /// （torn tail → body から復元）は `reopen_recovers_with_zeroed_wal_tail` が踏む。
 #[test]
 fn reopen_survives_oplog_truncation() {
-    let base = "/tmp/test_oplog_fault_trunc_base.db";
+    let base = tmp_path("test_oplog_fault_trunc_base");
     let written = make_durable(base, 5_000);
     let full = oplog_len(base);
     assert!(full > 0, "oplog が空");
 
     for pct in [0u64, 10, 33, 50, 75, 90, 99] {
-        let path = format!("/tmp/test_oplog_fault_trunc_{pct}.db");
+        let path = format!("{base}-{pct}");
         copy_db(base, &path);
         let new_len = full * pct / 100;
         let f = std::fs::OpenOptions::new()
@@ -144,7 +155,7 @@ fn reopen_survives_oplog_truncation() {
 /// こちらが「復旧経路」の本体検証。
 #[test]
 fn reopen_recovers_with_zeroed_wal_tail() {
-    let base = "/tmp/test_oplog_fault_zerotail_base.db";
+    let base = tmp_path("test_oplog_fault_zerotail_base");
     let written = make_durable(base, 5_000);
     let full = oplog_len(base);
     assert!(full > 0, "oplog が空");
@@ -156,7 +167,7 @@ fn reopen_recovers_with_zeroed_wal_tail() {
         if from >= full {
             continue;
         }
-        let path = format!("/tmp/test_oplog_fault_zerotail_{from}.db");
+        let path = format!("{base}-{from}");
         copy_db(base, &path);
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new()
@@ -180,7 +191,7 @@ fn reopen_recovers_with_zeroed_wal_tail() {
 /// oplog の各所を byte-flip → CRC32 検知で reopen が壊れない。
 #[test]
 fn reopen_survives_oplog_byte_flips() {
-    let base = "/tmp/test_oplog_fault_flip_base.db";
+    let base = tmp_path("test_oplog_fault_flip_base");
     let written = make_durable(base, 5_000);
     let full = oplog_len(base);
     assert!(full > 0, "oplog が空");
@@ -191,7 +202,7 @@ fn reopen_survives_oplog_byte_flips() {
         if off >= full {
             continue;
         }
-        let path = format!("/tmp/test_oplog_fault_flip_{off}.db");
+        let path = format!("{base}-{off}");
         copy_db(base, &path);
         // 1 byte を XOR 0xFF で反転。
         use std::io::{Read, Seek, SeekFrom, Write};
