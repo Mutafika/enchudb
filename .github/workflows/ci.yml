@@ -198,6 +198,11 @@ jobs:
       - name: power loss simulation, standalone open (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test issue880_standalone_open_replays_wal --release
 
+      # #902: `tables` の rename の後の directory の fsync (#884) に失敗したら、 次の書き出しは中身が file と同じでも送り直してから
+      # 置いたと返し、 覚えた中身を捨てる (その点の I/O の故障を子 process で起こす)
+      - name: tables dir fsync failure (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test issue902_tables_dir_sync_failure --release
+
       # #98 ③④: I/O の点ごとの故障 (I/O エラー / process の死 / 電源断 × flush / oplog の書き手)。 同じ crashsim feature の
       # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
       - name: fault injection / crash matrix (crashsim)
