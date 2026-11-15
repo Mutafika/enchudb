@@ -2215,8 +2215,12 @@ impl Syncer {
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
                 let r = ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc));
-                // #917: その行がもう場所に居ない (消えて使い回された) なら、 消えた行宛ての record (入口の照合と同じく捨てる)
+                // #917: その行がもう場所に居ない (引いた後に消えて使い回された) なら、 消えた行宛ての record。 自分の行なら入口の
+                // 照合の道をもう一度通す (引く前に消えていた時と同じ扱い。 入口で必ず返る = もう一度ここには来ない)
                 if r == ApplyResult::SkippedOlder && !self.engine.remote_row_holds(local_eid, row) {
+                    if self.engine.is_gone_own_eid(*eid) {
+                        return self.apply_one(store, rec, None, dying);
+                    }
                     return ApplyResult::SkippedOlder;
                 }
                 // 当てた後に (LWW で負けても) 束ねた identity のカードと名前の年表に積む (最初の改名は、 当てる前のカードから

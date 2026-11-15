@@ -16881,12 +16881,8 @@ impl Engine {
 
     /// untie 経路用の `clear_cell_local` — 採用が決まった cell の Leaf payload も
     /// 解放する。 不採用 (= 古い untie) のときは payload を **解放しない**
-    /// (cell がまだその payload を指しているため)。
-    fn clear_cell_local_freeing_leaf(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
-        self.clear_cell_in_freeing_leaf(None, local, himo_id, hlc)
-    }
-
-    /// `clear_cell_local_freeing_leaf` の、 行 `local` の lock を握っている呼び手も呼べる形 (`set_cell_in` と同じ)。
+    /// (cell がまだその payload を指しているため)。 行 `local` の lock を握っている呼び手は `row` に渡す (`set_cell_in` と同じ)、
+    /// `None` なら当てる間だけ握る。
     fn clear_cell_in_freeing_leaf(
         &self,
         row: Option<&crate::row_lock::RowWrite<'_>>,
@@ -19990,8 +19986,13 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
         if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
-            // #917: 引いた行を、 行の lock の下でもう一度確かめる
-            return self.remote_delete_apply_at(local_eid, self.remote_row_of(foreign_eid, local_eid), hlc);
+            // #917: 引いた行を、 行の lock の下でもう一度確かめる。 自分の行が引いた後に消えて場所が使い回されていれば、 もう無い
+            // 自分の行の削除として下の道へ (引く前に消えていた時と同じ扱い)
+            let row = self.remote_row_of(foreign_eid, local_eid);
+            let applied = self.remote_delete_apply_at(local_eid, row, hlc);
+            if applied || enchudb_oplog::eid_peer(foreign_eid) != self.peer_id() || self.remote_row_holds(local_eid, row) {
+                return applied;
+            }
         }
         self.observe_remote_hlc(hlc);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
