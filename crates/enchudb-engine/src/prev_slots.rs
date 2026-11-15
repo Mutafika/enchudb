@@ -44,8 +44,9 @@
 //! - **log** (開く時に戻す元): 使い回しのたびに今の周期の区画に 1 件積む。 周期は sidecar の書き出しごとに進む
 //!   ([`PrevSlots::begin_persist`]: 門を閉じて中の使い回しを待ってから進める = 周期 e の記録の memory の効果は、 e + 1 に進めた後に
 //!   取る sidecar の写しに全部入る)。 sidecar は WAL に書き込みのある consumer の周期で書くほか、 書き出していない記録が残っていれば
-//!   暇な周期でも書く (`Engine::persist_prev_if_pending`。 `oplog_sync()` の後に暇になった DB で周期が止まらない)。 sidecar を書けたら header に 「書き出した周期」 を置いて header の page を書き出す
-//!   ([`PrevSlots::end_persist`])。 開く時は書き出した周期より後の記録だけ戻す = 書き出し済みの記録・忘れてよい線 (`forget_deletes_before`)
+//!   暇な周期でも書く (`Engine::persist_prev_if_pending`。 `oplog_sync()` の後に暇になった DB で周期が止まらない。 1 秒に 1 回まで、
+//!   review946c [G])。 sidecar を書けたら DB の directory を fsync し (rename を disk へ、 review946c [C])、 header に 「書き出した周期」
+//!   を置いて header の page を書き出す ([`PrevSlots::end_persist`])。 開く時は書き出した周期より後の記録だけ戻す = 書き出し済みの記録・忘れてよい線 (`forget_deletes_before`)
 //!   で忘れた記録は戻さない (review946 [2])。 同じ場所を 1 つの周期で 2 回使い回しても、 2 件とも順に残る (場所ごとの配列は上書き)。
 //!   区画は周期の偶奇で交互に使い、 前の周期の区画を頭から使い直すのは、 その周期が書き出し済みの時だけ。 開く時になめるのは 2 つの
 //!   区画の commit 済みの所 (場所の数によらない、 review946 [4]。 全部 0 の件 = 並んだ書き手の穴は飛ばす、 review946c [B])。
@@ -57,8 +58,9 @@
 //!   2 語、 書き出した周期の記録は残りを読まない)
 //!
 //! - きれいに閉じなかった後に開く時:
-//!   - `.eidmap` の写像の面が、 配列の記録の identity (翻訳した行) のまま場所を指していて、 使い回しが本体に届いている (場所の最後の行が
-//!     記録の行でない) なら、 写像を戻さず削除の版数を identity に退避する (`Engine::prev_evicted`、 #925 の推測より先に決める)
+//!   - `.eidmap` の写像の面が、 配列の記録か書き出していない周期の記録 (`.eidmap` を読む前に読む、 review946c [A]) の identity
+//!     (翻訳した行) のまま場所を指していて、 使い回しが本体に届いている (場所の最後の行が記録の行でない) なら、 写像を戻さず削除の
+//!     版数を identity に退避する (`Engine::prev_evicted`、 #925 の推測より先に決める)
 //!   - 書き出していない記録の identity の削除が退避表に無ければ戻す (`Engine::restore_prev_residents`。 前の住人の削除が本体に届いて
 //!     いない像 = 場所の最後の行が記録の行で生きている、 は戻さない。 名前は今まで通り sidecar から、 `move_stale_slot_names`)
 //!   - WAL の再生は、 記録の行 (使い回した前の住人) 宛ての record を当てない (`Engine::replay_slot`)。 引くのは配列と log に残る
@@ -298,6 +300,9 @@ pub(crate) struct PrevSlots {
     /// 開く時に読んだ記録 ((場所, 前の住人の行) の順。 log に残る全部と、 書き出していない周期の配列の件)。 WAL の再生・bridge が、
     /// 場所ごとの配列で上書きされた前の住人 (同じ場所を 2 回使い回した 1 回目) も引く ([`Self::record_of`])
     replay: std::sync::Mutex<Vec<(u32, PrevRecord)>>,
+    /// 開く時に記録から戻した自分の行の削除 (前の住人の行, 削除の版数)。 #451 の作り直しが WAL に無い Delete を載せる
+    /// ([`Self::take_restored_own`]、 review946c [E])
+    restored_own: std::sync::Mutex<Vec<(u32, Hlc)>>,
 }
 
 /// 使い回しのたびに書く欄。 128 B (Apple の cache line) に揃えて他の欄と line を分ける (review946c [K]: 揃える前は `head` が
@@ -331,6 +336,7 @@ impl PrevSlots {
             persisted: AtomicU64::new(0),
             restored: AtomicU32::new(0),
             replay: std::sync::Mutex::new(Vec::new()),
+            restored_own: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -369,6 +375,16 @@ impl PrevSlots {
     /// 開く時に記録から退避を戻した数を足す / 読む (観測・試験用)。
     pub(crate) fn note_restored(&self, n: u32) {
         self.restored.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// 開く時に記録から自分の行 `gone` の削除 (版数 `tomb`) を戻した。
+    pub(crate) fn note_restored_own(&self, gone: u32, tomb: Hlc) {
+        self.restored_own.lock().unwrap_or_else(|p| p.into_inner()).push((gone, tomb));
+    }
+
+    /// 開く時に記録から戻した自分の行の削除 (取り出す)。
+    pub(crate) fn take_restored_own(&self) -> Vec<(u32, Hlc)> {
+        std::mem::take(&mut *self.restored_own.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     pub(crate) fn restored(&self) -> u32 {

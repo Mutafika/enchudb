@@ -3642,6 +3642,72 @@ fn a_reuse_record_that_reached_disk_before_the_delete_keeps_the_row_alive() {
     assert_eq!(restored, 0, "削除の届いていない X を記録から戻した");
 }
 
+/// review946c [E]: 本体の書き出しの WAL の書き出しの後に A のアプリが X を消して Y で場所を使い回し、 本体の書き出し (記録・生きている
+/// 印・0 にした tomb.seg) が返った後・次の WAL の書き出しの前に電源が落ちる (#451 の前提の像: WAL に X の Delete も Y も無い)。 開いた
+/// A は記録から X の削除を戻し (state に入る)、 #451 の作り直しが X の Delete を WAL に載せて bridge が配る (差分で受ける peer にも届く)。
+/// 前は作り直しが場所の削除の版数 (tomb.seg、 使い回しが 0 にした) しか見ず、 X の Delete は state にしか無かった (差分で受ける peer
+/// では X が生きたまま)。
+#[test]
+fn a_restored_own_delete_missing_from_the_wal_is_relogged() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_restored_relog");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, tomb) = {
+        let (eng, x) = full_named_table_engine(&live.join("db"));
+        let _hold = eng.hold_consumer();
+        // WAL に書き出す物を置く (書き出しが走る)
+        eng.tie_to(x, "t.v", 71u32);
+        eng.oplog_commit();
+        let reused: Arc<std::sync::Mutex<Option<(u64, Hlc)>>> = Arc::new(std::sync::Mutex::new(None));
+        let shot = Arc::new(AtomicBool::new(false));
+        let (e2, r2, s2, l, i) = (eng.clone(), reused.clone(), shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && r2.lock().unwrap().is_none() {
+                e2.delete(x);
+                e2.oplog_commit();
+                let tomb = e2.tombstone_hlc(x);
+                *r2.lock().unwrap() = Some((add_seven(&e2, 77), tomb));
+            }
+            if p == Phase::WrittenOut && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        let (y, tomb) = reused.lock().unwrap().expect("前提: 書き出しの途中で使い回した");
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
+        assert!(shot.load(Ordering::SeqCst), "前提: 本体の書き出しの後で撮った");
+        (x, tomb)
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let alive = eng.is_live(x);
+    let ys: Vec<u64> = eng.pull_raw("t.k", 7u32).into_iter().filter_map(|e| eng.get(e, "t.v")).collect();
+    let restored = eng.prev_residents_restored();
+    let in_state = eng.state_records().0.iter().any(|r| matches!(r.op, DecodedOp::Delete { eid } if eid == x) && r.hlc == tomb);
+    eng.transfer_oplog_to_sync_ops();
+    let bridged: Vec<(u64, Hlc)> = eng
+        .settled_sync_records(|_, _| true)
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } => Some((eid, r.hlc)),
+            _ => None,
+        })
+        .collect();
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(!alive && ys == vec![77], "前提: 像では X が消えて Y が生きている (本体が届いた): alive {alive}, Y {ys:?}");
+    assert_eq!(restored, 1, "前提: 記録から X の削除を戻した");
+    assert!(in_state, "前提: state に X の Delete がある");
+    assert!(bridged.contains(&(x, tomb)), "WAL に無い X の Delete を作り直して配らない (差分で受ける peer に届かない): {bridged:x?}");
+}
+
 /// review946 [1] の続き: X を消して Y で使い回してから `oplog_sync` し (WAL に X の Delete と Y が届く)、 `prev.seg` を書き出した後・
 /// 生きている印の前に電源が落ちる (本体は X の削除の前、 記録あり)。 開く時は記録を戻さず (X は本体で生きている)、 再生が X の Delete の
 /// 後に Y を生かす所で使い回しの後始末をやり直す = Y は生き、 state に X の Delete がある。

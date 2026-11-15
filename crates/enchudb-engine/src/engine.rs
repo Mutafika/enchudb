@@ -19481,6 +19481,11 @@ impl Engine {
         if !others.is_empty() {
             self.retreat_removed_keys(&others, rec.tomb);
         }
+        // review946c [E]: 戻した自分の行の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
+        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)
+        if rec.kind == crate::prev_slots::PrevKind::Own {
+            self.generations().prev.note_restored_own(rec.gone, rec.tomb);
+        }
         true
     }
 
@@ -28193,6 +28198,7 @@ impl Engine {
                 }
             }
         }
+        // (削除の版数, 消えた行の番号 = 世代 | 場所)
         let mut deletes: Vec<(Hlc, u32)> = Vec::new();
         if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
             for local in 0..n {
@@ -28201,8 +28207,16 @@ impl Engine {
                 // 見ると落ちた後に開くたびに 「載らなかった自分の削除」 に数え、 配った版数より古いので floor を上げて相手全員を
                 // bootstrap に回す
                 if unlogged(h) && !self.slot_is_in_engine_internal_table(local) {
-                    deletes.push((h, local));
+                    // #731: 消えた行の世代 (WAL の record は世代込み、 再生は世代 + 1 まで上げる)
+                    deletes.push((h, self.last_local_of_slot(local)));
                 }
+            }
+        }
+        // review946c [E]: 開く時に `prev.seg` の記録から戻した自分の行の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
+        // 前の住人の番号で載せる (bridge は記録から自分の世界番号と引く)
+        for (gone, h) in self.generations().prev.take_restored_own() {
+            if unlogged(h) {
+                deletes.push((h, gone));
             }
         }
         if trace {
@@ -28228,9 +28242,8 @@ impl Engine {
             wal.observe_hlc(top.max(reached));
             deletes.sort_unstable();
             cells.sort_unstable();
-            for (h, local) in &deletes {
-                // #731: 消えた行の世代 (WAL の record は世代込み、 再生は世代 + 1 まで上げる)
-                let row = enchudb_oplog::make_eid(me, self.last_local_of_slot(*local));
+            for (h, gone) in &deletes {
+                let row = enchudb_oplog::make_eid(me, *gone);
                 if wal.append_at_hlc(Op::Delete { eid: row }, *h).is_err() {
                     fallback = true;
                     break;
