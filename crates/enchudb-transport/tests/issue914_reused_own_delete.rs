@@ -372,6 +372,86 @@ fn a_ref_to_the_deleted_row_is_in_the_state() {
     assert!(own_state_deletes(&a.eng).contains(&(x, tomb)), "A の state に X の Delete が無い");
 }
 
+/// #921 の読み直し [1]: X を消したのが **他の peer B** (削除の版数が B の時計) の時。 A が X の名前で Y を足して場所を使い回し、 新しく入った C が
+/// B より先に A の state を直接取る。 A の state に X の Delete は入らない (B の時計の削除は B の record が運ぶ) ので、 X を指す ref も出さない。
+/// 出すと C は Ref の解決で生きた空の行を作り、 掃除が今の時刻で消して配り、 その削除が名前の削除優先で A / B / P の Y を消した (C でだけ生きる)。
+/// Y は X の削除の後に作った = 4 台で生きる。
+#[test]
+fn a_ref_to_a_row_another_peer_deleted_does_not_remove_the_readded_row() {
+    let dir = Dir::new("ref-other-delete");
+    let tr = Arc::new(InMemoryTransport::new());
+    for id in [A, B, P, C] {
+        tr.register_peer(id);
+    }
+    let (a, b, p) = (peer(&dir, &tr, A, 2), peer(&dir, &tr, B, 2), peer(&dir, &tr, P, 2));
+    let w = a.create(1, 10);
+    let x = a.create(7, 70);
+    a.eng.tie_ref_to(w, "notes.next", x);
+    a.eng.oplog_commit();
+    all(&[&a, &b, &p]);
+    // B が X を消し、 A と P が受ける
+    b.eng.delete(b.row(7));
+    b.push();
+    tick();
+    a.pull(B);
+    p.pull(B);
+    let tomb = a.eng.tombstone_hlc(x);
+    assert_eq!(tomb.peer, B, "前提: A の X の削除の版数は B の時計");
+    // A が名前 7 の Y を足して X の場所を使い回し、 P が受ける
+    let y = a.create(7, 77);
+    assert_eq!(a.eng.eid_slot(y), a.eng.eid_slot(x), "前提: X の場所を使い回した");
+    assert_ne!(y, x);
+    a.push();
+    p.pull(A);
+    assert_eq!(a.eng.get(w, "notes.next"), Some(enchudb_oplog::eid_local(x) as u64), "前提: A の W は消えた X を指したまま");
+    // 新しく入った C が、 B より先に A の state を直接取る
+    let c = peer(&dir, &tr, C, 2);
+    c.s.bootstrap_pull(A).expect("state を取れない");
+    all(&[&a, &b, &p, &c]);
+    eprintln!("[1] 名前 7 の行: A {:?} B {:?} P {:?} C {:?}", a.v(7), b.v(7), p.v(7), c.v(7));
+    assert_eq!([a.v(7), b.v(7), p.v(7), c.v(7)], [vec![77], vec![77], vec![77], vec![77]], "X の削除の後に足した Y が 4 台で生きていない [A, B, P, C]");
+    assert!(a.eng.is_live(y));
+    assert_eq!([a.v(1), b.v(1), p.v(1), c.v(1)], [vec![10], vec![10], vec![10], vec![10]], "他の行はそのまま");
+}
+
+/// #921 の読み直し [2]: state の合成の途中 (削除の版数の列を見た後・退避表を写す前 = `set_state_scan_hook` の `u16::MAX`) に、 消してあった X の
+/// 場所を使い回しても、 その state に X の Delete が入る。 前は退避表を先に写していて、 写しの後・列の走査の前の使い回しでどちらにも入らなかった。
+#[test]
+fn a_reuse_during_the_state_scan_keeps_the_delete_in_that_state() {
+    let dir = Dir::new("state-race");
+    let tr = Arc::new(InMemoryTransport::new());
+    tr.register_peer(A);
+    let a = peer(&dir, &tr, A, 2);
+    let x = a.create(7, 70);
+    a.create(1, 10);
+    a.eng.delete(x);
+    a.eng.oplog_commit();
+    let tomb = a.eng.tombstone_hlc(x);
+    assert_ne!(tomb, Hlc::ZERO, "前提: X の削除の版数");
+    tick();
+    let reused: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (eng, reused) = (a.eng.clone(), reused.clone());
+        a.eng.set_state_scan_hook(Some((
+            u16::MAX,
+            Box::new(move || {
+                let y = eng.entity_in("notes").unwrap();
+                eng.tie_to(y, "notes.k", 7u32);
+                eng.tie_to(y, "notes.v", 77u32);
+                *reused.lock().unwrap() = Some(y);
+            }),
+        )));
+    }
+    let deletes = own_state_deletes(&a.eng);
+    a.eng.set_state_scan_hook(None);
+    let y = reused.lock().unwrap().expect("前提: 割り込み点で使い回した");
+    assert_eq!(a.eng.eid_slot(y), a.eng.eid_slot(x), "前提: X の場所を使い回した");
+    assert!(deletes.contains(&(x, tomb)), "合成の途中で使い回した場所の、 X の Delete が state に無い: {deletes:?}");
+    assert!(!deletes.iter().any(|d| d.0 == y), "使い回した Y の Delete を出した");
+    // 次の state にも入る
+    assert!(own_state_deletes(&a.eng).contains(&(x, tomb)));
+}
+
 /// 開き直し (identity に移した削除の版数の永続 = `eidmap`) の後も、 state に X の Delete が同じ版数で入る。 忘れてよい線
 /// (`forget_deletes_before`) を越えた削除は state から外れる。
 #[test]

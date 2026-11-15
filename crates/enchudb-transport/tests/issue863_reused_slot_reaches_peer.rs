@@ -447,8 +447,9 @@ fn the_state_carries_the_reused_rows_number() {
 }
 
 /// state の形: 自分の行の宛名・自分の行を指す Ref の値・外した cell (Untie)・消えた行 (Delete) は世代込みの番号。 消えた行を指したまま
-/// 場所を使い回した ref は、 消えた行の番号のまま出す (今の住人を指さない)。 #914: 使い回した場所の前の住人の Delete も、 前の住人の
-/// 番号で出す (使い回す時に削除の版数を identity に移す)。
+/// 場所を使い回した ref は、 消えた行の削除が自分の時計の物 (= その Delete が同じ state に入る) なら消えた行の番号のまま出す (今の住人を
+/// 指さない。 他の peer の時計の削除なら出さない、 issue914 の `a_ref_to_a_row_another_peer_deleted_does_not_remove_the_readded_row`)。
+/// #914: 使い回した場所の前の住人の Delete も、 前の住人の番号で出す (使い回す時に削除の版数を identity に移す)。
 #[test]
 fn the_state_names_own_rows_with_their_generation() {
     use enchudb_oplog::oplog::DecodedOp;
