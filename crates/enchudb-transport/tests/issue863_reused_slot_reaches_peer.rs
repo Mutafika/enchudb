@@ -151,6 +151,14 @@ fn a_slot_that_held_a_peer_row_is_reused_and_reaches_the_peer() {
     let y = b.entity_in("notes").expect("相手の行を置いていた slot を拾わずに断った");
     b.tie_to(y, "notes.note", 77u32);
     settle(&b);
+    // #914: 前の住人は相手の行 (削除は相手の identity に移す、 #166) = B の自分の行の削除は無い (どの書き手の state にも)
+    for by in [A, B] {
+        let (st, _) = b.state_records_for(by);
+        assert!(
+            !st.iter().any(|r| matches!(&r.op, enchudb_oplog::oplog::DecodedOp::Delete { eid } if enchudb_oplog::eid_peer(*eid) == B)),
+            "相手の行を置いていた slot の削除を、 B の自分の行の削除として出した ({by} の state)"
+        );
+    }
     sb.publish_since(Hlc::ZERO);
     for _ in 0..3 {
         sa.pull_once(B);
@@ -439,7 +447,9 @@ fn the_state_carries_the_reused_rows_number() {
 }
 
 /// state の形: 自分の行の宛名・自分の行を指す Ref の値・外した cell (Untie)・消えた行 (Delete) は世代込みの番号。 消えた行を指したまま
-/// 場所を使い回した ref は出さない (前の住人が自分の行か翻訳した行か分からない、 今の住人を指して出すと別の行を指す)。
+/// 場所を使い回した ref は、 消えた行の削除が自分の時計の物 (= その Delete が同じ state に入る) なら消えた行の番号のまま出す (今の住人を
+/// 指さない。 他の peer の時計の削除なら出さない、 issue914 の `a_ref_to_a_row_another_peer_deleted_does_not_remove_the_readded_row`)。
+/// #914: 使い回した場所の前の住人の Delete も、 前の住人の番号で出す (使い回す時に削除の版数を identity に移す)。
 #[test]
 fn the_state_names_own_rows_with_their_generation() {
     use enchudb_oplog::oplog::DecodedOp;
@@ -479,12 +489,20 @@ fn the_state_names_own_rows_with_their_generation() {
         "使い回した行を指す ref の値が世代込みでない"
     );
     assert!(
-        !has(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, .. } | DecodedOp::TieRef { eid, himo_id, .. } if *eid == rows[0] && *himo_id == next)),
-        "消えた行を指したまま場所を使い回した ref を出した"
+        has(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, value } if *eid == rows[0] && *himo_id == next
+            && *value == enchudb_oplog::eid_local(rows[1]) as u64)),
+        "消えた行を指したまま場所を使い回した ref が、 消えた行の番号で出ない"
+    );
+    assert!(
+        !has(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, value } if *eid == rows[0] && *himo_id == next
+            && *value == enchudb_oplog::eid_local(y) as u64)),
+        "消えた行を指したまま場所を使い回した ref が、 今の住人を指した"
     );
     assert!(has(&|op| matches!(op, DecodedOp::Untie { eid, himo_id } if *eid == y && *himo_id == memo)), "使い回した行の Untie の宛名");
     assert!(has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == z)), "使い回して消えた行の Delete の宛名");
-    assert!(!has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == rows[3] || *eid == rows[1])), "前の住人の番号で Delete を出した");
+    assert!(has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == rows[1])), "使い回した場所の前の住人 (2 行目) の Delete が無い");
+    assert!(has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == rows[3])), "使い回した場所の前の住人 (4 行目) の Delete が無い");
+    assert!(!has(&|op| matches!(op, DecodedOp::Delete { eid } if *eid == y)), "生きている使い回した行の Delete を出した");
 }
 
 /// 表 `notes` (枠 4、 名前の無い表) に Number 2 本と、 同じ表を指す Ref `next`。
@@ -577,7 +595,8 @@ fn an_alias_naming_a_deleted_row_does_not_bind_the_reused_row() {
     ]);
     assert_eq!(a.get(y, "notes.note"), Some(99), "相手の世界番号が使い回した行に結ばれた");
     assert_eq!(a.pull_raw("notes.note", 777u32).len(), 1, "相手の行が別の行として現れない");
-    // もう無い行の削除は当たらない (退避表にも載せない)
-    assert!(!a.remote_delete_apply_foreign(rows[1], at(now + 3000)), "もう無い自分の行の削除を当てた");
+    // もう無い行のより新しい削除は、 使い回す時に移した削除の版数を上げるだけ (#915)。 使い回した行には当たらない
+    assert!(a.remote_delete_apply_foreign(rows[1], at(now + 3000)), "もう無い自分の行のより新しい削除で、 移した削除の版数を上げない");
+    assert!(!a.remote_delete_apply_foreign(rows[1], at(now + 3000)), "同じ削除をもう一度上げた");
     assert!(a.is_live(y), "もう無い行の削除で使い回した行が消えた");
 }

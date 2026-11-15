@@ -14,7 +14,8 @@
 //!
 //! - slot を使い回す時 (`clear_cell_versions`)、 消えた行の名前 (消えた時の名前と前の名前) を、 その slot に写っていた
 //!   identity (作った peer, その peer での番号) に移す (#545)。 写像の外れた identity 宛ての削除が後から届いた時に、 その名前の
-//!   削除の時刻を上げるため (slot の記録は使い回しで外れる)
+//!   削除の時刻を上げるため (slot の記録は使い回しで外れる)。 自分の消えた行は identity (自分の peer, 世代 | 場所) に移す (#914 /
+//!   #915、 engine の `keep_gone_own_delete`: 使い回した場所の新しい住人とは世代の違う番号)
 //!
 //! - 名前で束ねた slot は、 束ねた identity (作った peer, その peer での番号。 自分の行は (自分の peer, slot)) とその作成の
 //!   HLC を持つ (#581)。 束ねた後に削除が届いた時、 削除より後に作られた identity を切り離す (削除を先に受けた peer では別の
@@ -409,6 +410,16 @@ impl PkFormer {
             return false;
         }
         names.push((himo, key.into()));
+        self.log.ids.insert((peer, foreign_local));
+        true
+    }
+
+    /// identity `(peer, foreign_local)` に移した名前を外す (その identity の削除の版数を忘れた時、 engine の
+    /// `forget_deletes_before`)。 変えたら true。
+    pub(crate) fn forget_identity(&mut self, peer: u32, foreign_local: u32) -> bool {
+        if self.by_identity.remove(&(peer, foreign_local)).is_none() {
+            return false;
+        }
         self.log.ids.insert((peer, foreign_local));
         true
     }
@@ -1278,7 +1289,7 @@ mod tests {
         let himo = r.below(2) as u16;
         let key = [b"k0".as_slice(), b"k1", b"k2", b"k3"][r.below(4) as usize];
         let t = h(1 + r.below(50));
-        match r.below(15) {
+        match r.below(16) {
             0 => drop(f.insert(himo, key, slot)),
             1 => drop(f.insert_identity(id.0, id.1, himo, key)),
             2 => drop(f.move_names(slot, other)),
@@ -1303,6 +1314,7 @@ mod tests {
                 f.put_names(other, taken);
             }
             13 => drop(f.move_names_by_timeline(slot, other)),
+            14 => drop(f.forget_identity(id.0, id.1)),
             _ => drop(f.note_name(slot, id, himo, key, t)),
         }
     }
