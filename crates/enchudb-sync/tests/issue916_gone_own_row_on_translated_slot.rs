@@ -147,8 +147,9 @@ fn a_gone_own_rows_records_do_not_hit_a_translated_row_after_a_crash() {
 /// [E]: A が X を消し、 X の場所を C の行 F1 が使い回した後、 アプリが X の古い eid を的に ref を張る。 C の W の ref は F1 を指さない
 /// (A でも W は F1 を指していない)。
 ///
-/// `again`: ref を張った後・bridge の前に、 C が F1 を消して A の行 Z がその場所をもう一度使い回す (ref を張った後の変わり目の覚えは
-/// F1 の宛名、 X の宛名はその前の変わり目)。
+/// `again`: C が F1 を消した後に ref を張り、 bridge の前に A の行 Z がその場所をもう一度使い回す (ref を張った後の変わり目の覚えは
+/// F1 の宛名 = 世代が ref の値と違う)。 consumer を止めて、 Z が使い回した所を bridge が越える前に配る (受信の中継が bridge を
+/// 回すので、 ref と使い回しの間に pull を挟まない)。
 ///
 /// falsify: bridge の Ref の値の世代の照合を外すと、 C で W が F1 を指す。 覚えの 「書いた後の変わり目の行の世代が record の世代と
 /// 違えば使わない」 を外すと、 `again` で C の W が F1 を指す。
@@ -179,6 +180,13 @@ fn a_ref_to_a_gone_own_row_does_not_point_at_the_translated_row_on_its_slot() {
         assert_eq!(slot(on_a[0]), slot(x), "前提: F1 は X の場所を使い回した");
         assert_ne!(on_a[0], x, "前提: 使い回した場所の世代は X より新しい");
 
+        if again {
+            eng_c.delete(f1);
+            eng_c.oplog_sync().unwrap();
+            sync_c.publish_since(Hlc::ZERO);
+            sync_a.pull_once(3);
+            assert!(eng_a.pull_raw("companies.name", 50u32).is_empty(), "前提: A で F1 が消えた");
+        }
         let w = eng_a.entity_in("users").unwrap();
         eng_a.tie_to(w, "users.uid", 7u32);
         eng_a.tie_ref_to(w, "users.company", x);
@@ -186,17 +194,12 @@ fn a_ref_to_a_gone_own_row_does_not_point_at_the_translated_row_on_its_slot() {
         assert_eq!(a_val as u32, eid_local(x), "前提: A の W は X の番号を指す");
         assert!(!eng_a.is_live(make_eid(1, a_val as u32)), "前提: A の W の的は生きていない");
         if again {
-            eng_c.delete(f1);
-            eng_c.oplog_sync().unwrap();
-            sync_c.publish_since(Hlc::ZERO);
-            sync_a.pull_once(3);
-            assert!(eng_a.pull_raw("companies.name", 50u32).is_empty(), "前提: A で F1 が消えた");
             let z = eng_a.entity_in("companies").unwrap();
             eng_a.tie_to(z, "companies.name", 70u32);
             assert_eq!(slot(z), slot(x), "前提: Z は同じ場所をもう一度使い回した");
+            assert!(eng_a.former_addresses_len() > 0, "前提: bridge は使い回しの所の手前 (前の宛名を覚えている)");
         }
         eng_a.oplog_sync().unwrap();
-        assert!(eng_a.former_addresses_len() > 0, "前提: bridge は使い回しの所の手前 (前の宛名を覚えている)");
         sync_a.publish_since(Hlc::ZERO);
         drop(hold);
         for _ in 0..3 {
@@ -247,8 +250,8 @@ fn a_ref_to_a_gone_translated_row_does_not_make_a_phantom_row() {
     let w = eng_a.entity_in("users").unwrap();
     eng_a.tie_to(w, "users.uid", 7u32);
     eng_a.tie_ref_to(w, "users.company", f0_on_a);
-    eng_a.oplog_sync().unwrap();
     assert!(eng_a.former_addresses_len() > 0, "前提: bridge は使い回しの所の手前 (前の宛名を覚えている)");
+    eng_a.oplog_sync().unwrap();
     sync_a.publish_since(Hlc::ZERO);
     drop(hold);
     for _ in 0..3 {
