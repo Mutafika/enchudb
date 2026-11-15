@@ -334,9 +334,12 @@ struct ChangeBatch {
 #[derive(Default)]
 struct FormerAddresses {
     /// (slot, その HLC より前に書いた record に当てる) → (宛名 = (作った peer, その peer での番号)。 自分の peer なら自分の行、
-    /// 変わる時の WAL の位置)
-    until: std::collections::BTreeMap<(u32, enchudb_oplog::Hlc), ((enchudb_oplog::PeerId, u32), u64)>,
+    /// 変わる時の WAL の位置、 その宛名の行の世代 (#916))
+    until: std::collections::BTreeMap<(u32, enchudb_oplog::Hlc), FormerAddress>,
 }
+
+/// [`FormerAddresses`] の 1 つ: (宛名, 変わる時の WAL の位置, 宛名の行の世代)。
+type FormerAddress = ((enchudb_oplog::PeerId, u32), u64, u32);
 
 /// #779: [`FormerAddresses`] に覚える数の上限。 bridge が進めば外れるので、 越えるのは bridge が止まったまま slot を回し続けた時だけ。
 /// 越えた分は覚えない (その slot の前の住人宛ての record は、 前と同じく bridge する時の逆写像で出る)。
@@ -10295,10 +10298,10 @@ impl Engine {
                     enchudb_oplog::oplog::DecodedOp::Tie { eid, himo_id, value } => {
                         // Ref の列は u32 (local eid)。 #731: 値は 世代 | 場所、 宛名は場所で引く
                         let ref_local = u32::try_from(*value).ok().filter(|_| self.himo_is_ref(*himo_id));
-                        let ref_slot = ref_local.map(|l| self.generations().split(l).0);
                         // #779: 指す先の宛名も、 書いた時の住人の物 (`bridge_address`)
                         // #731 (段 4): 自分の行を指す ref は素の Tie のまま (値 = 世代 | 場所 = その行の wire の世界番号の local)
-                        if let Some((owner, owner_local)) = ref_slot.and_then(|l| self.bridge_address(l, rec.hlc)) {
+                        // #916: 値の世代で引く (消えた行の古い eid を的にした ref は、 その場所を使い回した行の宛名で出さない)
+                        if let Some((owner, owner_local)) = ref_local.and_then(|l| self.bridge_address(l, rec.hlc)) {
                             tie_ref = Some((enchudb_oplog::make_eid(owner, owner_local), *eid));
                         }
                         false
@@ -10330,10 +10333,11 @@ impl Engine {
                     | enchudb_oplog::oplog::DecodedOp::TieRef { eid, .. } => Some(*eid),
                     _ => None,
                 };
-                let row_local = row_eid.map(|e| self.slot_unchecked(e));
+                let row_local = row_eid.map(enchudb_oplog::eid_local);
                 // 行 eid 自体が translated foreign なら世界番号へ書き戻す (0.11 #76)。 #779: 書いた時の住人の宛名
                 // #731 (段 4): 自分の行は WAL の record の eid のまま = 書いた時の 世代 | 場所 (wire の自分の世界番号)。 場所を使い回した
                 // 後に bridge が読んでも、 消えた行宛ての record は消えた行の番号で出る (相手は削除優先で捨てる)
+                // #916: record の世代で引く (覚えの無い時も、 使い回した他の peer の行の宛名で出さない)
                 let row_world = row_local.and_then(|local| {
                     self.bridge_address(local, rec.hlc)
                         .map(|(owner, owner_local)| enchudb_oplog::make_eid(owner, owner_local))
@@ -13015,7 +13019,7 @@ impl Engine {
                 if !mine(tomb)
                     || self.entities.is_live(local)
                     || local_only.iter().any(|&(lo, hi)| local >= lo && local < hi)
-                    || self.bridge_address(local, tomb).is_some()
+                    || self.bridge_address(self.own_world_local(local), tomb).is_some()
                 {
                     continue;
                 }
@@ -18308,31 +18312,52 @@ impl Engine {
             }
             return;
         }
+        // #916: 宛名の行の世代。 使い回す時は、 場所はもう次の住人の世代 (消す時に上げた) なので、 死んでいた場所の
+        // `last_local_of_slot` と同じ引き方。 逆写像が外れるだけ (畳む) の時は今の行
+        let gens = self.generations();
+        let row_gen = if reused {
+            gens.relog_gen(local).unwrap_or_else(|| gens.get(local).saturating_sub(1))
+        } else {
+            gens.split(self.last_local_of_slot(local)).1
+        };
         // 時刻は lock の下で採る (この後に書く record は全部これより後の HLC、 これより後ろの位置)
         let until = wal.mint_hlc();
-        g.until.insert((local, until), (world, wal.head()));
+        g.until.insert((local, until), (world, wal.head(), row_gen));
         self.former_addresses_on.store(true, Ordering::Release);
     }
 
-    /// #779: bridge が、 行 `local` 宛ての、 版数 `hlc` の自分の record の宛名を引く。 Some = 他の peer の行の世界番号 (作った peer,
-    /// その peer での番号)、 None = 自分の行 (宛名を書き戻さない)。 書いた後に slot の住人 / 逆写像が変わっていれば、 変わる前の宛名
-    /// ([`FormerAddresses`])、 変わっていなければ今の逆写像。
+    /// #779: bridge が、 行 `local` (世代 | 場所) 宛ての、 版数 `hlc` の自分の record の宛名を引く (Ref の値なら、 その的の宛名)。
+    /// Some = 他の peer の行の世界番号 (作った peer, その peer での番号)、 None = 自分の行 (宛名を書き戻さない)。 書いた後に slot の
+    /// 住人 / 逆写像が変わっていれば、 変わる前の宛名 ([`FormerAddresses`])、 変わっていなければ今の逆写像。
     ///
     /// 今の逆写像を先に読む: 覚える (`remember_former_address`) のは逆写像を変える前なので、 変わった後の逆写像を読んだなら、 その
     /// entry は必ず見える。
+    ///
+    /// #916: 今の逆写像は場所の最後の行の宛名。 `local` の世代がその行の世代と違えば (書いた時にもう場所の住人でなかった行 = 消えた
+    /// 行の古い eid を的にした ref、 または覚えの無い時 (開き直した後 / 上限を越えた) の、 使い回す前の行宛ての record)、 今の逆写像を
+    /// 使わない: 覚えを世代で引き、 無ければ None (WAL の eid / 値のまま = 自分の世界番号で出る)。 前は今の逆写像で出し、 消えた自分の
+    /// 行宛ての record や ref が、 その場所を使い回した他の peer の行に当たった
     fn bridge_address(&self, local: u32, hlc: enchudb_oplog::Hlc) -> Option<(enchudb_oplog::PeerId, u32)> {
         use std::sync::atomic::Ordering;
-        let now = self.eid_translator.reverse(local);
+        let gens = self.generations();
+        let (slot, row_gen) = gens.split(local);
+        let now = self.eid_translator.reverse(slot);
+        let is_last_row = || row_gen == gens.split(self.last_local_of_slot(slot)).1;
         if !self.former_addresses_on.load(Ordering::Acquire) {
-            return now;
+            return now.filter(|_| is_last_row());
         }
-        let g = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
+        let fa = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
         let last = enchudb_oplog::Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX };
+        let address = |world: (enchudb_oplog::PeerId, u32)| (world.0 != self.peer_id()).then_some(world);
         // slot を何度も回していれば、 この record より後で、 いちばん近い変わり目の宛名
-        match g.until.range((local, hlc)..=(local, last)).find(|(k, _)| k.1 > hlc) {
-            Some((_, &(world, _))) => (world.0 != self.peer_id()).then_some(world),
-            None => now,
+        match fa.until.range((slot, hlc)..=(slot, last)).find(|(k, _)| k.1 > hlc) {
+            Some((_, &(world, _, then))) if then == row_gen => return address(world),
+            Some(_) => {}
+            None if is_last_row() => return now,
+            None => {}
         }
+        // 書いた時にもう場所の住人でなかった行: その行の世代の変わり目
+        fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen).and_then(|(_, v)| address(v.0))
     }
 
     /// #779: 覚えている 「slot の前の宛名」 の数 ([`FormerAddresses`]、 観測・試験用)。 bridge が追いつけば 0 に戻る。
@@ -18351,7 +18376,7 @@ impl Engine {
         // bridge の位置 (読み切った所)。 畳んだ区画を指す古い位置は、 今の周の位置より小さいので 「越えた」 にならない
         let cursor = self.sync_ops_offset.load(Ordering::Acquire);
         let mut g = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
-        g.until.retain(|_, &mut (_, pos)| cursor < pos && wal.holds(pos));
+        g.until.retain(|_, &mut (_, pos, _)| cursor < pos && wal.holds(pos));
         if g.until.is_empty() {
             self.former_addresses_on.store(false, Ordering::Release);
         }
@@ -24972,7 +24997,12 @@ impl Engine {
     /// 届いた削除・使い回し、 または開く時の突き合わせ `reconcile_generations` が削除の完了に寄せた形): 届いていれば、 その前の
     /// Delete も届いていて、 この record は checkpoint の手前 (再生しない)。 WAL に続く Delete があれば再生がもう一度消す。 戻さないと、
     /// 生かした行が新しい世代の eid になる (アプリの持つ eid と食い違う)。 「死んでいる」 印は呼び手が生かす時にも落とす
-    fn replay_slot(&self, eid: enchudb_oplog::EntityId, makes_live: bool) -> u32 {
+    ///
+    /// #916: `None` = 当てない (呼び手は record を捨てる)。 場所の世代が record の行より新しく、 場所に逆写像がある (受信で入った
+    /// 他の peer の行が使い回した) 時。 「新しい世代は WAL に無い」 は受信で入った行には当てはまらない (その行の払い出しは自分の WAL
+    /// に載らず、 本体と `.eidmap` は受けた後に書き出す = WAL より先に届く)。 使い回せたのは record の行が消えた後なので、 その行宛ての
+    /// record はもう古い。 前は戻して (`restore`) record の行の Delete が受けた行を消した
+    fn replay_slot(&self, eid: enchudb_oplog::EntityId, makes_live: bool) -> Option<u32> {
         let gens = self.generations();
         let (slot, g) = gens.split(enchudb_oplog::eid_local(eid));
         let now = gens.get(slot);
@@ -24981,10 +25011,15 @@ impl Engine {
                 self.drop_leftover_cells(slot, t);
             }
             self.raise_generation(slot, g);
-        } else if makes_live && g < now && self.slot_is_generational(slot) {
-            gens.restore(slot, g);
+        } else if g < now && self.slot_is_generational(slot) {
+            if self.eid_translator.reverse(slot).is_some() {
+                return None;
+            }
+            if makes_live {
+                gens.restore(slot, g);
+            }
         }
-        slot
+        Some(slot)
     }
 
     fn apply_oplog_op_inner(
@@ -25007,7 +25042,7 @@ impl Engine {
         match op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let hid = *himo_id as usize;
-                let local = self.replay_slot(*eid, true);
+                let Some(local) = self.replay_slot(*eid, true) else { return };
                 if hid < self.himos.len() {
                     // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
                     let value = match replay.vids.get(&(*value as u32)) {
@@ -25027,7 +25062,7 @@ impl Engine {
             }
             DecodedOp::Untie { eid, himo_id } => {
                 let hid = *himo_id as usize;
-                let local = self.replay_slot(*eid, false);
+                let Some(local) = self.replay_slot(*eid, false) else { return };
                 if hid < self.himos.len() {
                     self.clear_cell_local(local, *himo_id, hlc);
                 }
@@ -25036,7 +25071,7 @@ impl Engine {
                 // replay は冪等でなければならない — 同じ record を二度食っても
                 // 本体が落ちる (`apply_delete_local`)。 旧実装は同値 HLC を
                 // `set_tombstone_local` で弾いて本体を残していた。
-                let local = self.replay_slot(*eid, false);
+                let Some(local) = self.replay_slot(*eid, false) else { return };
                 self.apply_delete_local(local, hlc);
                 // #731: 消えた行の世代の次へ (v15)、 「死んでいる」 印も。 消す道の `live_free` は再生の間は上げない (本体の世代が先に
                 // 届いていると、 今の世代 + 1 では行き過ぎる。 購読には消えた行の世代を渡すので、 上げるのは消した後)。 再生の途中で
@@ -25052,7 +25087,7 @@ impl Engine {
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
                 // Op::Content を emit しないので、 旧 DB の WAL 再生でのみ通る。
-                let local = self.replay_slot(*eid, true);
+                let Some(local) = self.replay_slot(*eid, true) else { return };
                 if !self.contents.set(local, key, data) {
                     // #59: content data 領域が満杯。 panic せず拒否 + 計上。
                     self.record_fault(
@@ -25066,7 +25101,7 @@ impl Engine {
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 名前で himo を解決 (無ければ定義) して set。
-                let local = self.replay_slot(*eid, true);
+                let Some(local) = self.replay_slot(*eid, true) else { return };
                 let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
                     // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
@@ -25086,7 +25121,7 @@ impl Engine {
                 // 張り、 前の slot は空きに戻す (受信と同じ処理)。 版数のある DB は同じ HLC を弾くので二重にならない。
                 let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
-                    let slot = self.replay_slot(*eid, true);
+                    let Some(slot) = self.replay_slot(*eid, true) else { return };
                     let _ = self.remote_tieleaf_apply(enchudb_oplog::make_eid(enchudb_oplog::eid_peer(*eid), slot), hid, bytes, hlc);
                 }
             }
