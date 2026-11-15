@@ -20727,6 +20727,12 @@ impl Engine {
     }
 
     /// #779: bridge が読み終えた所より前の変わり目を外す (bridge の入口、 `transfer_lock` の下)。
+    ///
+    /// #952: 変わり目の位置が bridge の位置と同じ覚えは残す (bridge は変わり目の後ろの record をまだ 1 つも読んでいない)。 変わり目より
+    /// 前の record (#779) は読み終えているが、 変わり目の後ろに積まれた、 消えた行の古い eid を的にした ref (#916 の [E] の逆の形) は
+    /// この覚えで宛名を引く。 前は外していて、 bridge が WAL の頭に追いついた所 (書き込みの無い間の常の形) で使い回すと、 その ref が
+    /// 自分の世界番号で出て相手に幻の行ができた。 覚えは、 bridge が変わり目の後ろの record を読んだ後の入口で外れる (WAL に何も積まれない
+    /// 間は残る。 数は今まで通り [`FORMER_ADDRESS_LIMIT`] まで)。
     fn prune_former_addresses(&self) {
         use std::sync::atomic::Ordering;
         if !self.former_addresses_on.load(Ordering::Acquire) {
@@ -20736,7 +20742,7 @@ impl Engine {
         // bridge の位置 (読み切った所)。 畳んだ区画を指す古い位置は、 今の周の位置より小さいので 「越えた」 にならない
         let cursor = self.sync_ops_offset.load(Ordering::Acquire);
         let mut g = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
-        g.until.retain(|_, &mut (_, pos, _)| cursor < pos && wal.holds(pos));
+        g.until.retain(|_, &mut (_, pos, _)| cursor <= pos && wal.holds(pos));
         if g.until.is_empty() {
             self.former_addresses_on.store(false, Ordering::Release);
         }
