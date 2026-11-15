@@ -2646,6 +2646,23 @@ mod dead_name_hook {
     }
 }
 
+/// test 用の割り込み点: 名前の束ね (`bind_remote_eid_by_pk_at`) が `alloc_lock` を取った後・引いた行の lock を取る前 (#939 の読み直し
+/// [A1])。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod bind_lock_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: 受信の当て込みが宛名を引いた後・行の lock を取る前 (#917)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod remote_row_hook {
@@ -4466,6 +4483,84 @@ mod reuse_order_tests {
         assert_ne!(eng.slot_unchecked(y), slot, "同じ場所を 2 つの行に払い出した");
         assert_eq!(eng.resolve_remote_eid_existing(world), Some(theirs), "取れなかった後始末が、 先に取った X の写像を外した");
         assert_eq!(eng.former_addresses_len(), 0, "取れなかった場所の前の宛名の覚えを残した");
+        cleanup(&path, eng);
+    }
+
+    /// #939 の読み直し [A1]: 名前の束ね (`bind_remote_eid_by_pk_at`、 名前 5 の行 L に peer 2 の W を束ねる) と、 別の thread の受信の
+    /// 払い出し (C の行 F の Tie、 `resolve_remote_eid` → 満杯の表で消えた行 G の場所を使い回す) が、 L と G の場所が同じ stripe
+    /// (行の lock は場所の下位 12 bit) の時に互いを待たない。 束ねが最初の lock を取った所 (割り込み点 `bind_lock_hook`) で払い出しを
+    /// 走らせ、 払い出しが G の行を握れずに回り始める (行の待ちの割り込み点) まで進めてから束ねを続ける。
+    ///
+    /// 直す前 (束ねが 行 → `alloc_lock` の順): 束ねは L の stripe を握って `alloc_lock` を待ち、 払い出しは `alloc_lock` を握ったまま
+    /// G の行 (= L の stripe) を握れるまで回るので、 どちらも返らない (この試験は時間の上限で落ちる)。 直した後 (`alloc_lock` → 行):
+    /// 払い出しは `alloc_lock` を待ち、 束ねが放した後に G の場所を取る。
+    #[test]
+    fn a_bind_and_a_reuse_on_the_same_stripe_do_not_wait_on_each_other() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        // 枠 4097 の表: 最初の場所と最後の場所が同じ stripe
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-reuseorder-stripe-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 16_384).unwrap();
+        eng.define_table("t", 4097).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        eng.set_peer_id(1);
+        let rows: Vec<u64> = (0..4097).map(|_| eng.entity_in("t").unwrap()).collect();
+        // 先に 1 回使い回して v15 に移っておく (払い出しが移る手順で書き手を待つ道を通らず、 空きの一覧の道で回るように)
+        eng.delete(rows[1]);
+        let again = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(again), eng.slot_unchecked(rows[1]), "前提: 満杯の表で消えた場所を使い回した");
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        let (g, l) = (rows[0], rows[4096]);
+        let g_slot = eng.slot_unchecked(g);
+        assert_eq!(g_slot % 4096, eng.slot_unchecked(l) % 4096, "前提: G と L の場所は同じ stripe");
+        eng.tie_to(l, "t.k", 5u32);
+        eng.delete(g);
+        eng.oplog_commit();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let f = enchudb_oplog::make_eid(C, 100);
+        let (f_done, f_done_rx) = channel::<Option<u64>>();
+        let started: Arc<Mutex<bool>> = Default::default();
+        {
+            let (e2, started) = (eng.clone(), started.clone());
+            bind_lock_hook::set(&wal, move |_| {
+                *started.lock().unwrap() = true;
+                // 払い出しが G の行を握れずに回り始めるまで進める (直した後は `alloc_lock` を待っていて来ない: 上限まで待って続ける)
+                let (seen, seen_rx) = channel::<()>();
+                e2.row_locks.set_wait_hook(g_slot, move || {
+                    let _ = seen.send(());
+                });
+                let e3 = e2.clone();
+                std::thread::spawn(move || {
+                    let _ = f_done.send(e3.resolve_remote_eid(f, v));
+                });
+                let _ = seen_rx.recv_timeout(Duration::from_secs(2));
+            });
+        }
+        let w = enchudb_oplog::make_eid(2, 100);
+        let (bind_done, bind_done_rx) = channel::<Option<u64>>();
+        {
+            let e2 = eng.clone();
+            let created = at(now_ms(), 2);
+            std::thread::spawn(move || {
+                let _ = bind_done.send(e2.bind_remote_eid_by_pk_at(2, w, l, k, 5, created));
+            });
+        }
+        let bound = bind_done_rx.recv_timeout(Duration::from_secs(20));
+        let got = f_done_rx.recv_timeout(Duration::from_secs(20));
+        assert!(*started.lock().unwrap(), "前提: 束ねが割り込み点を通った");
+        let (Ok(bound), Ok(got)) = (bound, got) else {
+            // 止まった thread は回り続けるので、 DB は消さずに残す (process の終わりで止まる)
+            panic!("束ねと払い出しが互いを待って止まった (束ね {bound:?}、 払い出し {got:?})");
+        };
+        assert_eq!(bound, Some(l), "W を名前 5 の L に束ねない");
+        let got = got.expect("前提: F に場所を払い出した");
+        assert_eq!(eng.slot_unchecked(got), g_slot, "前提: F は消えた G の場所を使い回した");
+        assert_eq!(eng.resolve_remote_eid_existing(w), Some(l));
         cleanup(&path, eng);
     }
 
@@ -16445,12 +16540,7 @@ impl Engine {
         self_peer: enchudb_oplog::PeerId,
     ) -> (u32, bool) {
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        // #178: 束ねる前に、 この行に書いた record の宛名 (逆写像があればその世界番号、 無ければ自分の世界番号)
-        // #731 (段 4): 自分の世界番号は世代込み
-        let prior = self.eid_translator.reverse(target_local).map_or_else(
-            || enchudb_oplog::make_eid(self_peer, self.own_world_local(target_local)),
-            |(p, l)| enchudb_oplog::make_eid(p, l),
-        );
+        let prior = self.bind_prior_address(target_local, self_peer);
         // #613: 前向きの写像だけを張る (別名、 `EidTranslator::alias`)。 行の逆写像 (この行に書いた record の宛名) は行の元の
         // identity のまま。 前は束ねた identity に替えていたので、 束ねた後の書き込みが、 その identity の作成を受けていない受け手で
         // 別の行になった。 元の identity の作成は同じ書き手の流れの前にあるので、 受け手は必ず先に受けている
@@ -16461,22 +16551,42 @@ impl Engine {
             Ok(()) => (target_local, true),
             Err(existing) => (existing, false),
         };
-        // #178: **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま
-        // bridge されている (宛名の付け替えは bridge 時に `reverse()` を引くため)。
-        // 相手側はそれを別 entity として払い出すので PK 無しの重複行が生える。
-        // ここでは直せない (出て行った record は取り消せない) ので、 **観測できるように
-        // 数える**。 実地で静かに壊れていた経路。
-        // #178: 書く設定なら 「束ねる前の宛名と、 束ねた世界番号は同じ entity」 を配る (受け手は 2 行を畳む、
-        // `Engine::apply_alias`)
+        self.note_bind_alias(local, bound_now && local == target_local, prior, foreign_eid, self_peer);
+        (local, bound_now)
+    }
+
+    /// #178: 行 `target_local` に束ねる前に、 この行に書いた record の宛名 (逆写像があればその世界番号、 無ければ自分の世界番号)。
+    /// #731 (段 4): 自分の世界番号は世代込み。
+    fn bind_prior_address(&self, target_local: u32, self_peer: enchudb_oplog::PeerId) -> enchudb_oplog::EntityId {
+        self.eid_translator.reverse(target_local).map_or_else(
+            || enchudb_oplog::make_eid(self_peer, self.own_world_local(target_local)),
+            |(p, l)| enchudb_oplog::make_eid(p, l),
+        )
+    }
+
+    /// #178: 束ねた後の数えと別名の record。 `bound_here` = 今 `foreign_eid` の写像を、 宛名が `prior` の行 `local` に張った。
+    ///
+    /// **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま bridge されている (宛名の付け替えは bridge 時に
+    /// `reverse()` を引くため)。 相手側はそれを別 entity として払い出すので PK 無しの重複行が生える。 ここでは直せない (出て行った
+    /// record は取り消せない) ので、 **観測できるように数える**。 実地で静かに壊れていた経路。 書く設定なら 「束ねる前の宛名と、
+    /// 束ねた世界番号は同じ entity」 を配る (受け手は 2 行を畳む、 `Engine::apply_alias`)。
+    ///
+    /// WAL に積む (空きを待つ) ので、 `alloc_lock` の外で呼ぶ (#939 の読み直し [A1]: 持ったまま待つと、 払い出しを待つ受信が全部止まる)。
+    fn note_bind_alias(
+        &self,
+        local: u32,
+        bound_here: bool,
+        prior: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        self_peer: enchudb_oplog::PeerId,
+    ) {
         if self.note_bind_over_local_writes(local, self_peer)
-            && bound_now
-            && local == target_local
+            && bound_here
             && prior != foreign_eid
             && self.emit_alias.load(std::sync::atomic::Ordering::Relaxed)
         {
             self.emit_alias_record(prior, foreign_eid);
         }
-        (local, bound_now)
     }
 
     /// #513: [`Engine::bind_remote_eid`] の主キー版 (`Syncer` が、 主キー `pk_value` の生きた行 `local_eid` に束ねる時)。
@@ -16528,13 +16638,21 @@ impl Engine {
     /// #939 (review930 [7]): 名前で引いた生きた行 `row_eid` (世代 | 場所、 `former_pk_holder` / `query_by_id64` の返す番号) に
     /// `foreign_eid` を束ねる、 `Syncer` の名前の束ねの入口 ([`Self::note_bound_identity`] + [`Self::bind_remote_eid_by_pk`])。
     ///
-    /// 行の lock の下で、 引いた行がまだ場所の最後の行で生きているかを確かめてから、 束ねた identity を覚えて写像を張る。 違えば
-    /// 何もせず `None` (呼び手は名前で引き直す): 引いた後・束ねる前に、 その行が消えた (束ねて生かすと削除が戻る) か、 消えて場所を
-    /// 使い回された。 使い回しは写像を場所を生かす前に外す (`prepare_reuse`、 同じ行の lock の下) ので、 その後に張った写像は誰も
+    /// 行の lock の下で、 引いた行がまだ場所の最後の行で生きていて、 その名前 (今の名前か、 `created` の時に持っていた前の名前) を
+    /// 持つかを確かめてから、 束ねた identity を覚えて写像を張る。 違えば何もせず `None` (呼び手は名前で引き直す): 引いた後・束ねる
+    /// 前に、 その行が消えた (束ねて生かすと削除が戻る) か、 消えて場所を使い回されたか、 改名された。 使い回しは写像を場所を生かす前に外す (`prepare_reuse`、 同じ行の lock の下) ので、 その後に張った写像は誰も
     /// 外さず、 束ねた identity が使い回した新しい行を指した (その宛ての書き込み・削除が新しい行に当たる)。 確かめて張った後に
     /// 消えた / 使い回された時は、 束ねてから消えたのと同じ (使い回しが写像を外す)。
     ///
-    /// 前から写像があった (先に確定した束ね先) 時は [`Self::bind_remote_eid_by_pk`] と同じ (その場所を返す)。
+    /// 前から写像があった (先に確定した束ね先) 時は、 その場所を返す (束ねた identity を引いた行に覚えず、 その場所を生かさない
+    /// = 写像を張った側が決めた生き死にのまま。 読み直し [A4]: 前は引いた行に覚え、 並んだ受信が削除優先で死んだまま払い出した場所を
+    /// 生かした)。
+    ///
+    /// lock の順は `alloc_lock` → 行 (読み直し [A1])。 写像の払い出し (`EidTranslator::get_or_insert_with` の中の `entity_in`) は
+    /// `alloc_lock` を握ったまま、 使い回す場所の行を握れるまで回るので、 行を握ったまま `alloc_lock` を待つと、 その行と同じ stripe の
+    /// 場所を払い出す受信と互いを待って止まる。 WAL に積む (#178 の別名の record) のと #490 / #513 の削除は `alloc_lock` を放した後に、
+    /// 確かめた行の lock の下で。
+    #[doc(hidden)]
     pub fn bind_remote_eid_by_pk_at(
         &self,
         author_peer: enchudb_oplog::PeerId,
@@ -16550,36 +16668,57 @@ impl Engine {
             return Some(foreign_eid); // identity: 自分が産んだ entity
         }
         let target = self.slot_unchecked(row_eid);
-        let guard = self.row_locks.write(target);
-        if !self.entities.is_live(target) || !self.remote_row_holds_slot(target, Some(enchudb_oplog::eid_local(row_eid))) {
-            return None;
-        }
-        // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)。 写像と同じ行の
-        // lock の下 (使い回しは場所の名前の記録も生かす前に外すので、 外した後に覚えると新しい行に残る)
-        self.note_bound_identity(row_eid, foreign_eid, created);
-        let (local, bound_now) = self.alias_remote_eid(author_peer, foreign_eid, target, self_peer);
-        if !bound_now {
-            drop(guard);
-            self.ensure_live_slot(local);
-            Self::advance_table_next_local_for(&self.tables, local);
-            let bound = enchudb_oplog::make_eid(self_peer, local);
-            self.apply_name_delete_to_bound(bound, row_eid, pk_himo, pk_value);
-            return Some(bound);
-        }
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        let checked = self.eid_translator.if_unmapped(author_peer, foreign_local, || {
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                bind_lock_hook::call(wal);
+            }
+            let guard = self.row_locks.write(target);
+            if !self.entities.is_live(target) || !self.remote_row_holds_slot(target, Some(enchudb_oplog::eid_local(row_eid))) {
+                return None;
+            }
+            // 読み直し [A3]: 引いた後・束ねる前に改名された行には束ねない (今もその名前か、 `created` の時にその名前だった前の持ち主の
+            // 時だけ。 前は改名より後に作られた entity を改名した行に束ね、 その名前の書き込みが行の名前を書き戻した)
+            if self.himos[pk_himo as usize].get_value(target) != Some(pk_value)
+                && self.former_pk_holder(pk_himo, PkValue::Local(pk_value), created) != Some(row_eid)
+            {
+                return None;
+            }
+            let prior = self.bind_prior_address(target, self_peer);
+            // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)。 写像と同じ行の
+            // lock の下 (使い回しは場所の名前の記録も生かす前に外すので、 外した後に覚えると新しい行に残る)
+            self.note_bound_identity(row_eid, foreign_eid, created);
+            // #613: 前向きの写像だけ (`alias_remote_eid` と同じ)
+            self.eid_translator.alias(author_peer, foreign_local, target);
+            Some((guard, prior))
+        });
+        let (guard, prior) = match checked {
+            Ok(Some(held)) => held,
+            Ok(None) => return None,
+            Err(existing) => {
+                self.note_bind_alias(existing, false, foreign_eid, foreign_eid, self_peer);
+                Self::advance_table_next_local_for(&self.tables, existing);
+                let bound = enchudb_oplog::make_eid(self_peer, existing);
+                self.apply_name_delete_to_bound(bound, row_eid, pk_himo, pk_value);
+                return Some(bound);
+            }
+        };
         // 生きているのを確かめた行に張った (生かさない。 放した後に消えたなら、 束ねてから消えたのと同じ)
-        Self::advance_table_next_local_for(&self.tables, local);
+        self.note_bind_alias(target, true, prior, foreign_eid, self_peer);
+        Self::advance_table_next_local_for(&self.tables, target);
         // #490 (`bind_remote_eid` と同じ): 作成より先に届いた、 この entity 宛ての削除
-        if let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid)) {
-            self.apply_delete_in(Some(&guard), local, tomb, None);
+        if let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), foreign_local) {
+            self.apply_delete_in(Some(&guard), target, tomb, None);
         }
         // #513 (`apply_name_delete_to_bound` と同じ、 行は確かめた引いた行のまま)
         if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value))
-            && tomb > self.tombstone_version_of(local)
-            && self.version_of(local, pk_himo) < tomb
+            && tomb > self.tombstone_version_of(target)
+            && self.version_of(target, pk_himo) < tomb
         {
-            self.apply_delete_in(Some(&guard), local, tomb, None);
+            self.apply_delete_in(Some(&guard), target, tomb, None);
         }
-        Some(enchudb_oplog::make_eid(self_peer, local))
+        Some(enchudb_oplog::make_eid(self_peer, target))
     }
 
     /// #513: 主キー `pk_value` の生きた行が無い時 (`Syncer` が主キーで束ねる先を引いて、 無かった時)。
@@ -17392,7 +17531,8 @@ impl Engine {
 
     /// #923: 場所 `slot` の行に、 何も当たっていないか = 値のある cell も、 版数のある cell (外した cell を含む) も、 削除の版数も
     /// 無い。 どの書き手の record もまだ当たっていない行 (相手の行を指す Ref の解決で、 的として払い出しただけの翻訳した行など)。
-    /// 照合しない (場所の今の住人を見る)。 紐の数に比例する。
+    /// 照合しない (場所の今の住人を見る)。 紐の数に比例する。 sync の内部用 (state の掃除)。
+    #[doc(hidden)]
     pub fn slot_untouched(&self, slot: u32) -> bool {
         self.tombstone_version_of(slot) == enchudb_oplog::Hlc::ZERO
             && (0..self.himos.len()).all(|hid| {
