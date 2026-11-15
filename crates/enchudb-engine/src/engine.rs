@@ -33711,8 +33711,16 @@ mod remote_row_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// 枠 1 の表 t (列 v / w) の sync の DB。
-    fn engine(tag: &str) -> (String, Arc<Engine>) {
+    /// 落とすと DB の directory を消す (engine より後に落ちるように、 engine より先に束ねる)。
+    struct Rm(String);
+    impl Drop for Rm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 枠 1 の表 t (列 v / w) の sync の DB。 `let (_rm, eng) = engine(..)` で受ける (engine が先に落ちて書き出し、 その後に消す)。
+    fn engine(tag: &str) -> (Rm, Arc<Engine>) {
         let path = std::env::temp_dir()
             .join(format!("enchudb-917-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()))
             .to_str()
@@ -33726,7 +33734,7 @@ mod remote_row_tests {
         eng.enable_sync_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
         eng.set_peer_id(1);
-        (path, eng)
+        (Rm(path), eng)
     }
 
     fn slot(eid: u64) -> u32 {
@@ -33751,7 +33759,7 @@ mod remote_row_tests {
     /// falsify: `remote_delete_apply_in` の行の lock の下の照合を外すと、 Y が消える。
     #[test]
     fn a_received_delete_does_not_hit_the_row_that_reused_the_slot() {
-        let (path, eng) = engine("del");
+        let (_rm, eng) = engine("del");
         let x = eng.entity_in("t").unwrap();
         eng.tie_to(x, "t.v", 1u32);
         let made = reuse_in_hook(&eng, x);
@@ -33761,7 +33769,6 @@ mod remote_row_tests {
         assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
         assert_ne!(y, x, "前提: Y の世代は X より新しい");
         let alive = eng.get(y, "t.v");
-        let _ = std::fs::remove_dir_all(&path);
         assert!(!applied, "消えた行 X 宛ての Delete を当てた");
         assert_eq!(alive, Some(2), "X 宛ての受信の Delete が、 場所を使い回した Y を消した");
     }
@@ -33772,7 +33779,7 @@ mod remote_row_tests {
     /// falsify: 番号を確かめた後に引く (前の形) と、 Y の番号宛ての Delete (X の版数) が出る。
     #[test]
     fn the_state_does_not_send_a_gone_rows_delete_to_the_row_that_reused_its_slot() {
-        let (path, eng) = engine("stdel");
+        let (_rm, eng) = engine("stdel");
         let x = eng.entity_in("t").unwrap();
         eng.tie_to(x, "t.v", 1u32);
         eng.delete(x);
@@ -33787,7 +33794,6 @@ mod remote_row_tests {
         let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
         assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
         assert_ne!(y, x, "前提: Y の世代は X より新しい");
-        let _ = std::fs::remove_dir_all(&path);
         let to_y = records.iter().any(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Delete { eid } if eid == y));
         assert!(!to_y, "state に、 場所を使い回した Y 宛ての Delete (消えた X の版数) が出た");
     }
@@ -33798,7 +33804,7 @@ mod remote_row_tests {
     /// falsify: 宛名を確かめた後に引く (前の形) と、 Y の番号宛ての Untie が出る (受け手で Y の値が外れる)。
     #[test]
     fn the_state_does_not_send_a_gone_rows_untie_to_the_row_that_reused_its_slot() {
-        let (path, eng) = engine("stuntie");
+        let (_rm, eng) = engine("stuntie");
         let x = eng.entity_in("t").unwrap();
         eng.tie_to(x, "t.v", 1u32);
         eng.tie_to(x, "t.w", 1u32);
@@ -33816,7 +33822,6 @@ mod remote_row_tests {
         let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
         assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
         assert_ne!(y, x, "前提: Y の世代は X より新しい");
-        let _ = std::fs::remove_dir_all(&path);
         let to_y = records.iter().any(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Untie { eid, .. } if eid == y));
         assert!(!to_y, "state に、 場所を使い回した Y 宛ての Untie (X の外した cell) が出た");
     }
@@ -33827,7 +33832,7 @@ mod remote_row_tests {
     /// falsify: cell を読んだ後に宛名を引き直して確かめる所を外すと、 X の番号に Y の版数の Untie が出る。
     #[test]
     fn the_state_does_not_send_a_reused_rows_untie_to_the_gone_rows_number() {
-        let (path, eng) = engine("stread");
+        let (_rm, eng) = engine("stread");
         let x = eng.entity_in("t").unwrap();
         eng.tie_to(x, "t.v", 1u32);
         eng.tie_to(x, "t.w", 1u32);
@@ -33848,7 +33853,6 @@ mod remote_row_tests {
         assert_ne!(y, x, "前提: Y の世代は X より新しい");
         let w = eng.himo_id("t.w").unwrap() as u16;
         let y_untie = eng.cell_hlc(y, w);
-        let _ = std::fs::remove_dir_all(&path);
         let mixed = records
             .iter()
             .any(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Untie { eid, .. } if eid == x) && r.hlc == y_untie);

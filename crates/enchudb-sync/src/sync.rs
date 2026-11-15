@@ -2444,6 +2444,14 @@ mod tests {
         for untie in [false, true] {
             let path = format!("/tmp/enchudb_sync_917_{}_{}_{}", untie, std::process::id(), line!());
             let _ = std::fs::remove_dir_all(&path);
+            // 落とすと消す (engine と syncer より先に束ねる = 後に落ちる。 前提で落ちても残さない)
+            struct Rm(String);
+            impl Drop for Rm {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let _rm = Rm(path.clone());
             let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
             eng.define_table("t", 1).unwrap();
             eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
@@ -2476,9 +2484,6 @@ mod tests {
             assert_ne!(y, x, "前提: Y の世代は X より新しい");
             assert_eq!(out.applied, 0, "消えた行宛ての record を当てた (untie = {untie}, {out:?})");
             assert_eq!(eng.get(y, "t.v"), Some(2), "X 宛ての受信が、 場所を使い回した Y に当たった (untie = {untie})");
-            drop(syncer);
-            drop(eng);
-            let _ = std::fs::remove_dir_all(&path);
         }
     }
 
