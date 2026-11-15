@@ -19265,11 +19265,7 @@ impl Engine {
         };
         let recorded = record.is_some_and(|r| {
             let prev = &self.generations().prev;
-            let (ok, wake) = prev.put(slot, &r);
-            if wake && let Some(w) = self.consumer_waker() {
-                // 区画の 3/4: 次の周期を待たずに sidecar を書いて周期を進めさせる (区画が一杯になる前に)
-                w.wake();
-            }
+            let ok = prev.write(slot, &r);
             if !ok && prev.active() {
                 // review946 [12]: 書けない (commit を伸ばせない = 空き不足) 使い回しは記録なしで進む (落ちた時は前の形 = #914 の窓)
                 self.record_fault(FaultKind::DiskSpace, "prev.seg: the former resident of a reused slot was not recorded");
@@ -29361,10 +29357,7 @@ impl Engine {
                     {
                         let fold_off = engine.wal_fold_off.load(Ordering::Relaxed);
                         let switched = fold_off & WAL_FOLD_OFF_SWITCH == 0 && wal.switches() != seen_switches;
-                        // `prev.seg`: 書き手が log の区画の 3/4 を越えた (起こされた) = 次の周期を待たずに書き出して sidecar を書き、
-                        // 周期を進める (区画が一杯になる前に、 review946c の 3)
-                        let prev_urgent = engine.generations().prev.take_urgent();
-                        if last_fsync.elapsed() >= fsync_interval || switched || prev_urgent {
+                        if last_fsync.elapsed() >= fsync_interval || switched {
                             seen_switches = wal.switches();
                             // #850: この周期の書き出しを、 当てている途中の書き手の手前で切ったか
                             let mut tick_cut = false;
@@ -29436,8 +29429,8 @@ impl Engine {
                                 engine.flush_durable_mark_if_pending();
                                 // `prev.seg`: 書き出していない使い回しの記録が残っていれば sidecar を書いて周期を進める。 1 秒に 1 回まで
                                 // (review946c [G]: 「使い回し → `oplog_sync()` → 暇」 を繰り返す DB で、 100 ms ごとに `eidmap.log` の
-                                // 追記 (macOS は F_FULLFSYNC) と header の書き出しを足さない。 区画の 3/4 を越えた時は待たない)
-                                if (prev_urgent || last_idle_prev.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)))
+                                // 追記 (macOS は F_FULLFSYNC) と header の書き出しを足さない)
+                                if last_idle_prev.is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
                                     && engine.persist_prev_if_pending()
                                 {
                                     last_idle_prev = Some(Instant::now());

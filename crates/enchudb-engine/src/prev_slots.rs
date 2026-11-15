@@ -49,9 +49,7 @@
 //!   を置いて header の page を書き出す ([`PrevSlots::end_persist`])。 開く時は書き出した周期より後の記録だけ戻す = 書き出し済みの記録・忘れてよい線 (`forget_deletes_before`)
 //!   で忘れた記録は戻さない (review946 [2])。 同じ場所を 1 つの周期で 2 回使い回しても、 2 件とも順に残る (場所ごとの配列は上書き)。
 //!   区画は周期の偶奇で交互に使い、 前の周期の区画を頭から使い直すのは、 その周期が書き出し済みの時だけ。 開く時になめるのは 2 つの
-//!   区画の commit 済みの所 (場所の数によらない、 review946 [4]。 全部 0 の件 = 並んだ書き手の穴は飛ばす、 review946c [B])。
-//!   書き手が区画の 3/4 を越えたら consumer を起こし、 次の周期を待たずに sidecar を書いて周期を進めさせる (区画が一杯になる前に、
-//!   review946c の 3)
+//!   区画の commit 済みの所 (場所の数によらない、 review946 [4]。 全部 0 の件 = 並んだ書き手の穴は飛ばす、 review946c [B])
 //! - **場所ごとの配列** (引く元): 場所の最後の使い回しの記録 (bridge の宛名、 #924 の Ref、 再生の守り、 開く時の写像の見分け)。
 //!   区画が一杯の周期 (1 周期 (consumer の 100 ms) に 21845 回より多く使い回した / 書き出しが続けて失敗した間など) は配列にだけ書き、
 //!   header に 「一杯だった周期」 を置く (開く時はその周期が書き出し済みでなければ配列もなめる。 なめるのは場所ごとに語 0 と周期の
@@ -81,7 +79,7 @@
 use crate::region::Region;
 use enchudb_oplog::{Hlc, PeerId};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// `prev.seg` の先頭の header の長さ。
 pub(crate) const PREV_HEADER: usize = 4096;
@@ -105,8 +103,6 @@ const SLOT_CHECK: u32 = (1 << 22) - 1;
 const LOG_HALF: usize = 1 << 20;
 /// 1 区画の件数。
 const LOG_ENTRIES: u32 = (LOG_HALF / ENTRY) as u32;
-/// この件数目を積んだ書き手が consumer を起こす (区画の 3/4)
-const LOG_URGENT: u32 = LOG_ENTRIES / 4 * 3;
 /// 場所ごとの配列の始まり。
 const ARRAY_OFF: usize = PREV_HEADER + 2 * LOG_HALF;
 
@@ -297,8 +293,6 @@ pub(crate) struct PrevSlots {
     half_max: [AtomicU64; 2],
     /// 書き出した周期 (header と同じ)
     persisted: AtomicU64,
-    /// 書き手が今の区画の 3/4 を越えた (consumer が次の周期を待たずに sidecar を書いて周期を進める、 [`Self::take_urgent`])
-    urgent: AtomicBool,
     /// 開く時に記録から退避を戻した数 (観測・試験用)
     restored: AtomicU32,
     /// log の区画が一杯で配列にだけ書いた数 (観測用)
@@ -322,7 +316,6 @@ impl PrevSlots {
             head: AtomicU32::new(0),
             half_max: [AtomicU64::new(0), AtomicU64::new(0)],
             persisted: AtomicU64::new(0),
-            urgent: AtomicBool::new(false),
             restored: AtomicU32::new(0),
             log_full: AtomicU64::new(0),
             replay: std::sync::Mutex::new(Vec::new()),
@@ -545,12 +538,7 @@ impl PrevSlots {
     /// `prev.seg` が無い / 範囲の外 / 空き不足)。 使い回しは [`Self::enter_epoch`] の中で呼ぶ (開く時の再生は 1 本)。 呼び手は場所を
     /// 握っている (行の lock と空きの一覧から取り出した場所 = 同じ場所の書き手は 1 本)。
     pub(crate) fn write(&self, slot: u32, rec: &PrevRecord) -> bool {
-        self.put(slot, rec).0
-    }
-
-    /// [`Self::write`] と同じ。 (書けたか, consumer を起こすか = この書き込みが区画の 3/4 の件 ([`Self::take_urgent`]))。
-    pub(crate) fn put(&self, slot: u32, rec: &PrevRecord) -> (bool, bool) {
-        let Some(r) = self.region.get() else { return (false, false) };
+        let Some(r) = self.region.get() else { return false };
         // 門の中: 周期は動かない (閉じている間だけ進む)
         let epoch = self.epoch.load(Ordering::Acquire);
         // commit は gen.seg と同じく歩幅で伸ばす (`ensure_committed`)。 page ごとに伸ばす `ensure_committed_sparse` は、 使い回す
@@ -567,11 +555,6 @@ impl PrevSlots {
         } else {
             LOG_ENTRIES
         };
-        let wake = i == LOG_URGENT;
-        if wake {
-            // 区画の 3/4 (この件数目を積んだ書き手は 1 本だけ): 呼び手が consumer を起こし、 次の周期を待たずに周期を進めさせる
-            self.urgent.store(true, Ordering::Relaxed);
-        }
         let in_log = i < LOG_ENTRIES && r.ensure_committed(log_off(half, i) + ENTRY).is_ok();
         if in_log {
             Self::put_words(r, log_off(half, i), &encode(slot, epoch, rec));
@@ -589,7 +572,7 @@ impl PrevSlots {
                 r.mark_dirty(0, PREV_HEADER);
             }
         }
-        (in_array || in_log, wake)
+        in_array || in_log
     }
 
     /// 場所 `slot` の配列の記録 (無い / 書きかけ / 範囲の外は None)。
@@ -671,12 +654,6 @@ impl PrevSlots {
         }
         let p = self.persisted.load(Ordering::Relaxed);
         self.half_max.iter().any(|m| m.load(Ordering::Relaxed) > p) || self.header_u64(H_OVERFLOW).load(Ordering::Relaxed) > p
-    }
-
-    /// 書き手が今の区画の 3/4 を越えたか (印を下ろす)。 consumer は、 次の周期を待たずに sidecar を書いて周期を進める (区画が一杯に
-    /// なる前に。 一杯の周期の記録は配列にだけ = 同じ場所を 2 回使い回した 1 回目が残らない)。
-    pub(crate) fn take_urgent(&self) -> bool {
-        self.urgent.load(Ordering::Relaxed) && self.urgent.swap(false, Ordering::Relaxed)
     }
 
     /// sidecar (`.eidmap` / `eidalias` / `pktombs` / `pkformer`) を書き出す前 (呼び手は書き出しを 1 本に並べる lock を握っている)。
@@ -958,30 +935,6 @@ mod tests {
         let e = again.begin_persist().unwrap();
         assert!(again.end_persist(e));
         assert_eq!(again.unpersisted(), vec![], "書き出した後に戻した");
-    }
-
-    /// review946c の 3: 区画の 3/4 の件を積んだ書き手が 1 本だけ consumer を起こす印を立てる (周期を進めると次の区画でまた立つ)。
-    #[test]
-    fn the_writer_past_three_quarters_of_the_log_half_asks_for_a_persist() {
-        let mut buf = vec![0u64; segment_len(4).div_ceil(8)];
-        let p = PrevSlots::off();
-        p.prepare(region(&mut buf), 24, no_flush).unwrap();
-        let mut wakes = 0;
-        for i in 0..LOG_ENTRIES {
-            let (ok, wake) = p.put(1, &own(1, 1, u64::from(i) + 1));
-            assert!(ok);
-            if wake {
-                wakes += 1;
-                assert_eq!(i, LOG_URGENT, "起こす件");
-            }
-        }
-        assert_eq!(wakes, 1);
-        assert!(p.take_urgent());
-        assert!(!p.take_urgent(), "印を下ろさない");
-        assert_eq!(p.begin_persist(), Some(1));
-        assert!(p.end_persist(1));
-        let woke = (0..=LOG_URGENT).filter(|&i| p.put(2, &own(2, 1, u64::from(i) + 1)).1).count();
-        assert_eq!(woke, 1, "次の周期の区画で起こさない");
     }
 
     /// review946c [I]: 0 から始める時は、 0 に戻した中身を書き出してから header を書く (前の形の件が新しい header の下で残らない)。
