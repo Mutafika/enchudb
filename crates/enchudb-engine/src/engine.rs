@@ -2260,6 +2260,8 @@ pub mod write_out_hook {
         /// #731: 本体の書き出しで、 生きている印 (entities) を書き出した後、 場所の世代 (`gen.seg`) を書き出す前 (消す書き手を
         /// 止めている間)
         BeforeGenerations,
+        /// 本体の書き出しで、 前の住人の記録 (`prev.seg`) を書き出した後、 生きている印 (entities) を書き出す前
+        PrevWrittenOut,
         /// 本体の書き出しで、 版数の列を書き出し、 使い回しの門を閉じて前の住人の記録 (`prev.seg`) をもう一度書き出した後、
         /// tomb.seg を書き出す前 (v15 の DB だけ)
         BeforeTomb,
@@ -27516,8 +27518,43 @@ impl Engine {
             if makes_live {
                 gens.restore(slot, g);
             }
+        } else if g == now && makes_live && !self.entities.is_live(slot) {
+            self.redo_reuse_eviction(slot);
         }
         Some(slot)
+    }
+
+    /// `prev.seg`: 再生が死んだ場所 `slot` を次の住人の record (世代 = 場所の今の世代) で生かす時、 場所の記録の前の住人が場所の最後の行
+    /// (= 使い回しは記録を書いた所までしか本体に届いていない電源断の像) の翻訳した行で、 その写像がまだ場所を指していれば、 使い回しと
+    /// 同じく写像を外して削除の版数と名前を identity に移す。 開く時は使い回しが本体に届いていない記録で写像を外さない
+    /// (`prev_evicted`: 再生が新しい住人を生かさない像では、 外すと場所に残る消えた行の削除が持ち主を失う)。 生かす record が来た所で
+    /// 外さないと、 新しい住人がその identity になった (#925 の形)。 前の住人が自分の行なら、 削除は開く時に記録から戻してある
+    /// (`restore_prev_residents`)。
+    fn redo_reuse_eviction(&self, slot: u32) {
+        let Some(rec) = self.generations().prev.read(slot) else { return };
+        if rec.kind != crate::prev_slots::PrevKind::Translated
+            || rec.gone != self.last_local_of_slot(slot)
+            || self.eid_translator.get(rec.peer, rec.number) != Some(slot)
+        {
+            return;
+        }
+        let tomb = rec.tomb.max(self.tombstone_version_of(slot));
+        let self_peer = self.peer_id();
+        let mut ids: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
+        for (peer, foreign_local) in self.eid_translator.remove_local(slot) {
+            if peer == self_peer {
+                // #612: 畳んだ自分の行の世界番号 (`split_removed_keys` と同じ)
+                self.eid_translator.alias(peer, foreign_local, foreign_local);
+                self.set_tombstone_local(foreign_local, tomb);
+            } else {
+                ids.push((peer, foreign_local));
+            }
+        }
+        if let Some(i) = ids.iter().position(|&id| id == (rec.peer, rec.number)) {
+            ids.swap(0, i);
+        }
+        self.move_stale_slot_names(&ids, slot, tomb);
+        self.retreat_removed_keys(&ids, tomb);
     }
 
     fn apply_oplog_op_inner(
@@ -29213,6 +29250,8 @@ impl Engine {
         // 間に使い回した分は、 tomb.seg の前に門を閉じてもう一度 (下)
         let prev = |k: SegmentKind| matches!(k, SegmentKind::Prev);
         set.flush_where(all || catch_up, prev)?;
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::PrevWrittenOut);
         set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Entities))?;
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeGenerations);

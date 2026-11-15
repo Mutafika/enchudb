@@ -3425,3 +3425,150 @@ fn a_locally_deleted_translated_slot_reused_before_power_loss_stays_unmapped() {
     );
     assert_eq!(mapped, None, "開いた A で F の写像が戻った");
 }
+
+/// `prev.seg` の試験の DB (翻訳した行): sync する、 表 t (枠 1、 c = Number)、 peer A = 1。 C (peer 3) の行 F を受け、 C の削除も受けて
+/// 写像の面 (削除の版数あり) と本体を書き出す。 consumer の周期を止めずに engine と F の削除の版数を渡す。
+fn received_and_deleted_row_engine(db: &Path, world_f: u64) -> (Arc<Engine>, Hlc) {
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 1).unwrap();
+    eng.define_himo_in("t", "c", ValueType::Number, 0).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let hid = eng.himo_id("t.c").unwrap() as u16;
+    let t = eng.resolve_remote_eid(world_f, hid).unwrap();
+    assert!(eng.remote_tie_apply_result(t, hid, 5u32, Hlc { wall: 1_000, logical: 0, peer: 3 }).applied());
+    let del = Hlc { wall: 2_000, logical: 0, peer: 3 };
+    assert!(eng.remote_delete_apply_foreign(world_f, del), "前提: C の削除が当たった");
+    eng.persist_sync_state().unwrap();
+    eng.oplog_sync().unwrap();
+    assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "前提: 写像の面 (F の削除の版数あり) を書き出した");
+    (eng, del)
+}
+
+/// 像の state の (値 9 の行の宛名, F が消えたままか (C の遅い書き込みが当たらない), 自分の行宛ての Delete) と、 開いた時の (C, f) の
+/// 写像。
+fn translated_image_state(img: &Path, world_f: u64) -> (Vec<u64>, bool, Vec<u64>, Option<u64>) {
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let mapped = eng.resolve_remote_eid_existing(world_f);
+    if mapped.is_some() {
+        // 写像が戻った像は、 その後に足した行が F の場所を使い回す (使い回しが F の写像を外す)
+        let z = eng.entity_in("t").unwrap();
+        eng.tie_to(z, "t.c", 8u32);
+        eng.oplog_commit();
+    }
+    let (records, _) = eng.state_records();
+    let nine = records
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Tie { eid, value: 9, .. } => Some(eid),
+            _ => None,
+        })
+        .collect();
+    let own_deletes = records
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } if enchudb_oplog::eid_peer(eid) == 1 => Some(eid),
+            _ => None,
+        })
+        .collect();
+    let hid = eng.himo_id("t.c").unwrap() as u16;
+    let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 3 };
+    let f_dead = match eng.resolve_remote_eid(world_f, hid) {
+        None => true,
+        Some(t) => !eng.remote_tie_apply(t, hid, 6u32, later),
+    };
+    (nine, f_dead, own_deletes, mapped)
+}
+
+/// 受けた行 F (C の削除も受けて書き出した) の場所を Y で使い回し、 本体の書き出しの `prev.seg` の後・生きている印の前に電源が落ちる
+/// (WAL に Y の record、 本体には記録だけ)。 開く時は記録の行が場所の最後の行 (使い回しが本体に届いていない) なので写像を戻し、
+/// 再生が Y を生かす所で写像を外す = 開いた A の state は Y を A の行として出し、 F は (C, f) の削除で消えたまま。
+///
+/// 前は写像が戻ったまま再生が Y を生かし、 Y が C の行 F として扱われた (#925 の形)。
+#[test]
+fn a_translated_reuse_cut_after_its_record_is_finished_by_the_replay() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_translated_replay");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    {
+        let (eng, _) = received_and_deleted_row_engine(&live.join("db"), world_f);
+        let _hold = eng.hold_consumer();
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to(y, "t.c", 9u32);
+        eng.oplog_commit();
+        let shot = Arc::new(AtomicBool::new(false));
+        let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::PrevWrittenOut && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(shot.load(Ordering::SeqCst), "前提: prev.seg の後で撮った");
+    }
+    crashsim::stop();
+    let (nine, f_deleted, _, mapped) = translated_image_state(&img, world_f);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        nine.len() == 1 && enchudb_oplog::eid_peer(nine[0]) == 1,
+        "再生が生かした Y が A の行として state に出ない (C の行 F として出た?): {nine:x?}"
+    );
+    assert!(f_deleted, "消えた F に C の遅い書き込みが当たった (F の削除を失った)");
+    assert_eq!(mapped, None, "Y を生かした後も F の写像が場所を指す");
+}
+
+/// 受けた行 F の場所を、 本体の書き出しの途中 (WAL の書き出しの後) で Y が使い回し、 `prev.seg` の後・生きている印の前に電源が
+/// 落ちる (記録は届き、 Y の record は WAL に無い)。 開いた A では Y は無く、 F の写像は戻る (場所に F の削除が残る)。 その後に足した
+/// 行 Z が場所を使い回すと F の削除は (C, f) に退避され、 A の行の Delete は出ない。
+///
+/// 開く時に記録だけで写像を外すと、 Z の使い回しが前の住人 F を A の行と読み、 A の行の Delete (幻) を出す。
+#[test]
+fn a_translated_reuse_record_without_its_new_row_keeps_the_mapping() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_translated_record_only");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    {
+        let (eng, _) = received_and_deleted_row_engine(&live.join("db"), world_f);
+        let _hold = eng.hold_consumer();
+        let shot = Arc::new(AtomicBool::new(false));
+        let reused = Arc::new(AtomicBool::new(false));
+        let (s2, r2, e2, l, i) = (shot.clone(), reused.clone(), eng.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && !r2.swap(true, Ordering::SeqCst) {
+                let y = e2.entity_in("t").unwrap();
+                e2.tie_to(y, "t.c", 9u32);
+                e2.oplog_commit();
+            }
+            if p == Phase::PrevWrittenOut && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(reused.load(Ordering::SeqCst) && shot.load(Ordering::SeqCst), "前提: 書き出しの途中で使い回して撮った");
+    }
+    crashsim::stop();
+    let (nine, f_deleted, own_deletes, mapped) = translated_image_state(&img, world_f);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(nine.is_empty(), "前提: 像に Y は無い (WAL に届いていない): {nine:x?}");
+    assert!(mapped.is_some(), "使い回しが本体に届いていない像で F の写像を外した");
+    assert!(f_deleted, "消えた F に C の遅い書き込みが当たった (F の削除を失った)");
+    assert!(own_deletes.is_empty(), "A の行の Delete (前の住人 F を A の行と読んだ幻) を出した: {own_deletes:x?}");
+}
