@@ -1,0 +1,108 @@
+//! loom model — #899: Ref の紐の円柱の鍵を場所にした後の、 「世代 > 0 の entry を置いた」 印 (`HimoStore::has_gen`) と、 それを
+//! 見る読み手の順の約束を全 interleaving で検証する。
+//!
+//! ## 何を守っているのか
+//! 世代を持つ DB の Ref の紐は、 円柱の鍵 = 場所、 entry = 値の世代 << S | entity。 印が立っていない紐の entry は全部世代 0
+//! (= entity そのもの) なので、 読み手は世代を外す手間を省ける。 印は 1 度だけ立つ:
+//!
+//! - 書き手 (世代 > 0 の entry を置く) は、 印を Acquire で読み、 立っていなければ Release で立ててから、 値の鍵の下で entry を
+//!   bucket に置き (len を Release で)、 bucket の live を Release で +1 する
+//! - 値を引く読み (`pull`) は bucket を写した (len を Acquire で読んだ) **後** で印を読む
+//! - 数だけの読み (`slice_len`) は bucket の live を Acquire で読んだ **後** で印を読む
+//!
+//! 読み手が写した entry / 読んだ live を置いた書き手が、 その前に印を立てた (か、 立っているのを Acquire で見た) なら、 読み手は印を
+//! 見る。 live は同じ bucket の書き手が値の鍵で並んで書くので、 後の書き手 (印に触らない世代 0 の書き手) の live を読んでも、 鍵の
+//! 受け渡しで前の書き手の印まで届く。 印を見なかった読み手は、 世代 > 0 の entry を entity として返す (印の無い紐の速い道) /
+//! 世代 > 0 の entity を世代 0 の値の数に数える。
+//!
+//! ## model の範囲
+//! bucket 1 つ (len と live)、 値の鍵 1 本 (Mutex)、 印 1 つ。 書き手 A は世代 1 の entry を置き、 書き手 B は (A の後でも前でも)
+//! 世代 0 の entry を置く。 読み手は live / len を読んでから印を読む。 対照: live の store / load を Relaxed にすると、 B の live を
+//! 読んだ読み手が印を見ない interleaving を loom が見つける (`relaxed_live_misses_the_mark`)。
+//!
+//! ## 実行
+//! ```sh
+//! RUSTFLAGS="--cfg loom" cargo test -p enchudb-engine --test loom_ref_gen_mark --release
+//! ```
+//! 通常の `cargo test` では `#![cfg(loom)]` で空 build。
+
+#![cfg(loom)]
+
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use loom::sync::{Arc, Mutex};
+
+struct Model {
+    has_gen: AtomicBool,
+    /// bucket の publish 済みの長さ (`Buf::len`) と live (`AppendBucket::live`)
+    len: AtomicUsize,
+    live: AtomicUsize,
+    /// 置いた entry の世代 (len の手前まで publish 済み)
+    gens: [AtomicUsize; 2],
+    /// 値の鍵
+    lock: Mutex<()>,
+    live_order: (Ordering, Ordering),
+}
+
+impl Model {
+    fn push(&self, gen: usize) {
+        if gen != 0 && !self.has_gen.load(Ordering::Acquire) {
+            self.has_gen.store(true, Ordering::Release);
+        }
+        let _g = self.lock.lock().unwrap();
+        let l = self.len.load(Ordering::Relaxed);
+        self.gens[l].store(gen, Ordering::Relaxed);
+        self.len.store(l + 1, Ordering::Release);
+        let v = self.live.load(Ordering::Relaxed);
+        self.live.store(v + 1, self.live_order.0);
+    }
+}
+
+fn run(live_order: (Ordering, Ordering)) {
+    loom::model(move || {
+        let m = Arc::new(Model {
+            has_gen: AtomicBool::new(false),
+            len: AtomicUsize::new(0),
+            live: AtomicUsize::new(0),
+            gens: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            lock: Mutex::new(()),
+            live_order,
+        });
+        let a = {
+            let m = m.clone();
+            loom::thread::spawn(move || m.push(1))
+        };
+        let b = {
+            let m = m.clone();
+            loom::thread::spawn(move || m.push(0))
+        };
+        // 数の読み: live を読んでから印。 2 件とも数えたなら、 世代 1 の entry も数えている
+        let n = m.live.load(live_order.1);
+        let mark = m.has_gen.load(Ordering::Acquire);
+        if n == 2 {
+            assert!(mark, "live を読んだのに世代 > 0 の印を見ない (数の読みが世代 1 の entity を世代 0 に数える)");
+        }
+        // 値を引く読み: 写した entry に世代 1 があれば印を見る
+        let l = m.len.load(Ordering::Acquire);
+        let copied: Vec<usize> = (0..l).map(|i| m.gens[i].load(Ordering::Relaxed)).collect();
+        let mark = m.has_gen.load(Ordering::Acquire);
+        if copied.contains(&1) {
+            assert!(mark, "世代 1 の entry を写したのに印を見ない (entity として返す)");
+        }
+        a.join().unwrap();
+        b.join().unwrap();
+    });
+}
+
+/// 約束の形 (live の store は Release、 数の読みは Acquire) = 全 interleaving で印を見る。
+#[test]
+fn reads_after_the_bucket_see_the_mark() {
+    run((Ordering::Release, Ordering::Acquire));
+}
+
+/// 対照: live を Relaxed で書いて読むと、 世代 0 の書き手 B の live (2) を読んだ読み手が A の印を見ない interleaving がある
+/// (model が窓を表せていることの確認)。
+#[test]
+#[should_panic(expected = "印を見ない")]
+fn relaxed_live_misses_the_mark() {
+    run((Ordering::Relaxed, Ordering::Relaxed));
+}

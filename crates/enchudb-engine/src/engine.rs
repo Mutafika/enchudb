@@ -9152,6 +9152,12 @@ impl Engine {
             }
             generations.attach(backing.region(SegmentKind::Gen, &layout), u32::from(layout.gen_bits))?;
         }
+        // #899: Ref の紐の円柱は場所の bit を読む (世代を持つ DB では鍵を場所にする)
+        for (h, &ht) in himos.iter().zip(value_types.iter()) {
+            if ht == ValueType::Ref {
+                h.attach_generations(generations.clone());
+            }
+        }
         report("HimoStore::load × N", &mut t, &mut p);
 
         // β-light step 2: load 時は全 himo を anonymous table に attach する。
@@ -23901,6 +23907,10 @@ impl Engine {
             self.backing.region(SegmentKind::Himo(hid as u32), &*self.layout.read().unwrap()),
             ht, effective_mv, self.max_entities(), self.layout.read().unwrap().col_pad,
         );
+        // #899: Ref の紐の円柱は場所の bit を読む (世代を持つ DB では鍵を場所にする)
+        if ht == ValueType::Ref {
+            hs.attach_generations(self.live.gens_arc().clone());
+        }
 
         if self.layout.read().unwrap().has_cell_version() {
             let ver = ver_column_from_region(
@@ -26994,15 +27004,18 @@ impl crate::live::CellReader for Engine {
     fn ref_val(&self, e: u32) -> u64 {
         self.generations().local(e) as u64
     }
+    /// #899: Ref の紐の円柱は鍵が場所なので、 どの世代の値も bucket 1 つ (`HimoStore::pull_slot_into`)。 Ref でない紐 (番号を
+    /// 数で持つ via) は世代ごとの値を引く
     fn pull_ref_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
+        let Some(h) = self.himos.get(via as usize) else { return };
         let b = self.generations().bits();
-        if b == 0 || b >= 32 {
-            return crate::live::CellReader::pull_into(self, via, e as u64, out);
+        if h.value_type == ValueType::Ref || b == 0 || b >= 32 {
+            return h.pull_slot_into(e, None, out);
         }
         // 世代 0 から今の世代まで (使い回しの無い場所は 1 回)
         let top = self.generations().get(e).min(self.generations().retired_mark());
         for g in 0..=top {
-            crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
+            h.pull_into(u64::from((g << b) | e), out);
         }
     }
     fn pull_ref_stale_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
@@ -27010,9 +27023,14 @@ impl crate::live::CellReader for Engine {
         if b == 0 || b >= 32 {
             return;
         }
+        let Some(h) = self.himos.get(via as usize) else { return };
+        // 今の世代より前の値 (前の住人を指す ref)。 使い回しの無い場所 (今の世代 0) は無い
         let top = self.generations().get(e).min(self.generations().retired_mark());
+        if h.value_type == ValueType::Ref {
+            return h.pull_slot_into(e, Some(top), out);
+        }
         for g in 0..top {
-            crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
+            h.pull_into(u64::from((g << b) | e), out);
         }
     }
     #[inline]
