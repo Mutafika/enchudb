@@ -347,9 +347,20 @@ impl EidTranslator {
     /// #178: その local を指す別名も外して返す (逆写像の key が先頭。 別名を残すと、 別名宛ての record が新しい住人に入る)。
     #[must_use = "外した identity の tombstone を退避しないと削除済み entity が復活する (#166)"]
     pub fn remove_local(&self, local: u32) -> Vec<Key> {
+        self.remove_local_unless(local, || false)
+    }
+
+    /// [`Self::remove_local`] の、 写像の lock の下で `taken` が真なら何も外さない形 (#925 の C2)。 場所を生かす前に後始末する
+    /// 使い回しの道が、 その場所を先に生かした書き手 (#883、 払い出し位置から取った翻訳した行の払い出し) の写像を外さないために使う:
+    /// 払い出す側は場所を生かしてから写像を載せる (`get_or_insert_with`) ので、 載せた写像が見えるなら生かした印も見える。
+    #[must_use = "外した identity の tombstone を退避しないと削除済み entity が復活する (#166)"]
+    pub fn remove_local_unless(&self, local: u32, taken: impl FnOnce() -> bool) -> Vec<Key> {
         // lock 順序は `inner` → `translated_locals` → `aliases` に固定する (`insert` は同時には保持しないので、 この順序
         // だけ守れば cycle は生じない)。
         let mut fwd = self.inner.write().unwrap();
+        if taken() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if let Some(key) = self.translated_locals.write().unwrap().remove(&local) {
             // 同 key が別 local に張り替わっている可能性があるので、 一致する時だけ消す。

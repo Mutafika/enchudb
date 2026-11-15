@@ -2195,6 +2195,9 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
+                // #917: 当てる行は引いた直後に取る (#925: 値を引く間に、 その行が消えて場所が使い回されても、 使い回した新しい行を
+                // 取らない。 Ref の値の払い出しが同じ表の、 その行の消えた場所を使い回す事もある)
+                let row = self.engine.remote_row_of(*eid, local_eid);
                 // #9: entity 写像ができたので、 この foreign entity 宛に Tie より先に届いて
                 // 退避していた Content を drain して apply する (= 配送順序ロス防止)。
                 // #9: Ref himo は value 自体が foreign target eid なので、 ref の target
@@ -2217,26 +2220,29 @@ impl Syncer {
                 };
                 // 改名の時刻: 名前で束ねた行の名前を書き換える時、 改名より後に作られた identity (改名を先に受けた peer では
                 // 別のデッキ) を切り離してから当てる
-                let local_eid = if self.engine.is_pk_himo(*himo_id) {
-                    self.engine.split_for_rename(local_eid, *eid, *himo_id, value, rec.hlc).unwrap_or(local_eid)
+                let split = if self.engine.is_pk_himo(*himo_id) {
+                    self.engine.split_for_rename(local_eid, *eid, *himo_id, value, rec.hlc)
                 } else {
-                    local_eid
+                    None
                 };
-                // #917: 当てる行 (引いた後・行の lock の前にその行が消えて場所が使い回されたら、 engine が lock の下で外す)
-                let row = self.engine.remote_row_of(*eid, local_eid);
+                // #917: 当てる行 (引いた後・行の lock の前にその行が消えて場所が使い回されたら、 engine が lock の下で外す)。 切り離した
+                // 時は切り離した先の行
+                let (local_eid, row) = match split {
+                    Some(e) => (e, self.engine.remote_row_of(*eid, e)),
+                    None => (local_eid, row),
+                };
                 #[cfg(test)]
                 apply_hook::call();
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
                 let r = ApplyResult::from(self.engine.remote_tie_apply_at(local_eid, row, *himo_id, value, rec.hlc));
-                // #917: その行がもう場所に居ない (引いた後に消えて使い回された) なら、 消えた行宛ての record。 自分の行なら入口の
-                // 照合の道をもう一度通す (引く前に消えていた時と同じ扱い。 入口で必ず返る = もう一度ここには来ない)
+                // #917: その行がもう場所に居ない (引いた後に消えて使い回された) なら、 消えた行宛ての record。 入口からもう一度通す
+                // (引く前に消えていた時と同じ扱い): 自分の行は入口の照合で必ず返る。 他の peer の行は、 使い回す道が写像を場所を生かす
+                // 前に外す (#925 の C2) ので、 写像の無い行として引き直す (#166 の退避で死んだ場所 → 消えた行への改名の名前の扱い、
+                // #925 の [B3]。 前は何もせずに捨て、 名前がその行の削除の時刻に消した名前にならなかった)
                 if r == ApplyResult::SkippedOlder && !self.engine.remote_row_holds(local_eid, row) {
-                    if self.engine.is_gone_own_eid(*eid) {
-                        return self.apply_one(store, rec, None, dying);
-                    }
-                    return ApplyResult::SkippedOlder;
+                    return self.apply_one(store, rec, None, dying);
                 }
                 // 当てた後に (LWW で負けても) 束ねた identity のカードと名前の年表に積む (最初の改名は、 当てる前のカードから
                 // 年表を作る)
@@ -2283,6 +2289,8 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
+                // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
+                let row = self.engine.remote_row_of(*eid, local_eid);
                 let value = match self.engine.resolve_remote_ref_value(
                     enchudb_oplog::eid_peer(*target),
                     enchudb_oplog::eid_local(*target),
@@ -2291,8 +2299,6 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::Dropped,
                 };
-                // #917: Tie と同じ (当てる行を lock の下で確かめる)
-                let row = self.engine.remote_row_of(*eid, local_eid);
                 if !self.engine.remote_row_holds(local_eid, row) {
                     return ApplyResult::SkippedOlder;
                 }
@@ -2340,14 +2346,14 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
+                // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
+                let row = self.engine.remote_row_of(*eid, local_eid);
                 // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)。
                 // Tie と同じく、 翻訳できないなら書かない (`SyncOutcome::dropped_vocab`)。
                 let value = match self.engine.try_translate_remote_vid(rec.author_peer, local_hid, *value) {
                     Some(v) => v,
                     None => return ApplyResult::DroppedVocab,
                 };
-                // #917: Tie と同じ (当てる行を lock の下で確かめる)
-                let row = self.engine.remote_row_of(*eid, local_eid);
                 if !self.engine.remote_row_holds(local_eid, row) {
                     return ApplyResult::SkippedOlder;
                 }
@@ -2500,6 +2506,102 @@ mod tests {
             assert_eq!(out.applied, 0, "消えた行宛ての record を当てた (untie = {untie}, {out:?})");
             assert_eq!(eng.get(y, "t.v"), Some(2), "X 宛ての受信が、 場所を使い回した Y に当たった (untie = {untie})");
         }
+    }
+
+    /// review919-922 の [B3] (#925 の C2 の後に安全になった所): 受信の当て込みが、 消えた翻訳した行 F0 (C の行) 宛ての改名を引いた後・
+    /// 行の lock の前に、 アプリが F0 の場所を Y で使い回しても、 その改名は使い回しの後に届いた時と同じく、 消えた行への改名として
+    /// 名前を F0 の削除の時刻に消した名前にする (#551)。 Y には当たらない。
+    ///
+    /// 前は行の lock の下で 「もう場所に居ない」 と分かると、 自分の行でなければ何もせずに捨てた (名前が消した名前にならない)。
+    #[test]
+    fn a_rename_of_a_translated_row_reused_after_resolving_names_the_deleted_deck() {
+        let path = format!("/tmp/enchudb_sync_b3_{}_{}", std::process::id(), line!());
+        let _ = std::fs::remove_dir_all(&path);
+        struct Rm(String);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(path.clone());
+        let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let syncer = Syncer::new(eng.clone(), Arc::new(InMemoryTransport::new()));
+        let f0 = enchudb_oplog::make_eid(3, 100);
+        let base = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let made = WireRecord::unsigned(Hlc { wall: base, logical: 0, peer: 3 }, 3, DecodedOp::Tie { eid: f0, himo_id: k, value: 1 });
+        let deleted = Hlc { wall: base + 1, logical: 0, peer: 3 };
+        let gone = WireRecord::unsigned(deleted, 3, DecodedOp::Delete { eid: f0 });
+        let out = syncer.apply_records(&[made, gone]);
+        assert_eq!(out.applied, 2, "前提: F0 を作って消した ({out:?})");
+        let y = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let (e, yy) = (eng.clone(), y.clone());
+        apply_hook::set(move || {
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 70u32);
+            yy.set(y);
+        });
+        // B が (C の削除を知らずに) F0 を名前 5 に改名した
+        let rename = WireRecord::unsigned(Hlc { wall: base + 2, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: f0, himo_id: k, value: 5 });
+        let out = syncer.apply_records(&[rename]);
+        let y = y.get();
+        assert_ne!(y, 0, "前提: 割り込み点を通った");
+        assert_eq!(out.applied, 0, "消えた行への改名を当てた ({out:?})");
+        assert!(eng.is_live(y), "改名が使い回した Y を消した");
+        assert_eq!(eng.get(y, "t.v"), Some(70));
+        assert_eq!(eng.get(y, "t.k"), None, "消えた F0 への改名が、 場所を使い回した Y に当たった");
+        assert_eq!(
+            eng.name_deleted_at(k, PkValue::Local(5)),
+            Some(deleted),
+            "引いた後に場所を使い回された F0 への改名の名前 5 が、 F0 の削除の時刻に消した名前にならない"
+        );
+    }
+
+    /// #925: 消えた翻訳した行 F0 (C の行) 宛ての、 同じ表を指す Ref の Tie (F0 の削除を知らない B の書き込み) が届き、 Ref の的 (初めて
+    /// 見る B の行 T) の払い出しが、 満杯の表で F0 の場所を使い回しても、 その Tie は T に当たらない (F0 は消えている = 削除優先で捨てる)。
+    ///
+    /// 前は当てる行を値を引いた後に取っていて、 F0 の場所の最後の行 = 払い出したばかりの T に、 F0 宛ての書き込み (T を指す ref) を
+    /// 当てた。
+    #[test]
+    fn a_ref_write_to_a_deleted_row_does_not_hit_the_target_that_reused_its_slot() {
+        let path = format!("/tmp/enchudb_sync_refreuse_{}_{}", std::process::id(), line!());
+        let _ = std::fs::remove_dir_all(&path);
+        struct Rm(String);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(path.clone());
+        let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.define_ref_in("t", "next", "t").unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let (v, next) = (eng.himo_id("t.v").unwrap() as u16, eng.himo_id("t.next").unwrap() as u16);
+        let syncer = Syncer::new(eng.clone(), Arc::new(InMemoryTransport::new()));
+        let f0 = enchudb_oplog::make_eid(3, 100);
+        let base = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let made = WireRecord::unsigned(Hlc { wall: base, logical: 0, peer: 3 }, 3, DecodedOp::Tie { eid: f0, himo_id: v, value: 1 });
+        let gone = WireRecord::unsigned(Hlc { wall: base + 1, logical: 0, peer: 3 }, 3, DecodedOp::Delete { eid: f0 });
+        let out = syncer.apply_records(&[made, gone]);
+        assert_eq!(out.applied, 2, "前提: F0 を作って消した ({out:?})");
+        let f0_slot = eng.eid_slot(eng.resolve_remote_eid_existing(f0).unwrap());
+        // B が (C の削除を知らずに) F0.next を B の行 T (番号 200、 まだ誰も知らない) に向けた
+        let write = WireRecord::unsigned(Hlc { wall: base + 2, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: f0, himo_id: next, value: 200 });
+        let out = syncer.apply_records(&[write]);
+        let t = eng.resolve_remote_eid_existing(enchudb_oplog::make_eid(2, 200)).expect("前提: T に場所を払い出した");
+        assert_eq!(eng.eid_slot(t), f0_slot, "前提: T は F0 の場所を使い回した");
+        assert_eq!(out.applied, 0, "消えた F0 宛ての書き込みを当てた ({out:?})");
+        assert_eq!(eng.get(t, "t.next"), None, "消えた F0 宛ての書き込みが、 F0 の場所を使い回した T に当たった");
     }
 
     /// 固定 path だと並列 test run (別 binary / 前回 run の残骸) と衝突するため pid を混ぜる
