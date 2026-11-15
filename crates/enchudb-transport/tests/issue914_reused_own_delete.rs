@@ -373,9 +373,11 @@ fn a_ref_to_the_deleted_row_is_in_the_state() {
 }
 
 /// #921 の読み直し [1]: X を消したのが **他の peer B** (削除の版数が B の時計) の時。 A が X の名前で Y を足して場所を使い回し、 新しく入った C が
-/// B より先に A の state を直接取る。 A の state に X の Delete は入らない (B の時計の削除は B の record が運ぶ) ので、 X を指す ref も出さない。
-/// 出すと C は Ref の解決で生きた空の行を作り、 掃除が今の時刻で消して配り、 その削除が名前の削除優先で A / B / P の Y を消した (C でだけ生きる)。
-/// Y は X の削除の後に作った = 4 台で生きる。
+/// B より先に A の state を直接取る。 Y は X の削除の後に作った = 4 台で生きる。 Delete 無しで X を指す ref を出すと、 C は Ref の解決で生きた
+/// 空の行を作り、 掃除が今の時刻で消して配り、 その削除が名前の削除優先で A / B / P の Y を消した (C でだけ生きる)。
+///
+/// 段 2 (author の state に、 author の行を他の peer が消した Delete も入れる): A の state に X の Delete (書き手 A、 B の削除の版数) と X を指す
+/// ref が一緒に入り、 C の W は P と同じく消えた行を指す。 前 (#921) は Delete も ref も出さず、 C の W だけ null だった。
 #[test]
 fn a_ref_to_a_row_another_peer_deleted_does_not_remove_the_readded_row() {
     let dir = Dir::new("ref-other-delete");
@@ -404,9 +406,15 @@ fn a_ref_to_a_row_another_peer_deleted_does_not_remove_the_readded_row() {
     a.push();
     p.pull(A);
     assert_eq!(a.eng.get(w, "notes.next"), Some(enchudb_oplog::eid_local(x) as u64), "前提: A の W は消えた X を指したまま");
+    assert!(own_state_deletes(&a.eng).contains(&(x, tomb)), "A の state に、 B が消した X の Delete (B の削除の版数) が無い");
     // 新しく入った C が、 B より先に A の state を直接取る
     let c = peer(&dir, &tr, C, 2);
     c.s.bootstrap_pull(A).expect("state を取れない");
+    let target = |q: &Peer| q.eng.get(q.row(1), "notes.next").map(|v| enchudb_oplog::make_eid(q.eng.peer_id(), v as u32));
+    let (on_p, on_c) = (target(&p), target(&c));
+    eprintln!("[1] W.next: P {on_p:x?} C {on_c:x?}");
+    assert!(on_p.is_some_and(|t| !p.eng.is_live(t)), "前提: 差分で受けた P の W は消えた X を指す");
+    assert!(on_c.is_some_and(|t| !c.eng.is_live(t)), "C の W が消えた X を指さない (P は指す): {on_c:x?}");
     all(&[&a, &b, &p, &c]);
     eprintln!("[1] 名前 7 の行: A {:?} B {:?} P {:?} C {:?}", a.v(7), b.v(7), p.v(7), c.v(7));
     assert_eq!([a.v(7), b.v(7), p.v(7), c.v(7)], [vec![77], vec![77], vec![77], vec![77]], "X の削除の後に足した Y が 4 台で生きていない [A, B, P, C]");

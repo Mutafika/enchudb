@@ -2517,6 +2517,25 @@ mod settle_call_hook {
     }
 }
 
+/// #949: この thread の [`Engine::sync_op_walk_key`] を直す前の読み (payload を写して `decode_sync_ops_payload`) にする。 直す前の
+/// 実装と答えを比べる試験の参照に使う。
+#[cfg(test)]
+mod walk_key_full_decode {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn set(on: bool) {
+        ON.with(|c| c.set(on));
+    }
+
+    pub(super) fn on() -> bool {
+        ON.with(|c| c.get())
+    }
+}
+
 /// test 用の数え: [`Engine::table_rows_with_himo`] がなめた cell の数 (この thread の分、 #940)。
 #[cfg(test)]
 mod table_scan_cells {
@@ -2655,6 +2674,23 @@ mod names_taken_hook {
 /// 確かめた後・名前を足す前 (review930 [5])。 置いた WAL で 1 回だけ呼ぶ。 呼ぶのは行の lock を握ったまま。
 #[cfg(test)]
 mod dead_name_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 名前の束ね (`bind_remote_eid_by_pk_at`) が `alloc_lock` を取った後・引いた行の lock を取る前 (#939 の読み直し
+/// [A1])。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod bind_lock_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -4488,6 +4524,84 @@ mod reuse_order_tests {
         assert_ne!(eng.slot_unchecked(y), slot, "同じ場所を 2 つの行に払い出した");
         assert_eq!(eng.resolve_remote_eid_existing(world), Some(theirs), "取れなかった後始末が、 先に取った X の写像を外した");
         assert_eq!(eng.former_addresses_len(), 0, "取れなかった場所の前の宛名の覚えを残した");
+        cleanup(&path, eng);
+    }
+
+    /// #939 の読み直し [A1]: 名前の束ね (`bind_remote_eid_by_pk_at`、 名前 5 の行 L に peer 2 の W を束ねる) と、 別の thread の受信の
+    /// 払い出し (C の行 F の Tie、 `resolve_remote_eid` → 満杯の表で消えた行 G の場所を使い回す) が、 L と G の場所が同じ stripe
+    /// (行の lock は場所の下位 12 bit) の時に互いを待たない。 束ねが最初の lock を取った所 (割り込み点 `bind_lock_hook`) で払い出しを
+    /// 走らせ、 払い出しが G の行を握れずに回り始める (行の待ちの割り込み点) まで進めてから束ねを続ける。
+    ///
+    /// 直す前 (束ねが 行 → `alloc_lock` の順): 束ねは L の stripe を握って `alloc_lock` を待ち、 払い出しは `alloc_lock` を握ったまま
+    /// G の行 (= L の stripe) を握れるまで回るので、 どちらも返らない (この試験は時間の上限で落ちる)。 直した後 (`alloc_lock` → 行):
+    /// 払い出しは `alloc_lock` を待ち、 束ねが放した後に G の場所を取る。
+    #[test]
+    fn a_bind_and_a_reuse_on_the_same_stripe_do_not_wait_on_each_other() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        // 枠 4097 の表: 最初の場所と最後の場所が同じ stripe
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-reuseorder-stripe-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 16_384).unwrap();
+        eng.define_table("t", 4097).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        eng.set_peer_id(1);
+        let rows: Vec<u64> = (0..4097).map(|_| eng.entity_in("t").unwrap()).collect();
+        // 先に 1 回使い回して v15 に移っておく (払い出しが移る手順で書き手を待つ道を通らず、 空きの一覧の道で回るように)
+        eng.delete(rows[1]);
+        let again = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(again), eng.slot_unchecked(rows[1]), "前提: 満杯の表で消えた場所を使い回した");
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        let (g, l) = (rows[0], rows[4096]);
+        let g_slot = eng.slot_unchecked(g);
+        assert_eq!(g_slot % 4096, eng.slot_unchecked(l) % 4096, "前提: G と L の場所は同じ stripe");
+        eng.tie_to(l, "t.k", 5u32);
+        eng.delete(g);
+        eng.oplog_commit();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let f = enchudb_oplog::make_eid(C, 100);
+        let (f_done, f_done_rx) = channel::<Option<u64>>();
+        let started: Arc<Mutex<bool>> = Default::default();
+        {
+            let (e2, started) = (eng.clone(), started.clone());
+            bind_lock_hook::set(&wal, move |_| {
+                *started.lock().unwrap() = true;
+                // 払い出しが G の行を握れずに回り始めるまで進める (直した後は `alloc_lock` を待っていて来ない: 上限まで待って続ける)
+                let (seen, seen_rx) = channel::<()>();
+                e2.row_locks.set_wait_hook(g_slot, move || {
+                    let _ = seen.send(());
+                });
+                let e3 = e2.clone();
+                std::thread::spawn(move || {
+                    let _ = f_done.send(e3.resolve_remote_eid(f, v));
+                });
+                let _ = seen_rx.recv_timeout(Duration::from_secs(2));
+            });
+        }
+        let w = enchudb_oplog::make_eid(2, 100);
+        let (bind_done, bind_done_rx) = channel::<Option<u64>>();
+        {
+            let e2 = eng.clone();
+            let created = at(now_ms(), 2);
+            std::thread::spawn(move || {
+                let _ = bind_done.send(e2.bind_remote_eid_by_pk_at(2, w, l, k, 5, created));
+            });
+        }
+        let bound = bind_done_rx.recv_timeout(Duration::from_secs(20));
+        let got = f_done_rx.recv_timeout(Duration::from_secs(20));
+        assert!(*started.lock().unwrap(), "前提: 束ねが割り込み点を通った");
+        let (Ok(bound), Ok(got)) = (bound, got) else {
+            // 止まった thread は回り続けるので、 DB は消さずに残す (process の終わりで止まる)
+            panic!("束ねと払い出しが互いを待って止まった (束ね {bound:?}、 払い出し {got:?})");
+        };
+        assert_eq!(bound, Some(l), "W を名前 5 の L に束ねない");
+        let got = got.expect("前提: F に場所を払い出した");
+        assert_eq!(eng.slot_unchecked(got), g_slot, "前提: F は消えた G の場所を使い回した");
+        assert_eq!(eng.resolve_remote_eid_existing(w), Some(l));
         cleanup(&path, eng);
     }
 
@@ -13461,12 +13575,10 @@ impl Engine {
             std::collections::HashMap::new();
         let mut known_authors: Option<std::collections::HashSet<u32>> = None;
         for (lsn, eid) in rows.iter() {
-            let decoded = self
-                .sync_op_payload(*eid, &cols)
-                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
-            match decoded {
-                Some(rec) => {
-                    if !consumed(rec.author_peer, rec.hlc) {
+            // #949: (author, HLC) だけ読む (payload を写さず、 Record を組み立てない。 decode できない行の判定は同じ)
+            match self.sync_op_walk_key(*eid, &cols) {
+                Some((author, hlc)) => {
+                    if !consumed(author, hlc) {
                         break;
                     }
                     ack_lsn = *lsn;
@@ -13773,9 +13885,8 @@ impl Engine {
         };
         // #947: ring の表の枠だけなめる
         for eid in self.table_rows_with_himo(cols.lsn) {
-            let Some(bytes) = self.sync_op_payload(eid, &cols) else { continue };
-            if let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) {
-                set.insert(rec.author_peer);
+            if let Some((author, _)) = self.sync_op_walk_key(eid, &cols) {
+                set.insert(author);
             }
         }
         set
@@ -13848,11 +13959,8 @@ impl Engine {
         {
             // #947: ring の表の枠だけなめ、 watermark 以下の行だけ読み直す
             for (_, eid) in self.table_rows_with_value32(cols.lsn, |lsn| lsn <= watermark) {
-                if let Some(rec) = self
-                    .sync_op_payload(eid, &cols)
-                    .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
-                {
-                    bump(rec.author_peer, rec.hlc);
+                if let Some((author, hlc)) = self.sync_op_walk_key(eid, &cols) {
+                    bump(author, hlc);
                 }
             }
         }
@@ -13937,10 +14045,8 @@ impl Engine {
             if lsn >= watermark {
                 continue;
             }
-            let decoded = payload_cols
-                .as_ref()
-                .and_then(|c| self.sync_op_payload(eid, c))
-                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
+            // #949: (author, HLC) だけ読む (decode できない行の判定は同じ)
+            let decoded = payload_cols.as_ref().and_then(|c| self.sync_op_walk_key(eid, c));
             // payload の ring を開けないだけの row も消さない (`ack_sync_prefix` と同じ)。
             if decoded.is_none()
                 && (lsn >= inflight_lsn
@@ -13950,13 +14056,13 @@ impl Engine {
             }
             // #218: floor は **decode できた row だけ**で作っていた = 過少申告。
             // decode 不能な row も消す以上、 その分の履歴は差分 pull で配れない。
-            match &decoded {
-                Some(rec) => {
+            match decoded {
+                Some((author, hlc)) => {
                     let e = reclaimed_max
-                        .entry(rec.author_peer)
+                        .entry(author)
                         .or_insert(enchudb_oplog::Hlc::ZERO);
-                    if rec.hlc > *e {
-                        *e = rec.hlc;
+                    if hlc > *e {
+                        *e = hlc;
                     }
                 }
                 None => dead_raw_authors.push(
@@ -14178,13 +14284,16 @@ impl Engine {
     ///   版数は削除の版数) で出す。 slot を使い回して写像の外れた行は、 退避してある削除の版数から。 他の peer が消した行
     ///   (その peer の record が運ぶ) は出さない。 前はどちらも運ばず、 ホストが state を取り直すと、 まだ出していなかった
     ///   untie と他の peer の行の削除がどこにも配られなかった
-    /// - 自分の行の削除 (#784 / #800): **自分の時計の削除の版数**が slot に残っている、 消えた自分の行を `Delete` (宛名は自分の
+    /// - 自分の行の削除 (#784 / #800): 削除の版数が slot に残っている、 消えた自分の行を `Delete` (宛名は自分の
     ///   世界番号、 版数は削除の版数) で出す。 前は出さず、 state に現れない行を受け手の掃除が **今の時刻** で消していた:
     ///   名前で束ねた行は掃除が見つけられずに残り (#784)、 消した後に同じ名前で足した行は掃除の削除の方が新しくて消えた
-    ///   (#800)。 slot を使い回した行は削除の版数が残っていない (`clear_cell_versions`) ので出せない = 今までどおり受け手の
-    ///   掃除が消す。 出す数は 「払い出した slot のうち、 消えていてまだ使い回していない物」 まで
+    ///   (#800)。 **他の peer が消した自分の行も** (版数はその peer の時計、 書き手は自分): 前は自分の時計の削除だけで、 他の
+    ///   peer B が消した行 X は state に現れず、 B の削除を受ける前に state を取った受け手は、 X に何かの record が当たって
+    ///   いれば掃除で今の時刻に消して配り、 名前の削除優先 (#551) で B の削除の後に同じ名前で足した行まで消した (#923 の残り)。
+    ///   slot を使い回した行は、 使い回す時に移した退避表 (`keep_gone_own_delete`、 #914) から。 出す数は 「払い出した slot の
+    ///   うち、 消えている物」 まで
     /// - **含まないもの** (v1): 署名 (signature = zeros — require_signature な受信側
-    ///   では使えない)、 content blob、 他の peer が外した cell・消した行の記録
+    ///   では使えない)、 content blob、 他の peer が外した cell・消した他の peer の行の記録
     ///
     /// 戻り値 `(records, as_of)`。 oplog 無効 (standalone) では `as_of` が採番
     /// できないため空を返す。
@@ -14207,7 +14316,8 @@ impl Engine {
     /// - **author の時計の版数を持つ物は、 author の行の外の物も全部** (#783、 self 版の #761 / #766 / #784 と同じ中身を、
     ///   replica が持つ分だけ): author の行でない行 (自分の行 / 第三者の行) の、 版数が author の時計の cell (値と版数は
     ///   行の読みで揃える)、 生きている行の、 版数が author の時計で値の無い cell (`Untie`、 author の行も)、 削除の版数が
-    ///   author の時計の消えた行 (`Delete`、 author の行も。 slot を使い回して写像の外れた行は退避表から)。 書き手は
+    ///   author の時計の消えた行 (`Delete`、 author の行も。 slot を使い回して写像の外れた行は退避表から)、 **author の行は
+    ///   誰が消した削除も** (`Delete`、 版数はその削除の版数 = self 版の自分の行の削除と同じ中身)。 書き手は
     ///   `author`、 宛名は行の世界番号 (逆写像、 自分の行なら自分の番号) = author が差分で出した record と同じ形。
     ///   前は author の行の値のある cell だけで、 ホストが author の floor を上げて (遅れて載った state / 回収) 下の受け手が
     ///   取り直しても、 author の untie・削除・他の行への書き込みは届かなかった。 自分の行の slot を使い回した後の
@@ -14424,24 +14534,28 @@ impl Engine {
                         // 引く。 場所の最後の住人を指していない ref (消えた行を指したまま場所を使い回した後) は、 写像が今の住人の物なので
                         // 写像では引かない (前は今の住人を指して出していた)。 #914: 前の住人が自分の行なら、 使い回す時にその削除を
                         // identity (自分の peer, 値) に移してある (`keep_gone_own_delete`) = 自分の行を指す ref として出す。 出すのは、
-                        // その削除の版数が `author` の時計の時だけ (= その Delete が同じ state に入る、 `state_unties_and_foreign_deletes`
-                        // の `mine`)。 受け手でも消えた行を指す (出さないと受け手でだけ null)。 他の peer の時計の削除 (B が消した自分の行) を
-                        // 指す ref を Delete 無しで出すと、 受け手は Ref の解決で生きた空の行を作り、 state の掃除が今の時刻で消して配り、
-                        // その削除が名前の削除優先で同じ名前で足し直した行まで消す (#921 の読み直し [1]) ので出さない (null の小さい割れは
-                        // 残る)。 前の住人が翻訳した行 / 削除の版数の無い行も出さない
+                        // その Delete が同じ state に入る時だけ (`state_unties_and_foreign_deletes`): self 版は自分の行の削除を誰が消した
+                        // 物でも出すので常に、 replica 版 (この DB の行は `author` の行でない) は削除の版数が `author` の時計の時だけ。
+                        // 受け手でも消えた行を指す (出さないと受け手でだけ null)。 Delete 無しで出すと、 受け手は Ref の解決で生きた空の
+                        // 行を作り、 state の掃除が今の時刻で消して配り、 その削除が名前の削除優先で同じ名前で足し直した行まで消す
+                        // (#921 の読み直し [1])。 前の住人が翻訳した行 / 削除の版数の無い行は出さない
                         let target_slot = self.generations().split(value).0;
                         let stale = self.generations().active() && self.last_local_of_slot(target_slot) != value;
                         let gone_own =
-                            stale && self.foreign_tombstone_of(self_peer, value).is_some_and(|t| t.peer == author);
+                            stale && self.foreign_tombstone_of(self_peer, value).is_some_and(|t| is_self || t.peer == author);
                         // #924: 前の住人が翻訳した行で、 場所を最後に使い回した時の記録 (`prev.seg`) がその行なら、 その identity を
-                        // 指す ref として出す (自分の行と同じく、 その削除の版数が `author` の時計 = 同じ state に Delete が入る時だけ)。
+                        // 指す ref として出す (自分の行と同じく、 その Delete が同じ state に入る時だけ = 削除の版数が `author` の時計か、
+                        // その行が `author` の行 (#951: author の行は誰が消した削除も入る)。 `state_unties_and_foreign_deletes` の退避表の枝)。
                         // 記録は場所ごとに最後の使い回しの 1 つなので、 同じ場所を 2 回使い回した後の前の前の住人は出さない (前と同じ)
                         let gone_translated = if stale && !gone_own {
                             self.generations()
                                 .prev
                                 .read(target_slot)
                                 .filter(|r| r.gone == value && r.kind == crate::prev_slots::PrevKind::Translated)
-                                .filter(|r| self.foreign_tombstone_of(r.peer, r.number).is_some_and(|t| t.peer == author))
+                                .filter(|r| {
+                                    self.foreign_tombstone_of(r.peer, r.number)
+                                        .is_some_and(|t| t.peer == author || r.peer == author)
+                                })
                                 .map(|r| (r.peer, r.number))
                         } else {
                             None
@@ -14585,7 +14699,9 @@ impl Engine {
     /// #766: 自分の state に足す、 値の無い物の record (`state_records` の rustdoc の 「外した cell」 「他の peer の行の削除」)。
     ///
     /// どちらも差分 (bridge) で出す時と同じ形: 書き手は自分、 宛名は行の世界番号 (他の peer の行は逆写像)、 版数は
-    /// 書いた時の版数。 **自分の時計の版数の物だけ** — 他の peer の untie / 削除は、 その peer の record が運ぶ。
+    /// 書いた時の版数。 **自分の時計の版数の物だけ** — 他の peer の untie / 削除は、 その peer の record が運ぶ。 ただし
+    /// **`by` の行の削除は、 誰が消した物でも** その削除の版数で出す (掃除が 「state に無い = `by` が消した」 と読むため、 下の
+    /// 2 つの Delete の項)。
     ///
     /// #783: `by` が自分でなければ replica 版 (`state_records_for(by)`): 下の 「自分」 を 「`by`」 と読む (版数が `by` の時計の物を、
     /// `by` の record として)。 宛名の引き方は同じ (この DB の逆写像、 無ければこの DB の行)。 `by` の行の削除も 「他の peer の行の
@@ -14594,9 +14710,11 @@ impl Engine {
     /// - Untie: 版数の列をなめ、 生きている行の、 値が無くて版数が自分の時計の cell。 値と版数は行の lock の読みで
     ///   揃えて読む (間に書き込みが入ると、 値は前・版数は後を掴んで、 書いた cell を外す record になる)。 slot を使い回す時に
     ///   前の住人の版数は消してある (`clear_cell_versions`) ので、 生きている行の版数はその行の物
-    /// - Delete: 翻訳した行 (他の peer の行) のうち、 消えていて (`slot_is_dead`) 削除の版数が自分の時計の物。 slot を
+    /// - Delete: 翻訳した行 (他の peer の行) のうち、 消えていて (`slot_is_dead`) 削除の版数が自分の時計の物 (replica 版の
+    ///   `by` の行は、 削除の版数が誰の時計でも)。 slot を
     ///   使い回して写像が外れた行は退避表 (`foreign_tombs`) から。 生きている行は、 削除の版数が残っていても出さない
-    /// - Delete (自分の行、 #784 / #800): 削除の版数の列をなめ、 消えていて削除の版数が自分の時計の、 自分の行の slot。
+    /// - Delete (自分の行、 #784 / #800): 削除の版数の列をなめ、 消えている自分の行の slot (self 版は削除の版数が誰の時計でも、
+    ///   replica 版はこの DB の行のうち `by` の時計の物)。
     ///   slot を使い回した行は、 使い回す時に移した退避表 (`keep_gone_own_delete`、 #914) から
     fn state_unties_and_foreign_deletes(
         &self,
@@ -14614,6 +14732,12 @@ impl Engine {
             signed_bytes: Vec::new(),
         };
         let mine = |h: enchudb_oplog::Hlc| h != enchudb_oplog::Hlc::ZERO && h.peer == by;
+        // `by` の行の削除は、 誰が消した物でも出す (書き手は `by`、 版数はその削除の版数)。 受け手の掃除 (#140) は 「state に無い =
+        // `by` が消した」 と読む。 他の peer B が消した `by` の行 X が state に無いと、 B の削除を受ける前に取った受け手は、 X に何かの
+        // record (`by` の差分・第三の peer・受け手のアプリ) が当たっていれば今の時刻で消して配り、 名前の削除優先 (#551) で B の削除の
+        // 後に同じ名前で足した行まで消した (#923 の残り)。 書き手を B にしないのは、 中継の下の受け手の `cursor[B]` が B のまだ届いて
+        // いない record を越えないように (#786 の形)。 版数は `as_of` 以下 (B の削除を当てた時に時計を進めている)
+        let deleted = |h: enchudb_oplog::Hlc| h != enchudb_oplog::Hlc::ZERO;
         if self.has_cell_version() {
             for hid in 0..self.himos.len() {
                 if self.himo_is_in_reserved_table(hid) {
@@ -14670,7 +14794,7 @@ impl Engine {
                 continue;
             }
             let tomb = self.tombstone_version_of(local);
-            if mine(tomb) {
+            if mine(tomb) || (owner == by && deleted(tomb)) {
                 deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
             }
         }
@@ -14680,8 +14804,9 @@ impl Engine {
             let local_only = self.local_only_ranges();
             for local in 0..count {
                 let tomb = self.tombstone_hlc_local(local);
-                // 生きている行は番号を引く前に落とす (安い振り落とし。 決めるのは番号を引いた後の確かめ)
-                if !mine(tomb) || self.entities.is_live(local) {
+                // 生きている行は番号を引く前に落とす (安い振り落とし。 決めるのは番号を引いた後の確かめ)。 自分の行は誰が消した削除も
+                // (self 版 = `by` が自分)
+                if !(mine(tomb) || (by == self_peer && deleted(tomb))) || self.entities.is_live(local) {
                     continue;
                 }
                 // #731 (段 4): 消えた行の世界番号 (世代込み、 死んだ場所は消えた行の世代)
@@ -14710,7 +14835,9 @@ impl Engine {
         for (owner, owner_local, tomb) in self.orphan_foreign_tombstones() {
             // 写像のある行は上で見た (払い出す時に退避表の版数を slot に書き戻してある)
             // #914: 自分の peer の物は、 場所を使い回した自分の消えた行 (`keep_gone_own_delete`、 番号は世代込み)。 写像は持たない
-            if mine(tomb) && (owner == self_peer || self.eid_translator.get(owner, owner_local).is_none()) {
+            if (mine(tomb) || (owner == by && deleted(tomb)))
+                && (owner == self_peer || self.eid_translator.get(owner, owner_local).is_none())
+            {
                 deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
             }
         }
@@ -14829,6 +14956,27 @@ impl Engine {
         }
         let vid = self.get_by_id32(eid, cols.legacy?)?;
         Some(self.vocab.get(vid).to_vec())
+    }
+
+    /// #949: 行の payload の (author, HLC)。 `sync_op_payload(eid, cols).and_then(|b| decode_sync_ops_payload(&b))` の
+    /// `(author_peer, hlc)` と同じ答え (読めない / decode できない行は `None`) を、 payload を写さず `Record` を組み立てずに出す。
+    fn sync_op_walk_key(&self, eid: u64, cols: &SyncPayloadCols) -> Option<(enchudb_oplog::PeerId, enchudb_oplog::Hlc)> {
+        #[cfg(test)]
+        if walk_key_full_decode::on() {
+            return self
+                .sync_op_payload(eid, cols)
+                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
+                .map(|r| (r.author_peer, r.hlc));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(at) = cols.at
+            && let Some(handle) = self.get_by_id32(eid, at)
+        {
+            let lsn = self.get_by_id32(eid, cols.lsn)?;
+            return self.payload_ring(false)?.read_with(handle, lsn, enchudb_oplog::oplog::sync_ops_payload_walk_key)?;
+        }
+        let vid = self.get_by_id32(eid, cols.legacy?)?;
+        enchudb_oplog::oplog::sync_ops_payload_walk_key(self.vocab.get(vid))
     }
 
     /// row の payload が ring にあるのに ring を開けない (= 壊れているのは置き場で、 row ではない)。
@@ -16550,14 +16698,33 @@ impl Engine {
         if enchudb_oplog::eid_peer(foreign_eid) == self_peer {
             return foreign_eid; // identity: 自分が産んだ entity
         }
+        let (local, bound_now) = self.alias_remote_eid(author_peer, foreign_eid, self.slot_unchecked(local_eid), self_peer);
+        // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
+        self.ensure_live_slot(local);
+        Self::advance_table_next_local_for(&self.tables, local);
+        // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
+        // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
+        // 束ねた行が消えるので、 それと同じ答えにする。 払い出した slot と違って既にある行に束ねるので、 版数を書き戻すだけ
+        // (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、 届いた順で答えが割れる。
+        if bound_now
+            && let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid))
+        {
+            self.apply_delete_local(local, tomb);
+        }
+        enchudb_oplog::make_eid(self_peer, local)
+    }
+
+    /// [`Self::bind_remote_eid`] の写像を張る所 (#178 の束ねる前の書き込みの数えと別名の record も)。 戻り値は (束ねた先の場所,
+    /// 今張ったか)。 前から写像があれば張らずに、 その場所と false。
+    fn alias_remote_eid(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        target_local: u32,
+        self_peer: enchudb_oplog::PeerId,
+    ) -> (u32, bool) {
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        let target_local = self.slot_unchecked(local_eid);
-        // #178: 束ねる前に、 この行に書いた record の宛名 (逆写像があればその世界番号、 無ければ自分の世界番号)
-        // #731 (段 4): 自分の世界番号は世代込み
-        let prior = self.eid_translator.reverse(target_local).map_or_else(
-            || enchudb_oplog::make_eid(self_peer, self.own_world_local(target_local)),
-            |(p, l)| enchudb_oplog::make_eid(p, l),
-        );
+        let prior = self.bind_prior_address(target_local, self_peer);
         // #613: 前向きの写像だけを張る (別名、 `EidTranslator::alias`)。 行の逆写像 (この行に書いた record の宛名) は行の元の
         // identity のまま。 前は束ねた identity に替えていたので、 束ねた後の書き込みが、 その identity の作成を受けていない受け手で
         // 別の行になった。 元の identity の作成は同じ書き手の流れの前にあるので、 受け手は必ず先に受けている
@@ -16568,34 +16735,42 @@ impl Engine {
             Ok(()) => (target_local, true),
             Err(existing) => (existing, false),
         };
-        // #178: **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま
-        // bridge されている (宛名の付け替えは bridge 時に `reverse()` を引くため)。
-        // 相手側はそれを別 entity として払い出すので PK 無しの重複行が生える。
-        // ここでは直せない (出て行った record は取り消せない) ので、 **観測できるように
-        // 数える**。 実地で静かに壊れていた経路。
-        // #178: 書く設定なら 「束ねる前の宛名と、 束ねた世界番号は同じ entity」 を配る (受け手は 2 行を畳む、
-        // `Engine::apply_alias`)
+        self.note_bind_alias(local, bound_now && local == target_local, prior, foreign_eid, self_peer);
+        (local, bound_now)
+    }
+
+    /// #178: 行 `target_local` に束ねる前に、 この行に書いた record の宛名 (逆写像があればその世界番号、 無ければ自分の世界番号)。
+    /// #731 (段 4): 自分の世界番号は世代込み。
+    fn bind_prior_address(&self, target_local: u32, self_peer: enchudb_oplog::PeerId) -> enchudb_oplog::EntityId {
+        self.eid_translator.reverse(target_local).map_or_else(
+            || enchudb_oplog::make_eid(self_peer, self.own_world_local(target_local)),
+            |(p, l)| enchudb_oplog::make_eid(p, l),
+        )
+    }
+
+    /// #178: 束ねた後の数えと別名の record。 `bound_here` = 今 `foreign_eid` の写像を、 宛名が `prior` の行 `local` に張った。
+    ///
+    /// **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま bridge されている (宛名の付け替えは bridge 時に
+    /// `reverse()` を引くため)。 相手側はそれを別 entity として払い出すので PK 無しの重複行が生える。 ここでは直せない (出て行った
+    /// record は取り消せない) ので、 **観測できるように数える**。 実地で静かに壊れていた経路。 書く設定なら 「束ねる前の宛名と、
+    /// 束ねた世界番号は同じ entity」 を配る (受け手は 2 行を畳む、 `Engine::apply_alias`)。
+    ///
+    /// WAL に積む (空きを待つ) ので、 `alloc_lock` の外で呼ぶ (#939 の読み直し [A1]: 持ったまま待つと、 払い出しを待つ受信が全部止まる)。
+    fn note_bind_alias(
+        &self,
+        local: u32,
+        bound_here: bool,
+        prior: enchudb_oplog::EntityId,
+        foreign_eid: enchudb_oplog::EntityId,
+        self_peer: enchudb_oplog::PeerId,
+    ) {
         if self.note_bind_over_local_writes(local, self_peer)
-            && bound_now
-            && local == target_local
+            && bound_here
             && prior != foreign_eid
             && self.emit_alias.load(std::sync::atomic::Ordering::Relaxed)
         {
             self.emit_alias_record(prior, foreign_eid);
         }
-        // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
-        self.ensure_live_slot(local);
-        Self::advance_table_next_local_for(&self.tables, local);
-        // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
-        // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
-        // 束ねた行が消えるので、 それと同じ答えにする。 払い出した slot と違って既にある行に束ねるので、 版数を書き戻すだけ
-        // (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、 届いた順で答えが割れる。
-        if bound_now
-            && let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), foreign_local)
-        {
-            self.apply_delete_local(local, tomb);
-        }
-        enchudb_oplog::make_eid(self_peer, local)
     }
 
     /// #513: [`Engine::bind_remote_eid`] の主キー版 (`Syncer` が、 主キー `pk_value` の生きた行 `local_eid` に束ねる時)。
@@ -16603,6 +16778,8 @@ impl Engine {
     /// 束ねた後に、 その主キーの行を消した削除 (受け手が覚えている物、 `pk_tombs.rs`) を束ねた行にも当てる。 束ねた行が
     /// その削除の後に作り直された行でも、 削除より古い書き込み (束ねた entity の物も、 前に束ねた entity の物も) は消え、
     /// 新しい書き込みは残る (主キーが同じなら同じ行)。
+    ///
+    /// `local_eid` が引いた後に消えた / 場所を使い回されたかは確かめない (`Syncer` の束ねは [`Self::bind_remote_eid_by_pk_at`])。
     pub fn bind_remote_eid_by_pk(
         &self,
         author_peer: enchudb_oplog::PeerId,
@@ -16612,6 +16789,19 @@ impl Engine {
         pk_value: u64,
     ) -> enchudb_oplog::EntityId {
         let bound = self.bind_remote_eid(author_peer, foreign_eid, local_eid);
+        self.apply_name_delete_to_bound(bound, local_eid, pk_himo, pk_value);
+        bound
+    }
+
+    /// #513 の後半: 束ねた行 `bound` に、 主キー `pk_value` の行を消した削除 (受け手が覚えている物) を当てる。 `local_eid` は束ねる時に
+    /// 名前で引いた行。
+    fn apply_name_delete_to_bound(
+        &self,
+        bound: enchudb_oplog::EntityId,
+        local_eid: enchudb_oplog::EntityId,
+        pk_himo: u16,
+        pk_value: u64,
+    ) {
         if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value)) {
             let local = self.slot_unchecked(bound);
             // 削除優先: 消すのは、 その削除より前からある行だけ (削除の後に足し直した行は消さない)
@@ -16627,7 +16817,92 @@ impl Engine {
                 self.apply_delete_in(Some(&guard), local, tomb, None);
             }
         }
-        bound
+    }
+
+    /// #939 (review930 [7]): 名前で引いた生きた行 `row_eid` (世代 | 場所、 `former_pk_holder` / `query_by_id64` の返す番号) に
+    /// `foreign_eid` を束ねる、 `Syncer` の名前の束ねの入口 ([`Self::note_bound_identity`] + [`Self::bind_remote_eid_by_pk`])。
+    ///
+    /// 行の lock の下で、 引いた行がまだ場所の最後の行で生きていて、 その名前 (今の名前か、 `created` の時に持っていた前の名前) を
+    /// 持つかを確かめてから、 束ねた identity を覚えて写像を張る。 違えば何もせず `None` (呼び手は名前で引き直す): 引いた後・束ねる
+    /// 前に、 その行が消えた (束ねて生かすと削除が戻る) か、 消えて場所を使い回されたか、 改名された。 使い回しは写像を場所を生かす前に外す (`prepare_reuse`、 同じ行の lock の下) ので、 その後に張った写像は誰も
+    /// 外さず、 束ねた identity が使い回した新しい行を指した (その宛ての書き込み・削除が新しい行に当たる)。 確かめて張った後に
+    /// 消えた / 使い回された時は、 束ねてから消えたのと同じ (使い回しが写像を外す)。
+    ///
+    /// 前から写像があった (先に確定した束ね先) 時は、 その場所を返す (束ねた identity を引いた行に覚えず、 その場所を生かさない
+    /// = 写像を張った側が決めた生き死にのまま。 読み直し [A4]: 前は引いた行に覚え、 並んだ受信が削除優先で死んだまま払い出した場所を
+    /// 生かした)。
+    ///
+    /// lock の順は `alloc_lock` → 行 (読み直し [A1])。 写像の払い出し (`EidTranslator::get_or_insert_with` の中の `entity_in`) は
+    /// `alloc_lock` を握ったまま、 使い回す場所の行を握れるまで回るので、 行を握ったまま `alloc_lock` を待つと、 その行と同じ stripe の
+    /// 場所を払い出す受信と互いを待って止まる。 WAL に積む (#178 の別名の record) のと #490 / #513 の削除は `alloc_lock` を放した後に、
+    /// 確かめた行の lock の下で。
+    #[doc(hidden)]
+    pub fn bind_remote_eid_by_pk_at(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        row_eid: enchudb_oplog::EntityId,
+        pk_himo: u16,
+        pk_value: u64,
+        created: enchudb_oplog::Hlc,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if enchudb_oplog::eid_peer(foreign_eid) == self_peer {
+            return Some(foreign_eid); // identity: 自分が産んだ entity
+        }
+        let target = self.slot_unchecked(row_eid);
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        let checked = self.eid_translator.if_unmapped(author_peer, foreign_local, || {
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                bind_lock_hook::call(wal);
+            }
+            let guard = self.row_locks.write(target);
+            if !self.entities.is_live(target) || !self.remote_row_holds_slot(target, Some(enchudb_oplog::eid_local(row_eid))) {
+                return None;
+            }
+            // 読み直し [A3]: 引いた後・束ねる前に改名された行には束ねない (今もその名前か、 `created` の時にその名前だった前の持ち主の
+            // 時だけ。 前は改名より後に作られた entity を改名した行に束ね、 その名前の書き込みが行の名前を書き戻した)
+            if self.himos[pk_himo as usize].get_value(target) != Some(pk_value)
+                && self.former_pk_holder(pk_himo, PkValue::Local(pk_value), created) != Some(row_eid)
+            {
+                return None;
+            }
+            let prior = self.bind_prior_address(target, self_peer);
+            // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)。 写像と同じ行の
+            // lock の下 (使い回しは場所の名前の記録も生かす前に外すので、 外した後に覚えると新しい行に残る)
+            self.note_bound_identity(row_eid, foreign_eid, created);
+            // #613: 前向きの写像だけ (`alias_remote_eid` と同じ)
+            self.eid_translator.alias(author_peer, foreign_local, target);
+            Some((guard, prior))
+        });
+        let (guard, prior) = match checked {
+            Ok(Some(held)) => held,
+            Ok(None) => return None,
+            Err(existing) => {
+                self.note_bind_alias(existing, false, foreign_eid, foreign_eid, self_peer);
+                Self::advance_table_next_local_for(&self.tables, existing);
+                let bound = enchudb_oplog::make_eid(self_peer, existing);
+                self.apply_name_delete_to_bound(bound, row_eid, pk_himo, pk_value);
+                return Some(bound);
+            }
+        };
+        // 生きているのを確かめた行に張った (生かさない。 放した後に消えたなら、 束ねてから消えたのと同じ)
+        self.note_bind_alias(target, true, prior, foreign_eid, self_peer);
+        Self::advance_table_next_local_for(&self.tables, target);
+        // #490 (`bind_remote_eid` と同じ): 作成より先に届いた、 この entity 宛ての削除
+        if let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), foreign_local) {
+            self.apply_delete_in(Some(&guard), target, tomb, None);
+        }
+        // #513 (`apply_name_delete_to_bound` と同じ、 行は確かめた引いた行のまま)
+        if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value))
+            && tomb > self.tombstone_version_of(target)
+            && self.version_of(target, pk_himo) < tomb
+        {
+            self.apply_delete_in(Some(&guard), target, tomb, None);
+        }
+        Some(enchudb_oplog::make_eid(self_peer, target))
     }
 
     /// #513: 主キー `pk_value` の生きた行が無い時 (`Syncer` が主キーで束ねる先を引いて、 無かった時)。
@@ -17436,6 +17711,17 @@ impl Engine {
     /// 持つ column (A-5)。
     pub fn tombstone_hlc(&self, eid: enchudb_oplog::EntityId) -> enchudb_oplog::Hlc {
         self.tombstone_hlc_local(self.slot_unchecked(eid))
+    }
+
+    /// #923: 場所 `slot` の行に、 何も当たっていないか = 値のある cell も、 版数のある cell (外した cell を含む) も、 削除の版数も
+    /// 無い。 どの書き手の record もまだ当たっていない行 (相手の行を指す Ref の解決で、 的として払い出しただけの翻訳した行など)。
+    /// 照合しない (場所の今の住人を見る)。 紐の数に比例する。 sync の内部用 (state の掃除)。
+    #[doc(hidden)]
+    pub fn slot_untouched(&self, slot: u32) -> bool {
+        self.tombstone_version_of(slot) == enchudb_oplog::Hlc::ZERO
+            && (0..self.himos.len()).all(|hid| {
+                self.himos[hid].get_value(slot).is_none() && self.version_of(slot, hid as u16) == enchudb_oplog::Hlc::ZERO
+            })
     }
 
     #[inline]
@@ -31555,7 +31841,7 @@ mod ring_scans_tests {
         path
     }
 
-    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    pub(super) fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).unwrap();
         for e in std::fs::read_dir(from).unwrap() {
             let e = e.unwrap();
@@ -31765,6 +32051,174 @@ mod ring_scans_tests {
         let now = run(&copy, false);
         assert!(old.0 > 0, "前提: 回収した ({})", old.0);
         assert_eq!(old, now, "回収 / open_groups_on_ring の答えが直す前のなめと違う");
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_dir_all(&copy);
+    }
+}
+
+/// #949: ring の walk (ack / reclaim / 配り切った位置 / ring_authors) が行ごとに読む (author, HLC) を、 payload を写さず `Record` を
+/// 組み立てずに読む (`sync_op_walk_key`)。 答えが直す前の読み (`sync_op_payload` + `decode_sync_ops_payload`) と同じ。
+#[cfg(test)]
+mod walk_key_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> String {
+        let path = format!("{}/enchudb-949-{}-{}", std::env::temp_dir().display(), tag, std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    fn old_key(p: &[u8]) -> Option<(u32, enchudb_oplog::Hlc)> {
+        enchudb_oplog::oplog::decode_sync_ops_payload(p).map(|r| (r.author_peer, r.hlc))
+    }
+
+    fn settle(eng: &Engine) {
+        eng.oplog_commit();
+        eng.oplog_sync().unwrap();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+    }
+
+    /// sync の DB に書いて (Tie と Vocab の record)、 peer 3 本の ack で 1 回回収し、 回収で空いた lsn に decode できない payload の行
+    /// (辞書の payload の列、 dead row) を 1 つ置く。
+    fn build(path: &str) -> std::sync::Arc<Engine> {
+        {
+            let mut eng = Engine::create_with_capacity(path, 1 << 16).unwrap();
+            eng.define_table("t", 1000).unwrap();
+            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+            eng.define_himo_in("t", "s", ValueType::Tag, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(path, 8 << 20).unwrap();
+        eng.set_peer_id(1);
+        let (v, t) = (eng.himo_id("t.v").unwrap() as u16, eng.himo_id("t.s").unwrap() as u16);
+        let rows: Vec<_> = (0..20).map(|_| eng.entity_in("t").unwrap()).collect();
+        for i in 0..400u64 {
+            if i % 7 == 0 {
+                eng.tie_text_async(rows[(i % 20) as usize], "t.s", &format!("w{i}"));
+            } else {
+                eng.tie_to_by_id(rows[(i % 20) as usize], v, i + 1);
+            }
+        }
+        let _ = t;
+        settle(&eng);
+        let top = eng.current_sync_lsn();
+        for p in 2..5u32 {
+            eng.ack_sync(p, top / 2).unwrap();
+        }
+        assert!(eng.reclaim_sync_ops() > 0, "前提: 回収した");
+        // 回収で空いた lsn (top / 2 - 1) に decode できない payload の行
+        let cols = eng.sync_payload_cols().unwrap();
+        let e = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_bytes_to_by_id(e, cols.legacy.expect("前提: 辞書の payload の列"), b"not a record");
+        eng.tie_to_by_id(e, cols.lsn, top / 2 - 1);
+        assert!(eng.sync_op_payload(e, &cols).is_some() && eng.sync_op_walk_key(e, &cols).is_none(), "前提: dead row");
+        // 辞書の payload の列に読める payload の行も 1 つ (0.30 以前の形の行。 lsn は回収で空いた top / 2 - 2)
+        let src = eng.table_rows_with_value32(cols.lsn, |l| l > top / 2).into_iter().min().map(|(_, e)| e).unwrap();
+        let bytes = eng.sync_op_payload(src, &cols).unwrap();
+        let e2 = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_bytes_to_by_id(e2, cols.legacy.unwrap(), &bytes);
+        eng.tie_to_by_id(e2, cols.lsn, top / 2 - 2);
+        assert!(eng.sync_op_walk_key(e2, &cols).is_some() && eng.sync_op_walk_key(e2, &cols) == old_key(&bytes), "前提: 辞書の読める行");
+        eng
+    }
+
+    /// payload 1 つずつ: 本物の payload と、 その切り詰め (長さ 0〜全部)・header と op の byte を 1 つずつ変えたもの・でたらめな byte で、
+    /// `sync_ops_payload_walk_key` が `decode_sync_ops_payload` と同じ答え (受ける / 断る、 author、 HLC)。
+    #[test]
+    fn walk_key_equals_full_decode_per_payload() {
+        let path = tmp("payload");
+        let eng = build(&path);
+        let cols = eng.sync_payload_cols().unwrap();
+        let payloads: Vec<Vec<u8>> =
+            eng.entities_with_himo(cols.lsn).into_iter().filter_map(|e| eng.sync_op_payload(e, &cols)).collect();
+        assert!(payloads.len() > 100, "前提: ring の payload");
+        let (mut accepted, mut rejected) = (0, 0);
+        let mut check = |p: &[u8]| {
+            let want = old_key(p);
+            assert_eq!(enchudb_oplog::oplog::sync_ops_payload_walk_key(p), want, "payload {p:?}");
+            if want.is_some() { accepted += 1 } else { rejected += 1 }
+        };
+        for (i, p) in payloads.iter().enumerate().step_by(9) {
+            check(p);
+            for n in 0..p.len() {
+                check(&p[..n]);
+            }
+            let head = (enchudb_oplog::oplog::SYNC_OPS_PAYLOAD_PREFIX + 48).min(p.len());
+            for at in 0..head {
+                for x in [0x01u8, 0x80, 0xff] {
+                    let mut q = p.clone();
+                    q[at] ^= x;
+                    check(&q);
+                }
+            }
+            let mut q = p.clone();
+            q.extend_from_slice(&[0xAB; 7]);
+            check(&q);
+            let r: Vec<u8> = (0..p.len()).map(|k| ((k * 31 + i * 17) % 251) as u8).collect();
+            check(&r);
+        }
+        assert!(accepted > 50 && rejected > 1000, "前提: 受ける / 断る の両方を見た ({accepted} / {rejected})");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// ring の walk 全部: 同じ DB の写し 2 つで、 片方を直す前の読み、 もう片方を今の読みにして ack (session の最初の walk、 dead row を
+    /// 消す道を含む)・配り切った位置・ring_authors・reclaim を回す。 答えと、 残った行・floor が同じ。
+    #[test]
+    fn ring_walks_match_the_full_decode() {
+        let path = tmp("walks");
+        let eng = build(&path);
+        drop(eng);
+        let copy = format!("{path}-copy");
+        let _ = std::fs::remove_dir_all(&copy);
+        super::ring_scans_tests::copy_dir(std::path::Path::new(&path), std::path::Path::new(&copy));
+        let run = |p: &str, old: bool| {
+            let eng = Engine::open_concurrent_with_oplog(p, 8 << 20).unwrap();
+            eng.set_peer_id(1);
+            walk_key_full_decode::set(old);
+            let cols = eng.sync_payload_cols().unwrap();
+            let mut authors: Vec<u32> = eng.ring_authors().into_iter().collect();
+            authors.sort_unstable();
+            let delivered = eng.sync_delivered_cursors().map(|mut v| {
+                v.sort();
+                v
+            });
+            let me = eng.peer_id();
+            let mid = {
+                let mut r = eng.table_rows_with_value32(cols.lsn, |_| true);
+                r.sort_by_key(|x| x.0);
+                let (_, e) = r[r.len() * 2 / 3];
+                old_key(&eng.sync_op_payload(e, &cols).unwrap()).map(|(_, h)| h).unwrap_or(enchudb_oplog::Hlc::ZERO)
+            };
+            let acks: Vec<u32> = (2..6u32)
+                .map(|p| {
+                    if p % 2 == 0 {
+                        eng.ack_sync_up_to_hlc(p, mid).unwrap()
+                    } else {
+                        eng.ack_sync_up_to_cursors(p, &[(me, mid)]).unwrap()
+                    }
+                })
+                .collect();
+            let dead = eng.sync_dead_rows_purged();
+            let purged = eng.reclaim_sync_ops();
+            let mut lsns: Vec<u32> =
+                eng.entities_with_himo(cols.lsn).into_iter().filter_map(|e| eng.get_by_id32(e, cols.lsn)).collect();
+            lsns.sort_unstable();
+            let floors = eng.sync_reclaimed_floors().map(|mut v| {
+                v.retain(|(a, _)| *a != u32::MAX); // dead row の帰属できない floor は時計の今 (2 つの写しで違う)
+                v.sort();
+                v
+            });
+            walk_key_full_decode::set(false);
+            drop(eng);
+            (authors, delivered, acks, dead, purged, lsns, floors)
+        };
+        let old = run(&path, true);
+        let now = run(&copy, false);
+        assert!(old.3 > 0, "前提: ack の walk が dead row を消した");
+        assert!(old.2.iter().any(|&a| a > 0) && old.4 > 0, "前提: ack が進み、 回収した ({:?} / {})", old.2, old.4);
+        assert_eq!(old, now, "ring の walk の答えが直す前の読みと違う");
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_dir_all(&copy);
     }

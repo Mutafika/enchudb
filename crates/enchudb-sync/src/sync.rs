@@ -753,8 +753,14 @@ impl Syncer {
     /// 3. **ghost sweep**: 自 store に居る author の行のうち state に現れなかった
     ///    entity を削除 — author の現在状態に無い = author 側で削除済み。 truncated
     ///    期間に tombstone を取り逃した亡霊 (#140 の原症状) をここで吸収する。
-    ///    sweep の Delete は自分の oplog にも載って伝播するが、 対象は「author が
-    ///    既に消した行」なので LWW 的に正しい方向にしか働かない
+    ///    sweep の Delete は自分の oplog にも載って伝播する (受け手の今の時刻の削除)。
+    ///    author の state は author の行の削除を誰が消した物でもその版数で運ぶので、
+    ///    他の peer が消した author の行は state の Delete で消え、 掃除の対象にならない。
+    ///    何も当たっていない生きた行 (Ref の的として払い出しただけ) は消さない (#923:
+    ///    author が消した証でなく、 自分の行の削除を運ばない state = 0.37.4 以前の author
+    ///    からの守り)。 0.37.4 以前の author の state では、 何かの record が当たった行を
+    ///    他の peer が消していると、 今の時刻の削除として名前の削除優先 (#551) を通り、
+    ///    その削除の後に同じ名前で足した行を巻き込みうる (author を上げると直る)
     /// 4. cursor を `as_of` へ前進 (後退はさせない) — 以降は通常の差分 pull
     pub fn bootstrap_pull(&self, from: PeerId) -> Option<BootstrapOutcome> {
         self.bootstrap_pull_via(from, from)
@@ -959,8 +965,9 @@ impl Syncer {
                         // 全部外れた行も、 生きていれば残す)、 Delete は author が消した他の peer の行。 他の peer の行宛ての
                         // Untie / Delete は上の理由で数えない
                         //
-                        // #784 / #800: author が消した自分の行の Delete は数える = 上で author の削除の版数で消してあり、 掃除が
-                        // 今の時刻で消し直さない (今の時刻の削除は、 author の削除の後に同じ名前で足された行まで消す)
+                        // #784 / #800: author の行の Delete は数える = 上でその削除の版数で消してあり、 掃除が今の時刻で消し直さない
+                        // (今の時刻の削除は、 その削除の後に同じ名前で足された行まで消す)。 author の state は、 他の peer が消した
+                        // author の行の削除も author の record で運ぶ (#923 の残り)
                         (enchudb_oplog::eid_peer(*eid) == author).then(|| enchudb_oplog::eid_local(*eid))
                     }
                     // #178: 行の state ではない (state 転写には現れない)
@@ -974,12 +981,22 @@ impl Syncer {
                 // #782: もう消えている行 (生きていなくて、 削除の版数がある) は消し直さない。 author が前に消して、 その削除が
                 // もう届いている行は state に無くて当たり前で、 掃除がする事は無い。 前は state を取り直すたびに今の時刻の
                 // 新しい Delete で消し直していて、 その行の名前の削除の時刻が上がり (#551)、 前の削除の後に同じ名前で足し直された
-                // 行 (新しいデッキ) が、 掃除の Delete を受けた peer で消えた。 削除の版数の無い slot (まだ何も当たっていない
-                // 写像) は今までどおり消す (版数を置いて、 後から届く古い書き込みで行ができないようにする)
+                // 行 (新しいデッキ) が、 掃除の Delete を受けた peer で消えた。 削除の版数の無い、 生きていない slot は今までどおり
+                // 消す (版数を置いて、 後から届く古い書き込みで行ができないようにする)。 生きていて何も当たっていない行は下 (#923)
                 // #731: 翻訳した行の場所の今の住人の eid で (アプリの入口の `is_live` / `delete` は世代を照合する。 世代 0 の eid では
                 // 使い回した場所に載った行を生きていないと読み、 消さずに数えだけ進めた)
                 let row = self.engine.slot_eid(local);
-                if !self.engine.is_live(row) && self.engine.tombstone_hlc(row) != Hlc::ZERO {
+                let live = self.engine.is_live(row);
+                if !live && self.engine.tombstone_hlc(row) != Hlc::ZERO {
+                    continue;
+                }
+                // #923: 何も当たっていない生きた行 (値も版数のある cell も削除の版数も無い = Ref の解決で的として払い出しただけ) は
+                // 消さない。 author の state にある Ref の的が state に無いのは、 author が持つその行に中身が無いから (他の peer が
+                // 消した / 中身を書いていない) で、 author が消した証ではない (author の削除は state の Delete で運ぶ、 #784)。 前は
+                // 今の時刻の新しい Delete で消して配り、 他の peer の時計で消えていた行では、 より新しい削除として名前の削除優先 (#551)
+                // を通り、 その削除の後に同じ名前で足した行を受け手以外の全員で消した。 中身の無い生きた行では author の行が消えた。
+                // 他の peer の削除は、 その peer の差分 / state (#766) で届く
+                if live && self.engine.slot_untouched(local) {
                     continue;
                 }
                 self.engine.delete(row);
@@ -1927,49 +1944,61 @@ impl Syncer {
         // よらず同じ行にする)。 改名より後に作られた行は、 今その名前の行に束ねる (無ければ新しいデッキ)。 改名の後にその名前で
         // 作られた行が先に届いていても、 改名より前に作られた行はそちらに束ねない
         let created = rec.hlc;
-        let existing = self
-            .engine
-            .former_pk_holder(*himo_id, PkValue::Local(local_value), created)
-            .or_else(|| self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next());
         let reserve = || {
             self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Local(local_value), created).filter(|_| own)
         };
-        // 削除優先 (2026-10-21): この entity が消えた時刻 (作成より先に届いた削除 / 作成より後のその主キーの削除) と、 この batch の
-        // 後ろで消える時刻。 消える entity を、 その削除より後に作られた行 (消したのを見て足し直した行) に束ねると、 足し直した行まで
-        // 消える (届く順で答えが割れる)
-        let dead_at = self
-            .engine
-            .deleted_before_create(*eid)
-            .or_else(|| self.engine.name_deleted_at(*himo_id, PkValue::Local(local_value)).filter(|&t| t > created));
-        if let (Some(l), Some(t)) = (existing, dead_at.or_else(|| dying.get(eid).copied())) {
-            // #614: 改名した行は、 その名前を持ち始めた時刻で見る (名前の cell の版数は、 後の改名の版数)
-            if self.engine.name_held_from(l, *himo_id, local_value) > t {
-                // 足し直した行: 束ねない。 消えた entity は死んだ slot、 この batch で消える entity は普通の払い出し (後の削除で消える)
-                return if dead_at.is_some() { reserve() } else { None };
+        // #939: 引いた行が束ねる前に消えた (場所を使い回された) 時は、 名前で引き直す (引いた後の削除で答えが変わる: 削除より前に
+        // 作られた entity は消えたデッキ、 使い回した行が同じ名前なら足し直した行)。 回るのは、 引いてから行の lock までの間に
+        // その名前の行が消えた時だけ。 読み直し [A2]: 名前の索引から引くのは生きている行だけ (`query_by_id64` は生きているかを見ない。
+        // 消えた行の名前の cell が列に残っていると (列の書き込みが落ちた後など)、 束ねが毎回 `None` を返して回り続ける)
+        loop {
+            let existing = self.engine.former_pk_holder(*himo_id, PkValue::Local(local_value), created).or_else(|| {
+                self.engine
+                    .query_by_id64(&[(*himo_id, local_value)])
+                    .into_iter()
+                    .find(|&e| self.engine.is_live_unchecked(e))
+            });
+            // 削除優先 (2026-10-21): この entity が消えた時刻 (作成より先に届いた削除 / 作成より後のその主キーの削除) と、 この batch の
+            // 後ろで消える時刻。 消える entity を、 その削除より後に作られた行 (消したのを見て足し直した行) に束ねると、 足し直した行まで
+            // 消える (届く順で答えが割れる)
+            let dead_at = self
+                .engine
+                .deleted_before_create(*eid)
+                .or_else(|| self.engine.name_deleted_at(*himo_id, PkValue::Local(local_value)).filter(|&t| t > created));
+            if let (Some(l), Some(t)) = (existing, dead_at.or_else(|| dying.get(eid).copied())) {
+                // #614: 改名した行は、 その名前を持ち始めた時刻で見る (名前の cell の版数は、 後の改名の版数)
+                if self.engine.name_held_from(l, *himo_id, local_value) > t {
+                    // 足し直した行: 束ねない。 消えた entity は死んだ slot、 この batch で消える entity は普通の払い出し (後の削除で消える)
+                    return if dead_at.is_some() { reserve() } else { None };
+                }
+                if dead_at.is_some() {
+                    // その削除より前からある行は同じ行: 一緒に消える (先に束ねてから削除を受けた peer と同じ)
+                    // 読み直し [B4]: 引いた行の番号 (世代 | 場所、 `query_by_id64` / `former_pk_holder` の返す形) を渡し、 行の lock の下で
+                    // 場所の最後の行と比べる (前は照合なしで消し、 引いた後に消して場所を使い回した新しい行を消した)
+                    #[cfg(test)]
+                    apply_hook::call();
+                    self.engine.remote_delete_apply_at(l, enchudb_oplog::eid_local(l), t);
+                    return reserve();
+                }
             }
-            if dead_at.is_some() {
-                // その削除より前からある行は同じ行: 一緒に消える (先に束ねてから削除を受けた peer と同じ)
-                // 読み直し [B4]: 引いた行の番号 (世代 | 場所、 `query_by_id64` / `former_pk_holder` の返す形) を渡し、 行の lock の下で
-                // 場所の最後の行と比べる (前は照合なしで消し、 引いた後に消して場所を使い回した新しい行を消した)
-                #[cfg(test)]
-                apply_hook::call();
-                self.engine.remote_delete_apply_at(l, enchudb_oplog::eid_local(l), t);
+            let Some(existing) = existing else {
+                // 同じ PK の row は今は無い → 通常の払い出しに任せる。 #513: ただし、 その主キーの行を前に消していれば、
+                // 払い出す slot に削除の版数を載せる (削除より前に作られた entity なら死んだ slot、 削除優先)
                 return reserve();
+            };
+            // #513: 束ねた行にも、 その主キーの行を消した削除を当てる (削除の後に作り直された行に束ねる時、 削除より古い
+            // 書き込みを残さない)
+            // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)
+            // #939: 行の lock の下で、 引いた行 (番号 = 世代 | 場所) がまだ場所に生きているかを確かめてから覚えて束ねる (前は確かめずに
+            // 束ね、 引いた後に消して場所を使い回した新しい行に、 この entity の写像と束ねた identity を載せた)
+            #[cfg(test)]
+            apply_hook::call();
+            if let Some(bound) =
+                self.engine.bind_remote_eid_by_pk_at(rec.author_peer, *eid, existing, *himo_id, local_value, created)
+            {
+                return own.then_some(bound);
             }
         }
-        let Some(existing) = existing else {
-            // 同じ PK の row は今は無い → 通常の払い出しに任せる。 #513: ただし、 その主キーの行を前に消していれば、
-            // 払い出す slot に削除の版数を載せる (削除より前に作られた entity なら死んだ slot、 削除優先)
-            return reserve();
-        };
-        // #513: 束ねた行にも、 その主キーの行を消した削除を当てる (削除の後に作り直された行に束ねる時、 削除より古い
-        // 書き込みを残さない)
-        // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)
-        #[cfg(test)]
-        apply_hook::call();
-        self.engine.note_bound_identity(existing, *eid, rec.hlc);
-        let bound = self.engine.bind_remote_eid_by_pk(rec.author_peer, *eid, existing, *himo_id, local_value);
-        own.then_some(bound)
     }
 
     /// #544: batch の中の、 foreign entity ごとの最初の PK Tie の位置 (`bind_by_primary_key` が、 行の最初の record が PK で
@@ -2715,6 +2744,206 @@ mod tests {
             Some(deleted),
             "名前を足す前に場所を使い回された X への改名の名前 5 が、 X の削除の時刻に消した名前にならない"
         );
+    }
+
+    /// #939 (review930 [7]): 名前で束ねる受信が名前 5 の生きた行 L (自分の行) を引いた後・束ねる前に、 アプリが L を消す (場所を Y で
+    /// 使い回す)。 束ねは、 消えた L にも Y にも写像を載せない (使い回しの写像外しは束ねの前に済んでいるので、 載せると誰も外さない。
+    /// 消えた L に束ねると、 束ねの 「生きている扱い」 が L の場所を生かす)。 名前で引き直して、 引いた時と同じ規則で決める
+    /// (W = peer 2 の名前 5 の行):
+    ///
+    /// | case | W の作成 | Y | 答え |
+    /// |---|---|---|---|
+    /// | `old` | L の削除より前 | 名前 5 | W は消えたデッキ (消える)。 Y (削除の後に足した行) に束ねない。 後の W 宛ての書き込みも Y に当たらない |
+    /// | `new` | 削除より後 | 名前 6 | W は名前 5 の新しいデッキ (別の生きた行)。 Y の名前と値はそのまま |
+    /// | `new-translated` | 同上 | 同上 | `new` の L が peer 3 の行 (受けた翻訳した行) |
+    /// | `same` | 削除より後 | 名前 5 | W と Y は削除の後の名前 5 = 同じデッキ (Y に束ねる) |
+    /// | `gone` | 削除より前 | 無し | W は消えたデッキ。 L の場所を生かさない |
+    /// | `fresh` | 削除より後 | 無し | W は新しいデッキ (生きた行) |
+    ///
+    /// 直す前 (確かめずに束ねる): 束ねが (2, 100) → L の場所を載せ、 `old` は W を Y に束ね (アプリの書いた行に束ねた数え #178 が 1)、
+    /// `new` / `new-translated` は W の作成が Y の名前と値を書き換えた。 `same` / `gone` / `fresh` は直す前も同じ答え (`gone` は束ねが L の場所を生かした後、
+    /// 名前の削除より前の名前の書き込みとして消える)。 引き直しの規則と、 生きているかの確かめ (`fresh`: 消えた L に束ねると W の
+    /// 書き込みが捨てられる) を見る。
+    #[test]
+    fn a_bind_does_not_land_on_the_row_that_reused_the_slot_after_lookup() {
+        for (case, after, y_name) in [
+            ("old", false, Some(5u32)),
+            ("new", true, Some(6)),
+            ("new-translated", true, Some(6)),
+            ("same", true, Some(5)),
+            ("gone", false, None),
+            ("fresh", true, None),
+        ] {
+            let (_rm, eng, syncer) = reuse_engine(&format!("bind939_{case}"), true);
+            let (k, v) = (eng.himo_id("t.k").unwrap() as u16, eng.himo_id("t.v").unwrap() as u16);
+            // HLC の壁時計は ms。 W の作成は L の削除 (割り込み点の中、 今の時計) の前か、 後 (相手の時計が 10 秒先)
+            let now = now_ns() / 1_000_000;
+            let l = if case == "new-translated" {
+                // L は peer 3 の行 (受けた翻訳した行)。 引く番号は場所の今の世代 (`query_by_id64` の形)
+                let f = enchudb_oplog::make_eid(3, 100);
+                let t0 = Hlc { wall: now - 5_000, logical: 0, peer: 3 };
+                let out = syncer.apply_records(&[
+                    WireRecord::unsigned(t0, 3, DecodedOp::Tie { eid: f, himo_id: k, value: 5 }),
+                    WireRecord::unsigned(t0, 3, DecodedOp::Tie { eid: f, himo_id: v, value: 1 }),
+                ]);
+                assert_eq!(out.applied, 2, "前提: peer 3 の L を受けた ({out:?})");
+                eng.slot_eid(slot24(eng.resolve_remote_eid_existing(f).unwrap()))
+            } else {
+                let l = eng.entity_in("t").unwrap();
+                eng.tie_to(l, "t.k", 5u32);
+                eng.tie_to(l, "t.v", 1u32);
+                eng.oplog_commit();
+                l
+            };
+            assert_eq!(eng.pull_raw("t.k", 5u32), vec![l], "前提: 名前 5 の行は L ({case})");
+            let created = if after { now + 10_000 } else { now - 1_000 };
+            let y = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let deleted = std::rc::Rc::new(std::cell::Cell::new(Hlc::ZERO));
+            let (e, yy, dd) = (eng.clone(), y.clone(), deleted.clone());
+            apply_hook::set(move || {
+                e.delete(l);
+                dd.set(e.tombstone_hlc(l));
+                if let Some(name) = y_name {
+                    let y = e.entity_in("t").unwrap();
+                    e.tie_to(y, "t.k", name);
+                    e.tie_to(y, "t.v", 70u32);
+                    yy.set(y);
+                }
+                e.oplog_commit();
+            });
+            let w = enchudb_oplog::make_eid(2, 100);
+            let at = |wall: u64| Hlc { wall, logical: 0, peer: 2 };
+            let out = syncer.apply_records(&[
+                WireRecord::unsigned(at(created), 2, DecodedOp::Tie { eid: w, himo_id: k, value: 5 }),
+                WireRecord::unsigned(at(created), 2, DecodedOp::Tie { eid: w, himo_id: v, value: 9 }),
+            ]);
+            let deleted = deleted.get();
+            assert_ne!(deleted, Hlc::ZERO, "前提: 割り込み点で L を消した ({case})");
+            assert_eq!(created > deleted.wall, after, "前提: W の作成と L の削除の前後 ({case}: {created} / {deleted:?})");
+            let y = y_name.map(|_| y.get());
+            if let Some(y) = y {
+                assert_eq!(slot24(y), slot24(l), "前提: Y は L の場所を使い回した ({case})");
+                assert_ne!(y, l, "前提: Y の世代は L より新しい ({case})");
+            }
+            // W 宛ての、 Y の書き込みより新しい書き込み
+            syncer.apply_records(&[WireRecord::unsigned(at(now + 20_000), 2, DecodedOp::Tie { eid: w, himo_id: v, value: 99 })]);
+            let w_slot = eng.resolve_remote_eid_existing(w).map(slot24);
+            let w_row = w_slot.map(|s| eng.slot_eid(s)).filter(|&e| eng.is_live(e));
+            eprintln!("#939 {case}: {out:?}、 W の場所 {w_slot:?} (生きた行 {w_row:x?})、 L の場所 {}", slot24(l));
+            let fives: Vec<u64> = eng.pull_raw("t.k", 5u32);
+            match case {
+                "old" | "gone" => {
+                    assert_eq!(w_row, None, "削除より前に作られた W が生きた行になった ({case})");
+                    assert_eq!(fives, y.filter(|_| y_name == Some(5)).into_iter().collect::<Vec<_>>(), "名前 5 の行 ({case})");
+                }
+                "new" | "new-translated" | "fresh" => {
+                    let w_row = w_row.unwrap_or_else(|| panic!("削除の後に作られた W が生きた行にならない ({case})"));
+                    assert_ne!(Some(w_row), y, "W が Y に束なった ({case})");
+                    assert_eq!((eng.get(w_row, "t.k"), eng.get(w_row, "t.v")), (Some(5), Some(99)), "W の行の中身 ({case})");
+                }
+                _ => {
+                    assert_eq!(w_row, y, "削除の後に足した同じ名前の Y に W が束ならない ({case})");
+                    assert_eq!(eng.get(y.unwrap(), "t.v"), Some(99), "W の書き込みが同じデッキの Y に当たらない ({case})");
+                }
+            }
+            if case != "same" {
+                if let Some(y) = y {
+                    assert!(eng.is_live(y), "Y が消えた ({case})");
+                    assert_ne!(w_slot, Some(slot24(y)), "W の identity が、 引いた後に場所を使い回した Y に束なった ({case})");
+                    assert_eq!(eng.get(y, "t.k"), y_name.map(u64::from), "W の書き込みが Y の名前に当たった ({case})");
+                    assert_eq!(eng.get(y, "t.v"), Some(70), "W の書き込みが Y の値に当たった ({case})");
+                }
+                // 束ねた先は、 アプリが書いた行 (Y) でない (#178 の数え: 自分が書いた行に相手の identity を束ねた回数)
+                assert_eq!(eng.bind_over_local_writes(), 0, "W の identity を、 アプリが書いた行に束ねた ({case})");
+            }
+            if case == "gone" {
+                assert!(!eng.is_live(eng.slot_eid(slot24(l))), "消えた L の場所を、 束ねが生かした ({case})");
+            }
+        }
+    }
+
+    /// #939 の読み直し [A3]: 名前で束ねる受信が名前 5 の生きた行 L (自分の行) を引いた後・束ねる前 (割り込み点 `apply_hook`) に、 アプリが
+    /// L を名前 6 に改名する。 改名より後に作られた W (peer 2 の名前 5 の行) は L に束ねない (今その名前の行は無い = 名前 5 の新しいデッキ)。
+    /// 改名より前 (L が名前 5 を持った後) に作られた W は L に束ねる (改名を知らずに古い名前で作った行は同じデッキ)。
+    ///
+    /// 直す前 (行の lock の下で 「生きている + 場所の最後の行」 だけを見る): `after` で W を L に束ね、 W の名前の書き込み (改名より新しい)
+    /// が L の名前を 5 に書き戻した。 `before` は直す前も同じ答え (前の名前の持ち主の確かめが要ることを見る)。
+    #[test]
+    fn a_bind_does_not_land_on_a_row_renamed_after_lookup() {
+        for (case, after) in [("after", true), ("before", false)] {
+            let (_rm, eng, syncer) = reuse_engine(&format!("bind939_rename_{case}"), true);
+            let (k, v) = (eng.himo_id("t.k").unwrap() as u16, eng.himo_id("t.v").unwrap() as u16);
+            let l = eng.entity_in("t").unwrap();
+            eng.tie_to(l, "t.k", 5u32);
+            eng.tie_to(l, "t.v", 1u32);
+            eng.oplog_commit();
+            let named = eng.cell_hlc(l, k);
+            // 改名 (割り込み点の中、 今の時計) は名前 5 を持ってから 50 ms 以上後。 W の作成はその間か、 改名の 10 秒後
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let created = if after { now_ns() / 1_000_000 + 10_000 } else { named.wall + 10 };
+            let renamed = std::rc::Rc::new(std::cell::Cell::new(Hlc::ZERO));
+            let (e, rr) = (eng.clone(), renamed.clone());
+            apply_hook::set(move || {
+                e.tie_to(l, "t.k", 6u32);
+                e.oplog_commit();
+                rr.set(e.cell_hlc(l, k));
+            });
+            let w = enchudb_oplog::make_eid(2, 100);
+            let at = |wall: u64| Hlc { wall, logical: 0, peer: 2 };
+            let out = syncer.apply_records(&[
+                WireRecord::unsigned(at(created), 2, DecodedOp::Tie { eid: w, himo_id: k, value: 5 }),
+                WireRecord::unsigned(at(created), 2, DecodedOp::Tie { eid: w, himo_id: v, value: 9 }),
+            ]);
+            let renamed = renamed.get();
+            assert!(renamed.wall > named.wall, "前提: 割り込み点で L を改名した ({case}: {named:?} → {renamed:?})");
+            assert_eq!(created > renamed.wall, after, "前提: W の作成と改名の前後 ({case}: {created} / {renamed:?})");
+            assert!(created > named.wall, "前提: W は L が名前 5 を持った後に作られた ({case})");
+            let w_slot = eng.resolve_remote_eid_existing(w).map(slot24);
+            let w_row = w_slot.map(|s| eng.slot_eid(s)).filter(|&e| eng.is_live(e));
+            eprintln!("#939 [A3] {case}: {out:?}、 W の場所 {w_slot:?} (生きた行 {w_row:x?})、 L の場所 {}", slot24(l));
+            assert_eq!(eng.get(l, "t.k"), Some(6), "W の名前の書き込みが改名した L の名前を書き戻した ({case})");
+            if after {
+                let w_row = w_row.unwrap_or_else(|| panic!("改名の後に作られた W が生きた行にならない ({case})"));
+                assert_ne!(w_row, l, "改名の後に作られた W を、 引いた後に改名した L に束ねた ({case})");
+                assert_eq!((eng.get(w_row, "t.k"), eng.get(w_row, "t.v")), (Some(5), Some(9)), "W の行の中身 ({case})");
+                assert_eq!(eng.get(l, "t.v"), Some(1), "W の書き込みが L に当たった ({case})");
+            } else {
+                assert_eq!(w_row, Some(l), "改名の前に作られた W が、 改名した L (同じデッキ) に束ならない ({case})");
+            }
+        }
+    }
+
+    /// #939 の読み直し [A4]: 名前で束ねる受信が名前 5 の生きた行 L を引いた後・束ねる前 (割り込み点 `apply_hook`) に、 別の受信 (並んだ
+    /// link) が同じ W の名前の無い書き込みで場所 S を払い出し、 W の削除で S を消す。 束ねは先にある写像 S を返し、 S を生かさない (W の
+    /// 削除が戻らない)。 前は束ねが S を生かし、 中身の無い生きた行が残った。
+    #[test]
+    fn a_bind_that_finds_a_mapping_made_meanwhile_does_not_revive_it() {
+        let (_rm, eng, syncer) = reuse_engine("bind939_mapped", true);
+        let (k, v) = (eng.himo_id("t.k").unwrap() as u16, eng.himo_id("t.v").unwrap() as u16);
+        let l = eng.entity_in("t").unwrap();
+        eng.tie_to(l, "t.k", 5u32);
+        eng.tie_to(l, "t.v", 1u32);
+        eng.oplog_commit();
+        let now = now_ns() / 1_000_000;
+        let w = enchudb_oplog::make_eid(2, 100);
+        let at = |wall: u64| Hlc { wall, logical: 0, peer: 2 };
+        let e = eng.clone();
+        apply_hook::set(move || {
+            // 並んだ link の受信 (`apply_one` と同じ道): W の名前の無い書き込みで場所を払い出し、 W の削除を当てる
+            let s = e.resolve_remote_eid(w, v).expect("前提: W に場所を払い出した");
+            e.remote_tie_apply(s, v, 8, at(now + 2));
+            assert!(e.remote_delete_apply_foreign(w, at(now + 5)), "前提: W の削除が当たった");
+        });
+        syncer.apply_records(&[
+            WireRecord::unsigned(at(now + 1), 2, DecodedOp::Tie { eid: w, himo_id: k, value: 5 }),
+            WireRecord::unsigned(at(now + 1), 2, DecodedOp::Tie { eid: w, himo_id: v, value: 9 }),
+        ]);
+        let s = eng.resolve_remote_eid_existing(w).expect("前提: W の写像は並んだ受信の場所");
+        assert_ne!(slot24(s), slot24(l), "前提: W の写像は L でない");
+        assert!(!eng.is_live_unchecked(s), "束ねが、 並んだ受信が消した W の場所を生かした");
+        // W (名前 5) は消えたデッキ 5 の一員 = L も消える (並ばずに W の削除を先に受けた時と同じ答え: 束ねが削除優先で L を消す)
+        assert!(!eng.is_live(l), "W の削除 (名前 5 のデッキ) の後も L が生きている");
+        assert!(eng.pull_raw("t.k", 5u32).is_empty());
     }
 
     /// #925: 消えた翻訳した行 F0 (C の行) 宛ての、 同じ表を指す Ref の Tie (F0 の削除を知らない B の書き込み) が届き、 Ref の的 (初めて
