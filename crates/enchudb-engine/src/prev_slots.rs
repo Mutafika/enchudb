@@ -124,6 +124,9 @@ fn log_off(half: u32, i: u32) -> usize {
     PREV_HEADER + half as usize * LOG_HALF + ENTRY * i as usize
 }
 
+/// (場所, 記録) の並び。
+pub(crate) type Records = Vec<(u32, PrevRecord)>;
+
 /// 前の住人が自分の行か、 翻訳した行 (受けた他の peer の行) か。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrevKind {
@@ -590,6 +593,7 @@ impl PrevSlots {
     }
 
     /// 書き出していない周期の記録 (場所, 記録) を周期の順 (同じ周期は積んだ順、 配列の分は後) に ([`Self::open_records`] の 1 つ目)。
+    #[cfg(test)]
     pub(crate) fn unpersisted(&self) -> Vec<(u32, PrevRecord)> {
         self.open_records().0
     }
@@ -602,7 +606,7 @@ impl PrevSlots {
     /// 配列をなめるのは、 log の区画が一杯で配列にだけ書いた周期が書き出されていない時だけ。 配列の件は周期の下位 32 bit しか持た
     /// ないので、 書き出した周期の次から一杯だった周期までの窓の中の件だけ取る (窓との差で比べる = 周期の下位 bit が一周しても比べ
     /// 違えない。 窓の外の古い件と下位 32 bit が窓の中で重なるのは、 2^32 周期の間その場所を使い回さなかった件だけ)。
-    pub(crate) fn open_records(&self) -> (Vec<(u32, PrevRecord)>, Vec<(u32, PrevRecord)>) {
+    pub(crate) fn open_records(&self) -> (Records, Records) {
         let Some(r) = self.region.get() else { return (Vec::new(), Vec::new()) };
         let persisted = self.persisted.load(Ordering::Relaxed);
         // 並びの鍵 = (周期, 置き場 (0 = log、 1 = 配列), 区画, 順)
