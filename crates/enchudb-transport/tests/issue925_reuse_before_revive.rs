@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use enchudb::ValueType;
 use enchudb::engine::Engine;
+use enchudb::{PkValue, ValueType};
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 use enchudb_oplog::{Hlc, PeerId};
@@ -208,6 +208,77 @@ fn a_translated_slot_reused_right_before_a_crash_stays_unmapped() {
     assert_eq!(a.v(7), vec![70], "F0 宛ての B の削除が、 F0 の場所を使い回した Y を A で消した");
     assert_eq!([b.v(7), c.v(7)], [vec![70], vec![70]], "Y が B / C に届かない (外した写像が戻り、 Y を F0 宛てに配った) [B, C]");
     assert_eq!([a.v(5), b.v(5), c.v(5)], [vec![], vec![], vec![]], "F0 は 3 台で消えたまま");
+}
+
+/// review930 [2]: #925 の像 (A が C の消えた行 F0 の場所を Y で使い回した直後に落ちた) を開くと、 写像 (C, f0) は戻さないが、 F0 の
+/// 名前の記録 (消えた時の名前 5 と前の名前 4) は `pktombs` / `pkformer` の場所の記録に残っている (使い回す時に identity に移して外した
+/// のは memory だけ)。 開く時に identity に移して場所から外す:
+/// - その後に P が名前 5 の W を作り、 C の削除を知らない B が F0 を消す (2 人目の削除) と、 C と P は名前 5 の削除の時刻を上げて W を
+///   消す (#551)。 A も同じ (identity (C, f0) に名前 5 がある)
+/// - A で前の名前 4 の持ち主 (`former_pk_holder`) は Y でない
+///
+/// 前は名前の記録を Y の場所に残し、 A でだけ W が残り、 前の名前 4 の持ち主が Y だった。
+#[test]
+fn a_translated_slot_reused_right_before_a_crash_moves_its_names() {
+    let dir = Dir::new("names");
+    let tr = transport(&[A, B, P, C]);
+    let c = peer(&dir, &tr, C, 4);
+    let b = peer(&dir, &tr, B, 4);
+    let p = peer(&dir, &tr, P, 4);
+    {
+        let a = peer(&dir, &tr, A, 1);
+        // F0 は名前 4 で作って名前 5 に改名する (A は前の名前 4 を F0 の場所の記録に持つ)
+        let f0 = c.create(4, 50);
+        c.eng.tie_to(f0, "notes.k", 5u32);
+        c.push();
+        tick();
+        for q in [&a, &b, &p] {
+            q.pull(C);
+        }
+        assert_eq!([a.v(5), b.v(5), p.v(5)], [vec![50], vec![50], vec![50]], "前提: F0 (名前 5) が A・B・P にある");
+        let k = a.eng.himo_id("notes.k").unwrap() as u16;
+        let f0_slot = a.eng.eid_slot(a.row(5));
+        assert_eq!(a.eng.former_pk_holder(k, PkValue::Local(4), Hlc::ZERO), Some(a.row(5)), "前提: A で F0 は前に名前 4");
+        a.eng.persist_sync_state().unwrap();
+        // C が F0 を消し、 A と P は受ける (B は受けない)。 A の pull は名前の記録 (消えた時の名前 5、 前の名前 4) を書き出す
+        c.eng.delete(f0);
+        c.push();
+        a.pull(C);
+        p.pull(C);
+        assert_eq!([a.v(5), p.v(5)], [vec![], vec![]], "前提: A と P で F0 が消えた");
+        // consumer の周期を止めて、 Y で F0 の場所を使い回し、 落ちた像 (写し) を撮る
+        let hold = a.eng.hold_consumer();
+        let y = a.eng.entity_in("notes").unwrap();
+        a.eng.tie_to(y, "notes.k", 7u32);
+        a.eng.tie_to(y, "notes.v", 70u32);
+        a.eng.oplog_commit();
+        assert_eq!(a.eng.eid_slot(y), f0_slot, "前提: Y は F0 の場所を使い回した");
+        copy_dir(Path::new(&dir.db(A)), Path::new(&dir.image(A)));
+        drop(hold);
+    }
+    let a = attach(&dir.image(A), &tr, A);
+    assert_eq!(a.v(7), vec![70], "前提: 開いた A に Y がある");
+    let k = a.eng.himo_id("notes.k").unwrap() as u16;
+    let holder = a.eng.former_pk_holder(k, PkValue::Local(4), Hlc::ZERO);
+    tick();
+    // P が名前 5 の W を作る (C の削除の後 = F0 とは別のデッキ)。 B には届けない (B では F0 が生きていて束ねる)
+    p.create(5, 55);
+    p.push();
+    a.pull(P);
+    c.pull(P);
+    assert_eq!([a.v(5), c.v(5), p.v(5)], [vec![55], vec![55], vec![55]], "前提: W が A・C・P にある");
+    tick();
+    // B は C の削除を知らずに F0 を消す (W より後)。 A・C・P では 2 人目の削除
+    let f0_on_b = b.row(5);
+    b.eng.delete(f0_on_b);
+    b.push();
+    for q in [&a, &c, &p] {
+        q.pull(B);
+    }
+    eprintln!("[2]: 名前 5 A {:?} C {:?} P {:?} / 前の名前 4 の持ち主 {holder:?}", a.v(5), c.v(5), p.v(5));
+    assert_eq!(holder, None, "開いた A で、 消えた F0 の前の名前 4 の持ち主が使い回した Y になった");
+    assert_eq!([a.v(5), c.v(5), p.v(5)], [vec![], vec![], vec![]], "B の 2 人目の削除の後、 名前 5 の W が残った [A, C, P]");
+    assert_eq!(a.v(7), vec![70], "使い回した Y はそのまま");
 }
 
 /// #919 の A2 の残り: A (枠 1 の表) の行 X (名前 1) を P が受けた後、 bridge の前に A が X を名前 2 に改名して消し、 名前 3 の Y で

@@ -2278,7 +2278,14 @@ impl Syncer {
                 }
                 // 削除優先 (#551): 消えた行への改名は捨てるが、 その名前も消した名前 (改名を先に受けた peer と同じ名前の集まり)
                 if r == ApplyResult::SkippedOlder && self.engine.is_pk_himo(*himo_id) {
-                    self.engine.name_given_to_dead_row(local_eid, *himo_id, value);
+                    // review930 [5]: 当てた後に、 その行が消えて場所が使い回された (行の lock の下で見る) なら、 入口からもう一度 (上の
+                    // #917 と同じ。 前は lock を取らずに 「消えているか」 を見てから名前を足し、 その間に使い回されると新しい行の場所に
+                    // 前の名前を付けた)
+                    #[cfg(test)]
+                    dead_name_hook::call();
+                    if self.engine.name_given_to_dead_row(local_eid, row, *himo_id, value).is_none() {
+                        return self.apply_one(store, rec, None, dying);
+                    }
                     // #614: 生きた行への、 今の名前より古い名前の書き込み (後の改名を先に受けた)。 その名前がこの書き込みより後に
                     // 消されていれば、 この行はその時刻にその名前だった = 消されたデッキの一員 (当たった名前の書き込みと同じ確かめ。
                     // 書き込みを順に受けた peer では、 作成を当てた時か束ねた時に消している)
@@ -2474,6 +2481,26 @@ mod apply_hook {
     }
 }
 
+/// test 用の割り込み点: Tie が当たらなかった (消えた行への名前の書き込み) 後・`name_given_to_dead_row` の前 (review930 [5])。 1 回だけ呼ぶ。
+#[cfg(test)]
+mod dead_name_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2647,6 +2674,46 @@ mod tests {
             eng.name_deleted_at(k, PkValue::Local(5)),
             Some(deleted),
             "引いた後に場所を使い回された F0 への改名の名前 5 が、 F0 の削除の時刻に消した名前にならない"
+        );
+    }
+
+    /// review930 [5]: 自分の消えた行 X (名前 1) 宛ての改名 (名前 5、 X の削除を知らない B の) が当たらなかった後・消えた行への改名の名前の
+    /// 扱い (`name_given_to_dead_row`) の前に、 アプリが X の場所を Y で使い回しても、 名前 5 は X の削除の時刻に消した名前になる (使い回しの
+    /// 後に届いた時と同じ = 入口からもう一度、 もう無い自分の行への改名として扱う)。 Y の名前にも前の名前にもならない。
+    ///
+    /// 前は lock を取らずに 「消えているか」 を見て、 生きている (Y) と何もせず (名前 5 が消した名前にならない)、 見た後に使い回されると
+    /// 名前 5 を Y の場所の前の名前にした。
+    #[test]
+    fn a_rename_of_a_dead_row_whose_slot_is_reused_before_the_name_is_noted_names_the_deleted_deck() {
+        let (_rm, eng, syncer) = reuse_engine("deadname", true);
+        let k = eng.himo_id("t.k").unwrap() as u16;
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 1u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let deleted = eng.tombstone_hlc(x);
+        assert_ne!(deleted, Hlc::ZERO, "前提: X の削除の版数");
+        let y = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let (e, yy) = (eng.clone(), y.clone());
+        dead_name_hook::set(move || {
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 70u32);
+            yy.set(y);
+        });
+        // B が (X の削除を知らずに、 削除より後の時刻で) X を名前 5 に改名した
+        let later = Hlc { wall: deleted.wall + 1_000, logical: 0, peer: 2 };
+        let out = syncer.apply_records(&[WireRecord::unsigned(later, 2, DecodedOp::Tie { eid: x, himo_id: k, value: 5 })]);
+        let y = y.get();
+        assert_ne!(y, 0, "前提: 割り込み点を通った");
+        assert_eq!(slot24(y), slot24(x), "前提: Y は X の場所を使い回した");
+        assert_eq!(out.applied, 0, "消えた行への改名を当てた ({out:?})");
+        assert!(eng.is_live(y), "改名が使い回した Y を消した");
+        assert_eq!(eng.get(y, "t.k"), None, "消えた X への改名が Y に当たった");
+        assert_eq!(eng.former_pk_holder(k, PkValue::Local(5), Hlc::ZERO), None, "名前 5 が使い回した Y の前の名前になった");
+        assert_eq!(
+            eng.name_deleted_at(k, PkValue::Local(5)),
+            Some(deleted),
+            "名前を足す前に場所を使い回された X への改名の名前 5 が、 X の削除の時刻に消した名前にならない"
         );
     }
 
