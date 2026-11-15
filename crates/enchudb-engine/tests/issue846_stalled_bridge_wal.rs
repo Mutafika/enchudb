@@ -260,7 +260,13 @@ fn a_group_continued_while_stalled_is_held_back() {
 /// ring も WAL も満杯で落ちた書き込み (#57) の floor は、 止まった bridge が WAL を読み直さなくても上がる。 閉じる時は待たずに
 /// 上げる (#449)。 ring が空けば WAL が畳めて、 また書ける。
 ///
-/// falsify: 止まった周が落ちた record を見ない (`wal_drop_floors_due` を呼ばない) と floor が上がらない。
+/// 「読み直さない」 は、 bridge が止まった所から WAL の終わりまで読み終えた後に落とした書き込みの floor が上がるまでの間に、
+/// bridge が読んだ数で見る。 読み終えたかは時間でなく状態で見る (#935): 開いている group を閉じ、 試験の thread で bridge を
+/// 1 周回して、 直近の読みの終わり (`bridge_last_committed_end`) が WAL の head に届いた事。 前は WAL が満杯になった直後から
+/// 数えていて、 書き出しが遅いと consumer の bridge がまだ読んでいない (閉じの Commit がまだの) group を、 数え始めた後に読んだ。
+///
+/// falsify: 止まった周が落ちた record を見ない (`wal_drop_floors_due` を呼ばない) と floor が上がらない。 落ちた record のたびに
+/// 止まった所の覚えを捨てる (cursor から読み直す) と、 floor が上がるまでの周で WAL の残りを全部読む。
 #[test]
 fn dropped_writes_raise_the_floor_while_the_bridge_is_stalled() {
     const SMALL_WAL: usize = 256 * 1024;
@@ -282,18 +288,38 @@ fn dropped_writes_raise_the_floor_while_the_bridge_is_stalled() {
             ring_full(&eng)
         });
         // WAL も埋める (bridge が読み切れないので畳めない)
+        let bumps = eng.wal_drop_floor_bumps();
         until("WAL が満杯にならない", Duration::from_secs(60), || {
             eng.tie_to(e, "notes.note", v);
             v += 1;
             eng.wal_dropped_records() > 0
         });
         assert_eq!(eng.wal_room_wait_timeouts(), 0, "空きを待つ書き手が上限まで待った (畳めない状態はすぐ分かるはず)");
-        let read = eng.bridge_wal_records_read();
-        let bumps = eng.wal_drop_floor_bumps();
         // 落ちが止んで静かになったら (consumer の周期が) floor を上げる
         until("落ちた書き込みの floor が上がらない", Duration::from_secs(30), || eng.wal_drop_floor_bumps() > bumps);
+
+        // 前提: bridge が止まった所から WAL の終わりまで読み終えた。 開いている group を閉じ (data の record は閉じの Commit の
+        // 空きを残すので、 満杯でも入る。 consumer が閉じていれば入らずに何もしない)、 試験の thread で bridge を 1 周回す
+        eng.oplog_commit();
+        drain(&eng);
+        assert!(ring_full(&eng), "前提: ring は満杯のまま");
+        assert!(eng.sync_ops_bridge_offset() < eng.oplog_head(), "前提: bridge は止まったまま");
+        assert_eq!(
+            (eng.bridge_last_committed_end(), eng.bridge_pending_records()),
+            (eng.oplog_head(), 0),
+            "前提: bridge が WAL の終わりまで読み終えた ((読みの終わり, 閉じていない record) が (head, 0) でない)"
+        );
+        let read = eng.bridge_wal_records_read();
+        let bumps = eng.wal_drop_floor_bumps();
+        // 止まったまま、 もう 1 回落とす。 その floor が上がるまで (consumer の周が落ちた record を見る) の間、 WAL は読み直さない
+        let dropped = eng.wal_dropped_records();
+        eng.tie_to(e, "notes.note", v);
+        v += 1;
+        assert!(eng.wal_dropped_records() > dropped, "前提: WAL は満杯のまま (書き込みが落ちる)");
+        until("落ちた書き込みの floor が上がらない", Duration::from_secs(30), || eng.wal_drop_floor_bumps() > bumps);
         let floor = own_floor(&eng).expect("自分の floor");
-        assert!(eng.bridge_wal_records_read() - read < 64, "止まった bridge が、 落ちた record のたびに WAL を読み直した");
+        let grew = eng.bridge_wal_records_read() - read;
+        assert!(grew < 64, "止まった bridge が、 落ちた record のたびに WAL を読み直した (読んだ {grew} 件)");
 
         // もう 1 回落として、 静かになるのを待たずに閉じる
         let dropped = eng.wal_dropped_records();

@@ -2660,6 +2660,40 @@ mod remote_check_hook {
     }
 }
 
+/// test 用の割り込み点: 積んだ主キーの行を載せる側 (`drain_pk_pending`、 `pk_tombs` の書き込みの lock の下) が、 列から取り出した後・
+/// 表に載せる前 (#934)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod pk_drain_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 積んだ主キーの行があると見た読み手 (`flush_pk_pending`) が、 `pk_tombs` の書き込みの lock を取る直前 (#934)。
+/// 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod pk_flush_lock_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: `former_pk_holder` が番号を読んだ後・生きているかを見る前 (#928 の読み直し [2])。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod former_holder_hook {
@@ -3950,6 +3984,121 @@ mod gone_own_delete_tests {
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
+
+    /// #934: 積んだ主キーの行を別の thread が載せている最中 (列から取り出した後・表に載せる前、 本物では consumer の書き出しの
+    /// `persist_name_records`) に読んでも、 返った削除の名前を 「無い」 と答えない。 前は載せる側が印を先に下ろしたので、 その間の
+    /// 読み手が、 前に覚えた名前が無ければ lock を取らない早道 (`pk_tombs_empty && !pk_pending_nonempty`) で、 あれば lock の前の
+    /// bit の表 (`pk_bloom`) で 「無い」 と答えた: 上の試験は負荷の下で、 使い回す時に名前を identity に移さず
+    /// (`move_names_to_identities` の早道)、 名前 7 の削除の時刻が None になって落ちた。 書き出していない削除の名前があるのに
+    /// `sync_state_dirty` も false だった (`Syncer` が書き出さずに cursor を進める)。
+    ///
+    /// 載せる側は割り込み点 (`pk_drain_hook`) で止める。 読み手は、 直した形では印を見て lock を待ちに入る (その直前の割り込み点
+    /// `pk_flush_lock_hook` で載せる側を放す)、 直す前は lock の前で答える (答えた後に放す)。 時間では待たない。
+    #[test]
+    fn a_name_being_drained_by_another_thread_is_not_read_as_absent() {
+        for prior in [false, true] {
+            let tag = if prior { "前に覚えた名前あり" } else { "前に覚えた名前なし" };
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = format!("/tmp/enchudb-pkdrain-{}-{}-{nanos}.db", prior as u8, std::process::id());
+            let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+            eng.define_table("t", 4).unwrap();
+            let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+            eng.set_table_pk("t", k).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            eng.set_peer_id(1);
+            // consumer の書き出しが先に載せない (載せるのは下の thread)
+            let hold = eng.hold_consumer();
+            let x = eng.entity_in("t").unwrap();
+            eng.tie_to(x, "t.k", 7u32);
+            if prior {
+                let p = eng.entity_in("t").unwrap();
+                eng.tie_to(p, "t.k", 5u32);
+                eng.delete(p);
+                assert!(eng.name_deleted_at(k, PkValue::Local(5)).is_some(), "{tag}: 前提: 前に覚えた名前");
+            }
+            eng.delete(x);
+            let t_a = eng.tombstone_hlc(x);
+            assert_ne!(t_a, enchudb_oplog::Hlc::ZERO, "{tag}: 前提: X の削除の版数");
+            assert!(eng.sync_state_dirty(), "{tag}: 前提: 書き出していない削除の名前がある");
+            let wal = eng.oplog.as_ref().unwrap().clone();
+            let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            pk_drain_hook::set(&wal, move |_| {
+                in_tx.send(()).unwrap();
+                let _ = go_rx.recv();
+            });
+            let drainer = {
+                let e = eng.clone();
+                std::thread::spawn(move || e.name_deleted_at(k, PkValue::Local(7)))
+            };
+            in_rx.recv().unwrap();
+            // 載せる側は取り出した後・載せる前で止まっている
+            let dirty = eng.sync_state_dirty();
+            let go = go_tx.clone();
+            pk_flush_lock_hook::set(&wal, move |_| {
+                let _ = go.send(());
+            });
+            let got = eng.name_deleted_at(k, PkValue::Local(7));
+            let _ = go_tx.send(());
+            let drained = drainer.join().unwrap();
+            pk_flush_lock_hook::call(&wal); // 置いたまま残さない (直す前の形では読み手が lock に来ない)
+            drop(hold);
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+            assert_eq!(drained, Some(t_a), "{tag}: 前提: 載せる側の読み");
+            assert_eq!(got, Some(t_a), "{tag}: 別の thread が載せている最中の読みが、 返った削除の名前を無いと答えた");
+            // 前に覚えた名前がある時は、 その名前の書き出していない記録でも立つ (この形で直す前を見分けるのは前に覚えた名前なしの方)
+            assert!(dirty, "{tag}: 別の thread が載せている最中に、 書き出していない削除の名前があるのに sync_state_dirty が false");
+        }
+    }
+
+    /// #934 の直しの守り: 載せる側が取り出した後・印を下ろす前に別の書き手が積んだ削除の名前は、 印を立てたまま残す (その書き手は
+    /// 印が立っているのを見て立て直さない。 列を見ずに下ろすと、 その名前は次に誰かが積むまで 「無い」 になる)。 積む書き手は
+    /// 割り込み点 (`pk_drain_hook`) の中で走らせて終えてから進める (時間では待たない)。
+    #[test]
+    fn a_name_queued_while_another_thread_drains_is_not_lost() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-pkqueued-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_table("t", 4).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        let w = eng.entity_in("t").unwrap();
+        eng.tie_to(w, "t.k", 8u32);
+        let hold = eng.hold_consumer();
+        eng.delete(x);
+        let t_w: std::sync::Arc<std::sync::Mutex<Option<enchudb_oplog::Hlc>>> = Default::default();
+        {
+            let (e, t_w) = (eng.clone(), t_w.clone());
+            pk_drain_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                // 取り出した後・載せる前に、 別の thread が W を消し終える
+                let t = std::thread::spawn(move || {
+                    e.delete(w);
+                    e.tombstone_hlc(w)
+                })
+                .join()
+                .unwrap();
+                *t_w.lock().unwrap() = Some(t);
+            });
+        }
+        let t_a = eng.name_deleted_at(k, PkValue::Local(7));
+        let t_w = t_w.lock().unwrap().expect("前提: 載せる側が取り出した後に W を消した");
+        let got = eng.name_deleted_at(k, PkValue::Local(8));
+        drop(hold);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert!(t_a.is_some(), "前提: 取り出した削除の名前は載った");
+        assert_ne!(t_w, enchudb_oplog::Hlc::ZERO, "前提: W の削除の版数");
+        assert_eq!(got, Some(t_w), "載せている最中に積んだ削除の名前が、 印が下りて見えなくなった");
+    }
 }
 
 /// #925 の C2: `entity_in` の再利用の道で、 前の住人の後始末 (前の宛名の覚え・自分の消えた行の退避・翻訳した行の写像を外す) を
@@ -5216,8 +5365,14 @@ mod apply_liveness_tests {
     /// WAL の空きを待っている thread (#926)。 engine が置いた待ち手 (`wait_for_wal_room`) を、 中に居る thread を控える物で包む
     /// (待ち方は変えない)。 「書き手が空きを待ち始めた」 を、 書いた数が 50 ms 増えないか (時間) でなく、 待ち手の中に居るか (状態)
     /// で見るため。 前の形は、 負荷で書き手が 50 ms 走らないだけで 「待ち始めた」 と読んだ。 `checkpoint_before_apply_tests` も使う (#929)。
+    ///
+    /// thread ごとに、 空きを待った間に書き出しが当てている途中の書き手の手前で切った回数 (`OpLog::applying_cuts` の増え) も足す
+    /// ([`Self::cuts_while_waiting`]、 #935)。
     #[derive(Default)]
-    pub(super) struct RoomWaiters(std::sync::Mutex<Vec<std::thread::ThreadId>>);
+    pub(super) struct RoomWaiters {
+        waiting: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+        cuts: std::sync::Mutex<Vec<(std::thread::ThreadId, u64)>>,
+    }
 
     impl RoomWaiters {
         pub(super) fn watch(eng: &Arc<Engine>) -> Arc<Self> {
@@ -5227,12 +5382,21 @@ mod apply_liveness_tests {
             eng.oplog.as_ref().unwrap().set_room_waiter(Some(Arc::new(move |size, applying| {
                 // SAFETY: engine が置く待ち手と同じ (Engine の Drop が待ち手を外すまで engine は生きている)
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
+                let wal = engine.oplog.as_ref().unwrap();
                 let me = std::thread::current().id();
-                w.0.lock().unwrap_or_else(|p| p.into_inner()).push(me);
+                w.waiting.lock().unwrap_or_else(|p| p.into_inner()).push(me);
+                let cuts0 = wal.applying_cuts();
                 let room = engine.wait_for_wal_room(size, applying);
-                let mut v = w.0.lock().unwrap_or_else(|p| p.into_inner());
+                let cut = wal.applying_cuts() - cuts0;
+                let mut v = w.waiting.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(i) = v.iter().position(|&t| t == me) {
                     v.swap_remove(i);
+                }
+                drop(v);
+                let mut c = w.cuts.lock().unwrap_or_else(|p| p.into_inner());
+                match c.iter_mut().find(|(t, _)| *t == me) {
+                    Some((_, n)) => *n += cut,
+                    None => c.push((me, cut)),
                 }
                 room
             })));
@@ -5241,7 +5405,13 @@ mod apply_liveness_tests {
 
         /// `t` の thread が今、 WAL の空きを待っている。
         pub(super) fn has(&self, t: std::thread::ThreadId) -> bool {
-            self.0.lock().unwrap_or_else(|p| p.into_inner()).contains(&t)
+            self.waiting.lock().unwrap_or_else(|p| p.into_inner()).contains(&t)
+        }
+
+        /// `t` の thread が WAL の空きを待った間に、 書き出しが当てている途中の書き手の手前で切った回数の和 (待ち終えた分)。
+        /// 待っている書き手は位置を持たない (印が無い) ので、 切ったのは他の書き手の印。
+        pub(super) fn cuts_while_waiting(&self, t: std::thread::ThreadId) -> u64 {
+            self.cuts.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(x, _)| *x == t).map_or(0, |(_, n)| *n)
         }
     }
 
@@ -5342,6 +5512,9 @@ mod apply_liveness_tests {
     /// ので放し、 本題の assert (断られた / 落とした / 待ち切れの数が 0) で落ちる。 A が止める側で待ったかは、 A が書き始めた後に B が
     /// 書き始め、 止める側が放す時に A がまだ返っていないかで見る。 前は 1.5 秒持って 「放す時までに B が 3000 件書いた」 を見ていて、
     /// 遅い build (master の coverage) や並べた負荷では、 A と関係なく書き出しが遅い回に届かなかった。
+    ///
+    /// B が空きを待ち切れなかった回が A のせいかは、 B が待った間に書き出しが A の手前で切られたか ([`HeldRun::cut_while_b_waited`])
+    /// で分ける (#935、 [`held_writer_case`])。 書き出しが遅いだけの回 (切られていない) は本題で落とさず、 もう 1 回回す。
     #[test]
     fn a_writer_held_by_a_long_column_holder_does_not_hold_the_wal() {
         let cases: Vec<_> = [Holder::Guard, Holder::Build, Holder::Compact]
@@ -5357,9 +5530,73 @@ mod apply_liveness_tests {
         assert_eq!(failed, 0, "{failed} case が落ちた (上の panic を見る)");
     }
 
+    /// 1 case を何回まで回すか ([`held_writer_case`]、 書き出しが遅いだけで B が空きを待ち切れた回はもう 1 回)。
+    const HELD_ATTEMPTS: usize = 3;
+
+    /// [`held_writer_run`] の 1 回分。
+    #[derive(Debug)]
+    struct HeldRun {
+        /// B が断られた数 / 落とした record の数 / 空きを上限まで待って空かなかった回数 / 1 件の最大の待ち
+        rejected: usize,
+        dropped: u64,
+        timeouts: u64,
+        worst: Duration,
+        release: HoldRelease,
+        a_result: Result<(), TieRejected>,
+        /// (A の列 x、 B の列 y) の今の値
+        x_now: Option<u64>,
+        y_now: Option<u64>,
+        /// B が空きを待った間に、 書き出しが当てている途中の書き手の手前で切った回数 ([`RoomWaiters::cuts_while_waiting`])。
+        /// B 以外に書いているのは止める側で待つ A だけなので、 0 でなければ A が積んで印を持ったまま待った (直す前の形)
+        cut_while_b_waited: u64,
+    }
+
+    impl HeldRun {
+        /// B が待たされた (断られた / 落とされた / 空きを待ち切れなかった / 止める側が放すまでに書き終えなかった)。
+        fn b_held(&self) -> bool {
+            (self.rejected, self.dropped, self.timeouts) != (0, 0, 0) || self.release.b_done != B_WRITES
+        }
+    }
+
+    /// B が待たされたのが A のせいか、 書き出しが遅いだけかを分ける (#935)。 B が空きを待った間に、 書き出しが A の手前で切られて
+    /// いれば A のせい (本題の assert で落とす)。 切られていないのに待ち切れなかった回は、 A と関係なく書き出しが遅い (shim で
+    /// 書き出しを遅らせ lib の試験を並べると、 sync の DB は畳み 1 回に秒単位かかり、 B が上限 5 秒に当たった) のでもう 1 回回す
+    /// (`HELD_ATTEMPTS` 回とも遅ければ前提で落とす)。 前は区別せず本題で落としていた。
     fn held_writer_case(holder: Holder, write: AWrite, sync_db: bool) {
         let tag = format!("{holder:?} {write:?} sync {sync_db}");
-        let p = path(&format!("held-{holder:?}-{write:?}-{}", sync_db as u8));
+        let mut slow = Vec::new();
+        for attempt in 0..HELD_ATTEMPTS {
+            let r = held_writer_run(holder, write, sync_db, attempt);
+            eprintln!("[held] {tag} ({attempt}): {r:?}");
+            assert!(!r.release.gave_up, "{tag}: 前提: B が書き終えるか断られる / 落ちるまで止める側が持った ({:?})", r.release);
+            assert!(!r.release.a_returned, "{tag}: 前提: A は止める側を待った (放す時に A が返っていた)");
+            assert_eq!(r.a_result, Ok(()), "{tag}: 書き手 A");
+            if r.b_held() && r.cut_while_b_waited == 0 {
+                slow.push((r.rejected, r.dropped, r.timeouts, r.release.b_done, r.worst));
+                continue;
+            }
+            let (rejected, dropped, timeouts, worst, cut) = (r.rejected, r.dropped, r.timeouts, r.worst, r.cut_while_b_waited);
+            assert_eq!(
+                (rejected, dropped, timeouts),
+                (0, 0, 0),
+                "{tag}: B が断られた / 落ちた / 空きを待ち切れなかった (B が待つ間に A の手前で切った書き出し {cut} 回、 最大の待ち {worst:?})"
+            );
+            assert_eq!(r.release.b_done, B_WRITES, "{tag}: B は止める側が放すまで書き終えなかった ({:?}、 最大の待ち {worst:?})", r.release);
+            let x_want = match write {
+                AWrite::Tie => Some(1),
+                AWrite::Delete => None,
+            };
+            assert_eq!((r.x_now, r.y_now), (x_want, Some(5999)), "{tag}: 両方の書き込みが当たっている");
+            return;
+        }
+        panic!(
+            "{tag}: 前提: {HELD_ATTEMPTS} 回とも、 書き出しが A の手前で切られていないのに B が待たされた (書き出しが遅い。 \
+             (断られた, 落とした, 待ち切れ, 放す時までに書いた数, 最大の待ち) = {slow:?})"
+        );
+    }
+
+    fn held_writer_run(holder: Holder, write: AWrite, sync_db: bool, attempt: usize) -> HeldRun {
+        let p = path(&format!("held-{holder:?}-{write:?}-{}-{attempt}", sync_db as u8));
         let eng = if sync_db {
             // `_sync_ops` の ring (残りの eid 空間の半分) に、 B の record が ack なしで全部入る大きさ
             Engine::create_with_cell_version(&p, 65_536).unwrap()
@@ -5369,6 +5606,10 @@ mod apply_liveness_tests {
         let (eng, x, y, _) = open(eng, sync_db);
         let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
         eng.try_tie_to_by_id(e1, x, 5u32).unwrap();
+        // 作った後の最初の書き出し (全域) は B が書く前に済ませる (#935: 書き出しが遅いと、 sync の DB では B の最初の空きの待ちが
+        // これだけで上限 5 秒に近づいた。 shim 100 ms で 4.4 秒)
+        eng.oplog_sync().unwrap();
+        let waiters = RoomWaiters::watch(&eng);
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let ab = Arc::new(HeldWriters::default());
         let holder_thread = {
@@ -5427,25 +5668,14 @@ mod apply_liveness_tests {
             std::thread::yield_now();
         }
         let (rejected, worst) = write_many_counted(&eng, e2, y, B_WRITES, &ab.b_done, &ab.b_rejected);
+        let cut_while_b_waited = waiters.cuts_while_waiting(std::thread::current().id());
         let release = holder_thread.join().unwrap().expect("前提: 止める側の割り込み点を通った");
         let a_result = a.join().unwrap();
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (x_now, y_now) = (eng.get_by_id(e1, x), eng.get_by_id(e2, y));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
-        eprintln!(
-            "[held] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / 放す時 {release:?}"
-        );
-        assert!(!release.gave_up, "{tag}: 前提: B が書き終えるか断られる / 落ちるまで止める側が持った ({release:?})");
-        assert!(!release.a_returned, "{tag}: 前提: A は止める側を待った (放す時に A が返っていた)");
-        assert_eq!(a_result, Ok(()), "{tag}: 書き手 A");
-        assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "{tag}: B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
-        assert_eq!(release.b_done, B_WRITES, "{tag}: B は止める側が放すまで書き終えなかった ({release:?}、 最大の待ち {worst:?})");
-        let x_want = match write {
-            AWrite::Tie => Some(1),
-            AWrite::Delete => None,
-        };
-        assert_eq!((x_now, y_now), (x_want, Some(5999)), "{tag}: 両方の書き込みが当たっている");
+        HeldRun { rejected, dropped, timeouts, worst, release, a_result, x_now, y_now, cut_while_b_waited }
     }
 
     /// 辞書の語を回収する DB で、 A が Tag の値を書き換えた時の辞書の書き出し (`settle_retired_words`、 msync) が長くても、 B は
@@ -8932,7 +9162,8 @@ pub struct Engine {
     /// #513: 削除の道で積んだ、 まだ `pk_tombs` に載せていない主キーの行。 削除のたびに表に載せると、 削除 1 回 (約 0.17 µs)
     /// と同じくらいかかった (主キーのある行を消す速さが 0.4 倍)。 載せるのは引く時と書き出す時 (`drain_pk_pending`)。
     pk_pending: parking_lot::Mutex<Vec<PkPending>>,
-    /// #513: `pk_pending` に積んだ分があるかもしれない (無いのに立っていることはある)。
+    /// #513: `pk_pending` に積んだ分か、 載せる側 (`drain_pk_pending`) が取り出してまだ `pk_tombs` に載せていない分があるかもしれない
+    /// (無いのに立っていることはある)。 #934: 下りていて `pk_tombs_empty` も立っていれば、 返った削除の名前は 1 つも無い。
     pk_pending_nonempty: std::sync::atomic::AtomicBool,
     /// #513: 覚えた主キーの bit の表 (`pk_tombs.rs` の `PkBloom`)。 bit が無ければ、 その主キーは覚えていない。 受け手が新しい行
     /// ごとに引く時に、 lock を取らずに弾く。 初めて覚えた時に作り、 主キーが増えたら大きく作り直す (#560)。
@@ -18727,22 +18958,42 @@ impl Engine {
         }
     }
 
-    /// #513: 積んだ主キーの行を `pk_tombs` に載せる。 呼び手は `pk_tombs` の書き込みの lock を握っている。
+    /// #513: 積んだ主キーの行を `pk_tombs` に載せる。 呼び手は `pk_tombs` の書き込みの lock を握っている (載せる側は 1 本ずつ)。
+    ///
+    /// #934: 印 (`pk_pending_nonempty`) は載せ終えてから下ろす。 lock を取らない早道 (`pk_tombs_empty && !pk_pending_nonempty` =
+    /// 「何も覚えていない」、 `pk_tombstone_of` / `reserve_remote_eid_for_pk` / `move_names_to_identities` / `forget_pk_slot` /
+    /// `persist_name_records` / `sync_state_dirty` など) は、 取り出した行がまだ表に無い間も印を見る。 前は印を先に下ろしてから
+    /// 取り出したので、 下ろした後・載せ終える前 (consumer の書き出しが載せている最中) に早道を見た読み手が、 返った削除の名前を
+    /// 「無い」 と答えた (名前の削除の時刻が None、 使い回す時に名前を identity に移さない、 書き出しの前の `persist_name_records` が
+    /// 書かずに Ok、 `sync_state_dirty` が false、 受信の払い出しが名前の削除より前に作られた行を生かす)。 印は、 取り出した
+    /// 後に積んだ書き手が居なければ (積む所の lock の下で列が空なら) 下ろす: 居れば下ろさない (その書き手は印が立っているのを見て
+    /// 立て直さない)。 下ろした後に積む書き手は、 同じ lock の後で印を読むので下りたのを見て立て直す。
     fn drain_pk_pending(&self, g: &mut crate::pk_tombs::PkTombs) {
         use std::sync::atomic::Ordering;
-        // 印を先に下ろしてから取り出す (取り出した後に積んだ書き手は印を立て直す)
-        if !self.pk_pending_nonempty.swap(false, Ordering::AcqRel) {
+        if !self.pk_pending_nonempty.load(Ordering::Acquire) {
             return;
         }
         let items = std::mem::take(&mut *self.pk_pending.lock());
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            pk_drain_hook::call(wal);
+        }
         for p in items {
             self.with_pk_key(p.himo, PkValue::Local(p.value), |key| self.note_pk_locked(g, p.himo, key, p.slot, p.hlc));
+        }
+        let queue = self.pk_pending.lock();
+        if queue.is_empty() {
+            self.pk_pending_nonempty.store(false, Ordering::Release);
         }
     }
 
     /// #513: 積んだ主キーの行があれば `pk_tombs` に載せる (引く前・書き出す前)。
     fn flush_pk_pending(&self) {
         if self.pk_pending_nonempty.load(std::sync::atomic::Ordering::Acquire) {
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                pk_flush_lock_hook::call(wal);
+            }
             let mut g = self.pk_tombs.write().unwrap();
             self.drain_pk_pending(&mut g);
         }

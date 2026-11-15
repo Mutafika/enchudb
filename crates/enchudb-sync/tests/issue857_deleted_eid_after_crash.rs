@@ -234,7 +234,10 @@ fn the_checkpoint_catches_up_after_a_freed_slot() {
         assert!(t0.elapsed() < std::time::Duration::from_secs(5), "consumer の周期が checkpoint を進めない (5 秒)");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    // 進んだ後の oplog_sync は止めない
+    // 進んだ後の oplog_sync は止めない。 consumer の周期は止めておく (#933: 周期が `oplog_sync` の Commit の後に自分の Commit を
+    // 積むと、 head はその分 (120 B) 先に行き、 その Commit を書き出すのは周期の方 = `oplog_sync` が返った時に checkpoint は head に
+    // 届いていない。 止めると WAL に積むのはこの thread だけで、 checkpoint を進めるのも `oplog_sync` だけになる)
+    let _hold = eng.hold_consumer();
     eng.tie_to(a, "notes.note", 3u32);
     eng.oplog_sync().unwrap();
     let s = eng.stats();

@@ -56,7 +56,9 @@ impl Recorder {
 impl ChangeListener for Recorder {
     fn on_changes_at(&self, first: u64, recs: &[WireRecord]) {
         self.entered.store(true, Ordering::Release);
-        let until = Instant::now() + Duration::from_secs(30);
+        // 止める受け手: test が門を開けるまで返らない。 上限は試験が落ちて門を開けない時に止まらないためだけ (#935: 前は 30 秒で、
+        // 最初の配りが試験の thread で起きた時に、 そこで 30 秒待った。 changefeed_backlog と同じ)
+        let until = Instant::now() + Duration::from_secs(600);
         while !self.gate.load(Ordering::Acquire) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -212,7 +214,13 @@ fn a_stalled_listener_overrun_by_the_log_is_detached() {
     let rec = Recorder::new(false);
     eng.add_change_listener(rec.clone());
     write(&eng, 0..100);
-    eng.oplog_sync().unwrap(); // 通知係を最初の呼び出しで止める (5 秒で諦めて返る)
+    // 通知係を最初の呼び出しで止める: consumer の書き出しの後に通知係が配り始め、 門で止まったのを見てから書く (#935: 前は
+    // `oplog_sync()` で配らせていて、 配りは呼んだ試験の thread で起き、 門の上限 (30 秒) まで返らなかった)
+    let until = Instant::now() + Duration::from_secs(60);
+    while !rec.entered.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(rec.entered.load(Ordering::Acquire), "前提: 通知係が listener に配り始めた");
     let started = Instant::now();
     write(&eng, 100..40_000);
     let took = started.elapsed();
