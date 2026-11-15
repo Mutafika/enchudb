@@ -27698,10 +27698,6 @@ impl Engine {
         let (slot, g) = gens.split(enchudb_oplog::eid_local(eid));
         let now = gens.get(slot);
         if g > now {
-            // review946 [1] / 3 (ii): 再生した前の住人の Delete (世代を上げない) の後に、 次の住人の record が場所を生かす
-            if makes_live && !self.entities.is_live(slot) {
-                self.redo_reuse_eviction(slot, g, true);
-            }
             if let Some(t) = self.table_of_slot(slot) {
                 self.drop_leftover_cells(slot, t);
             }
@@ -27730,6 +27726,7 @@ impl Engine {
                 gens.restore(slot, g);
             }
         } else if g == now && makes_live && !self.entities.is_live(slot) {
+            // 死んだ場所を次の住人の record で生かす (本体の削除、 または再生した前の住人の Delete が世代を上げた後)
             self.redo_reuse_eviction(slot, g, true);
         }
         Some(slot)

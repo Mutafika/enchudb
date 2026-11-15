@@ -376,9 +376,10 @@ impl PrevSlots {
             }
         } else {
             self.log_full.fetch_add(1, Ordering::Relaxed);
-            if in_array {
-                // 開く時に配列もなめる (この周期を書き出す前に落ちた時)
-                self.header_word(H_OVERFLOW).fetch_max(epoch, Ordering::Relaxed);
+            // 開く時に配列もなめる (この周期を書き出す前に落ちた時)。 一杯の周期の残りの書き込みは読むだけ
+            let w = self.header_word(H_OVERFLOW);
+            if in_array && w.load(Ordering::Relaxed) < epoch {
+                w.fetch_max(epoch, Ordering::Relaxed);
                 r.mark_dirty(0, PREV_HEADER);
             }
         }

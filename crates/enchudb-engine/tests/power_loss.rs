@@ -3718,11 +3718,19 @@ fn a_reuse_only_in_the_wal_is_finished_by_the_replay() {
     };
     crashsim::stop();
     let (deletes, v, restored) = open_and_read_state(&img);
+    // 再生のやり直しは場所の版数も落とす (生きている Y の場所に X の削除の版数を残すと、 後で Y の cell が全部外れた時に、 きれいに
+    // 閉じなかった open の sweep が Y を消す、 review946 [11])
+    let left = {
+        let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        eng.tombstone_hlc(y)
+    };
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(v, vec![77], "前提: 再生が Y を生かした");
     assert_eq!(restored, 0, "前提: 記録は届いていない");
     assert!(deletes.contains(&(x, tomb)), "state に X の Delete が無い: {deletes:x?}");
     assert!(!deletes.iter().any(|&(e, _)| e == y), "生きている Y の Delete を出した: {deletes:x?}");
+    assert_eq!(left, Hlc::ZERO, "生きている Y の場所に前の住人 X の削除の版数が残った");
 }
 
 /// review946 3 (ii) の翻訳した行: 受けた行 F (C の削除も受けて書き出した) の場所を Y で使い回して `oplog_sync` し、 WAL の書き出しの
@@ -3765,4 +3773,47 @@ fn a_translated_reuse_only_in_the_wal_is_finished_by_the_replay() {
     );
     assert!(f_deleted, "消えた F に C の遅い書き込みが当たった (F の削除を失った)");
     assert_eq!(mapped, None, "Y を生かした後も F の写像が場所を指す");
+}
+
+/// review946 3 (ii) の守り: 受けた行 F の場所を Y で使い回した後、 公開の `persist_tables()` (本体を書き出さない) で外した写像と F の
+/// 退避 ((C, f) の削除の版数) だけが `.eidmap` に届き、 WAL の書き出しの後・`prev.seg` の前に電源が落ちる (記録も写像も無く、 本体の場所は
+/// F の削除の版数で死んでいる)。 再生が Y を生かす所で、 退避表に同じ版数の identity ((C, f)) があるので前の住人を自分の行と読まない =
+/// A の行の Delete (幻) を出さない。
+#[test]
+fn a_translated_reuse_whose_eidmap_reached_disk_first_is_not_read_as_an_own_row() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_translated_eidmap_first");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    {
+        let (eng, _) = received_and_deleted_row_engine(&live.join("db"), world_f);
+        let _hold = eng.hold_consumer();
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to(y, "t.c", 9u32);
+        eng.oplog_commit();
+        eng.persist_tables().unwrap();
+        assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "前提: 外した写像と F の退避が `.eidmap` に届いた");
+        let shot = Arc::new(AtomicBool::new(false));
+        let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(shot.load(Ordering::SeqCst), "前提: prev.seg の前で撮った");
+    }
+    crashsim::stop();
+    let (nine, f_deleted, own_deletes, mapped) = translated_image_state(&img, world_f);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(mapped, None, "前提: 写像は戻らない");
+    assert!(nine.len() == 1 && enchudb_oplog::eid_peer(nine[0]) == 1, "前提: Y は A の行: {nine:x?}");
+    assert!(f_deleted, "消えた F に C の遅い書き込みが当たった");
+    assert!(own_deletes.is_empty(), "F の場所の前の住人を A の行と読んで Delete を出した: {own_deletes:x?}");
 }
