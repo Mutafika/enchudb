@@ -3751,6 +3751,53 @@ mod gone_own_delete_tests {
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(&packed);
     }
+
+    /// #921 の読み直し [3] (#922 と組んだ形): B の、 A の行 X 宛ての削除を A が引いた後・行の lock の前 (`remote_row_hook`) に、 A が X の
+    /// 場所を同じ名前の Y で使い回しても、 その削除は入口で捨てた時 (使い回しの後に届いた時) と同じく、 移した削除の版数と名前 7 の削除の
+    /// 時刻を B の削除の版数に上げる (#922 が引いた後に消えた自分の行を入口の道へ戻し、 #915 の `raise_gone_own_delete` が上げる)。 Y は
+    /// B の削除を見た後に作った (版数が後) ので生きる = X の削除を先に受けた peer と同じ答え。
+    #[test]
+    fn a_delete_of_a_row_reused_after_it_was_looked_up_raises_the_moved_delete() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-goneown-hook-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.k", 7u32);
+        let z = eng.entity_in("t").unwrap();
+        eng.tie_to(z, "t.k", 1u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t_a = eng.tombstone_hlc(x);
+        assert_ne!(t_a, enchudb_oplog::Hlc::ZERO, "前提: X の削除の版数");
+        let y: std::sync::Arc<std::sync::Mutex<Option<u64>>> = Default::default();
+        {
+            let (e2, y) = (eng.clone(), y.clone());
+            remote_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                let n = e2.entity_in("t").unwrap();
+                e2.tie_to(n, "t.k", 7u32);
+                *y.lock().unwrap() = Some(n);
+            });
+        }
+        let t_b = enchudb_oplog::Hlc { wall: t_a.wall + 1_000, logical: 0, peer: 2 };
+        let raised = eng.remote_delete_apply_foreign(x, t_b);
+        let y = y.lock().unwrap().expect("前提: 引いた後・行の lock の前に使い回した");
+        assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(x), "前提: X の場所を使い回した");
+        assert!(raised, "引いた後に使い回された X 宛ての、 より新しい削除が当たらなかった");
+        assert_eq!(eng.foreign_tombstone_of(1, enchudb_oplog::eid_local(x)), Some(t_b), "移した削除の版数を上げない");
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(7)), Some(t_b), "名前 7 の削除の時刻を上げない");
+        assert!(eng.is_live(y), "B の削除の後に作った Y が消えた");
+        assert!(eng.is_live(z), "他の行が消えた");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
 }
 
 /// #882 / #883: 同じ slot を 2 回払い出す窓 2 つを、 割り込み点で決まって踏む。
