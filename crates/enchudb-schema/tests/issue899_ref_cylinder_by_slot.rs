@@ -246,8 +246,6 @@ fn run(seed: u64) {
     drop(grouped);
     drop(null_sub);
     drop(tokyo_sub);
-    drop(users);
-    drop(companies);
     drop(db);
     // 開き直す: 円柱を列から組み直す (前の世代と今の世代の entry が混ざった bucket を最初から組む)
     let db = Database::open(&path).unwrap();
