@@ -556,6 +556,36 @@ pub(crate) struct GenReader<'a> {
 }
 
 impl GenReader<'_> {
+    /// 世代を持つ DB か (写した時の場所の bit)。
+    #[inline]
+    pub(crate) fn active(&self) -> bool {
+        self.bits != 0
+    }
+
+    /// 写した時の場所の bit (読みの間に v15 に移ったかを見る)。
+    #[inline]
+    pub(crate) fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    /// local → (場所, 世代) ([`Generations::split`] を写した bit で)。
+    #[inline]
+    pub(crate) fn split(&self, local: u32) -> (u32, u32) {
+        match self.bits {
+            0 => (local, 0),
+            b => (local & ((1u32 << b) - 1), local >> b),
+        }
+    }
+
+    /// 場所の今の世代 ([`Generations::get`] を写した region で)。
+    #[inline]
+    pub(crate) fn current(&self, slot: u32) -> u32 {
+        match self.region {
+            Some(r) => read_gen(r, slot),
+            None => 0,
+        }
+    }
+
     #[inline]
     pub(crate) fn local(&self, slot: u32) -> u32 {
         match self.region {

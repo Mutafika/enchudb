@@ -3280,6 +3280,57 @@ mod eid_gen_claim_tests {
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
+
+    /// #900: lock を取らない読み (`read_app` = get など) は、 照合の後・読んだ後の世代の読み直しの前に行が消えて場所が使い回されたら
+    /// None (使い回した行の値を古い eid に渡さない)。 照合の前に使い回された古い eid も None。
+    #[test]
+    fn a_read_whose_row_is_deleted_and_reused_meanwhile_returns_none() {
+        let (path, eng) = engine("readapp");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x);
+        let a = eng.entity_in("u").unwrap(); // 使い回し = v15
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        let hid = eng.himo_id("u.a").unwrap();
+        eng.tie_to_by_id(a, hid as u16, 7u32);
+        assert_eq!(eng.get(a, "u.a"), Some(7));
+        assert_eq!(eng.get(x, "u.a"), None, "照合の前に使い回された古い eid の読みが、 使い回した行の値を返した");
+        let got = eng.read_app(a, |slot| {
+            let v = eng.himos[hid].get_value(slot);
+            // 読んだ後・世代を読み直す前に、 a を消して同じ場所を使い回す (枠 1 の表)
+            eng.delete(a);
+            let b = eng.entity_in("u").unwrap();
+            assert_eq!(eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+            v
+        });
+        assert_eq!(got, None, "読んでいる間に消えて使い回された行の値を返した");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// #900: v14 の間に照合した読み (世代なし) の最中に v15 に移り、 その行が消えて場所が使い回されたら None。 読み直しは移った後の
+    /// 場所の bit で引き直す (照合の時に写した bit / region では、 世代 0 の読みと区別できない)。
+    #[test]
+    fn a_read_across_the_move_to_v15_whose_row_is_reused_returns_none() {
+        let (path, eng) = engine("readmove");
+        let a = eng.entity_in("u").unwrap();
+        let hid = eng.himo_id("u.a").unwrap();
+        eng.tie_to_by_id(a, hid as u16, 7u32);
+        assert!(!eng.generations().moved(), "前提: まだ v14");
+        let got = eng.read_app(a, |slot| {
+            let v = eng.himos[hid].get_value(slot);
+            // 読んだ後に a を消し、 同じ場所を使い回す (枠 1 の表の使い回し = v15 に移る)
+            eng.delete(a);
+            let b = eng.entity_in("u").unwrap();
+            assert!(eng.generations().moved(), "前提: 読みの間に v15 に移った");
+            assert_eq!(eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+            v
+        });
+        assert_eq!(got, None, "読みの間に v15 に移って使い回された行の値を返した");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
 }
 
 /// #882 / #883: 同じ slot を 2 回払い出す窓 2 つを、 割り込み点で決まって踏む。
@@ -17525,15 +17576,34 @@ impl Engine {
     /// 使い回された = None)。 lock を取らない読み (`get` など) 用。
     #[inline]
     fn read_app<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
-        let slot = self.app_slot(eid)?;
-        let r = f(slot);
-        if self.generations().active() {
+        // #900: [`Self::app_slot`] を 2 回呼ぶと、 場所の bit を 4 回・region を 2 回 (live の registry をたどって) 読み直していた
+        // (v15 の DB の get 1 回 331 命令 → この形で 277、 #885 の前は 204)。 bit と region を 1 回写して照合し、 読んだ後は照合した
+        // 場所の世代だけ読み直す。 照合 (読む前) は読み直しが兼ねるので結果は変わらないが、 別の行の cell を `f` に読ませないために残す
+        let gens = self.generations();
+        let r = gens.reader();
+        let (home, g) = r.split(enchudb_oplog::eid_local(eid));
+        if r.active() && r.current(home) != g {
+            return None;
+        }
+        // 畳んだ自分の行 (#612) は残す行の場所を読む (照合は畳んだ行の場所で、 `app_slot` と同じ順)
+        let forwarded = self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed)
+            && enchudb_oplog::eid_peer(eid) == self.peer_id();
+        let slot = if forwarded { self.forward_local_slow(home) } else { home };
+        let out = f(slot);
+        let bits = gens.bits();
+        if bits != 0 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            if self.app_slot(eid) != Some(slot) {
+            if forwarded || bits != r.bits() {
+                // 別名をたどった / 読みの間に v15 に移った: 前と同じく全部を引き直す
+                if self.app_slot(eid) != Some(slot) {
+                    return None;
+                }
+            } else if r.current(home) != g {
+                // region は一度置いたら変わらないので、 写した物で読み直す
                 return None;
             }
         }
-        r
+        out
     }
 
     /// 場所 → アプリに渡す eid (今の世代 | 場所)。
