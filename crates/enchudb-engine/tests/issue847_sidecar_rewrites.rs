@@ -168,8 +168,11 @@ fn tables_is_rewritten_only_when_it_changes() {
         assert_ne!(after, before, "行を払い出した後の `tables` を作り直さなかった");
         eng.persist_tables().unwrap();
         assert_eq!(inode(&path, "tables"), after, "変わっていない `tables` を作り直した");
-        // 閉じずに落ちた形で読む (行は 1 つも書いていないので、 払い出した数は sidecar にしか無い)
+        // 閉じずに落ちた形で読む (行は 1 つも書いていないので、 払い出した数は sidecar にしか無い)。 写し終えるまで consumer を
+        // 止める (#944: 写す間に sidecar の置き換えの一時 file が消えて NotFound になる)
+        let hold = eng.hold_consumer();
         copy_dir(std::path::Path::new(&path), std::path::Path::new(&format!("{path}-image")));
+        drop(hold);
     }
     let image = format!("{path}-image");
     let _cleanup_image = Cleanup(image.clone());
@@ -225,8 +228,11 @@ fn a_reopened_ring_still_holds_its_whole_capacity() {
             before = ring(&eng).live;
             assert!(before >= 5 && before < ring(&eng).capacity / 2, "前提: ring はまだ空きの方が多い ({before} 行)");
             if !clean {
-                // 閉じずに落ちた形: 開いたままの directory を写す (sidecar と本体は上で書き出した所まで)
+                // 閉じずに落ちた形: 開いたままの directory を写す (sidecar と本体は上で書き出した所まで)。 写し終えるまで consumer を
+                // 止める (#944)
+                let hold = eng.hold_consumer();
                 copy_dir(std::path::Path::new(&made), std::path::Path::new(&image));
+                drop(hold);
             }
         }
         let eng = Engine::open_concurrent_with_oplog(&path, WAL).unwrap();

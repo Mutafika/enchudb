@@ -227,53 +227,69 @@ fn a_ref_to_a_gone_own_row_does_not_point_at_the_translated_row_on_its_slot() {
 /// [E] の逆の形: A が C の行 F0 を受けて、 C の削除で消し、 その場所を A の行 Y が使い回した後に、 アプリが F0 の古い eid を的に ref
 /// を張る。 C の W は F0 (C の消えた行) を指し、 幻の行 (A の世界番号の空の行) を作らない。
 ///
-/// 前の宛名の覚え (`FormerAddresses`) がある間 (bridge が使い回しの所を越える前) だけ。 越えた後 / 開き直した後に張った ref は、
-/// 前と同じく A の世界番号で出る (前の住人が他の peer の行だったと分かる物が残っていない)。 試験は consumer を止めて覚えのある間に張る。
+/// 前の宛名の覚え (`FormerAddresses`) がある間 (bridge が使い回しの所の後ろの record を読む前) だけ。 読んだ後 / 開き直した後に張った
+/// ref は、 前と同じく A の世界番号で出る (前の住人が他の peer の行だったと分かる物が残っていない)。 試験は consumer を止めて覚えのある
+/// 間に張る。
 ///
-/// falsify: bridge の Ref の値の世代の照合を外すと、 C に A の世界番号の行が現れる (W の的が F0 でない)。
+/// `caught_up`: bridge が WAL の頭に追いついた所 (書き込みの無い間の常の形) で使い回す = 覚えの位置 (使い回す時の WAL の頭) が bridge の
+/// 位置と同じ。 偽は bridge が使い回しの所の手前 (使い回しの前の A の書き込みを読んでいない)。 #952: 前は bridge の入口が、 位置が
+/// bridge の位置と同じ覚えを外し (使い回しの後ろの record を 1 つも読んでいないのに)、 ref が A の世界番号で出た。 この試験の前の形は
+/// consumer を止める前に consumer の最初の周期が来たか (負荷の下で来る) で前提が決まり、 並べると毎回落ちた。
+///
+/// falsify: bridge の Ref の値の世代の照合を外すと、 C に A の世界番号の行が現れる (W の的が F0 でない)。 覚えを外す境目を 「bridge の
+/// 位置 >= 覚えの位置」 に戻すと `caught_up` で同じ。
 #[test]
 fn a_ref_to_a_gone_translated_row_does_not_make_a_phantom_row() {
-    let (pa, pc) = (tmp_path("ra"), tmp_path("rc"));
-    let _c = Cleanup(vec![pa.clone(), pc.clone()]);
-    let transport = transport(&[1, 3]);
-    let eng_a = make_refs(&pa, 1, 1);
-    let eng_c = make_refs(&pc, 3, 100);
-    let sync_a = Syncer::new(eng_a.clone(), transport.clone());
-    let sync_c = Syncer::new(eng_c.clone(), transport.clone());
-    let f0 = eng_c.entity_in("companies").unwrap();
-    eng_c.tie_to(f0, "companies.name", 40u32);
-    eng_c.oplog_sync().unwrap();
-    sync_c.publish_since(Hlc::ZERO);
-    sync_a.pull_once(3);
-    let on_a = eng_a.pull_raw("companies.name", 40u32);
-    assert_eq!(on_a.len(), 1, "前提: A に F0 がある");
-    let f0_on_a = on_a[0];
-    eng_c.delete(f0);
-    eng_c.oplog_sync().unwrap();
-    sync_c.publish_since(Hlc::ZERO);
-    sync_a.pull_once(3);
-    assert!(eng_a.pull_raw("companies.name", 40u32).is_empty(), "前提: A で F0 が消えた");
-    let hold = eng_a.hold_consumer();
-    let y = eng_a.entity_in("companies").unwrap();
-    eng_a.tie_to(y, "companies.name", 60u32);
-    assert_eq!(slot(y), slot(f0_on_a), "前提: Y は F0 の場所を使い回した");
-    assert_ne!(y, f0_on_a, "前提: 使い回した場所の世代は F0 より新しい");
+    for caught_up in [false, true] {
+        let (pa, pc) = (tmp_path("ra"), tmp_path("rc"));
+        let _c = Cleanup(vec![pa.clone(), pc.clone()]);
+        let transport = transport(&[1, 3]);
+        let eng_a = make_refs(&pa, 1, 1);
+        let eng_c = make_refs(&pc, 3, 100);
+        let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+        let sync_c = Syncer::new(eng_c.clone(), transport.clone());
+        let f0 = eng_c.entity_in("companies").unwrap();
+        eng_c.tie_to(f0, "companies.name", 40u32);
+        eng_c.oplog_sync().unwrap();
+        sync_c.publish_since(Hlc::ZERO);
+        sync_a.pull_once(3);
+        let on_a = eng_a.pull_raw("companies.name", 40u32);
+        assert_eq!(on_a.len(), 1, "前提: A に F0 がある");
+        let f0_on_a = on_a[0];
+        eng_c.delete(f0);
+        eng_c.oplog_sync().unwrap();
+        sync_c.publish_since(Hlc::ZERO);
+        sync_a.pull_once(3);
+        assert!(eng_a.pull_raw("companies.name", 40u32).is_empty(), "前提: A で F0 が消えた");
+        let hold = eng_a.hold_consumer();
+        // bridge の位置は状態で決める (consumer の周期が止める前に来たかによらない): W を使い回しの前に書き、 読ませる / 読ませない
+        let w = eng_a.entity_in("users").unwrap();
+        eng_a.tie_to(w, "users.uid", 7u32);
+        if caught_up {
+            eng_a.oplog_sync().unwrap();
+            assert_eq!(eng_a.sync_ops_bridge_offset(), eng_a.stats().oplog_head, "前提: bridge は WAL の頭に追いついている");
+        } else {
+            assert!(eng_a.sync_ops_bridge_offset() < eng_a.stats().oplog_head, "前提: bridge は使い回しの所の手前 (W を読んでいない)");
+        }
+        let y = eng_a.entity_in("companies").unwrap();
+        eng_a.tie_to(y, "companies.name", 60u32);
+        assert_eq!(slot(y), slot(f0_on_a), "前提: Y は F0 の場所を使い回した");
+        assert_ne!(y, f0_on_a, "前提: 使い回した場所の世代は F0 より新しい");
 
-    let w = eng_a.entity_in("users").unwrap();
-    eng_a.tie_to(w, "users.uid", 7u32);
-    eng_a.tie_ref_to(w, "users.company", f0_on_a);
-    assert!(eng_a.former_addresses_len() > 0, "前提: bridge は使い回しの所の手前 (前の宛名を覚えている)");
-    eng_a.oplog_sync().unwrap();
-    sync_a.publish_since(Hlc::ZERO);
-    drop(hold);
-    for _ in 0..3 {
-        sync_c.pull_once(1);
+        eng_a.tie_ref_to(w, "users.company", f0_on_a);
+        assert!(eng_a.former_addresses_len() > 0, "前提: 前の宛名を覚えている");
+        eng_a.oplog_sync().unwrap();
+        sync_a.publish_since(Hlc::ZERO);
+        drop(hold);
+        for _ in 0..3 {
+            sync_c.pull_once(1);
+        }
+        let ws = eng_c.pull_raw("users.uid", 7u32);
+        assert_eq!(ws.len(), 1, "前提: C に W が届いた");
+        assert_eq!(eng_c.pull_raw("companies.name", 60u32).len(), 1, "前提: C に Y が届いた");
+        let c_val = eng_c.get(ws[0], "users.company");
+        assert_eq!(c_val, Some(u64::from(eid_local(f0))), "C の W が F0 (C の消えた行) を指さない (caught_up = {caught_up})");
     }
-    let ws = eng_c.pull_raw("users.uid", 7u32);
-    assert_eq!(ws.len(), 1, "前提: C に W が届いた");
-    assert_eq!(eng_c.pull_raw("companies.name", 60u32).len(), 1, "前提: C に Y が届いた");
-    let c_val = eng_c.get(ws[0], "users.company");
-    assert_eq!(c_val, Some(u64::from(eid_local(f0))), "C の W が F0 (C の消えた行) を指さない");
 }
 
 /// 読み直し A2: A が受けた C の行 F0 に書き (bridge の前)、 C が F0 を消して F1 を作り、 A が受けて F1 が F0 の場所を使い回した所で落ちた
