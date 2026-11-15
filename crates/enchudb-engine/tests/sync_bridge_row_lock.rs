@@ -12,11 +12,8 @@
 
 use enchudb_engine::{db_files, Engine, ValueType};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 const WRITES: u32 = 50_000;
-/// 書き手の待ちの上限 (5 秒) より十分短い
-const SLOW: Duration = Duration::from_secs(1);
 
 struct Cleanup(String);
 
@@ -26,8 +23,10 @@ impl Drop for Cleanup {
     }
 }
 
-/// sync の DB (WAL 256 KiB) で `write` を `WRITES` 回。 1 秒以上かかった書き込みがあれば、 その回と時間を返す。
-fn first_slow_write(tag: &str, ty: ValueType, write: impl Fn(&Engine, u64, u16, u32)) -> Option<(u32, Duration)> {
+/// sync の DB (WAL 256 KiB) で `write` を `WRITES` 回。 書き手が WAL の空きを上限 (5 秒) まで待って空かなかったら (止まった書き込み)、
+/// その回と、 それまでに落ちた record の数を返す。 書き込みにかかった時間では見ない (#929: 前は 1 秒を越えた書き込みを止まったと
+/// 見ていて、 書き出しが遅いと、 行の lock と関係なく畳むのを待つだけで越えた)。
+fn first_stalled_write(tag: &str, ty: ValueType, write: impl Fn(&Engine, u64, u16, u32)) -> Option<(u32, u64)> {
     let path = format!("/tmp/enchudb-sync-bridge-row-lock-{tag}-{}", std::process::id());
     let _ = db_files::remove_db(&path);
     let mut eng = Engine::create_with_capacity(&path, 1 << 16).unwrap();
@@ -37,12 +36,11 @@ fn first_slow_write(tag: &str, ty: ValueType, write: impl Fn(&Engine, u64, u16, 
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 256 * 1024).unwrap();
     let hid = eng.himo_id("t.v").unwrap() as u16;
     let rows: Vec<_> = (0..64).map(|_| eng.entity_in("t").unwrap()).collect();
-    let mut slow = None;
+    let mut stalled = None;
     for i in 0..WRITES {
-        let started = Instant::now();
         write(&eng, rows[i as usize % rows.len()], hid, i);
-        if started.elapsed() >= SLOW {
-            slow = Some((i, started.elapsed()));
+        if eng.wal_room_wait_timeouts() > 0 {
+            stalled = Some((i, eng.wal_dropped_records()));
             break;
         }
         if i % 100 == 99 {
@@ -55,24 +53,24 @@ fn first_slow_write(tag: &str, ty: ValueType, write: impl Fn(&Engine, u64, u16, 
     }
     drop(eng);
     drop(Cleanup(path));
-    slow
+    stalled
 }
 
 /// schema の `commit()` と同じ形: 行を握って数の列を書く。
 #[test]
 fn a_writer_holding_its_row_does_not_stall_the_bridge() {
-    let slow = first_slow_write("number", ValueType::Number, |eng, e, hid, i| {
+    let stalled = first_stalled_write("number", ValueType::Number, |eng, e, hid, i| {
         let _row = eng.write_row(e);
         eng.tie_to_by_id(e, hid, i);
     });
-    assert_eq!(slow, None, "(回, 時間): 行を握った書き込みが、 WAL の空きを待って止まった");
+    assert_eq!(stalled, None, "(回, 落ちた record): 行を握った書き込みが、 WAL の空きを待って止まった");
 }
 
 /// Leaf の書き込みは中で行を握る。
 #[test]
 fn a_leaf_writer_does_not_stall_the_bridge() {
-    let slow = first_slow_write("leaf", ValueType::Leaf, |eng, e, hid, i| {
+    let stalled = first_stalled_write("leaf", ValueType::Leaf, |eng, e, hid, i| {
         eng.tie_text_to_by_id(e, hid, &format!("memo-{i}"));
     });
-    assert_eq!(slow, None, "(回, 時間): Leaf の書き込みが、 WAL の空きを待って止まった");
+    assert_eq!(stalled, None, "(回, 落ちた record): Leaf の書き込みが、 WAL の空きを待って止まった");
 }

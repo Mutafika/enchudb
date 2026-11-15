@@ -7,7 +7,7 @@
 use enchudb_engine::change_log::Truncated;
 use enchudb_engine::changefeed::ChangeListener;
 use enchudb_engine::transport::WireRecord;
-use enchudb_engine::{db_files, Engine, ValueType};
+use enchudb_engine::{db_files, Engine, FaultKind, ValueType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -216,6 +216,10 @@ fn a_stalled_listener_overrun_by_the_log_is_detached() {
     let started = Instant::now();
     write(&eng, 100..40_000);
     let took = started.elapsed();
+    // 書き手が WAL の空きを待たされた印 (空きを上限 (5 秒) まで待って空かなかった回数, WAL に載らずに断られた書き込みの数)。 止まった
+    // listener を畳むのが待つと、 書き手は空きを待ち切れないか、 「畳めない状態」 と見て待たずに断られる。 書くのにかかった時間では
+    // 見ない (#929: 書き出しが遅いと、 listener と関係なく畳みだけで 3 秒を越えた)
+    let stalled = (eng.wal_room_wait_timeouts(), eng.fault_count(FaultKind::WalSpace));
     rec.gate.store(true, Ordering::Release);
     eng.oplog_sync().unwrap();
     let until = Instant::now() + Duration::from_secs(30);
@@ -229,7 +233,7 @@ fn a_stalled_listener_overrun_by_the_log_is_detached() {
     let resumed = eng.add_change_listener_from(again, first);
     drop(eng);
     let _ = db_files::remove_db(&p);
-    assert!(took < Duration::from_secs(3), "書き手が止まった listener を待った ({took:?})");
+    assert_eq!(stalled, (0, 0), "書き手が止まった listener を待った (空きを待ち切れなかった, 断られた) (書くのに {took:?})");
     let lost_from = detached.expect("外したことを知らせていない");
     // 渡せなかった最初の record の HLC (位置を記録が捨てる時に分かる。 0 は 「分からない」 で、 外す時に控えていない)
     assert!(lost_from.wall > 0, "渡せなかった最初の record の HLC が無い: {lost_from:?}");
