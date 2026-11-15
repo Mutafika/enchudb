@@ -18271,7 +18271,7 @@ impl Engine {
     /// 取れなかった時 (#883: 後始末の後に、 払い出し位置から同じ場所を取った書き手が先に生かした) の相手は、 前の住人の居ない新しい
     /// 場所 (全部なめが払い出し位置の手前を穴として拾った) なので、 外す写像も移す削除も無い (写像は生かしてから載るので、 載った写像は
     /// 外さない、 `remove_local_unless`)。 置いた覚えは呼び手が外す ([`Self::abandon_reuse`])。 例外は、 払い出し位置から取った書き手が
-    /// 退避表に削除のある identity の払い出しで、 生かした場所を殺してから写像を載せる形 (`remove_local_unless` の doc、 review930 [6])。
+    /// 退避表に削除のある identity の払い出しで、 生かした場所を殺してから写像を載せる形 (`remove_local_unless` の doc、 review930 [6]、 #938)。
     fn prepare_reuse(&self, slot: u32, named: bool) -> ReusePrep {
         // 前の住人 (消えた行) の番号。 生かす前の場所の最後の行
         let gone = self.last_local_of_slot(slot);
