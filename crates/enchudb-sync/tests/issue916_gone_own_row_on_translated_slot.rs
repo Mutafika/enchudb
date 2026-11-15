@@ -263,3 +263,65 @@ fn a_ref_to_a_gone_translated_row_does_not_make_a_phantom_row() {
     let c_val = eng_c.get(ws[0], "users.company");
     assert_eq!(c_val, Some(u64::from(eid_local(f0))), "C の W が F0 (C の消えた行) を指さない");
 }
+
+/// 読み直し A2: A が受けた C の行 F0 に書き (bridge の前)、 C が F0 を消して F1 を作り、 A が受けて F1 が F0 の場所を使い回した所で落ちた
+/// 像 (page cache は残る = 写し) を開く。 前の宛名の覚えはメモリだけなので無い。 A の F0 への書き込みは、 宛名が分からない (場所の最後の
+/// 行でない) ので配らない。 自分の世界番号で配ると、 C で A の行と読まれて幻の行 (F0 に書いた値の行) ができた。
+///
+/// 受けるのは `apply_records` で (pull の中継は bridge を回すので、 書き込みが落ちる前に配られる形を避ける)。
+///
+/// falsify: bridge の 「宛名が分からない書き込みは配らない」 を外すと、 C に値 5 の行が現れる。
+#[test]
+fn a_write_to_a_gone_translated_row_is_not_sent_under_our_number_after_a_crash() {
+    let (pa, pc) = (tmp_path("a2a"), tmp_path("a2c"));
+    let image = format!("{pa}-image");
+    let _c = Cleanup(vec![pa.clone(), pc.clone(), image.clone()]);
+    let transport = transport(&[1, 3]);
+    let eng_c = make_notes(&pc, 3, 100);
+    let sync_c = Syncer::new(eng_c.clone(), transport.clone());
+    let f1 = {
+        let eng_a = make_notes(&pa, 1, 1);
+        let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+        let f0 = eng_c.entity_in("notes").unwrap();
+        eng_c.tie_to(f0, "notes.note", 40u32);
+        eng_c.oplog_sync().unwrap();
+        sync_c.publish_since(Hlc::ZERO);
+        sync_a.apply_records(&transport.pull_as(1, 3, Hlc::ZERO));
+        let on_a = eng_a.pull_raw("notes.note", 40u32);
+        assert_eq!(on_a.len(), 1, "前提: A に F0 がある");
+        let f0_on_a = on_a[0];
+        eng_a.persist_sync_state().unwrap();
+        eng_a.oplog_sync().unwrap();
+        let hold = eng_a.hold_consumer();
+        let checkpoint = eng_a.stats().oplog_checkpoint;
+        eng_a.tie_to(f0_on_a, "notes.note", 5u32);
+        // C が F0 を消して F1 を作る。 A が受けて、 F1 が F0 の場所を使い回す
+        eng_c.delete(f0);
+        let f1 = eng_c.entity_in("notes").unwrap();
+        eng_c.tie_to(f1, "notes.note", 50u32);
+        eng_c.oplog_sync().unwrap();
+        sync_c.publish_since(Hlc::ZERO);
+        sync_a.apply_records(&transport.pull_as(1, 3, Hlc::ZERO));
+        assert!(eng_a.pull_raw("notes.note", 5u32).is_empty(), "前提: A で F0 が消えた");
+        let on_a = eng_a.pull_raw("notes.note", 50u32);
+        assert_eq!(on_a.len(), 1, "前提: A に F1 がある");
+        assert_eq!(slot(on_a[0]), slot(f0_on_a), "前提: F1 は F0 の場所を使い回した");
+        assert_ne!(on_a[0], f0_on_a, "前提: 使い回した場所の世代は F0 より新しい");
+        assert_eq!(eng_a.stats().oplog_checkpoint, checkpoint, "前提: A の書き込みは checkpoint の後ろ (bridge の前)");
+        eng_a.persist_sync_state().unwrap();
+        copy_dir(std::path::Path::new(&pa), std::path::Path::new(&image));
+        drop(hold);
+        drop(sync_a);
+        f1
+    };
+    let eng_a = Engine::open_concurrent_with_oplog(&image, WAL).unwrap();
+    eng_a.set_peer_id(1);
+    let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+    eng_a.oplog_sync().unwrap();
+    sync_a.publish_since(Hlc::ZERO);
+    for _ in 0..3 {
+        sync_c.pull_once(1);
+    }
+    assert_eq!(eng_c.get(f1, "notes.note"), Some(50), "前提: C の F1 は変わらない");
+    assert!(eng_c.pull_raw("notes.note", 5u32).is_empty(), "C に、 A が消えた受けた行 F0 に書いた値の幻の行ができた");
+}
