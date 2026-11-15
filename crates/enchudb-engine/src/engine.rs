@@ -3649,7 +3649,8 @@ mod eid_gen_claim_tests {
     /// #913: 受信・束ねの道 (`ensure_live_slot`、 ここでは名前で束ねる `bind_remote_eid` が消えた行を指した形) が死の印を落とした後・
     /// 生きている印を立てる前に、 別の書き手がその場所を使い回して消し終えると、 生きている印が殺された場所に立つ (「生きている、
     /// 死の印あり」 = きれいに閉じなかった後の突き合わせが、 生かした行を消す)。 消す書き手は行の lock を待たされるか (直した形)、
-    /// 消し終える (直す前) まで割り込み点で待つ (時間で待たない)。
+    /// 消し終える (直す前) まで割り込み点で待つ (時間で待たない)。 #931 から使い回しの道も場所の行を握るので、 別の書き手の insert は
+    /// 握られた場所を飛ばして (待たされた印 = "blocked") 束ねた後に別の場所を取る (同じ場所を取った時だけ消す)。
     #[test]
     fn a_slot_reused_and_deleted_while_ensure_live_revives_it_has_consistent_marks() {
         let (path, eng) = engine("ensurelive");
@@ -3671,8 +3672,9 @@ mod eid_gen_claim_tests {
             // 印を落とした後・生きている印を立てる前に、 別の thread が同じ場所を使い回して (空きの一覧から) 消す
             let h = std::thread::spawn(move || {
                 let b = e2.entity_in("u").unwrap();
-                assert_eq!(e2.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
-                e2.delete(b);
+                if e2.slot_unchecked(b) == slot {
+                    e2.delete(b);
+                }
                 let _ = tx.send("deleted");
             });
             let first = rx.recv().unwrap();
