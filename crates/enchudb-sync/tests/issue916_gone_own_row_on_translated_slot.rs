@@ -92,7 +92,7 @@ fn make_refs(path: &str, peer: PeerId, cap: u32) -> Arc<Engine> {
 /// そこで落ちた像 (page cache は残る = 写し) を開く。 F1 は A に残り、 写しの A を受けた C でも残る。
 ///
 /// falsify: 再生の 「翻訳した行の場所の古い世代の record は当てない」 を外すと、 写しの A で F1 が消える。 bridge の 「record の世代が
-/// 場所の今の行の世代と違えば今の逆写像を使わない」 を外すと、 C で F1 が消える。
+/// 場所の今の行の世代と違えば今の逆写像を使わない」 を外すと、 C で F1 が消える。 宛名の分からない Delete も配らないと、 C に X が残る。
 #[test]
 fn a_gone_own_rows_records_do_not_hit_a_translated_row_after_a_crash() {
     let (pa, pc) = (tmp_path("a"), tmp_path("c"));
@@ -108,6 +108,10 @@ fn a_gone_own_rows_records_do_not_hit_a_translated_row_after_a_crash() {
         let x = eng_a.entity_in("notes").unwrap();
         eng_a.tie_to(x, "notes.note", 1u32);
         eng_a.oplog_sync().unwrap();
+        // C は X を受けている (落ちた後に配る X の Delete で消える)
+        sync_a.publish_since(Hlc::ZERO);
+        sync_c.pull_once(1);
+        assert_eq!(eng_c.pull_raw("notes.note", 1u32).len(), 1, "前提: C に X がある");
         let checkpoint = eng_a.stats().oplog_checkpoint;
         // checkpoint の後ろ: X の Tie と Delete
         eng_a.tie_to(x, "notes.note", 2u32);
@@ -141,6 +145,7 @@ fn a_gone_own_rows_records_do_not_hit_a_translated_row_after_a_crash() {
         sync_c.pull_once(1);
     }
     assert_eq!(eng_c.get(f1, "notes.note"), Some(50), "落ちた後の bridge が、 X の record を F1 宛てに配った");
+    assert!(eng_c.pull_raw("notes.note", 1u32).is_empty(), "落ちた後の bridge が X の Delete を配らない (C に X が残る)");
     assert_eq!(eng_a.get(f1_on_a, "notes.note"), Some(50), "A の F1 は残る");
 }
 
@@ -151,11 +156,13 @@ fn a_gone_own_rows_records_do_not_hit_a_translated_row_after_a_crash() {
 /// F1 の宛名 = 世代が ref の値と違う)。 consumer を止めて、 Z が使い回した所を bridge が越える前に配る (受信の中継が bridge を
 /// 回すので、 ref と使い回しの間に pull を挟まない)。
 ///
-/// falsify: bridge の Ref の値の世代の照合を外すと、 C で W が F1 を指す。 覚えの 「書いた後の変わり目の行の世代が record の世代と
-/// 違えば使わない」 を外すと、 `again` で C の W が F1 を指す。
+/// `pruned`: ref を張る前に bridge を 2 回回して前の宛名の覚えを外す (覚えの無い道)。
+///
+/// falsify: bridge の Ref の値の世代の照合を外すと、 C で W が F1 を指す (覚えの無い道は `pruned`)。 覚えの 「書いた後の変わり目の行の
+/// 世代が record の世代と違えば使わない」 を外すと、 `again` で C の W が F1 を指す。
 #[test]
 fn a_ref_to_a_gone_own_row_does_not_point_at_the_translated_row_on_its_slot() {
-    for again in [false, true] {
+    for (again, pruned) in [(false, false), (false, true), (true, false)] {
         let (pa, pc) = (tmp_path("ea"), tmp_path("ec"));
         let _c = Cleanup(vec![pa.clone(), pc.clone()]);
         let transport = transport(&[1, 3]);
@@ -187,6 +194,11 @@ fn a_ref_to_a_gone_own_row_does_not_point_at_the_translated_row_on_its_slot() {
             sync_a.pull_once(3);
             assert!(eng_a.pull_raw("companies.name", 50u32).is_empty(), "前提: A で F1 が消えた");
         }
+        if pruned {
+            eng_a.oplog_sync().unwrap();
+            eng_a.oplog_sync().unwrap();
+            assert_eq!(eng_a.former_addresses_len(), 0, "前提: 前の宛名の覚えが無い");
+        }
         let w = eng_a.entity_in("users").unwrap();
         eng_a.tie_to(w, "users.uid", 7u32);
         eng_a.tie_ref_to(w, "users.company", x);
@@ -208,7 +220,7 @@ fn a_ref_to_a_gone_own_row_does_not_point_at_the_translated_row_on_its_slot() {
         let ws = eng_c.pull_raw("users.uid", 7u32);
         assert_eq!(ws.len(), 1, "前提: C に W が届いた");
         let c_val = eng_c.get(ws[0], "users.company");
-        assert_ne!(c_val, Some(u64::from(eid_local(f1))), "C の W が F1 を指す (A では消えた行 X を指す、 again = {again})");
+        assert_ne!(c_val, Some(u64::from(eid_local(f1))), "C の W が F1 を指す (A では消えた行 X を指す、 again = {again}、 pruned = {pruned})");
     }
 }
 
