@@ -329,6 +329,15 @@ impl Generations {
         read_raw(r, slot) & DEAD != 0
     }
 
+    /// 場所の (今の世代, 「死んでいる」 印) を 2 B の 1 回の読みで ([`Self::get`] + [`Self::is_dead`] は同じ 2 B と page の印を 2 回読む)。
+    /// 世代を持たない DB は (0, false)。
+    #[inline]
+    pub(crate) fn state(&self, slot: u32) -> (u32, bool) {
+        let Some(r) = self.region.get() else { return (0, false) };
+        let v = read_raw(r, slot);
+        ((v & GEN_MASK) as u32, v & DEAD != 0)
+    }
+
     /// 場所 → 今の世代の local。
     #[inline]
     pub(crate) fn local(&self, slot: u32) -> u32 {
