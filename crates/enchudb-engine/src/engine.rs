@@ -19853,7 +19853,7 @@ impl Engine {
     /// (1 件 = `(peer, foreign_local)` → HLC)。
     ///
     /// 戻り値は [`Engine::remote_delete_apply`] と同じ (`false` = 既に載っている削除より古いので不採用)。 もう無い自分の行の
-    /// 削除は、 使い回す時に移した削除の版数を上げた時だけ `true` ([`Self::raise_gone_own_delete`]、 #915)。
+    /// 削除は、 使い回す時に移した削除の版数を上げた時だけ `true` (`raise_gone_own_delete`、 #915)。
     ///
     /// [`EidTranslator::if_unmapped`]: crate::eid_translator::EidTranslator::if_unmapped
     pub fn remote_delete_apply_foreign(
