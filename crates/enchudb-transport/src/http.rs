@@ -564,6 +564,7 @@ fn send_response_with_body(stream: &mut TcpStream, status: u16, body: &[u8]) -> 
         404 => "Not Found",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Unknown",
     };
     let header = format!(

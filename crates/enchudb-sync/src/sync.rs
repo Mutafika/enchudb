@@ -1658,8 +1658,9 @@ impl Syncer {
 
     /// 自 peer の commit 済み ops を transport に publish
     /// (source は `_sync_ops` ring — [`Syncer::collect_records_since`] 参照)。
-    /// 戻り値は publish したレコード数 (重複カウントしない、 最終 broadcast/peer 別
-    /// のいずれか単一経路で配信した数)。
+    /// 戻り値は transport に渡した record の数 (broadcast は 1 回分、 peer 別は宛先ごとの和)。 #955: transport が送る前に捨てる位置
+    /// ([`Transport::publish_floor`]) を言う時、 その位置以下の record は集めないので数えない (渡した後に transport が捨てた record は
+    /// 数える = 実際に送った数とは限らない)。
     ///
     /// request4: transport が `known_peers()` を返すなら **per-peer 経路** (=
     /// `publish_since_for_peer` を全 peer に対して呼ぶのと同じ配り方。 #949: record を
@@ -1823,7 +1824,8 @@ impl Syncer {
 
     /// request4: `target_peer` 限定で publish。 `SubscriptionFilter::should_send`
     /// で per-peer に絞った record のみを `transport.publish_to(self_peer,
-    /// target_peer, ...)` で送る。 戻り値は実際に送った record 数。
+    /// target_peer, ...)` で送る。 戻り値は transport に渡した record の数 ([`Self::publish_since`] と同じ: #955 の
+    /// [`Transport::publish_floor`] が言う位置以下は集めないので数えない、 渡した後に transport が捨てた record は数える)。
     ///
     /// SaaS の full sync (= AllRecords filter) では `since` フィルタ後の全 record
     /// を target に送る (= 旧 broadcast 経路の挙動を per-peer 化したもの)。
@@ -3529,6 +3531,8 @@ mod tests {
     /// #955: filter は落とす物 (`Pick`) と全部を通す物 (`AllRecords`)、 transport は借りて受ける形を上書きする / しない、 宛先ごとに違う
     /// 捨てる位置 (`publish_floor`、 ホストの client の形) を持つ / 持たない、 の組で。 全部を通す filter の時だけ、 集める前に全部の宛先の
     /// 捨てる位置の最小で絞る (配る record と配らなかった記録は同じ。 数は transport に渡した数)。
+    ///
+    /// #962: 位置を言わない宛先がある組 (集める前に絞らない) と、 書き手の位置を言わない宛先がある組 (その書き手は絞らない) も。
     #[test]
     fn publish_hands_out_what_the_full_copy_did() {
         use std::sync::Mutex;
@@ -3637,9 +3641,16 @@ mod tests {
         cuts.push(hlcs[hlcs.len() - 1]);
         // #955: 宛先ごとに違う捨てる位置 (書き手 1 と 9 だけ。 7 は捨てない)
         let at = |i: usize| hlcs[(i * hlcs.len() / 7).min(hlcs.len() - 1)];
-        let floors: Vec<(PeerId, Vec<(PeerId, Hlc)>)> =
-            [5, 6, 7, 8].iter().enumerate().map(|(i, &p)| (p, vec![(1, at(i + 1)), (9, at(5 - i))])).collect();
-        let floor_of = |to: PeerId| floors.iter().find(|(p, _)| *p == to).map(|(_, f)| f.clone()).unwrap_or_default();
+        type Floors = Vec<(PeerId, Vec<(PeerId, Hlc)>)>;
+        let floors: Floors = [5, 6, 7, 8].iter().enumerate().map(|(i, &p)| (p, vec![(1, at(i + 1)), (9, at(5 - i))])).collect();
+        // #962: 宛先の一部 (5 と 6) だけが位置を言う組 (言わない宛先がある → 集める前に絞らない) と、 宛先 7 が書き手 9 の位置を言わない
+        // 組 (書き手 9 は絞らない)。 どちらも、 他の宛先の位置で絞ると、 位置を言わない宛先にその位置以下の record が届かない
+        let some: Floors = floors.iter().filter(|(p, _)| [5, 6].contains(p)).cloned().collect();
+        let holes: Floors = floors
+            .iter()
+            .map(|(p, f)| (*p, f.iter().filter(|(a, _)| !(*p == 7 && *a == 9)).copied().collect()))
+            .collect();
+        let floor_of = |set: &Floors, to: PeerId| set.iter().find(|(p, _)| *p == to).map(|(_, f)| f.clone());
         let above = |f: &[(PeerId, Hlc)], r: &WireRecord| f.iter().find(|(a, _)| *a == r.author_peer).is_none_or(|(_, h)| r.hlc > *h);
         let mut partial = 0;
         for &since in &cuts {
@@ -3648,10 +3659,12 @@ mod tests {
                 partial += 1;
             }
             for (fname, filter) in [("Pick", Arc::new(Pick) as Arc<dyn SubscriptionFilter>), ("AllRecords", Arc::new(AllRecords))] {
-                for (with_floors, refs) in [(false, false), (false, true), (true, true)] {
-                    let what = format!("since {since:?} filter {fname} floors {with_floors} refs {refs}");
+                let sets: [(&str, &Floors, bool); 5] =
+                    [("none", &vec![], false), ("none", &vec![], true), ("all", &floors, true), ("some", &some, true), ("holes", &holes, true)];
+                for (fset, set, refs) in sets {
+                    let what = format!("since {since:?} filter {fname} floors {fset} refs {refs}");
                     for peers in [vec![], vec![1], vec![1, 5], vec![5, 1, 6, 7, 8]] {
-                        let tr = Rec::new(peers.clone(), if with_floors { floors.clone() } else { vec![] }, refs);
+                        let tr = Rec::new(peers.clone(), set.clone(), refs);
                         let syncer = Syncer::new(eng.clone(), tr.clone() as Arc<dyn Transport>);
                         syncer.set_subscription_filter(filter.clone());
                         let n = syncer.publish_since(since);
@@ -3665,18 +3678,26 @@ mod tests {
                             want.push((u32::MAX, want_all.iter().map(key).collect()));
                         }
                         for &p in &targets {
-                            let f = if with_floors { floor_of(p) } else { vec![] };
+                            let f = floor_of(set, p).unwrap_or_default();
                             want.push((p, want_all.iter().filter(|r| filter.should_send(p, r) && above(&f, r)).map(key).collect()));
                         }
                         assert!(got == want, "{what} peers {peers:?}: 配った record が直す前と違う");
-                        // 数は transport に渡した数: 全部を通す filter は、 全部の宛先の捨てる位置の最小 (書き手ごと) 以下を集めない
+                        // 数は transport に渡した数: 全部を通す filter は、 全部の宛先が位置を言った時だけ、 全部の宛先が言った書き手の
+                        // 位置の最小以下を集めない
                         let handed: usize = if peers.is_empty() {
                             want_all.len()
                         } else {
-                            let least: Vec<(PeerId, Hlc)> = if with_floors && filter.sends_all() {
-                                [1, 9].iter().map(|&a| (a, targets.iter().map(|&p| floor_of(p).iter().find(|(x, _)| *x == a).unwrap().1).min().unwrap_or(Hlc::ZERO))).collect()
-                            } else {
-                                vec![]
+                            let answers: Option<Vec<Vec<(PeerId, Hlc)>>> = targets.iter().map(|&p| floor_of(set, p)).collect();
+                            let least: Vec<(PeerId, Hlc)> = match answers {
+                                Some(a) if filter.sends_all() && !a.is_empty() => [1, 7, 9]
+                                    .iter()
+                                    .filter_map(|&w| {
+                                        let each: Option<Vec<Hlc>> =
+                                            a.iter().map(|f| f.iter().find(|(x, _)| *x == w).map(|(_, h)| *h)).collect();
+                                        each.map(|hs| (w, hs.into_iter().min().unwrap()))
+                                    })
+                                    .collect(),
+                                _ => vec![],
                             };
                             targets.iter().map(|&p| want_all.iter().filter(|r| filter.should_send(p, r) && above(&least, r)).count()).sum()
                         };
@@ -3697,10 +3718,10 @@ mod tests {
                         }
                     }
                     // peer を名指しする道
-                    let tr = Rec::new(vec![], if with_floors { floors.clone() } else { vec![] }, refs);
+                    let tr = Rec::new(vec![], set.clone(), refs);
                     let syncer = Syncer::new(eng.clone(), tr.clone() as Arc<dyn Transport>);
                     syncer.set_subscription_filter(filter.clone());
-                    let f6 = if with_floors { floor_of(6) } else { vec![] };
+                    let f6 = floor_of(set, 6).unwrap_or_default();
                     let least6 = if filter.sends_all() { f6.clone() } else { vec![] };
                     assert_eq!(
                         syncer.publish_since_for_peer(6, since),
