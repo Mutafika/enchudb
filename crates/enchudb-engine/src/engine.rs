@@ -13178,10 +13178,11 @@ impl Engine {
                         continue;
                     }
                     // #731 (段 4): 自分の行の世界番号は世代込み (生きている行 = 今の世代)
-                    // #917 (G): 宛名は cell を読む前に引き、 読んだ後に場所の最後の行が同じか確かめる (間にその行が消えて場所が
-                    // 使い回されると、 新しい行宛ての Untie になる。 使い回すと世代が変わる)
-                    let row = self.own_world_local(local);
-                    let (owner, owner_local) = self.eid_translator.reverse(local).unwrap_or((self_peer, row));
+                    // #917 (G): 宛名は cell を読む前に引き、 読んだ後に場所の世代が同じか確かめる (間にその行が消えて場所が使い回される
+                    // と、 新しい行宛ての Untie になる。 消すと世代が上がる。 消えただけの行の Untie も出さないが、 その行の Delete が出る)
+                    let g0 = self.generations().get(local);
+                    let (owner, owner_local) =
+                        self.eid_translator.reverse(local).unwrap_or_else(|| (self_peer, self.own_world_local(local)));
                     #[cfg(test)]
                     if let Some(wal) = self.oplog.as_ref() {
                         state_read_hook::call(wal);
@@ -13192,7 +13193,7 @@ impl Engine {
                     if !empty || !mine(hlc) || !self.entities.is_live(local) {
                         continue;
                     }
-                    if self.own_world_local(local) != row {
+                    if self.generations().get(local) != g0 {
                         continue;
                     }
                     #[cfg(test)]
