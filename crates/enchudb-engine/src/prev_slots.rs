@@ -29,6 +29,7 @@
 //!   使い回しは記録を書いてから門 ([`PrevSlots::enter`]) の中で tomb.seg を 0 にし、 書き出しは門を閉じて (門を通った書き手が
 //!   居れば) `prev.seg` をもう一度書き出してから tomb.seg を書き出す (#656 の 「中身 → 列」 と同じ並べ方)。 0 にした tomb.seg が
 //!   届いた像には記録も届いている
+//! - commit は書いた場所まで歩幅で伸ばす (file は疎、 gen.seg と同じ)
 //! - 場所を次に使い回したら上書きする (書き出し済みの退避と重なっても残してよい: 開く時に退避表と比べて、 載っていれば何もしない)
 //! - 記録は sync する DB (`sync_tables_on`) の使い回しで、 移した削除がある時だけ書く。 世代を持たない DB (v14 以下 / packed /
 //!   wasm / 予約の表) は作らない・書かない
@@ -191,12 +192,14 @@ impl PrevSlots {
         (len.saturating_sub(PREV_HEADER) / RECORD).min(u32::MAX as usize) as u32
     }
 
-    /// 場所 `slot` に前の住人を書く (mmap に書くだけ。 commit を伸ばす時だけ file を伸ばす)。 書けたか (書けない = `prev.seg` が無い /
+    /// 場所 `slot` に前の住人を書く (mmap に書くだけ。 commit を伸ばす時だけ file を伸ばす、 歩幅は `grow_amortized`)。 書けたか (書けない = `prev.seg` が無い /
     /// 範囲の外 / 空き不足)。 呼び手は場所を握っている (行の lock と空きの一覧から取り出した場所 = 同じ場所の書き手は 1 本)。
     pub(crate) fn write(&self, slot: u32, rec: &PrevRecord) -> bool {
         let Some(r) = self.region.get() else { return false };
         let off = record_off(slot);
-        if off + RECORD > r.len() || r.ensure_committed_sparse(off + RECORD, RECORD).is_err() {
+        // commit は gen.seg と同じく歩幅で伸ばす (`ensure_committed`)。 page ごとに伸ばす `ensure_committed_sparse` は、 使い回す
+        // 場所が上へ進む間 page ごとに file を伸ばして空きを見に行き、 名前のある表の 「消して足す」 が 1 回 +0.5 µs だった
+        if off + RECORD > r.len() || r.ensure_committed(off + RECORD).is_err() {
             return false;
         }
         r.write_atomic(off, &rec.encode());
