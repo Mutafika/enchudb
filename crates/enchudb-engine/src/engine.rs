@@ -4405,17 +4405,14 @@ mod checkpoint_before_apply_tests {
 /// - 辞書の書き出し (`settle_retired_words` の msync、 FS が混むと秒単位 = #847) は当てた後
 ///
 /// 試験: 書き手 A が止められている間に、 別の列へ書く書き手 B が WAL の数倍を書き、 待たされない (落とさない・断らない・止める側が
-/// 放す前に書き終える) ことを見る。 止める時間は `ENCHU_850_HOLD_MS` (既定 1500 ms。 6000 にすると、 直す前の形は空きの待ちの上限
-/// (5 秒) を越えて落とす / 断る)。
+/// 放す前に書き終える) ことを見る。 止める側は時間で持たず、 B が書き終えるか、 B が断られた / 落とされた / 空きを待ち切れなかった
+/// 印が立つまで持つ ([`hold_until_b_ends`]、 #912 / #926)。 直す前の形は、 B が空きの待ちの上限 (5 秒) を越えて断られる / 落とされる
+/// ので放す。 「書き手が空きを待っている」 も時間 (書いた数が増えない) でなく、 待ち手の中に居るか ([`RoomWaiters`]) で見る。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod apply_liveness_tests {
     use super::*;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-
-    fn hold() -> Duration {
-        Duration::from_millis(std::env::var("ENCHU_850_HOLD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500))
-    }
 
     fn path(tag: &str) -> String {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -4440,11 +4437,9 @@ mod apply_liveness_tests {
 
     /// 書き手 B が書く数 (WAL 64 KiB は Tie の record で約 1400 件 = 6000 件は WAL の 4 倍ほど)
     const B_WRITES: u32 = 6000;
-    /// 止める側が放す時までに B が書き終えているべき数 (WAL 2 つ分を越える)。 直す前の形は、 A の record のある区画を畳めないので、
-    /// 2 区画を埋めた所 (WAL 1 つ分、 約 1400 件) で止まった
-    const B_BEFORE_RELEASE: u32 = 3000;
 
-    /// [`a_writer_held_by_a_long_column_holder_does_not_hold_the_wal`] の書き手 A / B の様子 (止める側が見る)。
+    /// 止める側が持つ間に書く書き手 (B) と、 止められる書き手 (A) の様子 (止める側が見る)。 `a_*` を使うのは
+    /// [`a_writer_held_by_a_long_column_holder_does_not_hold_the_wal`] だけ。
     #[derive(Default)]
     struct HeldWriters {
         /// A が書き始めた / 書き込みから返った
@@ -4453,6 +4448,46 @@ mod apply_liveness_tests {
         /// B が書いた数 / 断られた数
         b_done: std::sync::atomic::AtomicU32,
         b_rejected: std::sync::atomic::AtomicU32,
+    }
+
+    /// WAL の空きを待っている thread (#926)。 engine が置いた待ち手 (`wait_for_wal_room`) を、 中に居る thread を控える物で包む
+    /// (待ち方は変えない)。 「書き手が空きを待ち始めた」 を、 書いた数が 50 ms 増えないか (時間) でなく、 待ち手の中に居るか (状態)
+    /// で見るため。 前の形は、 負荷で書き手が 50 ms 走らないだけで 「待ち始めた」 と読んだ。
+    #[derive(Default)]
+    struct RoomWaiters(std::sync::Mutex<Vec<std::thread::ThreadId>>);
+
+    impl RoomWaiters {
+        fn watch(eng: &Arc<Engine>) -> Arc<Self> {
+            let waiters = Arc::new(Self::default());
+            let w = waiters.clone();
+            let engine_addr = Arc::as_ptr(eng) as usize;
+            eng.oplog.as_ref().unwrap().set_room_waiter(Some(Arc::new(move |size, applying| {
+                // SAFETY: engine が置く待ち手と同じ (Engine の Drop が待ち手を外すまで engine は生きている)
+                let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
+                let me = std::thread::current().id();
+                w.0.lock().unwrap_or_else(|p| p.into_inner()).push(me);
+                let room = engine.wait_for_wal_room(size, applying);
+                let mut v = w.0.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(i) = v.iter().position(|&t| t == me) {
+                    v.swap_remove(i);
+                }
+                room
+            })));
+            waiters
+        }
+
+        /// `t` の thread が今、 WAL の空きを待っている。
+        fn has(&self, t: std::thread::ThreadId) -> bool {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).contains(&t)
+        }
+    }
+
+    /// `ready` が立つまで待つ。 上限は前提が立たない時に止まらないためだけ。
+    fn wait_until(ready: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(60);
+        while !ready() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// 止める側が放した時の様子。
@@ -4653,6 +4688,11 @@ mod apply_liveness_tests {
     /// 辞書の語を回収する DB で、 A が Tag の値を書き換えた時の辞書の書き出し (`settle_retired_words`、 msync) が長くても、 B は
     /// 待たされない。 直す前は、 A が当てる途中 (WAL の印を持ったまま) にこれを呼び、 msync の間 checkpoint が止まった (#847: FS が
     /// 混むと msync は秒単位)。 書き出しの長さは割り込み点 (`settle_call_hook`) で作る。
+    ///
+    /// 時間では見ない (#926)。 割り込み点は、 B が全部書き終えるか、 B が断られた / 落とされた / 空きを待ち切れなかった印が立つまで
+    /// 持つ ([`hold_until_b_ends`])。 直した形は B が書き終えてから放し、 直す前の形は B が空きを待ち切れずに断られるので放し、 本題の
+    /// assert で落ちる。 前は 1.5 秒持って 「終わる時までに B が 3000 件書いた」 を見ていて、 CI では A と関係なく書き出しが遅い回に
+    /// 届かなかった (711 件)。
     #[test]
     fn a_slow_vocab_settle_does_not_hold_the_wal() {
         let p = path("settle");
@@ -4662,39 +4702,42 @@ mod apply_liveness_tests {
         assert!(eng.vocab.reclaim_enabled(), "前提: 辞書の語を回収する DB");
         let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
         eng.try_tie_text_to_by_id(e1, g, "aaaa").unwrap();
-        let hold = hold();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
-        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ab = Arc::new(HeldWriters::default());
         let a = {
-            let (eng, b_done) = (eng.clone(), b_done.clone());
+            let (eng, ab) = (eng.clone(), ab.clone());
             std::thread::spawn(move || {
-                // 書き出しが終わる時までに B が書いた数
-                let at_end = Arc::new(std::sync::atomic::AtomicU32::new(0));
-                let seen = at_end.clone();
+                // 書き出しを放す時の様子
+                let at_release = Arc::new(std::sync::Mutex::new(None));
+                let seen = at_release.clone();
+                let e = eng.clone();
                 settle_call_hook::set(move || {
                     in_tx.send(()).unwrap();
-                    std::thread::sleep(hold);
-                    seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                    *seen.lock().unwrap() = Some(hold_until_b_ends(&e, &ab));
                 });
                 let r = eng.try_tie_text_to_by_id(e1, g, "bbbb");
-                (r, at_end.load(std::sync::atomic::Ordering::Relaxed))
+                let release = at_release.lock().unwrap().take();
+                (r, release)
             })
         };
         in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が辞書の書き出しを呼んだ");
-        let (rejected, worst) = write_many(&eng, e2, y, B_WRITES, &b_done);
-        let (a_result, before_end) = a.join().unwrap();
+        let (rejected, worst) = write_many_counted(&eng, e2, y, B_WRITES, &ab.b_done, &ab.b_rejected);
+        let (a_result, release) = a.join().unwrap();
+        let release = release.expect("前提: 割り込み点を通った");
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (text, y_now) = (eng.get_text_owned(e1, "t.g"), eng.get_by_id(e2, y));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
         eprintln!(
-            "[settle] B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A の書き出しが終わる時までに書いた {before_end} 件"
+            "[settle] B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A の書き出しを放す時 {release:?}"
         );
+        assert!(!release.gave_up, "前提: B が書き終えるか断られる / 落ちるまで書き出しを持った ({release:?})");
         assert_eq!(a_result, Ok(()), "書き手 A");
         assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
-        assert!(
-            before_end >= B_BEFORE_RELEASE,
-            "B は A の辞書の書き出しが終わるまで待たされた (終わる時までに {before_end} 件、 最大の待ち {worst:?})"
+        assert_eq!(
+            release.b_done, B_WRITES,
+            "B は A の辞書の書き出しが終わるまで待たされた (放す時までに {} 件、 最大の待ち {worst:?})",
+            release.b_done
         );
         assert_eq!((text.as_deref(), y_now), (Some(&b"bbbb"[..]), Some(5999)), "両方の書き込みが当たっている");
     }
@@ -4708,6 +4751,7 @@ mod apply_liveness_tests {
     /// A が Leaf の値を外した (行を消した) 時の旧 slot の書き出し (`settle_retired_leaves`、 msync) が長くても、 B は待たされない。
     /// 直す前は、 A が当てる途中 (WAL の印を持ち、 紐の門の中) にこれを呼んだ (#873 の 2 回目のレビュー、 辞書の形と同じ)。 旧 slot は
     /// 1 つで書き出しの目安 (4 MiB) を越える大きさ (WAL より大きいので並行の形にする前に書く)、 書き出しの長さは割り込み点で作る。
+    /// 割り込み点の持ち方は辞書の形と同じ (時間で持たない、 #926。 前は CI で 「終わる時までに 2382 件 / 1906 件」 で落ちた)。
     #[test]
     fn a_slow_leaf_settle_does_not_hold_the_wal() {
         let running: Vec<_> =
@@ -4728,41 +4772,42 @@ mod apply_liveness_tests {
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 64 * 1024).unwrap();
         assert!(eng.oplog.as_ref().unwrap().two_halves(), "前提: 2 区画の WAL");
-        let hold = hold();
         let (in_tx, in_rx) = std::sync::mpsc::channel();
-        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ab = Arc::new(HeldWriters::default());
         let a = {
-            let (eng, b_done) = (eng.clone(), b_done.clone());
+            let (eng, ab) = (eng.clone(), ab.clone());
             std::thread::spawn(move || {
-                // 書き出しが終わる時までに B が書いた数
-                let at_end = Arc::new(std::sync::atomic::AtomicU32::new(0));
-                let seen = at_end.clone();
+                // 書き出しを放す時の様子
+                let at_release = Arc::new(std::sync::Mutex::new(None));
+                let seen = at_release.clone();
+                let e = eng.clone();
                 settle_call_hook::set_leaf(move || {
                     in_tx.send(()).unwrap();
-                    std::thread::sleep(hold);
-                    seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                    *seen.lock().unwrap() = Some(hold_until_b_ends(&e, &ab));
                 });
                 match free {
                     LeafFree::Untie => eng.untie_by_id(e1, z),
                     LeafFree::Delete => eng.delete(e1),
                 }
-                at_end.load(std::sync::atomic::Ordering::Relaxed)
+                at_release.lock().unwrap().take()
             })
         };
         in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が Leaf の旧 slot の書き出しを呼んだ");
-        let (rejected, worst) = write_many(&eng, e2, y, B_WRITES, &b_done);
-        let before_end = a.join().unwrap();
+        let (rejected, worst) = write_many_counted(&eng, e2, y, B_WRITES, &ab.b_done, &ab.b_rejected);
+        let release = a.join().unwrap().expect("前提: 割り込み点を通った");
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (z_now, y_now) = (eng.get_text_owned(e1, "t.z"), eng.get_by_id(e2, y));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
         eprintln!(
-            "[leaf] {free:?}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A の書き出しが終わる時までに書いた {before_end} 件"
+            "[leaf] {free:?}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A の書き出しを放す時 {release:?}"
         );
+        assert!(!release.gave_up, "{free:?}: 前提: B が書き終えるか断られる / 落ちるまで書き出しを持った ({release:?})");
         assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "{free:?}: B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
-        assert!(
-            before_end >= B_BEFORE_RELEASE,
-            "{free:?}: B は A の Leaf の書き出しが終わるまで待たされた (終わる時までに {before_end} 件、 最大の待ち {worst:?})"
+        assert_eq!(
+            release.b_done, B_WRITES,
+            "{free:?}: B は A の Leaf の書き出しが終わるまで待たされた (放す時までに {} 件、 最大の待ち {worst:?})",
+            release.b_done
         );
         assert_eq!((z_now, y_now), (None, Some(5999)), "{free:?}: 両方の書き込みが当たっている");
     }
@@ -4885,8 +4930,12 @@ mod apply_liveness_tests {
 
     /// WAL が満杯で、 書き手が門の中で空きを待っている間でも、 その紐を長く止める側は待たない (#896)。 前は止める側が門を閉じ、 空きを
     /// 待つ書き手 (上限 5 秒) が出るまで待った (master は待たなかった)。 A を積んだ後・当てる前で止めて WAL を畳めなくし、 B (y への
-    /// tie) と C (y に値のある行の削除) に空きを待たせてから、 y を止める側を走らせる。 止める側が A を放す前に終わるかを見る
-    /// (直す前は、 A を放して空きができるまで終わらない)。
+    /// tie) と C (y に値のある行の削除) に空きを待たせてから、 y を止める側を走らせる。 止める側が A を放す前に、 B と C が空きを
+    /// 待っている間に終わるかを見る (直す前は、 B と C が待ち切れずに (上限 5 秒) 門を出るか、 A を放して空きができるまで終わらない)。
+    ///
+    /// 時間では見ない (#926)。 B / C が空きを待ち始めたかは待ち手の中に居るか ([`RoomWaiters`]) で見る (前は 「書いた数が 50 ms
+    /// 増えない」 で、 負荷で B が 50 ms 走らない回に WAL が埋まる前の C を走らせ、 C が全部消し終えた)。 A は、 止める側が終わるか、
+    /// B / C が待つのをやめるまで放さない (前は 3 秒で放した)。
     #[test]
     fn a_stopper_does_not_wait_for_writers_short_of_wal_room() {
         let running: Vec<_> = [Stopper::Build, Stopper::Guard, Stopper::Subscribe]
@@ -4909,6 +4958,7 @@ mod apply_liveness_tests {
             eng.try_tie_to_by_id(e, y, 7u32).unwrap();
         }
         let wal = eng.oplog.as_ref().unwrap().clone();
+        let waiters = RoomWaiters::watch(&eng);
         let (in_tx, in_rx) = std::sync::mpsc::channel();
         let (release, parked) = std::sync::mpsc::channel::<()>();
         cell_append_hook::set(&wal, move |_| {
@@ -4925,21 +4975,10 @@ mod apply_liveness_tests {
             let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
         };
-        // 書いた数が 50 ms 増えなくなるまで (空きを待ち始めた)
-        let stall = |done: &std::sync::atomic::AtomicU32| {
-            let until = Instant::now() + Duration::from_secs(20);
-            let mut last = u32::MAX;
-            while Instant::now() < until {
-                let now = done.load(std::sync::atomic::Ordering::Acquire);
-                if now == last {
-                    break;
-                }
-                last = now;
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            last
-        };
-        let last = stall(&b_done);
+        let b_id = b.thread().id();
+        // B が空きを待ち始める (A の record の区画を畳めず、 2 区画を埋めた) まで
+        wait_until(|| waiters.has(b_id) || b.is_finished());
+        let last = b_done.load(std::sync::atomic::Ordering::Acquire);
         let c_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let c = {
             let (eng, rows, c_done) = (eng.clone(), rows.clone(), c_done.clone());
@@ -4950,12 +4989,16 @@ mod apply_liveness_tests {
                 }
             })
         };
-        let c_last = stall(&c_done);
+        let c_id = c.thread().id();
+        wait_until(|| waiters.has(c_id) || c.is_finished());
+        let c_last = c_done.load(std::sync::atomic::Ordering::Acquire);
         let built = eng.himos[y as usize].cylinder_built();
-        let waiting = last < B_WRITES && (c_last as usize) < rows.len() && !built;
+        let both_waiting = || waiters.has(b_id) && waiters.has(c_id);
+        let waiting = both_waiting() && !built;
+        // 止める側が終わった時の (かかった時間, B と C がまだ空きを待っていたか)
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let stopper = {
-            let eng = eng.clone();
+            let (eng, waiters) = (eng.clone(), waiters.clone());
             std::thread::spawn(move || {
                 let t = Instant::now();
                 match kind {
@@ -4965,29 +5008,55 @@ mod apply_liveness_tests {
                         drop(eng.subscribe(vec![crate::live::LivePred::Eq { himo_id: y, value: 7 }]).unwrap());
                     }
                 }
-                let _ = done_tx.send(t.elapsed());
+                let still = waiters.has(b_id) && waiters.has(c_id);
+                let _ = done_tx.send((t.elapsed(), still));
             })
         };
-        // 空きを待つ書き手の上限 (5 秒) より短く待つ
-        let before_release = done_rx.recv_timeout(Duration::from_secs(3)).ok();
+        // 止める側が終わるか、 B / C が空きを待つのをやめる (待ち切れた) まで A を放さない。 上限は止まらないためだけ
+        let mut before_release = None;
+        let until = Instant::now() + HOLD_CAP;
+        while Instant::now() < until {
+            if let Ok(done) = done_rx.try_recv() {
+                before_release = Some(done);
+                break;
+            }
+            if !both_waiting() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let still_waiting = both_waiting();
         release.send(()).unwrap();
         stopper.join().unwrap();
+        let after_release = done_rx.try_recv().ok();
         let a = a.join().unwrap();
         let (rejected, _) = b.join().unwrap();
         c.join().unwrap();
+        let timeouts = eng.wal_room_wait_timeouts();
         let (y2, y3) = (eng.get_by_id(e2, y), rows.iter().filter(|&&e| eng.get_by_id(e, y).is_some()).count());
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
-        eprintln!("[stopper] {kind:?}: B が待ち始めた所 {last} 件 / A を放す前に終わった {before_release:?}");
+        eprintln!(
+            "[stopper] {kind:?}: B が待ち始めた所 {last} 件 / C {c_last} 行 / A を放す前に終わった {before_release:?} / 放した後 \
+             {after_release:?} / 放す時に B と C が待っていた {still_waiting} / 待ち切れ {timeouts}"
+        );
         assert!(waiting, "{kind:?}: 前提: B と C が空きを待ち、 y の円柱はまだ無い (B {last} 件、 C {c_last} 行、 円柱 {built})");
-        assert!(before_release.is_some(), "{kind:?}: 止める側が、 門の中で WAL の空きを待つ書き手を待った");
+        assert!(
+            before_release.is_some_and(|(_, still)| still),
+            "{kind:?}: 止める側が、 門の中で WAL の空きを待つ書き手を待った (A を放す前に終わった {before_release:?}、 放した後 \
+             {after_release:?}、 待ち切れ {timeouts})"
+        );
         assert_eq!((a, rejected, y2, y3), (Ok(()), 0, Some(u64::from(B_WRITES - 1)), 0), "{kind:?}: A / B / C の書き込み");
     }
 
     /// #896: 門を出て空きを待つ書き手は、 空いた時に止める側が門を持っていれば、 出たまま止める側を待ってから入り直す (積む前 = 印に
     /// 位置が無い)。 A を積んだ後・当てる前で止めて B (y への tie) に空きを待たせ、 y の `write_guard` を取ってから A を放す (空きが
-    /// できる)。 guard を持つ間 (1.5 秒)、 B は進まず、 D (別の行の x への tie) は WAL の数倍を書ける (B が門を待たずに入って積むと、
-    /// B の印が checkpoint を止めて D も止まる)。 放した後は B / D とも全部当たる。
+    /// できる)。 guard を持つ間、 B は進まず、 D (別の行の x への tie) は WAL の数倍を書ける (B が門を待たずに入って積むと、 B の印が
+    /// checkpoint を止めて D も止まる)。 放した後は B / D とも全部当たる。
+    ///
+    /// 時間では見ない (#926)。 B が空きを待ち始めたかは待ち手の中に居るか ([`RoomWaiters`]) で見る (前は 「書いた数が 50 ms 増えない」)。
+    /// guard は、 D が全部書き終えるか、 D が断られた / 落とされた / 空きを待ち切れなかった印が立つまで持つ ([`hold_until_b_ends`]、
+    /// 前は 1.5 秒持って 「D が 3000 件書いた」 を見ていた)。
     #[test]
     fn a_writer_stepping_in_waits_for_a_holder_before_appending() {
         let p = path("stepin");
@@ -4995,6 +5064,7 @@ mod apply_liveness_tests {
         let (eng, x, y, _) = open(eng, false);
         let (e1, e2, e4) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
         let wal = eng.oplog.as_ref().unwrap().clone();
+        let waiters = RoomWaiters::watch(&eng);
         let (in_tx, in_rx) = std::sync::mpsc::channel();
         let (release, parked) = std::sync::mpsc::channel::<()>();
         cell_append_hook::set(&wal, move |_| {
@@ -5011,38 +5081,38 @@ mod apply_liveness_tests {
             let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
         };
-        let until = Instant::now() + Duration::from_secs(20);
-        let mut stalled = u32::MAX;
-        while Instant::now() < until {
-            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
-            if now == stalled {
-                break;
-            }
-            stalled = now;
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let b_id = b.thread().id();
+        // B が空きを待ち始める (A の record の区画を畳めず、 2 区画を埋めた) まで
+        wait_until(|| waiters.has(b_id) || b.is_finished());
+        let (waiting, stalled) = (waiters.has(b_id), b_done.load(std::sync::atomic::Ordering::Acquire));
         let guard = eng.himos[y as usize].write_guard();
         release.send(()).unwrap();
         let a = a.join().unwrap();
-        let d_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // D の様子 (`b_*` に置く)
+        let dw = Arc::new(HeldWriters::default());
         let d = {
-            let (eng, d_done) = (eng.clone(), d_done.clone());
-            std::thread::spawn(move || write_many(&eng, e4, x, B_WRITES, &d_done))
+            let (eng, dw) = (eng.clone(), dw.clone());
+            std::thread::spawn(move || write_many_counted(&eng, e4, x, B_WRITES, &dw.b_done, &dw.b_rejected))
         };
-        std::thread::sleep(hold());
-        let (b_held, d_held) = (b_done.load(std::sync::atomic::Ordering::Acquire), d_done.load(std::sync::atomic::Ordering::Acquire));
+        let held = hold_until_b_ends(&eng, &dw);
+        let b_held = b_done.load(std::sync::atomic::Ordering::Acquire);
         drop(guard);
         let ((b_rejected, _), (d_rejected, _)) = (b.join().unwrap(), d.join().unwrap());
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (y2, x4) = (eng.get_by_id(e2, y), eng.get_by_id(e4, x));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
-        eprintln!("[stepin] B は {stalled} 件で空きを待ち、 guard を持つ間に {b_held} 件 / D は guard を持つ間に {d_held} 件");
-        assert!(stalled < B_WRITES, "前提: B が空きを待った");
+        eprintln!("[stepin] B は {stalled} 件で空きを待ち、 guard を持つ間に {b_held} 件 / guard を放す時 (D の数) {held:?}");
+        assert!(waiting && stalled < B_WRITES, "前提: B が空きを待った ({stalled} 件)");
+        assert!(!held.gave_up, "前提: D が書き終えるか断られる / 落ちるまで guard を持った ({held:?})");
         assert_eq!(a, Ok(()), "書き手 A");
-        assert!(b_held <= stalled + 1, "B が止める側を待たずに進んだ ({stalled} → {b_held} 件)");
-        assert!(d_held >= B_BEFORE_RELEASE, "D が止まった (guard を持つ間に {d_held} 件): B が門を待たずに積んで印を持った");
-        assert_eq!((b_rejected, d_rejected, dropped, timeouts), (0, 0, 0, 0), "断られた / 落とした / 待ち切れ");
+        assert_eq!(b_held, stalled, "B が止める側を待たずに進んだ ({stalled} → {b_held} 件)");
+        assert_eq!(
+            (held.b_done, d_rejected, dropped, timeouts),
+            (B_WRITES, 0, 0, 0),
+            "D が止まった (guard を持つ間に書いた数 / 断られた / 落とした / 待ち切れ): B が門を待たずに積んで印を持った"
+        );
+        assert_eq!(b_rejected, 0, "B が断られた");
         assert_eq!((y2, x4), (Some(u64::from(B_WRITES - 1)), Some(u64::from(B_WRITES - 1))), "B / D の値");
     }
 
