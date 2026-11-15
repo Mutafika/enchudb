@@ -2509,6 +2509,25 @@ mod settle_call_hook {
     }
 }
 
+/// test 用の数え: [`Engine::table_rows_with_himo`] がなめた cell の数 (この thread の分、 #940)。
+#[cfg(test)]
+mod table_scan_cells {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CELLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(n: u32) {
+        CELLS.with(|c| c.set(c.get() + u64::from(n)));
+    }
+
+    /// 今までの数を返して 0 に戻す。
+    pub(super) fn take() -> u64 {
+        CELLS.with(|c| c.replace(0))
+    }
+}
+
 /// test 用の割り込み点: `entity_in` が払い出し位置から取った slot に生きている印を立てる前 (#883)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod claim_gap_hook {
@@ -13718,7 +13737,7 @@ impl Engine {
         let peer_id_hid = self.himo_id("_sync_peers.peer_id")? as u16;
         let self_peer = self.peer_id();
         // 下流 (self を除く登録済み peer) が 1 つも無ければ判定材料が無い。
-        let has_downstream = self.entities_with_himo(peer_id_hid).into_iter().any(|eid| {
+        let has_downstream = self.table_rows_with_himo(peer_id_hid).into_iter().any(|eid| {
             match self.get_by_id32(eid, peer_id_hid) {
                 Some(pid) => self_peer == 0 || pid != self_peer,
                 None => false,
@@ -13772,7 +13791,8 @@ impl Engine {
         let Some(peer_id_hid) = self.himo_id("_sync_peers.peer_id") else { return 0; };
         let Some(consumed_lsn_hid) = self.himo_id("_sync_peers.consumed_lsn") else { return 0; };
 
-        let peer_rows = self.entities_with_himo(peer_id_hid as u16);
+        // #940: 表の枠だけなめる (`_sync_peers` は ring の後ろに置かれ、 列を頭からなめると ring の幅をなめる)
+        let peer_rows = self.table_rows_with_himo(peer_id_hid as u16);
         if peer_rows.is_empty() { return 0; }
 
         // #149: 自分自身の peer row は watermark から除外する。 自分が自分の record を
@@ -13956,7 +13976,7 @@ impl Engine {
             return None;
         }
         let hid = self.himo_id("_sync_peers.reclaimed_floor")? as u16;
-        let row = self.entities_with_himo(hid).into_iter().next()?;
+        let row = self.table_rows_with_himo(hid).into_iter().next()?;
         let vid = self.get_by_id32(row, hid)?;
         let bytes = self.vocab.get(vid).to_vec();
         let hlc_at = |b: &[u8]| -> Option<enchudb_oplog::Hlc> {
@@ -14031,7 +14051,7 @@ impl Engine {
                 return false;
             }
         };
-        let row = match self.entities_with_himo(hid).into_iter().next() {
+        let row = match self.table_rows_with_himo(hid).into_iter().next() {
             Some(r) => r,
             None => match self.entity_in("_sync_peers") {
                 Ok(r) => r,
@@ -23779,6 +23799,36 @@ impl Engine {
         self.eids_of_slots_in(Some(hid as usize), hs.entities_with_value())
     }
 
+    /// #940: 紐 `hid` に値のある行を、 紐の表の枠 (extent) の中だけなめて列挙する。 答えの形は [`Engine::entities_with_himo`]
+    /// と同じ (eid の昇順、 出口の世代付き)。 表に属さない紐 (anonymous) は [`Engine::entities_with_himo`] と同じく列を頭から
+    /// なめる。
+    ///
+    /// 前提: 紐の値は、 その表の行 (`entity_in` が払い出した、 枠の中の場所) にしか書かれていない。 枠の外の場所に書かれた
+    /// 値は答えに入らない (`entities_with_himo` は入れる)。 使うのは engine が自分で書く表の紐だけ: `_sync_peers` の行は
+    /// `ack_sync` / `record_reclaimed_floors` が `entity_in("_sync_peers")` で作り、 その列には、 作った行か `query_by_id` /
+    /// この関数で引いたその表の行にしか書かない。
+    ///
+    /// `entities_with_himo` は列を場所 0 から列の長さまでなめるので、 前に大きな表 (ring の 100 万行、 アプリの表) があると、
+    /// 後ろの小さな表の列でも前の表の幅だけなめる (#940: reclaim のたびに `_sync_peers` の列を 100 万 cell × 3)。
+    fn table_rows_with_himo(&self, hid: u16) -> Vec<enchudb_oplog::EntityId> {
+        let Some(hs) = self.himos.get(hid as usize) else { return Vec::new(); };
+        let table = self
+            .himo_table_get(hid as usize)
+            .filter(|&t| t != ANONYMOUS_TABLE)
+            .and_then(|t| self.tables.get(t as usize));
+        let Some(table) = table else { return self.entities_with_himo(hid) };
+        // 答えを eid の昇順にそろえる (足す枠は今ある枠の後ろから切るので今も昇順だが、 ここの答えの順はそれに頼らない)
+        let mut extents = table.extents();
+        extents.sort_unstable();
+        let mut slots = Vec::new();
+        for (lo, hi) in extents {
+            #[cfg(test)]
+            table_scan_cells::add(hi.min(hs.column_len()).saturating_sub(lo));
+            hs.for_each_in(lo, hi, |slot, _| slots.push(slot));
+        }
+        self.eids_of_slots_in(Some(hid as usize), slots)
+    }
+
     /// 列 `himo_id` に値のある row を、 **新しい順** (その列の table が eid を払い出した逆順) に最大 `n` 件 (#21)。
     ///
     /// 「直近 N 件」 用。 table の払い出し済みの末尾から逆にたどり、 `n` 件そろった所で止まる — コストは
@@ -30706,6 +30756,124 @@ mod reclaimed_floor_tests {
         eng.record_reclaimed_floors(&[(2, hlc(150))]);
         let floors = eng.sync_reclaimed_floors().unwrap();
         assert!(floors.contains(&(2, hlc(200))), "floor が後退した: {floors:?}");
+    }
+}
+
+/// #940: `_sync_peers` の列を表の枠だけなめる (`table_rows_with_himo`) 答えが、 列を頭からなめる答え (`entities_with_himo`、 直す前の
+/// なめ) と同じ。 watermark / floor / 配り切った位置 も、 列を頭からなめて求めた値と同じ。
+#[cfg(test)]
+mod sync_peers_scan_tests {
+    use super::*;
+
+    const COLS: [&str; 4] =
+        ["_sync_peers.peer_id", "_sync_peers.consumed_lsn", "_sync_peers.last_seen_at", "_sync_peers.reclaimed_floor"];
+
+    fn hlc(wall: u64) -> enchudb_oplog::Hlc {
+        enchudb_oplog::Hlc { wall, logical: 0, peer: 0 }
+    }
+
+    fn assert_same_rows(eng: &Engine, what: &str) {
+        for name in COLS {
+            let Some(h) = eng.himo_id(name) else { continue };
+            let h = h as u16;
+            assert_eq!(eng.table_rows_with_himo(h), eng.entities_with_himo(h), "{what}: {name} の行が列を頭からなめた答えと違う");
+        }
+    }
+
+    /// 直す前の `sync_watermark` (列を頭からなめる)。
+    fn watermark_by_full_scan(eng: &Engine) -> u32 {
+        let (Some(p), Some(c)) = (eng.himo_id("_sync_peers.peer_id"), eng.himo_id("_sync_peers.consumed_lsn")) else {
+            return 0;
+        };
+        let me = eng.peer_id();
+        let mut min: Option<u32> = None;
+        for e in eng.entities_with_himo(p as u16) {
+            if me != 0 && eng.get_by_id32(e, p as u16) == Some(me) {
+                continue;
+            }
+            if let Some(v) = eng.get_by_id32(e, c as u16) {
+                min = Some(min.map_or(v, |m| m.min(v)));
+            }
+        }
+        min.unwrap_or(0)
+    }
+
+    fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+        v.sort();
+        v
+    }
+
+    /// 前に大きな表 (`t`) を置き、 `_sync_peers` (枠 8) の後ろに表 `u` を置いてから peer を 23 本 ack する: `_sync_peers` は枠を 3 回
+    /// 足し (4 本目の枠は 1 行だけ)、 足した枠は `u` の後ろ = 先頭の枠と離れる。 どの枠も最初と最後の場所に行がある (最後の枠は最初だけ)。
+    /// 開き直した後 (枠を `tables` から戻す) も同じ。
+    ///
+    /// なめる cell の数 (`table_scan_cells`) は表の枠の大きさ以下 (列を頭からなめると `t` の幅 3960 を越える)。
+    #[test]
+    fn table_scan_gives_the_full_scan_answers() {
+        let path = format!("{}/enchudb-940-peers-scan-{}", std::env::temp_dir().display(), std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        let check = |eng: &Engine, what: &str| {
+            assert_same_rows(eng, what);
+            assert_eq!(eng.sync_watermark(), watermark_by_full_scan(eng), "{what}: watermark");
+        };
+        {
+            let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+            eng.define_table("t", 3960).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.define_table("u", 16).unwrap();
+            eng.set_peer_id(1);
+            assert_eq!(eng.table_eid_usage("_sync_peers").unwrap().capacity, 8, "前提: _sync_peers の枠 8");
+
+            check(&eng, "行なし");
+            assert_eq!(eng.sync_watermark(), 0);
+            assert!(eng.sync_reclaimed_floors().is_none());
+            assert!(eng.sync_delivered_cursors().is_none());
+
+            // 自分の行 (watermark から外す) と floor の行
+            eng.ack_sync(1, 3).unwrap();
+            eng.record_reclaimed_floors(&[(2, hlc(10))]);
+            check(&eng, "自分の行と floor の行");
+            assert_eq!(eng.sync_watermark(), 0, "自分の行だけなら 0");
+            assert!(eng.sync_delivered_cursors().is_none(), "下流が居ない");
+
+            for p in 2..25u32 {
+                eng.ack_sync(p, 100 + p).unwrap();
+            }
+            assert_eq!(eng.table_eid_usage("_sync_peers").unwrap().capacity, 32, "前提: 枠を 3 回足した");
+            eng.forget_sync_peer(2);
+            eng.ack_sync(7, 50).unwrap();
+            eng.record_reclaimed_floors(&[(3, hlc(20)), (2, hlc(5))]);
+            check(&eng, "peer 23 本");
+            assert_eq!(eng.sync_watermark(), 50);
+            assert_eq!(sorted(eng.sync_reclaimed_floors().unwrap()), vec![(2, hlc(10)), (3, hlc(20))]);
+            assert_eq!(sorted(eng.sync_delivered_cursors().unwrap()), vec![(2, hlc(10)), (3, hlc(20))]);
+
+            // なめる cell の数: 1 回のなめは表の枠の大きさ以下、 どのなめも表の枠で (列を頭からなめる道に戻すと数えない)
+            let col_len = eng.himos.get(eng.himo_id("_sync_peers.peer_id").unwrap()).unwrap().column_len();
+            assert!(col_len > 3960, "前提: 列を頭からなめると t の幅を越える ({col_len})");
+            let _ = table_scan_cells::take();
+            let _ = eng.sync_watermark();
+            let wm = table_scan_cells::take();
+            assert!(wm > 0 && wm <= 32, "sync_watermark が表の枠の外をなめた / 表の枠でなめていない: {wm} cell");
+            let _ = eng.sync_reclaimed_floors();
+            let fl = table_scan_cells::take();
+            assert!(fl > 0 && fl <= 32, "floor を読む時に表の枠の外をなめた / 表の枠でなめていない: {fl} cell");
+            eng.record_reclaimed_floors(&[(3, hlc(21))]); // 上がる = 読んで、 行を引いて書く
+            assert_eq!(table_scan_cells::take(), 2 * fl, "floor を書く時のなめ (読む + 行を引く) が表の枠でない");
+            let _ = eng.sync_delivered_cursors();
+            assert_eq!(table_scan_cells::take(), 2 * wm + fl, "配り切った位置のなめ (下流 + watermark + floor) が表の枠でない");
+            assert_eq!(sorted(eng.sync_reclaimed_floors().unwrap()), vec![(2, hlc(10)), (3, hlc(21))]);
+            check(&eng, "floor を書いた後");
+            eng.flush().unwrap();
+        }
+        {
+            let eng = Engine::open_standalone(&path).unwrap();
+            eng.set_peer_id(1);
+            check(&eng, "開き直した後");
+            assert_eq!(eng.sync_watermark(), 50);
+            assert_eq!(sorted(eng.sync_reclaimed_floors().unwrap()), vec![(2, hlc(10)), (3, hlc(21))]);
+        }
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
