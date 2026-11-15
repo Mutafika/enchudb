@@ -2728,6 +2728,25 @@ mod fold_copy_tests {
     struct Quiet;
     impl crate::changefeed::ChangeListener for Quiet {}
 
+    /// 試験が途中で落ちても (前提の assert の panic でも)、 置いた割り込み点と書き出しの失敗 (`write_out_fault`) を外す。 外さないと、
+    /// 後で同じ番地に作られた別の試験の WAL が書き出せない (#912: 「前提: 記録に写した」 で落ちた試験の `write_out_fault` が、 同じ
+    /// process で後に走った `copying_into_the_change_log_while_making_wal_room_does_not_stop_writers` の WAL に残り、 古い区画を
+    /// 畳めずに 「前提: 古い区画を畳んだ」 で落ちた形。 `write_out_fault` は番地だけを持ち、 WAL を生かしておかない)。
+    struct Unhook {
+        wal: Arc<OpLog>,
+        stop: Option<Arc<AtomicBool>>,
+    }
+
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            if let Some(s) = &self.stop {
+                s.store(true, Ordering::Release);
+            }
+            write_out_fault::set(&self.wal, false);
+            change_copy_hook::set(&self.wal, |_| {});
+        }
+    }
+
     /// changefeed の record を写すたびに (`change_copy_hook`、 呼ばれた中で置き直す)、 別の thread が WAL に Commit を 1 つ積み、
     /// 5 秒の間に返ったかを `seen` に控える。 `stop` が立ったら何もせず置き直さない。
     fn watch_copies(wal: Arc<OpLog>, seen: Arc<Mutex<Vec<bool>>>, stop: Arc<AtomicBool>) {
@@ -2777,6 +2796,7 @@ mod fold_copy_tests {
         }
         let wal = eng.oplog.as_ref().unwrap().clone();
         let (seen, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
+        let _unhook = Unhook { wal: wal.clone(), stop: Some(stop.clone()) };
         watch_copies(wal.clone(), seen.clone(), stop.clone());
         // 区画を移るまで書き、 今の区画にも少し書いて止める (今の区画は埋まらないので、 積む thread は空きを待たない)
         let (lap0, switches0, room0) = (wal.lap(), eng.wal_switches(), eng.wal_room_folds());
@@ -2792,19 +2812,32 @@ mod fold_copy_tests {
             eng.tie_to(eids[i as usize % eids.len()], "v", i);
             i += 1;
         }
-        // 空け作りは試験の thread から呼ぶ (空きが 1/4 を切るのを consumer に待たせない)
-        while room && eng.make_wal_room(&wal) != WalRoom::Folded && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+        // 空け作りは試験の thread から呼ぶ (空きが 1/4 を切るのを consumer に待たせない)。 #912: 戻りを控える (畳めなかった時に
+        // 何で止まったかを見る)。 上限は書く間と別に取る
+        let mut rooms: Vec<WalRoom> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while room && rooms.last() != Some(&WalRoom::Folded) && Instant::now() < deadline {
+            rooms.push(eng.make_wal_room(&wal));
+            if rooms.last() != Some(&WalRoom::Folded) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
+        // 戻りの並び (続けて同じ値は数にまとめる)
+        let rooms = rooms.chunk_by(|a, b| a == b).map(|r| format!("{:?} x{}", r[0], r.len())).collect::<Vec<_>>().join(", ");
         // 区画を移らず (今の区画の周のまま)、 今の区画をその場で畳んでもいない
-        assert_eq!(wal.lap(), lap1, "前提: 畳んだのは古い区画");
+        assert_eq!(wal.lap(), lap1, "前提: 畳んだのは古い区画 (空け作りの戻り [{rooms}])");
         // 古い区画が畳まれるまで待つ (空け作りの形は畳み終えている)
         let old = wal_pos(lap0, HEADER_SIZE as u64);
         let deadline = Instant::now() + Duration::from_secs(20);
         while wal.holds(old) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!wal.holds(old), "前提: 古い区画を畳んだ");
+        assert!(
+            !wal.holds(old),
+            "前提: 古い区画を畳んだ (空け作りの戻り [{rooms}]、 区画の切り替え {}、 書き出しの失敗 {})",
+            eng.wal_switches() - switches0,
+            write_out_fault::active(&wal)
+        );
         stop.store(true, Ordering::Release);
         assert_eq!(eng.wal_room_folds() > room0, room, "前提: 空け作りで畳んだか");
         let seen = seen.lock().unwrap().clone();
@@ -2940,7 +2973,13 @@ mod fold_copy_tests {
     /// 畳む時も、 書き出していない record には記録の番号を振らない (畳む前に lock の外で写すのは書き出した所まで、 lock の下は畳む
     /// 区画の終わりまで)。 畳む時の写しが始まる所で 1 件積み、 それ以後の書き出しを止めて、 記録の最後の record が checkpoint より
     /// 前にあるかを見る (`tests/changefeed_log.rs` の `records_not_yet_written_out_get_no_number` を畳む時に)。 `room` = 試験の thread
-    /// から空け作りを呼んで畳む形、 でなければ consumer の 100 ms ごとの書き出しの後の形。
+    /// から空け作りを呼んで畳む形、 でなければ consumer の周期の書き出しの後の形。
+    ///
+    /// どちらも区画を移ってから (古い区画を畳む。 1 件積んだ今の区画は畳まないので、 積んだ後も畳む写しまで進む)。 周期の形は、 書く間
+    /// consumer を止め (`hold_consumer`)、 放した後の consumer の最初の周が、 書き出した後の写し (`try_fold_with_changes`) で割り込み点
+    /// を踏み、 同じ周で古い区画を畳む (前提は 「古い区画を畳んだ」 で見る)。 #912: 前は 1000 件書いた後の次の写しで踏んでいて、 負荷で
+    /// consumer の周が遅れると、 何も書き出す前の写しで踏んで以後の書き出しを止め、 記録に何も写らなかった (「前提: 記録に写した」)。
+    /// また区画を移らない形では、 積んだ 1 件のせいで今の区画を畳めず、 畳む前の写し (`move_changes_before_fold`) を通らなかった。
     fn a_fold_numbers_no_record_not_yet_written_out(room: bool) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = format!("/tmp/enchudb-foldnumber-{}-{room}-{nanos}.db", std::process::id());
@@ -2961,17 +3000,37 @@ mod fold_copy_tests {
         eng.enable_change_log(4 << 20).unwrap();
         let hid = eng.himo_id("v").unwrap() as u16;
         let wal = eng.oplog.as_ref().unwrap().clone();
+        let _unhook = Unhook { wal: wal.clone(), stop: None };
         let fired = Arc::new(AtomicBool::new(false));
         let room0 = eng.wal_room_folds();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        // 空け作りの形は区画を移ってから (古い区画を畳み、 積む record は今の区画に入る)
-        let switches0 = eng.wal_switches();
+        // 周期の形は、 割り込み点を置くまで consumer を止める (書き出しも畳みもしない = 古い区画は書き出し待ちで残る)
+        let held = (!room).then(|| eng.hold_consumer());
+        // 上限は前提が立たない時に止まらないためだけ
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // 区画を移ってから (古い区画を畳み、 積む record は今の区画に入る)、 今の区画にも少し書く
+        let (lap0, switches0) = (wal.lap(), eng.wal_switches());
         let mut i = 0u32;
-        while i < 1_000 || (room && eng.wal_switches() == switches0 && Instant::now() < deadline) {
+        while eng.wal_switches() == switches0 && Instant::now() < deadline {
             eng.tie_to_by_id(eids[i as usize % eids.len()], hid, i);
             i += 1;
         }
-        mark_at_copy(wal.clone(), fired.clone(), eids[0], hid, room.then(|| std::thread::current().id()));
+        assert!(eng.wal_switches() > switches0, "前提: 区画を移った");
+        for _ in 0..100 {
+            eng.tie_to_by_id(eids[i as usize % eids.len()], hid, i);
+            i += 1;
+        }
+        // 割り込み点を踏むのは、 空け作りの形は試験の thread、 周期の形は consumer の thread だけ (通知係や試験の thread の写しは
+        // 書き出しの前に来ることがある)
+        let only = if room {
+            std::thread::current().id()
+        } else {
+            while eng.consumer_thread.get().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            *eng.consumer_thread.get().expect("前提: consumer の thread が居る")
+        };
+        mark_at_copy(wal.clone(), fired.clone(), eids[0], hid, Some(only));
+        drop(held);
         while room && eng.make_wal_room(&wal) != WalRoom::Folded && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2979,6 +3038,12 @@ mod fold_copy_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(fired.load(Ordering::Acquire), "前提: 畳もうとして記録に写した");
+        // 割り込み点の後、 同じ試しで古い区画を畳む (畳む前の写しを通った)
+        let old = wal_pos(lap0, HEADER_SIZE as u64);
+        while wal.holds(old) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!wal.holds(old), "前提: 古い区画を畳んだ");
         // 畳む試しが終わるまで待つ (`change_emit` を持ったまま写して畳む。 ここで写すのは checkpoint まで)
         eng.change_log_range().unwrap();
         if room {
@@ -4237,13 +4302,72 @@ mod apply_liveness_tests {
     /// 2 区画を埋めた所 (WAL 1 つ分、 約 1400 件) で止まった
     const B_BEFORE_RELEASE: u32 = 3000;
 
+    /// [`a_writer_held_by_a_long_column_holder_does_not_hold_the_wal`] の書き手 A / B の様子 (止める側が見る)。
+    #[derive(Default)]
+    struct HeldWriters {
+        /// A が書き始めた / 書き込みから返った
+        a_started: std::sync::atomic::AtomicBool,
+        a_returned: std::sync::atomic::AtomicBool,
+        /// B が書いた数 / 断られた数
+        b_done: std::sync::atomic::AtomicU32,
+        b_rejected: std::sync::atomic::AtomicU32,
+    }
+
+    /// 止める側が放した時の様子。
+    #[derive(Debug)]
+    struct HoldRelease {
+        /// 放す時までに B が書いた数
+        b_done: u32,
+        /// 放す時に A が返っていた (= A は止める側を待っていない)
+        a_returned: bool,
+        /// B が書き終えず、 断られも落とされもしないまま上限 ([`HOLD_CAP`]) に届いた
+        gave_up: bool,
+    }
+
+    /// 止める側が持つ上限。 前提が崩れた時 (B が書き終えも断られもしない) に止まらないためだけ: 直す前の形でも、 B は空きを待ち切れず
+    /// (上限 5 秒) に断られる / 落とされるので、 その印で放す。
+    const HOLD_CAP: Duration = Duration::from_secs(120);
+
+    /// 止める側が持つ間: B が全部書き終えるか、 B が断られた / 落とされた / 空きを待ち切れなかった印が立つまで待つ (時間で持たない)。
+    fn hold_until_b_ends(eng: &Engine, ab: &HeldWriters) -> HoldRelease {
+        use std::sync::atomic::Ordering;
+        let ended = || {
+            ab.b_done.load(Ordering::Acquire) >= B_WRITES
+                || ab.b_rejected.load(Ordering::Acquire) > 0
+                || eng.wal_dropped_records() > 0
+                || eng.wal_room_wait_timeouts() > 0
+        };
+        let until = Instant::now() + HOLD_CAP;
+        while !ended() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        HoldRelease {
+            b_done: ab.b_done.load(Ordering::Acquire),
+            a_returned: ab.a_returned.load(Ordering::Acquire),
+            gave_up: !ended(),
+        }
+    }
+
     /// 書き手 B: 列 `y` に `n` 件書き、 書いた数を `done` に置く。 (断られた数, 1 件の最大の待ち)
     fn write_many(eng: &Engine, e: u64, y: u16, n: u32, done: &std::sync::atomic::AtomicU32) -> (usize, Duration) {
+        write_many_counted(eng, e, y, n, done, &std::sync::atomic::AtomicU32::new(0))
+    }
+
+    /// [`write_many`] の、 断られるたびに `rejected_now` にも足す版 (止める側が、 B が断られたのを見て放す)。
+    fn write_many_counted(
+        eng: &Engine,
+        e: u64,
+        y: u16,
+        n: u32,
+        done: &std::sync::atomic::AtomicU32,
+        rejected_now: &std::sync::atomic::AtomicU32,
+    ) -> (usize, Duration) {
         let (mut rejected, mut worst) = (0, Duration::ZERO);
         for i in 0..n {
             let t = Instant::now();
             if eng.try_tie_to_by_id(e, y, i).is_err() {
                 rejected += 1;
+                rejected_now.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
             worst = worst.max(t.elapsed());
             done.store(i + 1, std::sync::atomic::Ordering::Release);
@@ -4271,8 +4395,13 @@ mod apply_liveness_tests {
     /// 列 x の書き手を長く止める側が持つ間に、 A が x へ書き (行を消し)、 B が y に WAL の数倍を書く。 直す前は A が積んだ後に
     /// `write_lock` を待ち、 その record の手前で checkpoint が止まって、 B は止める側が放すまで空きを待った (6 秒持つと、 sync の DB は
     /// record を落とし、 sync の無い DB は書き込みを断った)。 組み合わせ (止める側 3 × A の書き込み 2 × sync の有無 2) は 4 つずつ
-    /// 並べて回す。 見るのは、 止める側が放す時までに B が書いた数 (時間では見ない: 負荷の下では、 A と関係なく書き出しが 1 秒近く
-    /// かかる回がある)。
+    /// 並べて回す。
+    ///
+    /// 時間では見ない (#912)。 止める側は、 B が全部書き終えるか、 B が断られた / 落とされた / 空きを待ち切れなかった印が立つまで持つ
+    /// ([`hold_until_b_ends`])。 直した形は B が書き終えてから放し、 直す前の形は B が空きを待ち切れずに (上限 5 秒) 断られる / 落とされる
+    /// ので放し、 本題の assert (断られた / 落とした / 待ち切れの数が 0) で落ちる。 A が止める側で待ったかは、 A が書き始めた後に B が
+    /// 書き始め、 止める側が放す時に A がまだ返っていないかで見る。 前は 1.5 秒持って 「放す時までに B が 3000 件書いた」 を見ていて、
+    /// 遅い build (master の coverage) や並べた負荷では、 A と関係なく書き出しが遅い回に届かなかった。
     #[test]
     fn a_writer_held_by_a_long_column_holder_does_not_hold_the_wal() {
         let cases: Vec<_> = [Holder::Guard, Holder::Build, Holder::Compact]
@@ -4300,50 +4429,48 @@ mod apply_liveness_tests {
         let (eng, x, y, _) = open(eng, sync_db);
         let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
         eng.try_tie_to_by_id(e1, x, 5u32).unwrap();
-        let hold = hold();
         let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ab = Arc::new(HeldWriters::default());
         let holder_thread = {
-            let (eng, b_done) = (eng.clone(), b_done.clone());
+            let (eng, ab) = (eng.clone(), ab.clone());
             std::thread::spawn(move || {
-                // 放す時までに B が書いた数
-                let at_release = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                // 放す時の様子
+                let at_release = Arc::new(std::sync::Mutex::new(None));
                 let seen = at_release.clone();
                 match holder {
                     Holder::Guard => {
                         let g = eng.himos[x as usize].write_guard();
                         held_tx.send(()).unwrap();
-                        std::thread::sleep(hold);
-                        seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                        *seen.lock().unwrap() = Some(hold_until_b_ends(&eng, &ab));
                         drop(g);
                     }
                     Holder::Build => {
+                        let e = eng.clone();
                         crate::himo_store::hook::set("building_cylinder", move || {
                             held_tx.send(()).unwrap();
-                            std::thread::sleep(hold);
-                            seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                            *seen.lock().unwrap() = Some(hold_until_b_ends(&e, &ab));
                         });
                         let _ = eng.himos[x as usize].slice_len(5);
                     }
                     Holder::Compact => {
                         let _ = eng.himos[x as usize].slice_len(5);
                         assert!(eng.himos[x as usize].cylinder_built(), "前提: 組んだ円柱");
+                        let e = eng.clone();
                         crate::himo_store::hook::set("compact_now", move || {
                             held_tx.send(()).unwrap();
-                            std::thread::sleep(hold);
-                            seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                            *seen.lock().unwrap() = Some(hold_until_b_ends(&e, &ab));
                         });
                         eng.himos[x as usize].compact_now();
                     }
                 }
-                at_release.load(std::sync::atomic::Ordering::Relaxed)
+                at_release.lock().unwrap().take()
             })
         };
-        held_rx.recv_timeout(Duration::from_secs(20)).expect("前提: 止める側が持った");
+        held_rx.recv_timeout(Duration::from_secs(60)).expect("前提: 止める側が持った");
         let a = {
-            let eng = eng.clone();
+            let (eng, ab) = (eng.clone(), ab.clone());
             std::thread::spawn(move || {
-                let t = Instant::now();
+                ab.a_started.store(true, std::sync::atomic::Ordering::Release);
                 let r = match write {
                     AWrite::Tie => eng.try_tie_to_by_id(e1, x, 1u32),
                     AWrite::Delete => {
@@ -4351,28 +4478,29 @@ mod apply_liveness_tests {
                         Ok(())
                     }
                 };
-                (r, t.elapsed())
+                ab.a_returned.store(true, std::sync::atomic::Ordering::Release);
+                r
             })
         };
-        // A が止める側で待つまで (直した形は積む前、 直す前の形は積んだ後)
-        std::thread::sleep(Duration::from_millis(50));
-        let (rejected, worst) = write_many(&eng, e2, y, B_WRITES, &b_done);
-        let before_release = holder_thread.join().unwrap();
-        let (a_result, a_took) = a.join().unwrap();
+        // A が書き始めてから B が書き始める (A は止める側で待つ: 直した形は積む前、 直す前の形は積んだ後)
+        while !ab.a_started.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let (rejected, worst) = write_many_counted(&eng, e2, y, B_WRITES, &ab.b_done, &ab.b_rejected);
+        let release = holder_thread.join().unwrap().expect("前提: 止める側の割り込み点を通った");
+        let a_result = a.join().unwrap();
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (x_now, y_now) = (eng.get_by_id(e1, x), eng.get_by_id(e2, y));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
         eprintln!(
-            "[held] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / 放す時までに書いた {before_release} 件 / A の待ち {a_took:?}"
+            "[held] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / 放す時 {release:?}"
         );
+        assert!(!release.gave_up, "{tag}: 前提: B が書き終えるか断られる / 落ちるまで止める側が持った ({release:?})");
+        assert!(!release.a_returned, "{tag}: 前提: A は止める側を待った (放す時に A が返っていた)");
         assert_eq!(a_result, Ok(()), "{tag}: 書き手 A");
-        assert!(a_took >= hold / 2, "{tag}: 前提: A は止める側を待った ({a_took:?})");
         assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "{tag}: B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
-        assert!(
-            before_release >= B_BEFORE_RELEASE,
-            "{tag}: B は止める側が放すまで待たされた (放す時までに {before_release} 件、 最大の待ち {worst:?})"
-        );
+        assert_eq!(release.b_done, B_WRITES, "{tag}: B は止める側が放すまで書き終えなかった ({release:?}、 最大の待ち {worst:?})");
         let x_want = match write {
             AWrite::Tie => Some(1),
             AWrite::Delete => None,
@@ -4922,32 +5050,34 @@ mod apply_liveness_tests {
             let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
         };
-        // B が空きを待ち始める (書いた数が 50 ms 増えない) まで
-        let until = Instant::now() + Duration::from_secs(20);
-        let mut last = u32::MAX;
-        while Instant::now() < until {
-            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
-            if now == last {
-                break;
-            }
-            last = now;
-            std::thread::sleep(Duration::from_millis(50));
+        // consumer が A の手前で切り、 B が空きを待ち始める (`wal_room_wanted` を立てるのは空きを待つ書き手だけ) まで。 #912: 前は
+        // 「B の書いた数が 50 ms 増えない」 で決めていて、 負荷で B が 50 ms 走らないと、 consumer が A の手前で切る前に進んだ。
+        // 上限は前提が立たない時に止まらないためだけ
+        let ready = || eng.wal_room_wanted.load(std::sync::atomic::Ordering::Acquire) && wal.applying_cuts() > 0;
+        let until = Instant::now() + Duration::from_secs(60);
+        while !ready() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
         }
-        let cut = wal.applying_cuts() > 0;
+        let (cut, waiting, last) = (wal.applying_cuts() > 0, ready(), b_done.load(std::sync::atomic::Ordering::Acquire));
         let woke = eng.consumer_wakeups();
+        let t = Instant::now();
         std::thread::sleep(Duration::from_millis(200));
         let woke = eng.consumer_wakeups() - woke;
+        // 窓の長さは測る (負荷で眠りが延びた分、 B が起こす回数も増える)
+        let window = t.elapsed();
         let still = b_done.load(std::sync::atomic::Ordering::Acquire) < B_WRITES;
         release.send(()).unwrap();
         let a = a.join().unwrap();
         let (rejected, _) = b.join().unwrap();
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
-        eprintln!("[pace] B が待ち始めた所 {last} 件 / 200 ms の consumer の周 {woke}");
-        assert!(cut && still, "前提: A の手前で切って畳めず、 B が空きを待った ({last} 件)");
+        eprintln!("[pace] B が待ち始めた所 {last} 件 / {window:?} の consumer の周 {woke}");
+        assert!(cut && waiting && still, "前提: A の手前で切って畳めず、 B が空きを待った ({last} 件、 切った {cut}、 待った {waiting} {still})");
         assert_eq!((a, rejected), (Ok(()), 0), "A / B の書き込み");
-        // 寝ていれば、 待つ書き手が起こす分 (200 µs ごと = 1000 回) まで。 回ると 10^5 を越える
-        assert!(woke < 5_000, "consumer が寝ずに回った (200 ms に {woke} 周)");
+        // 寝ていれば、 待つ書き手が起こす分 (200 µs ごと = 1 ms に 5 回) まで。 回ると 1 ms に 500 回を越える。 窓は測った長さで見る
+        // (上限は 1 ms に 25 回 = 200 ms で 5000 回)
+        let limit = 25 * window.as_millis().max(1) as u64;
+        assert!(woke < limit, "consumer が寝ずに回った ({window:?} に {woke} 周、 上限 {limit})");
     }
 }
 
