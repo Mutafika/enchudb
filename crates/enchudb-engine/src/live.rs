@@ -2522,6 +2522,15 @@ impl Exit<'_> {
         }
     }
 
+    /// 場所の並びの今の住人の eid (#899: 並べて写す時は page の印を 256 個ずつ見る `GenReader::eids`。 1 個ずつの [`eid`](Self::eid)
+    /// は使い回しの無い所でも場所ごとに印を読む)。
+    pub(crate) fn eids(self, slots: &[u32]) -> Vec<EntityId> {
+        match self {
+            Exit::Raw => slots.iter().map(|&s| s as EntityId).collect(),
+            Exit::App { peer, gens } => gens.reader().eids(peer, slots),
+        }
+    }
+
     /// 場所の今の世代 (`Raw` は 0)。
     #[inline]
     fn gen_now(self, slot: u32) -> u32 {
@@ -5020,6 +5029,12 @@ impl LiveRegistry {
         &self.gens
     }
 
+    /// #899: 同じ世代の共有の参照 (Ref の紐の円柱が場所の bit を読む、 `HimoStore::attach_generations`)。
+    #[inline]
+    pub(crate) fn gens_arc(&self) -> &Arc<crate::generation::Generations> {
+        &self.gens
+    }
+
     /// #731: アプリに渡す出口 (peer と場所の世代)。
     #[inline]
     pub(crate) fn exit(&self) -> Exit<'_> {
@@ -6663,8 +6678,7 @@ impl GroupedLiveQuery {
     }
 
     fn eids_of(&self, local: &[u32]) -> Vec<EntityId> {
-        let peer = self.inner.registry.exit();
-        local.iter().map(|&e| peer.eid(e)).collect()
+        self.inner.registry.exit().eids(local)
     }
 
     /// 未 poll の group の変化がありうるか。

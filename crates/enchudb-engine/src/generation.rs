@@ -90,6 +90,10 @@ fn slot_off(slot: u32) -> usize {
 pub(crate) struct Generations {
     /// 場所の bit `S`。 0 = 世代を持たない DB (local = 場所)。
     bits: AtomicU32,
+    /// #899: 世代を持つ前の、 移る時に決める `S` の下限 (`slot_bits_for(今の max_entities)`。 max_entities は伸びるだけなので
+    /// `S` ≥ これ)。 Ref の紐の円柱が、 移った後に場所で切ると別の値になりうる値 (2^これ 以上 = 自分の entity でない値) を見分ける
+    /// (`HimoStore::put_bits`)。 engine が開く時と `grow_entity_cap` で上げる。
+    floor: AtomicU32,
     region: std::sync::OnceLock<Region>,
     /// v15 に移る手順と消す道の揃え (1 語): 最上位 bit = 「消す時に上げる」 (v15)、 下位 = 印の立つ前に入って、 上げずに消している
     /// 書き手の数。 消す道は入る時の RMW で印を読み (`enter_free`)、 生きている印を下ろしてから出る (`exit_free`)。 移る側は印を
@@ -122,6 +126,7 @@ impl Generations {
     pub(crate) fn off() -> Self {
         Self {
             bits: AtomicU32::new(0),
+            floor: AtomicU32::new(MIN_SLOT_BITS),
             region: std::sync::OnceLock::new(),
             gate: Gate(AtomicU64::new(0)),
             move_lock: std::sync::Mutex::new(()),
@@ -275,6 +280,17 @@ impl Generations {
         while self.gate.0.load(Ordering::Acquire) & GATE_COUNT != 0 {
             std::thread::yield_now();
         }
+    }
+
+    /// #899: 世代を持つ前の `S` の下限を `max_entities` に合わせて上げる (下げない)。
+    pub(crate) fn raise_floor(&self, max_entities: u32) {
+        self.floor.fetch_max(slot_bits_for(max_entities), Ordering::Release);
+    }
+
+    /// #899: 世代を持つ前の `S` の下限 ([`raise_floor`](Self::raise_floor))。
+    #[inline]
+    pub(crate) fn floor_bits(&self) -> u32 {
+        self.floor.load(Ordering::Acquire)
     }
 
     /// 場所の bit。 0 = 世代を持たない。

@@ -8065,6 +8065,7 @@ impl Engine {
         };
 
         let generations = std::sync::Arc::new(crate::generation::Generations::off());
+        generations.raise_floor(max_entities);
         let eng = Self {
             path: path.to_string(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
@@ -9470,12 +9471,19 @@ impl Engine {
         // #731: 世代を持つ DB (v15) は `gen.seg` を開く。 header に場所の bit があるのに開けなければ開かない (世代が分からないと
         // 古い eid を見分けられない)
         let generations = std::sync::Arc::new(crate::generation::Generations::off());
+        generations.raise_floor(max_entities);
         if layout.gen_bits != 0 {
             #[cfg(not(target_arch = "wasm32"))]
             if let Backing::Segments(set) = &backing {
                 set.open_gen(layout.segment_reserve(SegmentKind::Gen)).map_err(|e| e.to_string())?;
             }
             generations.attach(backing.region(SegmentKind::Gen, &layout), u32::from(layout.gen_bits))?;
+        }
+        // #899: Ref の紐の円柱は場所の bit を読む (世代を持つ DB では鍵を場所にする)
+        for (h, &ht) in himos.iter().zip(value_types.iter()) {
+            if ht == ValueType::Ref {
+                h.attach_generations(generations.clone());
+            }
         }
         report("HimoStore::load × N", &mut t, &mut p);
 
@@ -15107,6 +15115,8 @@ impl Engine {
             write_header_crc(buf);
         }
         self.backing.flush_header(l.header_size)?;
+        // #899: 世代を持つ前の `S` の下限 (伸ばした枠の entity を指す ref を、 自分の entity でない値と見ない)
+        self.generations().raise_floor(new_cap);
         self.entity_cap.store(new_cap, std::sync::atomic::Ordering::Release);
         *layout = grown;
         Ok(new_cap)
@@ -24258,6 +24268,10 @@ impl Engine {
             self.backing.region(SegmentKind::Himo(hid as u32), &*self.layout.read().unwrap()),
             ht, effective_mv, self.max_entities(), self.layout.read().unwrap().col_pad,
         );
+        // #899: Ref の紐の円柱は場所の bit を読む (世代を持つ DB では鍵を場所にする)
+        if ht == ValueType::Ref {
+            hs.attach_generations(self.live.gens_arc().clone());
+        }
 
         if self.layout.read().unwrap().has_cell_version() {
             let ver = ver_column_from_region(
@@ -27356,15 +27370,22 @@ impl crate::live::CellReader for Engine {
     fn ref_val(&self, e: u32) -> u64 {
         self.generations().local(e) as u64
     }
+    /// #899: Ref の紐の円柱は鍵が場所なので、 どの世代の値も bucket 1 つ (`HimoStore::pull_slot_into`)。 Ref でない紐 (番号を
+    /// 数で持つ via) は世代ごとの値を引く
     fn pull_ref_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
+        let Some(h) = self.himos.get(via as usize) else { return };
         let b = self.generations().bits();
         if b == 0 || b >= 32 {
-            return crate::live::CellReader::pull_into(self, via, e as u64, out);
+            return h.pull_into(u64::from(e), out);
+        }
+        // 鍵が場所でない Ref の紐 (値を鍵に決めた紐) は下の世代ごとの値を引く
+        if h.value_type == ValueType::Ref && h.pull_slot_into(e, None, out) {
+            return;
         }
         // 世代 0 から今の世代まで (使い回しの無い場所は 1 回)
         let top = self.generations().get(e).min(self.generations().retired_mark());
         for g in 0..=top {
-            crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
+            h.pull_into(u64::from((g << b) | e), out);
         }
     }
     fn pull_ref_stale_into(&self, via: u16, e: u32, out: &mut Vec<u32>) {
@@ -27372,9 +27393,14 @@ impl crate::live::CellReader for Engine {
         if b == 0 || b >= 32 {
             return;
         }
+        let Some(h) = self.himos.get(via as usize) else { return };
+        // 今の世代より前の値 (前の住人を指す ref)。 使い回しの無い場所 (今の世代 0) は無い
         let top = self.generations().get(e).min(self.generations().retired_mark());
+        if h.value_type == ValueType::Ref && h.pull_slot_into(e, Some(top), out) {
+            return;
+        }
         for g in 0..top {
-            crate::live::CellReader::pull_into(self, via, ((g << b) | e) as u64, out);
+            h.pull_into(u64::from((g << b) | e), out);
         }
     }
     #[inline]
@@ -33027,6 +33053,65 @@ mod eidmap_log_read_tests {
         let got: std::collections::BTreeSet<_> = deserialize_eidmap(&served).unwrap().into_iter().collect();
         assert_eq!(got, expect, "読む間のまとめ直しで log にだけあった写像を落とした");
         drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// PR #907 の読み直し C: 世代を持つ前に自分の entity でない値 (他の peer の eid の local、 2^24 以上) を指す ref を組んだ円柱に置いた
+/// Ref の紐は、 開き直すまで円柱の鍵を値のままにする。 その紐の 「場所を指す全部の世代 / 前の世代」 (live の上へ伝える道) は、 円柱の
+/// bucket 1 つで引けないので世代ごとの値を引く。
+#[cfg(test)]
+mod issue899_value_keyed_ref_tests {
+    use super::*;
+    use crate::live::CellReader;
+    use enchudb_oplog::{eid_local, make_eid};
+
+    #[test]
+    fn value_keyed_ref_pulls_every_generation_of_a_slot() {
+        let path = format!("{}/enchu-issue899-vk-{}", std::env::temp_dir().display(), std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        {
+            let mut e = Engine::create_with_capacity(&path, 1 << 16).unwrap();
+            e.define_table("c", 4).unwrap();
+            e.define_himo_in("c", "a", ValueType::Number, 0).unwrap();
+            e.define_table("u", 64).unwrap();
+            e.define_ref_in("u", "co", "c").unwrap();
+            let cs: Vec<_> = (0..4).map(|_| e.entity_in("c").unwrap()).collect();
+            let us: Vec<_> = (0..8).map(|_| e.entity_in("u").unwrap()).collect();
+            for (i, &u) in us.iter().enumerate() {
+                e.tie_ref_to(u, "u.co", cs[i % 4]);
+            }
+            // 他の peer の行を指す ref (local = 2^24 + 5)、 v14 の間に円柱を組む
+            let stranger = e.entity_in("u").unwrap();
+            e.tie_ref_to(stranger, "u.co", make_eid(2, (1 << 24) | 5));
+            let via = e.himo_id("u.co").unwrap() as u16;
+            assert_eq!(e.pull_raw("u.co", e.ref_value(cs[0])).len(), 2, "前提: 円柱を組んだ");
+            assert_eq!(e.slot_bits(), 0, "前提: 世代を持つ前");
+            // 会社 0 を消して足す (場所を使い回す = v15)。 前の社員 2 人は消えた会社を指したまま、 2 人を新しい会社へ
+            e.delete(cs[0]);
+            let reborn = e.entity_in("c").unwrap();
+            assert!(e.slot_bits() > 0, "前提: 世代を持つ DB");
+            let slot = eid_local(cs[0]);
+            assert_eq!(eid_local(reborn) & ((1 << e.slot_bits()) - 1), slot, "前提: 場所を使い回した");
+            let movers: Vec<_> = (0..2).map(|_| e.entity_in("u").unwrap()).collect();
+            for &u in &movers {
+                e.tie_ref_to(u, "u.co", reborn);
+            }
+            assert!(!e.himo_value_is_dense("u.co", e.ref_value(reborn)).unwrap_or(true), "前提: 値を鍵にした紐 (世代 1 の値は sparse)");
+            let local = |v: Vec<u32>| -> Vec<u32> {
+                let mut v = v;
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let mut all = Vec::new();
+            CellReader::pull_ref_into(&e, via, slot, &mut all);
+            let want: Vec<u32> = local([us[0], us[4], movers[0], movers[1]].iter().map(|&u| eid_local(u)).collect());
+            assert_eq!(local(all), want, "場所の全部の世代を指す社員");
+            let mut stale = Vec::new();
+            CellReader::pull_ref_stale_into(&e, via, slot, &mut stale);
+            assert_eq!(local(stale), local(vec![eid_local(us[0]), eid_local(us[4])]), "前の世代を指す社員");
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 }
