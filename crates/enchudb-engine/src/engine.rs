@@ -14538,7 +14538,12 @@ impl Engine {
                     // 後 = この slot は自分の物 (前は落としてから立てていて、 #883 の形では、 先に印を立てて書き始めた別の書き手の版数を
                     // 落としうる)。 lock の順は `free_locals` → `EntitySet` の中、 の一方向のまま (`purge_sync_ops_row` の doc)
                     match prepared {
-                        Some(_) => self.forget_slot_versions(global),
+                        Some(_) => {
+                            // 名前の記録は生かす前に外した (`prepare_reuse`)。 生かすまでの間に消えた行への改名 (`name_given_to_dead_row`、
+                            // 行の lock を取らない) が場所の前の名前に足した分だけ外す (消した名前の記録は場所でなく名前で持つので触らない)
+                            self.forget_slot_former(global);
+                            self.clear_slot_versions(global);
+                        }
                         None => self.clear_cell_versions(global),
                     }
                     drop(fl);
@@ -17813,6 +17818,11 @@ impl Engine {
     /// 削除の版数は slot に載っていないので残る)。
     fn forget_slot_names(&self, local: u32) {
         self.forget_pk_slot(local);
+        self.forget_slot_former(local);
+    }
+
+    /// slot `local` の前の名前・束ねた identity・名前の年表 (`pk_former`) を外す。
+    fn forget_slot_former(&self, local: u32) {
         if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) && self.pk_former.write().unwrap().forget_slot(local) {
             self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -17822,6 +17832,11 @@ impl Engine {
     /// 写像を場所を生かす前に外す (`prepare_reuse`) ので、 場所を取った後はこちらだけ。
     fn forget_slot_versions(&self, local: u32) {
         self.forget_slot_names(local);
+        self.clear_slot_versions(local);
+    }
+
+    /// slot `local` の版数 (cell ごとの版数と削除の版数) を落とす ([`Self::forget_slot_versions`] の後半)。
+    fn clear_slot_versions(&self, local: u32) {
         if local >= self.max_entities() {
             return;
         }
@@ -17936,7 +17951,7 @@ impl Engine {
         self.evict_translation_unclaimed(slot);
         // review928 の [3]: 場所ごとの名前の記録も生かす前に外す (名前は上で identity に移した)。 生かした後に外すと、 その間の束ね・改名の
         // `former_pk_holder` が新しい行を前の持ち主として返した。 取れなかった時 (#883) の場所は前の住人が居ないので外す物も無い。 生かす
-        // までの間に消えた行への改名が足した記録は、 場所を取った後にもう一度外す (`forget_slot_versions`)
+        // までの間に消えた行への改名が足した前の名前は、 場所を取った後にもう一度外す (`forget_slot_former`)
         self.forget_slot_names(slot);
         ReusePrep { remembered }
     }
