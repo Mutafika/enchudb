@@ -9,6 +9,9 @@
 //!
 //! 窓を必ず踏む: WAL を畳ませずに (bridge が追いつかない = 畳めない) 閉じ、 開き直して、 前の record だけ ack して回収する。
 //! 空いた分だけ写し直しが進み、 組の続きの手前でまた満杯になる。
+//!
+//! 配ってよい行は、 配る側の本番の道 (`settled_sync_records`、 #949 から) と前の読み (`settled_sync_ops`) の両方で見る (#955)。
+//! falsify: `settled_sync_records` が配ってよい行の終わり (`lsn <= settled`) を見ないと、 組の前半を配る。
 
 use enchudb_engine::transport::WireRecord;
 use enchudb_engine::{Engine, ValueType};
@@ -48,12 +51,22 @@ fn drain(eng: &Engine) {
     while eng.transfer_oplog_to_sync_ops() > 0 {}
 }
 
+/// #955: 配る側の本番の道 (`settled_sync_records`: `Syncer` の publish とホストの pull が読む) で配ってよい record の (書き手, 版数)
+/// (lsn の順、 Commit は除く)。
+fn settled(eng: &Engine) -> Vec<(PeerId, Hlc)> {
+    eng.settled_sync_records(|_, _| true)
+        .into_iter()
+        .filter(|r| !matches!(r.op, DecodedOp::Commit))
+        .map(|r| (r.author_peer, r.hlc))
+        .collect()
+}
+
 #[test]
 fn a_group_cut_apart_is_not_handed_out_while_the_bridge_recopies_the_wal_after_reopen() {
     let path = tmp_path("recopy");
     let _cleanup = Cleanup(path.clone());
     let group_key = (AUTHOR, Hlc { wall: 5, logical: 0, peer: AUTHOR });
-    let on = |payloads: Vec<Vec<u8>>| rows(payloads).iter().filter(|k| **k == group_key).count();
+    let on = |rows: Vec<(PeerId, Hlc)>| rows.iter().filter(|k| **k == group_key).count();
     let (first_half, fillers) = {
         let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
         eng.define_table("notes", 8).unwrap();
@@ -83,16 +96,21 @@ fn a_group_cut_apart_is_not_handed_out_while_the_bridge_recopies_the_wal_after_r
         let first_half = all.iter().filter(|k| **k == group_key).count();
         assert!(first_half > 0 && first_half < GROUP, "前提: 組が ring の端で割れている (載った {first_half} / {GROUP} 本)");
         assert_eq!(all.iter().filter(|(a, _)| *a == ME).count(), fillers, "前提: 組の前の record は全部 ring にある");
-        assert_eq!(on(eng.settled_sync_ops()), 0, "閉じる前: 割れた組は配らない");
+        assert_eq!(on(settled(&eng)), 0, "閉じる前: 割れた組は配らない");
+        assert_eq!(on(rows(eng.settled_sync_ops())), 0, "閉じる前: 割れた組は配らない (前の読み)");
         assert_eq!(Arc::strong_count(&eng), 1);
         (first_half, fillers)
     };
 
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(ME);
+    // 開いた後の最初の読み (consumer の周より先なら、 読みが bridge を 1 周させてから読む。 engine の単体
+    // `the_first_read_after_reopen_does_not_hand_out_a_group_cut_apart` が consumer を止めて必ず踏む)
+    assert_eq!(on(settled(&eng)), 0, "開き直した直後の最初の読み: 割れた組は配らない");
     drain(&eng);
-    assert_eq!(on(eng.pending_sync_ops(0)), first_half, "前提: 開き直した直後も、 組は ring の上で割れたまま");
-    assert_eq!(on(eng.settled_sync_ops()), 0, "開き直した直後: 割れた組は配らない");
+    assert_eq!(on(rows(eng.pending_sync_ops(0))), first_half, "前提: 開き直した直後も、 組は ring の上で割れたまま");
+    assert_eq!(on(settled(&eng)), 0, "開き直した直後: 割れた組は配らない");
+    assert_eq!(on(rows(eng.settled_sync_ops())), 0, "開き直した直後: 割れた組は配らない (前の読み)");
 
     // 受け手が、 組の前の record を全部受けて ack する → 回収 → 空いた分だけ bridge が WAL を頭から写し直す
     let before: Vec<(PeerId, Hlc)> = rows(eng.pending_sync_ops(0)).into_iter().filter(|(a, _)| *a == ME).collect();
@@ -107,17 +125,21 @@ fn a_group_cut_apart_is_not_handed_out_while_the_bridge_recopies_the_wal_after_r
     assert!(recopied > 64, "前提: bridge は、 もう配った record を 65 個以上写し直した ({recopied} 行)");
     let now = all.iter().filter(|k| **k == group_key).count();
     assert!(now >= first_half && now < first_half + GROUP, "前提: 組の続きはまだ載り切っていない (ring に {now} 本、 前半 {first_half} 本)");
-    assert_eq!(on(eng.settled_sync_ops()), 0, "写し直しの途中: ring に残っている組の前半 ({first_half} 本) を配った");
+    assert_eq!(on(settled(&eng)), 0, "写し直しの途中: ring に残っている組の前半 ({first_half} 本) を配った");
+    assert_eq!(on(rows(eng.settled_sync_ops())), 0, "写し直しの途中: ring に残っている組の前半 ({first_half} 本) を配った (前の読み)");
 
     // 写し直した分も ack する。 組の前半の行 (ack していない) が回収の列の頭を塞ぐので、 写し直した行は回収されず、 ring は
     // 空かない = 組は載り切らない。 その時は書き手の floor が組の版数に上がっていて、 受け手は state で取り直す
     eng.ack_sync_up_to_cursors(PULLER, &[(ME, top)]).unwrap();
     eng.reclaim_sync_ops();
     drain(&eng);
-    let handed = on(eng.settled_sync_ops());
+    let handed = on(settled(&eng));
+    let handed_ops = on(rows(eng.settled_sync_ops()));
     let floor = eng.sync_reclaimed_floors().unwrap_or_default().into_iter().find(|(a, _)| *a == AUTHOR).map(|(_, h)| h);
-    assert!(
-        handed >= GROUP || (handed == 0 && floor >= Some(group_key.1)),
-        "組は、 全部載ってから配るか、 配らずに書き手の floor を組の版数に上げる (配ってよい行に {handed} 本、 floor {floor:?})"
-    );
+    for (handed, how) in [(handed, "settled_sync_records"), (handed_ops, "settled_sync_ops")] {
+        assert!(
+            handed >= GROUP || (handed == 0 && floor >= Some(group_key.1)),
+            "{how}: 組は、 全部載ってから配るか、 配らずに書き手の floor を組の版数に上げる (配ってよい行に {handed} 本、 floor {floor:?})"
+        );
+    }
 }
