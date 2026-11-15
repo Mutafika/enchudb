@@ -4514,6 +4514,74 @@ mod apply_liveness_tests {
         }
     }
 
+    /// #898: 書き出しの間に消した行が `tables` の sidecar の `next_local` より先にある (#857 / #870 の印) 空け作りを、 当てている途中の
+    /// 書き手の手前で切る。 書き出しの後の `tables_cover_checkpoint` はその場で `tables` を置き直すので、 置ければ 「当てている途中」
+    /// (`Applying`、 待つ書き手は諦めない)、 置けなければ 「畳めない」 (`Blocked`、 #870 の止め: 次の周期も置けないので、 待つ書き手を
+    /// 上限まで待たせない)。 書き出しの間に消すのは、 書き出しの前に `tables` を置く (`try_persist_tables`) ので、 その前に消した行は
+    /// 書き出しの後の判定まで残らないため。 `tables` を書けない状態は `{db}/tables.tmp` に directory を置いて作る (#870 の試験と同じ)。
+    #[test]
+    fn a_room_attempt_cut_by_an_applying_writer_with_rows_freed_ahead_of_tables() {
+        for tables_ok in [true, false] {
+            std::thread::spawn(move || freed_cut_room_case(tables_ok)).join().unwrap();
+        }
+    }
+
+    fn freed_cut_room_case(tables_ok: bool) {
+        let tag = format!("tables {}", if tables_ok { "ok" } else { "blocked" });
+        let p = path(&format!("freedcut{}", tables_ok as u8));
+        let eng = Engine::create_without_cell_version(&p, 4096).unwrap();
+        let (eng, x, y, _) = open(eng, false);
+        let e1 = eng.entity_in("t").unwrap();
+        eng.try_tie_to_by_id(e1, x, 1u32).unwrap();
+        eng.oplog_sync().unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let held = eng.hold_consumer();
+        let blocker = std::path::Path::new(&p).join("tables.tmp");
+        if !tables_ok {
+            std::fs::create_dir(&blocker).unwrap();
+        }
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        cell_append_hook::set(&wal, move |_| {
+            in_tx.send(()).unwrap();
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, x, 2u32))
+        };
+        in_rx.recv_timeout(Duration::from_secs(20)).expect("前提: A が積んだ後・当てる前で止まった");
+        // 書き出しの直前 (`tables` を置いた後) に行を足して消す
+        let freed: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
+        {
+            let (eng, freed) = (eng.clone(), freed.clone());
+            room_write_out_hook::set(&wal, move |_| {
+                let doomed = eng.entity_in("t").unwrap();
+                eng.try_tie_to_by_id(doomed, y, 1u32).unwrap();
+                eng.delete(doomed);
+                *freed.lock().unwrap() = Some(eng.checkpoint_held_for_freed_slots());
+            });
+        }
+        let cuts = wal.applying_cuts();
+        let room = eng.make_wal_room(&wal);
+        let cut = wal.applying_cuts() > cuts;
+        let (freed, still_held) = (freed.lock().unwrap().take(), eng.checkpoint_held_for_freed_slots());
+        release.send(()).unwrap();
+        let a = a.join().unwrap();
+        if !tables_ok {
+            std::fs::remove_dir(&blocker).unwrap();
+        }
+        drop(held);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&p);
+        assert_eq!(a, Ok(()), "{tag}: 書き手 A");
+        assert!(cut, "{tag}: 前提: A の手前で切った");
+        assert_eq!(freed, Some(true), "{tag}: 前提: 書き出しの時、 消した行が sidecar より先にある");
+        assert_eq!(still_held, !tables_ok, "{tag}: 前提: 書き出しの後の判定が `tables` を置いた (置けない時は置かない)");
+        let want = if tables_ok { WalRoom::Applying } else { WalRoom::Blocked };
+        assert_eq!(room, want, "{tag}: 空け作りの結果");
+    }
+
     /// 当てている途中の書き手の手前で切った空け作りの後、 次に試すまでの間 (`APPLYING_CUT_PACE`) も、 空きを待つ書き手が居る間の
     /// consumer は寝る (待つ書き手が 200 µs ごとに起こす分だけ起きる)。 前は、 その間寝ずに回った (#873 の 2 回目のレビュー)。
     /// A を積んだ後・当てる前で止め、 B に WAL を埋めさせて空きを待たせた間の 200 ms に、 consumer の周の数を見る。
@@ -7639,6 +7707,9 @@ pub struct Engine {
     defer_tables_persist: std::sync::atomic::AtomicBool,
     /// #847: `tables` の sidecar に最後に置いた中身 ([`Self::persist_tables_file`])。 同じ中身なら file に触らない。
     tables_persisted: std::sync::Mutex<Option<Vec<u8>>>,
+    /// #902: `tables` を置き換えた (rename した) 後、 親の directory の fsync がまだ済んでいない ([`Self::persist_tables_file`]、
+    /// `tables_persisted` の lock の下でだけ触る)。
+    tables_dir_unsynced: std::sync::atomic::AtomicBool,
     /// #847: sync の ring の穴を次に探し始める所 ([`Self::rebuild_free_locals`]、 `free_locals` の lock の下でだけ触る)。
     sync_ring_rebuild_from: std::sync::atomic::AtomicU32,
     /// #868: 枯渇した表の穴を探して枠をなめた回数 ([`Self::free_slot_scans`])。
@@ -8093,6 +8164,7 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
+            tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             written_out_pos: std::sync::atomic::AtomicU64::new(0),
@@ -9523,6 +9595,7 @@ impl Engine {
             abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
+            tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
             sync_ring_rebuild_from: std::sync::atomic::AtomicU32::new(0),
             free_slot_scans: std::sync::atomic::AtomicU64::new(0),
             written_out_pos: std::sync::atomic::AtomicU64::new(0),
@@ -13804,7 +13877,8 @@ impl Engine {
     ///
     /// #847: 中身が、 この engine が最後に置いた (または file と同じと確かめた) 中身と同じなら、 file に触らない。 前は
     /// 書き出しのたびに file を開いて読み比べていた (`write_atomic_if_changed`。 file system が混むと、 開くだけで待たされる)。
-    /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない。
+    /// sidecar を書くのは書き手の lock を持つこの engine だけなので、 覚えた中身と file は食い違わない (置けなかった回は覚えた中身を
+    /// 捨てる、 #902)。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_tables_file(&self) -> io::Result<()> {
         self.persist_tables_file_with(None)
@@ -13824,10 +13898,20 @@ impl Engine {
         );
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
+            use std::sync::atomic::Ordering;
             let path = tables_path_for(&self.path);
-            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)
+            // #902: 置けなかったら覚えた中身を捨てる (置き換えの途中・後で失敗すると、 file は覚えた中身と違いうる。 覚えたままだと、 中身が
+            // 前に置いた形に戻った時に file に触らずに済ませ、 失敗した回の中身が file に残る)
+            *last = None;
+            // #884: 置き換えた (rename した) 時は、 checkpoint を進める前に rename を disk へ送る (`sync_tables_dir` の doc)。 #902: 送れる
+            // まで印を残し、 中身が file と同じ (前の回の rename は通った) でも送り直す。 前は、 送るのに失敗した後の回が 「中身は同じ」 で
+            // 送らずに置いたと返し、 checkpoint が rename の永続を待たずに進みえた
             if crate::db_files::write_atomic_if_changed(&path, &bytes)? {
+                self.tables_dir_unsynced.store(true, Ordering::Release);
+            }
+            if self.tables_dir_unsynced.load(Ordering::Acquire) {
                 crate::db_files::sync_tables_dir(&path)?;
+                self.tables_dir_unsynced.store(false, Ordering::Release);
             }
             *last = Some(bytes);
         }
