@@ -12553,7 +12553,7 @@ impl Engine {
                         // 引く。 場所の最後の住人を指していない ref (消えた行を指したまま場所を使い回した後) は、 前の住人が自分の行か
                         // 翻訳した行か分からない (写像は今の住人の物) ので出さない (前は今の住人を指して出していた)
                         let target_slot = self.generations().split(value).0;
-                        if self.last_local_of_slot(target_slot) != value {
+                        if self.generations().active() && self.last_local_of_slot(target_slot) != value {
                             dropped += 1; // #236
                             continue;
                         }
