@@ -2509,6 +2509,25 @@ mod settle_call_hook {
     }
 }
 
+/// #949: この thread の [`Engine::sync_op_walk_key`] を直す前の読み (payload を写して `decode_sync_ops_payload`) にする。 直す前の
+/// 実装と答えを比べる試験の参照に使う。
+#[cfg(test)]
+mod walk_key_full_decode {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn set(on: bool) {
+        ON.with(|c| c.set(on));
+    }
+
+    pub(super) fn on() -> bool {
+        ON.with(|c| c.get())
+    }
+}
+
 /// test 用の数え: [`Engine::table_rows_with_himo`] がなめた cell の数 (この thread の分、 #940)。
 #[cfg(test)]
 mod table_scan_cells {
@@ -13395,12 +13414,10 @@ impl Engine {
             std::collections::HashMap::new();
         let mut known_authors: Option<std::collections::HashSet<u32>> = None;
         for (lsn, eid) in rows.iter() {
-            let decoded = self
-                .sync_op_payload(*eid, &cols)
-                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
-            match decoded {
-                Some(rec) => {
-                    if !consumed(rec.author_peer, rec.hlc) {
+            // #949: (author, HLC) だけ読む (payload を写さず、 Record を組み立てない。 decode できない行の判定は同じ)
+            match self.sync_op_walk_key(*eid, &cols) {
+                Some((author, hlc)) => {
+                    if !consumed(author, hlc) {
                         break;
                     }
                     ack_lsn = *lsn;
@@ -13707,9 +13724,8 @@ impl Engine {
         };
         // #947: ring の表の枠だけなめる
         for eid in self.table_rows_with_himo(cols.lsn) {
-            let Some(bytes) = self.sync_op_payload(eid, &cols) else { continue };
-            if let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) {
-                set.insert(rec.author_peer);
+            if let Some((author, _)) = self.sync_op_walk_key(eid, &cols) {
+                set.insert(author);
             }
         }
         set
@@ -13782,11 +13798,8 @@ impl Engine {
         {
             // #947: ring の表の枠だけなめ、 watermark 以下の行だけ読み直す
             for (_, eid) in self.table_rows_with_value32(cols.lsn, |lsn| lsn <= watermark) {
-                if let Some(rec) = self
-                    .sync_op_payload(eid, &cols)
-                    .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
-                {
-                    bump(rec.author_peer, rec.hlc);
+                if let Some((author, hlc)) = self.sync_op_walk_key(eid, &cols) {
+                    bump(author, hlc);
                 }
             }
         }
@@ -13871,10 +13884,8 @@ impl Engine {
             if lsn >= watermark {
                 continue;
             }
-            let decoded = payload_cols
-                .as_ref()
-                .and_then(|c| self.sync_op_payload(eid, c))
-                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
+            // #949: (author, HLC) だけ読む (decode できない行の判定は同じ)
+            let decoded = payload_cols.as_ref().and_then(|c| self.sync_op_walk_key(eid, c));
             // payload の ring を開けないだけの row も消さない (`ack_sync_prefix` と同じ)。
             if decoded.is_none()
                 && (lsn >= inflight_lsn
@@ -13884,13 +13895,13 @@ impl Engine {
             }
             // #218: floor は **decode できた row だけ**で作っていた = 過少申告。
             // decode 不能な row も消す以上、 その分の履歴は差分 pull で配れない。
-            match &decoded {
-                Some(rec) => {
+            match decoded {
+                Some((author, hlc)) => {
                     let e = reclaimed_max
-                        .entry(rec.author_peer)
+                        .entry(author)
                         .or_insert(enchudb_oplog::Hlc::ZERO);
-                    if rec.hlc > *e {
-                        *e = rec.hlc;
+                    if hlc > *e {
+                        *e = hlc;
                     }
                 }
                 None => dead_raw_authors.push(
@@ -14740,6 +14751,27 @@ impl Engine {
         }
         let vid = self.get_by_id32(eid, cols.legacy?)?;
         Some(self.vocab.get(vid).to_vec())
+    }
+
+    /// #949: 行の payload の (author, HLC)。 `sync_op_payload(eid, cols).and_then(|b| decode_sync_ops_payload(&b))` の
+    /// `(author_peer, hlc)` と同じ答え (読めない / decode できない行は `None`) を、 payload を写さず `Record` を組み立てずに出す。
+    fn sync_op_walk_key(&self, eid: u64, cols: &SyncPayloadCols) -> Option<(enchudb_oplog::PeerId, enchudb_oplog::Hlc)> {
+        #[cfg(test)]
+        if walk_key_full_decode::on() {
+            return self
+                .sync_op_payload(eid, cols)
+                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
+                .map(|r| (r.author_peer, r.hlc));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(at) = cols.at
+            && let Some(handle) = self.get_by_id32(eid, at)
+        {
+            let lsn = self.get_by_id32(eid, cols.lsn)?;
+            return self.payload_ring(false)?.read_with(handle, lsn, enchudb_oplog::oplog::sync_ops_payload_walk_key)?;
+        }
+        let vid = self.get_by_id32(eid, cols.legacy?)?;
+        enchudb_oplog::oplog::sync_ops_payload_walk_key(self.vocab.get(vid))
     }
 
     /// row の payload が ring にあるのに ring を開けない (= 壊れているのは置き場で、 row ではない)。
@@ -31122,7 +31154,7 @@ mod ring_scans_tests {
         path
     }
 
-    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    pub(super) fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).unwrap();
         for e in std::fs::read_dir(from).unwrap() {
             let e = e.unwrap();
@@ -31332,6 +31364,174 @@ mod ring_scans_tests {
         let now = run(&copy, false);
         assert!(old.0 > 0, "前提: 回収した ({})", old.0);
         assert_eq!(old, now, "回収 / open_groups_on_ring の答えが直す前のなめと違う");
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_dir_all(&copy);
+    }
+}
+
+/// #949: ring の walk (ack / reclaim / 配り切った位置 / ring_authors) が行ごとに読む (author, HLC) を、 payload を写さず `Record` を
+/// 組み立てずに読む (`sync_op_walk_key`)。 答えが直す前の読み (`sync_op_payload` + `decode_sync_ops_payload`) と同じ。
+#[cfg(test)]
+mod walk_key_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> String {
+        let path = format!("{}/enchudb-949-{}-{}", std::env::temp_dir().display(), tag, std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    fn old_key(p: &[u8]) -> Option<(u32, enchudb_oplog::Hlc)> {
+        enchudb_oplog::oplog::decode_sync_ops_payload(p).map(|r| (r.author_peer, r.hlc))
+    }
+
+    fn settle(eng: &Engine) {
+        eng.oplog_commit();
+        eng.oplog_sync().unwrap();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+    }
+
+    /// sync の DB に書いて (Tie と Vocab の record)、 peer 3 本の ack で 1 回回収し、 回収で空いた lsn に decode できない payload の行
+    /// (辞書の payload の列、 dead row) を 1 つ置く。
+    fn build(path: &str) -> std::sync::Arc<Engine> {
+        {
+            let mut eng = Engine::create_with_capacity(path, 1 << 16).unwrap();
+            eng.define_table("t", 1000).unwrap();
+            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+            eng.define_himo_in("t", "s", ValueType::Tag, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(path, 8 << 20).unwrap();
+        eng.set_peer_id(1);
+        let (v, t) = (eng.himo_id("t.v").unwrap() as u16, eng.himo_id("t.s").unwrap() as u16);
+        let rows: Vec<_> = (0..20).map(|_| eng.entity_in("t").unwrap()).collect();
+        for i in 0..400u64 {
+            if i % 7 == 0 {
+                eng.tie_text_async(rows[(i % 20) as usize], "t.s", &format!("w{i}"));
+            } else {
+                eng.tie_to_by_id(rows[(i % 20) as usize], v, i + 1);
+            }
+        }
+        let _ = t;
+        settle(&eng);
+        let top = eng.current_sync_lsn();
+        for p in 2..5u32 {
+            eng.ack_sync(p, top / 2).unwrap();
+        }
+        assert!(eng.reclaim_sync_ops() > 0, "前提: 回収した");
+        // 回収で空いた lsn (top / 2 - 1) に decode できない payload の行
+        let cols = eng.sync_payload_cols().unwrap();
+        let e = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_bytes_to_by_id(e, cols.legacy.expect("前提: 辞書の payload の列"), b"not a record");
+        eng.tie_to_by_id(e, cols.lsn, top / 2 - 1);
+        assert!(eng.sync_op_payload(e, &cols).is_some() && eng.sync_op_walk_key(e, &cols).is_none(), "前提: dead row");
+        // 辞書の payload の列に読める payload の行も 1 つ (0.30 以前の形の行。 lsn は回収で空いた top / 2 - 2)
+        let src = eng.table_rows_with_value32(cols.lsn, |l| l > top / 2).into_iter().min().map(|(_, e)| e).unwrap();
+        let bytes = eng.sync_op_payload(src, &cols).unwrap();
+        let e2 = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_bytes_to_by_id(e2, cols.legacy.unwrap(), &bytes);
+        eng.tie_to_by_id(e2, cols.lsn, top / 2 - 2);
+        assert!(eng.sync_op_walk_key(e2, &cols).is_some() && eng.sync_op_walk_key(e2, &cols) == old_key(&bytes), "前提: 辞書の読める行");
+        eng
+    }
+
+    /// payload 1 つずつ: 本物の payload と、 その切り詰め (長さ 0〜全部)・header と op の byte を 1 つずつ変えたもの・でたらめな byte で、
+    /// `sync_ops_payload_walk_key` が `decode_sync_ops_payload` と同じ答え (受ける / 断る、 author、 HLC)。
+    #[test]
+    fn walk_key_equals_full_decode_per_payload() {
+        let path = tmp("payload");
+        let eng = build(&path);
+        let cols = eng.sync_payload_cols().unwrap();
+        let payloads: Vec<Vec<u8>> =
+            eng.entities_with_himo(cols.lsn).into_iter().filter_map(|e| eng.sync_op_payload(e, &cols)).collect();
+        assert!(payloads.len() > 100, "前提: ring の payload");
+        let (mut accepted, mut rejected) = (0, 0);
+        let mut check = |p: &[u8]| {
+            let want = old_key(p);
+            assert_eq!(enchudb_oplog::oplog::sync_ops_payload_walk_key(p), want, "payload {p:?}");
+            if want.is_some() { accepted += 1 } else { rejected += 1 }
+        };
+        for (i, p) in payloads.iter().enumerate().step_by(9) {
+            check(p);
+            for n in 0..p.len() {
+                check(&p[..n]);
+            }
+            let head = (enchudb_oplog::oplog::SYNC_OPS_PAYLOAD_PREFIX + 48).min(p.len());
+            for at in 0..head {
+                for x in [0x01u8, 0x80, 0xff] {
+                    let mut q = p.clone();
+                    q[at] ^= x;
+                    check(&q);
+                }
+            }
+            let mut q = p.clone();
+            q.extend_from_slice(&[0xAB; 7]);
+            check(&q);
+            let r: Vec<u8> = (0..p.len()).map(|k| ((k * 31 + i * 17) % 251) as u8).collect();
+            check(&r);
+        }
+        assert!(accepted > 50 && rejected > 1000, "前提: 受ける / 断る の両方を見た ({accepted} / {rejected})");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// ring の walk 全部: 同じ DB の写し 2 つで、 片方を直す前の読み、 もう片方を今の読みにして ack (session の最初の walk、 dead row を
+    /// 消す道を含む)・配り切った位置・ring_authors・reclaim を回す。 答えと、 残った行・floor が同じ。
+    #[test]
+    fn ring_walks_match_the_full_decode() {
+        let path = tmp("walks");
+        let eng = build(&path);
+        drop(eng);
+        let copy = format!("{path}-copy");
+        let _ = std::fs::remove_dir_all(&copy);
+        super::ring_scans_tests::copy_dir(std::path::Path::new(&path), std::path::Path::new(&copy));
+        let run = |p: &str, old: bool| {
+            let eng = Engine::open_concurrent_with_oplog(p, 8 << 20).unwrap();
+            eng.set_peer_id(1);
+            walk_key_full_decode::set(old);
+            let cols = eng.sync_payload_cols().unwrap();
+            let mut authors: Vec<u32> = eng.ring_authors().into_iter().collect();
+            authors.sort_unstable();
+            let delivered = eng.sync_delivered_cursors().map(|mut v| {
+                v.sort();
+                v
+            });
+            let me = eng.peer_id();
+            let mid = {
+                let mut r = eng.table_rows_with_value32(cols.lsn, |_| true);
+                r.sort_by_key(|x| x.0);
+                let (_, e) = r[r.len() * 2 / 3];
+                old_key(&eng.sync_op_payload(e, &cols).unwrap()).map(|(_, h)| h).unwrap_or(enchudb_oplog::Hlc::ZERO)
+            };
+            let acks: Vec<u32> = (2..6u32)
+                .map(|p| {
+                    if p % 2 == 0 {
+                        eng.ack_sync_up_to_hlc(p, mid).unwrap()
+                    } else {
+                        eng.ack_sync_up_to_cursors(p, &[(me, mid)]).unwrap()
+                    }
+                })
+                .collect();
+            let dead = eng.sync_dead_rows_purged();
+            let purged = eng.reclaim_sync_ops();
+            let mut lsns: Vec<u32> =
+                eng.entities_with_himo(cols.lsn).into_iter().filter_map(|e| eng.get_by_id32(e, cols.lsn)).collect();
+            lsns.sort_unstable();
+            let floors = eng.sync_reclaimed_floors().map(|mut v| {
+                v.retain(|(a, _)| *a != u32::MAX); // dead row の帰属できない floor は時計の今 (2 つの写しで違う)
+                v.sort();
+                v
+            });
+            walk_key_full_decode::set(false);
+            drop(eng);
+            (authors, delivered, acks, dead, purged, lsns, floors)
+        };
+        let old = run(&path, true);
+        let now = run(&copy, false);
+        assert!(old.3 > 0, "前提: ack の walk が dead row を消した");
+        assert!(old.2.iter().any(|&a| a > 0) && old.4 > 0, "前提: ack が進み、 回収した ({:?} / {})", old.2, old.4);
+        assert_eq!(old, now, "ring の walk の答えが直す前の読みと違う");
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_dir_all(&copy);
     }
