@@ -29494,7 +29494,10 @@ impl Engine {
         // 開く時の突き合わせ (`reconcile_generations`、 gen.seg の 「死んでいる」 印と生きている印) が 「消す前」 か 「消した後」 に揃える
         let live_and_generations = |k: SegmentKind| matches!(k, SegmentKind::Entities | SegmentKind::Gen);
         // 前の住人の記録 (`prev.seg`) は、 使い回しが生かした印 (entities / gen.seg) と 0 にした tomb.seg より先に。 書き出しの
-        // 間に使い回した分は、 tomb.seg の前に門を閉じてもう一度 (下)
+        // 間に使い回した分は、 tomb.seg の前に門を閉じてもう一度 (下)。 生きている印より先なのは、 この書き出しの前の使い回しだけ:
+        // ここから entities / gen.seg の書き出しまでの間の使い回しは、 生きている印だけが届いて記録が届かない像がある (review946 [3]、
+        // 残す。 閉じるには 「記録 〜 生かす」 を門に入れ、 その門を prev.seg → entities → gen.seg の書き出しの間閉じる = 使い回しが
+        // 3 回の msync を待つ)
         let prev = |k: SegmentKind| matches!(k, SegmentKind::Prev);
         set.flush_where(all || catch_up, prev)?;
         #[cfg(feature = "crashsim")]

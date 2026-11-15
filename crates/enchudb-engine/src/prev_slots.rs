@@ -45,7 +45,8 @@
 //! - 書き出しの順: 本体の書き出し (`write_out_body`) は `prev.seg` を生きている印 (entities / gen.seg) と tomb.seg より先に書き出す。
 //!   使い回しは記録を書いてから門 ([`PrevSlots::enter`]) の中で tomb.seg を 0 にし、 書き出しは門を閉じて (門を通った書き手が
 //!   居れば) `prev.seg` をもう一度書き出してから tomb.seg を書き出す (#656 の 「中身 → 列」 と同じ並べ方)。 0 にした tomb.seg が
-//!   届いた像には記録も届いている
+//!   届いた像には記録も届いている。 生きている印より先なのはこの書き出しの前の使い回しだけで、 `prev.seg` の書き出しの後・entities /
+//!   gen.seg の書き出しの前の使い回しは、 生きている印だけが届いて記録が無い像がある (review946 [3]、 残す)
 //! - commit は書いた所まで歩幅で伸ばす (file は疎、 gen.seg と同じ)
 //! - 記録は sync する DB (`sync_tables_on`) の使い回しで、 移した削除がある時だけ書く。 世代を持たない DB (v14 以下 / packed /
 //!   wasm / 予約の表) は作らない・書かない
@@ -403,8 +404,9 @@ impl PrevSlots {
     pub(crate) fn unpersisted(&self) -> Vec<(u32, PrevRecord)> {
         let Some(r) = self.region.get() else { return Vec::new() };
         let persisted = self.persisted.load(Ordering::Relaxed);
-        // (周期, 置き場 (0 = log、 1 = 配列), 区画, 順)
-        let mut out: Vec<((u32, u32, u32, u32), u32, PrevRecord)> = Vec::new();
+        // 並びの鍵 = (周期, 置き場 (0 = log、 1 = 配列), 区画, 順)
+        type Order = (u32, u32, u32, u32);
+        let mut out: Vec<(Order, u32, PrevRecord)> = Vec::new();
         for half in 0..2u32 {
             Self::scan_half(r, half, |i, slot, epoch, rec| {
                 if epoch > persisted {
