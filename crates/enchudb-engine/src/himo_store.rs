@@ -1760,18 +1760,16 @@ impl HimoStore {
     pub fn slice_len(&self, value: impl CellValue) -> usize {
         let Some(value) = value.cell_value() else { return 0 };
         self.ensure_cylinder_built();
-        // #899: 鍵が場所の紐の bucket の live は世代を問わない数。 世代 > 0 の値と、 世代 > 0 の entry を置いたことのある紐は
-        // 引いて数える。 置いたことが無ければ live をそのまま使うが、 live を読む間に最初の世代 > 0 の entry が来たら引き直す
-        // (live の store は Release、 ここは Acquire で読んでから印を見る: その entry を数えた live を読んだなら印も見える)
-        if self.ref_bits() != 0 {
-            if value >> self.ref_bits() != 0 || self.has_gen.load(Ordering::Acquire) {
-                return self.pull(value).len();
-            }
-            let n = self.cyl.dense_live_len_acquire(value);
-            if self.has_gen.load(Ordering::Acquire) {
-                return self.pull(value).len();
-            }
-            return n.unwrap_or_else(|| self.pull(value).len());
+        // #899: 鍵が場所の紐の bucket の live は世代を問わない数。 live を使うのは、 世代 0 の値 (鍵 = 値) で、 世代 > 0 の entry を
+        // 置いたことの無い紐だけ (それ以外は引いて数える)。 印は live を読んだ **後** で見る (live の store は Release、 ここは Acquire:
+        // 最初の世代 > 0 の entry を数えた live を読んだなら印も見える、 `tests/loom_ref_gen_mark.rs`)
+        let bits = self.ref_bits();
+        if bits != 0 {
+            let n = (value >> bits == 0).then(|| self.cyl.dense_live_len_acquire(value)).flatten();
+            return match n {
+                Some(n) if !self.has_gen.load(Ordering::Acquire) => n,
+                _ => self.pull(value).len(),
+            };
         }
         match self.cyl.dense_live_len(value) {
             Some(n) => n,
@@ -3270,5 +3268,58 @@ mod tests {
         fresh.attach_generations(gens.clone());
         fresh.declare_marks(marks);
         check(&fresh, "列から組み直した円柱");
+    }
+
+    /// #899: 古い entry の扱いを、 bucket の 「古い entry がある」 印 (`removed`) の無い状態から 1 つずつ確かめる (上の乱数の試験は
+    /// 書き換えが多く、 ほとんどの bucket に印が立ったまま読むので、 印を立て損ねても Column の確かめが隠す)。
+    /// - 世代 > 0 の値から動く (書き換え / 外す) 時は、 場所の bucket に古い印を立てる (値そのものを鍵にすると、 窓の外 = sparse の
+    ///   古い entry に数えて、 bucket の印が立たない = 引く読みが動いた entity を返す)
+    /// - 同じ場所の中で世代だけが変わる書き換えが半分を越えて書き手が詰め直す時、 entry を置いた時の値で照らす (場所だけで照らすと、
+    ///   世代の古い entry を残したまま印を下ろす)
+    #[test]
+    fn ref_slot_keys_note_stale_on_the_slot_bucket() {
+        const N: u32 = 4096;
+        const S: u32 = 24;
+        let gens = Arc::new(crate::generation::Generations::off());
+        gens.start(S);
+        let g1 = |s: u64| 1u64 << S | s;
+        let g2 = |s: u64| 2u64 << S | s;
+        let sorted = |mut v: Vec<u32>| {
+            v.sort_unstable();
+            v
+        };
+        for how in ["retie", "remove", "same_slot"] {
+            let hs = HimoStore::init(heap_region(64 * 1024), ValueType::Ref, 0, N, false);
+            hs.attach_generations(gens.clone());
+            // 場所 5 を世代 1 で指す entity 0..100、 円柱を組んで印を下ろす (詰め直す)
+            for e in 0..100u32 {
+                hs.set(e, g1(5));
+            }
+            assert_eq!(hs.pull(g1(5)).len(), 100);
+            hs.compact_now();
+            assert!(!hs.cyl.bucket_needs_verify(5), "前提: 場所 5 の bucket に古い entry の印が無い");
+            match how {
+                // 世代 1 の値から別の場所へ (1 件)
+                "retie" => {
+                    hs.set(0, g1(6));
+                    assert_eq!(sorted(hs.pull(g1(5))), (1..100).collect::<Vec<_>>(), "{how}: 動いた entity を引いた");
+                }
+                // 世代 1 の値を外す (1 件)
+                "remove" => {
+                    hs.remove(0);
+                    assert_eq!(sorted(hs.pull(g1(5))), (1..100).collect::<Vec<_>>(), "{how}: 外した entity を引いた");
+                }
+                // 同じ場所の中で世代 1 → 2 (古い entry が bucket の半分に届いた所で書き手が詰め直す。 同じ bucket に足し直すので
+                // live は減らず、 99 件目を動かす時に届く: 古い entry 99 件 ≥ (長さ 198) / 2)
+                _ => {
+                    for e in 0..99u32 {
+                        hs.set(e, g2(5));
+                    }
+                    assert!(!hs.cyl.bucket_needs_verify(5), "前提: 書き手が詰め直して印を下ろした");
+                    assert_eq!(hs.pull(g1(5)), vec![99], "{how}: 世代 2 に移った entity を世代 1 で引いた");
+                    assert_eq!(sorted(hs.pull(g2(5))), (0..99).collect::<Vec<_>>(), "{how}: 世代 2");
+                }
+            }
+        }
     }
 }
