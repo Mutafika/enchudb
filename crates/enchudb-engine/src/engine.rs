@@ -6647,6 +6647,82 @@ mod settled_read_hook {
     }
 }
 
+/// #955: `_sync_ops` の行の (lsn, 場所) を (lsn, 場所) の順に並べる (`Engine::settled_sync_records` が ring を lsn の順に読むため)。
+///
+/// 配ってよい行の lsn はほぼ続いている (bridge は lsn を 1 から 1 つずつ振り、 回収は小さい方から消す) ので、 lsn の幅が行の数の 4 倍
+/// 以下なら、 lsn - 最小 の位置に場所を置いてから順に拾う (O(幅)。 60 万行で並べの 3.7〜5.3 ms → 下の測り)。 同じ lsn の行が 2 つ
+/// ある (無いはず) / 幅が広い時は、 1 語に詰めて安定に並べる (`sort`、 driftsort は途中の昇順 / 降順の走りを見つけて併せる)。
+fn lsn_order(rows: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    const EMPTY: u32 = u32::MAX;
+    let (Some(lo), Some(hi)) = (rows.iter().map(|r| r.0).min(), rows.iter().map(|r| r.0).max()) else { return rows };
+    let width = (hi - lo) as usize + 1;
+    if width <= rows.len().saturating_mul(4) {
+        let mut at = vec![EMPTY; width];
+        let mut placed = true;
+        for &(lsn, slot) in &rows {
+            let p = &mut at[(lsn - lo) as usize];
+            if *p != EMPTY || slot == EMPTY {
+                placed = false;
+                break;
+            }
+            *p = slot;
+        }
+        if placed {
+            let mut out = Vec::with_capacity(rows.len());
+            out.extend(at.into_iter().enumerate().filter(|&(_, s)| s != EMPTY).map(|(i, s)| (lo + i as u32, s)));
+            return out;
+        }
+    }
+    let mut packed: Vec<u64> = rows.into_iter().map(|(lsn, slot)| (u64::from(lsn) << 32) | u64::from(slot)).collect();
+    packed.sort();
+    packed.into_iter().map(|k| ((k >> 32) as u32, k as u32)).collect()
+}
+
+#[cfg(test)]
+mod lsn_order_tests {
+    /// 置く道 (幅が狭い・lsn が重ならない) も並べる道 (幅が広い / 同じ lsn がある / 場所が `u32::MAX`) も、 (lsn, 場所) の順に並べた物と同じ。
+    #[test]
+    fn lsn_order_matches_a_plain_sort() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut placed = 0;
+        for case in 0..400u32 {
+            let n = (next() % 300) as usize;
+            let base = (next() % 4_000_000_000) as u32;
+            let spread = match case % 4 {
+                0 => n as u64 + 1,
+                1 => 4 * n as u64 + 1,
+                2 => 50 * n as u64 + 1,
+                _ => 2,
+            };
+            let mut rows: Vec<(u32, u32)> = Vec::new();
+            let mut used = std::collections::HashSet::new();
+            for _ in 0..n {
+                let lsn = base + (next() % spread) as u32;
+                // case 3 は同じ lsn を許す (無いはずの形)。 他は lsn が重ならない
+                if case % 4 != 3 && !used.insert(lsn) {
+                    continue;
+                }
+                let slot = if case % 5 == 4 && next() % 97 == 0 { u32::MAX } else { (next() % 5000) as u32 };
+                rows.push((lsn, slot));
+            }
+            let mut want = rows.clone();
+            want.sort();
+            let width = rows.iter().map(|r| r.0).max().map_or(0, |hi| hi - rows.iter().map(|r| r.0).min().unwrap() + 1) as usize;
+            if !rows.is_empty() && width <= 4 * rows.len() && case % 4 != 3 && rows.iter().all(|r| r.1 != u32::MAX) {
+                placed += 1;
+            }
+            assert_eq!(super::lsn_order(rows), want, "case {case}");
+        }
+        assert!(placed > 50 && placed < 350, "前提: 置く道と並べる道の両方を通った ({placed} / 400 回が置く道)");
+    }
+}
+
 /// #451 (段階 1): 落ちた write の floor を本体に書いている間、 切れ目は候補を出さない (持ち越しから取り出してから書くと、 その間の
 /// 切れ目が floor の無い落ちた write を印で覆う = 隣のレビューで見つかった穴)。
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -15113,47 +15189,16 @@ impl Engine {
         &self,
         keep: impl Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
     ) -> Vec<crate::transport::WireRecord> {
-        let settled = self.settled_lsn();
-        if !self.sync_tables_enabled() {
-            return Vec::new();
-        }
-        let Some(cols) = self.sync_payload_cols() else { return Vec::new() };
+        let Some((rows, cols)) = self.settled_rows() else { return Vec::new() };
         // (lsn, 場所) の順に読む: payload の ring も lsn の順なので写しが続く。 前は場所の順に読んでから lsn で安定に並べた = 同じ lsn
-        // の行 (無いはず) は場所の順で、 答えの並びは同じ。 1 語に詰めて並べる (組の比べより速い)。 lsn 0 の行は入れない (bridge は
-        // lsn を 1 から振る。 前の読み `sync_ops_between` も `0 < lsn`)
-        let mut rows: Vec<u64> = self
-            .table_slots_with_value32(cols.lsn, |lsn| lsn != 0 && lsn <= settled)
-            .into_iter()
-            .map(|(lsn, slot)| (u64::from(lsn) << 32) | u64::from(slot))
-            .collect();
-        rows.sort_unstable();
+        // の行 (無いはず) は場所の順で、 答えの並びは同じ
+        let rows = lsn_order(rows);
         #[cfg(test)]
         if let Some(wal) = self.oplog.as_ref() {
             settled_read_hook::call(wal);
         }
-        let mut out = Vec::with_capacity(rows.len());
-        out.extend(rows.into_iter().filter_map(|k| self.sync_op_record_if(k as u32, (k >> 32) as u32, &cols, &keep)));
-        // 絞って少なくなった時は、 行の数で取った場所を返す
-        if out.capacity() > 2 * out.len() + 1024 {
-            out.shrink_to_fit();
-        }
-        out
-    }
-
-    /// #949: 場所 `slot` の行 (lsn の列の値 `lsn`) の payload を `decode_sync_ops_payload` した record のうち、 (書き手, 版数) が `keep` を
-    /// 満たす物。 `sync_op_payload(eid, cols).and_then(|b| decode_sync_ops_payload(&b)).filter(|r| keep(..))` と同じ答えを、 `keep` を
-    /// 満たさない行は写さずに出す。 header を読めない payload は decode もできない (`sync_ops_payload_author_hlc` は
-    /// `decode_sync_ops_payload` の検査の前半と同じ。 読めた (書き手, 版数) は decode した record の欄と同じ byte)。
-    ///
-    /// lsn は行をなめた時の値を使う (`sync_op_payload` は lsn の列を読み直す)。 なめた後にその場所が回収されて別の行に使い回されると、
-    /// ring の entry の lsn が違うので読まない (読み直すと、 lsn で並べて絞った位置に別の record を出しうる)。
-    fn sync_op_record_if(
-        &self,
-        slot: u32,
-        lsn: u32,
-        cols: &SyncPayloadCols,
-        keep: &impl Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
-    ) -> Option<crate::transport::WireRecord> {
+        // header の (書き手, 版数) で絞ってから decode する (header を読めない payload は decode もできない: `sync_ops_payload_author_hlc` は
+        // `decode_sync_ops_payload` の検査の前半と同じ。 読めた (書き手, 版数) は decode した record の欄と同じ byte)
         let pick = |b: &[u8]| {
             let (author, hlc) = enchudb_oplog::oplog::sync_ops_payload_author_hlc(b)?;
             if !keep(author, hlc) {
@@ -15163,18 +15208,61 @@ impl Engine {
             settled_decodes::add_decode();
             enchudb_oplog::oplog::decode_sync_ops_payload(b).map(crate::transport::WireRecord::from)
         };
+        let mut out = Vec::with_capacity(rows.len());
+        out.extend(rows.into_iter().filter_map(|(lsn, slot)| self.sync_op_read(slot, lsn, &cols, pick)));
+        // 絞って少なくなった時は、 行の数で取った場所を返す
+        if out.capacity() > 2 * out.len() + 1024 {
+            out.shrink_to_fit();
+        }
+        out
+    }
+
+    /// #955: [`Self::settled_sync_records`]`(keep)` の答えの版数の最小。 record を写さず、 decode と同じ検査
+    /// (`sync_ops_payload_walk_key`、 受ける / 断るの判定は `decode_sync_ops_payload` と同じ) で (書き手, 版数) だけを読む。 `keep` は
+    /// 確かめた後の値で呼ぶ。 floor を記録していない古い DB の広告 (`Syncer` の `advertise_history_floor`) が beat ごとに読む (前は全部を
+    /// 写して decode していた)。
+    pub fn settled_sync_min_hlc(
+        &self,
+        keep: impl Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
+    ) -> Option<enchudb_oplog::Hlc> {
+        let (rows, cols) = self.settled_rows()?;
+        rows.into_iter()
+            .filter_map(|(lsn, slot)| self.sync_op_read(slot, lsn, &cols, enchudb_oplog::oplog::sync_ops_payload_walk_key))
+            .filter(|&(a, h)| keep(a, h))
+            .map(|(_, h)| h)
+            .min()
+    }
+
+    /// #949: 配ってよい `_sync_ops` の行の (lsn, 場所) (場所の順) と payload の列。 終わり ([`Self::settled_lsn`]) は行をなめる前に読む。
+    /// lsn 0 の行は入れない (bridge は lsn を 1 から振る。 前の読み `sync_ops_between` も `0 < lsn`)。 sync の表が無ければ None。
+    fn settled_rows(&self) -> Option<(Vec<(u32, u32)>, SyncPayloadCols)> {
+        let settled = self.settled_lsn();
+        if !self.sync_tables_enabled() {
+            return None;
+        }
+        let cols = self.sync_payload_cols()?;
+        Some((self.table_slots_with_value32(cols.lsn, |lsn| lsn != 0 && lsn <= settled), cols))
+    }
+
+    /// #949: 場所 `slot` の行 (lsn の列の値 `lsn`) の payload を `f` で読んだ物 (`sync_op_payload(eid, cols).and_then(|b| f(&b))` と
+    /// 同じ答えを、 写さずに出す)。
+    ///
+    /// lsn は行をなめた時の値を使う (`sync_op_payload` は lsn の列を読み直す)。 なめた後にその場所が回収されて別の行に使い回されると、
+    /// ring の entry の lsn が違うので読まない (読み直すと、 lsn で並べて絞った位置に別の record を出しうる)。 `f` は ring の entry を
+    /// 読んでいる間に呼ぶので、 書きかけの byte で呼ばれうる (その答えは捨てる、 [`Self::settled_sync_records`] の doc)。
+    fn sync_op_read<T>(&self, slot: u32, lsn: u32, cols: &SyncPayloadCols, f: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
         // `get_by_id32` と同じ cell の読み (場所で引く)
         let cell = |hid: u16| self.himos.get(hid as usize)?.get_value32(slot);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(at) = cols.at
             && let Some(handle) = cell(at)
         {
-            return self.payload_ring(false)?.read_with(handle, lsn, pick)?;
+            return self.payload_ring(false)?.read_with(handle, lsn, f)?;
         }
         #[cfg(target_arch = "wasm32")]
         let _ = lsn;
         let vid = cell(cols.legacy?)?;
-        pick(self.vocab.get(vid))
+        f(self.vocab.get(vid))
     }
 
     /// `_sync_ops` の `since_lsn < lsn <= through_lsn` の行の payload (lsn の順)。
@@ -32026,6 +32114,23 @@ mod settled_records_tests {
         authors.dedup();
         authors.push(4321);
         let all = full_copy(eng, &|_, _| true).len();
+        // #955: 版数の最小 (floor を記録していない古い DB の広告) も、 直す前の読み (全部写して decode) と同じ
+        // 最小の record を外す絞りも (`keep` を見ない読みは、 外した最小を返す)
+        let lowest = eng.settled_sync_records(|_, _| true).into_iter().min_by_key(|r| r.hlc).map(|r| (r.author_peer, r.hlc));
+        let (low_author, low_hlc) = lowest.unwrap_or((u32::MAX, Hlc::ZERO));
+        for (label, keep) in [
+            ("全部", Box::new(|_: PeerId, _: Hlc| true) as Box<dyn Fn(PeerId, Hlc) -> bool>),
+            ("ZERO より後", Box::new(|_: PeerId, h: Hlc| h > Hlc::ZERO)),
+            ("書き手 1 以外", Box::new(|a: PeerId, _: Hlc| a != 1)),
+            ("最小の書き手以外", Box::new(move |a: PeerId, _: Hlc| a != low_author)),
+            ("最小より後", Box::new(move |_: PeerId, h: Hlc| h > low_hlc)),
+        ] {
+            assert_eq!(
+                eng.settled_sync_min_hlc(&*keep),
+                full_copy(eng, &*keep).iter().map(|k| k.0).min(),
+                "{what}: settled_sync_min_hlc ({label})"
+            );
+        }
         let mut partial = 0;
         let mut run = |keep: &dyn Fn(PeerId, Hlc) -> bool, label: &str| {
             let want = full_copy(eng, keep);
