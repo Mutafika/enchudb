@@ -13359,13 +13359,9 @@ impl Engine {
         };
         let start = session_start.unwrap_or(0);
 
-        // 前回 walk より先の生存 row を lsn 昇順に。
-        let mut rows: Vec<(u32, u64)> = self
-            .entities_with_himo(lsn_hid)
-            .into_iter()
-            .filter_map(|eid| self.get_by_id32(eid, lsn_hid).map(|lsn| (lsn, eid)))
-            .filter(|(lsn, _)| *lsn > start)
-            .collect();
+        // 前回 walk より先の生存 row を lsn 昇順に。 #943: ring の表の枠だけなめ、 lsn を読み直すのは先の行だけ (前は列を
+        // 場所 0 から = ring の前のアプリの表の幅もなめ、 生きている行を全部 1 行ずつ読んだ。 peer の ack 1 回ごとに)
+        let mut rows: Vec<(u32, u64)> = self.table_rows_with_value32(lsn_hid, |lsn| lsn > start);
         rows.sort_by_key(|r| r.0);
 
         // 生存 row 無し = reclaim するものが無い。 消化の証明が無いのに先端へ ack すると
@@ -23829,6 +23825,41 @@ impl Engine {
         self.eids_of_slots_in(Some(hid as usize), slots)
     }
 
+    /// #943: u32 の列 `hid` の値が `keep` を満たす行を `(値, eid)` で、 eid の昇順に。 答えは
+    /// `entities_with_himo(hid)` の各行を `get_by_id32` で読んで `keep` で絞ったものと同じ。 表に属する紐は
+    /// [`Engine::table_rows_with_himo`] と同じく表の枠だけなめ (前提も同じ)、 なめた値で絞ってから、 残った行だけ
+    /// `get_by_id32` (Acquire の読み) で読み直して値を決める。 ring の lsn の列で 「前回より先の行」 を探すと、 読み直すのは
+    /// 先の行だけになる (前は生きている行を全部 1 行ずつ読んだ)。
+    fn table_rows_with_value32(&self, hid: u16, keep: impl Fn(u32) -> bool) -> Vec<(u32, enchudb_oplog::EntityId)> {
+        let Some(hs) = self.himos.get(hid as usize) else { return Vec::new(); };
+        let table = self
+            .himo_table_get(hid as usize)
+            .filter(|&t| t != ANONYMOUS_TABLE)
+            .and_then(|t| self.tables.get(t as usize));
+        let eids = match table {
+            None => self.entities_with_himo(hid),
+            Some(table) => {
+                let mut extents = table.extents();
+                extents.sort_unstable();
+                let mut slots = Vec::new();
+                for (lo, hi) in extents {
+                    #[cfg(test)]
+                    table_scan_cells::add(hi.min(hs.column_len()).saturating_sub(lo));
+                    hs.for_each_in(lo, hi, |slot, v| {
+                        if keep(v as u32) {
+                            slots.push(slot);
+                        }
+                    });
+                }
+                self.eids_of_slots_in(Some(hid as usize), slots)
+            }
+        };
+        eids.into_iter()
+            .filter_map(|eid| self.get_by_id32(eid, hid).map(|v| (v, eid)))
+            .filter(|(v, _)| keep(*v))
+            .collect()
+    }
+
     /// 列 `himo_id` に値のある row を、 **新しい順** (その列の table が eid を払い出した逆順) に最大 `n` 件 (#21)。
     ///
     /// 「直近 N 件」 用。 table の払い出し済みの末尾から逆にたどり、 `n` 件そろった所で止まる — コストは
@@ -30873,6 +30904,194 @@ mod sync_peers_scan_tests {
             assert_eq!(eng.sync_watermark(), 50);
             assert_eq!(sorted(eng.sync_reclaimed_floors().unwrap()), vec![(2, hlc(10)), (3, hlc(21))]);
         }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// #943: ack の walk が ring の行を集める所 (`table_rows_with_value32`) が、 直す前の集め方 (列を場所 0 からなめて 1 行ずつ lsn を
+/// 読む) と同じ行を同じ並びで返す。 ack の答え (`ack_sync_up_to_hlc` / `ack_sync_up_to_cursors`) も、 直す前の walk を写した参照と同じ。
+#[cfg(test)]
+mod ack_ring_scan_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> String {
+        let path = format!("{}/enchudb-943-{}-{}", std::env::temp_dir().display(), tag, std::process::id());
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    /// 直す前の `ack_sync_prefix` の行の集め方。
+    fn rows_by_full_scan(eng: &Engine, lsn_hid: u16, start: u32) -> Vec<(u32, u64)> {
+        let mut rows: Vec<(u32, u64)> = eng
+            .entities_with_himo(lsn_hid)
+            .into_iter()
+            .filter_map(|eid| eng.get_by_id32(eid, lsn_hid).map(|lsn| (lsn, eid)))
+            .filter(|(lsn, _)| *lsn > start)
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        rows
+    }
+
+    fn rows_now(eng: &Engine, lsn_hid: u16, start: u32) -> Vec<(u32, u64)> {
+        let mut rows = eng.table_rows_with_value32(lsn_hid, |lsn| lsn > start);
+        rows.sort_by_key(|r| r.0);
+        rows
+    }
+
+    /// ring (枠 98) の前に大きな表 `t` (3900 行)、 後ろに表 `u`、 ring に枠を足して (`grow_table`、 足した枠は `u` の後ろ = 離れる)
+    /// 足した枠まで行を置く。 途中の行を消して場所を使い回させ、 lsn の順と場所の順をずらす。 どの段でも、 どの `start` でも、
+    /// 集めた行が直す前の集め方と同じ。 開き直した後も。 なめる cell は ring の枠以下 (列を頭からなめると `t` の幅を越える)。
+    #[test]
+    fn ring_rows_match_the_full_scan() {
+        let path = tmp("rows");
+        let (lsn_hid, lsn) = {
+            let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+            eng.define_table("t", 3900).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.define_table("u", 16).unwrap();
+            let cap0 = eng.table_eid_usage("_sync_ops").unwrap().capacity;
+            assert_eq!(cap0, 98, "前提: ring の枠");
+            eng.grow_table("_sync_ops", 40).unwrap();
+            let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+            let check = |eng: &Engine, what: &str| {
+                let top = eng.current_sync_lsn().max(200);
+                for start in [0, 1, 7, 50, 97, 98, 120, top - 1, top, top + 5] {
+                    assert_eq!(rows_now(eng, lsn_hid, start), rows_by_full_scan(eng, lsn_hid, start), "{what}: start {start}");
+                }
+            };
+            check(&eng, "行なし");
+            // 足した枠まで置く (98 + 30 行)
+            let mut lsn = 0u32;
+            let mut live = Vec::new();
+            for _ in 0..128 {
+                lsn += 1;
+                let e = eng.entity_in("_sync_ops").unwrap();
+                eng.tie_to_by_id(e, lsn_hid, lsn);
+                live.push((e, lsn));
+            }
+            check(&eng, "128 行");
+            // 途中を消して使い回させる (lsn の順と場所の順がずれる)
+            for (e, l) in live.iter().filter(|(_, l)| l % 3 == 0 || (40..60).contains(l)) {
+                assert!(eng.purge_sync_ops_row(*e, lsn_hid, *l));
+            }
+            check(&eng, "消した後");
+            for _ in 0..30 {
+                lsn += 1;
+                let e = eng.entity_in("_sync_ops").unwrap();
+                eng.tie_to_by_id(e, lsn_hid, lsn);
+            }
+            check(&eng, "使い回した後");
+            let slots: Vec<u32> = rows_now(&eng, lsn_hid, 128).iter().map(|(_, e)| eng.slot_unchecked(*e)).collect();
+            assert!(slots.windows(2).any(|w| w[0] > w[1]), "前提: lsn の順と場所の順がずれている ({slots:?})");
+            let ext = eng.tables.iter().find(|t| t.name == "_sync_ops").unwrap().extents();
+            assert_eq!(ext.len(), 2, "前提: ring の枠が 2 つ");
+            assert!(
+                rows_now(&eng, lsn_hid, 0).iter().any(|(_, e)| eng.slot_unchecked(*e) == ext[1].0)
+                    && rows_now(&eng, lsn_hid, 0).iter().any(|(_, e)| eng.slot_unchecked(*e) == ext[0].0)
+                    && rows_now(&eng, lsn_hid, 0).iter().any(|(_, e)| eng.slot_unchecked(*e) == ext[0].1 - 1),
+                "前提: 枠の最初と最後の場所に行がある ({ext:?})"
+            );
+            // なめる cell の数
+            let _ = table_scan_cells::take();
+            let _ = rows_now(&eng, lsn_hid, 0);
+            let cells = table_scan_cells::take();
+            let col_len = eng.himos.get(lsn_hid as usize).unwrap().column_len();
+            assert!(col_len > 3900, "前提: 列を頭からなめると t の幅を越える ({col_len})");
+            assert!(cells > 0 && cells <= 138, "表の枠の外をなめた / 表の枠でなめていない: {cells} cell");
+            eng.flush().unwrap();
+            (lsn_hid, lsn)
+        };
+        {
+            let eng = Engine::open_standalone(&path).unwrap();
+            for start in [0, 60, 128, lsn - 1, lsn] {
+                assert_eq!(rows_now(&eng, lsn_hid, start), rows_by_full_scan(&eng, lsn_hid, start), "開き直した後: start {start}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// 直す前の walk を写した参照 (dead row の無い ring 用): `start` より先の行を lsn の順に、 消化されている間だけ進む。
+    fn ack_by_full_scan(
+        eng: &Engine,
+        start: u32,
+        consumed: &dyn Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
+    ) -> u32 {
+        let cols = eng.sync_payload_cols().unwrap();
+        let mut ack = 0;
+        for (lsn, eid) in rows_by_full_scan(eng, cols.lsn, start) {
+            let rec = eng
+                .sync_op_payload(eid, &cols)
+                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
+                .expect("前提: dead row が無い");
+            if !consumed(rec.author_peer, rec.hlc) {
+                break;
+            }
+            ack = lsn;
+        }
+        ack
+    }
+
+    /// ring の前に大きな表がある sync の DB (WAL 付き) で、 peer ごとに cursor を変えて何度か ack する。 ack の lsn が、 同じ時点で
+    /// 直す前の walk を写した参照と同じ (session の最初の walk と、 前回からの再開の両方)。 ack の 1 回のなめは ring の枠以下。
+    #[test]
+    fn ack_answers_match_the_full_scan_walk() {
+        let path = tmp("ack");
+        {
+            let mut eng = Engine::create_with_capacity(&path, 1 << 16).unwrap();
+            eng.define_table("t", 50_000).unwrap();
+            eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 8 << 20).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("t.v").unwrap() as u16;
+        let cols = eng.sync_payload_cols().unwrap();
+        let rows: Vec<_> = (0..50).map(|_| eng.entity_in("t").unwrap()).collect();
+        let ring_cap = eng.table_eid_usage("_sync_ops").unwrap().capacity as u64;
+        let mut written = 0u64;
+        let mut starts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for round in 0..6u64 {
+            for _ in 0..300 {
+                eng.tie_to_by_id(rows[(written % 50) as usize], hid, written + 1);
+                written += 1;
+            }
+            // 全部を ring に写し終えてから比べる (ack の間に bridge が行を足すと、 参照と ack が違う ring を見る)
+            eng.oplog_commit();
+            eng.oplog_sync().unwrap();
+            while eng.transfer_oplog_to_sync_ops() > 0 {}
+            // ring の行の HLC を lsn の順に (cursor に使う)
+            let ring = rows_by_full_scan(&eng, cols.lsn, 0);
+            assert!(!ring.is_empty(), "前提: bridge が ring に行を置いた");
+            let hlc_at = |i: usize| {
+                let (_, eid) = ring[i.min(ring.len() - 1)];
+                enchudb_oplog::oplog::decode_sync_ops_payload(&eng.sync_op_payload(eid, &cols).unwrap()).unwrap().hlc
+            };
+            for p in 2..8u32 {
+                // peer ごとに違う所まで消化した cursor (round とともに進む)
+                let k = (ring.len() * (p as usize) / 8 + (round as usize) * 37) % ring.len();
+                let cursor = hlc_at(k);
+                let me = eng.peer_id();
+                let start = starts.get(&p).copied().unwrap_or(0);
+                let want = if p % 2 == 0 {
+                    ack_by_full_scan(&eng, start, &|a, h| (a == me || a == 0) && h <= cursor)
+                } else {
+                    ack_by_full_scan(&eng, start, &|a, h| a == me && h <= cursor)
+                };
+                let _ = table_scan_cells::take();
+                let got = if p % 2 == 0 {
+                    eng.ack_sync_up_to_hlc(p, cursor).unwrap()
+                } else {
+                    eng.ack_sync_up_to_cursors(p, &[(me, cursor)]).unwrap()
+                };
+                let cells = table_scan_cells::take();
+                assert_eq!(got, want, "round {round} peer {p}: ack の lsn が直す前の walk と違う (start {start})");
+                assert!(cells > 0 && cells <= ring_cap, "round {round} peer {p}: ack が ring の枠の外をなめた / 枠でなめていない ({cells})");
+                starts.insert(p, start.max(got));
+            }
+        }
+        assert!(starts.values().any(|&s| s > 0), "前提: どこかの peer が進んだ");
+        drop(eng);
         let _ = std::fs::remove_dir_all(&path);
     }
 }
