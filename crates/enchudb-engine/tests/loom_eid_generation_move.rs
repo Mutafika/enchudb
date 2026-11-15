@@ -31,6 +31,14 @@
 //!   戻す」 規則 (`reverting_heal_brings_the_deleted_rows_generation_back`) は、 使い回しの生きている印だけ届いた像を削除の途中と
 //!   読み違えて g に戻す (should_panic)
 //!
+//! ## 3. 払い出しと移る手順 (PR #885 の読み直し 3a) は `run_claim` の doc
+//!
+//! ## 4. 古い読みで印を落とす生かす道 (#901)
+//!
+//! 生かす道が 「死んでいる・生きていない」 と読んだ後に、 別の書き手が使い回してその行を消し始めた (kill の後・生きている印を下ろす
+//! 前) 場所の印を落とさない (落とすと消す途中の像が F1 の元の形になる)。 落とすのは読んだ 2 B のままの時だけ (CAS)、 引退した場所は
+//! 落とさない。 読み直して落とす形と、 引退した場所でも落とす形は、 loom が窓を見つける (should_panic)。 詳しくは 4 の model の doc。
+//!
 //! ## 実行
 //! ```sh
 //! RUSTFLAGS="--cfg loom" cargo test -p enchudb-engine --test loom_eid_generation_move --release
@@ -288,4 +296,129 @@ fn a_claim_overlapping_the_move_keeps_its_slot_and_eid() {
 #[should_panic(expected = "払い出した場所が死の印を持つ")]
 fn a_claim_without_the_gate_can_be_killed_by_the_move() {
     run_claim(false);
+}
+
+/// ## 4. 古い読みで印を落とす生かす道と、 使い回して消す書き手 (#901)
+///
+/// 生かす道 A (`Engine::revive_slot`: 受信の当て込み / 束ね / 空きの一覧の古い項目 / 払い出し位置): 場所の 2 B を読み、 生きている
+/// 印を読み、 「死んでいる・生きていない」 なら印を落とす。 その間に B が同じ場所を使い回し (印を落とす → 生きている印を立てる)、
+/// その行を消し始める (kill = 世代を上げて印 → 生きている印を下ろす)。 守る性質: **消す途中 (kill の後・生きている印を下ろす前) の
+/// 場所は死の印を持つ** (持たないと、 その間の像が F1 の元の形 「次の世代、 印なし、 生きている」 になり、 開く時に消えた行が次の
+/// 世代の eid で生きる)。
+///
+/// - 今の形 (`Revive::Cas`): 落とすのは読んだ 2 B のままの時だけ (CAS)、 引退した場所は落とさない
+/// - 読み直して落とす形 (`Revive::FetchAnd`、 #901 の前): 読んだ後に B が使い回して kill した印を落とす (should_panic)
+/// - 引退した場所でも CAS で落とす形 (`Revive::CasEvenRetired`): 引退の印は kill が上限で止める値なので、 使い回して (`entity()` の
+///   空きの山は引退した場所を取ってから引退を見る) 消すと同じ 2 B に戻り、 CAS が変化を見分けられない (should_panic)
+#[derive(Clone, Copy)]
+enum Revive {
+    Cas,
+    FetchAnd,
+    CasEvenRetired,
+}
+
+/// 使える世代の最大と引退の印 (場所の bit 24 の DB)。
+const MAX_GEN: u16 = 254;
+const RETIRED: u16 = 255;
+
+impl Model {
+    /// `Engine::revive_slot`。
+    fn revive_slot(&self, how: Revive) {
+        loop {
+            let seen = self.cell.load(Ordering::Acquire);
+            if seen & DEAD == 0 || (matches!(how, Revive::Cas) && seen & GEN > MAX_GEN) {
+                return;
+            }
+            if self.live.load(Ordering::Acquire) {
+                return;
+            }
+            match how {
+                Revive::FetchAnd => {
+                    self.cell.fetch_and(!DEAD, Ordering::AcqRel);
+                    return;
+                }
+                Revive::Cas | Revive::CasEvenRetired => {
+                    if self.cell.compare_exchange(seen, seen & !DEAD, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 払い出し: 生かす道 → 生きている印を立てる (`allocate_at` の RMW、 取れたか) → 自分の場所の死の印を落とす (`settle_claim`)。
+    fn claim(&self, how: Revive) -> bool {
+        self.revive_slot(how);
+        if self.live.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        if self.cell.load(Ordering::Acquire) & DEAD != 0 {
+            self.cell.fetch_and(!DEAD, Ordering::AcqRel);
+        }
+        true
+    }
+
+    /// 使い回した行を消す (`live_free`): kill (世代 + 1、 上限は引退の印) → 消す途中に死の印があるか → 生きている印を下ろす。
+    fn delete_claimed(&self) -> bool {
+        let g = self.generation();
+        self.kill((g + 1).min(RETIRED));
+        let marked = self.cell.load(Ordering::Acquire) & DEAD != 0;
+        self.live.store(false, Ordering::Release);
+        marked
+    }
+}
+
+/// 世代 1 の行が消えた場所 (「世代 2、 死んでいる」)。 B が使い回してその行を消し、 A が並んで生かす道を通る (取れたら自分の行)。
+fn run_stale_revive(how: Revive) {
+    loom::model(move || {
+        let m = Arc::new(Model::new(false, 2 | DEAD));
+        m.gate.store(ON, Ordering::Release);
+        let b = {
+            let m = m.clone();
+            thread::spawn(move || !m.claim(how) || m.delete_claimed())
+        };
+        m.claim(how);
+        assert!(b.join().unwrap(), "消す途中の場所の死の印を、 前に読んだ 「生きていない」 で落とした");
+    });
+}
+
+#[test]
+fn a_stale_revive_keeps_the_dead_mark_of_a_row_being_deleted() {
+    run_stale_revive(Revive::Cas);
+}
+
+#[test]
+#[should_panic(expected = "消す途中の場所の死の印")]
+fn stale_revive_by_fetch_and_drops_the_dead_mark_of_a_row_being_deleted() {
+    run_stale_revive(Revive::FetchAnd);
+}
+
+/// 引退した場所 (「引退の印、 死んでいる」) を `entity()` の空きの山が取り (生かす道 → 生きている印 → 引退を見て kill → 下ろす)、
+/// A が並んで生かす道を通る。
+fn run_retired_revive(how: Revive) {
+    loom::model(move || {
+        let m = Arc::new(Model::new(false, RETIRED | DEAD));
+        m.gate.store(ON, Ordering::Release);
+        let b = {
+            let m = m.clone();
+            thread::spawn(move || {
+                m.revive_slot(how);
+                m.live.store(true, Ordering::Release); // 空きの山から取った場所に印を立てる (取り合いは free_lock の下)
+                m.delete_claimed()
+            })
+        };
+        m.revive_slot(how);
+        assert!(b.join().unwrap(), "消す途中の場所の死の印を、 前に読んだ 「生きていない」 で落とした");
+    });
+}
+
+#[test]
+fn a_stale_revive_keeps_the_dead_mark_of_a_retired_slot() {
+    run_retired_revive(Revive::Cas);
+}
+
+#[test]
+#[should_panic(expected = "消す途中の場所の死の印")]
+fn a_stale_cas_revive_on_a_retired_slot_drops_the_dead_mark() {
+    run_retired_revive(Revive::CasEvenRetired);
 }

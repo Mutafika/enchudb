@@ -2582,6 +2582,38 @@ mod revive_gap_hook {
     }
 }
 
+/// test 用の割り込み点: `revive_slot` が場所の 2 B と生きている印を読んだ後・死の印を落とす前 (#901)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod revive_read_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 消す道 (`live_free`) が世代と死の印を書いた後・生きている印を下ろす前 (#901)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod free_gap_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: changefeed の record を記録 (`pump_change_log`) / 溜め (`move_changes_to_backlog`) に写し始める所 (#662)。
 /// 畳む時の写しが書き手を止めないこと (`append_lock` の外で写す) を、 写している間に別の thread が WAL に積めるかで確かめるため。
 /// 置いた WAL で 1 回だけ呼ぶ (続けて呼ばせるには、 呼ばれた中で置き直す)。
@@ -3276,6 +3308,85 @@ mod eid_gen_claim_tests {
         eng.kill_generation(slot, eng.generations().get(slot) + 1); // 消す書き手が kill した所 (生きている印はまだ)
         eng.ensure_live_slot(slot);
         assert!(eng.generations().is_dead(slot), "生きている場所の死の印を落とした");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// #901: 生かす道 (`ensure_live_slot` = 受信の当て込み / 束ね) が場所を 「死んでいる・生きていない」 と読んだ後・死の印を落とす前に、
+    /// 別の書き手がその場所を使い回し、 その行を消す書き手が kill した (生きている印を下ろす前) 所で落とすと、 消す途中の場所が
+    /// 「次の世代、 印なし、 生きている」 (F1 の元の像) になる。 その間に書き出した像は、 開く時に消えた行を次の世代の eid で生かす。
+    #[test]
+    fn a_stale_revive_keeps_the_dead_mark_of_a_reused_row_being_deleted() {
+        let (path, eng) = engine("stalerevive");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x);
+        let r = eng.entity_in("u").unwrap(); // 使い回し = v15
+        let slot = eng.slot_unchecked(r);
+        eng.delete(r);
+        let g = eng.generations().get(slot);
+        assert!(eng.generations().is_dead(slot) && !eng.entities.is_live(slot), "前提: 消えた行の場所");
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (killed_tx, killed_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (join_tx, join_rx) = std::sync::mpsc::channel();
+        free_gap_hook::set(&wal, move |_| {
+            // 使い回した行を消す書き手: kill の後・生きている印を下ろす前で止まる
+            killed_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        });
+        let e2 = eng.clone();
+        revive_read_hook::set(&wal, move |_| {
+            // 読んだ後・落とす前に、 別の thread が同じ場所を使い回して (空きの一覧から)、 その行を消し始める
+            let h = std::thread::spawn(move || {
+                let b = e2.entity_in("u").unwrap();
+                assert_eq!(e2.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+                e2.delete(b);
+            });
+            // 使い回しが別の場所に行った時 (前提の崩れ) に止まり続けないよう上限を置く
+            let killed = killed_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok();
+            join_tx.send((h, killed)).unwrap();
+        });
+        eng.ensure_live_slot(slot);
+        let (h, killed) = join_rx.recv().unwrap();
+        // 消す書き手は kill の後・生きている印を下ろす前に居る
+        let midway = killed && eng.entities.is_live(slot) && eng.generations().get(slot) == g + 1;
+        let dead = eng.generations().is_dead(slot);
+        let _ = go_tx.send(());
+        h.join().unwrap();
+        assert!(midway, "前提: 使い回した行が消える途中");
+        assert!(dead, "消す途中の場所の死の印を、 前に読んだ 「生きていない」 で落とした");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// #901 の続き: 読んだ後に使い回しと削除が終わった (2 B が変わって CAS が外れた) 場所は、 読み直して印を落としてから生かす
+    /// (外れたまま生かすと 「生きている、 死んでいる」 = きれいに閉じなかった後の突き合わせが生かした行を消す)。
+    #[test]
+    fn a_stale_revive_rereads_after_a_finished_reuse_and_delete() {
+        let (path, eng) = engine("rereadrevive");
+        let x = eng.entity_in("u").unwrap();
+        eng.delete(x);
+        let r = eng.entity_in("u").unwrap(); // 使い回し = v15
+        let slot = eng.slot_unchecked(r);
+        eng.delete(r);
+        let g = eng.generations().get(slot);
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let e2 = eng.clone();
+        revive_read_hook::set(&wal, move |_| {
+            std::thread::spawn(move || {
+                let b = e2.entity_in("u").unwrap();
+                assert_eq!(e2.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+                e2.delete(b);
+            })
+            .join()
+            .unwrap();
+        });
+        eng.ensure_live_slot(slot);
+        assert_eq!(eng.generations().get(slot), g + 1, "前提: 間で使い回した行が消えた");
+        assert!(eng.entities.is_live(slot), "前提: 生かした");
+        assert!(!eng.generations().is_dead(slot), "生かした場所に死の印が残った");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
@@ -14931,7 +15042,8 @@ impl Engine {
                 self.raise_generation(local, 1);
             }
             if self.generations().retired(local) {
-                // 世代を使い切った場所は渡さない (空きの山から外したまま、 次を取る)。 生かす前に落とした 「死んでいる」 印を戻す
+                // 世代を使い切った場所は渡さない (空きの山から外したまま、 次を取る)。 「死んでいる」 印は生かす前にも落としていない
+                // (引退した場所は落とさない、 #901) が、 念のため立てる
                 self.kill_generation(local, self.generations().retired_mark());
                 self.entities.free_without_reuse(local);
                 return self.entity();
@@ -16009,6 +16121,10 @@ impl Engine {
             && !self.is_folded_own_slot(local)
         {
             self.kill_generation(local, gen_of_row + 1);
+        }
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            free_gap_hook::call(wal);
         }
         if self.generations().retired(local) {
             self.entities.free_without_reuse(local);
@@ -17887,12 +18003,26 @@ impl Engine {
 
     /// 生かす前に 「死んでいる」 印を落とす。 生きている場所の印は落とさない (PR #885 の読み直し 3b: 生きている場所の印は、 消す書き手の
     /// kill と生きている印を下ろす間 = 落とすと 「次の世代、 印なし、 生きている」 の像が F1 の元の形で届く)。
+    ///
+    /// #901: 「生きていない」 と読んだ後に、 別の書き手が使い回してその行を消し始めた (kill の後・生きている印を下ろす前) 場所の印も
+    /// 落とさない。 場所の 2 B を生きている印より先に読み、 落とすのは 2 B がその値のままの時だけ (`Generations::revive_from` の CAS)。
+    /// 読んだ 2 B が消す書き手の kill (またはその後の RMW) の物なら、 Acquire でその前に立った生きている印も見える (消す途中なら
+    /// 「生きている」 と読む)。 読んだ後の kill は 2 B を変える (世代が上がる) ので CAS が外れる。 外れたら読み直す。
     #[inline]
     fn revive_slot(&self, slot: u32) {
         let gens = self.generations();
-        if gens.is_dead(slot) && !self.entities.is_live(slot) {
+        while let Some(seen) = gens.dead_cell(slot) {
+            if self.entities.is_live(slot) {
+                return;
+            }
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                revive_read_hook::call(wal);
+            }
             self.mark_gen_session_dirty();
-            gens.revive(slot);
+            if gens.revive_from(slot, seen) {
+                return;
+            }
         }
     }
 
