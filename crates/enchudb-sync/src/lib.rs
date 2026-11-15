@@ -32,6 +32,6 @@ pub mod sync;
 pub mod shard;
 pub mod subscription;
 
-pub use sync::{Syncer, SyncOutcome};
+pub use sync::{CursorMark, Syncer, SyncOutcome};
 pub use shard::{ShardRouter, ShardTransport, ShardQuery, HashRouter, ExplicitRouter, InMemoryShardTransport};
 pub use subscription::{SubscriptionFilter, AllRecords};
