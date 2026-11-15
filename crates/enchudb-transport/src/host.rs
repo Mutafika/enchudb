@@ -568,14 +568,11 @@ impl HostInner {
         // 同じ (書き手, 版数) の組 (state の Tag の cell の Vocab と Tie、 版数の無い cell の `as_of`) の途中だと、 前半だけ受けた
         // client の cursor がその版数に進み、 後から載る後半が `hlc > cursor` を通らない。 組がそろうまでその組は配らない
         // (`Engine::settled_sync_ops`)
+        //
+        // #949: (書き手, 版数) で絞ってから写す (前は ring の全部の行を写して decode してから絞った)。 絞りは (書き手, 版数) だけで
+        // 決まるので、 上の組は割らない
         let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
-        self.engine
-            .settled_sync_ops()
-            .iter()
-            .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
-            .map(WireRecord::from)
-            .filter(|r| r.author_peer != to && r.hlc > cursor(r.author_peer))
-            .collect()
+        self.engine.settled_sync_records(|author, hlc| author != to && hlc > cursor(author))
     }
 
     /// client `to` に配る floor (書き手ごと、 `(u32::MAX, h)` は書き手を問わない下限)。 `to` 自身の書き手の分は除く (`to` の
@@ -1210,6 +1207,82 @@ mod tests {
         // client の居ない / 置き場の無いホスト: 今の壁時計から
         let now = HostClock::resume(&Lines::default(), wall).now();
         assert!((wall..wall + 60_000).contains(&now), "{now}");
+    }
+
+    /// #949: client に配る record (`records_for`) が、 直す前の読み (配ってよい行の payload を全部写して decode し、 宛先の client
+    /// 自身の record と書き手ごとの cursor 以下を外す) と同じ record を同じ並びで出す。 ring の書き手は 3 人 (ホスト自身の Tie と、
+    /// 中継した 2 人の Vocab。 中継した版数はホストの版数の前と後に散る)。 宛先と cursor の組をいくつも。
+    #[test]
+    fn records_for_matches_the_full_copy() {
+        let path = std::env::temp_dir().join(format!("enchudb-949-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        {
+            let mut eng = Engine::create_standalone(path.to_str().unwrap()).unwrap();
+            eng.define_table("rows", 100).unwrap();
+            eng.define_himo_in("rows", "val", enchudb::ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(path.to_str().unwrap(), 8 << 20).unwrap();
+        eng.set_peer_id(1);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let rows: Vec<_> = (0..10).map(|_| eng.entity_in("rows").unwrap()).collect();
+        for i in 0..240u32 {
+            if i % 3 == 0 {
+                let author = if i % 2 == 0 { 7 } else { 9 };
+                let wall = if i % 5 < 2 { 100 + u64::from(i) } else { now + 1_000_000 + u64::from(i % 11) };
+                let rec = WireRecord::unsigned(
+                    Hlc { wall, logical: i % 4, peer: author },
+                    author,
+                    DecodedOp::Vocab { vid: i, bytes: format!("r{i}").into_bytes() },
+                );
+                assert!(eng.relay_record(&rec), "前提: 中継した record を WAL に載せた");
+            } else {
+                eng.tie_async(rows[(i % 10) as usize], "rows.val", i);
+            }
+        }
+        eng.oplog_commit();
+        eng.oplog_sync().unwrap();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+        let host = HttpHost::start("127.0.0.1:0", eng.clone(), None).unwrap();
+        type Key = (Hlc, PeerId, [u8; 64], [u8; 8], Vec<u8>);
+        let key = |r: &WireRecord| -> Key { (r.hlc, r.author_peer, r.signature, r.pubkey_fp, r.signed_bytes.clone()) };
+        // 直す前の読み
+        let old = |to: PeerId, since: &[(PeerId, Hlc)]| -> Vec<Key> {
+            let cursor = |a: PeerId| since.iter().find(|(p, _)| *p == a).map_or(Hlc::ZERO, |(_, h)| *h);
+            eng.settled_sync_ops()
+                .iter()
+                .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
+                .map(WireRecord::from)
+                .filter(|r| r.author_peer != to && r.hlc > cursor(r.author_peer))
+                .map(|r| key(&r))
+                .collect()
+        };
+        let all = old(0, &[]);
+        let mut hlcs: Vec<Hlc> = all.iter().map(|k| k.0).collect();
+        assert!(hlcs.windows(2).any(|w| w[0] > w[1]), "前提: ring の並び (lsn) と版数の並びがずれている");
+        hlcs.sort();
+        let mut cuts = vec![Hlc::ZERO];
+        cuts.extend(hlcs.iter().step_by(hlcs.len() / 6).copied());
+        cuts.push(hlcs[hlcs.len() - 1]);
+        let mut partial = 0;
+        for to in [0, 1, 7, 9, 42] {
+            for (i, &c) in cuts.iter().enumerate() {
+                let c2 = cuts[(i * 3 + 1) % cuts.len()];
+                for since in [vec![], vec![(1, c)], vec![(1, c), (7, c2), (9, c)], vec![(9, c2), (7, c)]] {
+                    let want = old(to, &since);
+                    let got: Vec<Key> = host.inner.records_for(to, &since).iter().map(key).collect();
+                    assert!(got == want, "to {to} since {since:?}: 直す前の読みと違う ({} / {} 件)", got.len(), want.len());
+                    if !want.is_empty() && want.len() < all.len() {
+                        partial += 1;
+                    }
+                }
+            }
+        }
+        assert!(partial > 20, "前提: 一部だけ配る組がある ({partial})");
+        drop(host);
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]

@@ -127,7 +127,9 @@ fn losing_batch_then_crash(bootstrap: bool) {
     std::thread::sleep(Duration::from_millis(3));
     b.upsert(K1, FROM_B);
 
-    // B が A から受ける: A の record は全部負ける (写像だけができる)
+    // B が A から受ける: A の record は全部負ける (写像だけができる)。 像を撮るまで B の consumer を止める (#944: 周期の書き出しが
+    // 写像を書き出すと、 受けた道が書き出さなくても像に写像が載る。 写す間に sidecar の置き換えの一時 file が消えて NotFound になる)
+    let hold = b.db.engine().hold_consumer();
     let out = if bootstrap { b.sync.bootstrap_pull(A).expect("前提: A の state が取れる").outcome } else { b.sync.pull_once(A) };
     assert!(out.received > 0, "前提: A の record が届いた ({out:?})");
     assert_eq!(out.applied, 0, "前提: A の record は全部 LWW で負けた ({out:?})");
@@ -137,6 +139,7 @@ fn losing_batch_then_crash(bootstrap: bool) {
     // ここで B が落ちた像 (disk にある物だけ)
     copy_dir(Path::new(&dir.db("b")), Path::new(&dir.db("b2")));
     std::fs::copy(cursor_path(&dir.db("b")), cursor_path(&dir.db("b2"))).unwrap();
+    drop(hold);
 
     // A がその行を書き換える (いちばん新しい)
     std::thread::sleep(Duration::from_millis(3));

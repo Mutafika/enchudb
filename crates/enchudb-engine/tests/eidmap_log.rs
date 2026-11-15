@@ -3,6 +3,8 @@
 //! pull で何か当てるたびの書き出し (`persist_sync_state`) は、 変わった key だけを `eidmap.log` に追記する (前は `eidmap` を全部
 //! 書き直していた)。 きれいに閉じずに落ちても、 開き直すと `eidmap` + log から写像と削除の記録が戻る。 きれいに閉じる時は `eidmap`
 //! をまとめ直し、 log は空 (header だけ) になる。 落ちた像は、 開いたままの DB の directory を写して作る (写しは閉じる処理を通らない)。
+//! 前提を確かめてから写し終えるまで consumer を止める (#944: 周期の書き出しが sidecar を置き換えると、 写す間に一時 file が消えて
+//! NotFound になり、 像も 1 つの時点の物でなくなる)。
 
 use enchudb_engine::ValueType;
 use enchudb_engine::db_files::{EIDMAP, EIDMAP_LOG, path_for};
@@ -78,10 +80,12 @@ fn appended_mappings_survive_an_unclean_close() {
     let dead = eng.resolve_remote_eid_existing(make_eid(AUTHOR, 2)).unwrap();
     assert!(eng.remote_delete_apply(dead, hlc(3_000)));
     eng.persist_sync_state().unwrap();
+    let hold = eng.hold_consumer();
     assert_eq!(len(&path, EIDMAP), eidmap_len, "前提: 2 回目の書き出しは eidmap を書き直さない (追記)");
     assert!(len(&path, EIDMAP_LOG) > LOG_HEADER, "前提: 2 回目の書き出しは eidmap.log に追記した");
     let expect: Vec<_> = (0..8).map(|i| eng.resolve_remote_eid_existing(make_eid(AUTHOR, i))).collect();
     copy_dir(&path, &image);
+    drop(hold);
     drop(eng);
 
     let back = Engine::open_concurrent_with_oplog(&image, 4 << 20).unwrap();
@@ -129,7 +133,9 @@ fn a_torn_log_tail_is_dropped_and_rewritten() {
     eng.persist_sync_state().unwrap();
     receive(&eng, h, 2, 1_002);
     eng.persist_sync_state().unwrap();
+    let hold = eng.hold_consumer();
     copy_dir(&path, &image);
+    drop(hold);
     drop(eng);
     // 最後の record (A の行 2) を切る
     let log = path_for(&image, EIDMAP_LOG);
@@ -163,11 +169,13 @@ fn bootstrap_serves_the_eidmap_with_the_log_applied() {
     let dead = eng.resolve_remote_eid_existing(make_eid(AUTHOR, 1)).unwrap();
     assert!(eng.remote_delete_apply(dead, hlc(3_000)));
     eng.persist_sync_state().unwrap();
+    let hold = eng.hold_consumer();
     assert!(len(&path, EIDMAP_LOG) > LOG_HEADER, "前提: log に追記がある (まとめ直していない)");
     let expect: Vec<_> = (0..6).map(|i| eng.resolve_remote_eid_existing(make_eid(AUTHOR, i))).collect();
 
     let served = Engine::eidmap_for_bootstrap(&path).unwrap().expect("eidmap がある");
     copy_dir(&path, &image);
+    drop(hold);
     std::fs::remove_file(path_for(&image, EIDMAP_LOG)).unwrap();
     std::fs::write(path_for(&image, EIDMAP), &served).unwrap();
     let back = Engine::open_concurrent_with_oplog(&image, 4 << 20).unwrap();
@@ -191,8 +199,10 @@ fn a_delete_before_its_row_survives_an_unclean_close() {
     eng.persist_sync_state().unwrap();
     assert!(eng.remote_delete_apply_foreign(make_eid(AUTHOR, 7), hlc(3_000)));
     eng.persist_sync_state().unwrap();
+    let hold = eng.hold_consumer();
     assert!(len(&path, EIDMAP_LOG) > LOG_HEADER, "前提: 2 回目の書き出しは eidmap.log に追記した");
     copy_dir(&path, &image);
+    drop(hold);
     drop(eng);
 
     let back = Engine::open_concurrent_with_oplog(&image, 4 << 20).unwrap();

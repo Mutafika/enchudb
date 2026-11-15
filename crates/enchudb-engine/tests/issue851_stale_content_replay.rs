@@ -80,11 +80,16 @@ fn an_acked_value_does_not_go_back_to_a_previous_lap_record_under_a_current_mark
 
     eng.tie_to(e, "t.x", 2u32);
     eng.oplog_sync().unwrap(); // ← 2 は電源断の後も残る
+    // 像を撮るまで consumer を止める (#944): 周期の Commit と書き出しが最後の record を書き出し済みにしない、 写す間に sidecar を
+    // 置き換えない (一覧に出た一時 file が写す前に rename で消えて NotFound になった)
+    let hold = eng.hold_consumer();
     eng.tie_to(other, "t.x", 7u32); // 書き出しの返っていない最後の record
+    assert!(eng.stats().oplog_checkpoint < eng.stats().oplog_head, "前提: 最後の record は書き出していない");
 
     // 今落ちた像 (全部の page が届いた形) を写し、 最後の record の header + payload だけ前の record の中身にする
     let img = root.0.join("img").join("db");
     copy_dir(&db, &img);
+    drop(hold);
     drop(eng);
     let img_oplog = img.join("oplog");
     let mut image = std::fs::read(&img_oplog).unwrap();
@@ -135,10 +140,14 @@ fn a_sync_db_does_not_hand_out_a_previous_lap_record_again() {
     while eng.transfer_oplog_to_sync_ops() > 0 {}
     eng.oplog_sync().unwrap(); // 写した行も書き出す
     assert_eq!((handed(&eng, 1), handed(&eng, 2)), (1, 1), "前提: 配る分に 1 回ずつ");
+    // 像を撮るまで consumer を止める (#944、 上の試験と同じ)
+    let hold = eng.hold_consumer();
     eng.tie_to(other, "t.x", 7u32);
+    assert!(eng.stats().oplog_checkpoint < eng.stats().oplog_head, "前提: 最後の record は書き出していない");
 
     let img = root.0.join("img").join("db");
     copy_dir(&db, &img);
+    drop(hold);
     drop(eng);
     let img_oplog = img.join("oplog");
     let mut image = std::fs::read(&img_oplog).unwrap();
