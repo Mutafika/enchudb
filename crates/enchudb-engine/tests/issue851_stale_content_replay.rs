@@ -127,6 +127,13 @@ fn a_sync_db_does_not_hand_out_a_previous_lap_record_again() {
         let pat = tie_payload(e, himo, v);
         eng.pending_sync_ops(0).iter().filter(|p| p.windows(pat.len()).any(|w| w == &pat[..])).count()
     };
+    // 像を撮るまで consumer を止める。 値 1 の record を書く前から (#958): 周期の畳みが値 1 と値 2 の record の間に入ると、 像の WAL
+    // には値 2 の record だけが残り、 開いた後の bridge が読み直す (配る分にもう 1 回積む) のが値 2 だけになる (値 1 は 1 回・値 2 は
+    // 2 回で、 下の本題の assert が直しと関係なく落ちた)。 周期の Commit と書き出しが最後の record を書き出し済みにしない事と、 写す間に
+    // sidecar を置き換えない事は上の試験と同じ (#944)
+    let hold = eng.hold_consumer();
+    let lap = |eng: &Engine| enchudb_oplog::oplog::wal_pos_lap(eng.stats().oplog_head);
+    let lap0 = lap(&eng);
 
     eng.tie_to(e, "t.x", 1u32);
     eng.oplog_sync().unwrap();
@@ -140,10 +147,9 @@ fn a_sync_db_does_not_hand_out_a_previous_lap_record_again() {
     while eng.transfer_oplog_to_sync_ops() > 0 {}
     eng.oplog_sync().unwrap(); // 写した行も書き出す
     assert_eq!((handed(&eng, 1), handed(&eng, 2)), (1, 1), "前提: 配る分に 1 回ずつ");
-    // 像を撮るまで consumer を止める (#944、 上の試験と同じ)
-    let hold = eng.hold_consumer();
     eng.tie_to(other, "t.x", 7u32);
     assert!(eng.stats().oplog_checkpoint < eng.stats().oplog_head, "前提: 最後の record は書き出していない");
+    assert_eq!(lap(&eng), lap0, "前提: 値 1 の record から最後の record まで WAL を畳んでいない (像の WAL に 3 つとも残る)");
 
     let img = root.0.join("img").join("db");
     copy_dir(&db, &img);
@@ -161,8 +167,9 @@ fn a_sync_db_does_not_hand_out_a_previous_lap_record_again() {
     assert_eq!(eng.get(e, "t.x"), Some(2), "版数のある DB は古い record を当てない");
     eng.oplog_sync().unwrap();
     while eng.transfer_oplog_to_sync_ops() > 0 {}
-    // きれいに閉じなかった後の bridge は WAL を読み直すので、 どの record も配る分にもう 1 回ずつ積まれうる (受け手は
-    // (author, HLC) で落とす)。 像の古い record を読むと、 値 1 の record だけ更に 1 回多い
+    // きれいに閉じなかった後の bridge は WAL を読み直すので、 像の WAL に残る record (値 1 と値 2 の両方、 上の前提) は配る分に
+    // もう 1 回ずつ積まれうる (元の record の版数のまま = 受け手は (author, HLC) で落とす)。 像の古い record を読むと、 値 1 の
+    // record だけ更に 1 回多い
     let (ones, twos) = (handed(&eng, 1), handed(&eng, 2));
     eprintln!("配る分: 値 1 の record {ones} 回、 値 2 の record {twos} 回");
     assert!(twos >= 1, "前提: 値 2 の record は配る分に居る");

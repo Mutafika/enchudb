@@ -575,6 +575,13 @@ impl HostInner {
         self.engine.settled_sync_records(|author, hlc| author != to && hlc > cursor(author))
     }
 
+    /// 古い client (`GET /pull`、 scalar の cursor) に配る record: `records_for(0, &[])` のうち `hlc > since` の物 (書き手 0 は除く)。
+    /// #955: 版数で絞ってから写す (前は全部を写して decode してから絞った)。 絞りは (書き手, 版数) だけで決まるので組は割らない。
+    fn records_since(&self, since: Hlc) -> Vec<WireRecord> {
+        let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
+        self.engine.settled_sync_records(|author, hlc| author != 0 && hlc > since)
+    }
+
     /// client `to` に配る floor (書き手ごと、 `(u32::MAX, h)` は書き手を問わない下限)。 `to` 自身の書き手の分は除く (`to` の
     /// record は `to` に配らないので、 `to` の cursor はそこで進まない)。
     fn floors_for(&self, to: PeerId) -> Vec<(PeerId, Hlc)> {
@@ -787,9 +794,7 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
                 logical: q.get("logical").and_then(|s| s.parse().ok()).unwrap_or(0),
                 peer: q.get("peer").and_then(|s| s.parse().ok()).unwrap_or(0),
             };
-            let records: Vec<WireRecord> =
-                host.records_for(0, &[]).into_iter().filter(|r| r.hlc > since).collect();
-            send_response(&mut stream, 200, &encode_batch(&records))
+            send_response(&mut stream, 200, &encode_batch(&host.records_since(since)))
         }
         ("POST", "/v2/ack") => {
             let Some(by) = peer_param("peer") else { return send_response(&mut stream, 400, b"peer") };
@@ -964,6 +969,12 @@ impl Transport for HttpHostTransport {
         if flags & NEED_STATE != 0 {
             self.push_state(from);
         }
+    }
+
+    /// #955: `publish_to` が捨てる位置 = ホストが受けた位置 (`acked`、 `merge_max` で上がるだけなので、 この後の `publish_to` が捨てる
+    /// 位置以下)。 `Syncer` は先に聞いて、 ホストが受けた record を集めない (since = ZERO の publish が ack 済みの行を写して decode しない)。
+    fn publish_floor(&self, _from: PeerId, _to: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
+        Some(self.acked.lock().unwrap().clone())
     }
 
     fn uses_published_through(&self) -> bool {
@@ -1241,6 +1252,9 @@ mod tests {
                 eng.tie_async(rows[(i % 10) as usize], "rows.val", i);
             }
         }
+        // #955: 書き手 0 の record (`records_for(0, ..)` と `GET /pull` は外す)
+        let zero = WireRecord::unsigned(Hlc { wall: now + 2_000_000, logical: 0, peer: 0 }, 0, DecodedOp::Vocab { vid: 9999, bytes: b"z".to_vec() });
+        assert!(eng.relay_record(&zero), "前提: 書き手 0 の record を WAL に載せた");
         eng.oplog_commit();
         eng.oplog_sync().unwrap();
         while eng.transfer_oplog_to_sync_ops() > 0 {}
@@ -1280,6 +1294,16 @@ mod tests {
             }
         }
         assert!(partial > 20, "前提: 一部だけ配る組がある ({partial})");
+        // #955: 古い client の `GET /pull` (scalar の cursor) も、 直す前の読み (`records_for(0, &[])` を全部写して絞る) と同じ
+        let mut part = 0;
+        for &c in &cuts {
+            let want: Vec<Key> = old(0, &[]).into_iter().filter(|k| k.0 > c).collect();
+            let got: Vec<Key> = host.inner.records_since(c).iter().map(key).collect();
+            assert!(got == want, "GET /pull since {c:?}: 直す前の読みと違う ({} / {} 件)", got.len(), want.len());
+            part += usize::from(!want.is_empty() && want.len() < all.len());
+        }
+        assert!(part >= 3, "前提: GET /pull で一部だけ配る since がある ({part})");
+        assert!(old(1, &[]).iter().any(|k| k.1 == 0), "前提: ring に書き手 0 の record がある");
         drop(host);
         drop(eng);
         let _ = std::fs::remove_dir_all(&path);

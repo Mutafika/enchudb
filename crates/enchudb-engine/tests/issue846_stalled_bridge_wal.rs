@@ -73,6 +73,18 @@ fn with_key(payloads: Vec<Vec<u8>>, key: (PeerId, Hlc)) -> usize {
     decoded(payloads).iter().filter(|r| !matches!(r.op, DecodedOp::Commit) && (r.author_peer, r.hlc) == key).count()
 }
 
+/// #955: 配る側の本番の道 (`settled_sync_records`: `Syncer` の publish とホストの pull が読む) で配ってよい record のうち、 鍵が
+/// `key` の物の数 (Commit は除く)。 前の読み (`settled_sync_ops`) の数も同じかを見る。
+fn settled_with_key(eng: &Engine, key: (PeerId, Hlc)) -> usize {
+    let n = eng
+        .settled_sync_records(|_, _| true)
+        .iter()
+        .filter(|r| !matches!(r.op, DecodedOp::Commit) && (r.author_peer, r.hlc) == key)
+        .count();
+    assert_eq!(n, with_key(eng.settled_sync_ops(), key), "配る側の道と前の読みで、 配ってよい組の行の数が違う");
+    n
+}
+
 fn ring_full(eng: &Engine) -> bool {
     let u = eng.table_eid_usage("_sync_ops").unwrap();
     u.live == u.capacity
@@ -126,6 +138,7 @@ fn a_stalled_bridge_does_not_reread_the_wal() {
         }
         assert_eq!(eng.bridge_wal_records_read(), read, "止まった bridge が、 何も書いていないのに WAL を読み直した");
         // 配ってよい所は、 止まっている間も置いてある (割れた組は無い)
+        assert_eq!(eng.settled_sync_records(|_, _| true).len(), eng.pending_sync_ops(0).len());
         assert_eq!(eng.settled_sync_ops().len(), eng.pending_sync_ops(0).len());
         assert_eq!(eng.bridge_wal_records_read(), read, "配る側の 1 周が WAL を読み直した");
         eng.oplog_sync().unwrap();
@@ -194,7 +207,8 @@ fn only_new_records_are_read_while_stalled_and_bridging_resumes_after_an_ack() {
 /// 止まっている間に、 ring にもう載っている行と同じ (書き手, 版数) の record が WAL に増えたら (中継した state の組の続き)、
 /// その組の行は配らない (#828)。 増えた分だけを読む道でも、 cursor から読み直した時と同じ答え。
 ///
-/// falsify: 増えた record の鍵を覚えに足さないと、 組の前半を配る。
+/// falsify: 増えた record の鍵を覚えに足さないと、 組の前半を配る。 配る側の本番の道 (`settled_sync_records`) が配ってよい行の
+/// 終わりを見ない時も (#955)。
 #[test]
 fn a_group_continued_while_stalled_is_held_back() {
     const HALF: usize = 20;
@@ -231,7 +245,7 @@ fn a_group_continued_while_stalled_is_held_back() {
     drain(&eng);
     assert!(ring_full(&eng), "前提: ring が満杯");
     assert_eq!(with_key(eng.pending_sync_ops(0), key), HALF, "前提: 組の前半が全部 ring に載っている");
-    assert_eq!(with_key(eng.settled_sync_ops(), key), HALF, "前提: 続きが WAL に無い間は、 載っている組の行は配ってよい");
+    assert_eq!(settled_with_key(&eng, key), HALF, "前提: 続きが WAL に無い間は、 載っている組の行は配ってよい");
 
     // 止まったまま、 組の続きが WAL に載る
     let read = eng.bridge_wal_records_read();
@@ -240,16 +254,16 @@ fn a_group_continued_while_stalled_is_held_back() {
     assert_eq!(eng.transfer_oplog_to_sync_ops(), 0, "前提: ring が満杯のまま");
     let grew = eng.bridge_wal_records_read() - read;
     assert!(grew >= HALF as u64 && grew <= 2 * HALF as u64 + 8, "前提: 増えた分だけ読んだ (読んだ {grew} 件)");
-    assert_eq!(with_key(eng.settled_sync_ops(), key), 0, "止まっている間に続きが WAL に載った組の、 前半を配った");
+    assert_eq!(settled_with_key(&eng, key), 0, "止まっている間に続きが WAL に載った組の、 前半を配った");
     for _ in 0..5 {
         eng.transfer_oplog_to_sync_ops();
-        assert_eq!(with_key(eng.settled_sync_ops(), key), 0, "割れた組の前半を配った");
+        assert_eq!(settled_with_key(&eng, key), 0, "割れた組の前半を配った");
     }
 
     // 組の前の行を受け手が受けて ack → 続きが載って、 組がそろう
     ack_all(&eng);
     drain(&eng);
-    let handed = with_key(eng.settled_sync_ops(), key);
+    let handed = settled_with_key(&eng, key);
     let floor = eng.sync_reclaimed_floors().unwrap_or_default().into_iter().find(|(a, _)| *a == AUTHOR).map(|(_, h)| h);
     assert!(
         handed == 2 * HALF || (handed == 0 && floor >= Some(key.1)),
