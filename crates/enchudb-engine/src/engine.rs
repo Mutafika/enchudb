@@ -6668,6 +6668,8 @@ fn lsn_order(rows: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
             *p = slot;
         }
         if placed {
+            #[cfg(test)]
+            lsn_order_tests::note_placed();
             let mut out = Vec::with_capacity(rows.len());
             out.extend(at.into_iter().enumerate().filter(|&(_, s)| s != EMPTY).map(|(i, s)| (lo + i as u32, s)));
             return out;
@@ -6680,6 +6682,17 @@ fn lsn_order(rows: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 
 #[cfg(test)]
 mod lsn_order_tests {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PLACED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// [`super::lsn_order`] が置く道で返した (この thread の分、 #962: 試験が条件を写して数えずに、 実際に通った道を見る)。
+    pub(super) fn note_placed() {
+        PLACED.with(|c| c.set(c.get() + 1));
+    }
+
     /// 置く道 (幅が狭い・lsn が重ならない) も並べる道 (幅が広い / 同じ lsn がある / 場所が `u32::MAX`) も、 (lsn, 場所) の順に並べた物と同じ。
     #[test]
     fn lsn_order_matches_a_plain_sort() {
@@ -6713,11 +6726,9 @@ mod lsn_order_tests {
             }
             let mut want = rows.clone();
             want.sort();
-            let width = rows.iter().map(|r| r.0).max().map_or(0, |hi| hi - rows.iter().map(|r| r.0).min().unwrap() + 1) as usize;
-            if !rows.is_empty() && width <= 4 * rows.len() && case % 4 != 3 && rows.iter().all(|r| r.1 != u32::MAX) {
-                placed += 1;
-            }
+            let before = PLACED.with(|c| c.get());
             assert_eq!(super::lsn_order(rows), want, "case {case}");
+            placed += PLACED.with(|c| c.get()) - before;
         }
         assert!(placed > 50 && placed < 350, "前提: 置く道と並べる道の両方を通った ({placed} / 400 回が置く道)");
     }
@@ -15217,8 +15228,9 @@ impl Engine {
         out
     }
 
-    /// #955: [`Self::settled_sync_records`]`(keep)` の答えの版数の最小。 record を写さず、 decode と同じ検査
-    /// (`sync_ops_payload_walk_key`、 受ける / 断るの判定は `decode_sync_ops_payload` と同じ) で (書き手, 版数) だけを読む。 `keep` は
+    /// #955: [`Self::settled_sync_records`]`(keep)` の答えの版数の最小。 `WireRecord` を作らず (署名と signed bytes を写さない)、 decode と
+    /// 同じ検査 (`sync_ops_payload_walk_key`、 受ける / 断るの判定は `decode_sync_ops_payload` と同じ) で (書き手, 版数) だけを読む。 検査は
+    /// op まで decode するので、 中身を持つ op (Vocab / TieLeaf 等) の bytes は写す (#962)。 `keep` は
     /// 確かめた後の値で呼ぶ。 floor を記録していない古い DB の広告 (`Syncer` の `advertise_history_floor`) が beat ごとに読む (前は全部を
     /// 写して decode していた)。
     pub fn settled_sync_min_hlc(
