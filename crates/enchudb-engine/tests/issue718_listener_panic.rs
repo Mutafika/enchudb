@@ -115,7 +115,9 @@ fn notifier_survives(with_log: bool, boom_in_detached: bool) {
 
     eng.tie_to_by_id(e, ts, 1u64);
     eng.oplog_commit();
-    assert!(wait_until(|| boom.fired.load(Ordering::SeqCst), 60), "前提: 通知係が 1 回目を配る");
+    // panic した thread の名前を控え終えるまで待つ (`fired` は控える前に立つ。 #929: 立ったのを見てすぐ名前を読むと、 負荷の下で
+    // 控える前の None を読んだ)
+    assert!(wait_until(|| boom.fired_on.lock().unwrap().is_some(), 60), "前提: 通知係が 1 回目を配る");
     // 前提: panic したのは通知係の thread の上 (oplog_sync の呼び手ではない)
     assert_eq!(boom.fired_on.lock().unwrap().as_deref(), Some("enchudb-notifier"), "前提: panic は通知係の thread で起きた");
 

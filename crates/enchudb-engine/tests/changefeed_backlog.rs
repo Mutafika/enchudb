@@ -8,7 +8,7 @@
 
 use enchudb_engine::changefeed::ChangeListener;
 use enchudb_engine::transport::WireRecord;
-use enchudb_engine::{db_files, Engine, ValueType};
+use enchudb_engine::{db_files, Engine, FaultKind, ValueType};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,8 +44,9 @@ impl Recorder {
 impl ChangeListener for Recorder {
     fn on_changes(&self, recs: &[WireRecord]) {
         self.entered.store(true, Ordering::Release);
-        // 止める受け手: test が門を開けるまで (最大 30 秒) 返らない
-        let until = Instant::now() + Duration::from_secs(30);
+        // 止める受け手: test が門を開けるまで返らない。 上限は試験が落ちて門を開けない時に止まらないためだけ (#929: 前は 30 秒で、
+        // 書き出しが遅いと書いている間に越えて返った = 「書いている間、 受け手は止まっていた」 が崩れた)
+        let until = Instant::now() + Duration::from_secs(600);
         while !self.gate.load(Ordering::Acquire) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -96,6 +97,13 @@ fn engine(tag: &str, wal_cap: usize) -> (String, Arc<Engine>) {
     (p, eng)
 }
 
+/// 書き手が WAL の空きを待たされた印: (空きを上限 (5 秒) まで待って空かなかった回数, WAL に載らずに断られた書き込みの数)。
+/// 止まった受け手を畳むのが待つと、 書き手は空きを待ち切れないか、 「畳めない状態」 と見て待たずに断られる。 書くのにかかった時間
+/// では見ない (#929: 書き出しが遅いと、 受け手と関係なく 50 回ほどの畳みだけで 3 秒を越えた)。
+fn writers_stalled(eng: &Engine) -> (u64, u64) {
+    (eng.wal_room_wait_timeouts(), eng.fault_count(FaultKind::WalSpace))
+}
+
 /// 受け手が `n` 件受け取るまで待ち (最大 `limit`)、 受け取った値の列を返す。
 fn wait_for(rec: &Recorder, n: usize, limit: Duration) -> Vec<u64> {
     let until = Instant::now() + limit;
@@ -144,7 +152,7 @@ fn stalled_listener_does_not_stall_writers() {
     eng.add_change_listener(rec.clone());
     const N: u64 = 50_000;
     let (folds, took) = write_in_order(&eng, N);
-    let dropped = eng.wal_dropped_records();
+    let (dropped, stalled) = (eng.wal_dropped_records(), writers_stalled(&eng));
     let calls_while_writing = rec.calls.load(Ordering::Relaxed);
     rec.gate.store(true, Ordering::Release);
     eng.oplog_sync().unwrap();
@@ -157,10 +165,9 @@ fn stalled_listener_does_not_stall_writers() {
     );
     eprintln!("{seen}");
     assert_eq!(calls_while_writing, 0, "前提: 書いている間、 受け手は止まっていた ({seen})");
-    assert!(folds >= 5, "前提: 書いている間に 5 回以上畳む ({seen})");
     assert_eq!(dropped, 0, "受け手が止まっている間に WAL が満杯で落ちた記録 ({seen})");
-    // 満杯の書き手が空きを待つのは最大 5 秒。 1 回でも待たされれば越える
-    assert!(took < Duration::from_secs(3), "書き手が止まっている受け手を待った ({seen})");
+    assert_eq!(stalled, (0, 0), "書き手が止まっている受け手を待った (空きを待ち切れなかった, 断られた) ({seen})");
+    assert!(folds >= 5, "前提: 書いている間に 5 回以上畳む ({seen})");
     if let Some(m) = first_mismatch(&got, N) {
         panic!("受け手に順に 1 回ずつ届いていない: {m} ({seen})");
     }
@@ -178,7 +185,7 @@ fn stalled_listener_is_detached_when_the_backlog_overflows() {
     eng.add_change_listener(rec.clone());
     const N: u64 = 50_000;
     let (folds, took) = write_in_order(&eng, N);
-    let dropped = eng.wal_dropped_records();
+    let (dropped, stalled) = (eng.wal_dropped_records(), writers_stalled(&eng));
     let (detached, listeners, backlog) = (eng.change_listeners_detached(), eng.change_listener_count(), eng.change_backlog_len());
     rec.gate.store(true, Ordering::Release);
     let until = Instant::now() + Duration::from_secs(30);
@@ -190,12 +197,12 @@ fn stalled_listener_is_detached_when_the_backlog_overflows() {
     drop(eng);
     let _ = db_files::remove_db(&p);
     let what = format!("畳んだ {folds} 回、 書くのに {took:?}、 落ちた記録 {dropped}、 外した {detached}、 受け手 {listeners}、 溜め {backlog}");
+    assert_eq!(dropped, 0, "記録が落ちた ({what})");
+    assert_eq!(stalled, (0, 0), "書き手が止まっている受け手を待った (空きを待ち切れなかった, 断られた) ({what})");
     assert!(folds >= 5, "前提: 書いている間に 5 回以上畳む ({what})");
     assert_eq!(detached, 1, "溜めが上限を越えても受け手を外さない ({what})");
     assert_eq!(listeners, 0, "外した受け手が残っている ({what})");
     assert_eq!(backlog, 0, "外した後も溜めている ({what})");
-    assert_eq!(dropped, 0, "記録が落ちた ({what})");
-    assert!(took < Duration::from_secs(3), "書き手が止まっている受け手を待った ({what})");
     assert!(lost_from.is_some(), "受け手が on_detached を受け取らない ({what})");
     assert!((seen as u64) < N, "外した受け手に全部届いた ({what}、 届いた {seen})");
 }

@@ -4377,65 +4377,192 @@ mod checkpoint_before_apply_tests {
     /// 当てている途中の書き手が居る間に WAL が満杯になっても、 空きを待つ書き手は諦めない (record を落とさない / 書き込みを
     /// 断らない)。 checkpoint は当てていない record の手前で止まるので、 その区画は畳めない — 「畳めない状態」 と数えると、 待って
     /// いる書き手が待たずに諦める (当てている途中の thread が CPU を外されている間、 ずっと)。 当て終えれば畳めて、 書き手は進む。
+    ///
+    /// 前提は時間でなく状態で作る (#929)。 B が空きを待ち始めたかは待ち手の中に居るか (`apply_liveness_tests::RoomWaiters`) で見る
+    /// (それまで consumer は止めておく)。 A は、 その後に始まった consumer の空け作りの試し (`make_wal_room_inner` の 1 回) が終わり、
+    /// それが 「畳めない状態」 と数えられていない (`wal_room_blocked` が増えていない) ところで放す。
+    /// 数えられた (直す前の形: A の手前で切って畳めなかった試しを 「畳めない状態」 と数える) なら、 B が諦める (断られる / 落とされる
+    /// / 空きを待ち切れない) まで持つ。 前は 「consumer が 20 回起きる」 まで持ち、 書き出しが遅いと周が遅れて、 その間に B の空きの
+    /// 待ち (上限 5 秒) が尽きた。
     #[test]
     fn a_full_wal_waits_for_a_writer_that_is_still_applying() {
         for sync_db in [false, true] {
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let path = format!("/tmp/enchudb-cpapply-full{}-{}-{nanos}.db", sync_db as u8, std::process::id());
-            let mut eng = if sync_db {
-                // `_sync_ops` の ring (残りの eid 空間の半分) に、 B の record が ack なしで全部入る大きさ
-                Engine::create_with_cell_version(&path, 65_536).unwrap()
-            } else {
-                Engine::create_without_cell_version(&path, 4096).unwrap()
-            };
-            eng.define_table("t", 100).unwrap();
-            let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
-            if sync_db {
-                eng.enable_sync_tables().unwrap();
-            }
-            eng.flush().unwrap();
-            eng.persist_tables().unwrap();
-            let eng = Engine::concurrentize_with_oplog(eng, 64 * 1024).unwrap();
-            let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
-            let wal = eng.oplog.as_ref().unwrap().clone();
-            assert!(wal.two_halves(), "前提: 2 区画の WAL");
-            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (release, parked) = std::sync::mpsc::channel::<()>();
-            let entered2 = entered.clone();
-            cell_append_hook::set(&wal, move |_| {
-                entered2.store(true, std::sync::atomic::Ordering::Release);
-                let _ = parked.recv_timeout(std::time::Duration::from_secs(30));
-            });
-            let a = {
-                let eng = eng.clone();
-                std::thread::spawn(move || eng.try_tie_to_by_id(e1, v, 1u32))
-            };
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            let wait = |what: &dyn Fn() -> bool| {
-                while !what() && std::time::Instant::now() < until {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                what()
-            };
-            assert!(wait(&|| entered.load(std::sync::atomic::Ordering::Acquire)), "前提: 書き手 A が積んだ後・当てる前で止まった");
-            // 書き手 B が WAL の大きさの数倍を書く (A の record のある区画は畳めないので、 2 区画とも埋まって空きを待つ)
-            let b = {
-                let eng = eng.clone();
-                std::thread::spawn(move || (0..3000u32).filter(|i| eng.try_tie_to_by_id(e2, v, *i).is_err()).count())
-            };
-            assert!(wait(&|| wal.free_bytes() < 1024), "前提: WAL が埋まった (空き {} B)", wal.free_bytes());
-            // 満杯のまま、 consumer に空け作りを何度か試させる (前は、 ここで 「畳めない」 と数えて B が諦めた)
-            let woke = eng.consumer_wakeups();
-            assert!(wait(&|| eng.consumer_wakeups() >= woke + 20), "前提: consumer が空け作りを試した");
-            release.send(()).unwrap();
-            let (a, rejected) = (a.join().unwrap(), b.join().unwrap());
-            let (dropped, timeouts, last) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts(), eng.get_by_id(e2, v));
-            drop(eng);
-            let _ = crate::db_files::remove_db(&path);
-            assert_eq!(a, Ok(()), "sync {sync_db}: 書き手 A");
-            assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "sync {sync_db}: 空きを待つ書き手が諦めた (断った, 落とした, 待ち切れ)");
-            assert_eq!(last, Some(2999), "sync {sync_db}: 書き手 B は全部書いた");
+            full_wal_case(sync_db);
         }
+    }
+
+    /// 割り込み点を、 落ちても (panic の unwind でも) 外す (#912 の `fold_copy_tests::Unhook` と同じ。 割り込み点は WAL の番地で
+    /// 置くので、 残すと同じ番地を使った後の試験の WAL で呼ばれる)。
+    struct Unhook {
+        wal: Arc<enchudb_oplog::oplog::OpLog>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            cell_append_hook::set(&self.wal, |_| {});
+            room_write_out_hook::set(&self.wal, |_| {});
+        }
+    }
+
+    /// consumer の空け作りの試し (`make_wal_room_inner` の回) が始まった回数と、 最後に始まった試しの始めの
+    /// `OpLog::applying_cuts` (1 つの lock で組にして読む)。
+    type RoomTries = Arc<std::sync::Mutex<(u64, u64)>>;
+
+    /// 空け作りの試しが始まるたび (`room_write_out_hook`、 呼ばれた中で置き直す) に `tries` を進める。 `stop` が立ったら置き直さない。
+    fn count_room_tries(wal: &enchudb_oplog::oplog::OpLog, tries: RoomTries, stop: Arc<std::sync::atomic::AtomicBool>) {
+        room_write_out_hook::set(wal, move |wal| {
+            {
+                let mut t = tries.lock().unwrap_or_else(|p| p.into_inner());
+                *t = (t.0 + 1, wal.applying_cuts());
+            }
+            if !stop.load(std::sync::atomic::Ordering::Acquire) {
+                count_room_tries(wal, tries, stop);
+            }
+        });
+    }
+
+    /// A を放す時の様子。
+    #[derive(Debug)]
+    #[allow(dead_code, reason = "assert の文に Debug で出す")]
+    struct AtRelease {
+        /// B が待ち始めた後に始まった空け作りの試しが 1 回終わった / その試しの数 / A の手前で切った回数 / 「畳めない状態」 と
+        /// 数えた回数
+        try_ended: bool,
+        tries: u64,
+        cuts: u64,
+        blocked: u64,
+        /// B がまだ空きを待っていた / B が諦めた / A が返っていた / WAL の空き / B が待ち始めたのを見てから放すまで
+        b_waiting: bool,
+        b_gave_up: bool,
+        a_returned: bool,
+        free: u64,
+        since_b_waited: std::time::Duration,
+    }
+
+    fn full_wal_case(sync_db: bool) {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+        let tag = format!("sync {sync_db}");
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-cpapply-full{}-{}-{nanos}.db", sync_db as u8, std::process::id());
+        let mut eng = if sync_db {
+            // `_sync_ops` の ring (残りの eid 空間の半分) に、 B の record が ack なしで全部入る大きさ
+            Engine::create_with_cell_version(&path, 65_536).unwrap()
+        } else {
+            Engine::create_without_cell_version(&path, 4096).unwrap()
+        };
+        eng.define_table("t", 100).unwrap();
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        if sync_db {
+            eng.enable_sync_tables().unwrap();
+        }
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 64 * 1024).unwrap();
+        let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        assert!(wal.two_halves(), "前提: 2 区画の WAL");
+        let waiters = super::apply_liveness_tests::RoomWaiters::watch(&eng);
+        let unhook = Unhook { wal: wal.clone(), stop: Arc::default() };
+        let tries = RoomTries::default();
+        count_room_tries(&wal, tries.clone(), unhook.stop.clone());
+        let entered = Arc::new(AtomicBool::new(false));
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let entered2 = entered.clone();
+        cell_append_hook::set(&wal, move |_| {
+            entered2.store(true, Ordering::Release);
+            // 放すのは下。 上限は止まらないためだけ (試験が落ちると `release` が落ちて、 すぐ返る)
+            let _ = parked.recv_timeout(Duration::from_secs(120));
+        });
+        let a = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.try_tie_to_by_id(e1, v, 1u32))
+        };
+        // 上限は前提が立たない時に止まらないためだけ
+        let wait = |ready: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(60);
+            while !ready() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait(&|| entered.load(Ordering::Acquire));
+        assert!(entered.load(Ordering::Acquire), "{tag}: 前提: 書き手 A が積んだ後・当てる前で止まった");
+        // B が待ち始めるまで consumer を止めておく (`hold_consumer`)。 放した後の consumer の最初の仕事が、 B が待ち始めた後の空け作りの
+        // 試しになる (止めないと、 その前に周期の書き出しが挟まる分、 B の空きの待ちが延びる)
+        let consumer = eng.hold_consumer();
+        // 書き手 B が WAL の大きさの数倍を書く (A の record のある区画は畳めないので、 2 区画とも埋まって空きを待つ)
+        let b_rejected = Arc::new(AtomicU32::new(0));
+        let b = {
+            let (eng, rejected) = (eng.clone(), b_rejected.clone());
+            std::thread::spawn(move || {
+                // 1 件の最大の待ち
+                let mut worst = Duration::ZERO;
+                for i in 0..3000u32 {
+                    let t = Instant::now();
+                    if eng.try_tie_to_by_id(e2, v, i).is_err() {
+                        rejected.fetch_add(1, Ordering::Release);
+                    }
+                    worst = worst.max(t.elapsed());
+                }
+                worst
+            })
+        };
+        let b_id = b.thread().id();
+        let b_gave_up =
+            || b_rejected.load(Ordering::Acquire) > 0 || eng.wal_dropped_records() > 0 || eng.wal_room_wait_timeouts() > 0;
+        // B が空きを待ち始めた (待ち手の中に居る)
+        wait(&|| waiters.has(b_id) || b_gave_up() || b.is_finished());
+        assert!(waiters.has(b_id) || b_gave_up(), "{tag}: 前提: B が WAL の空きを待ち始めた (空き {} B)", wal.free_bytes());
+        let b_waiting_since = Instant::now();
+        // consumer を放し、 その後に始まった空け作りの試しが 1 回終わるまで A を持つ。 終わりは、 試しの間だけ立つ `wal_room_busy` が
+        // 下りたか、 次の試しが始まった (`room_write_out_hook`) かで見る (試すのは consumer の thread だけ)
+        let (tries0, cuts0) = *tries.lock().unwrap();
+        let blocked0 = eng.wal_room_blocked.load(Ordering::Acquire);
+        drop(consumer);
+        let started = || tries.lock().unwrap().0 - tries0;
+        let try_ended = || {
+            let n = started();
+            n >= 2 || (n >= 1 && !eng.wal_room_busy.load(Ordering::Acquire))
+        };
+        let blocked = || eng.wal_room_blocked.load(Ordering::Acquire) - blocked0;
+        // その試しを 「畳めない状態」 と数えたなら (直す前の形)、 B が諦めるまで持つ
+        wait(&|| b_gave_up() || (try_ended() && blocked() == 0));
+        let held = AtRelease {
+            try_ended: try_ended(),
+            tries: started(),
+            cuts: wal.applying_cuts() - cuts0,
+            blocked: blocked(),
+            b_waiting: waiters.has(b_id),
+            b_gave_up: b_gave_up(),
+            a_returned: a.is_finished(),
+            free: wal.free_bytes(),
+            since_b_waited: b_waiting_since.elapsed(),
+        };
+        let _ = release.send(());
+        let a = a.join().unwrap();
+        let worst = b.join().unwrap();
+        let rejected = b_rejected.load(Ordering::Acquire);
+        let (dropped, timeouts, last) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts(), eng.get_by_id(e2, v));
+        drop(eng);
+        drop(unhook);
+        let _ = crate::db_files::remove_db(&path);
+        eprintln!(
+            "[full-wal] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / A を放す時 {held:?}"
+        );
+        assert!(!held.a_returned, "{tag}: 前提: A を放す時、 A は当てる途中で止まっていた ({held:?})");
+        assert!(
+            held.b_gave_up || (held.try_ended && held.cuts > 0),
+            "{tag}: 前提: B が待ち始めた後に、 consumer の空け作りの試しが A の手前で切って終わった ({held:?})"
+        );
+        assert_eq!(a, Ok(()), "{tag}: 書き手 A");
+        assert_eq!(
+            (rejected, dropped, timeouts),
+            (0, 0, 0),
+            "{tag}: 空きを待つ書き手が諦めた (断った, 落とした, 待ち切れ) (最大の待ち {worst:?}、 A を放す時 {held:?})"
+        );
+        assert_eq!(last, Some(2999), "{tag}: 書き手 B は全部書いた");
     }
 
     /// sync する DB (版数の列 + `_sync_ops`) でも同じ。 bridge はその record を `_sync_ops` に写してよい (落ちたら再生で本体にも
@@ -4502,12 +4629,12 @@ mod apply_liveness_tests {
 
     /// WAL の空きを待っている thread (#926)。 engine が置いた待ち手 (`wait_for_wal_room`) を、 中に居る thread を控える物で包む
     /// (待ち方は変えない)。 「書き手が空きを待ち始めた」 を、 書いた数が 50 ms 増えないか (時間) でなく、 待ち手の中に居るか (状態)
-    /// で見るため。 前の形は、 負荷で書き手が 50 ms 走らないだけで 「待ち始めた」 と読んだ。
+    /// で見るため。 前の形は、 負荷で書き手が 50 ms 走らないだけで 「待ち始めた」 と読んだ。 `checkpoint_before_apply_tests` も使う (#929)。
     #[derive(Default)]
-    struct RoomWaiters(std::sync::Mutex<Vec<std::thread::ThreadId>>);
+    pub(super) struct RoomWaiters(std::sync::Mutex<Vec<std::thread::ThreadId>>);
 
     impl RoomWaiters {
-        fn watch(eng: &Arc<Engine>) -> Arc<Self> {
+        pub(super) fn watch(eng: &Arc<Engine>) -> Arc<Self> {
             let waiters = Arc::new(Self::default());
             let w = waiters.clone();
             let engine_addr = Arc::as_ptr(eng) as usize;
@@ -4527,7 +4654,7 @@ mod apply_liveness_tests {
         }
 
         /// `t` の thread が今、 WAL の空きを待っている。
-        fn has(&self, t: std::thread::ThreadId) -> bool {
+        pub(super) fn has(&self, t: std::thread::ThreadId) -> bool {
             self.0.lock().unwrap_or_else(|p| p.into_inner()).contains(&t)
         }
     }
