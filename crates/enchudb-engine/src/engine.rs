@@ -2535,6 +2535,55 @@ mod pop_claim_hook {
     }
 }
 
+/// test 用の割り込み点: 受信の当て込みが宛名を引いた後・行の lock を取る前 (#917)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod remote_row_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: state の合成が、 外した cell の宛名を引いた後・cell を読む前 (#917 の G)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod state_read_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: state の合成が、 自分の行の Untie / Delete を確かめた後・record を作る前 (#917 の G)。 置いた WAL で 1 回だけ
+/// 呼ぶ。
+#[cfg(test)]
+mod state_number_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: 紐の動的な定義 (Number64) が header の version を読んで、 書き戻す前 (#731 の読み直し G)。 置いた WAL で
 /// 1 回だけ呼ぶ。
 #[cfg(test)]
@@ -2731,6 +2780,25 @@ mod fold_copy_tests {
     struct Quiet;
     impl crate::changefeed::ChangeListener for Quiet {}
 
+    /// 試験が途中で落ちても (前提の assert の panic でも)、 置いた割り込み点と書き出しの失敗 (`write_out_fault`) を外す。 外さないと、
+    /// 後で同じ番地に作られた別の試験の WAL が書き出せない (#912: 「前提: 記録に写した」 で落ちた試験の `write_out_fault` が、 同じ
+    /// process で後に走った `copying_into_the_change_log_while_making_wal_room_does_not_stop_writers` の WAL に残り、 古い区画を
+    /// 畳めずに 「前提: 古い区画を畳んだ」 で落ちた形。 `write_out_fault` は番地だけを持ち、 WAL を生かしておかない)。
+    struct Unhook {
+        wal: Arc<OpLog>,
+        stop: Option<Arc<AtomicBool>>,
+    }
+
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            if let Some(s) = &self.stop {
+                s.store(true, Ordering::Release);
+            }
+            write_out_fault::set(&self.wal, false);
+            change_copy_hook::set(&self.wal, |_| {});
+        }
+    }
+
     /// changefeed の record を写すたびに (`change_copy_hook`、 呼ばれた中で置き直す)、 別の thread が WAL に Commit を 1 つ積み、
     /// 5 秒の間に返ったかを `seen` に控える。 `stop` が立ったら何もせず置き直さない。
     fn watch_copies(wal: Arc<OpLog>, seen: Arc<Mutex<Vec<bool>>>, stop: Arc<AtomicBool>) {
@@ -2780,6 +2848,7 @@ mod fold_copy_tests {
         }
         let wal = eng.oplog.as_ref().unwrap().clone();
         let (seen, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
+        let _unhook = Unhook { wal: wal.clone(), stop: Some(stop.clone()) };
         watch_copies(wal.clone(), seen.clone(), stop.clone());
         // 区画を移るまで書き、 今の区画にも少し書いて止める (今の区画は埋まらないので、 積む thread は空きを待たない)
         let (lap0, switches0, room0) = (wal.lap(), eng.wal_switches(), eng.wal_room_folds());
@@ -2795,19 +2864,32 @@ mod fold_copy_tests {
             eng.tie_to(eids[i as usize % eids.len()], "v", i);
             i += 1;
         }
-        // 空け作りは試験の thread から呼ぶ (空きが 1/4 を切るのを consumer に待たせない)
-        while room && eng.make_wal_room(&wal) != WalRoom::Folded && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+        // 空け作りは試験の thread から呼ぶ (空きが 1/4 を切るのを consumer に待たせない)。 #912: 戻りを控える (畳めなかった時に
+        // 何で止まったかを見る)。 上限は書く間と別に取る
+        let mut rooms: Vec<WalRoom> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while room && rooms.last() != Some(&WalRoom::Folded) && Instant::now() < deadline {
+            rooms.push(eng.make_wal_room(&wal));
+            if rooms.last() != Some(&WalRoom::Folded) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
+        // 戻りの並び (続けて同じ値は数にまとめる)
+        let rooms = rooms.chunk_by(|a, b| a == b).map(|r| format!("{:?} x{}", r[0], r.len())).collect::<Vec<_>>().join(", ");
         // 区画を移らず (今の区画の周のまま)、 今の区画をその場で畳んでもいない
-        assert_eq!(wal.lap(), lap1, "前提: 畳んだのは古い区画");
+        assert_eq!(wal.lap(), lap1, "前提: 畳んだのは古い区画 (空け作りの戻り [{rooms}])");
         // 古い区画が畳まれるまで待つ (空け作りの形は畳み終えている)
         let old = wal_pos(lap0, HEADER_SIZE as u64);
         let deadline = Instant::now() + Duration::from_secs(20);
         while wal.holds(old) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!wal.holds(old), "前提: 古い区画を畳んだ");
+        assert!(
+            !wal.holds(old),
+            "前提: 古い区画を畳んだ (空け作りの戻り [{rooms}]、 区画の切り替え {}、 書き出しの失敗 {})",
+            eng.wal_switches() - switches0,
+            write_out_fault::active(&wal)
+        );
         stop.store(true, Ordering::Release);
         assert_eq!(eng.wal_room_folds() > room0, room, "前提: 空け作りで畳んだか");
         let seen = seen.lock().unwrap().clone();
@@ -2943,7 +3025,13 @@ mod fold_copy_tests {
     /// 畳む時も、 書き出していない record には記録の番号を振らない (畳む前に lock の外で写すのは書き出した所まで、 lock の下は畳む
     /// 区画の終わりまで)。 畳む時の写しが始まる所で 1 件積み、 それ以後の書き出しを止めて、 記録の最後の record が checkpoint より
     /// 前にあるかを見る (`tests/changefeed_log.rs` の `records_not_yet_written_out_get_no_number` を畳む時に)。 `room` = 試験の thread
-    /// から空け作りを呼んで畳む形、 でなければ consumer の 100 ms ごとの書き出しの後の形。
+    /// から空け作りを呼んで畳む形、 でなければ consumer の周期の書き出しの後の形。
+    ///
+    /// どちらも区画を移ってから (古い区画を畳む。 1 件積んだ今の区画は畳まないので、 積んだ後も畳む写しまで進む)。 周期の形は、 書く間
+    /// consumer を止め (`hold_consumer`)、 放した後の consumer の最初の周が、 書き出した後の写し (`try_fold_with_changes`) で割り込み点
+    /// を踏み、 同じ周で古い区画を畳む (前提は 「古い区画を畳んだ」 で見る)。 #912: 前は 1000 件書いた後の次の写しで踏んでいて、 負荷で
+    /// consumer の周が遅れると、 何も書き出す前の写しで踏んで以後の書き出しを止め、 記録に何も写らなかった (「前提: 記録に写した」)。
+    /// また区画を移らない形では、 積んだ 1 件のせいで今の区画を畳めず、 畳む前の写し (`move_changes_before_fold`) を通らなかった。
     fn a_fold_numbers_no_record_not_yet_written_out(room: bool) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = format!("/tmp/enchudb-foldnumber-{}-{room}-{nanos}.db", std::process::id());
@@ -2964,17 +3052,37 @@ mod fold_copy_tests {
         eng.enable_change_log(4 << 20).unwrap();
         let hid = eng.himo_id("v").unwrap() as u16;
         let wal = eng.oplog.as_ref().unwrap().clone();
+        let _unhook = Unhook { wal: wal.clone(), stop: None };
         let fired = Arc::new(AtomicBool::new(false));
         let room0 = eng.wal_room_folds();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        // 空け作りの形は区画を移ってから (古い区画を畳み、 積む record は今の区画に入る)
-        let switches0 = eng.wal_switches();
+        // 周期の形は、 割り込み点を置くまで consumer を止める (書き出しも畳みもしない = 古い区画は書き出し待ちで残る)
+        let held = (!room).then(|| eng.hold_consumer());
+        // 上限は前提が立たない時に止まらないためだけ
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // 区画を移ってから (古い区画を畳み、 積む record は今の区画に入る)、 今の区画にも少し書く
+        let (lap0, switches0) = (wal.lap(), eng.wal_switches());
         let mut i = 0u32;
-        while i < 1_000 || (room && eng.wal_switches() == switches0 && Instant::now() < deadline) {
+        while eng.wal_switches() == switches0 && Instant::now() < deadline {
             eng.tie_to_by_id(eids[i as usize % eids.len()], hid, i);
             i += 1;
         }
-        mark_at_copy(wal.clone(), fired.clone(), eids[0], hid, room.then(|| std::thread::current().id()));
+        assert!(eng.wal_switches() > switches0, "前提: 区画を移った");
+        for _ in 0..100 {
+            eng.tie_to_by_id(eids[i as usize % eids.len()], hid, i);
+            i += 1;
+        }
+        // 割り込み点を踏むのは、 空け作りの形は試験の thread、 周期の形は consumer の thread だけ (通知係や試験の thread の写しは
+        // 書き出しの前に来ることがある)
+        let only = if room {
+            std::thread::current().id()
+        } else {
+            while eng.consumer_thread.get().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            *eng.consumer_thread.get().expect("前提: consumer の thread が居る")
+        };
+        mark_at_copy(wal.clone(), fired.clone(), eids[0], hid, Some(only));
+        drop(held);
         while room && eng.make_wal_room(&wal) != WalRoom::Folded && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2982,6 +3090,12 @@ mod fold_copy_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(fired.load(Ordering::Acquire), "前提: 畳もうとして記録に写した");
+        // 割り込み点の後、 同じ試しで古い区画を畳む (畳む前の写しを通った)
+        let old = wal_pos(lap0, HEADER_SIZE as u64);
+        while wal.holds(old) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!wal.holds(old), "前提: 古い区画を畳んだ");
         // 畳む試しが終わるまで待つ (`change_emit` を持ったまま写して畳む。 ここで写すのは checkpoint まで)
         eng.change_log_range().unwrap();
         if room {
@@ -4240,13 +4354,72 @@ mod apply_liveness_tests {
     /// 2 区画を埋めた所 (WAL 1 つ分、 約 1400 件) で止まった
     const B_BEFORE_RELEASE: u32 = 3000;
 
+    /// [`a_writer_held_by_a_long_column_holder_does_not_hold_the_wal`] の書き手 A / B の様子 (止める側が見る)。
+    #[derive(Default)]
+    struct HeldWriters {
+        /// A が書き始めた / 書き込みから返った
+        a_started: std::sync::atomic::AtomicBool,
+        a_returned: std::sync::atomic::AtomicBool,
+        /// B が書いた数 / 断られた数
+        b_done: std::sync::atomic::AtomicU32,
+        b_rejected: std::sync::atomic::AtomicU32,
+    }
+
+    /// 止める側が放した時の様子。
+    #[derive(Debug)]
+    struct HoldRelease {
+        /// 放す時までに B が書いた数
+        b_done: u32,
+        /// 放す時に A が返っていた (= A は止める側を待っていない)
+        a_returned: bool,
+        /// B が書き終えず、 断られも落とされもしないまま上限 ([`HOLD_CAP`]) に届いた
+        gave_up: bool,
+    }
+
+    /// 止める側が持つ上限。 前提が崩れた時 (B が書き終えも断られもしない) に止まらないためだけ: 直す前の形でも、 B は空きを待ち切れず
+    /// (上限 5 秒) に断られる / 落とされるので、 その印で放す。
+    const HOLD_CAP: Duration = Duration::from_secs(120);
+
+    /// 止める側が持つ間: B が全部書き終えるか、 B が断られた / 落とされた / 空きを待ち切れなかった印が立つまで待つ (時間で持たない)。
+    fn hold_until_b_ends(eng: &Engine, ab: &HeldWriters) -> HoldRelease {
+        use std::sync::atomic::Ordering;
+        let ended = || {
+            ab.b_done.load(Ordering::Acquire) >= B_WRITES
+                || ab.b_rejected.load(Ordering::Acquire) > 0
+                || eng.wal_dropped_records() > 0
+                || eng.wal_room_wait_timeouts() > 0
+        };
+        let until = Instant::now() + HOLD_CAP;
+        while !ended() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        HoldRelease {
+            b_done: ab.b_done.load(Ordering::Acquire),
+            a_returned: ab.a_returned.load(Ordering::Acquire),
+            gave_up: !ended(),
+        }
+    }
+
     /// 書き手 B: 列 `y` に `n` 件書き、 書いた数を `done` に置く。 (断られた数, 1 件の最大の待ち)
     fn write_many(eng: &Engine, e: u64, y: u16, n: u32, done: &std::sync::atomic::AtomicU32) -> (usize, Duration) {
+        write_many_counted(eng, e, y, n, done, &std::sync::atomic::AtomicU32::new(0))
+    }
+
+    /// [`write_many`] の、 断られるたびに `rejected_now` にも足す版 (止める側が、 B が断られたのを見て放す)。
+    fn write_many_counted(
+        eng: &Engine,
+        e: u64,
+        y: u16,
+        n: u32,
+        done: &std::sync::atomic::AtomicU32,
+        rejected_now: &std::sync::atomic::AtomicU32,
+    ) -> (usize, Duration) {
         let (mut rejected, mut worst) = (0, Duration::ZERO);
         for i in 0..n {
             let t = Instant::now();
             if eng.try_tie_to_by_id(e, y, i).is_err() {
                 rejected += 1;
+                rejected_now.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
             worst = worst.max(t.elapsed());
             done.store(i + 1, std::sync::atomic::Ordering::Release);
@@ -4274,8 +4447,13 @@ mod apply_liveness_tests {
     /// 列 x の書き手を長く止める側が持つ間に、 A が x へ書き (行を消し)、 B が y に WAL の数倍を書く。 直す前は A が積んだ後に
     /// `write_lock` を待ち、 その record の手前で checkpoint が止まって、 B は止める側が放すまで空きを待った (6 秒持つと、 sync の DB は
     /// record を落とし、 sync の無い DB は書き込みを断った)。 組み合わせ (止める側 3 × A の書き込み 2 × sync の有無 2) は 4 つずつ
-    /// 並べて回す。 見るのは、 止める側が放す時までに B が書いた数 (時間では見ない: 負荷の下では、 A と関係なく書き出しが 1 秒近く
-    /// かかる回がある)。
+    /// 並べて回す。
+    ///
+    /// 時間では見ない (#912)。 止める側は、 B が全部書き終えるか、 B が断られた / 落とされた / 空きを待ち切れなかった印が立つまで持つ
+    /// ([`hold_until_b_ends`])。 直した形は B が書き終えてから放し、 直す前の形は B が空きを待ち切れずに (上限 5 秒) 断られる / 落とされる
+    /// ので放し、 本題の assert (断られた / 落とした / 待ち切れの数が 0) で落ちる。 A が止める側で待ったかは、 A が書き始めた後に B が
+    /// 書き始め、 止める側が放す時に A がまだ返っていないかで見る。 前は 1.5 秒持って 「放す時までに B が 3000 件書いた」 を見ていて、
+    /// 遅い build (master の coverage) や並べた負荷では、 A と関係なく書き出しが遅い回に届かなかった。
     #[test]
     fn a_writer_held_by_a_long_column_holder_does_not_hold_the_wal() {
         let cases: Vec<_> = [Holder::Guard, Holder::Build, Holder::Compact]
@@ -4303,50 +4481,48 @@ mod apply_liveness_tests {
         let (eng, x, y, _) = open(eng, sync_db);
         let (e1, e2) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
         eng.try_tie_to_by_id(e1, x, 5u32).unwrap();
-        let hold = hold();
         let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let b_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ab = Arc::new(HeldWriters::default());
         let holder_thread = {
-            let (eng, b_done) = (eng.clone(), b_done.clone());
+            let (eng, ab) = (eng.clone(), ab.clone());
             std::thread::spawn(move || {
-                // 放す時までに B が書いた数
-                let at_release = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                // 放す時の様子
+                let at_release = Arc::new(std::sync::Mutex::new(None));
                 let seen = at_release.clone();
                 match holder {
                     Holder::Guard => {
                         let g = eng.himos[x as usize].write_guard();
                         held_tx.send(()).unwrap();
-                        std::thread::sleep(hold);
-                        seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                        *seen.lock().unwrap() = Some(hold_until_b_ends(&eng, &ab));
                         drop(g);
                     }
                     Holder::Build => {
+                        let e = eng.clone();
                         crate::himo_store::hook::set("building_cylinder", move || {
                             held_tx.send(()).unwrap();
-                            std::thread::sleep(hold);
-                            seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                            *seen.lock().unwrap() = Some(hold_until_b_ends(&e, &ab));
                         });
                         let _ = eng.himos[x as usize].slice_len(5);
                     }
                     Holder::Compact => {
                         let _ = eng.himos[x as usize].slice_len(5);
                         assert!(eng.himos[x as usize].cylinder_built(), "前提: 組んだ円柱");
+                        let e = eng.clone();
                         crate::himo_store::hook::set("compact_now", move || {
                             held_tx.send(()).unwrap();
-                            std::thread::sleep(hold);
-                            seen.store(b_done.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Relaxed);
+                            *seen.lock().unwrap() = Some(hold_until_b_ends(&e, &ab));
                         });
                         eng.himos[x as usize].compact_now();
                     }
                 }
-                at_release.load(std::sync::atomic::Ordering::Relaxed)
+                at_release.lock().unwrap().take()
             })
         };
-        held_rx.recv_timeout(Duration::from_secs(20)).expect("前提: 止める側が持った");
+        held_rx.recv_timeout(Duration::from_secs(60)).expect("前提: 止める側が持った");
         let a = {
-            let eng = eng.clone();
+            let (eng, ab) = (eng.clone(), ab.clone());
             std::thread::spawn(move || {
-                let t = Instant::now();
+                ab.a_started.store(true, std::sync::atomic::Ordering::Release);
                 let r = match write {
                     AWrite::Tie => eng.try_tie_to_by_id(e1, x, 1u32),
                     AWrite::Delete => {
@@ -4354,28 +4530,29 @@ mod apply_liveness_tests {
                         Ok(())
                     }
                 };
-                (r, t.elapsed())
+                ab.a_returned.store(true, std::sync::atomic::Ordering::Release);
+                r
             })
         };
-        // A が止める側で待つまで (直した形は積む前、 直す前の形は積んだ後)
-        std::thread::sleep(Duration::from_millis(50));
-        let (rejected, worst) = write_many(&eng, e2, y, B_WRITES, &b_done);
-        let before_release = holder_thread.join().unwrap();
-        let (a_result, a_took) = a.join().unwrap();
+        // A が書き始めてから B が書き始める (A は止める側で待つ: 直した形は積む前、 直す前の形は積んだ後)
+        while !ab.a_started.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let (rejected, worst) = write_many_counted(&eng, e2, y, B_WRITES, &ab.b_done, &ab.b_rejected);
+        let release = holder_thread.join().unwrap().expect("前提: 止める側の割り込み点を通った");
+        let a_result = a.join().unwrap();
         let (dropped, timeouts) = (eng.wal_dropped_records(), eng.wal_room_wait_timeouts());
         let (x_now, y_now) = (eng.get_by_id(e1, x), eng.get_by_id(e2, y));
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
         eprintln!(
-            "[held] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / 放す時までに書いた {before_release} 件 / A の待ち {a_took:?}"
+            "[held] {tag}: B 断られた {rejected} / 落とした {dropped} / 待ち切れ {timeouts} / 最大の待ち {worst:?} / 放す時 {release:?}"
         );
+        assert!(!release.gave_up, "{tag}: 前提: B が書き終えるか断られる / 落ちるまで止める側が持った ({release:?})");
+        assert!(!release.a_returned, "{tag}: 前提: A は止める側を待った (放す時に A が返っていた)");
         assert_eq!(a_result, Ok(()), "{tag}: 書き手 A");
-        assert!(a_took >= hold / 2, "{tag}: 前提: A は止める側を待った ({a_took:?})");
         assert_eq!((rejected, dropped, timeouts), (0, 0, 0), "{tag}: B が断られた / 落ちた / 空きを待ち切れなかった (最大の待ち {worst:?})");
-        assert!(
-            before_release >= B_BEFORE_RELEASE,
-            "{tag}: B は止める側が放すまで待たされた (放す時までに {before_release} 件、 最大の待ち {worst:?})"
-        );
+        assert_eq!(release.b_done, B_WRITES, "{tag}: B は止める側が放すまで書き終えなかった ({release:?}、 最大の待ち {worst:?})");
         let x_want = match write {
             AWrite::Tie => Some(1),
             AWrite::Delete => None,
@@ -4925,32 +5102,34 @@ mod apply_liveness_tests {
             let (eng, b_done) = (eng.clone(), b_done.clone());
             std::thread::spawn(move || write_many(&eng, e2, y, B_WRITES, &b_done))
         };
-        // B が空きを待ち始める (書いた数が 50 ms 増えない) まで
-        let until = Instant::now() + Duration::from_secs(20);
-        let mut last = u32::MAX;
-        while Instant::now() < until {
-            let now = b_done.load(std::sync::atomic::Ordering::Acquire);
-            if now == last {
-                break;
-            }
-            last = now;
-            std::thread::sleep(Duration::from_millis(50));
+        // consumer が A の手前で切り、 B が空きを待ち始める (`wal_room_wanted` を立てるのは空きを待つ書き手だけ) まで。 #912: 前は
+        // 「B の書いた数が 50 ms 増えない」 で決めていて、 負荷で B が 50 ms 走らないと、 consumer が A の手前で切る前に進んだ。
+        // 上限は前提が立たない時に止まらないためだけ
+        let ready = || eng.wal_room_wanted.load(std::sync::atomic::Ordering::Acquire) && wal.applying_cuts() > 0;
+        let until = Instant::now() + Duration::from_secs(60);
+        while !ready() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
         }
-        let cut = wal.applying_cuts() > 0;
+        let (cut, waiting, last) = (wal.applying_cuts() > 0, ready(), b_done.load(std::sync::atomic::Ordering::Acquire));
         let woke = eng.consumer_wakeups();
+        let t = Instant::now();
         std::thread::sleep(Duration::from_millis(200));
         let woke = eng.consumer_wakeups() - woke;
+        // 窓の長さは測る (負荷で眠りが延びた分、 B が起こす回数も増える)
+        let window = t.elapsed();
         let still = b_done.load(std::sync::atomic::Ordering::Acquire) < B_WRITES;
         release.send(()).unwrap();
         let a = a.join().unwrap();
         let (rejected, _) = b.join().unwrap();
         drop(eng);
         let _ = crate::db_files::remove_db(&p);
-        eprintln!("[pace] B が待ち始めた所 {last} 件 / 200 ms の consumer の周 {woke}");
-        assert!(cut && still, "前提: A の手前で切って畳めず、 B が空きを待った ({last} 件)");
+        eprintln!("[pace] B が待ち始めた所 {last} 件 / {window:?} の consumer の周 {woke}");
+        assert!(cut && waiting && still, "前提: A の手前で切って畳めず、 B が空きを待った ({last} 件、 切った {cut}、 待った {waiting} {still})");
         assert_eq!((a, rejected), (Ok(()), 0), "A / B の書き込み");
-        // 寝ていれば、 待つ書き手が起こす分 (200 µs ごと = 1000 回) まで。 回ると 10^5 を越える
-        assert!(woke < 5_000, "consumer が寝ずに回った (200 ms に {woke} 周)");
+        // 寝ていれば、 待つ書き手が起こす分 (200 µs ごと = 1 ms に 5 回) まで。 回ると 1 ms に 500 回を越える。 窓は測った長さで見る
+        // (上限は 1 ms に 25 回 = 200 ms で 5000 回)
+        let limit = 25 * window.as_millis().max(1) as u64;
+        assert!(woke < limit, "consumer が寝ずに回った ({window:?} に {woke} 周、 上限 {limit})");
     }
 }
 
@@ -13132,15 +13311,29 @@ impl Engine {
                     if !mine(self.cell_hlc_local(local, himo_id)) || !self.entities.is_live(local) {
                         continue;
                     }
+                    // #731 (段 4): 自分の行の世界番号は世代込み (生きている行 = 今の世代)
+                    // #917 (G): 宛名は cell を読む前に引き、 読んだ後に場所の世代が同じか確かめる (間にその行が消えて場所が使い回される
+                    // と、 新しい行宛ての Untie になる。 消すと世代が上がる。 消えただけの行の Untie も出さないが、 その行の Delete が出る)
+                    let g0 = self.generations().get(local);
+                    let (owner, owner_local) =
+                        self.eid_translator.reverse(local).unwrap_or_else(|| (self_peer, self.own_world_local(local)));
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        state_read_hook::call(wal);
+                    }
                     let (empty, hlc) = self.row_locks.read(local, || {
                         (self.himos[hid].get_value(local).is_none(), self.cell_hlc_local(local, himo_id))
                     });
                     if !empty || !mine(hlc) || !self.entities.is_live(local) {
                         continue;
                     }
-                    // #731 (段 4): 自分の行の世界番号は世代込み (生きている行 = 今の世代)
-                    let (owner, owner_local) =
-                        self.eid_translator.reverse(local).unwrap_or_else(|| (self_peer, self.own_world_local(local)));
+                    if self.generations().get(local) != g0 {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        state_number_hook::call(wal);
+                    }
                     let eid = enchudb_oplog::make_eid(owner, owner_local);
                     records.push(mk(DecodedOp::Untie { eid, himo_id }, hlc));
                 }
@@ -13168,15 +13361,25 @@ impl Engine {
             let local_only = self.local_only_ranges();
             for local in 0..count {
                 let tomb = self.tombstone_hlc_local(local);
-                if !mine(tomb)
-                    || self.entities.is_live(local)
+                if !mine(tomb) {
+                    continue;
+                }
+                // #731 (段 4): 消えた行の世界番号 (世代込み、 死んだ場所は消えた行の世代)
+                // #917 (G): 番号は 「生きていない」 を確かめる前に引く。 前は確かめた後に引き、 間にその場所が使い回されると新しい
+                // 行の番号宛ての Delete (消えた行の版数) になって、 受け手が削除優先で新しい行を消した。 引く前に使い回されていれば、
+                // 新しい行が生きているので出さない
+                let row = self.own_world_local(local);
+                if self.entities.is_live(local)
                     || local_only.iter().any(|&(lo, hi)| local >= lo && local < hi)
                     || self.bridge_address(self.own_world_local(local), tomb).is_some()
                 {
                     continue;
                 }
-                // #731 (段 4): 消えた行の世界番号 (世代込み、 死んだ場所は消えた行の世代)
-                deletes.push((tomb, enchudb_oplog::make_eid(self_peer, self.own_world_local(local))));
+                #[cfg(test)]
+                if let Some(wal) = self.oplog.as_ref() {
+                    state_number_hook::call(wal);
+                }
+                deletes.push((tomb, enchudb_oplog::make_eid(self_peer, row)));
             }
         }
         deletes.sort_unstable();
@@ -16812,12 +17015,8 @@ impl Engine {
 
     /// untie 経路用の `clear_cell_local` — 採用が決まった cell の Leaf payload も
     /// 解放する。 不採用 (= 古い untie) のときは payload を **解放しない**
-    /// (cell がまだその payload を指しているため)。
-    fn clear_cell_local_freeing_leaf(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
-        self.clear_cell_in_freeing_leaf(None, local, himo_id, hlc)
-    }
-
-    /// `clear_cell_local_freeing_leaf` の、 行 `local` の lock を握っている呼び手も呼べる形 (`set_cell_in` と同じ)。
+    /// (cell がまだその payload を指しているため)。 行 `local` の lock を握っている呼び手は `row` に渡す (`set_cell_in` と同じ)、
+    /// `None` なら当てる間だけ握る。
     fn clear_cell_in_freeing_leaf(
         &self,
         row: Option<&crate::row_lock::RowWrite<'_>>,
@@ -17842,6 +18041,47 @@ impl Engine {
     /// sync の当ては、 その record を古い書き込み (削除優先で捨てる) として扱う。 他の peer の行の番号は false。
     pub fn is_gone_own_eid(&self, eid: enchudb_oplog::EntityId) -> bool {
         enchudb_oplog::eid_peer(eid) == self.peer_id() && self.own_world_slot(enchudb_oplog::eid_local(eid)).is_none()
+    }
+
+    /// #917: 受信の当て込みが宛名 `world` を中の eid `internal` に引いた (`resolve_remote_eid` など) 直後に呼び、 「その行」 の
+    /// 番号 (世代 | 場所) を取る。 当てる時 (`remote_*_apply_at`) に行の lock の下で、 場所の最後の行 ([`Self::last_local_of_slot`])
+    /// と比べる: 違えば、 引いた後・行の lock の前に、 その行が消えて場所が使い回された (新しい行に当てない)。 前は lock の外の
+    /// 照合 ([`Self::is_gone_own_eid`]) だけで、 その窓で消して使い回した行に、 古い行宛ての Delete / Tie が当たった。
+    ///
+    /// 自分の行 (畳んで別の行に転送していない) は宛名の番号そのもの (引く時に照合した番号。 引いた後に変わっていても lock の下で
+    /// 外れる)。 他の peer の行と転送した自分の行は、 引いた直後の場所の最後の行。
+    pub fn remote_row_of(&self, world: enchudb_oplog::EntityId, internal: enchudb_oplog::EntityId) -> u32 {
+        let slot = self.slot_unchecked(internal);
+        if enchudb_oplog::eid_peer(world) == self.peer_id() {
+            let local = enchudb_oplog::eid_local(world);
+            if self.generations().split(local).0 == slot {
+                return local;
+            }
+        }
+        self.last_local_of_slot(slot)
+    }
+
+    /// #917: 中の eid `internal` の場所に、 [`Self::remote_row_of`] で取った行 `row` がまだ居るか (場所の最後の行か)。 lock の外で
+    /// 見る時は目安 (受信の道が、 当たらなかった record の印を積む前に見る)。
+    pub fn remote_row_holds(&self, internal: enchudb_oplog::EntityId, row: u32) -> bool {
+        self.remote_row_holds_slot(self.slot_unchecked(internal), Some(row))
+    }
+
+    #[inline]
+    fn remote_row_holds_slot(&self, slot: u32, row: Option<u32>) -> bool {
+        let Some(r) = row else { return true };
+        let gens = self.generations();
+        // 生きている今の行 (よくある形): 場所の今の世代の番号と同じ。 消すと世代が上がるので、 死んだ場所の今の世代の番号は消えた行の
+        // 番号と違う (下の引き方で見る)
+        !gens.active() || gens.local(slot) == r || self.last_local_of_slot(slot) == r
+    }
+
+    /// test 用の割り込み点: 受信の当て込み (`remote_*_apply`) が行の lock を取る直前 (#917)。
+    #[cfg(test)]
+    fn remote_row_hook(&self) {
+        if let Some(wal) = self.oplog.as_ref() {
+            remote_row_hook::call(wal);
+        }
     }
 
     /// #731 (段 4): 相手から届いた record の宛名 `eid` の identity (名前の年表・束ねた identity のカードの鍵)。 自分の行の identity は
@@ -19085,6 +19325,29 @@ impl Engine {
         bytes: &[u8],
         hlc: enchudb_oplog::Hlc,
     ) -> RemoteApply {
+        self.remote_tieleaf_apply_in(eid, None, himo_id, bytes, hlc)
+    }
+
+    /// #917: [`Self::remote_tieleaf_apply`] の、 行の lock の下で 「行 `row` がまだその場所の行か」 を確かめる形 ([`Self::remote_row_of`])。
+    pub fn remote_tieleaf_apply_at(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: u32,
+        himo_id: u16,
+        bytes: &[u8],
+        hlc: enchudb_oplog::Hlc,
+    ) -> RemoteApply {
+        self.remote_tieleaf_apply_in(eid, Some(row), himo_id, bytes, hlc)
+    }
+
+    fn remote_tieleaf_apply_in(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: Option<u32>,
+        himo_id: u16,
+        bytes: &[u8],
+        hlc: enchudb_oplog::Hlc,
+    ) -> RemoteApply {
         let local = self.slot_unchecked(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return RemoteApply::Stale; }
@@ -19100,9 +19363,19 @@ impl Engine {
         if self.ensure_cell_room(hid, local).is_err() {
             return RemoteApply::RejectedCapacity;
         }
+        // #917: 引いた行がまだその場所の行か、 生かす前に (使い回した新しい行に当てない)
+        if !self.remote_row_holds_slot(local, row) {
+            return RemoteApply::Stale;
+        }
         self.ensure_live_slot(local);
+        #[cfg(test)]
+        self.remote_row_hook();
         // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない
         let _row = self.row_locks.write(local);
+        // #917: 行の lock の下でもう一度 (確かめた後・握る前に、 その行が消えて場所が使い回された)
+        if !self.remote_row_holds_slot(local, row) {
+            return RemoteApply::Stale;
+        }
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
         // #119: **insert → publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
         let old = self.take_leaf_cell(local, hid);
@@ -19153,6 +19426,30 @@ impl Engine {
         value: impl CellValue,
         hlc: enchudb_oplog::Hlc,
     ) -> RemoteApply {
+        self.remote_tie_apply_in(eid, None, himo_id, value, hlc)
+    }
+
+    /// #917: [`Self::remote_tie_apply_result`] の、 行の lock の下で 「行 `row` がまだその場所の行か」 を確かめる形
+    /// ([`Self::remote_row_of`])。 違えば `Stale` (書かない)。
+    pub fn remote_tie_apply_at(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: u32,
+        himo_id: u16,
+        value: impl CellValue,
+        hlc: enchudb_oplog::Hlc,
+    ) -> RemoteApply {
+        self.remote_tie_apply_in(eid, Some(row), himo_id, value, hlc)
+    }
+
+    fn remote_tie_apply_in(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: Option<u32>,
+        himo_id: u16,
+        value: impl CellValue,
+        hlc: enchudb_oplog::Hlc,
+    ) -> RemoteApply {
         let Some(value) = self.cell_value(value) else { return RemoteApply::Stale };
         let local = self.slot_unchecked(eid);
         let hid = himo_id as usize;
@@ -19165,11 +19462,16 @@ impl Engine {
         if self.ensure_cell_room(hid, local).is_err() {
             return RemoteApply::RejectedCapacity;
         }
+        #[cfg(test)]
+        self.remote_row_hook();
         // request17 step 5: LWW 判定は `set_cell` の内側だけ (A-2)。 sync 層で
         // 判定してから別関数で適用する形は、 呼び忘れれば黙って壊れる。
-        if !self.set_cell_local(local, himo_id, value, hlc) {
+        // #917: 行の lock の下で、 引いた行がまだその場所の行か確かめてから書く
+        let guard = self.row_locks.write(local);
+        if !self.remote_row_holds_slot(local, row) || !self.set_cell_in(Some(&guard), local, himo_id, value, hlc) {
             return RemoteApply::Stale;
         }
+        drop(guard);
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
         self.ensure_live_slot(local);
         // issue #47 fix: foreign local が我々の table eid_range 内に落ちた場合、
@@ -19189,11 +19491,35 @@ impl Engine {
         himo_id: u16,
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
+        self.remote_untie_apply_in(eid, None, himo_id, hlc)
+    }
+
+    /// #917: [`Self::remote_untie_apply`] の、 行の lock の下で 「行 `row` がまだその場所の行か」 を確かめる形 ([`Self::remote_row_of`])。
+    pub fn remote_untie_apply_at(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: u32,
+        himo_id: u16,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
+        self.remote_untie_apply_in(eid, Some(row), himo_id, hlc)
+    }
+
+    fn remote_untie_apply_in(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: Option<u32>,
+        himo_id: u16,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
         let local = self.slot_unchecked(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return false; }
         self.observe_remote_hlc(hlc);
-        if !self.clear_cell_local_freeing_leaf(local, himo_id, hlc) {
+        #[cfg(test)]
+        self.remote_row_hook();
+        let guard = self.row_locks.write(local);
+        if !self.remote_row_holds_slot(local, row) || !self.clear_cell_in_freeing_leaf(Some(&guard), local, himo_id, hlc) {
             return false;
         }
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
@@ -19207,19 +19533,50 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
+        self.remote_delete_apply_in(eid, None, hlc)
+    }
+
+    /// #917: [`Self::remote_delete_apply`] の、 行の lock の下で 「行 `row` がまだその場所の行か」 を確かめる形
+    /// ([`Self::remote_row_of`])。 違えば消さずに false (引いた後・行の lock の前に、 その行が消えて場所が使い回された)。
+    pub fn remote_delete_apply_at(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: u32,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
+        self.remote_delete_apply_in(eid, Some(row), hlc)
+    }
+
+    fn remote_delete_apply_in(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        row: Option<u32>,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
         let local = self.slot_unchecked(eid);
         self.observe_remote_hlc(hlc);
+        // #917: 束ねた identity を切り離す前にも見る (使い回した新しい行の identity を切り離さない)
+        if !self.remote_row_holds_slot(local, row) {
+            return false;
+        }
         // #581: 名前で束ねた identity のうち、 削除より後に作られたものを切り離してから消す
         if self.split_later_identities(local, hlc) {
             return true;
         }
         let raised = self.slot_is_dead(local) && hlc > self.tombstone_version_of(local);
+        #[cfg(test)]
+        self.remote_row_hook();
         // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 版数の記録と本体の除去は `apply_delete_local` で不可分に扱う (再配送でも
         // 本体が必ず落ちる = 冪等)。
-        if !self.apply_delete_local(local, hlc) {
-            return false;
+        // #917: 行の lock の下で、 引いた行がまだその場所の行か確かめてから消す (前は tombstone だけ見て、 引いた後に使い回した
+        // 新しい行を消した)
+        {
+            let guard = self.row_locks.write(local);
+            if !self.remote_row_holds_slot(local, row) || !self.apply_delete_in(Some(&guard), local, hlc, None) {
+                return false;
+            }
         }
         // 削除優先 (#551): 消えた行に別の author のより新しい削除が届いた (2 人が別々に消した)。 名前の削除の時刻が上がるので、
         // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)
@@ -19784,7 +20141,13 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
         if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
-            return self.remote_delete_apply(local_eid, hlc);
+            // #917: 引いた行を、 行の lock の下でもう一度確かめる。 自分の行が引いた後に消えて場所が使い回されていれば、 もう無い
+            // 自分の行の削除として下の道へ (引く前に消えていた時と同じ扱い)
+            let row = self.remote_row_of(foreign_eid, local_eid);
+            let applied = self.remote_delete_apply_at(local_eid, row, hlc);
+            if applied || enchudb_oplog::eid_peer(foreign_eid) != self.peer_id() || self.remote_row_holds(local_eid, row) {
+                return applied;
+            }
         }
         self.observe_remote_hlc(hlc);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
@@ -19808,7 +20171,8 @@ impl Engine {
             }
             Err(local) => {
                 let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-                self.remote_delete_apply(enchudb_oplog::make_eid(self_peer, local), hlc)
+                let local_eid = enchudb_oplog::make_eid(self_peer, local);
+                self.remote_delete_apply_at(local_eid, self.remote_row_of(foreign_eid, local_eid), hlc)
             }
         }
     }
@@ -33503,5 +33867,160 @@ mod issue899_value_keyed_ref_tests {
             assert_eq!(local(stale), local(vec![eid_local(us[0]), eid_local(us[4])]), "前の世代を指す社員");
         }
         let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// #917: 受信の当て込み / state の合成が、 行を引いた後に、 その行が消えて場所が使い回されても、 新しい行に当てない / 宛てない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod remote_row_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// 落とすと DB の directory を消す (engine より後に落ちるように、 engine より先に束ねる)。
+    struct Rm(String);
+    impl Drop for Rm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 枠 1 の表 t (列 v / w) の sync の DB。 `let (_rm, eng) = engine(..)` で受ける (engine が先に落ちて書き出し、 その後に消す)。
+    fn engine(tag: &str) -> (Rm, Arc<Engine>) {
+        let path = std::env::temp_dir()
+            .join(format!("enchudb-917-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&path);
+        let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("t", "w", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        (Rm(path), eng)
+    }
+
+    fn slot(eid: u64) -> u32 {
+        eid as u32 & ((1 << 24) - 1)
+    }
+
+    /// 割り込み点で X を消して、 場所を新しい行 Y (v = 2) に使い回させる。 Y の eid を返す入れ物。
+    fn reuse_in_hook(eng: &Arc<Engine>, x: u64) -> Arc<Mutex<Option<u64>>> {
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (eng.clone(), made.clone());
+        remote_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            e.delete(x);
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            *m.lock().unwrap() = Some(y);
+        });
+        made
+    }
+
+    /// [D]: 受信の Delete (自分の行 X の世界番号宛て) を引いた後・行の lock の前に、 X を消して場所を Y が使い回す。 Y は残る。
+    ///
+    /// falsify: `remote_delete_apply_in` の行の lock の下の照合を外すと、 Y が消える。
+    #[test]
+    fn a_received_delete_does_not_hit_the_row_that_reused_the_slot() {
+        let (_rm, eng) = engine("del");
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.v", 1u32);
+        let made = reuse_in_hook(&eng, x);
+        let h = eng.cell_hlc(x, eng.himo_id("t.v").unwrap() as u16);
+        let applied = eng.remote_delete_apply_foreign(x, enchudb_oplog::Hlc { wall: h.wall + 10_000_000, logical: 0, peer: 2 });
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
+        assert_ne!(y, x, "前提: Y の世代は X より新しい");
+        let alive = eng.get(y, "t.v");
+        assert!(!applied, "消えた行 X 宛ての Delete を当てた");
+        assert_eq!(alive, Some(2), "X 宛ての受信の Delete が、 場所を使い回した Y を消した");
+    }
+
+    /// G (Delete): state の合成が自分の消えた行 X の Delete を作る途中 (版数を読んで 「生きていない」 を確かめた後) に、 X の場所を
+    /// Y が使い回す。 state に Y の番号宛ての Delete が無い。
+    ///
+    /// falsify: 番号を確かめた後に引く (前の形) と、 Y の番号宛ての Delete (X の版数) が出る。
+    #[test]
+    fn the_state_does_not_send_a_gone_rows_delete_to_the_row_that_reused_its_slot() {
+        let (_rm, eng) = engine("stdel");
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.v", 1u32);
+        eng.delete(x);
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (eng.clone(), made.clone());
+        state_number_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            *m.lock().unwrap() = Some(y);
+        });
+        let (records, _) = eng.state_records();
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
+        assert_ne!(y, x, "前提: Y の世代は X より新しい");
+        let to_y = records.iter().any(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Delete { eid } if eid == y));
+        assert!(!to_y, "state に、 場所を使い回した Y 宛ての Delete (消えた X の版数) が出た");
+    }
+
+    /// G (Untie): state の合成が自分の行 X の外した cell の Untie を作る途中 (cell を読んで確かめた後) に、 X を消して場所を Y が
+    /// 使い回す。 state に Y の番号宛ての Untie が無い。
+    ///
+    /// falsify: 宛名を確かめた後に引く (前の形) と、 Y の番号宛ての Untie が出る (受け手で Y の値が外れる)。
+    #[test]
+    fn the_state_does_not_send_a_gone_rows_untie_to_the_row_that_reused_its_slot() {
+        let (_rm, eng) = engine("stuntie");
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.v", 1u32);
+        eng.tie_to(x, "t.w", 1u32);
+        eng.untie(x, "t.w");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (eng.clone(), made.clone());
+        state_number_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            e.delete(x);
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            e.tie_to(y, "t.w", 2u32);
+            *m.lock().unwrap() = Some(y);
+        });
+        let (records, _) = eng.state_records();
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
+        assert_ne!(y, x, "前提: Y の世代は X より新しい");
+        let to_y = records.iter().any(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Untie { eid, .. } if eid == y));
+        assert!(!to_y, "state に、 場所を使い回した Y 宛ての Untie (X の外した cell) が出た");
+    }
+
+    /// G (Untie、 読み直し): 宛名を引いた後・cell を読む前に X を消して場所を Y が使い回し、 Y も同じ cell を外す。 読んだ cell は Y の
+    /// 外した cell (版数は Y の書き込み) で、 宛名は X の番号のまま = X の番号に Y の版数の Untie を出さない。
+    ///
+    /// falsify: cell を読んだ後に宛名を引き直して確かめる所を外すと、 X の番号に Y の版数の Untie が出る。
+    #[test]
+    fn the_state_does_not_send_a_reused_rows_untie_to_the_gone_rows_number() {
+        let (_rm, eng) = engine("stread");
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.v", 1u32);
+        eng.tie_to(x, "t.w", 1u32);
+        eng.untie(x, "t.w");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (eng.clone(), made.clone());
+        state_read_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            e.delete(x);
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            e.tie_to(y, "t.w", 2u32);
+            e.untie(y, "t.w");
+            *m.lock().unwrap() = Some(y);
+        });
+        let (records, _) = eng.state_records();
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
+        assert_ne!(y, x, "前提: Y の世代は X より新しい");
+        let w = eng.himo_id("t.w").unwrap() as u16;
+        let y_untie = eng.cell_hlc(y, w);
+        let mixed = records
+            .iter()
+            .any(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Untie { eid, .. } if eid == x) && r.hlc == y_untie);
+        assert!(!mixed, "state に、 消えた X の番号で Y の外した cell の Untie が出た");
     }
 }
