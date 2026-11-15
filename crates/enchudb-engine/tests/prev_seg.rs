@@ -408,6 +408,61 @@ fn both_former_residents_of_a_slot_reused_twice_before_a_crash_come_back() {
     assert_eq!(eng.prev_residents_restored(), 2);
 }
 
+/// review946c [A]: 翻訳した行 F (C の行) の場所を、 A が F を消してから 1 つの周期の中で 2 回使い回して (F → Y → Z) 落ちる (kill)。
+/// 場所ごとの配列は 2 回目 (前の住人 Y = 自分の行) に上書きされるが、 log には F の記録が残る。 開いた A で写像 (C, f) は戻らず
+/// (Z は C の行 F ではない)、 state に F の Delete ((C, f) 宛て、 A の削除の版数) があり、 WAL に残った F の Delete の bridge は
+/// (C, f) 宛てに出る。 前は開く時の写像の見分け (`prev_evicted`) と bridge の宛名が配列 (最後の 1 件) しか見ず、 写像 (C, f) を
+/// 今の住人 Z に戻し (#925 の形)、 F の削除はどこにも残らなかった (F の Delete の bridge は A の世界番号で出た)。
+#[test]
+fn a_translated_slot_reused_twice_before_a_crash_stays_unmapped() {
+    let (p, img) = (tmp_path("translated-twice"), tmp_path("translated-twice-img"));
+    let _c = Cleanup(vec![p.clone(), img.clone()]);
+    const C: u32 = 3;
+    let eng = create(&p, 1, true);
+    let hk = eng.himo_id("t.k").unwrap() as u16;
+    let world_f = enchudb_oplog::make_eid(C, 9);
+    let f = eng.resolve_remote_eid(world_f, hk).unwrap();
+    assert!(eng.remote_tie_apply_result(f, hk, 5u32, Hlc { wall: 1_000, logical: 0, peer: C }).applied());
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "前提: `.eidmap` は F の写像 (削除の版数なし) を書き出し済み");
+    let (z, tomb) = {
+        let _hold = eng.hold_consumer();
+        eng.delete(f);
+        eng.oplog_commit();
+        let tomb = eng.tombstone_hlc(f);
+        assert_ne!(tomb, Hlc::ZERO, "前提: A が F を消した");
+        let y = add(&eng, 8);
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(f), "前提: Y は F の場所を使い回した");
+        let (z, _) = reuse(&eng, y, 9);
+        assert_eq!(
+            eng.prev_resident_of_slot(eng.eid_slot(z)).map(|r| r.3),
+            Some(true),
+            "前提: 場所の配列は 2 回目 (前の住人 Y = 自分の行) に上書きされた"
+        );
+        assert!(eng.eidmap_disk_diff().unwrap().is_some(), "前提: 外した写像は `.eidmap` に届いていない");
+        copy_dir(Path::new(&p), Path::new(&img));
+        (z, tomb)
+    };
+    drop(eng);
+    let eng = open(&img);
+    assert_eq!(eng.get(z, "t.k"), Some(9), "前提: 開いた像で Z が生きている");
+    assert_eq!(eng.resolve_remote_eid_existing(world_f), None, "開いた A で F の写像 (C, f) が今の住人 Z に戻った");
+    let deletes = state_deletes(&eng);
+    assert!(deletes.contains(&(world_f, tomb)), "state に F の Delete ((C, f) 宛て) が無い: {deletes:x?}");
+    // WAL に残った F の Delete は (C, f) 宛てに出る (A の世界番号で出さない)
+    eng.transfer_oplog_to_sync_ops();
+    let bridged: Vec<u64> = eng
+        .settled_sync_records(|_, _| true)
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } if r.hlc == tomb => Some(eid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bridged, vec![world_f], "F の Delete の bridge の宛名");
+}
+
 /// 使い回しの後に `oplog_sync()` して暇になった DB も、 consumer の暇な周期が sidecar を書いて `prev.seg` の周期を進める: その後に
 /// 落ちた (kill) 像を開くと記録から戻す物が無く、 前の住人の削除は sidecar から読む。 前は sidecar を書かず、 次の書き込みまで記録が
 /// 書き出されないまま溜まった (1 周期 21845 件の log から溢れて同じ場所の 2 回目が 1 回目を上書きし、 きれいに閉じなかった後の open は

@@ -309,7 +309,8 @@ impl PrevSlots {
         }
     }
 
-    /// 開く時に読んだ書き出していない記録を、 WAL の再生が引けるように置く ([`Self::record_of`])。
+    /// 開く時に読んだ書き出していない記録を、 開く時の写像の見分け ([`Self::for_each_record_at`])・WAL の再生・bridge が引けるように
+    /// 置く ([`Self::record_of`])。 `.eidmap` を読む前に置く (review946c [A])。
     pub(crate) fn keep_for_replay(&self, records: &[(u32, PrevRecord)]) {
         let mut v = records.to_vec();
         v.sort_unstable_by_key(|&(slot, r)| (slot, r.gone));
@@ -325,6 +326,19 @@ impl PrevSlots {
         let v = self.replay.lock().unwrap_or_else(|p| p.into_inner());
         let i = v.partition_point(|&(s, r)| (s, r.gone) < (slot, gone));
         v.get(i).filter(|&&(s, r)| s == slot && r.gone == gone).map(|&(_, r)| r)
+    }
+
+    /// 場所 `slot` の記録を全部 (場所ごとの配列と、 開く時に読んだ書き出していない記録。 同じ記録が 2 度来うる)。 review946c [A]:
+    /// 開く時の写像の見分けは、 同じ場所を 1 つの周期で 2 回使い回した 1 回目 (配列は 2 回目に上書き) の記録も見る。
+    pub(crate) fn for_each_record_at(&self, slot: u32, mut f: impl FnMut(PrevRecord)) {
+        if let Some(r) = self.read(slot) {
+            f(r);
+        }
+        let v = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+        let i = v.partition_point(|&(s, _)| s < slot);
+        for &(_, r) in v[i..].iter().take_while(|&&(s, _)| s == slot) {
+            f(r);
+        }
     }
 
     /// 開く時に記録から退避を戻した数を足す / 読む (観測・試験用)。
@@ -409,20 +423,26 @@ impl PrevSlots {
         r.mark_dirty(off, 4 * N);
     }
 
-    /// 区画 `half` の書いた所 (一度も書いていない件 = 全部の語が 0 の所まで) の (件数, 記録の周期の最大)。 書きかけの件は飛ばして続ける。
+    /// 区画 `half` の書いた所 (最後の 0 でない件の次) と記録の周期の最大 (件数, 周期)。 区画の commit 済みの所を全部なめる: 全部の語が
+    /// 0 の件 (一度も書いていない) と書きかけの件は飛ばして続ける。
+    ///
+    /// review946c [B]: 前は最初の全部 0 の件で止まった。 書き手は位置を取ってから (`head.fetch_add`) commit を伸ばして書くので、 別の表の
+    /// 使い回しが並ぶと、 前の位置が書かれる前に後ろの位置が書き終わる (commit を伸ばせなかった位置は区画を使い直すまで 0 のまま)。
+    /// その穴で止まると、 kill / 電源断の像で穴の後ろの記録を戻さず、 開いた後はその上に積んだ。
     fn scan_half(r: &Region, half: u32, mut each: impl FnMut(u32, u32, u32, PrevRecord)) -> (u32, u32) {
-        let mut max = 0;
+        let (mut end, mut max) = (0, 0);
         for i in 0..LOG_ENTRIES {
-            let Some(w) = Self::words_at::<WORDS>(r, log_off(half, i)) else { return (i, max) };
+            let Some(w) = Self::words_at::<WORDS>(r, log_off(half, i)) else { break };
             if w.iter().all(|&x| x == 0) {
-                return (i, max);
+                continue;
             }
+            end = i + 1;
             if let Some((slot, epoch, rec)) = decode(&w) {
                 max = max.max(epoch);
                 each(i, slot, epoch, rec);
             }
         }
-        (LOG_ENTRIES, max)
+        (end, max)
     }
 
     /// 開いた `prev.seg` の周期を決める: 今の周期 = 書き出した周期と記録の周期の最大の次。 今の周期の区画は書いた所の後ろから積む
@@ -758,6 +778,39 @@ mod tests {
         assert_eq!(again.begin_persist(), Some(4), "区画 1 は書き出し済み = 進む");
         assert!(again.end_persist(4));
         assert_eq!(again.unpersisted(), vec![]);
+    }
+
+    /// review946c [B]: 区画の途中に一度も書いていない件 (並んだ書き手が位置を取ってまだ書いていない / commit を伸ばせなかった位置) が
+    /// あっても、 その後ろの記録を戻し、 開き直した後は後ろの記録の後から積む (穴で止まって後ろを上書きしない)。
+    #[test]
+    fn a_hole_in_the_log_does_not_hide_the_records_behind_it() {
+        let mut buf = vec![0u64; segment_len(16).div_ceil(8)];
+        let p = PrevSlots::off();
+        p.prepare(region(&mut buf), 24).unwrap();
+        let recs: Vec<PrevRecord> = (0..4).map(|s| own(s, 1, u64::from(s) + 10)).collect();
+        for (s, r) in recs.iter().enumerate() {
+            assert!(p.write(s as u32, r));
+        }
+        // 件 1 を一度も書いていない件にする (周期 1 = 区画 1)
+        let r = p.region.get().unwrap();
+        r.fill_at(log_off(1, 1), ENTRY, 0);
+        let mut want: Vec<(u32, PrevRecord)> = [0usize, 2, 3].iter().map(|&s| (s as u32, recs[s])).collect();
+        assert_eq!(p.unpersisted(), want, "穴の後ろの記録を戻さない");
+        // 周期 2 (区画 0) に 1 件積んで、 書き出す前に開き直す: 周期 3 = 区画 1 (穴のある区画) の続きから積む
+        assert_eq!(p.begin_persist(), Some(1));
+        let x = own(8, 1, 80);
+        assert!(p.write(8, &x));
+        want.push((8, x));
+        let again = PrevSlots::off();
+        assert_eq!(again.attach(region(&mut buf), true, 24), Some(false));
+        assert_eq!(again.unpersisted(), want);
+        assert_eq!(again.head.load(Ordering::Relaxed), 4, "開き直した後に積む位置が穴の後ろの記録より前");
+        for s in [5u32, 6] {
+            let e = own(s, 1, u64::from(s) * 10);
+            assert!(again.write(s, &e));
+            want.push((s, e));
+        }
+        assert_eq!(again.unpersisted(), want, "開き直した後に穴の後ろの記録の上に積んだ");
     }
 
     /// log の区画が一杯の周期は配列にだけ書き、 その周期を書き出す前に開くと配列から戻す。

@@ -261,10 +261,21 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
 /// 頼っているのと同じ層の順。 drive の cache の中の順は、 WAL 自体も保証していない)。 Windows は directory を開けないので何もしない
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn sync_tables_dir(tables: &Path) -> io::Result<()> {
+    match tables.parent() {
+        Some(dir) => sync_dir_plain(dir, "tables.dir_sync"),
+        None => Ok(()),
+    }
+}
+
+/// directory `dir` を素の `fsync` (中の rename を disk へ送る。 `site` は I/O の点の名前)。 [`sync_tables_dir`] と同じ層の順の約束
+/// (F_FULLFSYNC にしない)。 review946c [C]: `prev.seg` の 「書き出した周期」 (header) を進める前に、 使い回しの退避の載る sidecar
+/// (`.eidmap` のまとめ直し・`eidalias`・`pktombs` / `pkformer` のまとめ直し = rename) を disk へ送る。 Windows は何もしない
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn sync_dir_plain(dir: &Path, site: &'static str) -> io::Result<()> {
     #[cfg(unix)]
-    if let Some(dir) = tables.parent() {
+    {
         use std::os::fd::AsRawFd;
-        enchudb_oplog::io_point("tables.dir_sync")?;
+        enchudb_oplog::io_point(site)?;
         let f = std::fs::File::open(dir)?;
         // SAFETY: 開いている file の fd を渡すだけ
         if unsafe { libc::fsync(f.as_raw_fd()) } != 0 {
@@ -272,7 +283,7 @@ pub(crate) fn sync_tables_dir(tables: &Path) -> io::Result<()> {
         }
     }
     #[cfg(not(unix))]
-    let _ = tables;
+    let _ = (dir, site);
     Ok(())
 }
 
