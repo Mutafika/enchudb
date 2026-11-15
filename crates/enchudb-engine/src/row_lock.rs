@@ -64,7 +64,15 @@ pub struct RowLocks {
     /// 足した範囲の数 (`INTERNAL_RANGES` を越えた分は `more_internal` にある)。
     internal_len: AtomicUsize,
     more_internal: std::sync::RwLock<Vec<(u32, u32)>>,
+    /// test 用: 行 (の stripe) を握れずに待ち始めた書き手が 1 回だけ呼ぶ (#913: 握っている間に別の書き手が待たされた事を、 時間で
+    /// なく状態で見るため)。
+    #[cfg(test)]
+    wait_hook: std::sync::Mutex<Option<WaitHook>>,
 }
+
+/// test 用の [`RowLocks::set_wait_hook`] (行, 呼ぶ物)。
+#[cfg(test)]
+type WaitHook = (u32, Box<dyn FnOnce() + Send>);
 
 /// 32 B に揃えて cache line をまたがせない (24 B のままだと 3 つに 1 つがまたぐ)。
 #[repr(align(32))]
@@ -133,6 +141,28 @@ impl RowLocks {
             internal: std::array::from_fn(|_| AtomicU64::new(0)),
             internal_len: AtomicUsize::new(0),
             more_internal: std::sync::RwLock::new(Vec::new()),
+            #[cfg(test)]
+            wait_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// test 用: 行 `local` の stripe を握れずに待ち始めた書き手が、 待つ前に 1 回だけ `f` を呼ぶ。
+    #[cfg(test)]
+    pub(crate) fn set_wait_hook(&self, local: u32, f: impl FnOnce() + Send + 'static) {
+        *self.wait_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some((local, Box::new(f)));
+    }
+
+    #[cfg(test)]
+    fn call_wait_hook(&self, i: usize) {
+        let hit = {
+            let mut h = self.wait_hook.lock().unwrap_or_else(|p| p.into_inner());
+            match h.as_ref() {
+                Some((l, _)) if self.stripe(*l) == i => h.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, f)) = hit {
+            f();
         }
     }
 
@@ -218,12 +248,19 @@ impl RowLocks {
             self.stripes[i].urgent.fetch_add(1, Ordering::Relaxed);
         }
         let mut spins = 0;
+        #[cfg(test)]
+        let mut hooked = false;
         loop {
             // Acquire: 前の書き手が離した後に見る 「先に握りたい読み手の数」 は、 その書き手が離す前に見た数より古くない
             let v = s.load(Ordering::Acquire);
             let wait = v & 1 == 1 || (!urgent && self.stripes[i].urgent.load(Ordering::Relaxed) != 0);
             if !wait && s.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 break;
+            }
+            #[cfg(test)]
+            if wait && !hooked {
+                hooked = true;
+                self.call_wait_hook(i);
             }
             backoff(&mut spins);
         }
