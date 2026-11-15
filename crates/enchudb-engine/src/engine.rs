@@ -11315,7 +11315,7 @@ impl Engine {
                 match set.open_prev(layout.segment_reserve(SegmentKind::Prev), !readonly) {
                     Ok(true) => {
                         // 0 から始めた header は書き出す (記録の page だけ届いて header の無い像を作らない、 review946 [10])
-                        if generations.prev.attach(set.region(SegmentKind::Prev), !readonly) == Some(true)
+                        if generations.prev.attach(set.region(SegmentKind::Prev), !readonly, u32::from(layout.gen_bits)) == Some(true)
                             && let Err(e) = set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)
                         {
                             eprintln!("warning: prev.seg header could not be written out: {e}");
@@ -15626,6 +15626,17 @@ impl Engine {
         self.persist_pk_former_if_dirty()?;
         self.prev_persist_end(covered);
         self.persist_vocab_map_if_dirty()
+    }
+
+    /// `prev.seg`: 書き出していない周期の使い回しの記録があれば sidecar を書き出す (周期を進める、 consumer の暇な周期)。 sidecar は
+    /// WAL に書き込みのある周期と `persist_tables()` / 受信の `persist_sync_state` でしか書かないので、 使い回しの後に `oplog_sync()`
+    /// が checkpoint を進めて暇になった DB は周期が進まなかった: 次の書き込みまで記録が書き出されないまま溜まり、 log の区画 (1 周期
+    /// 21845 件) から溢れて (同じ場所を 2 回使い回した 1 回目が残らない)、 きれいに閉じなかった後の open は配列をなめて溜まった記録を
+    /// 全部戻した (名前の無い表 20 万行の bench で開く時間 7 → 19 ms)。
+    fn persist_prev_if_pending(&self) {
+        if self.generations().prev.pending() {
+            self.try_persist_tables();
+        }
     }
 
     /// `prev.seg`: 使い回しの退避の載る sidecar (`.eidmap` / `eidalias` / `pktombs` / `pkformer`) を全部書けた後、 header の書き出した
@@ -20860,7 +20871,7 @@ impl Engine {
             // `prev.seg` は開く時に 0 から始める = 記録なし)
             if !self.generations().prev.active() {
                 set.ensure_prev(crate::prev_slots::segment_len(l.reserve_entities))?;
-                self.generations().prev.prepare(set.region(SegmentKind::Prev))?;
+                self.generations().prev.prepare(set.region(SegmentKind::Prev), bits)?;
                 // header は記録より先に disk へ (review946 [10])
                 set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)?;
             }
@@ -29039,6 +29050,8 @@ impl Engine {
                             } else {
                                 // #451 (段階 1): 書くものの無い周期に、 置いた印を ring だけ書き出す (暇になった後に kill されても印が残る)
                                 engine.flush_durable_mark_if_pending();
+                                // `prev.seg`: 書き出していない使い回しの記録が残っていれば sidecar を書いて周期を進める
+                                engine.persist_prev_if_pending();
                             }
                             // ring buffer reset を試みる。head == checkpoint の
                             // ときだけ head/checkpoint を HEADER_SIZE に戻す。
@@ -29810,6 +29823,9 @@ impl Engine {
         let tomb = |k: SegmentKind| matches!(k, SegmentKind::Tomb);
         let prev_slots = &self.generations().prev;
         if prev_slots.active() {
+            // 閉じる前に、 ここまでの記録を書き出す (閉じている間の書き出しを、 その間に入った使い回しの記録だけにする。 前は
+            // 書き出しの初めからの記録を、 使い回しを止めたまま書き出した)
+            set.flush_where(false, prev)?;
             let _closed = prev_slots.close();
             if prev_slots.take_written() {
                 set.flush_where(false, prev)?;

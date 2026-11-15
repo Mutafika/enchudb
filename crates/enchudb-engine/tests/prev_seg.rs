@@ -407,3 +407,44 @@ fn both_former_residents_of_a_slot_reused_twice_before_a_crash_come_back() {
     assert!(!deletes.iter().any(|&(e, _)| e == z), "生きている Z の Delete を出した: {deletes:x?}");
     assert_eq!(eng.prev_residents_restored(), 2);
 }
+
+/// 使い回しの後に `oplog_sync()` して暇になった DB も、 consumer の暇な周期が sidecar を書いて `prev.seg` の周期を進める: その後に
+/// 落ちた (kill) 像を開くと記録から戻す物が無く、 前の住人の削除は sidecar から読む。 前は sidecar を書かず、 次の書き込みまで記録が
+/// 書き出されないまま溜まった (1 周期 21845 件の log から溢れて同じ場所の 2 回目が 1 回目を上書きし、 きれいに閉じなかった後の open は
+/// 配列をなめて溜まった記録を全部戻した)。 前提: consumer を止めて撮った像は記録から戻す。
+#[test]
+fn an_idle_db_moves_the_reuse_records_to_the_sidecars() {
+    let (p, before, after) = (tmp_path("idle"), tmp_path("idle-before"), tmp_path("idle-after"));
+    let _c = Cleanup(vec![p.clone(), before.clone(), after.clone()]);
+    let eng = create(&p, 1, true);
+    let x = add(&eng, 7);
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    let (y, tomb) = {
+        let _hold = eng.hold_consumer();
+        let r = reuse(&eng, x, 8);
+        eng.oplog_sync().unwrap();
+        copy_dir(Path::new(&p), Path::new(&before));
+        r
+    };
+    {
+        let back = open(&before);
+        assert_eq!(back.prev_residents_restored(), 1, "前提: 暇な周期の前の像は記録から戻す");
+        assert!(state_deletes(&back).contains(&(x, tomb)), "前提: 戻した X の Delete が state に無い");
+    }
+    // consumer の暇な周期 (100 ms) を何回か待って撮る
+    let mut restored = u32::MAX;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = std::fs::remove_dir_all(&after);
+        copy_dir(Path::new(&p), Path::new(&after));
+        let back = open(&after);
+        restored = back.prev_residents_restored();
+        if restored == 0 {
+            assert!(state_deletes(&back).contains(&(x, tomb)), "sidecar から読んだ X の Delete が state に無い");
+            assert_eq!(back.get(y, "t.k"), Some(8));
+            break;
+        }
+    }
+    assert_eq!(restored, 0, "暇な DB が使い回しの記録を sidecar に書き出さない (開く時に記録から戻した)");
+}

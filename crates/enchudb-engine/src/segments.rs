@@ -56,7 +56,7 @@ pub enum SegmentKind {
     Tomb,
     /// #731: 場所ごとの世代 (1 B / 場所、 `crate::generation`)。 最初に場所を使い回した時に作る (file version 15)。
     Gen,
-    /// 場所を使い回した時の前の住人の記録 (32 B / 場所、 `crate::prev_slots`)。 file version 15 の DB だけ、 `gen.seg` と一緒に作る
+    /// 場所を使い回した時の前の住人の記録 (header + log 2 MiB + 32 B / 場所、 `crate::prev_slots`)。 file version 15 の DB だけ、 `gen.seg` と一緒に作る
     /// (前の binary が作った v15 の DB は開く時に作る)。 packed には入れない
     Prev,
     Himo(u32),
