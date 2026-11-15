@@ -7,7 +7,8 @@
 //! 次の答えを毎回比べる: 逆引き (`where_ref`、 消えた会社も)、 dotted path の find と購読の差分 (`company.city = Tokyo`、
 //! `company.city is null` = 消えた会社を指す ref は中身の無い行を指す ref)、 会社単位の購読の members (並びの索引 `.order` の帯で
 //! 読む `age >= 30`)。 開き直した後 (円柱を列から組み直す) も同じ。 使い回した会社を指す ref の値が円柱の dense に置かれている
-//! こと (速さの元) も状態で確かめる (前は sparse)。
+//! こと (速さの元) も状態で確かめる (前は sparse)。 数を読む道 (`where_ref(..).count()`、 2 つの等値の軸選び、 会社単位の購読の
+//! `count_in` / `count`) も (PR #907 の読み直し D: 使い回していない会社の数は bucket の live、 使い回した会社は引いて数える)。
 
 use enchudb_schema::{Database, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,8 +89,16 @@ fn build(db: &mut Database) {
 fn check_reads(db: &Database, s: &Shadow, when: &str) {
     let users = db.get_table("users").unwrap();
     for &c in &s.comps {
+        let want = s.pointing_at(c);
         let got: BTreeSet<u64> = users.where_ref("company", c).find().unwrap().into_iter().collect();
-        assert_eq!(got, s.pointing_at(c), "{when}: where_ref 会社 {c:#x} (生きている: {})", s.alive.contains_key(&c));
+        assert_eq!(got, want, "{when}: where_ref 会社 {c:#x} (生きている: {})", s.alive.contains_key(&c));
+        assert_eq!(users.where_ref("company", c).count().unwrap(), want.len(), "{when}: where_ref 会社 {c:#x} の count");
+        // 2 つの等値は数の短い方から引く (軸選びが会社の数を読む)
+        for age in [7i64, 45] {
+            let got: BTreeSet<u64> = users.where_ref("company", c).where_eq("age", age).find().unwrap().into_iter().collect();
+            let want: BTreeSet<u64> = want.iter().copied().filter(|u| s.users[u].1 == age).collect();
+            assert_eq!(got, want, "{when}: where_ref 会社 {c:#x} かつ age = {age}");
+        }
     }
     let tokyo: BTreeSet<u64> = users.where_eq("company.city", "Tokyo").find().unwrap().into_iter().collect();
     assert_eq!(tokyo, s.in_tokyo(), "{when}: find company.city = Tokyo");
@@ -146,6 +155,8 @@ fn run(seed: u64) {
     let tokyo_sub = users.where_eq("company.city", "Tokyo").subscribe().unwrap();
     let null_sub = users.all().where_null("company.city").subscribe().unwrap();
     let grouped = users.where_eq("company.city", "Tokyo").where_ge("age", 30i64).subscribe_grouped().unwrap();
+    // 社員側の条件の無い会社単位の購読: 会社の人数は円柱の数を読む
+    let grouped_all = users.where_eq("company.city", "Tokyo").subscribe_grouped().unwrap();
     let (mut seen_tokyo, mut seen_null, mut seen_groups) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     let integrate = |seen: &mut BTreeSet<u64>, d: enchudb_schema::LiveDelta, what: &str, when: &str| {
         for e in d.removed {
@@ -238,16 +249,84 @@ fn run(seed: u64) {
             let got: BTreeSet<u64> = grouped.members(c).into_iter().collect();
             let want: BTreeSet<u64> = s.users.iter().filter(|(_, (co, age))| *co == Some(c) && *age >= 30).map(|(&u, _)| u).collect();
             assert_eq!(got, want, "{when}: 会社 {c:#x} の members (age >= 30、 並びの索引)");
+            assert_eq!(grouped.count_in(c), want.len(), "{when}: 会社 {c:#x} の count_in (age >= 30)");
+            assert_eq!(grouped_all.count_in(c), s.pointing_at(c).len(), "{when}: 会社 {c:#x} の count_in");
         }
+        let _ = grouped_all.poll();
+        let all_tokyo: usize = want_groups.iter().map(|&c| s.pointing_at(c).len()).sum();
+        assert_eq!(grouped_all.count(), all_tokyo, "{when}: 会社単位の購読の count");
     }
     assert!(reused > 50, "前提: 会社の場所の使い回しが起きていない ({reused})");
     assert!(mixed_seen > 50, "前提: 同じ場所に前の世代と今の世代の ref が混ざっていない ({mixed_seen})");
     assert!(db.engine().slot_bits() > 0, "前提: 世代を持つ DB (v15)");
     drop(grouped);
+    drop(grouped_all);
     drop(null_sub);
     drop(tokyo_sub);
     drop(db);
     // 開き直す: 円柱を列から組み直す (前の世代と今の世代の entry が混ざった bucket を最初から組む)
     let db = Database::open(&path).unwrap();
     check_reads(&db, &s, &format!("seed {seed} 開き直した後"));
+}
+
+/// PR #907 の読み直し C: 世代を持つ前 (v14) に、 自分の entity でない eid (他の peer の行、 local が 2^24 以上) を指す ref を書き、
+/// 円柱を組む。 その後に会社の場所を使い回して DB が世代を持つ (v15) と、 その紐は開き直すまで円柱の鍵を値のままにする (前は鍵を
+/// 場所に変え、 v14 に置いた entry を引けなかった)。 値を鍵にした紐でも、 使い回した会社を指す社員の逆引き・dotted path の購読
+/// (会社の city の書き換えで社員を引く = 世代ごとの値を引く道) が shadow と合う。
+#[test]
+fn wide_ref_before_generations_keeps_value_keys() {
+    let path = tmp_path("wide");
+    let _c = Cleanup(path.clone());
+    let mut db = Database::create(&path).unwrap();
+    build(&mut db);
+    let companies = db.get_table("companies").unwrap();
+    let users = db.get_table("users").unwrap();
+    let comps: Vec<u64> =
+        (0..CAP as i64).map(|i| companies.insert().set("id", i).set("city", "Osaka").commit().unwrap()).collect();
+    // 他の peer の行を指す ref (local = 2^24 + 5)
+    let foreign = 2u64 << 32 | (1 << 24) | 5;
+    let stranger = users.insert().set("id", 0i64).set("company", Value::Ref(foreign)).set("age", 1i64).commit().unwrap();
+    for (i, &c) in comps.iter().enumerate() {
+        users.insert().set("id", 1 + i as i64).set("company", Value::Ref(c)).set("age", 1i64).commit().unwrap();
+    }
+    // v14 の間に円柱を組む
+    assert_eq!(users.where_ref("company", foreign).find().unwrap(), vec![stranger], "前提: 他の peer の行を指す ref を書けた");
+    assert_eq!(db.engine().slot_bits(), 0, "前提: 世代を持つ前");
+    // 会社 0 を消して足す (場所を使い回す = v15)
+    companies.entity(comps[0]).delete().unwrap();
+    let reborn = companies.insert().set("id", 100i64).set("city", "Osaka").commit().unwrap();
+    assert!(db.engine().slot_bits() > 0, "前提: 世代を持つ DB (v15)");
+    assert_ne!(reborn & SLOT_MASK, reborn & 0xFFFF_FFFF, "前提: 使い回した会社 (世代 > 0)");
+    let tokyo = users.where_eq("company.city", "Tokyo").subscribe().unwrap();
+    assert!(tokyo.poll().added.is_empty());
+    let movers: Vec<u64> = (10..20i64)
+        .map(|i| users.insert().set("id", i).set("company", Value::Ref(reborn)).set("age", 1i64).commit().unwrap())
+        .collect();
+    let mut want = movers.clone();
+    want.sort_unstable();
+    let mut got = users.where_ref("company", reborn).find().unwrap();
+    got.sort_unstable();
+    assert_eq!(got, want, "使い回した会社の逆引き");
+    assert_eq!(users.where_ref("company", reborn).count().unwrap(), want.len());
+    let eng = db.engine();
+    assert_eq!(eng.himo_value_is_dense(VIA, eng.ref_value(reborn)), Some(false), "前提: 値を鍵にした紐 (世代 1 の値は sparse)");
+    assert_eq!(users.where_ref("company", foreign).find().unwrap(), vec![stranger], "v14 に書いた他の peer の行を指す ref");
+    // 会社の city を書き換える: 購読は会社を指す社員を (世代ごとの値で) 引く
+    companies.entity(reborn).set("city", "Tokyo").commit().unwrap();
+    let mut added = tokyo.poll().added;
+    added.sort_unstable();
+    assert_eq!(added, want, "dotted path の購読 (使い回した会社を指す社員)");
+    // 会社を消す: 消えた会社を指す社員は company.city is null に入り、 Tokyo から出る
+    let null = users.all().where_null("company.city").subscribe().unwrap();
+    let _ = null.poll();
+    companies.entity(reborn).delete().unwrap();
+    let mut added = null.poll().added;
+    added.sort_unstable();
+    assert_eq!(added, want, "company.city is null の購読 (消した会社を指す社員)");
+    let mut removed = tokyo.poll().removed;
+    removed.sort_unstable();
+    assert_eq!(removed, want, "dotted path の購読 (消した会社を指す社員が出る)");
+    users.entity(stranger).set("company", Value::Ref(comps[1])).commit().unwrap();
+    assert!(users.where_ref("company", foreign).find().unwrap().is_empty(), "外した ref");
+    assert_eq!(users.where_ref("company", comps[1]).count().unwrap(), 2);
 }

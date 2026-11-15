@@ -30,15 +30,20 @@
 //! - 値の範囲・値の順の読み (`walk_values` / `count_range` / `pull_range*`) と値の一覧 (`unique_values` / `unique_count`) は、
 //!   鍵が値の順でないので、 世代 > 0 の entry を置いたことがある紐 (`has_gen`) では列をなめる (Ref の値は entity の番号 =
 //!   辞書の鍵で、 範囲・順に意味が無い。 schema は Ref の列で並べるのを断る)
-//! - 世代 > 0 の entry を置く書き手は、 置く前に `has_gen` を立てる。 読み手は bucket を読んだ **後で** `has_gen` を見る (見えた
-//!   entry を置いた書き手の印は見える)。 数だけを読む `slice_len` は bucket の live を Acquire で読む (書き手の live の store は
-//!   Release、 `AppendBucket::live_inc`)
+//! - 世代 > 0 の entry を置く書き手は、 置く前に場所の印 (`gen_slots`) と紐の印 (`has_gen`) を立てる。 読み手は bucket を読んだ
+//!   **後で** 印を見る (見えた entry を置いた書き手の印は見える)。 数だけを読む `slice_len` は bucket の live を Acquire で読み
+//!   (書き手の live の store は Release、 `AppendBucket::live_inc`)、 世代 0 の値で場所の印が無ければ live をそのまま使う (使い回した
+//!   場所だけ引いて数える、 PR #907 の読み直し D)
+//! - 読み手は場所の bit を写した **後で** 読み直し、 変わっていれば (0 → S) 新しい bit で読み直す (`with_ref_bits`、 読み直し B)。
+//!   u32 を越える値は Ref の cell に無い = 空 (`ref_key`、 読み直し A)
+//! - 世代を持つ前に、 移った後に場所で切ると別の値になる値 (自分の entity でない値、 2^下限 以上) を円柱に置いた紐は、 開き直すまで
+//!   鍵を値のままにする (`ref_mode`、 読み直し C)
 
 use crossbeam_epoch::{self as epoch, Guard};
 use parking_lot::{Mutex, MutexGuard};
 use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::column::Column;
 use crate::lockfree_cylinder::{LockFreeCylinder, Part};
@@ -233,6 +238,67 @@ pub struct HimoStore {
     /// #899: 円柱に世代 > 0 の entry を置いたことがあるか (一度立てたら下ろさない)。 置く書き手が置く前に立て、 読み手は bucket を
     /// 読んだ後で見る。 立っていなければ entry は全部世代 0 (= entity そのもの) で、 鍵は値の順。
     has_gen: AtomicBool,
+    /// #899: 世代 > 0 の entry を置いたことのある場所 (鍵) の bit ([`GenSlots`]、 最初の世代 > 0 の entry を置く時に作る)。
+    /// 数の読み (`slice_len`) は、 印の無い場所の世代 0 の値なら bucket の live をそのまま使う (使い回した場所が 1 つでもあると
+    /// 紐の全部の数の読みが bucket を引いていた、 PR #907 の読み直し D)。
+    gen_slots: OnceLock<GenSlots>,
+    /// #899: Ref の紐の円柱の鍵の決め方 (`REF_KEY_*`)。 DB が世代を持った後、 最初に場所の bit を読む読み手 / 書き手が決め、 開き直す
+    /// まで変えない。 世代を持つ前 (bit 0) の間に、 移った後に場所で切ると別の値になりうる値 (他の peer の eid を指す ref など、
+    /// 自分の entity でない値) を円柱に置いた紐は、 置く前に 「値を鍵」 に決める ([`put_bits`](HimoStore::put_bits)): その entry は
+    /// 鍵 = 値で置いてあるので、 移った後に場所を鍵にすると引けない / 外す時に別の bucket の数を減らす (PR #907 の読み直し C)。
+    ref_mode: AtomicU8,
+}
+
+/// 円柱の鍵をまだ決めていない (DB が世代を持つ前、 または持った後にまだ誰も読んでいない)。
+const REF_KEY_UNDECIDED: u8 = 0;
+/// 鍵 = 場所、 entry = 世代 << S | entity。
+const REF_KEY_SLOT: u8 = 1;
+/// 鍵 = 値 (世代を持たない時と同じ。 世代 > 0 の値は窓の外 = sparse)。
+const REF_KEY_VALUE: u8 = 2;
+
+/// #899: 世代 > 0 の entry を置いたことのある場所の bit。 場所 32768 個 (4 KiB) ごとの page で、 触った page だけを確保する。
+/// 立てるだけで下ろさない (詰め直しで世代 > 0 の entry が消えても立ったまま = 数の読みが bucket を引くだけ)。 書き手は entry を
+/// 置く **前** に立て、 読み手は bucket (の live) を読んだ **後** で見る (`has_gen` と同じ約束)。
+struct GenSlots {
+    pages: Box<[OnceLock<Box<[AtomicU64; GEN_PAGE_WORDS]>>]>,
+}
+
+const GEN_PAGE_WORDS: usize = 512;
+const GEN_PAGE_SHIFT: u32 = 15; // 512 語 × 64 bit = 2^15 場所
+
+impl GenSlots {
+    fn new(bits: u32) -> Self {
+        let n = ((1u64 << bits) >> GEN_PAGE_SHIFT).max(1) as usize;
+        GenSlots { pages: (0..n).map(|_| OnceLock::new()).collect() }
+    }
+
+    #[inline]
+    fn set(&self, slot: u64) {
+        let Some(p) = self.pages.get((slot >> GEN_PAGE_SHIFT) as usize) else { return };
+        let page = p.get_or_init(|| Box::new([const { AtomicU64::new(0) }; GEN_PAGE_WORDS]));
+        let w = &page[(slot as usize >> 6) & (GEN_PAGE_WORDS - 1)];
+        let bit = 1u64 << (slot & 63);
+        if w.load(Ordering::Acquire) & bit == 0 {
+            w.fetch_or(bit, Ordering::Release);
+        }
+    }
+
+    /// 立っているか (表の外の場所は立っていると答える)。
+    #[inline]
+    fn get(&self, slot: u64) -> bool {
+        let Some(p) = self.pages.get((slot >> GEN_PAGE_SHIFT) as usize) else { return true };
+        p.get().is_some_and(|page| page[(slot as usize >> 6) & (GEN_PAGE_WORDS - 1)].load(Ordering::Acquire) >> (slot & 63) & 1 != 0)
+    }
+}
+
+/// #899: 値 `value` を引く時の円柱の鍵。 `bits` = 場所の bit (0 = 値をそのまま鍵に)。 世代を持つ時、 u32 を越える値は Ref の
+/// cell に無い (どの entry も答えない) ので `None` (場所の bit で切ると、 別の値の場所の bucket を読む、 PR #907 の読み直し A)。
+#[inline(always)]
+fn ref_key(bits: u32, value: u64) -> Option<u64> {
+    if bits == 0 {
+        return Some(value);
+    }
+    (value <= u64::from(u32::MAX)).then(|| value & ((1u64 << bits) - 1))
 }
 
 /// #899: 値 `value` の entity `eid` の、 円柱の (鍵, entry)。 `bits` = 場所の bit (0 = 世代を持たない = 値をそのまま鍵に)。
@@ -589,6 +655,8 @@ impl HimoStore {
             intent: IntentGate::new(),
             gens: OnceLock::new(),
             has_gen: AtomicBool::new(false),
+            gen_slots: OnceLock::new(),
+            ref_mode: AtomicU8::new(REF_KEY_UNDECIDED),
         }
     }
 
@@ -615,6 +683,8 @@ impl HimoStore {
             intent: IntentGate::new(),
             gens: OnceLock::new(),
             has_gen: AtomicBool::new(false),
+            gen_slots: OnceLock::new(),
+            ref_mode: AtomicU8::new(REF_KEY_UNDECIDED),
         })
     }
 
@@ -645,6 +715,8 @@ impl HimoStore {
             intent: IntentGate::new(),
             gens: OnceLock::new(),
             has_gen: AtomicBool::new(false),
+            gen_slots: OnceLock::new(),
+            ref_mode: AtomicU8::new(REF_KEY_UNDECIDED),
         }
     }
 
@@ -715,24 +787,79 @@ impl HimoStore {
         let _ = self.gens.set(gens);
     }
 
-    /// #899: 円柱の鍵を場所にする時の場所の bit (0 = 値をそのまま鍵にする: Ref でない紐・世代を持たない DB)。 bit は 0 → S に
-    /// 1 回だけ変わる。 変わる前の値は全部世代 0 なので、 どちらで読んでも鍵と entry は同じ。
+    /// #899: 円柱の鍵を場所にする時の場所の bit (0 = 値をそのまま鍵にする: Ref でない紐・世代を持たない DB・値を鍵に決めた紐)。
+    /// bit は 0 → S に高々 1 回だけ変わる。 変わる前に置いた値は、 値を鍵に決めた紐 (`ref_mode`) でなければ全部場所の bit の中
+    /// (世代 0) なので、 どちらで読んでも鍵と entry は同じ。
     #[inline(always)]
     fn ref_bits(&self) -> u32 {
-        match self.gens.get() {
-            None => 0,
-            Some(g) => match g.bits() {
-                b @ 1..=31 => b,
-                _ => 0,
+        let Some(g) = self.gens.get() else { return 0 };
+        let b = g.bits();
+        if !(1..=31).contains(&b) {
+            return 0;
+        }
+        match self.ref_mode.load(Ordering::Acquire) {
+            REF_KEY_SLOT => b,
+            REF_KEY_VALUE => 0,
+            _ => match self.ref_mode.compare_exchange(REF_KEY_UNDECIDED, REF_KEY_SLOT, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) | Err(REF_KEY_SLOT) => b,
+                Err(_) => 0,
             },
         }
     }
 
-    /// #899: 世代 > 0 の entry を置く前に印を立てる。
+    /// #899: 値 `value` の entry を円柱に置く書き手 (と組む側) の場所の bit。 世代を持つ前 (0) に、 移った後に場所で切ると別の値に
+    /// なりうる値 (2^下限 以上、 `Generations::floor_bits`。 自分の entity の値は必ず下限の中) を置くなら、 置く前に紐を 「値を鍵」 に
+    /// 決める。 移った後の読み手が先に 「場所を鍵」 に決めていたら、 その bit で置く (CAS が SLOT を読んだ = 決めた側が読んだ S は
+    /// 見える)。
     #[inline(always)]
-    fn note_gen_entry(&self) {
+    fn put_bits(&self, value: u64) -> u32 {
+        let bits = self.ref_bits();
+        if bits != 0 {
+            return bits;
+        }
+        let Some(g) = self.gens.get() else { return 0 };
+        if value >> g.floor_bits() == 0 {
+            return 0;
+        }
+        match self.ref_mode.compare_exchange(REF_KEY_UNDECIDED, REF_KEY_VALUE, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) | Err(REF_KEY_VALUE) => 0,
+            Err(_) => self.ref_bits(),
+        }
+    }
+
+    /// #899: 世代 > 0 の entry を鍵 (場所) `key` の bucket / run に置く前に印を立てる (場所の印 → 紐の印の順。 読み手は紐の印を
+    /// 見てから場所の印を見る)。
+    #[inline(always)]
+    fn note_gen_entry(&self, bits: u32, key: u64) {
+        self.gen_slots.get_or_init(|| GenSlots::new(bits)).set(key);
         if !self.has_gen.load(Ordering::Acquire) {
             self.has_gen.store(true, Ordering::Release);
+        }
+    }
+
+    /// #899: 場所 `slot` の bucket / run に世代 > 0 の entry を置いたことがあるか (無ければ entry は全部世代 0 = entity そのもの)。
+    /// bucket (の live) を読んだ **後** で呼ぶ (読んだ entry を置いた書き手の印は見える)。
+    #[inline]
+    fn slot_has_gen(&self, slot: u64) -> bool {
+        self.has_gen.load(Ordering::Acquire) && self.gen_slots.get().is_none_or(|t| t.get(slot))
+    }
+
+    /// #899: 場所の bit を読んで `f(bits)` を呼び、 呼んだ後で読み直して違えば (0 → S に移った) 新しい bit で呼び直す (PR #907 の
+    /// 読み直し B: 移る前の bit で鍵を決めて写した bucket に、 移った後の書き手が世代 > 0 の entry を置いていると、 entry を entity
+    /// と読む)。 写した entry を置いた書き手は `S` を見ている (書き手が bit を読む → bucket に置く (Release) → 読み手が写す
+    /// (Acquire) → 読み手が bit を読む、 の読み読みの整合) ので、 写した後の読みが 0 なら写した entry は全部世代 0。 bit は 1 回しか
+    /// 変わらないので呼び直しは高々 1 回。
+    #[inline(always)]
+    fn with_ref_bits<R>(&self, mut f: impl FnMut(u32) -> R) -> R {
+        let mut bits = self.ref_bits();
+        loop {
+            hook::at("ref_bits_read");
+            let r = f(bits);
+            let after = self.ref_bits();
+            if after == bits {
+                return r;
+            }
+            bits = after;
         }
     }
 
@@ -742,8 +869,22 @@ impl HimoStore {
         self.ref_bits() != 0 && self.has_gen.load(Ordering::Acquire)
     }
 
+    /// #899: 値の範囲の読みが `scan_values` を見た後に写した `eids` に、 その後に置かれた最初の世代 > 0 の entry (entity の数
+    /// `count` 以上) が混ざっていれば、 それを落とした写し (`Owned`)。 混ざっていなければそのまま。 世代 > 0 の entry を Column の
+    /// 添字として読まないため (並んだ書き込みの途中の読み)。 場所の bit は写した後で読む (0 なら写した entry は全部世代 0)。
+    fn drop_late_gen<'a>(&self, eids: &'a [u32], count: u32) -> std::borrow::Cow<'a, [u32]> {
+        if self.gens.get().is_none() || eids.iter().all(|&e| e < count) {
+            return std::borrow::Cow::Borrowed(eids);
+        }
+        match self.ref_bits() {
+            0 => std::borrow::Cow::Borrowed(eids),
+            bits => std::borrow::Cow::Owned(eids.iter().copied().filter(|&x| x >> bits == 0).collect()),
+        }
+    }
+
     /// #899: 列をなめて、 値が `lo..=hi` の (値, entity) を entity の順に (`scan_values` の紐の値の範囲の読み)。
     fn scan_range(&self, lo: u64, hi: u64) -> Vec<(u64, u32)> {
+        hook::at("scan_range");
         let col = self.col();
         (0..col.count())
             .filter_map(|e| {
@@ -770,7 +911,7 @@ impl HimoStore {
     /// 組んだ cylinder で値を dense に置いているか (診断用。 組む前は false)。
     pub fn cylinder_is_dense(&self, value: u64) -> bool {
         // #899: Ref の紐は場所の bucket
-        self.cyl_built.load(Ordering::Acquire) && self.cyl.is_dense(ref_entry(self.ref_bits(), 0, value).0)
+        self.cyl_built.load(Ordering::Acquire) && ref_key(self.ref_bits(), value).is_some_and(|k| self.cyl.is_dense(k))
     }
 
     /// cylinder が未 build なら column から rebuild。lazy build の入口。
@@ -831,14 +972,22 @@ impl HimoStore {
         }
         // 全部を見てからまとめて組む (dense / sparse の振り分けを 1 度で決める、 #373)。 #899: Ref の紐は (entry, 場所) で
         // (世代 > 0 の entry の位置は覚えない: 位置の表は列の大きさ ≤ 2^S で、 entry は 2^S 以上 = 表の外)
-        let bits = self.ref_bits();
+        // 世代を持つ前 (bit 0) に組む時は、 自分の entity でない値を見たら紐の鍵を決める (`put_bits`。 決める前に出した値は全部
+        // 場所の bit の中 = どちらの鍵でも同じ)
+        let bits = std::cell::Cell::new(self.ref_bits());
+        let wide = self.gens.get().map_or(u64::MAX, |g| 1u64 << g.floor_bits());
+        let bits = &bits;
         self.cyl.build(|| {
             (0..count).filter_map(move |eid| {
                 let stored = stored_at(col, eid);
                 (stored != 0).then(|| {
-                    let (key, raw) = ref_entry(bits, eid, stored - 1);
+                    let v = stored - 1;
+                    if bits.get() == 0 && v >= wide {
+                        bits.set(self.put_bits(v));
+                    }
+                    let (key, raw) = ref_entry(bits.get(), eid, v);
                     if raw != eid {
-                        self.note_gen_entry();
+                        self.note_gen_entry(bits.get(), key);
                     }
                     (raw, key)
                 })
@@ -929,12 +1078,12 @@ impl HimoStore {
         if old == Some(value) {
             return true; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
-        let bits = self.ref_bits();
+        let bits = self.put_bits(value);
         let (key, raw) = ref_entry(bits, eid, value);
         let old_key = old.map(|o| ref_entry(bits, eid, o).0);
         if raw != eid {
             // 置く前に (読み手は bucket を読んだ後で見る)
-            self.note_gen_entry();
+            self.note_gen_entry(bits, key);
         }
         let (cyl, locks) = (&self.cyl, self.vlocks());
         {
@@ -1391,8 +1540,8 @@ impl HimoStore {
             return; // 同値 restore = no-op (bytes も同一)
         }
         let guard = epoch::pin();
-        // #899: Ref の紐は (場所, 世代 << S | eid)
-        let bits = self.ref_bits();
+        // #899: Ref の紐は (場所, 世代 << S | eid)。 置く値で鍵の決め方を決める (`put_bits`)
+        let bits = new.map_or_else(|| self.ref_bits(), |n| self.put_bits(n));
         let mut stale = None;
         if let (Some(cyl), Some(o)) = (cyl, old) {
             // flag → Column の順 (set と同じ、request12)。 覚えている位置の古い entry に印を立てる
@@ -1400,8 +1549,8 @@ impl HimoStore {
             stale = cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s));
         }
         let new_entry = new.map(|n| ref_entry(bits, eid, n));
-        if new_entry.is_some_and(|(_, raw)| raw != eid) {
-            self.note_gen_entry();
+        if let Some((key, _)) = new_entry.filter(|&(_, raw)| raw != eid) {
+            self.note_gen_entry(bits, key);
         }
         store_at(col, eid, stored);
         self.present.add(i64::from(new.is_some()) - i64::from(old.is_some()));
@@ -1433,15 +1582,17 @@ impl HimoStore {
     pub fn pull(&self, value: impl CellValue) -> Vec<u32> {
         let Some(value) = value.cell_value() else { return Vec::new() };
         self.ensure_cylinder_built();
-        // #899: Ref の紐は場所の bucket (鍵)
-        let bits = self.ref_bits();
-        let key = ref_entry(bits, 0, value).0;
-        let (mut raw, mut needs_verify, stale) = self.cyl.read_to_vec_marked(key);
-        // 古い entry があり、 前に読んだ時から書き込みが無ければ、 詰め直して読み直す (照らさずに済む。 古い entry の無い読みは
-        // 見ない。 古い印のそろった bucket も、 読み直しが続けば詰め直す = 印の立った entry を物理的に落とす)
-        if stale && self.compact_if_reread(key) {
-            (raw, needs_verify, _) = self.cyl.read_to_vec_marked(key);
-        }
+        // #899: Ref の紐は場所の bucket (鍵)。 bit は写した後で読み直す (`with_ref_bits`)
+        let (mut raw, needs_verify, bits) = self.with_ref_bits(|bits| {
+            let Some(key) = ref_key(bits, value) else { return (Vec::new(), false, bits) };
+            let (mut raw, mut needs_verify, stale) = self.cyl.read_to_vec_marked(key);
+            // 古い entry があり、 前に読んだ時から書き込みが無ければ、 詰め直して読み直す (照らさずに済む。 古い entry の無い読みは
+            // 見ない。 古い印のそろった bucket も、 読み直しが続けば詰め直す = 印の立った entry を物理的に落とす)
+            if stale && self.compact_if_reread(key) {
+                (raw, needs_verify, _) = self.cyl.read_to_vec_marked(key);
+            }
+            (raw, needs_verify, bits)
+        });
         if bits != 0 {
             self.keep_generation(bits, value, &mut raw, 0);
         }
@@ -1467,16 +1618,19 @@ impl HimoStore {
     pub fn pull_into(&self, value: impl CellValue, out: &mut Vec<u32>) {
         let Some(value) = value.cell_value() else { return };
         self.ensure_cylinder_built();
-        // #899: Ref の紐は場所の bucket (鍵)
-        let bits = self.ref_bits();
-        let key = ref_entry(bits, 0, value).0;
         let start = out.len();
-        let (mut needs_verify, stale) = self.cyl.read_into_marked(key, out);
-        // `pull` と同じ: 古い entry があり、 前に読んだ時から書き込みが無ければ、 詰め直して読み直す
-        if stale && self.compact_if_reread(key) {
+        // #899: Ref の紐は場所の bucket (鍵)。 bit は写した後で読み直す (`with_ref_bits`)
+        let (needs_verify, bits) = self.with_ref_bits(|bits| {
             out.truncate(start);
-            (needs_verify, _) = self.cyl.read_into_marked(key, out);
-        }
+            let Some(key) = ref_key(bits, value) else { return (false, bits) };
+            let (mut needs_verify, stale) = self.cyl.read_into_marked(key, out);
+            // `pull` と同じ: 古い entry があり、 前に読んだ時から書き込みが無ければ、 詰め直して読み直す
+            if stale && self.compact_if_reread(key) {
+                out.truncate(start);
+                (needs_verify, _) = self.cyl.read_into_marked(key, out);
+            }
+            (needs_verify, bits)
+        });
         if bits != 0 {
             self.keep_generation(bits, value, out, start);
         }
@@ -1510,7 +1664,8 @@ impl HimoStore {
     #[inline]
     fn keep_generation(&self, bits: u32, value: u64, v: &mut Vec<u32>, start: usize) {
         let want = (value >> bits << bits) as u32;
-        if want == 0 && !self.has_gen.load(Ordering::Acquire) {
+        // 場所の印は写した後で見る (世代 0 の値で、 その場所に世代 > 0 の entry を置いたことが無ければ全部 entity)
+        if want == 0 && !self.slot_has_gen(value) {
             return;
         }
         let mask = (1u32 << bits) - 1;
@@ -1536,30 +1691,35 @@ impl HimoStore {
 
     /// #899: Ref の紐で、 場所 `slot` を指す値を持つ entity を `out` の後ろに足す (重複なし、 順は決めない)。 `below` = None なら
     /// どの世代の値も (消えた行を指したままの ref も)、 Some(g) なら世代が g 未満の値だけ (前の住人を指す ref)。 鍵が場所なので
-    /// bucket 1 つを読む (前は世代ごとに値を引いていた = 世代 > 0 の値は sparse)。 世代を持たない紐 / DB は場所の値そのもの
-    /// (`below` が Some なら前の世代は無い = 何も足さない)。
-    pub(crate) fn pull_slot_into(&self, slot: u32, below: Option<u32>, out: &mut Vec<u32>) {
-        let bits = self.ref_bits();
-        if bits == 0 {
-            if below.is_none() {
-                self.pull_into(u64::from(slot), out);
-            }
-            return;
-        }
-        if below == Some(0) {
-            return;
-        }
-        self.ensure_cylinder_built();
-        let key = u64::from(slot);
+    /// bucket 1 つを読む (前は世代ごとに値を引いていた = 世代 > 0 の値は sparse)。 鍵が場所でない紐 (世代を持たない DB・値を鍵に
+    /// 決めた紐、 `ref_mode`) は何も足さずに `false` を返す (呼び手が世代ごとの値を引く)。
+    pub(crate) fn pull_slot_into(&self, slot: u32, below: Option<u32>, out: &mut Vec<u32>) -> bool {
         let start = out.len();
-        let (mut verify, stale) = self.cyl.read_into_marked(key, out);
-        if stale && self.compact_if_reread(key) {
+        // bit は写した後で読み直す (`with_ref_bits`)
+        let (verify, bits) = self.with_ref_bits(|bits| {
             out.truncate(start);
-            (verify, _) = self.cyl.read_into_marked(key, out);
+            if bits == 0 {
+                return (false, 0);
+            }
+            if below == Some(0) {
+                return (false, bits);
+            }
+            self.ensure_cylinder_built();
+            let key = u64::from(slot);
+            let (mut verify, stale) = self.cyl.read_into_marked(key, out);
+            if stale && self.compact_if_reread(key) {
+                out.truncate(start);
+                (verify, _) = self.cyl.read_into_marked(key, out);
+            }
+            (verify, bits)
+        });
+        if bits == 0 {
+            return false;
         }
         let mask = (1u32 << bits) - 1;
-        // entry を entity に (世代の条件があれば絞る)。 世代 > 0 の entry を置いたことが無ければ entry = entity (写した後に見る)
-        if below.is_some() || self.has_gen.load(Ordering::Acquire) {
+        // entry を entity に (世代の条件があれば絞る)。 その場所に世代 > 0 の entry を置いたことが無ければ entry = entity (写した
+        // 後に見る)
+        if below.is_some() || self.slot_has_gen(u64::from(slot)) {
             let mut w = start;
             for r in start..out.len() {
                 let x = out[r];
@@ -1595,6 +1755,7 @@ impl HimoStore {
             }
             out.truncate(w);
         }
+        true
     }
 
     /// 値が `lo..=hi` の entity を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, その値の entity を 1 件ずつ出す
@@ -1605,8 +1766,9 @@ impl HimoStore {
     /// 出すので、 上位 k・最小 / 最大は k 件で止まる。 dense の空の要素は飛ばす。
     pub(crate) fn walk_values(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &mut BucketIter<'_>) -> ControlFlow<()>) {
         self.ensure_cylinder_built();
-        // #899: 鍵が場所の紐は鍵の順 ≠ 値の順: 列をなめて値の順に
-        if self.ref_bits() != 0 {
+        // #899: 世代 > 0 の entry を置いたことのある Ref の紐は鍵の順 ≠ 値の順: 列をなめて値の順に (置いたことが無ければ鍵 = 値、
+        // PR #907 の読み直し E)
+        if self.scan_values() {
             let mut pairs = self.scan_range(lo, hi);
             pairs.sort_unstable_by(|a, b| if desc { b.0.cmp(&a.0).then(a.1.cmp(&b.1)) } else { a.cmp(b) });
             let mut i = 0;
@@ -1621,8 +1783,17 @@ impl HimoStore {
             }
             return;
         }
+        hook::at("range_checked");
         let col = self.col();
+        let (is_ref, count) = (self.gens.get().is_some(), col.count());
         self.cyl.walk(lo, hi, desc, |v, raw, verify, marks| {
+            // #899: 上で見た後に最初の世代 > 0 の entry が置かれた (鍵 = 場所 v の bucket に、 値 v でない entry が混ざる) 時は、
+            // 世代 > 0 の entry を落として Column で確かめる (並んだ書き込みの途中の読み)
+            if is_ref {
+                if let std::borrow::Cow::Owned(kept) = self.drop_late_gen(raw, count) {
+                    return f(v, &mut BucketIter::new(&kept, Some((col, v + 1))));
+                }
+            }
             // 古い印がそろっていれば、 Column の確かめと出した eid の集合の代わりに印で飛ばす
             let mut iter = match (verify, marks) {
                 (true, Some(m)) => BucketIter::marked(raw, m),
@@ -1640,12 +1811,20 @@ impl HimoStore {
             return 0;
         }
         self.ensure_cylinder_built();
-        // #899: 鍵が場所の紐は列をなめる
-        if self.ref_bits() != 0 {
+        // #899: 世代 > 0 の entry を置いたことのある Ref の紐は列をなめる
+        if self.scan_values() {
             return self.scan_range(lo, hi).len();
         }
+        hook::at("range_checked");
         let col = self.col();
-        self.cyl.count_range(lo, hi, |v, e| stored_at(col, e) == v + 1)
+        let count = col.count();
+        // 世代 > 0 の entry (entity の数より大きい) は Column を読まない
+        let n = self.cyl.count_range(lo, hi, |v, e| e < count && stored_at(col, e) == v + 1);
+        // 数える間に最初の世代 > 0 の entry が来た (場所の bucket の live を値の数と読みうる): 列で数え直す
+        if self.scan_values() {
+            return self.scan_range(lo, hi).len();
+        }
+        n
     }
 
     /// 値が `lo..=hi` の entity (重複なし、 順は決めない)。 置き場の単位で写す (値の順にたどらない、 全体を並べない):
@@ -1663,11 +1842,13 @@ impl HimoStore {
             return Vec::new();
         }
         self.ensure_cylinder_built();
-        // #899: 鍵が場所の紐は列をなめる
-        if self.ref_bits() != 0 {
+        // #899: 世代 > 0 の entry を置いたことのある Ref の紐は列をなめる
+        if self.scan_values() {
             return self.scan_range(lo, hi).into_iter().map(|p| p.1).collect();
         }
+        hook::at("range_checked");
         let col = self.col();
+        let count = col.count();
         let mut out = Vec::new();
         // 古い entry のある sparse で確かめた eid (最後に重複を落とす)
         let mut loose = Vec::new();
@@ -1679,7 +1860,7 @@ impl HimoStore {
                 let (mut eids, verify) = self.cyl.read_to_vec_verify(value);
                 if verify {
                     // 詰め直した後に書き手が触った: `pull` と同じく照らして並べ、 往復の重複を落とす
-                    eids.retain(|&e| stored_at(col, e) == value + 1);
+                    eids.retain(|&e| e < count && stored_at(col, e) == value + 1);
                     crate::append_bucket::sort_appended(&mut eids);
                     eids.dedup();
                 }
@@ -1687,15 +1868,22 @@ impl HimoStore {
             }
             // 古い印がそろった bucket は印の立った entry を飛ばして写す (Column の確かめも重複落としも無い)
             Part::Bucket { eids, verify: true, marks: Some(m), .. } => crate::append_bucket::copy_unmarked(eids, m, &mut out),
-            Part::Bucket { value, eids, verify: true, marks: None } => push_live_once(col, value, eids, &mut out),
+            Part::Bucket { value, eids, verify: true, marks: None } => {
+                push_live_once(col, value, &self.drop_late_gen(eids, count), &mut out)
+            }
             Part::Run { lo, hi, eids, verify: true } => loose.extend(eids.iter().copied().filter(|&e| {
-                let s = stored_at(col, e);
+                // #899: 世代 > 0 の entry (entity の数より大きい) は Column を読まない
+                let s = if e < count { stored_at(col, e) } else { 0 };
                 s != 0 && lo < s && s - 1 <= hi
             })),
         });
         if !loose.is_empty() {
             dedup_eids(&mut loose);
             out.extend_from_slice(&loose);
+        }
+        // #899: 写す間に最初の世代 > 0 の entry が来た (entry を entity として写しうる): 列で読み直す
+        if self.scan_values() {
+            return self.scan_range(lo, hi).into_iter().map(|p| p.1).collect();
         }
         out
     }
@@ -1707,13 +1895,23 @@ impl HimoStore {
             return Vec::new();
         }
         self.ensure_cylinder_built();
-        // #899: 鍵が場所の紐は列をなめる (entity の順・重複なし)
-        if self.ref_bits() != 0 {
+        // #899: 世代 > 0 の entry を置いたことのある Ref の紐は列をなめる (entity の順・重複なし)
+        if self.scan_values() {
             return self.scan_range(lo, hi).into_iter().map(|p| p.1).collect();
         }
+        hook::at("range_checked");
         let col = self.col();
+        let count = col.count();
         let mut out = self.cyl.range_raw(lo, hi);
+        // 写した後に最初の世代 > 0 の entry が来ていたら列で読み直す (写した後に見る)
+        if self.scan_values() {
+            return self.scan_range(lo, hi).into_iter().map(|p| p.1).collect();
+        }
         out.retain(|&eid| {
+            // #899: 世代 > 0 の entry (entity の数より大きい) は Column を読まない
+            if eid >= count {
+                return false;
+            }
             let s = stored_at(col, eid);
             // stored = 値 + 1 (0 = 未設定)
             s != 0 && lo < s && s - 1 <= hi
@@ -1760,16 +1958,23 @@ impl HimoStore {
     pub fn slice_len(&self, value: impl CellValue) -> usize {
         let Some(value) = value.cell_value() else { return 0 };
         self.ensure_cylinder_built();
-        // #899: 鍵が場所の紐の bucket の live は世代を問わない数。 live を使うのは、 世代 0 の値 (鍵 = 値) で、 世代 > 0 の entry を
-        // 置いたことの無い紐だけ (それ以外は引いて数える)。 印は live を読んだ **後** で見る (live の store は Release、 ここは Acquire:
-        // 最初の世代 > 0 の entry を数えた live を読んだなら印も見える、 `tests/loom_ref_gen_mark.rs`)
-        let bits = self.ref_bits();
-        if bits != 0 {
-            let n = (value >> bits == 0).then(|| self.cyl.dense_live_len_acquire(value)).flatten();
-            return match n {
-                Some(n) if !self.has_gen.load(Ordering::Acquire) => n,
-                _ => self.pull(value).len(),
-            };
+        // #899: 鍵が場所の紐の bucket の live は世代を問わない数。 live を使うのは、 世代 0 の値 (鍵 = 値) で、 その場所に世代 > 0
+        // の entry を置いたことが無い時だけ (それ以外は引いて数える。 使い回した場所の数だけ = 使い回していない場所の数は O(1)、 PR
+        // #907 の読み直し D)。 印は live を読んだ **後** で見る (live の store は Release、 ここは Acquire: 最初の世代 > 0 の entry を
+        // 数えた live を読んだなら印も見える、 `tests/loom_ref_gen_mark.rs`)。 bit は live を読んだ後で読み直す (`with_ref_bits`)
+        if self.gens.get().is_some() {
+            let n = self.with_ref_bits(|bits| match ref_key(bits, value) {
+                // u32 を越える値は Ref の cell に無い
+                None => Some(0),
+                Some(key) if key == value => {
+                    self.cyl.dense_live_len_acquire(value).filter(|_| bits == 0 || !self.slot_has_gen(value))
+                }
+                Some(_) => None,
+            });
+            return n.unwrap_or_else(|| {
+                hook::at("slice_len_pulls");
+                self.pull(value).len()
+            });
         }
         match self.cyl.dense_live_len(value) {
             Some(n) => n,
@@ -3321,5 +3526,243 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// PR #907 の読み直し A: 世代を持つ DB の Ref の紐を u32 を越える値で引くと、 場所の bit で切った鍵 (別の値の場所の bucket) を
+    /// 読んでいた (release は場所 5 の今の行を指す entity を `2^32 + 5` の答えとして返し、 debug は `ref_entry` の assert で panic)。
+    /// Ref の cell に u32 を越える値は無いので、 どの読みも空 / 0。
+    #[test]
+    fn ref_slot_keys_wide_value_reads_nothing() {
+        const S: u32 = 24;
+        let gens = Arc::new(crate::generation::Generations::off());
+        let hs = HimoStore::init(heap_region(64 * 1024), ValueType::Ref, 0, 4096, false);
+        hs.attach_generations(gens.clone());
+        for e in 0..10u32 {
+            hs.set(e, 5u64);
+        }
+        assert_eq!(hs.pull(5u64).len(), 10, "前提: 円柱を組んだ");
+        gens.start(S);
+        hs.set(10, 1u64 << S | 5);
+        for wide in [1u64 << 32 | 5, 1u64 << 32 | 1u64 << S | 5, u64::MAX - 1] {
+            assert!(hs.pull(wide).is_empty(), "{wide:#x}: 場所 5 の entity を返した");
+            let mut out = vec![7];
+            hs.pull_into(wide, &mut out);
+            assert_eq!(out, vec![7], "{wide:#x}: pull_into");
+            assert_eq!(hs.slice_len(wide), 0, "{wide:#x}: slice_len");
+            assert!(!hs.cylinder_is_dense(wide), "{wide:#x}: dense");
+        }
+        assert_eq!(hs.pull(5u64).len(), 10);
+        assert_eq!(hs.pull(1u64 << S | 5), vec![10]);
+    }
+
+    /// PR #907 の読み直し B: 読み手が場所の bit (0) で鍵を決めた後、 写す前に DB が世代を持ち (bit = S)、 書き手がその場所の bucket に
+    /// 世代 > 0 の entry を置く。 写した後で bit を読み直さないと、 entry (`1 << S | e`) を entity として返す (`GenReader::eids` /
+    /// Column を範囲の外で読む)。 値を引く読み (`pull` / `pull_into`)・場所の全部の世代 (`pull_slot_into`)・数 (`slice_len`) のどれも。
+    #[test]
+    fn ref_slot_keys_reread_bits_after_copy() {
+        const S: u32 = 24;
+        for how in ["pull", "pull_into", "pull_slot_into", "slice_len"] {
+            let gens = Arc::new(crate::generation::Generations::off());
+            let hs = Arc::new(HimoStore::init(heap_region(64 * 1024), ValueType::Ref, 0, 4096, false));
+            hs.attach_generations(gens.clone());
+            for e in 0..3u32 {
+                hs.set(e, 5u64);
+            }
+            assert_eq!(hs.pull(5u64).len(), 3, "前提: 円柱を組んだ");
+            assert_eq!(hs.ref_bits(), 0, "前提: 世代を持つ前");
+            let (g, h) = (gens.clone(), hs.clone());
+            hook::set("ref_bits_read", move || {
+                g.start(S);
+                // 場所 5 を使い回した行を指す ref (世代 1)
+                h.set(3, 1u64 << S | 5);
+            });
+            let mut got = match how {
+                "pull" => hs.pull(5u64),
+                "pull_into" => {
+                    let mut out = Vec::new();
+                    hs.pull_into(5u64, &mut out);
+                    out
+                }
+                "pull_slot_into" => {
+                    let mut out = Vec::new();
+                    hs.pull_slot_into(5, None, &mut out);
+                    out
+                }
+                _ => vec![0; hs.slice_len(5u64)],
+            };
+            assert_eq!(hs.ref_bits(), S, "{how}: 前提: 割り込みが走った");
+            got.sort_unstable();
+            let want: Vec<u32> = match how {
+                "pull_slot_into" => vec![0, 1, 2, 3],
+                "slice_len" => vec![0; 3],
+                _ => vec![0, 1, 2],
+            };
+            assert_eq!(got, want, "{how}: 世代 > 0 の entry を entity と読んだ / 数えた");
+        }
+    }
+
+    /// PR #907 の読み直し D: 世代 > 0 の entry を置いたのは場所 5 だけ。 使い回していない場所 (0) の世代 0 の値の数は bucket の live
+    /// をそのまま使う (前は紐に 1 本でも世代 > 0 の entry があると全部の値の数を引いて数えた = 会社の社員数に比例)。 場所 5 の数は
+    /// 引いて数える (live は世代を問わない数)。 答えはどちらも列と同じ。
+    #[test]
+    fn ref_slot_keys_count_unreused_slots_from_live() {
+        const S: u32 = 24;
+        let gens = Arc::new(crate::generation::Generations::off());
+        gens.start(S);
+        let hs = HimoStore::init(heap_region(64 * 1024), ValueType::Ref, 0, 4096, false);
+        hs.attach_generations(gens.clone());
+        for e in 0..300u32 {
+            hs.set(e, u64::from(e % 3) * 5); // 場所 0 / 5 / 10
+        }
+        assert_eq!(hs.pull(0u64).len(), 100, "前提: 円柱を組んだ");
+        for e in (1..300u32).step_by(3).take(40) {
+            hs.set(e, 1u64 << S | 5); // 場所 5 を世代 1 で
+        }
+        assert!(hs.has_gen.load(Ordering::Relaxed), "前提: 世代 > 0 の entry を置いた");
+        let pulls = |v: u64| {
+            let hit = std::rc::Rc::new(std::cell::Cell::new(false));
+            let h = hit.clone();
+            hook::set("slice_len_pulls", move || h.set(true));
+            let n = hs.slice_len(v);
+            hook::set("unused", || {});
+            (n, hit.get())
+        };
+        assert_eq!(pulls(0), (100, false), "使い回していない場所の数を引いて数えた");
+        assert_eq!(pulls(10), (100, false), "使い回していない場所の数を引いて数えた");
+        assert_eq!(pulls(5), (60, true), "場所 5 (世代 0 と 1 が混ざる) の世代 0 の数");
+        assert_eq!(pulls(1u64 << S | 5), (40, true), "場所 5 の世代 1 の数");
+        assert!(!hs.slot_has_gen(0) && !hs.slot_has_gen(10) && hs.slot_has_gen(5));
+        // 値を引く読みも、 使い回していない場所は世代を確かめない (答えは同じ)
+        assert_eq!(hs.pull(10u64).len(), 100);
+    }
+
+    /// PR #907 の読み直し E: 値の範囲の読みは、 世代を持つ DB でも世代 > 0 の entry を置いたことの無い Ref の紐では列をなめない
+    /// (鍵 = 値)。 範囲を見た後に最初の世代 > 0 の entry が来ても、 entry を entity として返さない / Column の添字にしない。
+    #[test]
+    fn ref_slot_keys_ranges_without_gen_entries() {
+        const S: u32 = 24;
+        let gens = Arc::new(crate::generation::Generations::off());
+        gens.start(S);
+        let fresh = || {
+            let hs = Arc::new(HimoStore::init(heap_region(64 * 1024), ValueType::Ref, 0, 4096, false));
+            hs.attach_generations(gens.clone());
+            for e in 0..300u32 {
+                hs.set(e, u64::from(e % 7));
+            }
+            hs
+        };
+        let want = |lo: u64, hi: u64| -> Vec<u32> { (0..300u32).filter(|e| (lo..=hi).contains(&u64::from(e % 7))).collect() };
+        let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sorted = |mut v: Vec<u32>| {
+            v.sort_unstable();
+            v
+        };
+        let walk = |hs: &HimoStore| {
+            let mut out = Vec::new();
+            hs.walk_values(2, 5, false, |_, it| {
+                out.extend(it.by_ref());
+                ControlFlow::Continue(())
+            });
+            sorted(out)
+        };
+        for how in ["pull_range", "pull_range_unordered", "count_range", "walk_values"] {
+            let hs = fresh();
+            // 世代 > 0 の entry が無い間は列をなめない
+            let c = scans.clone();
+            hook::set("scan_range", move || c.set(c.get() + 1));
+            let got = match how {
+                "pull_range" => hs.pull_range(2, 5),
+                "pull_range_unordered" => sorted(hs.pull_range_unordered(2, 5)),
+                "count_range" => vec![0; hs.count_range(2, 5)],
+                _ => walk(&hs),
+            };
+            hook::set("unused", || {});
+            assert_eq!(scans.get(), 0, "{how}: 世代 > 0 の entry の無い紐で列をなめた");
+            assert_eq!(got.len(), want(2, 5).len(), "{how}");
+            // 範囲を見た後に、 範囲の中の場所 (3) に世代 > 0 の entry が来る
+            let h = hs.clone();
+            let e = 300;
+            hook::set("range_checked", move || {
+                h.set(e, 1u64 << S | 3);
+            });
+            let got = match how {
+                "pull_range" => hs.pull_range(2, 5),
+                "pull_range_unordered" => sorted(hs.pull_range_unordered(2, 5)),
+                "count_range" => vec![0; hs.count_range(2, 5)],
+                _ => walk(&hs),
+            };
+            assert_eq!(hs.get_value(e), Some(1u64 << S | 3), "{how}: 前提: 割り込みが走った");
+            if how == "count_range" {
+                assert_eq!(got.len(), want(2, 5).len(), "{how}: 世代 > 0 の entry を数えた");
+            } else {
+                assert_eq!(got, want(2, 5), "{how}: 世代 > 0 の entry を entity として返した");
+            }
+        }
+    }
+
+    /// PR #907 の読み直し C: 世代を持つ前 (bit 0) に、 移った後に場所で切ると別の値になる Ref の値 (他の peer の eid を指す ref = 自分の
+    /// entity でない値、 2^24 以上) を組んだ円柱に置く。 前は移った後に鍵を場所にして、 その entry (鍵 = 値に置いた) を引けず、 外す時に
+    /// 場所の bucket の数を減らしていた。 置く時に紐を 「値を鍵」 に決める (開き直すまで)。 円柱を組む前に列にあった値も、 組む時に
+    /// 決める。 世代を持った後に組む円柱は場所を鍵に (その値は世代 1 の値と読む)。
+    #[test]
+    fn ref_slot_keys_wide_value_before_generations() {
+        const S: u32 = 24;
+        let wide = 1u64 << S | 5; // 他の peer の entity の local (2^24 + 5)
+        let sorted = |mut v: Vec<u32>| {
+            v.sort_unstable();
+            v
+        };
+        for how in ["set", "build", "after"] {
+            let gens = Arc::new(crate::generation::Generations::off());
+            let hs = HimoStore::init(heap_region(64 * 1024), ValueType::Ref, 0, 4096, false);
+            hs.attach_generations(gens.clone());
+            for e in 0..10u32 {
+                hs.set(e, 5u64);
+            }
+            match how {
+                // 組んだ円柱に置く
+                "set" => {
+                    assert_eq!(hs.pull(5u64).len(), 10, "前提: 円柱を組んだ");
+                    hs.set(10, wide);
+                    hs.set(11, wide);
+                }
+                // 列に置いてから組む
+                "build" => {
+                    hs.set(10, wide);
+                    hs.set(11, wide);
+                    assert_eq!(hs.pull(5u64).len(), 10, "前提: 円柱を組んだ");
+                }
+                // 移った後に組む (場所を鍵、 値は世代 1 の値と読む)
+                _ => {
+                    hs.set(10, wide);
+                    hs.set(11, wide);
+                }
+            }
+            gens.start(S);
+            assert_eq!(hs.ref_bits(), if how == "after" { S } else { 0 }, "{how}: 鍵の決め方");
+            assert_eq!(sorted(hs.pull(wide)), vec![10, 11], "{how}: 移る前に置いた値を引けない");
+            assert_eq!(hs.pull(5u64).len(), 10, "{how}");
+            hs.set(10, 6u64);
+            hs.remove(11);
+            assert_eq!(hs.slice_len(5u64), 10, "{how}: 外した値の数を別の bucket から引いた");
+            assert_eq!(hs.pull(5u64).len(), 10, "{how}");
+            assert!(hs.pull(wide).is_empty(), "{how}: 外した値を引いた");
+            assert_eq!(hs.unique_count(), 2, "{how}: 値の数");
+            // 値を鍵にした紐は、 場所の全部の世代を bucket 1 つで引かない (呼び手が世代ごとに引く)
+            let mut out = Vec::new();
+            assert_eq!(hs.pull_slot_into(5, None, &mut out), how == "after", "{how}");
+            hs.set(12, wide);
+            assert_eq!(hs.pull(wide), vec![12], "{how}: 移った後に置いた値");
+        }
+        // 枠が 2^24 を越える DB (移る時の S = 25) の自分の entity (2^24 + 5) を指す ref は、 下限 (`raise_floor`) の中 = 値を鍵に決めない
+        let gens = Arc::new(crate::generation::Generations::off());
+        gens.raise_floor(1 << 25);
+        let hs = HimoStore::init(heap_region(64 * 1024), ValueType::Ref, 0, 4096, false);
+        hs.attach_generations(gens.clone());
+        hs.set(0, wide);
+        assert_eq!(hs.pull(wide), vec![0], "前提: 円柱を組んだ");
+        gens.start(S + 1);
+        assert_eq!(hs.ref_bits(), S + 1, "枠の中の entity を指す ref で値を鍵に決めた");
+        assert_eq!(hs.pull(wide), vec![0]);
     }
 }
