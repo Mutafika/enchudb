@@ -200,7 +200,8 @@ fn schema_case(tag: &str, new_id: i64, host: bool) -> (u64, u64, Vec<i64>, Vec<i
     let dir = Dir::new(tag);
     let a = schema_db(&dir.db(A), A);
     let b = schema_db(&dir.db(B), B);
-    let (push, pull): (Box<dyn Fn()>, Box<dyn Fn()>);
+    type Step = Box<dyn Fn()>;
+    let (push, pull): (Step, Step);
     let mut keep: Vec<Box<dyn std::any::Any>> = Vec::new();
     if host {
         let host_db = schema_db(&dir.db(HOST), HOST);
