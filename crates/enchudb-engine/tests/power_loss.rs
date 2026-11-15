@@ -2975,3 +2975,77 @@ fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid(
     assert!(!eng.remote_tie_apply(world, hid, 9u32, later), "消えた行への相手の書き込みで行が生き返った");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// #916 の読み直し A1: 受けた行 F (他の peer C の行、 写像 (C,f)→場所 s) を A のアプリが消し、 書き出しの版数の段 (tombstone) の前で
+/// 落ちる。 開くと再生が F の Delete を当て直して tombstone を戻す (場所は使い回していない = 場所の最後の行は F)。 #919 の最初の形は
+/// 「逆写像があり、 record の世代が場所の世代より古い」 だけで F 自身の Delete も捨て、 tombstone を失った F に C の遅い書き込みが当たって
+/// A でだけ生き返った (state にも F の Delete が出なかった)。
+#[test]
+fn a_deleted_translated_row_keeps_its_tombstone_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("translated_delete");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    let hid = {
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "c", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("t.c").unwrap() as u16;
+        // 自分の行を消して使い回し、 v15 (世代を持つ DB) にする
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, "t.c", 1u32);
+        let keep = eng.entity_in("t").unwrap();
+        eng.tie_to(keep, "t.c", 2u32);
+        eng.delete(a);
+        let r = eng.entity_in("t").unwrap();
+        assert_ne!(r, a, "前提: v15");
+        // C の行 F を受ける
+        let t = eng.resolve_remote_eid(world_f, hid).unwrap();
+        assert!(eng.remote_tie_apply_result(t, hid, 5u32, Hlc { wall: 1_000, logical: 0, peer: 3 }).applied());
+        eng.persist_sync_state().unwrap(); // 写像を書き出す
+        eng.persist_tables().unwrap();
+        eng.oplog_sync().unwrap();
+        let f = eng.pull_raw("t.c", 5u32);
+        assert_eq!(f.len(), 1, "前提: A に F がある");
+        let _hold = eng.hold_consumer();
+        eng.delete(f[0]);
+        assert!(eng.pull_raw("t.c", 5u32).is_empty(), "前提: F は消えた");
+        // 書き出しの、 版数の列と tomb.seg の前で撮る (entities と gen.seg は届いている)
+        let shot = Arc::new(AtomicBool::new(false));
+        let (s2, l, i) = (shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeVersions && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(shot.load(Ordering::SeqCst), "前提: 書き出しの間に撮った");
+        hid
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert!(eng.pull_raw("t.c", 5u32).is_empty(), "前提: 開いた像で F は消えている");
+    let t = eng.resolve_remote_eid_existing(world_f).expect("前提: F の写像は残る");
+    let (records, _) = eng.state_records();
+    let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 3 };
+    let revived = eng.remote_tie_apply(t, hid, 9u32, later);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(!revived, "消えた受けた行 F に、 削除を知らない相手の遅い書き込みが当たって生き返った (tombstone を失った)");
+    assert!(
+        records.iter().any(|r| matches!(r.op, DecodedOp::Delete { eid } if eid == world_f)),
+        "state に受けた行 F の Delete が無い"
+    );
+}
