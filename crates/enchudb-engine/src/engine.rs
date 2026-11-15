@@ -16403,8 +16403,32 @@ impl Engine {
         if enchudb_oplog::eid_peer(foreign_eid) == self_peer {
             return foreign_eid; // identity: 自分が産んだ entity
         }
+        let (local, bound_now) = self.alias_remote_eid(author_peer, foreign_eid, self.slot_unchecked(local_eid), self_peer);
+        // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
+        self.ensure_live_slot(local);
+        Self::advance_table_next_local_for(&self.tables, local);
+        // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
+        // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
+        // 束ねた行が消えるので、 それと同じ答えにする。 払い出した slot と違って既にある行に束ねるので、 版数を書き戻すだけ
+        // (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、 届いた順で答えが割れる。
+        if bound_now
+            && let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid))
+        {
+            self.apply_delete_local(local, tomb);
+        }
+        enchudb_oplog::make_eid(self_peer, local)
+    }
+
+    /// [`Self::bind_remote_eid`] の写像を張る所 (#178 の束ねる前の書き込みの数えと別名の record も)。 戻り値は (束ねた先の場所,
+    /// 今張ったか)。 前から写像があれば張らずに、 その場所と false。
+    fn alias_remote_eid(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        target_local: u32,
+        self_peer: enchudb_oplog::PeerId,
+    ) -> (u32, bool) {
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        let target_local = self.slot_unchecked(local_eid);
         // #178: 束ねる前に、 この行に書いた record の宛名 (逆写像があればその世界番号、 無ければ自分の世界番号)
         // #731 (段 4): 自分の世界番号は世代込み
         let prior = self.eid_translator.reverse(target_local).map_or_else(
@@ -16436,19 +16460,7 @@ impl Engine {
         {
             self.emit_alias_record(prior, foreign_eid);
         }
-        // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
-        self.ensure_live_slot(local);
-        Self::advance_table_next_local_for(&self.tables, local);
-        // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
-        // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
-        // 束ねた行が消えるので、 それと同じ答えにする。 払い出した slot と違って既にある行に束ねるので、 版数を書き戻すだけ
-        // (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、 届いた順で答えが割れる。
-        if bound_now
-            && let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), foreign_local)
-        {
-            self.apply_delete_local(local, tomb);
-        }
-        enchudb_oplog::make_eid(self_peer, local)
+        (local, bound_now)
     }
 
     /// #513: [`Engine::bind_remote_eid`] の主キー版 (`Syncer` が、 主キー `pk_value` の生きた行 `local_eid` に束ねる時)。
@@ -16456,6 +16468,8 @@ impl Engine {
     /// 束ねた後に、 その主キーの行を消した削除 (受け手が覚えている物、 `pk_tombs.rs`) を束ねた行にも当てる。 束ねた行が
     /// その削除の後に作り直された行でも、 削除より古い書き込み (束ねた entity の物も、 前に束ねた entity の物も) は消え、
     /// 新しい書き込みは残る (主キーが同じなら同じ行)。
+    ///
+    /// `local_eid` が引いた後に消えた / 場所を使い回されたかは確かめない (`Syncer` の束ねは [`Self::bind_remote_eid_by_pk_at`])。
     pub fn bind_remote_eid_by_pk(
         &self,
         author_peer: enchudb_oplog::PeerId,
@@ -16465,6 +16479,19 @@ impl Engine {
         pk_value: u64,
     ) -> enchudb_oplog::EntityId {
         let bound = self.bind_remote_eid(author_peer, foreign_eid, local_eid);
+        self.apply_name_delete_to_bound(bound, local_eid, pk_himo, pk_value);
+        bound
+    }
+
+    /// #513 の後半: 束ねた行 `bound` に、 主キー `pk_value` の行を消した削除 (受け手が覚えている物) を当てる。 `local_eid` は束ねる時に
+    /// 名前で引いた行。
+    fn apply_name_delete_to_bound(
+        &self,
+        bound: enchudb_oplog::EntityId,
+        local_eid: enchudb_oplog::EntityId,
+        pk_himo: u16,
+        pk_value: u64,
+    ) {
         if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value)) {
             let local = self.slot_unchecked(bound);
             // 削除優先: 消すのは、 その削除より前からある行だけ (削除の後に足し直した行は消さない)
@@ -16480,7 +16507,63 @@ impl Engine {
                 self.apply_delete_in(Some(&guard), local, tomb, None);
             }
         }
-        bound
+    }
+
+    /// #939 (review930 [7]): 名前で引いた生きた行 `row_eid` (世代 | 場所、 `former_pk_holder` / `query_by_id64` の返す番号) に
+    /// `foreign_eid` を束ねる、 `Syncer` の名前の束ねの入口 ([`Self::note_bound_identity`] + [`Self::bind_remote_eid_by_pk`])。
+    ///
+    /// 行の lock の下で、 引いた行がまだ場所の最後の行で生きているかを確かめてから、 束ねた identity を覚えて写像を張る。 違えば
+    /// 何もせず `None` (呼び手は名前で引き直す): 引いた後・束ねる前に、 その行が消えた (束ねて生かすと削除が戻る) か、 消えて場所を
+    /// 使い回された。 使い回しは写像を場所を生かす前に外す (`prepare_reuse`、 同じ行の lock の下) ので、 その後に張った写像は誰も
+    /// 外さず、 束ねた identity が使い回した新しい行を指した (その宛ての書き込み・削除が新しい行に当たる)。 確かめて張った後に
+    /// 消えた / 使い回された時は、 束ねてから消えたのと同じ (使い回しが写像を外す)。
+    ///
+    /// 前から写像があった (先に確定した束ね先) 時は [`Self::bind_remote_eid_by_pk`] と同じ (その場所を返す)。
+    pub fn bind_remote_eid_by_pk_at(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        row_eid: enchudb_oplog::EntityId,
+        pk_himo: u16,
+        pk_value: u64,
+        created: enchudb_oplog::Hlc,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if enchudb_oplog::eid_peer(foreign_eid) == self_peer {
+            return Some(foreign_eid); // identity: 自分が産んだ entity
+        }
+        let target = self.slot_unchecked(row_eid);
+        let guard = self.row_locks.write(target);
+        if !self.entities.is_live(target) || !self.remote_row_holds_slot(target, Some(enchudb_oplog::eid_local(row_eid))) {
+            return None;
+        }
+        // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)。 写像と同じ行の
+        // lock の下 (使い回しは場所の名前の記録も生かす前に外すので、 外した後に覚えると新しい行に残る)
+        self.note_bound_identity(row_eid, foreign_eid, created);
+        let (local, bound_now) = self.alias_remote_eid(author_peer, foreign_eid, target, self_peer);
+        if !bound_now {
+            drop(guard);
+            self.ensure_live_slot(local);
+            Self::advance_table_next_local_for(&self.tables, local);
+            let bound = enchudb_oplog::make_eid(self_peer, local);
+            self.apply_name_delete_to_bound(bound, row_eid, pk_himo, pk_value);
+            return Some(bound);
+        }
+        // 生きているのを確かめた行に張った (生かさない。 放した後に消えたなら、 束ねてから消えたのと同じ)
+        Self::advance_table_next_local_for(&self.tables, local);
+        // #490 (`bind_remote_eid` と同じ): 作成より先に届いた、 この entity 宛ての削除
+        if let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid)) {
+            self.apply_delete_in(Some(&guard), local, tomb, None);
+        }
+        // #513 (`apply_name_delete_to_bound` と同じ、 行は確かめた引いた行のまま)
+        if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value))
+            && tomb > self.tombstone_version_of(local)
+            && self.version_of(local, pk_himo) < tomb
+        {
+            self.apply_delete_in(Some(&guard), local, tomb, None);
+        }
+        Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
     /// #513: 主キー `pk_value` の生きた行が無い時 (`Syncer` が主キーで束ねる先を引いて、 無かった時)。
@@ -17289,6 +17372,16 @@ impl Engine {
     /// 持つ column (A-5)。
     pub fn tombstone_hlc(&self, eid: enchudb_oplog::EntityId) -> enchudb_oplog::Hlc {
         self.tombstone_hlc_local(self.slot_unchecked(eid))
+    }
+
+    /// #923: 場所 `slot` の行に、 何も当たっていないか = 値のある cell も、 版数のある cell (外した cell を含む) も、 削除の版数も
+    /// 無い。 どの書き手の record もまだ当たっていない行 (相手の行を指す Ref の解決で、 的として払い出しただけの翻訳した行など)。
+    /// 照合しない (場所の今の住人を見る)。 紐の数に比例する。
+    pub fn slot_untouched(&self, slot: u32) -> bool {
+        self.tombstone_version_of(slot) == enchudb_oplog::Hlc::ZERO
+            && (0..self.himos.len()).all(|hid| {
+                self.himos[hid].get_value(slot).is_none() && self.version_of(slot, hid as u16) == enchudb_oplog::Hlc::ZERO
+            })
     }
 
     #[inline]
