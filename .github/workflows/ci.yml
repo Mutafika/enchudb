@@ -68,8 +68,14 @@ jobs:
         run: cargo test -p enchudb
 
   miri:
-    name: miri (unsafe UB)
+    # 段を 2 つの job に分けて並べる (1 本で順に回すと order_index 17 分 + 残り 13 分 = 31 分で CI 全体の長さを決めていた。
+    # 分けると最も長い job は test (stable) の 21 分)。 job を増やしすぎると無料枠の同時 job の上限 (20) で待つので 2 つまで
+    name: miri (unsafe UB, ${{ matrix.part }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [order_index, rest]
     # crossbeam-epoch 0.9 は Stacked Borrows 非互換なので Tree Borrows。
     # epoch 遅延解放の exit 時 garbage は ignore-leaks で除外。
     env:
@@ -81,17 +87,23 @@ jobs:
           # miri は sysroot を source から build するので rust-src が要る。
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-${{ matrix.part }}
       # lock-free プリミティブの unsafe (from_raw_parts / UnsafeCell / epoch) を UB 検証。
       - name: miri append_bucket
+        if: matrix.part == 'rest'
         run: cargo miri test -p enchudb-engine --lib append_bucket
       - name: miri lockfree_cylinder (dense)
+        if: matrix.part == 'rest'
         run: cargo miri test -p enchudb-engine --lib "lockfree_cylinder::tests::dense"
       # 並びの索引: 置き場の 3 段の表 (葉は CAS で置き、 drop まで動かさない) と bucket の Slot、 drop。
       - name: miri order_index
+        if: matrix.part == 'order_index'
         run: cargo miri test -p enchudb-engine --lib order_index
       # 名前は module の道まで書く (`value_locks` だけだと、 write_lock (parking_lot) を取り合う himo_store の test にも当たり、
       # Linux の Miri が parking_lot_core の futex の呼び方を UB と判定する。 0.32.0 の order_index の段と同じ問題)
       - name: miri value_locks (値の鍵と、 詰め直しの照合が並んだ書き手と data race にならないこと。 読み手の詰め直しも)
+        if: matrix.part == 'rest'
         run: cargo miri test -p enchudb-engine --lib -- value_locks::tests himo_store::tests::compaction_reads himo_store::tests::read_compaction_holds_the_value_lock
 
   loom:
