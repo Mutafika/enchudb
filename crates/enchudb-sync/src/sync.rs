@@ -754,12 +754,13 @@ impl Syncer {
     ///    entity を削除 — author の現在状態に無い = author 側で削除済み。 truncated
     ///    期間に tombstone を取り逃した亡霊 (#140 の原症状) をここで吸収する。
     ///    sweep の Delete は自分の oplog にも載って伝播する (受け手の今の時刻の削除)。
+    ///    author の state は author の行の削除を誰が消した物でもその版数で運ぶので、
+    ///    他の peer が消した author の行は state の Delete で消え、 掃除の対象にならない。
     ///    何も当たっていない生きた行 (Ref の的として払い出しただけ) は消さない (#923:
-    ///    author が消した証でなく、 他の peer の削除は他の peer の流れで届く)。 ただし
-    ///    何かの record が当たった行 (author・第三の peer・受け手のアプリが書いた行) を
-    ///    他の peer が消していて、 その削除がまだ届いていない時は、 今の時刻の削除として
-    ///    名前の削除優先 (#551) を通り、 その削除の後に同じ名前で足した行を巻き込みうる
-    ///    (#923 の残り: author の state が他の peer の削除を運ばない間)
+    ///    author が消した証でなく、 自分の行の削除を運ばない state = 0.37.4 以前の author
+    ///    からの守り)。 0.37.4 以前の author の state では、 何かの record が当たった行を
+    ///    他の peer が消していると、 今の時刻の削除として名前の削除優先 (#551) を通り、
+    ///    その削除の後に同じ名前で足した行を巻き込みうる (author を上げると直る)
     /// 4. cursor を `as_of` へ前進 (後退はさせない) — 以降は通常の差分 pull
     pub fn bootstrap_pull(&self, from: PeerId) -> Option<BootstrapOutcome> {
         self.bootstrap_pull_via(from, from)
@@ -964,8 +965,9 @@ impl Syncer {
                         // 全部外れた行も、 生きていれば残す)、 Delete は author が消した他の peer の行。 他の peer の行宛ての
                         // Untie / Delete は上の理由で数えない
                         //
-                        // #784 / #800: author が消した自分の行の Delete は数える = 上で author の削除の版数で消してあり、 掃除が
-                        // 今の時刻で消し直さない (今の時刻の削除は、 author の削除の後に同じ名前で足された行まで消す)
+                        // #784 / #800: author の行の Delete は数える = 上でその削除の版数で消してあり、 掃除が今の時刻で消し直さない
+                        // (今の時刻の削除は、 その削除の後に同じ名前で足された行まで消す)。 author の state は、 他の peer が消した
+                        // author の行の削除も author の record で運ぶ (#923 の残り)
                         (enchudb_oplog::eid_peer(*eid) == author).then(|| enchudb_oplog::eid_local(*eid))
                     }
                     // #178: 行の state ではない (state 転写には現れない)

@@ -14194,13 +14194,16 @@ impl Engine {
     ///   版数は削除の版数) で出す。 slot を使い回して写像の外れた行は、 退避してある削除の版数から。 他の peer が消した行
     ///   (その peer の record が運ぶ) は出さない。 前はどちらも運ばず、 ホストが state を取り直すと、 まだ出していなかった
     ///   untie と他の peer の行の削除がどこにも配られなかった
-    /// - 自分の行の削除 (#784 / #800): **自分の時計の削除の版数**が slot に残っている、 消えた自分の行を `Delete` (宛名は自分の
+    /// - 自分の行の削除 (#784 / #800): 削除の版数が slot に残っている、 消えた自分の行を `Delete` (宛名は自分の
     ///   世界番号、 版数は削除の版数) で出す。 前は出さず、 state に現れない行を受け手の掃除が **今の時刻** で消していた:
     ///   名前で束ねた行は掃除が見つけられずに残り (#784)、 消した後に同じ名前で足した行は掃除の削除の方が新しくて消えた
-    ///   (#800)。 slot を使い回した行は削除の版数が残っていない (`clear_cell_versions`) ので出せない = 今までどおり受け手の
-    ///   掃除が消す。 出す数は 「払い出した slot のうち、 消えていてまだ使い回していない物」 まで
+    ///   (#800)。 **他の peer が消した自分の行も** (版数はその peer の時計、 書き手は自分): 前は自分の時計の削除だけで、 他の
+    ///   peer B が消した行 X は state に現れず、 B の削除を受ける前に state を取った受け手は、 X に何かの record が当たって
+    ///   いれば掃除で今の時刻に消して配り、 名前の削除優先 (#551) で B の削除の後に同じ名前で足した行まで消した (#923 の残り)。
+    ///   slot を使い回した行は、 使い回す時に移した退避表 (`keep_gone_own_delete`、 #914) から。 出す数は 「払い出した slot の
+    ///   うち、 消えている物」 まで
     /// - **含まないもの** (v1): 署名 (signature = zeros — require_signature な受信側
-    ///   では使えない)、 content blob、 他の peer が外した cell・消した行の記録
+    ///   では使えない)、 content blob、 他の peer が外した cell・消した他の peer の行の記録
     ///
     /// 戻り値 `(records, as_of)`。 oplog 無効 (standalone) では `as_of` が採番
     /// できないため空を返す。
@@ -14223,7 +14226,8 @@ impl Engine {
     /// - **author の時計の版数を持つ物は、 author の行の外の物も全部** (#783、 self 版の #761 / #766 / #784 と同じ中身を、
     ///   replica が持つ分だけ): author の行でない行 (自分の行 / 第三者の行) の、 版数が author の時計の cell (値と版数は
     ///   行の読みで揃える)、 生きている行の、 版数が author の時計で値の無い cell (`Untie`、 author の行も)、 削除の版数が
-    ///   author の時計の消えた行 (`Delete`、 author の行も。 slot を使い回して写像の外れた行は退避表から)。 書き手は
+    ///   author の時計の消えた行 (`Delete`、 author の行も。 slot を使い回して写像の外れた行は退避表から)、 **author の行は
+    ///   誰が消した削除も** (`Delete`、 版数はその削除の版数 = self 版の自分の行の削除と同じ中身)。 書き手は
     ///   `author`、 宛名は行の世界番号 (逆写像、 自分の行なら自分の番号) = author が差分で出した record と同じ形。
     ///   前は author の行の値のある cell だけで、 ホストが author の floor を上げて (遅れて載った state / 回収) 下の受け手が
     ///   取り直しても、 author の untie・削除・他の行への書き込みは届かなかった。 自分の行の slot を使い回した後の
@@ -14440,15 +14444,15 @@ impl Engine {
                         // 引く。 場所の最後の住人を指していない ref (消えた行を指したまま場所を使い回した後) は、 写像が今の住人の物なので
                         // 写像では引かない (前は今の住人を指して出していた)。 #914: 前の住人が自分の行なら、 使い回す時にその削除を
                         // identity (自分の peer, 値) に移してある (`keep_gone_own_delete`) = 自分の行を指す ref として出す。 出すのは、
-                        // その削除の版数が `author` の時計の時だけ (= その Delete が同じ state に入る、 `state_unties_and_foreign_deletes`
-                        // の `mine`)。 受け手でも消えた行を指す (出さないと受け手でだけ null)。 他の peer の時計の削除 (B が消した自分の行) を
-                        // 指す ref を Delete 無しで出すと、 受け手は Ref の解決で生きた空の行を作り、 state の掃除が今の時刻で消して配り、
-                        // その削除が名前の削除優先で同じ名前で足し直した行まで消す (#921 の読み直し [1]) ので出さない (null の小さい割れは
-                        // 残る)。 前の住人が翻訳した行 / 削除の版数の無い行も出さない
+                        // その Delete が同じ state に入る時だけ (`state_unties_and_foreign_deletes`): self 版は自分の行の削除を誰が消した
+                        // 物でも出すので常に、 replica 版 (この DB の行は `author` の行でない) は削除の版数が `author` の時計の時だけ。
+                        // 受け手でも消えた行を指す (出さないと受け手でだけ null)。 Delete 無しで出すと、 受け手は Ref の解決で生きた空の
+                        // 行を作り、 state の掃除が今の時刻で消して配り、 その削除が名前の削除優先で同じ名前で足し直した行まで消す
+                        // (#921 の読み直し [1])。 前の住人が翻訳した行 / 削除の版数の無い行は出さない
                         let target_slot = self.generations().split(value).0;
                         let stale = self.generations().active() && self.last_local_of_slot(target_slot) != value;
                         let gone_own =
-                            stale && self.foreign_tombstone_of(self_peer, value).is_some_and(|t| t.peer == author);
+                            stale && self.foreign_tombstone_of(self_peer, value).is_some_and(|t| is_self || t.peer == author);
                         if stale && !gone_own {
                             dropped += 1; // #236
                             continue;
@@ -14578,7 +14582,9 @@ impl Engine {
     /// #766: 自分の state に足す、 値の無い物の record (`state_records` の rustdoc の 「外した cell」 「他の peer の行の削除」)。
     ///
     /// どちらも差分 (bridge) で出す時と同じ形: 書き手は自分、 宛名は行の世界番号 (他の peer の行は逆写像)、 版数は
-    /// 書いた時の版数。 **自分の時計の版数の物だけ** — 他の peer の untie / 削除は、 その peer の record が運ぶ。
+    /// 書いた時の版数。 **自分の時計の版数の物だけ** — 他の peer の untie / 削除は、 その peer の record が運ぶ。 ただし
+    /// **`by` の行の削除は、 誰が消した物でも** その削除の版数で出す (掃除が 「state に無い = `by` が消した」 と読むため、 下の
+    /// 2 つの Delete の項)。
     ///
     /// #783: `by` が自分でなければ replica 版 (`state_records_for(by)`): 下の 「自分」 を 「`by`」 と読む (版数が `by` の時計の物を、
     /// `by` の record として)。 宛名の引き方は同じ (この DB の逆写像、 無ければこの DB の行)。 `by` の行の削除も 「他の peer の行の
@@ -14587,9 +14593,11 @@ impl Engine {
     /// - Untie: 版数の列をなめ、 生きている行の、 値が無くて版数が自分の時計の cell。 値と版数は行の lock の読みで
     ///   揃えて読む (間に書き込みが入ると、 値は前・版数は後を掴んで、 書いた cell を外す record になる)。 slot を使い回す時に
     ///   前の住人の版数は消してある (`clear_cell_versions`) ので、 生きている行の版数はその行の物
-    /// - Delete: 翻訳した行 (他の peer の行) のうち、 消えていて (`slot_is_dead`) 削除の版数が自分の時計の物。 slot を
+    /// - Delete: 翻訳した行 (他の peer の行) のうち、 消えていて (`slot_is_dead`) 削除の版数が自分の時計の物 (replica 版の
+    ///   `by` の行は、 削除の版数が誰の時計でも)。 slot を
     ///   使い回して写像が外れた行は退避表 (`foreign_tombs`) から。 生きている行は、 削除の版数が残っていても出さない
-    /// - Delete (自分の行、 #784 / #800): 削除の版数の列をなめ、 消えていて削除の版数が自分の時計の、 自分の行の slot。
+    /// - Delete (自分の行、 #784 / #800): 削除の版数の列をなめ、 消えている自分の行の slot (self 版は削除の版数が誰の時計でも、
+    ///   replica 版はこの DB の行のうち `by` の時計の物)。
     ///   slot を使い回した行は、 使い回す時に移した退避表 (`keep_gone_own_delete`、 #914) から
     fn state_unties_and_foreign_deletes(
         &self,
@@ -14607,6 +14615,12 @@ impl Engine {
             signed_bytes: Vec::new(),
         };
         let mine = |h: enchudb_oplog::Hlc| h != enchudb_oplog::Hlc::ZERO && h.peer == by;
+        // `by` の行の削除は、 誰が消した物でも出す (書き手は `by`、 版数はその削除の版数)。 受け手の掃除 (#140) は 「state に無い =
+        // `by` が消した」 と読む。 他の peer B が消した `by` の行 X が state に無いと、 B の削除を受ける前に取った受け手は、 X に何かの
+        // record (`by` の差分・第三の peer・受け手のアプリ) が当たっていれば今の時刻で消して配り、 名前の削除優先 (#551) で B の削除の
+        // 後に同じ名前で足した行まで消した (#923 の残り)。 書き手を B にしないのは、 中継の下の受け手の `cursor[B]` が B のまだ届いて
+        // いない record を越えないように (#786 の形)。 版数は `as_of` 以下 (B の削除を当てた時に時計を進めている)
+        let deleted = |h: enchudb_oplog::Hlc| h != enchudb_oplog::Hlc::ZERO;
         if self.has_cell_version() {
             for hid in 0..self.himos.len() {
                 if self.himo_is_in_reserved_table(hid) {
@@ -14663,7 +14677,7 @@ impl Engine {
                 continue;
             }
             let tomb = self.tombstone_version_of(local);
-            if mine(tomb) {
+            if mine(tomb) || (owner == by && deleted(tomb)) {
                 deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
             }
         }
@@ -14673,8 +14687,9 @@ impl Engine {
             let local_only = self.local_only_ranges();
             for local in 0..count {
                 let tomb = self.tombstone_hlc_local(local);
-                // 生きている行は番号を引く前に落とす (安い振り落とし。 決めるのは番号を引いた後の確かめ)
-                if !mine(tomb) || self.entities.is_live(local) {
+                // 生きている行は番号を引く前に落とす (安い振り落とし。 決めるのは番号を引いた後の確かめ)。 自分の行は誰が消した削除も
+                // (self 版 = `by` が自分)
+                if !(mine(tomb) || (by == self_peer && deleted(tomb))) || self.entities.is_live(local) {
                     continue;
                 }
                 // #731 (段 4): 消えた行の世界番号 (世代込み、 死んだ場所は消えた行の世代)
@@ -14703,7 +14718,9 @@ impl Engine {
         for (owner, owner_local, tomb) in self.orphan_foreign_tombstones() {
             // 写像のある行は上で見た (払い出す時に退避表の版数を slot に書き戻してある)
             // #914: 自分の peer の物は、 場所を使い回した自分の消えた行 (`keep_gone_own_delete`、 番号は世代込み)。 写像は持たない
-            if mine(tomb) && (owner == self_peer || self.eid_translator.get(owner, owner_local).is_none()) {
+            if (mine(tomb) || (owner == by && deleted(tomb)))
+                && (owner == self_peer || self.eid_translator.get(owner, owner_local).is_none())
+            {
                 deletes.push((tomb, enchudb_oplog::make_eid(owner, owner_local)));
             }
         }
