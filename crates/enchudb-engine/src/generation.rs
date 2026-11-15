@@ -20,7 +20,9 @@
 //! 上げる / 生きている印を下ろす) の片方だけが届きうる。 消す書き手を止めずに像を揃えるため、 世代と同じ 2 B に 「死んでいる」 印を置く:
 //!
 //! - 消す: 印と世代 (+1) を **1 回の store** で書いてから ([`Generations::kill`])、 生きている印を下ろす
-//! - 使い回す / 位置から払い出す / 再生や受信で生かす: 印を落としてから ([`Generations::revive`]) 生きている印を立てる
+//! - 使い回す / 位置から払い出す / 再生や受信で生かす: 印を落としてから生きている印を立てる。 落とすのは 「死んでいる・生きていない」
+//!   と読んだ 2 B のままの時だけ ([`Generations::revive_from`] の CAS、 #901: 読んだ後に別の書き手が使い回して消し始めた場所の印を
+//!   落とさない)。 払い出した自分の場所 (eid を返す前) は [`Generations::revive`]
 //! - きれいに閉じなかった後に開いた時 (`Engine::reconcile_generations`、 WAL の再生の前): **死が勝つ**。 gen.seg だけ死んでいる
 //!   (生きている印は残る) 場所も、 entities だけ死んでいる (印なし) 場所も、 削除を完了させる (cell を落として生きている印を下ろす /
 //!   世代を上げて印を立てる)。 生き返らせる向きは無いので、 どの像でも消えた行の eid は戻らない。 「gen.seg だけ死 = 削除が届いていない
@@ -498,6 +500,38 @@ impl Generations {
         }
     }
 
+    /// 場所の 2 B (「死んでいる」 印が立っていて、 引退していない時だけ)。 `Engine::revive_slot` が生きている印を読む **前に** 読み、
+    /// [`Self::revive_from`] に渡す。 引退した場所 (世代 = 引退の印) は None (印を落とさない): 引退の印は消す道の kill が上限で止める
+    /// 値なので、 使い回して消した後も同じ 2 B に戻る (CAS が変化を見分けられない唯一の値、 #901)。 引退した場所は生かさないので
+    /// 印を持ったままでよい。
+    #[inline]
+    pub(crate) fn dead_cell(&self, slot: u32) -> Option<u16> {
+        let r = self.region.get()?;
+        let v = read_raw(r, slot);
+        (v & DEAD != 0 && u32::from(v & GEN_MASK) <= self.max_gen()).then_some(v)
+    }
+
+    /// 場所の 2 B が `seen` ([`Self::dead_cell`] で読んだ値) のままなら 「死んでいる」 印を落とす (1 回の CAS)。 変わっていれば
+    /// 何もせず false (呼び手が生きている印から読み直す)。 2 B は使い回すたびに変わり (印を落とす)、 消すたびに変わる (世代を上げる)
+    /// ので、 `seen` のまま = 読んでから使い回しも消す道の kill も無い。 #901: 前は読み直して印を落としていて、 読んだ後に別の書き手が
+    /// 使い回してその行を消し始める (kill の後・生きている印を下ろす前) と、 消す途中の場所の印を落とした (= 「次の世代、 印なし、
+    /// 生きている」 の像)。
+    pub(crate) fn revive_from(&self, slot: u32, seen: u16) -> bool {
+        let Some(r) = self.region.get() else { return true };
+        let off = slot_off(slot);
+        if off + 2 > r.len() || !r.is_committed(off + 2) {
+            return true;
+        }
+        let done = r
+            .as_atomic_u16(off)
+            .compare_exchange(seen, seen & !DEAD, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if done {
+            r.mark_dirty(off, 2);
+        }
+        done
+    }
+
     /// WAL の再生が行 (世代 `g`) を生かす record を当てる時、 場所の世代が `g` より新しい (本体が WAL より先 = その後の削除や使い回しは
     /// WAL に届いていない) なら、 場所を 「世代 `g`、 生きている」 に戻す (`Engine::replay_slot`)。 新しい世代の行は WAL に届いていない
     /// (届いていれば、 その前の Delete(g) も届いて、 この record は checkpoint の手前 = 再生しない)。 戻したか。
@@ -699,6 +733,28 @@ mod tests {
         assert_eq!((g.get(5), g.is_dead(5)), (2, true), "世代は下げない (印だけ立てる)");
         g.kill(7, 300).unwrap();
         assert!(g.retired(7) && g.is_dead(7), "使い切った場所は引退の印 + 死んでいる");
+    }
+
+    /// #901: 生かす道は読んだ 2 B のままの時だけ印を落とす。 読んだ後に使い回して消し始めた場所 (印を落とした後に kill = 世代が
+    /// 上がる) は落とさない。 引退した場所は読まない (kill が上限で止めるので、 使い回して消しても同じ 2 B に戻る)。
+    #[test]
+    fn revive_from_drops_the_mark_only_on_the_value_it_read() {
+        let mut v = buffer(segment_len(16));
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24).unwrap();
+        g.start(24);
+        g.kill(5, 2).unwrap();
+        let seen = g.dead_cell(5).expect("消えた場所の 2 B");
+        g.revive(5); // 別の書き手が使い回す
+        g.kill(5, 3).unwrap(); // その行を消し始める (生きている印はまだ)
+        assert!(!g.revive_from(5, seen), "読んだ後に変わった 2 B の印を落とした");
+        assert_eq!((g.get(5), g.is_dead(5)), (3, true));
+        let seen = g.dead_cell(5).unwrap();
+        assert!(g.revive_from(5, seen));
+        assert_eq!((g.get(5), g.is_dead(5)), (3, false), "読んだままの 2 B は印だけ落とす");
+        g.kill(7, 300).unwrap();
+        assert_eq!(g.dead_cell(7), None, "引退した場所の印を落とす値として読んだ");
+        assert_eq!(g.dead_cell(6), None, "印の無い場所");
     }
 
     #[test]
