@@ -13,7 +13,8 @@
 //! 届き直す。 #754: 先に載せると、 受け手の cursor が断った record を越えて、 後で通っても届かない)。
 //!
 //! - `POST /v2/publish?peer=c` : client c の record。 ホストが当てて中継し、 WAL を書き出してから、 ホストが当てた位置 (c への ack)
-//!   を返す。 client の `_sync_ops` はこの ack で回収される (ホストは record の置き場の権威なので、 #227 の下流の消化で丸めない)
+//!   を返す。 client の `_sync_ops` はこの ack で回収される (ホストは record の置き場の権威なので、 #227 の下流の消化で丸めない)。
+//!   書き出せなければ ack を返さない (503、 #961: client は受けたと思わずに次の beat で送り直す)
 //! - `POST /v2/pull?to=c` (body = 書き手ごとの cursor) : ホストの `_sync_ops` のうち cursor より後 (c 自身の record は除く) と、
 //!   ホストの floor。 floor は record を読んだ後に読む (間に回収が入っても穴を見逃さない側)。 cursor は ack も兼ねる。
 //!   返事は `[framed records][floor の列][配り終えの線 16][忘れてよい線 16]`、 c が黙って外された後に戻った client の時だけ、
@@ -31,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -204,6 +205,12 @@ impl Default for ClientState {
     }
 }
 
+/// `floor` (書き手ごとの位置) より後の record か。 位置の無い書き手の record は全部 (`Syncer` が `Transport::publish_floor` の位置で
+/// 集める record を絞る式と同じ)。
+fn above_floor(floor: &[(PeerId, Hlc)], r: &WireRecord) -> bool {
+    floor.iter().find(|(a, _)| *a == r.author_peer).is_none_or(|(_, h)| r.hlc > *h)
+}
+
 /// 書き手ごとの位置の列を、 書き手ごとに大きい方へ足す。
 fn merge_max(into: &mut Vec<(PeerId, Hlc)>, add: &[(PeerId, Hlc)]) {
     for (p, h) in add {
@@ -303,6 +310,13 @@ struct HostInner {
     ///
     /// #753: client が送った state を当てて載せる間 (write) と、 ring を読んで配る間 (read、 `records_for`) も分ける。
     gate: RwLock<()>,
+    /// #961: 失敗した WAL の書き出し (`oplog_sync`) の数と、 その後に始めて成功した書き出しが覆った数。 `wal_cleared < wal_failed` の間は、
+    /// 新しく載せた record が無くても ack の前に書き出し直す ([`HostInner::sync_for_ack`])。
+    wal_failed: AtomicU64,
+    wal_cleared: AtomicU64,
+    /// 試験: ホストの `oplog_sync` を失敗させる。
+    #[cfg(test)]
+    fail_wal: AtomicBool,
 }
 
 struct Lines {
@@ -410,8 +424,8 @@ impl HostInner {
     }
 
     /// client `from` の record を当てる。 `through` は from の配り終えの線 (この batch を全部当てたら進める)。 戻り値は (返事の印,
-    /// from への ack)。
-    fn accept(&self, from: PeerId, records: Vec<WireRecord>, through: Option<Hlc>) -> (u8, Vec<(PeerId, Hlc)>) {
+    /// from への ack)。 WAL を書き出せなかった時は `None` (ack を返さない、 #961)。
+    fn accept(&self, from: PeerId, records: Vec<WireRecord>, through: Option<Hlc>) -> Option<(u8, Vec<(PeerId, Hlc)>)> {
         let lock = self.client_lock(from);
         let _serial = lock.lock().unwrap();
         let seen = |s: &Self| s.syncer.cursors_of(from).into_iter().find(|(a, _)| *a == from).map_or(Hlc::ZERO, |(_, h)| h);
@@ -419,10 +433,10 @@ impl HostInner {
         let mine = records.iter().any(|r| r.author_peer == from);
         if returning && mine {
             self.touch(from, |_| {});
-            return (STALE, self.syncer.cursors_of(from));
+            return Some((STALE, self.syncer.cursors_of(from)));
         }
         let top = records.iter().filter(|r| r.author_peer == from).map(|r| r.hlc).max();
-        let (out, all_in) = {
+        let (out, all_in, durable) = {
             let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
             self.loopback.inbox.lock().unwrap().insert(from, records);
             let out = self.syncer.pull_once(from);
@@ -432,11 +446,15 @@ impl HostInner {
             // 中継として WAL に載せた record を書き出してから ack を返す (ack で client は自分の ring から消すので、 その後にホストが
             // 落ちて中継の record を失うと、 他の client に届く道が無くなる)。 #698: LWW で負けた record / 宛先を解決できなかった
             // record も中継に載っている
-            if out.applied + out.skipped + out.dropped_unresolved + out.dropped_vocab > 0 {
-                let _ = self.engine.oplog_sync();
-            }
-            (out, all_in)
+            let durable = self.sync_for_ack(out.applied + out.skipped + out.dropped_unresolved + out.dropped_vocab > 0);
+            (out, all_in, durable)
         };
+        if !durable {
+            // #961: ack も配り終えの線も進めない (client は受けたと思わずに次の beat で送り直す。 届き直した record はホストの cursor が
+            // 越えているので当たらないが、 次の ack の前に書き出し直す = `sync_for_ack`)
+            self.touch(from, |_| {});
+            return None;
+        }
         self.touch(from, |c| {
             if all_in && !c.returned && let Some(t) = through {
                 c.through = Some(c.through.map_or(t, |cur| cur.max(t)));
@@ -452,7 +470,42 @@ impl HostInner {
         if out.history_truncated {
             self.asked_state.lock().unwrap().insert(from);
         }
-        (if out.history_truncated { NEED_STATE } else { 0 }, ack)
+        Some((if out.history_truncated { NEED_STATE } else { 0 }, ack))
+    }
+
+    /// #961: ack を返す前の WAL の書き出し。 `needed` = この呼びで WAL に載せた record がある。 書き出せたら (書き出す物が無かったら)
+    /// true。
+    ///
+    /// 前に失敗した書き出しがあれば、 `needed` でなくても書き出し直す: 失敗した回に載せた record は、 client が送り直しても当たらず
+    /// 載らない (ホストの cursor は当てた時に越えている。 越えていなくても、 当て直して負けた record は `relay_held` で 2 度載せない)
+    /// ので、 書き出さずに ack を返すと、 書き出していない record を受けたと言う。 失敗の数は書き出しを始める**前**に読む: 読んだ数の
+    /// 失敗は、 その回の record を載せた後に書き出しが返っている = この書き出しが覆う。 並んで失敗した回 (読んだ後に足された数) は
+    /// 覆ったと数えない。
+    fn sync_for_ack(&self, needed: bool) -> bool {
+        let failed = self.wal_failed.load(Ordering::Acquire);
+        if !needed && self.wal_cleared.load(Ordering::Acquire) >= failed {
+            return true;
+        }
+        match self.oplog_sync() {
+            Ok(()) => {
+                self.wal_cleared.fetch_max(failed, Ordering::AcqRel);
+                true
+            }
+            Err(e) => {
+                self.wal_failed.fetch_add(1, Ordering::AcqRel);
+                eprintln!("[enchudb] host: oplog_sync failed ({e}) — not acking, the client will send the records again");
+                false
+            }
+        }
+    }
+
+    /// ホストの WAL の書き出し (試験は失敗させられる)。
+    fn oplog_sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_wal.load(Ordering::Acquire) {
+            return Err(io::Error::other("test: oplog_sync fails"));
+        }
+        self.engine.oplog_sync()
     }
 
     /// client `c` が来た: last_seen を今にして `f` を当て、 線を計算し直す。 外した client が来たら、 戻ったとして断る側に回す。
@@ -673,6 +726,10 @@ impl HttpHost {
             lines_path,
             clock,
             gate: RwLock::new(()),
+            wal_failed: AtomicU64::new(0),
+            wal_cleared: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_wal: AtomicBool::new(false),
         });
 
         let listener = TcpListener::bind(bind_addr)?;
@@ -750,7 +807,10 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             let Some(from) = peer_param("peer") else { return send_response(&mut stream, 400, b"peer") };
             let Ok(records) = decode_batch(&req.body) else { return send_response(&mut stream, 400, b"batch") };
             let through = q.get("through").and_then(|s| parse_hlc(s));
-            let (flags, ack) = host.accept(from, records, through);
+            // #961: WAL を書き出せなかった = ack を返さない (古い client の道も同じ。 古い client は返事を読まない)
+            let Some((flags, ack)) = host.accept(from, records, through) else {
+                return send_response(&mut stream, 503, b"oplog_sync");
+            };
             if req.route == "/publish" {
                 return send_response(&mut stream, 200, b"");
             }
@@ -836,8 +896,9 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             host.loopback.pushed_state.lock().unwrap().insert(author, state);
             let ok = host.syncer.bootstrap_pull_via(author, author).is_some();
             host.loopback.pushed_state.lock().unwrap().remove(&author);
-            let _ = host.engine.oplog_sync();
-            send_response(&mut stream, if ok { 200 } else { 500 }, b"")
+            // #961: 書き出せなかったら、 次の publish の ack の前に書き出し直す (state で当てた record も cursor を進めている)
+            let durable = host.sync_for_ack(true);
+            send_response(&mut stream, if ok && durable { 200 } else { 500 }, b"")
         }
         _ => send_response(&mut stream, 404, b"not found"),
     }
@@ -861,7 +922,8 @@ pub struct HttpHostTransport {
     me: PeerId,
     /// ホストが当てた位置 (publish の返事)。 `take_pull_acks_multi` で `Syncer` に渡す。
     pending_acks: Mutex<HashMap<PeerId, Vec<(PeerId, Hlc)>>>,
-    /// 書き手ごとにホストが当てた位置 (送り済みの record を送り直さない)。
+    /// 書き手ごとにホストが当てた位置 (送り済みの record を送り直さない)。 上がるだけで、 ホストの世代には結んでいない: 同じ URL の
+    /// 裏でホストを空の DB で作り直した / 戻したホストが ack 済みの record を持っていない時、 この process の間は送り直さない (#961)。
     acked: Mutex<Vec<(PeerId, Hlc)>>,
     /// 最後の pull の返事にあったホストの floor。
     floors: Mutex<Option<Vec<(PeerId, Hlc)>>>,
@@ -915,6 +977,12 @@ impl HttpHostTransport {
         self.host
     }
 
+    /// 送らずに捨てる位置: ホストが受けた位置 (`acked`) の写し。 `publish_to` の捨て ([`above_floor`]) と `publish_floor` はどちらも
+    /// これから作る (#962: `Transport::publish_floor` の約束 = 言う位置以下の record は送らない、 を形で揃える)。
+    fn sent_floor(&self) -> Cursors {
+        self.acked.lock().unwrap().clone()
+    }
+
     /// ホストが求めたので、 自分 (`author`) の state を送る。
     fn push_state(&self, author: PeerId) {
         let provider = self.own_state.lock().unwrap().get(&author).cloned();
@@ -939,11 +1007,8 @@ impl Transport for HttpHostTransport {
     }
 
     fn publish_to(&self, from: PeerId, _to: PeerId, records: Vec<WireRecord>) {
-        let records: Vec<WireRecord> = {
-            let acked = self.acked.lock().unwrap();
-            let done = |a: PeerId| acked.iter().find(|(p, _)| *p == a).map_or(Hlc::ZERO, |(_, h)| *h);
-            records.into_iter().filter(|r| r.hlc > done(r.author_peer)).collect()
-        };
+        let floor = self.sent_floor();
+        let records: Vec<WireRecord> = records.into_iter().filter(|r| above_floor(&floor, r)).collect();
         // 送る record が無くても、 配り終えの線が進んだら言う (書き込みの無い client が線を止めない)
         let (through, sent) = *self.through.lock().unwrap();
         if records.is_empty() && (from != self.me || through.is_none() || through == sent) {
@@ -973,8 +1038,9 @@ impl Transport for HttpHostTransport {
 
     /// #955: `publish_to` が捨てる位置 = ホストが受けた位置 (`acked`、 `merge_max` で上がるだけなので、 この後の `publish_to` が捨てる
     /// 位置以下)。 `Syncer` は先に聞いて、 ホストが受けた record を集めない (since = ZERO の publish が ack 済みの行を写して decode しない)。
+    /// #962: `publish_to` の捨てと同じ [`HttpHostTransport::sent_floor`] から作る。
     fn publish_floor(&self, _from: PeerId, _to: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
-        Some(self.acked.lock().unwrap().clone())
+        Some(self.sent_floor())
     }
 
     fn uses_published_through(&self) -> bool {
@@ -1307,6 +1373,113 @@ mod tests {
         drop(host);
         drop(eng);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// #961: ホストが ack を返す前の WAL の書き出し (`oplog_sync`) に失敗したら、 ack を返さない (client は受けたと思わずに次の beat で
+    /// 送り直す)。 送り直した record はホストの cursor が越えているので当たらないが、 書き出せるまでは、 その送り直しにも ack を返さない
+    /// (失敗した回に載せた record は書き出していない)。 書き出せた後は ack を返す。
+    #[test]
+    fn a_failed_oplog_sync_does_not_ack() {
+        let dir = std::env::temp_dir().join(format!("enchudb-961-host-ack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str, peer: PeerId| {
+            let path = dir.join(name).to_str().unwrap().to_string();
+            {
+                let mut eng = Engine::create_standalone(&path).unwrap();
+                eng.define_table("rows", 100).unwrap();
+                eng.define_himo_in("rows", "val", enchudb::ValueType::Number, 0).unwrap();
+                eng.enable_sync_tables().unwrap();
+                eng.flush().unwrap();
+            }
+            let eng = Engine::open_concurrent_with_oplog(&path, 8 << 20).unwrap();
+            eng.set_peer_id(peer);
+            eng
+        };
+        let host_eng = mk("host", 100);
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
+        let c = mk("c1", 1);
+        let t = Arc::new(HttpHostTransport::connect(format!("http://{}", host.addr()), 1).unwrap());
+        let s = Syncer::new(c.clone(), t.clone());
+        let row = c.entity_in("rows").unwrap();
+        c.tie_to(row, "rows.val", 42);
+        c.oplog_commit();
+        c.oplog_sync().unwrap();
+        while c.transfer_oplog_to_sync_ops() > 0 {}
+        let top = c.settled_sync_records(|a, _| a == 1).iter().map(|r| r.hlc).max();
+        assert!(top.is_some(), "前提: client の ring に自分の record がある");
+        let acked = |t: &HttpHostTransport| t.sent_floor().iter().find(|(a, _)| *a == 1).map(|(_, h)| *h);
+        let pending = |t: &HttpHostTransport| t.pending_acks.lock().unwrap().values().any(|v| !v.is_empty());
+
+        host.inner.fail_wal.store(true, Ordering::Release);
+        s.publish_since(Hlc::ZERO);
+        assert_eq!(host_eng.pull_raw("rows.val", 42).len(), 1, "前提: ホストに届いて当たった");
+        assert!(
+            host.syncer().cursors_of(1).iter().any(|&(a, h)| a == 1 && Some(h) == top),
+            "前提: ホストの cursor は当てた record を越えた (送り直しは当たらない)"
+        );
+        assert_eq!(acked(&t), None, "WAL を書き出せなかったのに ack を返した");
+        assert!(!pending(&t), "WAL を書き出せなかったのに、 client の ring を回収する ack を渡した");
+
+        // 送り直す (ack 済みと思っていない)。 書き出せないままなら、 当たらない送り直しにも ack を返さない
+        s.publish_since(Hlc::ZERO);
+        assert_eq!(acked(&t), None, "送り直しに、 書き出していない record の ack を返した");
+        assert!(!pending(&t));
+
+        host.inner.fail_wal.store(false, Ordering::Release);
+        s.publish_since(Hlc::ZERO);
+        assert_eq!(acked(&t), top, "書き出せた後も ack を返さない");
+        drop(s);
+        drop(t);
+        drop(host);
+        drop(host_eng);
+        drop(c);
+
+        // client が送った state (ホストが求めた、 #699) を当てた後の書き出しに失敗した時も同じ: state はホストの cursor を as_of に
+        // 進めるので、 次の publish の ack は state の record を覆う。 書き出せるまでは返さない
+        let host_eng = mk("host2", 100);
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), None).unwrap();
+        let c = mk("c2", 1);
+        let t = Arc::new(HttpHostTransport::connect(format!("http://{}", host.addr()), 1).unwrap());
+        let s = Syncer::new(c.clone(), t.clone());
+        s.serve_state();
+        let settle = |c: &Engine| {
+            c.oplog_commit();
+            c.oplog_sync().unwrap();
+            while c.transfer_oplog_to_sync_ops() > 0 {}
+        };
+        let row = c.entity_in("rows").unwrap();
+        c.tie_to(row, "rows.val", 1);
+        settle(&c);
+        // ホストに出す前に回収した (ホストの cursor は client の floor に届かない = ホストは state を求める)
+        c.ack_sync(100, c.current_sync_lsn() + 1).unwrap();
+        assert!(c.reclaim_sync_ops() > 0, "前提: client の ring を回収した");
+        let row = c.entity_in("rows").unwrap();
+        c.tie_to(row, "rows.val", 2);
+        settle(&c);
+        host.inner.fail_wal.store(true, Ordering::Release);
+        s.publish_since(Hlc::ZERO);
+        assert_eq!(
+            [host_eng.pull_raw("rows.val", 1).len(), host_eng.pull_raw("rows.val", 2).len()],
+            [1, 1],
+            "前提: ホストが state を求めて当てた"
+        );
+        let as_of = host.syncer().cursors_of(1).iter().find(|(a, _)| *a == 1).map(|(_, h)| *h);
+        let top = c.settled_sync_records(|a, _| a == 1).iter().map(|r| r.hlc).max();
+        assert!(as_of.is_some() && as_of >= top, "前提: state でホストの cursor が client の record を越えた ({as_of:?} / {top:?})");
+        assert_eq!(acked(&t), None, "前提: state の返事は ack を運ばない");
+        s.publish_since(Hlc::ZERO);
+        assert_eq!(acked(&t), None, "state を書き出せなかったのに、 次の publish で ack を返した");
+        assert!(!pending(&t));
+        host.inner.fail_wal.store(false, Ordering::Release);
+        s.publish_since(Hlc::ZERO);
+        assert_eq!(acked(&t), as_of, "書き出せた後も ack を返さない");
+        drop(s);
+        drop(t);
+        drop(host);
+        drop(host_eng);
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
