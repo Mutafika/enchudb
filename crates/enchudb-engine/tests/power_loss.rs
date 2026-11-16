@@ -4103,13 +4103,26 @@ fn a_wal_open_failure_before_the_prev_restore_leaves_it_to_the_next_open() {
 /// 残す (無ければ WAL に再生する record は無い = 単独の open は往復しない)。 故障が無ければ、 開く時の突き合わせが削除を完了させて (1, 0)、
 /// 残った cell を落とす (note = 3 を引いても 0 件)。 戻り値は像の DB。
 fn reconcile_image(root: &Path, replay: bool) -> PathBuf {
+    reconcile_image_with(root, replay, false)
+}
+
+/// [`reconcile_image`] の、 `sync` なら sync する DB (版数の列と sync の表がある) の形。 sync する DB はきれいに閉じていないので、 単独の open は
+/// 開いた後に #451 の往復をする。
+fn reconcile_image_with(root: &Path, replay: bool, sync: bool) -> PathBuf {
     let (made, before, after, img) = (root.join("made"), root.join("before"), root.join("after"), root.join("img"));
     {
-        let mut eng = Engine::create_with_capacity(made.to_str().unwrap(), 65_536).unwrap();
+        let mut eng = if sync {
+            Engine::create_with_cell_version(made.to_str().unwrap(), 65_536).unwrap()
+        } else {
+            Engine::create_with_capacity(made.to_str().unwrap(), 65_536).unwrap()
+        };
         eng.define_table("notes", 2).unwrap();
         eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
         eng.define_table("full", 1).unwrap();
         eng.define_himo_in("full", "x", ValueType::Number, 0).unwrap();
+        if sync {
+            eng.enable_sync_tables().unwrap();
+        }
         let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
         eng.set_peer_id(1);
         let a = eng.entity_in("notes").unwrap();
@@ -4162,6 +4175,48 @@ fn every_probe_failure_in_a_standalone_open_leaves_the_reconcile_whole() {
         assert!(faulted.starts_with("ERR ") && faulted.contains("#989"), "{nth} 番目の聞く点: 聞けないのに単独で開いた: {faulted}");
         let (again, _) = run_probe_child("standalone_gen", &probed, 3, &[]);
         assert_eq!(again, clean, "{nth} 番目の聞く点: 断った後の開き直しが、 突き合わせの仕上げをしない (消えた行が引ける)");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 読み直し 3 の [1]: 単独の open は、 #451 の往復が要るか (WAL の file があるか) も、 writer lock の下で開く時の直しが何かを書く前に聞いた
+/// stat の答えで決める。 単独の open 自身の stat (往復の WAL 付きの open が WAL を開く前の stat より前の点) のどれに故障を起こしても、 何も
+/// 書かずに断る (開く時の突き合わせが直す gen.seg / entities.seg が像のまま)。 開き直せば故障の無い open と同じ。 v15 の突き合わせのある
+/// sync する DB の像 (きれいに閉じていない = 開いた後に往復する、 WAL に再生する record は無い)。
+///
+/// 読み直し 2 の直しは往復の要否を本体を開いた後にもう一度 stat で聞き、 その stat の失敗で、 突き合わせが直し (`kill_generation` /
+/// `live_free`、 仕上げの cell 落とし) を map に書いた後に断った (開き直した突き合わせは直した場所を見つけない)。
+#[test]
+fn a_stat_failure_in_a_standalone_open_refuses_before_any_repair() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("stat_fault_standalone_relog");
+    let img = reconcile_image_with(&root, false, true);
+    let (clean, points) = count_points(&root, &img, "standalone_gen", 3);
+    assert!(clean.starts_with("OK 0 "), "前提: 故障が無ければ開けて、 消えた c が引けない: {clean}");
+    let repaired = ["gen.seg", "entities.seg"];
+    let read = |db: &Path, f: &str| std::fs::read(db.join(f)).unwrap();
+    for f in repaired {
+        assert!(read(&root.join("counted"), f) != read(&img, f), "前提: 単独の open の突き合わせが {f} を直す");
+    }
+    // 往復の WAL 付きの open は WAL の file を stat してから開く。 その stat より前の stat が単独の open 自身の物
+    let open = points.iter().position(|(_, s)| s == "oplog.open");
+    let Some(open) = open.filter(|&i| i > 0 && points[i - 1].1 == "oplog.stat") else {
+        panic!("前提: 単独の open が #451 の往復で WAL を開く: {points:?}")
+    };
+    let own = points_named(&points, "oplog.stat").into_iter().filter(|&n| n < points[open - 1].0).count();
+    assert!(own >= 1, "前提: 単独の open が WAL の file を stat する: {points:?}");
+    let after = root.join("after_stat_fault");
+    for nth in 1..=own {
+        let faulted = fault_at(&img, "standalone_gen", 3, &points, "oplog.stat", nth, &after);
+        assert!(faulted.starts_with("ERR "), "{nth} 番目の stat: 故障したのに開いた: {faulted}");
+        for f in repaired {
+            assert!(read(&after, f) == read(&img, f), "{nth} 番目の stat: 開く時の直し ({f}) を書いた後に断った: {faulted}");
+        }
+        let (again, _) = run_probe_child("standalone_gen", &after, 3, &[]);
+        assert_eq!(again, clean, "{nth} 番目の stat: 断った後の開き直しが、 故障の無い open と違う");
     }
     let _ = std::fs::remove_dir_all(&root);
 }

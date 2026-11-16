@@ -1938,7 +1938,8 @@ impl OpLog {
     }
 
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。 2 区画にできる大きさ (`2 * HALF_ALIGN` 以上) なら v5、 できなければ
-    /// 1 区画の v5 (版の数は 6)。
+    /// 1 区画の v5 (版の数は 6)。 header ([`HEADER_SIZE`]) より小さい capacity は 1 区画も作れないので `InvalidInput` (前は header を
+    /// 書く所で範囲外の panic、 file は truncate した後。 PR #986 の読み直し 3 の [2])。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &Path, capacity: usize) -> io::Result<Self> {
         crate::io_point("oplog.create")?;
@@ -1946,6 +1947,12 @@ impl OpLog {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("oplog capacity {capacity} must be below 4 GiB (the header keeps it in 32 bits)"),
+            ));
+        }
+        if capacity < HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("oplog capacity {capacity} is smaller than the WAL header ({HEADER_SIZE} bytes)"),
             ));
         }
         let file = OpenOptions::new()
@@ -5070,6 +5077,26 @@ mod tests {
         let t = at + REC_HEADER_SIZE + len;
         let lap = u32::from_le_bytes(bytes[t..t + 4].try_into().unwrap());
         write_lap_trailer(&mut bytes[t..t + LAP_TRAILER], lap, bind_word(crc));
+    }
+
+    /// PR #986 の読み直し 3 の [2]: header より小さい capacity は `InvalidInput` で断る (前は `fresh_layout` が header を書く所で範囲外の
+    /// panic)。 断る時は file を作らず、 既にある file を切り詰めない。 header ちょうどの capacity は作れて、 開き直せる。
+    #[test]
+    fn create_refuses_a_capacity_smaller_than_the_header() {
+        let p = tmp("create-tiny");
+        for cap in [0, 16, HEADER_SIZE - 1] {
+            match OpLog::create(&p, cap) {
+                Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "capacity {cap}: {e}"),
+                Ok(_) => panic!("capacity {cap} の WAL を作った"),
+            }
+        }
+        assert!(!p.exists(), "断った create が file を作った");
+        std::fs::write(&p, [7u8; 16]).unwrap();
+        assert!(OpLog::create(&p, 16).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), [7u8; 16], "断った create が既にある file を切り詰めた");
+        drop(OpLog::create(&p, HEADER_SIZE).expect("header ちょうどの WAL を作れない"));
+        drop(OpLog::open(&p).expect("header ちょうどの WAL を開き直せない"));
+        let _ = std::fs::remove_file(&p);
     }
 
     /// #972: 写しの map を作れない時 (`vm.overcommit_memory = 2` の `ENOMEM` など)、 聞く読みは読み書きの map (本当の open と同じ) で

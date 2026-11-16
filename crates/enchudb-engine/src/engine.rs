@@ -2029,6 +2029,21 @@ impl<'w> ReplayAhead<'w> {
     }
 }
 
+/// 単独の open が writer lock の下で WAL の file に聞いた答え ([`Engine::wal_records_to_replay`])。
+#[cfg(not(target_arch = "wasm32"))]
+struct WalAsked {
+    /// WAL の file の大きさ (file が無ければ None)。 #451 の往復の要否と、 往復の WAL 付きの open に渡す容量
+    /// ([`Engine::relog_before_standalone_session`]、 PR #986 の読み直し 3 の [1])
+    len: Option<u64>,
+    /// WAL に再生する record があれば WAL の容量 (往復の WAL 付きの open に渡す)
+    replay: Option<usize>,
+}
+
+/// #451 の往復 ([`Engine::relog_before_standalone_session`]) が、 header より短い (一度も書き出していない) WAL の file を作り直す時の
+/// 容量 (`Engine::open` と同じ)。 その file の大きさは WAL の容量を言わない (作った直後・`set_len` の前に落ちた)。
+#[cfg(not(target_arch = "wasm32"))]
+const STANDALONE_RELOG_OPLOG_CAPACITY: usize = 16 * 1024 * 1024;
+
 /// `.db.lock` に flock(LOCK_EX) を取り、 guard を返す。 guard が drop されると
 /// lock も解放。 **別プロセス**が保持中は block する (= sqlite と同様、 取れる
 /// まで待つ)。 **同一プロセス**が既に保持中は block せず即エラー (#80、
@@ -10706,7 +10721,8 @@ impl Engine {
     /// write の作り直し (#451) を飛ばして、 その write が相手に配られないまま残るので。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
-        let eng = Self::open_standalone_after_replay(path)?.relog_before_standalone_session(path)?;
+        let (eng, wal_len) = Self::open_standalone_after_replay(path)?;
+        let eng = eng.relog_before_standalone_session(path, wal_len)?;
         // #976 の読み直し 2 [B2]: WAL を再生しない open は、 記録から戻した所で前の住人の後始末が揃う (`prev.seg` の周期を進め始める)
         eng.finish_open_restores(false);
         Ok(eng)
@@ -10726,29 +10742,36 @@ impl Engine {
     ///
     /// 往復で lock を放してから取り直すまでの間に別の process が取れば、 その process が放すまで待つ (2 つの process が同時に開いた時と同じ)。
     /// 別の process の書き手が生きている時は lock で待つ (前の単独の open が lock で待っていたのと同じ)。
+    ///
+    /// 戻り値の 2 つ目は、 lock の下で聞いた時の WAL の file の大きさ (file が無ければ None)。 #451 の往復の要否
+    /// ([`Self::relog_before_standalone_session`]) はこの答えで決める (PR #986 の読み直し 3 の [1]): 返す engine が lock を持ち続けるので、
+    /// 答えてから往復の要否を決めるまでに WAL の file は変わらない。 前は本体を開いた後 (直しを map に書いた後) にもう一度 stat で聞き、
+    /// その stat が一時に失敗すると書いた後に断った (開き直した突き合わせは直した場所を見つけない)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_standalone_after_replay(path: &str) -> io::Result<Self> {
+    fn open_standalone_after_replay(path: &str) -> io::Result<(Self, Option<u64>)> {
         let lock = Self::writer_lock_for_open(path)?;
-        let lock = match Self::wal_records_to_replay(path)? {
-            None => lock,
+        let asked = Self::wal_records_to_replay(path)?;
+        let (lock, wal_len) = match asked.replay {
+            None => (lock, asked.len),
             Some(cap) => {
                 drop(lock);
                 drop(Self::open_concurrent_with_oplog(path, cap)?);
                 Self::lock_with_nothing_to_replay(path)?
             }
         };
-        Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)
+        Ok((Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?, wal_len))
     }
 
     /// #880: 往復 (WAL 付きの open で再生して閉じた) の後に、 単独で開き直すための writer lock を取り、 WAL に再生する record が残って
-    /// いないことを lock の下で確かめる (残っていれば断る、 聞けなければ断る)。
+    /// いないことを lock の下で確かめる (残っていれば断る、 聞けなければ断る)。 戻り値の 2 つ目は lock の下で見た WAL の file の大きさ。
     #[cfg(not(target_arch = "wasm32"))]
-    fn lock_with_nothing_to_replay(path: &str) -> io::Result<WriterLock> {
+    fn lock_with_nothing_to_replay(path: &str) -> io::Result<(WriterLock, Option<u64>)> {
         let lock = Self::writer_lock_for_open(path)?;
-        if Self::wal_records_to_replay(path)?.is_some() {
+        let asked = Self::wal_records_to_replay(path)?;
+        if asked.replay.is_some() {
             return Err(Self::wal_left_after_replay());
         }
-        Ok(lock)
+        Ok((lock, asked.len))
     }
 
     /// 書き手の open の writer lock (DB の directory を確かめてから、 mmap の前に取る = 他の書き手が居れば待つ)。
@@ -10773,32 +10796,32 @@ impl Engine {
     /// 往復の後も WAL に再生する record が残るか、 印が倒れたまま (WAL 付きの open が閉じる時に印を立てられなかった) なら断る。
     /// WAL の file が無い DB は往復しない: WAL 付きの open が WAL を作ることになり、 その大きさ (後で WAL 付きで開く時に渡す値) を
     /// 単独の open は知らない。 WAL を通らない書き込みは版数を付けない (`Hlc::ZERO` = 作り直しの対象外) ので、 WAL の file が無いまま
-    /// 書いた write は作り直す物でもない。 WAL の file があるかを stat で知れなければ (PR #986 の読み直し 2 の [3]) 断る: 「無い」 と
-    /// 読むと往復せずに開き、 閉じる時に印を立てて作り直しを飛ばす。
-    /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。
+    /// 書いた write は作り直す物でもない。
+    ///
+    /// WAL の file があるか (`wal_len`) は、 単独の open が writer lock の下で、 開く時の直しが何かを書く前に stat で聞いた答え
+    /// ([`Self::open_standalone_after_replay`]、 lock は `self` が持ち続ける)。 ここで聞き直さない (PR #986 の読み直し 3 の [1]): 前は
+    /// ここで stat し直し、 一時に失敗すると、 `open_internal` が直し (突き合わせの `kill_generation` / `live_free`、 仕上げの cell 落とし、
+    /// 記録の戻し) を map に書いた後に断った (開き直した突き合わせは直した場所を見つけない)。 lock の下の stat に失敗すれば、 何も
+    /// 書かずに断っている (#989、 読み直し 2 の [3])。
+    ///
+    /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。 ただし header より短い file (作った直後・
+    /// `set_len` の前に落ちた = 0 B もある) は、 その大きさでは WAL を作れない (前は `OpLog::create` が header を書く所で範囲外の panic、
+    /// 読み直し 3 の [2]) ので [`STANDALONE_RELOG_OPLOG_CAPACITY`] で作る。
     #[cfg(not(target_arch = "wasm32"))]
-    fn relog_before_standalone_session(self, path: &str) -> io::Result<Self> {
+    fn relog_before_standalone_session(self, path: &str, wal_len: Option<u64>) -> io::Result<Self> {
         if !self.relogs_unlogged_writes_on_open() {
             return Ok(self);
         }
-        let len = match Self::oplog_file_len(&oplog_path_for(path)) {
-            Ok(Some(len)) => len,
-            Ok(None) => return Ok(self),
-            Err(e) => {
-                self.abandoned.store(true, std::sync::atomic::Ordering::Release);
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "could not tell whether the DB has a WAL to relog the writes that are not in it ({e}) — \
-                         refusing to open without it (#451 / #880, try again)"
-                    ),
-                ));
-            }
+        let Some(len) = wal_len else { return Ok(self) };
+        let capacity = if len < enchudb_oplog::oplog::HEADER_SIZE as u64 {
+            STANDALONE_RELOG_OPLOG_CAPACITY
+        } else {
+            len as usize
         };
         self.abandoned.store(true, std::sync::atomic::Ordering::Release);
         drop(self);
-        drop(Self::open_concurrent_with_oplog(path, len as usize)?);
-        let lock = Self::lock_with_nothing_to_replay(path)?;
+        drop(Self::open_concurrent_with_oplog(path, capacity)?);
+        let (lock, _) = Self::lock_with_nothing_to_replay(path)?;
         let eng = Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?;
         if eng.relogs_unlogged_writes_on_open() {
             eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
@@ -10824,8 +10847,8 @@ impl Engine {
         }
     }
 
-    /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)。 単独の open が writer lock の下で
-    /// 聞く ([`Self::open_standalone_after_replay`])。
+    /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)、 と WAL の file の大きさ (#451 の
+    /// 往復の要否に使う、 PR #986 の読み直し 3 の [1])。 単独の open が writer lock の下で聞く ([`Self::open_standalone_after_replay`])。
     /// WAL の中身が壊れている / 切り詰められている (`InvalidData`) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を
     /// 見ずに開く、 警告だけ出す)。
     ///
@@ -10836,23 +10859,23 @@ impl Engine {
     /// #989: それ以外の失敗 (WAL の file の stat・一時の I/O の失敗・資源不足・読めない権限) は Err で返す (呼び手は何も書かずに断る)。
     /// 「再生する物が無い」 と読むと、 単独の open は WAL を見ずに開いた (WAL にだけある値を黙って失う、 #880 の前の形)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn wal_records_to_replay(path: &str) -> io::Result<Option<usize>> {
+    fn wal_records_to_replay(path: &str) -> io::Result<WalAsked> {
         use enchudb_oplog::oplog::OpLog;
         let oplog_path = oplog_path_for(path);
-        let probe = match Self::oplog_file_len(&oplog_path) {
-            Ok(None) => return Ok(None),
-            Ok(Some(_)) => match OpLog::was_never_written(&oplog_path) {
-                Ok(true) => return Ok(None),
-                Ok(false) => OpLog::probe_replay(&oplog_path),
-                Err(e) => Err(e),
+        let (len, probe) = match Self::oplog_file_len(&oplog_path) {
+            Ok(None) => return Ok(WalAsked { len: None, replay: None }),
+            Ok(Some(len)) => match OpLog::was_never_written(&oplog_path) {
+                Ok(true) => return Ok(WalAsked { len: Some(len), replay: None }),
+                Ok(false) => (Some(len), OpLog::probe_replay(&oplog_path)),
+                Err(e) => (Some(len), Err(e)),
             },
-            Err(e) => Err(e),
+            Err(e) => (None, Err(e)),
         };
         match probe {
-            Ok(p) => Ok(p.records.then_some(p.capacity as usize)),
+            Ok(p) => Ok(WalAsked { len, replay: p.records.then_some(p.capacity as usize) }),
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!("[enchudb] warning: the WAL is corrupt or cut short ({e}) — opening without replaying it (#880)");
-                Ok(None)
+                Ok(WalAsked { len, replay: None })
             }
             Err(e) => Err(io::Error::new(
                 e.kind(),

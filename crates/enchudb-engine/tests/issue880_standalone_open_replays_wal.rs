@@ -446,9 +446,14 @@ fn a_standalone_open_refuses_when_the_round_trip_cannot_close_cleanly() {
     assert!(!refused.is_empty(), "前提: 窓のどの点の故障でも、 往復が clean の印を立てられない形にならなかった");
 }
 
-/// PR #986 の読み直し 2 の [3] (D の続き): 単独の open が、 往復が要るか (WAL の file があるか) を知る stat に失敗したら断る。 前は
-/// `std::fs::metadata` の Err を 「WAL の file が無い」 と読んで往復せずに開き、 閉じると clean の印が立ち、 次の WAL 付きの open が #451 の
-/// 作り直しを飛ばした (本体にだけあった b の write が配る分に無く、 floor も覆わない)。 断った後も何も失っておらず、 開き直せば往復する。
+/// PR #986 の読み直し 2 の [3] / 読み直し 3 の [1] (D の続き): #451 の往復が要るか (WAL の file があるか) は、 単独の open が writer lock の
+/// 下で、 開く時の直しが何かを書く前に stat で聞いた答えで決める。 その stat に失敗したら何も書かずに断る (`#989`)。 断った後も何も失って
+/// おらず、 開き直せば往復する。
+/// - 読み直し 2 の前は `std::fs::metadata` の Err を 「WAL の file が無い」 と読んで往復せずに開き、 閉じると clean の印が立ち、 次の WAL
+///   付きの open が #451 の作り直しを飛ばした (本体にだけあった b の write が配る分に無く、 floor も覆わない)
+/// - 読み直し 2 の直しは、 往復の要否を本体を開いた後 (開く時の直しを map に書いた後) にもう一度 stat で聞き、 その stat の失敗で書いた後に
+///   断った (書いた直しが残る形は power_loss の `a_stat_failure_in_a_standalone_open_refuses_before_any_repair`)。 今、 lock の下で聞いた
+///   後から往復で WAL を開くまでの stat は、 往復の WAL 付きの open が WAL を開く所 (`oplog.open` の直前) の 1 回だけ
 #[test]
 fn a_standalone_open_refuses_when_it_cannot_stat_the_wal_for_the_relog() {
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -464,20 +469,73 @@ fn a_standalone_open_refuses_when_it_cannot_stat_the_wal_for_the_relog() {
         .lines()
         .filter_map(|l| l.split_once('\t').map(|(n, s)| (n.parse().unwrap(), s.to_string())))
         .collect();
-    // 単独の open は lock の下で聞き (`oplog.stat` → `oplog.probe`、 WAL に再生する record は無い)、 往復が要るかを見る stat の後に
-    // 往復で WAL を開く (`oplog.open`)
+    // 単独の open は lock の下で聞き (`oplog.stat` → `oplog.probe`、 WAL に再生する record は無い)、 往復で WAL を開く (`oplog.stat` →
+    // `oplog.open`)
     let probe = sites.iter().find(|(_, s)| s == "oplog.probe").map(|(n, _)| *n);
-    let open = sites.iter().find(|(_, s)| s == "oplog.open").map(|(n, _)| *n);
+    let open = sites.iter().position(|(_, s)| s == "oplog.open");
     let (Some(probe), Some(open)) = (probe, open) else { panic!("前提: 単独の open が聞いてから往復する: {sites:?}") };
-    let stat = sites.iter().find(|(n, s)| s == "oplog.stat" && *n > probe && *n < open).map(|(n, _)| *n);
-    let Some(stat) = stat else { panic!("前提: 往復の前に WAL の file を stat で見る: {sites:?}") };
+    let stats_in = |lo: u64, hi: u64| -> Vec<u64> {
+        sites.iter().filter(|(n, s)| s == "oplog.stat" && *n > lo && *n < hi).map(|(n, _)| *n).collect()
+    };
+    let asked = stats_in(0, probe);
+    assert_eq!(asked.len(), 1, "前提: 単独の open は lock の下で WAL の file を 1 回 stat してから聞く: {sites:?}");
+    assert!(
+        open > 0 && sites[open - 1].1 == "oplog.stat",
+        "前提: 往復の WAL 付きの open は WAL の file を stat してから開く: {sites:?}"
+    );
+    let between = stats_in(probe, sites[open].0);
+    assert_eq!(
+        between,
+        vec![sites[open - 1].0],
+        "単独の open が、 lock の下で聞いた後 (本体を開いて直しを書いた後) に、 往復の要否を WAL の file の stat でもう一度聞いた \
+         (聞く点 {probe}、 往復が WAL を開く点 {})",
+        sites[open].0
+    );
     let img = root.join("faulted");
     copy(&u.db, &img);
-    let (line, fired) = run_child(&img, &[("ENCHU_FAULT_AT", stat.to_string())]);
-    assert!(fired.as_deref().is_some_and(|f| f.ends_with(" oplog.stat")), "前提: 往復の前の stat に故障を当てた: {fired:?}");
-    assert!(line.starts_with("ERR ") && line.contains("#451"), "WAL の file の stat に失敗したのに往復せずに開いた: {line}");
+    let (line, fired) = run_child(&img, &[("ENCHU_FAULT_AT", asked[0].to_string())]);
+    assert!(fired.as_deref().is_some_and(|f| f.ends_with(" oplog.stat")), "前提: lock の下の stat に故障を当てた: {fired:?}");
+    assert!(line.starts_with("ERR ") && line.contains("#989"), "WAL の file の stat に失敗したのに断らなかった: {line}");
     match assert_nothing_lost(&img, &u, "stat の失敗で断った後") {
         Delivery::Relogged(hlc) => assert!(hlc > u.written_at, "作り直した record は新しい HLC"),
         d => panic!("作り直さずに floor で済ませた: {d:?}"),
+    }
+}
+
+/// PR #986 の読み直し 3 の [2] (D の続き): 一度も書き出していない WAL の file が header より短い (`concurrentize_with_oplog` が clean の印を
+/// 倒した後、 `OpLog::create` の file の作成だけ届いて `set_len` の前に落ちた = 0 B など) sync する DB を単独で開いても panic しない。
+/// #451 の往復は、 その file の大きさでは WAL を作れないので既定の容量で作る。 前は file の大きさ (0 / 16) を容量に渡し、 `OpLog::create`
+/// が header を書く所で範囲外の panic をした。 開いた後も値は残り、 WAL 付きで開き直せる。
+#[test]
+fn a_standalone_relog_with_a_wal_shorter_than_its_header_does_not_panic() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for len in [0usize, 16] {
+        let s = scratch(&format!("shortwal{len}"));
+        let live = s.0.join("live");
+        let (eng, note) = sync_engine(&live.join("db"));
+        let hold = eng.hold_consumer();
+        let x = eng.entity_in("notes").unwrap();
+        eng.tie_to_by_id(x, note, 7u32);
+        eng.oplog_sync().unwrap();
+        // 生きている engine の写し = きれいに閉じていない (紐名の辞書の clean の印が倒れている)
+        let image = s.0.join("img");
+        copy(&live, &image);
+        drop(hold);
+        drop(eng);
+        let db = image.join("db");
+        std::fs::write(db.join("oplog"), vec![0u8; len]).unwrap();
+        {
+            let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
+            assert!(ro.himo_index_rebuilt_on_load(), "前提: 像はきれいに閉じていない (#451 の往復の条件)");
+        }
+        let st = Engine::open_standalone(db.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("{len} B の WAL: 単独で開けない: {e}"));
+        assert!(!st.himo_index_rebuilt_on_load(), "{len} B の WAL: 前提: #451 の往復をして clean の印を立てた");
+        assert_eq!(st.get_by_id(x, note), Some(7), "{len} B の WAL: 値を失った");
+        drop(st);
+        assert!(std::fs::metadata(db.join("oplog")).unwrap().len() >= enchudb_oplog::oplog::HEADER_SIZE as u64);
+        let c = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), 4 << 20)
+            .unwrap_or_else(|e| panic!("{len} B の WAL: 単独の後に WAL 付きで開けない: {e}"));
+        assert_eq!(c.get_by_id(x, note), Some(7), "{len} B の WAL: WAL 付きで開き直して値を失った");
     }
 }
