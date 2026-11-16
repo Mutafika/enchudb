@@ -43,6 +43,16 @@ use enchudb_oplog::PeerId;
 /// `(author_peer, foreign_local)` を key にした foreign→local 写像。
 type Key = (PeerId, u32);
 
+/// [`EidTranslator::get_or_insert_waiting`] の払い出しの結果。
+pub enum Alloc {
+    /// 払い出した local
+    Got(u32),
+    /// 確保先が無い (写像を作らずに `None`)
+    Skip,
+    /// 使い回す場所 (global) の行が他の書き手に握られていた (#974)。 `alloc_lock` を放してから待ち、 もう一度払い出す
+    Busy(u32),
+}
+
 /// foreign eid → local eid の翻訳テーブル。
 pub struct EidTranslator {
     inner: RwLock<HashMap<Key, u32>>,
@@ -296,18 +306,47 @@ impl EidTranslator {
         foreign_local: u32,
         alloc: impl FnOnce() -> Option<u32>,
     ) -> Option<u32> {
+        let mut alloc = Some(alloc);
+        // Got / Skip で返るので 2 回は呼ばない
+        let once = || match alloc.take().and_then(|f| f()) {
+            Some(local) => Alloc::Got(local),
+            None => Alloc::Skip,
+        };
+        self.get_or_insert_waiting(author_peer, foreign_local, once, |_| {})
+    }
+
+    /// [`Self::get_or_insert_with`] の、 払い出しが待つことのある形 (#974)。 `alloc` が `Busy(場所)` を返したら、 `alloc_lock` を
+    /// 放してから `wait(場所)` を呼び (何も持たずに待つ)、 取り直して写像を確かめ直してから `alloc` をもう一度呼ぶ。 前は払い出し
+    /// (`entity_in`) が `alloc_lock` を握ったまま使い回す場所の行を待ち、 その間は写像を払い出す受信が表によらず全部止まった。
+    pub fn get_or_insert_waiting(
+        &self,
+        author_peer: PeerId,
+        foreign_local: u32,
+        mut alloc: impl FnMut() -> Alloc,
+        mut wait: impl FnMut(u32),
+    ) -> Option<u32> {
         // fast path: 既に登録済みなら read lock だけで返す。
         if let Some(local) = self.get(author_peer, foreign_local) {
             return Some(local);
         }
-        // slow path: alloc_lock で直列化 → 再 check (= double-checked) → 確保 → 登録。
-        let _serialize = self.alloc_lock.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(local) = self.get(author_peer, foreign_local) {
-            return Some(local); // 別 thread が先に確保した
+        loop {
+            let busy = {
+                // slow path: alloc_lock で直列化 → 再 check (= double-checked) → 確保 → 登録。
+                let _serialize = self.alloc_lock.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(local) = self.get(author_peer, foreign_local) {
+                    return Some(local); // 別 thread が先に確保した
+                }
+                match alloc() {
+                    Alloc::Got(local) => {
+                        self.insert(author_peer, foreign_local, local);
+                        return Some(local);
+                    }
+                    Alloc::Skip => return None,
+                    Alloc::Busy(slot) => slot,
+                }
+            };
+            wait(busy);
         }
-        let local = alloc()?;
-        self.insert(author_peer, foreign_local, local);
-        Some(local)
     }
 
     /// #490: 写像が無ければ `f` を呼ぶ。 写像があれば `f` を呼ばずに `Err(local)`。

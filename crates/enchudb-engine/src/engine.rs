@@ -4297,8 +4297,16 @@ mod reuse_order_tests {
         let out: Arc<Mutex<Option<bool>>> = Default::default();
         {
             let (e2, out) = (eng.clone(), out.clone());
+            // 削除は受信の thread から (場所を取った書き手は Y の行を握っているので、 その thread で受信を当てない = #974 の
+            // `debug_assert_no_user_row`)。 写像は場所を生かす前に外してあるので、 削除は Y の行を待たずに返る
             reuse_claim_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
-                *out.lock().unwrap() = Some(e2.remote_delete_apply_foreign(enchudb_oplog::make_eid(C, 100), t_b));
+                let e3 = e2.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(e3.remote_delete_apply_foreign(enchudb_oplog::make_eid(C, 100), t_b));
+                });
+                let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("F0 宛ての削除が、 場所を取った書き手を待った");
+                *out.lock().unwrap() = Some(got);
             });
         }
         let y = eng.entity_in("t").unwrap();
@@ -4625,16 +4633,15 @@ mod reuse_order_tests {
         cleanup(&path, eng);
     }
 
-    /// entity-in-busy-wait の調べ (issue 前、 master で落ちる): 受信の払い出し (`resolve_remote_eid` → `EidTranslator::get_or_insert_with`
-    /// の中の `entity_in`) は `alloc_lock` を握ったまま、 使い回す場所の行を握れるまで待つ (#931 の try_write と探し直し。 その前の
-    /// #885 からは `drop_leftover_cells` の `row_locks.write` で待っていた = 0.37.4 は待たない)。 満杯の表 t の消えた行 G の場所と
-    /// 同じ stripe の生きた行 L をアプリが `write_row` で握っている間、 t への受信 (F) は G を握れずに回り、 その間は別の表 u への
-    /// 受信 (H、 払い出し位置から新しい場所を取るだけ) も `alloc_lock` で止まる。 0.37.4 は払い出しが行を待たず、 H は止まらなかった
-    /// (F は払い出した後の当て込みで L の stripe を待つが、 `alloc_lock` は放している)。
+    /// #974: 受信の払い出し (`resolve_remote_eid` → `EidTranslator::get_or_insert_waiting` の中の `entity_in`) が、 使い回す場所の行を
+    /// 他の書き手が握っている時に `alloc_lock` を握ったまま待たない。 満杯の表 t の消えた行 G の場所と同じ stripe の生きた行 L を
+    /// アプリが `write_row` で握っている間、 t への受信 (F) は G を握れない。 その間も、 別の表 u への受信 (H、 払い出し位置から新しい
+    /// 場所を取るだけ) は返る。 F は L を放した後に G を使い回す。
     ///
-    /// 止まる長さはアプリが行を握る長さ (L を握った書き手が WAL の空きを待てば上限 5 秒)。 同じ thread が行を握ったまま受信を呼ぶと
-    /// (`write_row` の doc が禁じる 「握ったまま別の thread の書き込みを待つ」 形)、 H の役がその thread になり、 F と互いを待って
-    /// 返らない。 確かめ: try_write の 「握れない」 を #931 の前の 「握らずに取る」 に戻しても落ちる (`drop_leftover_cells` で待つ)。
+    /// 直す前: F は `alloc_lock` を握ったまま G の行を待ち (#931 の try_write と探し直し。 その前の #885 からは `drop_leftover_cells`
+    /// の `row_locks.write`。 0.37.4 は待たない)、 H も L を放すまで返らなかった (この試験は 5 秒で落ちた)。 同じ thread が行を握ったまま
+    /// 受信を呼ぶと (`write_row` の doc が禁じる形、 debug build は `debug_assert_no_user_row` で止まる)、 H の役がその thread になり F と
+    /// 互いを待って返らなかった。
     #[test]
     fn a_reuse_waiting_for_a_busy_slot_does_not_stall_receives_into_other_tables() {
         use std::sync::mpsc::channel;
@@ -4701,6 +4708,25 @@ mod reuse_order_tests {
             "別の表 u への受信 H が、 アプリが握る t の行 L (G の場所と同じ stripe) を放すまで返らなかった \
              (F が alloc_lock を握ったまま G の行を待っている)"
         );
+    }
+
+    /// #974: 行の lock を握ったまま `alloc_lock` を取る入口 (写像の払い出し) を呼ぶと (`write_row` の doc が禁じる形)、 debug build は止める。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "alloc_lock を取る前に")]
+    fn taking_alloc_lock_while_holding_a_row_is_caught_in_debug() {
+        struct Rm(String);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = crate::db_files::remove_db(&self.0);
+                let _ = std::fs::remove_file(oplog_path_for(&self.0));
+            }
+        }
+        let (path, eng, k) = engine("rowalloc", 4);
+        let _rm = Rm(path);
+        let e = eng.entity_in("t").unwrap();
+        let _row = eng.write_row(e);
+        let _ = eng.resolve_remote_eid(enchudb_oplog::make_eid(C, 7), k);
     }
 
     /// review930 [5]: 消えた自分の行 X (名前 7) への遅れた改名 (名前 8、 `name_given_to_dead_row`) が 「X はまだ場所の行で消えている」
@@ -9245,6 +9271,25 @@ impl TableDef {
 #[inline]
 pub fn is_reserved_table_name(name: &str) -> bool {
     name.starts_with('_')
+}
+
+/// [`Engine::entity_in_with`] の断り。
+enum EntityInError {
+    /// #974: 空きの一覧の場所が全部、 他の書き手に行を握られていた (待たない形だけ)。 場所 (global) は握られていた 1 つ
+    Busy(u32),
+    Other(String),
+}
+
+impl From<String> for EntityInError {
+    fn from(why: String) -> Self {
+        EntityInError::Other(why)
+    }
+}
+
+impl From<&str> for EntityInError {
+    fn from(why: &str) -> Self {
+        EntityInError::Other(why.to_string())
+    }
 }
 
 /// #847: [`Engine::rebuild_free_locals`] が sync の ring の穴を 1 回に拾う数。
@@ -15589,6 +15634,16 @@ impl Engine {
     /// mode) からも呼べる。 capacity check は load → fetch_add の seq の
     /// rollback 不要 (= 1 ずつ進む単調払出、 overflow は次回 check で弾く)。
     pub fn entity_in(&self, table_name: &str) -> Result<enchudb_oplog::EntityId, String> {
+        self.entity_in_with(table_name, false).map_err(|e| match e {
+            // 待つ形 (`nowait` が偽) は返さない
+            EntityInError::Busy(slot) => format!("table '{table_name}': slot {slot} is held by a writer"),
+            EntityInError::Other(why) => why,
+        })
+    }
+
+    /// [`Self::entity_in`] の中身。 `nowait` なら、 空きの一覧の場所が全部 (行を握れずに) 握られていた時に探し直さず `Busy(場所)`
+    /// を返す (#974: 受信の払い出しは `alloc_lock` を握っているので、 放してから待つ。 [`Self::wait_busy_slot`])。
+    fn entity_in_with(&self, table_name: &str, nowait: bool) -> Result<enchudb_oplog::EntityId, EntityInError> {
         use std::sync::atomic::Ordering;
         self.check_writable();
         if table_name.is_empty() {
@@ -15688,6 +15743,7 @@ impl Engine {
                 }
                 // 握れなかった場所しか無かった: 握っている書き手が離すのを待って探し直す (`free_locals` は放してから)
                 let retry = claimed.is_none() && !busy.is_empty();
+                let first_busy = busy.first().and_then(|&l| table.global_of(l));
                 fl.extend(busy);
                 if fl.is_empty() {
                     table.free_locals_nonempty.store(false, Ordering::Release);
@@ -15728,6 +15784,10 @@ impl Engine {
                 if !retry {
                     break;
                 }
+                // #974: `alloc_lock` を握っている受信の払い出しは、 ここで回らずに返る (lock を放してから握っている書き手を待つ)
+                if nowait && let Some(g) = first_busy {
+                    return Err(EntityInError::Busy(g));
+                }
                 std::thread::yield_now();
             }
         }
@@ -15737,7 +15797,7 @@ impl Engine {
         // もう一度払い出す。 その前でも、 穴の無い時に足す extent を伸びた分まで大きくした (回した回数の分の eid 空間を取る)
         let exhausted = table.global_of(table.next_local.load(Ordering::Acquire)).is_none();
         if exhausted && self.rebuild_free_locals(tid) {
-            return self.entity_in(table_name);
+            return self.entity_in_with(table_name, nowait);
         }
         // capacity check (= fetch_add 後の変換で extent の外なら枯渇)
         let cur = table.next_local.fetch_add(1, Ordering::AcqRel);
@@ -15754,7 +15814,7 @@ impl Engine {
                 if !exhausted && self.rebuild_free_locals(tid) {
                     // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
                     // 再構築後も枯渇なら fl が空のままなので次は grow / Err に落ちる。
-                    return self.entity_in(table_name);
+                    return self.entity_in_with(table_name, nowait);
                 }
                 // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
                 match self.grow_table_extent_for(tid, cur) {
@@ -15768,7 +15828,7 @@ impl Engine {
                             return Err(format!(
                                 "table '{table_name}' is full and the tables sidecar could not be written ({e}) — \
                                  the extent is not added (#881)"
-                            ));
+                            ).into());
                         }
                         if is_sync_ring_table(&table.name) {
                             // #368: ring は自動では足さない。 entity cap を伸ばしても空かない
@@ -15777,7 +15837,7 @@ impl Engine {
                                  frees it, Engine::grow_table enlarges it)",
                                 table_name,
                                 table.capacity(),
-                            ));
+                            ).into());
                         }
                         return Err(format!(
                             "table '{}' eid range exhausted ({} eids reserved, entity cap {} — \
@@ -15785,7 +15845,7 @@ impl Engine {
                             table_name,
                             table.capacity(),
                             self.max_entities(),
-                        ));
+                        ).into());
                     }
                 }
             }
@@ -15793,7 +15853,7 @@ impl Engine {
 
         // #731: 世代を使い切った場所は渡さない (落ちた後に払い出し位置が引退した場所の手前に戻った時だけ来る)
         if self.generations().retired(global) {
-            return self.entity_in(table_name);
+            return self.entity_in_with(table_name, nowait);
         }
         // #731: 落ちた後に払い出し位置が消した場所の手前に戻った時は、 その場所に 「死んでいる」 印がある (生かす前に落とす)
         self.revive_slot(global);
@@ -15804,7 +15864,7 @@ impl Engine {
         // EntitySet で live mark + next_eid 前進 (CAS safe)。 #883: 前から立っていたら、 全部なめがこの slot を穴として拾って
         // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す
         if self.entities.allocate_at(global) {
-            return self.entity_in(table_name);
+            return self.entity_in_with(table_name, nowait);
         }
         self.settle_claim(global);
         Ok(self.eid_of_slot(global)) // #731: 今の世代を付ける
@@ -17103,6 +17163,7 @@ impl Engine {
         // #613: 前向きの写像だけを張る (別名、 `EidTranslator::alias`)。 行の逆写像 (この行に書いた record の宛名) は行の元の
         // identity のまま。 前は束ねた identity に替えていたので、 束ねた後の書き込みが、 その identity の作成を受けていない受け手で
         // 別の行になった。 元の identity の作成は同じ書き手の流れの前にあるので、 受け手は必ず先に受けている
+        self.debug_assert_no_user_row("alias_remote_eid");
         let (local, bound_now) = match self
             .eid_translator
             .if_unmapped(author_peer, foreign_local, || self.eid_translator.alias(author_peer, foreign_local, target_local))
@@ -17207,9 +17268,9 @@ impl Engine {
     /// = 写像を張った側が決めた生き死にのまま。 読み直し [A4]: 前は引いた行に覚え、 並んだ受信が削除優先で死んだまま払い出した場所を
     /// 生かした)。
     ///
-    /// lock の順は `alloc_lock` → 行 (読み直し [A1])。 写像の払い出し (`EidTranslator::get_or_insert_with` の中の `entity_in`) は
-    /// `alloc_lock` を握ったまま、 使い回す場所の行を握れるまで回るので、 行を握ったまま `alloc_lock` を待つと、 その行と同じ stripe の
-    /// 場所を払い出す受信と互いを待って止まる。 WAL に積む (#178 の別名の record) のと #490 / #513 の削除は `alloc_lock` を放した後に、
+    /// lock の順は `alloc_lock` → 行 (読み直し [A1]、 入口の `debug_assert_no_user_row`)。 直す前の写像の払い出しは `alloc_lock` を
+    /// 握ったまま使い回す場所の行を握れるまで回ったので、 行を握ったまま `alloc_lock` を待つと、 その行と同じ stripe の場所を払い出す
+    /// 受信と互いを待って止まった (#974 からは `alloc_lock` を放してから待つ。 束ねは `alloc_lock` を握ったまま行を待つ)。 WAL に積む (#178 の別名の record) のと #490 / #513 の削除は `alloc_lock` を放した後に、
     /// 確かめた行の lock の下で。
     #[doc(hidden)]
     pub fn bind_remote_eid_by_pk_at(
@@ -17228,6 +17289,7 @@ impl Engine {
         }
         let target = self.slot_unchecked(row_eid);
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        self.debug_assert_no_user_row("bind_remote_eid_by_pk_at");
         let checked = self.eid_translator.if_unmapped(author_peer, foreign_local, || {
             #[cfg(test)]
             if let Some(wal) = self.oplog.as_ref() {
@@ -17318,18 +17380,28 @@ impl Engine {
         // #614: その名前を削除の後に持った entity (最初に見た名前の書き込みが削除より後。 削除の後に作った行、 別の名前から改名した
         // 行) は消えたデッキの一員でない。 その名前の削除を slot に載せると、 改名より前の (削除より古い) 書き込みを捨てる
         let by_pk = self.pk_tombstone_of(pk_himo, pk_value).filter(|&t| t > created);
-        let local = self.eid_translator.get_or_insert_with(owner, foreign_local, || {
-            let local = self.alloc_translated_local(pk_himo)?;
-            let early = self.foreign_tombstone_of(owner, foreign_local);
-            if let Some(tomb) = by_pk.max(early) {
-                self.set_tombstone_local(local, tomb);
-                let mut g = self.pk_tombs.write().unwrap();
-                self.drain_pk_pending(&mut g);
-                self.with_pk_key(pk_himo, pk_value, |key| self.note_pk_locked(&mut g, pk_himo, key, local, tomb));
-                self.live_free(local, None);
-            }
-            Some(local)
-        })?;
+        self.debug_no_row_before_alloc(owner, foreign_local, "reserve_remote_eid_for_pk");
+        let local = self.eid_translator.get_or_insert_waiting(
+            owner,
+            foreign_local,
+            || {
+                // #974: 使い回す場所の行が握られていたら、 alloc_lock を放してから待つ
+                let local = match self.alloc_translated_local_nowait(pk_himo) {
+                    crate::eid_translator::Alloc::Got(local) => local,
+                    other => return other,
+                };
+                let early = self.foreign_tombstone_of(owner, foreign_local);
+                if let Some(tomb) = by_pk.max(early) {
+                    self.set_tombstone_local(local, tomb);
+                    let mut g = self.pk_tombs.write().unwrap();
+                    self.drain_pk_pending(&mut g);
+                    self.with_pk_key(pk_himo, pk_value, |key| self.note_pk_locked(&mut g, pk_himo, key, local, tomb));
+                    self.live_free(local, None);
+                }
+                crate::eid_translator::Alloc::Got(local)
+            },
+            |slot| self.wait_busy_slot(slot),
+        )?;
         Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
@@ -21653,20 +21725,27 @@ impl Engine {
             return self.own_world_to_internal(foreign_eid);
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        self.debug_no_row_before_alloc(owner, foreign_local, "resolve_remote_eid");
         // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
-        // double-alloc しない)。 alloc が None (= table-less) なら写像を作らず None。
-        let local = self
-            .eid_translator
-            .get_or_insert_with(owner, foreign_local, || {
-                let local = self.alloc_translated_local(himo_id)?;
-                // #166: slot が回った identity なら、 退避してある削除版数を新しい slot に
-                // 書き戻す。 #490: 作成より先に Delete を受けた identity も同じ。
-                // 払い出す時だけ引く (前は写像のある record でも毎回引いたので、 退避表が空で
-                // ないと record を当てるたびに lock を取った)。 写像を載せる前に書くので、
-                // 写像を引いた別の thread が tombstone の無い slot を見ることはない。
-                self.restore_foreign_tombstone(owner, foreign_local, local);
-                Some(local)
-            })?;
+        // double-alloc しない)。 alloc が Skip (= table-less) なら写像を作らず None。
+        // #974: 使い回す場所の行が握られていたら、 alloc_lock を放してから待つ
+        let local = self.eid_translator.get_or_insert_waiting(
+            owner,
+            foreign_local,
+            || match self.alloc_translated_local_nowait(himo_id) {
+                crate::eid_translator::Alloc::Got(local) => {
+                    // #166: slot が回った identity なら、 退避してある削除版数を新しい slot に
+                    // 書き戻す。 #490: 作成より先に Delete を受けた identity も同じ。
+                    // 払い出す時だけ引く (前は写像のある record でも毎回引いたので、 退避表が空で
+                    // ないと record を当てるたびに lock を取った)。 写像を載せる前に書くので、
+                    // 写像を引いた別の thread が tombstone の無い slot を見ることはない。
+                    self.restore_foreign_tombstone(owner, foreign_local, local);
+                    crate::eid_translator::Alloc::Got(local)
+                }
+                other => other,
+            },
+            |slot| self.wait_busy_slot(slot),
+        )?;
         Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
@@ -21698,17 +21777,64 @@ impl Engine {
     /// `entity()` での anonymous fallback は使わない: sync engine では anonymous table が
     /// 閉じていて panic するし、 `entities.allocate()` は table range と衝突しうる。
     fn alloc_translated_local(&self, himo_id: u16) -> Option<u32> {
+        match self.alloc_translated_local_in(himo_id, false) {
+            crate::eid_translator::Alloc::Got(local) => Some(local),
+            _ => None,
+        }
+    }
+
+    /// #974: [`Self::alloc_translated_local`] の、 待たない形 (`alloc_lock` の下で呼ぶ。 使い回す場所の行が握られていれば `Busy`)。
+    fn alloc_translated_local_nowait(&self, himo_id: u16) -> crate::eid_translator::Alloc {
+        self.alloc_translated_local_in(himo_id, true)
+    }
+
+    fn alloc_translated_local_in(&self, himo_id: u16, nowait: bool) -> crate::eid_translator::Alloc {
+        use crate::eid_translator::Alloc;
         let hid = himo_id as usize;
         if let Some(tid) = self.himo_table_get(hid) {
             let tid = tid as usize;
             if tid < self.tables.len() && self.tables[tid].eid_range_hi != u32::MAX {
                 let name = self.tables[tid].name.clone();
-                if let Ok(e) = self.entity_in(&name) {
-                    return Some(self.slot_unchecked(e));
-                }
+                return self.alloc_result(self.entity_in_with(&name, nowait));
             }
         }
-        None
+        Alloc::Skip
+    }
+
+    /// `entity_in_with` の結果を払い出しの結果に (断られた = 確保できる slot が無い = Skip)。
+    fn alloc_result(&self, r: Result<enchudb_oplog::EntityId, EntityInError>) -> crate::eid_translator::Alloc {
+        use crate::eid_translator::Alloc;
+        match r {
+            Ok(e) => Alloc::Got(self.slot_unchecked(e)),
+            Err(EntityInError::Busy(slot)) => Alloc::Busy(slot),
+            Err(EntityInError::Other(_)) => Alloc::Skip,
+        }
+    }
+
+    /// #974: 払い出しが `Busy(slot)` を返した (使い回す場所の行を他の書き手が握っていた)。 `alloc_lock` を放した後に、 何も持たずに
+    /// その行の lock を取って離す (握っている書き手が離すまで待つ)。 呼び手は行の lock を持っていない
+    /// ([`Self::debug_no_row_before_alloc`])。
+    fn wait_busy_slot(&self, slot: u32) {
+        drop(self.row_locks.write(slot));
+    }
+
+    /// #974: `alloc_lock` を取る入口で、 この thread が user の表の行の lock を持っていないこと (debug build だけ)。 順は
+    /// `alloc_lock` → 行: 行を握ったまま `alloc_lock` を待つと、 `alloc_lock` を握って行を待つ道 (`bind_remote_eid_by_pk_at`) と
+    /// 互いを待つ。 `write_row` を握ったまま受信の API を呼ぶアプリ (`write_row` の doc が禁じる形) もここで止まる
+    #[inline]
+    fn debug_assert_no_user_row(&self, at: &str) {
+        debug_assert!(
+            !self.row_locks.holds_user_row_by_me(),
+            "{at}: alloc_lock を取る前に、 この thread が行の lock を握っている (#974、 lock の順は alloc_lock → 行)"
+        );
+    }
+
+    /// [`Self::debug_assert_no_user_row`] の、 写像を払い出す道 (`get_or_insert_*`) の形: 写像が無い (= `alloc_lock` を取る) 時だけ見る。
+    #[inline]
+    fn debug_no_row_before_alloc(&self, owner: enchudb_oplog::PeerId, foreign_local: u32, at: &str) {
+        if cfg!(debug_assertions) && self.eid_translator.get(owner, foreign_local).is_none() {
+            self.debug_assert_no_user_row(at);
+        }
     }
 
     /// #9: himo が Ref 型か。 Ref の value は foreign target eid なので apply 時に
@@ -21744,21 +21870,30 @@ impl Engine {
         // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
         // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
         // target table を導けなければ None (caller が op を skip)。
+        self.debug_no_row_before_alloc(author_peer, foreign_value, "resolve_remote_ref_value");
         self.eid_translator
-            .get_or_insert_with(author_peer, foreign_value, || {
-                let local = self.alloc_translated_local_in_target_table(ref_himo_id)?;
-                // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
-                // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
-                self.restore_foreign_tombstone(author_peer, foreign_value, local);
-                Some(local)
-            })
+            .get_or_insert_waiting(
+                author_peer,
+                foreign_value,
+                || match self.alloc_translated_local_in_target_table(ref_himo_id) {
+                    crate::eid_translator::Alloc::Got(local) => {
+                        // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
+                        // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
+                        self.restore_foreign_tombstone(author_peer, foreign_value, local);
+                        crate::eid_translator::Alloc::Got(local)
+                    }
+                    other => other,
+                },
+                |slot| self.wait_busy_slot(slot),
+            )
             // 死んだ場所 (相手の削除を先に当てた / 作成より先に削除が届いた) は消えた行の世代 (次の住人を指さない)
             .map(|slot| self.last_local_of_slot(slot))
     }
 
     /// #9: Ref himo の target table (fk_refs で引く) に fresh な local eid を払い出す。
     /// target table を導けない / entity_in 失敗なら `None` (caller が op を skip)。
-    fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> Option<u32> {
+    /// #974: `alloc_lock` の下で呼ぶので待たない (使い回す場所の行が握られていれば `Busy`)。
+    fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> crate::eid_translator::Alloc {
         let hid = ref_himo_id as usize;
         if let Some(owner_tid) = self.himo_table_get(hid) {
             let owner_tid = owner_tid as usize;
@@ -21772,14 +21907,12 @@ impl Engine {
                         && self.tables[target_tid].eid_range_hi != u32::MAX
                     {
                         let name = self.tables[target_tid].name.clone();
-                        if let Ok(e) = self.entity_in(&name) {
-                            return Some(self.slot_unchecked(e));
-                        }
+                        return self.alloc_result(self.entity_in_with(&name, true));
                     }
                 }
             }
         }
-        None
+        crate::eid_translator::Alloc::Skip
     }
 
     /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。
@@ -23016,6 +23149,7 @@ impl Engine {
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         let before = self.foreign_tombstone_of(owner, foreign_local);
+        self.debug_assert_no_user_row("remote_delete_apply_foreign");
         match self
             .eid_translator
             .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))

@@ -215,6 +215,12 @@ impl RowLocks {
         self.held(self.stripe(local), me())
     }
 
+    /// この thread がユーザの行 (内部の表の行でない stripe) をどれか握っているか。 stripe を全部見る (debug の確かめ用、 #974)。
+    pub fn holds_user_row_by_me(&self) -> bool {
+        let me = me();
+        (0..STRIPES).any(|i| self.held(i, me))
+    }
+
     /// この thread が stripe `i` を握っているか。
     fn held(&self, i: usize, me: usize) -> bool {
         self.stripes[i].ver.load(Ordering::Relaxed) & 1 == 1 && self.stripes[i].owner.load(Ordering::Relaxed) == me
