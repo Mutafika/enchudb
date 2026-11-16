@@ -684,15 +684,23 @@ impl SegmentSet {
         Self::flush_segments(&busy, all)
     }
 
-    /// `segs` を並べて msync する (`flush_parallel` の本体)。 1 つなら呼んだ thread で書く。
+    /// `segs` を並べて msync する (`flush_parallel` の本体)。 1 つなら呼んだ thread で書く。 thread を立てられなかった segment は呼んだ
+    /// thread で書く (#978 の読み直し 2 [H]: `Scope::spawn` は立てられないと panic し、 書き出しを呼んだ thread (consumer / `oplog_sync` の
+    /// 呼び手) を落とす。 前からあった形で、 書き出しの門 / 削除の門を閉じている間の段 2 と中身の書き直しが通る)。
     pub fn flush_segments(segs: &[(SegmentKind, Arc<SegmentMap>)], all: bool) -> io::Result<()> {
         match segs {
             [] => Ok(()),
             [(k, s)] => Self::flush_segment(*k, s, all),
             [(k, s), rest @ ..] => std::thread::scope(|scope| {
-                let others: Vec<_> =
-                    rest.iter().map(|(k, s)| scope.spawn(move || Self::flush_segment(*k, s, all))).collect();
-                let mut res = Self::flush_segment(*k, s, all);
+                let mut res = Ok(());
+                let mut others = Vec::with_capacity(rest.len());
+                for (k, s) in rest {
+                    match std::thread::Builder::new().spawn_scoped(scope, move || Self::flush_segment(*k, s, all)) {
+                        Ok(h) => others.push(h),
+                        Err(_) => res = res.and(Self::flush_segment(*k, s, all)),
+                    }
+                }
+                res = res.and(Self::flush_segment(*k, s, all));
                 for h in others {
                     let r = h.join().unwrap_or_else(|_| Err(io::Error::other("segment の書き出しの thread が panic した")));
                     res = res.and(r);

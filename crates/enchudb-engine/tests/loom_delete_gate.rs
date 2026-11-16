@@ -15,7 +15,14 @@
 //! 書き出す。 守る性質: **書き出す生きている印が 「死んでいる」 なら、 その削除の tombstone は先に書き出してある** (入っていないと、
 //! 生きている印だけが届いた像で、 WAL に record の無い行の削除を誰も知らない)。 対照: 生きている印を門を閉じる前に書き出す形 (前の順)。
 //!
-//! この model は `DeleteGate` の写し (shard 2 本、 待ちは yield。 phase-fair の待ちは閉じる側 1 本の model にだけ入れる、 `Gate::write_out`)。 `delete_gate.rs` の ordering を変えた時は、 ここも同じに変えること
+//! 読み直し [2] の phase-fair (閉じた門で待っている削除が居る間、 新しく閉じる側は閉じる前に待つ): 守る性質 (tombstone が先) は、 閉じる
+//! 側 2 本の model に待ちを入れても崩れない (待ちは yield 1 回の軽い形、 `Wait::Once`。 loop の待ちを入れると 3 本の thread の
+//! interleaving が増えて 10 分で終わらなかった)。 待ちの順そのもの (**新しく閉じる側が待っている削除を見たら、 閉じる前にその削除が
+//! 入っている**) は、 1 本目が閉じた後に削除と 2 本目が来る形 (`fair_model`、 待ちは loop) で見る。 対照: 待たない形で loom が順の
+//! 破れを見つける (読み直し 2 [E]: 前は閉じる側 1 本の model にだけ待ちがあり、 削除が待ち始めるのはその唯一の閉じる側が閉じた後
+//! = 待ちは毎回 0 で、 何も検査していなかった)。
+//!
+//! この model は `DeleteGate` の写し (shard 2 本、 待ちは yield)。 `delete_gate.rs` の ordering を変えた時は、 ここも同じに変えること
 //! (読み直し [10]: 写しなので、 本体だけ変えても model は落ちない)。
 //!
 //! ## 実行
@@ -26,7 +33,7 @@
 
 #![cfg(loom)]
 
-use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use loom::sync::Arc;
 use loom::thread;
 
@@ -47,6 +54,20 @@ struct Gate {
     cell: AtomicU32,
     /// 生きている印 (1 = 生きている、 0 = 下ろした)
     live: AtomicU32,
+    /// 削除が門に入った (`fair_model` の順を見る印)
+    entered: AtomicBool,
+}
+
+/// 閉じる側の phase-fair の待ち (`DeleteGate::close` の、 閉じた門で待っている削除が入るまで閉じない)。
+#[derive(Clone, Copy, PartialEq)]
+enum Wait {
+    /// 待たない
+    No,
+    /// 待っている削除が居なくなるまで待つ (本体と同じ)
+    Loop,
+    /// 待っている削除が居れば yield を 1 回だけ (閉じる側 2 本の model 用の軽い形: 待ちの数を読む所と、 その後に閉じる所の
+    /// interleaving は本体と同じに出る)
+    Once,
 }
 
 impl Gate {
@@ -57,6 +78,7 @@ impl Gate {
             tomb: AtomicU32::new(0),
             cell: AtomicU32::new(NAME),
             live: AtomicU32::new(1),
+            entered: AtomicBool::new(false),
         }
     }
 
@@ -72,6 +94,7 @@ impl Gate {
         loop {
             let v = s.load(Ordering::Acquire);
             if v < CLOSER && s.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                self.entered.store(true, Ordering::Release);
                 break;
             }
             if v >= CLOSER && !wanted {
@@ -94,10 +117,8 @@ impl Gate {
     /// 開いた側が、 もう片方の閉じた印も消す)。 `live_first` は生きている印を閉じる前 (tomb.seg の前) に書き出す (壊した形 = 読み直し
     /// [1] の前の順)。
     ///
-    /// `fair` は phase-fair の待ち (`DeleteGate::close` の、 閉じた門で待っている削除が入るまで閉じない) を入れる。 待ちは削除を飢え
-    /// させない liveness の仕組みで、 守る性質 (tombstone が先) には関わらない。 閉じる側 2 本の model に入れると、 待ちの loop が
-    /// 3 本の thread の interleaving を増やして 10 分で終わらなかったので、 そちらには入れない (`overlapping_model`)。
-    fn write_out(&self, tombs_first: bool, one_bit: bool, live_first: bool, fair: bool) {
+    /// `wait` は phase-fair の待ち ([`Wait`])。 待ちは削除を飢えさせない仕組みで、 守る性質 (tombstone が先) を崩さないこと。
+    fn write_out(&self, tombs_first: bool, one_bit: bool, live_first: bool, wait: Wait) {
         let mut durable_tomb = if tombs_first { self.tomb.load(Ordering::Relaxed) } else { 0 };
         // 生きている印を書き出す時、 下ろした印の tombstone はもう書き出してあること
         let write_live = |durable_tomb: u32| {
@@ -108,8 +129,18 @@ impl Gate {
         if live_first {
             write_live(durable_tomb);
         }
-        while fair && self.wanting.load(Ordering::Acquire) != 0 {
-            thread::yield_now();
+        match wait {
+            Wait::No => {}
+            Wait::Loop => {
+                while self.wanting.load(Ordering::Acquire) != 0 {
+                    thread::yield_now();
+                }
+            }
+            Wait::Once => {
+                if self.wanting.load(Ordering::Acquire) != 0 {
+                    thread::yield_now();
+                }
+            }
         }
         for s in &self.shards {
             if one_bit {
@@ -149,7 +180,7 @@ fn model(drop_first: bool, tombs_first: bool, live_first: bool) {
             let g = g.clone();
             thread::spawn(move || g.delete(1, drop_first))
         };
-        g.write_out(tombs_first, false, live_first, true);
+        g.write_out(tombs_first, false, live_first, Wait::Loop);
         d.join().unwrap();
     });
 }
@@ -161,7 +192,8 @@ fn a_dropped_cell_is_never_written_out_before_its_tombstone() {
 }
 
 /// 閉じる側 2 本と削除 1 本。 thread が 3 本で待ちの loop が 2 つあるので、 割り込みの回数を 2 までにして枝の上限を上げる
-/// (無制限だと終わらない)。
+/// (無制限だと終わらない)。 閉じる側の phase-fair の待ちは yield 1 回 (`Wait::Once`): 片方が閉じた門で削除が待ち始めてから、
+/// もう片方が待ちの数を読む interleaving が出る。
 fn overlapping_model(one_bit: bool) {
     let mut b = loom::model::Builder::new();
     b.preemption_bound = Some(2);
@@ -174,9 +206,9 @@ fn overlapping_model(one_bit: bool) {
         };
         let other = {
             let g = g.clone();
-            thread::spawn(move || g.write_out(false, one_bit, false, false))
+            thread::spawn(move || g.write_out(false, one_bit, false, Wait::Once))
         };
-        g.write_out(false, one_bit, false, false);
+        g.write_out(false, one_bit, false, Wait::Once);
         d.join().unwrap();
         other.join().unwrap();
     });
@@ -215,4 +247,67 @@ fn writing_the_tombstones_before_closing_misses_a_delete() {
 #[should_panic]
 fn writing_the_live_bits_before_closing_misses_a_tombstone() {
     model(false, false, true);
+}
+
+/// phase-fair の順 (読み直し [2] / 読み直し 2 [E]): 1 本目 (main) が閉じた後に、 削除と 2 本目の閉じる側が来る。 2 本目は閉じる前に待ちの数を
+/// 読み、 待っている削除が居たら、 2 本目が閉じた時にはその削除は門に入っている (1 本目が開いた後、 削除が 2 本目より先に入る)。
+/// `wait` = `Wait::No` は対照 (2 本目が待たずに閉じ、 待っていた削除は 2 本目が開くまで入れない = 閉じる側が重なり続けると飢える)。
+fn fair_model(wait: Wait) {
+    let mut b = loom::model::Builder::new();
+    b.preemption_bound = Some(3);
+    b.check(move || {
+        let g = Arc::new(Gate::new());
+        // 1 本目が閉じる (中に削除は居ない)
+        for s in &g.shards {
+            s.fetch_add(CLOSER, Ordering::AcqRel);
+        }
+        let d = {
+            let g = g.clone();
+            thread::spawn(move || g.delete(1, false))
+        };
+        let second = {
+            let g = g.clone();
+            thread::spawn(move || {
+                let saw = g.wanting.load(Ordering::Acquire) != 0;
+                if wait == Wait::Loop {
+                    while g.wanting.load(Ordering::Acquire) != 0 {
+                        thread::yield_now();
+                    }
+                }
+                for s in &g.shards {
+                    s.fetch_add(CLOSER, Ordering::AcqRel);
+                }
+                for s in &g.shards {
+                    while s.load(Ordering::Acquire) & INSIDE != 0 {
+                        thread::yield_now();
+                    }
+                }
+                if saw {
+                    assert!(g.entered.load(Ordering::Acquire), "待っている削除を見たのに、 その削除より先に閉じた");
+                }
+                for s in &g.shards {
+                    s.fetch_sub(CLOSER, Ordering::Release);
+                }
+            })
+        };
+        // 1 本目が開く
+        for s in &g.shards {
+            s.fetch_sub(CLOSER, Ordering::Release);
+        }
+        d.join().unwrap();
+        second.join().unwrap();
+    });
+}
+
+/// 待っている削除を見た新しく閉じる側は、 その削除が入るまで閉じない。
+#[test]
+fn a_new_closer_lets_a_waiting_delete_in_first() {
+    fair_model(Wait::Loop);
+}
+
+/// 対照: 待たずに閉じると、 待っていた削除より先に閉じる (loom が順の破れを見つける)。
+#[test]
+#[should_panic(expected = "その削除より先に閉じた")]
+fn a_closer_that_does_not_wait_goes_before_a_waiting_delete() {
+    fair_model(Wait::No);
 }

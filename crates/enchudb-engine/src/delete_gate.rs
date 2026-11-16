@@ -19,6 +19,15 @@
 //! (`wanting`)、 0 でない間は新しく閉じる側が閉じる前に待つ: 今閉じている側が開くと、 待っていた削除が先に入る。 閉じる側が待つのは、
 //! 待っている削除が入るまで (今閉じている側の残りの msync と、 削除の待ちの眠り 1 回分)。 閉じた後に来た削除は数えず、 開いている
 //! 門にはそのまま入るので、 閉じる側も飢えない。
+//!
+//! 削除の待ちの上限 (読み直し 2 [G]): 待ち始めた時に閉じていた窓 1 つとは限らない。 削除が閉じた門を読んでから待ちの数を足すまでの
+//! 間に、 新しく閉じる側が 0 を見て閉じうる (その窓も待つ = 窓 2 つ。 3 つ目の閉じる側は待ちの数を見て譲る)。 窓 1 つの長さは、 その段の
+//! msync の他に、 中身を指す列の段では書き出しの門 (`PublishGate::close` の Mutex) を待つ間を含む (削除の門を先に閉じるので、 書き出しが
+//! 重なると先に並んだ書き出しの列の msync の間も閉じたまま)。
+//!
+//! 譲りの値段 (読み直し 2 [K]): 閉じる側が 1 回譲ると、 待っている削除の眠り (50 µs、 OS の眠りの粒度で伸びる) が明けて入るまで閉じない。
+//! 中身を指す列を 1 本ずつ書き出す段は列ごとに閉じるので、 削除が続く間の書き出しは 「書く範囲のある中身を指す列の数 × 譲り 1 回」
+//! 伸びる (Mac の測り: Tag 16 列の表に 150 µs ごとの削除で、 `oplog_sync` の p50 1.4 → 2.6 ms、 Tag 4 列で 1.0 → 1.2 ms)。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -50,19 +59,47 @@ pub struct DeleteGate {
 
 // 読み直し [4]: 門の中で門を閉じる (門の中の削除が本体の書き出しを呼ぶ) と、 閉じる側が自分の退出を待って止まり続ける。 閉じた門に同じ
 // thread が入る / 閉じたままもう一度閉じる (phase-fair: 待っている削除が入るのを待つ) も同じ。 debug build は thread ごとに 「門の中」 と
-// 「閉じている」 の数を持ち、 止まる代わりに panic する。
+// 「閉じている」 の数を持ち、 止まる代わりに panic する。 数は門 (engine) ごと (読み直し 2 [I]: 前は thread で 1 つで、 engine A の門を
+// 閉じたまま engine B で消すと、 止まらない形でも panic した)。
 #[cfg(debug_assertions)]
 thread_local! {
-    static INSIDE_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static CLOSING_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// (門の番地, 中に居る数, 閉じている数)。 どちらも 0 になった門は外す (`DeletePass` / `DeleteClosed` は門を借りるので、 門が
+    /// drop される時は 0 = 番地の使い回しで取り違えない)
+    static HERE: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// この thread が削除の門の中に居るか (debug build だけ数える。 release は常に false。 試験用)。
+/// この thread の、 門 `key` の (中に居る数, 閉じている数)。
+#[cfg(debug_assertions)]
+fn here(key: usize) -> (u32, u32) {
+    HERE.with(|h| h.borrow().iter().find(|e| e.0 == key).map_or((0, 0), |e| (e.1, e.2)))
+}
+
+/// この thread の、 門 `key` の数を足す / 引く。
+#[cfg(debug_assertions)]
+fn count_here(key: usize, inside: i32, closing: i32) {
+    HERE.with(|h| {
+        let mut h = h.borrow_mut();
+        let i = match h.iter().position(|e| e.0 == key) {
+            Some(i) => i,
+            None => {
+                h.push((key, 0, 0));
+                h.len() - 1
+            }
+        };
+        h[i].1 = h[i].1.checked_add_signed(inside).expect("削除の門の 「中に居る」 数が負");
+        h[i].2 = h[i].2.checked_add_signed(closing).expect("削除の門の 「閉じている」 数が負");
+        if h[i].1 == 0 && h[i].2 == 0 {
+            h.swap_remove(i);
+        }
+    });
+}
+
+/// この thread がどれかの削除の門の中に居るか (debug build だけ数える。 release は常に false。 試験用)。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn inside_on_this_thread() -> bool {
     #[cfg(debug_assertions)]
     {
-        INSIDE_HERE.with(|c| c.get() > 0)
+        HERE.with(|h| h.borrow().iter().any(|e| e.1 > 0))
     }
     #[cfg(not(debug_assertions))]
     {
@@ -104,9 +141,11 @@ impl DeleteGate {
     /// 待ってから tomb.seg を書き出す)。 drop で出る。 中に居る間に本体の書き出しを呼ばないこと (自分を待つ)。
     pub fn enter(&self, key: u32) -> DeletePass<'_> {
         #[cfg(debug_assertions)]
-        CLOSING_HERE.with(|c| {
-            debug_assert_eq!(c.get(), 0, "#978: 削除の門を閉じている thread が門に入ろうとした (自分が開くのを待って止まる)")
-        });
+        debug_assert_eq!(
+            here(self.debug_key()).1,
+            0,
+            "#978: 削除の門を閉じている thread が門に入ろうとした (自分が開くのを待って止まる)"
+        );
         let s = &self.shards[key as usize % SHARDS].0;
         let mut spins = 0;
         let mut waited: Option<std::time::Instant> = None;
@@ -131,8 +170,18 @@ impl DeleteGate {
             self.wait_max_ns.fetch_max(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
         }
         #[cfg(debug_assertions)]
-        INSIDE_HERE.with(|c| c.set(c.get() + 1));
-        DeletePass { shard: s }
+        count_here(self.debug_key(), 1, 0);
+        DeletePass {
+            shard: s,
+            #[cfg(debug_assertions)]
+            gate: self.debug_key(),
+        }
+    }
+
+    /// debug の数の鍵 (門の番地)。
+    #[cfg(debug_assertions)]
+    fn debug_key(&self) -> usize {
+        self as *const Self as usize
     }
 
     /// 門を閉じ、 中に居る削除が出るのを待つ。 返った後は、 門の中で落とした cell とその前に書いた tombstone が全部見える。 閉じる側は
@@ -140,21 +189,19 @@ impl DeleteGate {
     /// (phase-fair、 module doc)。 閉じている物を持ったまま呼ばないこと (待っている削除が入れない)。
     pub fn close(&self) -> DeleteClosed<'_> {
         #[cfg(debug_assertions)]
-        INSIDE_HERE.with(|c| {
+        {
+            let (inside, closing) = here(self.debug_key());
             debug_assert_eq!(
-                c.get(),
+                inside,
                 0,
                 "#978: 削除の門の中で門を閉じた (自分の退出を待って止まる。 門の中で本体の書き出しを呼ばないこと、 `LocalApply::deferring_settles`)"
-            )
-        });
-        #[cfg(debug_assertions)]
-        CLOSING_HERE.with(|c| {
+            );
             debug_assert_eq!(
-                c.get(),
+                closing,
                 0,
                 "#978: 削除の門を閉じたまま、 もう一度閉じた (待っている削除が入れず、 それを待って止まる。 段ごとに開いてから閉じること)"
-            )
-        });
+            );
+        }
         let start = std::time::Instant::now();
         let mut spins = 0;
         while self.wanting.0.load(Ordering::Acquire) != 0 {
@@ -174,7 +221,7 @@ impl DeleteGate {
             }
         }
         #[cfg(debug_assertions)]
-        CLOSING_HERE.with(|c| c.set(c.get() + 1));
+        count_here(self.debug_key(), 0, 1);
         DeleteClosed { gate: self, start }
     }
 
@@ -202,13 +249,16 @@ impl DeleteGate {
 /// 門の中に居る間持つ。
 pub struct DeletePass<'a> {
     shard: &'a AtomicU64,
+    /// debug の数の鍵 (門の番地、 `DeleteGate::debug_key`)
+    #[cfg(debug_assertions)]
+    gate: usize,
 }
 
 impl Drop for DeletePass<'_> {
     fn drop(&mut self) {
         self.shard.fetch_sub(1, Ordering::Release);
         #[cfg(debug_assertions)]
-        INSIDE_HERE.with(|c| c.set(c.get() - 1));
+        count_here(self.gate, -1, 0);
     }
 }
 
@@ -221,7 +271,7 @@ pub struct DeleteClosed<'a> {
 impl Drop for DeleteClosed<'_> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        CLOSING_HERE.with(|c| c.set(c.get() - 1));
+        count_here(self.gate.debug_key(), 0, -1);
         for s in &self.gate.shards {
             s.0.fetch_sub(CLOSER, Ordering::Release);
         }
@@ -309,13 +359,46 @@ mod tests {
                 order.lock().unwrap().push("close");
             })
         };
+        // 2 本目が閉じる前の待ちに入るまで待つ (読み直し 2 [C]: 決まった時間だけ眠ってから数を見ると、 2 本目の thread が `close` に
+        // 入る前に見て落ちうる)
+        let end = Instant::now() + Duration::from_secs(5);
+        while gate.yields() == 0 {
+            assert!(order.lock().unwrap().is_empty(), "待っている削除が居るのに、 新しく閉じる側が閉じた ({:?})", order.lock().unwrap());
+            assert!(Instant::now() < end, "新しく閉じる側が、 待っている削除を先に通す待ちに入らない (待った回数が 0 のまま)");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // 待ちに入った後も、 1 本目が開くまで 2 本目は閉じない
         std::thread::sleep(Duration::from_millis(30));
         assert!(order.lock().unwrap().is_empty(), "待っている削除が居るのに、 新しく閉じる側が閉じた ({:?})", order.lock().unwrap());
-        assert!(gate.yields() >= 1, "新しく閉じる側が待った回数を数えていない");
         drop(first);
         d.join().unwrap();
         b.join().unwrap();
         assert_eq!(*order.lock().unwrap(), vec!["delete", "close"], "1 本目が開いた後、 待っていた削除より先に 2 本目が閉じた");
+    }
+
+    /// 読み直し 2 [I]: debug build の 「門の中」 「閉じている」 の数は門ごと。 1 本の thread が門 a を閉じたまま別の門 b に入る、 b の中に
+    /// 居て a を閉じるのは止まらない (panic しない。 前は thread で 1 つの数で、 engine をまたいで panic した)。
+    #[test]
+    fn the_debug_marks_are_per_gate() {
+        let (a, b) = (DeleteGate::new(), DeleteGate::new());
+        let closed = a.close();
+        drop(b.enter(1));
+        drop(closed);
+        let inside = b.enter(1);
+        drop(a.close());
+        assert_eq!(inside_on_this_thread(), cfg!(debug_assertions));
+        drop(inside);
+        assert!(!inside_on_this_thread());
+    }
+
+    /// 同じ門の中で閉じるのは、 debug build では止まる代わりに panic する。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "削除の門の中で門を閉じた")]
+    fn closing_the_gate_one_is_inside_panics_in_debug() {
+        let g = DeleteGate::new();
+        let _inside = g.enter(1);
+        let _closed = g.close();
     }
 
     /// 閉じる側が 2 本なら、 両方が開くまで入れない (1 本目が開いても 2 本目の閉じた印は消えない)。

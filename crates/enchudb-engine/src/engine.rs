@@ -2491,8 +2491,8 @@ pub mod write_out_hook {
         Column(u16),
         /// #705: 列を全部書き出した後 (版数の列・tombstone を書き出す前)
         BeforeVersions,
-        /// #978: 生きている印・場所の世代・残りの列でない物 (header …) を書き出した後、 残りの列 (中身を指さない列) を書き出す前 (削除の
-        /// 門は閉じている)
+        /// #978: 生きている印・場所の世代を書き出した後、 残りの列 (中身を指さない列) を書き出す前 (削除の門は閉じている。 残りの列でない物
+        /// (header …) は門を閉じる前に書き出してある)
         BeforeRest,
         /// #978: `prev.seg` の後に削除の門を閉じて tomb.seg を書き出した後 (生きている印・場所の世代・残りの列を書き出す前、 門は閉じた
         /// まま)
@@ -31998,11 +31998,13 @@ impl Engine {
     ///    待ち、 開くまで書かせない) → 中身のうち cell が読む分 (辞書の data と offsets / Leaf の slot) をもう一度 (書いた範囲
     ///    だけ) → その列を書き出す → 開く。 閉じている間の書き出しは segment を並べて msync する (`SegmentSet::flush_parallel`)
     /// 3. 残りの中身を指す列を 1 本ずつ: 門を閉じる → (閉じる前に門を通った書き手が居れば) 中身をもう一度 → 列 → 開く
-    /// 4. 残り (header / entity / 中身を指さない列 …)
+    /// 4. 残り: 前の住人の記録 (`prev.seg`) → 列でない物 (header / 紐名の辞書 …) → 生きている印 (entity) → 場所の世代 → 中身を指さない列
+    ///    → 版数の列 → tomb.seg
     ///
     /// #978: 2 / 3 の列と、 4 の生きている印・場所の世代・列を msync する前ごとに、 削除の門を閉じて tomb.seg を書き出す
     /// ([`Self::close_deletes`]。 削除が落とした cell と下ろした生きている印・上げた世代は tombstone より先に disk に届かない)。 tomb.seg は
-    /// 最後 (版数の列の後) にも書き出す。
+    /// 最後 (版数の列の後) にも書き出す。 削除の触らない物 (中身・`prev.seg`・列でない物・版数の列) は門の外で書き出す (閉じている間 =
+    /// 削除が待つ間に入れない)。
     ///
     /// #801: 書き出しは並んで走る (consumer の周期 / `oplog_sync` の呼び手 / 書き手の `body_msync`)。 返った時 「呼ぶ前に印を
     /// 付けた page は全部届いた」 を守るため、 書くものの無い segment を飛ばす所は `SegmentMap::flush_pending` で見る
@@ -32127,6 +32129,13 @@ impl Engine {
         let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k) && !prev(k);
         let rest_columns = |k: SegmentKind| rest(k) && matches!(k, SegmentKind::Himo(_));
         let rest_others = |k: SegmentKind| rest(k) && !matches!(k, SegmentKind::Himo(_));
+        // 残りの列でない物 (header / 紐名の辞書 / 凍結した旧 content の region) は削除が触らないので、 門を閉じる前に書き出す (読み直し 2
+        // [B]: 門を閉じている間 = 削除が待つ間に入れない。 `catch_up` / `all` の書き出しは全域の msync になる)
+        if catch_up {
+            set.flush_all_spread(rest_others)?;
+        } else {
+            set.flush_where(all, rest_others)?;
+        }
         {
             // #978: 生きている印・場所の世代・残りの列を書き出す間、 削除の門を閉じる (閉じて tomb.seg を書き出してから)。 削除は
             // tombstone を置いて門に入り、 cell を落として門を出てから生きている印を下ろす (`remove_entity_body_of` → `live_free`)。
@@ -32141,11 +32150,6 @@ impl Engine {
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
             set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))?;
-            if catch_up {
-                set.flush_all_spread(rest_others)?;
-            } else {
-                set.flush_where(all, rest_others)?;
-            }
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::BeforeRest);
             // 残りの列は、 門を閉じている間 (sync する DB) だけ並べて msync する (閉じている間 = 削除が待つ間を、 列 1 本ずつの
@@ -40981,16 +40985,19 @@ mod delete_gate_path_tests {
         eng
     }
 
-    /// `f` を別の thread で回す。 終わるか `blocked` が真になるまで待ち (上限 60 秒)、 その時に終わっていたかを返す。 `release` を
-    /// 呼んでから join する (待っていた道を通す)。
+    /// `f` (`what`) を別の thread で回す。 終わるか `blocked` が真になるまで待ち、 その時に終わっていたかを返す。 `release` を呼んでから
+    /// join する (待っていた道を通す)。 60 秒経っても終わらず `blocked` も真にならなければ、 join せずに panic する (読み直し 2 [D]: 止まった
+    /// thread を join すると試験も止まり続ける。 thread は残したまま落とす)。
     fn run_until<T: Send + 'static>(
+        what: &str,
         f: impl FnOnce() -> T + Send + 'static,
         blocked: impl Fn() -> bool,
         release: impl FnOnce(),
     ) -> (bool, std::thread::Result<T>) {
         let h = std::thread::spawn(f);
         let end = Instant::now() + Duration::from_secs(60);
-        while !h.is_finished() && !blocked() && Instant::now() < end {
+        while !h.is_finished() && !blocked() {
+            assert!(Instant::now() < end, "{what} が 60 秒返らない (止まっている。 join せずに落とす)");
             std::thread::sleep(Duration::from_millis(1));
         }
         let finished = h.is_finished();
@@ -41015,6 +41022,7 @@ mod delete_gate_path_tests {
         let (e2, done) = (eng.clone(), Arc::new(AtomicBool::new(false)));
         let done2 = done.clone();
         let (finished, out) = run_until(
+            "受けた Delete (削除の門の中で本体の書き出しを呼び、 自分の退出を待って止まった)",
             move || {
                 let seen: Arc<Mutex<Option<bool>>> = Arc::default();
                 let s2 = seen.clone();
@@ -41051,6 +41059,7 @@ mod delete_gate_path_tests {
         let closed = eng.delete_gate.close();
         let e2 = eng.clone();
         let (finished, out) = run_until(
+            "purge",
             move || e2.purge_sync_ops_row(row, lsn, 1),
             || eng.delete_gate_waits() != waits,
             move || drop(closed),
@@ -41080,6 +41089,7 @@ mod delete_gate_path_tests {
         let cell_when_blocked: Arc<Mutex<Option<Option<u64>>>> = Arc::default();
         let (e2, e3, c2) = (eng.clone(), eng.clone(), cell_when_blocked.clone());
         let (finished, out) = run_until(
+            "畳む",
             move || e2.merge_entity_into(s, d),
             move || {
                 let blocked = e3.delete_gate_waits() != waits;
