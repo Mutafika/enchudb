@@ -4625,6 +4625,84 @@ mod reuse_order_tests {
         cleanup(&path, eng);
     }
 
+    /// entity-in-busy-wait の調べ (issue 前、 master で落ちる): 受信の払い出し (`resolve_remote_eid` → `EidTranslator::get_or_insert_with`
+    /// の中の `entity_in`) は `alloc_lock` を握ったまま、 使い回す場所の行を握れるまで待つ (#931 の try_write と探し直し。 その前の
+    /// #885 からは `drop_leftover_cells` の `row_locks.write` で待っていた = 0.37.4 は待たない)。 満杯の表 t の消えた行 G の場所と
+    /// 同じ stripe の生きた行 L をアプリが `write_row` で握っている間、 t への受信 (F) は G を握れずに回り、 その間は別の表 u への
+    /// 受信 (H、 払い出し位置から新しい場所を取るだけ) も `alloc_lock` で止まる。 0.37.4 は払い出しが行を待たず、 H は止まらなかった
+    /// (F は払い出した後の当て込みで L の stripe を待つが、 `alloc_lock` は放している)。
+    ///
+    /// 止まる長さはアプリが行を握る長さ (L を握った書き手が WAL の空きを待てば上限 5 秒)。 同じ thread が行を握ったまま受信を呼ぶと
+    /// (`write_row` の doc が禁じる 「握ったまま別の thread の書き込みを待つ」 形)、 H の役がその thread になり、 F と互いを待って
+    /// 返らない。 確かめ: try_write の 「握れない」 を #931 の前の 「握らずに取る」 に戻しても落ちる (`drop_leftover_cells` で待つ)。
+    #[test]
+    fn a_reuse_waiting_for_a_busy_slot_does_not_stall_receives_into_other_tables() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        // 枠 4097 の表 t: 最初の場所と最後の場所が同じ stripe。 u は空きのある別の表
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-reuseorder-busy-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 16_384).unwrap();
+        eng.define_table("t", 4097).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.set_table_pk("t", k).unwrap();
+        eng.define_table("u", 64).unwrap();
+        let w = eng.define_himo_in("u", "w", ValueType::Number, 0).unwrap() as u16;
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        eng.set_peer_id(1);
+        let rows: Vec<u64> = (0..4097).map(|_| eng.entity_in("t").unwrap()).collect();
+        // 先に 1 回使い回して v15 に移っておく (払い出しが空きの一覧の道で回るように)
+        eng.delete(rows[1]);
+        let again = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(again), eng.slot_unchecked(rows[1]), "前提: 満杯の表で消えた場所を使い回した");
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        let (g, l) = (rows[0], rows[4096]);
+        let g_slot = eng.slot_unchecked(g);
+        assert_eq!(g_slot % 4096, eng.slot_unchecked(l) % 4096, "前提: G と L の場所は同じ stripe");
+        eng.delete(g);
+        eng.oplog_commit();
+        // アプリが L の行を握る (G の行とは別の行。 この thread は他の thread の書き込みを待たない = `write_row` の doc の通り)
+        let held = eng.write_row(l);
+        let (seen, seen_rx) = channel::<()>();
+        eng.row_locks.set_wait_hook(g_slot, move || {
+            let _ = seen.send(());
+        });
+        let (f_done, f_rx) = channel::<Option<u64>>();
+        {
+            let e = eng.clone();
+            std::thread::spawn(move || {
+                let _ = f_done.send(e.resolve_remote_eid(enchudb_oplog::make_eid(C, 100), v));
+            });
+        }
+        seen_rx.recv_timeout(Duration::from_secs(10)).expect("前提: t への受信 F が G の場所の行を握れずに回り始めた");
+        let (h_done, h_rx) = channel::<Option<u64>>();
+        {
+            let e = eng.clone();
+            std::thread::spawn(move || {
+                let _ = h_done.send(e.resolve_remote_eid(enchudb_oplog::make_eid(C, 200), w));
+            });
+        }
+        // L を握っている間に H が返るか (返らなければ、 5 秒後に L を放して両方が返るのを確かめてから落とす)
+        let during = h_rx.recv_timeout(Duration::from_secs(5));
+        let returned_while_held = during.is_ok();
+        drop(held);
+        let f = f_rx.recv_timeout(Duration::from_secs(20)).expect("L を放した後も F が返らない");
+        let h = match during {
+            Ok(h) => h,
+            Err(_) => h_rx.recv_timeout(Duration::from_secs(20)).expect("L を放した後も H が返らない"),
+        };
+        assert_eq!(f.map(|e| eng.slot_unchecked(e)), Some(g_slot), "前提: F は消えた G の場所を使い回した");
+        assert!(h.is_some(), "前提: H に u の場所を払い出した");
+        cleanup(&path, eng);
+        assert!(
+            returned_while_held,
+            "別の表 u への受信 H が、 アプリが握る t の行 L (G の場所と同じ stripe) を放すまで返らなかった \
+             (F が alloc_lock を握ったまま G の行を待っている)"
+        );
+    }
+
     /// review930 [5]: 消えた自分の行 X (名前 7) への遅れた改名 (名前 8、 `name_given_to_dead_row`) が 「X はまだ場所の行で消えている」
     /// を見た後 (割り込み点 `dead_name_hook`) に、 別の thread の insert が X の場所を使い回そうとしても、 名前 8 は使い回した新しい行 Y
     /// の前の名前にならない (`former_pk_holder` が Y を返さない)。 insert は改名が握る行を飛ばして待ち、 改名の後に場所を取って、 名前 8
