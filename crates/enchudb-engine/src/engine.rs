@@ -17030,15 +17030,18 @@ impl Engine {
     #[doc(hidden)]
     pub fn compact_name_records_now(&self) {
         let addr = self as *const Engine as usize;
-        loop {
+        // 書けない (やめて頼んだまま) 時に回り続けない
+        for _ in 0..4 {
             name_compactor::join(addr);
             while self.pk_tombs.read().unwrap().compact_running() || self.pk_former.read().unwrap().compact_running() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             self.compact_name_records();
             name_compactor::join(addr);
-            let (t, f) = (self.pk_tombs.read().unwrap(), self.pk_former.read().unwrap());
-            if !(t.compact_wanted() || t.compact_running() || f.compact_wanted() || f.compact_running()) {
+            let busy = |t: bool, f: bool| t || f;
+            let tombs = { let t = self.pk_tombs.read().unwrap(); t.compact_wanted() || t.compact_running() };
+            let former = { let f = self.pk_former.read().unwrap(); f.compact_wanted() || f.compact_running() };
+            if !busy(tombs, former) {
                 return;
             }
         }

@@ -234,6 +234,16 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
                 }
             });
         }
+        // 別の書き出し (pull の `persist_sync_state` に当たる): まとめ直しを作っている間にも追記する
+        {
+            let (eng, stop) = (&eng, &stop);
+            s.spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    eng.persist_sync_state().unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
         let (mut prev_tombs, mut prev_former) = (0u64, 0u64);
         for round in 0..60 {
             eng.persist_sync_state().unwrap();

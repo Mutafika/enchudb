@@ -2067,6 +2067,103 @@ fn name_records_compacted_outside_the_lock_survive_power_loss_mid_compaction() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// review987 [1]: `pktombs` のまとめ直しは書き出しの lock の外で作り、 作っている間に別の書き出しが追記した分 (伸びた分) を一時 file の
+/// 後ろに足して置く。 まとめ直しの後に checkpoint を進めた (= WAL からは引き直せない) 像で、 伸びた分の削除の版数も残る。
+#[test]
+fn pktombs_compacted_outside_the_lock_keeps_the_appends_made_meanwhile() {
+    use enchudb_engine::engine::name_compact_hook::{self, Phase as CPhase};
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const ROWS: u32 = 256;
+    let root = scratch("tombs_compact");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    let path = db.to_str().unwrap().to_string();
+    crashsim::start();
+    name_compact_hook::set(Some(Arc::new(|_| {})));
+    let mut eng = Engine::create_with_cell_version(&path, 65_536).unwrap();
+    eng.define_table("t", ROWS).unwrap();
+    eng.define_himo_in("t", "key", ValueType::Number, 0).unwrap();
+    let key = eng.himo_id("t.key").expect("t.key") as u16;
+    eng.set_table_pk("t", key).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let rows: Vec<u64> = (0..ROWS)
+        .map(|i| {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to_by_id(e, key, i);
+            e
+        })
+        .collect();
+    // 満杯の表で、 名前を i と i + ROWS の間で行き来させながら消して足す (同じ名前を何度も消す = record が生きている記録より速く増える)
+    let state = Arc::new(std::sync::Mutex::new((rows, (0..ROWS).collect::<Vec<u32>>(), 0u32)));
+    let churn = {
+        let (eng, state) = (eng.clone(), state.clone());
+        move |n: usize| {
+            let mut st = state.lock().unwrap();
+            let (rows, names, round) = &mut *st;
+            for i in 0..n {
+                let at = (i * 2 + *round as usize % 2) % ROWS as usize;
+                eng.delete(rows[at]);
+                let e = eng.entity_in("t").unwrap();
+                names[at] = if names[at] < ROWS { names[at] + ROWS } else { names[at] - ROWS };
+                eng.tie_to_by_id(e, key, names[at]);
+                rows[at] = e;
+            }
+            *round += 1;
+        }
+    };
+    let fired = Arc::new(AtomicBool::new(false));
+    {
+        let (eng, fired, churn) = (eng.clone(), fired.clone(), churn.clone());
+        name_compact_hook::set(Some(Arc::new(move |phase| {
+            if phase == CPhase::TombsPrepared && !fired.swap(true, Ordering::AcqRel) {
+                // 一時 file を作った後に、 書き手が進んで別の書き出しが `pktombs` に追記する
+                churn(ROWS as usize / 2);
+                eng.persist_sync_state().unwrap();
+            }
+        })));
+    }
+    let tombs_len = || std::fs::metadata(enchudb_engine::db_files::path_for(&path, enchudb_engine::db_files::PKTOMBS)).map_or(0, |m| m.len());
+    let mut shrank = false;
+    for _ in 0..60 {
+        churn(ROWS as usize / 2);
+        eng.persist_sync_state().unwrap();
+        let before = tombs_len();
+        eng.compact_name_records_now();
+        if fired.load(Ordering::Acquire) {
+            shrank = tombs_len() < before;
+            break;
+        }
+    }
+    name_compact_hook::set(None);
+    // checkpoint を進める (像を開いた時に、 WAL から削除を引き直させない)
+    eng.oplog_sync().unwrap();
+    let versions: Vec<Option<Hlc>> = (0..2 * ROWS).map(|n| eng.deleted_name_version(key, n as u64)).collect();
+    let deleted = eng.deleted_primary_key_count();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    let back = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    let got: Vec<Option<Hlc>> = (0..2 * ROWS).map(|n| back.deleted_name_version(key, n as u64)).collect();
+    let got_deleted = back.deleted_primary_key_count();
+    drop(back);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(fired.load(Ordering::Acquire), "前提: pktombs をまとめ直した");
+    assert!(shrank, "前提: まとめ直して縮んだ");
+    assert_eq!(got_deleted, deleted, "像の消した名前の数が違う");
+    let differ = (0..versions.len()).filter(|&i| got[i] != versions[i]).count();
+    assert_eq!(differ, 0, "まとめ直しの間に追記した削除の版数が像に無い ({differ} 個違う)");
+}
+
 /// #557: sync の表の無い v9 の DB (cell の版数あり) で、 汚れた終了の後に開いた時、 cell の版数が時計より先にあっても (時計が
 /// 戻った = cell に未来の版数を置いて真似る)、 ローカルの書き込みが弾かれない。 開く時の HLC の種は WAL に残った record だけで、
 /// WAL に無い版数 (畳んだ後) を知らなかった。
