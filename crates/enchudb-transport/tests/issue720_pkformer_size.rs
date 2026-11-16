@@ -82,6 +82,9 @@ fn a_one_row_pull_does_not_rewrite_pkformer_and_deleted_rows_leave_it() {
     p2.sync.pull_once(1);
     p1.sync.pull_once(2);
     assert_eq!(p2.db.get_table(T).unwrap().all().count().unwrap(), n, "前提: 同じ名前の行は 1 行に束ねられた");
+    // 最初の書き出し (log だけ) の後の、 書き出しの lock の外のまとめ直し (consumer の周期、 review987 [1] / [3]) を待って済ませる
+    // (下の 1 行ずつの書き出しの間に `pkformer` が置き換わると、 その回に書いた量を数え違える)
+    p2.db.engine().compact_name_records_now();
     let (snapshot, log) = sidecars(&p2);
     let full = snapshot.len() as u64 + log;
     println!("[issue720] {n} 行を束ねた後: pkformer {} B + log {log} B", snapshot.len());
@@ -117,6 +120,8 @@ fn a_one_row_pull_does_not_rewrite_pkformer_and_deleted_rows_leave_it() {
     p2.publish();
     p1.sync.pull_once(2);
     assert_eq!(p2.db.get_table(T).unwrap().all().count().unwrap(), 0, "前提: 全部の行が消えた");
+    // まとめ直しは consumer の周期が書き出しの lock の外で走らせる。 ここで待って走らせる
+    p2.db.engine().compact_name_records_now();
     let (snapshot, log) = sidecars(&p2);
     let after = snapshot.len() as u64 + log;
     println!("[issue720] 全部消した後: pkformer {} B + log {log} B", snapshot.len());

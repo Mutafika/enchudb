@@ -283,8 +283,8 @@ fn a_torn_log_tail_is_dropped_and_rewritten() {
     assert!(bytes(&image, PKFORMER) == on_disk(&image));
 }
 
-/// log の無い `pkformer` (0.37.4 以前が書いた物) はそのまま読め、 最初の書き出しでまとめ直して log を作る。 `pkformer` を
-/// 書き直された後に残った古い log (log を知らない binary が開いて書いた) は読まない。
+/// log の無い `pkformer` (0.37.4 以前が書いた物) はそのまま読め、 最初の書き出しで、 その `pkformer` の続きの log を作る (review987
+/// [4]: `pkformer` を並べ直さない)。 `pkformer` を書き直された後に残った古い log (log を知らない binary が開いて書いた) は読まない。
 #[test]
 fn a_pkformer_without_a_log_or_with_a_stale_log_is_read_as_it_is() {
     let dir = Dir::new("nolog");
@@ -306,9 +306,12 @@ fn a_pkformer_without_a_log_or_with_a_stale_log_is_read_as_it_is() {
     assert_eq!(back.pkformer_disk_diff().unwrap(), None);
     retitle(&back, &c, 3, 2);
     back.persist_sync_state().unwrap();
-    assert_eq!(len(&old, PKFORMER_LOG), LOG_HEADER, "log の無い所はまとめて書き、 header だけの log を作る");
+    assert!(len(&old, PKFORMER_LOG) > LOG_HEADER, "log の無い所に、 変わった分の log を作っていない");
+    assert!(bytes(&old, PKFORMER) == closed, "log の無い所の最初の書き出しで pkformer を並べ直した");
     assert_eq!(back.pkformer_disk_diff().unwrap(), None);
     drop(back);
+    // きれいに閉じた後は `pkformer` に全部ある
+    assert_eq!(len(&old, PKFORMER_LOG), LOG_HEADER);
 
     // `pkformer` が書き直された後に、 前の `pkformer` の続きの log が残っている
     let stale = dir.db("stale");
@@ -332,6 +335,8 @@ fn deleting_the_bound_rows_shrinks_pkformer() {
         assert!(eng.remote_delete_apply(row, later()), "前提: 削除が当たった");
     }
     eng.persist_sync_state().unwrap();
+    // まとめ直しは書き出しの lock の外で、 consumer の周期が走らせる (review987 [1])。 ここで待って走らせる
+    eng.compact_name_records_now();
     let after = len(&path, PKFORMER) + len(&path, PKFORMER_LOG);
     assert!(after < full / 4, "全行を消した後も pkformer + log が {after} B (前は {full} B)");
     assert_eq!(eng.pkformer_disk_diff().unwrap(), None);
