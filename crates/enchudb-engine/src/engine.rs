@@ -11512,7 +11512,7 @@ impl Engine {
         // 生死が決まる)・WAL の再生の前 (再生する中継の record がその別名で次の住人に当たらない)。 再生が前の住人を生かし直しうる物
         // (使い回しの記録が無い、 PR #1006 の読み直し [3])・世代が上の別名 (本体より先に届いた) は開く道の仕上げ (`finish_open_restores`)
         if unclean && !readonly {
-            eng.drop_stale_generation_aliases(false, replay.follows());
+            eng.drop_stale_generation_aliases(Some(&replay));
         }
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
@@ -20409,7 +20409,7 @@ impl Engine {
     fn finish_open_restores(&self) {
         let gens = self.generations();
         if gens.prev.opening() {
-            self.drop_stale_generation_aliases(true, false);
+            self.drop_stale_generation_aliases(None);
         }
         gens.take_alias_overrides();
         gens.prev.drop_tomb_index();
@@ -20534,7 +20534,9 @@ impl Engine {
 
     /// #993 / #994: v15 の DB をきれいに閉じなかった後に開いた時 (書ける open)、 別名のうち指す行の世代 (`eidalias` 版 2) が場所の
     /// 住人と合わない物を外す ([`Self::drop_former_generation_aliases`])。 呼ぶのは突き合わせ (`reconcile_generations`) の後・WAL の
-    /// 再生の前 (`final_pass` = 偽) と、 再生と後に回した戻しの後 ([`Self::finish_open_restores`]、 `final_pass` = 真)。
+    /// 再生の前 (`replay` = この open の後の再生) と、 再生と後に回した戻しの後 ([`Self::finish_open_restores`]、 `replay` = None =
+    /// 仕上げ)。 再生する record があるかは、 要る時 (生きている場所に、 使い回しの記録の無い下の世代の別名がある時) だけ聞く (#972:
+    /// 聞くのは WAL を読む。 前の住人の別名の無い open は聞かない)。
     ///
     /// - 生きている場所: 指す行の世代が住人より下の別名 (使い回した場所の前の住人の別名。 住人が後から来た = 使い回した) を外す。
     ///   再生の前は、 再生がその行を生かし直せない物だけ (`prev.seg` に使い回しの記録がある = 再生の守りが当てない、 か再生する record
@@ -20545,11 +20547,14 @@ impl Engine {
     ///   前は 2 回目のきれいでない open が、 1 回目の突き合わせで世代を 2 つ上げた場所の消えた行の正しい別名を外した)。 上の世代も残す
     ///   (読み直し [2]: 書き込みは死んだ場所に当たって捨てられる。 前は突き合わせで殺した使い回しの住人の別名を退避なしで外し、 その
     ///   別名宛ての書き込みが新しい生きた行になった)
-    fn drop_stale_generation_aliases(&self, final_pass: bool, replay_follows: bool) {
+    fn drop_stale_generation_aliases(&self, replay: Option<&ReplayAhead<'_>>) {
         let gens = self.generations();
         if !gens.active() {
             return;
         }
+        let final_pass = replay.is_none();
+        // 再生がその行を生かし直しうるか (仕上げでは無い)。 `ReplayAhead::follows` は 1 回だけ読む
+        let replay_follows = || replay.is_some_and(|r| r.follows());
         let mut slots: Vec<u32> = self.eid_translator.alias_snapshot().into_iter().map(|(_, _, local, _)| local).collect();
         slots.sort_unstable();
         slots.dedup();
@@ -20558,7 +20563,7 @@ impl Engine {
                 let now = self.alias_row_gen(slot);
                 let former = |g: u32| {
                     self.alias_row_left_slot(slot, g, Some(now))
-                        && (final_pass || !replay_follows || gens.prev.evicted_at_or_after(slot, g))
+                        && (final_pass || gens.prev.evicted_at_or_after(slot, g) || !replay_follows())
                 };
                 self.drop_former_generation_aliases(slot, former, final_pass.then_some(now));
             } else {
