@@ -42,8 +42,10 @@
 //! 前は変わるたびに `pkformer` をまるごと書いていた。 束ねた行は identity ごとのカードを Leaf の中身ごと持つので、 同じ名前の
 //! 行を 2 台が 2,000 個ずつ作る表で 1.36 MB になり、 1 行の書き換えのたびに全部を書き直した。 今は `eidmap.log` (#560) と同じ形:
 //!
-//! - 変える method は、 変えた slot / identity に印を付ける (`LogTrack`)。 書き出しは、 印の付いた slot / identity の**今の中身**
-//!   (slot なら前の名前・束ねた identity・カード・名前の年表の全部) を 1 record にして log に足す。 読む時は record の順に、
+//! - 変える method は、 変えた slot に印を付ける (`LogTrack`)。 書き出しは、 印の付いた slot の**今の中身** (前の名前・束ねた
+//!   identity・カード・名前の年表の全部) を 1 record にして log に足す。 identity (移した名前) は、 変える method がその場で今の
+//!   中身の record を作り、 書き出しはそれを取り出すだけ (#959: identity は場所を使い回すたびに 1 つ増え、 書き出しが印の全部の
+//!   中身を `pk_former` の書き込みの lock の下で作ると、 その間 主キーのある表の書き手が止まった)。 読む時は record の順に、
 //!   その slot / identity の中身を置き換える
 //! - `pkformer` の形は変えない (版 4)。 log を読まない 0.37.4 以前は `pkformer` だけを読む。 きれいに閉じる時にまとめ直す
 //!   (`pkformer` を書き直して log を header だけにする) ので、 きれいに閉じた後は全部ある。 落ちた後 (log に record が残って
@@ -53,7 +55,11 @@
 //! - 切れた / 壊れた / 知らない種類の record から後は捨て、 次の書き出しでまとめ直す (切れた跡の後ろに追記すると、 次に読む
 //!   時にそこで止まって失う)
 //! - まとめ直すのは他に、 disk (`pkformer` + log) が今の中身の 2 倍 + 64 KiB を越えた時 (書き換えが溜まった / 消えた行の
-//!   カードを落として中身が減った)。 今の中身の大きさは slot / identity ごとの record の長さの和で持つ
+//!   カードを落として中身が減った)。 今の中身の大きさは slot / identity ごとの record の長さの和で持つ。 #959: この時は追記した
+//!   後に、 書き手の lock の外で、 追記の済んだ disk の 2 つから作る (disk の中身 = 追記の仕事を取り出した時の memory の中身。
+//!   前は lock の下で memory の全部を並べ直した)
+//! - disk に何も無い (file の無い DB を開いた / 作った) 間の最初の書き出しは、 log の header + 開いてからの record だけ (#959、
+//!   memory の全部を並べない)。 `pkformer` を作るのは、 大きくなってまとめ直す時と、 きれいに閉じる時
 //! - 消えた行のカードは落とす (engine の `drop_cards_of_dead_slot`。 カードは生きた行を切り離す時にだけ使う)
 //!
 //! log の file: magic "PKFL"(4) + version u32 + 続く `pkformer` の長さ u64 + その FNV-1a 64、 続いて record: 種類 u8 (1 = slot /
@@ -422,18 +428,20 @@ impl PkFormer {
         if names.iter().any(|(h, k)| *h == himo && &k[..] == key) {
             return false;
         }
+        let before = identity_record_len(names);
         names.push((himo, key.into()));
-        self.log.ids.insert((peer, foreign_local));
+        // 大きさは目安 (まとめ直す時を決めるだけ)。 数えていない物 (`deserialize` だけで作った) を変えても下に抜けない
+        self.log.live_bytes = (self.log.live_bytes + identity_record_len(names)).saturating_sub(before);
+        encode_identity_record((peer, foreign_local), names, &mut self.log.id_records);
         true
     }
 
     /// identity `(peer, foreign_local)` に移した名前を外す (その identity の削除の版数を忘れた時、 engine の
     /// `forget_deletes_before`)。 変えたら true。
     pub(crate) fn forget_identity(&mut self, peer: u32, foreign_local: u32) -> bool {
-        if self.by_identity.remove(&(peer, foreign_local)).is_none() {
-            return false;
-        }
-        self.log.ids.insert((peer, foreign_local));
+        let Some(names) = self.by_identity.remove(&(peer, foreign_local)) else { return false };
+        self.log.live_bytes = self.log.live_bytes.saturating_sub(identity_record_len(&names));
+        encode_identity_record((peer, foreign_local), &[], &mut self.log.id_records);
         true
     }
 
@@ -602,7 +610,11 @@ impl PkFormer {
                 p += 14;
                 let key = buf.get(p..p + len).ok_or("pkformer sidecar: torn identity key")?;
                 p += len;
-                out.insert_identity(peer, fl, himo, key);
+                // `insert_identity` と同じ (読み込みでは record を作らない)
+                let names = out.by_identity.entry((peer, fl)).or_default();
+                if !names.iter().any(|(h, k)| *h == himo && &k[..] == key) {
+                    names.push((himo, key.into()));
+                }
             }
         }
         if version >= 3 {
@@ -666,7 +678,7 @@ impl PkFormer {
             return Err(format!("pkformer sidecar: {} trailing bytes (corrupt)", buf.len() - p));
         }
         // 読み込みで付いた印は捨てる (読んだ中身は disk と同じ)
-        out.log = LogTrack::default();
+        out.log = LogTrack { fresh: false, ..LogTrack::default() };
         Ok(out)
     }
 }
@@ -684,15 +696,21 @@ const REC_IDENTITY: u8 = 2;
 const LOG_SLACK: u64 = 64 * 1024;
 
 /// 追記の log の様子と、 前の書き出しから変わった所。
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct LogTrack {
     /// 前の書き出しの後に変わった slot
     slots: HashSet<u32>,
-    /// 前の書き出しの後に変わった identity (移した名前)
-    ids: HashSet<(u32, u32)>,
+    /// 前の書き出しの後に変わった identity (移した名前) の record。 #959: identity は変える method がその場で record を作る
+    /// (前は印を付けて、 書き出しが `pk_former` の書き込みの lock の下で全部の印の今の中身を作っていた。 場所を使い回すたびに
+    /// identity が 1 つ増えるので、 使い回しの多い DB では 1 回の書き出しが数万個を作り、 その間 書き手が止まった)。 同じ identity を
+    /// 2 回変えれば record も 2 つ (読む時は後の物が勝つ)
+    id_records: Vec<u8>,
     /// log が今の `pkformer` の続きとして信用できるか。 false なら次の書き出しでまとめ直す (log が無い / header が合わない /
     /// 切れた record がある / 前の書き出しが失敗した)
     ok: bool,
+    /// disk に何も無い (`pkformer` も log も無い DB を開いた、 または作った) まま、 まだ書き出していない。 この間の変化は全部、 印と
+    /// `id_records` にある = 最初の書き出しは log の header + それ (memory の全部を並べない、 #959)
+    fresh: bool,
     /// disk の `pkformer` の長さ
     snapshot_bytes: u64,
     /// disk の log の長さ (header 込み)
@@ -701,8 +719,47 @@ struct LogTrack {
     live_bytes: u64,
     /// slot → その record の長さ (中身のある slot だけ。 `live_bytes` を変わった分だけ直すため)
     slot_bytes: HashMap<u32, u32>,
-    /// identity → その record の長さ
-    id_bytes: HashMap<(u32, u32), u32>,
+}
+
+impl Default for LogTrack {
+    fn default() -> Self {
+        Self {
+            slots: HashSet::new(),
+            id_records: Vec::new(),
+            ok: false,
+            fresh: true,
+            snapshot_bytes: 0,
+            log_bytes: 0,
+            live_bytes: 0,
+            slot_bytes: HashMap::new(),
+        }
+    }
+}
+
+/// identity `id` に移した名前 `names` の record の長さ (名前が無ければ 0 = 中身なし)。 [`encode_identity_record`] の長さと同じ。
+fn identity_record_len(names: &[Name]) -> u64 {
+    if names.is_empty() {
+        return 0;
+    }
+    // 種類 1 + 中身の長さ 4 + (peer 4 + 番号 4 + 数 4 + 名前ごとに (himo 2 + 鍵の長さ 4 + 鍵)) + 検査値 4
+    21 + names.iter().map(|(_, k)| 6 + k.len() as u64).sum::<u64>()
+}
+
+/// identity `id` に移した名前 `names` の record を `out` に足す (名前が無ければ 「外す」 record)。
+fn encode_identity_record(id: (u32, u32), names: &[Name], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.push(REC_IDENTITY);
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&id.0.to_le_bytes());
+    out.extend_from_slice(&id.1.to_le_bytes());
+    out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for (himo, key) in names {
+        put_key(out, *himo, key);
+    }
+    let len = (out.len() - start - 5) as u32;
+    out[start + 1..start + 5].copy_from_slice(&len.to_le_bytes());
+    let sum = crate::integrity::fnv1a_region(&out[start..]);
+    out.extend_from_slice(&sum.to_le_bytes());
 }
 
 /// 書き出す仕事 (`PkFormer::take_for_persist`)。
@@ -710,8 +767,9 @@ struct LogTrack {
 pub(crate) enum Persist {
     /// `pkformer` を `snapshot` に書き直し (空なら file を消す)、 log を `log` (header だけ) に置き換える
     Rewrite { snapshot: Vec<u8>, log: Vec<u8> },
-    /// log に `bytes` を追記する
-    Append { bytes: Vec<u8> },
+    /// log に `bytes` を追記する。 `compact` = 追記の後にまとめ直す (disk が今の中身の 2 倍 + 64 KiB を越えた。 まとめ直すのは書き手の
+    /// lock の外で、 追記の済んだ disk の 2 つから = [`PkFormer::compact_files`]、 #959)
+    Append { bytes: Vec<u8>, compact: bool },
 }
 
 /// `pkformer` の bytes `snapshot` (無ければ空) の続きの、 record の無い log。
@@ -831,19 +889,6 @@ impl PkFormer {
         push_record(out, REC_SLOT, &p);
     }
 
-    /// identity `id` に移した名前の record。
-    fn encode_identity(&self, id: (u32, u32), out: &mut Vec<u8>) {
-        let mut p = Vec::new();
-        p.extend_from_slice(&id.0.to_le_bytes());
-        p.extend_from_slice(&id.1.to_le_bytes());
-        let names = self.by_identity.get(&id).map_or(&[][..], |v| &v[..]);
-        p.extend_from_slice(&(names.len() as u32).to_le_bytes());
-        for (himo, key) in names {
-            put_key(&mut p, *himo, key);
-        }
-        push_record(out, REC_IDENTITY, &p);
-    }
-
     /// record の中身を当てる (slot / identity の中身をその record の物に置き換える)。 読めなければ None (何も変えない)。
     fn apply_record(&mut self, kind: u8, payload: &[u8]) -> Option<()> {
         let mut c = Cur(payload);
@@ -920,6 +965,21 @@ impl PkFormer {
     /// 壊れた / 知らない種類の record から後は捨て、 次の書き出しでまとめ直す (切れた跡の後ろに追記すると、 次に読む時にそこで
     /// 止まって失う)。 `snapshot` が読めなければ Err。
     pub(crate) fn load(snapshot: Option<&[u8]>, log: Option<&[u8]>) -> Result<Self, String> {
+        let mut out = Self::load_records(snapshot, log)?;
+        // 今の中身の大きさを数える (slot / identity ごとの record の長さ)
+        let mut slots: HashSet<u32> = out.by_slot.keys().copied().collect();
+        slots.extend(out.bound.keys().chain(out.cards.keys()).chain(out.timeline.keys()));
+        let mut scratch = Vec::new();
+        for slot in slots {
+            scratch.clear();
+            out.account_slot(slot, &mut scratch);
+        }
+        out.log.live_bytes += out.by_identity.values().map(|v| identity_record_len(v)).sum::<u64>();
+        Ok(out)
+    }
+
+    /// [`Self::load`] の、 今の中身の大きさを数えない形 (読んだ中身を並べ直すだけの [`Self::compact_files`] 用)。
+    fn load_records(snapshot: Option<&[u8]>, log: Option<&[u8]>) -> Result<Self, String> {
         let mut out = match snapshot {
             Some(buf) => Self::deserialize(buf)?,
             None => Self::default(),
@@ -954,21 +1014,22 @@ impl PkFormer {
             }
             log_bytes = off as u64;
         }
-        out.log = LogTrack { ok, snapshot_bytes: snap.len() as u64, log_bytes, ..LogTrack::default() };
-        // 今の中身の大きさを数える (slot / identity ごとの record の長さ)
-        let mut slots: HashSet<u32> = out.by_slot.keys().copied().collect();
-        slots.extend(out.bound.keys().chain(out.cards.keys()).chain(out.timeline.keys()));
-        let ids: Vec<(u32, u32)> = out.by_identity.keys().copied().collect();
-        let mut scratch = Vec::new();
-        for slot in slots {
-            scratch.clear();
-            out.account_slot(slot, &mut scratch);
-        }
-        for id in ids {
-            scratch.clear();
-            out.account_identity(id, &mut scratch);
-        }
+        out.log = LogTrack { ok, fresh: false, snapshot_bytes: snap.len() as u64, log_bytes, ..LogTrack::default() };
         Ok(out)
+    }
+
+    /// #959: 追記の済んだ disk の `pkformer` の bytes `snapshot` と log `log` を、 まとめ直す仕事 (`Rewrite`) にする (書き手の lock の
+    /// 外で呼ぶ)。 disk の中身は、 追記の仕事を取り出した時の memory の中身 (印の付いた slot / identity の今の中身を足した物) と同じ
+    /// なので、 その時に memory から並べた [`Self::serialize`] と同じ bytes になる。 log が `snapshot` の続きとして読めない (header が
+    /// 合わない / 切れた record がある) 時は Err (memory から書き直す)。
+    pub(crate) fn compact_files(snapshot: Option<&[u8]>, log: Option<&[u8]>) -> Result<Persist, String> {
+        let f = Self::load_records(snapshot, log)?;
+        if !f.log.ok {
+            return Err("pkformer.log is not readable as the continuation of pkformer".into());
+        }
+        let snapshot = if f.is_empty() { Vec::new() } else { f.serialize() };
+        let log = log_header(&snapshot);
+        Ok(Persist::Rewrite { snapshot, log })
     }
 
     /// log に record があるか (きれいに閉じる時にまとめ直すかの判定)。
@@ -996,44 +1057,41 @@ impl PkFormer {
         self.log.live_bytes = self.log.live_bytes + now as u64 - before.unwrap_or(0) as u64;
     }
 
-    /// [`Self::account_slot`] の identity 版。
-    fn account_identity(&mut self, id: (u32, u32), out: &mut Vec<u8>) {
-        let start = out.len();
-        self.encode_identity(id, out);
-        let now = if self.by_identity.contains_key(&id) { (out.len() - start) as u32 } else { 0 };
-        let before = match now {
-            0 => self.log.id_bytes.remove(&id),
-            n => self.log.id_bytes.insert(id, n),
-        };
-        self.log.live_bytes = self.log.live_bytes + now as u64 - before.unwrap_or(0) as u64;
-    }
-
     /// 書き出す仕事を取り出す (変わった所の印を下ろす)。 何も変わっていなければ None。
     ///
-    /// - log が信用できない / `compact` (きれいに閉じる時、 log に record があれば) / 足した後の disk の大きさ (`pkformer` +
-    ///   log) が今の中身の 2 倍 + 64 KiB を越える (書き換えが溜まった / 消えた行のカードを落として中身が減った) → まとめ直す
-    /// - それ以外 → 変わった slot / identity の今の中身を log に足す
+    /// - log が信用できない / `compact` (きれいに閉じる時、 log に record があれば) → memory の中身からまとめ直す
+    /// - それ以外 → 変わった slot / identity の今の中身を log に足す。 足した後の disk の大きさ (`pkformer` + log) が今の中身の
+    ///   2 倍 + 64 KiB を越える (書き換えが溜まった / 消えた行のカードを落として中身が減った) 時は、 足した後にまとめ直す
+    ///   (`Append { compact: true }`)。 #959: 呼び手は書き込みの lock を握っている。 前はここで memory の全部を並べ直していて
+    ///   (`serialize`)、 その間、 主キーのある表の行を消す / 場所を使い回す書き手が止まった (使い回した identity 10 万で 16〜28 ms)。
+    ///   まとめ直しは lock の外で、 追記の済んだ disk から作る ([`Self::compact_files`])
     ///
     /// 書けたら [`Self::persisted`]、 書けなかったら [`Self::persist_failed`] を呼ぶ。
     pub(crate) fn take_for_persist(&mut self, compact: bool) -> Option<Persist> {
         let mut slots: Vec<u32> = std::mem::take(&mut self.log.slots).into_iter().collect();
-        let mut ids: Vec<(u32, u32)> = std::mem::take(&mut self.log.ids).into_iter().collect();
         slots.sort_unstable();
-        ids.sort_unstable();
-        let mut bytes = Vec::new();
+        let mut bytes = std::mem::take(&mut self.log.id_records);
         for slot in slots {
             self.account_slot(slot, &mut bytes);
         }
-        for id in ids {
-            self.account_identity(id, &mut bytes);
-        }
         let after = self.log.snapshot_bytes + self.log.log_bytes + bytes.len() as u64;
-        if !self.log.ok || (compact && self.log_has_records()) || after > 2 * self.log.live_bytes + LOG_SLACK {
+        if self.log.fresh && !compact {
+            // disk に何も無い DB の最初の書き出し: 開いてからの変化は全部 `bytes` にある (並べ直さない、 #959)。 きれいに閉じる時
+            // (`compact`) は下で `pkformer` に並べる (log を読まない旧 binary も読める形)
+            if bytes.is_empty() {
+                return None;
+            }
+            let mut log = log_header(&[]);
+            log.extend_from_slice(&bytes);
+            return Some(Persist::Rewrite { snapshot: Vec::new(), log });
+        }
+        if !self.log.ok || (compact && self.log_has_records()) {
             let snapshot = if self.is_empty() { Vec::new() } else { self.serialize() };
             let log = log_header(&snapshot);
             return Some(Persist::Rewrite { snapshot, log });
         }
-        (!bytes.is_empty()).then_some(Persist::Append { bytes })
+        let compact = after > 2 * self.log.live_bytes + LOG_SLACK;
+        (!bytes.is_empty() || compact).then_some(Persist::Append { bytes, compact })
     }
 
     /// `job` を書けた。
@@ -1041,16 +1099,19 @@ impl PkFormer {
         match job {
             Persist::Rewrite { snapshot, log } => {
                 self.log.ok = true;
+                self.log.fresh = false;
                 self.log.snapshot_bytes = snapshot.len() as u64;
                 self.log.log_bytes = log.len() as u64;
             }
-            Persist::Append { bytes } => self.log.log_bytes += bytes.len() as u64,
+            Persist::Append { bytes, .. } => self.log.log_bytes += bytes.len() as u64,
         }
     }
 
     /// 書けなかった: 次の書き出しでまとめ直す (途中まで書けた record の後ろに足さない)。
     pub(crate) fn persist_failed(&mut self) {
         self.log.ok = false;
+        // 取り出した印 / record は書けたか分からないので、 次は memory の全部から
+        self.log.fresh = false;
     }
 }
 
@@ -1260,22 +1321,41 @@ mod tests {
     }
 
     impl Disk {
-        /// 書き出しを 1 回 (engine の `persist_pk_former` と同じ当て方)。 何を書いたか。
+        /// 書き出しを 1 回 (engine の `persist_pk_former` と同じ当て方: 追記 → 追記の済んだ disk からまとめ直す)。 何を書いたか。
         fn persist(&mut self, f: &mut PkFormer, compact: bool) -> Option<&'static str> {
             let job = f.take_for_persist(compact)?;
             let what = match &job {
+                Persist::Rewrite { .. } => "rewrite",
+                Persist::Append { compact: true, .. } => "compact",
+                Persist::Append { .. } => "append",
+            };
+            self.write(&job);
+            f.persisted(&job);
+            if what == "compact" {
+                let job = self.compact();
+                f.persisted(&job);
+            }
+            Some(what)
+        }
+
+        fn write(&mut self, job: &Persist) {
+            match job {
                 Persist::Rewrite { snapshot, log } => {
                     self.snapshot = (!snapshot.is_empty()).then(|| snapshot.clone());
                     self.log = Some(log.clone());
-                    "rewrite"
                 }
-                Persist::Append { bytes } => {
+                Persist::Append { bytes, .. } => {
                     self.log.as_mut().expect("log の無い所に追記した").extend_from_slice(bytes);
-                    "append"
                 }
-            };
-            f.persisted(&job);
-            Some(what)
+            }
+        }
+
+        /// 追記の済んだ disk からまとめ直して置く (engine の `compact_pk_former_files`)。
+        fn compact(&mut self) -> Persist {
+            let job = PkFormer::compact_files(self.snapshot.as_deref(), self.log.as_deref()).unwrap();
+            assert!(matches!(job, Persist::Rewrite { .. }));
+            self.write(&job);
+            job
         }
 
         fn load(&self) -> PkFormer {
@@ -1336,7 +1416,7 @@ mod tests {
     /// 追記の両方を踏む (前提)。 印を 1 つ外すと落ちる (変異で確かめた)。
     #[test]
     fn the_log_plus_the_snapshot_always_reads_back_what_is_in_memory() {
-        let (mut appends, mut rewrites) = (0, 0);
+        let (mut appends, mut rewrites, mut compacts) = (0, 0, 0);
         for seed in 0..200u64 {
             let mut r = Rng(seed);
             let mut f = PkFormer::default();
@@ -1347,10 +1427,24 @@ mod tests {
                 }
                 match disk.persist(&mut f, false) {
                     Some("append") => appends += 1,
+                    Some("compact") => compacts += 1,
                     Some(_) => rewrites += 1,
                     None => {}
                 }
                 assert_eq!(disk.load().serialize(), f.serialize(), "seed {seed} round {round}: disk と memory が違う");
+                // #959: 追記の済んだ disk からまとめ直す (大きくなった時の道。 ここでは大きさによらず踏む)。 まとめ直す間に書き手が
+                // 進んだ分は、 印が残って次の書き出しで新しい log に足される
+                if r.below(4) == 0 && disk.log.is_some() {
+                    let racing = r.below(3);
+                    for _ in 0..racing {
+                        mutate(&mut f, &mut r);
+                    }
+                    let job = disk.compact();
+                    f.persisted(&job);
+                    compacts += 1;
+                    disk.persist(&mut f, false);
+                    assert_eq!(disk.load().serialize(), f.serialize(), "seed {seed} round {round}: まとめ直した後に disk と memory が違う");
+                }
                 // 開き直した物に続けて足しても同じ (log の様子が戻る)
                 if round % 9 == 8 {
                     f = disk.load();
@@ -1362,7 +1456,7 @@ mod tests {
             let old_reader = disk.snapshot.as_deref().map(|b| PkFormer::deserialize(b).unwrap()).unwrap_or_default();
             assert_eq!(old_reader.serialize(), f.serialize(), "seed {seed}: 閉じた後の pkformer だけでは足りない");
         }
-        assert!(appends > 1000 && rewrites >= 200, "前提: 追記 {appends} 回 / まとめ直し {rewrites} 回");
+        assert!(appends > 1000 && rewrites >= 200 && compacts > 1000, "前提: 追記 {appends} 回 / まとめ直し {rewrites} 回 / disk から {compacts} 回");
     }
 
     /// #720: 追記の途中で切れた / 壊れた record から後は捨て、 次の書き出しでまとめ直す。 header が今の `pkformer` と合わない log
@@ -1439,7 +1533,8 @@ mod tests {
                 f.note_card(slot, id, 2, Card::Bytes(body.clone().into()), h(1));
             }
         }
-        assert_eq!(disk.persist(&mut f, false), Some("rewrite"));
+        // きれいに閉じる時と同じ書き出しで `pkformer` に並べる (disk の無い DB の最初の書き出しは log だけ、 #959)
+        assert_eq!(disk.persist(&mut f, true), Some("rewrite"));
         let snapshot = disk.snapshot.as_ref().unwrap().len();
         assert!(snapshot > 1_000_000, "前提: pkformer は 1 MB を越える ({snapshot} B)");
         for round in 0..5u64 {
@@ -1454,9 +1549,103 @@ mod tests {
         for slot in 0..2000u32 {
             f.drop_cards(slot);
         }
-        assert_eq!(disk.persist(&mut f, false), Some("rewrite"), "中身が減ったのにまとめ直さない");
+        assert_eq!(disk.persist(&mut f, false), Some("compact"), "中身が減ったのにまとめ直さない");
         let after = disk.snapshot.as_ref().map_or(0, |s| s.len()) + disk.log.as_ref().unwrap().len();
         assert!(after < snapshot / 4, "消した後も {after} B (前は {snapshot} B)");
         assert_eq!(disk.load().serialize(), f.serialize());
+    }
+
+    /// #959: identity は変える method がその場で record を作る (書き出しは取り出すだけ)。 disk の無い DB の最初の書き出しは log の
+    /// header + 開いてからの record (memory の全部を並べない)。 書けなかった後と、 disk を読んだ物は memory から並べる。
+    #[test]
+    fn identities_are_logged_as_they_change_and_a_fresh_store_writes_only_the_log() {
+        let mut f = PkFormer::default();
+        let mut disk = Disk::default();
+        for n in 0..1000u32 {
+            f.insert_identity(1, n, 3, &n.to_le_bytes());
+            f.insert_identity(1, n, 4, b"former");
+        }
+        for n in 0..10u32 {
+            f.forget_identity(1, n);
+        }
+        f.insert(3, b"tokyo", 7);
+        let records = f.log.id_records.len();
+        assert!(records > 0 && f.log.slots.len() == 1, "前提: identity は record、 slot は印");
+        assert_eq!(disk.persist(&mut f, false), Some("rewrite"));
+        assert!(disk.snapshot.is_none(), "disk の無い DB の最初の書き出しで pkformer を並べた");
+        assert!(disk.log.as_ref().unwrap().len() > LOG_HEADER_LEN + records, "identity の record を書いていない");
+        let back = disk.load();
+        assert_eq!(back.serialize(), f.serialize());
+        assert_eq!(back.log.live_bytes, f.log.live_bytes, "変える時に数えた大きさが読み直した大きさと違う");
+        // 続きは追記
+        f.insert_identity(2, 1, 3, b"k");
+        assert_eq!(disk.persist(&mut f, false), Some("append"));
+        assert_eq!(disk.load().serialize(), f.serialize());
+        // 書けなかった後は memory から並べる (取り出した record を落とさない)
+        f.insert_identity(2, 2, 3, b"lost");
+        let _lost = f.take_for_persist(false).unwrap();
+        f.persist_failed();
+        f.insert_identity(2, 3, 3, b"k");
+        let Some(Persist::Rewrite { snapshot, .. }) = f.take_for_persist(false) else { panic!("書けなかった後に追記した") };
+        assert_eq!(snapshot, f.serialize());
+        // disk の無い DB でも、 書けなかった後は memory から
+        let mut g = PkFormer::default();
+        g.insert_identity(1, 1, 3, b"a");
+        let _lost = g.take_for_persist(false).unwrap();
+        g.persist_failed();
+        g.insert_identity(1, 2, 3, b"b");
+        let Some(Persist::Rewrite { snapshot, .. }) = g.take_for_persist(false) else { panic!() };
+        assert_eq!(snapshot, g.serialize(), "最初の書き出しが失敗した後に、 後の record だけを書いた");
+        // 読んだ物は disk の無い DB ではない
+        assert!(!PkFormer::deserialize(&f.serialize()).unwrap().log.fresh);
+        assert!(!disk.load().log.fresh);
+    }
+
+    /// #959: disk が大きくなった時、 書き込みの lock の下では印の付いた所を取り出すだけ (`Append { compact: true }`、 memory の全部を
+    /// 並べない)。 まとめ直しは追記の済んだ disk から作り、 取り出した時の memory から並べた物と同じ bytes (取り出した後の書き換えは
+    /// 入らず、 印が残って次に追記する)。 log が `pkformer` の続きとして読めなければ作らない (memory から書き直す)。
+    #[test]
+    fn a_grown_store_is_compacted_from_the_appended_disk() {
+        let mut f = PkFormer::default();
+        let mut disk = Disk::default();
+        f.insert_identity(1, 0, 3, b"k");
+        assert_eq!(disk.persist(&mut f, false), Some("rewrite"));
+        let mut n = 0u32;
+        let job = loop {
+            n += 1;
+            // 場所を使い回すたびに、 前の住人の名前を identity に移して slot を外す (engine の `move_names_and_forget_slot`)
+            f.insert(3, &n.to_le_bytes(), n % 7);
+            f.insert_identity(1, n, 3, &n.to_le_bytes());
+            f.forget_identity(1, n.saturating_sub(3));
+            let job = f.take_for_persist(false).unwrap();
+            match job {
+                Persist::Append { compact: true, .. } => break job,
+                Persist::Append { .. } => {
+                    disk.write(&job);
+                    f.persisted(&job);
+                }
+                Persist::Rewrite { .. } => panic!("log を信用できるのに memory から並べ直した ({n})"),
+            }
+        };
+        assert!(n > 100, "前提: 追記を重ねてからまとめ直す ({n})");
+        disk.write(&job);
+        f.persisted(&job);
+        let at_take = f.serialize();
+        // 取り出した後の書き換え (まとめ直しの間に書き手が進んだ)
+        f.insert_identity(2, 9, 3, b"later");
+        f.forget_slot(1);
+        let compacted = disk.compact();
+        let Persist::Rewrite { snapshot, log } = &compacted else { unreachable!() };
+        assert_eq!(snapshot, &at_take, "まとめ直した pkformer が取り出した時の memory と違う");
+        assert_eq!(log.len(), LOG_HEADER_LEN);
+        f.persisted(&compacted);
+        assert_eq!(disk.persist(&mut f, false), Some("append"), "取り出した後の書き換えを次に追記しない");
+        assert_eq!(disk.load().serialize(), f.serialize());
+        // 切れた log / 続きでない log からはまとめ直さない
+        f.insert_identity(2, 10, 3, b"x");
+        disk.persist(&mut f, false);
+        let log = disk.log.clone().unwrap();
+        assert!(PkFormer::compact_files(disk.snapshot.as_deref(), Some(&log[..log.len() - 2])).is_err());
+        assert!(PkFormer::compact_files(None, Some(&log)).is_err());
     }
 }

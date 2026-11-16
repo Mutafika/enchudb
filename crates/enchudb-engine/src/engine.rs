@@ -1805,6 +1805,26 @@ fn load_pkformer_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_for
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// `pkformer` を `snapshot` に書き直し (空なら file を消す)、 `pkformer.log` を `log` (header だけ) に置き換える。 `pkformer` → 空の
+/// log の順 (間で落ちても、 header の合わない log は読まれない)。
+#[cfg(not(target_arch = "wasm32"))]
+fn write_pkformer_files(path: &std::path::Path, log_path: &std::path::Path, snapshot: &[u8], log: &[u8]) -> io::Result<()> {
+    let snap = if snapshot.is_empty() {
+        // 電源断の模擬: 消す file の控えを捨てる (inode の番号は次に作った file に渡る)
+        #[cfg(all(feature = "crashsim", unix))]
+        let r = enchudb_oplog::crashsim::releasing(path, || std::fs::remove_file(path));
+        #[cfg(not(all(feature = "crashsim", unix)))]
+        let r = std::fs::remove_file(path);
+        match r {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        crate::db_files::write_atomic_if_changed(path, snapshot).map(|_| ())
+    };
+    snap.and_then(|()| crate::db_files::write_atomic_if_changed(log_path, log).map(|_| ()))
+}
+
 /// #513: `pktombs` を読む。 不在なら Ok(None)。 2 つ目は切れた末尾を捨てたか。
 #[cfg(not(target_arch = "wasm32"))]
 fn load_pktombs_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_tombs::PkTombs, bool)>> {
@@ -16321,8 +16341,9 @@ impl Engine {
 
     /// 主キーの前の名前を、 変わっていれば書き出す。 #720: 変わった slot / identity の今の中身だけを `pkformer.log` に追記する
     /// (前は `pkformer` をまるごと書き直していた。 束ねた行は Leaf の中身ごとカードを持つので、 行の数に比例した)。 log が
-    /// 信用できない / 大きくなった / きれいに閉じる時 (`compact`) は、 まとめ直す (`pkformer` を書き直して log を header だけに
-    /// する。 `pk_former.rs` の `take_for_persist`)。 印を先に下ろしてから取り出すので、 取り出した後に変わった分は印が立ち直り、
+    /// 信用できない / きれいに閉じる時 (`compact`) は、 memory からまとめ直す (`pkformer` を書き直して log を header だけに
+    /// する。 `pk_former.rs` の `take_for_persist`)。 大きくなった時は、 追記した後に disk からまとめ直す (#959、
+    /// [`Self::compact_pk_former_files`])。 印を先に下ろしてから取り出すので、 取り出した後に変わった分は印が立ち直り、
     /// 次に書く。 書けなかったら印を戻し、 次はまとめ直す。 呼び手は `sidecar_persist_lock` を握っている。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_pk_former(&self, compact: bool) -> io::Result<()> {
@@ -16335,34 +16356,63 @@ impl Engine {
         let Some(job) = self.pk_former.write().unwrap().take_for_persist(compact) else { return Ok(()) };
         let (path, log_path) = (pkformer_path_for(&self.path), pkformer_log_path_for(&self.path));
         let r = match &job {
-            // `pkformer` → 空の log の順 (間で落ちても、 header の合わない log は読まれない)
-            Persist::Rewrite { snapshot, log } => {
-                let snap = if snapshot.is_empty() {
-                    // 電源断の模擬: 消す file の控えを捨てる (inode の番号は次に作った file に渡る)
-                    #[cfg(all(feature = "crashsim", unix))]
-                    let r = enchudb_oplog::crashsim::releasing(&path, || std::fs::remove_file(&path));
-                    #[cfg(not(all(feature = "crashsim", unix)))]
-                    let r = std::fs::remove_file(&path);
-                    match r {
-                        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                        _ => Ok(()),
-                    }
-                } else {
-                    crate::db_files::write_atomic_if_changed(&path, snapshot).map(|_| ())
-                };
-                snap.and_then(|()| crate::db_files::write_atomic_if_changed(&log_path, log).map(|_| ()))
-            }
-            Persist::Append { bytes } => crate::db_files::append_synced(&log_path, bytes),
+            Persist::Rewrite { snapshot, log } => write_pkformer_files(&path, &log_path, snapshot, log),
+            Persist::Append { bytes, .. } if bytes.is_empty() => Ok(()),
+            Persist::Append { bytes, .. } => crate::db_files::append_synced(&log_path, bytes),
         };
-        let mut g = self.pk_former.write().unwrap();
-        match &r {
-            Ok(()) => g.persisted(&job),
-            Err(_) => {
-                g.persist_failed();
-                self.pk_former_dirty.store(true, Ordering::Release);
+        {
+            let mut g = self.pk_former.write().unwrap();
+            match &r {
+                Ok(()) => g.persisted(&job),
+                Err(_) => {
+                    g.persist_failed();
+                    self.pk_former_dirty.store(true, Ordering::Release);
+                }
             }
         }
-        r
+        r?;
+        if matches!(job, Persist::Append { compact: true, .. }) {
+            self.compact_pk_former_files(&path, &log_path);
+        }
+        Ok(())
+    }
+
+    /// #959: `pkformer` + `pkformer.log` を、 追記の済んだ disk の中身からまとめ直す (`pk_former` の lock の外)。 disk の中身は、
+    /// 追記の仕事を取り出した時の memory の中身なので、 その時に memory から並べるのと同じ bytes (`PkFormer::compact_files`)。
+    /// 取り出した後の書き換えは印が残り、 次の書き出しが新しい log に足す。 前は disk が大きくなると、 書き出しが `pk_former` の
+    /// 書き込みの lock を握ったまま memory の全部を並べ直し、 その間、 主キーのある表の行を消す / 場所を使い回す書き手が止まった
+    /// (使い回した場所の前の住人の名前 (#914) が 10 万で 16〜28 ms)。
+    ///
+    /// 読めない / 続きとして読めない / 書けない時は、 次の書き出しで memory から書き直す (前の道)。 失敗は返さない (追記は済んで
+    /// いて、 disk は取り出した時の中身を持つ。 本体の書き出し・checkpoint を止める理由にならない)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compact_pk_former_files(&self, path: &std::path::Path, log_path: &std::path::Path) {
+        use std::sync::atomic::Ordering;
+        let read = |p: &std::path::Path| match std::fs::read(p) {
+            Ok(buf) => Ok(Some(buf)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        };
+        let r = (|| -> io::Result<crate::pk_former::Persist> {
+            let log = read(log_path)?;
+            let snapshot = read(path)?;
+            let job = crate::pk_former::PkFormer::compact_files(snapshot.as_deref(), log.as_deref())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if let crate::pk_former::Persist::Rewrite { snapshot, log } = &job {
+                write_pkformer_files(path, log_path, snapshot, log)?;
+            }
+            Ok(job)
+        })();
+        let mut g = self.pk_former.write().unwrap();
+        match r {
+            Ok(job) => g.persisted(&job),
+            Err(e) => {
+                g.persist_failed();
+                self.pk_former_dirty.store(true, Ordering::Release);
+                drop(g);
+                self.warn_persist_failure_rate_limited(&e);
+            }
+        }
     }
 
     /// [`Self::persist_pk_former`] の、 まとめ直しを求めない形。
@@ -16590,17 +16640,48 @@ impl Engine {
         let path = pktombs_path_for(&self.path);
         let r = match &job {
             Persist::Rewrite { bytes, .. } => crate::db_files::write_atomic_if_changed(&path, bytes).map(|_| ()),
+            Persist::Append { bytes, .. } if bytes.is_empty() => Ok(()),
             Persist::Append { bytes, .. } => crate::db_files::append_synced(&path, bytes),
         };
-        let mut g = self.pk_tombs.write().unwrap();
-        match &r {
-            Ok(()) => g.persisted(&job),
-            Err(_) => {
-                g.persist_failed();
-                self.pk_tombs_dirty.store(true, Ordering::Release);
+        {
+            let mut g = self.pk_tombs.write().unwrap();
+            match &r {
+                Ok(()) => g.persisted(&job),
+                Err(_) => {
+                    g.persist_failed();
+                    self.pk_tombs_dirty.store(true, Ordering::Release);
+                }
             }
         }
-        r
+        r?;
+        if matches!(job, Persist::Append { compact: true, .. }) {
+            self.compact_pk_tombs_file(&path);
+        }
+        Ok(())
+    }
+
+    /// #959: `pktombs` を、 追記の済んだ file の中身からまとめ直す (`pk_tombs` の lock の外。 `PkTombs::compact_file`)。 前は record が
+    /// 増えすぎると、 書き出しが `pk_tombs` の書き込みの lock を握ったまま memory の全部を並べ直し、 その間、 主キーのある表の行を
+    /// 消す / 場所を使い回す / 主キーを書く書き手が止まった (主キー 10 万で 4〜7 ms)。 読めない / 書けない時は、 次の書き出しで
+    /// memory から書き直す (前の道)。 失敗は返さない (`compact_pk_former_files` と同じ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compact_pk_tombs_file(&self, path: &std::path::Path) {
+        use std::sync::atomic::Ordering;
+        let r = std::fs::read(path)
+            .and_then(|buf| {
+                crate::pk_tombs::PkTombs::compact_file(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .and_then(|(bytes, records)| crate::db_files::write_atomic_if_changed(path, &bytes).map(|_| records));
+        let mut g = self.pk_tombs.write().unwrap();
+        match r {
+            Ok(records) => g.compacted(records),
+            Err(e) => {
+                g.persist_failed();
+                self.pk_tombs_dirty.store(true, Ordering::Release);
+                drop(g);
+                self.warn_persist_failure_rate_limited(&e);
+            }
+        }
     }
 
     /// wasm 版 (sidecar を持たないので no-op)。

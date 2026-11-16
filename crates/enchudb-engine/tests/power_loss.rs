@@ -1861,8 +1861,8 @@ fn deleted_primary_keys_survive_power_loss_after_oplog_sync() {
 }
 
 /// #720: `pkformer` の追記 (`pkformer.log`) は、 書き出し (`persist_sync_state`) が返った直後の電源断の像でも残る。 1 回目の
-/// 書き出しは `pkformer` をまとめて書き、 2 回目は変わった slot の record だけを log に足す (前提)。 像の `pkformer` + log を読んだ
-/// 中身が、 電源を落とす前の中身と同じで、 像は開ける。
+/// 書き出しは log を作り (#959: disk の無い DB の最初の書き出しは log の header + record だけで、 `pkformer` は作らない)、 2 回目は
+/// 変わった slot の record だけを log に足す (前提)。 像の `pkformer` + log を読んだ中身が、 電源を落とす前の中身と同じで、 像は開ける。
 #[test]
 fn appended_pkformer_records_survive_power_loss() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -1902,12 +1902,12 @@ fn appended_pkformer_records_survive_power_loss() {
     eng.persist_sync_state().unwrap();
     let pkformer = enchudb_engine::db_files::path_for(path, enchudb_engine::db_files::PKFORMER);
     let log = enchudb_engine::db_files::path_for(path, enchudb_engine::db_files::PKFORMER_LOG);
-    let snapshot = std::fs::read(&pkformer).expect("前提: 1 回目の書き出しは pkformer を書く");
-    let log_before = std::fs::metadata(&log).expect("前提: log がある").len();
+    let snapshot = std::fs::read(&pkformer).ok();
+    let log_before = std::fs::metadata(&log).expect("前提: 1 回目の書き出しは log を作る").len();
     assert!(eng.remote_tie_apply(local, title, 2u32, at(1)), "前提: 相手の書き換えが当たった");
     eng.note_bound_write(local, foreign, title, Some(2), at(1));
     eng.persist_sync_state().unwrap();
-    let appended = std::fs::metadata(&log).unwrap().len() > log_before && std::fs::read(&pkformer).unwrap() == snapshot;
+    let appended = std::fs::metadata(&log).unwrap().len() > log_before && std::fs::read(&pkformer).ok() == snapshot;
     let expect = Engine::pkformer_for_bootstrap(path).unwrap().unwrap();
     let img = root.join("img");
     let captured = crashsim::capture(&live, &img, Mode::Lost);
@@ -1919,7 +1919,7 @@ fn appended_pkformer_records_survive_power_loss() {
     let back = Engine::open_concurrent_with_oplog(img_db.to_str().unwrap(), OPLOG_CAP).map(|e| e.pkformer_disk_diff().unwrap());
     let _ = std::fs::remove_dir_all(&root);
     assert!(appended, "前提: 2 回目の書き出しは log への追記 (pkformer は書き直さない)");
-    assert!(expect != snapshot, "前提: 追記の分は pkformer だけでは読めない");
+    assert!(expect != snapshot.unwrap_or_default(), "前提: 追記の分は pkformer だけでは読めない");
     assert!(got.as_deref() == Some(&expect[..]), "書き出しの返った追記が電源断の像で消えた");
     assert_eq!(back.expect("像を開けない"), None);
 }

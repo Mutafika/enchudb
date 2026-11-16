@@ -16,7 +16,9 @@
 //!
 //! 消した主キーの数だけ増える (減らさない)。 永続化は DB directory の `pktombs` に **追記** する (変わった分だけ。 他の
 //! sidecar のように毎回まるごと書くと、 消すほど書き出しが重くなる)。 record が生きている記録の 2 倍を越えたら、 書き出しの
-//! 時にまとめ直す (一時 file に書いて rename)。
+//! 時にまとめ直す (一時 file に書いて rename)。 #959: まとめ直しは追記した後に、 書き手の lock の外で追記の済んだ file から作る
+//! (前は lock の下で memory の全部を並べ直し、 その間 主キーのある表の書き手が止まった)。 file の無い DB の最初の書き出しは
+//! header + 覚えた record (並べ直さない)。
 //!
 //! memory (#560): 主キー 1 つに記録 32 B (8 byte 以下の鍵はその中に置き、 長い鍵だけ `arena` に 1 回置く) + 番号の表 4 B ×
 //! 2〜4 + slot の記録。 前は鍵を 2 回 heap に写し、 主キーの himo ごとの `HashMap` で引いていた (数の鍵で 1 鍵 147 B、 100 万鍵)。
@@ -99,6 +101,9 @@ pub(crate) struct PkTombs {
     /// まだ file に書いていない record。
     pending: Vec<u8>,
     pending_records: u64,
+    /// `pending` が今の記録の全部を作る record ではない (取り出した / file から読んだ / 忘れて作り直した)。 false の間 (file の無い
+    /// DB を開いてから、 まだ書き出していない) は、 最初の書き出しが header + `pending` で済む (#959、 `take_for_persist`)。
+    pending_partial: bool,
     /// file にある record の数。 `None` = file が無い / 信用できない (次の書き出しでまとめ直す)。
     in_file: Option<u64>,
 }
@@ -106,9 +111,10 @@ pub(crate) struct PkTombs {
 /// 書き出しの仕事 ([`PkTombs::take_for_persist`])。
 #[derive(Debug)]
 pub(crate) enum Persist {
-    /// file に追記する record。
-    Append { bytes: Vec<u8>, records: u64 },
-    /// file 全体 (header から) を書き直す。
+    /// file に追記する record。 `compact` = 追記の後に file をまとめ直す (record が生きている記録の 2 倍を越えた。 まとめ直すのは
+    /// 書き手の lock の外で、 追記の済んだ file から = [`PkTombs::compact_file`]、 #959)。
+    Append { bytes: Vec<u8>, records: u64, compact: bool },
+    /// file 全体 (header から) を memory の中身から書き直す (file が無い / 信用できない時)。
     Rewrite { bytes: Vec<u8>, records: u64 },
 }
 
@@ -276,31 +282,45 @@ impl PkTombs {
                 self.by_slot.insert(slot, new_id[id as usize]);
             }
         }
-        // `in_file = None` (既定) = 次の書き出しでまとめ直す
+        // `in_file = None` (既定) = 次の書き出しでまとめ直す (作り直した記録は `pending` に無い)
+        self.pending_partial = true;
         gone
     }
 
     /// 書き出す分を取り出す (呼び手は書いた結果を [`PkTombs::persisted`] / [`PkTombs::persist_failed`] で返す)。 file を
-    /// 信用できない時と、 record が増えすぎた時はまとめ直す。 書くものが無ければ `None`。
+    /// 信用できない時は memory の中身から書き直す。 record が増えすぎた時は追記した後にまとめ直す (`compact`)。 書くものが無ければ
+    /// `None`。
+    ///
+    /// #959: 呼び手は書き込みの lock を握っているので、 ここは主キーの数に比例する仕事をしない。 前は増えすぎた時もここで
+    /// memory の全部を並べ直していた (`snapshot`)。 その間、 主キーのある表の行を消す / 場所を使い回す書き手が止まった (主キー
+    /// 10 万個で 4〜7 ms)。
     pub(crate) fn take_for_persist(&mut self) -> Option<Persist> {
-        let live = (self.keys.len() + self.by_slot.len()) as u64;
-        let rewrite = match self.in_file {
-            None => true,
-            Some(n) => n + self.pending_records > 2 * live + REWRITE_SLACK,
-        };
-        if rewrite {
+        let Some(n) = self.in_file else {
+            if !self.pending_partial {
+                // file の無い DB を開いてから最初の書き出し: 覚えた record の全部が `pending` にある (並べ直さない)
+                self.pending_partial = true;
+                let mut bytes = Vec::with_capacity(HEADER_LEN + self.pending.len());
+                bytes.extend_from_slice(MAGIC);
+                bytes.extend_from_slice(&VERSION.to_le_bytes());
+                bytes.extend_from_slice(&std::mem::take(&mut self.pending));
+                let records = std::mem::replace(&mut self.pending_records, 0);
+                return Some(Persist::Rewrite { bytes, records });
+            }
             // 確保も手放す (clear だと溜めた山の大きさのまま残る)
             self.pending = Vec::new();
             self.pending_records = 0;
             let (bytes, records) = self.snapshot();
             return Some(Persist::Rewrite { bytes, records });
-        }
-        if self.pending_records == 0 {
+        };
+        let live = (self.keys.len() + self.by_slot.len()) as u64;
+        let compact = n + self.pending_records > 2 * live + REWRITE_SLACK;
+        if self.pending_records == 0 && !compact {
             return None;
         }
+        self.pending_partial = true;
         let bytes = std::mem::take(&mut self.pending);
         let records = std::mem::replace(&mut self.pending_records, 0);
-        Some(Persist::Append { bytes, records })
+        Some(Persist::Append { bytes, records, compact })
     }
 
     /// 書き出しが済んだ。
@@ -308,9 +328,28 @@ impl PkTombs {
         self.in_file = match (job, self.in_file) {
             (Persist::Rewrite { records, .. }, _) => Some(*records),
             (Persist::Append { records, .. }, Some(n)) => Some(n + records),
-            // 書いている間に別の書き出しが失敗した (今は書き出しを 1 本に並べているので起きない)。 まとめ直しに倒す
+            // 書いている間に file を信用しなくなった (`forget_before`)。 まとめ直しに倒す
             (Persist::Append { .. }, None) => None,
         };
+    }
+
+    /// #959: 追記の済んだ file の中身 `buf` をまとめ直した bytes と record の数 (書き手の lock の外で呼ぶ)。 file の中身は、 追記の
+    /// 仕事を取り出した時の memory の中身と同じなので、 その時に memory から並べた [`Self::snapshot`] と同じ bytes になる。 切れた
+    /// record のある file は Err (memory から書き直す)。
+    pub(crate) fn compact_file(buf: &[u8]) -> Result<(Vec<u8>, u64), String> {
+        let (t, torn) = Self::load(buf)?;
+        if torn {
+            return Err("pktombs sidecar: torn record after an append".into());
+        }
+        Ok(t.snapshot())
+    }
+
+    /// #959: [`Self::compact_file`] でまとめ直した file (`records` 個の record) を置けた。 間に file を信用しなくなっていれば
+    /// (`forget_before`: 忘れた主キーは追記では消せないので、 memory から書き直す) そのまま。
+    pub(crate) fn compacted(&mut self, records: u64) {
+        if self.in_file.is_some() {
+            self.in_file = Some(records);
+        }
     }
 
     /// 書き出しに失敗した。 追記の途中で切れた record が file に残りうるので、 次はまとめ直す (取り出した record は
@@ -386,6 +425,7 @@ impl PkTombs {
             records += 1;
         }
         out.in_file = if torn { None } else { Some(records) };
+        out.pending_partial = true;
         Ok((out, torn))
     }
 }
@@ -545,7 +585,7 @@ mod tests {
         Hlc { wall, logical: 0, peer: 1 }
     }
 
-    /// 書き出しの仕事を file (Vec) に当てる。
+    /// 書き出しの仕事を file (Vec) に当てる (engine の `persist_pk_tombs_if_dirty` と同じ順: 追記 → 追記の済んだ file からまとめ直す)。
     fn write(file: &mut Vec<u8>, p: &mut PkTombs) -> Option<&'static str> {
         let job = p.take_for_persist()?;
         let kind = match &job {
@@ -553,12 +593,17 @@ mod tests {
                 *file = bytes.clone();
                 "rewrite"
             }
-            Persist::Append { bytes, .. } => {
+            Persist::Append { bytes, compact, .. } => {
                 file.extend_from_slice(bytes);
-                "append"
+                if *compact { "compact" } else { "append" }
             }
         };
         p.persisted(&job);
+        if kind == "compact" {
+            let (bytes, records) = PkTombs::compact_file(file).unwrap();
+            *file = bytes;
+            p.compacted(records);
+        }
         Some(kind)
     }
 
@@ -684,6 +729,94 @@ mod tests {
         assert!(same(&back, &p));
         // 生きている記録は 主キー 2 (z, y) + slot 2 (10, 11)
         assert!(back.in_file.unwrap() <= 2 * 4 + REWRITE_SLACK, "まとめ直して record が減った");
+    }
+
+    /// #959: file の無い DB を開いてから最初の書き出しは header + 覚えた record (memory の全部を並べない)。 読み直すと memory と
+    /// 同じ。 file から読んだ / 忘れて作り直した記録は `pending` に全部は無いので、 memory から並べる。
+    #[test]
+    fn the_first_write_of_a_fresh_store_is_the_pending_records() {
+        let mut p = PkTombs::default();
+        for i in 0..50u32 {
+            p.note(3, &i.to_le_bytes(), i, hlc(10 + i as u64));
+        }
+        p.forget_slot(7);
+        p.note(3, &1u32.to_le_bytes(), 40, hlc(99));
+        let pending_len = p.pending.len();
+        let job = p.take_for_persist().unwrap();
+        let Persist::Rewrite { bytes, records } = &job else { panic!("file が無いのに追記した") };
+        assert_eq!(bytes.len(), HEADER_LEN + pending_len, "並べ直した (覚えた record をそのまま書いていない)");
+        assert_eq!(*records, 52);
+        p.persisted(&job);
+        let (back, torn) = PkTombs::load(bytes).unwrap();
+        assert!(!torn && same(&back, &p));
+        assert_eq!(back.in_file, Some(52));
+        // 一度取り出した後に信用しなくなった (書けなかった) 時は memory から
+        p.note(4, b"x", 1, hlc(5));
+        let _ = p.take_for_persist();
+        p.persist_failed();
+        p.note(4, b"y", 2, hlc(6));
+        let Some(Persist::Rewrite { bytes, .. }) = p.take_for_persist() else { panic!() };
+        assert_eq!(bytes, p.snapshot().0, "取り出した後に失敗したのに覚えた record だけを書いた");
+        // 読んだ記録 / 忘れて作り直した記録も memory から
+        let (mut back, _) = PkTombs::load(&bytes).unwrap();
+        back.in_file = None;
+        back.note(5, b"z", 3, hlc(7));
+        let Some(Persist::Rewrite { bytes, .. }) = back.take_for_persist() else { panic!() };
+        assert_eq!(bytes, back.snapshot().0, "file から読んだ記録を落とした");
+        let mut q = PkTombs::default();
+        q.note(3, b"a", 1, hlc(1));
+        q.note(3, b"b", 2, hlc(9));
+        assert_eq!(q.forget_before(hlc(5)), 1);
+        q.note(3, b"c", 3, hlc(10));
+        let Some(Persist::Rewrite { bytes, .. }) = q.take_for_persist() else { panic!() };
+        assert_eq!(bytes, q.snapshot().0, "忘れて作り直した記録を落とした");
+    }
+
+    /// #959: record が増えすぎた時は、 書き込みの lock の下では追記の分を取り出すだけ (`Append { compact: true }`)。 まとめ直しは
+    /// 追記の済んだ file から作り、 その時の memory から並べた物と同じ bytes。 取り出した後に覚えた分は次に追記し、 間に忘れた
+    /// (`forget_before`) 時は memory から書き直す。
+    #[test]
+    fn many_records_are_compacted_from_the_appended_file() {
+        let mut p = PkTombs::default();
+        let mut file = Vec::new();
+        p.note(3, b"z", 10, hlc(5));
+        assert_eq!(write(&mut file, &mut p), Some("rewrite"));
+        let mut i = 0u64;
+        let job = loop {
+            i += 1;
+            p.note(3, b"z", 10 + (i % 3) as u32, hlc(10 + i));
+            let job = p.take_for_persist().unwrap();
+            if matches!(job, Persist::Append { compact: true, .. }) {
+                break job;
+            }
+            let Persist::Append { bytes, .. } = &job else { panic!("file があるのに memory から書き直した") };
+            file.extend_from_slice(bytes);
+            p.persisted(&job);
+        };
+        assert!(i > REWRITE_SLACK / 2, "早くまとめ直した ({i})");
+        let Persist::Append { bytes, .. } = &job else { unreachable!() };
+        file.extend_from_slice(bytes);
+        p.persisted(&job);
+        // 取り出した時の memory の中身 (この後に覚えた分は入らない)
+        let at_take = p.snapshot();
+        p.note(4, b"later", 99, hlc(10_000));
+        let (bytes, records) = PkTombs::compact_file(&file).unwrap();
+        assert_eq!((bytes.clone(), records), at_take, "まとめ直した file が取り出した時の memory と違う");
+        p.compacted(records);
+        assert_eq!(p.in_file, Some(records));
+        file = bytes;
+        assert_eq!(write(&mut file, &mut p), Some("append"), "後に覚えた分を次に追記しない");
+        assert!(same(&PkTombs::load(&file).unwrap().0, &p));
+        // 切れた file はまとめ直さない (memory から書き直す)
+        assert!(PkTombs::compact_file(&file[..file.len() - 2]).is_err());
+        // まとめ直しの間に忘れたら、 置いた file の数を信用しない (忘れた主キーは追記では消せない)
+        p.note(5, b"x", 7, hlc(1));
+        let _ = p.take_for_persist();
+        assert_eq!(p.forget_before(hlc(2)), 1);
+        p.compacted(1);
+        assert_eq!(p.in_file, None, "忘れた後に file の数を戻した");
+        assert_eq!(write(&mut file, &mut p), Some("rewrite"));
+        assert!(same(&PkTombs::load(&file).unwrap().0, &p));
     }
 
     /// 乱数 (xorshift)。
