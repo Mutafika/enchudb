@@ -20,7 +20,7 @@ use enchudb_transport::host::{HttpHost, HttpHostTransport};
 
 const HOST: PeerId = 100;
 const WORDS: u32 = 1_500;
-const ATTEMPTS: u32 = 3;
+const ATTEMPTS: u32 = 8;
 
 /// Tag の列 `name` を持つ表 `rows`。
 fn db(path: &str, peer: PeerId) -> Arc<Engine> {
