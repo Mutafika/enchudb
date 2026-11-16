@@ -124,15 +124,6 @@ pub(crate) struct Generations {
     missing_tombs: std::sync::Mutex<Vec<u32>>,
     /// 場所を使い回した時の前の住人の記録 (`prev.seg`、 `crate::prev_slots`)。 `gen.seg` と一緒に持つ (v15 の DB だけ)。
     pub(crate) prev: crate::prev_slots::PrevSlots,
-    /// #970: 行が消えたのに世代も 「死んでいる」 印も書けなかった場所 (gen.seg の commit を伸ばせなかった kill、 この process の中)。
-    /// 消す道は WAL に積む前に場所の page を commit しておく (できなければ消す操作を断る、 `Engine::gen_room`) ので、 ここに載るのは
-    /// 断れない道 (受信の Delete・名前の削除で一緒に消える行・畳んだ行の切り離し・開く時の突き合わせ など) が空き不足に当たった時
-    /// だけ。 載っている場所は使い回さず (`Engine::entity_in` の取り出しと拾い直しが飛ばす、 anonymous は空きの山に積まない)、 アプリの
-    /// 書き込みを断る (世代が同じなので消えた行の eid が照合を通る)。 kill をやり直せたら外す (`Engine::retry_unkilled`)。 残ったまま
-    /// きれいに閉じる時は header の 「汚れた session」 の印を倒さない (次に開く時の突き合わせが削除を完了させる)。 状態からは推さない:
-    /// 「生きていない・死の印なし」 は払い出し位置から取って生かす前の場所と見分けられない (PR #977 の読み直し [1])。
-    unkilled: std::sync::Mutex<Vec<u32>>,
-    has_unkilled: std::sync::atomic::AtomicBool,
 }
 
 impl Generations {
@@ -153,66 +144,40 @@ impl Generations {
             has_relog_gens: std::sync::atomic::AtomicBool::new(false),
             missing_tombs: std::sync::Mutex::new(Vec::new()),
             prev: crate::prev_slots::PrevSlots::off(),
-            unkilled: std::sync::Mutex::new(Vec::new()),
-            has_unkilled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// #970: kill を書けなかった場所を覚える ([`Self::unkilled`] の doc)。
-    pub(crate) fn note_unkilled(&self, slot: u32) {
-        let mut v = self.unkilled.lock().unwrap_or_else(|p| p.into_inner());
-        if !v.contains(&slot) {
-            v.push(slot);
-        }
-        self.has_unkilled.store(true, Ordering::Release);
-    }
-
-    /// #970: kill を書けなかった場所か (覚えた場所が無い間は atomic の load 1 回)。
-    #[inline]
-    pub(crate) fn is_unkilled(&self, slot: u32) -> bool {
-        self.has_unkilled.load(Ordering::Acquire) && self.unkilled.lock().unwrap_or_else(|p| p.into_inner()).contains(&slot)
-    }
-
-    /// #970: kill を書けなかった場所があるか。
-    #[inline]
-    pub(crate) fn has_unkilled(&self) -> bool {
-        self.has_unkilled.load(Ordering::Acquire)
-    }
-
-    /// #970: kill を書けた (やり直した) 場所を外す。
-    pub(crate) fn forget_unkilled(&self, slot: u32) {
-        if !self.has_unkilled() {
-            return;
-        }
-        let mut v = self.unkilled.lock().unwrap_or_else(|p| p.into_inner());
-        v.retain(|&s| s != slot);
-        if v.is_empty() {
-            self.has_unkilled.store(false, Ordering::Release);
-        }
-    }
-
-    /// #970: kill を書けなかった場所の写し。
-    pub(crate) fn unkilled_slots(&self) -> Vec<u32> {
-        if !self.has_unkilled() {
-            return Vec::new();
-        }
-        self.unkilled.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-
-    /// #970: 場所 `slot` の page (の手前まで) の gen.seg を commit する (書かない)。 commit 済みなら atomic の load だけ。 この後の
+    /// 場所 `slot` の page (の手前まで) の gen.seg を commit する (書かない)。 commit 済みなら atomic の load だけ。 この後の
     /// [`Self::kill`] / [`Self::raise`] は commit の失敗では落ちない (commit は縮まない)。 書けなければ (ディスクの空き) Err。
-    pub(crate) fn commit_slot(&self, slot: u32) -> std::io::Result<()> {
+    fn commit_slot(&self, slot: u32) -> std::io::Result<()> {
         match self.slot_page_end(slot) {
             Some((r, end)) => r.ensure_committed(end),
             None => Ok(()),
         }
     }
 
-    /// #970: 場所 `slot` の page まで gen.seg が commit 済みか (atomic の load だけ)。 範囲の外と gen.seg の無い DB は true
-    /// ([`Self::commit_slot`] が何もしない)。
+    /// #970: 場所 `0..end` の全部の 2 B を書けるように gen.seg を commit する (書かない。 page の終わりまで、 commit 済みなら atomic の
+    /// load だけ)。 世代を持つ表の枠の全部を、 場所を払い出す前に commit しておく (`Engine::commit_generations_through`): commit は縮まない
+    /// ので、 その後の消す道の kill / 使い回しの raise は commit の失敗で落ちない (= 世代も 「死んでいる」 印も書けないまま場所を空ける形を
+    /// 作らない)。 伸ばすのは file の長さだけ (疎、 block は書いた page の分だけ)。 gen.seg の無い DB は何もしない。 書けなければ Err。
+    pub(crate) fn commit_through(&self, end: u32) -> std::io::Result<()> {
+        if end == 0 {
+            return Ok(());
+        }
+        self.commit_slot(end - 1)
+    }
+
+    /// gen.seg を持つか (v15 の DB、 または v15 に移る手順が `gen.seg` を用意した後)。 用意した後に足す表の枠は、 枠の場所の gen.seg を
+    /// 足す前に commit する (`Engine::push_table_extent_locked` など)。
     #[inline]
-    pub(crate) fn slot_committed(&self, slot: u32) -> bool {
-        self.slot_page_end(slot).is_none_or(|(r, end)| r.is_committed(end))
+    pub(crate) fn has_region(&self) -> bool {
+        self.region.get().is_some()
+    }
+
+    /// 試験用: gen.seg の commit 済みの長さ (byte)。 gen.seg の無い DB は 0。
+    #[cfg(test)]
+    pub(crate) fn committed_bytes(&self) -> usize {
+        self.region.get().map_or(0, |r| r.committed_len())
     }
 
     /// 場所 `slot` を書くために commit する長さ (page の終わり)。 範囲の外 / gen.seg の無い DB は None。
@@ -319,10 +284,19 @@ impl Generations {
     /// v15 に移る時: `region` を 0 から初めて (前の残りは消す)、 header を書く。 まだ照合は始めない ([`Self::start`])。
     pub(crate) fn prepare(&self, region: Region, bits: u32) -> std::io::Result<()> {
         region.ensure_committed(GEN_HEADER)?;
+        // 0 でない 4 KiB だけ 0 に戻す (#970: 移る手順は表の枠の全部を commit するので、 移り損ねた後にやり直すと commit 済みの長さは
+        // 大きい。 全部を 0 で埋めると疎な file の穴を全部書いて実ディスクにする)
+        const CHUNK: usize = 4096;
         let used = region.committed_len();
-        if used > 0 {
-            region.fill_at(0, used, 0);
-            region.mark_dirty(0, used);
+        let s = region.slice();
+        let mut at = 0;
+        while at < used {
+            let end = (at + CHUNK).min(used);
+            if s[at..end].iter().any(|&b| b != 0) {
+                region.fill_at(at, end - at, 0);
+                region.mark_dirty(at, end - at);
+            }
+            at = end;
         }
         region.write_at(0, &MAGIC);
         region.write_at(OFF_BITS, &bits.to_le_bytes());
@@ -493,7 +467,15 @@ impl Generations {
         }
         let mut dead_but_live = Vec::new();
         let n = ((len - GEN_HEADER) / 2) as u32;
-        for slot in 0..n {
+        let mut next = 0u32;
+        while next < n {
+            // #970: gen.seg は表の枠の全部を commit する (疎) ので、 0 の並びは 4 場所 (8 B) ずつ飛ばす
+            if next % 4 == 0 && next + 4 <= n && r.as_atomic_u64(slot_off(next)).load(Ordering::Relaxed) == 0 {
+                next += 4;
+                continue;
+            }
+            let slot = next;
+            next += 1;
             let v = r.as_atomic_u16(slot_off(slot)).load(Ordering::Relaxed);
             if v == 0 {
                 continue;

@@ -40,9 +40,9 @@ pub struct EntitySet {
 unsafe impl Sync for EntitySet {}
 unsafe impl Send for EntitySet {}
 
-/// [`EntitySet::allocate_tracked_with`] の空きの山の場所をどうするか。
+/// [`EntitySet::allocate_or_keep`] の空きの山の場所をどうするか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reuse {
+pub(crate) enum Reuse {
     /// 生かして返す。
     Take,
     /// 山から外して次を見る (二度と渡さない場所)。
@@ -51,9 +51,9 @@ pub enum Reuse {
     Keep,
 }
 
-/// [`EntitySet::allocate_tracked_with`] の結果。
+/// [`EntitySet::allocate_or_keep`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Allocated {
+pub(crate) enum Allocated {
     /// 位置から払い出した新しい場所。
     Fresh(u32),
     /// 空きの山から使い回した場所。
@@ -216,18 +216,27 @@ impl EntitySet {
     /// (`Engine::clear_cell_versions`)。 monotonic 払い出し (= 新品 slot) では
     /// 消す物が無いので、 hot path に消去コストを持ち込まないための戻り値。
     pub fn allocate_tracked(&self) -> Option<(u32, bool)> {
-        match self.allocate_tracked_with(|_| {}, |_| Reuse::Take) {
+        self.allocate_tracked_with(|_| {})
+    }
+
+    /// `allocate_tracked` + 生きている印を立てる直前に `before(slot)` を呼ぶ (#731: 場所の 「死んでいる」 印を先に落とす)。
+    pub fn allocate_tracked_with(&self, before: impl Fn(u32)) -> Option<(u32, bool)> {
+        match self.allocate_or_keep(&before, |slot| {
+            before(slot);
+            Reuse::Take
+        }) {
             Allocated::Fresh(e) => Some((e, false)),
             Allocated::Reused(e) => Some((e, true)),
             Allocated::Full | Allocated::Kept(_) => None,
         }
     }
 
-    /// `allocate_tracked` + 生きている印を立てる直前に呼ぶ手を渡す (#731: 場所の 「死んでいる」 印を先に落とす)。 新しい場所 (位置
-    /// から払い出す) は `fresh(slot)`。 空きの山から使い回す場所は `reuse(slot)` が決める (#970: 世代を上げられない場所を生かさない):
-    /// [`Reuse::Take`] = 生かして返す、 [`Reuse::Discard`] = 山から外して次を見る (二度と渡さない場所)、 [`Reuse::Keep`] = 山に
-    /// 残したまま返す ([`Allocated::Kept`]、 呼び手が理由に応じて断る / 仕度してから取り直す)。 `reuse` は空きの山の lock の下で呼ぶ。
-    pub fn allocate_tracked_with(&self, fresh: impl Fn(u32), reuse: impl Fn(u32) -> Reuse) -> Allocated {
+    /// [`Self::allocate_tracked_with`] の、 空きの山から使い回す場所を呼び手が決める形 (#970、 anonymous の `Engine::entity`)。 新しい
+    /// 場所 (位置から払い出す) は生きている印を立てる直前に `fresh(slot)`。 空きの山の一番上の場所は `reuse(slot)` が決める (空きの山の
+    /// lock の下で呼ぶ): [`Reuse::Take`] = 生かして返す (生かす前の仕度は `reuse` の中で)、 [`Reuse::Discard`] = 山から外して次を見る
+    /// (二度と渡さない場所)、 [`Reuse::Keep`] = 山に残したまま返す ([`Allocated::Kept`]、 呼び手が理由に応じて断る / 仕度してから
+    /// 取り直す)。
+    pub(crate) fn allocate_or_keep(&self, fresh: impl Fn(u32), reuse: impl Fn(u32) -> Reuse) -> Allocated {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
         let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
         if eid < self.max_entities() {

@@ -440,6 +440,11 @@ impl SegmentSet {
         } else {
             SegmentMap::create(&p, size, INITIAL_COMMIT.min(size))?
         };
+        // 開いた後に作る segment (列・gen.seg など) にも `set_space_margin` の余裕を効かせる (遅延 open の slot と同じ)
+        let margin = self.space_margin.load(Ordering::Relaxed);
+        if margin > 0 {
+            seg.set_space_margin(margin);
+        }
         Ok(Arc::new(seg))
     }
 

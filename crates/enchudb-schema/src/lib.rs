@@ -7256,15 +7256,9 @@ impl<'a> EntityRef<'a> {
         }
     }
 
-    /// 行を消す。 容量で断った時は `SchemaError::WriteRejected` (何も変えない): WAL に載らない (`FaultKind::WalSpace`、 #553 /
-    /// #554)、 #970 の 「場所を使い回したことのある DB で、 場所の世代を書く gen.seg を伸ばせない」 (`FaultKind::DiskSpace`、 消すと
-    /// 次の行が消えた行と同じ eid で場所を使い回す)。 もう無い行 (消えた行の eid) と、 記録した削除より古い版数での削除は今まで
-    /// 通り `Ok` (何もしない)。
     pub fn delete(self) -> Result<(), SchemaError> {
-        match self.db.engine().try_delete(self.eid) {
-            Err(e @ enchudb_engine::TieRejected::Fault(_)) => Err(SchemaError::WriteRejected(e)),
-            _ => Ok(()),
-        }
+        self.db.engine().delete(self.eid);
+        Ok(())
     }
 }
 
