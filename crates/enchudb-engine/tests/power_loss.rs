@@ -874,6 +874,10 @@ fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
 /// 周期の書き出しが `during` の write の record を oplog ごと届かせることがある (CI の少ない CPU では毎回届いた)。 止める
 /// 所 (周期の oplog の fsync) は lock を持たない。 WAL の空き作り (#388) は append の lock を持ったまま書き出すので、 WAL
 /// が埋まる試験では使わないこと。 `during` で queue の write (`tie_async` …) を待つと止まる。
+///
+/// 止めるのは oplog 全体の fsync の写し (`Copied::Oplog`) だけ。 header を届ける書き出し (`Copied::OplogHeader`) は、 書き手が
+/// `append_lock` を持ったまま (畳んだ区画に書く前) か、 consumer が畳んだ直後 (bridge の lock を持ったまま) に写す。 そこで
+/// 止めると `during` の書き込みが `append_lock` を待ち続ける (#1000、 [`a_stalled_sync_does_not_wait_for_a_fold_header_being_written_out`])。
 fn with_stalled_sync(eng: &Arc<Engine>, during: impl FnOnce()) -> ConsumerHeld {
     let (copied_tx, copied_rx) = std::sync::mpsc::channel::<()>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
@@ -921,6 +925,84 @@ impl Drop for ConsumerHeld {
             let _ = release.send(());
         }
         crashsim::set_after_copy_hook(None);
+    }
+}
+
+/// #1000: consumer が暇な WAL を畳み、 畳んだ区画の header を届けている途中 (遅い disk の msync の間) に [`with_stalled_sync`] を
+/// 始めても、 互いに待たない。
+///
+/// 止めた `oplog_sync` の Commit は、 畳んだ区画に書く前にその header を自分で届ける (`alloc_after_switch`、 `append_lock` の
+/// 下)。 前はその写しも全体の fsync と同じ `Copied::Oplog` で、 hook がそこで止めた = `append_lock` を持ったまま止まり、 `during`
+/// の書き込みが lock を待ち続けた (CI の `writes_after_a_durable_mark_are_still_relogged_after_power_loss` で 2 時間。 consumer
+/// は同じ hook で畳んだ header の写しに止まっていた)。 遅い msync の代わりに、 consumer を畳んだ header の写し (WAL が空の時に
+/// consumer が oplog を写すのはここだけ、 種類は問わない) で止めて窓を開けておく = 毎回この順になる。 止まった時に落ちるように、
+/// 本体は別の thread で回して上限を付ける (止まった thread は放っておく)。
+#[test]
+fn a_stalled_sync_does_not_wait_for_a_fold_header_being_written_out() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let body = std::thread::spawn(move || {
+        let root = scratch("fold_header");
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        crashsim::start();
+        let eng = notes_engine(&live.join("db"), OPLOG_CAP);
+        let wal = eng.oplog().unwrap().clone();
+        let [a, b] = [(); 2].map(|_| eng.entity_in("notes").unwrap());
+        // consumer を、 暇な WAL を畳んだ後の header の写し (書き出しの前) で止める。 書いた後に周期が書き出して畳む (試験は
+        // 何も積まない: 積むと畳んだ区画の header を試験の thread が届けてしまう)。 hook を置く前に畳み終えていたら書き直す
+        let mut release = None;
+        for i in 0..5u32 {
+            eng.tie_to(a, "notes.note", i);
+            let lap = wal.lap();
+            let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let fold = std::sync::Mutex::new(Some((parked_tx, release_rx)));
+            let w = wal.clone();
+            crashsim::set_after_copy_hook(Some(Arc::new(move |what| {
+                if what != Copied::Segment
+                    && std::thread::current().name() == Some("enchudb-consumer")
+                    && w.is_empty()
+                    && w.lap() != lap
+                {
+                    let taken = fold.lock().unwrap().take();
+                    if let Some((parked, release)) = taken {
+                        let _ = parked.send(());
+                        let _ = release.recv();
+                    }
+                }
+            })));
+            if parked_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok() {
+                assert!(wal.is_empty() && wal.lap() != lap, "前提: 畳んだ");
+                release = Some(release_tx);
+                break;
+            }
+        }
+        let release_tx = release.expect("前提: consumer が暇な WAL を畳んで、 その header の写しで止まる");
+        let held = with_stalled_sync(&eng, || {
+            // 止めた sync の bridge が consumer の持つ lock を待たないように放す (consumer は header を届け終え、 次の周期で
+            // with_stalled_sync の hook に止まる)
+            release_tx.send(()).unwrap();
+            eng.tie_to(b, "notes.note", 2);
+        });
+        assert_eq!(eng.get(b, "notes.note"), Some(2));
+        drop(held);
+        crashsim::stop();
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = done_tx.send(());
+    });
+    match done_rx.recv_timeout(std::time::Duration::from_secs(90)) {
+        Ok(()) => body.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::panic::resume_unwind(body.join().unwrap_err()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crashsim::set_after_copy_hook(None);
+            crashsim::stop();
+            panic!("止めた oplog_sync と試験の書き込みが 90 秒互いに待った (畳んだ header の写しで止めた、 #1000)");
+        }
     }
 }
 
@@ -1976,6 +2058,7 @@ fn local_writes_after_power_loss_are_not_older_than_cells() {
 /// consumer は空き作り (#388、 `make_wal_room_inner`) に入り、 transfer の lock を持ったまま書き出す = その写しで止まると、 試験の
 /// `oplog_sync` の bridge (同じ lock を待つ) と互いに待つ。 Linux の CI で踏んだ (試験の `oplog_sync` の Commit で起きた consumer が、
 /// 試験 thread の fsync と本体の書き出しの間に lock を取った。 Mac は書き出しが速く、 bridge が先に済んで consumer は lock を取れない)。
+/// 畳んだ直後に header を届ける写しも bridge の lock の下なので、 止めるのは全体の fsync (`Copied::Oplog`) だけ (#1000)。
 fn hold_consumer(eng: &Arc<Engine>) -> ConsumerHeld {
     let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();

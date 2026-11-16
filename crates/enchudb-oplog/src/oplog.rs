@@ -2323,9 +2323,11 @@ impl OpLog {
         {
             let b = h.base();
             let len = (HALF_ALIGN as usize).min(self.mmap.len() - b);
+            // #1000: 全体の fsync (`Copied::Oplog`) と分ける (呼び手は `append_lock` か、 engine の bridge の lock を持っていうる)
             #[cfg(all(feature = "crashsim", unix))]
-            let sim = crate::crashsim::active()
-                .then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, b as u64, &self.mmap[b..b + len]));
+            let sim = crate::crashsim::active().then(|| {
+                crate::crashsim::copy_for_sync(crate::crashsim::Copied::OplogHeader, b as u64, &self.mmap[b..b + len])
+            });
             if crate::io_point(io).is_ok() && self.mmap.flush_range(b, len).is_ok() {
                 #[cfg(all(feature = "crashsim", unix))]
                 if let Some(copy) = sim {
