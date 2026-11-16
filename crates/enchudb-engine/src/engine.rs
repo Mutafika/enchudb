@@ -1446,6 +1446,21 @@ impl<'a> LocalApply<'a> {
         Self { eng, mark: None, intents: Intents::None, counted: false }
     }
 
+    /// #978: 印も門も持たず、 辞書と Leaf の旧 slot の書き出しを落とす時まで回さないだけの物 (削除の門の中で、 本体の書き出しを
+    /// 呼ばない = 門を閉じて自分を待たない)。 自分の書き込みの `LocalApply` の中なら、 書き出しはいちばん外が落ちる時。
+    #[inline]
+    fn deferring_settles(eng: &'a Engine) -> Self {
+        IN_LOCAL_APPLY.with(|d| {
+            let mut t = d.get();
+            if t.bits & LOCAL_APPLY_DEPTH == 0 {
+                (t.one, t.many, t.many_len) = (std::ptr::null(), std::ptr::null(), 0);
+            }
+            t.bits += 1;
+            d.set(t);
+        });
+        Self { eng, mark: None, intents: Intents::None, counted: true }
+    }
+
     /// `Engine::append_local_op` に渡す印。
     #[inline]
     fn mark(&self) -> Option<&enchudb_oplog::oplog::Applying<'a>> {
@@ -2253,6 +2268,10 @@ pub mod write_out_hook {
         Column(u16),
         /// #705: 列を全部書き出した後 (版数の列・tombstone を書き出す前)
         BeforeVersions,
+        /// #978: 生きている印と場所の世代を書き出した後、 残りの列 (中身を指さない列 …) の前に削除の門を閉じる前
+        BeforeRest,
+        /// #978: 残りの列の前に削除の門を閉じて tomb.seg を書き出した後 (残りの列を書き出す前、 門は閉じたまま)
+        RestClosed,
         /// 0.37: `body_msync` が本体を書き出し終えた後 (書き出しが届かせた bridge の位置を置く前)
         WrittenOut,
         /// #731: v15 に移る時、 `gen.seg` を書き出した後 (header に場所の bit と version 15 を書く前)
@@ -9739,6 +9758,9 @@ pub struct Engine {
     /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しがその列を msync する間だけ
     /// 待たせる (`write_out_body`、 `crate::publish_gate`)。
     publish_gate: crate::publish_gate::PublishGate,
+    /// #978: tombstone を置いた削除が行の cell を落とす間を、 書き出しが列を msync する間だけ待たせる (`write_out_body` は門を閉じて
+    /// tomb.seg を書き出してから列を msync する、 `crate::delete_gate`)。
+    delete_gate: crate::delete_gate::DeleteGate,
     /// #656: 開いてから中身 (辞書 / Leaf) の全域を 1 度書き出したか。 前の session が書き出さずに残した page には印が無いので、
     /// それまでは辞書の境目 (`Vocabulary::durable_mark`) を進められない
     content_settled: std::sync::atomic::AtomicBool,
@@ -10359,6 +10381,7 @@ impl Engine {
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
+            delete_gate: crate::delete_gate::DeleteGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
             columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -11913,6 +11936,7 @@ impl Engine {
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
+            delete_gate: crate::delete_gate::DeleteGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
             columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -21054,8 +21078,16 @@ impl Engine {
     }
 
     /// [`Self::remove_entity_body`] の、 値のある紐の並び (`valued`、 行の lock の下で数えた物) を渡せる版。 None なら紐を全部なめる。
+    ///
+    /// #978: sync する DB (tomb.seg がある) は、 cell を落とす間を削除の門 (`crate::delete_gate`) の中にする。 本体の書き出しは門を閉じて
+    /// tomb.seg を書き出してから列を msync するので、 列の msync が拾う落とした cell の tombstone (呼び手が先に置いた物) は、 必ずその前に
+    /// disk に届く。 門の中では辞書 / Leaf の旧 slot の書き出し (`settle_retired_*`、 本体の書き出し = 門を閉じて自分を待つ) を回さず、
+    /// 門を出た後に回す ([`LocalApply::deferring_settles`])。
     fn remove_entity_body_of(&self, local: u32, hlc: enchudb_oplog::Hlc, valued: Option<&[usize]>) {
         let _row = self.row_locks.write(local);
+        let gated = self.tomb_col.is_some();
+        let _settles = gated.then(|| LocalApply::deferring_settles(self));
+        let pass = gated.then(|| self.delete_gate.enter(local));
         let mut survivor = false;
         let mut each = |hid: usize| {
             if self.himos[hid].get_value(local).is_none() {
@@ -21071,6 +21103,7 @@ impl Engine {
             Some(v) => v.iter().copied().for_each(&mut each),
             None => (0..self.himos.len()).for_each(&mut each),
         }
+        drop(pass);
         if !survivor {
             self.live_free(local, None);
         }
@@ -30866,6 +30899,9 @@ impl Engine {
     /// 3. 残りの中身を指す列を 1 本ずつ: 門を閉じる → (閉じる前に門を通った書き手が居れば) 中身をもう一度 → 列 → 開く
     /// 4. 残り (header / entity / 中身を指さない列 …)
     ///
+    /// #978: 2 / 3 / 4 の列を msync する前ごとに、 削除の門を閉じて tomb.seg を書き出す ([`Self::close_deletes`]。 削除が落とした cell は
+    /// tombstone より先に disk に届かない)。 tomb.seg は最後 (版数の列の後) にも書き出す。
+    ///
     /// #801: 書き出しは並んで走る (consumer の周期 / `oplog_sync` の呼び手 / 書き手の `body_msync`)。 返った時 「呼ぶ前に印を
     /// 付けた page は全部届いた」 を守るため、 書くものの無い segment を飛ばす所は `SegmentMap::flush_pending` で見る
     /// (`has_dirty` は、 別の書き出しが msync している最中の segment で false。 飛ばすと、 その msync が失敗するか届く前に
@@ -30925,8 +30961,12 @@ impl Engine {
             SegmentKind::Himo(h) => h as u16,
             _ => unreachable!("中身を指す列は紐の segment"),
         };
+        // #978: 列を msync する段 (2 / 3 / 残りの列) の前ごとに削除の門を閉じ、 tomb.seg を書き出してから msync して開く
+        // ([`Self::close_deletes`])。 最初の 1 回の tomb.seg は `all` なら全域 (前の process が書き出さずに落ちた tombstone の page)
+        let tombs_full = std::cell::Cell::new(all);
         {
             let _closed = self.publish_gate.close(fresh.iter().map(|(k, _)| column(*k)));
+            let _deletes = if fresh.is_empty() { None } else { self.close_deletes(set, &tombs_full)? };
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::Closed);
             let mut entered = false;
@@ -30950,6 +30990,7 @@ impl Engine {
                 continue;
             }
             let _closed = self.publish_gate.close([column(*k)]);
+            let _deletes = self.close_deletes(set, &tombs_full)?;
             if self.publish_gate.take_written(column(*k)) {
                 rewrite_content()?;
             }
@@ -30981,10 +31022,17 @@ impl Engine {
         write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
         set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))?;
         let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k) && !prev(k);
-        if catch_up {
-            set.flush_all_spread(rest)?;
-        } else {
-            set.flush_where(all, rest)?;
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::BeforeRest);
+        {
+            let _deletes = self.close_deletes(set, &tombs_full)?;
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::RestClosed);
+            if catch_up {
+                set.flush_all_spread(rest)?;
+            } else {
+                set.flush_where(all, rest)?;
+            }
         }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeVersions);
@@ -30994,11 +31042,54 @@ impl Engine {
         } else {
             set.flush_where(all, ver_columns)?;
         }
-        // tomb.seg: 使い回しは前の住人を `prev.seg` に書いてから門の中で tomb.seg を 0 にする。 門を閉じ、 門を通った使い回しが
-        // 居れば (記録を書いたのは門に入る前) `prev.seg` をもう一度書き出してから tomb.seg を書き出す = 0 にした tomb.seg が届いた
-        // 像には、 その記録も届いている (`crate::prev_slots`)。 閉じている間に来た使い回しは開くまで待つ (行を握ったまま、
-        // `free_locals` は放して)
+        // tomb.seg (列の段の後に置いた tombstone と、 使い回しが 0 にした所)
+        self.write_out_tombs(set, all, true)?;
+        if all {
+            self.columns_settled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// #978: 本体の書き出しが列を msync する段の前に呼ぶ: 削除の門 (`crate::delete_gate`) を閉じ、 中の削除が出た後に tomb.seg を
+    /// 書き出す。 返した物を持っている間に列を msync し、 落として開く。 sync しない DB (tomb.seg が無い) は何もしない。
+    ///
+    /// 削除は tombstone を置いてから門に入り、 門の中で行の cell を落とす (`remove_entity_body_of`)。 閉じている間に来た削除は開くまで
+    /// 待つ。 = 列の msync が拾う落とした cell の tombstone は、 必ずその前に disk に届いている。 前は tomb.seg を版数の列の後 (書き出しの
+    /// 最後) にだけ書き出し、 列 (落とした名前の cell) が届いて tomb.seg が届く前の電源断の像で、 削除の record が WAL に無い (本体は WAL の
+    /// 書き出しの後に書き出す、 #451) と、 開いた再生が checkpoint の後ろの record で行を名前の無い行として生かし直した。 tombstone も
+    /// 無いので #451 の作り直しも開く時の sweep も削除を知らず、 相手と永久に食い違った。 tombstone が届いていれば、 再生の後の sweep
+    /// (`finish_deletes_revived_by_the_replay`) が削除を完了させ、 #451 の作り直しが Delete を配る (削除は 「あった」)。 逆の像 (tombstone は
+    /// 届き cell は残る) も同じ sweep (死が勝つ) が完了させる。
+    ///
+    /// `full` (書き出しの最初の 1 回だけ真、 呼ぶと偽にする): tomb.seg を全域で書き出す (`all` / `catch_up` の書き出し)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn close_deletes(
+        &self,
+        set: &SegmentSet,
+        full: &std::cell::Cell<bool>,
+    ) -> io::Result<Option<crate::delete_gate::DeleteClosed<'_>>> {
+        if self.tomb_col.is_none() {
+            return Ok(None);
+        }
+        let closed = self.delete_gate.close();
+        self.write_out_tombs(set, full.replace(false), false)?;
+        Ok(Some(closed))
+    }
+
+    /// tomb.seg を書き出す (`full` = 全域)。 `last` = 書き出しの最後の段 (書くものが無くても使い回しの門の手順を通る。 でなければ、
+    /// 印のある page も msync 中の page も無い時は何もしない)。
+    ///
+    /// 使い回しは前の住人を `prev.seg` に書いてから門の中で tomb.seg を 0 にする。 門を閉じ、 門を通った使い回しが居れば (記録を
+    /// 書いたのは門に入る前) `prev.seg` をもう一度書き出してから tomb.seg を書き出す = 0 にした tomb.seg が届いた像には、 その記録も
+    /// 届いている (`crate::prev_slots`)。 閉じている間に来た使い回しは開くまで待つ (行を握ったまま、 `free_locals` は放して)。 #978 で
+    /// 列の段の前にも書き出す (`close_deletes`) ので、 そこでも同じ手順。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_out_tombs(&self, set: &SegmentSet, full: bool, last: bool) -> io::Result<()> {
         let tomb = |k: SegmentKind| matches!(k, SegmentKind::Tomb);
+        let prev = |k: SegmentKind| matches!(k, SegmentKind::Prev);
+        if !last && !full && !set.segment(SegmentKind::Tomb).is_some_and(|s| s.flush_pending()) {
+            return Ok(());
+        }
         let prev_slots = &self.generations().prev;
         if prev_slots.active() {
             // 閉じる前に、 ここまでの記録を書き出す (閉じている間の書き出しを、 その間に入った使い回しの記録だけにする。 前は
@@ -31009,13 +31100,12 @@ impl Engine {
                 set.flush_where(false, prev)?;
             }
             #[cfg(feature = "crashsim")]
-            write_out_hook::call(write_out_hook::Phase::BeforeTomb);
-            set.flush_where(all || catch_up, tomb)?;
+            if last {
+                write_out_hook::call(write_out_hook::Phase::BeforeTomb);
+            }
+            set.flush_where(full, tomb)?;
         } else {
-            set.flush_where(all || catch_up, tomb)?;
-        }
-        if all {
-            self.columns_settled.store(true, Ordering::Release);
+            set.flush_where(full, tomb)?;
         }
         Ok(())
     }
@@ -31029,6 +31119,11 @@ impl Engine {
     /// #656: 書き出しが門を閉じていた時間の合計 (ns)。 閉じている間、 その列に新しい語 / Leaf の値を書く書き手は待つ。
     pub fn publish_gate_closed_ns(&self) -> u64 {
         self.publish_gate.closed_ns()
+    }
+
+    /// #978: 削除 (tombstone を置いた後に行の cell を落とす所) が、 書き出しが列を msync する間の削除の門で待った回数 (観測用)。
+    pub fn delete_gate_waits(&self) -> u64 {
+        self.delete_gate.waits()
     }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。

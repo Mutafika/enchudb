@@ -5248,3 +5248,272 @@ fn a_deferred_restore_keeps_an_alias_the_replay_put_on_the_new_resident() {
     assert_eq!(c_now, Some(y_slot), "再生が Y に張った別名 c を、 後に回した戻しが外した");
     assert!(!deletes.iter().any(|&(e, _)| e == WORLD_C), "生きている Y の別名 c の Delete を state に出した: {deletes:x?}");
 }
+
+// ──── #978: 削除が落とした cell だけ届き、 tombstone (tomb.seg) が届く前に落ちた像 ────
+
+/// #978 の名前の列の型と、 削除が落とした名前の cell が disk に届く書き出しの段 (像を撮る段)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Name978 {
+    /// 名前が Number 列 (中身を指さない列 = 残りの段で書き出す)。 像は版数の列の前 (`BeforeVersions`、 issue の像)
+    Number,
+    /// 名前が Tag 列で、 書き出しの前に別の行 Z の名前に新しい語を書く (列に門の印 = 中身を指す列の最初の段で書き出す)。 像はその段の
+    /// 後 (`Opened`)
+    TagFresh,
+    /// 名前が Tag 列 (印なし = 中身を指す列を 1 本ずつ書き出す段)。 像はその段の後 (`PrevWrittenOut`。 生きている印は書き出す前)
+    TagColumn,
+}
+
+impl Name978 {
+    fn tag(self) -> bool {
+        self != Name978::Number
+    }
+    fn shot(self) -> Phase {
+        match self {
+            Name978::Number => Phase::BeforeVersions,
+            Name978::TagFresh => Phase::Opened,
+            Name978::TagColumn => Phase::PrevWrittenOut,
+        }
+    }
+}
+
+/// #978 の DB: sync する (cell の版数あり)、 表 t (枠 3、 名前 k、 v = Number)、 peer A = 1。 名前 7 (Tag は "n7") の X に v = 70 を書き、
+/// 名前 1 の行も置いて全部書き出す。 `reuse` = 1 度使い回して v15 にする (X が前の住人 W の場所を使い回す)。
+fn named_x_engine_978(db: &Path, name: Name978, reuse: bool) -> (Arc<Engine>, u64) {
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 3).unwrap();
+    let kt = if name.tag() { ValueType::Tag } else { ValueType::Number };
+    eng.define_himo_in("t", "k", kt, 0).unwrap();
+    eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+    let k = eng.himo_id("t.k").unwrap() as u16;
+    eng.set_table_pk("t", k).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let tag = name.tag();
+    let name_it = |e: u64, n: u32| {
+        if tag {
+            eng.tie_text_to(e, "t.k", &format!("n{n}"));
+        } else {
+            eng.tie_to(e, "t.k", n);
+        }
+    };
+    let x = if reuse {
+        let w = eng.entity_in("t").unwrap();
+        name_it(w, 100);
+        let keep = eng.entity_in("t").unwrap();
+        name_it(keep, 1);
+        let fill = eng.entity_in("t").unwrap();
+        name_it(fill, 2);
+        eng.delete(w);
+        let x = eng.entity_in("t").unwrap();
+        assert_eq!(eng.eid_slot(x), eng.eid_slot(w), "前提: 使い回した (v15)");
+        x
+    } else {
+        let keep = eng.entity_in("t").unwrap();
+        name_it(keep, 1);
+        eng.entity_in("t").unwrap()
+    };
+    name_it(x, 7);
+    eng.tie_to(x, "t.v", 70u32);
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    assert_eq!(eng.slot_bits() > 0, reuse, "前提: v15 か (場所を使い回した DB)");
+    (eng, x)
+}
+
+/// X の名前 (Number は数、 Tag は語)。
+fn name_978(eng: &Engine, x: u64, name: Name978) -> Option<String> {
+    if name.tag() {
+        eng.get_text_owned(x, "t.k").map(|b| String::from_utf8_lossy(&b).into_owned())
+    } else {
+        eng.get(x, "t.k").map(|v| v.to_string())
+    }
+}
+
+/// state と bridge が配る、 X 宛ての Delete の版数。
+fn deletes_of_978(eng: &Engine, x: u64) -> (Vec<Hlc>, Vec<Hlc>) {
+    let in_state = eng
+        .state_records()
+        .0
+        .iter()
+        .filter_map(|r| match r.op {
+            DecodedOp::Delete { eid } if eid == x => Some(r.hlc),
+            _ => None,
+        })
+        .collect();
+    let bridged = bridged_deletes(eng).into_iter().filter(|&(e, _)| e == x).map(|(_, h)| h).collect();
+    (in_state, bridged)
+}
+
+/// #978 の像を撮る: X の v を 71 に書き (WAL の checkpoint の後ろに X の Tie)、 本体の書き出し (WAL の書き出しの後) の中身の段の後
+/// (`BeforeGate`) に A のアプリが X を消し、 削除が落とした名前の cell が disk に届いた段 (`Name978::shot`) で撮る。 WAL に X の Delete は
+/// 無い。 X と削除の版数を返す。
+fn dropped_name_image_978(live: &Path, img: &Path, name: Name978, reuse: bool) -> (u64, Hlc) {
+    let (eng, x) = named_x_engine_978(&live.join("db"), name, reuse);
+    let _hold = eng.hold_consumer();
+    eng.tie_to(x, "t.v", 71u32);
+    if name == Name978::TagFresh {
+        let z = eng.entity_in("t").unwrap();
+        eng.tie_text_to(z, "t.k", "n3"); // 書き出していない語 = 名前の列に門の印
+    }
+    eng.oplog_commit();
+    let deleted: Arc<std::sync::Mutex<Option<Hlc>>> = Arc::new(std::sync::Mutex::new(None));
+    let shot = Arc::new(AtomicBool::new(false));
+    let (e2, d2, s2, l, i) = (eng.clone(), deleted.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf());
+    let at = name.shot();
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::BeforeGate && d2.lock().unwrap().is_none() {
+            e2.delete(x);
+            e2.oplog_commit();
+            *d2.lock().unwrap() = Some(e2.tombstone_hlc(x));
+        }
+        if p == at && d2.lock().unwrap().is_some() && !s2.swap(true, Ordering::SeqCst) {
+            let _ = crashsim::capture(&l, &i, Mode::Lost);
+        }
+    })));
+    eng.oplog_sync().unwrap();
+    write_out_hook::set(None);
+    assert!(shot.load(Ordering::SeqCst), "前提: 書き出しの {at:?} で撮った");
+    let tomb = deleted.lock().unwrap().expect("前提: 書き出しの途中で X を消した");
+    (x, tomb)
+}
+
+/// #978: 本体の書き出しの途中で消した行 X の、 削除が落とした名前の cell が disk に届き、 削除の record は WAL に無い像
+/// (`dropped_name_image_978`)。 開いた A の X は名前の無い行として生きない: 名前の cell は checkpoint の手前に書いたので再生で戻らない =
+/// 削除は 「あった」 しか無い。 X は消え、 state の X の Delete と #451 の作り直しが配る X の Delete が一致する。 きれいに閉じて開き直しても同じ。
+///
+/// 前は tomb.seg を書き出しの最後 (版数の列の後) にだけ書き出していて、 この像に tombstone が無かった。 再生が checkpoint の後ろの X の
+/// Tie (v = 71) で X を生かし直し (`k None, v 71`)、 #451 の作り直しも開く時の sweep も削除を知らず、 Delete を配らなかった (相手は
+/// `k 7, v 71` のまま = 永久に食い違う)。
+fn a_dropped_name_is_not_revived_without_its_delete(tag: &str, name: Name978, reuse: bool) {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch(tag);
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, tomb) = dropped_name_image_978(&live, &img, name, reuse);
+    crashsim::stop();
+    let db = img.join("db");
+    // 再生の前の像 (readonly は WAL を見ない): 削除が落とした X の名前の cell は disk に届いている
+    let before = {
+        let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
+        (name_978(&ro, x, name), ro.tombstone_hlc(x), ro.is_live(x))
+    };
+    let first = {
+        let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        let out = (
+            eng.is_live(x),
+            name_978(&eng, x, name),
+            eng.get(x, "t.v"),
+            deletes_of_978(&eng, x),
+            eng.unlogged_writes_relogged(),
+        );
+        eng.oplog_sync().unwrap();
+        out
+    };
+    let second = {
+        let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        (eng.is_live(x), eng.get(x, "t.v"), deletes_of_978(&eng, x).0, eng.verify_invariants().violations)
+    };
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("[978 {tag}] 像: 名前 {:?} tomb.seg {:?} live {} / 1 回目: {first:?} / 2 回目: {second:?}", before.0, before.1, before.2);
+    assert_eq!(before.0, None, "前提: 削除が落とした X の名前の cell が disk に届いた像");
+    let (alive, k, v, (in_state, bridged), _) = first;
+    assert!(!alive, "再生が X を名前の無い行として生かし直した (名前 {k:?}、 v {v:?}、 像の tomb.seg {:?}、 state の Delete {in_state:?})", before.1);
+    assert_eq!(in_state, vec![tomb], "state の X の Delete が無い / 削除の版数でない");
+    assert_eq!(bridged, vec![tomb], "作り直して配る X の Delete が無い / 1 つでない");
+    assert_eq!(second, (false, None, vec![tomb], Vec::<String>::new()), "開き直すと答えが変わった");
+}
+
+#[test]
+fn a_dropped_number_name_is_not_revived_without_its_delete_v14() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_dropped_name_is_not_revived_without_its_delete("dropped_name_number_v14", Name978::Number, false);
+}
+
+#[test]
+fn a_dropped_number_name_is_not_revived_without_its_delete_v15() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_dropped_name_is_not_revived_without_its_delete("dropped_name_number_v15", Name978::Number, true);
+}
+
+#[test]
+fn a_dropped_tag_name_in_a_marked_column_is_not_revived_without_its_delete() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_dropped_name_is_not_revived_without_its_delete("dropped_name_tag_fresh", Name978::TagFresh, false);
+}
+
+#[test]
+fn a_dropped_tag_name_is_not_revived_without_its_delete_v14() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_dropped_name_is_not_revived_without_its_delete("dropped_name_tag_v14", Name978::TagColumn, false);
+}
+
+#[test]
+fn a_dropped_tag_name_is_not_revived_without_its_delete_v15() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_dropped_name_is_not_revived_without_its_delete("dropped_name_tag_v15", Name978::TagColumn, true);
+}
+
+/// #978 の削除の門: 書き出しが残りの列の前に削除の門を閉じて tomb.seg を書き出した後 (`RestClosed`) に、 別の thread で X を消す。 消す
+/// 書き手は門が開くまで cell を落とさない (300 ms 待たせて書き出しを進める)。 版数の列の前 (`BeforeVersions`) で撮った像は、 落とした
+/// cell が届いていない (X は名前のまま生き、 削除は WAL に無い = 無かった。 配る物にも無い)。
+///
+/// 門が無いと、 消す書き手が tomb.seg の書き出しの後に tombstone を置いて cell を落とし、 残りの列の msync がその cell を拾う
+/// (tombstone は書き出しの最後まで届かない) = 再生が X を名前の無い行として生かし直した。
+#[test]
+fn a_delete_during_the_column_write_out_waits_for_the_tombstones() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("delete_gate_978");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, waits) = {
+        let (eng, x) = named_x_engine_978(&live.join("db"), Name978::Number, false);
+        let _hold = eng.hold_consumer();
+        eng.tie_to(x, "t.v", 71u32); // checkpoint の後ろの X の Tie (残りの列に書き出す物)
+        eng.oplog_commit();
+        let done = delete_during_write_out(&eng, x, Phase::RestClosed, Phase::BeforeVersions, &live, &img);
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while eng.is_live(x) {
+            assert!(std::time::Instant::now() < deadline, "門が開いた後も X が消えない");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        (x, eng.delete_gate_waits())
+    };
+    crashsim::stop();
+    let db = img.join("db");
+    let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let (alive, k, v) = (eng.is_live(x), eng.get(x, "t.k"), eng.get(x, "t.v"));
+    let (in_state, bridged) = deletes_of_978(&eng, x);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("[978 gate] alive {alive} k {k:?} v {v:?} state {in_state:?} bridged {bridged:?} waits {waits}");
+    assert!(!alive || k.is_some(), "再生が X を名前の無い行として生かし直した (v {v:?}、 state の Delete {in_state:?})");
+    assert!(alive, "門で待った削除の cell も tombstone も届いていないのに X が消えた");
+    assert_eq!((k, v), (Some(7), Some(71)), "X の名前 / 値が書き出しの返った値でない");
+    assert!(in_state.is_empty() && bridged.is_empty(), "WAL に無い削除を配る ({in_state:?} / {bridged:?})");
+    assert!(waits >= 1, "前提: 消す書き手が門で待った");
+}
