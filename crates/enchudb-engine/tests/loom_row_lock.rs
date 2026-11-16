@@ -90,3 +90,35 @@ fn the_same_thread_can_take_a_stripe_it_holds() {
         assert_eq!(cell.with(|p| unsafe { *p }), 11);
     });
 }
+
+/// 握らずに待つ (`wait_released`、 #974 の読み直し 2) は、 待ち始めた時に握っていた書き手が離すまで返らない: 書き手が行 0 を握ってから
+/// 印を立て、 中身を書いて離す。 印を見てから待つ thread が返った後に読む中身は、 書き手の書き込みと重ならず (重なれば data race)、
+/// 書いた値が見える (待つのは行 2 = 同じ stripe の別の行)。
+#[test]
+fn waiting_without_taking_returns_after_the_holder_releases() {
+    loom::model(|| {
+        let locks = Arc::new(RowLocks::new());
+        let cell = Arc::new(UnsafeCell::new(0u32));
+        let taken = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (locks, cell, taken) = (locks.clone(), cell.clone(), taken.clone());
+            loom::thread::spawn(move || {
+                let _w = locks.write(0);
+                taken.store(1, Ordering::Release);
+                cell.with_mut(|p| unsafe { *p = 7 });
+            })
+        };
+        let waiter = {
+            let (locks, cell, taken) = (locks.clone(), cell.clone(), taken.clone());
+            loom::thread::spawn(move || {
+                while taken.load(Ordering::Acquire) == 0 {
+                    loom::thread::yield_now();
+                }
+                locks.wait_released(2);
+                assert_eq!(cell.with(|p| unsafe { *p }), 7, "握っていた書き手が離す前に返った");
+            })
+        };
+        writer.join().unwrap();
+        waiter.join().unwrap();
+    });
+}
