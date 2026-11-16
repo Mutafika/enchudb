@@ -6398,7 +6398,7 @@ fn alias_ahead_of_the_body_image(live: &Path, img: &Path) -> u64 {
     assert!(eng.remote_tie_apply_result(c, hv, 8u32, Hlc { wall: 1_001, logical: 0, peer: 2 }).applied());
     eng.merge_entity_into(c, y).unwrap();
     eng.persist_tables().unwrap();
-    let _ = crashsim::capture(&live, &img, Mode::Lost);
+    let _ = crashsim::capture(live, img, Mode::Lost);
     x
 }
 
