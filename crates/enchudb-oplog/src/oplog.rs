@@ -228,6 +228,25 @@ pub struct ReplayProbe {
     pub capacity: u64,
 }
 
+/// [`WalReads`] の時間を測り始める。 wasm32 は時計を読まない (wasm32-unknown-unknown の `Instant::now` は panic する)。
+#[inline]
+fn read_clock() -> Option<std::time::Instant> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(std::time::Instant::now())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+/// [`read_clock`] からの ns (wasm32 は 0)。
+#[inline]
+fn read_clock_ns(t: Option<std::time::Instant>) -> u64 {
+    t.map_or(0, |t| t.elapsed().as_nanos() as u64)
+}
+
 fn note_wal_read(f: impl FnOnce(&mut WalReads)) {
     WAL_READS.with(|c| {
         let mut r = c.get();
@@ -4333,7 +4352,7 @@ impl OpLog {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn probe_replay(path: &Path) -> io::Result<ReplayProbe> {
         crate::io_point("oplog.probe")?;
-        let t0 = std::time::Instant::now();
+        let t0 = read_clock();
         let file = OpenOptions::new().read(true).open(path)?;
         let mut mmap = unsafe { memmap2::MmapOptions::new().no_reserve_swap().map_copy(&file)? };
         let layout = read_layout(&mut mmap)?;
@@ -4341,7 +4360,7 @@ impl OpLog {
         let records = !wal.is_empty() && wal.has_records_to_replay();
         note_wal_read(|r| {
             r.probes += 1;
-            r.probe_ns += t0.elapsed().as_nanos() as u64;
+            r.probe_ns += read_clock_ns(t0);
         });
         Ok(ReplayProbe { records, capacity: wal.capacity() })
     }
@@ -4419,11 +4438,11 @@ impl OpLog {
     /// [`Self::drop_records_after_a_hole`] の前半 (`append_lock` の下)。
     fn drop_after_hole_locked(&self) -> bool {
         let start = self.checkpoint();
-        let t0 = std::time::Instant::now();
+        let t0 = read_clock();
         let s = self.scan_from_offset(start);
         note_wal_read(|r| {
             r.hole_scans += 1;
-            r.hole_scan_ns += t0.elapsed().as_nanos() as u64;
+            r.hole_scan_ns += read_clock_ns(t0);
         });
         if s.stop == ScanStop::Head {
             return false;
@@ -4467,7 +4486,7 @@ impl OpLog {
     /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
     fn recover_inner(&self) -> (Vec<Record>, Vec<Record>) {
         let start = self.checkpoint();
-        let t0 = std::time::Instant::now();
+        let t0 = read_clock();
         let s = self.scan_from_offset(start);
         if s.max_lsn > 0 {
             self.hot.next_lsn.store(s.max_lsn + 1, Ordering::Release);
@@ -4478,7 +4497,7 @@ impl OpLog {
         let out = (strip_offsets(s.out), strip_offsets(s.tail));
         note_wal_read(|r| {
             r.replays += 1;
-            r.replay_ns += t0.elapsed().as_nanos() as u64;
+            r.replay_ns += read_clock_ns(t0);
         });
         out
     }
