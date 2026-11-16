@@ -316,6 +316,12 @@ pub(crate) struct PrevSlots {
     /// 開く時に戻すかを WAL の再生の後に回した記録 (場所, 記録, 退避が書き出し済みか)。 review946d [N1]
     /// (`Engine::finish_prev_restores`)
     deferred: std::sync::Mutex<Vec<(u32, PrevRecord, bool)>>,
+    /// [R2] (#969 / #968 の PR): WAL の再生の間だけ持つ、 退避表 (`Engine::foreign_tombs`) の削除の版数 → それを持つ identity の数。
+    /// 再生の後始末のやり直し (`redo_reuse_eviction`) が 「退避表に同じ版数の identity があるか」 を record ごとに引く ([`Self::tomb_held`])。
+    /// 前は record ごとに退避表の全部をなめた (開く時 O(record の数 × 退避表の大きさ))。 None = 作っていない (最初に引く時に作る)
+    tomb_index: std::sync::Mutex<Option<std::collections::HashMap<Hlc, u32>>>,
+    /// `tomb_index` を持っている間 (退避表を書く道が数を合わせる)。 持っていない間の書く道は atomic 1 回
+    tomb_index_on: std::sync::atomic::AtomicBool,
 }
 
 impl PrevSlots {
@@ -334,7 +340,60 @@ impl PrevSlots {
             replay: std::sync::Mutex::new(Vec::new()),
             restored_own: std::sync::Mutex::new(Vec::new()),
             deferred: std::sync::Mutex::new(Vec::new()),
+            tomb_index: std::sync::Mutex::new(None),
+            tomb_index_on: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// [R2]: 退避表に削除の版数 `h` を持つ identity があるか。 WAL の再生の間だけ (開く時、 1 本の thread、 退避表を書く者は他に居ない)
+    /// 呼ぶ。 索引が無ければ `values` (退避表の今の版数の全部、 退避表の read lock を取る) で作り、 再生が終わる
+    /// ([`Self::drop_tomb_index`]) まで退避表を書く道 ([`Self::tomb_index_moved`]) と数を合わせる。 `values` は索引の lock の外で呼ぶ
+    /// (書く道の lock の順は 退避表 → 索引)。
+    pub(crate) fn tomb_held(&self, h: Hlc, values: impl FnOnce() -> Vec<Hlc>) -> bool {
+        if let Some(idx) = self.tomb_index.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            return idx.contains_key(&h);
+        }
+        let vs = values();
+        let mut g = self.tomb_index.lock().unwrap_or_else(|p| p.into_inner());
+        let idx = g.get_or_insert_with(|| {
+            let mut m = std::collections::HashMap::with_capacity(vs.len());
+            for v in vs {
+                if v != Hlc::ZERO {
+                    *m.entry(v).or_insert(0u32) += 1;
+                }
+            }
+            self.tomb_index_on.store(true, Ordering::Release);
+            m
+        });
+        idx.contains_key(&h)
+    }
+
+    /// [R2]: 退避表の 1 identity の削除の版数が `old` から `new` に変わった (ZERO = 無い)。 索引を持っていない間は何もしない。
+    /// 呼び手は退避表の write lock を握っている (lock の順は 退避表 → 索引、 索引を作る側は退避表の lock を放してから索引の lock)。
+    #[inline]
+    pub(crate) fn tomb_index_moved(&self, old: Hlc, new: Hlc) {
+        if old == new || !self.tomb_index_on.load(Ordering::Acquire) {
+            return;
+        }
+        let mut g = self.tomb_index.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(idx) = g.as_mut() else { return };
+        if old != Hlc::ZERO
+            && let std::collections::hash_map::Entry::Occupied(mut e) = idx.entry(old)
+        {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+        if new != Hlc::ZERO {
+            *idx.entry(new).or_insert(0) += 1;
+        }
+    }
+
+    /// [R2]: WAL の再生の後に索引を捨てる (再生の後は引かない)。
+    pub(crate) fn drop_tomb_index(&self) {
+        self.tomb_index_on.store(false, Ordering::Release);
+        *self.tomb_index.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// 開く時に読んだ記録 ([`Self::open_records`] の 2 つ目) を、 WAL の再生・bridge・#924 の Ref が引けるように置く
@@ -770,6 +829,29 @@ impl PrevSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [R2]: 再生の間の退避表の版数の索引は、 作った時の版数の全部を数え、 退避表を書く道の動き (上げる / 外す) に数を合わせる。
+    /// 作る前と捨てた後は動きを無視する (atomic 1 回)。
+    #[test]
+    fn the_tomb_index_follows_the_moves_while_it_is_held() {
+        let p = PrevSlots::off();
+        let h = |w: u64| Hlc { wall: w, logical: 0, peer: 1 };
+        p.tomb_index_moved(Hlc::ZERO, h(9)); // 作る前: 無視
+        assert!(p.tomb_held(h(1), || vec![h(1), h(1), h(2), Hlc::ZERO]));
+        assert!(!p.tomb_held(h(9), || unreachable!("作った後は作り直さない")));
+        assert!(!p.tomb_held(Hlc::ZERO, || unreachable!()));
+        p.tomb_index_moved(h(1), h(3)); // 2 つの identity の 1 つが h(1) → h(3)
+        assert!(p.tomb_held(h(1), || unreachable!()), "h(1) を持つ identity がまだ 1 つある");
+        assert!(p.tomb_held(h(3), || unreachable!()));
+        p.tomb_index_moved(h(1), Hlc::ZERO); // 残りの 1 つを外す (忘れてよい線)
+        assert!(!p.tomb_held(h(1), || unreachable!()), "h(1) を持つ identity は無い");
+        p.tomb_index_moved(Hlc::ZERO, h(4)); // 新しい identity
+        assert!(p.tomb_held(h(4), || unreachable!()));
+        p.drop_tomb_index();
+        p.tomb_index_moved(Hlc::ZERO, h(5)); // 捨てた後: 無視
+        assert!(!p.tomb_held(h(4), || vec![h(5)]), "捨てた後は今の版数で作り直す");
+        assert!(p.tomb_held(h(5), || unreachable!()));
+    }
 
     fn region(v: &mut [u64]) -> Region {
         unsafe { Region::new(v.as_mut_ptr() as *mut u8, v.len() * 8) }
