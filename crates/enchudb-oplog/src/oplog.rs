@@ -180,6 +180,94 @@ pub const HALF_ALIGN: u64 = 16 * 1024;
 /// record は page に残りうる) を使い直さない。 書き出し (fsync) の間に置く周は高々 1 つ。
 const LAP_SKIP_ON_OPEN: u32 = 16;
 
+/// #972: この thread が WAL を読んだ回数 (試験と測り用、 [`wal_reads`])。 開く道は呼んだ thread で読むので、 開く前後の差が
+/// その open の回数。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalReads {
+    /// checkpoint から読み切って record を全部解いた回数 ([`OpLog::recover`] / [`OpLog::recover_with_tail`])
+    pub replays: u64,
+    /// 開いた時の穴の確かめ ([`OpLog::drop_records_after_a_hole`]) が checkpoint から読み切った回数
+    pub hole_scans: u64,
+    /// 「再生する record があるか」 を file に聞いた回数 ([`OpLog::probe_replay`]、 全部は解かない)
+    pub probes: u64,
+    /// 「再生する record があるか」 を開いた WAL に聞いた回数 ([`OpLog::has_records_to_replay`]。 [`OpLog::probe_replay`] の中の 1 回と、
+    /// WAL 付きの open が開いた WAL に聞く回)
+    pub asks: u64,
+    /// その問い合わせ ([`OpLog::has_records_to_replay`]) が読んだ record の数 (Commit と当てる record。 止まれば当てる record は 1 件)
+    pub probe_records: u64,
+    /// 問い合わせが写しの map を作れず、 読み書きの map で開いた回数 ([`OpLog::probe_replay`])
+    pub probe_fallbacks: u64,
+    /// それぞれの読みにかかった時間の和 (ns。 問い合わせは file を開く所から)
+    pub replay_ns: u64,
+    pub hole_scan_ns: u64,
+    pub probe_ns: u64,
+}
+
+thread_local! {
+    static WAL_READS: std::cell::Cell<WalReads> = const {
+        std::cell::Cell::new(WalReads {
+            replays: 0,
+            hole_scans: 0,
+            probes: 0,
+            asks: 0,
+            probe_records: 0,
+            probe_fallbacks: 0,
+            replay_ns: 0,
+            hole_scan_ns: 0,
+            probe_ns: 0,
+        })
+    };
+}
+
+// 試験: この thread の [`OpLog::probe_replay`] の写しの map を失敗させる
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static PROBE_MAP_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #972: この thread が今までに WAL を読んだ回数 ([`WalReads`])。
+#[doc(hidden)]
+pub fn wal_reads() -> WalReads {
+    WAL_READS.with(std::cell::Cell::get)
+}
+
+/// #972: [`OpLog::probe_replay`] の答え。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayProbe {
+    /// 開いた時の再生 ([`OpLog::recover_with_tail`]) が当てる record がある
+    pub records: bool,
+    /// WAL の容量 (byte、 2 区画の和、 [`OpLog::capacity`])
+    pub capacity: u64,
+}
+
+/// [`WalReads`] の時間を測り始める。 wasm32 は時計を読まない (wasm32-unknown-unknown の `Instant::now` は panic する)。
+#[inline]
+fn read_clock() -> Option<std::time::Instant> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(std::time::Instant::now())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+/// [`read_clock`] からの ns (wasm32 は 0)。
+#[inline]
+fn read_clock_ns(t: Option<std::time::Instant>) -> u64 {
+    t.map_or(0, |t| t.elapsed().as_nanos() as u64)
+}
+
+fn note_wal_read(f: impl FnOnce(&mut WalReads)) {
+    WAL_READS.with(|c| {
+        let mut r = c.get();
+        f(&mut r);
+        c.set(r);
+    });
+}
+
 /// WAL の中の位置: `(周 << 32) | 区画の中の offset`。 大小は WAL に積んだ順 (周が 2^32 で回るまで)。 周 0 (v2 の file) は
 /// offset そのもの。 0 と [`HEADER_SIZE`] は 「どの区画よりも前」 (先頭から読む)。
 #[inline]
@@ -1850,7 +1938,8 @@ impl OpLog {
     }
 
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。 2 区画にできる大きさ (`2 * HALF_ALIGN` 以上) なら v5、 できなければ
-    /// 1 区画の v5 (版の数は 6)。
+    /// 1 区画の v5 (版の数は 6)。 header ([`HEADER_SIZE`]) より小さい capacity は 1 区画も作れないので `InvalidInput` (前は header を
+    /// 書く所で範囲外の panic、 file は truncate した後。 PR #986 の読み直し 3 の [2])。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &Path, capacity: usize) -> io::Result<Self> {
         crate::io_point("oplog.create")?;
@@ -1858,6 +1947,12 @@ impl OpLog {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("oplog capacity {capacity} must be below 4 GiB (the header keeps it in 32 bits)"),
+            ));
+        }
+        if capacity < HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("oplog capacity {capacity} is smaller than the WAL header ({HEADER_SIZE} bytes)"),
             ));
         }
         let file = OpenOptions::new()
@@ -4252,6 +4347,73 @@ impl OpLog {
         out
     }
 
+    /// #972: 開いた時の再生 ([`Self::recover_with_tail`]) が当てる record があるか (= `!recover_with_tail().is_empty()`)。
+    /// checkpoint から同じ確かめ方で読み、 最初の当てる record (Commit と読み飛ばしてよい op 以外の、 読めた record) で止まる
+    /// (record を解いて写すのはその 1 件だけ)。 読むだけ (clock を戻さない)。
+    pub fn has_records_to_replay(&self) -> bool {
+        let s = self.scan_range_until(self.checkpoint(), u64::MAX, |_| (), || true);
+        // 当てる record を見た数 (止まれば 1)
+        let seen = (s.out.len() + s.tail.len()) as u64;
+        let read = s.commit_ends.len() as u64 + seen;
+        note_wal_read(|r| {
+            r.asks += 1;
+            r.probe_records += read;
+        });
+        seen > 0
+    }
+
+    /// #972: `path` の WAL を読むだけで開いて (file には何も書かない)、 開いた時の再生が当てる record があるかを答える
+    /// ([`Self::has_records_to_replay`])。 engine が 「WAL 付きの open の前に再生が要るか」 を聞くのに使う (前は `open` (読み書き) +
+    /// `recover_with_tail` で、 256 MiB の WAL を聞くたびに全部解いていた)。
+    ///
+    /// file は読むだけで開き、 写しの map (copy-on-write、 swap を確保しない) に置く: 開く時の header の直し ([`read_layout`] が
+    /// 読めない B の header を書き直す / A = 4・B = 5 の B の版を戻す) は写しにだけ入り、 file に届かない (本当の open
+    /// ([`Self::open`]) が同じ直しをする)。 区画と周の形は `open` と同じに決めるので、 答えは `open(path)?.recover_with_tail()`
+    /// が空かと同じ。 書き手の lock は取らない。 [`Self::was_never_written`] の file (header が全部 0) は `open` と同じく
+    /// `bad WAL magic` の Err。
+    ///
+    /// 写しの map を作れない時 (書ける私的な map は commit の勘定に入る: Linux の `vm.overcommit_memory = 2` では
+    /// `MAP_NORESERVE` が効かず、 WAL の大きさで `ENOMEM` になりうる。 Windows の写しの view も map の時に commit を取る) は、
+    /// 本当の open と同じ読み書きの map (`MAP_SHARED`、 勘定に入らない) で開いて同じに答える。 その時だけ header の直しが
+    /// file に届く (#972 の前の聞き方と同じ。 直すのは本当の open が直すのと同じ所)。 それも開けなければ Err (呼び手は 「再生する
+    /// 物が無い」 と読まないこと: `InvalidData` = 壊れた / 切り詰められた file 以外は、 本当の open なら開けるかもしれない、 #989)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn probe_replay(path: &Path) -> io::Result<ReplayProbe> {
+        crate::io_point("oplog.probe")?;
+        let t0 = read_clock();
+        let file = OpenOptions::new().read(true).open(path)?;
+        let wal = match Self::map_private_copy(&file) {
+            Ok(mut mmap) => {
+                let layout = read_layout(&mut mmap)?;
+                Self::assemble(file, mmap, layout)
+            }
+            Err(copy_err) => {
+                drop(file);
+                note_wal_read(|r| r.probe_fallbacks += 1);
+                // 種類は読み書きの map の Err の物 (`InvalidData` = 本当の open も開けない、 の見分けはこちら)。 写しの map の Err も言う
+                Self::open(path).map_err(|e| {
+                    io::Error::new(e.kind(), format!("{e} (after a private copy map of the WAL failed: {copy_err})"))
+                })?
+            }
+        };
+        let records = !wal.is_empty() && wal.has_records_to_replay();
+        note_wal_read(|r| {
+            r.probes += 1;
+            r.probe_ns += read_clock_ns(t0);
+        });
+        Ok(ReplayProbe { records, capacity: wal.capacity() })
+    }
+
+    /// [`Self::probe_replay`] の写しの map (MAP_PRIVATE + MAP_NORESERVE)。 試験は thread ごとに失敗させられる。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn map_private_copy(file: &File) -> io::Result<MmapMut> {
+        #[cfg(test)]
+        if PROBE_MAP_FAILS.with(std::cell::Cell::get) {
+            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
+        }
+        unsafe { memmap2::MmapOptions::new().no_reserve_swap().map_copy(file) }
+    }
+
     /// 開いた時の再生 (`recover_with_tail`、 checkpoint から読む) が head より手前で止まったら (読めない record = 届かなかった
     /// page)、 そこから先の record を捨てる。 再生は前だけを当てるので、 先の record は本体に当てていない。 開いた直後 (書き手の
     /// 居ない間) に、 再生と同じ所から読んで決める。 戻り値は捨てたか。
@@ -4325,7 +4487,12 @@ impl OpLog {
     /// [`Self::drop_records_after_a_hole`] の前半 (`append_lock` の下)。
     fn drop_after_hole_locked(&self) -> bool {
         let start = self.checkpoint();
+        let t0 = read_clock();
         let s = self.scan_from_offset(start);
+        note_wal_read(|r| {
+            r.hole_scans += 1;
+            r.hole_scan_ns += read_clock_ns(t0);
+        });
         if s.stop == ScanStop::Head {
             return false;
         }
@@ -4368,6 +4535,7 @@ impl OpLog {
     /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
     fn recover_inner(&self) -> (Vec<Record>, Vec<Record>) {
         let start = self.checkpoint();
+        let t0 = read_clock();
         let s = self.scan_from_offset(start);
         if s.max_lsn > 0 {
             self.hot.next_lsn.store(s.max_lsn + 1, Ordering::Release);
@@ -4375,7 +4543,12 @@ impl OpLog {
         if s.max_hlc.wall > 0 {
             *self.hot.hlc_state.lock() = (s.max_hlc.wall, s.max_hlc.logical);
         }
-        (strip_offsets(s.out), strip_offsets(s.tail))
+        let out = (strip_offsets(s.out), strip_offsets(s.tail));
+        note_wal_read(|r| {
+            r.replays += 1;
+            r.replay_ns += read_clock_ns(t0);
+        });
+        out
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
@@ -4403,7 +4576,22 @@ impl OpLog {
     }
 
     /// [`Self::scan_range`] の record 1 件の形を `mk` で決める版 (確かめ方は同じ)。 `mk` は Commit 以外の読めた record ごとに 1 回。
-    fn scan_range_with<'s, R>(&'s self, start_offset: u64, upto: u64, mut mk: impl FnMut(RecordRef<'s>) -> R) -> ScanOut<R> {
+    fn scan_range_with<'s, R>(&'s self, start_offset: u64, upto: u64, mk: impl FnMut(RecordRef<'s>) -> R) -> ScanOut<R> {
+        self.scan_range_until(start_offset, upto, mk, || false)
+    }
+
+    /// [`Self::scan_range_with`] の、 `mk` で record を積んだ後に `stop_after` が true ならそこで読むのを止める版 (#972: 再生する record が
+    /// あるかを聞く読みは最初の 1 件で止まる)。 止めた時の `ScanOut` の位置 (`committed_end` / `stop`) は読み切った読みの物ではない
+    /// (使わないこと)。 確かめ方 (magic / 版 / CRC / 周の印 / op) は同じ 1 本の道。 `stop_after` を `mk` の戻り値 (`ControlFlow<(), R>`) に
+    /// しないのは、 changefeed の記録への写し (#683、 `R` = `RecordRef`) で record ごとに包みを動かす分 1 件 1 ns ほど遅くなったため
+    /// (`|| false` は消える)。
+    fn scan_range_until<'s, R>(
+        &'s self,
+        start_offset: u64,
+        upto: u64,
+        mut mk: impl FnMut(RecordRef<'s>) -> R,
+        mut stop_after: impl FnMut() -> bool,
+    ) -> ScanOut<R> {
         // `out[..committed]` は Commit で閉じた group、 その後ろは閉じていない末尾 (#683: 前は group ごとに別の Vec に積んで Commit で
         // 移していた。 changefeed の記録への写しでは group が 1〜2 件で、 移すのが record ごとの memmove になっていた)
         let mut out = Vec::new();
@@ -4504,6 +4692,9 @@ impl OpLog {
                             mk(RecordRef { lsn, hlc, author_peer, op: other, header, payload: payload_slice }),
                             wal_pos(lap, (next_off - base) as u64),
                         ));
+                        if stop_after() {
+                            break 'parts;
+                        }
                     }
                     // #178: 知らない版が書いた 「読み飛ばしてよい」 op は、 その record だけ飛ばして先を読む (下の打ち切りと違い、
                     // 後ろの record を捨てない)
@@ -4888,6 +5079,86 @@ mod tests {
         let t = at + REC_HEADER_SIZE + len;
         let lap = u32::from_le_bytes(bytes[t..t + 4].try_into().unwrap());
         write_lap_trailer(&mut bytes[t..t + LAP_TRAILER], lap, bind_word(crc));
+    }
+
+    /// PR #986 の読み直し 3 の [2]: header より小さい capacity は `InvalidInput` で断る (前は `fresh_layout` が header を書く所で範囲外の
+    /// panic)。 断る時は file を作らず、 既にある file を切り詰めない。 header ちょうどの capacity は作れて、 開き直せる。
+    #[test]
+    fn create_refuses_a_capacity_smaller_than_the_header() {
+        let p = tmp("create-tiny");
+        for cap in [0, 16, HEADER_SIZE - 1] {
+            match OpLog::create(&p, cap) {
+                Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "capacity {cap}: {e}"),
+                Ok(_) => panic!("capacity {cap} の WAL を作った"),
+            }
+        }
+        assert!(!p.exists(), "断った create が file を作った");
+        std::fs::write(&p, [7u8; 16]).unwrap();
+        assert!(OpLog::create(&p, 16).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), [7u8; 16], "断った create が既にある file を切り詰めた");
+        drop(OpLog::create(&p, HEADER_SIZE).expect("header ちょうどの WAL を作れない"));
+        drop(OpLog::open(&p).expect("header ちょうどの WAL を開き直せない"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #972: 写しの map を作れない時 (`vm.overcommit_memory = 2` の `ENOMEM` など)、 聞く読みは読み書きの map (本当の open と同じ) で
+    /// 開いて同じ答えを出す (Err にしない)。 その時だけ header の直しが file に届く。 B の header を読めなくした WAL で、 写しの map の
+    /// 答えと比べる。
+    #[test]
+    fn a_probe_that_cannot_map_a_private_copy_opens_like_the_real_open() {
+        let p = tmp("probe-fallback");
+        {
+            let wal = OpLog::create(&p, 2 * HALF_ALIGN as usize).unwrap();
+            for v in 0..5 {
+                wal.append(Op::Tie { eid: 1, himo_id: 0, value: v }).unwrap();
+            }
+            wal.fsync().unwrap();
+        }
+        let mut image = std::fs::read(&p).unwrap();
+        let b = HALF_ALIGN as usize;
+        image[b..b + 4].copy_from_slice(b"XXXX");
+        std::fs::write(&p, &image).unwrap();
+        let copied = OpLog::probe_replay(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), image, "前提: 写しの map の聞く読みは file を書かない");
+        let before = wal_reads();
+        PROBE_MAP_FAILS.with(|f| f.set(true));
+        let fell_back = OpLog::probe_replay(&p);
+        PROBE_MAP_FAILS.with(|f| f.set(false));
+        let fell_back = fell_back.expect("写しの map を作れない時に Err を返した");
+        assert_eq!(fell_back, copied, "読み書きの map で開いた答えが違う");
+        assert_eq!(wal_reads().probe_fallbacks - before.probe_fallbacks, 1);
+        assert_ne!(std::fs::read(&p).unwrap(), image, "前提: 読み書きの map では header の直し (B) が file に届く");
+        assert!(copied.records);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// PR #986 の読み直し 2 の [5]: 写しの map も読み書きの map も作れない時、 Err の種類は読み書きの map (本当の open と同じ開き方) の物で、
+    /// 写しの map の Err も言う (前は写しの map の Err を捨て、 2 つ目だけが見えた)。 読み書きで開けない file (読むだけの権限) で作る。
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_cannot_map_either_way_reports_both_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp("probe-both-fail");
+        {
+            let wal = OpLog::create(&p, 2 * HALF_ALIGN as usize).unwrap();
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+            wal.fsync().unwrap();
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if OpenOptions::new().read(true).write(true).open(&p).is_ok() {
+            // root は権限で断られない (前提を作れない)
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = std::fs::remove_file(&p);
+            return;
+        }
+        PROBE_MAP_FAILS.with(|f| f.set(true));
+        let r = OpLog::probe_replay(&p);
+        PROBE_MAP_FAILS.with(|f| f.set(false));
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = r.expect_err("読み書きで開けない file を、 写しの map なしに開けたと言った");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "Err の種類が読み書きの map の物でない: {e}");
+        assert!(e.to_string().contains("os error 12"), "写しの map の Err (ENOMEM) を捨てた: {e}");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// ホストの形: 切れ目の後に Commit と中継しか積んでいなければ 「中身のある自分の record は積んでいない」 (時計を今まで進め、

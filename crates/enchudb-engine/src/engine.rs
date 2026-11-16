@@ -2079,6 +2079,48 @@ impl Drop for WriterLock {
     }
 }
 
+/// 開く時の直し (`prev.seg` の記録の戻し [`Engine::restore_prev_residents`] / gen.seg の突き合わせ [`Engine::reconcile_generations`]) が、
+/// 仕上げを WAL の再生の後に回すか (この open の後に再生が当てる record があるか)。 書き手の open が writer lock の下で、 何かを直す前に
+/// 決める (PR #986 の読み直し 2 の [1] [2])。 前は直しの中で WAL の file を開き直して聞いた: 直しを map (gen.seg / entities.seg) に書いた
+/// 後に聞けずに断る道と、 WAL 付きの open が直しの後に WAL を開けずに返る (Drop が clean の印を立てる) 道があり、 どちらも次の open が
+/// 直した場所を見つけず、 仕上げ (残った cell を落とす・消えた行の世代と tombstone を覚える) が二度と走らなかった。
+enum ReplayAhead<'w> {
+    /// 再生しない: 単独の open (lock の下で聞いて 「無い」 と分かった時だけ開く。 あれば往復し、 聞けなければ断る)・readonly (直しを
+    /// しない)・WAL 付きの open が WAL を作った (無かった / 一度も書き出していない)
+    Nothing,
+    /// WAL 付きの open が lock の下で開いた WAL (再生はこの WAL から)。 当てる record があるかは要る時に 1 回だけ読む (最初の 1 件で止まる)
+    Wal(&'w enchudb_oplog::oplog::OpLog, std::cell::OnceCell<bool>),
+}
+
+impl<'w> ReplayAhead<'w> {
+    fn of(wal: &'w enchudb_oplog::oplog::OpLog) -> Self {
+        ReplayAhead::Wal(wal, std::cell::OnceCell::new())
+    }
+
+    /// この open の後の再生が当てる record がある (`OpLog::recover_with_tail` が空でない)。
+    fn follows(&self) -> bool {
+        match self {
+            ReplayAhead::Nothing => false,
+            ReplayAhead::Wal(w, answer) => *answer.get_or_init(|| !w.is_empty() && w.has_records_to_replay()),
+        }
+    }
+}
+
+/// 単独の open が writer lock の下で WAL の file に聞いた答え ([`Engine::wal_records_to_replay`])。
+#[cfg(not(target_arch = "wasm32"))]
+struct WalAsked {
+    /// WAL の file の大きさ (file が無ければ None)。 #451 の往復の要否と、 往復の WAL 付きの open に渡す容量
+    /// ([`Engine::relog_before_standalone_session`]、 PR #986 の読み直し 3 の [1])
+    len: Option<u64>,
+    /// WAL に再生する record があれば WAL の容量 (往復の WAL 付きの open に渡す)
+    replay: Option<usize>,
+}
+
+/// #451 の往復 ([`Engine::relog_before_standalone_session`]) が、 header より短い (一度も書き出していない) WAL の file を作り直す時の
+/// 容量 (`Engine::open` と同じ)。 その file の大きさは WAL の容量を言わない (作った直後・`set_len` の前に落ちた)。
+#[cfg(not(target_arch = "wasm32"))]
+const STANDALONE_RELOG_OPLOG_CAPACITY: usize = 16 * 1024 * 1024;
+
 /// `.db.lock` に flock(LOCK_EX) を取り、 guard を返す。 guard が drop されると
 /// lock も解放。 **別プロセス**が保持中は block する (= sqlite と同様、 取れる
 /// まで待つ)。 **同一プロセス**が既に保持中は block せず即エラー (#80、
@@ -10820,7 +10862,7 @@ impl Engine {
     ///
     /// #880: WAL 付きで書いて落ちた DB (WAL に checkpoint より後の record が残る) は、 先に WAL 付きの open
     /// ([`Self::open_concurrent_with_oplog`]) で再生・書き出し・checkpoint を進めて閉じてから、 単独で開き直す
-    /// ([`Self::replay_wal_before_standalone_open`])。 前は WAL を見ずに開き、 WAL にだけある値 (書き出しの前に落ちた
+    /// ([`Self::open_standalone_after_replay`])。 前は WAL を見ずに開き、 WAL にだけある値 (書き出しの前に落ちた
     /// 書き込み) を黙って失い、 #857 の止めで残した Delete を再生せずに消した行の eid をもう一度払い出した。 きれいに閉じた DB
     /// (WAL が空) は WAL の header を読むだけで今までどおり。
     ///
@@ -10829,12 +10871,64 @@ impl Engine {
     /// write の作り直し (#451) を飛ばして、 その write が相手に配られないまま残るので。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
-        Self::replay_wal_before_standalone_open(path)?;
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)?;
-        let eng = eng.relog_before_standalone_session(path)?;
-        // 読み直し 2 [B2]: WAL を再生しない open は、 記録から戻した所で前の住人の後始末が揃う (`prev.seg` の周期を進め始める)
+        let (eng, wal_len) = Self::open_standalone_after_replay(path)?;
+        let eng = eng.relog_before_standalone_session(path, wal_len)?;
+        // #976 の読み直し 2 [B2]: WAL を再生しない open は、 記録から戻した所で前の住人の後始末が揃う (`prev.seg` の周期を進め始める)
         eng.finish_open_restores(false);
         Ok(eng)
+    }
+
+    /// #880 / #989 / PR #986 の読み直し 2 の [1]: 単独の open の本体。 writer lock を取った直後、 開く時の直し (`prev.seg` の記録の戻し・
+    /// gen.seg の突き合わせ) が何かを書く前に、 WAL に再生していない record (checkpoint より後、 閉じていない末尾も含む = WAL 付きの open が
+    /// 当てる物) があるかを一度だけ聞く ([`Self::wal_records_to_replay`])。
+    /// - 無い: 単独の open は再生しないので、 直しはその場で仕上げる (`ReplayAhead::Nothing`)
+    /// - ある: lock を放し、 WAL 付きの open で再生して閉じ (Drop が書き出して checkpoint を進め、 畳む)、 lock を取り直して聞き直す。 まだ
+    ///   残っていれば (書き出し / `tables` を書けない、 #870) 断る
+    /// - 聞けない (一時の I/O の失敗・資源不足・権限、 #989): 何も書かずに断る。 呼び手が開き直せば聞き直す
+    ///
+    /// 前 (#986 の最初の形) は聞くのが lock の前と、 突き合わせが直しを map (gen.seg / entities.seg) に書いた後だった。 後の問いが聞けずに
+    /// 断ると、 開き直した突き合わせは直した場所を見つけず (死の印と生きている印が揃っている)、 仕上げ (残った cell を落とす・消えた行の
+    /// 世代と tombstone を覚える) が二度と走らなかった。 lock の下で聞くので、 答えてから開くまでに別の process が WAL に積む窓も無い。
+    ///
+    /// 往復で lock を放してから取り直すまでの間に別の process が取れば、 その process が放すまで待つ (2 つの process が同時に開いた時と同じ)。
+    /// 別の process の書き手が生きている時は lock で待つ (前の単独の open が lock で待っていたのと同じ)。
+    ///
+    /// 戻り値の 2 つ目は、 lock の下で聞いた時の WAL の file の大きさ (file が無ければ None)。 #451 の往復の要否
+    /// ([`Self::relog_before_standalone_session`]) はこの答えで決める (PR #986 の読み直し 3 の [1]): 返す engine が lock を持ち続けるので、
+    /// 答えてから往復の要否を決めるまでに WAL の file は変わらない。 前は本体を開いた後 (直しを map に書いた後) にもう一度 stat で聞き、
+    /// その stat が一時に失敗すると書いた後に断った (開き直した突き合わせは直した場所を見つけない)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_standalone_after_replay(path: &str) -> io::Result<(Self, Option<u64>)> {
+        let lock = Self::writer_lock_for_open(path)?;
+        let asked = Self::wal_records_to_replay(path)?;
+        let (lock, wal_len) = match asked.replay {
+            None => (lock, asked.len),
+            Some(cap) => {
+                drop(lock);
+                drop(Self::open_concurrent_with_oplog(path, cap)?);
+                Self::lock_with_nothing_to_replay(path)?
+            }
+        };
+        Ok((Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?, wal_len))
+    }
+
+    /// #880: 往復 (WAL 付きの open で再生して閉じた) の後に、 単独で開き直すための writer lock を取り、 WAL に再生する record が残って
+    /// いないことを lock の下で確かめる (残っていれば断る、 聞けなければ断る)。 戻り値の 2 つ目は lock の下で見た WAL の file の大きさ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lock_with_nothing_to_replay(path: &str) -> io::Result<(WriterLock, Option<u64>)> {
+        let lock = Self::writer_lock_for_open(path)?;
+        let asked = Self::wal_records_to_replay(path)?;
+        if asked.replay.is_some() {
+            return Err(Self::wal_left_after_replay());
+        }
+        Ok((lock, asked.len))
+    }
+
+    /// 書き手の open の writer lock (DB の directory を確かめてから、 mmap の前に取る = 他の書き手が居れば待つ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn writer_lock_for_open(path: &str) -> io::Result<WriterLock> {
+        Self::check_db_dir(path)?;
+        acquire_writer_lock(path)
     }
 
     /// 開く時に #451 の作り直し ([`Self::relog_unlogged_writes`]) が走る DB か: 開いた時に紐名の辞書の clean の印が倒れていた
@@ -10853,22 +10947,32 @@ impl Engine {
     /// WAL の file が無い DB は往復しない: WAL 付きの open が WAL を作ることになり、 その大きさ (後で WAL 付きで開く時に渡す値) を
     /// 単独の open は知らない。 WAL を通らない書き込みは版数を付けない (`Hlc::ZERO` = 作り直しの対象外) ので、 WAL の file が無いまま
     /// 書いた write は作り直す物でもない。
-    /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。
+    ///
+    /// WAL の file があるか (`wal_len`) は、 単独の open が writer lock の下で、 開く時の直しが何かを書く前に stat で聞いた答え
+    /// ([`Self::open_standalone_after_replay`]、 lock は `self` が持ち続ける)。 ここで聞き直さない (PR #986 の読み直し 3 の [1]): 前は
+    /// ここで stat し直し、 一時に失敗すると、 `open_internal` が直し (突き合わせの `kill_generation` / `live_free`、 仕上げの cell 落とし、
+    /// 記録の戻し) を map に書いた後に断った (開き直した突き合わせは直した場所を見つけない)。 lock の下の stat に失敗すれば、 何も
+    /// 書かずに断っている (#989、 読み直し 2 の [3])。
+    ///
+    /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。 ただし header より短い file (作った直後・
+    /// `set_len` の前に落ちた = 0 B もある) は、 その大きさでは WAL を作れない (前は `OpLog::create` が header を書く所で範囲外の panic、
+    /// 読み直し 3 の [2]) ので [`STANDALONE_RELOG_OPLOG_CAPACITY`] で作る。
     #[cfg(not(target_arch = "wasm32"))]
-    fn relog_before_standalone_session(self, path: &str) -> io::Result<Self> {
+    fn relog_before_standalone_session(self, path: &str, wal_len: Option<u64>) -> io::Result<Self> {
         if !self.relogs_unlogged_writes_on_open() {
             return Ok(self);
         }
-        let Ok(meta) = std::fs::metadata(oplog_path_for(path)) else {
-            return Ok(self);
+        let Some(len) = wal_len else { return Ok(self) };
+        let capacity = if len < enchudb_oplog::oplog::HEADER_SIZE as u64 {
+            STANDALONE_RELOG_OPLOG_CAPACITY
+        } else {
+            len as usize
         };
         self.abandoned.store(true, std::sync::atomic::Ordering::Release);
         drop(self);
-        drop(Self::open_concurrent_with_oplog(path, meta.len() as usize)?);
-        if Self::wal_records_to_replay(path)?.is_some() {
-            return Err(Self::wal_left_after_replay());
-        }
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)?;
+        drop(Self::open_concurrent_with_oplog(path, capacity)?);
+        let (lock, _) = Self::lock_with_nothing_to_replay(path)?;
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?;
         if eng.relogs_unlogged_writes_on_open() {
             eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
             return Err(io::Error::other(
@@ -10879,44 +10983,55 @@ impl Engine {
         Ok(eng)
     }
 
-    /// #880: `path` の WAL に再生していない record (checkpoint より後、 閉じていない末尾も含む = WAL 付きの open が当てる物) が
-    /// あれば、 WAL 付きの open で再生して閉じる (Drop が書き出して checkpoint を進め、 畳む)。 その後も残っていれば (書き出し /
-    /// `tables` を書けない、 #870) 断る。 書き手の lock は WAL 付きの open が取って Drop が放す。 放してから単独で開き直すまでの間に
-    /// 別の process が取れば、 単独の open は lock で断る (2 つの process が同時に開いた時と同じ)。 別の process の書き手が生きて
-    /// いる時は、 WAL 付きの open が lock で断る (前の単独の open が lock で断っていたのと同じ)。
+    /// PR #986 の読み直し 2 の [3]: `oplog_path` の WAL の file があれば大きさ、 無ければ None。 stat の失敗 (NotFound 以外: EIO / ESTALE /
+    /// ENOMEM / ELOOP / 権限) は Err。 `Path::exists` は stat の失敗を全部 「無い」 と読むので、 一時の失敗で WAL 付きの open が WAL を
+    /// 作り直し (`OpLog::create` は truncate する) 再生していない record を捨て、 単独の open は WAL を見ずに開いた。 I/O の点は
+    /// `oplog.stat` (crashsim の `fault`)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn replay_wal_before_standalone_open(path: &str) -> io::Result<()> {
-        let Some(cap) = Self::wal_records_to_replay(path)? else { return Ok(()) };
-        drop(Self::open_concurrent_with_oplog(path, cap)?);
-        if Self::wal_records_to_replay(path)?.is_some() {
-            return Err(Self::wal_left_after_replay());
+    fn oplog_file_len(oplog_path: &std::path::Path) -> io::Result<Option<u64>> {
+        enchudb_oplog::io_point("oplog.stat")?;
+        match std::fs::metadata(oplog_path) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
-    /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)。
-    /// WAL 自体を読めない (切り詰められた / 壊れた file) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を見ずに開く、
-    /// 警告だけ出す)。
+    /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)、 と WAL の file の大きさ (#451 の
+    /// 往復の要否に使う、 PR #986 の読み直し 3 の [1])。 単独の open が writer lock の下で聞く ([`Self::open_standalone_after_replay`])。
+    /// WAL の中身が壊れている / 切り詰められている (`InvalidData`) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を
+    /// 見ずに開く、 警告だけ出す)。
+    ///
+    /// #972: 聞くだけなので、 WAL は読むだけで開き (file を書かない)、 checkpoint の後の最初の当てる record で読むのを止める
+    /// ([`enchudb_oplog::oplog::OpLog::probe_replay`])。 前は読み書きで開いて (header の直しを本当の open の前に書いた) 全部を解き、
+    /// 256 MiB の WAL では聞くたびに再生と同じだけ読んで写していた (standalone の open で 2〜5 回)。
+    ///
+    /// #989: それ以外の失敗 (WAL の file の stat・一時の I/O の失敗・資源不足・読めない権限) は Err で返す (呼び手は何も書かずに断る)。
+    /// 「再生する物が無い」 と読むと、 単独の open は WAL を見ずに開いた (WAL にだけある値を黙って失う、 #880 の前の形)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn wal_records_to_replay(path: &str) -> io::Result<Option<usize>> {
+    fn wal_records_to_replay(path: &str) -> io::Result<WalAsked> {
+        use enchudb_oplog::oplog::OpLog;
         let oplog_path = oplog_path_for(path);
-        if !oplog_path.exists() {
-            return Ok(None);
-        }
-        let w = match enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)
-            .and_then(|never| if never { Ok(None) } else { enchudb_oplog::oplog::OpLog::open(&oplog_path).map(Some) })
-        {
-            Ok(Some(w)) => w,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                eprintln!("[enchudb] warning: could not read the WAL ({e}) — opening without replaying it (#880)");
-                return Ok(None);
-            }
+        let (len, probe) = match Self::oplog_file_len(&oplog_path) {
+            Ok(None) => return Ok(WalAsked { len: None, replay: None }),
+            Ok(Some(len)) => match OpLog::was_never_written(&oplog_path) {
+                Ok(true) => return Ok(WalAsked { len: Some(len), replay: None }),
+                Ok(false) => (Some(len), OpLog::probe_replay(&oplog_path)),
+                Err(e) => (Some(len), Err(e)),
+            },
+            Err(e) => (None, Err(e)),
         };
-        if w.is_empty() || w.recover_with_tail().is_empty() {
-            return Ok(None);
+        match probe {
+            Ok(p) => Ok(WalAsked { len, replay: p.records.then_some(p.capacity as usize) }),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("[enchudb] warning: the WAL is corrupt or cut short ({e}) — opening without replaying it (#880)");
+                Ok(WalAsked { len, replay: None })
+            }
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("could not tell whether the WAL has records to replay ({e}) — refusing to open without it (#989, try again)"),
+            )),
         }
-        Ok(Some(w.capacity() as usize))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -10935,7 +11050,7 @@ impl Engine {
     /// 書いて落ちた DB は、 書き手が開き直す (再生する) までは、 WAL にだけある値 (書き出しの前に落ちた書き込み) を見ない。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_readonly(path: &str) -> io::Result<Self> {
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false, /*readonly=*/ true)?;
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, None, ReplayAhead::Nothing)?;
         eng.is_readonly.store(true, std::sync::atomic::Ordering::Release);
         Ok(eng)
     }
@@ -10980,16 +11095,20 @@ impl Engine {
     }
 
     /// 内部用: region CRC 検証を skip できる open。WAL ルート用。
-    /// `take_lock = true` で `.db.lock` の flock(LOCK_EX) を取得し、 Engine 寿命中保持。
+    /// `writer_lock` は書き手の open が mmap の前に取った `.db.lock` の flock(LOCK_EX) ([`Self::writer_lock_for_open`]、 Engine 寿命中
+    /// 保持)。 None は readonly の open (lock を取らず、 開く時の直しも書かない)。
+    ///
+    /// `replay` は、 この open の後に WAL の再生が当てる record があるか (開く時の `prev.seg` の記録の戻しと gen.seg の突き合わせが、 仕上げを
+    /// 再生の後に回すか)。 呼び手が writer lock の下で、 何かを直す前に決める (PR #986 の読み直し 2 の [1] [2])。
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_internal(path: &str, verify_region_crc: bool, take_lock: bool, readonly: bool) -> io::Result<Self> {
-        // open path: writer lock を mmap 前に取る (= 他 writer 居れば block)
+    fn open_internal(
+        path: &str,
+        verify_region_crc: bool,
+        writer_lock: Option<WriterLock>,
+        replay: ReplayAhead<'_>,
+    ) -> io::Result<Self> {
         Self::check_db_dir(path)?;
-        let writer_lock = if take_lock {
-            Some(acquire_writer_lock(path)?)
-        } else {
-            None
-        };
+        let readonly = writer_lock.is_none();
         // v10: header.seg を先に読んで検証 → Layout と himo_count → segment 群を open。
         // 書き込み mapping で開く (readonly engine も旧来 MmapMut と同じく RW map;
         // 「書かない」 は engine 側の契約)。
@@ -11262,7 +11381,7 @@ impl Engine {
         // `prev.seg`: きれいに閉じなかった後、 使い回しが identity に移した前の住人の削除 (と名前) が sidecar に届いていなければ戻す
         // (readonly は戻さない: 書き手の DB の tomb.seg に書きうる、 review946 [6])
         if unclean && !readonly {
-            eng.restore_prev_residents(&prev_records);
+            eng.restore_prev_residents(&prev_records, &replay);
             // 読み直し 2 [B1]: 生きている場所を指す別名のうち、 使い回しが外した物 (`eidalias` だけが使い回しの前) を外す。 再生の
             // 前に (再生する中継の record がその別名で次の住人に当たらない)。 再生が生かす場所は再生の後にもう一度
             // (`finish_open_restores`)
@@ -11304,7 +11423,7 @@ impl Engine {
         eng.exhaust_sync_ring();
         // #731: gen.seg と生きている印を突き合わせる (きれいに閉じなかった後だけ)。 表・別名 (#612 の畳んだ自分の行)・払い出し位置
         // の後、 WAL の再生の前
-        eng.reconcile_generations(readonly);
+        eng.reconcile_generations(readonly, &replay);
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
         // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
@@ -20141,22 +20260,21 @@ impl Engine {
     /// `records` は `.eidmap` を読む前に読んで置いた書き出していない記録 ([`Self::load_prev_records`])。
     ///
     /// review946d [N1]: 自分の行の記録で、 前の住人の削除は本体に届き使い回しは届いていない像 (場所の最後の行が記録の行で死んでいる)
-    /// は、 WAL に再生する record があれば戻すかを再生の後に決める ([`Self::finish_prev_restores`])。 再生は、 本体にだけ届いた削除を
+    /// は、 WAL に再生する record があれば (`replay`、 呼び手が lock の下で決めた答え) 戻すかを再生の後に決める ([`Self::finish_prev_restores`])。 再生は、 本体にだけ届いた削除を
     /// その行の古い record で取り消す (`replay_slot` の `restore`)。 前は再生の前に戻し、 再生が生き返らせた行の Delete を state に出し、
     /// #451 の作り直しも配った (A では生きていて、 peer では消える)。 翻訳した行の記録はこの像で写像が場所を指したままなので戻さない
     /// (下の写像の守り)。
-    fn restore_prev_residents(&self, records: &[(u32, crate::prev_slots::PrevRecord)]) {
+    fn restore_prev_residents(&self, records: &[(u32, crate::prev_slots::PrevRecord)], replay: &ReplayAhead<'_>) {
         let gens = self.generations();
         let prev = &gens.prev;
         if !prev.active() || !gens.active() {
             return;
         }
-        let mut replay_follows: Option<bool> = None;
         let mut restored = 0u32;
         for &(slot, rec) in records {
             if rec.kind == crate::prev_slots::PrevKind::Own
                 && self.last_row_unmarked(slot) == (rec.gone, true)
-                && *replay_follows.get_or_insert_with(|| self.wal_has_records_to_replay())
+                && replay.follows()
             {
                 // 退避が書き出し済みかは再生の前の退避表で決める (再生の後始末のやり直し `redo_reuse_eviction` が同じ版数を
                 // 退避するので、 再生の後に見ると、 戻す時の別名の外しを飛ばす)。 書き出していなければ外す別名も再生の前に控える
@@ -20198,18 +20316,6 @@ impl Engine {
         }
         prev.drop_tomb_index();
         prev.release_open();
-    }
-
-    /// きれいに閉じなかった後に開く時、 この後の WAL 付きの open が再生する record が WAL にあるか (`reconcile_generations` の仕上げを
-    /// 後に回すのと同じ見方)。
-    #[cfg(not(target_arch = "wasm32"))]
-    fn wal_has_records_to_replay(&self) -> bool {
-        matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_)))
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn wal_has_records_to_replay(&self) -> bool {
-        false
     }
 
     /// 記録の identity の削除が退避表に記録の版数以上で載っている (書き出し済み、 [`Self::restore_prev_resident`])。
@@ -21747,7 +21853,10 @@ impl Engine {
     /// (Delete は消して上げる = 冪等、 行を生かす record は場所の世代がその行より新しければ戻す = ここで完了に寄せた使い回し /
     /// 届いていなかった削除を、 WAL にある分だけ戻す、 `replay_slot`)。 後に回すと、 再生が生かした場所に残った印を読み違える形を
     /// 再生の側で全部消す必要がある。 readonly は書けないので回さない。 表の定義・別名 (`eidalias`)・払い出し位置の後。
-    fn reconcile_generations(&self, readonly: bool) {
+    ///
+    /// 仕上げ ([`Self::finish_reconcile`]) は、 この open の後に WAL の再生が当てる record があれば (`replay`、 呼び手が writer lock の下で
+    /// 何かを直す前に決めた答え、 PR #986 の読み直し 2 の [1] [2]) 再生の後、 無ければここで済ませる。
+    fn reconcile_generations(&self, readonly: bool, replay: &ReplayAhead<'_>) {
         let gens = self.generations();
         // WAL の無い engine は session の途中の flush でも紐名の辞書の clean の印が立つ: gen.seg の header の印でも見る (読み直し 2)
         if readonly || !gens.active() || !(self.himo_reg.rebuilt_on_load || gens.session_dirty()) {
@@ -21810,8 +21919,7 @@ impl Engine {
         }
         gens.note_repaired(1, completed);
         // 再生する record が WAL に無ければ、 ここで仕上げる (あれば WAL 付きの open が再生の後に仕上げる)
-        #[cfg(not(target_arch = "wasm32"))]
-        if gens.has_pending() && !matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_))) {
+        if gens.has_pending() && !replay.follows() {
             self.finish_reconcile(None);
         }
     }
@@ -28999,75 +29107,101 @@ impl Engine {
     /// WAL 付き open_concurrent。既存 WAL があればリカバリする。
     /// region CRC は WAL ルートでは skip(WAL が source of truth)。
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
+    ///
+    /// PR #986 の読み直し 2 の [2]: 既にある WAL は本体を開く前 (writer lock の下、 開く時の直し (`prev.seg` の記録の戻し・gen.seg の
+    /// 突き合わせ) が何かを書く前) に開き、 直しが仕上げを再生の後に回すかは開いた WAL に聞く (`ReplayAhead::Wal`)。 前は本体を開いた後に
+    /// WAL を開き、 直しは WAL の file を開き直して聞いた: 直しを map に書いて仕上げを再生の後に回した後に WAL を開けずに返ると、 engine の
+    /// Drop が clean の印を立て、 次の open は突き合わせをせず (きれいに閉じたと読む)、 仕上げ (残った cell を落とす) が二度と走らなかった。
+    /// 今は WAL を開けなければ engine を作る前に返る (何も書かない)。 無い WAL は (再生する record も無いので) 今まで通り本体を開いた後に
+    /// 作る。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_oplog(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
-        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true, /*readonly=*/ false)?;
+        let lock = Self::writer_lock_for_open(path)?;
+        let oplog_path = oplog_path_for(path);
+        let wal = Self::existing_wal(&oplog_path)?;
+        let replay = wal.as_ref().map_or(ReplayAhead::Nothing, ReplayAhead::of);
+        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, Some(lock), replay)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
         let _ = std::fs::remove_dir_all(&crc_path); // v10: DB は directory
         let _ = std::fs::remove_file(&crc_path);
-        let oplog_path = oplog_path_for(path);
-        // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
-        let wal = if oplog_path.exists() && !enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)? {
-            let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
-            // リカバリ: commit されたレコードを本体に適用
-            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
-            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
-            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
-            // ここで適用せずに checkpoint で越えると恒久消失する
-            // (`OpLog::recover_with_tail` の doc 参照)。
-            let records = w.recover_with_tail();
-            // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
-            let dropped = w.drop_records_after_a_hole();
-            let mut replay = ReplayVocab::default();
-            for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+        let wal = match wal {
+            Some(w) => {
+                // リカバリ: commit されたレコードを本体に適用
+                // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+                // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+                // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+                // ここで適用せずに checkpoint で越えると恒久消失する
+                // (`OpLog::recover_with_tail` の doc 参照)。
+                let records = w.recover_with_tail();
+                // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
+                let dropped = w.drop_records_after_a_hole();
+                let mut replay = ReplayVocab::default();
+                for rec in &records {
+                    eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+                }
+                eng.finish_replay_vocab(&mut replay);
+                // #968: 再生が生き返らせた、 tombstone まで本体に届いた削除の行は、 削除を完了させる (再生の前の sweep と同じ決め)
+                eng.finish_deletes_revived_by_the_replay(!records.is_empty());
+                // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
+                eng.finish_reconcile(Some(&w));
+                // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
+                eng.finish_prev_restores();
+                // 読み直し 2 [B1] / [B2] / [R2]: 再生が生かした場所の使い回しが外した別名を外し、 版数の索引を捨て、 `prev.seg` の周期を
+                // 進め始める
+                eng.finish_open_restores(!records.is_empty());
+                // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
+                // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
+                // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
+                // body より先に writeback すると、 recovery 直後の再 crash で
+                // 「一度 durable だった committed record」 が replay 対象外になり
+                // 恒久消失した。
+                // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
+                // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+                // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+                if eng.persist_name_records().is_ok()
+                    && eng.body_msync().is_ok()
+                    && (wal_untouched || w.fsync().is_ok())
+                    && !eng.checkpoint_held_for_freed_slots()
+                {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            eng.finish_replay_vocab(&mut replay);
-            // #968: 再生が生き返らせた、 tombstone まで本体に届いた削除の行は、 削除を完了させる (再生の前の sweep と同じ決め)
-            eng.finish_deletes_revived_by_the_replay(!records.is_empty());
-            // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
-            eng.finish_reconcile(Some(&w));
-            // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
-            eng.finish_prev_restores();
-            // 読み直し 2 [B1] / [B2] / [R2]: 再生が生かした場所の使い回しが外した別名を外し、 版数の索引を捨て、 `prev.seg` の周期を
-            // 進め始める
-            eng.finish_open_restores(!records.is_empty());
-            // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
-            // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
-            // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
-            // body より先に writeback すると、 recovery 直後の再 crash で
-            // 「一度 durable だった committed record」 が replay 対象外になり
-            // 恒久消失した。
-            // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
-            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
-            if eng.persist_name_records().is_ok()
-                && eng.body_msync().is_ok()
-                && (wal_untouched || w.fsync().is_ok())
-                && !eng.checkpoint_held_for_freed_slots()
-            {
-                w.advance_checkpoint(w.head());
+            None => {
+                let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+                // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
+                eng.finish_reconcile(Some(&w));
+                eng.finish_prev_restores();
+                eng.finish_open_restores(false);
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            std::sync::Arc::new(w)
-        } else {
-            let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
-            // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            eng.finish_reconcile(Some(&w));
-            eng.finish_prev_restores();
-            eng.finish_open_restores(false);
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
-                w.advance_checkpoint(w.head());
-            }
-            std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+    }
+
+    /// WAL 付きにする時の WAL (`oplog_path`): 既にある (header を書き出した) WAL なら開く (再生する record がありうる)。 無い / header を
+    /// 一度も書き出していない WAL (#415: 作った直後に落ちた = record も無い) は None で、 呼び手が本体を開いた後に作る (開けなかった
+    /// DB に WAL の file を残さない: create の途中で落ちた DB の directory に残すと、 作り直す create が残骸と見ずに断る)。 WAL の file が
+    /// あるかを stat で知れなければ Err (PR #986 の読み直し 2 の [3]: 前は `Path::exists` が stat の失敗を 「無い」 と読み、
+    /// `OpLog::create` (truncate) が再生していない record を捨てた)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn existing_wal(oplog_path: &std::path::Path) -> io::Result<Option<enchudb_oplog::oplog::OpLog>> {
+        use enchudb_oplog::oplog::OpLog;
+        if Self::oplog_file_len(oplog_path)?.is_some() && !OpLog::was_never_written(oplog_path)? {
+            Ok(Some(OpLog::open(oplog_path)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// #796: 開く道が WAL に何も足さず、 本体に何も当てていないか (再生する record も、 捨てた穴も、 作り直した write (#451) も
@@ -29877,53 +30011,55 @@ impl Engine {
         // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)
         eng.mark_session_dirty();
         // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
-        let wal = if oplog_path.exists() && !enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)? {
-            let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
-            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
-            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
-            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
-            // ここで適用せずに checkpoint で越えると恒久消失する
-            // (`OpLog::recover_with_tail` の doc 参照)。
-            let records = w.recover_with_tail();
-            // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
-            let dropped = w.drop_records_after_a_hole();
-            let mut replay = ReplayVocab::default();
-            for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+        let wal = match Self::existing_wal(&oplog_path)? {
+            Some(w) => {
+                // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+                // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+                // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+                // ここで適用せずに checkpoint で越えると恒久消失する
+                // (`OpLog::recover_with_tail` の doc 参照)。
+                let records = w.recover_with_tail();
+                // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
+                let dropped = w.drop_records_after_a_hole();
+                let mut replay = ReplayVocab::default();
+                for rec in &records {
+                    eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+                }
+                eng.finish_replay_vocab(&mut replay);
+                // #968 / #731 / #451 / review946d [N1] / 読み直し 2 [B1] [B2]: open_concurrent_with_oplog と同じ
+                eng.finish_deletes_revived_by_the_replay(!records.is_empty());
+                eng.finish_reconcile(Some(&w));
+                eng.finish_prev_restores();
+                eng.finish_open_restores(!records.is_empty());
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
+                // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
+                // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
+                // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+                // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+                if eng.persist_name_records().is_ok()
+                    && eng.body_msync().is_ok()
+                    && (wal_untouched || w.fsync().is_ok())
+                    && !eng.checkpoint_held_for_freed_slots()
+                {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            eng.finish_replay_vocab(&mut replay);
-            // #968 / #731 / #451 / review946d [N1] / 読み直し 2 [B1] [B2]: open_concurrent_with_oplog と同じ
-            eng.finish_deletes_revived_by_the_replay(!records.is_empty());
-            eng.finish_reconcile(Some(&w));
-            eng.finish_prev_restores();
-            eng.finish_open_restores(!records.is_empty());
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
-            // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
-            // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
-            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
-            if eng.persist_name_records().is_ok()
-                && eng.body_msync().is_ok()
-                && (wal_untouched || w.fsync().is_ok())
-                && !eng.checkpoint_held_for_freed_slots()
-            {
-                w.advance_checkpoint(w.head());
+            None => {
+                let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+                // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
+                eng.finish_reconcile(Some(&w));
+                eng.finish_prev_restores();
+                eng.finish_open_restores(false);
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            std::sync::Arc::new(w)
-        } else {
-            let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
-            // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            eng.finish_reconcile(Some(&w));
-            eng.finish_prev_restores();
-            eng.finish_open_restores(false);
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
-                w.advance_checkpoint(w.head());
-            }
-            std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
