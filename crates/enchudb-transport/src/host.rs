@@ -712,17 +712,6 @@ impl HostInner {
         p
     }
 
-    /// ホストの `_sync_ops` に残っている record の HLC の最小 (残っていなければ None)。 F はこれを越えない: 残っている record は
-    /// まだ個別に配りうるので、 その削除をホストが忘れた後に誰かが当てると、 名前で束ねた行の答えが割れる。
-    fn ring_min(&self) -> Option<Hlc> {
-        self.engine
-            .pending_sync_ops(0)
-            .iter()
-            .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
-            .map(|r| r.hlc)
-            .min()
-    }
-
     /// 黙ったので外した client か、 外した後に戻ってきた client か (線を持つホストだけ)。
     fn is_stale(&self, c: PeerId) -> bool {
         self.lines_path.is_some() && self.lines.lock().unwrap().clients.get(&c).is_some_and(|c| c.dropped || c.returned)
@@ -779,8 +768,13 @@ impl HostInner {
                     hook();
                 }
             }
-            // 登録を外した受信の record は ring にある (外したのは `sync_for_ack` の後) = 登録を読んだ後に ring を読む
-            let f = self.ring_min().map_or(upper, |m| upper.min(m));
+            // 登録を外した受信の record は ring にある (外したのは `sync_for_ack` の後) = 登録を読んだ後に ring を読む。 ホストの
+            // `_sync_ops` に残っている record は、 まだ個別に配りうるので F はそれを越えない (その削除をホストが忘れた後に誰かが当てると、
+            // 名前で束ねた行の答えが割れる)。
+            // #985: min(上限, ring の最小)。 前は ring の全部の行を写して decode した (100 万行で 1 回 60〜110 ms、 F が ring の最古の
+            // record に留められている間は要求のたびに)。 engine の覚え (`Engine::sync_ring_min_below`) は、 bridge が足した行と回収で
+            // 消えた行で直し、 下の境が上限以上なら読まない
+            let f = self.engine.sync_ring_min_below(upper).unwrap_or(upper);
             let current = self.lines.lock().unwrap().forget;
             if f > current {
                 if self.engine.forget_deletes_before(f) > 0 {
@@ -1815,6 +1809,12 @@ mod tests {
         c.settled_sync_records(|x, _| x == me).iter().map(|r| r.hlc).max().unwrap()
     }
 
+    /// ホストの ring に残る record の版数の最小を、 ring の全部の行を写して decode して読む (#985 の覚え
+    /// (`Engine::sync_ring_min_hlc`) と独立の読み。 試験の前提はこれで見る)。
+    fn full_ring_min(e: &Engine) -> Option<Hlc> {
+        e.pending_sync_ops(0).iter().filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p)).map(|r| r.hlc).min()
+    }
+
     /// cursor の置き場の中身 `text` にある (link, 書き手) の位置 (無ければ ZERO)。
     fn cursor_in(text: &str, link: PeerId, author: PeerId) -> Hlc {
         text.lines()
@@ -2194,7 +2194,7 @@ mod tests {
         let forget = host.forget_line();
         assert!(candidate.is_some_and(|c| c > old), "前提: F の候補が n の record より上 ({candidate:?} / {old:?})");
         assert!(forget < old, "前提: F はまだ n の record より下 ({forget:?} / {old:?})");
-        assert!(host.inner.ring_min().is_none_or(|m| m > old), "前提: ホストの ring は n の record より古い物を持たない");
+        assert!(full_ring_min(&host_eng).is_none_or(|m| m > old), "前提: ホストの ring は n の record より古い物を持たない");
         (dir, host, host_eng, ab, n, old)
     }
 
@@ -2211,7 +2211,7 @@ mod tests {
             *host.inner.wal_sync_hook.lock().unwrap() = Some(Box::new(move |after| {
                 let mut g = seen.lock().unwrap();
                 if let (false, None, Some(inner)) = (after, g.as_ref(), inner.upgrade()) {
-                    let ring = inner.ring_min();
+                    let ring = full_ring_min(&inner.engine);
                     inner.recompute(inner.clock.now());
                     *g = Some((ring, inner.lines.lock().unwrap().forget));
                 }
@@ -2249,7 +2249,7 @@ mod tests {
         host.inner.recompute(host.inner.clock.now());
         let forget = host.forget_line();
         let applied = host_eng.pull_raw("rows.val", 900).len();
-        let in_ring = host.inner.ring_min().is_some_and(|m| m <= old);
+        let in_ring = full_ring_min(&host_eng).is_some_and(|m| m <= old);
         drop(host);
         drop((ab, sn, n, host_eng));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2290,6 +2290,73 @@ mod tests {
         let (waited, during) = seen.expect("前提: F を忘れる段に入らない");
         assert!(returned && applied == 1, "前提: 忘れ終えた後に n の record が当たらない (返った {returned}, 当たった {applied})");
         assert!(waited && during == 0, "忘れている途中に、 F より古い n の record を当てた (待った {waited}, 当たった {during})");
+    }
+
+    /// #985: F が ring の最古の record に留められている間 (ring を回収しない)、 client の要求のたびに F を進めようとしても ring を
+    /// 読み直さない。 F は直す前の読み (ring の全部の行を写して decode した最小) の所に留まる。 回収で最古の行が消えた後は 1 回だけ
+    /// 読み直し、 F は進むが ring に残る行を越えない。
+    ///
+    /// 直す前: F を進めようとする回 (`forget_rounds`) ごとに ring の全部の行を写して decode した (100 万行で 1 回 60〜110 ms)。
+    #[test]
+    fn a_pinned_forget_line_does_not_read_the_ring_per_request() {
+        let dir = std::env::temp_dir().join(format!("enchudb-985-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let host_eng = rows_db(&path("host"), 100);
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(path("host.cursors").into())).unwrap();
+        let url = format!("http://{}", host.addr());
+        let clients: Vec<(Arc<Engine>, Syncer)> = [1, 2]
+            .into_iter()
+            .map(|peer| {
+                let e = rows_db(&path(&format!("c{peer}")), peer);
+                let s = Syncer::new(e.clone(), Arc::new(HttpHostTransport::connect(url.clone(), peer).unwrap()));
+                (e, s)
+            })
+            .collect();
+        let round = |v: u32| {
+            for (i, (e, s)) in clients.iter().enumerate() {
+                write_row(e, v + i as u32);
+                s.publish_since(Hlc::ZERO);
+                s.pull_once(100);
+            }
+        };
+        let full = full_ring_min;
+        for v in [10, 20, 30] {
+            round(v);
+        }
+        let pinned = full(&host_eng);
+        let scans = || host_eng.sync_ring_min_scans();
+        let rounds = || host.inner.forget_rounds.load(Ordering::Acquire);
+        let (s0, r0) = (scans(), rounds());
+        for i in 0..10 {
+            round(100 + 10 * i);
+        }
+        let (s1, r1) = (scans(), rounds());
+        let forget = host.forget_line();
+        let still = full(&host_eng);
+        // 回収で最古の行が消える: 次に F を進めようとする回が 1 回だけ読み直す
+        let purged = host_eng.reclaim_sync_ops();
+        let after_reclaim = full(&host_eng);
+        for i in 0..5 {
+            round(300 + 10 * i);
+        }
+        let (s2, r2) = (scans(), rounds());
+        let forget_after = host.forget_line();
+        let ring_after = full(&host_eng);
+        drop(host);
+        drop(clients);
+        drop(host_eng);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(pinned.is_some() && still == pinned, "前提: ring の最古の record は回収まで残る ({pinned:?} / {still:?})");
+        assert_eq!(Some(forget), pinned, "前提: F が ring の最古の record に留められている");
+        assert!(r1 - r0 >= 10, "前提: 要求のたびに F を進めようとした ({})", r1 - r0);
+        assert_eq!(s1 - s0, 0, "F が ring の最古の record に留められている間に、 要求で ring を読み直した ({} 回)", s1 - s0);
+        assert!(purged > 0 && after_reclaim > pinned, "前提: 回収で最古の行が消えた ({purged} 行、 {after_reclaim:?})");
+        assert!(r2 > r1, "前提: 回収の後も F を進めようとした");
+        assert_eq!(s2 - s1, 1, "回収の後に ring を読み直した回数");
+        assert!(forget_after > forget, "回収の後に F が進まない ({forget:?} → {forget_after:?})");
+        assert!(ring_after.is_none_or(|m| forget_after <= m), "F が ring に残る record を越えた ({forget_after:?} > {ring_after:?})");
     }
 
     #[test]
