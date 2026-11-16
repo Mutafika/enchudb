@@ -14,7 +14,10 @@
 //!
 //! - `POST /v2/publish?peer=c` : client c の record。 ホストが当てて中継し、 WAL を書き出してから、 ホストが当てた位置 (c への ack)
 //!   を返す。 client の `_sync_ops` はこの ack で回収される (ホストは record の置き場の権威なので、 #227 の下流の消化で丸めない)。
-//!   書き出せなければ ack を返さない (503、 #961: client は受けたと思わずに次の beat で送り直す)
+//!   書き出せなければ ack を返さない (503、 #961: client は受けたと思わずに次の beat で送り直す)。 client の cursor の置き場は
+//!   書き出しが返った後に書く (#964)。 query の `acked=peer:w.l.p,..` は client が 「ホストが受けた」 と思っている位置 (#961 (b)):
+//!   ホストの cursor がそこまで届いていなければ (作り直した / 古い控えから戻した)、 当てずに印 `BEHIND` と今の位置を返す (client は
+//!   覚えを置き換えて、 足りない所から送り直す)。 付けない client (0.37.4 以前) には確かめない
 //! - `POST /v2/pull?to=c` (body = 書き手ごとの cursor) : ホストの `_sync_ops` のうち cursor より後 (c 自身の record は除く) と、
 //!   ホストの floor。 floor は record を読んだ後に読む (間に回収が入っても穴を見逃さない側)。 cursor は ack も兼ねる。
 //!   返事は `[framed records][floor の列][配り終えの線 16][忘れてよい線 16]`、 c が黙って外された後に戻った client の時だけ、
@@ -34,7 +37,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use enchudb::Engine;
@@ -136,6 +139,17 @@ const NEED_STATE: u8 = 1;
 /// record は今までどおり配る。 印の無い返事は今までと同じ長さなので、 古い client には外された時だけ長さが変わる (古い client は
 /// 長さの違う後ろを読まず、 線を ZERO と読む = 何も忘れない側。 外された client は線に数えていない)
 const STALE: u8 = 2;
+/// publish の返事の印 (#961、 要求に `acked` を付けた client にだけ返す): ホストの cursor が、 client の言う 「ホストが受けた位置」
+/// に届いていない (同じ URL の裏でホストを空の DB で作り直した / 古い控えから戻した / cursor の置き場が WAL より遅れている)。
+/// record は当てていない (当てると cursor が新しい record で進み、 届いていない古い record を送り直しても `hlc > cursor` で落ちる)。
+/// 返事の位置はホストの今の cursor で、 client は覚え (`acked`) をそれに置き換えて、 次の beat で足りない所から送り直す。
+///
+/// 返事の形は今までと同じ (`[印][位置の列]`)。 `acked` を付けない client (0.37.4 以前) には返さない (古い client は知らない印を
+/// 読まずに位置を ack として足すので)。 0.37.4 以前のホストは `acked` を読まない (今までどおり当てる = 直らないが壊れない)
+const BEHIND: u8 = 4;
+/// `acked` に載せる書き手の数の上限 (request line の長さ。 ホストは header を 16 KiB までしか読まない)。 載せない書き手は確かめない
+/// だけ (誤って `BEHIND` にはならない)。
+const ACKED_PARAM_MAX: usize = 64;
 
 /// 黙った client を線と回収の数から外すまでの既定 (30 日)。
 const DEFAULT_SILENCE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -180,6 +194,26 @@ fn parse_hlc(s: &str) -> Option<Hlc> {
     let mut it = s.split('.');
     let h = Hlc { wall: it.next()?.parse().ok()?, logical: it.next()?.parse().ok()?, peer: it.next()?.parse().ok()? };
     it.next().is_none().then_some(h)
+}
+
+/// 書き手ごとの位置の列を query の値に: `peer:w.l.p,peer:w.l.p`。 `first` の書き手を先に、 [`ACKED_PARAM_MAX`] 個まで。
+fn cursors_param(list: &[(PeerId, Hlc)], first: PeerId) -> String {
+    let head = list.iter().filter(|(p, _)| *p == first);
+    let rest = list.iter().filter(|(p, _)| *p != first);
+    head.chain(rest)
+        .take(ACKED_PARAM_MAX)
+        .map(|(p, h)| format!("{p}:{}", hlc_param(*h)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_cursors_param(s: &str) -> Option<Cursors> {
+    s.split(',')
+        .map(|e| {
+            let (p, h) = e.split_once(':')?;
+            Some((p.parse().ok()?, parse_hlc(h)?))
+        })
+        .collect()
 }
 
 /// ホストが client ごとに覚えること (削除を忘れてよい線のため、 `HOST_PLAN.md` の段 2)。
@@ -317,7 +351,14 @@ struct HostInner {
     /// 試験: ホストの `oplog_sync` を失敗させる。
     #[cfg(test)]
     fail_wal: AtomicBool,
+    /// 試験: ホストの `oplog_sync` の割り込み点 (#964)。 書き出しの直前に `false`、 書き出しが返った直後に `true` で呼ぶ。
+    #[cfg(test)]
+    wal_sync_hook: Mutex<Option<WalSyncHook>>,
 }
+
+/// 試験の割り込み点 ([`HostInner`] の `wal_sync_hook`)。 引数は 「書き出しが返った後か」。
+#[cfg(test)]
+type WalSyncHook = Box<dyn FnMut(bool) + Send>;
 
 struct Lines {
     clients: HashMap<PeerId, ClientState>,
@@ -423,9 +464,16 @@ impl HostInner {
         self.client_locks.lock().unwrap().entry(c).or_default().clone()
     }
 
-    /// client `from` の record を当てる。 `through` は from の配り終えの線 (この batch を全部当てたら進める)。 戻り値は (返事の印,
-    /// from への ack)。 WAL を書き出せなかった時は `None` (ack を返さない、 #961)。
-    fn accept(&self, from: PeerId, records: Vec<WireRecord>, through: Option<Hlc>) -> Option<(u8, Vec<(PeerId, Hlc)>)> {
+    /// client `from` の record を当てる。 `through` は from の配り終えの線 (この batch を全部当てたら進める)。 `acked` は from が
+    /// 「ホストが受けた」 と思っている位置 (#961、 0.37.4 以前の client は付けない)。 戻り値は (返事の印, from への ack)。 WAL を
+    /// 書き出せなかった時は `None` (ack を返さない、 #961)。
+    fn accept(
+        &self,
+        from: PeerId,
+        records: Vec<WireRecord>,
+        through: Option<Hlc>,
+        acked: Option<Cursors>,
+    ) -> Option<(u8, Vec<(PeerId, Hlc)>)> {
         let lock = self.client_lock(from);
         let _serial = lock.lock().unwrap();
         let seen = |s: &Self| s.syncer.cursors_of(from).into_iter().find(|(a, _)| *a == from).map_or(Hlc::ZERO, |(_, h)| h);
@@ -434,6 +482,18 @@ impl HostInner {
         if returning && mine {
             self.touch(from, |_| {});
             return Some((STALE, self.syncer.cursors_of(from)));
+        }
+        // #961: client が 「ホストが受けた」 と思っている位置に、 ホストの cursor が届いていない (同じ URL の裏でホストを作り直した /
+        // 古い控えから戻した / cursor の置き場が WAL より遅れている = #964)。 この batch を当てると cursor が新しい record で進み、
+        // その後に client が届いていない古い record を送り直しても `hlc > cursor` で落ちる。 当てずに今の位置を返す (`BEHIND`、
+        // client は覚えを置き換えて、 次の beat で足りない所から送り直す。 client の ring が回収済みなら、 その時 floor で state を求める)
+        if let Some(acked) = acked {
+            let have = self.syncer.cursors_of(from);
+            let pos = |a: PeerId| have.iter().find(|(p, _)| *p == a).map_or(Hlc::ZERO, |(_, h)| *h);
+            if acked.iter().any(|(a, h)| pos(*a) < *h) {
+                self.touch(from, |_| {});
+                return Some((BEHIND, have));
+            }
         }
         let top = records.iter().filter(|r| r.author_peer == from).map(|r| r.hlc).max();
         let (out, all_in, durable) = {
@@ -481,14 +541,21 @@ impl HostInner {
     /// ので、 書き出さずに ack を返すと、 書き出していない record を受けたと言う。 失敗の数は書き出しを始める**前**に読む: 読んだ数の
     /// 失敗は、 その回の record を載せた後に書き出しが返っている = この書き出しが覆う。 並んで失敗した回 (読んだ後に足された数) は
     /// 覆ったと数えない。
+    ///
+    /// #964: client ごとの cursor の置き場は、 この書き出しが返った後に書く (`Syncer::hold_cursor_file`)。 書くのは書き出しを始める
+    /// **前**の cursor の写し (写しの位置までの record は当てた時に WAL に載っている = この書き出しが覆う)。 前は `pull_once` の中で
+    /// 当てた直後に書いていて、 書き出しまでの間に電源が落ちた像では置き場だけが 「受けた」 と言い、 開き直したホストは client の
+    /// 送り直しを cursor で落とした。
     fn sync_for_ack(&self, needed: bool) -> bool {
         let failed = self.wal_failed.load(Ordering::Acquire);
         if !needed && self.wal_cleared.load(Ordering::Acquire) >= failed {
             return true;
         }
+        let mark = self.syncer.cursor_mark();
         match self.oplog_sync() {
             Ok(()) => {
                 self.wal_cleared.fetch_max(failed, Ordering::AcqRel);
+                self.syncer.save_cursors_through(mark);
                 true
             }
             Err(e) => {
@@ -502,10 +569,19 @@ impl HostInner {
     /// ホストの WAL の書き出し (試験は失敗させられる)。
     fn oplog_sync(&self) -> io::Result<()> {
         #[cfg(test)]
+        if let Some(hook) = self.wal_sync_hook.lock().unwrap().as_mut() {
+            hook(false);
+        }
+        #[cfg(test)]
         if self.fail_wal.load(Ordering::Acquire) {
             return Err(io::Error::other("test: oplog_sync fails"));
         }
-        self.engine.oplog_sync()
+        let r = self.engine.oplog_sync();
+        #[cfg(test)]
+        if let Some(hook) = self.wal_sync_hook.lock().unwrap().as_mut() {
+            hook(true);
+        }
+        r
     }
 
     /// client `c` が来た: last_seen を今にして `f` を当て、 線を計算し直す。 外した client が来たら、 戻ったとして断る側に回す。
@@ -684,6 +760,19 @@ impl HttpHost {
     /// 印 (`set_gossip_remote_apply`) を立てる。 `cursor_path` は client ごとの受けた位置の置き場 (無ければ memory だけで、
     /// 開き直すと client の record を当て直す。 当て直しは冪等)。 その横 (`<cursor_path>.clients`) に client ごとの線を置き、
     /// 削除を忘れてよい線を配る (`cursor_path` が無ければ線を配らない = 誰も削除の記録を忘れない)。
+    ///
+    /// 置き場が無いと、 開き直すたびに、 繋いでいる client は ring の自分の record を全部送り直し (前の ack を覚えている同じ process の
+    /// client も、 #961 の `BEHIND` で)、 ホストはそれを全部もう一度中継に載せる (#698: 当たらなかった record も載せる)。 1 client に
+    /// つき開き直し 1 回で、 その client の ring の行の数まで。 受け手は cursor で落とすが、 ホストの ring を埋める。 置き場を付けること。
+    ///
+    /// 控えから戻す時 (#961): 置き場 (`cursor_path`) は DB と同じ時に控えた物か、 それより古い物を使う。 戻す前のホストの置き場 (DB より
+    /// 新しい) を残すと、 ホストの cursor が client の言う 「ホストが受けた位置」 以上になって `BEHIND` を返さず、 client の送り直しを
+    /// cursor で落とす (控えの後に ack した record が、 戻したホストにも他の client にも届かない)。 置き場を消して開くのは安全な側
+    /// (全部の client が送り直す = 上の載せ直し)。
+    ///
+    /// ホストは publish の要求の query (`acked=peer:w.l.p,..`) を percent-decode せずに読む。 query を作り直す proxy (`:` / `,` を
+    /// `%3A` / `%2C` にする等) を挟むと、 読めない `acked` は無いものとして確かめない: 誤って `BEHIND` にはならないが、 作り直した /
+    /// 戻したホストに ack 済みの record を送り直さない (#961 (b) が直らない)。
     pub fn start(bind_addr: &str, engine: Arc<Engine>, cursor_path: Option<PathBuf>) -> io::Result<Self> {
         let host = engine.peer_id();
         if host == 0 {
@@ -708,6 +797,8 @@ impl HttpHost {
         if let Some(p) = cursor_path {
             syncer = syncer.with_cursor_path(p);
         }
+        // #964: cursor の置き場は WAL を書き出してから書く (`HostInner::sync_for_ack`)
+        syncer.hold_cursor_file(true);
         syncer.set_host(true);
         syncer.serve_state();
         // #798: 前の版が、 外した後に戻ってきた client を回収の数に戻したまま保存している時
@@ -730,6 +821,8 @@ impl HttpHost {
             wal_cleared: AtomicU64::new(0),
             #[cfg(test)]
             fail_wal: AtomicBool::new(false),
+            #[cfg(test)]
+            wal_sync_hook: Mutex::new(None),
         });
 
         let listener = TcpListener::bind(bind_addr)?;
@@ -807,8 +900,10 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             let Some(from) = peer_param("peer") else { return send_response(&mut stream, 400, b"peer") };
             let Ok(records) = decode_batch(&req.body) else { return send_response(&mut stream, 400, b"batch") };
             let through = q.get("through").and_then(|s| parse_hlc(s));
+            // #961: client が 「ホストが受けた」 と思っている位置 (0.37.4 以前の client は付けない = 確かめない)
+            let acked = q.get("acked").and_then(|s| parse_cursors_param(s));
             // #961: WAL を書き出せなかった = ack を返さない (古い client の道も同じ。 古い client は返事を読まない)
-            let Some((flags, ack)) = host.accept(from, records, through) else {
+            let Some((flags, ack)) = host.accept(from, records, through, acked) else {
                 return send_response(&mut stream, 503, b"oplog_sync");
             };
             if req.route == "/publish" {
@@ -908,6 +1003,15 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
 // client
 // ─────────────────────────────────────────────────────────────
 
+/// [`HttpHostTransport`] が覚えている 「ホストが受けた位置」。
+#[derive(Default)]
+struct Acked {
+    /// 書き手ごとの位置。
+    at: Cursors,
+    /// `BEHIND` の返事で `at` を下げた回数 (review965 F1: 下げる前の位置で集めた batch を送らない)。
+    lowered: u64,
+}
+
 /// ホストと話す client の transport。 `Syncer::new(engine, Arc::new(HttpHostTransport::connect(url, me)?))` で使い、
 /// `publish_since` / `pull_once(t.host_id())` を回す。 自分の state をホストに送れるよう、 client も `serve_state()` を呼ぶこと
 /// (ホストが求めた時だけ送る)。
@@ -915,6 +1019,11 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
 /// `Syncer` には cursor の置き場 (`Syncer::with_cursor_path`) を付けること。 無いと受けた位置は memory だけで、 開き直すたびに
 /// 「初めて来た client」 になる: ホストが一度でも回収していれば、 最初の pull は何も当てずに `history_truncated` を返し、 アプリが
 /// 取り直し (`bootstrap_pull_via`) を呼ぶまで受け取りが止まる (#710)。
+///
+/// publish は `publish_since(Hlc::ZERO)` で回すこと (ホストが受けた位置は transport が覚えていて、 それ以下の record は集めない)。
+/// ZERO より後の `since` を渡すと、 ホストを作り直した / 古い控えから戻した時 (#961、 [`BEHIND`]) に、 ホストに足りない record のうち
+/// `since` 以下の物を集めない。 その publish は下がった位置を名乗ってホストに当たるので、 ホストの cursor がその穴を越え、 その
+/// record は新しいホストにも他の client にも届かない。
 pub struct HttpHostTransport {
     http: HttpTransport,
     host: PeerId,
@@ -922,9 +1031,15 @@ pub struct HttpHostTransport {
     me: PeerId,
     /// ホストが当てた位置 (publish の返事)。 `take_pull_acks_multi` で `Syncer` に渡す。
     pending_acks: Mutex<HashMap<PeerId, Vec<(PeerId, Hlc)>>>,
-    /// 書き手ごとにホストが当てた位置 (送り済みの record を送り直さない)。 上がるだけで、 ホストの世代には結んでいない: 同じ URL の
-    /// 裏でホストを空の DB で作り直した / 戻したホストが ack 済みの record を持っていない時、 この process の間は送り直さない (#961)。
-    acked: Mutex<Vec<(PeerId, Hlc)>>,
+    /// 書き手ごとにホストが当てた位置 (送り済みの record を送り直さない)。 ack で上がる。 publish のたびにホストに言い (`acked`)、
+    /// ホストの cursor がそこまで届いていなければ (同じ URL の裏でホストを空の DB で作り直した / 古い控えから戻した、 #961)、 ホストの
+    /// 返事 (`BEHIND`) の位置に置き換える (下がる)。 0.37.4 以前のホストは `acked` を読まないので、 その相手では上がるだけ (作り直した
+    /// ホストに ack 済みの record を、 この process の間は送り直さない)。
+    acked: Mutex<Acked>,
+    /// thread ごとに、 `publish_floor` を答えた時の [`Acked::lowered`]。 同じ thread の次の `publish_to` が取り出して比べる (review965
+    /// F1)。 `Syncer` の外から `publish_floor` だけを呼んだ thread も控えが残り、 その間に下げていれば次の `publish_to` を 1 回送らない
+    /// (次の beat が送る)。
+    floor_reads: Mutex<HashMap<ThreadId, u64>>,
     /// 最後の pull の返事にあったホストの floor。
     floors: Mutex<Option<Vec<(PeerId, Hlc)>>>,
     /// 自分の state の配布元 (`serve_state` が登録する)。 ホストが求めた時に送る。
@@ -954,7 +1069,8 @@ impl HttpHostTransport {
             host,
             me,
             pending_acks: Mutex::new(HashMap::new()),
-            acked: Mutex::new(Vec::new()),
+            acked: Mutex::new(Acked::default()),
+            floor_reads: Mutex::new(HashMap::new()),
             floors: Mutex::new(None),
             own_state: Mutex::new(HashMap::new()),
             through: Mutex::new((None, None)),
@@ -977,10 +1093,12 @@ impl HttpHostTransport {
         self.host
     }
 
-    /// 送らずに捨てる位置: ホストが受けた位置 (`acked`) の写し。 `publish_to` の捨て ([`above_floor`]) と `publish_floor` はどちらも
-    /// これから作る (#962: `Transport::publish_floor` の約束 = 言う位置以下の record は送らない、 を形で揃える)。
-    fn sent_floor(&self) -> Cursors {
-        self.acked.lock().unwrap().clone()
+    /// 送らずに捨てる位置: ホストが受けた位置 (`acked`) の写しと、 その時の下げた回数 ([`Acked::lowered`])。 `publish_to` の捨て
+    /// ([`above_floor`]) と `publish_floor` はどちらもこれから作る (#962: `Transport::publish_floor` の約束 = 言う位置以下の record は
+    /// 送らない、 を形で揃える)。
+    fn sent_floor(&self) -> (Cursors, u64) {
+        let acked = self.acked.lock().unwrap();
+        (acked.at.clone(), acked.lowered)
     }
 
     /// ホストが求めたので、 自分 (`author`) の state を送る。
@@ -1007,7 +1125,16 @@ impl Transport for HttpHostTransport {
     }
 
     fn publish_to(&self, from: PeerId, _to: PeerId, records: Vec<WireRecord>) {
-        let floor = self.sent_floor();
+        // review965 F1: この thread が record を集める前に `publish_floor` を聞いた後、 並んだ publish が `BEHIND` を受けて覚えを
+        // 下げていたら、 この batch は送らない。 batch は下げる前の位置より後の record だけで、 送ると下がった位置を名乗ってホストに
+        // 当たり、 ホストの cursor が間の record (下がった位置と下げる前の位置の間) を越える (ack で覚えも上がり、 その record を二度と
+        // 集めない)。 次の beat が下がった位置から集め直す (配り終えの線もその beat が言う)。 `publish_floor` を聞いていない publish
+        // (`Syncer` が絞らずに `since` から集めた batch) は確かめない
+        let read_at = self.floor_reads.lock().unwrap().remove(&std::thread::current().id());
+        let (floor, lowered) = self.sent_floor();
+        if read_at.is_some_and(|l| l != lowered) {
+            return;
+        }
         let records: Vec<WireRecord> = records.into_iter().filter(|r| above_floor(&floor, r)).collect();
         // 送る record が無くても、 配り終えの線が進んだら言う (書き込みの無い client が線を止めない)
         let (through, sent) = *self.through.lock().unwrap();
@@ -1020,27 +1147,61 @@ impl Transport for HttpHostTransport {
         {
             path.push_str(&format!("&through={}", hlc_param(t)));
         }
+        // #961: ホストが受けたと思っている位置を言う (ホストの cursor が届いていなければ、 ホストは当てずに `BEHIND` と今の位置を返す)
+        if from == self.me && !floor.is_empty() {
+            path.push_str(&format!("&acked={}", cursors_param(&floor, from)));
+        }
         let Ok((200, body)) = self.http.request("POST", &path, &encode_batch(&records)) else { return };
         let (Some(&flags), Some(ack)) = (body.first(), body.get(1..).and_then(decode_cursors)) else { return };
         if flags & STALE != 0 {
             self.rebase.store(true, Ordering::Release);
             return;
         }
+        if flags & BEHIND != 0 {
+            // #961: ホストは言った位置まで受けていない (作り直した / 古い控えから戻した)。 この batch は当たっていない。 覚えをホストの
+            // 今の位置に置き換え (`publish_floor` / 捨ての位置が下がる)、 次の beat で足りない所から送り直す。 下げた回数を上げて、
+            // 下げる前の位置で集めた並んだ publish の batch を送らせない (review965 F1)。 配り終えの線は送っていないことにする (次の
+            // publish でまた言う)。
+            // まだ `Syncer` に渡していない ack は捨てる。 これで止まるのは、 並べて回した publish がこの beat の頭より後に受けた ack
+            // だけ (新しいホストの ack なら、 次の ack が同じ位置以上を運ぶ)。 前のホストの最後の ack は beat の頭 (`absorb_pull_acks`)
+            // で取り込み済みで、 client の ring はその ack で回収されうる (review965 F2: 止めない)。 新しいホストが持たない record を
+            // 回収しても失わない: 回収した beat の頭で floor を言ってから送るので、 ホストは送り直しの代わりに state を求める (差分より
+            // 重いだけ)
+            eprintln!(
+                "[enchudb] host {} has not received records it acknowledged before (rebuilt or restored?) — sending them again",
+                self.host
+            );
+            {
+                let mut acked = self.acked.lock().unwrap();
+                acked.at = ack;
+                acked.lowered += 1;
+            }
+            self.pending_acks.lock().unwrap().remove(&from);
+            return;
+        }
         if from == self.me {
             self.through.lock().unwrap().1 = through;
         }
-        merge_max(&mut self.acked.lock().unwrap(), &ack);
+        merge_max(&mut self.acked.lock().unwrap().at, &ack);
         merge_max(self.pending_acks.lock().unwrap().entry(from).or_default(), &ack);
         if flags & NEED_STATE != 0 {
             self.push_state(from);
         }
     }
 
-    /// #955: `publish_to` が捨てる位置 = ホストが受けた位置 (`acked`、 `merge_max` で上がるだけなので、 この後の `publish_to` が捨てる
+    /// #955: `publish_to` が捨てる位置 = ホストが受けた位置 (`acked`、 ack の `merge_max` で上がるので、 この後の `publish_to` が捨てる
     /// 位置以下)。 `Syncer` は先に聞いて、 ホストが受けた record を集めない (since = ZERO の publish が ack 済みの行を写して decode しない)。
     /// #962: `publish_to` の捨てと同じ [`HttpHostTransport::sent_floor`] から作る。
+    ///
+    /// #961: 下がるのは `BEHIND` の返事を読んだ時だけ (ホストを作り直した)。 その返事は publish の最後に読むので、 下がった位置は次の
+    /// beat の `publish_floor` が言う。 同じ transport の publish を並べて回すと、 間の beat が下がる前の位置で集めうる: その batch は
+    /// `publish_to` が送らない (review965 F1。 送ると下がった位置を名乗って当たり、 ホストの cursor が間の record を越える)。 答えた時の
+    /// 下げた回数を thread ごとに控え、 同じ thread の次の `publish_to` が比べる (`Syncer` は `publish_floor` → 集める → `publish_to` を
+    /// 1 本の thread で呼ぶ)。 送らなかった batch の record は次の beat が下がった位置から集める。
     fn publish_floor(&self, _from: PeerId, _to: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
-        Some(self.sent_floor())
+        let (at, lowered) = self.sent_floor();
+        self.floor_reads.lock().unwrap().insert(std::thread::current().id(), lowered);
+        Some(at)
     }
 
     fn uses_published_through(&self) -> bool {
@@ -1408,7 +1569,7 @@ mod tests {
         while c.transfer_oplog_to_sync_ops() > 0 {}
         let top = c.settled_sync_records(|a, _| a == 1).iter().map(|r| r.hlc).max();
         assert!(top.is_some(), "前提: client の ring に自分の record がある");
-        let acked = |t: &HttpHostTransport| t.sent_floor().iter().find(|(a, _)| *a == 1).map(|(_, h)| *h);
+        let acked = |t: &HttpHostTransport| t.sent_floor().0.iter().find(|(a, _)| *a == 1).map(|(_, h)| *h);
         let pending = |t: &HttpHostTransport| t.pending_acks.lock().unwrap().values().any(|v| !v.is_empty());
 
         host.inner.fail_wal.store(true, Ordering::Release);
@@ -1480,6 +1641,173 @@ mod tests {
         drop(host_eng);
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 試験の DB: 表 `rows` (Number の `val`)、 sync の表、 WAL 付き。
+    fn rows_db(path: &str, peer: PeerId) -> Arc<Engine> {
+        {
+            let mut eng = Engine::create_standalone(path).unwrap();
+            eng.define_table("rows", 100).unwrap();
+            eng.define_himo_in("rows", "val", enchudb::ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(path, 8 << 20).unwrap();
+        eng.set_peer_id(peer);
+        eng
+    }
+
+    /// 行を 1 つ書いて ring に載せ、 自分の record の版数の最大を返す。
+    fn write_row(c: &Engine, v: u32) -> Hlc {
+        let row = c.entity_in("rows").unwrap();
+        c.tie_to(row, "rows.val", v);
+        c.oplog_commit();
+        c.oplog_sync().unwrap();
+        while c.transfer_oplog_to_sync_ops() > 0 {}
+        let me = c.peer_id();
+        c.settled_sync_records(|x, _| x == me).iter().map(|r| r.hlc).max().unwrap()
+    }
+
+    /// cursor の置き場の中身 `text` にある (link, 書き手) の位置 (無ければ ZERO)。
+    fn cursor_in(text: &str, link: PeerId, author: PeerId) -> Hlc {
+        text.lines()
+            .find_map(|l| match l.split_whitespace().collect::<Vec<_>>().as_slice() {
+                [l, a, w, lo, p] if l.parse() == Ok(link) && a.parse() == Ok(author) => {
+                    Some(Hlc { wall: w.parse().ok()?, logical: lo.parse().ok()?, peer: p.parse().ok()? })
+                }
+                _ => None,
+            })
+            .unwrap_or(Hlc::ZERO)
+    }
+
+    fn cursor_file(path: &str, link: PeerId, author: PeerId) -> Hlc {
+        cursor_in(&std::fs::read_to_string(path).unwrap_or_default(), link, author)
+    }
+
+    /// #964: ホストは client ごとの cursor の置き場を、 当てた record を WAL に書き出した**後**に書く。
+    ///
+    /// 電源断の像: client a の 2 つ目の行 (k=2) を当てた後、 WAL の書き出しが返る前に電源が落ちた。 DB は k=1 まで (k=2 の前に
+    /// 取った控え = k=2 の record は WAL ごと disk に届かなかった)、 cursor の置き場は落ちた時点で disk にある中身 (OS が先に書いた
+    /// 最悪の形)。 書き出しは返らないので a に ack は無い。 その像でホストを同じ addr に立て直すと、 a の送り直した k=2 がホストと
+    /// client b に届く。 前は置き場を当てた時 (`pull_once` の中) に書いたので、 像の置き場は k=2 を受けたと言い、 立て直したホストは
+    /// 送り直しを cursor で落とした。
+    #[test]
+    fn the_cursor_file_does_not_run_ahead_of_the_wal() {
+        let dir = std::env::temp_dir().join(format!("enchudb-964-host-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let cursors = path("host.cursors");
+        let host_eng = rows_db(&path("host"), 100);
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(cursors.clone().into())).unwrap();
+        let addr = host.addr().to_string();
+        let a = rows_db(&path("a"), 1);
+        let ta = Arc::new(HttpHostTransport::connect(format!("http://{addr}"), 1).unwrap());
+        let sa = Syncer::new(a.clone(), ta.clone());
+        let b = rows_db(&path("b"), 2);
+        let sb = Syncer::new(b.clone(), Arc::new(HttpHostTransport::connect(format!("http://{addr}"), 2).unwrap()));
+        let top1 = write_row(&a, 1);
+        sa.publish_since(Hlc::ZERO);
+        assert_eq!(host_eng.pull_raw("rows.val", 1).len(), 1, "前提: k=1 がホストに届いた");
+        assert_eq!(cursor_file(&cursors, 1, 1), top1, "前提: k=1 を受けた位置が置き場にある");
+        // k=2 の前の DB の像
+        host_eng.oplog_sync().unwrap();
+        host_eng.snapshot_export(&path("img")).unwrap();
+
+        // 割り込み点: k=2 を当てた後、 ack の前の WAL の書き出しの直前。 その時点の置き場の中身を控え、 書き出しは返らない (失敗)
+        let at_point = Arc::new(Mutex::new(None));
+        {
+            let (at_point, cursors) = (at_point.clone(), cursors.clone());
+            *host.inner.wal_sync_hook.lock().unwrap() = Some(Box::new(move |after| {
+                let mut g = at_point.lock().unwrap();
+                if !after && g.is_none() {
+                    *g = Some(std::fs::read_to_string(&cursors).unwrap_or_default());
+                }
+            }));
+        }
+        host.inner.fail_wal.store(true, Ordering::Release);
+        let top2 = write_row(&a, 2);
+        sa.publish_since(Hlc::ZERO);
+        assert_eq!(host_eng.pull_raw("rows.val", 2).len(), 1, "前提: k=2 はホストに当たった (書き出しの前)");
+        assert!(
+            host.syncer().cursors_of(1).iter().any(|&(x, h)| x == 1 && h == top2),
+            "前提: ホストの memory の cursor は k=2 を越えた"
+        );
+        let seen = cursor_in(&at_point.lock().unwrap().clone().expect("前提: 割り込み点を通った"), 1, 1);
+        assert!(ta.sent_floor().0.iter().all(|(x, h)| *x != 1 || *h < top2), "前提: a は k=2 の ack を受けていない");
+        // 電源が落ちた: 置き場は今 disk にある中身
+        std::fs::copy(&cursors, path("img.cursors")).unwrap();
+        drop(host);
+        drop(host_eng);
+
+        // 像で同じ addr に立て直す
+        let h2 = Engine::open_concurrent_with_oplog(&path("img"), 8 << 20).unwrap();
+        h2.set_peer_id(100);
+        assert_eq!(h2.pull_raw("rows.val", 2).len(), 0, "前提: 像の DB に k=2 は無い");
+        let host = HttpHost::start(&addr, h2.clone(), Some(path("img.cursors").into())).unwrap();
+        for _ in 0..3 {
+            sa.publish_since(Hlc::ZERO);
+        }
+        for _ in 0..2 {
+            sb.pull_once(100);
+        }
+        let got = [h2.pull_raw("rows.val", 2).len(), b.pull_raw("rows.val", 1).len(), b.pull_raw("rows.val", 2).len()];
+        let saved = cursor_file(&path("img.cursors"), 1, 1);
+        drop(host);
+        drop(h2);
+        drop((sa, ta, sb));
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, [1, 1, 1], "[立て直したホストの k=2, b の k=1, k=2] (書き出しの前に置き場が受けたと言った record が届かない)");
+        assert!(seen < top2, "WAL の書き出しの前に、 置き場が k=2 を受けたと言った ({seen:?} >= {top2:?})");
+        assert_eq!(saved, top2, "書き出せた後も置き場に位置を書かない");
+    }
+
+    /// #964: 置き場に書くのは、 書き出しを**始める前**の cursor の写し。 書き出しの間に別の client (c) の record を当てて cursor が
+    /// 進んでも、 その位置はこの書き出しの後に書かない (c の record はこの書き出しが覆っていない。 c の分は c の ack の前の書き出しが
+    /// 書く)。
+    #[test]
+    fn the_cursor_file_takes_the_cursors_from_before_the_wal_sync() {
+        let dir = std::env::temp_dir().join(format!("enchudb-964-host-mark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let cursors = path("host.cursors");
+        let host_eng = rows_db(&path("host"), 100);
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(cursors.clone().into())).unwrap();
+        let a = rows_db(&path("a"), 1);
+        let sa = Syncer::new(a.clone(), Arc::new(HttpHostTransport::connect(format!("http://{}", host.addr()), 1).unwrap()));
+        let c = rows_db(&path("c"), 3);
+        let top_c = write_row(&c, 30);
+        let recs_c = c.settled_sync_records(|x, _| x == 3);
+        // a の ack の前の書き出しが返った直後 (置き場を書く前) に、 c の record を当てる (c の publish が並んで当たった形)
+        {
+            let inner = Arc::downgrade(&host.inner);
+            let mut recs_c = Some(recs_c);
+            *host.inner.wal_sync_hook.lock().unwrap() = Some(Box::new(move |after| {
+                if let (true, Some(inner)) = (after, inner.upgrade())
+                    && let Some(recs) = recs_c.take()
+                {
+                    inner.loopback.inbox.lock().unwrap().insert(3, recs);
+                    inner.syncer.pull_once(3);
+                    inner.loopback.inbox.lock().unwrap().remove(&3);
+                }
+            }));
+        }
+        let top_a = write_row(&a, 1);
+        sa.publish_since(Hlc::ZERO);
+        let applied = [host_eng.pull_raw("rows.val", 1).len(), host_eng.pull_raw("rows.val", 30).len()];
+        let mem_c = host.syncer().cursors_of(3).iter().find(|(x, _)| *x == 3).map_or(Hlc::ZERO, |(_, h)| *h);
+        let file = [cursor_file(&cursors, 1, 1), cursor_file(&cursors, 3, 3)];
+        *host.inner.wal_sync_hook.lock().unwrap() = None;
+        drop(host);
+        drop(host_eng);
+        drop((sa, a, c));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(applied, [1, 1], "前提: a と c の行がホストに当たった");
+        assert_eq!(mem_c, top_c, "前提: ホストの memory の cursor は c の record を越えた");
+        assert_eq!(file[0], top_a, "書き出しの前に当てた a の位置を置き場に書かない");
+        assert!(file[1] < top_c, "書き出しの後に当てた c の位置を、 その書き出しの後に書いた ({:?})", file[1]);
     }
 
     #[test]

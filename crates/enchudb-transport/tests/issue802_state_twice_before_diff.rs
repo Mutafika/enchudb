@@ -554,6 +554,10 @@ fn a_host_without_a_cursor_does_not_relay_the_whole_state_again() {
     let host = HttpHost::start(&addr.to_string(), host_eng.clone(), None).unwrap();
     assert_eq!(host_cursor(&host, 1), Hlc::ZERO, "前提: 開き直したホストに c1 の cursor は無い");
     assert_eq!(ring_count(&host_eng, 1, h), 1, "前提: ring の行は残っている");
+    // #961: c1 (同じ transport) は開き直す前のホストの ack を覚えている。 cursor の無いホストは最初の publish に `BEHIND` を返し、
+    // c1 は覚えを空にする (次の publish からホストの位置 = 最初から送る)
+    c1.push();
+    assert!(c1.t.publish_floor(1, HOST).is_some_and(|f| f.is_empty()), "前提: c1 は覚えをホストの位置に置き換えた");
     let batch = push_state(&host, &c1);
     assert!(batch.records.iter().any(|r| r.hlc == h), "前提: state にその record がある");
     assert_eq!(ring_count(&host_eng, 1, h), 1, "cursor の無いホストが、 載せてある record を state から載せ直した");
