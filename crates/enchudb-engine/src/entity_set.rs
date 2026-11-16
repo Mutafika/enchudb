@@ -476,6 +476,15 @@ impl EntitySet {
         let mm = self.region.slice();
         let mut e = hi; // exclusive 上端
         while e > lo {
+            // 64 場所 (8 byte) の境目では、 空の 8 byte をまとめて飛ばす (PR #977 の読み直し 4 の [7]: anonymous の DB を開く時に
+            // `max_entities` の全部をなめる。 16M 場所で byte ずつ 2M 回)
+            if e.is_multiple_of(64) && e - lo >= 64 {
+                let at = self.bitset_offset + ((e - 64) / 8) as usize;
+                if mm[at..at + 8] == [0u8; 8] {
+                    e -= 64;
+                    continue;
+                }
+            }
             e -= 1;
             let byte = mm[self.bitset_offset + (e / 8) as usize];
             if byte == 0 {
@@ -581,6 +590,21 @@ mod tests {
         let ptr = Box::leak(buf).as_mut_ptr();
         let region = unsafe { Region::new(ptr, size) };
         Arc::new(EntitySet::init(region, max_entities, max_entities))
+    }
+
+    /// `highest_live_in` (8 byte ずつ飛ばす形、 PR #977 の読み直し 4 の [7]) は、 どの範囲でも素朴になめた答えと同じ。
+    #[test]
+    fn highest_live_in_matches_a_plain_scan() {
+        let set = make_set(1000);
+        for e in [3u32, 63, 64, 65, 127, 128, 500, 511, 512, 700, 999] {
+            set.ensure_live(e);
+        }
+        let plain = |lo: u32, hi: u32| (lo..hi.min(1000)).rev().find(|&e| set.is_live(e));
+        for lo in (0..1000).step_by(7).chain([0, 63, 64, 128, 512]) {
+            for hi in (lo..1001).step_by(13).chain([lo, 64, 128, 192, 512, 1000, u32::MAX]) {
+                assert_eq!(set.highest_live_in(lo, hi), plain(lo, hi), "[{lo}, {hi})");
+            }
+        }
     }
 
     /// #77-H7 regression: 並行 allocate で隣接 eid の live bit が消えないこと。

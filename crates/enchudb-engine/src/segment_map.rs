@@ -283,6 +283,26 @@ pub fn set_default_space_margin(bytes: u64) {
 /// その分は厳しめ、 flush のたびに減る)。
 static UNFLUSHED: AtomicU64 = AtomicU64::new(0);
 
+/// 試験用: この thread で、 伸ばす時に空きを確かめた量 (segment の path, byte)。 PR #977 の読み直し 4 の [5] (伸ばした範囲の全部を
+/// 数えたか) を、 ディスクの実際の空きによらずに見る。
+#[cfg(test)]
+pub(crate) mod space_probe {
+    use std::path::{Path, PathBuf};
+
+    std::thread_local! {
+        static ASKED: std::cell::RefCell<Vec<(PathBuf, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(path: &Path, n: u64) {
+        ASKED.with(|a| a.borrow_mut().push((path.to_path_buf(), n)));
+    }
+
+    /// 溜めた分を取り出して空にする。
+    pub(crate) fn take() -> Vec<(PathBuf, u64)> {
+        ASKED.with(|a| std::mem::take(&mut *a.borrow_mut()))
+    }
+}
+
 /// #317: 空きがこれ (+ まだ flush していない分) を切ったら、 flush で msync の後に fsync して書き出しの失敗を拾う。
 const FSYNC_BELOW: u64 = 1 << 30;
 
@@ -635,6 +655,8 @@ impl SegmentMap {
                 Need::Nothing => 0,
             };
             if need_bytes > 0 {
+                #[cfg(test)]
+                space_probe::note(&self.path, need_bytes);
                 self.check_space(need_bytes)?;
             }
             enchudb_oplog::io_point("segment.grow")?;

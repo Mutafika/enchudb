@@ -19,7 +19,8 @@
 //!   場所まで commit し直す。 commit は縮まないので、 生かした場所の kill / raise は gen.seg を伸ばさない = ディスクの空きの不足で
 //!   落ちない。 前は消す時に場所の page を commit していて、 伸ばせないと世代も 「死んでいる」 印も書けないまま場所を空け、 次の
 //!   insert が消えた行と同じ eid で使い回した。 commit できない時は払い出す側 (insert / 受信の払い出し / 移る手順 / 開く) を断る。
-//!   gen.seg の大きさは払い出した場所の桁 (2 B / 場所 + 先回りの 64 KiB まで)。 表の予約した枠の全部は commit しない (PR #977 の
+//!   gen.seg の大きさは払い出した場所の桁 (2 B / 場所の 2 倍か + 先回りの 1 MiB まで)。 伸ばす時は伸ばす分の全部を空きの数え (#317)
+//!   に入れる (後で消す時に初めて書く page も、 PR #977 の読み直し 4 の [5])。 表の予約した枠の全部は commit しない (PR #977 の
 //!   読み直し 3: 枠の全部では見かけの大きさと開く時のなめが予約に比例し、 APFS は header を書いた所から 16 MiB を実ディスクにした)
 //!
 //! ## 生きている印 (entities) と世代 (gen.seg) は別の segment (PR #885 の読み直し F1)
@@ -121,9 +122,12 @@ fn commit_slot_in(r: &Region, slot: u32) -> std::io::Result<()> {
     if r.is_committed(need) {
         return Ok(());
     }
-    // 書くのは場所の page から先 (先回りの page は後の払い出しが書く)。 空きはそこから先の分だけ見る
+    // 空きは伸ばす分の全部を数える (PR #977 の読み直し 4 の [5])。 手前の穴 (払い出していない場所の page) と先回りの page も、 後で
+    // 払い出した場所を消す時に初めて書く (block を取る) = 伸ばす時に数えておかないと、 その書き込みが #317 の数えの外になる (APFS は
+    // 書き出しの時に確保、 Linux の ext4 は mmap の穴への書き込みが空きの無い時に SIGBUS)。 前は場所の page から先だけ数え、 移る時・
+    // 開く時に 0 から伸ばす commit は最後の page と先回りだけだった
     let ahead = r.committed_len().saturating_sub(GEN_HEADER).clamp(COMMIT_AHEAD_MIN, COMMIT_AHEAD_MAX);
-    r.ensure_committed_window((need + ahead).min(r.len()), page_off(page))
+    r.ensure_committed_window((need + ahead).min(r.len()), 0)
 }
 
 /// 場所 `0..end` の 2 B を全部書けるように `r` を commit する。 範囲の外は gen.seg の終わりで切る。
@@ -173,6 +177,10 @@ pub(crate) struct Generations {
     pub(crate) prev: crate::prev_slots::PrevSlots,
     /// #979: 開く時の WAL の再生が場所の世代を上げられなかった ([`Self::note_replay_unraised`])。
     replay_unraised: std::sync::atomic::AtomicBool,
+    /// #970 (PR #977 の読み直し 4 の [3]): 消す道の kill を書けなかった場所 (約束の破れの守り、 [`Self::note_unkilled`])。 この session
+    /// では二度と渡さない ([`Self::retired`] が真)。 普段は空 (atomic の load 1 回)。
+    unkilled: std::sync::Mutex<Vec<u32>>,
+    has_unkilled: std::sync::atomic::AtomicBool,
 }
 
 impl Generations {
@@ -194,6 +202,8 @@ impl Generations {
             missing_tombs: std::sync::Mutex::new(Vec::new()),
             prev: crate::prev_slots::PrevSlots::off(),
             replay_unraised: std::sync::atomic::AtomicBool::new(false),
+            unkilled: std::sync::Mutex::new(Vec::new()),
+            has_unkilled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -207,6 +217,15 @@ impl Generations {
             Some(r) => commit_slot_in(r, slot),
             None => Ok(()),
         }
+    }
+
+    /// 場所 `slot` の page が commit 済みか (atomic の load 1 回)。 gen.seg の無い DB は true。
+    #[inline]
+    pub(crate) fn slot_committed(&self, slot: u32) -> bool {
+        self.region.get().is_none_or(|r| {
+            let page_end = GEN_HEADER as u64 + 2 * ((u64::from(slot >> PAGE_SHIFT) + 1) << PAGE_SHIFT);
+            r.is_committed((page_end.min(r.len() as u64)) as usize)
+        })
     }
 
     /// #970: 場所 `0..end` の 2 B を全部書けるように commit する (移る手順・開く時の、 払い出し済みの範囲)。 範囲の外は gen.seg の
@@ -244,6 +263,50 @@ impl Generations {
 
     pub(crate) fn take_replay_unraised(&self) -> bool {
         self.replay_unraised.swap(false, Ordering::AcqRel)
+    }
+
+    /// PR #977 の読み直し 4 の [3]: 消す道が場所 `slot` の kill (世代と 「死んでいる」 印) を書けなかった (生かす前に page を commit する
+    /// 約束が破れた時だけ)。 場所は今の世代のまま 「生きていない・死の印なし」 = 状態からは位置から取って断った穴と見分けられない (前の
+    /// 形は状態で推して上げ直し、 払い出し中の場所を殺した = 読み直し 1 の [1])。 覚えた場所はこの session の使い回し (空きの一覧・
+    /// 消した行の一覧・全部なめ) が [`Self::retired`] で飛ばす。 閉じる時にもう一度書き、 書けなければ汚れた印を残す (次に開く時の
+    /// 突き合わせ = `Engine::reconcile_generations` の 2. が、 払い出し済みの範囲の 「生きていない・死の印なし」 を完了させる)。
+    pub(crate) fn note_unkilled(&self, slot: u32) {
+        let mut l = self.unkilled.lock().unwrap_or_else(|p| p.into_inner());
+        if !l.contains(&slot) {
+            l.push(slot);
+        }
+        self.has_unkilled.store(true, Ordering::Release);
+    }
+
+    /// kill を書けなかった場所が残っているか。
+    #[inline]
+    pub(crate) fn has_unkilled(&self) -> bool {
+        self.has_unkilled.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn is_unkilled(&self, slot: u32) -> bool {
+        self.has_unkilled() && self.unkilled.lock().unwrap_or_else(|p| p.into_inner()).contains(&slot)
+    }
+
+    /// 覚えた場所 (書き直す前の一覧)。
+    pub(crate) fn unkilled_slots(&self) -> Vec<u32> {
+        if !self.has_unkilled() {
+            return Vec::new();
+        }
+        self.unkilled.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// 場所 `slot` の kill が後から書けた (覚えを外す)。
+    pub(crate) fn forget_unkilled(&self, slot: u32) {
+        if !self.has_unkilled() {
+            return;
+        }
+        let mut l = self.unkilled.lock().unwrap_or_else(|p| p.into_inner());
+        l.retain(|&s| s != slot);
+        if l.is_empty() {
+            self.has_unkilled.store(false, Ordering::Release);
+        }
     }
 
     /// 開いた DB の `gen.seg` (header に場所の bit が焼いてある)。 中身の header が合わなければ Err。
@@ -340,7 +403,11 @@ impl Generations {
     /// #970: 前に移りかけて公開した後に断った (`prepare` の後の commit が空きの不足で落ちた) 時は、 作り直さずに場所の bit だけ書き
     /// 直す (読み直し 3 の [4]: 公開した gen.seg の header を非 atomic に書き直すと、 消す道の page の印の atomic の読みと並ぶ)。 公開した
     /// 後・照合を始める前は誰も gen.seg に書かない (kill / raise / 印は照合を始めた後だけ) ので、 中身は前の `prepare` のまま。
-    pub(crate) fn prepare(&self, region: Region, bits: u32) -> std::io::Result<()> {
+    ///
+    /// `leftover`: 前の残りのありうる長さ (移る手順が 1a で伸ばす前の file の長さ)。 その先は伸ばした所 (ftruncate の 0) なので読まない
+    /// (PR #977 の読み直し 4 の [10]: 前は commit 済みの全部 = 払い出し済みの場所と先回りを読み、 1 億場所の DB なら 200 MiB の穴を移る
+    /// 手順の lock を持ったまま読んだ)。
+    pub(crate) fn prepare(&self, region: Region, bits: u32, leftover: usize) -> std::io::Result<()> {
         if let Some(r) = self.region.get() {
             r.write_at(OFF_BITS, &bits.to_le_bytes());
             r.mark_dirty(OFF_BITS, 4);
@@ -350,7 +417,7 @@ impl Generations {
         // 0 でない 4 KiB だけ 0 に戻す (移る手順は払い出し済みの場所まで先に commit するので、 前の残りの無い所は穴のまま。 全部を 0 で
         // 埋めると疎な file の穴を全部書いて実ディスクにする)
         const CHUNK: usize = 4096;
-        let used = region.committed_len();
+        let used = region.committed_len().min(leftover.max(GEN_HEADER));
         let s = region.slice();
         let mut at = 0;
         while at < used {
@@ -579,10 +646,11 @@ impl Generations {
         self.max_gen() + 1
     }
 
-    /// 場所が引退している (世代を使い切った = 二度と渡さない) か。
+    /// 場所が引退している (世代を使い切った = 二度と渡さない) か。 PR #977 の読み直し 4 の [3]: この session で kill を書けなかった場所
+    /// ([`Self::note_unkilled`]) も渡さない。
     #[inline]
     pub(crate) fn retired(&self, slot: u32) -> bool {
-        self.active() && self.get(slot) > self.max_gen()
+        self.active() && (self.get(slot) > self.max_gen() || self.is_unkilled(slot))
     }
 
     /// 場所の 2 B を書く準備 (commit を確かめ、 page の印を先に立てる)。 書く場所の atomic。 #970: 生かした場所の page は生かす前に
@@ -857,7 +925,7 @@ mod tests {
             }
         }
         let g = Generations::off();
-        g.prepare(region(&mut v), 24).unwrap();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, len) };
         assert_eq!(&bytes[..4], &MAGIC);
         assert_eq!(u32::from_le_bytes(bytes[OFF_BITS..OFF_BITS + 4].try_into().unwrap()), 24);
@@ -869,7 +937,7 @@ mod tests {
     fn the_top_local_stays_below_the_sentinels() {
         let mut v = buffer(segment_len(16));
         let g = Generations::off();
-        g.prepare(region(&mut v), 24).unwrap();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         g.start(24);
         assert_eq!(g.max_gen(), 254);
         assert_eq!(g.retired_mark(), 255);
@@ -889,7 +957,7 @@ mod tests {
     fn kill_and_raise_past_the_segment_are_errors() {
         let mut v = buffer(segment_len(16));
         let g = Generations::off();
-        g.prepare(region(&mut v), 24).unwrap();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         g.start(24);
         let past = ((v.len() * 8 - GEN_HEADER) / 2) as u32;
         assert!(g.kill(past, 1).is_err(), "範囲の外の kill を書けたことにした");
@@ -902,7 +970,7 @@ mod tests {
     fn kill_revive_and_restore_move_the_mark_with_the_generation() {
         let mut v = buffer(segment_len(16));
         let g = Generations::off();
-        g.prepare(region(&mut v), 24).unwrap();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         g.start(24);
         g.kill(5, 1).unwrap();
         assert_eq!((g.get(5), g.is_dead(5)), (1, true), "消す時は世代と印を一緒に");
@@ -924,7 +992,7 @@ mod tests {
     fn revive_from_drops_the_mark_only_on_the_value_it_read() {
         let mut v = buffer(segment_len(16));
         let g = Generations::off();
-        g.prepare(region(&mut v), 24).unwrap();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         g.start(24);
         g.kill(5, 2).unwrap();
         let seen = g.dead_cell(5).expect("消えた場所の 2 B");
@@ -944,7 +1012,7 @@ mod tests {
     fn a_page_without_a_raised_slot_reads_generation_zero_without_its_byte() {
         let mut v = buffer(segment_len(3 << PAGE_SHIFT));
         let g = Generations::off();
-        g.prepare(region(&mut v), 24).unwrap();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         g.start(24);
         let far = (2 << PAGE_SHIFT) + 5;
         assert!(g.raise(far, 1).unwrap());
@@ -967,7 +1035,7 @@ mod tests {
     fn heal_reports_a_live_slot_with_the_dead_mark() {
         let mut v = buffer(segment_len(16));
         let g = Generations::off();
-        g.prepare(region(&mut v), 24).unwrap();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         g.start(24);
         g.raise(3, 2).unwrap();
         g.kill(3, 3).unwrap(); // 世代 2 の行を消す → 3 + 死んでいる (生きている印は下ろす前)

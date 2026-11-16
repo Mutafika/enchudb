@@ -2263,10 +2263,12 @@ impl<'a> RowBuilder<'a> {
             None => {
                 // 0.7.0: 各 table 内の eid_range から払出。 entity_in は &self で
                 // 動く (next_local は AtomicU32、 CAS で並行 safe)。
-                eng.entity_in(&self.table.name)
-                    .map_err(|e| SchemaError::Internal(format!(
-                        "entity_in({}) failed: {e}", self.table.name
-                    )))?
+                // #970 (PR #977 の読み直し 4 の [9]): 場所の世代を書く gen.seg を伸ばせない (ディスクの空き) 断りは、 列を伸ばせない
+                // 時と同じ `WriteRejected(Fault(DiskSpace))`
+                eng.try_entity_in(&self.table.name).map_err(|(fault, e)| match fault {
+                    Some(k) => SchemaError::WriteRejected(enchudb_engine::TieRejected::Fault(k)),
+                    None => SchemaError::Internal(format!("entity_in({}) failed: {e}", self.table.name)),
+                })?
             }
         };
         // table 識別は column 名 prefix (`emp.foo` himo) で行うので、

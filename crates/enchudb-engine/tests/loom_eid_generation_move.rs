@@ -48,6 +48,13 @@
 //! が越え、 後なら書き手は公開を見る。 移る側が位置を load で読む形 (store-buffering: 移る側は書き手の取った位置を見ず、 書き手は公開を
 //! 見ない) は loom が窓を見つける (should_panic)。 詳しくは 5 の model の doc。
 //!
+//! ## 6. 受信が生かす場所の page の commit と移る手順の公開 (PR #977 の読み直し 4 の [6])
+//!
+//! 受信 (写像の払い出しを通らない自分の行の場所 / 束ね) は、 場所を生かしてから払い出し位置を RMW で進める (`advance_table_next_local_for`
+//! の CAS / anonymous の `fetch_max`)。 生かす前の commit は公開を位置の RMW より前に読むので、 移る手順の 「公開 → 位置の RMW」 と
+//! store-buffering になりうる。 位置の RMW の後に公開を読み直して commit する (`Engine::settle_live_slot`)。 読み直さない形は loom が
+//! 窓を見つける (should_panic)。
+//!
 //! ## 実行
 //! ```sh
 //! RUSTFLAGS="--cfg loom" cargo test -p enchudb-engine --test loom_eid_generation_move --release
@@ -468,4 +475,43 @@ fn a_slot_claimed_while_the_move_publishes_gen_seg_is_committed() {
 #[should_panic(expected = "払い出した場所の page が commit されていない")]
 fn a_move_that_loads_the_claim_position_misses_a_claimed_slot() {
     run_publish(false);
+}
+
+/// 6. 受信が生かす場所 (PR #977 の読み直し 4 の [6])。 受信は場所 `SLOT` を、 公開を見たら commit → 生かす → 位置を RMW で進める →
+/// (`recheck`) 公開を読み直して commit。 移る側は 5. と同じ。 両方の後に、 受信の場所が commit 済みか。
+fn run_receive(recheck: bool) {
+    const SLOT: u64 = 5;
+    loom::model(move || {
+        let published = Arc::new(AtomicBool::new(false));
+        let next = Arc::new(AtomicU64::new(0));
+        let committed = Arc::new(AtomicU64::new(0));
+        let r = {
+            let (published, next, committed) = (published.clone(), next.clone(), committed.clone());
+            thread::spawn(move || {
+                if published.load(Ordering::Acquire) {
+                    committed.fetch_max(SLOT + 1, Ordering::AcqRel);
+                }
+                next.fetch_max(SLOT + 1, Ordering::AcqRel);
+                if recheck && published.load(Ordering::Acquire) {
+                    committed.fetch_max(SLOT + 1, Ordering::AcqRel);
+                }
+            })
+        };
+        published.store(true, Ordering::Release);
+        let end = next.fetch_add(0, Ordering::AcqRel);
+        committed.fetch_max(end, Ordering::AcqRel);
+        r.join().unwrap();
+        assert!(committed.load(Ordering::Acquire) > SLOT, "受信が生かした場所の page が commit されていない");
+    });
+}
+
+#[test]
+fn a_slot_made_live_by_a_receive_while_the_move_publishes_gen_seg_is_committed() {
+    run_receive(true);
+}
+
+#[test]
+#[should_panic(expected = "受信が生かした場所の page が commit されていない")]
+fn a_receive_that_reads_the_publication_only_before_advancing_misses_the_move() {
+    run_receive(false);
 }
