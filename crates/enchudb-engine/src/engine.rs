@@ -345,6 +345,9 @@ type FormerAddress = ((enchudb_oplog::PeerId, u32), u64, u32);
 struct ReusePrep {
     /// 置いた前の宛名の覚えの鍵 (取れなかったら外す)
     remembered: Option<(u32, enchudb_oplog::Hlc)>,
+    /// 前の住人を `prev.seg` に書いた (tomb.seg を 0 にするのは門の中で、 `crate::prev_slots`)。 取れなかった時 (#883) は書いて
+    /// いない (前の住人の居ない新しい場所 = 移す削除が無い)
+    recorded: bool,
 }
 
 /// #779: [`FormerAddresses`] に覚える数の上限。 bridge が進めば外れるので、 越えるのは bridge が止まったまま slot を回し続けた時だけ。
@@ -2257,6 +2260,11 @@ pub mod write_out_hook {
         /// #731: 本体の書き出しで、 生きている印 (entities) を書き出した後、 場所の世代 (`gen.seg`) を書き出す前 (消す書き手を
         /// 止めている間)
         BeforeGenerations,
+        /// 本体の書き出しで、 前の住人の記録 (`prev.seg`) を書き出した後、 生きている印 (entities) を書き出す前
+        PrevWrittenOut,
+        /// 本体の書き出しで、 版数の列を書き出し、 使い回しの門を閉じて前の住人の記録 (`prev.seg`) をもう一度書き出した後、
+        /// tomb.seg を書き出す前 (v15 の DB だけ)
+        BeforeTomb,
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
@@ -8868,6 +8876,8 @@ impl Layout {
             SegmentKind::LeafData => self.leaf_data_off,
             SegmentKind::Tomb => self.tomb_off,
             SegmentKind::Gen => self.gen_packed_off(),
+            // `prev.seg` は packed に入れない (`segment_kinds_for` が並べない、 Memory backing は開かない)
+            SegmentKind::Prev => unreachable!("prev.seg is not part of a packed DB"),
             SegmentKind::Himo(h) if self.is_wide(h) => {
                 let rank = self.wide.iter().take(h as usize).filter(|&&w| w).count();
                 self.total_size + rank * self.himo_col_size64
@@ -8895,6 +8905,7 @@ impl SegmentSizes for Layout {
             SegmentKind::LeafData => self.leaf_data_size,
             SegmentKind::Tomb => self.tomb_size,
             SegmentKind::Gen => crate::generation::segment_len(self.max_entities),
+            SegmentKind::Prev => crate::prev_slots::segment_len(self.max_entities),
             SegmentKind::Himo(h) if self.is_wide(h) => self.himo_col_size64,
             SegmentKind::Himo(_) => self.himo_col_size,
             SegmentKind::Ver(_) => self.ver_col_size,
@@ -8920,6 +8931,7 @@ impl SegmentSizes for Layout {
             SegmentKind::Ver(_) => self.ver_col_reserve + self.col_pad_extra(),
             SegmentKind::Tomb => self.tomb_reserve + self.col_pad_extra(),
             SegmentKind::Gen => crate::generation::segment_len(self.reserve_entities),
+            SegmentKind::Prev => crate::prev_slots::segment_len(self.reserve_entities),
             _ => self.segment_size(kind),
         }
     }
@@ -10513,6 +10525,10 @@ impl Engine {
         }
         // request18: table 定義が確定したので hot path 用 cache を張り直す。
         eng.refresh_sync_tables_flag();
+        // `prev.seg` の無い sync する v15 の DB (前の binary が作った) は作る (記録なし)
+        if !readonly && let Err(e) = eng.ensure_prev_seg() {
+            eprintln!("warning: prev.seg could not be created (reuse records are not kept): {e}");
+        }
         // #385: 辞書の参照数を数え直す (要る時だけ)。 table が決まった後、 oplog の回復で書く前
         eng.finish_vocab_refs_at_open();
         // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を再構成 (free-list は非永続)。
@@ -10548,6 +10564,15 @@ impl Engine {
         // sync で mapping は張り直せる)。
         // #925: 落ちる前に場所の使い回しが外した写像 (書き出す前に落ちて `.eidmap` から戻った物)。 読み込みの印を捨てた後に印を付け直す
         let mut stale_mappings: Vec<(enchudb_oplog::PeerId, u32, u32, enchudb_oplog::Hlc)> = Vec::new();
+        // きれいに閉じなかった後か (`prev.seg` の記録を見るのはこの時だけ、 `reconcile_generations` と同じ条件。 review946 [9])
+        let unclean = eng.himo_reg.rebuilt_on_load || eng.generations().session_dirty();
+        // review946c [A]: 書き出していない記録は `.eidmap` を読む前に読む (写像の見分けが、 配列で上書きされた記録も見る)
+        let prev_records = if unclean { eng.load_prev_records() } else { Vec::new() };
+        let prev_by_slot = {
+            let mut v = prev_records.clone();
+            v.sort_unstable_by_key(|&(slot, r)| (slot, r.gone));
+            v
+        };
         match load_eidmap_from_sidecar(path) {
             Ok(Some((entries, log))) => {
                 *eng.eidmap_log.lock().unwrap_or_else(|p| p.into_inner()) = log;
@@ -10557,6 +10582,15 @@ impl Engine {
                     // identity へ slot を払い出すとき書き戻される。
                     if local == NO_LOCAL_SLOT {
                         eng.remember_foreign_tombstone(peer, foreign_local, tomb);
+                        continue;
+                    }
+                    // 落ちる前に場所を使い回して外した写像 (`prev.seg` の記録の前の住人がこの identity): 戻さず、 記録の削除の版数を
+                    // identity に退避する (下の #925 の推測より先に、 記録で決める。 面の削除の版数が無い = 削除を書き出す前の面でも
+                    // 決まる)。 名前の記録は `pktombs` / `pkformer` を読んだ後に移す
+                    if let Some(t) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
+                        let tomb = tomb.max(t);
+                        eng.remember_foreign_tombstone(peer, foreign_local, tomb);
+                        stale_mappings.push((peer, foreign_local, local, tomb));
                         continue;
                     }
                     // #925: 写像の面は消えた行 (削除の版数がある。 翻訳した行の削除の版数は `set_tombstone_local` が印を付けて
@@ -10636,6 +10670,30 @@ impl Engine {
         for &(peer, foreign_local, _, _) in &stale_mappings {
             eng.eid_translator.mark_dirty((peer, foreign_local));
         }
+        // review946 [5]: 戻さなかった写像の場所を指す別名も使い回しの前の物 (`eidalias` は `.eidmap` の後に書くので、 `.eidmap` が
+        // 使い回しの前なら `eidalias` もその前)。 使い回しと同じく外して同じ版数を退避する (残すと別名の peer の書き込みが新しい
+        // 住人に当たり、 その peer の削除が新しい住人を消した)
+        if !readonly {
+            let self_peer = eng.peer_id();
+            for &(_, _, local, tomb) in &stale_mappings {
+                let mut others: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
+                for (peer, foreign_local) in eng.eid_translator.aliases_of(local) {
+                    if !eng.eid_translator.unalias(peer, foreign_local) {
+                        continue;
+                    }
+                    if peer == self_peer {
+                        // #612: 畳んだ自分の行の世界番号は、 その slot を自分自身の別名にして予約したまま削除の版数を載せる
+                        eng.eid_translator.alias(peer, foreign_local, foreign_local);
+                        eng.set_tombstone_local(foreign_local, tomb);
+                    } else {
+                        others.push((peer, foreign_local));
+                    }
+                }
+                if !others.is_empty() {
+                    eng.retreat_removed_keys(&others, tomb);
+                }
+            }
+        }
         // 主キーの前の名前。 壊れていたら警告して無しで続ける (今の名前でだけ束ねる = 前の版の動き)
         match load_pkformer_from_sidecar(path) {
             Ok(Some((former, _))) => {
@@ -10679,7 +10737,12 @@ impl Engine {
 
         // review930 [2]: 開く時に戻さなかった写像 (#925) の場所の名前の記録を、 使い回す時と同じく identity に移して場所から外す
         for (peer, foreign_local, local, tomb) in stale_mappings {
-            eng.move_stale_slot_names(peer, foreign_local, local, tomb);
+            eng.move_stale_slot_names(&[(peer, foreign_local)], local, tomb);
+        }
+        // `prev.seg`: きれいに閉じなかった後、 使い回しが identity に移した前の住人の削除 (と名前) が sidecar に届いていなければ戻す
+        // (readonly は戻さない: 書き手の DB の tomb.seg に書きうる、 review946 [6])
+        if unclean && !readonly {
+            eng.restore_prev_residents(&prev_records);
         }
 
         // text 写像 (`(author_peer, remote_vid) → local_vid`) の sidecar 読み込み。
@@ -11382,6 +11445,29 @@ impl Engine {
             #[cfg(not(target_arch = "wasm32"))]
             if let Backing::Segments(set) = &backing {
                 set.open_gen(layout.segment_reserve(SegmentKind::Gen)).map_err(|e| e.to_string())?;
+                // 前の住人の記録 (`prev.seg`)。 有れば開く。 無い時 (前の binary が作った v15 の DB / sync しない DB) は、 sync する DB
+                // なら表の定義を読んだ後に作る (`ensure_prev_seg`、 review946c [I])。 開けなくても開く (記録を書かない = 落ちた時に
+                // 使い回しの退避を失う前の形、 #914 の窓だけ残る)
+                match set.open_prev(layout.segment_reserve(SegmentKind::Prev), false) {
+                    Ok(true) => {
+                        // 0 から始めた / 前の形 (`PRV3`) から写した header は書き出す (記録の page だけ届いて header の無い像を
+                        // 作らない、 review946 [10])
+                        let flush = |off, len| set.flush_kind(SegmentKind::Prev, off, len);
+                        match generations.prev.attach(set.region(SegmentKind::Prev), !readonly, u32::from(layout.gen_bits), flush) {
+                            Some(true) => {
+                                if let Err(e) = set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER) {
+                                    eprintln!("warning: prev.seg header could not be written out: {e}");
+                                }
+                            }
+                            // review946d [N5]: 0 から始められなかった (書き出せない)。 後の `ensure_prev_seg` は file の有る
+                            // `prev.seg` を触らない
+                            None if !readonly => eprintln!("warning: prev.seg could not be started over (reuse records are not kept)"),
+                            _ => {}
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("warning: prev.seg could not be opened (reuse records are not kept): {e}"),
+                }
             }
             generations.attach(backing.region(SegmentKind::Gen, &layout), u32::from(layout.gen_bits))?;
         }
@@ -11761,6 +11847,10 @@ impl Engine {
             );
         }
         self.refresh_sync_tables_flag();
+        // v15 に移った後に sync を始めた DB は、 ここで `prev.seg` を作る (review946c [I]: 移る時は sync する DB にだけ作る)
+        if let Err(e) = self.ensure_prev_seg() {
+            eprintln!("[enchudb] warning: prev.seg could not be created on enable_sync_tables (reuse records are not kept): {e}");
+        }
 
         Ok(())
     }
@@ -14601,8 +14691,36 @@ impl Engine {
                         let stale = self.generations().active() && self.last_local_of_slot(target_slot) != value;
                         let gone_own =
                             stale && self.foreign_tombstone_of(self_peer, value).is_some_and(|t| is_self || t.peer == author);
-                        if stale && !gone_own {
+                        // #924: 前の住人が翻訳した行で、 場所を最後に使い回した時の記録 (`prev.seg`) がその行なら、 その identity を
+                        // 指す ref として出す (自分の行と同じく、 その Delete が同じ state に入る時だけ = 削除の版数が `author` の時計か、
+                        // その行が `author` の行 (#951: author の行は誰が消した削除も入る)。 `state_unties_and_foreign_deletes` の退避表の枝)。
+                        // 記録は場所ごとに最後の使い回しの 1 つ (と、 きれいに閉じなかった後に開いた時に読んだ書き出していない記録) なので、
+                        // 同じ場所を 2 回使い回した後の前の前の住人は出さない (前と同じ)
+                        let gone_translated = if stale && !gone_own {
+                            self.generations()
+                                .prev
+                                .record_of(target_slot, value)
+                                .filter(|r| r.kind == crate::prev_slots::PrevKind::Translated)
+                                .filter(|r| {
+                                    self.foreign_tombstone_of(r.peer, r.number)
+                                        .is_some_and(|t| t.peer == author || r.peer == author)
+                                })
+                                .map(|r| (r.peer, r.number))
+                        } else {
+                            None
+                        };
+                        if stale && !gone_own && gone_translated.is_none() {
                             dropped += 1; // #236
+                            continue;
+                        }
+                        if let Some((owner, owner_local)) = gone_translated {
+                            // 翻訳した行を指す ref と同じ形 (下の `reverse` の枝)
+                            let op = if owner == author && !is_self {
+                                DecodedOp::Tie { eid: out_eid, himo_id, value: owner_local as u64 }
+                            } else {
+                                DecodedOp::TieRef { eid: out_eid, himo_id, target: enchudb_oplog::make_eid(owner, owner_local) }
+                            };
+                            records.push(mk(op, hlc));
                             continue;
                         }
                         // bridge と同じ規則: translated foreign target は世界番号
@@ -15504,13 +15622,19 @@ impl Engine {
                     // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす (`clear_cell_versions` の doc 参照)。 印を立てた
                     // 後 = この slot は自分の物 (前は落としてから立てていて、 #883 の形では、 先に印を立てて書き始めた別の書き手の版数を
                     // 落としうる)。 lock の順は `free_locals` → `EntitySet` の中、 の一方向のまま (`purge_sync_ops_row` の doc)
-                    match prepared {
-                        // 名前の記録は生かす前に外した (`prepare_reuse`。 その後に場所の名前の記録に足す道は無い = 消えた行への改名も
-                        // 行の lock の下で足す、 review930 [5])
-                        Some(_) => self.clear_slot_versions(global),
-                        None => self.clear_cell_versions(global),
+                    if prepared.is_none() {
+                        self.clear_cell_versions(global);
                     }
                     drop(fl);
+                    // 名前の記録は生かす前に外した (`prepare_reuse`。 その後に場所の名前の記録に足す道は無い = 消えた行への改名も
+                    // 行の lock の下で足す、 review930 [5])。 前の住人を `prev.seg` に書いた使い回しは、 tomb.seg を門の中で 0 にする
+                    // (本体の書き出しは門を閉じて記録をもう一度書き出してから tomb.seg を書き出す = 0 にした tomb.seg だけが届く像を
+                    // 作らない、 `crate::prev_slots`)。 `free_locals` を放してから (門で待つ間、 同じ表の他の insert を止めない)。 行は
+                    // 握ったまま
+                    if let Some(p) = prepared {
+                        let _pass = p.recorded.then(|| self.generations().prev.enter(global));
+                        self.clear_slot_versions(global);
+                    }
                     // #731: 消えた行の古い eid が、 消した後・使い回す前に死んだ場所へ書いた cell を落とす (v15 の DB では世代違いで断る
                     // ので、 残るのは v14 の間に書かれた分と、 v15 に移る途中で書き終えた分だけ)。 行の lock の下 (ユーザの表は上で握った
                     // 行の入れ子)。 `free_locals` を放してから (行を握ったまま `entity_in` を呼ぶ書き手 = `write_row` を握ったまま insert
@@ -15764,6 +15888,8 @@ impl Engine {
         // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `prev.seg` の周期を進めてから写しを取る (`PrevSlots::begin_persist`)
+        let covered = self.generations().prev.begin_persist();
         self.persist_tables_file()?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。 #560: 変わった分だけ追記
         self.persist_eidmap()?;
@@ -15772,7 +15898,45 @@ impl Engine {
         // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
         self.persist_pk_tombs_if_dirty()?;
         self.persist_pk_former_if_dirty()?;
+        self.prev_persist_end(covered);
         self.persist_vocab_map_if_dirty()
+    }
+
+    /// `prev.seg`: 書き出していない周期の使い回しの記録があれば sidecar を書き出す (周期を進める、 consumer の暇な周期)。 sidecar は
+    /// WAL に書き込みのある周期と `persist_tables()` / 受信の `persist_sync_state` でしか書かないので、 使い回しの後に `oplog_sync()`
+    /// が checkpoint を進めて暇になった DB は周期が進まなかった: 次の書き込みまで記録が書き出されないまま溜まり、 log の区画 (1 周期
+    /// 21845 件) から溢れて (同じ場所を 2 回使い回した 1 回目が残らない)、 きれいに閉じなかった後の open は配列をなめて溜まった記録を
+    /// 全部戻した (名前の無い表 20 万行の bench で開く時間 7 → 19 ms)。
+    ///
+    /// 書いたか (書き出していない記録があったか) を返す。
+    fn persist_prev_if_pending(&self) -> bool {
+        let pending = self.generations().prev.pending();
+        if pending {
+            self.try_persist_tables();
+        }
+        pending
+    }
+
+    /// `prev.seg`: 使い回しの退避の載る sidecar (`.eidmap` / `eidalias` / `pktombs` / `pkformer`) を全部書けた後、 header の書き出した
+    /// 周期を `covered` ([`crate::prev_slots::PrevSlots::begin_persist`] の返り) に進めて header の page を書き出す (開く時はその周期
+    /// より後の記録だけ戻す。 書き出さないと、 忘れてよい線で外した identity の `.eidmap` が古い header と一緒に届いた像で、 外した
+    /// 削除を戻して今の住人の別名を外した、 review946 [2])。 書き出せなくても進めたまま (区画を使い直すのは sidecar に載った記録だけ)。
+    ///
+    /// review946c [C]: 進める前に DB の directory を素の fsync する (sidecar の rename を disk へ送る。 `tables` の #884 と同じ層の順)。
+    /// `eidalias` と、 `.eidmap` / `pktombs` / `pkformer` のまとめ直しは tmp + rename で、 rename が戻る電源断の像では header だけが
+    /// 「書き出した」 と言い、 使い回しの前の sidecar のまま記録を戻さなかった。 fsync できなければ進めない (次の書き出しで覆う)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prev_persist_end(&self, covered: Option<u64>) {
+        let Some(c) = covered else { return };
+        if let Err(e) = crate::db_files::sync_dir_plain(std::path::Path::new(&self.path), "prev.dir_sync") {
+            self.warn_persist_failure_rate_limited(&e);
+            return;
+        }
+        if self.generations().prev.end_persist(c)
+            && let Err(e) = self.backing.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)
+        {
+            self.warn_persist_failure_rate_limited(&e);
+        }
     }
 
     /// 主キーの前の名前を、 変わっていれば書き出す。 #720: 変わった slot / identity の今の中身だけを `pkformer.log` に追記する
@@ -16193,6 +16357,9 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // `prev.seg` の周期を進めてから写しを取る (`PrevSlots::begin_persist`)。 使い回しの退避の載る 4 つを全部書けたら進める
+                let covered = self.generations().prev.begin_persist();
+                let mut moved_ok = true;
                 let tables_ok = match self.persist_tables_file() {
                     Ok(()) => true,
                     Err(e) => {
@@ -16208,19 +16375,26 @@ impl Engine {
                 // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
                 // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
                 if let Err(e) = self.persist_eidmap() {
+                    moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // #178: 別名も
                 if let Err(e) = persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot()) {
+                    moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // #513: 消した主キーの記録も。 変わった時だけ書く。
                 if let Err(e) = self.persist_pk_tombs_if_dirty() {
+                    moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // 主キーの前の名前も
                 if let Err(e) = self.persist_pk_former_if_dirty() {
+                    moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
+                }
+                if moved_ok {
+                    self.prev_persist_end(covered);
                 }
                 // text 写像も同格。 dirty のときだけ書く。
                 if let Err(e) = self.persist_vocab_map_if_dirty() {
@@ -19045,12 +19219,17 @@ impl Engine {
     /// 1. 前の宛名を覚える (#779、 逆写像を外す前に)
     /// 2. 前の住人が自分の消えた行なら、 その削除の版数と名前を identity に移す (#914 / #915、 [`Self::keep_gone_own_delete`])
     /// 3. 前の住人が翻訳した行なら写像を外して削除の版数を退避する (#166 / #545)。 外した写像は consumer の次の書き出しまで
-    ///    memory だけ。 その前に落ちて戻った写像は、 開く時に 「写像の面は消えた行なのに場所が生きていて、 場所の削除の版数が
-    ///    無く、 場所の行は削除の後に作り直された」 で見分けて外す (#925、 `.eidmap` を読む所)
+    ///    memory だけ。 その前に落ちて戻った写像は、 開く時に 5. の記録で外す (`prev_evicted`)。 記録の無い時 (前の binary の DB /
+    ///    同じ場所を 2 回使い回して上書きした) は 「写像の面は消えた行なのに場所が生きていて、 場所の削除の版数が無く、 場所の行は
+    ///    削除の後に作り直された」 で見分けて外す (#925、 `.eidmap` を読む所)
     /// 4. 名前の記録: 2 / 3 の identity に場所の名前 (消えた時の名前と前の名前) を移し、 場所ごとの名前の記録 (`pk_tombs` の場所の
     ///    記録、 `pk_former` の前の名前・束ね・年表) を外す (review928 の [3])。 `pk_tombs` と `pk_former` をそれぞれ 1 回の書き込みの
     ///    lock で済ませる (`move_names_and_forget_slot`、 review930 [P])。 名前の無い表 (`named` が偽) は名前の記録を持たないので飛ばす。
     ///    名前は版数の退避の前に移す (退避の後に届いた、 より新しい削除が identity の名前を上げる時に、 名前が移っている)
+    /// 5. 2 / 3 で移した前の住人 (行の番号・identity・削除の版数・自分の行か) を `prev.seg` に書く (`crate::prev_slots`、 v15 の DB で
+    ///    移した削除がある時だけ)。 2 / 3 / 4 で移した先は consumer の次の周期まで memory だけで、 呼び手は場所の tomb.seg を 0 に
+    ///    する (門の中、 `PrevSlots::enter`) ので、 その前に落ちると前の住人の削除がどこにも残らなかった (review921 [4])。 開く時に
+    ///    sidecar に無い分を記録から戻す (`restore_prev_residents`)
     ///
     /// 生かすまでの間に場所の名前の記録に足す道は無い: 消えた行への改名 (`name_given_to_dead_row`) は行の lock の下で足し (review930
     /// [5])、 使い回しは場所の行を握っている (#931)。 束ね・カードは生きた行にしか積まない。
@@ -19060,6 +19239,9 @@ impl Engine {
     /// 外さない、 `remove_local_unless`)。 置いた覚えは呼び手が外す ([`Self::abandon_reuse`])。 例外は、 払い出し位置から取った書き手が
     /// 退避表に削除のある identity の払い出しで、 生かした場所を殺してから写像を載せる形 (`remove_local_unless` の doc、 review930 [6]、 #938)。
     fn prepare_reuse(&self, slot: u32, named: bool) -> ReusePrep {
+        // `prev.seg` の周期の門: 後始末の memory の効果 (写像を外す・名前を移す・退避) と記録を、 sidecar の書き出しが周期を進める
+        // 間に割らない (`PrevSlots::begin_persist`。 周期 e の記録の効果は、 e + 1 に進めた後に取る sidecar の写しに全部入る)
+        let _epoch = if self.sync_tables_on() { self.generations().prev.enter_epoch(slot) } else { None };
         // 前の住人 (消えた行) の番号。 生かす前の場所の最後の行
         let gone = self.last_local_of_slot(slot);
         let remembered = self.remember_former_address(slot, true);
@@ -19080,13 +19262,41 @@ impl Engine {
             }
             self.move_names_and_forget_slot(slot, &ids);
         }
+        // 5. 前の住人を `prev.seg` に書く (tomb.seg を 0 にする前、 生かす前)。 移した版数と名前は consumer の次の周期まで memory
+        // だけなので、 その前に落ちた時に開く時が戻す (`restore_prev_residents`)。 翻訳した行は写像を外した最初の identity (逆写像)
+        let record = match own {
+            Some(t) => Some(crate::prev_slots::PrevRecord {
+                kind: crate::prev_slots::PrevKind::Own,
+                gone,
+                peer: self.peer_id(),
+                number: gone,
+                tomb: t,
+            }),
+            None if evicted > 0 => Some(crate::prev_slots::PrevRecord {
+                kind: crate::prev_slots::PrevKind::Translated,
+                gone,
+                peer: ids[0].0,
+                number: ids[0].1,
+                tomb,
+            }),
+            None => None,
+        };
+        let recorded = record.is_some_and(|r| {
+            let prev = &self.generations().prev;
+            let ok = prev.write(slot, &r);
+            if !ok && prev.active() {
+                // review946 [12]: 書けない (commit を伸ばせない = 空き不足) 使い回しは記録なしで進む (落ちた時は前の形 = #914 の窓)
+                self.record_fault(FaultKind::DiskSpace, "prev.seg: the former resident of a reused slot was not recorded");
+            }
+            ok
+        });
         if let Some(t) = own {
             self.remember_foreign_tombstone(self.peer_id(), gone, t);
         }
         if evicted > 0 {
             self.retreat_removed_keys(&ids[..evicted], tomb);
         }
-        ReusePrep { remembered }
+        ReusePrep { remembered, recorded }
     }
 
     /// review930 [2]: 開く時に戻さなかった写像 (#925、 identity `(peer, foreign_local)` → 場所 `local`、 写像の面の削除の版数 `tomb`) の、
@@ -19098,8 +19308,11 @@ impl Engine {
     /// 場所の記録が使い回しの前の物と言える時だけ移す: (1) identity に名前が無い (移しが書き出されていれば identity に名前があり、
     /// 場所の記録も外れて書き出されている)、 (2) `pk_tombs` の場所の記録 (消えた時の名前) の版数が `tomb` 以下 (新しい行が後で消えた
     /// 記録は `tomb` より新しい)。 消えた時の名前の無い行 (名前の cell が無いまま消えた) は見分けられないので移さない (前と同じ)。
-    fn move_stale_slot_names(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32, tomb: enchudb_oplog::Hlc) {
+    ///
+    /// `identities` の先頭が前の住人の identity (`prev.seg` の記録から戻す時は、 後ろに場所を指していた別名が続く。 名前は全部に移す)。
+    fn move_stale_slot_names(&self, identities: &[(enchudb_oplog::PeerId, u32)], local: u32, tomb: enchudb_oplog::Hlc) {
         use std::sync::atomic::Ordering;
+        let Some(&(peer, foreign_local)) = identities.first() else { return };
         if self.pk_tombs_empty.load(Ordering::Acquire) {
             return;
         }
@@ -19113,8 +19326,237 @@ impl Engine {
             g.key_of_slot(local).and_then(|(h, k)| g.tomb_of(h, k)).is_some_and(|t| t <= tomb)
         };
         if before_reuse {
-            self.move_names_and_forget_slot(local, &[(peer, foreign_local)]);
+            self.move_names_and_forget_slot(local, identities);
         }
+    }
+
+    /// `.eidmap` の写像の面 (`peer`, `foreign_local`) → 場所 `local` が、 落ちる前に場所を使い回した時に外した写像か: `prev.seg` の
+    /// 場所の記録の前の住人がその identity (翻訳した行) なら、 記録の削除の版数。 開く時 (`.eidmap` を読む所) だけ。
+    ///
+    /// 記録は使い回した時にしか書かない (前の住人を消して、 写像を外して、 場所を次の行に渡した)。 記録の identity と面の identity が
+    /// 同じで、 使い回しが本体に届いている (場所の最後の行が記録の行でない) なら、 面は使い回しの前の物 = 戻すと新しい住人がその
+    /// identity になる (#925)。 決めない (今まで通り #925 の推測 `slot_rewritten_after` に任せる) 時:
+    /// - 違う identity の記録 (同じ場所を 2 回使い回して上書きした / 面の行より前の住人の記録): 面の行が今の住人かを記録からは言えない
+    /// - 記録だけが届いて使い回しが本体に届いていない電源断の像 (場所の最後の行 = 記録の行 = 消えた面の行): 写像を外すと、 場所に残った
+    ///   面の行の削除が持ち主を失い、 次の使い回しがその場所の前の住人を自分の行と読む (`keep_gone_own_delete`)。 WAL に使い回しの
+    ///   record があれば再生が新しい住人を生かす (写像は戻ったまま = 前と同じ)
+    ///
+    /// 場所の最後の行は page の印を見ずに読む (開く時の突き合わせ `reconcile_generations` が印を立て直す前に呼ぶ)。
+    ///
+    /// review946c [A]: 見る記録は場所ごとの配列 (最後の使い回し) と、 開く時に読んだ書き出していない記録 (`.eidmap` を読む前に読む、
+    /// `unpersisted` は (場所, 前の住人の行) の順) の全部。 同じ場所を 1 つの周期で 2 回使い回すと (翻訳した行 F → 自分の行 Y → Z)、 配列は 2 回目
+    /// (前の住人 Y) に上書きされ、 前は配列だけを見て写像 (C, f) を今の住人 Z に戻した (F の削除の版数は面に無く #925 の推測も外さない)。
+    fn prev_evicted(
+        &self,
+        unpersisted: &[(u32, crate::prev_slots::PrevRecord)],
+        local: u32,
+        peer: enchudb_oplog::PeerId,
+        foreign_local: u32,
+    ) -> Option<enchudb_oplog::Hlc> {
+        let gens = self.generations();
+        let mut found: Option<crate::prev_slots::PrevRecord> = None;
+        let mut last: Option<u32> = None;
+        gens.prev.for_each_record_at(unpersisted, local, |rec| {
+            if rec.kind != crate::prev_slots::PrevKind::Translated || rec.peer != peer || rec.number != foreign_local {
+                return;
+            }
+            // 場所の最後の行 (`last_local_of_slot` と同じ決め方を、 page の印を見ずに)
+            let last = *last.get_or_insert_with(|| self.last_row_unmarked(local).0);
+            if last != rec.gone && found.is_none_or(|f| f.tomb < rec.tomb) {
+                found = Some(rec);
+            }
+        });
+        found.map(|r| r.tomb)
+    }
+
+    /// きれいに閉じなかった後に開いた時 (sidecar を読んだ後、 突き合わせと WAL の再生の前)、 `prev.seg` の記録で、 使い回しが
+    /// identity に移した前の住人の削除の版数と名前を戻す (`crate::prev_slots`)。 移した先 (`foreign_tombs` と `pkformer` の identity の
+    /// 名前) は sidecar の次の書き出しまで memory だけで、 使い回しは場所の削除の版数 (tomb.seg) を 0 にするので、 その前に落ちると
+    /// 前の住人の削除がどこにも残らなかった (自分の行 = #914 / #915 の形、 review921 [4] / review930 [Q4])。
+    ///
+    /// 戻すのは書き出していない周期の記録だけ (`PrevSlots::unpersisted`: log の区画、 書き出した周期より後)。 書き出した記録は sidecar に
+    /// 効果があり、 その後に忘れてよい線 (`forget_deletes_before`) が外した identity を戻すと、 今の住人の別名を外して消えた identity に
+    /// した (review946 [2])。 同じ場所を 1 つの周期で 2 回使い回した記録も、 積んだ順に両方戻す。
+    ///
+    /// - 前の住人の削除が本体に届いていない像 (場所の最後の行が記録の行で生きている、 または記録の行より前の行 = 記録だけが disk に
+    ///   届いた電源断、 review946 [1]) は戻さない。 WAL に削除と使い回しが届いていれば、 再生が生かす所でやり直す
+    ///   (`redo_reuse_eviction`)
+    /// - 記録の identity の削除が退避表 (`.eidmap` から読んだ) に記録の版数以上で載っていれば、 書き出し済み (何もしない)。 翻訳した
+    ///   行の identity が写像を持つ (落ちる前に別の場所に払い直した = 削除の版数はその場所) 時も何もしない
+    /// - 載っていなければ、 退避表に戻し、 場所を指す別名 (`eidalias` は `.eidmap` の後に書くので、 使い回しの前の物) を外して同じ
+    ///   版数を退避する (使い回しが外したのと同じ)
+    /// - 名前: 場所の名前の記録 (`pktombs` / `pkformer`) が使い回しの前の物なら identity に移して場所から外す
+    ///   ([`Self::move_stale_slot_names`] と同じ決め方。 名前は退避と別の sidecar なので、 退避が書き出し済みでも見る)
+    ///
+    /// 世代の page の印は見ない (突き合わせが印を立て直す前に呼ぶ)。 readonly の open は呼ばない (#612 の別名の枝が tomb.seg に書く、
+    /// review946 [6])。
+    ///
+    /// `records` は `.eidmap` を読む前に読んで置いた書き出していない記録 ([`Self::load_prev_records`])。
+    ///
+    /// review946d [N1]: 自分の行の記録で、 前の住人の削除は本体に届き使い回しは届いていない像 (場所の最後の行が記録の行で死んでいる)
+    /// は、 WAL に再生する record があれば戻すかを再生の後に決める ([`Self::finish_prev_restores`])。 再生は、 本体にだけ届いた削除を
+    /// その行の古い record で取り消す (`replay_slot` の `restore`)。 前は再生の前に戻し、 再生が生き返らせた行の Delete を state に出し、
+    /// #451 の作り直しも配った (A では生きていて、 peer では消える)。 翻訳した行の記録はこの像で写像が場所を指したままなので戻さない
+    /// (下の写像の守り)。
+    fn restore_prev_residents(&self, records: &[(u32, crate::prev_slots::PrevRecord)]) {
+        let gens = self.generations();
+        let prev = &gens.prev;
+        if !prev.active() || !gens.active() {
+            return;
+        }
+        let mut replay_follows: Option<bool> = None;
+        let mut restored = 0u32;
+        for &(slot, rec) in records {
+            if rec.kind == crate::prev_slots::PrevKind::Own
+                && self.last_row_unmarked(slot) == (rec.gone, true)
+                && *replay_follows.get_or_insert_with(|| self.wal_has_records_to_replay())
+            {
+                // 退避が書き出し済みかは再生の前の退避表で決める (再生の後始末のやり直し `redo_reuse_eviction` が同じ版数を
+                // 退避するので、 再生の後に見ると、 戻す時の別名の外しを飛ばす)
+                prev.defer_restore(slot, rec, self.prev_delete_written(rec));
+                continue;
+            }
+            if self.restore_prev_resident(slot, rec, None) {
+                restored += 1;
+            }
+        }
+        prev.note_restored(restored);
+    }
+
+    /// review946d [N1]: WAL の再生の後 (`finish_reconcile` の後、 #451 の作り直しの前) に、 [`Self::restore_prev_residents`] が
+    /// 後に回した記録を戻す。 再生が記録の行を生き返らせた (場所の最後の行が記録の行で生きている) 記録は戻さない (戻さなかったのと
+    /// 同じ = 本体に届いていない削除の像、 review946 [1])。 まだ死んでいれば、 再生の前に戻したのと同じに戻す。
+    fn finish_prev_restores(&self) {
+        let prev = &self.generations().prev;
+        let restored = prev
+            .take_deferred()
+            .into_iter()
+            .filter(|&(slot, rec, written)| self.restore_prev_resident(slot, rec, Some(written)))
+            .count();
+        prev.note_restored(restored as u32);
+    }
+
+    /// きれいに閉じなかった後に開く時、 この後の WAL 付きの open が再生する record が WAL にあるか (`reconcile_generations` の仕上げを
+    /// 後に回すのと同じ見方)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_has_records_to_replay(&self) -> bool {
+        matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_)))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn wal_has_records_to_replay(&self) -> bool {
+        false
+    }
+
+    /// 記録の identity の削除が退避表に記録の版数以上で載っている (書き出し済み、 [`Self::restore_prev_resident`])。
+    fn prev_delete_written(&self, rec: crate::prev_slots::PrevRecord) -> bool {
+        self.foreign_tombs.read().unwrap().get(&(rec.peer, rec.number)).is_some_and(|&t| t >= rec.tomb)
+    }
+
+    /// きれいに閉じなかった後に開く時、 `.eidmap` を読む前に `prev.seg` の書き出していない記録を読んで置く (review946c [A])。 開く時の
+    /// 写像の見分け ([`Self::prev_evicted`])・退避を戻す所 ([`Self::restore_prev_residents`])・WAL の再生の守り (`replay_slot`)・
+    /// 後始末のやり直し (`redo_reuse_eviction`)・bridge の宛名 ([`Self::bridge_row_address`]) が、 場所ごとの配列で上書きされた前の
+    /// 住人 (同じ場所を 1 つの周期で 2 回使い回した 1 回目) も引く。
+    ///
+    /// 返すのは書き出していない周期の記録 (周期の順)。 再生の守りと bridge には、 log に残る記録の全部も置く (review946c [D]: pull の
+    /// sidecar の書き出しが WAL の checkpoint より先に周期を進めた像で、 書き出した周期の記録の前の住人宛ての record も再生する)。
+    fn load_prev_records(&self) -> Vec<(u32, crate::prev_slots::PrevRecord)> {
+        let gens = self.generations();
+        if !gens.prev.active() || !gens.active() {
+            return Vec::new();
+        }
+        let (records, logged) = gens.prev.open_records();
+        gens.prev.keep_for_replay(&logged);
+        records
+    }
+
+    /// sync する v15 の DB に `prev.seg` が無ければ作る (記録なし): 前の binary が作った v15 の DB を書ける open で開いた時 / v15 に
+    /// 移った後に sync を始めた時 (`enable_sync_tables`)。 sync しない DB には作らない (記録を書かない、 review946c [I])。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ensure_prev_seg(&self) -> io::Result<()> {
+        let gens = self.generations();
+        if !gens.active() || gens.prev.active() || !self.sync_tables_on() {
+            return Ok(());
+        }
+        let Backing::Segments(set) = &self.backing else { return Ok(()) };
+        if self.is_readonly() {
+            return Ok(());
+        }
+        let reserve = self.layout.read().unwrap().reserve_entities;
+        // review946d [N5]: file の有る `prev.seg` は触らない (開く時に開けなかった / 使えなかった file。 開く時に警告を出した)。 前は
+        // 開く時の失敗が一時的だと、 ここで開けて中身を 0 に戻し、 書き出していない記録を黙って捨てた
+        if !set.create_prev(crate::prev_slots::segment_len(reserve))? {
+            return Ok(());
+        }
+        gens.prev.prepare(set.region(SegmentKind::Prev), gens.bits(), |off, len| set.flush_kind(SegmentKind::Prev, off, len))?;
+        set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn ensure_prev_seg(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// 場所 `local` の最後の行 (`last_local_of_slot` と同じ決め方を、 page の印を見ずに) と、 死んでいるか。 開く時の突き合わせ
+    /// (`reconcile_generations`) が印を立て直す前に読む所用。
+    fn last_row_unmarked(&self, local: u32) -> (u32, bool) {
+        let gens = self.generations();
+        let (now, dead_mark) = gens.state_unmarked(local);
+        let dead = dead_mark || !self.entities.is_live(local);
+        (((if now > 0 && dead { now - 1 } else { now }) << gens.bits()) | local, dead)
+    }
+
+    /// [`Self::restore_prev_residents`] の 1 場所。 退避を戻したか。 `written` = 退避が書き出し済みか (None = 今の退避表で決める。
+    /// 再生の後に戻す時は再生の前に決めた物、 [`Self::finish_prev_restores`])。
+    fn restore_prev_resident(&self, slot: u32, rec: crate::prev_slots::PrevRecord, written: Option<bool>) -> bool {
+        let id = (rec.peer, rec.number);
+        // review946 [1]: 前の住人の削除が本体に届いていない (場所の最後の行が記録の行で生きている / 記録の行より前の行 = 使い回しも
+        // 届いていない)。 戻すと生きている行の Delete を state に出す。 届いた削除 (死んでいる) と使い回し (後の行) だけ戻す
+        let (last, dead) = self.last_row_unmarked(slot);
+        let bits = self.generations().bits();
+        let (last_gen, gone_gen) = (last >> bits, rec.gone >> bits);
+        if last_gen < gone_gen || (last == rec.gone && !dead) {
+            return false;
+        }
+        // 翻訳した行の identity が写像を持つ: 落ちる前に別の場所に払い直した (退避した削除の版数と名前はその場所に戻してある)
+        if rec.kind == crate::prev_slots::PrevKind::Translated && self.eid_translator.get(id.0, id.1).is_some() {
+            return false;
+        }
+        let written = written.unwrap_or_else(|| self.prev_delete_written(rec));
+        // 退避が書き出されていなければ、 場所を指す別名 (使い回しの前の住人の物) も外す (`split_removed_keys` と同じ)
+        let mut others: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
+        if !written {
+            let self_peer = self.peer_id();
+            for (peer, foreign_local) in self.eid_translator.aliases_of(slot) {
+                if !self.eid_translator.unalias(peer, foreign_local) {
+                    continue;
+                }
+                if peer == self_peer {
+                    // #612: 畳んだ自分の行の世界番号は、 その slot を自分自身の別名にして予約したまま削除の版数を載せる
+                    self.eid_translator.alias(peer, foreign_local, foreign_local);
+                    self.set_tombstone_local(foreign_local, rec.tomb);
+                } else {
+                    others.push((peer, foreign_local));
+                }
+            }
+        }
+        // 名前 (場所の記録が使い回しの前の物の時だけ移す)。 使い回しと同じく版数の退避の前に
+        let mut ids = vec![id];
+        ids.extend_from_slice(&others);
+        self.move_stale_slot_names(&ids, slot, rec.tomb);
+        if written {
+            return false;
+        }
+        self.remember_foreign_tombstone(rec.peer, rec.number, rec.tomb);
+        if !others.is_empty() {
+            self.retreat_removed_keys(&others, rec.tomb);
+        }
+        // review946c [E]: 戻した自分の行の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
+        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)
+        if rec.kind == crate::prev_slots::PrevKind::Own {
+            self.generations().prev.note_restored_own(rec.gone, rec.tomb);
+        }
+        true
     }
 
     /// [`Self::prepare_reuse`] の後に場所を取れなかった (#883): 置いた前の宛名の覚えを外す (その場所の今の住人は前の住人ではない)。
@@ -20528,6 +20970,37 @@ impl Engine {
         self.generations().repaired()
     }
 
+    /// 開いた時に `prev.seg` の記録から、 使い回しが identity に移した前の住人の削除の版数を戻した場所の数 (観測・試験用、
+    /// `restore_prev_residents`)。
+    #[doc(hidden)]
+    pub fn prev_residents_restored(&self) -> u32 {
+        self.generations().prev.restored()
+    }
+
+    /// 場所 (`eid_slot`) の `prev.seg` の記録 (前の住人の identity の peer・番号・削除の版数・自分の行か)。 無い / 世代を持たない DB は
+    /// None (試験用)。
+    #[doc(hidden)]
+    pub fn prev_resident_of_slot(&self, slot: u32) -> Option<(enchudb_oplog::PeerId, u32, enchudb_oplog::Hlc, bool)> {
+        self.generations()
+            .prev
+            .read(slot)
+            .map(|r| (r.peer, r.number, r.tomb, r.kind == crate::prev_slots::PrevKind::Own))
+    }
+
+    /// 名前の列 `himo` の値 `value` (Number / Tag の辞書の番号) を消した名前として覚えた削除の版数 (`pk_tombs`、 試験用)。
+    #[doc(hidden)]
+    pub fn deleted_name_version(&self, himo: u16, value: u64) -> Option<enchudb_oplog::Hlc> {
+        let mut g = self.pk_tombs.write().unwrap();
+        self.drain_pk_pending(&mut g);
+        self.with_pk_key(himo, PkValue::Local(value), |key| g.tomb_of(himo, key)).flatten()
+    }
+
+    /// `prev.seg` の log の区画が一杯で、 使い回しの記録を場所ごとの配列にだけ書いた数 (観測用)。
+    #[doc(hidden)]
+    pub fn prev_log_full(&self) -> u64 {
+        self.generations().prev.log_full()
+    }
+
     /// 表 `tid` の払い出し済みの範囲 (場所の `[lo, hi)` の並び)。 名前のある表は払い出し位置までの extent、 anonymous は `next_eid` まで。
     fn handed_out_ranges(&self, tid: usize) -> Vec<(u32, u32)> {
         let t = &self.tables[tid];
@@ -20796,6 +21269,17 @@ impl Engine {
             let bits = crate::generation::slot_bits_for(l.max_entities);
             set.ensure_gen(crate::generation::segment_len(l.reserve_entities))?;
             self.generations().prepare(set.region(SegmentKind::Gen), bits)?;
+            // 前の住人の記録 (`prev.seg`) も作る (前の残りは 0 に戻す)。 header より先に届かなくてよい (header の合わない
+            // `prev.seg` は開く時に 0 から始める = 記録なし)。 記録を書くのは sync する DB だけなので、 sync しない DB には作らない
+            // (review946c [I]。 後から sync を始めた DB は `enable_sync_tables` / 開く時に作る)
+            if !self.generations().prev.active() && self.sync_tables_on() {
+                set.ensure_prev(crate::prev_slots::segment_len(l.reserve_entities))?;
+                self.generations().prev.prepare(set.region(SegmentKind::Prev), bits, |off, len| {
+                    set.flush_kind(SegmentKind::Prev, off, len)
+                })?;
+                // header は記録より先に disk へ (review946 [10])
+                set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)?;
+            }
             // 2. 行の lock は待たない (行を握ったまま `entity_in` を呼ぶ書き手 = schema の upsert が居る)。 照合は書き込みの道が
             // 行の lock の下で見る (使い回しはこの後)。 消す道とは 1 語の RMW で揃える (`Generations::gate`、 `live_free`)
             self.generations().start(bits);
@@ -20947,8 +21431,15 @@ impl Engine {
         let (slot, row_gen) = gens.split(local);
         let now = self.eid_translator.reverse(slot);
         let is_last_row = || row_gen == gens.split(self.last_local_of_slot(slot)).1;
-        // 覚えに無い、 場所の最後の行でない行: 自分の行の退避があれば自分の行
-        let own_gone = || self.foreign_tombstone_of(self.peer_id(), local).map(|_| None);
+        // 覚えに無い、 場所の最後の行でない行: `prev.seg` の記録の行 (場所を最後に使い回した時の前の住人、 または開く時に読んだ
+        // 書き出していない記録 = 同じ場所を 1 つの周期で 2 回使い回した 1 回目の前の住人、 review946c [A]) なら記録の identity、 自分の
+        // 行の退避があれば自分の行
+        let own_gone = || {
+            gens.prev
+                .record_of(slot, local)
+                .map(|r| (r.kind == crate::prev_slots::PrevKind::Translated).then_some((r.peer, r.number)))
+                .or_else(|| self.foreign_tombstone_of(self.peer_id(), local).map(|_| None))
+        };
         if !self.former_addresses_on.load(Ordering::Acquire) {
             return if is_last_row() { Some(now) } else { own_gone() };
         }
@@ -27571,6 +28062,8 @@ impl Engine {
             eng.finish_replay_vocab(&mut replay);
             // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
             eng.finish_reconcile(Some(&w));
+            // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
+            eng.finish_prev_restores();
             // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
@@ -27595,6 +28088,7 @@ impl Engine {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
             eng.finish_reconcile(Some(&w));
+            eng.finish_prev_restores();
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
             if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
@@ -27777,6 +28271,7 @@ impl Engine {
                 }
             }
         }
+        // (削除の版数, 消えた行の番号 = 世代 | 場所)
         let mut deletes: Vec<(Hlc, u32)> = Vec::new();
         if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
             for local in 0..n {
@@ -27785,10 +28280,22 @@ impl Engine {
                 // 見ると落ちた後に開くたびに 「載らなかった自分の削除」 に数え、 配った版数より古いので floor を上げて相手全員を
                 // bootstrap に回す
                 if unlogged(h) && !self.slot_is_in_engine_internal_table(local) {
-                    deletes.push((h, local));
+                    // #731: 消えた行の世代 (WAL の record は世代込み、 再生は世代 + 1 まで上げる)
+                    deletes.push((h, self.last_local_of_slot(local)));
                 }
             }
         }
+        // review946c [E]: 開く時に `prev.seg` の記録から戻した自分の行の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
+        // 前の住人の番号で載せる (bridge は記録から自分の世界番号と引く)
+        for (gone, h) in self.generations().prev.take_restored_own() {
+            if unlogged(h) {
+                deletes.push((h, gone));
+            }
+        }
+        // review946d [N2]: 記録から戻した削除と tomb.seg のなめは同じ (版数, 行) を出しうる (削除が本体に届いた後に使い回しの記録
+        // だけが届き、 0 にした tomb.seg は届いていない像)。 同じ Delete を 2 つ載せない
+        deletes.sort_unstable();
+        deletes.dedup();
         if trace {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
@@ -27812,9 +28319,8 @@ impl Engine {
             wal.observe_hlc(top.max(reached));
             deletes.sort_unstable();
             cells.sort_unstable();
-            for (h, local) in &deletes {
-                // #731: 消えた行の世代 (WAL の record は世代込み、 再生は世代 + 1 まで上げる)
-                let row = enchudb_oplog::make_eid(me, self.last_local_of_slot(*local));
+            for (h, gone) in &deletes {
+                let row = enchudb_oplog::make_eid(me, *gone);
                 if wal.append_at_hlc(Op::Delete { eid: row }, *h).is_err() {
                     fallback = true;
                     break;
@@ -27950,6 +28456,20 @@ impl Engine {
             }
             self.raise_generation(slot, g);
         } else if g < now && self.slot_is_generational(slot) {
+            // review946 [7]: 開く時の突き合わせが場所の世代を上げた (使い回した行の生きている印と、 前の住人の死の印が届いた像) 後に、
+            // その使い回した行の record が来た。 記録の行がこの行のすぐ前の住人の時だけ、 下の #916 の守り (場所に逆写像がある) の前に
+            // 後始末をやり直す (逆写像は前の住人の物)。 場所の削除の版数は後の行の物でありうるので記録の版数だけ使う
+            if makes_live && !self.entities.is_live(slot) {
+                self.redo_reuse_eviction(slot, g, false);
+            }
+            // 使い回した前の住人 (`prev.seg` の記録の行、 場所はもう次の行に移った) 宛ての record は当てない。 その行の削除の版数と
+            // 名前は開く時に記録から戻した (`restore_prev_residents`)。 当てると、 生かす record は場所を前の住人の世代に戻し、 Delete
+            // は新しい住人の cell を落として場所の名前を前の住人の削除の時刻で消した名前にした (後の record が新しい住人を生かし直すまで)。
+            // 写像を開く時に外した翻訳した行 (`prev_evicted`) の Delete は、 逆写像が無いので下の守りを通らない
+            let row = enchudb_oplog::eid_local(eid);
+            if self.last_local_of_slot(slot) != row && gens.prev.record_of(slot, row).is_some() {
+                return None;
+            }
             if self.eid_translator.reverse(slot).is_some()
                 && (makes_live || self.last_local_of_slot(slot) != enchudb_oplog::eid_local(eid))
             {
@@ -27958,8 +28478,80 @@ impl Engine {
             if makes_live {
                 gens.restore(slot, g);
             }
+        } else if g == now && makes_live && !self.entities.is_live(slot) {
+            // 死んだ場所を次の住人の record で生かす (本体の削除、 または再生した前の住人の Delete が世代を上げた後)
+            self.redo_reuse_eviction(slot, g, true);
         }
         Some(slot)
+    }
+
+    /// 再生が死んだ場所 `slot` を世代 `row_gen` の行の record で生かす時 (`replay_slot`)、 使い回しの後始末 (`prepare_reuse`) が disk に
+    /// 届いていなければやり直す。 前の住人は世代のすぐ前の行 ((`row_gen` - 1) | 場所、 消す道は世代を 1 つ上げ、 使い回しはその世代で
+    /// 生かす)。 前の住人の identity と削除の版数の決め方 (review946 3 (ii)):
+    /// 1. 場所の記録 (`prev.seg` の配列) の行が前の住人なら、 記録に従う。 記録だけが届いて使い回しが本体に届いていない電源断の像
+    ///    (開く時は写像を戻し (`prev_evicted`)、 生きている前の住人の記録は戻さない (`restore_prev_resident`、 [1]))
+    /// 2. 記録が無く (WAL の書き出しの後・`prev.seg` の書き出しの前に落ちた)、 場所に写像がある: 翻訳した行
+    /// 3. 記録も写像も無い: 自分の行 (自分の peer, 前の住人)。 ただし退避表に同じ版数の identity があれば何もしない (`.eidmap` が本体より
+    ///    先に届く道で、 翻訳した行の外しが先に届いた像。 HLC は書き込み 1 回ごとに一意)
+    ///
+    /// 翻訳した行は写像がまだ場所を指す時だけ外して削除の版数を退避し、 自分の行は退避する。 名前は `move_stale_slot_names` と同じ
+    /// 決め方で移す。 やり直した後始末は `prev.seg` に書き (書き出す前にもう一度落ちても戻せる)、 場所の版数を落とす (生きている
+    /// 使い回しと同じ、 [11])。 前の住人の削除の版数の無い場所 (版数なしで消した行) は何もしない。
+    ///
+    /// `slot_tomb`: 場所の削除の版数が前の住人の物か (偽 = 突き合わせが場所の世代を上げた後の古い record、 [7]。 記録の版数だけ使い、
+    /// 記録が無ければ何もしない)。
+    fn redo_reuse_eviction(&self, slot: u32, row_gen: u32, slot_tomb: bool) {
+        use crate::prev_slots::{PrevKind, PrevRecord};
+        let gens = self.generations();
+        if row_gen == 0 || !gens.prev.active() || !self.sync_tables_on() || !self.slot_is_generational(slot) {
+            return;
+        }
+        let prev_row = ((row_gen - 1) << gens.bits()) | slot;
+        let here = if slot_tomb { self.tombstone_version_of(slot) } else { enchudb_oplog::Hlc::ZERO };
+        let self_peer = self.peer_id();
+        let (kind, id, tomb) = match gens.prev.record_of(slot, prev_row) {
+            Some(r) => (r.kind, (r.peer, r.number), r.tomb.max(here)),
+            None if here == enchudb_oplog::Hlc::ZERO => return,
+            None => match self.eid_translator.reverse(slot) {
+                Some(key) => (PrevKind::Translated, key, here),
+                None => {
+                    if self.foreign_tombs.read().unwrap().values().any(|&t| t == here) {
+                        return;
+                    }
+                    (PrevKind::Own, (self_peer, prev_row), here)
+                }
+            },
+        };
+        match kind {
+            PrevKind::Translated => {
+                if self.eid_translator.get(id.0, id.1) != Some(slot) {
+                    return;
+                }
+                let mut ids: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
+                for (peer, foreign_local) in self.eid_translator.remove_local(slot) {
+                    if peer == self_peer {
+                        // #612: 畳んだ自分の行の世界番号 (`split_removed_keys` と同じ)
+                        self.eid_translator.alias(peer, foreign_local, foreign_local);
+                        self.set_tombstone_local(foreign_local, tomb);
+                    } else {
+                        ids.push((peer, foreign_local));
+                    }
+                }
+                if let Some(i) = ids.iter().position(|&k| k == id) {
+                    ids.swap(0, i);
+                }
+                self.move_stale_slot_names(&ids, slot, tomb);
+                self.retreat_removed_keys(&ids, tomb);
+            }
+            PrevKind::Own => {
+                self.move_stale_slot_names(&[id], slot, tomb);
+                self.remember_foreign_tombstone(id.0, id.1, tomb);
+            }
+        }
+        gens.prev.write(slot, &PrevRecord { kind, gone: prev_row, peer: id.0, number: id.1, tomb });
+        if slot_tomb {
+            self.clear_slot_versions(slot);
+        }
     }
 
     fn apply_oplog_op_inner(
@@ -28289,8 +28881,9 @@ impl Engine {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
             eng.finish_replay_vocab(&mut replay);
-            // #731 / #451: open_concurrent_with_oplog と同じ
+            // #731 / #451 / review946d [N1]: open_concurrent_with_oplog と同じ
             eng.finish_reconcile(Some(&w));
+            eng.finish_prev_restores();
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
             let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
@@ -28310,6 +28903,7 @@ impl Engine {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
             eng.finish_reconcile(Some(&w));
+            eng.finish_prev_restores();
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
             if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
@@ -28817,6 +29411,8 @@ impl Engine {
                 // #850: 当てている途中の書き手の手前で切ったせいで古い区画を畳めなかった周期が続いた回の、 次の周期までの間
                 // (0 = 続いていない。 1 ms から倍々、 上限 10 ms = 空け作りの間と同じ)
                 let mut cut_retry = Duration::ZERO;
+                // `prev.seg`: 暇な周期に sidecar を書いて周期を進めた最後の時 (review946c [G]: 1 秒に 1 回まで)
+                let mut last_idle_prev: Option<Instant> = None;
 
                 loop {
                     engine.consumer_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -28914,6 +29510,14 @@ impl Engine {
                             } else {
                                 // #451 (段階 1): 書くものの無い周期に、 置いた印を ring だけ書き出す (暇になった後に kill されても印が残る)
                                 engine.flush_durable_mark_if_pending();
+                                // `prev.seg`: 書き出していない使い回しの記録が残っていれば sidecar を書いて周期を進める。 1 秒に 1 回まで
+                                // (review946c [G]: 「使い回し → `oplog_sync()` → 暇」 を繰り返す DB で、 100 ms ごとに `eidmap.log` の
+                                // 追記 (macOS は F_FULLFSYNC) と header の書き出しを足さない)
+                                if last_idle_prev.is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+                                    && engine.persist_prev_if_pending()
+                                {
+                                    last_idle_prev = Some(Instant::now());
+                                }
                             }
                             // ring buffer reset を試みる。head == checkpoint の
                             // ときだけ head/checkpoint を HEADER_SIZE に戻す。
@@ -29651,11 +30255,20 @@ impl Engine {
         // 書き出しの間に消すと 「生きている、 世代は上がって死んでいる印」 の像が届き、 OS が page を先に書き出せば逆の像も届く。 どちらも
         // 開く時の突き合わせ (`reconcile_generations`、 gen.seg の 「死んでいる」 印と生きている印) が 「消す前」 か 「消した後」 に揃える
         let live_and_generations = |k: SegmentKind| matches!(k, SegmentKind::Entities | SegmentKind::Gen);
+        // 前の住人の記録 (`prev.seg`) は、 使い回しが生かした印 (entities / gen.seg) と 0 にした tomb.seg より先に。 書き出しの
+        // 間に使い回した分は、 tomb.seg の前に門を閉じてもう一度 (下)。 生きている印より先なのは、 この書き出しの前の使い回しだけ:
+        // ここから entities / gen.seg の書き出しまでの間の使い回しは、 生きている印だけが届いて記録が届かない像がある (review946 [3]、
+        // 残す。 閉じるには 「記録 〜 生かす」 を門に入れ、 その門を prev.seg → entities → gen.seg の書き出しの間閉じる = 使い回しが
+        // 3 回の msync を待つ)
+        let prev = |k: SegmentKind| matches!(k, SegmentKind::Prev);
+        set.flush_where(all || catch_up, prev)?;
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::PrevWrittenOut);
         set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Entities))?;
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
         set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))?;
-        let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k);
+        let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k) && !prev(k);
         if catch_up {
             set.flush_all_spread(rest)?;
         } else {
@@ -29663,10 +30276,31 @@ impl Engine {
         }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeVersions);
+        let ver_columns = |k: SegmentKind| matches!(k, SegmentKind::Ver(_));
         if catch_up {
-            set.flush_all_spread(version)?;
+            set.flush_all_spread(ver_columns)?;
         } else {
-            set.flush_where(all, version)?;
+            set.flush_where(all, ver_columns)?;
+        }
+        // tomb.seg: 使い回しは前の住人を `prev.seg` に書いてから門の中で tomb.seg を 0 にする。 門を閉じ、 門を通った使い回しが
+        // 居れば (記録を書いたのは門に入る前) `prev.seg` をもう一度書き出してから tomb.seg を書き出す = 0 にした tomb.seg が届いた
+        // 像には、 その記録も届いている (`crate::prev_slots`)。 閉じている間に来た使い回しは開くまで待つ (行を握ったまま、
+        // `free_locals` は放して)
+        let tomb = |k: SegmentKind| matches!(k, SegmentKind::Tomb);
+        let prev_slots = &self.generations().prev;
+        if prev_slots.active() {
+            // 閉じる前に、 ここまでの記録を書き出す (閉じている間の書き出しを、 その間に入った使い回しの記録だけにする。 前は
+            // 書き出しの初めからの記録を、 使い回しを止めたまま書き出した)
+            set.flush_where(false, prev)?;
+            let _closed = prev_slots.close();
+            if prev_slots.take_written() {
+                set.flush_where(false, prev)?;
+            }
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::BeforeTomb);
+            set.flush_where(all || catch_up, tomb)?;
+        } else {
+            set.flush_where(all || catch_up, tomb)?;
         }
         if all {
             self.columns_settled.store(true, Ordering::Release);
@@ -37890,5 +38524,51 @@ mod remote_row_tests {
         assert_eq!(eng.remote_tieleaf_apply(f, n, b"f", t0), RemoteApply::Applied);
         assert!(eng.entities.is_live(slot(f)), "TieLeaf だけで届いた行が生きていない");
         assert_eq!(eng.get_text_owned(f, "t.n").as_deref(), Some(&b"f"[..]));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod prev_seg_open_failure_tests {
+    use super::*;
+
+    /// review946d [N5]: 開く時に開けなかった `prev.seg` (一時的な失敗) を、 表を読んだ後の `ensure_prev_seg` が開けて 0 に戻さない
+    /// (file の有る `prev.seg` は作り直さない)。 前は書き出していない記録を黙って捨てた。
+    #[test]
+    fn a_prev_seg_that_failed_to_open_is_not_started_over() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("enchudb-prev-open-fail-{}-{nanos}", std::process::id()));
+        let path = dir.to_str().unwrap();
+        {
+            let mut eng = Engine::create_with_capacity(path, 1024).unwrap();
+            eng.define_table("t", 1).unwrap();
+            eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+            eng.persist_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+            eng.set_peer_id(1);
+            let x = eng.entity_in("t").unwrap();
+            eng.tie_to(x, "t.k", 7u32);
+            eng.oplog_commit();
+            eng.delete(x);
+            eng.oplog_commit();
+            let y = eng.entity_in("t").unwrap();
+            assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: 場所を使い回した");
+            assert!(eng.prev_resident_of_slot(eng.eid_slot(y)).is_some(), "前提: 使い回しの記録を書いた");
+        }
+        let file = dir.join("prev.seg");
+        let before = std::fs::read(&file).unwrap();
+        assert!(before.iter().any(|&b| b != 0), "前提: `prev.seg` に中身がある");
+        crate::segments::FAIL_NEXT_OPEN_PREV.with(|f| f.set(true));
+        let active = {
+            let eng = Engine::open_concurrent_with_oplog(path, 4 << 20).unwrap();
+            eng.generations().prev.active()
+        };
+        let failed = !crate::segments::FAIL_NEXT_OPEN_PREV.with(|f| f.replace(false));
+        let after = std::fs::read(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failed, "前提: 開く時に `prev.seg` を開けなかった");
+        assert!(!active, "開けなかった `prev.seg` を後で作り直して使った");
+        assert!(before == after, "開けなかった `prev.seg` の中身を 0 に戻した");
     }
 }

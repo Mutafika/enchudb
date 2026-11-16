@@ -122,6 +122,8 @@ pub(crate) struct Generations {
     relog_gens: std::sync::Mutex<std::collections::BTreeMap<u32, u32>>,
     has_relog_gens: std::sync::atomic::AtomicBool,
     missing_tombs: std::sync::Mutex<Vec<u32>>,
+    /// 場所を使い回した時の前の住人の記録 (`prev.seg`、 `crate::prev_slots`)。 `gen.seg` と一緒に持つ (v15 の DB だけ)。
+    pub(crate) prev: crate::prev_slots::PrevSlots,
 }
 
 impl Generations {
@@ -141,6 +143,7 @@ impl Generations {
             relog_gens: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             has_relog_gens: std::sync::atomic::AtomicBool::new(false),
             missing_tombs: std::sync::Mutex::new(Vec::new()),
+            prev: crate::prev_slots::PrevSlots::off(),
         }
     }
 
@@ -335,6 +338,19 @@ impl Generations {
     pub(crate) fn state(&self, slot: u32) -> (u32, bool) {
         let Some(r) = self.region.get() else { return (0, false) };
         let v = read_raw(r, slot);
+        ((v & GEN_MASK) as u32, v & DEAD != 0)
+    }
+
+    /// 場所の (世代, 「死んでいる」 印) を page の印を見ずに読む (commit 済みの範囲の 2 B そのまま)。 開く時の突き合わせ
+    /// (`heal`、 page の印を立て直す) より前に読む所 (`prev.seg` の記録と比べる `Engine::prev_evicted`) 用: 電源断の像では世代だけが
+    /// 届いて page の印が届いていないことがある。 世代を持たない DB は (0, false)。
+    pub(crate) fn state_unmarked(&self, slot: u32) -> (u32, bool) {
+        let Some(r) = self.region.get() else { return (0, false) };
+        let off = slot_off(slot);
+        if off + 2 > r.len() || !r.is_committed(off + 2) {
+            return (0, false);
+        }
+        let v = r.as_atomic_u16(off).load(Ordering::Acquire);
         ((v & GEN_MASK) as u32, v & DEAD != 0)
     }
 
