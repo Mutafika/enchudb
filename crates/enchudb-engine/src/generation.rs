@@ -124,6 +124,15 @@ pub(crate) struct Generations {
     missing_tombs: std::sync::Mutex<Vec<u32>>,
     /// 場所を使い回した時の前の住人の記録 (`prev.seg`、 `crate::prev_slots`)。 `gen.seg` と一緒に持つ (v15 の DB だけ)。
     pub(crate) prev: crate::prev_slots::PrevSlots,
+    /// #970: 行が消えたのに世代も 「死んでいる」 印も書けなかった場所 (gen.seg の commit を伸ばせなかった kill、 この process の中)。
+    /// 消す道は WAL に積む前に場所の page を commit しておく (できなければ消す操作を断る、 `Engine::gen_room`) ので、 ここに載るのは
+    /// 断れない道 (受信の Delete・名前の削除で一緒に消える行・畳んだ行の切り離し・開く時の突き合わせ など) が空き不足に当たった時
+    /// だけ。 載っている場所は使い回さず (`Engine::entity_in` の取り出しと拾い直しが飛ばす、 anonymous は空きの山に積まない)、 アプリの
+    /// 書き込みを断る (世代が同じなので消えた行の eid が照合を通る)。 kill をやり直せたら外す (`Engine::retry_unkilled`)。 残ったまま
+    /// きれいに閉じる時は header の 「汚れた session」 の印を倒さない (次に開く時の突き合わせが削除を完了させる)。 状態からは推さない:
+    /// 「生きていない・死の印なし」 は払い出し位置から取って生かす前の場所と見分けられない (PR #977 の読み直し [1])。
+    unkilled: std::sync::Mutex<Vec<u32>>,
+    has_unkilled: std::sync::atomic::AtomicBool,
 }
 
 impl Generations {
@@ -144,7 +153,62 @@ impl Generations {
             has_relog_gens: std::sync::atomic::AtomicBool::new(false),
             missing_tombs: std::sync::Mutex::new(Vec::new()),
             prev: crate::prev_slots::PrevSlots::off(),
+            unkilled: std::sync::Mutex::new(Vec::new()),
+            has_unkilled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// #970: kill を書けなかった場所を覚える ([`Self::unkilled`] の doc)。
+    pub(crate) fn note_unkilled(&self, slot: u32) {
+        let mut v = self.unkilled.lock().unwrap_or_else(|p| p.into_inner());
+        if !v.contains(&slot) {
+            v.push(slot);
+        }
+        self.has_unkilled.store(true, Ordering::Release);
+    }
+
+    /// #970: kill を書けなかった場所か (覚えた場所が無い間は atomic の load 1 回)。
+    #[inline]
+    pub(crate) fn is_unkilled(&self, slot: u32) -> bool {
+        self.has_unkilled.load(Ordering::Acquire) && self.unkilled.lock().unwrap_or_else(|p| p.into_inner()).contains(&slot)
+    }
+
+    /// #970: kill を書けなかった場所があるか。
+    #[inline]
+    pub(crate) fn has_unkilled(&self) -> bool {
+        self.has_unkilled.load(Ordering::Acquire)
+    }
+
+    /// #970: kill を書けた (やり直した) 場所を外す。
+    pub(crate) fn forget_unkilled(&self, slot: u32) {
+        if !self.has_unkilled() {
+            return;
+        }
+        let mut v = self.unkilled.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|&s| s != slot);
+        if v.is_empty() {
+            self.has_unkilled.store(false, Ordering::Release);
+        }
+    }
+
+    /// #970: kill を書けなかった場所の写し。
+    pub(crate) fn unkilled_slots(&self) -> Vec<u32> {
+        if !self.has_unkilled() {
+            return Vec::new();
+        }
+        self.unkilled.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// #970: 場所 `slot` の page (の手前まで) の gen.seg を commit する (書かない)。 commit 済みなら atomic の load だけ。 この後の
+    /// [`Self::kill`] / [`Self::raise`] は commit の失敗では落ちない (commit は縮まない)。 書けなければ (ディスクの空き) Err。
+    pub(crate) fn commit_slot(&self, slot: u32) -> std::io::Result<()> {
+        let Some(r) = self.region.get() else { return Ok(()) };
+        let off = slot_off(slot);
+        if off + 2 > r.len() {
+            return Ok(());
+        }
+        let page_end = slot_off(((slot >> PAGE_SHIFT) + 1) << PAGE_SHIFT).min(r.len());
+        r.ensure_committed(page_end.max(off + 2))
     }
 
     /// 開いた DB の `gen.seg` (header に場所の bit が焼いてある)。 中身の header が合わなければ Err。
@@ -467,8 +531,7 @@ impl Generations {
             return Ok(None);
         }
         // page の場所を全部 commit する (印の立った page の場所は、 commit を確かめずに読む = `read_raw`)
-        let page_end = slot_off(((slot >> PAGE_SHIFT) + 1) << PAGE_SHIFT).min(r.len());
-        r.ensure_committed(page_end.max(off + 2))?;
+        self.commit_slot(slot)?;
         // page の印を先に (印の無い page の場所は世代を読まない。 印 → 世代 の順なら、 印を読まずに 0 と答えた読みは上げる前の読み)
         self.mark_page(r, slot);
         Ok(Some(r.as_atomic_u16(off)))

@@ -670,6 +670,15 @@ impl std::fmt::Display for TieRejected {
 
 impl std::error::Error for TieRejected {}
 
+/// #970: anonymous の `entity()` が空きの山の一番上の場所を取らずに残した理由。
+#[derive(Debug, Clone, Copy)]
+enum KeptFor {
+    /// 世代を持たない DB で使い回す前に、 v15 に移る (移ってから取り直す)。
+    Move,
+    /// 場所の世代を上げる gen.seg の page を commit できない (断る)。
+    Space,
+}
+
 /// #513: 削除の道で積む、 消した主キーの行 (`Engine::pk_pending`)。 値は local な値 (Tag は辞書の番号。 辞書を回収する DB
 /// の文字列の主キーは積まずにその場で載せるので、 番号は載せる時まで同じ文字列を指す)。
 #[derive(Debug, Clone, Copy)]
@@ -2891,6 +2900,23 @@ mod anon_reuse_hook {
     }
 }
 
+/// #970 の test: anonymous の `entity()` が 「上限に届いたら先に v15 に移る」 を見た後・払い出す前の割り込み点 (その間に別の thread が
+/// 上限に届かせ、 空きの山から使い回す道に落ちる形を作る)。
+#[cfg(test)]
+mod anon_alloc_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: 畳んだ自分の行を戻す 2 段 (生きている印を立てる / 別名を外す) の間 (#882)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod revive_gap_hook {
@@ -3993,16 +4019,19 @@ mod eid_gen_claim_tests {
     }
 }
 
-/// #970: v15 に移る手順が、 v14 の間に消した場所を 「世代 1、 死んでいる」 にできない (gen.seg を伸ばせない) 時、 その場所を世代 0 =
-/// 消えた行と同じ eid で使い回さない。 移る手順の 4. の直前の割り込み点 (`move_fill_hook`) で空きを無くす (`set_space_margin`)。
-/// 消した場所は gen.seg の最初の commit (64 KiB = 場所 24576 まで) より後ろ。 eid の空間は使い切る (表の枠を足せない / anonymous
-/// は空きの山からしか払い出せない)。 v15 で消す時の形は `tests/eid_generation.rs` の #970 の試験。
+/// #970 (PR #977 を作り直した形): 行を消す道は WAL に積む前に場所の gen.seg の page を commit し、 できなければ消す操作を断る
+/// (`Engine::gen_room`)。 断れない道 (受信の Delete・名前で一緒に消える行・畳んだ行の切り離し・開く時の突き合わせ) が kill を書け
+/// なかった場所は覚えて (`Generations::unkilled`) 使い回さず、 消えた行の eid の書き込みを断る。 v15 に移る手順は上げられなければ
+/// 移らない。 anonymous の使い回しは生かす前に上げる。 空きの不足は `set_space_margin`、 割り込み点で順を作る (sleep に頼らない)。
+/// 場所は gen.seg の最初の commit (64 KiB = 場所 24576 まで) より後ろ (前提で確かめる)。 eid の空間は使い切る (表の枠を足せない /
+/// anonymous は空きの山からしか払い出せない)。 結合の形 (WAL の無い engine・開き直し) は `tests/eid_generation.rs` の #970 の試験。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod kill_fail_tests {
     use super::*;
     use std::sync::Arc;
 
     const CAP: u32 = 40_000;
+    const NO_SPACE: u64 = u64::MAX / 2;
 
     fn path(tag: &str) -> String {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -4019,22 +4048,41 @@ mod kill_fail_tests {
     fn no_space_at_the_move(eng: &Arc<Engine>) {
         let wal = eng.oplog.as_ref().unwrap().clone();
         let e2 = Arc::clone(eng);
-        move_fill_hook::set(&wal, move |_| e2.set_space_margin(u64::MAX / 2));
+        move_fill_hook::set(&wal, move |_| e2.set_space_margin(NO_SPACE));
     }
 
-    /// 表: 満杯の表 `t` で v14 の間に消した場所を、 次の insert が使い回す (その前に v15 に移る)。 移る手順で上げられなかった場所は、
-    /// 取り出す道 (`entity_in` の空きの一覧) が上げ直す。 上げられない間は渡さず、 空きが戻ったら次の世代で渡す。
-    ///
-    /// falsify: `entity_in` の取り出しの `raise_unkilled_slot` を外すと、 移る前に一覧に積んだ場所を世代 0 (消えた行の eid) で渡す。
-    #[test]
-    fn a_table_slot_the_move_could_not_raise_is_not_reused_with_the_same_eid() {
-        let p = path("table");
-        let mut eng = Engine::create_with_capacity(&p, CAP).unwrap();
+    /// 場所 `slot` の 2 B が gen.seg の commit の外か (その場所の世代を書くには gen.seg を伸ばす)。
+    fn beyond_gen_commit(eng: &Engine, slot: u32) -> bool {
+        let Backing::Segments(set) = &eng.backing else { return false };
+        let committed = set.segment(SegmentKind::Gen).map_or(0, |m| m.committed());
+        committed < crate::generation::GEN_HEADER + 2 * slot as usize + 2
+    }
+
+    fn wal_head(eng: &Engine) -> u64 {
+        eng.stats().oplog_head
+    }
+
+    /// 表 `u` (枠 1、 最初の使い回し用) / `pad` / `t` (枠 4、 列 `a`) で eid の空間を使い切る DB。 `t` の場所は 39996〜。
+    fn far_table(tag: &str) -> (String, Arc<Engine>) {
+        far_table_with(tag, false)
+    }
+
+    /// `versions`: 版数の列を持つ DB (削除の版数 = tombstone を持つ、 受信の Delete の形)。
+    fn far_table_with(tag: &str, versions: bool) -> (String, Arc<Engine>) {
+        let p = path(tag);
+        let mut eng = if versions {
+            Engine::create_with_cell_version(&p, CAP).unwrap()
+        } else {
+            Engine::create_with_capacity(&p, CAP).unwrap()
+        };
         eng.define_table("u", 1).unwrap();
         eng.define_table("pad", CAP - 1 - 4).unwrap();
         eng.define_table("t", 4).unwrap();
         eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
-        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        (p, Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap())
+    }
+
+    fn fill_t(eng: &Engine) -> Vec<u64> {
         let rows: Vec<u64> = (0..4u32)
             .map(|i| {
                 let e = eng.entity_in("t").unwrap();
@@ -4042,34 +4090,173 @@ mod kill_fail_tests {
                 e
             })
             .collect();
+        assert_eq!(eng.remaining_eid_capacity(), 0, "前提: 枠を足せない");
+        rows
+    }
+
+    /// `far_table` を表 `u` で 1 回使い回して v15 にしてから `t` を埋める。
+    fn v15_far_table(tag: &str) -> (String, Arc<Engine>, Vec<u64>) {
+        v15_far_table_with(tag, false)
+    }
+
+    fn v15_far_table_with(tag: &str, versions: bool) -> (String, Arc<Engine>, Vec<u64>) {
+        let (p, eng) = far_table_with(tag, versions);
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u);
+        let u2 = eng.entity_in("u").unwrap();
+        assert!(eng.generations().moved() && u2 != u, "前提: v15");
+        let rows = fill_t(&eng);
+        (p, eng, rows)
+    }
+
+    /// アプリの消す道は、 場所の世代を書く gen.seg の page を commit できなければ断る: 何も変えない (行は生きたまま・値もそのまま・
+    /// WAL に載らない)・fault を数える・上げ損ねた場所を作らない (満杯の表は使い回さず断る)。 空きが戻れば消せて、 場所を次の世代で
+    /// 使い回す。
+    ///
+    /// falsify: `delete_with` の `gen_room` を外すと、 消してしまう (行が消え、 世代 0 のまま場所が空く)。
+    #[test]
+    fn a_delete_is_refused_while_the_generation_of_its_slot_cannot_be_written() {
+        let (p, eng, rows) = v15_far_table("refuse");
         let old = rows[1];
         let slot = eng.slot_unchecked(old);
-        assert!(slot >= 32_768 && eng.remaining_eid_capacity() == 0, "前提: gen.seg の最初の commit の外の場所、 枠を足せない");
+        assert!(beyond_gen_commit(&eng, slot), "前提: 場所 {slot} は gen.seg の commit の外");
+        eng.set_space_margin(NO_SPACE);
+        let faults = eng.fault_count(FaultKind::DiskSpace);
+        let head = wal_head(&eng);
+        assert_eq!(eng.try_delete(old), Err(TieRejected::Fault(FaultKind::DiskSpace)), "空きが無いのに消した");
+        eng.delete(old); // 戻り値の無い delete も同じ
+        assert!(eng.fault_count(FaultKind::DiskSpace) >= faults + 2, "断った delete を fault に数えない");
+        assert_eq!(wal_head(&eng), head, "断った delete を WAL に積んだ");
+        assert!(eng.is_live(old) && eng.get(old, "t.a") == Some(1), "断った delete が行を変えた");
+        let gens = eng.generations();
+        assert!(!gens.has_unkilled() && gens.get(slot) == 0 && !gens.is_dead(slot), "断った delete が場所の状態を変えた");
+        assert!(eng.entity_in("t").is_err(), "前提: 満杯の表 (消していないので使い回す場所は無い)");
+        eng.set_space_margin(0);
+        assert_eq!(eng.try_delete(old), Ok(()), "空きが戻ったのに消せない");
+        assert!(!eng.is_live(old) && gens.is_dead(slot) && gens.get(slot) == 1, "消した場所が 「次の世代、 死んでいる」 でない");
+        let new = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(new), slot, "前提: 満杯の表は消えた場所を使い回す");
+        assert_ne!(new, old, "消えた行と同じ eid で使い回した");
+        assert!(eng.is_live(new) && !eng.is_live(old));
+        cleanup(eng, &p);
+    }
+
+    /// 断れない道 (受信の Delete) は空きが無くても消す。 kill を書けなかった場所は覚えて、 使い回さず (満杯の表は断る)、 消えた行の
+    /// eid の書き込み / untie / delete を断る (WAL に載せない)。 空きが戻ると、 枯渇した表の拾い直しが kill をやり直して次の世代で
+    /// 使い回す。
+    ///
+    /// falsify: `kill_generation` の `note_unkilled` を外すと、 空きが無いまま足した行が消えた行と同じ eid で場所を使い回す。
+    /// `app_slot_holds` の照合を外すと、 消えた行の eid の書き込みが WAL に載る。
+    #[test]
+    fn a_received_delete_without_space_quarantines_the_slot() {
+        let (p, eng, rows) = v15_far_table("recv");
+        let old = rows[1];
+        let slot = eng.slot_unchecked(old);
+        assert!(beyond_gen_commit(&eng, slot), "前提: 場所 {slot} は gen.seg の commit の外");
+        let hid = eng.himo_id("t.a").unwrap() as u16;
+        eng.set_space_margin(NO_SPACE);
+        let faults = eng.fault_count(FaultKind::DiskSpace);
+        assert!(eng.remote_delete_apply(old, enchudb_oplog::Hlc { wall: 1, logical: 0, peer: 2 }), "前提: 受信の Delete は断らない");
+        let gens = eng.generations();
+        assert!(eng.fault_count(FaultKind::DiskSpace) > faults, "前提: kill を書けなかった");
+        assert!(!eng.is_live(old) && gens.is_unkilled(slot) && gens.get(slot) == 0 && !gens.is_dead(slot), "前提: 世代も印も書けていない");
+        // 使い回さない (表は満杯で断る)
+        let got = eng.entity_in("t");
+        assert!(got.is_err(), "kill を書けなかった場所を使い回した: {got:?} (消えた行 {old:#x})");
+        // 消えた行の eid の書き込みを断る
+        let head = wal_head(&eng);
+        assert_eq!(eng.try_tie_to_by_id(old, hid, 7u32), Err(TieRejected::DeadRow), "消えた行の eid の書き込みを通した");
+        eng.tie_to(old, "t.a", 8u32);
+        eng.untie(old, "t.a");
+        assert!(eng.try_delete(old).is_err());
+        assert_eq!(wal_head(&eng), head, "消えた行の eid の操作を WAL に積んだ");
+        assert_eq!(eng.get(old, "t.a"), None);
+        // 空きが戻ると、 拾い直しが kill をやり直して使い回す
+        eng.set_space_margin(0);
+        let new = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(new), slot, "前提: 満杯の表は消えた場所を使い回す");
+        assert_ne!(new, old, "消えた行と同じ eid で使い回した");
+        assert!(eng.is_live(new) && !eng.is_live(old) && !gens.is_unkilled(slot));
+        cleanup(eng, &p);
+    }
+
+    /// PR #977 の読み直し [3]: kill を書けなかった場所の消えた行の eid の書き込みを通すと、 WAL に載り、 きれいに閉じずに開いた時、
+    /// 突き合わせが削除を完了させた後の再生がその行を生き返らせた。 断るので、 開いた後も消えたまま (値も無い)。 開いた後の使い回しは
+    /// 次の世代。
+    ///
+    /// falsify: `app_slot_holds` の照合を外すと、 開いた後に消えた行が生き返る。
+    #[test]
+    fn a_write_through_a_quarantined_eid_does_not_bring_the_row_back_after_an_unclean_open() {
+        let (p, eng, rows) = v15_far_table_with("recvimg", true);
+        let image = format!("{p}-img");
+        let old = rows[1];
+        let slot = eng.slot_unchecked(old);
+        let hid = eng.himo_id("t.a").unwrap() as u16;
+        let t = enchudb_oplog::Hlc { wall: eng.cell_hlc(old, hid).wall + 1, logical: 0, peer: 2 };
+        eng.set_space_margin(NO_SPACE);
+        assert!(eng.remote_delete_apply(old, t), "前提: 受信の Delete は断らない");
+        assert!(eng.generations().is_unkilled(slot), "前提: kill を書けなかった");
+        eng.set_space_margin(0);
+        // 受信の Delete は WAL に積まない: 本体を書き出して (checkpoint を進めて)、 消えた行を像に置く (kill は書けていないまま)
+        eng.oplog_sync().unwrap();
+        assert!(eng.generations().is_unkilled(slot), "前提: 書き出しは kill をやり直さない");
+        let hold = eng.hold_consumer();
+        eng.tie_to(old, "t.a", 7u32);
+        assert!(std::process::Command::new("cp").arg("-R").arg(&p).arg(&image).status().unwrap().success());
+        drop(hold);
+        cleanup(eng, &p);
+        let img = Engine::open_standalone(&image).unwrap();
+        let (alive, v) = (img.is_live(old), img.get(old, "t.a"));
+        let new = img.entity_in("t");
+        let new_live = new.as_ref().is_ok_and(|&e| img.is_live(e));
+        drop(img);
+        let _ = crate::db_files::remove_db(&image);
+        assert!(!alive && v.is_none(), "消えた行が生き返った (alive {alive}, value {v:?})");
+        let new = new.expect("開いた後に消えた場所を使い回せない");
+        assert_eq!(new as u32 & 0xFF_FFFF, slot, "前提: 満杯の表は消えた場所を使い回す");
+        assert_ne!(new, old, "開いた後に消えた行と同じ eid で使い回した");
+        assert!(new_live);
+    }
+
+    /// 表: v14 の間に消した場所を、 次の insert が使い回す (その前に v15 に移る)。 移る手順が場所の世代を上げられなければ移らない
+    /// (Err、 移り終えた印を立てない)。 上げられなかった場所の消えた行の eid の書き込みは断る。 空きが戻れば移って次の世代で使い回す。
+    ///
+    /// falsify: 移る手順の 4. の Err を外すと (上げられないまま移る)、 満杯の表が消えた行と同じ eid で使い回す。
+    #[test]
+    fn the_move_to_v15_waits_while_a_table_slot_deleted_in_v14_cannot_be_raised() {
+        let (p, eng) = far_table("move");
+        let rows = fill_t(&eng);
+        let old = rows[1];
+        let slot = eng.slot_unchecked(old);
         eng.delete(old); // v14 (世代を持たない) の間に消す
         assert!(!eng.generations().active(), "前提: v14");
         no_space_at_the_move(&eng);
         let faults = eng.fault_count(FaultKind::DiskSpace);
         let got = eng.entity_in("t");
-        assert!(eng.generations().moved(), "前提: v15 に移った");
+        assert!(beyond_gen_commit(&eng, slot), "前提: 場所 {slot} は gen.seg の commit の外");
         assert!(eng.fault_count(FaultKind::DiskSpace) > faults, "前提: 移る手順が場所の世代を上げられなかった");
-        if let Ok(e) = got {
-            assert_ne!(e, old, "移る手順が上げられなかった場所を、 消えた行と同じ eid で渡した");
-        }
-        assert!(!eng.entities.is_live(slot), "上げられない場所を使い回した");
+        assert!(got.is_err(), "上げられないのに使い回した: {got:?} (消えた行 {old:#x})");
+        assert!(!eng.generations().moved(), "上げられないのに移り終えた");
+        assert!(!eng.entities.is_live(slot));
+        let hid = eng.himo_id("t.a").unwrap() as u16;
+        assert_eq!(eng.try_tie_to_by_id(old, hid, 7u32), Err(TieRejected::DeadRow), "上げられなかった場所の消えた行の eid の書き込みを通した");
         eng.set_space_margin(0);
         let new = eng.entity_in("t").unwrap();
+        assert!(eng.generations().moved(), "空きが戻っても移らない");
         assert_eq!(eng.slot_unchecked(new), slot, "前提: 満杯の表は消えた場所を使い回す");
         assert_ne!(new, old, "空きが戻った後、 消えた行と同じ eid で渡した");
         assert!(eng.is_live(new) && !eng.is_live(old));
         cleanup(eng, &p);
     }
 
-    /// anonymous (`entity()`): 満杯の DB で v14 の間に消した場所を、 次の `entity()` が使い回す (その前に v15 に移る)。 移る手順でも
-    /// 取り出した後でも世代を上げられない間は渡さず (空きの山に戻して断る)、 空きが戻ったら次の世代で渡す。
+    /// anonymous (`entity()`): 満杯の DB で v14 の間に消した場所を、 次の `entity()` が使い回す (その前に v15 に移る)。 上げられなければ
+    /// 移らずに断る。 空きが戻ったら移って次の世代で渡す。 PR #977 の読み直し [2]: 使い回す場所は生かす前に上げる (取り出して生かした
+    /// 直後 = `anon_reuse_hook` に消えた行の eid の delete が来ても、 照合で外れる。 前は生かしてから上げていて、 その delete が生かした
+    /// 場所を殺して空きの山に積み直し、 次の `entity()` が同じ eid をもう一度渡した)。
     ///
-    /// falsify: `entity()` の `raise_generation` の失敗を見ないと、 世代 0 (消えた行の eid) で渡す。
+    /// falsify: 移る手順の 4. の Err を外すと、 世代 0 (消えた行の eid) で渡す。
     #[test]
-    fn an_anonymous_slot_the_move_could_not_raise_is_not_reused_with_the_same_eid() {
+    fn the_move_to_v15_waits_while_an_anonymous_slot_deleted_in_v14_cannot_be_raised() {
         let p = path("anon");
         let mut eng = Engine::create_with_capacity(&p, CAP).unwrap();
         eng.define_himo("v", ValueType::Number, 0);
@@ -4082,27 +4269,32 @@ mod kill_fail_tests {
         no_space_at_the_move(&eng);
         let faults = eng.fault_count(FaultKind::DiskSpace);
         let got = eng.entity();
-        assert!(eng.generations().moved(), "前提: v15 に移った");
+        assert!(beyond_gen_commit(&eng, slot), "前提: 場所 {slot} は gen.seg の commit の外");
         assert!(eng.fault_count(FaultKind::DiskSpace) > faults, "前提: 場所の世代を上げられなかった");
-        if let Ok(e) = got {
-            assert_ne!(e, old, "上げられなかった場所を、 消えた行と同じ eid で渡した");
-        }
-        assert!(!eng.entities.is_live(slot), "上げられない場所を使い回した");
+        assert!(got.is_err(), "上げられないのに使い回した: {got:?} (消えた行 {old:#x})");
+        assert!(!eng.generations().moved(), "上げられないのに移り終えた");
+        assert!(!eng.entities.is_live(slot));
         eng.set_space_margin(0);
+        // 取り出して生かした直後に、 消えた行の eid を持ち続けたアプリが delete する ([2])
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let e2 = Arc::clone(&eng);
+        anon_reuse_hook::set(&wal, move |_| e2.delete(old));
         let new = eng.entity().unwrap();
-        assert_eq!(eng.slot_unchecked(new), slot, "前提: 空きの山に戻した場所を使い回す");
+        assert!(eng.generations().moved(), "空きが戻っても移らない");
+        assert_eq!(eng.slot_unchecked(new), slot, "前提: 空きの山の場所を使い回す");
         assert_ne!(new, old, "空きが戻った後、 消えた行と同じ eid で渡した");
-        assert!(eng.is_live(new) && !eng.is_live(old));
+        assert!(eng.is_live(new) && !eng.is_live(old), "返した eid {new:#x} の行が生きていない (消えた行の eid の delete が当たった)");
+        let again = eng.entity();
+        assert!(again.is_err(), "同じ場所をもう一度渡した: {again:?} (前に渡した {new:#x})");
         cleanup(eng, &p);
     }
 
-    /// v15 の anonymous の行を消す時に世代を上げられなかった (gen.seg を伸ばせない) 場所は、 空きの山に積まない。 積むと、 空きが
-    /// 戻った後の `entity()` が取り出して生かしてから上げるまでの間 (`anon_reuse_hook`)、 場所は消えた行の eid (世代 0) で生きていて、
-    /// 消えた行の eid を持ち続けたアプリの delete が新しい行を消す (返した eid は生きていない行を指し、 場所は空きの山に戻る)。
+    /// v15 の anonymous の行も、 場所の世代を書けなければ消すのを断る (空きの山に 「上げ損ねた場所」 を積まない)。 空きが戻れば消せて、
+    /// `entity()` が次の世代で使い回す。
     ///
-    /// falsify: `live_free` の 「上げられなかった場所は `free_without_reuse`」 を外すと、 返した eid が生きていない。
+    /// falsify: `delete_with` の `gen_room` を外すと、 消してしまう。
     #[test]
-    fn an_anonymous_slot_deleted_without_space_is_not_put_on_the_free_stack() {
+    fn an_anonymous_delete_is_refused_while_the_generation_of_its_slot_cannot_be_written() {
         let p = path("anonv15");
         let mut eng = Engine::create_with_capacity(&p, CAP).unwrap();
         eng.define_himo("v", ValueType::Number, 0);
@@ -4112,22 +4304,116 @@ mod kill_fail_tests {
         let first = eng.entity().unwrap(); // 場所 0 を使い回す = v15
         assert!(eng.generations().moved() && eng.slot_unchecked(first) == 0, "前提: v15");
         let old = rows[39_000];
+        eng.tie_to(old, "v", 5u32);
         let slot = eng.slot_unchecked(old);
-        eng.set_space_margin(u64::MAX / 2);
-        let faults = eng.fault_count(FaultKind::DiskSpace);
-        eng.delete(old);
-        assert!(eng.fault_count(FaultKind::DiskSpace) > faults, "前提: 消す時に世代を上げられなかった");
-        assert!(!eng.entities.is_live(slot) && !eng.generations().is_dead(slot) && eng.generations().get(slot) == 0, "前提: 印も世代も無い");
+        assert!(beyond_gen_commit(&eng, slot), "前提: 場所 {slot} は gen.seg の commit の外");
+        eng.set_space_margin(NO_SPACE);
+        let head = wal_head(&eng);
+        assert_eq!(eng.try_delete(old), Err(TieRejected::Fault(FaultKind::DiskSpace)), "空きが無いのに消した");
+        assert_eq!(wal_head(&eng), head, "断った delete を WAL に積んだ");
+        assert!(eng.is_live(old) && eng.get(old, "v") == Some(5), "断った delete が行を変えた");
+        assert!(eng.entity().is_err(), "前提: 満杯 (消していないので使い回す場所は無い)");
         eng.set_space_margin(0);
-        // 取り出して生かした直後に、 消えた行の eid を持ち続けたアプリが delete する
-        let wal = eng.oplog.as_ref().unwrap().clone();
-        let e2 = Arc::clone(&eng);
-        anon_reuse_hook::set(&wal, move |_| e2.delete(old));
-        if let Ok(e) = eng.entity() {
-            assert_ne!(e, old, "消えた行と同じ eid で渡した");
-            assert!(eng.is_live(e), "返した eid {e:#x} の行が生きていない (消えた行の eid の delete が新しい行を消した)");
-        }
+        assert_eq!(eng.try_delete(old), Ok(()));
+        let new = eng.entity().unwrap();
+        assert_eq!(eng.slot_unchecked(new), slot, "前提: 空きの山の場所を使い回す");
+        assert_ne!(new, old, "消えた行と同じ eid で使い回した");
+        assert!(eng.is_live(new) && !eng.is_live(old));
         cleanup(eng, &p);
+    }
+
+    /// 表の無い DB (anonymous) で、 断れない道 (受信の Delete) が kill を書けなかった場所は払い出さない: 消す道 (`live_free`) が空きの
+    /// 山に積まず、 山から取る道 (`entity()` の `reuse`) も覚えた場所を外す。 守りは 2 つで、 どちらか一方で足りる (片方ずつ外しても
+    /// 通り、 両方外すと落ちる)。 anonymous の覚えた場所は、 kill をやり直せても山に戻さない (使わなくなる)。 消えた行の eid の書き込みは
+    /// 断る。
+    ///
+    /// falsify: `live_free` の `unkilled ||` と `reuse` の `is_unkilled` を両方外すと、 消えた行と同じ eid で払い出す。
+    #[test]
+    fn an_anonymous_slot_quarantined_by_a_received_delete_is_not_given_out() {
+        let p = path("anonrecv");
+        let mut eng = Engine::create_with_capacity(&p, CAP).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let rows: Vec<u64> = (0..CAP).map(|_| eng.entity().unwrap()).collect();
+        eng.delete(rows[0]);
+        let first = eng.entity().unwrap(); // 場所 0 を使い回す = v15
+        assert!(eng.generations().moved() && eng.slot_unchecked(first) == 0, "前提: v15");
+        let old = rows[39_000];
+        let slot = eng.slot_unchecked(old);
+        assert!(beyond_gen_commit(&eng, slot), "前提: 場所 {slot} は gen.seg の commit の外");
+        eng.set_space_margin(NO_SPACE);
+        assert!(eng.remote_delete_apply(old, enchudb_oplog::Hlc { wall: 1, logical: 0, peer: 2 }), "前提: 受信の Delete は断らない");
+        assert!(!eng.is_live(old) && eng.generations().is_unkilled(slot), "前提: kill を書けなかった");
+        let got = eng.entity();
+        assert!(got.is_err(), "kill を書けなかった場所を払い出した: {got:?} (消えた行 {old:#x})");
+        eng.set_space_margin(0);
+        let hid = eng.himo_id("v").unwrap() as u16;
+        assert_eq!(eng.try_tie_to_by_id(old, hid, 7u32), Err(TieRejected::DeadRow), "消えた行の eid の書き込みを通した");
+        let got = eng.entity();
+        assert!(got.is_err(), "kill を書けなかった場所を払い出した (空きが戻った後): {got:?} (消えた行 {old:#x})");
+        cleanup(eng, &p);
+    }
+
+    /// PR #977 の読み直し [4]: 名前で束ねた行の切り離し (#581) が、 畳んだ自分の行 (#612) の場所を 「消えた slot」 にする所で、
+    /// 世代を上げてから別名を外す。 逆の順では間の一瞬 (`split_release_hook`) その場所が 「生きていない・畳んでいない・死の印なし」 に
+    /// 見え、 枯渇した表へ足した別の書き手が今の世代のまま払い出し、 その後の kill がその行を殺した。
+    ///
+    /// falsify: 別名を外す → 世代を上げる の順に戻すと、 割り込み点で足した行が生きていない。
+    #[test]
+    fn a_split_does_not_kill_a_row_given_out_from_the_released_folded_slot() {
+        let p = path("split");
+        let eng = {
+            let mut eng = Engine::create_with_cell_version(&p, 65_536).unwrap();
+            eng.define_table("owners", 1).unwrap();
+            eng.define_himo_in("owners", "name", ValueType::Number, 0).unwrap();
+            eng.define_table("notes", 2).unwrap();
+            eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+            let k = eng.himo_id("notes.note").unwrap() as u16;
+            eng.set_table_pk("notes", k).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            eng.set_peer_id(1);
+            eng
+        };
+        // 表 owners で 1 回使い回して v15 に
+        let o = eng.entity_in("owners").unwrap();
+        eng.delete(o);
+        let o2 = eng.entity_in("owners").unwrap();
+        eng.delete(o2);
+        assert!(eng.generations().moved(), "前提: v15");
+        let k = eng.himo_id("notes.note").unwrap() as u16;
+        let x = eng.entity_in("notes").unwrap();
+        eng.tie_to(x, "notes.note", 5u32);
+        let tx = eng.cell_hlc(x, k);
+        // Y の作成を X の作成より後の時刻に (時計を進める)
+        eng.observe_remote_hlc(enchudb_oplog::Hlc { wall: tx.wall + 10, logical: 0, peer: 2 });
+        let y = eng.entity_in("notes").unwrap();
+        eng.tie_to(y, "notes.note", 5u32);
+        let ty = eng.cell_hlc(y, k);
+        assert!(tx.wall + 1 < ty.wall, "前提: X は Y より前に作った ({tx:?} / {ty:?})");
+        assert!(eng.fold_rows_with_same_pk(y, k, 5, None) >= 1, "前提: 同じ名前の自分の行を畳んだ");
+        let xs = eng.slot_unchecked(x);
+        assert!(eng.is_folded_own_slot(xs) && !eng.entities.is_live(xs), "前提: X の場所は畳んだ自分の行");
+        // 切り離しが X の場所を 「消えた slot」 にする間に、 枯渇した表 notes へ別の書き手が足す
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let taken: Arc<std::sync::Mutex<Option<Result<u64, String>>>> = Arc::default();
+        let (e2, t2) = (eng.clone(), taken.clone());
+        split_release_hook::set(&wal, move |_| {
+            let r = std::thread::spawn(move || e2.entity_in("notes")).join().unwrap();
+            *t2.lock().unwrap() = Some(r);
+        });
+        let t = enchudb_oplog::Hlc { wall: tx.wall + 1, logical: 0, peer: 2 };
+        eng.remote_delete_apply(y, t);
+        let theirs = taken.lock().unwrap().take().expect("前提: 割り込み点を通った").expect("前提: 足せた");
+        let (live_y, live_theirs) = (eng.is_live(y), eng.is_live(theirs));
+        let later = eng.entity_in("notes").unwrap();
+        let live_later = eng.is_live(later);
+        cleanup(eng, &p);
+        assert!(live_y, "前提: 削除の後に作られた Y は残る");
+        assert_ne!(theirs, x);
+        assert!(live_theirs, "割り込み点で足した行 {theirs:#x} が消えた (切り離しの kill が当たった)");
+        assert_ne!(later, x, "別名を外した場所を、 畳んだ行と同じ eid で使い回した");
+        assert!(live_later);
     }
 }
 
@@ -5024,6 +5310,45 @@ mod slot_claim_tests {
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 
+    /// #970 (PR #977 の作り直し): 上の並びで、 `entity()` が 「上限に届いたら先に移る」 を見た後に別の thread が上限に届かせても、
+    /// 空きの山から v14 のまま (世代を持たずに) 使い回さない。 取る前に移ってから取り直す (`KeptFor::Move`)。 前は取って生かしてから
+    /// 移り、 生かした後に世代を上げていた (その間は消えた行の eid が照合を通る、 PR #977 の読み直し [2] と同じ窓)。
+    ///
+    /// falsify: `entity()` の空きの山の `reuse` で 「移り終える前は残す」 を外すと、 消えた行と同じ eid で使い回す。
+    #[test]
+    fn an_anonymous_reuse_that_reaches_the_limit_late_moves_before_taking_the_slot() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-anonlate-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 3).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let _b = eng.entity().unwrap();
+        eng.delete(a);
+        assert!(!eng.generations().active(), "前提: v14");
+        // 上限を見た後に、 別の thread が最後の新しい場所を取る (上限に届かせる)
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let other: Arc<Mutex<Option<Result<u64, String>>>> = Arc::default();
+        let (e2, o2) = (eng.clone(), other.clone());
+        anon_alloc_hook::set(&wal, move |_| {
+            let r = std::thread::spawn(move || e2.entity()).join().unwrap();
+            *o2.lock().unwrap() = Some(r);
+        });
+        let c = eng.entity().unwrap();
+        let theirs = other.lock().unwrap().take().expect("前提: 割り込み点を通った").expect("前提: 最後の新しい場所を取れた");
+        let (live_c, live_a) = (eng.is_live(c), eng.is_live(a));
+        let moved = eng.generations().moved();
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert_eq!(enchudb_oplog::eid_local(theirs), 2, "前提: 別の thread は最後の新しい場所を取った");
+        assert_eq!(c as u32 & 0xFF_FFFF, a as u32, "前提: 空きの山の場所を使い回した");
+        assert!(moved, "使い回す前に v15 に移らなかった");
+        assert_ne!(c, a, "消えた行と同じ eid で使い回した");
+        assert!(live_c && !live_a);
+    }
+
     /// #883 の逆の並び: 全部なめで穴として拾った slot を取り出した書き手 (Y) が印を立てる前に、 払い出し位置からその slot を取った
     /// 書き手 (X) が先に印を立てても、 Y は同じ slot を返さない (前は取り出す時に 「生きていない」 を確かめてから立て、 結果を見なかった)。
     #[test]
@@ -5062,6 +5387,60 @@ mod slot_claim_tests {
         cleanup(&path, eng);
         let (mine, theirs) = (mine.expect("前提: X は払い出された"), theirs.expect("前提: Y は払い出された"));
         assert_ne!(mine, theirs, "最後の slot {mine:#x} を 2 つの行に払い出した");
+    }
+
+    /// PR #977 の読み直し [1]: 上の並びを v15 の DB で (先に別の表で 1 回使い回して移る)。 払い出し位置から取って生かす前の場所は
+    /// 「生きていない・死の印なし」 なので、 枯渇を見た別の書き手 (Y) の全部なめ・取り出しが、 その場所を 「消す時に世代を上げ損ねた
+    /// 場所」 と読んで kill すると、 X が生かして返した行が生まれた時から 「消えた行」 になる (場所は 「生きている + 死の印」)。
+    #[test]
+    fn a_popped_slot_claimed_first_from_next_local_stays_live_in_a_v15_db() {
+        use std::sync::mpsc::channel;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-slotclaim-pop15-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("u", 1).unwrap();
+        eng.define_table("t", 4).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        // 表 u で 1 回使い回して v15 に移る
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u);
+        let u2 = eng.entity_in("u").unwrap();
+        assert!(eng.generations().moved() && u2 != u, "前提: v15");
+        for _ in 0..3 {
+            eng.entity_in("t").unwrap();
+        }
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (x_at, x_at_rx) = channel::<()>();
+        let (x_go, x_go_rx) = channel::<()>();
+        let (y_at, y_at_rx) = channel::<()>();
+        let (y_go, y_go_rx) = channel::<()>();
+        claim_gap_hook::set(&wal, move |_| {
+            x_at.send(()).unwrap();
+            x_go_rx.recv().unwrap();
+        });
+        pop_claim_hook::set(&wal, move |_| {
+            y_at.send(()).unwrap();
+            y_go_rx.recv().unwrap();
+        });
+        let ex = eng.clone();
+        let x = std::thread::spawn(move || ex.entity_in("t"));
+        x_at_rx.recv().unwrap();
+        let ey = eng.clone();
+        let y = std::thread::spawn(move || ey.entity_in("t"));
+        y_at_rx.recv().unwrap();
+        x_go.send(()).unwrap();
+        let mine = x.join().unwrap().expect("前提: X は払い出された");
+        y_go.send(()).unwrap();
+        let theirs = y.join().unwrap().expect("前提: Y は払い出された");
+        let slot = eng.slot_unchecked(mine);
+        let (live, dead) = (eng.is_live(mine), eng.generations().is_dead(slot));
+        cleanup(&path, eng);
+        assert_ne!(mine, theirs, "最後の slot {mine:#x} を 2 つの行に払い出した");
+        assert!(live, "X が払い出した行 {mine:#x} が生まれた時から消えた行になった (全部なめ / 取り出しが生かす前の場所を kill した)");
+        assert!(!dead, "生きている場所 {slot} に死の印が立った");
     }
 
     /// #882: 畳んだ自分の行を戻している最中 (生きている印 / 別名を外す の間) に、 枯渇した表へ別の書き手が足しても、 戻している
@@ -6780,6 +7159,23 @@ mod floor_write_hook {
 /// 無くし、 gen.seg を伸ばせない形を作る)。
 #[cfg(test)]
 mod move_fill_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// PR #977 の読み直し [4] の test: 名前で束ねた行の切り離し (`split_later_identities`) が、 畳んだ自分の行の場所を 「消えた slot」 に
+/// する所の、 世代を上げる と 別名を外す の間の割り込み点 (その間に枯渇した表へ別の書き手が足す形を作る)。
+#[cfg(test)]
+mod split_release_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -15749,10 +16145,11 @@ impl Engine {
                     if let Some(wal) = self.oplog.as_ref() {
                         pop_claim_hook::call(wal);
                     }
-                    // #970: 消す時に世代を上げ損ねた場所 (v15 に移る前に一覧に積み、 移る手順の穴埋めで上げられなかった場所も) は、
-                    // 上げてから使い回す。 上げられなければ渡さない (一覧からも外す。 次に枯渇した時の拾い直し `rebuild_free_locals` が
-                    // また上げてみる)
-                    if !table.is_reserved() && self.unkilled_slot(g) && !self.raise_unkilled_slot(g) {
+                    // #970: 行が消えた時に kill を書けなかった場所 (`Generations::unkilled`、 断れない消す道が空き不足に当たった) は、
+                    // kill をやり直せた時だけ使い回す (行を握った後に。 書けなければ渡さず一覧からも外す。 次に枯渇した時の拾い直しが
+                    // やり直す)。 状態 (生きていない・死の印なし) からは推さない: 払い出し位置から取って生かす前の場所と見分けられず、
+                    // 生かした行を殺した (PR #977 の読み直し [1])
+                    if !table.is_reserved() && self.generations().is_unkilled(g) && !self.retry_kill_locked(g) {
                         continue;
                     }
                     // #925 の C2: 前の住人の後始末 (前の宛名の覚え・自分の消えた行の退避・翻訳した行の写像を外す・場所ごとの名前の
@@ -15884,8 +16281,9 @@ impl Engine {
             }
         };
 
-        // #731: 世代を使い切った場所は渡さない (落ちた後に払い出し位置が引退した場所の手前に戻った時だけ来る)
-        if self.generations().retired(global) {
+        // #731: 世代を使い切った場所は渡さない (落ちた後に払い出し位置が引退した場所の手前に戻った時だけ来る)。 #970: kill を書け
+        // なかった場所も (開く時の突き合わせが空き不足で書けず、 払い出し位置がその手前に戻っていた時だけ来る。 拾い直しがやり直す)
+        if self.generations().retired(global) || self.generations().is_unkilled(global) {
             return self.entity_in(table_name);
         }
         // #731: 落ちた後に払い出し位置が消した場所の手前に戻った時は、 その場所に 「死んでいる」 印がある (生かす前に落とす)
@@ -15919,22 +16317,20 @@ impl Engine {
     fn rebuild_free_locals(&self, tid: usize) -> bool {
         use std::sync::atomic::Ordering;
         let table = &self.tables[tid];
+        // #970: kill を書けなかった場所 (`Generations::unkilled`) の kill を、 拾う前にやり直す (空きが戻っていれば、 その場所は
+        // 次の世代で拾える)。 `free_locals` を握る前に (gen.seg を伸ばす I/O を表の lock の下でしない)。 覚えた場所が無ければ atomic 1 回
+        if !table.is_reserved() {
+            self.retry_unkilled();
+        }
         let mut fl = table.free_locals.lock().unwrap();
         if !fl.is_empty() {
             return true; // 別 thread が再構築済み
         }
         let allocated = table.next_local.load(Ordering::Acquire).min(table.capacity());
         let ring = is_sync_ring_table(&table.name);
-        // #970: 消す時に世代を上げ損ねた場所 (gen.seg を伸ばせなかった) は、 ここで上げられた時だけ拾う。 上げられないのに拾うと、 取り
-        // 出す `entity_in` が上げられずに外し、 枯渇した表がまたここで拾っては外す (払い出し位置の道に落ちない)。 開き直した後も同じ
-        // (印の無い場所は印が無いまま残る)。 行の lock は待たない (握れなければ今回は拾わない、 `entity_in` の取り出しと同じ順)
-        let raised = |g: u32| {
-            if table.is_reserved() || !self.unkilled_slot(g) {
-                return true;
-            }
-            let Some(_row) = self.row_locks.try_write(g) else { return false };
-            !self.entities.is_live(g) && self.raise_unkilled_slot(g)
-        };
+        // #970: やり直しても kill を書けない場所は拾わない。 拾うと、 取り出す `entity_in` が外し、 枯渇した表がまたここで拾っては外す
+        // (払い出し位置の道に落ちない)
+        let raised = |g: u32| !self.generations().is_unkilled(g);
         // #868: 消した行の一覧から拾う (枠の全部をなめない)。 一覧は、 積んだ後に生き返った slot (全部なめが同じ穴を拾って使い回した、
         // 畳んだ自分の行を戻した)、 同じ slot の 2 度目の削除 (重複)、 積んだ後に畳んだ自分の行の slot (#612) を含みうるので、 全部なめと
         // 同じ条件で選び直す (取り出す `entity_in` も同じ条件で見る)。 ここに来るのは表が枯渇した時 = 一覧の local は全部払い出し済み。
@@ -17544,7 +17940,7 @@ impl Engine {
         }
         // #731: 上限に達した後の払い出しは空きの山から使い回す = 先に v15 に移る (払い出してから移ると、 世代を上げるまでの間、
         // 使い回した場所が消えた行と同じ eid (世代 0) で生きている。 その間に古い eid の delete が来ると新しい行に当たる)。 間に
-        // 別の thread が上限に届かせた時は下の道 (払い出した後に移る) に落ちる
+        // 別の thread が上限に届かせた時は、 空きの山から取る前に下の `reuse` が見て移り直す
         if !self.generations().moved()
             && self.can_move_to_generations()
             && self.entities.next_eid() >= self.entities.max_entities()
@@ -17556,48 +17952,70 @@ impl Engine {
         // 上限到達後の `allocate` は free stack から slot を再利用する。
         // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
         // #731: 「死んでいる」 印は生きている印を立てる前に落とす (`Generations::revive`)
-        let Some((local, reused)) = self.entities.allocate_tracked_with(|slot| self.revive_slot(slot)) else {
-            self.record_fault(
-                FaultKind::EntitySpace,
-                "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
-            );
-            return Err(format!(
-                "entity space exhausted: max_entities={} and the free stack is empty — \
-                 delete entities to free slots, or recreate the DB with a larger \
-                 create_with_capacity (remaining_eid_space() で残量が見られる)",
-                self.entities.max_entities(),
-            ));
+        // #970: 使い回す場所の世代は、 生きている印を立てる **前に** 上げる (PR #977 の読み直し [2]: 生かしてから上げると、 その間は
+        // 消えた行の eid (世代 0) が照合を通り、 その eid の delete が生かした場所を殺して空きの山に積み直し、 同じ eid を 2 回渡した)。
+        // 上げられなければ (gen.seg を伸ばせない) 山に残して断る。 世代を持たない DB で使い回す時は、 取る前に移る (移る手順は消す
+        // 書き手を待つので、 空きの山の lock の下では移れない = 残して、 移ってから取り直す)
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            anon_alloc_hook::call(wal);
+        }
+        let kept_for = std::cell::Cell::new(KeptFor::Move);
+        let gens = self.generations();
+        let alloc = self.entities.allocate_tracked_with(
+            |slot| self.revive_slot(slot),
+            |slot| {
+                if !gens.moved() && self.can_move_to_generations() {
+                    kept_for.set(KeptFor::Move);
+                    return crate::entity_set::Reuse::Keep;
+                }
+                // 世代を使い切った場所と、 kill を書けなかった場所 (開く時の突き合わせが書けなかった、 #970) は二度と渡さない
+                if gens.retired(slot) || gens.is_unkilled(slot) {
+                    return crate::entity_set::Reuse::Discard;
+                }
+                // 世代 0 = v14 の間に消えた場所 (移る手順の穴埋めが上げる。 ここに来るのは、 開く時の再生の Delete が上げられなかった
+                // 場所 = #979 の残り)
+                if gens.get(slot) == 0 && !self.raise_generation(slot, 1) {
+                    kept_for.set(KeptFor::Space);
+                    return crate::entity_set::Reuse::Keep;
+                }
+                self.revive_slot(slot);
+                crate::entity_set::Reuse::Take
+            },
+        );
+        let (local, reused) = match alloc {
+            crate::entity_set::Allocated::Fresh(l) => (l, false),
+            crate::entity_set::Allocated::Reused(l) => (l, true),
+            crate::entity_set::Allocated::Kept(slot) => {
+                return match kept_for.get() {
+                    KeptFor::Move => {
+                        self.move_to_generations().map_err(|e| format!("entity(): {e}"))?;
+                        self.entity()
+                    }
+                    KeptFor::Space => Err(format!(
+                        "entity(): the slot to reuse needs a new generation, and gen.seg cannot grow (disk space, #970) — slot \
+                         {slot} is kept for later"
+                    )),
+                };
+            }
+            crate::entity_set::Allocated::Full => {
+                self.record_fault(
+                    FaultKind::EntitySpace,
+                    "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
+                );
+                return Err(format!(
+                    "entity space exhausted: max_entities={} and the free stack is empty — \
+                     delete entities to free slots, or recreate the DB with a larger \
+                     create_with_capacity (remaining_eid_space() で残量が見られる)",
+                    self.entities.max_entities(),
+                ));
+            }
         };
         #[cfg(test)]
         if reused && let Some(wal) = self.oplog.as_ref() {
             anon_reuse_hook::call(wal);
         }
         if reused {
-            // #731: 最初の使い回しで v15 に移る。 この場所はもう生きている印が立っている (移る時の穴埋めが見ない) ので、 世代 0
-            // (v14 の間に消えた場所) なら自分で上げる。 移り終えたかに関わらず見る (取り出した後に別の thread が移り終えた形でも)
-            if !self.generations().moved()
-                && self.can_move_to_generations()
-                && let Err(e) = self.move_to_generations()
-            {
-                self.live_free(local, None);
-                return Err(format!("entity(): {e}"));
-            }
-            // #970: 上げられなければ (gen.seg を伸ばせない) 渡さない。 世代 0 のまま渡すと、 消えた行と同じ eid になる。 空きの山に
-            // 戻して断る (次の `entity()` が取り出して上げ直す。 引退と違い、 空きが戻れば使える)
-            if self.generations().get(local) == 0 && !self.raise_generation(local, 1) {
-                self.entities.free(local);
-                return Err(format!(
-                    "entity(): the slot to reuse needs a new generation, and gen.seg cannot grow (disk space, #970) — slot {local} is \
-                     kept for later"
-                ));
-            }
-            if self.generations().retired(local) {
-                // 世代を使い切った場所は渡さない (空きの山から外したまま、 次を取る)。 「死んでいる」 印は生かす前にも落としていない
-                // (引退した場所は落とさない、 #901) が、 念のため立てる
-                self.kill_generation(local, self.generations().retired_mark());
-                self.entities.free_without_reuse(local);
-                return self.entity();
-            }
             // #779: `entity_in` の再利用枝と同じ
             self.remember_former_address(local, true);
             self.clear_cell_versions(local);
@@ -18677,8 +19095,8 @@ impl Engine {
         // F1: 世代と 「死んでいる」 印を 1 回の store で書いてから生きている印を下ろす (本体の書き出しは止めない。 2 つの segment の
         // 片方だけ届いた像は、 開く時の突き合わせ `reconcile_generations` が 「消す前」 か 「消した後」 に揃える)
         // #970: 世代も 「死んでいる」 印も書けなかった (gen.seg を伸ばせない) 場所は、 空きの山 (anonymous の `entity()` が取り出す) に
-        // 積まない。 積むと、 取り出した `entity()` が世代を上げられなければ、 消えた行と同じ eid で渡す (上げられても、 生かしてから
-        // 上げるまでの間は消えた行の eid が新しい行に当たる)。 表の場所は使い回す道が上げ直してから使う (`raise_unkilled_slot`)
+        // 積まない (積むと、 取り出した `entity()` が消えた行と同じ eid で渡す)。 アプリの消す道は WAL に積む前に page を commit して
+        // おくので (`gen_room`) ここで書けないのは断れない道だけ。 場所は `kill_generation` が覚え、 表の使い回しも飛ばす
         let mut unkilled = false;
         if on
             && (row_gen.is_some() || was_live)
@@ -20915,9 +21333,13 @@ impl Engine {
     }
 
     /// 行 `slot` の lock の下で、 `eid` がまだその場所の住人か ([`Self::app_slot`] を lock の外で引いた後)。
+    ///
+    /// #970: kill を書けなかった場所 (`Generations::unkilled`) は住人が居ない (行は消えたが世代が同じ = 消えた行の eid が照合を通る)。
+    /// 通すと、 消えた行の eid の書き込みが死んだ場所に cell を置いて WAL に載り、 きれいに閉じずに開くと、 突き合わせが削除を完了させた
+    /// 後の再生がその行を生き返らせた (PR #977 の読み直し [3])。 覚えた場所が無ければ atomic の load 1 回。
     #[inline]
     fn app_slot_holds(&self, eid: enchudb_oplog::EntityId, slot: u32) -> bool {
-        self.app_slot(eid) == Some(slot)
+        self.app_slot(eid) == Some(slot) && !self.generations().is_unkilled(slot)
     }
 
     /// アプリの書き込みが行 `slot` の lock を取る所。 lock の下で `app` (アプリの eid) がまだその場所の住人か確かめ直す (lock の外で
@@ -21246,9 +21668,10 @@ impl Engine {
     }
 
     /// 場所の行が消える: 世代を `g` 以上にし、 「死んでいる」 印を立てる (1 回の store、 表の印も立てる)。 生きている印を下ろす前に呼ぶ。
-    /// 書けなければ (ディスクの空き) fault に積んで false (#970: 世代も印も書けていない = その場所を使い回すと消えた行と同じ eid に
-    /// なる。 呼び手は使い回さない / 使い回す前に上げ直す、 [`Self::raise_unkilled_slot`])。 書けない形は、 場所の page (8192 場所) に
-    /// gen.seg の commit がまだ無い時 = 世代 0 の場所だけ (世代 > 0 の場所は page を書いた事がある)。
+    /// 書けなければ (ディスクの空き) fault に積み、 場所を覚えて (`Generations::unkilled`) false。 書けない形は、 場所の page (8192
+    /// 場所) に gen.seg の commit がまだ無い時だけ (`Generations::cell_for_write`)。 #970: 消す道は WAL に積む前に page を commit
+    /// しておく ([`Self::gen_room`]、 できなければ断る) ので、 書けないのは断れない道 (受信の Delete・一緒に消える行・開く時の突き合わせ
+    /// など) だけ。 覚えた場所は使い回さず、 アプリの書き込みを断る (世代も印も書けていない = 消えた行の eid が照合を通る)。
     fn kill_generation(&self, slot: u32, g: u32) -> bool {
         if !self.generations().active() {
             return true;
@@ -21259,27 +21682,57 @@ impl Engine {
         self.mark_gen_session_dirty();
         if self.generations().kill(slot, g).is_err() {
             self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 場所の世代を上げられない");
+            self.generations().note_unkilled(slot);
+            return false;
+        }
+        self.generations().forget_unkilled(slot);
+        true
+    }
+
+    /// #970: 行 `slot` を消す前に (WAL に積む前に)、 gen.seg のその場所の page を commit しておく。 この後の消す道の kill は commit の
+    /// 失敗では落ちない (commit は縮まない) = 世代も 「死んでいる」 印も書けないまま場所を空ける形を作らない。 commit できなければ
+    /// (ディスクの空き) fault に積んで false = 呼び手は消す操作を断る (何も変えない、 #553 / #554 の `WalSpace` と同じ)。 世代を
+    /// 持たない DB (v14) と予約の表 (世代を持たない) は何もしない。 commit 済みなら atomic の load だけ。
+    fn gen_room(&self, slot: u32) -> bool {
+        let gens = self.generations();
+        if !gens.active() || !self.slot_is_generational(slot) {
+            return true;
+        }
+        if gens.commit_slot(slot).is_err() {
+            self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 行の場所の世代を書けないので消さない");
             return false;
         }
         true
     }
 
-    /// #970: 消す時に世代を上げ損ねた場所か: v15 に移り終えた DB の、 世代を持つ表の、 生きていない場所なのに 「死んでいる」 印が
-    /// 無い。 消す道 (`live_free` / 再生の Delete) と移る手順の穴埋め (v14 の間に消した場所) は必ず印を立てるので、 印が無いのは
-    /// gen.seg を伸ばせずに書けなかった場所 (と、 払い出し位置を取った後・生かす前に落ちた場所 = 世代 0 の eid を誰にも渡していない)。
-    /// 呼ぶのは、 使い回しの候補 (払い出し済みの範囲の、 生きていない・畳んだ自分の行でない・引退していない場所) だけ。 払い出し
-    /// 位置から取る新しい場所 (印も世代も無い) には呼ばない。 移り終える前 (v14 / 移れない DB) は false (使い回しは今まで通り)。
-    fn unkilled_slot(&self, slot: u32) -> bool {
+    /// #970: kill を書けなかった場所 (`Generations::unkilled`) の kill を、 場所の行を握ってやり直す。 生きていない時だけ (生きて
+    /// いれば外す)。 やり直せたか (= 使い回してよい: 次の世代、 死んでいる、 引退していない)。 呼び手は行の lock を握っている。
+    ///
+    /// 覚えた場所は、 この process で生きていた (払い出し位置はその先) か、 開く時の突き合わせが払い出し済みの範囲で見た場所なので、
+    /// 払い出し位置から取って生かす前の場所ではない (PR #977 の読み直し [1] の形は作らない)。
+    fn retry_kill_locked(&self, slot: u32) -> bool {
         let gens = self.generations();
-        gens.moved() && !gens.is_dead(slot) && self.slot_is_generational(slot)
+        debug_assert!(self.row_locks.held_by_me(slot), "行 {slot} の lock を握っていない");
+        if self.entities.is_live(slot) {
+            gens.forget_unkilled(slot);
+            return false;
+        }
+        self.kill_generation(slot, gens.get(slot) + 1) && !gens.retired(slot)
     }
 
-    /// #970: [`Self::unkilled_slot`] の場所を、 使い回す前に消す道と同じく 「次の世代、 死んでいる」 にする (gen.seg を伸ばせるように
-    /// なっていれば)。 使い回してよいか (上げられた・引退していない)。 上げられなければ false = 使い回さない (今の世代で渡すと、 消えた
-    /// 行の eid のまま)。 生きていない場所を、 その場所の行の lock を握って呼ぶ (受信が同じ場所を生かす道と並べる、 #931)。
-    fn raise_unkilled_slot(&self, slot: u32) -> bool {
+    /// #970: kill を書けなかった場所の kill を全部やり直す (行を待たずに握れた場所だけ、 [`Self::retry_kill_locked`])。 残ったか。
+    /// 覚えた場所が無ければ atomic の load 1 回。
+    fn retry_unkilled(&self) -> bool {
         let gens = self.generations();
-        self.kill_generation(slot, gens.get(slot) + 1) && !gens.retired(slot)
+        if !gens.has_unkilled() {
+            return false;
+        }
+        for slot in gens.unkilled_slots() {
+            if let Some(_row) = self.row_locks.try_write(slot) {
+                self.retry_kill_locked(slot);
+            }
+        }
+        gens.has_unkilled()
     }
 
     /// 場所を生かす (生きている印を立てる、 既に生きていれば何もしない)。 「死んでいる」 印を先に落とす (`Generations::revive` の doc)。
@@ -21375,6 +21828,11 @@ impl Engine {
     fn clear_gen_session_dirty(&self) {
         let gens = self.generations();
         if !gens.active() {
+            return;
+        }
+        // #970: kill を書けなかった場所が残るなら倒さない (次に開く時の突き合わせ `reconcile_generations` の 2. が、 生きていない・
+        // 死の印の無い場所の削除を完了させる。 倒すと、 開き直した後にその場所を消えた行と同じ eid で使い回す)。 先にやり直す
+        if self.retry_unkilled() {
             return;
         }
         let _l = gens.dirty_lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -21513,7 +21971,9 @@ impl Engine {
         if let Some(wal) = self.oplog.as_ref() {
             move_fill_hook::call(wal);
         }
-        // 4. (#970: gen.seg を伸ばせずに上げられなかった場所は、 印の無いまま残る。 使い回す道が上げ直す、 `raise_unkilled_slot`)
+        // 4. #970: 上げられなければ (gen.seg を伸ばせない) 移らずに Err (移り終えた印を立てない = 使い回しは始まらない。 次に
+        // 使い回す時に 4. からやり直す)。 前は印の無いまま残して移り終え、 使い回す道が状態から推して上げ直していた (PR #977 の
+        // 読み直し [1] の形)。 上げられなかった場所は `kill_generation` が覚え、 アプリの書き込みを断る (消えた行の eid が照合を通る)
         for (tid, t) in self.tables.iter().enumerate() {
             if t.is_reserved() {
                 continue;
@@ -21524,7 +21984,15 @@ impl Engine {
                     if !self.is_folded_own_slot(slot) && !self.entities.is_live(slot) && self.generations().get(slot) == 0 {
                         // 見直しの購読に、 消えた行の世代 (0) を覚えさせてから上げる (`touched` にアプリの持つ eid を出す)
                         self.live.note_gen(slot, 0);
-                        self.kill_generation(slot, 1);
+                        if !self.kill_generation(slot, 1) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::StorageFull,
+                                format!(
+                                    "moving to eid generations (file version 15): gen.seg cannot grow to raise the generation of \
+                                     slot {slot} deleted before the move (disk space, #970) — not moved, retried on the next reuse"
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -22911,11 +23379,19 @@ impl Engine {
                     if self.is_folded_own_slot(fl) {
                         // #731: 別名を外した場所は 「消えた行」 で使い回せる = 消す道と同じく世代を上げる (畳む時は上げていない)。
                         // 移る手順と揃える (別名を外すのを消す道の門の中で)
+                        // PR #977 の読み直し [4]: 上げてから別名を外す。 逆の順では間の一瞬、 場所が 「生きていない・畳んでいない・死の
+                        // 印なし」 に見え、 枯渇した表の拾い直し / 取り出しが今の世代のまま新しい行に払い出し、 その後の kill がその行を
+                        // 殺した (場所は 「生きている + 死の印」)。 畳んでいる間は使い回しの道が飛ばす (`is_folded_own_slot` を先に読む)。
+                        // 上げた時点で畳んだ行の eid (今の世代) は転送されない (`app_slot` は世代を先に照合する) = 外した後と同じ
                         let on = self.generations().enter_free();
-                        self.eid_translator.unalias(peer, fl);
                         if on && self.slot_is_generational(fl) {
                             self.kill_generation(fl, self.generations().get(fl) + 1);
                         }
+                        #[cfg(test)]
+                        if let Some(wal) = self.oplog.as_ref() {
+                            split_release_hook::call(wal);
+                        }
+                        self.eid_translator.unalias(peer, fl);
                         self.generations().exit_free();
                         self.set_tombstone_local(fl, t);
                     }
@@ -24276,22 +24752,56 @@ impl Engine {
 
     // ──── delete ────
 
+    /// 行を消す。 消さなかった時 (下の [`Engine::try_delete`] の `Err`) は何も変えない (WAL にも積まない)。 容量で断った時は
+    /// `Engine::fault_count` に積まれる。
     pub fn delete(&self, eid: enchudb_oplog::EntityId) {
+        let _ = self.delete_with(eid, true);
+    }
+
+    /// [`Engine::delete`] の結果付き版。 消さなかった時は理由を返す (何も変えない、 WAL にも積まない):
+    ///
+    /// - `DeadRow`: eid の行がもう無い (消えた行の eid / 場所を使い回す前の eid)
+    /// - `Fault(DiskSpace)`: #970 — 場所を使い回したことのある DB (file version 15) で、 行の場所の世代と 「死んでいる」 印を書く
+    ///   `gen.seg` の page を commit できない (ディスクの空き不足)。 消すと、 その場所を次の行が消えた行と同じ eid で使い回す (#731 の
+    ///   取り違え) ので、 空きが戻るまで消さない
+    /// - `Fault(WalSpace)`: WAL に載らない (#553 / #554)。 `Fault(SegmentIo)`: 列の segment を開けない (#534)
+    /// - `OlderThanCell`: 記録した削除より古い版数で消そうとした (時計が戻った)
+    pub fn try_delete(&self, eid: enchudb_oplog::EntityId) -> Result<(), TieRejected> {
+        self.delete_with(eid, true)
+    }
+
+    /// #970: 断れない削除 (sync の道: state を当てた後の掃除。 相手に無い行を消さずに残すと相手と食い違う)。 行の場所の世代を書く
+    /// `gen.seg` の page を commit できなくても消す。 その時は場所を覚えて (`Generations::unkilled`) 使い回さず、 消えた行の eid の
+    /// 書き込みを断る (受信の Delete と同じ)。 他は [`Engine::delete`] と同じ。
+    #[doc(hidden)]
+    pub fn delete_or_quarantine(&self, eid: enchudb_oplog::EntityId) {
+        let _ = self.delete_with(eid, false);
+    }
+
+    /// `refuse_without_gen_room`: gen.seg の page を commit できない時に断るか ([`Engine::try_delete`] の `Fault(DiskSpace)`)。
+    fn delete_with(&self, eid: enchudb_oplog::EntityId, refuse_without_gen_room: bool) -> Result<(), TieRejected> {
         let app = eid;
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は何もしない (#612: 畳んだ自分の行の eid は残す行へ)
-        let Some(eid) = self.app_slot(app) else { return };
+        let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
         // #534: 消すには全部の列の古い値を読む (索引と Leaf の領域の片付け)。 開けない列があれば何も積まずに断る (途中まで
         // 消さない。 WAL に積んでから断ると、 配った相手でだけ消える)
-        if (0..self.himos.len()).any(|hid| self.load_column(hid).is_err()) {
-            return;
+        if let Some(e) = (0..self.himos.len()).find_map(|hid| self.load_column(hid).err()) {
+            return Err(e);
+        }
+        // #970: 行の場所の世代と 「死んでいる」 印を書く gen.seg の page を、 WAL に積む前に commit しておく (消す道の kill が commit の
+        // 失敗で落ちない)。 できなければ断る: 消してから kill を書けないと、 世代が上がらないまま場所が空き、 次の行がその場所を消えた
+        // 行と同じ eid で使い回す (#731 の取り違え)。 前は消してから 「上げ損ねた場所」 を状態で推して使い回す時に上げ直していて、
+        // 払い出し位置から取って生かす前の場所 (同じ状態) を殺した (PR #977 の読み直し [1])。 行の lock の前に (commit は I/O)。
+        // commit は縮まないので、 握った後も commit 済み
+        if refuse_without_gen_room && !self.gen_room(eid) {
+            return Err(TieRejected::Fault(FaultKind::DiskSpace));
         }
         // request17 step 4 (A-5): 削除は himo を持たないので eid 空間の tombstone
         // column に版数を記録する。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 行を握ってから積む (`append_local_op` の doc)
-        let Some(row) = self.lock_app_row(app, eid) else { return };
-        let row = Some(row);
+        let row = Some(self.lock_app_row(app, eid).ok_or(TieRejected::DeadRow)?);
         let oplog_eid = self.oplog_eid(eid);
         let (applying, valued) = self.local_apply_row(eid);
         // #877: 版数の無い DB は、 消す行を WAL に積む前に数える (#857 の止め)。 積んだ後・`apply_delete_in` の中で数える前に
@@ -24301,9 +24811,7 @@ impl Engine {
         if !self.has_cell_version() {
             self.note_freed_slot(eid, enchudb_oplog::Hlc::ZERO);
         }
-        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark()) else {
-            return;
-        };
+        let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark())?;
         self.at_apply_point(true);
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc, valued.as_deref());
         drop(applying);
@@ -24316,8 +24824,10 @@ impl Engine {
                 names_taken_hook::call(wal);
             }
             self.remove_rows_holding_names(eid, names, hlc);
+            Ok(())
         } else {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
+            Err(TieRejected::OlderThanCell)
         }
     }
 

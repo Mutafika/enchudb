@@ -1052,7 +1052,9 @@ impl Syncer {
                 if live && self.engine.slot_untouched(local) {
                     continue;
                 }
-                self.engine.delete(row);
+                // #970: 断らない削除 (場所の世代を書く gen.seg の page を commit できなくても消す。 書けなかった場所は engine が覚えて
+                // 使い回さない)。 断ると、 author に無い行がこの peer にだけ残る (cursor は進むので、 次の state まで直らない)
+                self.engine.delete_or_quarantine(row);
                 swept += 1;
             }
         }
