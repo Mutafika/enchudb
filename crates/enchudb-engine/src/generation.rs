@@ -122,10 +122,13 @@ fn commit_slot_in(r: &Region, slot: u32) -> std::io::Result<()> {
     if r.is_committed(need) {
         return Ok(());
     }
-    // 空きは伸ばす分の全部を数える (PR #977 の読み直し 4 の [5])。 手前の穴 (払い出していない場所の page) と先回りの page も、 後で
-    // 払い出した場所を消す時に初めて書く (block を取る) = 伸ばす時に数えておかないと、 その書き込みが #317 の数えの外になる (APFS は
-    // 書き出しの時に確保、 Linux の ext4 は mmap の穴への書き込みが空きの無い時に SIGBUS)。 前は場所の page から先だけ数え、 移る時・
-    // 開く時に 0 から伸ばす commit は最後の page と先回りだけだった
+    // 空きは伸ばす分の全部で確かめる (PR #977 の読み直し 4 の [5])。 手前の穴 (払い出していない場所の page) と先回りの page も、 後で
+    // 払い出した場所を消す時に初めて書く (block を取る)。 前は場所の page から先だけで確かめ、 移る時・開く時に 0 から伸ばす commit は
+    // 最後の page と先回りだけだった。
+    // 読み直し 5 の [J]: 守るのは伸ばす時の確かめ (その時に伸ばす分の全部の空きがあるか) だけ。 block は取らない (穴のまま): 伸ばした後に
+    // 他の書き込み・他の process が空きを使えば、 後で穴に書く時に足りないことはある (APFS は書き出しの時に確保して #317 の数えの外、
+    // Linux の ext4 は空きの無い時の mmap の穴への書き込みが SIGBUS = 前からの列の疎な書き込みと同じ)。 数え (#317 の未書き出しの量) は
+    // 伸ばした全部の分だけ増え、 次の gen.seg の書き出しで戻る (APFS では書き出すまでの間、 1 億場所の表が移る時なら 200 MiB 多く見積もる)
     let ahead = r.committed_len().saturating_sub(GEN_HEADER).clamp(COMMIT_AHEAD_MIN, COMMIT_AHEAD_MAX);
     r.ensure_committed_window((need + ahead).min(r.len()), 0)
 }
@@ -263,6 +266,11 @@ impl Generations {
 
     pub(crate) fn take_replay_unraised(&self) -> bool {
         self.replay_unraised.swap(false, Ordering::AcqRel)
+    }
+
+    /// 印が立っているか (取らずに見る。 PR #977 の読み直し 5 の [A]: 再生は最初の断りで止める)。
+    pub(crate) fn replay_refused(&self) -> bool {
+        self.replay_unraised.load(Ordering::Acquire)
     }
 
     /// PR #977 の読み直し 4 の [3]: 消す道が場所 `slot` の kill (世代と 「死んでいる」 印) を書けなかった (生かす前に page を commit する
@@ -651,6 +659,14 @@ impl Generations {
     #[inline]
     pub(crate) fn retired(&self, slot: u32) -> bool {
         self.active() && (self.get(slot) > self.max_gen() || self.is_unkilled(slot))
+    }
+
+    /// 世代を使い切ったか (引退の印) だけを見る ([`Self::retired`] から kill を書けなかった場所の覚えを除く)。 PR #977 の読み直し 5 の
+    /// [G]: 払い出し位置から取る場所は払い出し位置の先 = 生きたことが無い (覚えた場所ではありえない) ので、 覚えの Mutex と線形探索を
+    /// 通さない。
+    #[inline]
+    pub(crate) fn used_up(&self, slot: u32) -> bool {
+        self.active() && self.get(slot) > self.max_gen()
     }
 
     /// 場所の 2 B を書く準備 (commit を確かめ、 page の印を先に立てる)。 書く場所の atomic。 #970: 生かした場所の page は生かす前に

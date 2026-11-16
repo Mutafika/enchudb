@@ -278,6 +278,15 @@ enum ApplyResult {
     /// #210: **容量が足りず apply を拒否した**。 値は書いていないので、
     /// `SkippedOlder` (再配送不要) ではなく **cursor を止めて再配送させる**。
     RejectedCapacity,
+    /// PR #977 の読み直し 5 の [B]: 当てた (`Applied`) 後の続き (名前の削除優先で、 その名前より後に消された行を消す時の名前の束ねの
+    /// 切り離し) が容量で断られた。 record は当たっているので中継の一覧に当たった物として積み (ホストでない中継も載せる)、 続きを
+    /// 当て直すために cursor だけを止めて再配送させる (届き直した record は同じ版数・同じ中身で LWW が飛ばし、 #614 の確かめが消し
+    /// 直す)。 `RejectedCapacity` (= 何も当てていない、 #210) と分ける: 前は `RejectedCapacity` を返し、 ホストでない中継が当たった
+    /// record を配らず、 届き直した時は LWW で飛ばして配らない = 下流がその行の名前の書き込みを一度も受けなかった。
+    ///
+    /// 今の束ねの規則では起きない (束ねた identity の作成はその名前の書き込みの版数 = 行の名前の cell の版数以下なので、 当たった
+    /// 名前の書き込みより後に消された名前の行に、 その削除より後に作られた identity は居ない = 切り離しは払い出さない) 守り
+    AppliedRedeliver,
 }
 
 impl From<RemoteApply> for ApplyResult {
@@ -2298,10 +2307,10 @@ impl Syncer {
             };
             if let Some(list) = relay_accepted.as_deref_mut() {
                 let relayable = !matches!(rec.op, DecodedOp::Commit) && rec.author_peer != self_peer;
-                let applied = result == ApplyResult::Applied;
+                let applied = matches!(result, ApplyResult::Applied | ApplyResult::AppliedRedeliver);
                 let passed_over = match result {
                     ApplyResult::SkippedOlder | ApplyResult::Dropped | ApplyResult::DroppedVocab => true,
-                    ApplyResult::Applied | ApplyResult::RejectedCapacity => false,
+                    ApplyResult::Applied | ApplyResult::RejectedCapacity | ApplyResult::AppliedRedeliver => false,
                 };
                 if relayable && (applied || passed_over) {
                     list.push((idx, applied));
@@ -2312,8 +2321,12 @@ impl Syncer {
                 ApplyResult::SkippedOlder => out.skipped += 1,
                 ApplyResult::Dropped => out.dropped_unresolved += 1,
                 ApplyResult::DroppedVocab => out.dropped_vocab += 1,
-                ApplyResult::RejectedCapacity => {
-                    // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。
+                ApplyResult::RejectedCapacity | ApplyResult::AppliedRedeliver => {
+                    // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。 読み直し 5 の [B]: 当てた後の続きが断られた
+                    // record も (当てた分は `applied` にも数える = 派生 state を書き出してから cursor を決める)
+                    if result == ApplyResult::AppliedRedeliver {
+                        out.applied += 1;
+                    }
                     out.rejected_capacity += 1;
                     note_reject(&mut out, rec.hlc);
                     if hold_behind_refused {
@@ -2457,9 +2470,10 @@ impl Syncer {
                     match self.engine.name_deleted_at(*himo_id, PkValue::Local(value)) {
                         Some(t) if t > rec.hlc => {
                             // #970 (読み直し 4 の [1]): 切り離しが場所を払い出せなければ、 この record を再配送させる (届き直すと同じ名前の
-                            // 書き込みとして下の #614 の確かめが消し直す)
+                            // 書き込みとして下の #614 の確かめが消し直す)。 読み直し 5 の [B]: 名前の書き込みは当たっている = `AppliedRedeliver`
+                            // (中継は載せる。 前は `RejectedCapacity` で、 ホストでない中継が配らなかった)
                             if self.engine.remote_delete_apply_at_result(local_eid, row, t) == RemoteApply::RejectedCapacity {
-                                return ApplyResult::RejectedCapacity;
+                                return ApplyResult::AppliedRedeliver;
                             }
                         }
                         _ => {

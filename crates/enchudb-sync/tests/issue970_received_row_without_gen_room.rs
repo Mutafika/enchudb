@@ -369,3 +369,66 @@ fn a_delete_that_keeps_the_row_is_refused_whole_when_one_of_the_dead_slots_canno
         cleanup(p);
     }
 }
+
+const D: PeerId = 5;
+
+/// PR #977 の読み直し 5 の [B]: 当たった名前の書き込みの後に、 名前の削除優先 (その名前がこの書き込みより後に消された) で行を消す
+/// 切り離しが場所を払い出せない (空きの不足) 時、 record は当たっているので、 ホストでない中継 R はそれを配る (cursor だけを止めて
+/// 再配送させ、 届き直した record で消し直す)。 前は `RejectedCapacity` (= 何も当てていない、 #210) を返し、 中継の一覧に積まず、 届き
+/// 直した record は LWW で飛ばして配らない = 下流 D がその行の名前の書き込みを一度も受けなかった (他の列だけが届いた行は、 名前の無い
+/// 行として名前の削除を逃れて生き残る)。
+///
+/// この形は今の束ねの規則では起きない (束ねた identity の作成はその名前の書き込みの版数 = 束ねた行の名前の cell の版数以下なので、
+/// 当たった名前の書き込みより後に消された名前の行に、 その削除より後に作られた identity は居ない)。 守りなので、 束ねを手で作る: R の
+/// X の行 L を名前より先に払い出し (他の列が別の配りで先に届いた形)、 L に削除より後に作られた identity W を束ねる
+/// (`note_bound_identity`)。
+///
+/// falsify: 当てた後の切り離しの断りを `RejectedCapacity` に戻すと (前の形)、 D が X の名前の書き込みを受けない。
+#[test]
+fn a_name_write_applied_before_its_split_is_refused_is_still_relayed() {
+    let (pa, pc, pr, pd) = (tmp("relay-a"), tmp("relay-c"), tmp("relay-r"), tmp("relay-d"));
+    let a = make_named(&pa, A, 64);
+    let c = make_named(&pc, C, 64);
+    // R の `notes` は 1 枠: Z の消えた場所を X の行 L が使い回し、 切り離しが移す先は枠を足す (gen.seg の commit の外)
+    let r = make_named(&pr, R, 1);
+    let d = make_named(&pd, D, 64);
+    to_v15(&r);
+    r.set_gossip_remote_apply(true);
+    let net = Net::new(&[(A, &a), (C, &c), (R, &r), (D, &d)]);
+    let k = a.himo_id("notes.n").unwrap() as u16;
+    // A の X (名前 5) は、 C が Z (名前 5) を消すより前に作る
+    let x = a.entity_in("notes").unwrap();
+    a.tie_to(x, "notes.n", 5u32);
+    wait_past(a.cell_hlc(x, k).wall);
+    let z = c.entity_in("notes").unwrap();
+    c.tie_to(z, "notes.n", 5u32);
+    wait_past(c.cell_hlc(z, k).wall);
+    c.delete(z);
+    let t = c.tombstone_hlc(z);
+    net.publish(C, &c);
+    assert!(net.pull(R, C).applied >= 1, "前提: R が Z の作成と削除を受けた");
+    let l = r.resolve_remote_eid(x, k).expect("前提: R が X の行を払い出した");
+    r.note_bound_identity(l, enchudb_oplog::make_eid(7, 1), Hlc { wall: t.wall + 1000, logical: 0, peer: 7 });
+
+    r.set_gen_space_margin(NO_SPACE);
+    net.publish(A, &a);
+    let out = net.pull(R, A);
+    assert_refused(&out, "当てた後の名前の削除の切り離し");
+    assert!(r.is_live_unchecked(l), "前提: 断った (L はまだ消していない)");
+    r.set_gen_space_margin(0);
+    net.publish(R, &r);
+    net.pull(D, R);
+    let got = d.resolve_remote_eid_existing(x).is_some();
+
+    // 空きが戻ると届き直して、 R が L を消す
+    net.publish(A, &a);
+    let again = net.pull(R, A);
+    let l_live = r.is_live_unchecked(l);
+    drop((net, a, c, r, d));
+    for p in [&pa, &pc, &pr, &pd] {
+        cleanup(p);
+    }
+    assert!(got, "下流 D が X の名前の書き込みを受けていない (中継 R が当たった record を配らなかった)");
+    assert_eq!(again.rejected_capacity, 0, "空きが戻っても断った: {again:?}");
+    assert!(!l_live, "届き直した名前の書き込みで、 名前の削除優先が L を消していない");
+}

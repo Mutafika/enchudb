@@ -804,7 +804,10 @@ enum Split {
     NotBound,
     /// 切り離して消した
     Done,
-    /// #970 (PR #977 の読み直し 4 の [1]): 場所を払い出せない (gen.seg の page を commit できない)。 何も変えていない
+    /// #970 (PR #977 の読み直し 4 の [1]): 場所を払い出せない (gen.seg の page を commit できない)。 行・写像・名前・束ねは変えていない。
+    /// 元の行が消える枝 (と改名の切り離し) は払い出しの前に何も書いていない。 元の行が残る枝は、 先に払い出した消えた slot を返して
+    /// から断る (PR #977 の読み直し 5 の [M]): 返した slot は世代を 1 つ使い、 購読の 「消えた」 印 (`live.freed`) と、 使い回した slot
+    /// なら前の住人の後始末 (`prepare_reuse`、 sync する DB は `prev.seg` の記録) を残す (どれも空の行を 1 つ作って消したのと同じ)
     NoRoom,
 }
 
@@ -2756,6 +2759,23 @@ mod claim_gap_hook {
 /// できずに断った後・払い出し位置を戻す (CAS) 前。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod refuse_gap_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点 (PR #977 の読み直し 5 の [D] (a)): `entity_in` が空きの一覧から取り出した場所を 「覚えていない・生きていない」
+/// と読んだ後・場所の行を握る前。 置いた WAL で 1 回だけ呼ぶ。 呼ぶのは表の `free_locals` を握ったまま。
+#[cfg(test)]
+mod pop_checked_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -5106,6 +5126,119 @@ mod kill_fail_tests {
         assert_eq!(after.expect("空きが戻っても開けない"), Some(Some(7)), "空きが戻った open が中継した行を再生していない");
     }
 
+    /// PR #977 の読み直し 5 の [C]: 受信の払い出しが、 gen.seg の空きの不足でない I/O の失敗 (file を開き直す EMFILE・remap の ENOMEM・
+    /// `set_len` の EDQUOT など、 一時的でありうる) で断られた時は、 record を落とさず再配送させる (`RejectedCapacity`)。 場所が gen.seg の
+    /// 範囲の外 (`InvalidInput`、 再配送しても通らない) だけは落とす (`Ok(None)` = `Dropped`)。 失敗は `gen_io_fail_hook` で起こす。
+    ///
+    /// falsify: `alloc_result` が `EntityInError::Io` を `Skip` にすると (前の形)、 I/O の失敗で `Ok(None)` (cursor が越えて二度と届かない)。
+    #[test]
+    fn a_received_row_refused_by_a_gen_seg_io_failure_is_redelivered() {
+        let p = path("genio");
+        let eng = {
+            let mut eng = Engine::create_with_capacity(&p, 200_000).unwrap();
+            eng.define_table("u", 1).unwrap();
+            eng.define_table("pad", 100_000).unwrap();
+            eng.define_table("t", 16).unwrap();
+            eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            eng.set_peer_id(1);
+            eng
+        };
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u);
+        assert!(eng.entity_in("u").is_ok() && eng.generations().moved(), "前提: v15");
+        let hid = eng.himo_id("t.a").unwrap() as u16;
+        let foreign = enchudb_oplog::make_eid(9, 5);
+        gen_io_fail_hook::set(Some(io::ErrorKind::Other));
+        let io_failed = eng.try_resolve_remote_eid(foreign, hid);
+        gen_io_fail_hook::set(Some(io::ErrorKind::InvalidInput));
+        let out_of_range = eng.try_resolve_remote_eid(foreign, hid);
+        gen_io_fail_hook::set(None);
+        let mapped_while_refused = eng.resolve_remote_eid_existing(foreign).is_some();
+        let live_while_refused = eng.table_eid_usage("t").unwrap().live;
+        let later = eng.try_resolve_remote_eid(foreign, hid);
+        let faults = eng.fault_count(FaultKind::SegmentIo);
+        cleanup(eng, &p);
+        assert_eq!(io_failed, Err(RemoteApply::RejectedCapacity), "gen.seg の I/O の失敗で record を落とした (再配送されない)");
+        assert_eq!(out_of_range, Ok(None), "範囲の外 (再配送しても通らない) を再配送させた");
+        assert!(!mapped_while_refused && live_while_refused == 0, "断ったのに写像 / 行を作った");
+        assert!(later.is_ok_and(|e| e.is_some()), "失敗が止んだ後に払い出せない: {later:?}");
+        assert!(faults >= 1, "空きの不足でない I/O の失敗を fault `SegmentIo` に数えていない");
+    }
+
+    /// PR #977 の読み直し 5 の [A]: 再生が中継した record を 2 つ当てる。 1 つ目 (表 `s` の新しい行 F1、 場所は gen.seg の commit の中)
+    /// は払い出して当たり、 2 つ目 (表 `t` の新しい行 F2、 commit の外) が空きの不足で断る = 開くのを断る。 断るまでに再生が払い出した
+    /// F1 の場所の生きている印と値は共有の mmap の page にあり、 断った engine が書き出さなくても disk (次の open) に届く。 前は F1 の写像を
+    /// 置かずに断ったので、 空きが戻った open の再生が F1 を新しい場所に当て直し、 前の場所は写像の無い生きた行 (同じ値) として残った。
+    /// 今は断る前に再生が載せた写像を `.eidmap` に置き (`keep_replayed_mappings`)、 開き直した再生は同じ場所に当て直す。
+    ///
+    /// falsify: `keep_replayed_mappings` を外すと、 空きが戻った open の後に表 `s` の生きている行と値 7 の行が 1 つ多い。 (再生を最初の
+    /// 断りで止めるのを外しても、 この試験は通る: 後ろの record の払い出しも写像に載り、 読む時に払い出し位置が越える)
+    #[test]
+    fn a_refused_replay_keeps_the_mapping_of_a_relayed_row_it_placed_before_refusing() {
+        use crate::transport::WireRecord;
+        use enchudb_oplog::oplog::DecodedOp;
+        let p = path("relay979two");
+        let image = format!("{p}-img");
+        let eng = {
+            let mut eng = Engine::create_with_capacity(&p, 200_000).unwrap();
+            eng.define_table("u", 1).unwrap();
+            eng.define_table("s", 16).unwrap();
+            eng.define_himo_in("s", "a", ValueType::Number, 0).unwrap();
+            eng.define_table("pad", 100_000).unwrap();
+            eng.define_table("t", 16).unwrap();
+            eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            eng.set_peer_id(1);
+            eng
+        };
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u);
+        assert!(eng.entity_in("u").is_ok() && eng.generations().moved(), "前提: v15");
+        // 表 s の列の page を先に書いておく (1 つ目の record が列を伸ばす断り (#210) で止まらない)
+        let mine = eng.entity_in("s").unwrap();
+        eng.tie_to(mine, "s.a", 1u32);
+        let s_slot = eng.tables.iter().find(|t| t.name == "s").unwrap().global_of(1).unwrap();
+        let t_slot = eng.tables.iter().find(|t| t.name == "t").unwrap().global_of(0).unwrap();
+        assert!(gen_covers(&eng, s_slot) && !gen_covers(&eng, t_slot), "前提: s の次の場所は gen.seg の commit の中、 t の先頭は外");
+        eng.oplog_sync().unwrap();
+        let hold = eng.hold_consumer();
+        let hlc = enchudb_oplog::Hlc { wall: Engine::unix_millis(), logical: 0, peer: 9 };
+        let later = enchudb_oplog::Hlc { logical: 1, ..hlc };
+        let (s_a, t_a) = (eng.himo_id("s.a").unwrap() as u16, eng.himo_id("t.a").unwrap() as u16);
+        let (f1, f2) = (enchudb_oplog::make_eid(9, 5), enchudb_oplog::make_eid(9, 6));
+        assert!(eng.relay_record(&WireRecord::unsigned(hlc, 9, DecodedOp::Tie { eid: f1, himo_id: s_a, value: 7 })));
+        assert!(eng.relay_record(&WireRecord::unsigned(later, 9, DecodedOp::Tie { eid: f2, himo_id: t_a, value: 8 })));
+        eng.oplog_commit();
+        assert!(std::process::Command::new("cp").arg("-R").arg(&p).arg(&image).status().unwrap().success());
+        drop(hold);
+        cleanup(eng, &p);
+        open_space_margin_hook::set(NO_SPACE);
+        let refused = Engine::open_concurrent_with_oplog(&image, 1 << 20).map(|_| ());
+        let img = Engine::open_concurrent_with_oplog(&image, 1 << 20);
+        let after = img
+            .as_ref()
+            .map(|e| {
+                (
+                    e.table_eid_usage("s").unwrap().live,
+                    e.pull_raw("s.a", 7u32).len(),
+                    e.resolve_remote_eid_existing(f1).map(|l| e.get(l, "s.a")),
+                    e.resolve_remote_eid_existing(f2).map(|l| e.get(l, "t.a")),
+                )
+            })
+            .map_err(|e| e.to_string());
+        drop(img);
+        let _ = crate::db_files::remove_db(&image);
+        let e = refused.expect_err("前提: 再生が 2 つ目の中継した行を置けずに断った");
+        assert_eq!(e.kind(), io::ErrorKind::StorageFull, "断った理由: {e}");
+        let (live, sevens, v1, v2) = after.expect("空きが戻っても開けない");
+        assert_eq!((v1, v2), (Some(Some(7)), Some(Some(8))), "空きが戻った open が中継した行を再生していない");
+        assert_eq!(sevens, 1, "断った open が払い出した F1 の場所が、 写像の無い同じ値の行として残った (行が 2 つ)");
+        assert_eq!(live, 2, "表 s の生きている行 (自分の行 + F1) の数が違う");
+    }
+
     /// PR #977 の読み直し [4]: 名前で束ねた行の切り離し (#581) が、 畳んだ自分の行 (#612) の場所を 「消えた slot」 にする所で、
     /// 世代を上げてから別名を外す。 逆の順では間の一瞬 (`split_release_hook`) その場所が 「生きていない・畳んでいない・死の印なし」 に
     /// 見え、 枯渇した表へ足した別の書き手が今の世代のまま払い出し、 その後の kill がその行を殺した。
@@ -6529,6 +6662,70 @@ mod slot_claim_tests {
         assert_ne!(mine, theirs, "最後の slot {mine:#x} を 2 つの行に払い出した");
         assert!(live, "X が払い出した行 {mine:#x} が生まれた時から消えた行になった (全部なめ / 取り出しが生かす前の場所を kill した)");
         assert!(!dead, "生きている場所 {slot} に死の印が立った");
+    }
+
+    /// PR #977 の読み直し 5 の [D] (a): 上の並びの続き。 Y が全部なめで拾った場所を 「覚えていない・生きていない」 と読んだ後・場所の
+    /// 行を握る前 (`pop_checked_hook`) に、 X が払い出し位置から同じ場所を取って生かして返し、 その行を消す書き手が kill を書けずに
+    /// (約束の破れ = 守りの道、 `kill_fail_hook`) 覚えて空ける。 Y は行を握った後に覚えを見直して、 その場所を渡さない。 前は見直さず、
+    /// 今の世代 (kill を書けなかったので上がっていない) のまま生かして、 消えた X の行と同じ eid を返した。
+    ///
+    /// falsify: 行を握った後の `retired` の見直しを外すと、 Y が消えた X の行と同じ eid を返す。
+    #[test]
+    fn a_popped_slot_whose_kill_failed_meanwhile_is_not_given_out_with_the_dead_rows_eid() {
+        use std::sync::mpsc::channel;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-slotclaim-unkilled-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("u", 1).unwrap();
+        eng.define_table("t", 4).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u);
+        let u2 = eng.entity_in("u").unwrap();
+        assert!(eng.generations().moved() && u2 != u, "前提: v15");
+        for _ in 0..3 {
+            eng.entity_in("t").unwrap();
+        }
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (x_at, x_at_rx) = channel::<()>();
+        let (x_go, x_go_rx) = channel::<()>();
+        // X: 払い出し位置から最後の場所を取り、 生かす前で止まる
+        claim_gap_hook::set(&wal, move |_| {
+            x_at.send(()).unwrap();
+            x_go_rx.recv().unwrap();
+        });
+        let ex = eng.clone();
+        let x = std::thread::spawn(move || ex.entity_in("t"));
+        x_at_rx.recv().unwrap();
+        // Y: 全部なめで同じ場所を穴として拾い、 「覚えていない・生きていない」 と読んだ後で、 X を返させてその行を kill を書けずに消す
+        let mine: Arc<std::sync::Mutex<Option<u64>>> = Arc::default();
+        let (e2, m2) = (eng.clone(), mine.clone());
+        pop_checked_hook::set(&wal, move |_| {
+            x_go.send(()).unwrap();
+            let got = x.join().unwrap().expect("前提: X は払い出された");
+            *m2.lock().unwrap() = Some(got);
+            std::thread::spawn(move || {
+                kill_fail_hook::set(Some(e2.slot_unchecked(got)));
+                e2.delete(got);
+                kill_fail_hook::set(None);
+            })
+            .join()
+            .unwrap();
+        });
+        let theirs = eng.entity_in("t");
+        let mine = mine.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        let slot = eng.slot_unchecked(mine);
+        let gens = eng.generations();
+        let unkilled = !eng.is_live(mine) && !gens.is_dead(slot) && gens.retired(slot);
+        cleanup(&path, eng);
+        assert!(unkilled, "前提: X の行を kill を書けずに消した (覚えた)");
+        assert!(
+            theirs.as_ref().is_err() || theirs.as_ref().is_ok_and(|&e| e != mine),
+            "kill を書けなかった場所を、 消えた X の行と同じ eid {mine:#x} で渡した: {theirs:?}"
+        );
     }
 
     /// #882: 畳んだ自分の行を戻している最中 (生きている印 / 別名を外す の間) に、 枯渇した表へ別の書き手が足しても、 戻している
@@ -8257,6 +8454,23 @@ mod kill_fail_hook {
 
     pub(super) fn forced(slot: u32) -> bool {
         SLOT.with(|c| c.get() == Some(slot))
+    }
+}
+
+/// PR #977 の読み直し 5 の [C] の test: この thread の `gen_slot_ready` (払い出す場所の gen.seg の page の commit) を、 空きの不足で
+/// ない I/O の失敗 (種類 `kind`) で落とす (EMFILE / ENOMEM などを起こす口の代わり)。
+#[cfg(test)]
+mod gen_io_fail_hook {
+    std::thread_local! {
+        static KIND: std::cell::Cell<Option<std::io::ErrorKind>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn set(kind: Option<std::io::ErrorKind>) {
+        KIND.with(|c| c.set(kind));
+    }
+
+    pub(super) fn forced() -> Option<std::io::ErrorKind> {
+        KIND.with(|c| c.get())
     }
 }
 
@@ -10900,7 +11114,24 @@ enum EntityInError {
     /// #970: 払い出す場所の世代を書く gen.seg の page を commit できない / v15 に移れない (ディスクの空き)。 空きが戻れば通る
     /// (受信の払い出しは record を落とさず、 再配送させる = `RemoteApply::RejectedCapacity`、 PR #977 の読み直し 3 の [1])
     Space(String),
+    /// PR #977 の読み直し 5 の [C]: 払い出す場所の世代を書く gen.seg の、 空きの不足でない I/O の失敗 (file を開き直す EMFILE・remap の
+    /// ENOMEM・`set_len` の EDQUOT など)。 一時的でありうるので、 受信の払い出しは `Space` と同じく再配送させる (前は `Other` =
+    /// 確保先なし = `Dropped` で cursor が越え、 その record は二度と届かなかった)。 場所が gen.seg の範囲の外 (`InvalidInput`、 再配送
+    /// しても通らない) は `Other`。 fault は `SegmentIo` (`Space` は `DiskSpace`)
+    Io(String),
     Other(String),
+}
+
+impl EntityInError {
+    /// gen.seg を伸ばす失敗 `e` の断り: 空きの不足は `Space`、 範囲の外と形の違い (やり直しても通らない: 範囲の外・packed の DB・
+    /// gen.seg でない file) は `Other`、 他の I/O は `Io`。
+    fn of_gen_io(e: &io::Error, why: String) -> Self {
+        match e.kind() {
+            io::ErrorKind::StorageFull => EntityInError::Space(why),
+            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported | io::ErrorKind::InvalidData => EntityInError::Other(why),
+            _ => EntityInError::Io(why),
+        }
+    }
 }
 
 impl From<String> for EntityInError {
@@ -11388,6 +11619,10 @@ pub struct Engine {
     /// #533: 開くのをやめた engine (open の途中で sidecar を読めなかった等)。 Drop は何も書かずに閉じる (書くと、 読めなかった
     /// sidecar を空の中身で上書きする)。
     abandoned: std::sync::atomic::AtomicBool,
+    /// PR #977 の読み直し 5 の値段 [7]: きれいに閉じなかった後に開いた時の、 anonymous の生きている印の最大 + 1 (0 = 無い / きれいに
+    /// 閉じた後)。 開く時に 1 回だけなめて覚え、 払い出し済みの場所の上限 ([`Self::given_out_slot_end`]) が読む (前は開く時の commit・
+    /// 再生の後・v15 に移る 1a のたびに予約の全部をなめた)。
+    anon_live_end: std::sync::atomic::AtomicU32,
     /// 0.8.2: build phase の sidecar fsync 抑止。 schema crate が
     /// `Database::create → build×N` 中 true にして、 `finish_*` / Drop で
     /// false に戻して 1 度だけ explicit に `persist_tables()` を呼ぶ。
@@ -11854,6 +12089,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
             tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
@@ -12333,6 +12569,7 @@ impl Engine {
         // (`finish_open_restores` が放す)
         if unclean && !readonly {
             eng.generations().prev.hold_open();
+            eng.note_anon_live_end();
         }
         // review946c [A]: 書き出していない記録は `.eidmap` を読む前に読む (写像の見分けが、 配列で上書きされた記録も見る)
         let prev_records = if unclean { eng.load_prev_records() } else { Vec::new() };
@@ -13431,6 +13668,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
             tables_dir_unsynced: std::sync::atomic::AtomicBool::new(false),
@@ -17469,7 +17707,7 @@ impl Engine {
             // 待つ形 (`nowait` が偽) は返さない
             EntityInError::Busy(slot) => (None, format!("table '{table_name}': slot {slot} is held by a writer")),
             EntityInError::Space(why) => (Some(FaultKind::DiskSpace), why),
-            EntityInError::Other(why) => (None, why),
+            EntityInError::Io(why) | EntityInError::Other(why) => (None, why),
         })
     }
 
@@ -17521,7 +17759,8 @@ impl Engine {
                 let mut busy: Vec<u32> = Vec::new();
                 // #970: 世代を書く gen.seg の page を commit できなかった場所 (一覧に戻す)
                 let mut no_room: Vec<u32> = Vec::new();
-                let mut io_failed: Option<String> = None;
+                // 空きの不足でない失敗 (最初の 1 つ、 読み直し 5 の [C]: 範囲の外かを分ける)
+                let mut io_failed: Option<io::Error> = None;
                 while let Some(local) = fl.pop() {
                     let Some(g) = table.global_of(local) else { continue };
                     // #731: 世代を使い切った場所は二度と渡さない (印を立てる前に見る)
@@ -17541,7 +17780,7 @@ impl Engine {
                     {
                         // 読み直し 4 の [8]: 空きの不足でない失敗は 「空きが戻れば通る」 と言わない
                         if e.kind() != io::ErrorKind::StorageFull {
-                            io_failed.get_or_insert(e.to_string());
+                            io_failed.get_or_insert(e);
                         }
                         no_room.push(local);
                         continue;
@@ -17550,6 +17789,10 @@ impl Engine {
                     // (`apply_delete_in`) と受信の当て込みは行の lock の下で 「その場所の行」 を見て決めるので、 握らずに生かすと、 死んだ
                     // 前の住人宛ての受信の Delete が握っている間に新しい行が生き、 その Delete に消された。 待たない (`free_locals` を
                     // 持ったまま待つと、 行を握ったまま insert する書き手と互いを待つ)。 握れなければ飛ばして、 一覧に戻す
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        pop_checked_hook::call(wal);
+                    }
                     let row = if table.is_reserved() {
                         None
                     } else {
@@ -17561,6 +17804,13 @@ impl Engine {
                             }
                         }
                     };
+                    // PR #977 の読み直し 5 の [D] (a): 行を握った後に、 kill を書けなかった場所の覚えを見直す。 上の 「覚えていない・
+                    // 生きていない」 の読みの後・行を握る前に、 払い出し位置から同じ場所を取った書き手が生かして返し、 その行を消す
+                    // 書き手が kill を書けずに覚えて空けると (消す道は行の lock の下)、 ここで今の世代のまま生かして消えた行と同じ eid を
+                    // 返した。 行を握った後は消す書き手の覚えが見える (握れたのは消す書き手が lock を放した後)
+                    if row.is_some() && self.generations().retired(g) {
+                        continue;
+                    }
                     #[cfg(test)]
                     if let Some(wal) = self.oplog.as_ref() {
                         pop_claim_hook::call(wal);
@@ -17634,10 +17884,13 @@ impl Engine {
                 drop(fl);
                 if no_room_only {
                     if let Some(e) = io_failed {
-                        return Err(EntityInError::Other(format!(
-                            "table '{table_name}': the eid generation of the slot to reuse cannot be written (gen.seg: {e}, \
-                             #970) — not given out"
-                        )));
+                        return Err(EntityInError::of_gen_io(
+                            &e,
+                            format!(
+                                "table '{table_name}': the eid generation of the slot to reuse cannot be written (gen.seg: {e}, \
+                                 #970) — not given out"
+                            ),
+                        ));
                     }
                     return Err(EntityInError::Space(format!(
                         "table '{table_name}': the eid generation of the slot to reuse cannot be written (gen.seg cannot grow, \
@@ -17714,8 +17967,10 @@ impl Engine {
             }
         };
 
-        // #731: 世代を使い切った場所は渡さない (落ちた後に払い出し位置が引退した場所の手前に戻った時だけ来る)
-        if self.generations().retired(global) {
+        // #731: 世代を使い切った場所は渡さない (落ちた後に払い出し位置が引退した場所の手前に戻った時だけ来る)。 PR #977 の読み直し 5 の
+        // [G]: kill を書けなかった場所の覚えは見ない (払い出し位置の先は生きたことが無い = 覚えた場所ではありえない。 覚えが 1 つでも
+        // あると `retired` は大域の Mutex と線形探索を通り、 ここは insert の毎回の道)
+        if self.generations().used_up(global) {
             return self.entity_in_with(table_name, nowait);
         }
         // #970 (案 P): 生かす前に、 場所の世代を書く gen.seg の page を commit 済みにする (普段は atomic の load 1 回、 page をまたぐ時
@@ -19495,8 +19750,10 @@ impl Engine {
                     return crate::entity_set::Reuse::Keep;
                 }
                 // 世代を使い切った場所は二度と渡さない。 生きている場所 (山に積んだ穴 = 位置から取って断った場所を、 後で別の道が
-                // 生かした) も外す
-                if gens.retired(slot) || self.entities.is_live(slot) {
+                // 生かした) も外す。 PR #977 の読み直し 5 の [D] (a): 生きているかを先に読む (消す道は kill を書けない場所を覚えてから
+                // 生きている印を下ろす = 下りた印を読んだ後に覚えを読めば、 覚えが見える。 逆の順では、 覚える前に読んで、 印が下りた
+                // 後に読んだ 「生きていない」 で取りうる)
+                if self.entities.is_live(slot) || gens.retired(slot) {
                     return crate::entity_set::Reuse::Discard;
                 }
                 // 世代 0 = v14 の間に消えた場所 (移る手順の穴埋めと開く時の突き合わせが上げる) か、 位置から取って断った穴
@@ -20660,7 +20917,7 @@ impl Engine {
                 #[cfg(not(test))]
                 let forced = false;
                 debug_assert!(forced, "#970: 生きていた場所 {local} の世代を書けない (生かす前に gen.seg の page を commit していない)");
-                self.generations().note_unkilled(local);
+                self.note_unkilled_slot(local);
                 unkilled = true;
             }
         }
@@ -23425,16 +23682,13 @@ impl Engine {
             }
             let hi = if tid == ANONYMOUS_TABLE as usize {
                 let next = if synced { self.entities.next_eid_synced() } else { self.entities.next_eid() };
-                let mut hi = t.eid_range_hi.min(next).max(t.eid_range_lo);
+                let hi = t.eid_range_hi.min(next).max(t.eid_range_lo);
                 // PR #977 の読み直し 4 の [7]: 開く時 (`synced` でない) は生きている印の最大も見る。 anonymous の高水位 (entities の
                 // 先頭の page) は開く時に生きている印から直さない (表の `next_local` は直す、 `reconcile_next_local_from_bitmap`)
-                // ので、 生きている印の page だけが届いた電源断の像で、 高水位の先に生きている場所がありうる
-                if !synced
-                    && let Some(live) = self.entities.highest_live_in(hi, t.eid_range_hi)
-                {
-                    hi = live + 1;
-                }
-                hi
+                // ので、 生きている印の page だけが届いた電源断の像で、 高水位の先に生きている場所がありうる。 読み直し 5 の [7]:
+                // なめるのはきれいに閉じなかった後に開く時の 1 回だけ (`note_anon_live_end`、 きれいに閉じた後は高水位と生きている印が
+                // 揃っている)
+                if synced { hi } else { hi.max(self.anon_live_end.load(Ordering::Acquire).min(t.eid_range_hi)) }
             } else {
                 let mut left =
                     if synced { t.next_local.fetch_add(0, Ordering::AcqRel) } else { t.next_local.load(Ordering::Acquire) };
@@ -23453,6 +23707,17 @@ impl Engine {
             end = end.max(hi);
         }
         end
+    }
+
+    /// PR #977 の読み直し 5 の値段 [7]: きれいに閉じなかった後に開く時、 anonymous の高水位の先の生きている印の最大 + 1 を覚える
+    /// (`anon_live_end`、 [`Self::given_out_slot_end`] が読む)。 開く時に 1 回だけ (予約に比例して bitmap をなめる。 64 場所ずつ飛ばす
+    /// `EntitySet::highest_live_in`)。
+    fn note_anon_live_end(&self) {
+        let Some(t) = self.tables.get(ANONYMOUS_TABLE as usize) else { return };
+        let hi = t.eid_range_hi.min(self.entities.next_eid()).max(t.eid_range_lo);
+        if let Some(live) = self.entities.highest_live_in(hi, t.eid_range_hi) {
+            self.anon_live_end.fetch_max(live + 1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// #970: 場所 `0..end` の gen.seg を commit する (`Generations::ensure_slots`)。 gen.seg の無い DB (v14) は何もしない。 書けなければ
@@ -23481,7 +23746,11 @@ impl Engine {
     /// [`Self::alloc_refusal`] と同じ)。 空きの不足だけが 「空きが戻れば通る」 (受信は再配送させる)、 他は fault `SegmentIo`。
     #[inline]
     fn gen_slot_ready(&self, slot: u32) -> io::Result<()> {
-        self.generations().ensure_slot(slot).inspect_err(|e| {
+        #[cfg(test)]
+        let forced = gen_io_fail_hook::forced().map(|k| Err(io::Error::new(k, "test: gen.seg の I/O の失敗")));
+        #[cfg(not(test))]
+        let forced = None;
+        forced.unwrap_or_else(|| self.generations().ensure_slot(slot)).inspect_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull {
                 self.record_fault(FaultKind::DiskSpace, "gen.seg の page を commit できない — 場所を払い出さない (#970)");
             } else {
@@ -23492,7 +23761,7 @@ impl Engine {
 
     /// `move_to_generations` の断り → `entity_in` の断り (空きの不足は [`EntityInError::Space`] = 受信は再配送させる)。
     fn alloc_refusal(e: &io::Error, why: String) -> EntityInError {
-        if e.kind() == io::ErrorKind::StorageFull { EntityInError::Space(why) } else { EntityInError::Other(why) }
+        EntityInError::of_gen_io(e, why)
     }
 
     /// 場所を生かす (生きている印を立てる、 既に生きていれば何もしない)。 「死んでいる」 印を先に落とす (`Generations::revive` の doc)。
@@ -23626,22 +23895,45 @@ impl Engine {
     ///
     /// PR #977 の読み直し 4 の [3]: kill を書けなかった場所 (`Generations::note_unkilled`) が残っていれば、 先にもう一度書く (生きて
     /// いない場所だけ)。 書けない場所が残れば印を倒さない (次に開く時の突き合わせが完了させる)。
+    ///
+    /// PR #977 の読み直し 5 の [D]: (b) 書き直しは場所の行の lock の下で (生きているかの読みと kill の間に、 その場所を生かす書き手を
+    /// 入れない。 WAL の無い engine の `flush_clean` は session の途中でここを通る)。 (c) 覚えが残っているかの確かめと印を倒すのは
+    /// `dirty_lock` の下 (覚える側 [`Self::note_unkilled_slot`] も `dirty_lock` の下で覚えて印を立てる。 前は確かめた後・倒す前に覚えた
+    /// 場所が、 倒れた印のまま残った)。
     fn clear_gen_session_dirty(&self) {
         let gens = self.generations();
         if !gens.active() {
             return;
         }
         for slot in gens.unkilled_slots() {
+            let _row = self.row_locks.write(slot);
             if self.entities.is_live(slot) || self.kill_generation(slot, gens.get(slot) + 1) {
                 gens.forget_unkilled(slot);
             }
         }
+        let _l = gens.dirty_lock.lock().unwrap_or_else(|p| p.into_inner());
         if gens.has_unkilled() {
             return;
         }
-        let _l = gens.dirty_lock.lock().unwrap_or_else(|p| p.into_inner());
         gens.write_dirty_flag(false);
         gens.set_session_dirty(false);
+    }
+
+    /// 消す道が場所 `slot` の kill を書けなかった (約束の破れの守り): 覚えて (`Generations::note_unkilled`、 この session の使い回しが
+    /// 飛ばす)、 gen.seg の 「きれいに閉じた後に kill / revive した」 印を立てる (倒れていれば書き出す)。 `dirty_lock` の下で
+    /// (PR #977 の読み直し 5 の [D] (c): 印を倒す [`Self::clear_gen_session_dirty`] の確かめと並べる)。 呼び手は場所の行の lock を
+    /// 握っていてよい (順は 行 → `dirty_lock`、 kill の `mark_gen_session_dirty` と同じ)。
+    fn note_unkilled_slot(&self, slot: u32) {
+        let gens = self.generations();
+        let _l = gens.dirty_lock.lock().unwrap_or_else(|p| p.into_inner());
+        gens.note_unkilled(slot);
+        if !gens.session_dirty() {
+            gens.write_dirty_flag(true);
+            if self.backing.flush_kind(SegmentKind::Gen, 0, crate::generation::GEN_HEADER).is_err() {
+                self.record_fault(FaultKind::DiskSpace, "gen.seg の header を書き出せない — 汚れた session の印が届かない");
+            }
+            gens.set_session_dirty(true);
+        }
     }
 
     /// 使い回す場所に残った cell を落とす (表 `tid` の紐だけ、 行の lock の下)。 消えた行の古い eid が、 消した後・使い回す前に
@@ -24202,7 +24494,8 @@ impl Engine {
         match r {
             Ok(e) => Alloc::Got(self.slot_unchecked(e)),
             Err(EntityInError::Busy(slot)) => Alloc::Busy(slot),
-            Err(EntityInError::Space(_)) => Alloc::Retry,
+            // PR #977 の読み直し 5 の [C]: 空きの不足でない gen.seg の I/O の失敗も再配送させる (一時的でありうる)
+            Err(EntityInError::Space(_) | EntityInError::Io(_)) => Alloc::Retry,
             Err(EntityInError::Other(_)) => Alloc::Skip,
         }
     }
@@ -24901,8 +25194,9 @@ impl Engine {
 
     /// [`Self::remote_delete_apply_at`] の結果付きの形 (#970、 PR #977 の読み直し 4 の [1])。 `RejectedCapacity` = 名前で束ねた
     /// identity の切り離し (#581) が、 移す / 消えた slot にする場所を払い出せない (場所の世代を書く gen.seg の page を commit できない
-    /// = ディスクの空き)。 何も変えていない: 呼び手 (sync の当て込み) は record を落とさず再配送させる (前は 「確保先なし」 と読んで行を
-    /// 丸ごと消した / 消える identity を付け替えずに束ねから外した)。
+    /// = ディスクの空き)。 行・写像・名前は変えていない (先に払い出して返した slot の跡は `Split::NoRoom` の doc): 呼び手 (sync の
+    /// 当て込み) は record を落とさず再配送させる (前は 「確保先なし」 と読んで行を丸ごと消した / 消える identity を付け替えずに束ねから
+    /// 外した)。
     pub fn remote_delete_apply_at_result(
         &self,
         eid: enchudb_oplog::EntityId,
@@ -25311,7 +25605,8 @@ impl Engine {
     /// 前の版の file の束ね) だけは、 前と同じく版数で分ける (`t` より新しければ残る側)。
     ///
     /// #970 (PR #977 の読み直し 4 の [1]): 移す / 消えた slot にする場所を払い出せない (場所の世代を書く gen.seg の page を commit
-    /// できない = ディスクの空き) 時は、 何も変えずに [`Split::NoRoom`] (呼び手は削除を当てずに再配送させる)。 元の行が残る枝は、 消える
+    /// できない = ディスクの空き) 時は、 行・写像・名前・束ねを変えずに [`Split::NoRoom`] (呼び手は削除を当てずに再配送させる。 返した
+    /// slot が残す物は [`Split::NoRoom`] の doc)。 元の行が残る枝は、 消える
     /// identity ごとの消えた slot を状態を変える前にまとめて払い出し、 足りなければ払い出した分を全部返してから断る (前は払い出せない
     /// identity を付け替えずに束ねから外し、 写像が残る行を指したまま = 削除を知らない peer の書き込みが残る行に当たった)。 元の行が
     /// 消える枝は、 払い出す前は何も変えていない (前は払い出せないと false を返し、 呼び手が後の identity ごと行を消した)。
@@ -25349,6 +25644,7 @@ impl Engine {
             // 元の行は残る: 早い identity を消えた slot に付け替える。 読み直し 4 [1]: 他の peer の identity の消えた slot は、 状態を
             // 変える前にまとめて払い出す (足りなければ全部返して断る = 何も変えない)。 確保先の無い (`Skip`) identity は前と同じく
             // 付け替えない
+            // `None` = 自分の peer の identity (払い出さない) / 枠が尽きて払い出せなかった (`Skip`、 下で返した場所を回す)
             let mut dead_slots: Vec<Option<u32>> = Vec::with_capacity(earlier.len());
             for &((peer, _), _) in &earlier {
                 if peer == self_peer {
@@ -25368,6 +25664,17 @@ impl Engine {
                 }
             }
             for (&((peer, fl), _), dead) in earlier.iter().zip(dead_slots) {
+                // PR #977 の読み直し 5 の [H]: 枠が尽きて (空きの slot が identity の数より少ない) 先に払い出せなかった identity は、
+                // 前の identity に付け替えて返した消えた slot (`live_free` = 枯渇した表の消した行の一覧に載る) を払い出して回す (前の形
+                // = 1 つずつ払い出して返す、 と同じ数の slot で済む。 世代が上がるので identity ごとに別の eid)。 ここでの断り (`Retry`)
+                // は、 返した slot が commit 済みの page なので普段は無い。 その時と、 それでも無い時は前と同じく付け替えない
+                let dead = match dead {
+                    None if peer != self_peer => match self.alloc_translated_local_in(pk, false) {
+                        crate::eid_translator::Alloc::Got(d) => Some(d),
+                        _ => None,
+                    },
+                    d => d,
+                };
                 if peer == self_peer && fl == local {
                     continue;
                 }
@@ -25381,8 +25688,11 @@ impl Engine {
                         // 殺した (場所は 「生きている + 死の印」)。 畳んでいる間は使い回しの道が飛ばす (`is_folded_own_slot` を先に読む)。
                         // 上げた時点で畳んだ行の eid (今の世代) は転送されない (`app_slot` は世代を先に照合する) = 外した後と同じ
                         let on = self.generations().enter_free();
-                        if on && self.slot_is_generational(fl) {
-                            self.kill_generation(fl, self.generations().get(fl) + 1);
+                        // PR #977 の読み直し 5 の [E]: kill を書けなければ (約束の破れ = 守り、 畳んだ行の場所は払い出した時に page を
+                        // commit してある) 覚える (消す道と同じ)。 前は結果を捨て、 別名を外した後の場所が 「生きていない・畳んでいない・
+                        // 死の印なし・前の世代」 = 枯渇した表の全部なめが、 畳んだ行と同じ eid で使い回した
+                        if on && self.slot_is_generational(fl) && !self.kill_generation(fl, self.generations().get(fl) + 1) {
+                            self.note_unkilled_slot(fl);
                         }
                         #[cfg(test)]
                         if let Some(wal) = self.oplog.as_ref() {
@@ -30768,12 +31078,10 @@ impl Engine {
             // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
             let dropped = w.drop_records_after_a_hole();
             let mut replay = ReplayVocab::default();
-            for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
-            }
+            let journal = eng.replay_records(&records, &mut replay);
             // #979: 再生が場所の世代を上げられなかった / 再生が生かした場所の gen.seg を commit できない (ディスクの空き) なら開かない
             // (checkpoint を進めず、 印も立てない = 次の open がもう一度再生する)
-            eng.settle_replayed_generations()?;
+            eng.settle_replayed_generations(&journal)?;
             eng.finish_replay_vocab(&mut replay);
             // #968: 再生が生き返らせた、 tombstone まで本体に届いた削除の行は、 削除を完了させる (再生の前の sweep と同じ決め)
             eng.finish_deletes_revived_by_the_replay(!records.is_empty());
@@ -31149,12 +31457,97 @@ impl Engine {
         self.generations().replaying.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 開く時の WAL の再生 (`records` を順に当てる)。 再生が写像を載せた key (中継した他の peer の行の払い出し・付け替え) を返す
+    /// ([`Self::settle_replayed_generations`] が、 開くのを断る時に `.eidmap` に置く)。
+    ///
+    /// PR #977 の読み直し 5 の [A]: 空きの不足で record を当てられない / 場所の世代を上げられない (印が立つ) と、 そこで止める (後ろの
+    /// record は当てない)。 開くのは断るので、 断った engine が共有の mmap に書く物 (後ろの record の払い出し・値) を増やさない。 次に
+    /// 開く再生は、 止めた record までを置いた写像 (`keep_replayed_mappings`) の上で同じ順に当て直し、 新しく払い出すのは止めた record
+    /// から (それより前に払い出した場所は写像と、 写像を読む時の払い出し位置の前進 (#9 H4) で覆われる)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn replay_records(
+        &mut self,
+        records: &[enchudb_oplog::oplog::Record],
+        replay: &mut ReplayVocab,
+    ) -> Vec<(enchudb_oplog::PeerId, u32)> {
+        self.eid_translator.start_journal();
+        for rec in records {
+            self.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, replay);
+            if self.generations().replay_refused() {
+                break;
+            }
+        }
+        self.eid_translator.take_journal()
+    }
+
+    /// PR #977 の読み直し 5 の [A]: 開く時の再生が空きの不足で開くのを断る時、 断るまでに再生が載せた写像 (`keys`: 再生が中継した
+    /// record のために払い出した / 付け替えた他の peer の行の key) を `.eidmap` に置く。
+    ///
+    /// 断った engine は `.eidmap` を書かない (`abandoned` の Drop は sidecar を書かない) が、 再生が払い出した場所の生きている印と値は
+    /// 共有の mmap の page に書いてあり、 書き出さなくても OS が disk に届ける。 写像を置かないと、 空きを作って開き直した再生がその
+    /// record を写像の無い行として新しい場所に当て直し、 前に払い出した場所は写像も逆写像も無い生きた行 (名前ごと) として残った
+    /// (同じ名前の行が 2 つ。 #451 の作り直しは自分の行の cell しか見ないので消えない)。
+    ///
+    /// 置いた後に開き直す再生は、 その record を置いた場所に当て直す (LWW で冪等)。 順は受信の書き出し (`persist_sync_state`) と同じ
+    /// 本体 → 写像: 本体を書き出せなければ置かない (書き出しの失敗した page は disk に届かない = 写像の無い場所は生きていない)。 写像は
+    /// 読む時に払い出し位置をその場所の先へ進める (#9 H4) ので、 本体が届かない電源断の像でも、 開き直した再生が同じ場所を別の行に
+    /// 払い出さない。 `.eidmap` は開いた時のまま (`eidmap.log` が信用できれば追記、 できなければ disk の中身に足してまとめ直す): memory の
+    /// 写像は開く途中の物 (前の住人の記録から戻した写像など、 開く道が後で仕上げる) なので、 再生が載せた key 以外は書かない。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn keep_replayed_mappings(&self, keys: &[(enchudb_oplog::PeerId, u32)]) {
+        if self.path.is_empty() {
+            return;
+        }
+        let recs: Vec<EidmapEntry> = keys
+            .iter()
+            .filter_map(|&(peer, fl)| {
+                self.eid_translator.mapped_local(peer, fl).map(|l| (peer, fl, l, self.tombstone_version_of(l)))
+            })
+            .collect();
+        if recs.is_empty() {
+            return;
+        }
+        if self.body_msync().is_err() {
+            self.record_fault(FaultKind::DiskSpace, "断った open の再生が払い出した場所を書き出せない — 写像を置かない");
+            return;
+        }
+        if let Err(e) = self.append_eidmap_entries(&recs) {
+            self.warn_persist_failure_rate_limited(&e);
+        }
+    }
+
+    /// `.eidmap` に写像の面 `recs` を足す ([`Self::keep_replayed_mappings`])。 `eidmap.log` が今の `eidmap` の続きなら追記、 そうで
+    /// なければ disk の `eidmap` (+ log) に足してまとめ直す。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn append_eidmap_entries(&self, recs: &[EidmapEntry]) -> io::Result<()> {
+        let mut log = self.eidmap_log.lock().unwrap_or_else(|p| p.into_inner());
+        let log_path = crate::db_files::path_for(&self.path, crate::db_files::EIDMAP_LOG);
+        if log.ok {
+            let mut buf = Vec::with_capacity(recs.len() * crate::eidmap_log::RECORD_LEN);
+            for &r in recs {
+                crate::eidmap_log::push_record(&mut buf, r);
+            }
+            crate::db_files::append_synced(&log_path, &buf)?;
+            log.records += recs.len() as u64;
+            return Ok(());
+        }
+        let on_disk = load_eidmap_from_sidecar(&self.path)?.map(|(e, _)| e).unwrap_or_default();
+        let bytes = serialize_eidmap(&crate::eidmap_log::merge(on_disk, recs));
+        crate::db_files::write_atomic_if_changed(&eidmap_path_for(&self.path), &bytes)?;
+        crate::db_files::write_atomic_if_changed(&log_path, &crate::eidmap_log::header(&bytes))?;
+        *log = crate::eidmap_log::LogState { records: 0, ok: true };
+        Ok(())
+    }
+
     /// #979 (案 P): WAL の再生の後、 世代を持つ DB は、 再生が生かした場所 (払い出し位置の先でありうる、 再生が位置を進める) まで
     /// gen.seg を commit し直す。 再生が場所の世代を上げられなかった (`replay_slot`) 時と、 commit できない時 (ディスクの空き) は
     /// `StorageFull` で開くのを断る (`abandoned`: Drop は何も書かない = checkpoint を進めず、 汚れた印も残す。 空きを作って開き直せば
     /// もう一度再生する)。
+    ///
+    /// `journal`: 再生が写像を載せた key ([`Self::replay_records`])。 断る時は先に `.eidmap` に置く (PR #977 の読み直し 5 の [A]、
+    /// [`Self::keep_replayed_mappings`])。
     #[cfg(not(target_arch = "wasm32"))]
-    fn settle_replayed_generations(&self) -> io::Result<()> {
+    fn settle_replayed_generations(&self, journal: &[(enchudb_oplog::PeerId, u32)]) -> io::Result<()> {
         let gens = self.generations();
         // 読み直し 4 の [2]: 印は世代を持たない DB (v14) でも見る (中継した record の払い出しが v15 に移れずに断った形)
         let unraised = gens.take_replay_unraised();
@@ -31173,6 +31566,8 @@ impl Engine {
             self.commit_generations_through(self.given_out_slot_end(false), "replaying the WAL")
         };
         if r.is_err() {
+            // 再生の後の commit し直しで断った時も、 再生は全部の record を当てている (払い出した場所は mmap にある)
+            self.keep_replayed_mappings(journal);
             self.abandoned.store(true, std::sync::atomic::Ordering::Release);
         }
         r
@@ -31507,9 +31902,14 @@ impl Engine {
     /// skip — relay の役目上、 元 record は author に在り再 pull で埋め直せる。
     ///
     /// #970 / #979 (PR #977 の読み直し 4 の [2]): 空きの不足で当てられない record (払い出しが gen.seg の page を commit できない /
-    /// v15 に移れない、 生かす場所の page・列を伸ばせない、 名前の束ねの切り離しが場所を払い出せない) は、 印を立てて開くのを断る
-    /// (`settle_replayed_generations`。 飛ばして開くと checkpoint が進み、 その record はこの peer に当たらないまま消える: 受信の cursor は
-    /// 落ちる前に進んでいる)。 空きを作って開き直せば再生し直す。
+    /// v15 に移れない、 生かす場所の page・列を伸ばせない、 名前の束ねの切り離しが場所を払い出せない、 読み直し 5 の [K]: 語を辞書に
+    /// 入れられない) は、 印を立てて開くのを断る (`settle_replayed_generations`。 飛ばして開くと checkpoint が進み、 その record はこの
+    /// peer に当たらないまま消える: 受信の cursor は落ちる前に進んでいる)。 空きを作って開き直せば再生し直す。
+    ///
+    /// 断らずに飛ばす (前と同じ) 物: 紐を名前で定義できない (`ensure_himo_named` の失敗。 紐の枠が尽きた / segment を作れないの
+    /// 区別が無い)、 語の番号を訳せない (Vocab の record が checkpoint の前に畳まれ、 `.vocabmap` にも無い)、 辞書が上限 (`Full`)、
+    /// 写像の無い Content (0.9 より前の WAL)。 どれも受信 (`Syncer::apply_one`) では `Dropped` / `DroppedVocab` の物。 語の番号は行を
+    /// 払い出す前に訳す (訳せない record は行を作らない)。
     fn replay_relayed_op(
         &self,
         op: &enchudb_oplog::oplog::DecodedOp,
@@ -31542,21 +31942,35 @@ impl Engine {
         match op {
             DecodedOp::Vocab { vid, bytes } => {
                 if !self.has_remote_vocab(author, *vid, bytes) {
+                    // PR #977 の読み直し 5 の [K]: 空きの不足で語を辞書に入れられなければ断る (入れられない語の番号は写像に置かない。
+                    // 置くと後の Tie がその番号を引けず、 語の無い cell になる)。 辞書が上限 (`Full`、 空けても入らない) は前と同じ
+                    if let Err(crate::vocabulary::VocabFail::Space) = self.vocab.try_get_or_insert(bytes) {
+                        self.generations().note_replay_unraised();
+                        return;
+                    }
                     self.remote_vocab_apply(author, *vid, bytes);
                 }
             }
             DecodedOp::Tie { eid, himo_id, value } => {
-                let Some(le) = resolve(*eid, *himo_id) else { return };
-                let v = if self.himo_is_ref(*himo_id) {
-                    let Ok(value) = u32::try_from(*value) else { return }; // Ref の列は u32
-                    match resolve_ref(author, value, *himo_id) {
-                        Some(v) => v as u64,
-                        None => return,
-                    }
+                // 読み直し 5 の [K]: 語の番号は行を払い出す前に訳す (訳せない record は行を払い出さずに飛ばす。 前は払い出してから
+                // 訳し、 訳せないと値の無い生きた行が残った)
+                let translated = if self.himo_is_ref(*himo_id) {
+                    None
                 } else {
                     match self.try_translate_remote_vid(author, *himo_id, *value) {
-                        Some(v) => v,
+                        Some(v) => Some(v),
                         None => return,
+                    }
+                };
+                let Some(le) = resolve(*eid, *himo_id) else { return };
+                let v = match translated {
+                    Some(v) => v,
+                    None => {
+                        let Ok(value) = u32::try_from(*value) else { return }; // Ref の列は u32
+                        match resolve_ref(author, value, *himo_id) {
+                            Some(v) => v as u64,
+                            None => return,
+                        }
                     }
                 };
                 refused(self.remote_tie_apply_result(le, *himo_id, v, hlc));
@@ -31570,8 +31984,9 @@ impl Engine {
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 let Ok(hid) = self.ensure_himo_named(himo_name, *himo_kind) else { return };
-                let Some(le) = resolve(*eid, hid) else { return };
+                // 読み直し 5 の [K]: 訳してから払い出す (Tie と同じ)
                 let Some(v) = self.try_translate_remote_vid(author, hid, *value) else { return };
+                let Some(le) = resolve(*eid, hid) else { return };
                 refused(self.remote_tie_apply_result(le, hid, v, hlc));
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
@@ -31701,12 +32116,10 @@ impl Engine {
             // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
             let dropped = w.drop_records_after_a_hole();
             let mut replay = ReplayVocab::default();
-            for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
-            }
+            let journal = eng.replay_records(&records, &mut replay);
             // #979: 再生が場所の世代を上げられなかった / 再生が生かした場所の gen.seg を commit できない (ディスクの空き) なら開かない
             // (checkpoint を進めず、 印も立てない = 次の open がもう一度再生する)
-            eng.settle_replayed_generations()?;
+            eng.settle_replayed_generations(&journal)?;
             eng.finish_replay_vocab(&mut replay);
             // #968 / #731 / #451 / review946d [N1] / 読み直し 2 [B1] [B2]: open_concurrent_with_oplog と同じ
             eng.finish_deletes_revived_by_the_replay(!records.is_empty());
