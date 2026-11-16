@@ -215,6 +215,12 @@ impl RowLocks {
         self.held(self.stripe(local), me())
     }
 
+    /// この thread がユーザの行 (内部の表の行でない stripe) をどれか握っているか。 stripe を全部見る (debug の確かめ用、 #974)。
+    pub fn holds_user_row_by_me(&self) -> bool {
+        let me = me();
+        (0..STRIPES).any(|i| self.held(i, me))
+    }
+
     /// この thread が stripe `i` を握っているか。
     fn held(&self, i: usize, me: usize) -> bool {
         self.stripes[i].ver.load(Ordering::Relaxed) & 1 == 1 && self.stripes[i].owner.load(Ordering::Relaxed) == me
@@ -313,6 +319,25 @@ impl RowLocks {
             while s.ver.load(Ordering::Acquire) & 1 == 1 {
                 backoff(&mut spins);
             }
+        }
+    }
+
+    /// 行 `local` の stripe を今握っている書き手 (と、 先に握りたい読み手) が離すまで、 握らずに待つ (#974 の読み直し 2)。 見た版が
+    /// 偶数で先に握りたい読み手も居なければすぐ返る。 握られていれば版が動く (その書き手が離す) まで待つ: 離した直後に別の書き手が
+    /// 握り直していても返る (呼び手は [`Self::try_write`] で握り直し、 握れなければまた待つ)。 この thread が握っている stripe は待たない。
+    ///
+    /// [`Self::try_write`] に断られた呼び手が、 別の lock を放してから待つ所で使う。 握ってから離す待ちは、 待つ thread が 2 本以上だと
+    /// 片方が握った一瞬がもう片方の `try_write` を断らせ、 握るたびに版を 2 つ進めて同じ stripe の読み手を読み直させた。
+    pub fn wait_released(&self, local: u32) {
+        let i = self.stripe(local);
+        if self.held(i, me()) {
+            return;
+        }
+        let s = &self.stripes[i];
+        let v = s.ver.load(Ordering::Acquire);
+        let mut spins = 0;
+        while (v & 1 == 1 || s.urgent.load(Ordering::Relaxed) != 0) && s.ver.load(Ordering::Acquire) == v {
+            backoff(&mut spins);
         }
     }
 
