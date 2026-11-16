@@ -445,3 +445,39 @@ fn a_standalone_open_refuses_when_the_round_trip_cannot_close_cleanly() {
     );
     assert!(!refused.is_empty(), "前提: 窓のどの点の故障でも、 往復が clean の印を立てられない形にならなかった");
 }
+
+/// PR #986 の読み直し 2 の [3] (D の続き): 単独の open が、 往復が要るか (WAL の file があるか) を知る stat に失敗したら断る。 前は
+/// `std::fs::metadata` の Err を 「WAL の file が無い」 と読んで往復せずに開き、 閉じると clean の印が立ち、 次の WAL 付きの open が #451 の
+/// 作り直しを飛ばした (本体にだけあった b の write が配る分に無く、 floor も覆わない)。 断った後も何も失っておらず、 開き直せば往復する。
+#[test]
+fn a_standalone_open_refuses_when_it_cannot_stat_the_wal_for_the_relog() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let u = unlogged_image("relogstat");
+    let root = u._s.0.clone();
+    let counted = root.join("counted");
+    copy(&u.db, &counted);
+    let trace = root.join("trace.txt");
+    let (line, _) = run_child(&counted, &[("ENCHU_FAULT_TRACE", trace.to_str().unwrap().to_string())]);
+    assert_eq!(line, "OK false", "前提: 故障が無ければ往復して開ける");
+    let sites: Vec<(u64, String)> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.split_once('\t').map(|(n, s)| (n.parse().unwrap(), s.to_string())))
+        .collect();
+    // 単独の open は lock の下で聞き (`oplog.stat` → `oplog.probe`、 WAL に再生する record は無い)、 往復が要るかを見る stat の後に
+    // 往復で WAL を開く (`oplog.open`)
+    let probe = sites.iter().find(|(_, s)| s == "oplog.probe").map(|(n, _)| *n);
+    let open = sites.iter().find(|(_, s)| s == "oplog.open").map(|(n, _)| *n);
+    let (Some(probe), Some(open)) = (probe, open) else { panic!("前提: 単独の open が聞いてから往復する: {sites:?}") };
+    let stat = sites.iter().find(|(n, s)| s == "oplog.stat" && *n > probe && *n < open).map(|(n, _)| *n);
+    let Some(stat) = stat else { panic!("前提: 往復の前に WAL の file を stat で見る: {sites:?}") };
+    let img = root.join("faulted");
+    copy(&u.db, &img);
+    let (line, fired) = run_child(&img, &[("ENCHU_FAULT_AT", stat.to_string())]);
+    assert!(fired.as_deref().is_some_and(|f| f.ends_with(" oplog.stat")), "前提: 往復の前の stat に故障を当てた: {fired:?}");
+    assert!(line.starts_with("ERR ") && line.contains("#451"), "WAL の file の stat に失敗したのに往復せずに開いた: {line}");
+    match assert_nothing_lost(&img, &u, "stat の失敗で断った後") {
+        Delivery::Relogged(hlc) => assert!(hlc > u.written_at, "作り直した record は新しい HLC"),
+        d => panic!("作り直さずに floor で済ませた: {d:?}"),
+    }
+}

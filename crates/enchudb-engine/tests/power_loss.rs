@@ -3822,36 +3822,50 @@ fn a_former_resident_the_replay_revives_is_not_restored() {
     assert!(bridged.is_empty(), "生きている X の Delete を作り直して配った (差分で受ける peer で X が消える): {bridged:x?}");
     assert_eq!(restored, 0, "再生が生き返らせた X の削除を記録から戻したまま");
     // #972: 戻すかを再生の後に回すために WAL に再生する record があるかを聞く (`restore_prev_residents`) のは、 最初の 1 件で止まる
-    // 読み。 全部を解くのは再生の 1 回
-    let probes = reads.probes - reads_before.probes;
-    assert!(probes >= 1, "前提: 記録を戻すかを決める前に WAL に聞いた ({reads:?})");
+    // 読み。 全部を解くのは再生の 1 回。 PR #986 の読み直し 2 の [2]: WAL 付きの open は、 開いた WAL に聞く (file を開き直して聞かない)
+    let asks = reads.asks - reads_before.asks;
+    assert!(asks >= 1, "前提: 記録を戻すかを決める前に WAL に聞いた ({reads:?})");
+    assert_eq!(reads.probes - reads_before.probes, 0, "WAL 付きの open が WAL の file を開き直して聞いた ({reads:?})");
     assert_eq!(reads.replays - reads_before.replays, 1, "WAL を全部解いたのが再生の 1 回でない ({reads:?})");
-    assert!(reads.probe_records - reads_before.probe_records <= 4 * probes, "聞く読みが最初の数件で止まらない ({reads:?})");
+    assert!(reads.probe_records - reads_before.probe_records <= 4 * asks, "聞く読みが最初の数件で止まらない ({reads:?})");
 }
 
-// ──── #989: 「WAL に再生する record があるか」 を聞けない時 (I/O の点 `oplog.probe` の一時の故障) ────
+// ──── #989 / PR #986 の読み直し 2: 開く時に WAL を聞けない・開けない・WAL の file の stat が失敗した時 ────
 //
-// 聞く読み (`OpLog::probe_replay`) が Err の時、 前の engine は 「再生する物が無い」 と読んだ。 単独の open の往復の前の見直しでは
-// WAL を見ずに開き (WAL にだけある値を失う)、 往復の後の見直しは素通り、 WAL 付きの open の突き合わせ / 記録の戻しは再生の前に
-// 仕上げた (#885 読み直し 1 / review946d [N1] の形に戻る)。 今は: 単独の open の前後の見直しは断る、 WAL 付きの open の中は
-// 「再生あり」 と見て仕上げを再生の後に回す。 故障は子 process で起こす (`ENCHU_FAULT_AT`、 数えるだけの回で点の番号を引く)。
+// 聞く読み (`OpLog::probe_replay`) が Err の時、 #986 の前の engine は 「再生する物が無い」 と読んだ (単独の open は WAL を見ずに
+// 開き、 往復の後の見直しは素通り、 WAL 付きの open の突き合わせ / 記録の戻しは再生の前に仕上げた)。 #986 の最初の直しは、 突き合わせが
+// 直しを map に書いた後に聞き、 聞けなければ断った: 断った後の開き直しは直した場所を見つけず、 仕上げ (残った cell を落とす) が二度と
+// 走らなかった (読み直し 2 の [1])。 WAL 付きの open は突き合わせの後に WAL を開けずに返ると、 Drop が clean の印を立てて後に回した
+// 仕上げを失った ([2])。 WAL の file があるかの stat (`Path::exists`) は失敗を 「無い」 と読み、 WAL 付きの open は WAL を作り直した ([3])。
+// 今は何かを直す前 (writer lock を取った直後) に決める: 単独の open はそこで一度だけ聞いて、 聞けなければ何も書かずに断り、 WAL 付きの
+// open はそこで WAL を開いて、 開いた WAL に聞く。 故障は子 process で起こす (`ENCHU_FAULT_AT`、 数えるだけの回で点の番号を引く)。
 
 const PROBE_CHILD_ENV: &str = "ENCHU_POWER_LOSS_PROBE_CHILD";
 
 /// 子: `ENCHU_POWER_LOSS_PROBE_CHILD` = `<開き方>\t<DB>\t<eid>` を開いて、 結果を 1 行 (`PROBE_CHILD ...`) 出す。 開けたら閉じる。
 /// 親が呼ばない時は何もしない。
-/// - `standalone`: 単独で開いて `t.a` の値
+/// - `standalone` / `writer`: 単独 / WAL 付きで開いて `t.a` の値
+/// - `concurrentize`: 単独で開いて `concurrentize_with_oplog` に渡し、 `t.a` の値
 /// - `keep`: WAL 付きで開いて、 行が生きているか・`t.c`・`t.a` (Tag)
 /// - `prev`: WAL 付きで開いて、 X が生きているか・記録から戻した数・state に出た X の Delete の数
-/// - `standalone_gen`: 単独で開いて、 `notes.note` = eid の欄の値を引いた数
+/// - `standalone_gen` / `writer_gen`: 単独 / WAL 付きで開いて、 `notes.note` = eid の欄の値を引いた数と、 開く時の突き合わせが完了させた数
 #[test]
 fn probe_fault_child() {
     let Ok(spec) = std::env::var(PROBE_CHILD_ENV) else { return };
     let mut it = spec.split('\t');
     let (kind, db, e) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap().parse::<u64>().unwrap());
+    let gen_line = |eng: &Engine| format!("OK {} {:?}", eng.pull_raw("notes.note", e as u32).len(), eng.generation_repairs());
     let line = match kind {
         "standalone" => match Engine::open_standalone(db) {
             Ok(st) => format!("OK {:?}", st.get(e, "t.a")),
+            Err(err) => format!("ERR {err}"),
+        },
+        "writer" => match Engine::open_concurrent_with_oplog(db, OPLOG_CAP) {
+            Ok(eng) => format!("OK {:?}", eng.get(e, "t.a")),
+            Err(err) => format!("ERR {err}"),
+        },
+        "concurrentize" => match Engine::open_standalone(db).and_then(|st| Engine::concurrentize_with_oplog(st, OPLOG_CAP)) {
+            Ok(eng) => format!("OK {:?}", eng.get(e, "t.a")),
             Err(err) => format!("ERR {err}"),
         },
         "keep" => match Engine::open_concurrent_with_oplog(db, OPLOG_CAP) {
@@ -3877,7 +3891,11 @@ fn probe_fault_child() {
             Err(err) => format!("ERR {err}"),
         },
         "standalone_gen" => match Engine::open_standalone(db) {
-            Ok(st) => format!("OK {}", st.pull_raw("notes.note", e as u32).len()),
+            Ok(st) => gen_line(&st),
+            Err(err) => format!("ERR {err}"),
+        },
+        "writer_gen" => match Engine::open_concurrent_with_oplog(db, OPLOG_CAP) {
+            Ok(eng) => gen_line(&eng),
             Err(err) => format!("ERR {err}"),
         },
         k => panic!("開き方 {k}"),
@@ -3906,40 +3924,56 @@ fn run_probe_child(kind: &str, db: &Path, e: u64, envs: &[(&str, String)]) -> (S
     (line, fired)
 }
 
-/// 像 `db` の写しを子で開き、 `nth` 番目 (1 始まり) の `oplog.probe` の点で EIO を 1 回起こす。 点の番号は、 故障なしで数えるだけの回の
-/// 写しで引く (consumer の thread も同じ数を進めるので、 往復の後の点はずれうる: 当たった点が `oplog.probe` になるまで近くを探す)。
-/// 戻り値: (故障なしの結果, 故障ありの結果)。 故障ありで当てた写しは、 故障なしで開き直した結果も確かめられるよう `after` に残す。
-fn open_with_probe_fault(root: &Path, db: &Path, kind: &str, e: u64, nth: usize, after: &Path) -> (String, String) {
+/// 像 `db` の写しを子で故障なしに開く (数えるだけの回)。 戻り値: (結果, 通った I/O の点 (番号, 名前) の並び)。
+fn count_points(root: &Path, db: &Path, kind: &str, e: u64) -> (String, Vec<(u64, String)>) {
     let counted = root.join("counted");
     let _ = std::fs::remove_dir_all(&counted);
     copy_tree(db, &counted);
     let trace = root.join("trace.txt");
     let _ = std::fs::remove_file(&trace);
     let (clean, _) = run_probe_child(kind, &counted, e, &[("ENCHU_FAULT_TRACE", trace.to_str().unwrap().to_string())]);
-    let probes: Vec<u64> = std::fs::read_to_string(&trace)
+    let points = std::fs::read_to_string(&trace)
         .unwrap()
         .lines()
         .filter_map(|l| l.split_once('\t'))
-        .filter(|(_, s)| *s == "oplog.probe")
-        .map(|(n, _)| n.parse().unwrap())
+        .map(|(n, s)| (n.parse().unwrap(), s.to_string()))
         .collect();
-    assert!(probes.len() >= nth, "前提: {kind} の open が WAL に {nth} 回以上聞く: {probes:?}");
-    let first = probes[0];
-    let at = probes[nth - 1];
+    (clean, points)
+}
+
+/// 名前 `site` の点の番号 (通った順)。
+fn points_named(points: &[(u64, String)], site: &str) -> Vec<u64> {
+    points.iter().filter(|(_, s)| s == site).map(|(n, _)| *n).collect()
+}
+
+/// 像 `db` の写し (`after` に置き、 故障の後も残す) を子で開き、 数えた回の `site` の点のうち `nth` 番目 (1 始まり) で EIO を 1 回起こす。
+/// consumer の thread も同じ数を進めるので、 当たった点が `site` になるまで、 同じ名前の前後の点の間で近くを探す。 戻り値は故障ありの結果。
+fn fault_at(db: &Path, kind: &str, e: u64, points: &[(u64, String)], site: &str, nth: usize, after: &Path) -> String {
+    let named = points_named(points, site);
+    assert!(named.len() >= nth, "前提: {kind} の open が {site} を {nth} 回以上通る: {points:?}");
+    let at = named[nth - 1] as i64;
+    let lo = if nth > 1 { named[nth - 2] as i64 } else { 0 };
+    let hi = named.get(nth).map_or(i64::MAX, |&n| n as i64);
     for d in 0..=16i64 {
-        for n in [at as i64 + d, at as i64 - d] {
-            if n < 1 || (nth > 1 && n as u64 <= first) {
+        for n in [at + d, at - d] {
+            if n <= lo || n >= hi {
                 continue;
             }
             let _ = std::fs::remove_dir_all(after);
             copy_tree(db, after);
             let (line, fired) = run_probe_child(kind, after, e, &[("ENCHU_FAULT_AT", n.to_string())]);
-            if fired.as_deref().is_some_and(|f| f.ends_with(" oplog.probe")) {
-                return (clean, line);
+            if fired.as_deref().is_some_and(|f| f.ends_with(&format!(" {site}"))) {
+                return line;
             }
         }
     }
-    panic!("{kind}: {nth} 番目の聞く点に故障を当てられなかった (数えた点 {probes:?})");
+    panic!("{kind}: {nth} 番目の {site} の点に故障を当てられなかった (数えた点 {points:?})");
+}
+
+/// 像 `db` の写しを子で開き、 `nth` 番目 (1 始まり) の `site` の点で EIO を 1 回起こす ([`fault_at`])。 戻り値: (故障なしの結果, 故障ありの結果)。
+fn open_with_fault(root: &Path, db: &Path, kind: &str, e: u64, site: &str, nth: usize, after: &Path) -> (String, String) {
+    let (clean, points) = count_points(root, db, kind, e);
+    (clean, fault_at(db, kind, e, &points, site, nth, after))
 }
 
 /// `src` の directory を `dst` に写す。
@@ -3994,7 +4028,7 @@ fn a_probe_failure_before_the_standalone_round_trip_refuses_to_open() {
     let root = scratch("probe_fault_before");
     let (db, x) = wal_only_value_image(&root);
     let after = root.join("after");
-    let (clean, faulted) = open_with_probe_fault(&root, &db, "standalone", x, 1, &after);
+    let (clean, faulted) = open_with_fault(&root, &db, "standalone", x, "oplog.probe", 1, &after);
     assert_eq!(clean, "OK Some(2)", "前提: 故障が無ければ往復して WAL にだけある値を見る");
     assert!(faulted.starts_with("ERR ") && faulted.contains("#989"), "聞けないのに単独で開いた: {faulted}");
     let (again, _) = run_probe_child("standalone", &after, x, &[]);
@@ -4013,7 +4047,7 @@ fn a_probe_failure_after_the_standalone_round_trip_refuses_to_open() {
     let root = scratch("probe_fault_after");
     let (db, x) = wal_only_value_image(&root);
     let after = root.join("after");
-    let (clean, faulted) = open_with_probe_fault(&root, &db, "standalone", x, 2, &after);
+    let (clean, faulted) = open_with_fault(&root, &db, "standalone", x, "oplog.probe", 2, &after);
     assert_eq!(clean, "OK Some(2)");
     assert!(faulted.starts_with("ERR ") && faulted.contains("#989"), "往復の後の見直しを聞けないのに開いた: {faulted}");
     let (again, _) = run_probe_child("standalone", &after, x, &[]);
@@ -4021,51 +4055,54 @@ fn a_probe_failure_after_the_standalone_round_trip_refuses_to_open() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// #989 (b): WAL 付きの open の突き合わせが WAL に聞けなければ、 仕上げ (cell を落とす) を再生の後に回す (`kept_columns_image`)。
-/// 前は再生の前に仕上げ、 再生で生き返った行の書き出しの返った列 (`t.a`) が消えた。
+/// #989 (b) / 読み直し 2 の [2]: WAL 付きの open は、 突き合わせの前 (writer lock の下) に WAL を開き、 開いた WAL に再生する record があるかを
+/// 聞く (file を開き直して聞かない)。 その WAL を開けなければ、 何も直さずに返り、 開き直した open が突き合わせ・再生・仕上げをする
+/// (`kept_columns_image`: 再生で生き返った行の書き出しの返った列 `t.a` が残る = #885 読み直し 1 の像)。
 #[test]
-fn a_probe_failure_in_the_reconcile_waits_for_the_replay() {
+fn a_wal_open_failure_before_the_reconcile_leaves_it_to_the_next_open() {
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = scratch("probe_fault_reconcile");
+    let root = scratch("wal_open_fault_reconcile");
     let (db, r) = kept_columns_image(&root);
     let after = root.join("after");
-    let (clean, faulted) = open_with_probe_fault(&root, &db, "keep", r, 1, &after);
+    let (clean, points) = count_points(&root, &db, "keep", r);
     assert_eq!(clean, "OK true Some(5) Some(\"kept\")", "前提: 故障が無ければ再生が r を生かし直して列も残る");
-    assert_eq!(faulted, clean, "聞けなかった突き合わせが再生の前に仕上げた");
+    assert!(points_named(&points, "oplog.probe").is_empty(), "WAL 付きの open が WAL の file を開き直して聞いた: {points:?}");
+    let faulted = fault_at(&db, "keep", r, &points, "oplog.open", 1, &after);
+    assert!(faulted.starts_with("ERR "), "WAL を開けないのに開いた: {faulted}");
+    let (again, _) = run_probe_child("keep", &after, r, &[]);
+    assert_eq!(again, clean, "WAL を開けなかった後の開き直しが、 故障の無い open と違う");
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// #989 (c): WAL 付きの open の `prev.seg` の記録の戻しが WAL に聞けなければ、 戻すかを再生の後に決める
-/// (`revived_former_resident_image`)。 前は再生の前に戻し、 再生が生き返らせた X の Delete を state に出した。
+/// #989 (c) / 読み直し 2 の [2]: WAL 付きの open の `prev.seg` の記録の戻しも、 開いた WAL に聞く。 WAL を開けなければ何も戻さずに返り、
+/// 開き直した open が戻すかを再生の後に決める (`revived_former_resident_image`: 再生が生き返らせた X を戻さない = review946d [N1])。
 #[test]
-fn a_probe_failure_in_the_prev_restore_waits_for_the_replay() {
+fn a_wal_open_failure_before_the_prev_restore_leaves_it_to_the_next_open() {
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = scratch("probe_fault_prev");
+    let root = scratch("wal_open_fault_prev");
     let (db, x, _) = revived_former_resident_image(&root);
     let after = root.join("after");
-    let (clean, faulted) = open_with_probe_fault(&root, &db, "prev", x, 1, &after);
+    let (clean, points) = count_points(&root, &db, "prev", x);
     assert_eq!(clean, "OK true 0 0", "前提: 故障が無ければ再生が X を生かし、 記録から戻さない");
-    assert_eq!(faulted, clean, "聞けなかった記録の戻しが再生の前に戻した");
+    assert!(points_named(&points, "oplog.probe").is_empty(), "WAL 付きの open が WAL の file を開き直して聞いた: {points:?}");
+    let faulted = fault_at(&db, "prev", x, &points, "oplog.open", 1, &after);
+    assert!(faulted.starts_with("ERR "), "WAL を開けないのに開いた: {faulted}");
+    let (again, _) = run_probe_child("prev", &after, x, &[]);
+    assert_eq!(again, clean, "WAL を開けなかった後の開き直しが、 故障の無い open と違う");
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// #989 (e): 単独の open の中の突き合わせ (`reconcile_generations`) が WAL に聞けずに仕上げを再生の後に回したら、 断る (単独の open は
-/// 再生しないので、 回した仕上げを誰も済ませない)。 像は sync しない v15 の DB で、 gen.seg は削除の後・生きている印は削除の前、 WAL に
-/// 再生する record は無い (往復の前の見直しは 「無い」 = 往復しない、 突き合わせの問いが 2 つ目の点)。 故障が無ければ突き合わせが
-/// 削除を完了させて消した行の cell (3) を落とす。
-#[test]
-fn a_probe_failure_in_a_standalone_reconcile_refuses_to_open() {
-    if std::env::var(VERIFY_ENV).is_ok() {
-        return;
-    }
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = scratch("probe_fault_standalone_gen");
+/// 開く時の突き合わせが削除を完了させる v15 の像 (sync しない): gen.seg は行 c の削除の後、 生きている印 (`entities.seg`) と列 (`himo/`) は
+/// 削除の前 (c の場所に note = 3 の cell が残る)。 `replay` なら WAL に再生する record (行 b の note = 9、 削除とは関係の無い行) を 1 つ
+/// 残す (無ければ WAL に再生する record は無い = 単独の open は往復しない)。 故障が無ければ、 開く時の突き合わせが削除を完了させて (1, 0)、
+/// 残った cell を落とす (note = 3 を引いても 0 件)。 戻り値は像の DB。
+fn reconcile_image(root: &Path, replay: bool) -> PathBuf {
     let (made, before, after, img) = (root.join("made"), root.join("before"), root.join("after"), root.join("img"));
     {
         let mut eng = Engine::create_with_capacity(made.to_str().unwrap(), 65_536).unwrap();
@@ -4089,17 +4126,139 @@ fn a_probe_failure_in_a_standalone_reconcile_refuses_to_open() {
         eng.delete(c);
         eng.persist_tables().unwrap(); // #870 の止めを外して checkpoint を削除の先へ
         eng.oplog_sync().unwrap();
+        if replay {
+            eng.tie_to(b, "notes.note", 9u32);
+            eng.oplog_commit();
+        }
         copy_tree(&made, &after);
         drop(hold);
     }
     copy_tree(&after, &img);
     std::fs::copy(before.join("entities.seg"), img.join("entities.seg")).unwrap();
+    std::fs::remove_dir_all(img.join("himo")).unwrap();
+    copy_tree(&before.join("himo"), &img.join("himo"));
+    img
+}
+
+/// 読み直し 2 の [1]: 単独の open は、 開く時の突き合わせが何かを直す前 (writer lock を取った直後) に WAL に再生する record があるかを聞く。
+/// 聞けなければ何も書かずに断り、 開き直した open が突き合わせから全部をやる。 #986 の最初の直しは突き合わせが直しを map に書いた後に
+/// 聞いて断ったので、 開き直した open は直した場所を見つけず、 残った cell を落とす仕上げが二度と走らなかった (消えた c が note = 3 で
+/// 引けた)。 単独の open が聞く全部の点で確かめる (WAL に再生する record は無い = 往復しない)。
+#[test]
+fn every_probe_failure_in_a_standalone_open_leaves_the_reconcile_whole() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("probe_fault_standalone_gen");
+    let img = reconcile_image(&root, false);
+    let (clean, points) = count_points(&root, &img, "standalone_gen", 3);
+    assert_eq!(clean, "OK 0 (1, 0)", "前提: 故障が無ければ単独の open の突き合わせが削除を完了させ、 残った cell を落とす");
+    let probes = points_named(&points, "oplog.probe").len();
+    assert!(probes >= 1, "前提: 単独の open が WAL に聞く: {points:?}");
     let probed = root.join("probed");
-    let (clean, faulted) = open_with_probe_fault(&root, &img, "standalone_gen", 3, 2, &probed);
-    assert_eq!(clean, "OK 0", "前提: 故障が無ければ単独の open の突き合わせが削除を完了させる");
-    assert!(faulted.starts_with("ERR ") && faulted.contains("#989"), "仕上げを回したまま単独で開いた: {faulted}");
-    let (again, _) = run_probe_child("standalone_gen", &probed, 3, &[]);
-    assert_eq!(again, "OK 0", "断った後に開き直せない");
+    for nth in 1..=probes {
+        let faulted = fault_at(&img, "standalone_gen", 3, &points, "oplog.probe", nth, &probed);
+        assert!(faulted.starts_with("ERR ") && faulted.contains("#989"), "{nth} 番目の聞く点: 聞けないのに単独で開いた: {faulted}");
+        let (again, _) = run_probe_child("standalone_gen", &probed, 3, &[]);
+        assert_eq!(again, clean, "{nth} 番目の聞く点: 断った後の開き直しが、 突き合わせの仕上げをしない (消えた行が引ける)");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 読み直し 2 の [2]: WAL 付きの open が WAL を開けずに返っても、 開き直した open が突き合わせから全部をやる (WAL を開くのは突き合わせの前)。
+/// 前は突き合わせが直しを map に書き、 仕上げを再生の後に回した後に WAL を開けずに返り、 engine の Drop が clean の印を立てた: 開き直した
+/// open は突き合わせをせず (きれいに閉じたと読む)、 消えた c が note = 3 で引けた。 WAL に再生する record がある像。
+#[test]
+fn a_wal_open_failure_leaves_the_reconcile_whole() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("wal_open_fault_gen");
+    let img = reconcile_image(&root, true);
+    let after = root.join("after_fault");
+    let (clean, faulted) = open_with_fault(&root, &img, "writer_gen", 3, "oplog.open", 1, &after);
+    assert_eq!(clean, "OK 0 (1, 0)", "前提: 故障が無ければ突き合わせが削除を完了させ、 再生の後に残った cell を落とす");
+    assert!(faulted.starts_with("ERR "), "WAL を開けないのに開いた: {faulted}");
+    let (again, _) = run_probe_child("writer_gen", &after, 3, &[]);
+    assert_eq!(again, clean, "WAL を開けなかった後の開き直しが、 突き合わせの仕上げをしない (消えた行が引ける)");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 読み直し 2 の [3]: WAL 付きの open は、 WAL の file があるかの stat が失敗した時に 「無い」 と読まない。 前は `Path::exists` が stat の
+/// 失敗を false にし、 `OpLog::create` が WAL を作り直して (truncate) 再生していない record を捨てた (WAL にだけある `t.a` = 2 を失って 1)。
+#[test]
+fn a_wal_stat_failure_does_not_recreate_the_wal() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("wal_stat_fault_writer");
+    let (db, x) = wal_only_value_image(&root);
+    let after = root.join("after");
+    let (clean, faulted) = open_with_fault(&root, &db, "writer", x, "oplog.stat", 1, &after);
+    assert_eq!(clean, "OK Some(2)", "前提: 故障が無ければ再生して WAL にだけある値を見る");
+    assert!(faulted.starts_with("ERR "), "WAL の stat が失敗したのに開いた: {faulted}");
+    let (again, _) = run_probe_child("writer", &after, x, &[]);
+    assert_eq!(again, "OK Some(2)", "WAL の stat が失敗した後に WAL にだけある値を失った (WAL を作り直した)");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 読み直し 2 の [3]: 単独の open も、 WAL の file があるかの stat の失敗を 「WAL 無し」 と読まない (#989 と同じく断る)。 前は WAL を見ずに
+/// 開いた (`t.a` = 1)。
+#[test]
+fn a_wal_stat_failure_refuses_a_standalone_open() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("wal_stat_fault_standalone");
+    let (db, x) = wal_only_value_image(&root);
+    let after = root.join("after");
+    let (clean, faulted) = open_with_fault(&root, &db, "standalone", x, "oplog.stat", 1, &after);
+    assert_eq!(clean, "OK Some(2)");
+    assert!(faulted.starts_with("ERR ") && faulted.contains("#989"), "WAL の stat が失敗したのに単独で開いた: {faulted}");
+    let (again, _) = run_probe_child("standalone", &after, x, &[]);
+    assert_eq!(again, "OK Some(2)", "断った後に開き直せない / 値を失った");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 読み直し 2 の [3]: `concurrentize_with_oplog` も、 WAL の file があるかの stat の失敗で WAL を作り直さない (Err を返し、 WAL の file は
+/// 1 byte も変わらない)。 像はきれいに閉じた WAL 付きの DB (単独で開いてから渡す = 利用者の build → runtime の形)。
+#[test]
+fn a_wal_stat_failure_does_not_recreate_the_wal_in_concurrentize() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("wal_stat_fault_concurrentize");
+    let db = root.join("db");
+    let x = {
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 16).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to(x, "t.a", 4u32);
+        eng.oplog_sync().unwrap();
+        x
+    };
+    let (clean, points) = count_points(&root, &db, "concurrentize", x);
+    assert_eq!(clean, "OK Some(4)");
+    let (stats, open) = (points_named(&points, "oplog.stat"), points_named(&points, "oplog.open"));
+    // 単独の open は往復しない (きれいに閉じた)。 WAL を開くのは concurrentize_with_oplog の 1 回で、 その前の stat が 2 つ目
+    // (1 つ目は単独の open が lock の下で聞く所)
+    assert_eq!(open.len(), 1, "前提: 単独の open は往復しない: {points:?}");
+    assert!(stats.len() >= 2 && stats[1] < open[0], "前提: 単独の open と concurrentize_with_oplog が WAL の file を見る: {points:?}");
+    let after = root.join("after");
+    let faulted = fault_at(&db, "concurrentize", x, &points, "oplog.stat", 2, &after);
+    assert!(faulted.starts_with("ERR "), "WAL の stat が失敗したのに WAL 付きにした: {faulted}");
+    assert_eq!(
+        std::fs::read(after.join("oplog")).unwrap(),
+        std::fs::read(db.join("oplog")).unwrap(),
+        "WAL の stat が失敗した concurrentize_with_oplog が WAL を書き換えた (作り直した)"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

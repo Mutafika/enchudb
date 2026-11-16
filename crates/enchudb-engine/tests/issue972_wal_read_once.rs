@@ -1,6 +1,7 @@
 //! #972: きれいに閉じなかった後に開く時、 WAL を全部解くのは本当の再生 (WAL 付きの open の `recover_with_tail`) の 1 回だけ。
-//! 「再生する record があるか」 を聞く道 (#880 の往復の前と後、 `reconcile_generations` の仕上げ、 `restore_prev_residents`) は、
-//! WAL を読むだけで開いて最初の当てる record で止まる (`OpLog::probe_replay`)。
+//! 「再生する record があるか」 を聞く道は、 最初の当てる record で止まる: 単独の open が writer lock の下で聞く所 (#880 の往復の前と後)
+//! は WAL を読むだけで開いて聞き (`OpLog::probe_replay`)、 WAL 付きの open は開いた WAL に聞く (`OpLog::has_records_to_replay`、
+//! `reconcile_generations` の仕上げと `restore_prev_residents` が要る時に 1 回。 PR #986 の読み直し 2 の [2])。
 //!
 //! 前は聞くたびに WAL を読み書きで開いて全部を解き (`OpLog::open` + `recover_with_tail`)、 単独の open (`open_standalone`) は
 //! 1 回の open で 2〜5 回 WAL を全部読んだ (256 MiB の WAL で 1 回 0.3〜1 秒)。
@@ -59,17 +60,21 @@ fn reads<T>(f: impl FnOnce() -> T) -> (T, WalReads) {
         replays: b.replays - a.replays,
         hole_scans: b.hole_scans - a.hole_scans,
         probes: b.probes - a.probes,
+        asks: b.asks - a.asks,
         probe_records: b.probe_records - a.probe_records,
         ..WalReads::default()
     };
     (out, d)
 }
 
-/// 全部を解いたのは本当の再生の 1 回、 聞く読みは `probes` 回で、 どれも最初の数件で止まった。
-fn assert_read_once(r: WalReads, probes: u64, what: &str) {
+/// 全部を解いたのは本当の再生の 1 回、 再生する record があるかを WAL の file に聞いたのは `probes` 回 (単独の open が lock の下で)、
+/// 開いた WAL に聞いたのは全部で `asks` 回 (file に聞く 1 回ごとの 1 回と、 WAL 付きの open が開いた WAL に聞く回) で、 どれも最初の数件で
+/// 止まった。
+fn assert_read_once(r: WalReads, probes: u64, asks: u64, what: &str) {
     assert_eq!(r.replays, 1, "{what}: WAL を全部解いた回数 ({r:?})");
-    assert_eq!(r.probes, probes, "{what}: 再生する record があるかを聞いた回数 ({r:?})");
-    assert!(r.probe_records <= PROBE_RECORDS_MAX * probes, "{what}: 聞く読みが最初の数件で止まらない ({r:?})");
+    assert_eq!(r.probes, probes, "{what}: 再生する record があるかを WAL の file に聞いた回数 ({r:?})");
+    assert_eq!(r.asks, asks, "{what}: 再生する record があるかを聞いた回数 ({r:?})");
+    assert!(r.probe_records <= PROBE_RECORDS_MAX * asks, "{what}: 聞く読みが最初の数件で止まらない ({r:?})");
 }
 
 /// 表 `t` (枠 `rows`、 列 a)。
@@ -104,8 +109,8 @@ fn image_with_records(sync: bool, made: &str, img: &str) -> (u64, u32) {
     (last, 100 + ROWS - 1)
 }
 
-/// WAL に再生する record がある kill の像: WAL 付きの open は聞かずに 1 回だけ解く。 単独の open は往復の前と後に 1 回ずつ聞いて、
-/// 解くのは往復の中の再生の 1 回だけ (前は前と中の 2 回 + 後の見直し)。 sync する DB / しない DB。
+/// WAL に再生する record がある kill の像: WAL 付きの open は聞かずに 1 回だけ解く。 単独の open は往復の前と後に 1 回ずつ (lock の下で)
+/// 聞いて、 解くのは往復の中の再生の 1 回だけ (前は前と中の 2 回 + 後の見直し)。 sync する DB / しない DB。
 #[test]
 fn an_open_after_a_kill_decodes_the_wal_once() {
     for sync in [false, true] {
@@ -118,12 +123,12 @@ fn an_open_after_a_kill_decodes_the_wal_once() {
         let (eng, r) = reads(|| Engine::open_concurrent_with_oplog(&w, WAL).unwrap());
         assert_eq!(eng.get(last, "t.a"), Some(v as u64), "前提: 再生した (sync = {sync})");
         drop(eng);
-        assert_read_once(r, 0, &format!("WAL 付きの open (sync = {sync})"));
+        assert_read_once(r, 0, 0, &format!("WAL 付きの open (sync = {sync})"));
 
         let (eng, r) = reads(|| Engine::open_standalone(&s).unwrap());
         assert_eq!(eng.get(last, "t.a"), Some(v as u64), "前提: 往復が再生した (sync = {sync})");
         drop(eng);
-        assert_read_once(r, 2, &format!("単独の open (sync = {sync})"));
+        assert_read_once(r, 2, 2, &format!("単独の open (sync = {sync})"));
     }
 }
 
@@ -148,7 +153,7 @@ fn the_relog_round_trip_of_an_unclean_sync_db_reads_the_wal_once() {
     assert_eq!(eng.get(e, "t.a"), Some(5));
     assert!(!eng.himo_index_rebuilt_on_load(), "前提: 往復した (往復が閉じて clean の印を立てた)");
     drop(eng);
-    assert_read_once(r, 2, "往復する単独の open");
+    assert_read_once(r, 2, 2, "往復する単独の open");
 }
 
 /// 表 `notes` (枠 2、 列 note) と、 使い回しを起こすための表 `full` (枠 1)。 (`eid_generation.rs` と同じ形)
@@ -168,8 +173,8 @@ fn create_v15(path: &str, sync: bool) -> Arc<Engine> {
 
 /// v15 の DB で、 開く時の突き合わせが削除を完了させる像 (`eid_generation.rs` の `reconcile_through_standalone_open` と同じ:
 /// gen.seg は削除の後、 生きている印は削除の前) に、 再生する record を `ROWS` 件足す。 突き合わせは仕上げを再生の後に回すかを
-/// 聞く (`reconcile_generations`)。 WAL 付きの open は 1 回聞いて 1 回解く、 単独の open は往復の前・突き合わせ・往復の後で 3 回聞いて
-/// 1 回解く (前は 3 回全部を解いた)。
+/// 聞く (`reconcile_generations`)。 WAL 付きの open は開いた WAL に 1 回聞いて 1 回解く。 単独の open は往復の前と後に WAL の file に
+/// 聞き (lock の下、 突き合わせの前)、 往復の WAL 付きの open が開いた WAL に 1 回聞いて、 1 回解く (#972 の前は 3 回全部を解いた)。
 #[test]
 fn an_open_that_reconciles_generations_decodes_the_wal_once() {
     for sync in [false, true] {
@@ -213,12 +218,12 @@ fn an_open_that_reconciles_generations_decodes_the_wal_once() {
         assert_eq!(eng.get(b, "notes.note"), Some(10 + ROWS as u64 - 1), "前提: 再生した");
         assert!(!eng.is_live(c));
         drop(eng);
-        assert_read_once(r, 1, &format!("突き合わせのある WAL 付きの open (sync = {sync})"));
+        assert_read_once(r, 0, 1, &format!("突き合わせのある WAL 付きの open (sync = {sync})"));
 
         let (eng, r) = reads(|| Engine::open_standalone(&s).unwrap());
         assert_eq!(eng.get(b, "notes.note"), Some(10 + ROWS as u64 - 1), "前提: 往復が再生した");
         assert!(!eng.is_live(c));
         drop(eng);
-        assert_read_once(r, 3, &format!("突き合わせのある単独の open (sync = {sync})"));
+        assert_read_once(r, 2, 3, &format!("突き合わせのある単独の open (sync = {sync})"));
     }
 }

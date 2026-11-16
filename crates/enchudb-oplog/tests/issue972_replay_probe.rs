@@ -12,6 +12,7 @@
 #![cfg(unix)]
 
 use enchudb_oplog::oplog::{Op, OpLog, op_type, wal_pos_offset, wal_reads};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const HALF: usize = 16 * 1024;
@@ -53,33 +54,37 @@ impl Drop for Scratch {
     }
 }
 
-/// #972 の前の engine の判定: 写しを読み書きで開き、 record が 1 件も無いか再生が空なら false。 開けなければ None。
-fn full_answer(path: &Path) -> Option<bool> {
+/// #972 の前の engine の判定: 写しを読み書きで開き、 record が 1 件も無いか再生が空なら false。 開けなければ Err の種類。
+fn full_answer(path: &Path) -> Result<bool, ErrorKind> {
     let copy = path.with_extension("full");
     std::fs::copy(path, &copy).unwrap();
-    let r = OpLog::open(&copy).ok().map(|w| !(w.is_empty() || w.recover_with_tail().is_empty()));
+    let r = OpLog::open(&copy).map(|w| !(w.is_empty() || w.recover_with_tail().is_empty())).map_err(|e| e.kind());
     let _ = std::fs::remove_file(&copy);
     r
 }
 
-/// 聞く読みの答え (開けなければ None)。 file を 1 byte も書かないことと、 容量が `open` と同じことも確かめる。
-fn probe_answer(path: &Path) -> Option<bool> {
+/// 聞く読みの答え (開けなければ Err の種類)。 file を 1 byte も書かないことと、 容量が `open` と同じことも確かめる。
+fn probe_answer(path: &Path) -> Result<bool, ErrorKind> {
     let before = std::fs::read(path).unwrap();
     let r = OpLog::probe_replay(path);
     assert_eq!(std::fs::read(path).unwrap(), before, "聞く読みが file を書いた ({})", path.display());
-    let r = r.ok()?;
+    let r = r.map_err(|e| e.kind())?;
     let copy = path.with_extension("cap");
     std::fs::copy(path, &copy).unwrap();
     assert_eq!(Some(r.capacity), OpLog::open(&copy).ok().map(|w| w.capacity()), "容量が open と違う");
     let _ = std::fs::remove_file(&copy);
-    Some(r.records)
+    Ok(r.records)
 }
 
-/// 2 つの答えが同じ (同じ値を返す)。
+/// 2 つの答えが同じ (同じ値を返す)。 開けない file は、 どちらも `InvalidData` (engine はこの種類だけを 「壊れた / 切り詰められた WAL =
+/// 再生する物なし」 と読み、 他の Err では開くのを断る (#989)。 聞く読みだけ別の種類を返すと、 開けていた DB が開けなくなる)。
 fn same(path: &Path, what: &str) -> Option<bool> {
     let full = full_answer(path);
     assert_eq!(probe_answer(path), full, "{what}: 聞く読みと全部を解く再生の答えが違う");
-    full
+    if let Err(kind) = full {
+        assert_eq!(kind, ErrorKind::InvalidData, "{what}: 開けない WAL の Err の種類");
+    }
+    full.ok()
 }
 
 fn r32(file: &[u8], at: usize) -> u32 {

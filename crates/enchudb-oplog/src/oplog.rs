@@ -191,6 +191,9 @@ pub struct WalReads {
     pub hole_scans: u64,
     /// 「再生する record があるか」 を file に聞いた回数 ([`OpLog::probe_replay`]、 全部は解かない)
     pub probes: u64,
+    /// 「再生する record があるか」 を開いた WAL に聞いた回数 ([`OpLog::has_records_to_replay`]。 [`OpLog::probe_replay`] の中の 1 回と、
+    /// WAL 付きの open が開いた WAL に聞く回)
+    pub asks: u64,
     /// その問い合わせ ([`OpLog::has_records_to_replay`]) が読んだ record の数 (Commit と当てる record。 止まれば当てる record は 1 件)
     pub probe_records: u64,
     /// 問い合わせが写しの map を作れず、 読み書きの map で開いた回数 ([`OpLog::probe_replay`])
@@ -207,6 +210,7 @@ thread_local! {
             replays: 0,
             hole_scans: 0,
             probes: 0,
+            asks: 0,
             probe_records: 0,
             probe_fallbacks: 0,
             replay_ns: 0,
@@ -4342,7 +4346,10 @@ impl OpLog {
         // 当てる record を見た数 (止まれば 1)
         let seen = (s.out.len() + s.tail.len()) as u64;
         let read = s.commit_ends.len() as u64 + seen;
-        note_wal_read(|r| r.probe_records += read);
+        note_wal_read(|r| {
+            r.asks += 1;
+            r.probe_records += read;
+        });
         seen > 0
     }
 
@@ -4371,10 +4378,13 @@ impl OpLog {
                 let layout = read_layout(&mut mmap)?;
                 Self::assemble(file, mmap, layout)
             }
-            Err(_) => {
+            Err(copy_err) => {
                 drop(file);
                 note_wal_read(|r| r.probe_fallbacks += 1);
-                Self::open(path)?
+                // 種類は読み書きの map の Err の物 (`InvalidData` = 本当の open も開けない、 の見分けはこちら)。 写しの map の Err も言う
+                Self::open(path).map_err(|e| {
+                    io::Error::new(e.kind(), format!("{e} (after a private copy map of the WAL failed: {copy_err})"))
+                })?
             }
         };
         let records = !wal.is_empty() && wal.has_records_to_replay();
@@ -5062,8 +5072,6 @@ mod tests {
         write_lap_trailer(&mut bytes[t..t + LAP_TRAILER], lap, bind_word(crc));
     }
 
-    /// ホストの形: 切れ目の後に Commit と中継しか積んでいなければ 「中身のある自分の record は積んでいない」 (時計を今まで進め、
-    /// 以後の採番はそれより後)。 中身のある自分の record を積んだら、 次の切れ目までは言わない。
     /// #972: 写しの map を作れない時 (`vm.overcommit_memory = 2` の `ENOMEM` など)、 聞く読みは読み書きの map (本当の open と同じ) で
     /// 開いて同じ答えを出す (Err にしない)。 その時だけ header の直しが file に届く。 B の header を読めなくした WAL で、 写しの map の
     /// 答えと比べる。
@@ -5095,6 +5103,37 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// PR #986 の読み直し 2 の [5]: 写しの map も読み書きの map も作れない時、 Err の種類は読み書きの map (本当の open と同じ開き方) の物で、
+    /// 写しの map の Err も言う (前は写しの map の Err を捨て、 2 つ目だけが見えた)。 読み書きで開けない file (読むだけの権限) で作る。
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_cannot_map_either_way_reports_both_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tmp("probe-both-fail");
+        {
+            let wal = OpLog::create(&p, 2 * HALF_ALIGN as usize).unwrap();
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+            wal.fsync().unwrap();
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if OpenOptions::new().read(true).write(true).open(&p).is_ok() {
+            // root は権限で断られない (前提を作れない)
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = std::fs::remove_file(&p);
+            return;
+        }
+        PROBE_MAP_FAILS.with(|f| f.set(true));
+        let r = OpLog::probe_replay(&p);
+        PROBE_MAP_FAILS.with(|f| f.set(false));
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = r.expect_err("読み書きで開けない file を、 写しの map なしに開けたと言った");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "Err の種類が読み書きの map の物でない: {e}");
+        assert!(e.to_string().contains("os error 12"), "写しの map の Err (ENOMEM) を捨てた: {e}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ホストの形: 切れ目の後に Commit と中継しか積んでいなければ 「中身のある自分の record は積んでいない」 (時計を今まで進め、
+    /// 以後の採番はそれより後)。 中身のある自分の record を積んだら、 次の切れ目までは言わない。
     #[test]
     fn quiet_since_ignores_commits_and_relays_but_not_own_data() {
         let p = tmp("quiet_since");
