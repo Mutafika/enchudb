@@ -2799,18 +2799,27 @@ fn a_relogged_delete_carries_the_generation_of_the_deleted_row() {
     panic!("5 回とも consumer が先に oplog を届かせた");
 }
 
-/// 書き出しの段 `when` で、 別の thread で `eid` を消す (待たせない。 300 ms で書き出しを進める)。 段 `shot` で像を撮る。
+/// 書き出しの段 `when` で、 別の thread で `eid` を消す。 消し終えるか、 削除の門で待ち始めたら (#978、 `Phase::DeleteGateWait`) 書き出しを
+/// 進める (時間では待たない、 読み直し [9])。 段 `shot` で像を撮る。
 fn delete_during_write_out(eng: &Arc<Engine>, eid: u64, when: Phase, shot: Phase, live: &Path, img: &Path) -> Arc<AtomicBool> {
     let (e2, done, (l, i)) = (eng.clone(), Arc::new(AtomicBool::new(false)), (live.to_path_buf(), img.to_path_buf()));
     let (done2, shot_once) = (done.clone(), AtomicBool::new(false));
+    let waiting: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>> = Arc::default();
     write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::DeleteGateWait
+            && let Some(tx) = waiting.lock().unwrap().take()
+        {
+            let _ = tx.send(());
+        }
         if p == when && !done2.swap(true, Ordering::SeqCst) {
             let (e3, (tx, rx)) = (e2.clone(), std::sync::mpsc::channel::<()>());
+            *waiting.lock().unwrap() = Some(tx.clone());
             std::thread::spawn(move || {
                 e3.delete(eid);
                 let _ = tx.send(());
             });
-            let _ = rx.recv_timeout(std::time::Duration::from_millis(300));
+            rx.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("削除が 60 秒終わらず、 削除の門で待ち始めた印 (`Phase::DeleteGateWait`) も来ない");
         }
         // 撮るのは消した書き出しの段で 1 回だけ (`flush_clean` は本体を 2 回書き出す。 2 回目で撮ると揃った像になる)
         if p == shot && done2.load(Ordering::SeqCst) && !shot_once.swap(true, Ordering::SeqCst) {
@@ -2916,22 +2925,28 @@ fn a_db_without_a_wal_reconciles_a_delete_after_a_clean_flush() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// 読み直し Q1 / 4: gen.seg だけ死の場所を突き合わせが完了させ、 tombstone は届いていない (sync の DB。 #978 から書き出しは列の段の前に
-/// tomb.seg を書き出すので、 その前 = 残りの列の段の前 `BeforeRest` で落ちる)。
+/// 読み直し Q1 / 4: gen.seg だけ死の場所を突き合わせが完了させ、 tombstone は届いていない (sync の DB)。
 /// tombstone を新しい HLC で置き、 #451 が Delete を作り直す (相手に配る)。 その Delete の eid は消えた行の世代込み (突き合わせは世代を
 /// 2 つ上げるので、 今 − 1 ではない)。 消えた行への相手の書き込みは弾く (前は `slot_is_dead` が偽で、 新しい世代で生き返った)。
+///
+/// #978 から本体の書き出しは、 生きている印・場所の世代・列の前に削除の門を閉じて tomb.seg を書き出すので、 書き出しの段で撮る像
+/// (`Lost`) にはこの形が無い (消した場所の世代が届く像には tombstone も届く)。 残る道は OS が書き出しの前に page を先に書いた像: 書き出して
+/// いない r の削除のうち、 gen.seg の page だけが届いた像 (`Mixed`) を seed で探す (r の削除の record の page・tomb.seg・生きている印の
+/// page が書き出し済みの中身、 gen.seg の page が今の中身、 の組。 1 枚が当たる率は Mac で 1/9〜1/23 = 3 回の run で 160 枚に 7〜18 枚。
+/// 320 枚で 1 枚も無い率は 1e-6 以下)。
 #[test]
 fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid() {
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
+    const SEEDS: u64 = 320;
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = scratch("gen_tomb");
-    let (live, img) = (root.join("live"), root.join("img"));
+    let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
     crashsim::start();
     let db = live.join("db");
-    let (a, r, hid) = {
+    let (a, r, hid, deleted_at) = {
         let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
         eng.define_table("notes", 2).unwrap();
         let hid = eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap() as u16;
@@ -2949,35 +2964,67 @@ fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid(
         eng.tie_to(r, "notes.note", 5u32);
         eng.persist_tables().unwrap();
         eng.oplog_sync().unwrap();
+        // もう 1 度: 1 回目が進めた checkpoint (r の Tie の後ろ) を WAL の header ごと書き出す (でないと、 header の page が書き出し済みの
+        // 中身の像で再生が r の Tie を当て直して r を生かし直す)
+        eng.oplog_sync().unwrap();
         let _hold = eng.hold_consumer();
         eng.tie_to(keep, "notes.note", 7u32);
-        let done = delete_during_write_out(&eng, r, Phase::BeforeGenerations, Phase::BeforeRest, &live, &img);
-        eng.oplog_sync().unwrap();
-        write_out_hook::set(None);
-        assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
-        (a, r, hid)
+        // 書き出さない (r の削除は WAL にも本体にも page cache にだけある)
+        eng.delete(r);
+        let deleted_at = eng.tombstone_hlc(r);
+        for seed in 0..SEEDS {
+            crashsim::capture(&live, &root.join(format!("img{seed}")), Mode::Mixed { seed }).unwrap();
+        }
+        (a, r, hid, deleted_at)
     };
     crashsim::stop();
-    let tomb_in_image = Engine::open_readonly(img.join("db").to_str().unwrap()).unwrap().tombstone_hlc(r);
-    assert_eq!(tomb_in_image, Hlc::ZERO, "前提: 像に r の tombstone は届いていない");
-    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
-    assert_eq!(eng.generation_repairs().0, 1, "前提: gen.seg だけ死の場所を突き合わせが完了させた");
-    assert!(!eng.is_live(r), "前提: r の Tie は checkpoint の手前 (再生で生き返らない)");
-    let deletes: Vec<u64> = eng
-        .audit(&enchudb_engine::AuditFilter::default())
-        .into_iter()
-        .filter_map(|r| match r.op {
-            DecodedOp::Delete { eid } => Some(eid),
-            _ => None,
-        })
-        .collect();
-    // a の Delete は前の session の record (WAL が畳まれていれば無い)。 r の Delete は作り直した物
-    let relogged: Vec<u64> = deletes.iter().copied().filter(|&d| d != a).collect();
-    assert_eq!(relogged, vec![r], "作り直した Delete が無い / 消えた行の世代込みの eid でない ({deletes:x?})");
-    let world = enchudb_oplog::make_eid(1, eng.eid_slot(r));
-    let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
-    assert!(!eng.remote_tie_apply(world, hid, 9u32, later), "消えた行への相手の書き込みで行が生き返った");
+    let (mut hits, mut revived) = (0, 0);
+    for seed in 0..SEEDS {
+        let img = root.join(format!("img{seed}"));
+        let idb = img.join("db");
+        // 前提の形: r の削除の record は WAL に無く、 tombstone も無く、 gen.seg だけ死
+        let in_wal = OpLog::open(&idb.join("oplog")).unwrap().records_with_tail().iter().any(|x| x.hlc == deleted_at);
+        let tomb_in_image = Engine::open_readonly(idb.to_str().unwrap()).unwrap().tombstone_hlc(r);
+        if in_wal || tomb_in_image != Hlc::ZERO {
+            let _ = std::fs::remove_dir_all(&img);
+            continue;
+        }
+        let eng = Engine::open_concurrent_with_oplog(idb.to_str().unwrap(), OPLOG_CAP).unwrap();
+        if eng.generation_repairs().0 != 1 {
+            drop(eng);
+            let _ = std::fs::remove_dir_all(&img);
+            continue;
+        }
+        let deletes: Vec<u64> = eng
+            .audit(&enchudb_engine::AuditFilter::default())
+            .into_iter()
+            .filter_map(|r| match r.op {
+                DecodedOp::Delete { eid } => Some(eid),
+                _ => None,
+            })
+            .collect();
+        // a の Delete は前の session の record (WAL が畳まれていれば無い)。 r の Delete は作り直した物
+        let relogged: Vec<u64> = deletes.iter().copied().filter(|&d| d != a).collect();
+        if eng.is_live(r) {
+            // WAL の header の page が古い像 (checkpoint が r の Tie の手前) では、 再生が r の Tie で r を生かし直す = 削除は 「無かった」。
+            // その時は Delete を配らないこと (配ると相手でだけ消える)
+            assert!(relogged.is_empty(), "再生が生かし直した r の Delete を作り直した (seed {seed}: {deletes:x?})");
+            revived += 1;
+            drop(eng);
+            let _ = std::fs::remove_dir_all(&img);
+            continue;
+        }
+        hits += 1;
+        assert_eq!(relogged, vec![r], "作り直した Delete が無い / 消えた行の世代込みの eid でない (seed {seed}: {deletes:x?})");
+        let world = enchudb_oplog::make_eid(1, eng.eid_slot(r));
+        let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
+        assert!(!eng.remote_tie_apply(world, hid, 9u32, later), "消えた行への相手の書き込みで行が生き返った (seed {seed})");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&img);
+    }
     let _ = std::fs::remove_dir_all(&root);
+    eprintln!("[gen_tomb] gen.seg だけ死で tombstone の無い像: {hits} / {SEEDS} (再生が r を生かし直した像 {revived})");
+    assert!(hits >= 1, "前提: gen.seg だけ死で tombstone の届いていない像が {SEEDS} 枚に 1 枚も無い");
 }
 
 /// #916 の読み直し A1: 受けた行 F (他の peer C の行、 写像 (C,f)→場所 s) を A のアプリが消し、 書き出しの版数の段 (tombstone) の前で
@@ -5472,9 +5519,9 @@ fn a_dropped_tag_name_is_not_revived_without_its_delete_v15() {
     a_dropped_name_is_not_revived_without_its_delete("dropped_name_tag_v15", Name978::TagColumn, true);
 }
 
-/// #978 の削除の門: 書き出しが残りの列の前に削除の門を閉じて tomb.seg を書き出した後 (`RestClosed`) に、 別の thread で X を消す。 消す
-/// 書き手は門が開くまで cell を落とさない (300 ms 待たせて書き出しを進める)。 版数の列の前 (`BeforeVersions`) で撮った像は、 落とした
-/// cell が届いていない (X は名前のまま生き、 削除は WAL に無い = 無かった。 配る物にも無い)。
+/// #978 の削除の門: 書き出しが生きている印・残りの列の前に削除の門を閉じて tomb.seg を書き出した後 (`DeletesClosed`) に、 別の thread で
+/// X を消す。 消す書き手は門が開くまで cell を落とさない (門で待ち始めたら書き出しを進める)。 版数の列の前 (`BeforeVersions`) で撮った像は、
+/// 落とした cell が届いていない (X は名前のまま生き、 削除は WAL に無い = 無かった。 配る物にも無い)。
 ///
 /// 門が無いと、 消す書き手が tomb.seg の書き出しの後に tombstone を置いて cell を落とし、 残りの列の msync がその cell を拾う
 /// (tombstone は書き出しの最後まで届かない) = 再生が X を名前の無い行として生かし直した。
@@ -5493,7 +5540,7 @@ fn a_delete_during_the_column_write_out_waits_for_the_tombstones() {
         let _hold = eng.hold_consumer();
         eng.tie_to(x, "t.v", 71u32); // checkpoint の後ろの X の Tie (残りの列に書き出す物)
         eng.oplog_commit();
-        let done = delete_during_write_out(&eng, x, Phase::RestClosed, Phase::BeforeVersions, &live, &img);
+        let done = delete_during_write_out(&eng, x, Phase::DeletesClosed, Phase::BeforeVersions, &live, &img);
         eng.oplog_sync().unwrap();
         write_out_hook::set(None);
         assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
@@ -5518,4 +5565,113 @@ fn a_delete_during_the_column_write_out_waits_for_the_tombstones() {
     assert_eq!((k, v), (Some(7), Some(71)), "X の名前 / 値が書き出しの返った値でない");
     assert!(in_state.is_empty() && bridged.is_empty(), "WAL に無い削除を配る ({in_state:?} / {bridged:?})");
     assert!(waits >= 1, "前提: 消す書き手が門で待った");
+}
+
+/// #978 の読み直し [1]: checkpoint の後ろに record の無い行 X (名前 k = 7、 書き出し済み) を、 本体の書き出しの `prev.seg` の後・生きている
+/// 印 (entities) の前 (`PrevWrittenOut`) に A のアプリが消し、 段 `shot` (生きている印 / 場所の世代を書き出した後、 残りの列の前) で電源が
+/// 落ちる。 削除は WAL の書き出しの後 = WAL に X の Delete は無い。 X の削除は 「あった」 (生きている印に届いた): 開いた A の X は消えていて、
+/// state と #451 の作り直しが X の Delete を配る。 きれいに閉じて開き直しても同じ。
+///
+/// 前は削除の門を残りの列の前 (`BeforeRest` の後) で閉じていて、 生きている印と gen.seg が tomb.seg より先に届いた: 像は 「X は生きて
+/// いない (gen は死)、 tomb.seg は 0、 cell は残る」。 再生に X の record は無く、 突き合わせは両方死なので何もせず (v14 は突き合わせ自体が
+/// 無い)、 #451 も sweep も tombstone が無いので削除を知らない = X は A でだけ黙って消え、 Delete は state にも作り直しにも出ず、 相手は
+/// `k 7` のまま食い違った。
+fn a_record_less_delete_torn_before_the_tombstones_is_relogged(tag: &str, reuse: bool, shot: Phase) {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch(tag);
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let (x, tomb) = {
+        let (eng, x) = named_x_engine_978(&live.join("db"), Name978::Number, reuse);
+        let _hold = eng.hold_consumer();
+        // 書き出す物 (X でない行。 X には checkpoint の後ろの record を作らない)
+        let keep = eng.pull_raw("t.k", 1u32)[0];
+        eng.tie_to(keep, "t.v", 5u32);
+        eng.oplog_commit();
+        let deleted: Arc<std::sync::Mutex<Option<Hlc>>> = Arc::default();
+        let shot_once = Arc::new(AtomicBool::new(false));
+        let (e2, d2, s2, l, i) = (eng.clone(), deleted.clone(), shot_once.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::PrevWrittenOut && d2.lock().unwrap().is_none() {
+                e2.delete(x);
+                *d2.lock().unwrap() = Some(e2.tombstone_hlc(x));
+            }
+            if p == shot && d2.lock().unwrap().is_some() && !s2.swap(true, Ordering::SeqCst) {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        assert!(shot_once.load(Ordering::SeqCst), "前提: 書き出しの {shot:?} で撮った");
+        let tomb = deleted.lock().unwrap().expect("前提: 書き出しの途中で X を消した");
+        (x, tomb)
+    };
+    crashsim::stop();
+    let db = img.join("db");
+    let in_wal = OpLog::open(&db.join("oplog")).unwrap().records_with_tail().iter().any(|r| r.hlc == tomb);
+    // 再生の前の像 (readonly は WAL を見ない)
+    let (live_in_image, tomb_in_image, name_in_image) = {
+        let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
+        (ro.is_live(x), ro.tombstone_hlc(x), ro.get(x, "t.k"))
+    };
+    let first = {
+        let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        let out = (eng.is_live(x), eng.get(x, "t.k"), deletes_of_978(&eng, x));
+        eng.oplog_sync().unwrap();
+        out
+    };
+    let second = {
+        let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        (eng.is_live(x), deletes_of_978(&eng, x).0, eng.verify_invariants().violations)
+    };
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!(
+        "[978 r1 {tag}] 像: live {live_in_image} tomb.seg {tomb_in_image:?} 名前 {name_in_image:?} / 1 回目: {first:?} / 2 回目: {second:?}"
+    );
+    assert!(!in_wal, "前提: X の Delete は WAL に無い (書き出しの WAL の書き出しの後に消した)");
+    assert!(!live_in_image, "前提: X の削除は生きている印に届いた ({shot:?})");
+    let (alive, k, (in_state, bridged)) = first;
+    assert!(!alive, "前提: 開いた A の X は消えている (名前 {k:?})");
+    assert_eq!(
+        in_state,
+        vec![tomb],
+        "生きている印に届いた削除の Delete が state に無い (像の tomb.seg {tomb_in_image:?}: 相手は k 7 のまま食い違う)"
+    );
+    assert_eq!(bridged, vec![tomb], "生きている印に届いた削除の Delete を作り直して配らない (像の tomb.seg {tomb_in_image:?})");
+    assert_eq!(second, (false, vec![tomb], Vec::<String>::new()), "開き直すと答えが変わった");
+}
+
+#[test]
+fn a_record_less_delete_torn_before_the_rest_is_relogged_v14() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_record_less_delete_torn_before_the_tombstones_is_relogged("r1_rest_v14", false, Phase::BeforeRest);
+}
+
+#[test]
+fn a_record_less_delete_torn_before_the_rest_is_relogged_v15() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_record_less_delete_torn_before_the_tombstones_is_relogged("r1_rest_v15", true, Phase::BeforeRest);
+}
+
+#[test]
+fn a_record_less_delete_torn_before_the_generations_is_relogged_v14() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_record_less_delete_torn_before_the_tombstones_is_relogged("r1_gen_v14", false, Phase::BeforeGenerations);
+}
+
+#[test]
+fn a_record_less_delete_torn_before_the_generations_is_relogged_v15() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_record_less_delete_torn_before_the_tombstones_is_relogged("r1_gen_v15", true, Phase::BeforeGenerations);
 }

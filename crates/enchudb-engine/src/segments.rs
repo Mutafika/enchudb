@@ -630,14 +630,26 @@ impl SegmentSet {
     /// (#978: 削除の門を閉じている間の、 中身を指さない列の書き出し。 閉じている間を列 1 本ずつの msync の和でなく、 長い物に寄せる。
     /// [`Self::flush_parallel`] は segment ごとに thread を立てるので、 列の多い表では書き出しのたびに列の数だけ立てる)。 書くものの
     /// 有無は [`Self::flush_parallel`] と同じ (`SegmentMap::flush_pending`)。 印を通さない store (header / entity) は選ばないこと。
+    ///
+    /// thread を立てるのは、 大きい segment (書く範囲、 `all` なら commit 済みが [`FLUSH_ALL_SMALL`] を越える、 または別の flush が
+    /// 書き出している最中 = その msync を待つ) が 2 つ以上ある時だけ、 その数まで (読み直し [5]: 前は書き出しのたびに、 1 page の
+    /// msync でも書くもののある segment の数だけ立てた)。
     pub fn flush_spread(&self, all: bool, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
         let segs: Vec<(SegmentKind, Arc<SegmentMap>)> =
             self.all().into_iter().filter(|(k, s)| pick(*k) && (all || s.flush_pending())).collect();
-        let workers = segs.len().clamp(1, FLUSH_ALL_WORKERS);
+        let big = |s: &SegmentMap| {
+            if all {
+                s.committed() > FLUSH_ALL_SMALL
+            } else {
+                s.dirty_bytes() > FLUSH_ALL_SMALL || !s.has_dirty()
+            }
+        };
+        let workers = segs.iter().filter(|(_, s)| big(s)).count().clamp(1, FLUSH_ALL_WORKERS);
         Self::flush_by_workers(&segs, all, workers)
     }
 
     /// `segs` を `workers` 本の thread (呼んだ thread を含む) が 1 つずつ取って msync する。 どれかが失敗したら Err (残りも試みる)。
+    /// thread を立てられなければ、 立てられた分と呼んだ thread で書く (読み直し [5]: `Scope::spawn` は立てられないと panic する)。
     fn flush_by_workers(segs: &[(SegmentKind, Arc<SegmentMap>)], all: bool, workers: usize) -> io::Result<()> {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let work = || -> io::Result<()> {
@@ -651,7 +663,8 @@ impl SegmentSet {
             return work();
         }
         std::thread::scope(|scope| {
-            let others: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
+            let others: Vec<_> =
+                (1..workers).filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, work).ok()).collect();
             let mut res = work();
             for h in others {
                 let r = h.join().unwrap_or_else(|_| Err(io::Error::other("segment の書き出しの thread が panic した")));
