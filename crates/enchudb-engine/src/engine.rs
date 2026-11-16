@@ -6805,25 +6805,26 @@ mod slot_claim_tests {
         let x = std::thread::spawn(move || ex.entity_in("t"));
         x_at_rx.recv().unwrap();
         // Y: 全部なめで同じ場所を穴として拾い、 「覚えていない・生きていない」 と読んだ後で、 X を返させてその行を kill を書けずに消す
-        let mine: Arc<std::sync::Mutex<Option<u64>>> = Arc::default();
+        // (X の行の eid, 消した直後に 「生きていない・死の印なし・覚えた」 か)
+        let mine: Arc<std::sync::Mutex<Option<(u64, bool)>>> = Arc::default();
         let (e2, m2) = (eng.clone(), mine.clone());
         pop_checked_hook::set(&wal, move |_| {
             x_go.send(()).unwrap();
             let got = x.join().unwrap().expect("前提: X は払い出された");
-            *m2.lock().unwrap() = Some(got);
+            let e3 = e2.clone();
             std::thread::spawn(move || {
-                kill_fail_hook::set(Some(e2.slot_unchecked(got)));
-                e2.delete(got);
+                kill_fail_hook::set(Some(e3.slot_unchecked(got)));
+                e3.delete(got);
                 kill_fail_hook::set(None);
             })
             .join()
             .unwrap();
+            let slot = e2.slot_unchecked(got);
+            let gens = e2.generations();
+            *m2.lock().unwrap() = Some((got, !e2.is_live(got) && !gens.is_dead(slot) && gens.retired(slot)));
         });
         let theirs = eng.entity_in("t");
-        let mine = mine.lock().unwrap().take().expect("前提: 割り込み点を通った");
-        let slot = eng.slot_unchecked(mine);
-        let gens = eng.generations();
-        let unkilled = !eng.is_live(mine) && !gens.is_dead(slot) && gens.retired(slot);
+        let (mine, unkilled) = mine.lock().unwrap().take().expect("前提: 割り込み点を通った");
         cleanup(&path, eng);
         assert!(unkilled, "前提: X の行を kill を書けずに消した (覚えた)");
         assert!(

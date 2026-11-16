@@ -432,3 +432,77 @@ fn a_name_write_applied_before_its_split_is_refused_is_still_relayed() {
     assert_eq!(again.rejected_capacity, 0, "空きが戻っても断った: {again:?}");
     assert!(!l_live, "届き直した名前の書き込みで、 名前の削除優先が L を消していない");
 }
+
+/// PR #977 の読み直し 5 の [H]: 元の行が残る枝 (#581) で、 eid の空間を使い切った表の空きの slot が消える identity の数より少ない時も、
+/// 全部の identity を消えた slot に付け替える (前の identity に付け替えて返した slot を次の identity に回す)。 読み直し 4 の [1] の形
+/// (先にまとめて払い出す) は、 2 つ目以降が確保先なし (`Skip`) で付け替えず、 写像が残る行を指したまま束ねから外した (払い出してから
+/// 返す前の形は 1 つの slot で足りていた)。 R の `notes` は 2 枠で、 Y の行 L と、 R が作って消した行の場所 1 つだけが空き、 枠は足せない。
+/// 回した slot は次の identity の払い出しで前の identity の写像を外す (削除の版数は退避表に移る = 消えたデッキのまま、 前の形と同じ)。
+///
+/// falsify: 返した slot を回さないと、 Z の写像が L に残る。
+#[test]
+fn a_delete_that_keeps_the_row_moves_every_dead_identity_with_one_free_slot() {
+    let (pa, pb, pc, pr) = (tmp("split-one-a"), tmp("split-one-b"), tmp("split-one-c"), tmp("split-one-r"));
+    let a = make_named(&pa, A, 64);
+    let b = make_named(&pb, B, 64);
+    let c = make_named(&pc, C, 64);
+    let r = {
+        let mut e = Engine::create_with_capacity(&pr, 400_000).unwrap();
+        e.define_table("u", 1).unwrap();
+        e.define_himo_in("u", "x", ValueType::Number, 0).unwrap();
+        e.define_table("pad", 100_000).unwrap();
+        e.define_table("notes", 2).unwrap();
+        let k = e.define_himo_in("notes", "n", ValueType::Number, 0).unwrap() as u16;
+        e.set_table_pk("notes", k).unwrap();
+        e.enable_sync_tables().unwrap();
+        let rest = e.remaining_eid_capacity();
+        e.define_table("rest", rest).unwrap();
+        let e = Engine::concurrentize_with_oplog(e, 16 * 1024 * 1024).unwrap();
+        e.set_peer_id(R);
+        e
+    };
+    let net = Net::new(&[(A, &a), (B, &b), (C, &c), (R, &r)]);
+    let k = r.himo_id("notes.n").unwrap() as u16;
+    let z = c.entity_in("notes").unwrap();
+    c.tie_to(z, "notes.n", 5u32);
+    net.publish(C, &c);
+    let x = a.entity_in("notes").unwrap();
+    a.tie_to(x, "notes.n", 5u32);
+    net.publish(A, &a);
+    wait_past(c.cell_hlc(z, k).wall.max(a.cell_hlc(x, k).wall));
+    a.delete(x); // A は削除をまだ配らない
+    wait_past(a.tombstone_hlc(x).wall);
+    let y = b.entity_in("notes").unwrap();
+    b.tie_to(y, "notes.n", 5u32);
+    net.publish(B, &b);
+    assert!(net.pull(R, B).applied >= 1, "前提: R が Y を受けた");
+    let l = r.resolve_remote_eid_existing(y).expect("前提: Y の行");
+    // R の自分の行を作って消す (表の空きはこの 1 つ、 枠は足せない)
+    let mine = r.entity_in("notes").unwrap();
+    r.tie_to(mine, "notes.n", 99u32);
+    r.delete(mine);
+    assert_eq!(r.remaining_eid_capacity(), 0, "前提: 枠を足せない");
+    assert_eq!(r.table_eid_usage("notes").unwrap().free, 1, "前提: 表の空きは 1 つ");
+    assert!(net.pull(R, A).received >= 1, "前提: R が X の作成を受けた");
+    assert!(net.pull(R, C).received >= 1, "前提: R が Z を受けた");
+    assert_eq!(
+        (r.resolve_remote_eid_existing(x), r.resolve_remote_eid_existing(z)),
+        (Some(l), Some(l)),
+        "前提: R は X と Z を Y の行 L に束ねた"
+    );
+
+    net.publish(A, &a);
+    let out = net.pull(R, A);
+    let (mx, mz) = (r.resolve_remote_eid_existing(x), r.resolve_remote_eid_existing(z));
+    // 消えたデッキ: 消えた slot を指す、 または (次の identity にその slot を回した時に外れて) 写像が無い (削除の版数は退避表)
+    let dead = |m: Option<u64>| m.is_none_or(|m| m != l && !r.is_live_unchecked(m));
+    let (dx, dz, live_l) = (dead(mx), dead(mz), r.is_live_unchecked(l) && r.get(l, "notes.n") == Some(5));
+    drop((net, a, b, c, r));
+    for p in [&pa, &pb, &pc, &pr] {
+        cleanup(p);
+    }
+    assert!(out.applied >= 1 && out.rejected_capacity == 0, "前提: 削除を当てた: {out:?}");
+    assert!(dx, "X が消えた slot に付け替わっていない ({mx:?}、 L {l:#x})");
+    assert!(dz, "Z が消えた slot に付け替わっていない ({mz:?}、 L {l:#x}): 空きの slot が足りない identity を飛ばした");
+    assert!(live_l, "Y の行 L が残っていない");
+}
