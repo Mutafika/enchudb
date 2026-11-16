@@ -4203,7 +4203,8 @@ mod kill_fail_tests {
     /// してから照合を始めるので、 commit できなければ (空きの不足) 何も始めずに断る (使い回しの insert は Err、 v14 のまま)。 空きが
     /// 戻れば移って、 次の世代で使い回す。
     ///
-    /// falsify: 移る手順の `commit_generations_through` の `?` を外すと (commit できないまま移る)、 空きの無い insert が通る。
+    /// falsify: 移る手順の commit の `?` を外すと (commit できないまま移る)、 空きの無い insert が通る。 公開する前の commit (1a) を
+    /// 外すと、 公開した後 (1c) に断る = gen.seg を公開したまま v14 に残る。
     #[test]
     fn the_move_to_v15_is_refused_while_gen_seg_cannot_cover_the_tables() {
         let (p, eng) = far_table("move");
@@ -4216,6 +4217,9 @@ mod kill_fail_tests {
         let got = eng.entity_in("t");
         assert!(got.is_err(), "gen.seg を表の枠まで伸ばせないのに移って使い回した: {got:?} (消えた行 {old:#x})");
         assert!(!eng.generations().active() && !eng.generations().moved(), "commit できないのに照合を始めた / 移り終えた");
+        // PR #977 の読み直し 3 の [4]: 公開する前に commit して断る (公開した後に断ると、 v14 のままの session の払い出しも gen.seg を
+        // commit しに行く)
+        assert!(!eng.generations().has_region(), "commit できないのに gen.seg を公開した");
         assert!(!eng.entities.is_live(slot));
         eng.set_space_margin(0);
         let new = eng.entity_in("t").unwrap();
@@ -4247,7 +4251,7 @@ mod kill_fail_tests {
     /// 使い回す場所は生かす前に上げる (取り出して生かした直後 = `anon_reuse_hook` に消えた行の eid の delete が来ても、 照合で外れる。
     /// 前は生かしてから上げていて、 その delete が生かした場所を殺して空きの山に積み直し、 次の `entity()` が同じ eid をもう一度渡した)。
     ///
-    /// falsify: 移る手順の `commit_generations_through` の `?` を外すと、 空きの無い `entity()` が通る。
+    /// falsify: 移る手順の commit の `?` を外すと、 空きの無い `entity()` が通る。 公開する前の commit (1a) を外すと、 公開した後に断る。
     #[test]
     fn the_move_to_v15_is_refused_while_gen_seg_cannot_cover_the_anonymous_slots() {
         let p = path("anon");
@@ -4263,6 +4267,9 @@ mod kill_fail_tests {
         let got = eng.entity();
         assert!(got.is_err(), "gen.seg を伸ばせないのに移って使い回した: {got:?} (消えた行 {old:#x})");
         assert!(!eng.generations().active() && !eng.generations().moved(), "commit できないのに照合を始めた / 移り終えた");
+        // PR #977 の読み直し 3 の [4]: 公開する前に commit して断る (公開した後に断ると、 v14 のままの session の払い出しも gen.seg を
+        // commit しに行く)
+        assert!(!eng.generations().has_region(), "commit できないのに gen.seg を公開した");
         assert!(!eng.entities.is_live(slot));
         eng.set_space_margin(0);
         // 取り出して生かした直後に、 消えた行の eid を持ち続けたアプリが delete する ([2])
@@ -4546,6 +4553,70 @@ mod kill_fail_tests {
     #[test]
     fn a_row_given_out_after_the_move_publishes_gen_seg_commits_its_own_page() {
         claim_during_move("race-commit", |wal, f| move_commit_hook::set(wal, f));
+    }
+
+    /// 案 P、 空きの一覧の道: 位置から取って断った書き手が位置を戻せなかった場所 (穴、 生きていない) は、 表が枯渇した時の全部なめが
+    /// 拾う。 穴の page が commit の外なら、 空きの一覧の道も生かす前に commit し、 できなければ一覧に戻して断る。 空きが戻れば払い
+    /// 出す。 穴は 2 本の書き手の戻し合いの順で決まる (先に断った方の戻しが、 後から進めた書き手に負ける) ので、 試験では払い出し
+    /// 位置を進めて作る (生きていない場所が払い出し位置の手前にある形)。
+    ///
+    /// falsify: 空きの一覧の道の `gen_slot_ready` を外すと、 空きの無い insert が穴を commit の外の page のまま生かす。
+    #[test]
+    fn a_hole_on_an_uncommitted_page_is_given_out_from_the_free_list_only_once_its_page_is_committed() {
+        let (p, eng) = move_race_db("hole");
+        let u2 = eng.entity_in("u").unwrap(); // v15 に移る
+        assert!(eng.generations().moved() && eng.is_live(u2), "前提: v15");
+        let tid = eng.tables.iter().position(|t| t.name == "t").unwrap();
+        let hole = eng.tables[tid].global_of(0).unwrap();
+        assert!(hole >= FIRST_COMMIT_SLOTS && !gen_covers(&eng, hole), "前提: 穴の場所は gen.seg の commit の外");
+        // 位置から取って断った書き手の穴 (位置は戻っていない、 場所は生きていない)
+        eng.tables[tid].next_local.store(1, std::sync::atomic::Ordering::Release);
+        eng.set_space_margin(NO_SPACE);
+        let refused = eng.entity_in("t");
+        assert!(refused.is_err(), "gen.seg の page を commit できないのに穴を払い出した: {refused:?}");
+        assert!(!eng.entities.is_live(hole), "断った insert が穴を生かした");
+        eng.set_space_margin(0);
+        let e = eng.entity_in("t").unwrap();
+        assert!(eng.slot_unchecked(e) == hole && gen_covers(&eng, hole), "穴の場所 {hole} の gen.seg が commit されていない");
+        eng.set_space_margin(NO_SPACE);
+        eng.delete(e);
+        assert_eq!((eng.generations().get(hole), eng.generations().is_dead(hole)), (1, true), "穴から払い出した行の kill が書けない");
+        cleanup(eng, &p);
+    }
+
+    /// gen.seg だけの空きの余裕 (他の segment は伸ばせる = 列の cell の commit で断らない形を作る)。
+    fn gen_seg_margin(eng: &Engine, margin: u64) {
+        let Backing::Segments(set) = &eng.backing else { panic!("前提: segment の DB") };
+        set.segment(SegmentKind::Gen).expect("前提: gen.seg がある").set_space_margin(margin);
+    }
+
+    /// PR #977 の読み直し 3 の [7]: 受信の書き込み (翻訳を通さない eid の公開の道 `remote_tie_apply_result`) が生きていない場所を生かす
+    /// 時も、 値を書く前に場所の gen.seg の page を確かめる。 commit できなければ値を書かずに `RejectedCapacity` (再配送させる)。 前は
+    /// commit の外の場所を生かし、 空きの不足の間に消すと kill が書けなかった。
+    ///
+    /// falsify: `remote_tie_apply_in` の `remote_slot_ready` を外すと、 空きの無い受信が commit の外の場所を生かす。
+    #[test]
+    fn a_received_write_that_makes_a_slot_live_needs_its_gen_seg_page() {
+        let (p, eng) = move_race_db("remote7");
+        eng.entity_in("u").unwrap(); // v15 に移る
+        assert!(eng.generations().moved(), "前提: v15");
+        let tid = eng.tables.iter().position(|t| t.name == "t").unwrap();
+        let slot = eng.tables[tid].global_of(0).unwrap();
+        assert!(!gen_covers(&eng, slot), "前提: 場所は gen.seg の commit の外");
+        let eid = enchudb_oplog::make_eid(eng.peer_id(), slot);
+        let hid = eng.himo_id("t.a").unwrap() as u16;
+        let hlc = enchudb_oplog::Hlc { wall: u64::MAX / 8, logical: 0, peer: 2 };
+        gen_seg_margin(&eng, NO_SPACE);
+        let refused = eng.remote_tie_apply_result(eid, hid, 5u32, hlc);
+        let live_refused = eng.entities.is_live(slot);
+        gen_seg_margin(&eng, 0);
+        let applied = eng.remote_tie_apply_result(eid, hid, 5u32, hlc);
+        let (live, covered) = (eng.entities.is_live(slot), gen_covers(&eng, slot));
+        cleanup(eng, &p);
+        assert_eq!(refused, RemoteApply::RejectedCapacity, "gen.seg の page を commit できないのに受信の書き込みが場所を生かした");
+        assert!(!live_refused, "断った受信が場所を生かした");
+        assert_eq!(applied, RemoteApply::Applied, "空きが戻っても受信の書き込みが当たらない");
+        assert!(live && covered, "受信が生かした場所 {slot} の gen.seg が commit されていない (live {live})");
     }
 
     /// 案 P の大きさ: v15 の DB の gen.seg は払い出した場所の桁 (2 B / 場所 + 先回り) で、 表の予約した枠には比例しない。 前の形

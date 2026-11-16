@@ -879,6 +879,20 @@ mod tests {
         assert!(g.retired(3), "使える世代を越えたら引退");
     }
 
+    /// PR #977 の読み直し 3 の [5]: gen.seg の範囲の外の場所の kill / raise は Err (前は黙って書いたことにした = 呼び手は書けたと
+    /// 読んで場所を使い回しの一覧に積んだ)。 範囲の中は書ける。
+    #[test]
+    fn kill_and_raise_past_the_segment_are_errors() {
+        let mut v = buffer(segment_len(16));
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24).unwrap();
+        g.start(24);
+        let past = ((v.len() * 8 - GEN_HEADER) / 2) as u32;
+        assert!(g.kill(past, 1).is_err(), "範囲の外の kill を書けたことにした");
+        assert!(g.raise(past, 1).is_err(), "範囲の外の raise を書けたことにした");
+        assert!(g.kill(past - 1, 1).is_ok() && g.is_dead(past - 1));
+    }
+
     /// 消す (印と世代を 1 回で) → 使い回す (印だけ落とす) → 再生が古い行を生かす (その世代に戻す)。
     #[test]
     fn kill_revive_and_restore_move_the_mark_with_the_generation() {
