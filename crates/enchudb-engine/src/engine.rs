@@ -16642,6 +16642,19 @@ impl Engine {
         self.persist_pk_former(false)
     }
 
+    /// #959 / review987: 書き出した `pktombs` を読み直した中身が、 書き出した分の memory の中身と同じか (まだ書き出していない記録が
+    /// あれば Some)。 まとめ直しが追記を落とす誤りを試験で拾う。 違えば Some(説明)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn pktombs_disk_diff(&self) -> io::Result<Option<String>> {
+        self.flush_pk_pending();
+        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let disk = load_pktombs_from_sidecar(&self.path)?.map(|(t, _)| t.snapshot().0).unwrap_or_default();
+        let mem = self.pk_tombs.read().unwrap().snapshot().0;
+        let disk = if disk.is_empty() { crate::pk_tombs::PkTombs::default().snapshot().0 } else { disk };
+        Ok((disk != mem).then(|| format!("pktombs: disk {} B と memory {} B の中身が違う", disk.len(), mem.len())))
+    }
+
     /// #720: 書き出した `pkformer` + `pkformer.log` を読み直した中身が、 memory の中身と同じか。 印の付け忘れ (変えたのに log に
     /// 載らない) を試験で拾う。 違えば Some(説明)。
     #[cfg(not(target_arch = "wasm32"))]
