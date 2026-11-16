@@ -5239,6 +5239,60 @@ mod kill_fail_tests {
         assert_eq!(live, 2, "表 s の生きている行 (自分の行 + F1) の数が違う");
     }
 
+    /// PR #977 の読み直し 5 の [K]: 開く時の再生が、 語の番号を訳せない中継した record (Vocab の record が無い Tag の Tie / TieNamed) を
+    /// 飛ばす時、 行を払い出さない (語の番号を払い出しの前に訳す)。 前は払い出してから訳し、 訳せないと値の無い生きた行 (と写像) が
+    /// 残った。
+    ///
+    /// falsify: Tie / TieNamed で払い出してから訳すと (前の形)、 開いた後に表 `s` に値の無い生きた行がある。
+    #[test]
+    fn a_replayed_relayed_tie_whose_word_cannot_be_translated_leaves_no_row() {
+        use crate::transport::WireRecord;
+        use enchudb_oplog::oplog::DecodedOp;
+        let p = path("relayvid");
+        let image = format!("{p}-img");
+        let eng = {
+            let mut eng = Engine::create_with_capacity(&p, 4096).unwrap();
+            eng.define_table("s", 16).unwrap();
+            eng.define_himo_in("s", "c", ValueType::Tag, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            eng.set_peer_id(1);
+            eng
+        };
+        eng.oplog_sync().unwrap();
+        let hold = eng.hold_consumer();
+        let hlc = enchudb_oplog::Hlc { wall: Engine::unix_millis(), logical: 0, peer: 9 };
+        let hid = eng.himo_id("s.c").unwrap() as u16;
+        let (f1, f2) = (enchudb_oplog::make_eid(9, 5), enchudb_oplog::make_eid(9, 6));
+        assert!(eng.relay_record(&WireRecord::unsigned(hlc, 9, DecodedOp::Tie { eid: f1, himo_id: hid, value: 1234 })));
+        let named = DecodedOp::TieNamed {
+            eid: f2,
+            himo_name: "s.c".into(),
+            himo_kind: ValueType::Tag as u8,
+            value: 1235,
+        };
+        assert!(eng.relay_record(&WireRecord::unsigned(enchudb_oplog::Hlc { logical: 1, ..hlc }, 9, named)));
+        eng.oplog_commit();
+        assert!(std::process::Command::new("cp").arg("-R").arg(&p).arg(&image).status().unwrap().success());
+        drop(hold);
+        cleanup(eng, &p);
+        let img = Engine::open_concurrent_with_oplog(&image, 1 << 20);
+        let after = img
+            .as_ref()
+            .map(|e| {
+                (
+                    e.table_eid_usage("s").unwrap().live,
+                    e.resolve_remote_eid_existing(f1).is_some(),
+                    e.resolve_remote_eid_existing(f2).is_some(),
+                )
+            })
+            .map_err(|e| e.to_string());
+        drop(img);
+        let _ = crate::db_files::remove_db(&image);
+        let (live, m1, m2) = after.expect("開けない");
+        assert_eq!((live, m1, m2), (0, false, false), "訳せない record のために行を払い出した (値の無い生きた行 / 写像が残った)");
+    }
+
     /// PR #977 の読み直し [4]: 名前で束ねた行の切り離し (#581) が、 畳んだ自分の行 (#612) の場所を 「消えた slot」 にする所で、
     /// 世代を上げてから別名を外す。 逆の順では間の一瞬 (`split_release_hook`) その場所が 「生きていない・畳んでいない・死の印なし」 に
     /// 見え、 枯渇した表へ足した別の書き手が今の世代のまま払い出し、 その後の kill がその行を殺した。
@@ -5299,6 +5353,56 @@ mod kill_fail_tests {
         assert!(live_theirs, "割り込み点で足した行 {theirs:#x} が消えた (切り離しの kill が当たった)");
         assert_ne!(later, x, "別名を外した場所を、 畳んだ行と同じ eid で使い回した");
         assert!(live_later);
+    }
+
+    /// PR #977 の読み直し 5 の [E]: 上の切り離しで、 畳んだ自分の行の場所の kill を書けない (約束の破れ = 守りの道、 `kill_fail_hook`) と、
+    /// その場所を覚える (消す道と同じ)。 前は結果を捨て、 別名を外した後の場所が 「生きていない・畳んでいない・死の印なし・前の世代」 に
+    /// 見え、 枯渇した表の全部なめが畳んだ行と同じ eid で使い回した。
+    ///
+    /// falsify: 切り離しの kill の失敗で覚えない (前の形) と、 枯渇した表への insert が畳んだ行と同じ eid を返す。
+    #[test]
+    fn a_folded_slot_whose_kill_failed_in_a_split_is_not_reused_with_the_same_eid() {
+        let p = path("splitkill");
+        let eng = {
+            let mut eng = Engine::create_with_cell_version(&p, 65_536).unwrap();
+            eng.define_table("owners", 1).unwrap();
+            eng.define_himo_in("owners", "name", ValueType::Number, 0).unwrap();
+            eng.define_table("notes", 2).unwrap();
+            eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+            let k = eng.himo_id("notes.note").unwrap() as u16;
+            eng.set_table_pk("notes", k).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            eng.set_peer_id(1);
+            eng
+        };
+        let o = eng.entity_in("owners").unwrap();
+        eng.delete(o);
+        let o2 = eng.entity_in("owners").unwrap();
+        eng.delete(o2);
+        assert!(eng.generations().moved(), "前提: v15");
+        let k = eng.himo_id("notes.note").unwrap() as u16;
+        let x = eng.entity_in("notes").unwrap();
+        eng.tie_to(x, "notes.note", 5u32);
+        let tx = eng.cell_hlc(x, k);
+        eng.observe_remote_hlc(enchudb_oplog::Hlc { wall: tx.wall + 10, logical: 0, peer: 2 });
+        let y = eng.entity_in("notes").unwrap();
+        eng.tie_to(y, "notes.note", 5u32);
+        assert!(eng.fold_rows_with_same_pk(y, k, 5, None) >= 1, "前提: 同じ名前の自分の行を畳んだ");
+        let xs = eng.slot_unchecked(x);
+        assert!(eng.is_folded_own_slot(xs) && !eng.entities.is_live(xs), "前提: X の場所は畳んだ自分の行");
+        kill_fail_hook::set(Some(xs));
+        eng.remote_delete_apply(y, enchudb_oplog::Hlc { wall: tx.wall + 1, logical: 0, peer: 2 });
+        kill_fail_hook::set(None);
+        let released = !eng.is_folded_own_slot(xs) && !eng.entities.is_live(xs) && eng.generations().get(xs) == 0;
+        let later = eng.entity_in("notes");
+        let live_y = eng.is_live(y);
+        cleanup(eng, &p);
+        assert!(released && live_y, "前提: 切り離しが X の場所の別名を外し (kill は書けない)、 Y は残る");
+        assert!(
+            later.as_ref().is_err() || later.as_ref().is_ok_and(|&e| e != x),
+            "kill を書けなかった畳んだ行の場所を、 畳んだ行と同じ eid {x:#x} で使い回した: {later:?}"
+        );
     }
 }
 
