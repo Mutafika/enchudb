@@ -114,7 +114,7 @@ impl RingNewest {
 /// #985: `_sync_ops` の ring に残る行の版数の最小の覚え ([`Engine::sync_ring_min_hlc`] / [`Engine::sync_ring_min_below`])。
 ///
 /// ホスト (`enchudb-transport` の `HttpHost`) は、 削除を忘れてよい線を ring に残るいちばん古い record の版数で抑える。 前は
-/// 線を進めようとする度に ring の全部の行を写して decode した (100 万行で 1 回 76〜112 ms。 線が ring の最古の record に
+/// 線を進めようとする度に ring の全部の行を写して decode した (100 万行で 1 回 60〜110 ms。 線が ring の最古の record に
 /// 留められている間は、 client の要求のたびに)。 覚えは下の境 `min` と、 それが最小そのものか (`exact`):
 ///
 /// - bridge が行を足す (lsn を書いた) たびに [`Self::note`] で `min` を下げる。 足した後も `min` は下の境で、 最小そのものなら
@@ -128,6 +128,9 @@ impl RingNewest {
 /// (触る前に問いが来ても、 消えた行の版数を含む = 下の境のまま)。 数える行は前の読み (`pending_sync_ops(0)` を
 /// `decode_sync_ops_payload` で decode できた物) と同じ: lsn が 0 でない全部の行 (配ってよい所 = 組の途中で止まった後ろも、
 /// 書き手 0 も、 Vocab も)、 payload を読めない / decode できない行 (dead row) は数えない。
+///
+/// 下の境が下の境であるのは、 行を足すのが bridge だけ (lsn の列を書く本番の道は bridge の 1 か所) だから。 lsn の列を書く道を
+/// 足したら、 そこでも `note` を呼ぶこと。
 struct RingOldest {
     /// 覚えを作ったか (開いた後の最初の問いが ring を読む)。
     seeded: bool,

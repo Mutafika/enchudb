@@ -715,7 +715,7 @@ impl HostInner {
     /// ホストの `_sync_ops` に残っている record の HLC の最小 (残っていなければ None)。 F はこれを越えない: 残っている record は
     /// まだ個別に配りうるので、 その削除をホストが忘れた後に誰かが当てると、 名前で束ねた行の答えが割れる。
     ///
-    /// #985: 前は呼ぶたびに ring の全部の行を写して decode した (`pending_sync_ops(0)`、 100 万行で 1 回 76〜112 ms)。 F が ring の
+    /// #985: 前は呼ぶたびに ring の全部の行を写して decode した (`pending_sync_ops(0)`、 100 万行で 1 回 60〜110 ms)。 F が ring の
     /// 最古の record に留められている間は client の要求のたびに走った。 engine の覚え ([`Engine::sync_ring_min_hlc`]) は、 bridge が
     /// 足した行と回収で消えた行で直し、 最小以下の行が消えた後だけ ring を読み直す (答えは同じ)。
     #[cfg(test)]
