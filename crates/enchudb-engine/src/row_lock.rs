@@ -322,6 +322,25 @@ impl RowLocks {
         }
     }
 
+    /// 行 `local` の stripe を今握っている書き手 (と、 先に握りたい読み手) が離すまで、 握らずに待つ (#974 の読み直し 2)。 見た版が
+    /// 偶数で先に握りたい読み手も居なければすぐ返る。 握られていれば版が動く (その書き手が離す) まで待つ: 離した直後に別の書き手が
+    /// 握り直していても返る (呼び手は [`Self::try_write`] で握り直し、 握れなければまた待つ)。 この thread が握っている stripe は待たない。
+    ///
+    /// [`Self::try_write`] に断られた呼び手が、 別の lock を放してから待つ所で使う。 握ってから離す待ちは、 待つ thread が 2 本以上だと
+    /// 片方が握った一瞬がもう片方の `try_write` を断らせ、 握るたびに版を 2 つ進めて同じ stripe の読み手を読み直させた。
+    pub fn wait_released(&self, local: u32) {
+        let i = self.stripe(local);
+        if self.held(i, me()) {
+            return;
+        }
+        let s = &self.stripes[i];
+        let v = s.ver.load(Ordering::Acquire);
+        let mut spins = 0;
+        while (v & 1 == 1 || s.urgent.load(Ordering::Relaxed) != 0) && s.ver.load(Ordering::Acquire) == v {
+            backoff(&mut spins);
+        }
+    }
+
     /// 行 `local` を、 同じ行への書き込みと重ならずに読む。 `f` は途中の書き込みを見たら捨てられ、
     /// 呼び直される (副作用を持たないこと)。 書き手が休まず同じ stripe を書き続けて揃わない時は、 握って読む。
     pub fn read<R>(&self, local: u32, mut f: impl FnMut() -> R) -> R {

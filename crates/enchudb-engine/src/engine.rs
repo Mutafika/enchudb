@@ -4294,23 +4294,29 @@ mod reuse_order_tests {
         let base = now_ms();
         let f0 = receive_deleted(&eng, k, 100, 5, at(base, C), at(base + 1, C));
         let t_b = at(base + 2, 2);
-        let out: Arc<Mutex<Option<bool>>> = Default::default();
+        // 割り込み点を通ったら Some (中は削除の答え。 待ちが切れたら None)
+        let out: Arc<Mutex<Option<Option<bool>>>> = Default::default();
         {
             let (e2, out) = (eng.clone(), out.clone());
             // 削除は受信の thread から (場所を取った書き手は Y の行を握っているので、 その thread で受信を当てない = #974 の
-            // `debug_assert_no_user_row`)。 写像は場所を生かす前に外してあるので、 削除は Y の行を待たずに返る
+            // `debug_assert_no_user_row`)。 写像は場所を生かす前に外してあるので、 削除は Y の行を待たずに返る。 割り込み点の中では
+            // 落とさない (`free_locals` を持っているので、 落とすと mutex が毒されて後の失敗が重なる。 #974 の読み直し 6)
             reuse_claim_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
                 let e3 = e2.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let _ = tx.send(e3.remote_delete_apply_foreign(enchudb_oplog::make_eid(C, 100), t_b));
                 });
-                let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("F0 宛ての削除が、 場所を取った書き手を待った");
-                *out.lock().unwrap() = Some(got);
+                *out.lock().unwrap() = Some(rx.recv_timeout(std::time::Duration::from_secs(10)).ok());
             });
         }
         let y = eng.entity_in("t").unwrap();
-        out.lock().unwrap().expect("前提: 場所を取った直後の割り込み点を通った");
+        let got = out.lock().unwrap().take().expect("前提: 場所を取った直後の割り込み点を通った");
+        assert!(
+            got.is_some(),
+            "F0 宛ての削除が、 場所を取った書き手が使い回しを終えるまで (10 秒) 返らなかった。 写像 (C, 100) → 場所 が場所を生かす前 \
+             (`prepare_reuse`) に外れていないと、 削除は場所の行 (使い回した Y、 場所を取った書き手が握っている) を待つ"
+        );
         assert_eq!(eng.slot_unchecked(y), eng.slot_unchecked(f0), "前提: F0 の場所を使い回した");
         eng.tie_to(y, "t.v", 70u32);
         assert!(eng.is_live(y), "場所を取った直後に届いた F0 宛ての削除が、 使い回した Y を消した");
@@ -4633,6 +4639,24 @@ mod reuse_order_tests {
         cleanup(&path, eng);
     }
 
+    /// 枠 `t_cap` の表 `t` (名前 `k`、 `v`) と、 空きのある別の表 `u` (`w`) を持つ、 sync の表のある WAL 付きの engine (peer 1)。
+    /// (path, engine, k, v, w)
+    fn engine_with_u(tag: &str, t_cap: u32) -> (String, Arc<Engine>, u16, u16, u16) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-reuseorder-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 16_384).unwrap();
+        eng.define_table("t", t_cap).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.set_table_pk("t", k).unwrap();
+        eng.define_table("u", 64).unwrap();
+        let w = eng.define_himo_in("u", "w", ValueType::Number, 0).unwrap() as u16;
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        eng.set_peer_id(1);
+        (path, eng, k, v, w)
+    }
+
     /// #974: 受信の払い出し (`resolve_remote_eid` → `EidTranslator::get_or_insert_waiting` の中の `entity_in`) が、 使い回す場所の行を
     /// 他の書き手が握っている時に `alloc_lock` を握ったまま待たない。 満杯の表 t の消えた行 G の場所と同じ stripe の生きた行 L を
     /// アプリが `write_row` で握っている間、 t への受信 (F) は G を握れない。 その間も、 別の表 u への受信 (H、 払い出し位置から新しい
@@ -4642,23 +4666,15 @@ mod reuse_order_tests {
     /// の `row_locks.write`。 0.37.4 は待たない)、 H も L を放すまで返らなかった (この試験は 5 秒で落ちた)。 同じ thread が行を握ったまま
     /// 受信を呼ぶと (`write_row` の doc が禁じる形、 debug build は `debug_assert_no_user_row` で止まる)、 H の役がその thread になり F と
     /// 互いを待って返らなかった。
+    ///
+    /// 読み直し [C]: L を握っている間、 F は G の場所を生かしていない (#931 の守り = 場所は行を握ってから生かす、 を受信の道でも見る)。
+    /// 「待たない形の時だけ行を握らずに生かす」 (+ `drop_leftover_cells` も待たない) 壊れ方は、 H が返る所までは通るので、 ここで落とす
     #[test]
     fn a_reuse_waiting_for_a_busy_slot_does_not_stall_receives_into_other_tables() {
         use std::sync::mpsc::channel;
         use std::time::Duration;
         // 枠 4097 の表 t: 最初の場所と最後の場所が同じ stripe。 u は空きのある別の表
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = format!("/tmp/enchudb-reuseorder-busy-{}-{nanos}.db", std::process::id());
-        let mut eng = Engine::create_with_capacity(&path, 16_384).unwrap();
-        eng.define_table("t", 4097).unwrap();
-        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
-        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
-        eng.set_table_pk("t", k).unwrap();
-        eng.define_table("u", 64).unwrap();
-        let w = eng.define_himo_in("u", "w", ValueType::Number, 0).unwrap() as u16;
-        eng.enable_sync_tables().unwrap();
-        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
-        eng.set_peer_id(1);
+        let (path, eng, _k, v, w) = engine_with_u("busy", 4097);
         let rows: Vec<u64> = (0..4097).map(|_| eng.entity_in("t").unwrap()).collect();
         // 先に 1 回使い回して v15 に移っておく (払い出しが空きの一覧の道で回るように)
         eng.delete(rows[1]);
@@ -4670,6 +4686,7 @@ mod reuse_order_tests {
         assert_eq!(g_slot % 4096, eng.slot_unchecked(l) % 4096, "前提: G と L の場所は同じ stripe");
         eng.delete(g);
         eng.oplog_commit();
+        let f_world = enchudb_oplog::make_eid(C, 100);
         // アプリが L の行を握る (G の行とは別の行。 この thread は他の thread の書き込みを待たない = `write_row` の doc の通り)
         let held = eng.write_row(l);
         let (seen, seen_rx) = channel::<()>();
@@ -4680,7 +4697,7 @@ mod reuse_order_tests {
         {
             let e = eng.clone();
             std::thread::spawn(move || {
-                let _ = f_done.send(e.resolve_remote_eid(enchudb_oplog::make_eid(C, 100), v));
+                let _ = f_done.send(e.resolve_remote_eid(f_world, v));
             });
         }
         seen_rx.recv_timeout(Duration::from_secs(10)).expect("前提: t への受信 F が G の場所の行を握れずに回り始めた");
@@ -4694,6 +4711,10 @@ mod reuse_order_tests {
         // L を握っている間に H が返るか (返らなければ、 5 秒後に L を放して両方が返るのを確かめてから落とす)
         let during = h_rx.recv_timeout(Duration::from_secs(5));
         let returned_while_held = during.is_ok();
+        // [C]: L を放す前の G の場所と F の写像。 F は G を握れない間 `alloc_lock` の外で待つので、 G は死んだまま・写像も無い。
+        // 握らずに生かす形なら、 F は `alloc_lock` の下で G を生かして写像を載せてから放す (H はその後に `alloc_lock` を取って返る)
+        let g_live_while_held = eng.entities.is_live(g_slot);
+        let f_mapped_while_held = eng.resolve_remote_eid_existing(f_world);
         drop(held);
         let f = f_rx.recv_timeout(Duration::from_secs(20)).expect("L を放した後も F が返らない");
         let h = match during {
@@ -4708,6 +4729,213 @@ mod reuse_order_tests {
             "別の表 u への受信 H が、 アプリが握る t の行 L (G の場所と同じ stripe) を放すまで返らなかった \
              (F が alloc_lock を握ったまま G の行を待っている)"
         );
+        assert!(
+            !g_live_while_held && f_mapped_while_held.is_none(),
+            "t への受信 F が、 G の場所の行 (L と同じ stripe) を握れないまま G の場所を生かした (生きている {g_live_while_held}、 \
+             写像 {f_mapped_while_held:?}) = #931 の守りが受信の道で外れた"
+        );
+    }
+
+    /// #974 の読み直し [A]: 名前の束ね (`bind_remote_eid_by_pk_at`) が、 引いた手元の生きた行 R をアプリが `write_row` で握っている間、
+    /// `alloc_lock` を握ったまま R を待たない。 束ね B が R を待つ間も、 別の表 u への新しい写像の受信 H は返る。 B は呼び手
+    /// (`Syncer::bind_by_primary_key`) と同じく `None` なら引き直し、 R を放した後に R に束ねる。
+    ///
+    /// 直す前: B は `alloc_lock` を握ったまま R の行を待ち (closure の中の `row_locks.write`)、 H も R を放すまで返らなかった
+    /// (この試験は 5 秒で落ちた)。 同じ名前を両側で書く時は stripe の偶然でなく 「同じ行」 に当たる
+    #[test]
+    fn a_bind_waiting_for_a_held_row_does_not_stall_receives_into_other_tables() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let (path, eng, k, _v, w) = engine_with_u("bindheld", 4);
+        let r = eng.entity_in("t").unwrap();
+        eng.tie_to(r, "t.k", 5u32);
+        eng.oplog_commit();
+        let r_slot = eng.slot_unchecked(r);
+        let held = eng.write_row(r);
+        let (seen, seen_rx) = channel::<()>();
+        eng.row_locks.set_wait_hook(r_slot, move || {
+            let _ = seen.send(());
+        });
+        let peer_w = enchudb_oplog::make_eid(2, 100);
+        // 名前で引き直した回数 (呼び手の loop と同じく、 `None` なら引き直す。 R は名前 5 の生きた行のまま)
+        let (b_done, b_rx) = channel::<(Option<u64>, u32)>();
+        {
+            let e = eng.clone();
+            let created = at(now_ms(), 2);
+            std::thread::spawn(move || {
+                let mut again = 0;
+                let bound = loop {
+                    let existing = e.query_by_id64(&[(k, 5)]).into_iter().find(|&x| e.is_live_unchecked(x));
+                    let Some(existing) = existing else { break None };
+                    if let Some(b) = e.bind_remote_eid_by_pk_at(2, peer_w, existing, k, 5, created) {
+                        break Some(b);
+                    }
+                    again += 1;
+                    if again > 1000 {
+                        break None;
+                    }
+                };
+                let _ = b_done.send((bound, again));
+            });
+        }
+        seen_rx.recv_timeout(Duration::from_secs(10)).expect("前提: 束ね B が R の行を握れずに待ち始めた");
+        let (h_done, h_rx) = channel::<Option<u64>>();
+        {
+            let e = eng.clone();
+            std::thread::spawn(move || {
+                let _ = h_done.send(e.resolve_remote_eid(enchudb_oplog::make_eid(C, 200), w));
+            });
+        }
+        let during = h_rx.recv_timeout(Duration::from_secs(5));
+        let returned_while_held = during.is_ok();
+        // R をもう少し握ったままにする (B が待たずに引き直しを繰り返す壊れ方を、 引き直しの回数で見るため。 正しい形の B は
+        // 握っている書き手が離すまで待つので、 握る長さによらず 1 回)
+        std::thread::sleep(Duration::from_millis(300));
+        // B は R を握れない間 写像を張らない
+        let mapped_while_held = eng.resolve_remote_eid_existing(peer_w);
+        drop(held);
+        let (bound, again) = b_rx.recv_timeout(Duration::from_secs(20)).expect("R を放した後も束ね B が返らない");
+        let h = match during {
+            Ok(h) => h,
+            Err(_) => h_rx.recv_timeout(Duration::from_secs(20)).expect("R を放した後も H が返らない"),
+        };
+        let mapped = eng.resolve_remote_eid_existing(peer_w);
+        cleanup(&path, eng);
+        assert!(h.is_some(), "前提: H に u の場所を払い出した");
+        assert_eq!(bound, Some(r), "W を名前 5 の R に束ねない (引き直し {again} 回)");
+        assert!(again <= 2, "束ねが待たずに空回りした (引き直し {again} 回)");
+        assert_eq!(mapped, Some(r));
+        assert_eq!(mapped_while_held, None, "R を握れないまま W の写像を張った");
+        assert!(
+            returned_while_held,
+            "別の表 u への受信 H が、 アプリが握る R を放すまで返らなかった (束ねが alloc_lock を握ったまま R の行を待っている)"
+        );
+    }
+
+    /// #974 の読み直し [C]: `a_delete_holding_the_dead_row_does_not_remove_the_insert_reusing_its_slot` (#931) の受信版。 受信の Delete
+    /// (消えた X 宛ての再配送) が X の場所の行を握っている間 (割り込み点 `delete_locked_hook`) に、 別の thread の受信 F (C の行の払い出し、
+    /// `resolve_remote_eid`) が X の場所を使い回そうとしても、 Delete が F の新しい行を消さない。 F は行を握れずに `alloc_lock` を放して
+    /// 待ち、 Delete の後に場所を取る。
+    ///
+    /// 受信の道は #974 から握れない時に別の道 (`Busy` → `alloc_lock` の外で待つ) を通るので、 アプリの insert (待つ形) の試験では
+    /// 「待たない形の時だけ行を握らずに生かす」 壊れ方を捕まえない。 その形では F は Delete が握っている間に場所を生かして返り、 Delete に
+    /// 消される
+    #[test]
+    fn a_delete_holding_the_dead_row_does_not_remove_the_received_row_reusing_its_slot() {
+        use std::sync::mpsc::{channel, Receiver};
+        use std::time::Duration;
+        let (path, eng, k) = engine("relockrx", 2);
+        // 先に 1 回使い回して v15 に移っておく (F の払い出しが移る手順を通らず、 空きの一覧の道で回るように)
+        let a = eng.entity_in("t").unwrap();
+        let x = eng.entity_in("t").unwrap();
+        eng.delete(a);
+        let again = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(again), eng.slot_unchecked(a), "前提: 満杯の表で消えた場所を使い回した");
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        eng.tie_to(x, "t.k", 7u32);
+        eng.delete(x);
+        eng.oplog_commit();
+        let t = eng.tombstone_hlc(x);
+        assert_ne!(t, enchudb_oplog::Hlc::ZERO, "前提: X の削除の版数");
+        let slot = eng.slot_unchecked(x);
+        let f_world = enchudb_oplog::make_eid(C, 100);
+        // 割り込み点の中で見た F の答え (Delete が行を握っている間に返ったら Some) と、 F の答えの受け口
+        type Early = (Option<Option<u64>>, Receiver<Option<u64>>);
+        let early: Arc<Mutex<Option<Early>>> = Default::default();
+        {
+            let (e2, early) = (eng.clone(), early.clone());
+            delete_locked_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+                let (seen, seen_rx) = channel::<()>();
+                e2.row_locks.set_wait_hook(slot, move || {
+                    let _ = seen.send(());
+                });
+                let (f_done, f_rx) = channel::<Option<u64>>();
+                let e3 = e2.clone();
+                std::thread::spawn(move || {
+                    let _ = f_done.send(e3.resolve_remote_eid(f_world, k));
+                });
+                // F が X の場所の行を握れなかった所まで進め、 さらに 0.5 秒、 F が (行を握らずに) 返るかを見てから Delete を続ける
+                let _ = seen_rx.recv_timeout(Duration::from_secs(10));
+                let got = f_rx.recv_timeout(Duration::from_millis(500)).ok();
+                *early.lock().unwrap() = Some((got, f_rx));
+            });
+        }
+        // X の削除の再配送 (同じ版数)
+        eng.remote_delete_apply_foreign(x, t);
+        let (early, f_rx) = early.lock().unwrap().take().expect("前提: 行の lock の下の割り込み点を通った");
+        let f = match early {
+            Some(f) => f,
+            None => f_rx.recv_timeout(Duration::from_secs(20)).expect("Delete の後も F が返らない"),
+        };
+        let f = f.expect("前提: F に場所を払い出した");
+        let f_slot = eng.slot_unchecked(f);
+        let live = eng.entities.is_live(slot);
+        let mapped = eng.resolve_remote_eid_existing(f_world).map(|e| eng.slot_unchecked(e));
+        cleanup(&path, eng);
+        assert_eq!(f_slot, slot, "前提: F は X の場所を使い回した");
+        assert!(early.is_none(), "F が、 Delete の握る X の場所の行を握らないまま場所を使い回して返った");
+        assert!(live, "受信の Delete が、 行の lock を握っている間に受信 F が場所を使い回した新しい行を消した");
+        assert_eq!(mapped, Some(slot), "F の写像が場所を指さない");
+    }
+
+    /// #974 の読み直し 1: 名前の削除の記録のある受信 (`reserve_remote_eid_for_pk`) が、 使い回す場所の行を握れずに `alloc_lock` の外で
+    /// 待つ間に届いた、 その名前の削除 (作成より後) も払い出した場所に載せる (削除より前に作られた entity は死んだ場所)。 待つ前に
+    /// 名前の削除を 1 回だけ読む形は、 待つ間に届いた削除を見ずに場所を生かした。
+    #[test]
+    fn a_name_delete_arriving_while_a_reserve_waits_for_a_busy_slot_is_put_on_the_slot() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let (path, eng, k, _v, _w) = engine_with_u("reservewait", 4097);
+        let rows: Vec<u64> = (0..4097).map(|_| eng.entity_in("t").unwrap()).collect();
+        // 先に 1 回使い回して v15 に移っておく
+        eng.delete(rows[1]);
+        let again = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(again), eng.slot_unchecked(rows[1]), "前提: 満杯の表で消えた場所を使い回した");
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        let (g, l, x2) = (rows[0], rows[4096], rows[2]);
+        let g_slot = eng.slot_unchecked(g);
+        assert_eq!(g_slot % 4096, eng.slot_unchecked(l) % 4096, "前提: G と L の場所は同じ stripe");
+        assert_ne!(eng.slot_unchecked(x2) % 4096, g_slot % 4096, "前提: X2 は別の stripe");
+        // G (名前 1) を消して、 名前の削除の記録を空でなくする (`reserve_remote_eid_for_pk` が払い出しを引き受ける)
+        eng.tie_to(g, "t.k", 1u32);
+        eng.tie_to(x2, "t.k", 9u32);
+        eng.delete(g);
+        eng.oplog_commit();
+        assert!(eng.name_deleted_at(k, PkValue::Local(1)).is_some(), "前提: 名前 1 の削除を覚えた");
+        assert_eq!(eng.name_deleted_at(k, PkValue::Local(9)), None, "前提: 名前 9 はまだ消えていない");
+        let created = at(now_ms(), C);
+        let t_del = at(created.wall + 1_000, 2);
+        let held = eng.write_row(l);
+        // F が G の行を握れなかった所で、 別の thread に名前 9 の行 X2 の (作成より後の) 削除を当てさせる (F は `alloc_lock` を
+        // 放してから L を待つので、 削除は F の待ちの間に当たる)
+        let (d_done, d_rx) = channel::<bool>();
+        {
+            let e = eng.clone();
+            eng.row_locks.set_wait_hook(g_slot, move || {
+                std::thread::spawn(move || {
+                    let _ = d_done.send(e.remote_delete_apply_foreign(x2, t_del));
+                });
+            });
+        }
+        let (f_done, f_rx) = channel::<Option<u64>>();
+        {
+            let e = eng.clone();
+            std::thread::spawn(move || {
+                let _ = f_done.send(e.reserve_remote_eid_for_pk(enchudb_oplog::make_eid(C, 300), k, PkValue::Local(9), created));
+            });
+        }
+        let deleted = d_rx.recv_timeout(Duration::from_secs(10));
+        let f_early = f_rx.try_recv().ok();
+        drop(held);
+        assert!(deleted.expect("前提: F が G の行を握れずに待つ間に、 X2 の削除が返った"), "前提: X2 の削除が当たった");
+        assert_eq!(f_early, None, "前提: F は L を放すまで待った");
+        let f = f_rx.recv_timeout(Duration::from_secs(20)).expect("L を放した後も F が返らない").expect("前提: F に場所を払い出した");
+        let f_slot = eng.slot_unchecked(f);
+        let live = eng.entities.is_live(f_slot);
+        let tomb = eng.tombstone_version_of(f_slot);
+        cleanup(&path, eng);
+        assert!(!live, "名前 9 の削除 (作成より後) が、 待つ間に届いたのに、 払い出した場所を生かした");
+        assert_eq!(tomb, t_del, "払い出した場所に名前 9 の削除の版数を載せない");
     }
 
     /// #974: 行の lock を握ったまま `alloc_lock` を取る入口 (写像の払い出し) を呼ぶと (`write_row` の doc が禁じる形)、 debug build は止める。
@@ -4715,15 +4943,19 @@ mod reuse_order_tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "alloc_lock を取る前に")]
     fn taking_alloc_lock_while_holding_a_row_is_caught_in_debug() {
-        struct Rm(String);
+        /// 落ちた時の巻き戻しで、 engine を落としてから directory を消す (#974 の読み直し 5: 前は directory を消した後に engine が
+        /// 落ち、 消えた directory に書き出そうとした。 drop の中で落ちると test binary ごと止まる)
+        struct Rm(String, Option<Arc<Engine>>);
         impl Drop for Rm {
             fn drop(&mut self) {
+                drop(self.1.take());
                 let _ = crate::db_files::remove_db(&self.0);
                 let _ = std::fs::remove_file(oplog_path_for(&self.0));
             }
         }
         let (path, eng, k) = engine("rowalloc", 4);
-        let _rm = Rm(path);
+        let rm = Rm(path, Some(eng));
+        let eng = rm.1.as_ref().unwrap();
         let e = eng.entity_in("t").unwrap();
         let _row = eng.write_row(e);
         let _ = eng.resolve_remote_eid(enchudb_oplog::make_eid(C, 7), k);
@@ -17274,14 +17506,18 @@ impl Engine {
     /// 外さず、 束ねた identity が使い回した新しい行を指した (その宛ての書き込み・削除が新しい行に当たる)。 確かめて張った後に
     /// 消えた / 使い回された時は、 束ねてから消えたのと同じ (使い回しが写像を外す)。
     ///
+    /// 引いた行 (の stripe) を他の書き手が握っていた時も `None` (#974 の読み直し [A]): `alloc_lock` を放してから、 何も持たずにその
+    /// 書き手が離すまで待って返る (呼び手は名前で引き直す。 待つ間にその行が消えた / 改名された / 名前の削除が来た時も、 引き直しが
+    /// 束ねる前の窓を待つ前と同じ幅にする)。
+    ///
     /// 前から写像があった (先に確定した束ね先) 時は、 その場所を返す (束ねた identity を引いた行に覚えず、 その場所を生かさない
     /// = 写像を張った側が決めた生き死にのまま。 読み直し [A4]: 前は引いた行に覚え、 並んだ受信が削除優先で死んだまま払い出した場所を
     /// 生かした)。
     ///
-    /// lock の順は `alloc_lock` → 行 (読み直し [A1]、 入口の `debug_assert_no_user_row`)。 直す前の写像の払い出しは `alloc_lock` を
-    /// 握ったまま使い回す場所の行を握れるまで回ったので、 行を握ったまま `alloc_lock` を待つと、 その行と同じ stripe の場所を払い出す
-    /// 受信と互いを待って止まった (#974 からは `alloc_lock` を放してから待つ。 束ねは `alloc_lock` を握ったまま行を待つ)。 WAL に積む (#178 の別名の record) のと #490 / #513 の削除は `alloc_lock` を放した後に、
-    /// 確かめた行の lock の下で。
+    /// lock の順は `alloc_lock` → 行 (読み直し [A1]、 入口の `debug_assert_no_user_row`)。 行は待たずに握る (`try_write`): 前は
+    /// `alloc_lock` を握ったまま引いた行を待ち、 その間は写像を払い出す受信が表によらず全部止まった (#974 の読み直し [A]。 同じ名前を
+    /// 両側で書く時は 「同じ行」 に当たるので、 使い回す場所の stripe の偶然より出やすい)。 WAL に積む (#178 の別名の record) のと
+    /// #490 / #513 の削除は `alloc_lock` を放した後に、 確かめた行の lock の下で。
     #[doc(hidden)]
     pub fn bind_remote_eid_by_pk_at(
         &self,
@@ -17300,21 +17536,31 @@ impl Engine {
         let target = self.slot_unchecked(row_eid);
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         self.debug_assert_no_user_row("bind_remote_eid_by_pk_at");
+        /// 束ねる前の確かめの結果 (`alloc_lock` の下)
+        enum Checked<G> {
+            /// 確かめて写像を張った (行の lock と前の宛名)
+            Bound(G, enchudb_oplog::EntityId),
+            /// 引いた行がもう束ねる先でない
+            Gone,
+            /// 引いた行を他の書き手が握っていた (`alloc_lock` を放してから待つ)
+            Busy,
+        }
         let checked = self.eid_translator.if_unmapped(author_peer, foreign_local, || {
             #[cfg(test)]
             if let Some(wal) = self.oplog.as_ref() {
                 bind_lock_hook::call(wal);
             }
-            let guard = self.row_locks.write(target);
+            // #974 の読み直し [A]: `alloc_lock` を握ったまま行を待たない (待つ間、 写像を払い出す受信が表によらず全部止まる)
+            let Some(guard) = self.row_locks.try_write(target) else { return Checked::Busy };
             if !self.entities.is_live(target) || !self.remote_row_holds_slot(target, Some(enchudb_oplog::eid_local(row_eid))) {
-                return None;
+                return Checked::Gone;
             }
             // 読み直し [A3]: 引いた後・束ねる前に改名された行には束ねない (今もその名前か、 `created` の時にその名前だった前の持ち主の
             // 時だけ。 前は改名より後に作られた entity を改名した行に束ね、 その名前の書き込みが行の名前を書き戻した)
             if self.himos[pk_himo as usize].get_value(target) != Some(pk_value)
                 && self.former_pk_holder(pk_himo, PkValue::Local(pk_value), created) != Some(row_eid)
             {
-                return None;
+                return Checked::Gone;
             }
             let prior = self.bind_prior_address(target, self_peer);
             // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)。 写像と同じ行の
@@ -17322,11 +17568,16 @@ impl Engine {
             self.note_bound_identity(row_eid, foreign_eid, created);
             // #613: 前向きの写像だけ (`alias_remote_eid` と同じ)
             self.eid_translator.alias(author_peer, foreign_local, target);
-            Some((guard, prior))
+            Checked::Bound(guard, prior)
         });
         let (guard, prior) = match checked {
-            Ok(Some(held)) => held,
-            Ok(None) => return None,
+            Ok(Checked::Bound(guard, prior)) => (guard, prior),
+            Ok(Checked::Gone) => return None,
+            Ok(Checked::Busy) => {
+                // `alloc_lock` は放した。 何も持たずに握っている書き手が離すのを待ち、 呼び手に名前で引き直させる
+                self.wait_busy_slot(target);
+                return None;
+            }
             Err(existing) => {
                 self.note_bind_alias(existing, false, foreign_eid, foreign_eid, self_peer);
                 Self::advance_table_next_local_for(&self.tables, existing);
@@ -17387,9 +17638,6 @@ impl Engine {
             return None;
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        // #614: その名前を削除の後に持った entity (最初に見た名前の書き込みが削除より後。 削除の後に作った行、 別の名前から改名した
-        // 行) は消えたデッキの一員でない。 その名前の削除を slot に載せると、 改名より前の (削除より古い) 書き込みを捨てる
-        let by_pk = self.pk_tombstone_of(pk_himo, pk_value).filter(|&t| t > created);
         self.debug_no_row_before_alloc(owner, foreign_local, "reserve_remote_eid_for_pk");
         let local = self.eid_translator.get_or_insert_waiting(
             owner,
@@ -17400,6 +17648,11 @@ impl Engine {
                     crate::eid_translator::Alloc::Got(local) => local,
                     other => return other,
                 };
+                // #614: その名前を削除の後に持った entity (最初に見た名前の書き込みが削除より後。 削除の後に作った行、 別の名前から
+                // 改名した行) は消えたデッキの一員でない。 その名前の削除を slot に載せると、 改名より前の (削除より古い) 書き込みを
+                // 捨てる。 #974 の読み直し 1: 払い出した後に読む (`Busy` で待った後も、 払い出しの直前の名前の削除で決める。 前は
+                // 待つ前に 1 回だけ読み、 待つ間に届いた名前の削除を見なかった)。 lock の順は `alloc_lock` → `pk_tombs` (下の書きと同じ)
+                let by_pk = self.pk_tombstone_of(pk_himo, pk_value).filter(|&t| t > created);
                 let early = self.foreign_tombstone_of(owner, foreign_local);
                 if let Some(tomb) = by_pk.max(early) {
                     self.set_tombstone_local(local, tomb);
@@ -21821,16 +22074,19 @@ impl Engine {
         }
     }
 
-    /// #974: 払い出しが `Busy(slot)` を返した (使い回す場所の行を他の書き手が握っていた)。 `alloc_lock` を放した後に、 何も持たずに
-    /// その行の lock を取って離す (握っている書き手が離すまで待つ)。 呼び手は行の lock を持っていない
-    /// ([`Self::debug_no_row_before_alloc`])。
+    /// #974: 払い出しが `Busy(slot)` を返した (使い回す場所の行を他の書き手が握っていた) / 名前の束ねが引いた行を握れなかった。
+    /// `alloc_lock` を放した後に、 何も持たずに、 その行の stripe を握っている書き手が離すまで待つ (握らない: 読み直し 2。 握ってから
+    /// 離すと、 待つ受信が 2 本以上の時に片方の一瞬の握りがもう片方の `try_write` を断らせ、 版も進めて同じ stripe の読み手を読み
+    /// 直させた)。 呼び手は行の lock を持っていない ([`Self::debug_no_row_before_alloc`])。
     fn wait_busy_slot(&self, slot: u32) {
-        drop(self.row_locks.write(slot));
+        self.row_locks.wait_released(slot);
     }
 
     /// #974: `alloc_lock` を取る入口で、 この thread が user の表の行の lock を持っていないこと (debug build だけ)。 順は
-    /// `alloc_lock` → 行: 行を握ったまま `alloc_lock` を待つと、 `alloc_lock` を握って行を待つ道 (`bind_remote_eid_by_pk_at`) と
-    /// 互いを待つ。 `write_row` を握ったまま受信の API を呼ぶアプリ (`write_row` の doc が禁じる形) もここで止まる
+    /// `alloc_lock` → 行。 `alloc_lock` の下では行を待たずに握る (`try_write`。 写像の払い出しも名前の束ねも、 握れなければ
+    /// `alloc_lock` を放してから待つ) ので今は互いを待つ道は無いが、 行を握ったまま `alloc_lock` を待つ形は、 `alloc_lock` の下に
+    /// 行の待ちを足した時に互いを待つ (読み直し [A1] の形)。 `write_row` を握ったまま受信の API を呼ぶアプリ (`write_row` の doc が
+    /// 禁じる形) もここで止まる
     #[inline]
     fn debug_assert_no_user_row(&self, at: &str) {
         debug_assert!(
