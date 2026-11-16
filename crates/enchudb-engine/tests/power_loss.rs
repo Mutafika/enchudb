@@ -6524,3 +6524,87 @@ fn an_alias_of_a_former_resident_the_replay_brings_back_is_kept() {
     assert!(x_alive && x_v == Some(71), "前提: 再生が X を戻した (v = {x_v:?})");
     assert_eq!(b_at, Some(ro_slot), "再生が戻した X の別名 b を、 再生の前に外した");
 }
+
+/// PR #1006 の読み直し [1] の死んだ場所の決め方の、 外す側の B の行の世界番号。
+const WORLD_B4: u64 = (2u64 << 32) | 14;
+
+/// 名前 7 の自分の行 X に B の行 b を畳み (b は X の場所の別名、 `eidalias` に書き出す)、 X を消して Y で X の場所を使い回し (使い回しが b を
+/// 外して X の削除の版数を退避する、 `prev.seg` に前の住人 X の記録)、 Y も消す。 sidecar の書き出しを `.eidmap` の後・`eidalias` の前で
+/// kill (page cache は残る: 場所は Y の削除で死んでいる、 `eidalias` は使い回しの前 = b → X の場所)。 (X, X の削除の版数) を返す。
+fn dead_slot_former_alias_image(live: &Path, img: &Path) -> (u64, Hlc) {
+    let (eng, x) = full_named_table_engine(&live.join("db"));
+    let hv = eng.himo_id("t.v").unwrap() as u16;
+    let b = eng.resolve_remote_eid(WORLD_B4, hv).unwrap();
+    assert!(eng.remote_tie_apply_result(b, hv, 8u32, Hlc { wall: 1_001, logical: 0, peer: 2 }).applied());
+    eng.merge_entity_into(b, x).unwrap();
+    // b を受けて伸びた表を使い切る (使い切った表は、 消した場所を次の行に使い回す)
+    let mut n = 300u32;
+    while eng.table_eid_usage("t").is_some_and(|u| u.allocated < u.capacity) {
+        let e = eng.entity_in("t").unwrap();
+        eng.tie_to(e, "t.k", n);
+        n += 1;
+    }
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    let _hold = eng.hold_consumer();
+    eng.delete(x);
+    eng.oplog_commit();
+    let t_x = eng.tombstone_hlc(x);
+    assert_ne!(t_x, Hlc::ZERO, "前提: X の削除の版数");
+    let y = add_seven(&eng, 72);
+    assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y が X の場所を使い回した");
+    assert_eq!(eng.resolve_remote_eid_existing(WORLD_B4), None, "前提: 使い回しが b を外した (memory)");
+    eng.delete(y);
+    eng.oplog_commit();
+    let shot = Arc::new(AtomicBool::new(false));
+    let (s2, l, i) = (shot.clone(), live.to_path_buf(), img.to_path_buf());
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::EidmapWritten && !s2.swap(true, Ordering::SeqCst) {
+            kill_image(&l, &i);
+        }
+    })));
+    eng.persist_tables().unwrap();
+    write_out_hook::set(None);
+    assert!(shot.load(Ordering::SeqCst), "前提: sidecar の書き出しの途中で撮った");
+    (x, t_x)
+}
+
+/// PR #1006 の読み直し [1] の死んだ場所の決め方 (外す側): `dead_slot_former_alias_image` を開くと、 場所は死んでいて (Y の削除)、
+/// `eidalias` の b は X の世代を指す。 `prev.seg` の使い回しの記録が X を場所から離したので、 b は前の住人の別名として外す (死んだ場所でも)。
+/// その後に場所を Z で使い回しても、 b の削除の版数は X の削除のまま (外さないと、 Z の使い回しが b を場所の削除 = Y の削除で退避し直し、
+/// b の削除の版数が Y の物に上がる)。
+///
+/// この像で b を外すのは記録から戻す道 (書き出していない周期の記録、 `restore_prev_resident`) が先で、 死んだ場所のなめ
+/// (`alias_row_left_slot`) は同じ別名の受け止め (変異で記録を見ないなめにしても通る)。 `eidalias` が使い回しの前のまま残る像は、 その
+/// 記録の周期を書き出していない (周期は `eidalias` を書いた後に進む) ので、 なめだけが外す像は作れていない。
+#[test]
+fn a_former_alias_at_a_dead_slot_is_dropped_by_the_reuse_record() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("dead_slot_former_alias");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    let (x, t_x) = dead_slot_former_alias_image(&live, &img);
+    let db = img.join("db");
+    let (ro_b, ro_slot, ro_record) = {
+        let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
+        let s = ro.eid_slot(x);
+        (ro.resolve_remote_eid_existing(WORLD_B4).map(|e| ro.eid_slot(e)), s, ro.prev_resident_of_slot(s))
+    };
+    let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let b_at = eng.resolve_remote_eid_existing(WORLD_B4).map(|e| eng.eid_slot(e));
+    let z = add_seven(&eng, 73);
+    let z_slot = eng.eid_slot(z);
+    let b_tomb = eng.deleted_before_create(WORLD_B4);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(ro_b, Some(ro_slot), "前提: 像の `eidalias` は b → X の場所 (使い回しの前)");
+    assert!(ro_record.is_some_and(|r| r.1 == eid_local(x)), "前提: 場所の記録は前の住人 X: {ro_record:x?}");
+    assert_eq!(z_slot, ro_slot, "前提: Z が場所を使い回した");
+    assert_ne!(b_at, Some(ro_slot), "使い回しが外した X の別名 b が、 死んだ場所に残った");
+    assert_eq!(b_tomb, Some(t_x), "b の削除の版数が X の削除でない (後の使い回しが場所の削除で退避し直した)");
+}
