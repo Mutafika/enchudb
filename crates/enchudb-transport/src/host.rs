@@ -350,13 +350,19 @@ struct HostInner {
     ///    record の答えは F より前の削除の記録に依らない (依るなら、 F を受けて忘れてから当てる client (`Syncer::pull_once`) と、
     ///    忘れる前に当てたホストで答えが割れる = 前の作りでも同じ前提)
     ///
+    /// 数える client の受信では、 その client の線 (候補 ≤ 配り終えの線 < 新しい record) が先に効く。 登録が F を抑えるのは、 数えない
+    /// client の受信 (新しい client の最初の publish、 `BEHIND` / 503 の後の送り直し、 他の書き手の record を運ぶ client) と state の
+    /// 道。 今の F より下の record を当てている受信が居る間 (state の古い cell など)、 F は進まない (上限が今の F 以下)。
+    ///
     /// #980: 前は `RwLock` (当てる間 read、 忘れる間 write) で締め出した。 当てる間は行の lock を待ちうる (アプリが握る行・WAL の
     /// 空きを待つ書き手の行・同じ stripe の行) ので、 write で待つと、 std の `RwLock` は書き手が待つ間に新しい読み手を通さず、
     /// 後から来た全 client の受信が、 その 1 つの受信が行を待つ間ずっと止まった。 待たない `try_write` にすると、 受信が絶えず
     /// 重なるホストで F が上限なく遅れた。 登録の形は誰も締め出さない (待つのは 2 の古い record の受信が、 忘れる間だけ)。
     ///
-    /// 残り: `oplog_sync` の bridge が ring に全部を写す前提 (ring が満杯で止まった時 #846 / 落ちた書き込みの後の止め #783 は、
-    /// 外した後も record が WAL にだけある)。 外すのを bridge の位置で決めたいが、 bridge の cursor は畳む時に頭へ戻る (単調でない)。
+    /// 残り: `oplog_sync` の bridge が ring に全部を写す前提。 ring が満杯で止まった時 (#846)・落ちた書き込みの後の止め (#783)・
+    /// `oplog_sync` の失敗 (fsync の失敗は bridge の前に返る。 `sync_for_ack` は false のまま登録を外す) は、 外した後も record が
+    /// WAL にだけある = F が越えうる (前の gate も同じ所で外れた)。 外すのを bridge の位置で決めたいが、 bridge の cursor は畳む時に
+    /// 頭へ戻る (単調でない)。 engine から 「bridge がまだ書いていない record の版数の最小」 を出して F を抑えるのが直す道。
     applying: Mutex<Applying>,
     /// [`Applying::forgetting`] が外れた (待っている受信を起こす)。
     forgot: std::sync::Condvar,
@@ -384,6 +390,9 @@ struct HostInner {
     /// 試験: 忘れている間に待った受信の数。
     #[cfg(test)]
     waited: AtomicU64,
+    /// 試験: `recompute` が登録を読む (`applying` の lock を取る) 直前の割り込み点 (1 回だけ呼ぶ)。
+    #[cfg(test)]
+    lock_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// 当てている受信の登録 ([`HostInner`] の `applying`)。
@@ -392,6 +401,8 @@ struct Applying {
     next: u64,
     /// 当てている受信ごとの、 当てる record の版数の最小。
     live: std::collections::BTreeMap<u64, Hlc>,
+    /// 忘れている途中に来て待っている受信の、 当てる record の版数の最小 (次の回の上限に入れる)。
+    waiting: std::collections::BTreeMap<u64, Hlc>,
     /// F を忘れている途中なら、 その上限 (候補と登録の最小の小さい方)。 この上限より古い record を持つ受信は、 外れるまで待つ。
     forgetting: Option<Hlc>,
 }
@@ -534,17 +545,19 @@ impl HostInner {
     fn begin_apply(&self, min: Option<Hlc>) -> ApplyGuard<'_> {
         let Some(min) = min else { return ApplyGuard { host: self, id: None } };
         let mut a = self.applying.lock().unwrap_or_else(|p| p.into_inner());
-        #[cfg(test)]
-        let mut counted = false;
-        while a.forgetting.is_some_and(|f| min < f) {
-            #[cfg(test)]
-            if !std::mem::replace(&mut counted, true) {
-                self.waited.fetch_add(1, Ordering::AcqRel);
-            }
-            a = self.forgot.wait(a).unwrap_or_else(|p| p.into_inner());
-        }
         a.next += 1;
         let id = a.next;
+        if a.forgetting.is_some_and(|f| min < f) {
+            #[cfg(test)]
+            self.waited.fetch_add(1, Ordering::AcqRel);
+            // 待つ間も次の回の上限に入れる (待っている間に始まった次の回が、 この受信の record を越えて上限を上げない = 待つのは
+            // 高々 1 回)
+            a.waiting.insert(id, min);
+            while a.forgetting.is_some_and(|f| min < f) {
+                a = self.forgot.wait(a).unwrap_or_else(|p| p.into_inner());
+            }
+            a.waiting.remove(&id);
+        }
         a.live.insert(id, min);
         ApplyGuard { host: self, id: Some(id) }
     }
@@ -742,8 +755,15 @@ impl HostInner {
         // 当てている受信の record の最小と ring の最小で丸め、 忘れ終えてから F を置く。 忘れている間に来た、 上限より古い record の
         // 受信は待つ (`applying` の 2)。 登録の最小を読むのと印を立てるのは同じ lock の下: その後に登録する受信は印を見る
         let upper = candidate.and_then(|candidate| {
+            #[cfg(test)]
+            {
+                let hook = self.lock_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             let mut a = self.applying.lock().unwrap_or_else(|p| p.into_inner());
-            let upper = a.live.values().fold(candidate, |m, h| m.min(*h));
+            let upper = a.live.values().chain(a.waiting.values()).fold(candidate, |m, h| m.min(*h));
             let current = self.lines.lock().unwrap().forget;
             (a.forgetting.is_none() && upper > current).then(|| {
                 a.forgetting = Some(upper);
@@ -939,6 +959,8 @@ impl HttpHost {
             forget_hook: Mutex::new(None),
             #[cfg(test)]
             waited: AtomicU64::new(0),
+            #[cfg(test)]
+            lock_hook: Mutex::new(None),
         });
 
         let listener = TcpListener::bind(bind_addr)?;
@@ -1104,17 +1126,20 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             // 当てて ring に写し終えるまで、 F は state の record を越えない (`applying`、 `accept` と同じ。 state の record の版数は
             // cell の版数 = 古い物も、 当たらない Vocab を載せる版数の `as_of` も見る)
             let lo = state.records.iter().map(|r| r.hlc).min().map_or(state.as_of, |m| m.min(state.as_of));
-            let _applying = host.begin_apply(Some(lo));
+            let applying = host.begin_apply(Some(lo));
             // #753: 当てて、 載せて、 ring に写し終える (`oplog_sync`) まで pull を止める (`records_for` が `state_gate` の read で待つ)。
             // 差分 (`accept`) の record は書き手ごとに HLC の昇順で載るので止めなくてよいが、 state の record はそう並ばない。
             // #980: 差分の受信は止めない (前は F を進める間と同じ lock の write で止めていた。 止まっている受信の後ろで write を待つと、
             // 後から来た全 client の受信も止まった)
-            let _state = host.state_gate.write().unwrap_or_else(|p| p.into_inner());
+            let state_gate = host.state_gate.write().unwrap_or_else(|p| p.into_inner());
             host.loopback.pushed_state.lock().unwrap().insert(author, state);
             let ok = host.syncer.bootstrap_pull_via(author, author).is_some();
             host.loopback.pushed_state.lock().unwrap().remove(&author);
             // #961: 書き出せなかったら、 次の publish の ack の前に書き出し直す (state で当てた record も cursor を進めている)
             let durable = host.sync_for_ack(true);
+            // ring に写し終えた: 返事を書く前に pull を通し、 登録を外す
+            drop(state_gate);
+            drop(applying);
             send_response(&mut stream, if ok && durable { 200 } else { 500 }, b"")
         }
         _ => send_response(&mut stream, 404, b"not found"),
@@ -1946,7 +1971,8 @@ mod tests {
 
     /// #980: client a の受信 (`accept`) がホストの行の lock を待つ間 (アプリが同じ行を `write_row` で握っている)、 client b の要求が
     /// 忘れてよい線を進めようとしても、 client c の publish と pull は返る。 d の state も当たる。 a が当て続けている間も、 他の client が
-    /// 線を上げれば F は進む (a の record は越えない)。
+    /// 線を上げれば F は進む (a は数える client なので、 a の record を越えないのは a 自身の線が候補を抑えるから。 登録が F を抑える
+    /// 形は `the_forget_line_does_not_pass_a_record_being_applied` / `the_forget_line_reads_the_ring_after_the_registrations`)。
     ///
     /// 直す前: a は `gate` の read を持ったまま行を待ち、 b の要求の `touch` → `recompute` が `gate.write()` で待つ。 std の `RwLock`
     /// は書き手が待つ間に新しい読み手を通さないので、 c の `accept` (read) も pull の `records_for` (read) も、 アプリが行を放すまで
@@ -2123,7 +2149,7 @@ mod tests {
             forget_while_a_applies > forget_stuck,
             "a の受信が当て続けている間、 他の client が線を上げても F が進まない ({forget_stuck:?} → {forget_while_a_applies:?})"
         );
-        assert!(forget_while_a_applies < top_a, "F が当てている a の record を越えた");
+        assert!(forget_while_a_applies < top_a, "前提: 候補は a の配り終えの線で抑えられている (数える client はその線が先に効く)");
         assert!(forget_after > forget_before, "止まった受信の後も線が進まない ({forget_before:?} → {forget_after:?})");
     }
 
@@ -2204,6 +2230,32 @@ mod tests {
         let (ring, forget) = seen.expect("前提: 書き出しの前の割り込み点を通った");
         assert!(ring.is_none_or(|m| m > old), "前提: 割り込み点で n の record はまだ ring に無い ({ring:?})");
         assert!(forget <= old, "F が当てている途中の n の record を越えた ({forget:?} > {old:?})");
+    }
+
+    /// #980 の 2 回目の読み直し: `recompute` は登録を読んでから `ring_min` を読む。 逆だと、 `ring_min` を読んだ後に n の受信が当て終えて
+    /// ring に写して登録を外すと、 登録の写しにも `ring_min` にも n の record が無く、 F がそれを越える。 登録を読む直前
+    /// (`lock_hook`) に n の受信を最後まで (ring に写して外すまで) 進める。
+    #[test]
+    fn the_forget_line_reads_the_ring_after_the_registrations() {
+        let (dir, host, host_eng, ab, (n, sn), old) = host_and_an_old_record("order");
+        let ran = Arc::new(AtomicBool::new(false));
+        {
+            let (ran, sn) = (ran.clone(), sn.clone());
+            *host.inner.lock_hook.lock().unwrap() = Some(Box::new(move || {
+                sn.publish_since(Hlc::ZERO);
+                ran.store(true, Ordering::Release);
+            }));
+        }
+        host.inner.recompute(host.inner.clock.now());
+        let forget = host.forget_line();
+        let applied = host_eng.pull_raw("rows.val", 900).len();
+        let in_ring = host.inner.ring_min().is_some_and(|m| m <= old);
+        drop(host);
+        drop((ab, sn, n, host_eng));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ran.load(Ordering::Acquire), "前提: 登録を読む直前の割り込み点を通った");
+        assert!(applied == 1 && in_ring, "前提: n の record は割り込み点の中で当たり、 ring に写った (当たった {applied}, ring {in_ring})");
+        assert!(forget <= old, "F が、 登録を外して ring に写った n の record を越えた ({forget:?} > {old:?})");
     }
 
     /// #980 の読み直し: F を忘れている途中に来た、 その F より古い record を持つ受信は、 忘れ終えるまで当てない (忘れる前に当てた

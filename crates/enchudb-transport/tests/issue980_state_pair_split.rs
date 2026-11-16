@@ -59,6 +59,8 @@ fn a_pull_while_the_host_relays_a_state_does_not_split_a_word_from_its_cell() {
     };
     let ((d, sd), (b, sb)) = (client("d", 4), client("b", 2));
     let mut words = Vec::new();
+    // 前提の数: state を載せている途中で終わった書き出し (ring が state の途中まで伸びた所で止まった) と、 載せている間に重なった pull
+    let (mut split_syncs, mut overlapped_pulls) = (0usize, 0usize);
     for attempt in 0..ATTEMPTS {
         // d が語を 1 つずつ持つ行を書き、 ホストに出す前に自分の ring を回収する (ホストは次の publish で d の state を求める)
         for i in 0..WORDS {
@@ -73,22 +75,36 @@ fn a_pull_while_the_host_relays_a_state_does_not_split_a_word_from_its_cell() {
         let e = d.entity_in("rows").unwrap();
         d.tie_text_to(e, "rows.name", &format!("tail{attempt}"));
         settle(&d);
-        // state を載せる間: ホストの書き出し (Commit + bridge) と b の pull を回し続ける
+        // state を載せる間: ホストの書き出し (Commit + bridge) と b の pull を回し続ける。 それぞれ始めた時と終えた時のホストの ring の
+        // 位置 (lsn) を控える
         let stop = AtomicBool::new(false);
-        std::thread::scope(|s| {
-            s.spawn(|| {
+        let before = host_eng.current_sync_lsn();
+        let (syncs, pulls) = std::thread::scope(|s| {
+            let syncs = s.spawn(|| {
+                let mut at = Vec::new();
                 while !stop.load(Ordering::Acquire) {
                     let _ = host_eng.oplog_sync();
+                    at.push(host_eng.current_sync_lsn());
                 }
+                at
             });
-            s.spawn(|| {
+            let pulls = s.spawn(|| {
+                let mut at = Vec::new();
                 while !stop.load(Ordering::Acquire) {
+                    let start = host_eng.current_sync_lsn();
                     sb.pull_once(HOST);
+                    at.push((start, host_eng.current_sync_lsn()));
                 }
+                at
             });
             sd.publish_since(Hlc::ZERO);
             stop.store(true, Ordering::Release);
+            (syncs.join().unwrap(), pulls.join().unwrap())
         });
+        let after = host_eng.current_sync_lsn();
+        assert!(after - before >= 2 * WORDS, "前提: ホストは state の record を ring に載せた ({before} → {after})");
+        split_syncs += syncs.iter().filter(|&&end| before < end && end < after).count();
+        overlapped_pulls += pulls.iter().filter(|&&(start, end)| start < after && (start > before || end > start)).count();
         let host_has = words.iter().filter(|w| host_eng.vocab_id(w).is_some_and(|v| host_eng.pull_raw("rows.name", v).len() == 1)).count();
         assert_eq!(host_has, words.len(), "前提: ホストは d の行を state で受けた (attempt {attempt})");
     }
@@ -96,11 +112,14 @@ fn a_pull_while_the_host_relays_a_state_does_not_split_a_word_from_its_cell() {
         sd.publish_since(Hlc::ZERO);
         sb.pull_once(HOST);
     }
+    println!("[980] state の途中で終わった書き出し {split_syncs}、 載せている間に重なった pull {overlapped_pulls}");
     let missing: Vec<&String> =
         words.iter().filter(|w| !b.vocab_id(w).is_some_and(|v| b.pull_raw("rows.name", v).len() == 1)).collect();
     drop((sd, sb, host));
     drop((d, b, host_eng));
     let _ = std::fs::remove_dir_all(&dir);
+    assert!(split_syncs > 0, "前提: state を載せている途中で書き出し (Commit + bridge) が終わらなかった");
+    assert!(overlapped_pulls > 0, "前提: state を載せている間に b の pull が重ならなかった");
     assert!(
         missing.is_empty(),
         "b が d の行を {} / {} 受けない (例 {:?}): state の組の Vocab だけを受けて cursor が Tie を越えた",
