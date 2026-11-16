@@ -166,6 +166,12 @@ jobs:
       - name: loom model check (書き出しの門の境目と列の印)
         run: cargo test -p enchudb-engine --test loom_publish_gate_durable --release
 
+      # #978 削除の門: 削除は tombstone を置いてから門に入って cell を落とし、 書き出しは門を閉じて中が出るのを待ってから
+      # tomb.seg → 列の順に書き出す (閉じる側は並んでよい)。 門の前で cell を落とす形・閉じる前に tomb.seg を書き出す形の対照で、
+      # loom が窓を見つけることも見る。
+      - name: loom model check (削除の門と tomb.seg)
+        run: cargo test -p enchudb-engine --test loom_delete_gate --release
+
       # #708 辞書の回収: 最後の参照を返す側は 「書き出しを待つ印」 を立ててから参照を 0 にし、 場所を取る側は 0 → CLAIMED の
       # 後に印を読む (待ち行列の古い entry で、 付け替えの書き出しを待つ場所を取らない)。 印を後に立てる形の対照で、 loom が
       # 窓を見つけることも見る。
