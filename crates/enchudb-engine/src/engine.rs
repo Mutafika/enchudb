@@ -4501,9 +4501,12 @@ mod kill_fail_tests {
         (p, eng)
     }
 
+    /// 割り込み点に置く関数。
+    type HookFn = Box<dyn FnOnce(&enchudb_oplog::oplog::OpLog) + Send>;
+
     /// `move_race_db` で、 移る手順の割り込み点 (`set_hook`) の中で別の thread が `t` に行を足し、 その後に移り終える。 足した行は gen.seg の
     /// page が commit 済みで、 空きが無くても消せて、 次の世代で使い回す。
-    fn claim_during_move(tag: &str, set_hook: fn(&enchudb_oplog::oplog::OpLog, Box<dyn FnOnce(&enchudb_oplog::oplog::OpLog) + Send>)) {
+    fn claim_during_move(tag: &str, set_hook: fn(&enchudb_oplog::oplog::OpLog, HookFn)) {
         let (p, eng) = move_race_db(tag);
         let wal = eng.oplog.as_ref().unwrap().clone();
         let got: Arc<std::sync::Mutex<Option<Result<u64, String>>>> = Arc::default();
