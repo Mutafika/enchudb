@@ -307,9 +307,9 @@ pub(crate) struct PrevSlots {
     restored: AtomicU32,
     /// log の区画が一杯で配列にだけ書いた数 (観測用)
     log_full: AtomicU64,
-    /// 開く時に読んだ記録 ((場所, 前の住人の行) の順。 log に残る全部と、 書き出していない周期の配列の件)。 WAL の再生・bridge が、
-    /// 場所ごとの配列で上書きされた前の住人 (同じ場所を 2 回使い回した 1 回目) も引く ([`Self::record_of`])
-    replay: std::sync::Mutex<Vec<(u32, PrevRecord)>>,
+    /// 開く時に読んだ記録 ((場所, 前の住人の行) の順、 記録の周期と。 log に残る全部と、 書き出していない周期の配列の件)。 WAL の
+    /// 再生・bridge が、 場所ごとの配列で上書きされた前の住人 (同じ場所を 2 回使い回した 1 回目) も引く ([`Self::record_of`])
+    replay: std::sync::Mutex<Vec<(u32, PrevRecord, u64)>>,
     /// 開く時に記録から戻した自分の行の削除 (前の住人の行, 削除の版数)。 #451 の作り直しが WAL に無い Delete を載せる
     /// ([`Self::take_restored_own`]、 review946c [E])
     restored_own: std::sync::Mutex<Vec<(u32, Hlc)>>,
@@ -398,21 +398,38 @@ impl PrevSlots {
 
     /// 開く時に読んだ記録 ([`Self::open_records`] の 2 つ目) を、 WAL の再生・bridge・#924 の Ref が引けるように置く
     /// ([`Self::record_of`])。 `.eidmap` を読む前に置く (review946c [A])。
-    pub(crate) fn keep_for_replay(&self, records: &[(u32, PrevRecord)]) {
+    pub(crate) fn keep_for_replay(&self, records: &[(u32, PrevRecord, u64)]) {
         let mut v = records.to_vec();
-        v.sort_unstable_by_key(|&(slot, r)| (slot, r.gone));
+        v.sort_unstable_by_key(|&(slot, r, _)| (slot, r.gone));
         *self.replay.lock().unwrap_or_else(|p| p.into_inner()) = v;
     }
 
     /// 場所 `slot` の前の住人が行 `gone` だった使い回しの記録: 場所ごとの配列 (最後の使い回し) か、 開く時に読んだ記録 (同じ場所の
     /// 前の使い回し。 log に残る全部 = 書き出した周期の記録も、 review946c [D])。
     pub(crate) fn record_of(&self, slot: u32, gone: u32) -> Option<PrevRecord> {
-        if let Some(r) = self.read(slot).filter(|r| r.gone == gone) {
-            return Some(r);
+        self.record_at(slot, gone).map(|(r, _)| r)
+    }
+
+    /// [`Self::record_of`] と、 その記録の周期が書き出し済みか (= その使い回しの memory の効果は sidecar に全部ある、
+    /// [`Self::end_persist`])。 読み直し [A1] (#969 / #968 の PR): 再生の後始末のやり直し (`Engine::redo_reuse_eviction`) は、
+    /// 書き出し済みの記録の後始末をやり直さない。
+    pub(crate) fn record_at(&self, slot: u32, gone: u32) -> Option<(PrevRecord, bool)> {
+        if let Some((lo, r)) = self.read_slot(slot).filter(|(_, r)| r.gone == gone) {
+            return Some((r, self.slot_epoch_written(lo)));
         }
+        let persisted = self.persisted.load(Ordering::Relaxed);
         let v = self.replay.lock().unwrap_or_else(|p| p.into_inner());
-        let i = v.partition_point(|&(s, r)| (s, r.gone) < (slot, gone));
-        v.get(i).filter(|&&(s, r)| s == slot && r.gone == gone).map(|&(_, r)| r)
+        let i = v.partition_point(|&(s, r, _)| (s, r.gone) < (slot, gone));
+        v.get(i).filter(|&&(s, r, _)| s == slot && r.gone == gone).map(|&(_, r, epoch)| (r, epoch <= persisted))
+    }
+
+    /// 配列の件の周期 (下位 32 bit `lo`) が書き出した周期以下か: 書き出した周期より後・今の周期以下の窓の中なら書き出していない
+    /// (窓との差で比べる = [`Self::open_records`] の配列の窓と同じ。 窓の外の件は書き出した周期の物)。
+    fn slot_epoch_written(&self, lo: u32) -> bool {
+        let persisted = self.persisted.load(Ordering::Relaxed);
+        let width = self.epoch.load(Ordering::Acquire).saturating_sub(persisted);
+        let d = lo.wrapping_sub(persisted as u32);
+        d == 0 || u64::from(d) > width
     }
 
     /// 場所 `slot` の記録を全部 (場所ごとの配列と、 `sorted` ((場所, 前の住人の行) の順に並べた記録) の場所 `slot` の件。 同じ記録が
@@ -691,6 +708,11 @@ impl PrevSlots {
 
     /// 場所 `slot` の配列の記録 (無い / 書きかけ / 範囲の外は None)。
     pub(crate) fn read(&self, slot: u32) -> Option<PrevRecord> {
+        self.read_slot(slot).map(|(_, rec)| rec)
+    }
+
+    /// [`Self::read`] と、 記録の周期の下位 32 bit。
+    fn read_slot(&self, slot: u32) -> Option<(u32, PrevRecord)> {
         let r = self.region.get()?;
         let off = record_off(slot);
         if off + SLOT_ENTRY > r.len() || !r.is_committed(off + SLOT_ENTRY) {
@@ -700,7 +722,7 @@ impl PrevSlots {
         if r.as_atomic_u32(off).load(Ordering::Relaxed) & SLOT_CHECK == 0 {
             return None;
         }
-        decode_slot(slot, self.bits.load(Ordering::Relaxed), &Self::words_at::<SLOT_WORDS>(r, off)?).map(|(_, rec)| rec)
+        decode_slot(slot, self.bits.load(Ordering::Relaxed), &Self::words_at::<SLOT_WORDS>(r, off)?)
     }
 
     /// 書き出していない周期の記録 (場所, 記録) を周期の順 (同じ周期は積んだ順、 配列の分は後) に ([`Self::open_records`] の 1 つ目)。
@@ -710,23 +732,23 @@ impl PrevSlots {
     }
 
     /// 開く時 (きれいに閉じなかった後だけ) に読む記録: (書き出していない周期の記録を周期の順 (同じ周期は積んだ順、 配列の分は後) に、
-    /// log に残る記録の全部 (周期によらない) と書き出していない周期の配列の件)。 1 つ目は退避を戻す元、 2 つ目は WAL の再生の守り・
-    /// bridge が引く元 ([`Self::keep_for_replay`]。 review946c [D]: 書き出した周期の記録も、 区画を使い直すまで log に残る。 pull の
-    /// sidecar の書き出しが WAL の checkpoint より先に周期を進めた像で、 再生する前の住人宛ての record を守る)。
+    /// log に残る記録の全部 (周期によらない) と書き出していない周期の配列の件 (記録の周期と))。 1 つ目は退避を戻す元、 2 つ目は WAL の
+    /// 再生の守り・bridge が引く元 ([`Self::keep_for_replay`]。 review946c [D]: 書き出した周期の記録も、 区画を使い直すまで log に残る。
+    /// pull の sidecar の書き出しが WAL の checkpoint より先に周期を進めた像で、 再生する前の住人宛ての record を守る)。
     ///
     /// 配列をなめるのは、 log の区画が一杯で配列にだけ書いた周期が書き出されていない時だけ。 配列の件は周期の下位 32 bit しか持た
     /// ないので、 書き出した周期の次から一杯だった周期までの窓の中の件だけ取る (窓との差で比べる = 周期の下位 bit が一周しても比べ
     /// 違えない。 窓の外の古い件と下位 32 bit が窓の中で重なるのは、 2^32 周期の間その場所を使い回さなかった件だけ)。
-    pub(crate) fn open_records(&self) -> (Records, Records) {
+    pub(crate) fn open_records(&self) -> (Records, Vec<(u32, PrevRecord, u64)>) {
         let Some(r) = self.region.get() else { return (Vec::new(), Vec::new()) };
         let persisted = self.persisted.load(Ordering::Relaxed);
         // 並びの鍵 = (周期, 置き場 (0 = log、 1 = 配列), 区画, 順)
         type Order = (u64, u32, u32, u32);
         let mut out: Vec<(Order, u32, PrevRecord)> = Vec::new();
-        let mut logged: Vec<(u32, PrevRecord)> = Vec::new();
+        let mut logged: Vec<(u32, PrevRecord, u64)> = Vec::new();
         for half in 0..2u32 {
             Self::scan_half(r, half, |i, slot, epoch, rec| {
-                logged.push((slot, rec));
+                logged.push((slot, rec, epoch));
                 if epoch > persisted {
                     out.push(((epoch, 0, half, i), slot, rec));
                 }
@@ -754,7 +776,7 @@ impl PrevSlots {
                     .and_then(|(lo, rec)| in_window(lo).map(|e| (e, rec)))
                 {
                     out.push(((epoch, 1, 0, slot), slot, rec));
-                    logged.push((slot, rec));
+                    logged.push((slot, rec, epoch));
                 }
             }
         }
@@ -898,6 +920,31 @@ mod tests {
         assert_eq!(p.unpersisted(), vec![(3, tr)], "check の合わない log の件を読んだ");
         assert!(p.write(64, &tr), "範囲の外の場所も log には積む");
         assert_eq!(p.read(64), None);
+    }
+
+    /// 読み直し [A1] (#969 / #968 の PR): 記録は周期が書き出し済みかを言う。 配列の件は周期の下位 32 bit を 「書き出した周期より後・
+    /// 今の周期以下」 の窓と比べ、 開く時に読んだ log の件 (配列は後の使い回しで上書きされた) は周期で比べる。
+    #[test]
+    fn a_record_says_whether_its_epoch_was_written_out() {
+        let mut buf = vec![0u64; segment_len(64).div_ceil(8)];
+        let p = PrevSlots::off();
+        p.prepare(region(&mut buf), 24, no_flush).unwrap();
+        let (a, b) = (own(3, 1, 10), own(4, 1, 20));
+        assert!(p.write(3, &a));
+        assert_eq!(p.record_at(3, a.gone), Some((a, false)), "書き出していない周期の記録");
+        assert_eq!(p.record_at(3, own(3, 2, 10).gone), None, "前の住人の違う記録");
+        let covered = p.begin_persist().expect("書き出していない記録がある");
+        assert!(p.write(4, &b), "次の周期の使い回し");
+        assert!(p.end_persist(covered));
+        assert_eq!(p.record_at(3, a.gone), Some((a, true)), "書き出した周期の記録");
+        assert_eq!(p.record_at(4, b.gone), Some((b, false)), "書き出した周期の後の記録");
+        // 開く時に読んだ log の件 (場所 5 の配列は後の使い回し d で上書き、 場所 6 は配列に無い)
+        let (c, d, e) = (own(5, 1, 30), own(5, 2, 40), own(6, 1, 50));
+        assert!(p.write(5, &d));
+        p.keep_for_replay(&[(5, c, covered), (6, e, covered + 1)]);
+        assert_eq!(p.record_at(5, c.gone), Some((c, true)), "log の書き出した周期の件");
+        assert_eq!(p.record_at(6, e.gone), Some((e, false)), "log の書き出していない周期の件");
+        assert_eq!(p.record_at(5, d.gone), Some((d, false)), "配列の件が先");
     }
 
     /// 配列の 1 件 (32 B) は行の番号を世代だけで持ち、 場所は並びの位置: 世代と場所の bit が変わっても読み戻せる。 check は場所も
