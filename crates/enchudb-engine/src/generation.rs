@@ -209,6 +209,12 @@ impl Generations {
         self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner()).push((key, slot, agen));
     }
 
+    /// #994 [C4]: 別名 `key` が上書きした `.eidmap` の写像 (場所, 住人の世代) を見る (取り出さない)。
+    pub(crate) fn alias_override(&self, key: (enchudb_oplog::PeerId, u32)) -> Option<(u32, u32)> {
+        let g = self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter().find(|e| e.0 == key).map(|&(_, slot, agen)| (slot, agen))
+    }
+
     /// #994 [C4]: 別名 `key` が上書きした `.eidmap` の写像 (場所, 住人の世代) を取り出す。
     pub(crate) fn take_alias_override(&self, key: (enchudb_oplog::PeerId, u32)) -> Option<(u32, u32)> {
         let mut g = self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner());

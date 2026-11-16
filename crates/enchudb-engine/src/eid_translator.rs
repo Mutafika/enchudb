@@ -288,6 +288,16 @@ impl EidTranslator {
         }
     }
 
+    /// `(author_peer, foreign_local)` が別名なら (指す local, 指す行の世代)。 逆写像の key と写像の無い key は None。
+    pub fn alias_target(&self, author_peer: PeerId, foreign_local: u32) -> Option<(u32, u32)> {
+        let key = (author_peer, foreign_local);
+        // lock の順は `inner` → `aliases`
+        let fwd = self.inner.read().unwrap();
+        let local = *fwd.get(&key)?;
+        let al = self.aliases.read().unwrap();
+        al.get(&local)?.iter().find(|(k, _)| *k == key).map(|&(_, agen)| (local, agen))
+    }
+
     /// #178: `local` を指す別名 (別名でなく逆写像の key は含まない)。
     pub fn aliases_of(&self, local: u32) -> Vec<Key> {
         self.aliases.read().unwrap().get(&local).map(|v| v.iter().map(|&(k, _)| k).collect()).unwrap_or_default()
