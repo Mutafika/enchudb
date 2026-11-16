@@ -145,15 +145,18 @@ fn eidalias_is_written_in_the_form_of_the_db_version() {
 }
 
 /// directory `from` を `to` に丸ごと写す (kill の像: 開いている engine の page cache の中身も届く。 きれいに閉じた印は立っていない)。
+/// 写す間に消えた file (背景の名前の記録のまとめ直し (#959) の一時 file など) は像に無いだけ。
 fn kill_image(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let dest = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
             kill_image(&entry.path(), &dest);
-        } else {
-            std::fs::copy(entry.path(), dest).unwrap();
+        } else if let Err(e) = std::fs::copy(entry.path(), &dest) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{}: {e}", entry.path().display());
+            let _ = std::fs::remove_file(&dest);
         }
     }
 }

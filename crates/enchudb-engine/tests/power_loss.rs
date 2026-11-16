@@ -5505,15 +5505,20 @@ fn a_redo_for_a_written_eviction_keeps_the_aliases_of_the_slot() {
 }
 
 /// directory `from` を `to` に丸ごと写す (kill の像: page cache の中身 = 書き出していない mmap の書き込みも届く)。
+///
+/// 写す間に消えた file は像に無いだけ (その file を消す / rename する前に kill した像と同じ)。 開いている engine の背景の名前の記録の
+/// まとめ直し (#959) が一時 file `pkformer.compact.tmp` を置いて rename するので、 開いた engine の kill の像を撮る試験で起きる。
 fn kill_image(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let dest = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
             kill_image(&entry.path(), &dest);
-        } else {
-            std::fs::copy(entry.path(), dest).unwrap();
+        } else if let Err(e) = std::fs::copy(entry.path(), &dest) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{}: {e}", entry.path().display());
+            let _ = std::fs::remove_file(&dest);
         }
     }
 }
