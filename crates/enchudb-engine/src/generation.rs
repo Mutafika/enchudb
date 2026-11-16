@@ -475,7 +475,7 @@ impl Generations {
         let mut next = 0u32;
         while next < n {
             // #970: gen.seg は表の枠の全部を commit する (疎) ので、 0 の並びは 4 場所 (8 B) ずつ飛ばす
-            if next % 4 == 0 && next + 4 <= n && r.as_atomic_u64(slot_off(next)).load(Ordering::Relaxed) == 0 {
+            if next.is_multiple_of(4) && next + 4 <= n && r.as_atomic_u64(slot_off(next)).load(Ordering::Relaxed) == 0 {
                 next += 4;
                 continue;
             }
@@ -785,6 +785,28 @@ mod tests {
         assert_eq!(slot_bits_for((1 << 24) + 1), 25);
         assert_eq!(slot_bits_for(100_000_000), 27);
         assert_eq!(slot_bits_for(u32::MAX), 32);
+    }
+
+    /// v15 に移る途中で落ちた像の gen.seg (前の残り) を作り直す時、 0 でない所を全部 0 に戻して header を書く。 #970: 0 でない 4 KiB
+    /// だけを 0 に戻す (commit した穴を全部書かない) ので、 4 KiB の境目をまたぐ残り・最後の半端な 4 KiB の残りも戻すことを見る。
+    #[test]
+    fn prepare_clears_every_leftover_byte() {
+        let n = 3 << PAGE_SHIFT;
+        let mut v = buffer(segment_len(n));
+        let len = v.len() * 8;
+        {
+            let base = v.as_mut_ptr() as *mut u8;
+            for off in [OFF_DIRTY, OFF_PAGES + 1, slot_off(5), slot_off(2047) + 1, slot_off(2048), len - 1] {
+                unsafe { *base.add(off) = 0xA5 };
+            }
+        }
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, len) };
+        assert_eq!(&bytes[..4], &MAGIC);
+        assert_eq!(u32::from_le_bytes(bytes[OFF_BITS..OFF_BITS + 4].try_into().unwrap()), 24);
+        let left: Vec<usize> = (OFF_BITS + 4..len).filter(|&i| bytes[i] != 0).collect();
+        assert!(left.is_empty(), "前の残りを 0 に戻していない: {left:?}");
     }
 
     #[test]
