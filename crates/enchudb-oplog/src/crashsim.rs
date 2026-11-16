@@ -59,8 +59,16 @@ static AFTER_COPY: Mutex<Option<Hook>> = Mutex::new(None);
 /// 写したものの種類 ([`copy_for_sync`]、 hook にも渡す)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Copied {
-    /// oplog の fsync
+    /// oplog 全体の fsync ([`OpLog::fsync`](crate::oplog::OpLog::fsync): engine の consumer の周期 / `oplog_sync` / 閉じる時)。
+    /// 試験が 「oplog の書き出しの前」 で thread を止める (`with_stalled_sync` / `hold_consumer`) のはここ。 consumer の周期と
+    /// `oplog_sync` は lock を持たずに呼ぶ (例外: WAL の空き作り (#388) は bridge の lock の下 (1 区画の形は `append_lock` も)、
+    /// 1 区画の WAL を 2 区画にする時と開いた時に穴の後を切った時は `append_lock` の下)
     Oplog,
+    /// oplog の区画の header の page だけの書き出し (区画を移る時・畳んだ header を届ける時・版を結ぶ時・2 区画にする時)。 書き手が
+    /// `append_lock` を持ったまま (畳んだ区画 / 移る先に書く前) か、 engine の consumer が畳んだ直後 (bridge の lock を持ったまま)
+    /// に写す = ここで thread を止めると、 その lock を待つ書き手 / bridge と互いに待つ (#1000: `Oplog` と同じ種類だった頃、
+    /// 止めた `oplog_sync` の Commit が畳んだ区画の header を届ける所で止まり、 試験の書き込みが `append_lock` を待ち続けた)
+    OplogHeader,
     /// segment の msync
     Segment,
 }

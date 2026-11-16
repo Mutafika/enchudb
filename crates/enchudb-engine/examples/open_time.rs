@@ -1,10 +1,15 @@
 //! 開く時間 (OPEN_TIME_PLAN.md の段階 0): 子 process に書かせて SIGKILL し、 新しい process で開く時間を測る。
 //!
 //! 形: 行 × 列 (列は Number / Tag (語 1 万) / Leaf の順に混ぜる、 50 行に 1 行は消す)、 sync の表あり (`s`) / なし。
-//! 止め方 3 つ: `clean` (きれいに閉じる) / `idle` (書き終えて同期し、 暇にしてから kill = スマホの background の kill) /
-//! `mid` (書いている最中に kill)。 開き方 2 つ: `writer` (`open_concurrent_with_oplog`、 復旧と #451 の照合が走る) /
-//! `readonly` (復旧なし = 下限)。 止めた DB は APFS の clone (`cp -c`) で写してから開くので、 同じ像を何回でも開ける
-//! (開くと復旧が済んで次は 「きれいに閉じた後」 になるので、 元は触らない)。
+//! 止め方 4 つ: `clean` (きれいに閉じる) / `idle` (書き終えて同期し、 暇にしてから kill = スマホの background の kill) /
+//! `mid` (書いている最中に kill) / `full` (#972: v15 の DB の WAL を再生する record で埋めて kill。 表 t の枠を行の数ちょうどに
+//! して埋め、 消して足して場所を使い回してから、 consumer を止めて書き換え・消して足すを WAL の空きが 4 MiB を切るまで続ける)。
+//! 開き方 3 つ: `writer` (`open_concurrent_with_oplog`、 復旧と #451 の照合が走る) / `readonly` (復旧なし = 下限) /
+//! `standalone` (`open_standalone`、 #880 の往復)。 止めた DB は APFS の clone (`cp -c`) で写してから開くので、 同じ像を何回でも
+//! 開ける (開くと復旧が済んで次は 「きれいに閉じた後」 になるので、 元は触らない)。 開いた子は WAL を読んだ回数
+//! (`enchudb_oplog::oplog::wal_reads`) も出す。
+//!
+//! 像だけ作る: `open_time make <dir> <形> <止め方>` (消さずに残す)。 開くだけ: `open_time open <dir> <開き方>`。
 //!
 //! ```text
 //! cargo run --release -p enchudb-engine --example open_time                          # 既定の形 5 つ
@@ -37,6 +42,11 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("child") => child(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap(), args[5] == "1", &args[6]),
         Some("open") => open_once(&args[2], &args[3]),
+        Some("make") => {
+            let (rows, cols, sync) = parse_spec(&args[3]);
+            let (wrote, entities) = write_db(&std::env::current_exe().unwrap(), &args[2], rows, cols, sync, &args[4]);
+            println!("MADE {wrote:.0} ms entities {entities} {:.0} MiB", du_mib(&args[2]));
+        }
         _ => driver(&args[1..]),
     }
 }
@@ -62,6 +72,9 @@ fn kind_of(c: u32) -> ValueType {
 
 /// 書く側 (子 process)。 止め方は stdout の 1 行で親に知らせる: `MID` (半分書いた) / `IDLE` (書き終えて同期した) / `CLEAN`。
 fn child(dir: &str, rows: u32, cols: u32, sync: bool, stop: &str) {
+    if stop == "full" {
+        return child_full(dir, rows, cols, sync);
+    }
     let _ = enchudb_engine::db_files::remove_db(dir);
     // 行の分 + 消した分 + sync の表の分 (`_sync_ops` は残りの半分、 最大 100 万行)
     let cap = rows.saturating_mul(3).max(1 << 21);
@@ -126,23 +139,152 @@ fn child(dir: &str, rows: u32, cols: u32, sync: bool, stop: &str) {
     }
 }
 
+/// 行 `i` の列 `c` を書く (`child` と同じ値の作り方)。
+fn write_cell(eng: &Engine, e: u64, name: &str, i: u32, c: u32, text: &mut String) {
+    match kind_of(c) {
+        ValueType::Number => eng.tie_async(e, name, (i.wrapping_mul(2_654_435_761) >> 8) % 1000 + c),
+        ValueType::Tag => {
+            text.clear();
+            write!(text, "w{}", i.wrapping_mul(7).wrapping_add(c) % 10_000).unwrap();
+            eng.tie_text_async(e, name, text);
+        }
+        _ => {
+            text.clear();
+            write!(text, "行 {i} の本文 {c}: 短い文がここに入る").unwrap();
+            eng.tie_text_async(e, name, text);
+        }
+    }
+}
+
+/// `full` の書く側 (#972): v15 の DB の WAL を、 再生する record で埋めて kill を待つ。
+///
+/// 表 t の枠は `rows` ちょうど (残りの eid 空間は表 pad に渡して、 t が伸びないようにする)。 consumer を動かしたまま t を埋め、
+/// 1 行消して足して場所を使い回し (v15)、 書き出して畳まれるのを待つ。 その後 consumer を止め (checkpoint が進まない)、 行を
+/// 順に書き換え、 `OPEN_TIME_DELETE_EVERY` 回に 1 回は消して足す (使い回し) を、 WAL の空きが 4 MiB を切るまで続ける。
+fn child_full(dir: &str, rows: u32, cols: u32, sync: bool) {
+    let _ = enchudb_engine::db_files::remove_db(dir);
+    // sync の表は残りの eid 空間の半分 (最大 100 万行)。 t の 1 周目の record (行 × (列 + 1)) が入る大きさに
+    let cap = rows.saturating_mul(cols + 2).saturating_mul(2).max(1 << 21);
+    let mut eng = Engine::create_with_cell_version(dir, cap).unwrap();
+    eng.define_table("t", rows).unwrap();
+    for c in 0..cols {
+        eng.define_himo_in("t", &format!("c{c}"), kind_of(c), 0).unwrap();
+    }
+    if sync {
+        eng.enable_sync_tables().unwrap();
+    }
+    let rest = eng.remaining_eid_capacity();
+    if rest > 0 {
+        eng.define_table("pad", rest).unwrap();
+    }
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let names: Vec<String> = (0..cols).map(|c| format!("t.c{c}")).collect();
+    let mut text = String::new();
+    let t0 = Instant::now();
+    let mut live = Vec::with_capacity(rows as usize);
+    for i in 0..rows {
+        let e = eng.entity_in("t").unwrap();
+        for c in 0..cols {
+            write_cell(&eng, e, &names[c as usize], i, c, &mut text);
+        }
+        live.push(e);
+        if i % 1000 == 999 {
+            eng.oplog_commit();
+        }
+    }
+    assert!(eng.entity_in("t").is_err(), "前提: 表 t の枠を使い切った");
+    eng.delete(live[0]);
+    let e = eng.entity_in("t").unwrap();
+    assert_eq!(eng.eid_slot(e), eng.eid_slot(live[0]), "前提: 場所を使い回した (v15)");
+    live[0] = e;
+    for c in 0..cols {
+        write_cell(&eng, e, &names[c as usize], 0, c, &mut text);
+    }
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    // 畳まれて WAL が空くのを待つ (止めた後に積む record の分を広く取る)
+    let cap_bytes = eng.oplog().unwrap().capacity();
+    let until = Instant::now() + Duration::from_secs(5);
+    while eng.wal_free_bytes() < cap_bytes / 10 * 9 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _hold = eng.hold_consumer();
+    let del = delete_every().max(2);
+    let mut i = rows;
+    while eng.wal_free_bytes() > 4 << 20 {
+        let k = (i % rows) as usize;
+        let mut e = live[k];
+        if i % del == del - 1 {
+            eng.delete(e);
+            e = eng.entity_in("t").unwrap();
+            live[k] = e;
+        }
+        for c in 0..cols {
+            write_cell(&eng, e, &names[c as usize], i, c, &mut text);
+        }
+        if i % 1000 == 999 {
+            eng.oplog_commit();
+        }
+        i += 1;
+    }
+    let s = eng.stats();
+    println!(
+        "WROTE {:.0} ms entities {} (書き足した行 {}、 再生する WAL {:.0} MiB)",
+        ms(t0.elapsed()),
+        eng.entity_count(),
+        i - rows,
+        s.oplog_lag_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!("IDLE");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
 /// 開く側 (新しい process)。 開く呼び出しだけを測り、 閉じずに exit (写しは捨てるので Drop の書き出しは要らない)。
 fn open_once(dir: &str, kind: &str) {
+    let before = enchudb_oplog::oplog::wal_reads();
     let t = Instant::now();
-    let (took, n) = if kind == "writer" {
-        let eng = Engine::open_concurrent_with_oplog(dir, OPLOG_CAP).unwrap();
-        let took = t.elapsed();
-        let n = eng.entity_count();
-        std::mem::forget(eng);
-        (took, n)
-    } else {
-        let eng = Engine::open_readonly(dir).unwrap();
-        let took = t.elapsed();
-        let n = eng.entity_count();
-        std::mem::forget(eng);
-        (took, n)
+    let (took, n) = match kind {
+        "writer" => {
+            let eng = Engine::open_concurrent_with_oplog(dir, OPLOG_CAP).unwrap();
+            let took = t.elapsed();
+            let n = eng.entity_count();
+            std::mem::forget(eng);
+            (took, n)
+        }
+        "standalone" => {
+            let eng = Engine::open_standalone(dir).unwrap();
+            let took = t.elapsed();
+            let n = eng.entity_count();
+            std::mem::forget(eng);
+            (took, n)
+        }
+        _ => {
+            let eng = Engine::open_readonly(dir).unwrap();
+            let took = t.elapsed();
+            let n = eng.entity_count();
+            std::mem::forget(eng);
+            (took, n)
+        }
     };
-    println!("OPEN_MS {:.3} entities {n}", ms(took));
+    let r = enchudb_oplog::oplog::wal_reads();
+    println!(
+        "OPEN_MS {:.3} entities {n} reads replays={} ({:.1} ms) hole_scans={} ({:.1} ms) probes={} ({:.3} ms) asks={} probe_records={}",
+        ms(took),
+        r.replays - before.replays,
+        (r.replay_ns - before.replay_ns) as f64 / 1e6,
+        r.hole_scans - before.hole_scans,
+        (r.hole_scan_ns - before.hole_scan_ns) as f64 / 1e6,
+        r.probes - before.probes,
+        (r.probe_ns - before.probe_ns) as f64 / 1e6,
+        r.asks - before.asks,
+        r.probe_records - before.probe_records
+    );
     std::process::exit(0);
 }
 
@@ -243,6 +385,9 @@ fn write_db(exe: &Path, dir: &str, rows: u32, cols: u32, sync: bool, stop: &str)
         }
         let l = line.trim();
         if let Some(rest) = l.strip_prefix("WROTE ") {
+            if stop == "full" {
+                eprintln!("   {l}");
+            }
             let mut it = rest.split_whitespace();
             wrote = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
             entities = it.nth(2).and_then(|x| x.parse().ok()).unwrap_or(0);

@@ -111,6 +111,83 @@ impl RingNewest {
     }
 }
 
+/// #985: `_sync_ops` の ring に残る行の版数の最小の覚え ([`Engine::sync_ring_min_hlc`] / [`Engine::sync_ring_min_below`])。
+///
+/// ホスト (`enchudb-transport` の `HttpHost`) は、 削除を忘れてよい線を ring に残るいちばん古い record の版数で抑える。 前は
+/// 線を進めようとする度に ring の全部の行を写して decode した (100 万行で 1 回 60〜110 ms。 線が ring の最古の record に
+/// 留められている間は、 client の要求のたびに)。 覚えは下の境 `min` と、 それが最小そのものか (`exact`):
+///
+/// - bridge が行を足す (lsn を書いた) たびに [`Self::note`] で `min` を下げる。 足した後も `min` は下の境で、 最小そのものなら
+///   足した後も最小そのもの
+/// - 行が消える ([`Engine::purge_sync_ops_row_at`]、 #858 の `drop_cells_of_dead_ring_slot`) 時、 消える行の版数が `min` 以下 (か読めない) なら `exact` を倒す ([`Self::gone`])。
+///   `min` は下の境のまま (消えると最小は上がる側)。 消える行の版数が `min` より上なら、 最小の行は残っている
+/// - ring を読み直すのは、 最小そのものが要る問い (`exact` でなく、 下の境が問いの境より下) だけ
+///
+/// 読み直す間 (`scanning`) に足された行と消えた行の版数の最小を貯め、 読み直しの答えに足す / 答えが最小そのものかを決める。
+/// 読み直しの前に足された行は読み直しが見る (bridge は lsn を書いてから覚えを触る)。 消えた行は、 消してから覚えを触る
+/// (触る前に問いが来ても、 消えた行の版数を含む = 下の境のまま)。 数える行は前の読み (`pending_sync_ops(0)` を
+/// `decode_sync_ops_payload` で decode できた物) と同じ: lsn が 0 でない全部の行 (配ってよい所 = 組の途中で止まった後ろも、
+/// 書き手 0 も、 Vocab も)、 payload を読めない / decode できない行 (dead row) は数えない。
+///
+/// 下の境が下の境であるのは、 行を足すのが bridge だけ (lsn の列を書く本番の道は bridge の 1 か所) だから。 lsn の列を書く道を
+/// 足したら、 そこでも `note` を呼ぶこと。 bridge は書いた行を読み直しと同じ読みで読めた時だけ `note` する (payload / lsn を
+/// 書けなかった行は読み直しも数えない)。 行を消す道を足したら `gone` を呼ぶこと (呼ばないと、 消えた版数を最小そのものとして
+/// 返し続ける = F が低く留まる側)。
+///
+/// 覚えを作る前 (`ring_oldest_on` が立つ前、 = ホストでない peer はずっと) は bridge も回収もこの lock を取らない。
+struct RingOldest {
+    /// 覚えを作ったか (開いた後の最初の問いが ring を読む)。
+    seeded: bool,
+    /// ring のどの行 (decode できる物) の版数もこれ以上 (下の境)。 None は行が無い。
+    min: Option<enchudb_oplog::Hlc>,
+    /// `min` が最小そのものか。
+    exact: bool,
+    /// ring を読み直している途中なら Some((その間に足された行の版数の最小, その間に消えた行の版数の最小 (読めない行は ZERO)))。
+    scanning: Option<(Option<enchudb_oplog::Hlc>, Option<enchudb_oplog::Hlc>)>,
+}
+
+impl RingOldest {
+    fn new() -> Self {
+        Self { seeded: false, min: None, exact: false, scanning: None }
+    }
+
+    /// 版数 `hlc` の行を ring に足した (lsn を書いた後)。
+    fn note(&mut self, hlc: enchudb_oplog::Hlc) {
+        if self.seeded {
+            self.min = Some(self.min.map_or(hlc, |m| m.min(hlc)));
+        }
+        if let Some((added, _)) = &mut self.scanning {
+            *added = Some(added.map_or(hlc, |m| m.min(hlc)));
+        }
+    }
+
+    /// 版数 `hlc` の行を ring から消した (消した後)。 `None` = 版数を読めなかった (最小の行だったかもしれない)。
+    fn gone(&mut self, hlc: Option<enchudb_oplog::Hlc>) {
+        let h = hlc.unwrap_or(enchudb_oplog::Hlc::ZERO);
+        if self.min.is_none_or(|m| h <= m) {
+            self.exact = false;
+        }
+        if let Some((_, gone)) = &mut self.scanning {
+            *gone = Some(gone.map_or(h, |g| g.min(h)));
+        }
+    }
+
+    /// 覚えだけで答えが決まるなら Some(答え)。 `below` は問いの境 (None = 最小そのもの)。
+    fn answer(&self, below: Option<enchudb_oplog::Hlc>) -> Option<Option<enchudb_oplog::Hlc>> {
+        if !self.seeded {
+            return None;
+        }
+        if self.exact {
+            return Some(self.min.filter(|m| below.is_none_or(|b| *m < b)));
+        }
+        // 下の境が問いの境以上なら、 境より下の行は無い (行が無い (`min` が None) のに最小そのものでない覚えは読み直す)
+        match (self.min, below) {
+            (Some(m), Some(b)) if m >= b => Some(None),
+            _ => None,
+        }
+    }
+}
+
 /// #846: bridge が `_sync_ops` の ring の満杯で止まった所の覚え (`transfer_lock` の下でだけ触る)。
 ///
 /// 止まった bridge は、 cursor の record を ring に置けない。 ring が空く (行が消える / 枠が足される) まで、 何周しても同じ所で
@@ -2106,6 +2183,48 @@ impl Drop for WriterLock {
     }
 }
 
+/// 開く時の直し (`prev.seg` の記録の戻し [`Engine::restore_prev_residents`] / gen.seg の突き合わせ [`Engine::reconcile_generations`]) が、
+/// 仕上げを WAL の再生の後に回すか (この open の後に再生が当てる record があるか)。 書き手の open が writer lock の下で、 何かを直す前に
+/// 決める (PR #986 の読み直し 2 の [1] [2])。 前は直しの中で WAL の file を開き直して聞いた: 直しを map (gen.seg / entities.seg) に書いた
+/// 後に聞けずに断る道と、 WAL 付きの open が直しの後に WAL を開けずに返る (Drop が clean の印を立てる) 道があり、 どちらも次の open が
+/// 直した場所を見つけず、 仕上げ (残った cell を落とす・消えた行の世代と tombstone を覚える) が二度と走らなかった。
+enum ReplayAhead<'w> {
+    /// 再生しない: 単独の open (lock の下で聞いて 「無い」 と分かった時だけ開く。 あれば往復し、 聞けなければ断る)・readonly (直しを
+    /// しない)・WAL 付きの open が WAL を作った (無かった / 一度も書き出していない)
+    Nothing,
+    /// WAL 付きの open が lock の下で開いた WAL (再生はこの WAL から)。 当てる record があるかは要る時に 1 回だけ読む (最初の 1 件で止まる)
+    Wal(&'w enchudb_oplog::oplog::OpLog, std::cell::OnceCell<bool>),
+}
+
+impl<'w> ReplayAhead<'w> {
+    fn of(wal: &'w enchudb_oplog::oplog::OpLog) -> Self {
+        ReplayAhead::Wal(wal, std::cell::OnceCell::new())
+    }
+
+    /// この open の後の再生が当てる record がある (`OpLog::recover_with_tail` が空でない)。
+    fn follows(&self) -> bool {
+        match self {
+            ReplayAhead::Nothing => false,
+            ReplayAhead::Wal(w, answer) => *answer.get_or_init(|| !w.is_empty() && w.has_records_to_replay()),
+        }
+    }
+}
+
+/// 単独の open が writer lock の下で WAL の file に聞いた答え ([`Engine::wal_records_to_replay`])。
+#[cfg(not(target_arch = "wasm32"))]
+struct WalAsked {
+    /// WAL の file の大きさ (file が無ければ None)。 #451 の往復の要否と、 往復の WAL 付きの open に渡す容量
+    /// ([`Engine::relog_before_standalone_session`]、 PR #986 の読み直し 3 の [1])
+    len: Option<u64>,
+    /// WAL に再生する record があれば WAL の容量 (往復の WAL 付きの open に渡す)
+    replay: Option<usize>,
+}
+
+/// #451 の往復 ([`Engine::relog_before_standalone_session`]) が、 header より短い (一度も書き出していない) WAL の file を作り直す時の
+/// 容量 (`Engine::open` と同じ)。 その file の大きさは WAL の容量を言わない (作った直後・`set_len` の前に落ちた)。
+#[cfg(not(target_arch = "wasm32"))]
+const STANDALONE_RELOG_OPLOG_CAPACITY: usize = 16 * 1024 * 1024;
+
 /// `.db.lock` に flock(LOCK_EX) を取り、 guard を返す。 guard が drop されると
 /// lock も解放。 **別プロセス**が保持中は block する (= sqlite と同様、 取れる
 /// まで待つ)。 **同一プロセス**が既に保持中は block せず即エラー (#80、
@@ -2683,6 +2802,50 @@ mod write_out_fault {
     }
 
     pub(super) fn active(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
+/// test 用 (#985): 置いた WAL の engine の bridge が、 行の payload を ring にも辞書にも書かない (payload を書けなかった行)。
+#[cfg(test)]
+mod bridge_payload_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn on(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
+/// test 用 (#985): 置いた WAL の engine が、 payload の ring (`sync.payload.seg`) をまだ開いていなければ開けない (fd が尽きた等)。
+#[cfg(test)]
+mod payload_ring_open_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn on(wal: &OpLog) -> bool {
         ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
     }
 }
@@ -7237,6 +7400,22 @@ mod settled_read_hook {
     }
 }
 
+/// test 用: #985 の ring の最小の読み直しが行をなめ終えた後・覚えに置く前の割り込み点 (`Engine::ring_oldest_answer`、 WAL ごと)。
+#[cfg(test)]
+mod ring_oldest_scan_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// #955: `_sync_ops` の行の (lsn, 場所) を (lsn, 場所) の順に並べる (`Engine::settled_sync_records` が ring を lsn の順に読むため)。
 ///
 /// 配ってよい行の lsn はほぼ続いている (bridge は lsn を 1 から 1 つずつ振り、 回収は小さい方から消す) ので、 lsn の幅が行の数の 4 倍
@@ -10204,6 +10383,15 @@ pub struct Engine {
     ring_newest: std::sync::Mutex<RingNewest>,
     /// #843: `_sync_ops` の行を消した回数 ([`Self::purge_sync_ops_row`])。 [`RingNewest::last`] が 「行が消えていない」 を見る。
     sync_ops_purges: std::sync::atomic::AtomicU64,
+    /// #985: ring に残る行の版数の最小の覚え ([`RingOldest`])。
+    ring_oldest: std::sync::Mutex<RingOldest>,
+    /// #985: 覚えを作り始めたか (最初の問いが `transfer_lock` と `sync_ops_purge_lock` の下で立てる)。 立つまで bridge と回収は
+    /// 覚えの lock を取らない (ホストでない peer は問わないので、 ずっと取らない)。
+    ring_oldest_on: std::sync::atomic::AtomicBool,
+    /// #985: ring を読み直す問いを 1 つずつにする (後から来た問いは、 前の読み直しの答えを使う)。
+    ring_oldest_scan: std::sync::Mutex<()>,
+    /// #985: [`RingOldest`] を作るために ring の行をなめた回数 ([`Self::sync_ring_min_scans`])。
+    ring_oldest_scans: std::sync::atomic::AtomicU64,
     /// #843: [`Self::open_groups_on_ring`] が ring の行をなめた回数 ([`Self::sync_ring_scans`])。
     sync_ring_scans: std::sync::atomic::AtomicU64,
     /// #846: bridge が ring の満杯で止まった所の覚え ([`BridgeStall`]、 `transfer_lock` の下でだけ触る)。
@@ -10687,6 +10875,10 @@ impl Engine {
             sync_settled_known: std::sync::atomic::AtomicBool::new(false),
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
+            ring_oldest: std::sync::Mutex::new(RingOldest::new()),
+            ring_oldest_on: std::sync::atomic::AtomicBool::new(false),
+            ring_oldest_scan: std::sync::Mutex::new(()),
+            ring_oldest_scans: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
             bridge_stall: std::sync::Mutex::new(None),
             bridge_stalled_from: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -10914,7 +11106,7 @@ impl Engine {
     ///
     /// #880: WAL 付きで書いて落ちた DB (WAL に checkpoint より後の record が残る) は、 先に WAL 付きの open
     /// ([`Self::open_concurrent_with_oplog`]) で再生・書き出し・checkpoint を進めて閉じてから、 単独で開き直す
-    /// ([`Self::replay_wal_before_standalone_open`])。 前は WAL を見ずに開き、 WAL にだけある値 (書き出しの前に落ちた
+    /// ([`Self::open_standalone_after_replay`])。 前は WAL を見ずに開き、 WAL にだけある値 (書き出しの前に落ちた
     /// 書き込み) を黙って失い、 #857 の止めで残した Delete を再生せずに消した行の eid をもう一度払い出した。 きれいに閉じた DB
     /// (WAL が空) は WAL の header を読むだけで今までどおり。
     ///
@@ -10923,12 +11115,64 @@ impl Engine {
     /// write の作り直し (#451) を飛ばして、 その write が相手に配られないまま残るので。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
-        Self::replay_wal_before_standalone_open(path)?;
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)?;
-        let eng = eng.relog_before_standalone_session(path)?;
-        // 読み直し 2 [B2]: WAL を再生しない open は、 記録から戻した所で前の住人の後始末が揃う (`prev.seg` の周期を進め始める)
+        let (eng, wal_len) = Self::open_standalone_after_replay(path)?;
+        let eng = eng.relog_before_standalone_session(path, wal_len)?;
+        // #976 の読み直し 2 [B2]: WAL を再生しない open は、 記録から戻した所で前の住人の後始末が揃う (`prev.seg` の周期を進め始める)
         eng.finish_open_restores(false);
         Ok(eng)
+    }
+
+    /// #880 / #989 / PR #986 の読み直し 2 の [1]: 単独の open の本体。 writer lock を取った直後、 開く時の直し (`prev.seg` の記録の戻し・
+    /// gen.seg の突き合わせ) が何かを書く前に、 WAL に再生していない record (checkpoint より後、 閉じていない末尾も含む = WAL 付きの open が
+    /// 当てる物) があるかを一度だけ聞く ([`Self::wal_records_to_replay`])。
+    /// - 無い: 単独の open は再生しないので、 直しはその場で仕上げる (`ReplayAhead::Nothing`)
+    /// - ある: lock を放し、 WAL 付きの open で再生して閉じ (Drop が書き出して checkpoint を進め、 畳む)、 lock を取り直して聞き直す。 まだ
+    ///   残っていれば (書き出し / `tables` を書けない、 #870) 断る
+    /// - 聞けない (一時の I/O の失敗・資源不足・権限、 #989): 何も書かずに断る。 呼び手が開き直せば聞き直す
+    ///
+    /// 前 (#986 の最初の形) は聞くのが lock の前と、 突き合わせが直しを map (gen.seg / entities.seg) に書いた後だった。 後の問いが聞けずに
+    /// 断ると、 開き直した突き合わせは直した場所を見つけず (死の印と生きている印が揃っている)、 仕上げ (残った cell を落とす・消えた行の
+    /// 世代と tombstone を覚える) が二度と走らなかった。 lock の下で聞くので、 答えてから開くまでに別の process が WAL に積む窓も無い。
+    ///
+    /// 往復で lock を放してから取り直すまでの間に別の process が取れば、 その process が放すまで待つ (2 つの process が同時に開いた時と同じ)。
+    /// 別の process の書き手が生きている時は lock で待つ (前の単独の open が lock で待っていたのと同じ)。
+    ///
+    /// 戻り値の 2 つ目は、 lock の下で聞いた時の WAL の file の大きさ (file が無ければ None)。 #451 の往復の要否
+    /// ([`Self::relog_before_standalone_session`]) はこの答えで決める (PR #986 の読み直し 3 の [1]): 返す engine が lock を持ち続けるので、
+    /// 答えてから往復の要否を決めるまでに WAL の file は変わらない。 前は本体を開いた後 (直しを map に書いた後) にもう一度 stat で聞き、
+    /// その stat が一時に失敗すると書いた後に断った (開き直した突き合わせは直した場所を見つけない)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_standalone_after_replay(path: &str) -> io::Result<(Self, Option<u64>)> {
+        let lock = Self::writer_lock_for_open(path)?;
+        let asked = Self::wal_records_to_replay(path)?;
+        let (lock, wal_len) = match asked.replay {
+            None => (lock, asked.len),
+            Some(cap) => {
+                drop(lock);
+                drop(Self::open_concurrent_with_oplog(path, cap)?);
+                Self::lock_with_nothing_to_replay(path)?
+            }
+        };
+        Ok((Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?, wal_len))
+    }
+
+    /// #880: 往復 (WAL 付きの open で再生して閉じた) の後に、 単独で開き直すための writer lock を取り、 WAL に再生する record が残って
+    /// いないことを lock の下で確かめる (残っていれば断る、 聞けなければ断る)。 戻り値の 2 つ目は lock の下で見た WAL の file の大きさ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lock_with_nothing_to_replay(path: &str) -> io::Result<(WriterLock, Option<u64>)> {
+        let lock = Self::writer_lock_for_open(path)?;
+        let asked = Self::wal_records_to_replay(path)?;
+        if asked.replay.is_some() {
+            return Err(Self::wal_left_after_replay());
+        }
+        Ok((lock, asked.len))
+    }
+
+    /// 書き手の open の writer lock (DB の directory を確かめてから、 mmap の前に取る = 他の書き手が居れば待つ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn writer_lock_for_open(path: &str) -> io::Result<WriterLock> {
+        Self::check_db_dir(path)?;
+        acquire_writer_lock(path)
     }
 
     /// 開く時に #451 の作り直し ([`Self::relog_unlogged_writes`]) が走る DB か: 開いた時に紐名の辞書の clean の印が倒れていた
@@ -10947,22 +11191,32 @@ impl Engine {
     /// WAL の file が無い DB は往復しない: WAL 付きの open が WAL を作ることになり、 その大きさ (後で WAL 付きで開く時に渡す値) を
     /// 単独の open は知らない。 WAL を通らない書き込みは版数を付けない (`Hlc::ZERO` = 作り直しの対象外) ので、 WAL の file が無いまま
     /// 書いた write は作り直す物でもない。
-    /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。
+    ///
+    /// WAL の file があるか (`wal_len`) は、 単独の open が writer lock の下で、 開く時の直しが何かを書く前に stat で聞いた答え
+    /// ([`Self::open_standalone_after_replay`]、 lock は `self` が持ち続ける)。 ここで聞き直さない (PR #986 の読み直し 3 の [1]): 前は
+    /// ここで stat し直し、 一時に失敗すると、 `open_internal` が直し (突き合わせの `kill_generation` / `live_free`、 仕上げの cell 落とし、
+    /// 記録の戻し) を map に書いた後に断った (開き直した突き合わせは直した場所を見つけない)。 lock の下の stat に失敗すれば、 何も
+    /// 書かずに断っている (#989、 読み直し 2 の [3])。
+    ///
+    /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。 ただし header より短い file (作った直後・
+    /// `set_len` の前に落ちた = 0 B もある) は、 その大きさでは WAL を作れない (前は `OpLog::create` が header を書く所で範囲外の panic、
+    /// 読み直し 3 の [2]) ので [`STANDALONE_RELOG_OPLOG_CAPACITY`] で作る。
     #[cfg(not(target_arch = "wasm32"))]
-    fn relog_before_standalone_session(self, path: &str) -> io::Result<Self> {
+    fn relog_before_standalone_session(self, path: &str, wal_len: Option<u64>) -> io::Result<Self> {
         if !self.relogs_unlogged_writes_on_open() {
             return Ok(self);
         }
-        let Ok(meta) = std::fs::metadata(oplog_path_for(path)) else {
-            return Ok(self);
+        let Some(len) = wal_len else { return Ok(self) };
+        let capacity = if len < enchudb_oplog::oplog::HEADER_SIZE as u64 {
+            STANDALONE_RELOG_OPLOG_CAPACITY
+        } else {
+            len as usize
         };
         self.abandoned.store(true, std::sync::atomic::Ordering::Release);
         drop(self);
-        drop(Self::open_concurrent_with_oplog(path, meta.len() as usize)?);
-        if Self::wal_records_to_replay(path)?.is_some() {
-            return Err(Self::wal_left_after_replay());
-        }
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)?;
+        drop(Self::open_concurrent_with_oplog(path, capacity)?);
+        let (lock, _) = Self::lock_with_nothing_to_replay(path)?;
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?;
         if eng.relogs_unlogged_writes_on_open() {
             eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
             return Err(io::Error::other(
@@ -10973,44 +11227,55 @@ impl Engine {
         Ok(eng)
     }
 
-    /// #880: `path` の WAL に再生していない record (checkpoint より後、 閉じていない末尾も含む = WAL 付きの open が当てる物) が
-    /// あれば、 WAL 付きの open で再生して閉じる (Drop が書き出して checkpoint を進め、 畳む)。 その後も残っていれば (書き出し /
-    /// `tables` を書けない、 #870) 断る。 書き手の lock は WAL 付きの open が取って Drop が放す。 放してから単独で開き直すまでの間に
-    /// 別の process が取れば、 単独の open は lock で断る (2 つの process が同時に開いた時と同じ)。 別の process の書き手が生きて
-    /// いる時は、 WAL 付きの open が lock で断る (前の単独の open が lock で断っていたのと同じ)。
+    /// PR #986 の読み直し 2 の [3]: `oplog_path` の WAL の file があれば大きさ、 無ければ None。 stat の失敗 (NotFound 以外: EIO / ESTALE /
+    /// ENOMEM / ELOOP / 権限) は Err。 `Path::exists` は stat の失敗を全部 「無い」 と読むので、 一時の失敗で WAL 付きの open が WAL を
+    /// 作り直し (`OpLog::create` は truncate する) 再生していない record を捨て、 単独の open は WAL を見ずに開いた。 I/O の点は
+    /// `oplog.stat` (crashsim の `fault`)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn replay_wal_before_standalone_open(path: &str) -> io::Result<()> {
-        let Some(cap) = Self::wal_records_to_replay(path)? else { return Ok(()) };
-        drop(Self::open_concurrent_with_oplog(path, cap)?);
-        if Self::wal_records_to_replay(path)?.is_some() {
-            return Err(Self::wal_left_after_replay());
+    fn oplog_file_len(oplog_path: &std::path::Path) -> io::Result<Option<u64>> {
+        enchudb_oplog::io_point("oplog.stat")?;
+        match std::fs::metadata(oplog_path) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
-    /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)。
-    /// WAL 自体を読めない (切り詰められた / 壊れた file) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を見ずに開く、
-    /// 警告だけ出す)。
+    /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)、 と WAL の file の大きさ (#451 の
+    /// 往復の要否に使う、 PR #986 の読み直し 3 の [1])。 単独の open が writer lock の下で聞く ([`Self::open_standalone_after_replay`])。
+    /// WAL の中身が壊れている / 切り詰められている (`InvalidData`) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を
+    /// 見ずに開く、 警告だけ出す)。
+    ///
+    /// #972: 聞くだけなので、 WAL は読むだけで開き (file を書かない)、 checkpoint の後の最初の当てる record で読むのを止める
+    /// ([`enchudb_oplog::oplog::OpLog::probe_replay`])。 前は読み書きで開いて (header の直しを本当の open の前に書いた) 全部を解き、
+    /// 256 MiB の WAL では聞くたびに再生と同じだけ読んで写していた (standalone の open で 2〜5 回)。
+    ///
+    /// #989: それ以外の失敗 (WAL の file の stat・一時の I/O の失敗・資源不足・読めない権限) は Err で返す (呼び手は何も書かずに断る)。
+    /// 「再生する物が無い」 と読むと、 単独の open は WAL を見ずに開いた (WAL にだけある値を黙って失う、 #880 の前の形)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn wal_records_to_replay(path: &str) -> io::Result<Option<usize>> {
+    fn wal_records_to_replay(path: &str) -> io::Result<WalAsked> {
+        use enchudb_oplog::oplog::OpLog;
         let oplog_path = oplog_path_for(path);
-        if !oplog_path.exists() {
-            return Ok(None);
-        }
-        let w = match enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)
-            .and_then(|never| if never { Ok(None) } else { enchudb_oplog::oplog::OpLog::open(&oplog_path).map(Some) })
-        {
-            Ok(Some(w)) => w,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                eprintln!("[enchudb] warning: could not read the WAL ({e}) — opening without replaying it (#880)");
-                return Ok(None);
-            }
+        let (len, probe) = match Self::oplog_file_len(&oplog_path) {
+            Ok(None) => return Ok(WalAsked { len: None, replay: None }),
+            Ok(Some(len)) => match OpLog::was_never_written(&oplog_path) {
+                Ok(true) => return Ok(WalAsked { len: Some(len), replay: None }),
+                Ok(false) => (Some(len), OpLog::probe_replay(&oplog_path)),
+                Err(e) => (Some(len), Err(e)),
+            },
+            Err(e) => (None, Err(e)),
         };
-        if w.is_empty() || w.recover_with_tail().is_empty() {
-            return Ok(None);
+        match probe {
+            Ok(p) => Ok(WalAsked { len, replay: p.records.then_some(p.capacity as usize) }),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("[enchudb] warning: the WAL is corrupt or cut short ({e}) — opening without replaying it (#880)");
+                Ok(WalAsked { len, replay: None })
+            }
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("could not tell whether the WAL has records to replay ({e}) — refusing to open without it (#989, try again)"),
+            )),
         }
-        Ok(Some(w.capacity() as usize))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -11029,7 +11294,7 @@ impl Engine {
     /// 書いて落ちた DB は、 書き手が開き直す (再生する) までは、 WAL にだけある値 (書き出しの前に落ちた書き込み) を見ない。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_readonly(path: &str) -> io::Result<Self> {
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false, /*readonly=*/ true)?;
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, None, ReplayAhead::Nothing)?;
         eng.is_readonly.store(true, std::sync::atomic::Ordering::Release);
         Ok(eng)
     }
@@ -11074,16 +11339,20 @@ impl Engine {
     }
 
     /// 内部用: region CRC 検証を skip できる open。WAL ルート用。
-    /// `take_lock = true` で `.db.lock` の flock(LOCK_EX) を取得し、 Engine 寿命中保持。
+    /// `writer_lock` は書き手の open が mmap の前に取った `.db.lock` の flock(LOCK_EX) ([`Self::writer_lock_for_open`]、 Engine 寿命中
+    /// 保持)。 None は readonly の open (lock を取らず、 開く時の直しも書かない)。
+    ///
+    /// `replay` は、 この open の後に WAL の再生が当てる record があるか (開く時の `prev.seg` の記録の戻しと gen.seg の突き合わせが、 仕上げを
+    /// 再生の後に回すか)。 呼び手が writer lock の下で、 何かを直す前に決める (PR #986 の読み直し 2 の [1] [2])。
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_internal(path: &str, verify_region_crc: bool, take_lock: bool, readonly: bool) -> io::Result<Self> {
-        // open path: writer lock を mmap 前に取る (= 他 writer 居れば block)
+    fn open_internal(
+        path: &str,
+        verify_region_crc: bool,
+        writer_lock: Option<WriterLock>,
+        replay: ReplayAhead<'_>,
+    ) -> io::Result<Self> {
         Self::check_db_dir(path)?;
-        let writer_lock = if take_lock {
-            Some(acquire_writer_lock(path)?)
-        } else {
-            None
-        };
+        let readonly = writer_lock.is_none();
         // v10: header.seg を先に読んで検証 → Layout と himo_count → segment 群を open。
         // 書き込み mapping で開く (readonly engine も旧来 MmapMut と同じく RW map;
         // 「書かない」 は engine 側の契約)。
@@ -11356,7 +11625,7 @@ impl Engine {
         // `prev.seg`: きれいに閉じなかった後、 使い回しが identity に移した前の住人の削除 (と名前) が sidecar に届いていなければ戻す
         // (readonly は戻さない: 書き手の DB の tomb.seg に書きうる、 review946 [6])
         if unclean && !readonly {
-            eng.restore_prev_residents(&prev_records);
+            eng.restore_prev_residents(&prev_records, &replay);
             // 読み直し 2 [B1]: 生きている場所を指す別名のうち、 使い回しが外した物 (`eidalias` だけが使い回しの前) を外す。 再生の
             // 前に (再生する中継の record がその別名で次の住人に当たらない)。 再生が生かす場所は再生の後にもう一度
             // (`finish_open_restores`)
@@ -11398,7 +11667,7 @@ impl Engine {
         eng.exhaust_sync_ring();
         // #731: gen.seg と生きている印を突き合わせる (きれいに閉じなかった後だけ)。 表・別名 (#612 の畳んだ自分の行)・払い出し位置
         // の後、 WAL の再生の前
-        eng.reconcile_generations(readonly);
+        eng.reconcile_generations(readonly, &replay);
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
         // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
@@ -12248,6 +12517,10 @@ impl Engine {
             sync_settled_known: std::sync::atomic::AtomicBool::new(false),
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
+            ring_oldest: std::sync::Mutex::new(RingOldest::new()),
+            ring_oldest_on: std::sync::atomic::AtomicBool::new(false),
+            ring_oldest_scan: std::sync::Mutex::new(()),
+            ring_oldest_scans: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
             bridge_stall: std::sync::Mutex::new(None),
             bridge_stalled_from: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -12748,6 +13021,11 @@ impl Engine {
             local_only_ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
         };
 
+        // #985: ring の版数の最小の覚えがある (ホストが一度でも問うた) 時だけ、 足した行をその覚えに入れる。 印は `transfer_lock`
+        // の下で立つので、 この周の間は変わらない
+        let oldest_cols = if self.ring_oldest_on.load(Ordering::Acquire) { self.sync_payload_cols() } else { None };
+        #[cfg(test)]
+        let payload_fault = bridge_payload_fault::on(wal);
         let mut count = 0usize;
         // #152: 「ここまでは処理し切った」record の終端 offset。 挿入した record だけ
         // でなく、 skip した record も「処理し切った」に含める (再訪しても同じく skip
@@ -12978,6 +13256,9 @@ impl Engine {
             self.tie_to_by_id(row_eid, hlc_wall_lo_hid, rec.hlc.wall as u32);
             #[cfg(not(target_arch = "wasm32"))]
             let in_ring = match ring_slot {
+                // 試験: payload をどこにも書けなかった行 (#985: 覚えはその行を数えない)
+                #[cfg(test)]
+                _ if payload_fault => true,
                 Some((r, at_hid, off)) => match r.write(off, lsn, &wire_payload) {
                     Ok(handle) => {
                         self.tie_to_by_id(row_eid, at_hid, handle);
@@ -13008,6 +13289,13 @@ impl Engine {
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             // #843: ring の行のいちばん新しい版数を覚える (止まった周が ring を読み直さないため)
             self.ring_newest.lock().unwrap_or_else(|p| p.into_inner()).note(rec.hlc);
+            // #985: 版数の最小の覚えも (lsn を書いた後に触る = 触る前に始まった読み直しはこの行を見る)。 読み直しと同じ読み (行の
+            // payload から (書き手, 版数) を読めた時だけ) で数える: payload / lsn を書けなかった行は読み直しも数えない
+            if let Some(cols) = &oldest_cols
+                && let Some((_, h)) = self.sync_op_walk_key(row_eid, cols)
+            {
+                self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).note(h);
+            }
             self.sync_bridged.fetch_add(1, Ordering::Release);
             done_end = Some(*rec_end);
         }
@@ -14381,7 +14669,8 @@ impl Engine {
                         self.dead_row_floor_candidate(*eid, known)
                     };
                     // #221: delete + free list push は専用 lock 下で atomic に。
-                    if self.purge_sync_ops_row(*eid, lsn_hid, *lsn) {
+                    // #985: decode できない行 (版数は分からない)
+                    if self.purge_sync_ops_row_at(*eid, lsn_hid, *lsn, None) {
                         let (author, hlc) = cand;
                         let whose = if author == u32::MAX {
                             "all authors (unattributable row)".to_string()
@@ -14479,11 +14768,30 @@ impl Engine {
     ///
     /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
     /// 消した / slot が再利用されて別 row になっていた。
+    #[cfg(test)]
     fn purge_sync_ops_row(
         &self,
         eid: enchudb_oplog::EntityId,
         lsn_hid: u16,
         expected_lsn: u32,
+    ) -> bool {
+        // #985: 版数を持たない呼び手 (試験) の形。 覚えがある時だけ読む
+        let hlc = if self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire) {
+            self.sync_payload_cols().and_then(|c| self.sync_op_walk_key(eid, &c)).map(|(_, h)| h)
+        } else {
+            None
+        };
+        self.purge_sync_ops_row_at(eid, lsn_hid, expected_lsn, hlc)
+    }
+
+    /// [`Self::purge_sync_ops_row`] の本体。 `hlc` = 消える行の版数 (#985 の ring の最小の覚えに渡す。 呼び手が読み済みの物、
+    /// 分からなければ None = 最小だったかもしれない)。
+    fn purge_sync_ops_row_at(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        lsn_hid: u16,
+        expected_lsn: u32,
+        gone_hlc: Option<enchudb_oplog::Hlc>,
     ) -> bool {
         let _guard = self.sync_ops_purge_lock.lock().unwrap();
         if self.get_by_id32(eid, lsn_hid) != Some(expected_lsn) {
@@ -14507,6 +14815,9 @@ impl Engine {
                 // `free_locals` を握ったまま (上の doc)
                 self.check_writable();
                 let row_local = self.slot_unchecked(eid);
+                // #985: 覚えを作り始めたか (印は `sync_ops_purge_lock` の下で立つ = この purge の間は変わらない。 立つ前に消した行は、
+                // 印を立てた後の読み直しが見ない)
+                let watched = self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire);
                 let hlc = self.oplog.as_ref().map_or(enchudb_oplog::Hlc::ZERO, |wal| wal.mint_hlc());
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
@@ -14514,6 +14825,10 @@ impl Engine {
                 drop(row);
                 if !applied {
                     self.warn_local_write_rejected(row_local, u16::MAX, hlc);
+                }
+                // #985: 消した後に覚えを触る (触る前の問いは消えた行の版数を含む = 下の境のまま)
+                if watched {
+                    self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).gone(gone_hlc);
                 }
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
@@ -14842,7 +15157,8 @@ impl Engine {
             // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)。
             // #221: delete + push は専用 lock 下で atomic に (並行 reclaim の二重
             // push = slot 二重払い出し → bridge row の silent 上書き、を塞ぐ)。
-            if self.purge_sync_ops_row(eid, lsn_hid_u16, lsn) {
+            // #985: 版数は上で読んだ物を渡す (読み直さない)
+            if self.purge_sync_ops_row_at(eid, lsn_hid_u16, lsn, decoded.map(|(_, h)| h)) {
                 purged += 1;
             }
         }
@@ -15818,6 +16134,12 @@ impl Engine {
         if let Some(r) = self.sync_payload_ring.get() {
             return Some(r);
         }
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref()
+            && payload_ring_open_fault::on(wal)
+        {
+            return None;
+        }
         let Backing::Segments(set) = &self.backing else { return None };
         let readonly = self.is_readonly();
         let exists = set.dir().join(FILE).exists();
@@ -15896,6 +16218,98 @@ impl Engine {
     /// 流す」 用途で呼ぶ。 返り値の各 entry は payload (= 完全 wire bytes)。
     pub fn pending_sync_ops(&self, since_lsn: u32) -> Vec<Vec<u8>> {
         self.sync_ops_between(since_lsn, u32::MAX)
+    }
+
+    /// #985: `_sync_ops` の ring に残る行の版数の最小 (行が無ければ None)。 答えは
+    /// `pending_sync_ops(0).iter().filter_map(|p| decode_sync_ops_payload(p)).map(|r| r.hlc).min()` と同じ: lsn が 0 でない全部の
+    /// 行 (配ってよい所の後ろ = 組の途中で止まった行も、 書き手 0 も、 Vocab も)、 payload を読めない / decode できない行は数えない。
+    ///
+    /// ring を毎回読まない ([`RingOldest`]): bridge が足した行と消えた行で覚えを直し、 読み直すのは覚えが最小そのものでない時
+    /// (最小以下の版数の行が消えた後) だけ。 読み直しも payload を写さず、 (書き手, 版数) だけを読む。
+    pub fn sync_ring_min_hlc(&self) -> Option<enchudb_oplog::Hlc> {
+        self.ring_oldest_answer(None)
+    }
+
+    /// #985: [`Self::sync_ring_min_hlc`] が `below` より小さければ Some(それ)、 そうでなければ (行が無い時も) None。
+    /// `min(below, ring の最小)` = `sync_ring_min_below(below).unwrap_or(below)`。 覚えの下の境が `below` 以上なら ring を読まない
+    /// (行が消えて覚えが最小そのものでなくても)。 ホストが削除を忘れてよい線を ring の最古の record で抑えるのに使う。
+    pub fn sync_ring_min_below(&self, below: enchudb_oplog::Hlc) -> Option<enchudb_oplog::Hlc> {
+        self.ring_oldest_answer(Some(below))
+    }
+
+    /// #985: [`RingOldest`] を作るために ring の行をなめた回数 (観測・試験用)。
+    pub fn sync_ring_min_scans(&self) -> u64 {
+        self.ring_oldest_scans.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn ring_oldest_answer(&self, below: Option<enchudb_oplog::Hlc>) -> Option<enchudb_oplog::Hlc> {
+        if let Some(a) = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).answer(below) {
+            return a;
+        }
+        // 読み直しは 1 つずつ (待っていた間に前の読み直しが覚えを作ったら、 それを使う)
+        let _scan = self.ring_oldest_scan.lock().unwrap_or_else(|p| p.into_inner());
+        // 最初の問い: bridge と回収が覚えを触り始める印を立てる。 bridge の周 (`transfer_lock`) と回収 (`sync_ops_purge_lock`) の
+        // 外で立てる = 立てる前に済んだ周の行と消えた行は読み直しが見て、 立てた後の周と回収は覚えを触る (印の前は誰も lock を取らない)
+        if !self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire) {
+            let _bridge = self.transfer_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _purge = self.sync_ops_purge_lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.ring_oldest_on.store(true, std::sync::atomic::Ordering::Release);
+        }
+        {
+            let mut st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(a) = st.answer(below) {
+                return a;
+            }
+            st.scanning = Some((None, None));
+        }
+        self.ring_oldest_scans.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let scanned = self.scan_ring_min();
+        // 試験: なめ終えた後・覚えに置く前の割り込み点 (その間に足された / 消えた行)
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            ring_oldest_scan_hook::call(wal);
+        }
+        let mut st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
+        // 読み直しの間に足された行は読み直しが見ていないかもしれない (足す)。 消えた行は読み直しが数えたかもしれない: その版数が
+        // 答え以下なら、 答えは下の境 (最小そのものとは言わない)
+        let (added, gone) = st.scanning.take().unwrap_or((None, Some(enchudb_oplog::Hlc::ZERO)));
+        let Some(scanned) = scanned else {
+            // ring を開けず、 payload が ring にある行の版数を読めなかった: 覚えを作らない (次の問いが読み直す)。 答えは
+            // 「どの行より上か分からない」 = ZERO (F を進めない側。 前は読めた行だけの最小を返した = 読めない行を越えうる)
+            return Some(enchudb_oplog::Hlc::ZERO).filter(|m| below.is_none_or(|b| *m < b));
+        };
+        let min = match (scanned, added) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        st.seeded = true;
+        st.min = min;
+        st.exact = gone.is_none_or(|g| min.is_none_or(|m| g > m));
+        min.filter(|m| below.is_none_or(|b| *m < b))
+    }
+
+    /// #985: ring の行 (lsn が 0 でない) を全部なめた版数の最小 (`Some(None)` = 行が無い)。 payload は写さず、 decode と同じ検査で
+    /// (書き手, 版数) だけを読む。 payload が ring にある行があるのに ring を開けない時は None (読めないのは置き場で、 行は壊れて
+    /// いない = 数えないと最小が上に出る。 ack の walk と回収の `sync_payload_unreachable` と同じ見方)。
+    fn scan_ring_min(&self) -> Option<Option<enchudb_oplog::Hlc>> {
+        if !self.sync_tables_enabled() {
+            return Some(None);
+        }
+        let Some(cols) = self.sync_payload_cols() else { return Some(None) };
+        let rows = self.table_slots_with_value32(cols.lsn, |lsn| lsn != 0);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(at) = cols.at
+            && self.payload_ring(false).is_none()
+            && rows.iter().any(|&(_, slot)| self.himos.get(at as usize).is_some_and(|h| h.get_value32(slot).is_some()))
+        {
+            return None;
+        }
+        Some(
+            rows.into_iter()
+                .filter_map(|(lsn, slot)| self.sync_op_read(slot, lsn, &cols, enchudb_oplog::oplog::sync_ops_payload_walk_key))
+                .map(|(_, h)| h)
+                .min(),
+        )
     }
 
     /// #828: `_sync_ops` の行のうち **配ってよい物** の payload (lsn の順)。 ring が満杯で bridge が同じ (書き手, 版数) の組の
@@ -16472,11 +16886,18 @@ impl Engine {
     /// 生きている印の届いていない行は書き出しが済んでおらず、 その record は WAL に残っていて、 開いた後に写し直される。
     /// lock の順は purge と同じ (`free_locals` → 行)。
     fn drop_cells_of_dead_ring_slot(&self, local: u32) {
-        let _row = self.row_locks.write(local);
-        for hid in 0..self.himos.len() {
-            if self.himos[hid].get_value(local).is_some() {
-                self.remove_cell_freeing_leaf(local, hid);
+        {
+            let _row = self.row_locks.write(local);
+            for hid in 0..self.himos.len() {
+                if self.himos[hid].get_value(local).is_some() {
+                    self.remove_cell_freeing_leaf(local, hid);
+                }
             }
+        }
+        // #985: ring の行が 1 つ消えた (版数は読まない = 最小だったかもしれない)。 bridge (`transfer_lock` の下) の払い出しから
+        // 来るので、 覚えの印はこの間変わらない
+        if self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire) {
+            self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).gone(None);
         }
     }
 
@@ -20467,22 +20888,21 @@ impl Engine {
     /// `records` は `.eidmap` を読む前に読んで置いた書き出していない記録 ([`Self::load_prev_records`])。
     ///
     /// review946d [N1]: 自分の行の記録で、 前の住人の削除は本体に届き使い回しは届いていない像 (場所の最後の行が記録の行で死んでいる)
-    /// は、 WAL に再生する record があれば戻すかを再生の後に決める ([`Self::finish_prev_restores`])。 再生は、 本体にだけ届いた削除を
+    /// は、 WAL に再生する record があれば (`replay`、 呼び手が lock の下で決めた答え) 戻すかを再生の後に決める ([`Self::finish_prev_restores`])。 再生は、 本体にだけ届いた削除を
     /// その行の古い record で取り消す (`replay_slot` の `restore`)。 前は再生の前に戻し、 再生が生き返らせた行の Delete を state に出し、
     /// #451 の作り直しも配った (A では生きていて、 peer では消える)。 翻訳した行の記録はこの像で写像が場所を指したままなので戻さない
     /// (下の写像の守り)。
-    fn restore_prev_residents(&self, records: &[(u32, crate::prev_slots::PrevRecord)]) {
+    fn restore_prev_residents(&self, records: &[(u32, crate::prev_slots::PrevRecord)], replay: &ReplayAhead<'_>) {
         let gens = self.generations();
         let prev = &gens.prev;
         if !prev.active() || !gens.active() {
             return;
         }
-        let mut replay_follows: Option<bool> = None;
         let mut restored = 0u32;
         for &(slot, rec) in records {
             if rec.kind == crate::prev_slots::PrevKind::Own
                 && self.last_row_unmarked(slot) == (rec.gone, true)
-                && *replay_follows.get_or_insert_with(|| self.wal_has_records_to_replay())
+                && replay.follows()
             {
                 // 退避が書き出し済みかは再生の前の退避表で決める (再生の後始末のやり直し `redo_reuse_eviction` が同じ版数を
                 // 退避するので、 再生の後に見ると、 戻す時の別名の外しを飛ばす)。 書き出していなければ外す別名も再生の前に控える
@@ -20524,18 +20944,6 @@ impl Engine {
         }
         prev.drop_tomb_index();
         prev.release_open();
-    }
-
-    /// きれいに閉じなかった後に開く時、 この後の WAL 付きの open が再生する record が WAL にあるか (`reconcile_generations` の仕上げを
-    /// 後に回すのと同じ見方)。
-    #[cfg(not(target_arch = "wasm32"))]
-    fn wal_has_records_to_replay(&self) -> bool {
-        matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_)))
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn wal_has_records_to_replay(&self) -> bool {
-        false
     }
 
     /// 記録の identity の削除が退避表に記録の版数以上で載っている (書き出し済み、 [`Self::restore_prev_resident`])。
@@ -22069,7 +22477,10 @@ impl Engine {
     /// (Delete は消して上げる = 冪等、 行を生かす record は場所の世代がその行より新しければ戻す = ここで完了に寄せた使い回し /
     /// 届いていなかった削除を、 WAL にある分だけ戻す、 `replay_slot`)。 後に回すと、 再生が生かした場所に残った印を読み違える形を
     /// 再生の側で全部消す必要がある。 readonly は書けないので回さない。 表の定義・別名 (`eidalias`)・払い出し位置の後。
-    fn reconcile_generations(&self, readonly: bool) {
+    ///
+    /// 仕上げ ([`Self::finish_reconcile`]) は、 この open の後に WAL の再生が当てる record があれば (`replay`、 呼び手が writer lock の下で
+    /// 何かを直す前に決めた答え、 PR #986 の読み直し 2 の [1] [2]) 再生の後、 無ければここで済ませる。
+    fn reconcile_generations(&self, readonly: bool, replay: &ReplayAhead<'_>) {
         let gens = self.generations();
         // WAL の無い engine は session の途中の flush でも紐名の辞書の clean の印が立つ: gen.seg の header の印でも見る (読み直し 2)
         if readonly || !gens.active() || !(self.himo_reg.rebuilt_on_load || gens.session_dirty()) {
@@ -22132,8 +22543,7 @@ impl Engine {
         }
         gens.note_repaired(1, completed);
         // 再生する record が WAL に無ければ、 ここで仕上げる (あれば WAL 付きの open が再生の後に仕上げる)
-        #[cfg(not(target_arch = "wasm32"))]
-        if gens.has_pending() && !matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_))) {
+        if gens.has_pending() && !replay.follows() {
             self.finish_reconcile(None);
         }
     }
@@ -29321,75 +29731,101 @@ impl Engine {
     /// WAL 付き open_concurrent。既存 WAL があればリカバリする。
     /// region CRC は WAL ルートでは skip(WAL が source of truth)。
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
+    ///
+    /// PR #986 の読み直し 2 の [2]: 既にある WAL は本体を開く前 (writer lock の下、 開く時の直し (`prev.seg` の記録の戻し・gen.seg の
+    /// 突き合わせ) が何かを書く前) に開き、 直しが仕上げを再生の後に回すかは開いた WAL に聞く (`ReplayAhead::Wal`)。 前は本体を開いた後に
+    /// WAL を開き、 直しは WAL の file を開き直して聞いた: 直しを map に書いて仕上げを再生の後に回した後に WAL を開けずに返ると、 engine の
+    /// Drop が clean の印を立て、 次の open は突き合わせをせず (きれいに閉じたと読む)、 仕上げ (残った cell を落とす) が二度と走らなかった。
+    /// 今は WAL を開けなければ engine を作る前に返る (何も書かない)。 無い WAL は (再生する record も無いので) 今まで通り本体を開いた後に
+    /// 作る。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_oplog(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
-        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true, /*readonly=*/ false)?;
+        let lock = Self::writer_lock_for_open(path)?;
+        let oplog_path = oplog_path_for(path);
+        let wal = Self::existing_wal(&oplog_path)?;
+        let replay = wal.as_ref().map_or(ReplayAhead::Nothing, ReplayAhead::of);
+        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, Some(lock), replay)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
         let _ = std::fs::remove_dir_all(&crc_path); // v10: DB は directory
         let _ = std::fs::remove_file(&crc_path);
-        let oplog_path = oplog_path_for(path);
-        // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
-        let wal = if oplog_path.exists() && !enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)? {
-            let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
-            // リカバリ: commit されたレコードを本体に適用
-            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
-            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
-            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
-            // ここで適用せずに checkpoint で越えると恒久消失する
-            // (`OpLog::recover_with_tail` の doc 参照)。
-            let records = w.recover_with_tail();
-            // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
-            let dropped = w.drop_records_after_a_hole();
-            let mut replay = ReplayVocab::default();
-            for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+        let wal = match wal {
+            Some(w) => {
+                // リカバリ: commit されたレコードを本体に適用
+                // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+                // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+                // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+                // ここで適用せずに checkpoint で越えると恒久消失する
+                // (`OpLog::recover_with_tail` の doc 参照)。
+                let records = w.recover_with_tail();
+                // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
+                let dropped = w.drop_records_after_a_hole();
+                let mut replay = ReplayVocab::default();
+                for rec in &records {
+                    eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+                }
+                eng.finish_replay_vocab(&mut replay);
+                // #968: 再生が生き返らせた、 tombstone まで本体に届いた削除の行は、 削除を完了させる (再生の前の sweep と同じ決め)
+                eng.finish_deletes_revived_by_the_replay(!records.is_empty());
+                // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
+                eng.finish_reconcile(Some(&w));
+                // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
+                eng.finish_prev_restores();
+                // 読み直し 2 [B1] / [B2] / [R2]: 再生が生かした場所の使い回しが外した別名を外し、 版数の索引を捨て、 `prev.seg` の周期を
+                // 進め始める
+                eng.finish_open_restores(!records.is_empty());
+                // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
+                // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
+                // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
+                // body より先に writeback すると、 recovery 直後の再 crash で
+                // 「一度 durable だった committed record」 が replay 対象外になり
+                // 恒久消失した。
+                // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
+                // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+                // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+                if eng.persist_name_records().is_ok()
+                    && eng.body_msync().is_ok()
+                    && (wal_untouched || w.fsync().is_ok())
+                    && !eng.checkpoint_held_for_freed_slots()
+                {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            eng.finish_replay_vocab(&mut replay);
-            // #968: 再生が生き返らせた、 tombstone まで本体に届いた削除の行は、 削除を完了させる (再生の前の sweep と同じ決め)
-            eng.finish_deletes_revived_by_the_replay(!records.is_empty());
-            // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
-            eng.finish_reconcile(Some(&w));
-            // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
-            eng.finish_prev_restores();
-            // 読み直し 2 [B1] / [B2] / [R2]: 再生が生かした場所の使い回しが外した別名を外し、 版数の索引を捨て、 `prev.seg` の周期を
-            // 進め始める
-            eng.finish_open_restores(!records.is_empty());
-            // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
-            // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
-            // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
-            // body より先に writeback すると、 recovery 直後の再 crash で
-            // 「一度 durable だった committed record」 が replay 対象外になり
-            // 恒久消失した。
-            // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
-            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
-            if eng.persist_name_records().is_ok()
-                && eng.body_msync().is_ok()
-                && (wal_untouched || w.fsync().is_ok())
-                && !eng.checkpoint_held_for_freed_slots()
-            {
-                w.advance_checkpoint(w.head());
+            None => {
+                let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+                // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
+                eng.finish_reconcile(Some(&w));
+                eng.finish_prev_restores();
+                eng.finish_open_restores(false);
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            std::sync::Arc::new(w)
-        } else {
-            let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
-            // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            eng.finish_reconcile(Some(&w));
-            eng.finish_prev_restores();
-            eng.finish_open_restores(false);
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
-                w.advance_checkpoint(w.head());
-            }
-            std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+    }
+
+    /// WAL 付きにする時の WAL (`oplog_path`): 既にある (header を書き出した) WAL なら開く (再生する record がありうる)。 無い / header を
+    /// 一度も書き出していない WAL (#415: 作った直後に落ちた = record も無い) は None で、 呼び手が本体を開いた後に作る (開けなかった
+    /// DB に WAL の file を残さない: create の途中で落ちた DB の directory に残すと、 作り直す create が残骸と見ずに断る)。 WAL の file が
+    /// あるかを stat で知れなければ Err (PR #986 の読み直し 2 の [3]: 前は `Path::exists` が stat の失敗を 「無い」 と読み、
+    /// `OpLog::create` (truncate) が再生していない record を捨てた)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn existing_wal(oplog_path: &std::path::Path) -> io::Result<Option<enchudb_oplog::oplog::OpLog>> {
+        use enchudb_oplog::oplog::OpLog;
+        if Self::oplog_file_len(oplog_path)?.is_some() && !OpLog::was_never_written(oplog_path)? {
+            Ok(Some(OpLog::open(oplog_path)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// #796: 開く道が WAL に何も足さず、 本体に何も当てていないか (再生する record も、 捨てた穴も、 作り直した write (#451) も
@@ -30199,53 +30635,55 @@ impl Engine {
         // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)
         eng.mark_session_dirty();
         // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
-        let wal = if oplog_path.exists() && !enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)? {
-            let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
-            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
-            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
-            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
-            // ここで適用せずに checkpoint で越えると恒久消失する
-            // (`OpLog::recover_with_tail` の doc 参照)。
-            let records = w.recover_with_tail();
-            // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
-            let dropped = w.drop_records_after_a_hole();
-            let mut replay = ReplayVocab::default();
-            for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+        let wal = match Self::existing_wal(&oplog_path)? {
+            Some(w) => {
+                // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+                // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+                // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+                // ここで適用せずに checkpoint で越えると恒久消失する
+                // (`OpLog::recover_with_tail` の doc 参照)。
+                let records = w.recover_with_tail();
+                // #663: 再生が古い区画の穴で止まったら、 穴の後の新しい区画 (再生していない) を捨てる
+                let dropped = w.drop_records_after_a_hole();
+                let mut replay = ReplayVocab::default();
+                for rec in &records {
+                    eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
+                }
+                eng.finish_replay_vocab(&mut replay);
+                // #968 / #731 / #451 / review946d [N1] / 読み直し 2 [B1] [B2]: open_concurrent_with_oplog と同じ
+                eng.finish_deletes_revived_by_the_replay(!records.is_empty());
+                eng.finish_reconcile(Some(&w));
+                eng.finish_prev_restores();
+                eng.finish_open_restores(!records.is_empty());
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
+                // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
+                // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
+                // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
+                // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
+                if eng.persist_name_records().is_ok()
+                    && eng.body_msync().is_ok()
+                    && (wal_untouched || w.fsync().is_ok())
+                    && !eng.checkpoint_held_for_freed_slots()
+                {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            eng.finish_replay_vocab(&mut replay);
-            // #968 / #731 / #451 / review946d [N1] / 読み直し 2 [B1] [B2]: open_concurrent_with_oplog と同じ
-            eng.finish_deletes_revived_by_the_replay(!records.is_empty());
-            eng.finish_reconcile(Some(&w));
-            eng.finish_prev_restores();
-            eng.finish_open_restores(!records.is_empty());
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
-            // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
-            // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
-            // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
-            if eng.persist_name_records().is_ok()
-                && eng.body_msync().is_ok()
-                && (wal_untouched || w.fsync().is_ok())
-                && !eng.checkpoint_held_for_freed_slots()
-            {
-                w.advance_checkpoint(w.head());
+            None => {
+                let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+                // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
+                eng.finish_reconcile(Some(&w));
+                eng.finish_prev_restores();
+                eng.finish_open_restores(false);
+                let relogged = eng.relog_unlogged_writes(&w);
+                eng.generations().forget_relog_gens();
+                if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
+                    w.advance_checkpoint(w.head());
+                }
+                std::sync::Arc::new(w)
             }
-            std::sync::Arc::new(w)
-        } else {
-            let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
-            // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            eng.finish_reconcile(Some(&w));
-            eng.finish_prev_restores();
-            eng.finish_open_restores(false);
-            let relogged = eng.relog_unlogged_writes(&w);
-            eng.generations().forget_relog_gens();
-            if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
-                w.advance_checkpoint(w.head());
-            }
-            std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
@@ -32994,6 +33432,330 @@ mod ring_newest_tests {
         assert!(!n.is_newer_than_every_row(at(now + (1 << 32), 3)), "下位 32 bit が同じ鍵");
         n.unknown = true;
         assert!(!n.is_newer_than_every_row(at(now + 1, 0)), "版数の分からない行がある間は使わない");
+    }
+}
+
+/// #985: ring に残る行の版数の最小の覚え ([`RingOldest`]、 [`Engine::sync_ring_min_hlc`] / [`Engine::sync_ring_min_below`]) が、
+/// 直す前の読み (`pending_sync_ops(0)` を全部 decode した最小) と同じ答えを出す。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod ring_oldest_tests {
+    use super::*;
+    use crate::transport::WireRecord;
+    use enchudb_oplog::Hlc;
+    use enchudb_oplog::oplog::DecodedOp;
+    use std::sync::Arc;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        format!("{}/enchudb-issue985-unit-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id())
+    }
+
+    fn engine(path: &str) -> Arc<Engine> {
+        let mut eng = Engine::create_with_capacity(path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        eng
+    }
+
+    /// 直す前の読み (ring の全部の行を写して decode した最小)。
+    fn full(eng: &Engine) -> Option<Hlc> {
+        eng.pending_sync_ops(0).iter().filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p)).map(|r| r.hlc).min()
+    }
+
+    /// 中継の形の record (書き手 `author`、 版数 `hlc`) を WAL に載せて ring まで写す。
+    fn relay(eng: &Engine, author: u32, hlcs: &[Hlc]) {
+        for (i, h) in hlcs.iter().enumerate() {
+            let rec = WireRecord::unsigned(*h, author, DecodedOp::Vocab { vid: 7_000 + i as u32, bytes: b"w".to_vec() });
+            assert!(eng.relay_record(&rec), "前提: record を WAL に載せた");
+        }
+        eng.oplog_commit();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+    }
+
+    /// 自分の書き込みを `n` 個 ring まで写す。
+    fn own(eng: &Engine, n: u32) {
+        for i in 0..n {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.v", i);
+        }
+        eng.oplog_commit();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+    }
+
+    /// ring の行のうち版数 `hlc` の物の (eid, lsn)。
+    fn rows_at(eng: &Engine, hlc: Hlc) -> Vec<(u64, u32)> {
+        let cols = eng.sync_payload_cols().unwrap();
+        eng.entities_with_himo(cols.lsn)
+            .into_iter()
+            .filter(|e| {
+                eng.sync_op_payload(*e, &cols)
+                    .and_then(|p| enchudb_oplog::oplog::decode_sync_ops_payload(&p))
+                    .is_some_and(|r| r.hlc == hlc)
+            })
+            .filter_map(|e| Some((e, eng.get_by_id32(e, cols.lsn)?)))
+            .collect()
+    }
+
+    fn purge(eng: &Engine, rows: &[(u64, u32)]) {
+        let lsn = eng.sync_payload_cols().unwrap().lsn;
+        for (e, l) in rows {
+            assert!(eng.purge_sync_ops_row(*e, lsn, *l), "前提: 行を消した");
+        }
+    }
+
+    /// 答えが直す前の読みと同じ (境つきの問いも)。
+    #[track_caller]
+    fn same(eng: &Engine, what: &str) -> Option<Hlc> {
+        let want = full(eng);
+        assert_eq!(eng.sync_ring_min_hlc(), want, "{what}: 直す前の読みと違う");
+        let bounds = [Hlc::ZERO, want.unwrap_or(Hlc::ZERO), Hlc { wall: u64::MAX, logical: 0, peer: 0 }];
+        for b in bounds.into_iter().chain(want.map(|m| Hlc { logical: m.logical + 1, ..m })) {
+            assert_eq!(eng.sync_ring_min_below(b), want.filter(|m| *m < b), "{what}: 境 {b:?}");
+        }
+        want
+    }
+
+    fn at(wall: u64, logical: u32, peer: u32) -> Hlc {
+        Hlc { wall, logical, peer }
+    }
+
+    /// 足す・消す・開き直すの各段で、 直す前の読みと同じ答え。 覚えが最小そのものの間 (行が足されただけ / 最小より上の行が消えた
+    /// だけ) は ring を読まない。
+    ///
+    /// falsify: bridge が覚えを触らない (`note`) と、 覚えを作った後に載った古い版数の record (中継) を数えない。 消した行を覚えに
+    /// 渡さない (`gone`) と、 消えた最小の版数を返す。 `gone` の比べを `h < m` にすると、 同じ版数の 2 行 (組) を消した後に消えた
+    /// 版数を返す。
+    #[test]
+    fn the_ring_min_matches_the_full_decode() {
+        let p = path("same");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        let scans = |e: &Engine| e.sync_ring_min_scans();
+        assert_eq!(same(&eng, "空の ring"), None);
+        own(&eng, 5);
+        let own_min = same(&eng, "自分の書き込み").expect("前提: 自分の行がある");
+        let s0 = scans(&eng);
+        // 覚えを作った後に、 それより古い版数の record が中継で載る (書き手 9、 書き手 0)。 組 = 同じ版数の 2 行
+        let old = at(own_min.wall - 50_000, 0, 9);
+        relay(&eng, 9, &[at(own_min.wall - 10_000, 3, 9), old, old]);
+        assert_eq!(rows_at(&eng, old).len(), 2, "前提: 同じ版数の行が 2 つ");
+        assert_eq!(same(&eng, "古い版数の中継"), Some(old));
+        let zero = at(own_min.wall - 20_000, 1, 0);
+        relay(&eng, 0, &[zero]);
+        assert_eq!(same(&eng, "書き手 0 の中継"), Some(old));
+        own(&eng, 3);
+        assert_eq!(scans(&eng), s0, "行が足されただけなのに ring を読んだ");
+        // 最小より上の行が消えても最小そのもの (読まない)
+        purge(&eng, &rows_at(&eng, zero));
+        assert_eq!(same(&eng, "最小より上の行を消した"), Some(old));
+        assert_eq!(scans(&eng), s0, "最小より上の行が消えただけなのに ring を読んだ");
+        // 最小の組の片方を消す: 最小は残る
+        let pair = rows_at(&eng, old);
+        purge(&eng, &pair[..1]);
+        assert_eq!(same(&eng, "最小の組の片方を消した"), Some(old));
+        // もう片方も消す: 最小が上がる
+        let s1 = scans(&eng);
+        purge(&eng, &pair[1..]);
+        // 境が下の境 (消えた最小) 以下の問いは読まない
+        assert_eq!(eng.sync_ring_min_below(old), None);
+        assert_eq!(scans(&eng), s1, "下の境が問いの境以上なのに ring を読んだ");
+        let next = same(&eng, "最小の組を両方消した");
+        assert!(next > Some(old), "前提: 最小が上がった ({next:?})");
+        // 回収 (ack の後の reclaim) で古い方の行が消える。 消える行より lsn が新しく版数の古い行 (中継) が最小なら、 回収は
+        // 最小を消さない = 読み直さない (回収は読んだ版数を渡す)
+        let lsn_mid = eng.current_sync_lsn();
+        let pin = at(old.wall - 1_000, 0, 9);
+        relay(&eng, 9, &[pin]);
+        assert_eq!(same(&eng, "回収の前の中継"), Some(pin));
+        let s3 = scans(&eng);
+        eng.ack_sync(42, lsn_mid).unwrap();
+        assert!(eng.reclaim_sync_ops() > 0, "前提: 回収した");
+        assert_eq!(same(&eng, "最小より上の行の回収"), Some(pin));
+        assert_eq!(scans(&eng), s3, "回収が最小より上の行だけを消したのに ring を読んだ");
+        // 最小も回収する
+        purge(&eng, &rows_at(&eng, pin));
+        same(&eng, "回収の後");
+        // 読めない行 (lsn はあるが payload の無い行、 #217 の dead row) は数えない
+        let cols = eng.sync_payload_cols().unwrap();
+        let dead = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_to_by_id(dead, cols.lsn, 3_000_000);
+        same(&eng, "読めない行");
+        drop(eng);
+        // 開き直す (覚えは無い = 最初の問いが読む)。 配ってよい所 (#828) の後ろの行も数える
+        let eng = Engine::open_concurrent_with_oplog(&p, 1 << 20).unwrap();
+        let s2 = scans(&eng);
+        {
+            // 配ってよい所の終わりを置く bridge (consumer の周) を止めておく (`transfer_lock` は最初の問いが取るので握らない)
+            let _no_bridge = eng.hold_consumer();
+            eng.sync_settled_known.store(true, std::sync::atomic::Ordering::Release);
+            eng.sync_settled_lsn.store(1, std::sync::atomic::Ordering::Release);
+            assert!(eng.settled_sync_ops().len() < eng.pending_sync_ops(0).len(), "前提: 配ってよい所の後ろに行がある");
+            let m = same(&eng, "開き直した後");
+            assert!(m.is_some() && scans(&eng) == s2 + 1, "前提: 開き直した後の最初の問いが ring を読んだ ({})", scans(&eng) - s2);
+        }
+        relay(&eng, 9, &[at(1_000, 0, 9)]);
+        assert_eq!(same(&eng, "開き直した後の中継"), Some(at(1_000, 0, 9)));
+        assert_eq!(scans(&eng), s2 + 1);
+    }
+
+    /// 読み直しが行をなめ終えた後・覚えに置く前 (`ring_oldest_scan_hook`) に足された行と消えた行。
+    ///
+    /// 足された行 (なめた後に載った、 どの行よりも古い版数の中継) は、 その読み直しの答えに入る。 消えた行 (なめた時に数えた最小の
+    /// 行) を消した後の読み直しの答えは下の境 (消えた版数を含みうる) で、 次の問いは読み直して最小そのものを返す。
+    ///
+    /// falsify: 読み直しの間に足された版数を答えに足さないと、 1 つ目の答えが中継の版数より上。 読み直しの間に消えた版数を見ずに
+    /// 最小そのものとすると、 2 つ目の後の問いが消えた行の版数を返す。
+    #[test]
+    fn rows_added_or_purged_while_the_ring_is_read() {
+        let p = path("window");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        own(&eng, 4);
+        let base = full(&eng).unwrap();
+        let older = at(base.wall - 90_000, 0, 9);
+        {
+            let e = eng.clone();
+            ring_oldest_scan_hook::set(eng.oplog.as_ref().unwrap(), move |_| relay(&e, 9, &[older]));
+        }
+        let got = eng.sync_ring_min_hlc();
+        assert_eq!(full(&eng), Some(older), "前提: 割り込み点で中継の行が載った");
+        assert_eq!(got, Some(older), "読み直しの間に載った、 どの行よりも古い行を数えない");
+        assert_eq!(same(&eng, "読み直しの後"), Some(older));
+
+        // 覚えを最小そのものでなくする (最小の行を消す) → 次の読み直しの間に、 なめた時の最小の行 (`base` の行) を消す
+        purge(&eng, &rows_at(&eng, older));
+        let base_rows = rows_at(&eng, base);
+        assert!(!base_rows.is_empty(), "前提: 自分の最初の行がある");
+        {
+            let e = eng.clone();
+            ring_oldest_scan_hook::set(eng.oplog.as_ref().unwrap(), move |_| purge(&e, &base_rows));
+        }
+        let s = eng.sync_ring_min_scans();
+        let got = eng.sync_ring_min_hlc();
+        assert_eq!(eng.sync_ring_min_scans(), s + 1, "前提: 読み直した");
+        let want = full(&eng);
+        assert!(want > Some(base), "前提: 割り込み点で最小の行が消えた ({want:?})");
+        assert!(got <= want, "読み直しの答えが ring の最小より上 ({got:?} > {want:?})");
+        assert_eq!(eng.sync_ring_min_hlc(), want, "読み直しの間に消えた最小の行の版数を、 最小そのものとして覚えた");
+    }
+
+    /// payload の ring を開けない時の読み直し (開き直した後、 ring を開く最初の呼び手が覚えを作る読み直しで、 その 1 回だけ開けない
+    /// = fd が尽きた等)。 ring に payload を持つ行の版数を読めないので、 答えは下の境 (ZERO) で、 覚えは作らない。 開けるように
+    /// なった後の問いは読み直して最小そのものを返す。
+    ///
+    /// falsify: 開けなかった読み直しで覚えを作ると、 読めた行だけの最小 (ここでは行が無い = None) を最小そのものとして覚え、 開ける
+    /// ようになった後も返し続ける (F が ring の行を越える側)。
+    #[test]
+    fn a_ring_that_cannot_be_opened_is_not_remembered() {
+        let p = path("unopened");
+        let _tmp = Tmp(p.clone());
+        {
+            let eng = engine(&p);
+            own(&eng, 3);
+            relay(&eng, 9, &[at(1_000, 0, 9)]);
+            eng.oplog_sync().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&p, 1 << 20).unwrap();
+        let wal = eng.oplog.as_ref().unwrap();
+        payload_ring_open_fault::set(wal, true);
+        assert!(eng.sync_payload_ring.get().is_none(), "前提: 開き直した後、 まだ ring を開いていない");
+        let during = eng.sync_ring_min_hlc();
+        let below = eng.sync_ring_min_below(at(u64::MAX, 0, 0));
+        payload_ring_open_fault::set(wal, false);
+        let want = full(&eng);
+        assert_eq!(want, Some(at(1_000, 0, 9)), "前提: ring に行がある");
+        assert!(during.is_some_and(|d| d <= at(1_000, 0, 9)), "ring を開けない間の答えが ring の最小より上 ({during:?})");
+        assert!(below.is_some(), "ring を開けない間に 「境より下の行は無い」 と答えた");
+        assert_eq!(same(&eng, "開けるようになった後"), want);
+    }
+
+    /// bridge が payload をどこにも書けなかった行 (lsn だけの行 = 読み直しが数えない dead row) は、 覚えにも入れない。 bridge を
+    /// 通る形 (`bridge_payload_fault`)。
+    ///
+    /// falsify: bridge が書いた行を読まずに record の版数で覚えを下げると、 読めない行の版数を最小として返し続ける (F が低く留まる)。
+    #[test]
+    fn rows_the_bridge_could_not_write_are_not_remembered() {
+        let p = path("unwritten");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        own(&eng, 3);
+        let base = same(&eng, "自分の書き込み").unwrap();
+        let wal = eng.oplog.as_ref().unwrap();
+        bridge_payload_fault::set(wal, true);
+        relay(&eng, 9, &[at(base.wall - 5_000, 0, 9)]);
+        bridge_payload_fault::set(wal, false);
+        let cols = eng.sync_payload_cols().unwrap();
+        let rows = eng.table_slots_with_value32(cols.lsn, |l| l != 0).len();
+        assert!(eng.pending_sync_ops(0).len() < rows, "前提: payload の無い行が ring にある");
+        assert_eq!(same(&eng, "payload を書けなかった行"), Some(base));
+    }
+
+    /// #858: 開き直した ring の 「生きていないのに lsn の列に居る」 slot を、 bridge の払い出しが穴として拾って cell を落とす。
+    /// その行が最小なら、 覚えは最小そのものでなくなる。
+    ///
+    /// falsify: cell を落とす道が覚えに知らせないと、 消えた行の版数を返し続ける (F が低く留まる)。
+    #[test]
+    fn a_dead_ring_slot_picked_up_by_the_bridge_leaves_the_remembered_min() {
+        let p = path("dead858");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        own(&eng, 3);
+        let ghost = at(1_000, 0, 9);
+        relay(&eng, 9, &[ghost]);
+        assert_eq!(same(&eng, "最小の行"), Some(ghost));
+        let rows = rows_at(&eng, ghost);
+        assert_eq!(rows.len(), 1, "前提: 最小の行が 1 つ");
+        // 生きている印だけが届かなかった像の slot (cell は残る)
+        eng.entities.free(enchudb_oplog::eid_local(rows[0].0));
+        assert_eq!(full(&eng), Some(ghost), "前提: 直す前の読みも、 生きていない slot の行を数える");
+        // 払い出し切った ring = 次の払い出しが穴を探して、 その slot の cell を落とす
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+        let table = &eng.tables[tid];
+        table.next_local.store(table.capacity(), std::sync::atomic::Ordering::Release);
+        table.free_locals.lock().unwrap().clear();
+        table.free_locals_nonempty.store(false, std::sync::atomic::Ordering::Release);
+        {
+            let _bridge = eng.transfer_lock_for_fold();
+            eng.entity_in("_sync_ops").unwrap();
+        }
+        assert!(full(&eng) > Some(ghost), "前提: 払い出しが slot の cell を落とした ({:?})", full(&eng));
+        same(&eng, "cell を落とした後");
+    }
+
+    /// 覚えの 4 つの形の答え (行を使わない)。
+    #[test]
+    fn the_remembered_bound_answers() {
+        let h = |w| at(w, 0, 1);
+        let mut o = RingOldest::new();
+        assert_eq!(o.answer(None), None, "作る前は読む");
+        o.seeded = true;
+        o.exact = true;
+        assert_eq!(o.answer(None), Some(None), "行の無い ring");
+        o.note(h(50));
+        o.note(h(70));
+        assert_eq!((o.answer(None), o.answer(Some(h(50))), o.answer(Some(h(51)))), (Some(Some(h(50))), Some(None), Some(Some(h(50)))));
+        o.gone(Some(h(70)));
+        assert!(o.exact, "最小より上の行が消えた");
+        o.gone(Some(h(50)));
+        assert!(!o.exact, "最小の行が消えた");
+        assert_eq!(o.answer(Some(h(50))), Some(None), "下の境が問いの境以上");
+        assert_eq!(o.answer(Some(h(51))), None, "下の境が問いの境より下 = 読む");
+        assert_eq!(o.answer(None), None);
+        o.exact = true;
+        o.gone(None);
+        assert!(!o.exact, "版数を読めない行が消えた");
+        o.min = None;
+        assert_eq!(o.answer(Some(h(1))), None, "行の無い覚えが最小そのものでない時は読む");
     }
 }
 
