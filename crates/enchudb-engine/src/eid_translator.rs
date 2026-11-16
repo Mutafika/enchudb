@@ -273,6 +273,21 @@ impl EidTranslator {
         true
     }
 
+    /// 別名 `(author_peer, foreign_local)` が `local` を指していれば、 指す行の世代を `agen` に替える (外しも張り直しもしない)。 替えたら
+    /// true。 engine が別名を張った後に場所を生かした時 (`Engine::bind_remote_eid`、 PR #1006 の読み直し [4]) に、 生かした行の世代に
+    /// 合わせる。
+    pub fn set_alias_gen(&self, author_peer: PeerId, foreign_local: u32, local: u32, agen: u32) -> bool {
+        let key = (author_peer, foreign_local);
+        let mut al = self.aliases.write().unwrap();
+        match al.get_mut(&local).and_then(|v| v.iter_mut().find(|(k, _)| *k == key)) {
+            Some(e) => {
+                e.1 = agen;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// #178: `local` を指す別名 (別名でなく逆写像の key は含まない)。
     pub fn aliases_of(&self, local: u32) -> Vec<Key> {
         self.aliases.read().unwrap().get(&local).map(|v| v.iter().map(|&(k, _)| k).collect()).unwrap_or_default()

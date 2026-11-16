@@ -11403,17 +11403,19 @@ impl Engine {
         }
         // review946 [5]: 戻さなかった写像の場所を指す別名のうち使い回しの前の住人の物を、 使い回しと同じく外して同じ版数を退避する
         // (残すと別名の peer の書き込みが新しい住人に当たり、 その peer の削除が新しい住人を消した)。 v15 の DB は指す行の世代
-        // (`eidalias` 版 2) で決める: 場所の最後の行 (突き合わせの前なので page の印を見ずに読む) より下の世代の別名 (#993 / #994。
-        // 本体が古い電源断の像で残る物は、 再生の使い回しの移り目と開く道の仕上げが外す)。 世代を持たない DB は場所の別名の全部
-        // (`.eidmap` を書いてから `eidalias` を書くので、 `.eidmap` が使い回しの前なら `eidalias` もその前)
+        // (`eidalias` 版 2) で決める: 生きている場所は住人 (突き合わせの前なので page の印を見ずに読む) より下の世代の別名 (#993 /
+        // #994)、 死んだ場所は使い回しの記録が場所から離した行の別名 (`alias_row_left_slot`、 PR #1006 の読み直し [1])。 本体が古い
+        // 電源断の像で残る物は、 再生の使い回しの移り目と開く道の仕上げが外す。 世代を持たない DB は場所の別名の全部 (`.eidmap` を
+        // 書いてから `eidalias` を書くので、 `.eidmap` が使い回しの前なら `eidalias` もその前)
         if !readonly {
             for &(_, _, local, tomb) in &stale_mappings {
-                let below = if eng.generations().active() {
-                    eng.last_row_unmarked(local).0 >> eng.generations().bits()
+                let others = if !eng.generations().active() {
+                    eng.drop_aliases_where(local, |_| true, tomb)
                 } else {
-                    u32::MAX
+                    let (row, dead) = eng.last_row_unmarked(local);
+                    let live_gen = (!dead).then(|| row >> eng.generations().bits());
+                    eng.drop_aliases_where(local, |g| eng.alias_row_left_slot(local, g, live_gen), tomb)
                 };
-                let others = eng.drop_aliases_below(local, below, tomb);
                 if !others.is_empty() {
                     eng.retreat_removed_keys(&others, tomb);
                 }
@@ -11510,7 +11512,7 @@ impl Engine {
         // 使い回しの前のまま届いた像) を外す。 突き合わせの後 (場所の最後の行が決まる)・WAL の再生の前 (再生する中継の record がその
         // 別名で次の住人に当たらない)。 世代が上の別名 (本体より先に届いた) と、 再生が生かす場所は開く道の仕上げ (`finish_open_restores`)
         if unclean && !readonly {
-            eng.drop_stale_generation_aliases(false);
+            eng.drop_stale_generation_aliases(false, replay.follows());
         }
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
@@ -17915,6 +17917,13 @@ impl Engine {
         let (local, bound_now) = self.alias_remote_eid(author_peer, foreign_eid, self.slot_unchecked(local_eid), self_peer);
         // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
         self.ensure_live_slot(local);
+        // PR #1006 の読み直し [4]: 別名の指す行の世代は、 生かした後の場所の住人の世代 (`alias_remote_eid` は生かす前に決めるので、
+        // 死んだ場所に束ねると消えた行 = 今 − 1 を指し、 次のきれいでない open が今の住人の別名として外した)。 この後の #490 の削除は
+        // 同じ行を消す (場所の最後の行 = この世代のまま)
+        if bound_now {
+            let agen = self.alias_row_gen(local);
+            self.eid_translator.set_alias_gen(author_peer, enchudb_oplog::eid_local(foreign_eid), local, agen);
+        }
         Self::advance_table_next_local_for(&self.tables, local);
         // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
         // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
@@ -20400,7 +20409,7 @@ impl Engine {
     fn finish_open_restores(&self) {
         let gens = self.generations();
         if gens.prev.opening() {
-            self.drop_stale_generation_aliases(true);
+            self.drop_stale_generation_aliases(true, false);
         }
         gens.take_alias_overrides();
         gens.prev.drop_tomb_index();
@@ -20470,10 +20479,10 @@ impl Engine {
         if !self.generations().active() || !self.eid_translator.aliases_with_gen_of(slot).iter().any(|&(_, g)| g < row_gen) {
             return;
         }
-        self.drop_former_generation_aliases(slot, row_gen, None);
+        self.drop_former_generation_aliases(slot, |g| g < row_gen, None);
     }
 
-    /// #993 / #994: 場所 `slot` を指す別名のうち、 指す行の世代が `below` より下の物 (前の住人とそれより前の行の別名) を、 指す行ごとに
+    /// #993 / #994: 場所 `slot` を指す別名のうち、 指す行の世代 `g` が `former(g)` の物 (前の住人とそれより前の行の別名) を、 指す行ごとに
     /// 外す。 前の住人の identity と削除の版数を引いて (`prev.seg` の記録 / 退避表の自分の行 / 場所の削除の版数 = 再生が当てた削除)、
     /// 名前の記録を移し ([`Self::move_stale_slot_names`]、 #994 [C3]: 前の住人の identity を先頭に)、 退避が sidecar に無い時 (書き出して
     /// いない周期の記録 / 場所にある削除) だけ外した別名に退避する (書き出した周期の退避は sidecar にあるか、 忘れてよい線が忘れた後 =
@@ -20481,12 +20490,12 @@ impl Engine {
     ///
     /// `ahead_of` = Some(今の行の世代) なら、 それより上の世代の別名 (本体にも WAL にも無い行を指す) も外す (前の住人ではないので名前も
     /// 退避も触らない)。
-    fn drop_former_generation_aliases(&self, slot: u32, below: u32, ahead_of: Option<u32>) {
+    fn drop_former_generation_aliases(&self, slot: u32, former: impl Fn(u32) -> bool, ahead_of: Option<u32>) {
         let gens = self.generations();
         let bits = gens.bits();
         let self_peer = self.peer_id();
         let mut rows: Vec<u32> =
-            self.eid_translator.aliases_with_gen_of(slot).into_iter().map(|(_, g)| g).filter(|&g| g < below).collect();
+            self.eid_translator.aliases_with_gen_of(slot).into_iter().map(|(_, g)| g).filter(|&g| former(g)).collect();
         rows.sort_unstable();
         rows.dedup();
         for row_gen in rows {
@@ -20524,14 +20533,19 @@ impl Engine {
     }
 
     /// #993 / #994: v15 の DB をきれいに閉じなかった後に開いた時 (書ける open)、 別名のうち指す行の世代 (`eidalias` 版 2) が場所の
-    /// 最後の行の世代と合わない物を外す ([`Self::drop_former_generation_aliases`])。 呼ぶのは突き合わせ (`reconcile_generations`) の
-    /// 後・WAL の再生の前 (`final_pass` = 偽: 前の住人を指す物 = 世代が下の物だけ。 本体より先に届いた `eidalias` の、 次の住人を指す
-    /// 物 (世代が上) は、 再生がその行を生かす) と、 再生と後に回した戻しの後 ([`Self::finish_open_restores`]、 `final_pass` = 真: 合わない
-    /// 物を全部。 世代が上のまま = 本体にも WAL にも無い行を指す)。
+    /// 住人と合わない物を外す ([`Self::drop_former_generation_aliases`])。 呼ぶのは突き合わせ (`reconcile_generations`) の後・WAL の
+    /// 再生の前 (`final_pass` = 偽) と、 再生と後に回した戻しの後 ([`Self::finish_open_restores`]、 `final_pass` = 真)。
     ///
-    /// 場所の最後の行の世代は、 突き合わせが削除を完了させた場所なら消えた行の世代 (`finish_reconcile` の前は `Generations` の
-    /// pending、 後は relog の世代)。 死んだ場所の別名も同じに見る (#490 で束ねて消した行の別名は、 消えた行の世代 = 合う、 #994 [C2])。
-    fn drop_stale_generation_aliases(&self, final_pass: bool) {
+    /// - 生きている場所: 指す行の世代が住人より下の別名 (使い回した場所の前の住人の別名。 住人が後から来た = 使い回した) を外す。
+    ///   再生の前は、 再生がその行を生かし直せない物だけ (`prev.seg` に使い回しの記録がある = 再生の守りが当てない、 か再生する record
+    ///   が無い。 PR #1006 の読み直し [3]: 記録の無い本体が先の像で、 再生が前の住人を戻すと別名だけが写像を失った)。 仕上げは上の
+    ///   世代の別名 (本体にも WAL にも無い行を指す = 本体より先に届いた `eidalias`) も外す
+    /// - 死んだ場所: 使い回しの記録が、 指す行を場所から離した物だけ外す ([`Self::alias_row_left_slot`])。 死んだ場所の世代は使い回し
+    ///   でなくても進む (突き合わせが削除を完了させる時に 2 つ上げる) ので、 世代が下でも前の住人の証にならない (PR #1006 の読み直し [1]:
+    ///   前は 2 回目のきれいでない open が、 1 回目の突き合わせで世代を 2 つ上げた場所の消えた行の正しい別名を外した)。 上の世代も残す
+    ///   (読み直し [2]: 書き込みは死んだ場所に当たって捨てられる。 前は突き合わせで殺した使い回しの住人の別名を退避なしで外し、 その
+    ///   別名宛ての書き込みが新しい生きた行になった)
+    fn drop_stale_generation_aliases(&self, final_pass: bool, replay_follows: bool) {
         let gens = self.generations();
         if !gens.active() {
             return;
@@ -20540,16 +20554,28 @@ impl Engine {
         slots.sort_unstable();
         slots.dedup();
         for slot in slots {
-            let now = self.open_alias_row_gen(slot);
-            self.drop_former_generation_aliases(slot, now, final_pass.then_some(now));
+            if self.entities.is_live(slot) {
+                let now = self.alias_row_gen(slot);
+                let former = |g: u32| {
+                    self.alias_row_left_slot(slot, g, Some(now))
+                        && (final_pass || !replay_follows || gens.prev.evicted_at_or_after(slot, g))
+                };
+                self.drop_former_generation_aliases(slot, former, final_pass.then_some(now));
+            } else {
+                self.drop_former_generation_aliases(slot, |g| self.alias_row_left_slot(slot, g, None), None);
+            }
         }
     }
 
-    /// 開く道で、 場所 `slot` の最後の行の世代 ([`Self::alias_row_gen`]、 突き合わせが削除を完了させて仕上げを待つ場所は消えた行の世代)。
-    fn open_alias_row_gen(&self, slot: u32) -> u32 {
-        match self.generations().pending_row_gen(slot) {
-            Some(g) if !self.entities.is_live(slot) => g,
-            _ => self.alias_row_gen(slot),
+    /// 場所 `slot` を指す別名の指す行 (世代 `agen`) が、 場所を離れた行 (前の住人とそれより前の行) か。 `live_gen` = 場所の住人の世代
+    /// (生きている場所)。 生きている場所は住人より下の世代 (住人は後から来た = 使い回した)。 死んだ場所は `prev.seg` の使い回しの記録で
+    /// 決める (死んだ場所の世代は、 開く時の突き合わせが削除を完了させる時にも進む = 世代の大小は使い回しの証にならない、
+    /// [`crate::prev_slots::PrevSlots::evicted_at_or_after`])。 記録の無い使い回し (移す削除の無い前の住人 / 生きている印だけ届いた
+    /// 電源断の像、 review946 [3]) の古い別名は残る (死んだ場所なので書き込みは当たらない。 master は死んだ場所の別名を全部残した)。
+    fn alias_row_left_slot(&self, slot: u32, agen: u32, live_gen: Option<u32>) -> bool {
+        match live_gen {
+            Some(now) => agen < now,
+            None => self.generations().prev.evicted_at_or_after(slot, agen),
         }
     }
 
@@ -21893,7 +21919,17 @@ impl Engine {
     pub(crate) fn alias_row_gen(&self, slot: u32) -> u32 {
         match self.generations().bits() {
             0 | 32.. => 0,
-            b => self.last_local_of_slot(slot) >> b,
+            b => {
+                // 開く時の突き合わせが削除を完了させて仕上げ (`finish_reconcile`) を待つ場所は、 消えた行の世代 (世代を 2 つ上げた形が
+                // ある。 仕上げの後は `last_local_of_slot` が relog の世代で読む)。 PR #1006 の読み直し [1] の 「同じ根」: 前は再生の中で
+                // 張る別名 (中継した `Alias` の再生) が今 − 1 (無かった行) を指した
+                if !self.entities.is_live(slot)
+                    && let Some(r) = self.generations().pending_row_gen(slot)
+                {
+                    return r;
+                }
+                self.last_local_of_slot(slot) >> b
+            }
         }
     }
 

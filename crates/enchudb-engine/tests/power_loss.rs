@@ -6073,10 +6073,15 @@ fn bound_dead_alias_image(live: &Path, img: &Path, power_loss: bool) -> (u64, u6
 ///
 /// 前は再生の前の 1 か所が突き合わせの前の生死で場所を見て、 電源断の像 (生きている印だけ届かない) で S を生きていると読み、 K (退避表に
 /// 居る) を外して X の名前の記録を K に移した (#915 の型)。 kill の像は死んだ場所を飛ばしたので通る (変異 Q6 = 死んだ場所も見る形で落ちる)。
-fn a_bound_alias_of_a_dead_row_is_kept(tag: &str, power_loss: bool) {
+///
+/// `reopen` (PR #1006 の読み直し [1]): 開いた A の kill の像をもう一度開いても同じ。 電源断の像は、 突き合わせが削除を完了させる時に
+/// 場所の世代を 2 つ上げる (X の世代 + 2) ので、 開いた後の場所の読み (`last_local_of_slot`) は X + 1 (無かった行) になる。 前は
+/// 2 回目の open が K (X の世代) を 「場所の最後の行より下 = 前の住人の別名」 と読み、 退避表の K の削除の版数で X の名前 7 の記録を K に
+/// 移して外した (K の写像も消えた)。
+fn a_bound_alias_of_a_dead_row_is_kept(tag: &str, power_loss: bool, reopen: bool) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = scratch(tag);
-    let (live, img) = (root.join("live"), root.join("img"));
+    let (live, img, img2) = (root.join("live"), root.join("img"), root.join("img2"));
     std::fs::create_dir_all(&live).unwrap();
     crashsim::start();
     let (x, world_k, t_k) = bound_dead_alias_image(&live, &img, power_loss);
@@ -6086,24 +6091,41 @@ fn a_bound_alias_of_a_dead_row_is_kept(tag: &str, power_loss: bool) {
         let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
         (ro.resolve_remote_eid_existing(world_k), ro.eid_slot(x))
     };
+    let read = |eng: &Engine| {
+        let hk = eng.himo_id("t.k").unwrap() as u16;
+        (
+            eng.is_live(x),
+            eng.resolve_remote_eid_existing(world_k),
+            eng.deleted_name_version(hk, 7),
+            eng.deleted_before_create(world_k),
+        )
+    };
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     eng.set_peer_id(1);
-    let hk = eng.himo_id("t.k").unwrap() as u16;
-    let x_alive = eng.is_live(x);
-    let k_now = eng.resolve_remote_eid_existing(world_k);
-    let seven = eng.deleted_name_version(hk, 7);
-    let k_tomb = eng.deleted_before_create(world_k);
+    let first = read(&eng);
     let repairs = eng.generation_repairs();
+    if reopen {
+        // 開いた A を kill した像 (page cache に開く道の直しが届く、 きれいに閉じた印は立っていない)
+        kill_image(&img, &img2);
+    }
     drop(eng);
+    let second = reopen.then(|| {
+        let eng = Engine::open_concurrent_with_oplog(img2.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        read(&eng)
+    });
     let _ = std::fs::remove_dir_all(&root);
     let at_slot = Some(enchudb_oplog::make_eid(1, ro_slot));
     assert_eq!(ro_k, at_slot, "前提: 像の `eidalias` は K → X の場所");
     // 電源断の像: gen.seg の死の印は届き、 生きている印は届いていない (突き合わせが削除を完了させた)
     assert_eq!(repairs.0, u32::from(power_loss), "前提: 本体の生きている印と gen.seg の死の印 ({tag}): {repairs:?}");
-    assert!(!x_alive, "前提: 開いた A で X は消えている");
-    assert_eq!(k_now, at_slot, "消えた X の正しい別名 K を外した ({tag})");
-    assert_eq!(k_tomb, Some(t_k), "前提: K の削除は退避表に残る ({tag})");
-    assert_eq!(seven, Some(t_k), "X の名前 7 の削除が残らない ({tag})");
+    for (n, (x_alive, k_now, seven, k_tomb)) in std::iter::once(first).chain(second).enumerate() {
+        let n = n + 1;
+        assert!(!x_alive, "前提: 開いた A で X は消えている ({n} 回目)");
+        assert_eq!(k_now, at_slot, "消えた X の正しい別名 K を外した ({tag}、 {n} 回目の open)");
+        assert_eq!(k_tomb, Some(t_k), "前提: K の削除は退避表に残る ({tag}、 {n} 回目)");
+        assert_eq!(seven, Some(t_k), "X の名前 7 の削除が残らない ({tag}、 {n} 回目の open)");
+    }
 }
 
 #[test]
@@ -6111,7 +6133,7 @@ fn a_bound_alias_of_a_dead_row_is_kept_after_power_loss() {
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
-    a_bound_alias_of_a_dead_row_is_kept("bound_dead_alias_power_loss", true);
+    a_bound_alias_of_a_dead_row_is_kept("bound_dead_alias_power_loss", true, false);
 }
 
 #[test]
@@ -6119,7 +6141,102 @@ fn a_bound_alias_of_a_dead_row_is_kept_after_kill() {
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
-    a_bound_alias_of_a_dead_row_is_kept("bound_dead_alias_kill", false);
+    a_bound_alias_of_a_dead_row_is_kept("bound_dead_alias_kill", false, false);
+}
+
+/// PR #1006 の読み直し [1]: 上の電源断の像を開いた A を kill して、 もう一度開く。
+#[test]
+fn a_bound_alias_of_a_dead_row_is_kept_when_reopened_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    a_bound_alias_of_a_dead_row_is_kept("bound_dead_alias_power_loss_reopen", true, true);
+}
+
+/// PR #1006 の読み直し [1] の、 別名の identity が退避表に居ない形: 翻訳した行 F (C の行、 B の行 b を名前で畳んだ = b の世界番号は
+/// F の場所の別名) を C の削除で消す。 消す時機は本体の書き出しの生きている印の後・世代の前 (`BeforeGenerations`) で、 書き出しの
+/// 終わり (`WrittenOut`) で電源断 (gen.seg の死の印は届き、 生きている印は届かない)。 F を返す。
+fn dead_translated_alias_image(live: &Path, img: &Path) -> u64 {
+    let (eng, f) = translated_row_with_alias_engine(&live.join("db"));
+    let _hold = eng.hold_consumer();
+    let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (d2, s2, l, i, e2) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone());
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::BeforeGenerations && !d2.swap(true, Ordering::SeqCst) {
+            let e3 = e2.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                assert!(e3.remote_delete_apply_foreign(WORLD_F, F_DELETE), "前提: C の削除が F に当たった");
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 消すのが返った");
+        }
+        if p == Phase::WrittenOut && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
+            let _ = crashsim::capture(&l, &i, Mode::Lost);
+        }
+    })));
+    // 書き出す物を作る (本体の書き出しが段を通る)
+    let z = eng.entity_in("t").unwrap();
+    eng.tie_to(z, "t.c", 3u32);
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    write_out_hook::set(None);
+    assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で消して撮った");
+    f
+}
+
+/// PR #1006 の読み直し [1]: `dead_translated_alias_image` を開き、 開いた A を kill してもう一度開く。 b は消えた F の別名のまま (F の場所を
+/// 指す) で、 B の遅れた書き込み (F の削除を知らない、 b 宛て) は死んだ場所に当たって捨てられる (新しい行にならない)。
+///
+/// 前は 2 回目の open が b (F の世代) を 「場所の最後の行 (F + 1、 突き合わせが世代を 2 つ上げた) より下」 と読んで外し、 b の identity は
+/// 退避表に居ないので退避もせず、 B の遅れた書き込みが b に新しい生きた行を払い出した (幽霊行。 master は死んだ場所の別名を見ないので
+/// b を残した)。
+#[test]
+fn an_alias_of_a_dead_translated_row_is_kept_when_reopened_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("dead_translated_alias_reopen");
+    let (live, img, img2) = (root.join("live"), root.join("img"), root.join("img2"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let f = dead_translated_alias_image(&live, &img);
+    crashsim::stop();
+    let f_slot = {
+        let ro = Engine::open_readonly(img.join("db").to_str().unwrap()).unwrap();
+        let s = ro.eid_slot(f);
+        assert_eq!(ro.resolve_remote_eid_existing(WORLD_B2).map(|e| ro.eid_slot(e)), Some(s), "前提: 像の `eidalias` は b → F の場所");
+        s
+    };
+    // (b の行き先の場所, F が生きているか, 突き合わせの直した数, b 宛ての遅れた書き込みが当たったか / 生きた行になったか)
+    let read = |eng: &Engine, late: bool| {
+        let b_at = eng.resolve_remote_eid_existing(WORLD_B2).map(|e| eng.eid_slot(e));
+        let repaired = eng.generation_repairs();
+        let landed = late.then(|| {
+            let hid = eng.himo_id("t.c").unwrap() as u16;
+            let at = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
+            let t = eng.resolve_remote_eid(WORLD_B2, hid);
+            let applied = t.is_some_and(|t| eng.remote_tie_apply(t, hid, 4u32, at));
+            (applied, t.is_some_and(|t| eng.is_live(t)))
+        });
+        (b_at, eng.is_live(f), repaired, landed)
+    };
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let first = read(&eng, false);
+    kill_image(&img, &img2);
+    drop(eng);
+    let eng = Engine::open_concurrent_with_oplog(img2.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let second = read(&eng, true);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(first.2 .0, 1, "前提: 突き合わせが F の削除を完了させた (世代を 2 つ上げた): {:?}", first.2);
+    assert!(!first.1 && !second.1, "前提: 開いた A で F は消えている");
+    assert_eq!(first.0, Some(f_slot), "消えた F の別名 b を外した (1 回目の open)");
+    assert_eq!(second.3, Some((false, false)), "b 宛ての遅れた書き込みが当たった / 生きた行になった (幽霊行)");
+    assert_eq!(second.0, Some(f_slot), "消えた F の別名 b を外した (2 回目の open)");
 }
 
 /// #994 [C3]: `eidalias_behind_image` の電源断の像 (本体の X は生きている、 WAL に X の Delete と Y)。 再生が X の Delete で場所の名前の

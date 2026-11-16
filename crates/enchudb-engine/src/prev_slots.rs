@@ -429,6 +429,21 @@ impl PrevSlots {
         *self.replay.lock().unwrap_or_else(|p| p.into_inner()) = v;
     }
 
+    /// PR #1006 の読み直し [1]: 場所 `slot` を使い回した記録のうち、 前の住人の行の世代が `agen` 以上の物があるか (場所ごとの配列 =
+    /// 最後の使い回しか、 開く時に読んだ記録)。 あれば世代 `agen` の行は使い回しで場所を離れた (その後に別の行が住んだ)。 開く道が
+    /// 死んだ場所の別名を前の住人の物と見るかを決める (`Engine::alias_row_left_slot`): 死んだ場所の世代は、 開く時の突き合わせが削除を
+    /// 完了させる時に 2 つ上がる (`Engine::reconcile_generations` の 1.) ので、 場所の最後の行より下の世代でも使い回しの証にならない。
+    pub(crate) fn evicted_at_or_after(&self, slot: u32, agen: u32) -> bool {
+        let bits = self.bits.load(Ordering::Relaxed);
+        let gen_of = |gone: u32| if bits == 0 || bits >= 32 { 0 } else { gone >> bits };
+        if self.read(slot).is_some_and(|r| gen_of(r.gone) >= agen) {
+            return true;
+        }
+        let v = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+        let i = v.partition_point(|&(s, _, _)| s < slot);
+        v[i..].iter().take_while(|&&(s, _, _)| s == slot).any(|&(_, r, _)| gen_of(r.gone) >= agen)
+    }
+
     /// 場所 `slot` の前の住人が行 `gone` だった使い回しの記録: 場所ごとの配列 (最後の使い回し) か、 開く時に読んだ記録 (同じ場所の
     /// 前の使い回し。 log に残る全部 = 書き出した周期の記録も、 review946c [D])。
     pub(crate) fn record_of(&self, slot: u32, gone: u32) -> Option<PrevRecord> {
