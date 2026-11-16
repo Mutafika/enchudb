@@ -1994,9 +1994,11 @@ fn name_records_compacted_outside_the_lock_survive_power_loss_mid_compaction() {
     type Shot = (PathBuf, Vec<u8>, Vec<Option<Hlc>>);
     let shots: Arc<Mutex<Vec<(CPhase, Shot)>>> = Arc::new(Mutex::new(Vec::new()));
     let appended = Arc::new(AtomicBool::new(false));
+    // 追記の書き出しが返った後の disk の中身 (以後に撮った像は全部これを持つ)
+    let after_tail: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     {
-        let (eng, shots, appended, live, root, path) =
-            (eng.clone(), shots.clone(), appended.clone(), live.clone(), root.clone(), path.clone());
+        let (eng, shots, appended, live, root, path, after_tail) =
+            (eng.clone(), shots.clone(), appended.clone(), live.clone(), root.clone(), path.clone(), after_tail.clone());
         let churn = churn.clone();
         let versions = versions.clone();
         name_compact_hook::set(Some(Arc::new(move |phase| {
@@ -2008,10 +2010,10 @@ fn name_records_compacted_outside_the_lock_survive_power_loss_mid_compaction() {
             if n >= 4 {
                 return;
             }
-            // 置く前は、 撮る時の disk の中身 (`pkformer` + log) が像の中身。 置いた後 (lock の下、 disk は途中) は後で最後の中身と比べる
-            let expect = match phase {
-                CPhase::FormerPlaced => Vec::new(),
-                _ => Engine::pkformer_for_bootstrap(&path).unwrap().unwrap(),
+            // 像が持つべき中身: 追記の後は追記の書き出しが返った時の disk の中身。 前は撮る時の disk の中身 (`pkformer` + log)
+            let expect = match after_tail.lock().unwrap().clone() {
+                Some(t) => t,
+                None => Engine::pkformer_for_bootstrap(&path).unwrap().unwrap(),
             };
             let img = root.join(format!("img{n}"));
             crashsim::capture(&live, &img, Mode::Lost).unwrap();
@@ -2021,13 +2023,15 @@ fn name_records_compacted_outside_the_lock_survive_power_loss_mid_compaction() {
                 // 作り終えた後・置く前に、 書き手が進んで別の書き出しが log に追記する (置く時に当てて作り直す)
                 churn(ROWS as usize / 4);
                 eng.persist_sync_state().unwrap();
+                *after_tail.lock().unwrap() = Some(Engine::pkformer_for_bootstrap(&path).unwrap().unwrap());
             }
         })));
     }
     eng.compact_name_records_now();
     name_compact_hook::set(None);
+    // 置いた disk が memory と同じ (伸びた分を当てずに置くと違う)
+    let live_diff = eng.pkformer_disk_diff().unwrap();
     let fin = Engine::pkformer_for_bootstrap(&path).unwrap().unwrap();
-    let fin_versions = versions();
     let shots = std::mem::take(&mut *shots.lock().unwrap());
     crashsim::stop();
     let log_len = std::fs::metadata(enchudb_engine::db_files::path_for(&path, enchudb_engine::db_files::PKFORMER_LOG)).unwrap().len();
@@ -2038,16 +2042,14 @@ fn name_records_compacted_outside_the_lock_survive_power_loss_mid_compaction() {
         let img_db = img.join("db");
         let img_path = img_db.to_str().unwrap();
         let got = Engine::pkformer_for_bootstrap(img_path).unwrap();
-        // 置く前の像は撮った時の中身、 置いた後の像は最後の中身 (間に追記した分を含む)
-        let want = if *phase == CPhase::FormerPlaced { &fin } else { expect };
+        let want = expect;
         if got.as_deref() != Some(&want[..]) {
             failures.push(format!("像 {i} ({phase:?}): pkformer の中身が違う ({:?} B, 期待 {} B)", got.map(|g| g.len()), want.len()));
         }
         match Engine::open_concurrent_with_oplog(img_path, OPLOG_CAP) {
             Ok(back) => {
                 let got_v: Vec<Option<Hlc>> = (0..2 * ROWS).map(|n| back.deleted_name_version(key, n as u64)).collect();
-                let want_v = if *phase == CPhase::FormerPlaced { &fin_versions } else { vers };
-                if &got_v != want_v {
+                if &got_v != vers {
                     failures.push(format!("像 {i} ({phase:?}): 消した名前の版数が違う"));
                 }
                 if let Some(d) = back.pkformer_disk_diff().unwrap() {
@@ -2058,13 +2060,17 @@ fn name_records_compacted_outside_the_lock_survive_power_loss_mid_compaction() {
         }
     }
     let _ = std::fs::remove_dir_all(&root);
+    let after_tail = after_tail.lock().unwrap().clone();
+    assert!(after_tail.is_some() && phases.contains(&CPhase::FormerPlaced), "前提: 作り終えた後に追記があり、 置いた ({phases:?})");
+    assert!(failures.is_empty(), "{phases:?}: {failures:#?}");
+    assert_eq!(live_diff, None, "まとめ直して置いた disk が memory と違う");
+    assert_eq!(Some(fin), after_tail, "置いた disk の中身が、 置く前に書き出しの返った中身と違う");
     assert_eq!(
         phases,
         vec![CPhase::FormerPrepared, CPhase::FormerPrepared, CPhase::FormerPlaced],
         "前提: 作り終えた後に追記があり、 当てて作り直してから置いた"
     );
     assert_eq!(log_len, 24, "前提: まとめ直した後の log は header だけ");
-    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// review987 [1]: `pktombs` のまとめ直しは書き出しの lock の外で作り、 作っている間に別の書き出しが追記した分 (伸びた分) を一時 file の
