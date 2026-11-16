@@ -7441,8 +7441,8 @@ fn a_relayed_write_to_a_former_alias_does_not_hit_the_new_resident_on_replay() {
 
 /// #994 [C4] の死んだ場所 (PR #1006 の 2 回目の読み直し): 翻訳した行 F (B の行 b を畳んだ) を C の削除で消し、 Y で F の場所を使い回す
 /// (使い回しが b を外して退避する)。 B の遅れた b 宛ての書き込みが b を新しい死んだ場所 S2 に払い直し (`.eidmap` の (B, b) → S2)、 Y も
-/// 消す (F の場所は死んだ場所)。 sidecar の書き出しを `.eidmap` の後・`eidalias` の前で kill (`eidalias` は使い回しの前 = b → F の場所)。
-/// (F の場所, S2) を返す。
+/// 消す (F の場所は死んだ場所)。 WAL と本体を書き出してから、 sidecar の書き出しを `.eidmap` の後・`eidalias` の前で kill (`eidalias` は
+/// 使い回しの前 = b → F の場所)。 (F の場所, S2) を返す。
 fn overridden_alias_at_dead_slot_image(live: &Path, img: &Path) -> (u32, u32) {
     let (eng, f) = translated_row_with_alias_engine(&live.join("db"));
     let f_slot = eng.eid_slot(f);
@@ -7459,6 +7459,11 @@ fn overridden_alias_at_dead_slot_image(live: &Path, img: &Path) -> (u32, u32) {
     assert!(!eng.is_live(late), "前提: 払い直した場所は退避表の削除で死んでいる");
     eng.delete(y);
     eng.oplog_commit();
+    // WAL と本体を書き出して checkpoint を Y の record の先へ (`oplog_sync` は `.eidmap` / `eidalias` を書かない)。 再生が Y の record で
+    // 場所を生かし直す所 (使い回しの移り目の外し) を通らない = 開く道の仕上げのなめだけが b を見る
+    eng.oplog_sync().unwrap();
+    let s = eng.stats();
+    assert_eq!(s.oplog_checkpoint, s.oplog_head, "前提: checkpoint が Y の削除の先まで進んだ");
     let shot = Arc::new(AtomicBool::new(false));
     let (s3, l, i) = (shot.clone(), live.to_path_buf(), img.to_path_buf());
     write_out_hook::set(Some(Arc::new(move |p: Phase| {
