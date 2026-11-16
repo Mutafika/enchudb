@@ -134,8 +134,8 @@ fn log_off(half: u32, i: u32) -> usize {
 /// (場所, 記録) の並び。
 pub(crate) type Records = Vec<(u32, PrevRecord)>;
 
-/// 開く時に戻すかを WAL の再生の後に回した記録 (場所, 記録, 退避が書き出し済みか, 書き出していなければ外す別名)。
-pub(crate) type Deferred = (u32, PrevRecord, bool, Vec<(PeerId, u32)>);
+/// 開く時に戻すかを WAL の再生の後に回した記録 (場所, 記録, 退避が書き出し済みか)。
+pub(crate) type Deferred = (u32, PrevRecord, bool);
 
 /// 前の住人が自分の行か、 翻訳した行 (受けた他の peer の行) か。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,8 +316,8 @@ pub(crate) struct PrevSlots {
     /// 開く時に記録から戻した自分の行の削除 (前の住人の行, 削除の版数)。 #451 の作り直しが WAL に無い Delete を載せる
     /// ([`Self::take_restored_own`]、 review946c [E])
     restored_own: std::sync::Mutex<Vec<(u32, Hlc)>>,
-    /// 開く時に戻すかを WAL の再生の後に回した記録 (場所, 記録, 退避が書き出し済みか, 書き出していなければ外す別名 = 再生の前の
-    /// 場所の別名)。 review946d [N1] (`Engine::finish_prev_restores`)、 読み直し 2 [B3]
+    /// 開く時に戻すかを WAL の再生の後に回した記録 (場所, 記録, 退避が書き出し済みか)。 review946d [N1]
+    /// (`Engine::finish_prev_restores`)
     deferred: std::sync::Mutex<Vec<Deferred>>,
     /// 読み直し 2 [B2] (#969 / #968 の PR): きれいに閉じなかった後に開く道が、 前の住人の後始末 (記録から戻す・WAL の再生のやり直し・
     /// 後に回した戻し) を memory に作り終えるまで立てる ([`Self::hold_open`] / [`Self::release_open`])。 立っている間の
@@ -497,10 +497,10 @@ impl PrevSlots {
         std::mem::take(&mut *self.restored_own.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
-    /// 開く時に戻すかを WAL の再生の後に回す (review946d [N1])。 `aliases` = 退避が書き出されていなければ外す別名 (再生の前の場所の
-    /// 別名、 読み直し 2 [B3])。
-    pub(crate) fn defer_restore(&self, slot: u32, rec: PrevRecord, written: bool, aliases: Vec<(PeerId, u32)>) {
-        self.deferred.lock().unwrap_or_else(|p| p.into_inner()).push((slot, rec, written, aliases));
+    /// 開く時に戻すかを WAL の再生の後に回す (review946d [N1])。 外す別名は戻す時に世代で決める (#993 / #994。 前は再生の前の場所の
+    /// 別名を控えた、 読み直し 2 [B3])。
+    pub(crate) fn defer_restore(&self, slot: u32, rec: PrevRecord, written: bool) {
+        self.deferred.lock().unwrap_or_else(|p| p.into_inner()).push((slot, rec, written));
     }
 
     /// 後に回した記録 (取り出す、 回した順)。
