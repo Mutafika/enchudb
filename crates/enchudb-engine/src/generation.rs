@@ -202,13 +202,29 @@ impl Generations {
     /// #970: 場所 `slot` の page (の手前まで) の gen.seg を commit する (書かない)。 commit 済みなら atomic の load だけ。 この後の
     /// [`Self::kill`] / [`Self::raise`] は commit の失敗では落ちない (commit は縮まない)。 書けなければ (ディスクの空き) Err。
     pub(crate) fn commit_slot(&self, slot: u32) -> std::io::Result<()> {
-        let Some(r) = self.region.get() else { return Ok(()) };
+        match self.slot_page_end(slot) {
+            Some((r, end)) => r.ensure_committed(end),
+            None => Ok(()),
+        }
+    }
+
+    /// #970: 場所 `slot` の page まで gen.seg が commit 済みか (atomic の load だけ)。 範囲の外と gen.seg の無い DB は true
+    /// ([`Self::commit_slot`] が何もしない)。
+    #[inline]
+    pub(crate) fn slot_committed(&self, slot: u32) -> bool {
+        self.slot_page_end(slot).is_none_or(|(r, end)| r.is_committed(end))
+    }
+
+    /// 場所 `slot` を書くために commit する長さ (page の終わり)。 範囲の外 / gen.seg の無い DB は None。
+    #[inline]
+    fn slot_page_end(&self, slot: u32) -> Option<(&Region, usize)> {
+        let r = self.region.get()?;
         let off = slot_off(slot);
         if off + 2 > r.len() {
-            return Ok(());
+            return None;
         }
         let page_end = slot_off(((slot >> PAGE_SHIFT) + 1) << PAGE_SHIFT).min(r.len());
-        r.ensure_committed(page_end.max(off + 2))
+        Some((r, page_end.max(off + 2)))
     }
 
     /// 開いた DB の `gen.seg` (header に場所の bit が焼いてある)。 中身の header が合わなければ Err。

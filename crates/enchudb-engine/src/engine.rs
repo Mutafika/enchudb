@@ -22098,7 +22098,9 @@ impl Engine {
     /// 持たない DB (v14) と予約の表 (世代を持たない) は何もしない。 commit 済みなら atomic の load だけ。
     fn gen_room(&self, slot: u32) -> bool {
         let gens = self.generations();
-        if !gens.active() || !self.slot_is_generational(slot) {
+        // commit 済みかを先に見る (atomic の load だけ)。 表を引く `slot_is_generational` は、 前の表の extent の lock (`extra`) を
+        // 読みにいくので、 書き手を並べた削除で取り合う (先に引く形は書き手 8 本の削除 1 回が 1.2〜1.7 倍だった)。 commit が要る時だけ引く
+        if !gens.active() || gens.slot_committed(slot) || !self.slot_is_generational(slot) {
             return true;
         }
         if gens.commit_slot(slot).is_err() {
