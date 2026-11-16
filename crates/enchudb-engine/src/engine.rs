@@ -23852,10 +23852,13 @@ impl Engine {
     #[inline]
     fn gen_slot_ready(&self, slot: u32) -> io::Result<()> {
         #[cfg(test)]
-        let forced = gen_io_fail_hook::forced().map(|k| Err(io::Error::new(k, "test: gen.seg の I/O の失敗")));
+        let r = match gen_io_fail_hook::forced() {
+            Some(k) => Err(io::Error::new(k, "test: gen.seg の I/O の失敗")),
+            None => self.generations().ensure_slot(slot),
+        };
         #[cfg(not(test))]
-        let forced = None;
-        forced.unwrap_or_else(|| self.generations().ensure_slot(slot)).inspect_err(|e| {
+        let r = self.generations().ensure_slot(slot);
+        r.inspect_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull {
                 self.record_fault(FaultKind::DiskSpace, "gen.seg の page を commit できない — 場所を払い出さない (#970)");
             } else {
