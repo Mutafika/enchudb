@@ -4,13 +4,25 @@
 //! (`tables` の #884 と同じ形)。
 //!
 //! rename の戻りは crashsim の像では作れないので、 I/O の点 (`enchudb_oplog::io_point`) を通った順で確かめる: sidecar の書き出し 1 回の
-//! 中で `sidecar.rename` (`eidalias`) → `prev.dir_sync` → `segment.msync` (`prev.seg` の header)。 点の記録 (`ENCHU_FAULT_TRACE`) は
-//! process に 1 つなので、 この file の試験は 1 本だけ。
+//! 中で `sidecar.rename` (`eidalias`) → `prev.dir_sync` → `segment.msync` (`prev.seg` の header)。 点の名前は rename した file を
+//! 言わない (`tables` の rename も同じ点) ので、 書き出しの前後で sidecar の inode を比べ、 置き換わった周期の約束の sidecar
+//! (`tables` / `eidmap` (.log) / `eidalias` / `pktombs` / `pkformer` (.log)) の数だけ directory の fsync の前に rename があり、 その中に `eidalias`
+//! があることも見る (review946d [N4])。 点の記録 (`ENCHU_FAULT_TRACE`) は process に 1 つなので、 この file の試験は 1 本だけ。
 
 #![cfg(all(feature = "crashsim", unix))]
 
 use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::Hlc;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+
+/// 周期の約束 (使い回しの退避の載る sidecar を書いてから directory を fsync して周期を進める) の sidecar。 `vocabmap` は約束の外 (後に書く)
+const PROMISED: [&str; 7] = ["tables", "eidmap", "eidmap.log", "eidalias", "pktombs", "pkformer", "pkformer.log"];
+
+/// sidecar の inode (無ければ None)。 rename で置き換わると変わる。
+fn inodes(db: &Path) -> Vec<Option<u64>> {
+    PROMISED.iter().map(|f| std::fs::metadata(db.join(f)).ok().map(|m| m.ino())).collect()
+}
 
 #[test]
 fn the_sidecar_renames_are_synced_before_the_persisted_epoch_is_written_out() {
@@ -51,7 +63,7 @@ fn the_sidecar_renames_are_synced_before_the_persisted_epoch_is_written_out() {
             .map(|l| l.split('\t').nth(1).unwrap_or_default().to_string())
             .collect()
     };
-    let sites = {
+    let (sites, before, after) = {
         let _hold = eng.hold_consumer();
         // X を消して場所を使い回し (記録を書く)、 b を Y の別名にする (`eidalias` を書き直す = rename)
         eng.delete(x);
@@ -60,17 +72,25 @@ fn the_sidecar_renames_are_synced_before_the_persisted_epoch_is_written_out() {
         assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: 場所を使い回した");
         eng.tie_to(y, "t.k", 7u32);
         eng.merge_entity_into(b, y).unwrap();
+        let before = inodes(&db);
         let start = read().len();
         eng.persist_tables().unwrap();
-        read()[start..].to_vec()
+        (read()[start..].to_vec(), before, inodes(&db))
     };
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
+    let replaced: Vec<&str> = PROMISED.iter().zip(before.iter().zip(&after)).filter(|(_, (b, a))| b != a).map(|(f, _)| *f).collect();
+    assert!(replaced.contains(&"eidalias"), "前提: この書き出しが `eidalias` を置き換えた: {replaced:?}");
     let i = sites
         .iter()
         .position(|s| s == "prev.dir_sync")
         .unwrap_or_else(|| panic!("`prev.seg` の周期を進める前に directory を fsync していない: {sites:?}"));
-    assert!(sites[..i].iter().any(|s| s == "sidecar.rename"), "前提: sidecar を rename した: {sites:?}");
+    let renamed_before = sites[..i].iter().filter(|s| *s == "sidecar.rename").count();
+    assert_eq!(
+        renamed_before,
+        replaced.len(),
+        "置き換えた周期の約束の sidecar ({replaced:?}) の rename が directory の fsync の前に揃っていない: {sites:?}"
+    );
     assert!(
         sites[i + 1..].iter().any(|s| s == "segment.msync"),
         "前提: 周期を進めた `prev.seg` の header の書き出しが directory の fsync の後にある: {sites:?}"

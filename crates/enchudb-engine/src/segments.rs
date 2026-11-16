@@ -123,6 +123,12 @@ pub trait SegmentSizes {
 /// `ensure_committed` が書きに応じて伸ばす。
 const INITIAL_COMMIT: usize = 4096;
 
+#[cfg(test)]
+thread_local! {
+    /// 試験用: この thread の次の [`SegmentSet::open_prev`] を失敗させる (review946d [N5])。
+    pub(crate) static FAIL_NEXT_OPEN_PREV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// [`SegmentSet::flush_all_spread`] が並べる thread の数 (呼んだ thread を含む)。
 const FLUSH_ALL_WORKERS: usize = 8;
 
@@ -498,9 +504,25 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// `prev.seg` を作る (file が無い時だけ、 作ったら Ok(true))。 有る file は開かずに Ok(false): review946d [N5] 開く時に開けなかった
+    /// `prev.seg` (一時的な失敗) を後で作る道 (`Engine::ensure_prev_seg`) が開いて 0 に戻すと、 書き出していない記録を黙って捨てた。
+    pub fn create_prev(&self, size: usize) -> io::Result<bool> {
+        let p = Self::path_of(&self.dir, SegmentKind::Prev);
+        let mut g = self.prev.write().unwrap();
+        if g.is_some() || p.exists() {
+            return Ok(false);
+        }
+        *g = Some(Arc::new(SegmentMap::create(&p, size, INITIAL_COMMIT.min(size))?));
+        Ok(true)
+    }
+
     /// 開いた v15 の DB の `prev.seg` を開く。 無ければ、 `create` (書ける open) なら作る (前の binary が作った v15 の DB = 記録なし)、
     /// でなければ開かない (Ok(false))。 開けた / 作れたら Ok(true)。
     pub fn open_prev(&self, size: usize, create: bool) -> io::Result<bool> {
+        #[cfg(test)]
+        if FAIL_NEXT_OPEN_PREV.with(|f| f.replace(false)) {
+            return Err(io::Error::other("test: open_prev fails once"));
+        }
         let p = Self::path_of(&self.dir, SegmentKind::Prev);
         let seg = if p.exists() {
             SegmentMap::open(&p, size, self.readonly)

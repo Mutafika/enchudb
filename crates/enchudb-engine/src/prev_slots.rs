@@ -34,7 +34,8 @@
 //!
 //! header (4 KiB、 `PRV4`): 0..4 magic、 4..8 行の番号の場所の bit、 8..16 書き出した周期 (u64)、 16..24 log の区画が一杯だった
 //! 周期の最大 (u64)。 周期は u64 (review946c [F]: u32 は受けた batch ごとに書き出すホストで数か月〜年であふれ、 黙って記録を
-//! 戻さなくなった。 前の形 `PRV3` は開く時に 0 から始める)。
+//! 戻さなくなった。 前の形 `PRV3` は件の形が同じなので、 書ける open が header を写して続ける (review946d [N3]。 `PRV1` / `PRV2` は
+//! 0 から始める))。
 //!
 //! check は語ごとに別の奇数を掛けて足す (掛け算が互いに独立 = 依存の鎖にならない。 前の 「語ごとに混ぜる」 は 11 段の鎖で、 使い回し
 //! 1 回の値段の 1/4 ほどだった)。
@@ -83,7 +84,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// `prev.seg` の先頭の header の長さ。
 pub(crate) const PREV_HEADER: usize = 4096;
-/// `PRV4`: 周期を u64 に (review946c [F]。 この PR の前の commit の `PRV1` / `PRV2` / `PRV3` は開く時に 0 から始める)
+/// `PRV4`: 周期を u64 に (review946c [F]。 この PR の前の commit の `PRV1` / `PRV2` は開く時に 0 から始め、 `PRV3` は header を写す)
 const MAGIC: [u8; 4] = *b"PRV4";
 /// header: 行の番号 (世代 | 場所) の場所の bit (配列の記録は世代だけを持つ)
 const H_BITS: usize = 4;
@@ -91,6 +92,12 @@ const H_BITS: usize = 4;
 const H_PERSISTED: usize = 8;
 /// header: log の区画が一杯で配列にだけ書いた周期の最大 (u64)
 const H_OVERFLOW: usize = 16;
+/// 前の形 `PRV3` (周期 u32。 件の形は `PRV4` と同じ = 開く時に header を写す、 review946d [N3]): 4 = 書き出した周期、 8 = 一杯だった
+/// 周期、 12 = 場所の bit
+const MAGIC_PRV3: [u8; 4] = *b"PRV3";
+const PRV3_PERSISTED: usize = 4;
+const PRV3_OVERFLOW: usize = 8;
+const PRV3_BITS: usize = 12;
 /// log の 1 件の長さ。
 pub(crate) const ENTRY: usize = 48;
 const WORDS: usize = ENTRY / 4;
@@ -306,6 +313,9 @@ pub(crate) struct PrevSlots {
     /// 開く時に記録から戻した自分の行の削除 (前の住人の行, 削除の版数)。 #451 の作り直しが WAL に無い Delete を載せる
     /// ([`Self::take_restored_own`]、 review946c [E])
     restored_own: std::sync::Mutex<Vec<(u32, Hlc)>>,
+    /// 開く時に戻すかを WAL の再生の後に回した記録 (場所, 記録, 退避が書き出し済みか)。 review946d [N1]
+    /// (`Engine::finish_prev_restores`)
+    deferred: std::sync::Mutex<Vec<(u32, PrevRecord, bool)>>,
 }
 
 impl PrevSlots {
@@ -323,6 +333,7 @@ impl PrevSlots {
             log_full: AtomicU64::new(0),
             replay: std::sync::Mutex::new(Vec::new()),
             restored_own: std::sync::Mutex::new(Vec::new()),
+            deferred: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -368,9 +379,20 @@ impl PrevSlots {
         self.restored_own.lock().unwrap_or_else(|p| p.into_inner()).push((gone, tomb));
     }
 
-    /// 開く時に記録から戻した自分の行の削除 (取り出す)。
+    /// 開く時に記録から戻した自分の行の削除 (取り出す)。 tomb.seg のなめと同じ (版数, 行) を含みうる (呼び手の #451 の作り直しが
+    /// 重ねを落とす、 review946d [N2])。
     pub(crate) fn take_restored_own(&self) -> Vec<(u32, Hlc)> {
         std::mem::take(&mut *self.restored_own.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// 開く時に戻すかを WAL の再生の後に回す (review946d [N1])。
+    pub(crate) fn defer_restore(&self, slot: u32, rec: PrevRecord, written: bool) {
+        self.deferred.lock().unwrap_or_else(|p| p.into_inner()).push((slot, rec, written));
+    }
+
+    /// 後に回した記録 (取り出す、 回した順)。
+    pub(crate) fn take_deferred(&self) -> Vec<(u32, PrevRecord, bool)> {
+        std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     pub(crate) fn restored(&self) -> u32 {
@@ -383,9 +405,10 @@ impl PrevSlots {
     }
 
     /// 開いた v15 の DB の `prev.seg` (行の番号の場所の bit は `bits`)。 header が合わない (作った直後に落ちた / 前の binary の残り /
-    /// 前の形 `PRV1`〜`PRV3` / 場所の bit が違う) 時は、 `writable` なら中身を 0 に戻して使う (記録なし、 [`Self::prepare`])、 readonly
-    /// なら使わない。 使えない時は None、 0 に戻した時は Some(true) (呼び手は header の page を書き出す)。 `flush` は `prev.seg` の
-    /// 範囲 (off, len) を書き出す。
+    /// 前の形 `PRV1` / `PRV2` / 場所の bit が違う) 時は、 `writable` なら中身を 0 に戻して使う (記録なし、 [`Self::prepare`])、 readonly
+    /// なら使わない。 前の形 `PRV3` (場所の bit が合う) は、 `writable` なら header を写して記録ごと使う (review946d [N3])。 使えない
+    /// 時は None、 header を書き換えた (0 に戻した / 写した) 時は Some(true) (呼び手は header の page を書き出す)。 `flush` は
+    /// `prev.seg` の範囲 (off, len) を書き出す。
     pub(crate) fn attach(
         &self,
         region: Region,
@@ -394,7 +417,8 @@ impl PrevSlots {
         flush: impl Fn(usize, usize) -> std::io::Result<()>,
     ) -> Option<bool> {
         let committed = region.committed_len() >= PREV_HEADER;
-        let ok = committed && region.read_atomic(0, 4) == MAGIC && region.as_atomic_u32(H_BITS).load(Ordering::Relaxed) == bits;
+        let magic = if committed { region.read_atomic(0, 4) } else { Vec::new() };
+        let ok = magic == MAGIC && region.as_atomic_u32(H_BITS).load(Ordering::Relaxed) == bits;
         if ok {
             let _ = self.region.set(region);
             self.bits.store(bits, Ordering::Relaxed);
@@ -404,18 +428,46 @@ impl PrevSlots {
         if !writable {
             return None;
         }
+        // review946d [N3]: `PRV3` は件の形 (log の 48 B・配列の 32 B・check) が `PRV4` と同じで、 header の 3 欄 (周期 u32 → u64 と
+        // 場所の bit の位置) だけ違う。 header を写して続ける (0 から始めると、 その binary で書いてきれいに閉じなかった DB の記録を
+        // 全部落とした)
+        if magic == MAGIC_PRV3 && region.as_atomic_u32(PRV3_BITS).load(Ordering::Relaxed) == bits {
+            Self::upgrade_prv3_header(&region, bits);
+            let _ = self.region.set(region);
+            self.bits.store(bits, Ordering::Relaxed);
+            self.load_state();
+            return Some(true);
+        }
         // review946c [I]: 前の中身 (前の形の header / 場所の bit の違う header) を捨てる時は言う
         if committed && region.as_atomic_u32(0).load(Ordering::Relaxed) != 0 {
-            let magic = region.read_atomic(0, 4);
+            // 場所の bit の位置は形ごと (`PRV1` / `PRV2` は持たない)
+            let their_bits = match magic.as_slice() {
+                m if m == MAGIC => Some(H_BITS),
+                m if m == MAGIC_PRV3 => Some(PRV3_BITS),
+                _ => None,
+            }
+            .map_or_else(String::new, |off| format!(", slot bits {}", region.as_atomic_u32(off).load(Ordering::Relaxed)));
             eprintln!(
-                "warning: prev.seg ({}, slot bits {}) does not match this binary ({}, slot bits {bits}); starting it over \
+                "warning: prev.seg ({}{their_bits}) does not match this binary ({}, slot bits {bits}); starting it over \
                  (reuse records of an unclean shutdown before this open are dropped)",
                 String::from_utf8_lossy(&magic),
-                region.as_atomic_u32(H_BITS).load(Ordering::Relaxed),
                 String::from_utf8_lossy(&MAGIC),
             );
         }
         self.prepare(region, bits, flush).is_ok().then_some(true)
+    }
+
+    /// review946d [N3]: `PRV3` の header (4 = 書き出した周期 u32、 8 = 一杯だった周期 u32、 12 = 場所の bit) を `PRV4` の形に写す。
+    /// 3 欄を読んでから新しい位置に置き、 magic を最後に書く (header の page は呼び手が書き出す)。 書き換えの途中の page が先に disk に
+    /// 届いた像 (magic は `PRV3`、 場所の bit の位置に周期の上位 = 0) は、 次に開く時に場所の bit が合わず 0 から始める (前と同じ)。
+    fn upgrade_prv3_header(region: &Region, bits: u32) {
+        let persisted = u64::from(region.as_atomic_u32(PRV3_PERSISTED).load(Ordering::Relaxed));
+        let overflow = u64::from(region.as_atomic_u32(PRV3_OVERFLOW).load(Ordering::Relaxed));
+        region.as_atomic_u64(H_OVERFLOW).store(overflow, Ordering::Relaxed);
+        region.as_atomic_u64(H_PERSISTED).store(persisted, Ordering::Relaxed);
+        region.as_atomic_u32(H_BITS).store(bits, Ordering::Relaxed);
+        region.write_atomic(0, &MAGIC);
+        region.mark_dirty(0, PREV_HEADER);
     }
 
     /// 0 から始める (前の残りは消す): v15 に移る時 / 開いた `prev.seg` の header が合わない時。 header の page は呼び手が書き出す
@@ -950,9 +1002,9 @@ mod tests {
             p.prepare(region(&mut buf), 24, no_flush).unwrap();
             assert!(p.write(3, &own(3, 1, 7)));
         }
-        // 前の形の header (`PRV3`) と前の件
+        // 前の形の header (`PRV2`、 件の形が違う) と前の件
         let r = region(&mut buf);
-        r.write_atomic(0, b"PRV3");
+        r.write_atomic(0, b"PRV2");
         let base = buf.as_ptr() as usize;
         let len = buf.len() * 8;
         let flushed = std::cell::Cell::new(0usize);
@@ -970,6 +1022,54 @@ mod tests {
         assert!(flushed.get() > log_off(1, 0), "前提: 前の件の所まで書き出した");
         assert_eq!(q.unpersisted(), vec![], "前の形の件を読んだ");
         assert_eq!(q.read(3), None);
+    }
+
+    /// review946d [N3]: 前の形 `PRV3` (この PR の途中の binary、 周期 u32) の file は、 書ける open が header を写して記録ごと使う
+    /// (件の形は `PRV4` と bit まで同じ = 2^32 より前の周期の件は今の binary が書く物と同じ)。 場所の bit が違う `PRV3` と readonly は
+    /// 今まで通り (0 から始める / 使わない)。
+    #[test]
+    fn a_prv3_file_keeps_its_records() {
+        let mut buf = vec![0u64; segment_len(8).div_ceil(8)];
+        let want = {
+            let p = PrevSlots::off();
+            p.prepare(region(&mut buf), 24, no_flush).unwrap();
+            assert!(p.write(3, &own(3, 1, 7))); // 周期 1 (書き出す)
+            let e = p.begin_persist().unwrap();
+            assert!(p.end_persist(e));
+            assert!(p.write(5, &own(5, 1, 9))); // 周期 2 (書き出していない = 落ちた像で戻す)
+            p.unpersisted()
+        };
+        assert_eq!(want, vec![(5, own(5, 1, 9))], "前提: 書き出していない記録が 1 つ");
+        // header を `PRV3` の形に書き直す (4 = 書き出した周期 u32、 8 = 一杯だった周期 u32、 12 = 場所の bit)
+        let to_prv3 = |buf: &mut [u64], bits: u32| {
+            let r = region(buf);
+            let persisted = r.as_atomic_u64(H_PERSISTED).load(Ordering::Relaxed);
+            let overflow = r.as_atomic_u64(H_OVERFLOW).load(Ordering::Relaxed);
+            r.as_atomic_u64(H_OVERFLOW).store(0, Ordering::Relaxed);
+            r.as_atomic_u32(PRV3_PERSISTED).store(persisted as u32, Ordering::Relaxed);
+            r.as_atomic_u32(PRV3_OVERFLOW).store(overflow as u32, Ordering::Relaxed);
+            r.as_atomic_u32(PRV3_BITS).store(bits, Ordering::Relaxed);
+            r.write_atomic(0, &MAGIC_PRV3);
+        };
+        let saved = buf.clone();
+        to_prv3(&mut buf, 24);
+        assert_eq!(PrevSlots::off().attach(region(&mut buf), false, 24, no_flush), None, "readonly で `PRV3` を使った");
+        let q = PrevSlots::off();
+        assert_eq!(q.attach(region(&mut buf), true, 24, no_flush), Some(true), "写した header を書き出させない");
+        assert_eq!(q.unpersisted(), want, "`PRV3` の書き出していない記録を落とした");
+        assert_eq!(q.read(3), Some(own(3, 1, 7)), "`PRV3` の配列の記録を落とした");
+        assert_eq!(q.epoch.load(Ordering::Relaxed), 3, "写した後の周期");
+        assert_eq!(buf, saved, "写した header が `PRV4` の header と違う");
+        // 開き直しても同じ (`PRV4` として開く)
+        let again = PrevSlots::off();
+        assert_eq!(again.attach(region(&mut buf), true, 24, no_flush), Some(false));
+        assert_eq!(again.unpersisted(), want);
+        // 場所の bit が違う `PRV3` は 0 から始める
+        to_prv3(&mut buf, 20);
+        let other = PrevSlots::off();
+        assert_eq!(other.attach(region(&mut buf), true, 24, no_flush), Some(true));
+        assert_eq!(other.unpersisted(), vec![], "場所の bit が違う `PRV3` の記録を読んだ");
+        assert_eq!(other.read(3), None);
     }
 
     /// log の区画が一杯の周期は配列にだけ書き、 その周期を書き出す前に開くと配列から戻す。

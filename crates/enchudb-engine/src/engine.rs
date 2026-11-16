@@ -11450,13 +11450,19 @@ impl Engine {
                 // 使い回しの退避を失う前の形、 #914 の窓だけ残る)
                 match set.open_prev(layout.segment_reserve(SegmentKind::Prev), false) {
                     Ok(true) => {
-                        // 0 から始めた header は書き出す (記録の page だけ届いて header の無い像を作らない、 review946 [10])
+                        // 0 から始めた / 前の形 (`PRV3`) から写した header は書き出す (記録の page だけ届いて header の無い像を
+                        // 作らない、 review946 [10])
                         let flush = |off, len| set.flush_kind(SegmentKind::Prev, off, len);
-                        if generations.prev.attach(set.region(SegmentKind::Prev), !readonly, u32::from(layout.gen_bits), flush)
-                            == Some(true)
-                            && let Err(e) = set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)
-                        {
-                            eprintln!("warning: prev.seg header could not be written out: {e}");
+                        match generations.prev.attach(set.region(SegmentKind::Prev), !readonly, u32::from(layout.gen_bits), flush) {
+                            Some(true) => {
+                                if let Err(e) = set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER) {
+                                    eprintln!("warning: prev.seg header could not be written out: {e}");
+                                }
+                            }
+                            // review946d [N5]: 0 から始められなかった (書き出せない)。 後の `ensure_prev_seg` は file の有る
+                            // `prev.seg` を触らない
+                            None if !readonly => eprintln!("warning: prev.seg could not be started over (reuse records are not kept)"),
+                            _ => {}
                         }
                     }
                     Ok(false) => {}
@@ -19386,14 +19392,65 @@ impl Engine {
     /// review946 [6])。
     ///
     /// `records` は `.eidmap` を読む前に読んで置いた書き出していない記録 ([`Self::load_prev_records`])。
+    ///
+    /// review946d [N1]: 自分の行の記録で、 前の住人の削除は本体に届き使い回しは届いていない像 (場所の最後の行が記録の行で死んでいる)
+    /// は、 WAL に再生する record があれば戻すかを再生の後に決める ([`Self::finish_prev_restores`])。 再生は、 本体にだけ届いた削除を
+    /// その行の古い record で取り消す (`replay_slot` の `restore`)。 前は再生の前に戻し、 再生が生き返らせた行の Delete を state に出し、
+    /// #451 の作り直しも配った (A では生きていて、 peer では消える)。 翻訳した行の記録はこの像で写像が場所を指したままなので戻さない
+    /// (下の写像の守り)。
     fn restore_prev_residents(&self, records: &[(u32, crate::prev_slots::PrevRecord)]) {
         let gens = self.generations();
         let prev = &gens.prev;
         if !prev.active() || !gens.active() {
             return;
         }
-        let restored = records.iter().filter(|&&(slot, rec)| self.restore_prev_resident(slot, rec)).count();
+        let mut replay_follows: Option<bool> = None;
+        let mut restored = 0u32;
+        for &(slot, rec) in records {
+            if rec.kind == crate::prev_slots::PrevKind::Own
+                && self.last_row_unmarked(slot) == (rec.gone, true)
+                && *replay_follows.get_or_insert_with(|| self.wal_has_records_to_replay())
+            {
+                // 退避が書き出し済みかは再生の前の退避表で決める (再生の後始末のやり直し `redo_reuse_eviction` が同じ版数を
+                // 退避するので、 再生の後に見ると、 戻す時の別名の外しを飛ばす)
+                prev.defer_restore(slot, rec, self.prev_delete_written(rec));
+                continue;
+            }
+            if self.restore_prev_resident(slot, rec, None) {
+                restored += 1;
+            }
+        }
+        prev.note_restored(restored);
+    }
+
+    /// review946d [N1]: WAL の再生の後 (`finish_reconcile` の後、 #451 の作り直しの前) に、 [`Self::restore_prev_residents`] が
+    /// 後に回した記録を戻す。 再生が記録の行を生き返らせた (場所の最後の行が記録の行で生きている) 記録は戻さない (戻さなかったのと
+    /// 同じ = 本体に届いていない削除の像、 review946 [1])。 まだ死んでいれば、 再生の前に戻したのと同じに戻す。
+    fn finish_prev_restores(&self) {
+        let prev = &self.generations().prev;
+        let restored = prev
+            .take_deferred()
+            .into_iter()
+            .filter(|&(slot, rec, written)| self.restore_prev_resident(slot, rec, Some(written)))
+            .count();
         prev.note_restored(restored as u32);
+    }
+
+    /// きれいに閉じなかった後に開く時、 この後の WAL 付きの open が再生する record が WAL にあるか (`reconcile_generations` の仕上げを
+    /// 後に回すのと同じ見方)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_has_records_to_replay(&self) -> bool {
+        matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_)))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn wal_has_records_to_replay(&self) -> bool {
+        false
+    }
+
+    /// 記録の identity の削除が退避表に記録の版数以上で載っている (書き出し済み、 [`Self::restore_prev_resident`])。
+    fn prev_delete_written(&self, rec: crate::prev_slots::PrevRecord) -> bool {
+        self.foreign_tombs.read().unwrap().get(&(rec.peer, rec.number)).is_some_and(|&t| t >= rec.tomb)
     }
 
     /// きれいに閉じなかった後に開く時、 `.eidmap` を読む前に `prev.seg` の書き出していない記録を読んで置く (review946c [A])。 開く時の
@@ -19426,7 +19483,11 @@ impl Engine {
             return Ok(());
         }
         let reserve = self.layout.read().unwrap().reserve_entities;
-        set.ensure_prev(crate::prev_slots::segment_len(reserve))?;
+        // review946d [N5]: file の有る `prev.seg` は触らない (開く時に開けなかった / 使えなかった file。 開く時に警告を出した)。 前は
+        // 開く時の失敗が一時的だと、 ここで開けて中身を 0 に戻し、 書き出していない記録を黙って捨てた
+        if !set.create_prev(crate::prev_slots::segment_len(reserve))? {
+            return Ok(());
+        }
         gens.prev.prepare(set.region(SegmentKind::Prev), gens.bits(), |off, len| set.flush_kind(SegmentKind::Prev, off, len))?;
         set.flush_kind(SegmentKind::Prev, 0, crate::prev_slots::PREV_HEADER)
     }
@@ -19445,8 +19506,9 @@ impl Engine {
         (((if now > 0 && dead { now - 1 } else { now }) << gens.bits()) | local, dead)
     }
 
-    /// [`Self::restore_prev_residents`] の 1 場所。 退避を戻したか。
-    fn restore_prev_resident(&self, slot: u32, rec: crate::prev_slots::PrevRecord) -> bool {
+    /// [`Self::restore_prev_residents`] の 1 場所。 退避を戻したか。 `written` = 退避が書き出し済みか (None = 今の退避表で決める。
+    /// 再生の後に戻す時は再生の前に決めた物、 [`Self::finish_prev_restores`])。
+    fn restore_prev_resident(&self, slot: u32, rec: crate::prev_slots::PrevRecord, written: Option<bool>) -> bool {
         let id = (rec.peer, rec.number);
         // review946 [1]: 前の住人の削除が本体に届いていない (場所の最後の行が記録の行で生きている / 記録の行より前の行 = 使い回しも
         // 届いていない)。 戻すと生きている行の Delete を state に出す。 届いた削除 (死んでいる) と使い回し (後の行) だけ戻す
@@ -19460,7 +19522,7 @@ impl Engine {
         if rec.kind == crate::prev_slots::PrevKind::Translated && self.eid_translator.get(id.0, id.1).is_some() {
             return false;
         }
-        let written = self.foreign_tombs.read().unwrap().get(&id).is_some_and(|&t| t >= rec.tomb);
+        let written = written.unwrap_or_else(|| self.prev_delete_written(rec));
         // 退避が書き出されていなければ、 場所を指す別名 (使い回しの前の住人の物) も外す (`split_removed_keys` と同じ)
         let mut others: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
         if !written {
@@ -28000,6 +28062,8 @@ impl Engine {
             eng.finish_replay_vocab(&mut replay);
             // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
             eng.finish_reconcile(Some(&w));
+            // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
+            eng.finish_prev_restores();
             // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
@@ -28024,6 +28088,7 @@ impl Engine {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
             eng.finish_reconcile(Some(&w));
+            eng.finish_prev_restores();
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
             if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
@@ -28227,6 +28292,10 @@ impl Engine {
                 deletes.push((h, gone));
             }
         }
+        // review946d [N2]: 記録から戻した削除と tomb.seg のなめは同じ (版数, 行) を出しうる (削除が本体に届いた後に使い回しの記録
+        // だけが届き、 0 にした tomb.seg は届いていない像)。 同じ Delete を 2 つ載せない
+        deletes.sort_unstable();
+        deletes.dedup();
         if trace {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
@@ -28812,8 +28881,9 @@ impl Engine {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut replay);
             }
             eng.finish_replay_vocab(&mut replay);
-            // #731 / #451: open_concurrent_with_oplog と同じ
+            // #731 / #451 / review946d [N1]: open_concurrent_with_oplog と同じ
             eng.finish_reconcile(Some(&w));
+            eng.finish_prev_restores();
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
             let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
@@ -28833,6 +28903,7 @@ impl Engine {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
             eng.finish_reconcile(Some(&w));
+            eng.finish_prev_restores();
             let relogged = eng.relog_unlogged_writes(&w);
             eng.generations().forget_relog_gens();
             if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
@@ -38453,5 +38524,51 @@ mod remote_row_tests {
         assert_eq!(eng.remote_tieleaf_apply(f, n, b"f", t0), RemoteApply::Applied);
         assert!(eng.entities.is_live(slot(f)), "TieLeaf だけで届いた行が生きていない");
         assert_eq!(eng.get_text_owned(f, "t.n").as_deref(), Some(&b"f"[..]));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod prev_seg_open_failure_tests {
+    use super::*;
+
+    /// review946d [N5]: 開く時に開けなかった `prev.seg` (一時的な失敗) を、 表を読んだ後の `ensure_prev_seg` が開けて 0 に戻さない
+    /// (file の有る `prev.seg` は作り直さない)。 前は書き出していない記録を黙って捨てた。
+    #[test]
+    fn a_prev_seg_that_failed_to_open_is_not_started_over() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("enchudb-prev-open-fail-{}-{nanos}", std::process::id()));
+        let path = dir.to_str().unwrap();
+        {
+            let mut eng = Engine::create_with_capacity(path, 1024).unwrap();
+            eng.define_table("t", 1).unwrap();
+            eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+            eng.persist_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+            eng.set_peer_id(1);
+            let x = eng.entity_in("t").unwrap();
+            eng.tie_to(x, "t.k", 7u32);
+            eng.oplog_commit();
+            eng.delete(x);
+            eng.oplog_commit();
+            let y = eng.entity_in("t").unwrap();
+            assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: 場所を使い回した");
+            assert!(eng.prev_resident_of_slot(eng.eid_slot(y)).is_some(), "前提: 使い回しの記録を書いた");
+        }
+        let file = dir.join("prev.seg");
+        let before = std::fs::read(&file).unwrap();
+        assert!(before.iter().any(|&b| b != 0), "前提: `prev.seg` に中身がある");
+        crate::segments::FAIL_NEXT_OPEN_PREV.with(|f| f.set(true));
+        let active = {
+            let eng = Engine::open_concurrent_with_oplog(path, 4 << 20).unwrap();
+            eng.generations().prev.active()
+        };
+        let failed = !crate::segments::FAIL_NEXT_OPEN_PREV.with(|f| f.replace(false));
+        let after = std::fs::read(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failed, "前提: 開く時に `prev.seg` を開けなかった");
+        assert!(!active, "開けなかった `prev.seg` を後で作り直して使った");
+        assert!(before == after, "開けなかった `prev.seg` の中身を 0 に戻した");
     }
 }

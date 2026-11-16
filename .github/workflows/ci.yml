@@ -224,6 +224,10 @@ jobs:
       - name: tables dir fsync order (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test issue884_tables_dir_sync_order --release
 
+      # review946c [C]: 使い回しの退避の載る sidecar の rename の後に directory を fsync し、 その後に `prev.seg` の書き出した周期を進める順
+      - name: prev.seg dir fsync order (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test prev_seg_dir_sync_order --release
+
       # #98 ③④: I/O の点ごとの故障 (I/O エラー / process の死 / 電源断 × flush / oplog の書き手)。 同じ crashsim feature の
       # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
       - name: fault injection / crash matrix (crashsim)
