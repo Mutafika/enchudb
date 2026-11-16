@@ -274,23 +274,49 @@ fn corrupt(image: &mut [u8], rng: &mut Rng, n: usize) {
     }
 }
 
-/// 乱数で積んで畳んだ WAL (1 区画の v5 / 2 区画の v5) を、 開き直しを挟みながら何度も写して、 そのままと byte を壊した写しで
-/// 突き合わせる。 両方の答え (true / false / 開けない) が出ることも確かめる。
+/// 写しの file の形: (A の版, B の版 (1 区画の形は 0))。
+fn versions(file: &[u8]) -> (u32, u32) {
+    let a = r32(file, 4);
+    if a == 4 || a == 5 {
+        let half = r32(file, 24) as usize;
+        if file.len() >= half + 8 && &file[half..half + 4] == b"EWAL" {
+            return (a, r32(file, half + 4));
+        }
+    }
+    (a, 0)
+}
+
+/// 乱数で積んで畳んだ WAL を、 開き直しを挟みながら何度も写して、 そのままと byte を壊した写しで突き合わせる。 始めの形は
+/// `OpLog::create` の v5 (1 区画 / 2 区画) と、 fixture 4 つ (0.36.2 の v3、 0.37.4 の v4 2 つ、 v5) を開いて (再生 → 穴の後を捨てて
+/// 周を置く) 書き足す物。 v4 の fixture から書き足すと、 結ばない印の record (v4 の間)、 畳んだ A だけ v5 になった A = 5・B = 4 の
+/// 混ざり、 古い区画の record を壊した写し (穴のある v4 / v5) が出る。 v3 の fixture は最初に畳む時に 2 区画になる。 v2 の file は
+/// 作れない (fixture が無い) ので入れていない。 3 つの答え (true / false / 開けない) と、 形 (v3 / v4 / A = 5・B = 4 / v5) が全部出る
+/// ことも確かめる。
 #[test]
 fn generated_wals_answer_like_the_full_replay() {
     let root = Scratch::new("gen");
     let (mut yes, mut no, mut unreadable) = (0, 0, 0);
-    let mut tally = |a: Option<bool>| match a {
-        Some(true) => yes += 1,
-        Some(false) => no += 1,
-        None => unreadable += 1,
-    };
-    for (ci, cap) in [24 * 1024, 2 * HALF, 4 * HALF].into_iter().enumerate() {
-        for seed in 0..12u64 {
-            let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (seed * 1000 + ci as u64 + 1));
-            let p = root.0.join(format!("gen{ci}-{seed}"));
-            let snap = root.0.join(format!("gen{ci}-{seed}.snap"));
-            let mut wal = OpLog::create(&p, cap).unwrap();
+    let mut shapes: std::collections::BTreeMap<(u32, u32), u32> = std::collections::BTreeMap::new();
+    // (始めの形の名前, 容量 (fixture は None))
+    let starts: Vec<(&str, Option<usize>)> = [("create-24k", Some(24 * 1024)), ("create-32k", Some(2 * HALF)), ("create-64k", Some(4 * HALF))]
+        .into_iter()
+        .chain(FIXTURES.iter().map(|&f| (f, None)))
+        .collect();
+    for (si, &(start, cap)) in starts.iter().enumerate() {
+        for seed in 0..10u64 {
+            let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (seed * 1000 + si as u64 + 1));
+            let p = root.0.join(format!("gen{si}-{seed}"));
+            let snap = root.0.join(format!("gen{si}-{seed}.snap"));
+            let mut wal = match cap {
+                Some(cap) => OpLog::create(&p, cap).unwrap(),
+                None => {
+                    std::fs::copy(fixture_path(start), &p).unwrap();
+                    let wal = OpLog::open(&p).unwrap();
+                    wal.recover_with_tail();
+                    wal.drop_records_after_a_hole();
+                    wal
+                }
+            };
             let mut v = 0;
             for k in 0..240 {
                 step(&wal, &mut rng, &mut v);
@@ -305,17 +331,30 @@ fn generated_wals_answer_like_the_full_replay() {
                     continue;
                 }
                 std::fs::copy(&p, &snap).unwrap();
-                tally(same(&snap, &format!("容量 {cap} 種 {seed} 歩 {k}")));
-                let mut image = std::fs::read(&p).unwrap();
-                let n = 1 + rng.below(3) as usize;
-                corrupt(&mut image, &mut rng, n);
-                std::fs::write(&snap, &image).unwrap();
-                tally(same(&snap, &format!("容量 {cap} 種 {seed} 歩 {k} の壊した写し")));
+                let image = std::fs::read(&p).unwrap();
+                *shapes.entry(versions(&image)).or_default() += 1;
+                let what = format!("{start} 種 {seed} 歩 {k}");
+                for a in [same(&snap, &what), {
+                    let mut image = image.clone();
+                    let n = 1 + rng.below(3) as usize;
+                    corrupt(&mut image, &mut rng, n);
+                    std::fs::write(&snap, &image).unwrap();
+                    same(&snap, &format!("{what} の壊した写し"))
+                }] {
+                    match a {
+                        Some(true) => yes += 1,
+                        Some(false) => no += 1,
+                        None => unreadable += 1,
+                    }
+                }
             }
         }
     }
-    println!("答え: 再生する物あり {yes} / なし {no} / 開けない {unreadable}");
+    println!("答え: 再生する物あり {yes} / なし {no} / 開けない {unreadable}、 形 (A の版, B の版) ごとの写し {shapes:?}");
     assert!(yes > 100 && no > 100 && unreadable > 0, "前提: 3 つの答えが全部出る ({yes} / {no} / {unreadable})");
+    for shape in [(3, 0), (4, 4), (5, 4), (5, 5), (6, 0)] {
+        assert!(shapes.contains_key(&shape), "前提: 形 {shape:?} の写しが出る: {shapes:?}");
+    }
 }
 
 /// 聞く読みは最初の当てる record で止まる: checkpoint の後に Tie が 1000 件あっても、 読むのは 1 件 (全部を解く再生の回数は
