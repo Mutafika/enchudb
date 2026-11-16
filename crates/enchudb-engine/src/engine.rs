@@ -4375,9 +4375,10 @@ mod kill_fail_tests {
         let between = between.lock().unwrap().take().expect("前提: 割り込み点を通った");
         assert!(between.is_err(), "前提: 間に来た insert は満杯の表で断られた: {between:?}");
         assert!(!eng.is_live(old));
-        assert_eq!((eng.generations().get(slot), eng.generations().is_dead(slot)), (1, true), "修復の kill が世代を書けなかった");
+        let killed = (eng.generations().get(slot), eng.generations().is_dead(slot));
         let new = eng.entity_in("t").expect("空きが無い時に、 満杯の表が消えた場所を使い回せない");
         stale_eid_misses(&eng, old, new, "t.a");
+        assert_eq!(killed, (1, true), "修復の kill が世代を書けなかった");
         cleanup(eng, &p);
     }
 
@@ -18486,7 +18487,7 @@ impl Engine {
 
     /// anonymous entity を払い出す。
     ///
-    /// **`Err` を返す条件は 2 つ** (どちらも旧実装では panic だった、 #59):
+    /// **`Err` を返す条件** (上の 2 つは旧実装では panic だった、 #59):
     ///
     /// - **entity 枠が満杯** — 「DB が一杯」 は実行時の状態であって使い方の誤りではない。
     ///   embedded DB は他人の process に埋め込まれるので、 これで host を殺してはいけない。
@@ -18494,6 +18495,8 @@ impl Engine {
     ///   空き枠は `remaining_eid_space()` で事前に見られる
     /// - **anonymous table が closed** (= `define_table` 済み) — この DB では
     ///   `entity_in("<table>")` を使うこと
+    /// - **最初の使い回しで file version 15 に移れない** (#731 / #970) — 満杯の後に消えた場所を使い回す前に、 場所の世代を書く
+    ///   `gen.seg` を枠の全部 (`max_entities`) まで伸ばす。 ディスクの空きが足りなければ移らずに断る (空きが戻れば次の呼び出しで移る)
     ///
     /// table 版の [`Engine::entity_in`] と同じ形 (`Result<_, String>`) にしてある。
     /// 同じ 「entity を作る」 操作が、 片方は Err で片方は process 即死、 という
