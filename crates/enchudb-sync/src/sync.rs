@@ -2370,9 +2370,11 @@ impl Syncer {
                 // gossip は default off。
                 // table-less (himo を closed table に解決できない) なら確保先が無いので
                 // skip。 entity / ref value を先に解決してから LWW を更新する。
-                let local_eid = match bound.or_else(|| self.engine.resolve_remote_eid(*eid, *himo_id)) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                // #970: 払い出しが空きの不足で断られた (`RejectedCapacity`) なら落とさず再配送させる (PR #977 の読み直し 3 の [1])
+                let local_eid = match bound.map_or_else(|| self.engine.try_resolve_remote_eid(*eid, *himo_id), |e| Ok(Some(e))) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: 当てる行は引いた直後に取る (#925: 値を引く間に、 その行が消えて場所が使い回されても、 使い回した新しい行を
                 // 取らない。 Ref の値の払い出しが同じ表の、 その行の消えた場所を使い回す事もある)
@@ -2385,9 +2387,10 @@ impl Syncer {
                 let value = if self.engine.himo_is_ref(*himo_id) {
                     // Ref の列は u32 (local eid)。 入らない値は target を導けない
                     let Ok(foreign) = u32::try_from(*value) else { return ApplyResult::Dropped };
-                    match self.engine.resolve_remote_ref_value(rec.author_peer, foreign, *himo_id) {
-                        Some(v) => v as u64,
-                        None => return ApplyResult::Dropped,
+                    match self.engine.try_resolve_remote_ref_value(rec.author_peer, foreign, *himo_id) {
+                        Ok(Some(v)) => v as u64,
+                        Ok(None) => return ApplyResult::Dropped,
+                        Err(r) => return ApplyResult::from(r),
                     }
                 } else {
                     // 未翻訳の生値を書くと**無関係な local 文字列**が cell に入る
@@ -2471,19 +2474,21 @@ impl Syncer {
                 // eid_peer が author) で ref target table 空間の local eid へ翻訳する。
                 // 自分が target の産みの親なら identity、第三者 peer なら target 自身の
                 // Tie と同じ写像に収束する (resolve_remote_ref_value の key 空間共有)。
-                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, *himo_id) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
                 let row = self.engine.remote_row_of(*eid, local_eid);
-                let value = match self.engine.resolve_remote_ref_value(
+                let value = match self.engine.try_resolve_remote_ref_value(
                     enchudb_oplog::eid_peer(*target),
                     enchudb_oplog::eid_local(*target),
                     *himo_id,
                 ) {
-                    Some(v) => v,
-                    None => return ApplyResult::Dropped,
+                    Ok(Some(v)) => v,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: 当てる行は上で引いた直後に取った物 (Ref の的の払い出しがその行の消えた場所を使い回しても、 的の行に当てない)。
                 // lock の下で確かめる。 引いた直後の lock の外の確かめは、 lock の下と同じ事を見るので置かない = 読み直し [P]
@@ -2498,9 +2503,10 @@ impl Syncer {
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
-                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, *himo_id) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
                 let row = self.engine.remote_row_of(*eid, local_eid);
@@ -2533,9 +2539,10 @@ impl Syncer {
                     Ok(h) => h,
                     Err(_) => return ApplyResult::Dropped, // himo 予算枯渇等 — 適用不能
                 };
-                let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, local_hid) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
                 let row = self.engine.remote_row_of(*eid, local_eid);
@@ -2562,9 +2569,10 @@ impl Syncer {
                     Ok(h) => h,
                     Err(_) => return ApplyResult::Dropped,
                 };
-                let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, local_hid) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
                 let row = self.engine.remote_row_of(*eid, local_eid);

@@ -518,6 +518,12 @@ impl SegmentMap {
         self.grow_inner(new_size, Need::Whole)
     }
 
+    /// commit を `new_size` まで伸ばす (先回りしない、 page 切り上げ)。 空きは `write_from` から先の分だけ見る (#970: gen.seg は
+    /// 払い出す場所の page と少しの先だけを commit する。 `grow_amortized` の ×2 の先回りは使わない)。
+    pub fn grow_window(&self, new_size: usize, write_from: usize) -> io::Result<()> {
+        self.grow_inner(new_size, Need::From(write_from))
+    }
+
     /// 疎な書き込み: [start, start + len) だけを書く時 (hash の場所に散る索引の slot)。 見かけは
     /// 伸ばすが、 空きは **初めて触るページの分**だけ見る (#316: 見かけの長さ = 数 GB と比べて断っていた。
     /// #317: 伸ばした先のページを書くたびに数えないと、 空きを超えても気付けない)。

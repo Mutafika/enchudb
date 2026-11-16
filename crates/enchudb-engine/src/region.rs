@@ -280,6 +280,19 @@ impl Region {
         Ok(())
     }
 
+    /// `ensure_committed` の先回りしない版 (#970): commit を `end_in_region` まで伸ばし (page 切り上げ)、 空きは `write_from_in_region`
+    /// から先の分だけ見る。 commit 済みなら atomic の load だけ。
+    pub fn ensure_committed_window(&self, end_in_region: usize, write_from_in_region: usize) -> std::io::Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower
+            && !self.is_committed(end_in_region)
+        {
+            g.grow_window(self.file_offset + end_in_region, self.file_offset + write_from_in_region)?;
+        }
+        let _ = (end_in_region, write_from_in_region);
+        Ok(())
+    }
+
     /// 見かけだけ `end_in_region` まで commit する (空きは見ない、 #327)。 読むだけの範囲を用意する時に使い、
     /// 書く page は `ensure_committed_sparse` で数える。
     pub fn ensure_committed_apparent(&self, end_in_region: usize) -> std::io::Result<()> {

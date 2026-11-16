@@ -62,6 +62,9 @@ pub(crate) enum Allocated {
     Full,
     /// 空きの山の一番上の場所を `reuse` が残した (取っていない)。
     Kept(u32),
+    /// 位置から取った新しい場所を `fresh` が断った (#970: 場所の世代を書く gen.seg の page を commit できない)。 生かしていない。
+    /// 位置は戻した (後から誰も進めていなければ) か、 戻せなければ穴として空きの山に積んだ。
+    Refused(u32),
 }
 
 impl EntitySet {
@@ -221,26 +224,42 @@ impl EntitySet {
 
     /// `allocate_tracked` + 生きている印を立てる直前に `before(slot)` を呼ぶ (#731: 場所の 「死んでいる」 印を先に落とす)。
     pub fn allocate_tracked_with(&self, before: impl Fn(u32)) -> Option<(u32, bool)> {
-        match self.allocate_or_keep(&before, |slot| {
-            before(slot);
-            Reuse::Take
-        }) {
+        match self.allocate_or_keep(
+            |slot| {
+                before(slot);
+                true
+            },
+            |slot| {
+                before(slot);
+                Reuse::Take
+            },
+        ) {
             Allocated::Fresh(e) => Some((e, false)),
             Allocated::Reused(e) => Some((e, true)),
-            Allocated::Full | Allocated::Kept(_) => None,
+            Allocated::Full | Allocated::Kept(_) | Allocated::Refused(_) => None,
         }
     }
 
-    /// [`Self::allocate_tracked_with`] の、 空きの山から使い回す場所を呼び手が決める形 (#970、 anonymous の `Engine::entity`)。 新しい
-    /// 場所 (位置から払い出す) は生きている印を立てる直前に `fresh(slot)`。 空きの山の一番上の場所は `reuse(slot)` が決める (空きの山の
-    /// lock の下で呼ぶ): [`Reuse::Take`] = 生かして返す (生かす前の仕度は `reuse` の中で)、 [`Reuse::Discard`] = 山から外して次を見る
-    /// (二度と渡さない場所)、 [`Reuse::Keep`] = 山に残したまま返す ([`Allocated::Kept`]、 呼び手が理由に応じて断る / 仕度してから
-    /// 取り直す)。
-    pub(crate) fn allocate_or_keep(&self, fresh: impl Fn(u32), reuse: impl Fn(u32) -> Reuse) -> Allocated {
+    /// [`Self::allocate_tracked_with`] の、 払い出す場所を呼び手が決める形 (#970、 anonymous の `Engine::entity`)。 新しい場所 (位置から
+    /// 払い出す) は生きている印を立てる直前に `fresh(slot)` が決める: true = 生かして返す、 false = 生かさずに断る ([`Allocated::Refused`]、
+    /// 位置は戻す / 戻せなければ穴として空きの山に積む)。 空きの山の一番上の場所は `reuse(slot)` が決める (空きの山の lock の下で
+    /// 呼ぶ): [`Reuse::Take`] = 生かして返す (生かす前の仕度は `reuse` の中で)、 [`Reuse::Discard`] = 山から外して次を見る (二度と渡さない
+    /// 場所)、 [`Reuse::Keep`] = 山に残したまま返す ([`Allocated::Kept`]、 呼び手が理由に応じて断る / 仕度してから取り直す)。
+    ///
+    /// 位置の RMW は AcqRel (#970: v15 に移る手順は位置を RMW で読み、 その後に位置から取った書き手は、 移る手順が先に公開した gen.seg
+    /// を見る = 自分で page を commit する。 `Engine::move_to_generations`)。
+    pub(crate) fn allocate_or_keep(&self, fresh: impl Fn(u32) -> bool, reuse: impl Fn(u32) -> Reuse) -> Allocated {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
-        let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
+        let eid = self.next_eid_atomic().fetch_add(1, Ordering::AcqRel);
         if eid < self.max_entities() {
-            fresh(eid);
+            if !fresh(eid) {
+                // 戻せるのは、 後から誰も進めていない時だけ (表の払い出し位置の #868 と同じ)。 戻せなければ穴 (生きていない場所) として
+                // 空きの山に積む (anonymous は空きの山からしか使い回さない)
+                if self.next_eid_atomic().compare_exchange(eid + 1, eid, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                    self.push_hole(eid);
+                }
+                return Allocated::Refused(eid);
+            }
             self.set_bit(eid, true);
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
             // issue6 (perf 退化対策): writer hot path から mark_dirty を撤廃。
@@ -312,6 +331,28 @@ impl EntitySet {
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
     }
 
+    /// #970: 位置から取ったが生かさなかった場所 (穴) を空きの山に積む ([`Allocated::Refused`] で位置を戻せなかった時)。 生きている印は
+    /// 触らない。 積めなければ (山が満杯 / 山の page を commit できない) 積まない (欠番、 `free` と同じ安全側)。
+    fn push_hole(&self, eid: u32) {
+        let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let free_count_off = self.free_offset;
+        let fc = u32::from_le_bytes(self.region.slice()[free_count_off..free_count_off + 4].try_into().unwrap());
+        if fc < Self::free_cap_for(self.bitset_cap) {
+            let eid_off = self.free_offset + 4 + (fc as usize) * 4;
+            if self.region.ensure_committed(eid_off + 4).is_err() {
+                return;
+            }
+            self.region.write_at(eid_off, &eid.to_le_bytes());
+            self.region.write_at(free_count_off, &(fc + 1).to_le_bytes());
+        }
+    }
+
+    /// #970: 位置 (`next_eid`) を RMW で読む (v15 に移る手順が、 位置から払い出す書き手と揃える: この後に位置から取る書き手は、 この
+    /// 前に公開した gen.seg を見る。 `Engine::move_to_generations`)。
+    pub(crate) fn next_eid_synced(&self) -> u32 {
+        self.next_eid_atomic().fetch_add(0, Ordering::AcqRel)
+    }
+
     /// #731: 生きている印を下ろし、 空きの山には積まない (世代を使い切った場所 = 二度と渡さない)。
     pub fn free_without_reuse(&self, eid: u32) {
         if self.set_bit(eid, false) {
@@ -335,11 +376,9 @@ impl EntitySet {
         if eid >= self.max_entities() { return false; }
         if self.set_bit(eid, true) { return false; } // 既に live
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
-        // next_eid は「これまで allocate した最大 +1」の概念。local を超えていたら進める。
-        let cur = self.next_eid_atomic().load(Ordering::Acquire);
-        if eid >= cur {
-            self.next_eid_atomic().store(eid + 1, Ordering::Release);
-        }
+        // next_eid は「これまで allocate した最大 +1」の概念。local を超えていたら進める。 #970: RMW で (位置から取る書き手の
+        // fetch_add と並んでも戻さない、 v15 に移る手順の位置の RMW の並びを切らない)
+        self.next_eid_atomic().fetch_max(eid + 1, Ordering::AcqRel);
         true
     }
 

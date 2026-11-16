@@ -51,6 +51,9 @@ pub enum Alloc {
     Skip,
     /// 使い回す場所 (global) の行が他の書き手に握られていた (#974)。 `alloc_lock` を放してから待ち、 もう一度払い出す
     Busy(u32),
+    /// 確保先はあるが今は空きが無い (#970: 場所の世代を書く gen.seg の page を commit できない)。 写像を作らずに `None` (`Skip` と
+    /// 同じ)。 呼び手 (`Engine::try_resolve_remote_eid`) は払い出しの中でこれを見て、 record を落とさず再配送させる
+    Retry,
 }
 
 /// foreign eid → local eid の翻訳テーブル。
@@ -341,7 +344,7 @@ impl EidTranslator {
                         self.insert(author_peer, foreign_local, local);
                         return Some(local);
                     }
-                    Alloc::Skip => return None,
+                    Alloc::Skip | Alloc::Retry => return None,
                     Alloc::Busy(slot) => slot,
                 }
             };

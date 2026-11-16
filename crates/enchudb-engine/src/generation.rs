@@ -13,11 +13,14 @@
 //!   `move_to_generations`)。 その時に、 世代を持つ表の死んだ場所 (v14 の間に消した場所) を全部 「世代 1、 死んでいる」 にする。
 //!   v15 では行を消す時に上げる (死んだ場所の値 = 次の住人の世代)。 使い回す時・位置から払い出す時は今の値で渡す
 //! - 予約の表 (`_` で始まる、 `_sync_ops` の ring など) は世代を持たない (0 のまま使い回す)
-//! - #970: 世代を持つ表の枠の全部の場所の gen.seg は、 場所を払い出す前に commit しておく ([`Generations::commit_through`]: v15 に
-//!   移る時 (照合を始める前)・枠を足す時・表を作る時・anonymous の枠を伸ばす時・書き手として開く時)。 commit は縮まないので、 払い出した
-//!   行の kill / raise は gen.seg を伸ばさない = ディスクの空きの不足で落ちない。 前は消す時に場所の page を commit していて、 伸ばせ
-//!   ないと世代も 「死んでいる」 印も書けないまま場所を空け、 次の insert が消えた行と同じ eid で使い回した。 commit できない時は
-//!   払い出す側 (移る手順・枠を足す insert・開く) を断る。 伸ばすのは file の長さだけ (疎) で、 実ディスクは書いた page の分
+//! - #970 (案 P): 生かす場所の gen.seg の page は、 生かす前に commit しておく ([`Generations::ensure_slot`]、 払い出しの全部の道。
+//!   commit 済みなら atomic の load 1 回、 伸ばす時は場所の page と [`COMMIT_AHEAD_PAGES`] page 先まで)。 v15 に移る時は払い出し済みの
+//!   場所まで ([`Generations::ensure_slots`]、 公開する前に [`Generations::commit_unpublished`])、 書き手として開く時も払い出し済みの
+//!   場所まで commit し直す。 commit は縮まないので、 生かした場所の kill / raise は gen.seg を伸ばさない = ディスクの空きの不足で
+//!   落ちない。 前は消す時に場所の page を commit していて、 伸ばせないと世代も 「死んでいる」 印も書けないまま場所を空け、 次の
+//!   insert が消えた行と同じ eid で使い回した。 commit できない時は払い出す側 (insert / 受信の払い出し / 移る手順 / 開く) を断る。
+//!   gen.seg の大きさは払い出した場所の桁 (2 B / 場所 + 先回りの 64 KiB まで)。 表の予約した枠の全部は commit しない (PR #977 の
+//!   読み直し 3: 枠の全部では見かけの大きさと開く時のなめが予約に比例し、 APFS は header を書いた所から 16 MiB を実ディスクにした)
 //!
 //! ## 生きている印 (entities) と世代 (gen.seg) は別の segment (PR #885 の読み直し F1)
 //!
@@ -94,6 +97,41 @@ fn slot_off(slot: u32) -> usize {
     GEN_HEADER + 2 * slot as usize
 }
 
+/// #970 (案 P): 場所を書く前の commit で、 場所の page の後ろに先回りして commit する page の数 (1 回の伸ばしは最大 4 page = 64 KiB
+/// = 32768 場所)。 `Region::ensure_committed` の ×2 の先回りは使わない: gen.seg の見かけの大きさを払い出した場所の桁に保つ
+/// (APFS は書いた page に隣り合う 16 MiB 未満の穴を実ディスクにする、 #400)。
+const COMMIT_AHEAD_PAGES: u64 = 3;
+
+/// 場所 `slot` の 2 B を書けるように `r` を commit する ([`Generations::ensure_slot`])。 commit 済みなら atomic の load 1 回。
+#[inline]
+fn commit_slot_in(r: &Region, slot: u32) -> std::io::Result<()> {
+    let off = slot_off(slot);
+    if off + 2 > r.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("gen.seg: slot {slot} is past the generation segment ({} bytes)", r.len()),
+        ));
+    }
+    let page = (slot >> PAGE_SHIFT) as u64;
+    let page_off = |p: u64| -> usize { (GEN_HEADER as u64 + 2 * (p << PAGE_SHIFT)).min(r.len() as u64) as usize };
+    let need = page_off(page + 1).max(off + 2);
+    if r.is_committed(need) {
+        return Ok(());
+    }
+    // 書くのは場所の page から先 (先回りの page は後の払い出しが書く)。 空きはそこから先の分だけ見る
+    r.ensure_committed_window(page_off(page + 1 + COMMIT_AHEAD_PAGES).max(need), page_off(page))
+}
+
+/// 場所 `0..end` の 2 B を全部書けるように `r` を commit する。 範囲の外は gen.seg の終わりで切る。
+fn commit_slots_in(r: &Region, end: u32) -> std::io::Result<()> {
+    r.ensure_committed_window(GEN_HEADER, 0)?;
+    if end == 0 || r.len() < GEN_HEADER + 2 {
+        return Ok(());
+    }
+    let last_in_region = ((r.len() - GEN_HEADER) / 2 - 1).min(u32::MAX as usize) as u32;
+    commit_slot_in(r, (end - 1).min(last_in_region))
+}
+
 pub(crate) struct Generations {
     /// 場所の bit `S`。 0 = 世代を持たない DB (local = 場所)。
     bits: AtomicU32,
@@ -129,6 +167,8 @@ pub(crate) struct Generations {
     missing_tombs: std::sync::Mutex<Vec<u32>>,
     /// 場所を使い回した時の前の住人の記録 (`prev.seg`、 `crate::prev_slots`)。 `gen.seg` と一緒に持つ (v15 の DB だけ)。
     pub(crate) prev: crate::prev_slots::PrevSlots,
+    /// #979: 開く時の WAL の再生が場所の世代を上げられなかった ([`Self::note_replay_unraised`])。
+    replay_unraised: std::sync::atomic::AtomicBool,
 }
 
 impl Generations {
@@ -149,31 +189,39 @@ impl Generations {
             has_relog_gens: std::sync::atomic::AtomicBool::new(false),
             missing_tombs: std::sync::Mutex::new(Vec::new()),
             prev: crate::prev_slots::PrevSlots::off(),
+            replay_unraised: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// 場所 `slot` の page (の手前まで) の gen.seg を commit する (書かない)。 commit 済みなら atomic の load だけ。 この後の
-    /// [`Self::kill`] / [`Self::raise`] は commit の失敗では落ちない (commit は縮まない)。 書けなければ (ディスクの空き) Err。
-    fn commit_slot(&self, slot: u32) -> std::io::Result<()> {
-        match self.slot_page_end(slot) {
-            Some((r, end)) => r.ensure_committed(end),
+    /// #970 (案 P): 場所 `slot` の 2 B を書ける (この後の [`Self::kill`] / [`Self::raise`] が commit で落ちない) ように、 場所の page
+    /// の終わりまで gen.seg を commit する (伸ばす時は [`COMMIT_AHEAD_PAGES`] page 先回り)。 commit 済みなら atomic の load 1 回。 場所を
+    /// 生かす前に呼ぶ (払い出しの道)。 commit は縮まないので、 生かした場所の kill / raise は空きの不足で落ちない。 gen.seg の無い DB
+    /// (v14、 移る手順が公開する前) は何もしない。 gen.seg の範囲の外 (場所の上限の先) と、 書けない時 (ディスクの空き) は Err。
+    #[inline]
+    pub(crate) fn ensure_slot(&self, slot: u32) -> std::io::Result<()> {
+        match self.region.get() {
+            Some(r) => commit_slot_in(r, slot),
             None => Ok(()),
         }
     }
 
-    /// #970: 場所 `0..end` の全部の 2 B を書けるように gen.seg を commit する (書かない。 page の終わりまで、 commit 済みなら atomic の
-    /// load だけ)。 世代を持つ表の枠の全部を、 場所を払い出す前に commit しておく (`Engine::commit_generations_through`): commit は縮まない
-    /// ので、 その後の消す道の kill / 使い回しの raise は commit の失敗で落ちない (= 世代も 「死んでいる」 印も書けないまま場所を空ける形を
-    /// 作らない)。 伸ばすのは file の長さだけ (疎、 block は書いた page の分だけ)。 gen.seg の無い DB は何もしない。 書けなければ Err。
-    pub(crate) fn commit_through(&self, end: u32) -> std::io::Result<()> {
-        if end == 0 {
-            return Ok(());
+    /// #970: 場所 `0..end` の 2 B を全部書けるように commit する (移る手順・開く時の、 払い出し済みの範囲)。 範囲の外は gen.seg の
+    /// 終わりで切る (読み直し 3 の [5]: 前は黙って何もしなかった)。 gen.seg の無い DB は何もしない。
+    pub(crate) fn ensure_slots(&self, end: u32) -> std::io::Result<()> {
+        match self.region.get() {
+            Some(r) => commit_slots_in(r, end),
+            None => Ok(()),
         }
-        self.commit_slot(end - 1)
     }
 
-    /// gen.seg を持つか (v15 の DB、 または v15 に移る手順が `gen.seg` を用意した後)。 用意した後に足す表の枠は、 枠の場所の gen.seg を
-    /// 足す前に commit する (`Engine::push_table_extent_locked` など)。
+    /// [`Self::ensure_slots`] の、 まだ公開していない gen.seg 用 (移る手順の 1.: 公開する前に commit し、 できなければ何も変えずに
+    /// 断る、 読み直し 3 の [4])。
+    pub(crate) fn commit_unpublished(region: &Region, end: u32) -> std::io::Result<()> {
+        commit_slots_in(region, end)
+    }
+
+    /// gen.seg を公開したか (v15 の DB、 または v15 に移る手順が `prepare` した後)。 公開した後に生かす場所は、 生かす前に場所の page を
+    /// commit する ([`Self::ensure_slot`])。
     #[inline]
     pub(crate) fn has_region(&self) -> bool {
         self.region.get().is_some()
@@ -185,16 +233,13 @@ impl Generations {
         self.region.get().map_or(0, |r| r.committed_len())
     }
 
-    /// 場所 `slot` を書くために commit する長さ (page の終わり)。 範囲の外 / gen.seg の無い DB は None。
-    #[inline]
-    fn slot_page_end(&self, slot: u32) -> Option<(&Region, usize)> {
-        let r = self.region.get()?;
-        let off = slot_off(slot);
-        if off + 2 > r.len() {
-            return None;
-        }
-        let page_end = slot_off(((slot >> PAGE_SHIFT) + 1) << PAGE_SHIFT).min(r.len());
-        Some((r, page_end.max(off + 2)))
+    /// #979: 開く時の WAL の再生が場所の世代を上げられなかった (gen.seg を伸ばせない) 印を立てる / 取る (開く道が見て、 開くのを断る)。
+    pub(crate) fn note_replay_unraised(&self) {
+        self.replay_unraised.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_replay_unraised(&self) -> bool {
+        self.replay_unraised.swap(false, Ordering::AcqRel)
     }
 
     /// 開いた DB の `gen.seg` (header に場所の bit が焼いてある)。 中身の header が合わなければ Err。
@@ -286,11 +331,20 @@ impl Generations {
         self.moved.store(true, Ordering::Release);
     }
 
-    /// v15 に移る時: `region` を 0 から初めて (前の残りは消す)、 header を書く。 まだ照合は始めない ([`Self::start`])。
+    /// v15 に移る時: `region` を 0 から初めて (前の残りは消す)、 header を書いて公開する。 まだ照合は始めない ([`Self::start`])。
+    ///
+    /// #970: 前に移りかけて公開した後に断った (`prepare` の後の commit が空きの不足で落ちた) 時は、 作り直さずに場所の bit だけ書き
+    /// 直す (読み直し 3 の [4]: 公開した gen.seg の header を非 atomic に書き直すと、 消す道の page の印の atomic の読みと並ぶ)。 公開した
+    /// 後・照合を始める前は誰も gen.seg に書かない (kill / raise / 印は照合を始めた後だけ) ので、 中身は前の `prepare` のまま。
     pub(crate) fn prepare(&self, region: Region, bits: u32) -> std::io::Result<()> {
-        region.ensure_committed(GEN_HEADER)?;
-        // 0 でない 4 KiB だけ 0 に戻す (#970: 移る手順は表の枠の全部を commit するので、 移り損ねた後にやり直すと commit 済みの長さは
-        // 大きい。 全部を 0 で埋めると疎な file の穴を全部書いて実ディスクにする)
+        if let Some(r) = self.region.get() {
+            r.write_at(OFF_BITS, &bits.to_le_bytes());
+            r.mark_dirty(OFF_BITS, 4);
+            return Ok(());
+        }
+        region.ensure_committed_window(GEN_HEADER, 0)?;
+        // 0 でない 4 KiB だけ 0 に戻す (移る手順は払い出し済みの場所まで先に commit するので、 前の残りの無い所は穴のまま。 全部を 0 で
+        // 埋めると疎な file の穴を全部書いて実ディスクにする)
         const CHUNK: usize = 4096;
         let used = region.committed_len();
         let s = region.slice();
@@ -474,7 +528,7 @@ impl Generations {
         let n = ((len - GEN_HEADER) / 2) as u32;
         let mut next = 0u32;
         while next < n {
-            // #970: gen.seg は表の枠の全部を commit する (疎) ので、 0 の並びは 4 場所 (8 B) ずつ飛ばす
+            // 0 の並び (使い回していない場所、 先回りした所) は 4 場所 (8 B) ずつ飛ばす
             if next.is_multiple_of(4) && next + 4 <= n && r.as_atomic_u64(slot_off(next)).load(Ordering::Relaxed) == 0 {
                 next += 4;
                 continue;
@@ -527,28 +581,26 @@ impl Generations {
         self.active() && self.get(slot) > self.max_gen()
     }
 
-    /// 場所の 2 B を書く準備 (commit を伸ばし、 page の印を先に立てる)。 書く場所の atomic。 範囲の外は None。
-    fn cell_for_write<'r>(&self, r: &'r Region, slot: u32) -> std::io::Result<Option<&'r AtomicU16>> {
-        let off = slot_off(slot);
-        if off + 2 > r.len() {
-            return Ok(None);
-        }
+    /// 場所の 2 B を書く準備 (commit を確かめ、 page の印を先に立てる)。 書く場所の atomic。 #970: 生かした場所の page は生かす前に
+    /// commit してある ([`Self::ensure_slot`]) ので、 ここは atomic の load で済む。 範囲の外・書けない時は Err (読み直し 3 の [5]: 前は
+    /// 範囲の外を黙って書いたことにした)。
+    fn cell_for_write<'r>(&self, r: &'r Region, slot: u32) -> std::io::Result<&'r AtomicU16> {
         // page の場所を全部 commit する (印の立った page の場所は、 commit を確かめずに読む = `read_raw`)
-        self.commit_slot(slot)?;
+        commit_slot_in(r, slot)?;
         // page の印を先に (印の無い page の場所は世代を読まない。 印 → 世代 の順なら、 印を読まずに 0 と答えた読みは上げる前の読み)
         self.mark_page(r, slot);
-        Ok(Some(r.as_atomic_u16(off)))
+        Ok(r.as_atomic_u16(slot_off(slot)))
     }
 
     /// 場所の世代を `g` 以上にする (`g` が使える世代を越えれば引退の印)。 「死んでいる」 印は変えない。 上げたか。 書けなければ
-    /// (ディスクの空き) Err。
+    /// (ディスクの空き / 範囲の外) Err。
     pub(crate) fn raise(&self, slot: u32, g: u32) -> std::io::Result<bool> {
         let Some(r) = self.region.get() else { return Ok(false) };
         let g = g.min(self.retired_mark()) as u16;
         if self.get(slot) >= g as u32 {
             return Ok(false);
         }
-        let Some(c) = self.cell_for_write(r, slot)? else { return Ok(false) };
+        let c = self.cell_for_write(r, slot)?;
         let raised = c
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| (v & GEN_MASK < g).then_some((v & !GEN_MASK) | g))
             .is_ok();
@@ -559,11 +611,11 @@ impl Generations {
     }
 
     /// 行が消える: 世代を `g` 以上にし、 「死んでいる」 印を立てる (1 回の store)。 消す道はこの後に生きている印を下ろす。 書けなければ
-    /// (ディスクの空き) Err。
+    /// (ディスクの空き / 範囲の外) Err。 #970: 生かした場所の page は生かす前に commit してあるので、 生かした場所の kill は落ちない。
     pub(crate) fn kill(&self, slot: u32, g: u32) -> std::io::Result<()> {
         let Some(r) = self.region.get() else { return Ok(()) };
         let g = g.min(self.retired_mark()) as u16;
-        let Some(c) = self.cell_for_write(r, slot)? else { return Ok(()) };
+        let c = self.cell_for_write(r, slot)?;
         let _ = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
             let new = (v & !GEN_MASK) | (v & GEN_MASK).max(g) | DEAD;
             (new != v).then_some(new)
