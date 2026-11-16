@@ -347,7 +347,7 @@ fn is_unchanged(sidecar: &Path, bytes: &[u8]) -> bool {
 /// `from` が既にあればその mode を `to` に写す。 mode が取れない / 設定できない環境
 /// (Windows、 権限不足) では黙って諦める — 内容の永続化を mode の都合で失敗させない。
 #[cfg(not(target_arch = "wasm32"))]
-fn inherit_mode(from: &Path, to: &Path) {
+pub(crate) fn inherit_mode(from: &Path, to: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

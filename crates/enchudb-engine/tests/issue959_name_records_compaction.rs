@@ -177,10 +177,12 @@ fn compacted_name_records_read_back_after_an_unclean_copy() {
 
 /// review987 [7]: 書き手が並んで消して足す間に、 書き出し (`persist_sync_state`) と書き出しの lock の外のまとめ直し (`pktombs` /
 /// `pkformer`) が何度も走る。 まとめ直しを作っている間にも書き手が進み、 別の書き出しが追記する (置く時に後ろに足す / 当てて作り直す)。
-/// 時々、 線より前の削除を忘れる (`pkformer` が縮んでまとめ直す)。 止めた後の disk は memory と同じで、 開き直すと同じ記録が戻る。
+/// 時々、 線より前の削除を忘れる (`pkformer` が縮んでまとめ直す)。 回ごとに書き手を止めて書き出し、 disk が memory と同じかを見る
+/// (consumer の周期が始めたまとめ直しが走っている最中でもよい。 review987 2 回目 [G]: 前は止めた後に写した像の file を元の file と
+/// 比べていて、 ほぼ自明だった)。 止めた後の disk は memory と同じで、 閉じて開き直すと同じ記録が戻る。
 #[test]
 fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, RwLock};
     use std::sync::atomic::{AtomicBool, Ordering};
     const WRITERS: usize = 4;
     const PER: usize = 128;
@@ -207,17 +209,21 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
         .collect();
     eng.persist_sync_state().unwrap();
     let stop = AtomicBool::new(false);
+    // 書き手を止める (止めている間に書き出して disk と memory を比べる)
+    let pause = RwLock::new(());
     // 書き手が最後に消した名前の削除の版数 (忘れる線に使う)
     let lines: Mutex<Vec<Hlc>> = Mutex::new(Vec::new());
     let (mut tombs_shrank, mut former_shrank, mut forgotten) = (0, 0, 0);
+    let mut mid: Vec<String> = Vec::new();
     std::thread::scope(|s| {
         for w in 0..WRITERS {
-            let (eng, rows, stop, lines) = (&eng, &rows, &stop, &lines);
+            let (eng, rows, stop, lines, pause) = (&eng, &rows, &stop, &lines, &pause);
             s.spawn(move || {
                 // 自分の受け持ちの行を、 名前を n と n + total の間で行き来させながら消して足す
                 let mut mine: Vec<(u64, u32)> = (0..PER).map(|i| (rows[w * PER + i], (w * PER + i) as u32)).collect();
                 let mut i = 0usize;
                 while !stop.load(Ordering::Acquire) {
+                    let _running = pause.read().unwrap();
                     let (row, name) = &mut mine[i % PER];
                     let gone = *name;
                     eng.delete(*row);
@@ -246,7 +252,17 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
         }
         let (mut prev_tombs, mut prev_former) = (0u64, 0u64);
         for round in 0..60 {
-            eng.persist_sync_state().unwrap();
+            {
+                // 書き手を止めて書き出す: disk は memory と同じ (まとめ直しが追記を落とす / 忘れた後に置いた file を信用すると違う)
+                let _paused = pause.write().unwrap();
+                eng.persist_sync_state().unwrap();
+                if let Some(d) = eng.pktombs_disk_diff().unwrap() {
+                    mid.push(format!("{round} 回目: {d}"));
+                }
+                if let Some(d) = eng.pkformer_disk_diff().unwrap() {
+                    mid.push(format!("{round} 回目: {d}"));
+                }
+            }
             if round % 15 == 14 {
                 // 少し前の線より前の削除を忘れる
                 let line = {
@@ -257,7 +273,10 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
                     forgotten += eng.forget_deletes_before(h);
                 }
             }
-            eng.compact_name_records_now();
+            // 3 回に 1 回はここで待って走らせる (他の回は consumer の周期が始めたまとめ直しが、 次の回の比べと重なりうる)
+            if round % 3 == 2 {
+                eng.compact_name_records_now();
+            }
             let (t, f) = (len(&path, PKTOMBS), len(&path, PKFORMER) + len(&path, PKFORMER_LOG));
             tombs_shrank += (t < prev_tombs) as u32;
             former_shrank += (f < prev_former) as u32;
@@ -269,23 +288,13 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
     eng.persist_sync_state().unwrap();
     eng.compact_name_records_now();
     assert!(tombs_shrank >= 2 && former_shrank >= 2 && forgotten > 0, "前提: まとめ直し pktombs {tombs_shrank} 回 / pkformer {former_shrank} 回、 忘れた {forgotten}");
+    assert!(mid.is_empty(), "書き手を止めて書き出した disk と memory が違う: {mid:#?}");
     // 書き出した file が memory と同じ (まとめ直しが追記を落とす / 忘れた後に置いた file を信用すると違う)
     assert_eq!(eng.pktombs_disk_diff().unwrap(), None, "pktombs の disk と memory が違う");
     assert_eq!(eng.pkformer_disk_diff().unwrap(), None, "pkformer の disk と memory が違う");
     let versions: Vec<Option<Hlc>> = (0..2 * total).map(|n| eng.deleted_name_version(key, n as u64)).collect();
     let deleted = eng.deleted_primary_key_count();
-    // 閉じずに写した像 (きれいに閉じない) の名前の記録の file は、 写した時の file と同じ。 像を開いて版数を比べることはしない
-    // (閉じずに落ちた像を開くと、 消した名前の版数が新しくなる回がある。 まとめ直しと関係なく起きる)
-    let img = format!("{path}-img");
-    enchudb_engine::copy_db_dir(std::path::Path::new(&path), std::path::Path::new(&img)).unwrap();
-    let files = |p: &str| [PKTOMBS, PKFORMER, PKFORMER_LOG].map(|n| std::fs::read(path_for(p, n)).unwrap_or_default());
-    let live = files(&path);
-    assert!(files(&img) == live, "閉じずに写した像の名前の記録の file が、 写した時の file と違う");
     drop(eng);
-    let back = open(&img);
-    assert_eq!(back.pkformer_disk_diff().unwrap(), None);
-    drop(back);
-    let _ = std::fs::remove_dir_all(&img);
     // 閉じて開き直した DB は同じ記録
     let back = open(&path);
     let got: Vec<Option<Hlc>> = (0..2 * total).map(|n| back.deleted_name_version(key, n as u64)).collect();
@@ -358,4 +367,80 @@ fn the_consumer_starts_the_compaction_in_the_background() {
     assert_eq!(back.pkformer_disk_diff().unwrap(), None);
     drop(back);
     let _ = std::fs::remove_dir_all(&path);
+}
+
+/// review987 2 回目 [E]: まとめ直しが (I/O で) 書けない間は、 consumer の周期ごとに始め直さない (書けなかった後は 1 秒から倍々に間を
+/// 空ける。 前は周期ごとに thread を作り、 disk の全部を読んで並べ直してから失敗した)。 書けるようになれば、 間を空けた後にまとめ直す。
+/// ここでは `pktombs` の一時 file の名前に directory を置いて、 一時 file を作れなくする (追記は通る)。
+#[test]
+fn a_compaction_that_cannot_write_backs_off() {
+    use std::time::{Duration, Instant};
+    let path = tmp("backoff");
+    {
+        let mut eng = Engine::create_with_cell_version(&path, 1 << 16).unwrap();
+        eng.define_table("t", ROWS).unwrap();
+        eng.define_himo_in("t", "key", ValueType::Number, 0).unwrap();
+        let key = eng.himo_id("t.key").unwrap() as u16;
+        eng.set_table_pk("t", key).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+    }
+    let eng = open(&path);
+    let key = eng.himo_id("t.key").unwrap() as u16;
+    let mut rows: Vec<u64> = (0..ROWS)
+        .map(|i| {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to_by_id(e, key, i);
+            e
+        })
+        .collect();
+    let mut names: Vec<u32> = (0..ROWS).collect();
+    let blocker = enchudb_engine::db_files::compact_tmp_path_for(&path_for(&path, PKTOMBS));
+    std::fs::create_dir_all(&blocker).unwrap();
+    // 名前を行き来させる churn (consumer の周期を回し続け、 `pktombs` のまとめ直しを頼ませる)
+    let mut round = 0u32;
+    let mut churn = || {
+        for i in 0..(ROWS / 8) as usize {
+            let at = (i * 2 + round as usize % 2) % ROWS as usize;
+            eng.delete(rows[at]);
+            let e = eng.entity_in("t").unwrap();
+            names[at] = if names[at] < ROWS { names[at] + ROWS } else { names[at] - ROWS };
+            eng.tie_to_by_id(e, key, names[at]);
+            rows[at] = e;
+        }
+        round += 1;
+        eng.persist_sync_state().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let until = Instant::now() + Duration::from_secs(20);
+    while eng.name_compaction_failures() == 0 {
+        assert!(Instant::now() < until, "前提: consumer の周期が pktombs をまとめ直そうとして書けなかった");
+        churn();
+    }
+    // 書けない間、 書き手を回しながら 1.5 秒: 間を空けるので試すのは高々 2 回 (1 秒後にもう 1 回)。 空けなければ周期 (100 ms) ごと
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(1500) {
+        churn();
+    }
+    let failures = eng.name_compaction_failures();
+    // 書けるようにすると、 間を空けた後にまとめ直す (書けなかった回数が 0 に戻る)
+    std::fs::remove_dir(&blocker).unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    let mut recovered = false;
+    while Instant::now() < until {
+        churn();
+        if eng.name_compaction_failures() == 0 {
+            recovered = true;
+            break;
+        }
+    }
+    eng.persist_sync_state().unwrap();
+    eng.compact_name_records_now();
+    let diff = eng.pktombs_disk_diff().unwrap();
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&path);
+    assert!(failures <= 3, "書けない間に周期ごとに始め直した ({failures} 回、 1.5 秒)");
+    assert!(recovered, "書けるようになった後にまとめ直さない");
+    assert_eq!(diff, None);
 }

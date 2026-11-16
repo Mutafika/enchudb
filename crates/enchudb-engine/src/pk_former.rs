@@ -791,6 +791,9 @@ struct CompactState {
     running: bool,
     /// disk を置き換えた / 信用しなくなった回数。 まとめ直しは、 始めた時と置く時でこれが同じ時だけ置く
     epoch: u64,
+    /// まとめ直しを置いた回数を、 何回目で置いたかごとに (1 回目 = 作る間に伸びなかった、 2 回目 = 1 度伸びた分を当てて作り直した、
+    /// 3 回目 = 2 度伸びて最後は書き出しの lock の下で作った)。 review987 2 回目 [I] の測りと試験の前提用
+    placed: [u64; 3],
 }
 
 /// まとめ直しを始めた時の disk ([`PkFormer::begin_compact`])。
@@ -1039,6 +1042,13 @@ impl PkFormer {
     /// 止まって失う)。 `snapshot` が読めなければ Err。
     pub(crate) fn load(snapshot: Option<&[u8]>, log: Option<&[u8]>) -> Result<Self, String> {
         let mut out = Self::load_records(snapshot, log)?;
+        // review987 2 回目 [D]: `pkformer` が無く、 log に record がある (file の無い DB の最初の書き出しの後、 まとめ直しの前に落ちた /
+        // log を読まない旧 binary が `pkformer` を消した後の続きの log) = 前の名前が log にしか無い。 log を読まない 0.37.4 以前で開くと
+        // 前の名前を 1 つも読まず、 その session が場所を使い回した後に開き直すと log の前の名前が今の住人に当たる。 開いた session の
+        // まとめ直しで `pkformer` に並べる (前は 2 倍 + 64 KiB を越えるか、 きれいに閉じるまで log だけのままだった)
+        if snapshot.is_none() && out.log.ok && out.log_has_records() {
+            out.log.compact.wanted = true;
+        }
         // 今の中身の大きさを数える (slot / identity ごとの record の長さ)
         let mut slots: HashSet<u32> = out.by_slot.keys().copied().collect();
         slots.extend(out.bound.keys().chain(out.cards.keys()).chain(out.timeline.keys()));
@@ -1221,6 +1231,8 @@ impl PkFormer {
                 self.log.ok = true;
                 self.log.log_bytes = (header.len() + records.len()) as u64;
                 self.log.compact.epoch += 1;
+                // review987 2 回目 [D]: 続きの log の record は log を読まない 0.37.4 以前が読まない (`Fresh` と同じ)。 `pkformer` に並べる
+                self.log.compact.wanted = true;
             }
             Persist::Append { bytes, compact } => {
                 self.log.log_bytes += bytes.len() as u64;
@@ -1280,6 +1292,16 @@ impl PkFormer {
     /// まとめ直しを終えた (置いた / やめた)。
     pub(crate) fn end_compact(&mut self) {
         self.log.compact.running = false;
+    }
+
+    /// まとめ直しを `round` 回目 (0 始まり、 2 = 書き出しの lock の下で作った) で置いた。
+    pub(crate) fn count_placed(&mut self, round: usize) {
+        self.log.compact.placed[round] += 1;
+    }
+
+    /// まとめ直しを置いた回数 (何回目で置いたかごと、 [`CompactState::placed`])。
+    pub(crate) fn compact_rounds(&self) -> [u64; 3] {
+        self.log.compact.placed
     }
 
     /// まとめ直しが走っているか (試験の待ち合わせ用)。
@@ -1847,6 +1869,51 @@ mod tests {
         // 読んだ物は disk の無い DB ではない
         assert!(!PkFormer::deserialize(&f.serialize()).unwrap().log.fresh);
         assert!(!disk.load().log.fresh);
+    }
+
+    /// review987 2 回目 [D]: `pkformer` が無く log に record がある disk (file の無い DB の最初の書き出しの後、 まとめ直しの前に落ちた) を
+    /// 読むと、 まとめ直しを頼む (log を読まない 0.37.4 以前で開いても前の名前を読めるように `pkformer` に並べる。 前は 2 倍 + 64 KiB を
+    /// 越えるか、 きれいに閉じるまで log だけだった)。 続きの log を作った後 (`Resume`: log の無い / header の合わない `pkformer`、 または
+    /// `pkformer` の無い disk の合わない log を読んだ) も頼む。 `pkformer` があって log に record があるだけ (追記の後に落ちた) と、 header
+    /// だけの log は頼まない。
+    #[test]
+    fn a_log_the_old_binary_cannot_read_is_compacted_into_pkformer() {
+        let mut f = PkFormer::default();
+        let mut disk = Disk::default();
+        f.insert_identity(1, 0, 3, b"k");
+        f.insert(3, b"tokyo", 7);
+        assert_eq!(disk.persist(&mut f, false), Some("rewrite"));
+        assert!(disk.snapshot.is_none(), "前提: 最初の書き出しは log だけ");
+        // まとめ直しの前に落ちて開いた
+        let mut back = disk.load();
+        assert!(back.compact_wanted(), "log にしか無い前の名前を pkformer に並べない");
+        assert!(disk.compact(&mut back, |_, _| {}));
+        assert_eq!(PkFormer::deserialize(disk.snapshot.as_ref().unwrap()).unwrap().serialize(), f.serialize());
+        // header だけの log、 `pkformer` + record のある log は頼まない
+        assert!(!Disk { snapshot: None, log: Some(log_header(&[]).to_vec()) }.load().compact_wanted());
+        back.insert(3, b"osaka", 8);
+        assert_eq!(disk.persist(&mut back, false), Some("append"));
+        assert!(!disk.load().compact_wanted(), "pkformer のある普通の log でまとめ直しを頼んだ");
+        // log の無い `pkformer` (0.37.4 が書いた) の続きの log
+        let mut old = Disk { snapshot: Some(f.serialize()), log: None };
+        let mut g = old.load();
+        assert!(!g.compact_wanted());
+        g.insert(3, b"kyoto", 9);
+        assert_eq!(old.persist(&mut g, false), Some("resume"));
+        assert!(g.compact_wanted(), "続きの log を作った後に pkformer にまとめ直さない");
+        assert!(old.compact(&mut g, |_, _| {}));
+        assert_eq!(PkFormer::deserialize(old.snapshot.as_ref().unwrap()).unwrap().serialize(), g.serialize());
+        // `pkformer` が無く header の合わない log (log を読まない binary が `pkformer` を消した後): 続きの log は log だけ
+        let mut gone = Disk { snapshot: None, log: disk.log.clone() };
+        assert!(disk.snapshot.is_some() && disk.log.as_ref().unwrap()[..LOG_HEADER_LEN] != log_header(&[])[..], "前提");
+        let mut h2 = gone.load();
+        assert!(!h2.compact_wanted());
+        h2.insert(3, b"nara", 10);
+        assert_eq!(gone.persist(&mut h2, false), Some("resume"));
+        assert!(gone.snapshot.is_none());
+        assert!(h2.compact_wanted(), "pkformer の無い続きの log の後にまとめ直さない");
+        assert!(gone.compact(&mut h2, |_, _| {}));
+        assert_eq!(PkFormer::deserialize(gone.snapshot.as_ref().unwrap()).unwrap().serialize(), h2.serialize());
     }
 
     /// #959 / review987 [1]: disk が大きくなった時、 書き込みの lock の下では印の付いた所を取り出すだけ (`Append { compact: true }`、

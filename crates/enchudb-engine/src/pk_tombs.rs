@@ -125,6 +125,9 @@ struct CompactState {
     /// file を置き換えた / 信用しなくなった回数 (書き直し・最初の書き出し・まとめ直し・書けなかった・忘れた)。 まとめ直しは、
     /// 始めた時と置く時でこれが同じ時だけ置く (間に置き換わった file の続きではない)。
     epoch: u64,
+    /// まとめ直しを置いた回数を、 伸びた分をどこで足したかごとに (0 = 作る間に伸びなかった、 1 = 書き出しの lock の外で 1 回足した、
+    /// 2 = もう一度伸びて書き出しの lock の下で足して書き出した)。 review987 2 回目 [I] の測りと試験の前提用
+    placed: [u64; 3],
 }
 
 /// まとめ直しを始めた時の file ([`PkTombs::begin_compact`])。
@@ -313,7 +316,7 @@ impl PkTombs {
         // review987 [2]: 取り出し済みの書き直しは、 書けても file を信用させない。 走っているまとめ直しは置かせない (置いても
         // file を信用しないので次は memory から書き直すが、 走っている印は残す = 2 本目を始めない)
         self.forgets = old.forgets + 1;
-        self.compact = CompactState { wanted: false, running: old.compact.running, epoch: old.compact.epoch + 1 };
+        self.compact = CompactState { wanted: false, epoch: old.compact.epoch + 1, ..old.compact };
         let mut new_id = vec![EMPTY; old.keys.len()];
         for (id, k) in old.keys.iter().enumerate() {
             if k.hlc() >= h {
@@ -432,6 +435,16 @@ impl PkTombs {
     /// まとめ直しを終えた (置いた / やめた)。
     pub(crate) fn end_compact(&mut self) {
         self.compact.running = false;
+    }
+
+    /// まとめ直しを置いた ([`CompactState::placed`] の `round`)。
+    pub(crate) fn count_placed(&mut self, round: usize) {
+        self.compact.placed[round] += 1;
+    }
+
+    /// まとめ直しを置いた回数 ([`CompactState::placed`])。
+    pub(crate) fn compact_rounds(&self) -> [u64; 3] {
+        self.compact.placed
     }
 
     /// まとめ直しが走っているか (試験の待ち合わせ用)。
