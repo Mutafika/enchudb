@@ -2288,6 +2288,9 @@ fn pkformer_compaction_under_the_lock_applies_the_appends_made_meanwhile() {
     crashsim::stop();
     drop(eng);
     captured.unwrap();
+    // 置いた log (header だけ) は書き出さない: 置き終えた後の像の log には header が無い (読まれず、 `pkformer` だけで全部ある)
+    let live_log = std::fs::read(enchudb_engine::db_files::path_for(&path, enchudb_engine::db_files::PKFORMER_LOG)).unwrap();
+    let img_log = std::fs::read(fin_img.join("db").join(enchudb_engine::db_files::PKFORMER_LOG)).unwrap_or_default();
     let appended = std::mem::take(&mut *appended.lock().unwrap());
     let mut shots = std::mem::take(&mut *shots.lock().unwrap());
     shots.push((CPhase::FormerPlaced, fin_img, appended.last().cloned().unwrap_or_default()));
@@ -2318,6 +2321,7 @@ fn pkformer_compaction_under_the_lock_applies_the_appends_made_meanwhile() {
     assert_eq!(live_diff, None, "3 回目に置いた disk が memory と違う");
     assert!(fin == appended[2], "置いた disk の中身が、 最後の追記の書き出しが返った中身と違う");
     assert_eq!(log_len, 24, "前提: まとめ直した後の log は header だけ");
+    assert!(img_log != live_log, "前提: 置き終えた後の像の log は header を持たない (書き出していない log を読まずに開く像)");
 }
 
 /// review987 2 回目 [F]: まとめ直しの途中で panic しても、 まとめ直しの印 (走っている) を下ろし、 一時 file を消す (次の機会に始め直せる)。

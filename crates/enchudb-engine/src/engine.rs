@@ -1831,16 +1831,18 @@ fn remove_sidecar(path: &std::path::Path) -> io::Result<()> {
     }
 }
 
-/// #959 / review987 [1]: 書き出しの lock の外のまとめ直しが、 一時 file `tmp` に `parts` をつないで書いて書き出す。
+/// #959 / review987 [1]: 書き出しの lock の外のまとめ直しが、 一時 file `tmp` に `parts` をつないで書く。 `sync` なら書き出す。
 #[cfg(not(target_arch = "wasm32"))]
-fn write_compact_tmp(tmp: &std::path::Path, parts: &[&[u8]]) -> io::Result<std::fs::File> {
+fn write_compact_tmp(tmp: &std::path::Path, parts: &[&[u8]], sync: bool) -> io::Result<std::fs::File> {
     use std::io::Write;
     enchudb_oplog::io_point("sidecar.compact_write")?;
     let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(tmp)?;
     for part in parts {
         f.write_all(part)?;
     }
-    sync_compact_tmp(&f, tmp)?;
+    if sync {
+        sync_compact_tmp(&f, tmp)?;
+    }
     Ok(f)
 }
 
@@ -16702,9 +16704,13 @@ impl Engine {
                 }
                 let (snapshot, log) = f.compacted_files();
                 if !snapshot.is_empty() {
-                    write_compact_tmp(&tmp_snap, &[&snapshot])?;
+                    write_compact_tmp(&tmp_snap, &[&snapshot], true)?;
                 }
-                write_compact_tmp(&tmp_log, &[&log])?;
+                // log は header だけ (record 無し) なので書き出さない (review987 2 回目 [I]: 回ごとの F_FULLFSYNC を 1 つ減らす。 3 回目は
+                // 書き出しの lock の下)。 置いた後に中身が disk に届く前に落ちても、 header の合わない (ゼロの / 空の) log は読まれず、 置いた
+                // `pkformer` だけで全部ある (log の無い `pkformer` を読んだ時と同じ = 次の書き出しが続きの log を作る)。 置いた後の追記は
+                // 追記の書き出し (`sync_all`) が header ごと disk に届ける
+                write_compact_tmp(&tmp_log, &[&log], false)?;
                 #[cfg(feature = "crashsim")]
                 if held.is_none() {
                     name_compact_hook::call(name_compact_hook::Phase::FormerPrepared);
@@ -17101,7 +17107,7 @@ impl Engine {
                 ));
             }
             drop(buf);
-            let mut out = write_compact_tmp(&tmp, &[&bytes])?;
+            let mut out = write_compact_tmp(&tmp, &[&bytes], true)?;
             drop(bytes);
             let (mut len, mut n) = (len0, mark.records);
             for round in 0..2 {
