@@ -274,7 +274,7 @@ fn open_once(dir: &str, kind: &str) {
     };
     let r = enchudb_oplog::oplog::wal_reads();
     println!(
-        "OPEN_MS {:.3} entities {n} reads replays={} ({:.1} ms) hole_scans={} ({:.1} ms) probes={} ({:.3} ms) probe_records={}",
+        "OPEN_MS {:.3} entities {n} reads replays={} ({:.1} ms) hole_scans={} ({:.1} ms) probes={} ({:.3} ms) asks={} probe_records={}",
         ms(took),
         r.replays - before.replays,
         (r.replay_ns - before.replay_ns) as f64 / 1e6,
@@ -282,6 +282,7 @@ fn open_once(dir: &str, kind: &str) {
         (r.hole_scan_ns - before.hole_scan_ns) as f64 / 1e6,
         r.probes - before.probes,
         (r.probe_ns - before.probe_ns) as f64 / 1e6,
+        r.asks - before.asks,
         r.probe_records - before.probe_records
     );
     std::process::exit(0);
