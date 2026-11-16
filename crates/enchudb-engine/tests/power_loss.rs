@@ -21,6 +21,7 @@
 #![cfg(all(feature = "crashsim", unix))]
 
 use enchudb_engine::engine::write_out_hook::{self, Phase};
+use enchudb_engine::engine::ConsumerHold;
 use enchudb_engine::sync_payload_ring::PayloadRing;
 use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::crashsim::{self, Copied, Mode};
@@ -3195,17 +3196,25 @@ fn full_named_table_engine(db: &Path) -> (Arc<Engine>, u64) {
 }
 
 /// X を消し、 sidecar (`tables` / `.eidmap` …) と WAL・本体を書き出して checkpoint を X の Delete の先へ進める (落ちた後の再生は
-/// X の Delete を当て直さない = X の削除は本体の tomb.seg にだけある)。 X の削除の版数を返す。
-fn delete_and_checkpoint(eng: &Engine, x: u64) -> Hlc {
+/// X の Delete を当て直さない = X の削除は本体の tomb.seg にだけある)。 X の削除の版数と、 consumer の周期を止めた guard を返す
+/// (落とすまで止めたまま。 呼び手はこの後の仕度もこの guard の下でする)。
+///
+/// consumer は消す前から止める (#981): 周期は head が checkpoint より先にあると自分の Commit を積んで書き出す。 `oplog_sync` の
+/// 書き出しの最中 (Commit を積んで覆う位置を取った後・checkpoint を進める前) に周期が来ると、 周期の Commit (payload 0 = 120 B) は
+/// `oplog_sync` の覆う位置の先に積まれ、 それを書き出して checkpoint を進めるのは周期の方 = `oplog_sync` が返った時、 checkpoint は
+/// head の 120 B 手前にある (X の Delete は checkpoint の手前。 #933 と同じ形)。 書き出しが遅い (CI / fsync を遅らせる shim) と、
+/// 書き出しの間に周期 (100 ms) が来る。 止めると WAL に積むのも checkpoint を進めるのもこの thread だけになる。
+fn delete_and_checkpoint(eng: &Engine, x: u64) -> (Hlc, ConsumerHold<'_>) {
+    let hold = eng.hold_consumer();
     eng.delete(x);
     eng.oplog_commit();
     let tomb = eng.tombstone_hlc(x);
-    assert_ne!(tomb, Hlc::ZERO, "前提: X の削除の版数");
+    assert_ne!(tomb, Hlc::ZERO, "前提: 消した行の削除の版数");
     eng.persist_sync_state().unwrap();
     eng.oplog_sync().unwrap();
     let s = eng.stats();
-    assert_eq!(s.oplog_checkpoint, s.oplog_head, "前提: checkpoint が X の Delete の先へ進んだ");
-    tomb
+    assert_eq!(s.oplog_checkpoint, s.oplog_head, "前提: checkpoint が消した行の Delete の先へ進んだ");
+    (tomb, hold)
 }
 
 /// 名前 7 の行 Y を足す (X の場所を使い回す)。
@@ -3253,8 +3262,7 @@ fn a_moved_delete_of_a_reused_slot_survives_power_loss_before_the_sidecar() {
     crashsim::start();
     let (x, tomb) = {
         let (eng, x) = full_named_table_engine(&live.join("db"));
-        let tomb = delete_and_checkpoint(&eng, x);
-        let _hold = eng.hold_consumer();
+        let (tomb, _hold) = delete_and_checkpoint(&eng, x);
         let y = add_seven(&eng, 77);
         assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
         eng.oplog_sync().unwrap();
@@ -3288,8 +3296,7 @@ fn a_reuse_during_the_write_out_reaches_disk_with_its_record_before_the_cleared_
     crashsim::start();
     let (x, tomb) = {
         let (eng, x) = full_named_table_engine(&live.join("db"));
-        let tomb = delete_and_checkpoint(&eng, x);
-        let _hold = eng.hold_consumer();
+        let (tomb, _hold) = delete_and_checkpoint(&eng, x);
         let reused: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
         let (e2, r2) = (eng.clone(), reused.clone());
         write_out_hook::set(Some(Arc::new(move |p: Phase| {
@@ -3331,8 +3338,7 @@ fn a_reuse_cut_before_the_tombstones_keeps_the_reused_row_and_the_delete() {
         crashsim::start();
         let (x, tomb) = {
             let (eng, x) = full_named_table_engine(&live.join("db"));
-            let tomb = delete_and_checkpoint(&eng, x);
-            let _hold = eng.hold_consumer();
+            let (tomb, _hold) = delete_and_checkpoint(&eng, x);
             let y = add_seven(&eng, 77);
             assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
             let shot = Arc::new(AtomicBool::new(false));
@@ -4000,8 +4006,7 @@ fn a_reuse_only_in_the_wal_is_finished_by_the_replay() {
     crashsim::start();
     let (x, tomb, y) = {
         let (eng, x) = full_named_table_engine(&live.join("db"));
-        let tomb = delete_and_checkpoint(&eng, x);
-        let _hold = eng.hold_consumer();
+        let (tomb, _hold) = delete_and_checkpoint(&eng, x);
         let y = add_seven(&eng, 77);
         assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y は X の場所を使い回した");
         let shot = Arc::new(AtomicBool::new(false));
@@ -4105,13 +4110,7 @@ fn a_translated_reuse_whose_eidmap_reached_disk_first_is_not_read_as_an_own_row(
         assert!(eng.remote_tie_apply_result(t, hid, 5u32, Hlc { wall: 1_000, logical: 0, peer: 3 }).applied());
         let f = eng.pull_raw("t.c", 5u32);
         assert_eq!(f.len(), 1, "前提: A に F がある");
-        eng.delete(f[0]);
-        eng.oplog_commit();
-        eng.persist_sync_state().unwrap();
-        eng.oplog_sync().unwrap();
-        let s = eng.stats();
-        assert_eq!(s.oplog_checkpoint, s.oplog_head, "前提: checkpoint が F の Delete の先へ進んだ");
-        let _hold = eng.hold_consumer();
+        let (_, _hold) = delete_and_checkpoint(&eng, f[0]);
         let y = eng.entity_in("t").unwrap();
         eng.tie_to(y, "t.c", 9u32);
         eng.oplog_commit();
