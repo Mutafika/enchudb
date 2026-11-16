@@ -183,7 +183,7 @@ fn compacted_name_records_read_back_after_an_unclean_copy() {
 #[test]
 fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
     use std::sync::{Mutex, RwLock};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     const WRITERS: usize = 4;
     const PER: usize = 128;
     let path = tmp("parallel");
@@ -209,15 +209,18 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
         .collect();
     eng.persist_sync_state().unwrap();
     let stop = AtomicBool::new(false);
+    // 書き手が消して足した回数 (回ごとに一定の数だけ進ませる。 時間で回すと、 速い CI で書き手が止めている間にほとんど進まず、
+    // まとめ直しが起きる大きさにならなかった)
+    let ops = AtomicUsize::new(0);
     // 書き手を止める (止めている間に書き出して disk と memory を比べる)
     let pause = RwLock::new(());
     // 書き手が最後に消した名前の削除の版数 (忘れる線に使う)
     let lines: Mutex<Vec<Hlc>> = Mutex::new(Vec::new());
-    let (mut tombs_shrank, mut former_shrank, mut forgotten) = (0, 0, 0);
+    let mut forgotten = 0;
     let mut mid: Vec<String> = Vec::new();
     std::thread::scope(|s| {
         for w in 0..WRITERS {
-            let (eng, rows, stop, lines, pause) = (&eng, &rows, &stop, &lines, &pause);
+            let (eng, rows, stop, lines, pause, ops) = (&eng, &rows, &stop, &lines, &pause, &ops);
             s.spawn(move || {
                 // 自分の受け持ちの行を、 名前を n と n + total の間で行き来させながら消して足す
                 let mut mine: Vec<(u64, u32)> = (0..PER).map(|i| (rows[w * PER + i], (w * PER + i) as u32)).collect();
@@ -231,6 +234,7 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
                     *name = if *name < total { *name + total } else { *name - total };
                     eng.tie_to_by_id(e, key, *name);
                     *row = e;
+                    ops.fetch_add(1, Ordering::Relaxed);
                     if i.is_multiple_of(64)
                         && let Some(h) = eng.deleted_name_version(key, gone as u64)
                     {
@@ -250,7 +254,6 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
                 }
             });
         }
-        let (mut prev_tombs, mut prev_former) = (0u64, 0u64);
         for round in 0..60 {
             {
                 // 書き手を止めて書き出す: disk は memory と同じ (まとめ直しが追記を落とす / 忘れた後に置いた file を信用すると違う)
@@ -277,17 +280,25 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
             if round % 3 == 2 {
                 eng.compact_name_records_now();
             }
-            let (t, f) = (len(&path, PKTOMBS), len(&path, PKFORMER) + len(&path, PKFORMER_LOG));
-            tombs_shrank += (t < prev_tombs) as u32;
-            former_shrank += (f < prev_former) as u32;
-            (prev_tombs, prev_former) = (t, f);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            // 書き手を 1500 回ほど進ませる (遅い機械で回り続けないよう 5 秒まで)
+            let (from, until) = (ops.load(Ordering::Relaxed), std::time::Instant::now() + std::time::Duration::from_secs(5));
+            while ops.load(Ordering::Relaxed) < from + 1500 && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         stop.store(true, Ordering::Release);
     });
     eng.persist_sync_state().unwrap();
     eng.compact_name_records_now();
-    assert!(tombs_shrank >= 2 && former_shrank >= 2 && forgotten > 0, "前提: まとめ直し pktombs {tombs_shrank} 回 / pkformer {former_shrank} 回、 忘れた {forgotten}");
+    // 前提: 書き手が走っている間に、 lock の外のまとめ直しを何度も置いた (置いた数は何回目で置いたかごとの数の和。 file の大きさを回ごとに
+    // 見て縮んだ回を数えると、 consumer の周期のまとめ直しの後に伸び直した回を見落とした: CI で pkformer 1 回)
+    let (rt, rf) = eng.name_compaction_rounds();
+    let placed = |r: [u64; 3]| r.iter().sum::<u64>();
+    assert!(
+        placed(rt) >= 2 && placed(rf) >= 2 && forgotten > 0,
+        "前提: まとめ直しを置いた pktombs {rt:?} / pkformer {rf:?}、 忘れた {forgotten}"
+    );
+    eprintln!("まとめ直しを置いた pktombs {rt:?} / pkformer {rf:?}、 忘れた {forgotten}");
     assert!(mid.is_empty(), "書き手を止めて書き出した disk と memory が違う: {mid:#?}");
     // 書き出した file が memory と同じ (まとめ直しが追記を落とす / 忘れた後に置いた file を信用すると違う)
     assert_eq!(eng.pktombs_disk_diff().unwrap(), None, "pktombs の disk と memory が違う");
