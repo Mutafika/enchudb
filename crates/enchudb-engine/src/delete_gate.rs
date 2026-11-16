@@ -17,19 +17,31 @@
 //! 読み直し [2] (phase-fair): 閉じる側が並ぶ形 (ホストが client ごとの publish で `oplog_sync` する、 Sync mode の書き手が複数、 pull の
 //! たびの書き出し) では、 閉じている数が 0 に戻らない間が続き、 削除が門に入れない (飢える)。 そこで閉じた門で待ち始めた削除を数え
 //! (`wanting`)、 0 でない間は新しく閉じる側が閉じる前に待つ: 今閉じている側が開くと、 待っていた削除が先に入る。 閉じる側が待つのは、
-//! 待っている削除が入るまで (今閉じている側の残りの msync と、 削除の待ちの眠り 1 回分)。 閉じた後に来た削除は数えず、 開いている
-//! 門にはそのまま入るので、 閉じる側も飢えない。
+//! 待っている削除が入るまで (今閉じている側の残りの msync と、 開いた時に起こされた削除が入ってくるまで)。 閉じた後に来た削除は
+//! 数えず、 開いている門にはそのまま入るので、 閉じる側も飢えない。
 //!
 //! 削除の待ちの上限 (読み直し 2 [G]): 待ち始めた時に閉じていた窓 1 つとは限らない。 削除が閉じた門を読んでから待ちの数を足すまでの
 //! 間に、 新しく閉じる側が 0 を見て閉じうる (その窓も待つ = 窓 2 つ。 3 つ目の閉じる側は待ちの数を見て譲る)。 窓 1 つの長さは、 その段の
 //! msync の他に、 中身を指す列の段では書き出しの門 (`PublishGate::close` の Mutex) を待つ間を含む (削除の門を先に閉じるので、 書き出しが
 //! 重なると先に並んだ書き出しの列の msync の間も閉じたまま)。
 //!
-//! 譲りの値段 (読み直し 2 [K]): 閉じる側が 1 回譲ると、 待っている削除の眠り (50 µs、 OS の眠りの粒度で伸びる) が明けて入るまで閉じない。
-//! 中身を指す列を 1 本ずつ書き出す段は列ごとに閉じるので、 削除が続く間の書き出しは 「書く範囲のある中身を指す列の数 × 譲り 1 回」
-//! 伸びる (Mac の測り: Tag 16 列の表に 150 µs ごとの削除で、 `oplog_sync` の p50 1.4 → 2.6 ms、 Tag 4 列で 1.0 → 1.2 ms)。
+//! 待ち方 (読み直し 2 [K] の後): 待つ側は短く spin してから寝て、 待ちを解く側が起こす。 閉じた門で待つ削除は、 開いた閉じる側が
+//! 起こす (`opened`)。 閉じる側の待ち (待っている削除が入る / 中の削除が出る) は、 待っている削除が入って待ちの数を 0 にした時と、
+//! 閉じた門の中から最後の削除が出た時に、 その削除が起こす (`progressed`)。 閉じる側は寝る前に [`CLOSER_SPIN`] の間 spin する (待つ
+//! 相手は起こされて入ってくる削除か門の中の短い仕事なので、 たいていその間に終わる = 閉じる側は寝ない)。 前は待つ側が 50 µs の眠りで
+//! 見に行き、 閉じる側が 1 回譲ると削除の眠り (OS の眠りの粒度で約 130 µs) が明けて入るまで閉じなかった: 中身を指す列を 1 本ずつ
+//! 書き出す段は列ごとに閉じるので、 削除が続く間の書き出しが 「書く範囲のある中身を指す列の数 × 約 130 µs」 伸びた (Mac の測り: Tag 16
+//! 列の表に 150 µs ごとの削除で、 `oplog_sync` の p50 1.4 → 2.6 ms)。
+//!
+//! 起こし損ねない約束 (`tests/loom_delete_gate.rs` の model): 寝る側は寝床の lock (`sleep`) の下で条件を読み直し、 寝ている数を足して
+//! から寝る。 起こす側は atomic を書き換えた後に寝床の lock を取り、 寝ている数が 0 でなければ起こす。 = 起こす側が lock を取る前に寝る
+//! 側が lock の下で読めば書き換えが見え、 後なら寝る側はもう数えられて寝ている。 削除の速い道 (開いている門に入る / 出る) は今まで
+//! 通り atomic の CAS 1 回と fetch_sub 1 回 (出る時は返った値を比べるだけ) で、 寝床の lock を取るのは、 閉じている門に当たった削除・
+//! 閉じた門の中から最後に出る削除・閉じる側だけ。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 /// shard の数 (削除は slot で選ぶ)。 閉じる側は全部を閉じる。
 const SHARDS: usize = 8;
@@ -37,6 +49,11 @@ const SHARDS: usize = 8;
 const CLOSER: u64 = 1 << 32;
 /// shard の語の、 中に居る削除の数の bit。
 const INSIDE: u64 = CLOSER - 1;
+/// 閉じた門に当たった削除が、 寝る前に読み直す回数 (門は列の msync の間 = 数十 µs 以上閉じるので、 すぐ寝る)。
+const DELETE_SPINS: u32 = 64;
+/// 閉じる側が寝る前に spin する長さ。 待つ相手は、 起こされて入ってくる削除 (起こす遅れ) か、 門の中で cell を落としている削除
+/// (短い) なので、 たいていこの間に終わる (閉じる側が寝て起こされる遅れを、 書き出しの段ごとの譲りに足さない)。
+const CLOSER_SPIN: Duration = Duration::from_micros(100);
 
 /// 64 B に揃えて shard ごとに cache line を分ける。
 #[derive(Default)]
@@ -55,6 +72,22 @@ pub struct DeleteGate {
     wait_max_ns: AtomicU64,
     /// 門を閉じていた時間の合計 (ns、 観測用。 閉じる側が並んだ区間は、 それぞれの区間を足す)
     closed_ns: AtomicU64,
+    /// 寝床 (遅い道だけ): 寝ている削除と閉じる側の数。 中では atomic を読む / 数を足し引きするだけ (他の lock を取らない)
+    sleep: Mutex<Sleepers>,
+    /// 閉じた門で寝ている削除 (閉じる側が開いた時に起こす)
+    opened: Condvar,
+    /// 寝ている閉じる側 (待っている削除が入って待ちの数を 0 にした時、 閉じた門の中から最後の削除が出た時に起こす)
+    progressed: Condvar,
+}
+
+/// 寝床で寝ている数 (`DeleteGate::sleep`)。 起こす側は、 0 なら起こさない (起こすたびの syscall を省く)。
+#[derive(Default)]
+struct Sleepers {
+    deletes: u32,
+    closers: u32,
+    /// 寝た回数 (試験の前提: 寝る道を通ったか)
+    #[cfg(test)]
+    slept: (u64, u64),
 }
 
 // 読み直し [4]: 門の中で門を閉じる (門の中の削除が本体の書き出しを呼ぶ) と、 閉じる側が自分の退出を待って止まり続ける。 閉じた門に同じ
@@ -113,18 +146,6 @@ impl Default for DeleteGate {
     }
 }
 
-/// 待つ: 最初は spin、 次に yield、 長くなったら短く眠る (門は列の msync の間 = ms 単位で閉じる)。
-fn backoff(spins: &mut u32) {
-    if *spins < 64 {
-        std::hint::spin_loop();
-    } else if *spins < 128 {
-        std::thread::yield_now();
-    } else {
-        std::thread::sleep(std::time::Duration::from_micros(50));
-    }
-    *spins = spins.saturating_add(1);
-}
-
 impl DeleteGate {
     pub fn new() -> Self {
         Self {
@@ -134,6 +155,48 @@ impl DeleteGate {
             yields: AtomicU64::new(0),
             wait_max_ns: AtomicU64::new(0),
             closed_ns: AtomicU64::new(0),
+            sleep: Mutex::new(Sleepers::default()),
+            opened: Condvar::new(),
+            progressed: Condvar::new(),
+        }
+    }
+
+    /// 寝床の lock (中で panic する所は無いが、 毒は無視する)。
+    fn sleepers(&self) -> MutexGuard<'_, Sleepers> {
+        self.sleep.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 寝ている閉じる側を起こす。 待ちを解く atomic (待ちの数 / 中に居る数) を書き換えた後に呼ぶ (寝床の lock の下で数を見るので、
+    /// この lock より前に寝床で読み直した閉じる側は書き換えを見ていて、 後の閉じる側は数えられて寝ている)。
+    fn wake_closers(&self) {
+        let g = self.sleepers();
+        if g.closers > 0 {
+            self.progressed.notify_all();
+        }
+    }
+
+    /// 閉じる側が `done` になるまで待つ: [`CLOSER_SPIN`] の間 spin し、 まだなら寝床で寝る (待っている削除が入って待ちの数を 0 にした
+    /// 時 / 閉じた門の中から最後の削除が出た時に、 その削除が起こす)。
+    fn closer_wait(&self, done: impl Fn() -> bool) {
+        let mut spins = 0u32;
+        let mut since: Option<Instant> = None;
+        while !done() {
+            std::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if !spins.is_multiple_of(64) || since.get_or_insert_with(Instant::now).elapsed() < CLOSER_SPIN {
+                continue;
+            }
+            let mut g = self.sleepers();
+            while !done() {
+                #[cfg(test)]
+                {
+                    g.slept.1 += 1;
+                }
+                g.closers += 1;
+                g = self.progressed.wait(g).unwrap_or_else(PoisonError::into_inner);
+                g.closers -= 1;
+            }
+            return;
         }
     }
 
@@ -146,35 +209,59 @@ impl DeleteGate {
             0,
             "#978: 削除の門を閉じている thread が門に入ろうとした (自分が開くのを待って止まる)"
         );
-        let s = &self.shards[key as usize % SHARDS].0;
+        let shard = key as usize % SHARDS;
+        let s = &self.shards[shard].0;
         let mut spins = 0;
-        let mut waited: Option<std::time::Instant> = None;
+        let mut waited: Option<Instant> = None;
         loop {
             let v = s.load(Ordering::Acquire);
-            // 語全体で CAS するので、 読んだ後に閉じられたら失敗して読み直す (閉じた後には入れない)
-            if v < CLOSER && s.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                break;
+            if v < CLOSER {
+                // 語全体で CAS するので、 読んだ後に閉じられたら失敗して読み直す (閉じた後には入れない)
+                if s.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    break;
+                }
+                continue;
             }
-            if v >= CLOSER && waited.is_none() {
-                waited = Some(std::time::Instant::now());
+            if waited.is_none() {
+                waited = Some(Instant::now());
                 self.waits.fetch_add(1, Ordering::Relaxed);
                 // 新しく閉じる側に、 先に通してもらう (入ったら外す)
                 self.wanting.0.fetch_add(1, Ordering::AcqRel);
                 #[cfg(feature = "crashsim")]
                 crate::engine::write_out_hook::call(crate::engine::write_out_hook::Phase::DeleteGateWait);
             }
-            backoff(&mut spins);
+            if spins < DELETE_SPINS {
+                spins += 1;
+                std::hint::spin_loop();
+                continue;
+            }
+            // 開くまで寝る。 開く側は閉じた数を下ろしてから寝床の lock を取って起こすので、 lock の下で閉じているのを見てから寝れば
+            // 起こし損ねない (module doc)
+            let mut g = self.sleepers();
+            while s.load(Ordering::Acquire) >= CLOSER {
+                #[cfg(test)]
+                {
+                    g.slept.0 += 1;
+                }
+                g.deletes += 1;
+                g = self.opened.wait(g).unwrap_or_else(PoisonError::into_inner);
+                g.deletes -= 1;
+            }
         }
         if let Some(t) = waited {
-            self.wanting.0.fetch_sub(1, Ordering::AcqRel);
+            // 待ちの数を 0 にしたら、 待っている削除を先に通そうと待つ閉じる側を起こす
+            if self.wanting.0.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.wake_closers();
+            }
             self.wait_max_ns.fetch_max(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
         }
         #[cfg(debug_assertions)]
         count_here(self.debug_key(), 1, 0);
         DeletePass {
-            shard: s,
+            gate: self,
+            shard,
             #[cfg(debug_assertions)]
-            gate: self.debug_key(),
+            key: self.debug_key(),
         }
     }
 
@@ -202,23 +289,19 @@ impl DeleteGate {
                 "#978: 削除の門を閉じたまま、 もう一度閉じた (待っている削除が入れず、 それを待って止まる。 段ごとに開いてから閉じること)"
             );
         }
-        let start = std::time::Instant::now();
-        let mut spins = 0;
-        while self.wanting.0.load(Ordering::Acquire) != 0 {
-            if spins == 0 {
-                self.yields.fetch_add(1, Ordering::Relaxed);
-            }
-            backoff(&mut spins);
+        let start = Instant::now();
+        if self.wanting.0.load(Ordering::Acquire) != 0 {
+            self.yields.fetch_add(1, Ordering::Relaxed);
+            // 待っている削除が入って待ちの数を 0 にすると、 その削除が起こす
+            self.closer_wait(|| self.wanting.0.load(Ordering::Acquire) == 0);
         }
         for s in &self.shards {
             s.0.fetch_add(CLOSER, Ordering::AcqRel);
         }
         for s in &self.shards {
-            let mut spins = 0;
-            // Acquire: 出た削除の Release と対 (その削除が書いた tombstone と落とした cell が見える)
-            while s.0.load(Ordering::Acquire) & INSIDE != 0 {
-                backoff(&mut spins);
-            }
+            // Acquire: 出た削除の Release と対 (その削除が書いた tombstone と落とした cell が見える)。 閉じた門の中から最後に出た削除が
+            // 起こす
+            self.closer_wait(|| s.0.load(Ordering::Acquire) & INSIDE == 0);
         }
         #[cfg(debug_assertions)]
         count_here(self.debug_key(), 0, 1);
@@ -248,24 +331,29 @@ impl DeleteGate {
 
 /// 門の中に居る間持つ。
 pub struct DeletePass<'a> {
-    shard: &'a AtomicU64,
+    gate: &'a DeleteGate,
+    shard: usize,
     /// debug の数の鍵 (門の番地、 `DeleteGate::debug_key`)
     #[cfg(debug_assertions)]
-    gate: usize,
+    key: usize,
 }
 
 impl Drop for DeletePass<'_> {
     fn drop(&mut self) {
-        self.shard.fetch_sub(1, Ordering::Release);
+        let prev = self.gate.shards[self.shard].0.fetch_sub(1, Ordering::Release);
+        // 閉じた門の中から最後に出た: 中が出るのを待っている閉じる側を起こす (開いている門から出る速い道は、 この比べだけ)
+        if prev >= CLOSER && prev & INSIDE == 1 {
+            self.gate.wake_closers();
+        }
         #[cfg(debug_assertions)]
-        count_here(self.gate, -1, 0);
+        count_here(self.key, -1, 0);
     }
 }
 
 /// 閉じている間持つ。
 pub struct DeleteClosed<'a> {
     gate: &'a DeleteGate,
-    start: std::time::Instant,
+    start: Instant,
 }
 
 impl Drop for DeleteClosed<'_> {
@@ -277,6 +365,12 @@ impl Drop for DeleteClosed<'_> {
         }
         let ns = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.gate.closed_ns.fetch_add(ns, Ordering::Relaxed);
+        // 閉じた門で寝ている削除を起こす (閉じた数を下ろした後に寝床の lock を取る = この lock より前に寝床で読み直した削除は開いた
+        // のを見ていて、 後の削除は数えられて寝ている。 閉じる側がまだ居れば、 起きた削除は読み直してまた寝る)
+        let g = self.gate.sleepers();
+        if g.deletes > 0 {
+            self.gate.opened.notify_all();
+        }
     }
 }
 
@@ -399,6 +493,149 @@ mod tests {
         let g = DeleteGate::new();
         let _inside = g.enter(1);
         let _closed = g.close();
+    }
+
+    /// 読み直し 2 [K] の後: 閉じた門で待つ削除は寝て、 開いた閉じる側が起こす (50 µs の眠りで見に行かない)。 寝たこと (寝床の数) を
+    /// 見てから開く。
+    #[test]
+    fn a_sleeping_delete_is_woken_by_the_opener() {
+        let gate = Arc::new(DeleteGate::new());
+        let c = gate.close();
+        let h = {
+            let gate = gate.clone();
+            std::thread::spawn(move || drop(gate.enter(2)))
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while gate.sleepers().deletes == 0 {
+            assert!(Instant::now() < end, "閉じた門で待つ削除が寝ない");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(c);
+        let end = Instant::now() + Duration::from_secs(60);
+        while !h.is_finished() {
+            assert!(Instant::now() < end, "開いても寝た削除が起きない (起こし損ね。 join せずに落とす)");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        h.join().unwrap();
+        assert_eq!(gate.sleepers().deletes, 0, "寝ている削除の数が戻らない");
+    }
+
+    /// 閉じる側も寝て、 待ちを解いた削除が起こす: 中の削除が出る (閉じた門の中から最後に出る) / 待っている削除が入る (待ちの数を 0 に
+    /// する)。 どちらも閉じる側が寝たこと (寝床の数) を見てから解く。
+    #[test]
+    fn a_sleeping_closer_is_woken_by_the_delete() {
+        // 中の削除が出るのを待つ閉じる側
+        let gate = Arc::new(DeleteGate::new());
+        let inside = gate.enter(1);
+        let h = {
+            let gate = gate.clone();
+            std::thread::spawn(move || drop(gate.close()))
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while gate.sleepers().closers == 0 {
+            assert!(Instant::now() < end, "中の削除を待つ閉じる側が寝ない");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(inside);
+        let end = Instant::now() + Duration::from_secs(60);
+        while !h.is_finished() {
+            assert!(Instant::now() < end, "中の削除が出ても閉じる側が起きない (起こし損ね。 join せずに落とす)");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        h.join().unwrap();
+
+        // 待っている削除が入るのを待つ閉じる側 (phase-fair)。 1 本目が閉じた門で削除が待ち、 2 本目が寝た後に 1 本目が開く
+        let gate = Arc::new(DeleteGate::new());
+        let first = gate.close();
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<()>();
+        let d = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let _p = gate.enter(1);
+                in_tx.send(()).unwrap();
+                out_rx.recv().unwrap();
+            })
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while gate.wanting.0.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < end, "前提: 削除が閉じた門で待ち始めない");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = {
+            let gate = gate.clone();
+            std::thread::spawn(move || drop(gate.close()))
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while gate.sleepers().closers == 0 {
+            assert!(Instant::now() < end, "待っている削除を先に通す閉じる側が寝ない");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(first);
+        in_rx.recv().unwrap();
+        out_tx.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(60);
+        while !second.is_finished() {
+            assert!(Instant::now() < end, "待っていた削除が入っても閉じる側が起きない (起こし損ね。 join せずに落とす)");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        second.join().unwrap();
+        d.join().unwrap();
+        assert_eq!(gate.sleepers().closers, 0, "寝ている閉じる側の数が戻らない");
+    }
+
+    /// 起こし損ねない (実物の門で): 削除 4 本と閉じる側 2 本が、 入る / 閉じるを繰り返しても止まらない。 削除は時々門の中に長く居て
+    /// (閉じる側が spin を越えて寝る)、 閉じる側は時々閉じたまま待つ (削除が寝る)。 起こし損ねると、 寝た削除 / 閉じる側が起きずに
+    /// 止まる (60 秒で落とす。 止まった thread は join しない)。 model (`tests/loom_delete_gate.rs`) は写しなので、 本体の起こし方も
+    /// ここで回す。
+    #[test]
+    fn no_lost_wakeups_under_churn() {
+        let gate = Arc::new(DeleteGate::new());
+        let done = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for t in 0..4u32 {
+            let (gate, done) = (gate.clone(), done.clone());
+            hs.push(std::thread::spawn(move || {
+                for i in 0..1600u32 {
+                    let _p = gate.enter(t * 3 + i);
+                    if i % 8 == 0 {
+                        std::thread::sleep(Duration::from_micros(300));
+                    }
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for _ in 0..2 {
+            let (gate, done) = (gate.clone(), done.clone());
+            hs.push(std::thread::spawn(move || {
+                for i in 0..800u32 {
+                    let _c = gate.close();
+                    if i % 2 == 0 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let end = Instant::now() + Duration::from_secs(60);
+        while done.load(Ordering::SeqCst) < 6 {
+            if Instant::now() >= end {
+                let s = gate.sleepers();
+                panic!(
+                    "60 秒で終わらない (起こし損ねて寝たまま: 寝ている削除 {} / 閉じる側 {}、 待ちの数 {})",
+                    s.deletes,
+                    s.closers,
+                    gate.wanting.0.load(Ordering::SeqCst)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let (deletes, closers) = gate.sleepers().slept;
+        assert!(deletes > 0 && closers > 0, "前提: 削除も閉じる側も寝た (寝た回数 削除 {deletes} / 閉じる側 {closers})");
+        eprintln!("寝た回数: 削除 {deletes} / 閉じる側 {closers}、 譲り {}", gate.yields());
     }
 
     /// 閉じる側が 2 本なら、 両方が開くまで入れない (1 本目が開いても 2 本目の閉じた印は消えない)。
