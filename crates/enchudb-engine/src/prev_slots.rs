@@ -390,6 +390,11 @@ impl PrevSlots {
         self.deferred.lock().unwrap_or_else(|p| p.into_inner()).push((slot, rec, written));
     }
 
+    /// 再生の後に回した戻しが残っているか (#989)。
+    pub(crate) fn has_deferred(&self) -> bool {
+        !self.deferred.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
     /// 後に回した記録 (取り出す、 回した順)。
     pub(crate) fn take_deferred(&self) -> Vec<(u32, PrevRecord, bool)> {
         std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()))

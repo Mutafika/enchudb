@@ -121,6 +121,9 @@ pub(crate) struct Generations {
     /// 再生の後も死んでいる完了させた場所の 「消えた行の世代」 (#451 の作り直しの Delete が使う、 作り直しの後に忘れる)。
     relog_gens: std::sync::Mutex<std::collections::BTreeMap<u32, u32>>,
     has_relog_gens: std::sync::atomic::AtomicBool,
+    /// 開く時の突き合わせが、 仕上げ (`pending` の cell を落とす) を WAL の再生の後に回した (再生する record があるか、 聞けなかった、
+    /// #989)。 `Engine::finish_reconcile` が下ろす。 単独の open は再生しないので、 立ったままなら開かない
+    waits_for_replay: std::sync::atomic::AtomicBool,
     missing_tombs: std::sync::Mutex<Vec<u32>>,
     /// 場所を使い回した時の前の住人の記録 (`prev.seg`、 `crate::prev_slots`)。 `gen.seg` と一緒に持つ (v15 の DB だけ)。
     pub(crate) prev: crate::prev_slots::PrevSlots,
@@ -142,6 +145,7 @@ impl Generations {
             pending: std::sync::Mutex::new(Vec::new()),
             relog_gens: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             has_relog_gens: std::sync::atomic::AtomicBool::new(false),
+            waits_for_replay: std::sync::atomic::AtomicBool::new(false),
             missing_tombs: std::sync::Mutex::new(Vec::new()),
             prev: crate::prev_slots::PrevSlots::off(),
         }
@@ -195,6 +199,15 @@ impl Generations {
 
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
+    /// 突き合わせの仕上げを WAL の再生の後に回した印 (#989)。
+    pub(crate) fn set_waits_for_replay(&self, on: bool) {
+        self.waits_for_replay.store(on, Ordering::Release);
+    }
+
+    pub(crate) fn waits_for_replay(&self) -> bool {
+        self.waits_for_replay.load(Ordering::Acquire)
     }
 
     /// #451 の作り直しが使う 「消えた行の世代」 を覚える / 引く / 忘れる。

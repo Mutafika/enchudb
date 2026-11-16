@@ -193,6 +193,8 @@ pub struct WalReads {
     pub probes: u64,
     /// その問い合わせ ([`OpLog::has_records_to_replay`]) が読んだ record の数 (Commit と当てる record。 止まれば当てる record は 1 件)
     pub probe_records: u64,
+    /// 問い合わせが写しの map を作れず、 読み書きの map で開いた回数 ([`OpLog::probe_replay`])
+    pub probe_fallbacks: u64,
     /// それぞれの読みにかかった時間の和 (ns。 問い合わせは file を開く所から)
     pub replay_ns: u64,
     pub hole_scan_ns: u64,
@@ -206,11 +208,18 @@ thread_local! {
             hole_scans: 0,
             probes: 0,
             probe_records: 0,
+            probe_fallbacks: 0,
             replay_ns: 0,
             hole_scan_ns: 0,
             probe_ns: 0,
         })
     };
+}
+
+// 試験: この thread の [`OpLog::probe_replay`] の写しの map を失敗させる
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static PROBE_MAP_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// #972: この thread が今までに WAL を読んだ回数 ([`WalReads`])。
@@ -4349,20 +4358,44 @@ impl OpLog {
     /// ([`Self::open`]) が同じ直しをする)。 区画と周の形は `open` と同じに決めるので、 答えは `open(path)?.recover_with_tail()`
     /// が空かと同じ。 書き手の lock は取らない。 [`Self::was_never_written`] の file (header が全部 0) は `open` と同じく
     /// `bad WAL magic` の Err。
+    ///
+    /// 写しの map を作れない時 (書ける私的な map は commit の勘定に入る: Linux の `vm.overcommit_memory = 2` では
+    /// `MAP_NORESERVE` が効かず、 WAL の大きさで `ENOMEM` になりうる。 Windows の写しの view も map の時に commit を取る) は、
+    /// 本当の open と同じ読み書きの map (`MAP_SHARED`、 勘定に入らない) で開いて同じに答える。 その時だけ header の直しが
+    /// file に届く (#972 の前の聞き方と同じ。 直すのは本当の open が直すのと同じ所)。 それも開けなければ Err (呼び手は 「再生する
+    /// 物が無い」 と読まないこと: `InvalidData` = 壊れた / 切り詰められた file 以外は、 本当の open なら開けるかもしれない、 #989)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn probe_replay(path: &Path) -> io::Result<ReplayProbe> {
         crate::io_point("oplog.probe")?;
         let t0 = read_clock();
         let file = OpenOptions::new().read(true).open(path)?;
-        let mut mmap = unsafe { memmap2::MmapOptions::new().no_reserve_swap().map_copy(&file)? };
-        let layout = read_layout(&mut mmap)?;
-        let wal = Self::assemble(file, mmap, layout);
+        let wal = match Self::map_private_copy(&file) {
+            Ok(mut mmap) => {
+                let layout = read_layout(&mut mmap)?;
+                Self::assemble(file, mmap, layout)
+            }
+            Err(_) => {
+                drop(file);
+                note_wal_read(|r| r.probe_fallbacks += 1);
+                Self::open(path)?
+            }
+        };
         let records = !wal.is_empty() && wal.has_records_to_replay();
         note_wal_read(|r| {
             r.probes += 1;
             r.probe_ns += read_clock_ns(t0);
         });
         Ok(ReplayProbe { records, capacity: wal.capacity() })
+    }
+
+    /// [`Self::probe_replay`] の写しの map (MAP_PRIVATE + MAP_NORESERVE)。 試験は thread ごとに失敗させられる。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn map_private_copy(file: &File) -> io::Result<MmapMut> {
+        #[cfg(test)]
+        if PROBE_MAP_FAILS.with(std::cell::Cell::get) {
+            return Err(io::Error::from_raw_os_error(12)); // ENOMEM
+        }
+        unsafe { memmap2::MmapOptions::new().no_reserve_swap().map_copy(file) }
     }
 
     /// 開いた時の再生 (`recover_with_tail`、 checkpoint から読む) が head より手前で止まったら (読めない record = 届かなかった
@@ -5030,6 +5063,37 @@ mod tests {
 
     /// ホストの形: 切れ目の後に Commit と中継しか積んでいなければ 「中身のある自分の record は積んでいない」 (時計を今まで進め、
     /// 以後の採番はそれより後)。 中身のある自分の record を積んだら、 次の切れ目までは言わない。
+    /// #972: 写しの map を作れない時 (`vm.overcommit_memory = 2` の `ENOMEM` など)、 聞く読みは読み書きの map (本当の open と同じ) で
+    /// 開いて同じ答えを出す (Err にしない)。 その時だけ header の直しが file に届く。 B の header を読めなくした WAL で、 写しの map の
+    /// 答えと比べる。
+    #[test]
+    fn a_probe_that_cannot_map_a_private_copy_opens_like_the_real_open() {
+        let p = tmp("probe-fallback");
+        {
+            let wal = OpLog::create(&p, 2 * HALF_ALIGN as usize).unwrap();
+            for v in 0..5 {
+                wal.append(Op::Tie { eid: 1, himo_id: 0, value: v }).unwrap();
+            }
+            wal.fsync().unwrap();
+        }
+        let mut image = std::fs::read(&p).unwrap();
+        let b = HALF_ALIGN as usize;
+        image[b..b + 4].copy_from_slice(b"XXXX");
+        std::fs::write(&p, &image).unwrap();
+        let copied = OpLog::probe_replay(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), image, "前提: 写しの map の聞く読みは file を書かない");
+        let before = wal_reads();
+        PROBE_MAP_FAILS.with(|f| f.set(true));
+        let fell_back = OpLog::probe_replay(&p);
+        PROBE_MAP_FAILS.with(|f| f.set(false));
+        let fell_back = fell_back.expect("写しの map を作れない時に Err を返した");
+        assert_eq!(fell_back, copied, "読み書きの map で開いた答えが違う");
+        assert_eq!(wal_reads().probe_fallbacks - before.probe_fallbacks, 1);
+        assert_ne!(std::fs::read(&p).unwrap(), image, "前提: 読み書きの map では header の直し (B) が file に届く");
+        assert!(copied.records);
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn quiet_since_ignores_commits_and_relays_but_not_own_data() {
         let p = tmp("quiet_since");

@@ -10675,7 +10675,24 @@ impl Engine {
     pub fn open_standalone(path: &str) -> io::Result<Self> {
         Self::replay_wal_before_standalone_open(path)?;
         let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)?;
+        eng.refuse_unfinished_reconcile()?;
         eng.relog_before_standalone_session(path)
+    }
+
+    /// #989: 単独で開いた `self` (`open_internal` の直後) の、 開く時の突き合わせ / `prev.seg` の記録の戻しが、 WAL に再生する record が
+    /// あるか聞けず (または往復の前の見直しの後に record が現れて) 仕上げを再生の後に回したまま残っていれば、 開くのをやめる (単独の
+    /// open は再生しないので、 回した仕上げを誰も済ませない)。 この engine の Drop は何も書かない。 呼び手が開き直せば聞き直す。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refuse_unfinished_reconcile(&self) -> io::Result<()> {
+        let gens = self.generations();
+        if !gens.waits_for_replay() && !gens.prev.has_deferred() {
+            return Ok(());
+        }
+        self.abandoned.store(true, std::sync::atomic::Ordering::Release);
+        Err(io::Error::other(
+            "the open-time repair of an unclean close waits for a WAL replay that a standalone open does not do (could not tell \
+             whether the WAL has records to replay, #989) — try again",
+        ))
     }
 
     /// 開く時に #451 の作り直し ([`Self::relog_unlogged_writes`]) が走る DB か: 開いた時に紐名の辞書の clean の印が倒れていた
@@ -10736,12 +10753,17 @@ impl Engine {
     }
 
     /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)。
-    /// WAL 自体を読めない (切り詰められた / 壊れた file) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を見ずに開く、
-    /// 警告だけ出す)。
+    /// WAL の中身が壊れている / 切り詰められている (`InvalidData`) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を
+    /// 見ずに開く、 警告だけ出す)。
     ///
     /// #972: 聞くだけなので、 WAL は読むだけで開き (file を書かない)、 checkpoint の後の最初の当てる record で読むのを止める
     /// ([`enchudb_oplog::oplog::OpLog::probe_replay`])。 前は読み書きで開いて (header の直しを本当の open の前に書いた) 全部を解き、
     /// 256 MiB の WAL では聞くたびに再生と同じだけ読んで写していた (standalone の open で 2〜5 回)。
+    ///
+    /// #989: それ以外の失敗 (一時の I/O の失敗・資源不足・読めない権限) は Err で返す。 「再生する物が無い」 と読むと、 単独の open は
+    /// WAL を見ずに開き (WAL にだけある値を黙って失う、 #880 の前の形)、 開く時の突き合わせ / 記録の戻しは再生の前に仕上げた
+    /// (#885 読み直し 1 / review946d [N1] の形)。 呼び手: 単独の open の前後の見直しは断る、 WAL 付きの open の中は 「再生あり」 と
+    /// 見て仕上げを再生の後に回す ([`Self::wal_may_have_records_to_replay`])。
     #[cfg(not(target_arch = "wasm32"))]
     fn wal_records_to_replay(path: &str) -> io::Result<Option<usize>> {
         use enchudb_oplog::oplog::OpLog;
@@ -10749,17 +10771,22 @@ impl Engine {
         if !oplog_path.exists() {
             return Ok(None);
         }
-        let probe = match OpLog::was_never_written(&oplog_path)
-            .and_then(|never| if never { Ok(None) } else { OpLog::probe_replay(&oplog_path).map(Some) })
-        {
-            Ok(Some(p)) => p,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                eprintln!("[enchudb] warning: could not read the WAL ({e}) — opening without replaying it (#880)");
-                return Ok(None);
-            }
+        let probe = match OpLog::was_never_written(&oplog_path) {
+            Ok(true) => return Ok(None),
+            Ok(false) => OpLog::probe_replay(&oplog_path),
+            Err(e) => Err(e),
         };
-        Ok(probe.records.then_some(probe.capacity as usize))
+        match probe {
+            Ok(p) => Ok(p.records.then_some(p.capacity as usize)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("[enchudb] warning: the WAL is corrupt or cut short ({e}) — opening without replaying it (#880)");
+                Ok(None)
+            }
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("could not tell whether the WAL has records to replay ({e}) — refusing to open without it (#989, try again)"),
+            )),
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -19824,7 +19851,7 @@ impl Engine {
         for &(slot, rec) in records {
             if rec.kind == crate::prev_slots::PrevKind::Own
                 && self.last_row_unmarked(slot) == (rec.gone, true)
-                && *replay_follows.get_or_insert_with(|| self.wal_has_records_to_replay())
+                && *replay_follows.get_or_insert_with(|| self.wal_may_have_records_to_replay())
             {
                 // 退避が書き出し済みかは再生の前の退避表で決める (再生の後始末のやり直し `redo_reuse_eviction` が同じ版数を
                 // 退避するので、 再生の後に見ると、 戻す時の別名の外しを飛ばす)
@@ -19851,15 +19878,17 @@ impl Engine {
         prev.note_restored(restored as u32);
     }
 
-    /// きれいに閉じなかった後に開く時、 この後の WAL 付きの open が再生する record が WAL にあるか (`reconcile_generations` の仕上げを
-    /// 後に回すのと同じ見方)。
+    /// きれいに閉じなかった後に開く時、 この後の WAL 付きの open が再生する record が WAL にあるかもしれない (開く時の突き合わせ /
+    /// 記録の戻しの仕上げを再生の後に回す)。 聞けなかった時 (#989、 [`Self::wal_records_to_replay`] の Err) も 「ある」 と見る: WAL
+    /// 付きの open は再生の後に必ず仕上げる (`finish_reconcile` / `finish_prev_restores`)。 単独の open は仕上げを回せないので、
+    /// 回した物が残れば断る ([`Self::open_standalone`])。
     #[cfg(not(target_arch = "wasm32"))]
-    fn wal_has_records_to_replay(&self) -> bool {
-        matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_)))
+    fn wal_may_have_records_to_replay(&self) -> bool {
+        !matches!(Self::wal_records_to_replay(&self.path), Ok(None))
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn wal_has_records_to_replay(&self) -> bool {
+    fn wal_may_have_records_to_replay(&self) -> bool {
         false
     }
 
@@ -21325,10 +21354,14 @@ impl Engine {
             }
         }
         gens.note_repaired(1, completed);
-        // 再生する record が WAL に無ければ、 ここで仕上げる (あれば WAL 付きの open が再生の後に仕上げる)
+        // 再生する record が WAL に無ければ、 ここで仕上げる (あれば / 聞けなければ (#989) WAL 付きの open が再生の後に仕上げる)
         #[cfg(not(target_arch = "wasm32"))]
-        if gens.has_pending() && !matches!(Self::wal_records_to_replay(&self.path), Ok(Some(_))) {
-            self.finish_reconcile(None);
+        if gens.has_pending() {
+            if self.wal_may_have_records_to_replay() {
+                gens.set_waits_for_replay(true);
+            } else {
+                self.finish_reconcile(None);
+            }
         }
     }
 
@@ -21342,6 +21375,7 @@ impl Engine {
     ///   消した後の書き込みを余分に消す事は無い)。 `wal` = 版数を採る WAL (無い open は tombstone を置かない = 配らない DB)
     pub(crate) fn finish_reconcile(&self, wal: Option<&enchudb_oplog::oplog::OpLog>) {
         let gens = self.generations();
+        gens.set_waits_for_replay(false);
         let pending = gens.take_pending();
         if pending.is_empty() {
             return;

@@ -60,9 +60,7 @@ fn reads<T>(f: impl FnOnce() -> T) -> (T, WalReads) {
         hole_scans: b.hole_scans - a.hole_scans,
         probes: b.probes - a.probes,
         probe_records: b.probe_records - a.probe_records,
-        replay_ns: 0,
-        hole_scan_ns: 0,
-        probe_ns: 0,
+        ..WalReads::default()
     };
     (out, d)
 }
