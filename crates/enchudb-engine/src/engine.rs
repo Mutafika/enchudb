@@ -1958,6 +1958,110 @@ fn load_pkformer_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_for
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// `pkformer` を `snapshot` に書き直し (空なら file を消す)、 `pkformer.log` を `log` (header だけ) に置き換える。 `pkformer` → 空の
+/// log の順 (間で落ちても、 header の合わない log は読まれない)。
+#[cfg(not(target_arch = "wasm32"))]
+fn write_pkformer_files(path: &std::path::Path, log_path: &std::path::Path, snapshot: &[u8], log: &[u8]) -> io::Result<()> {
+    let snap = if snapshot.is_empty() {
+        remove_sidecar(path)
+    } else {
+        crate::db_files::write_atomic_if_changed(path, snapshot).map(|_| ())
+    };
+    snap.and_then(|()| crate::db_files::write_atomic_if_changed(log_path, log).map(|_| ()))
+}
+
+/// sidecar を消す (無ければ何もしない)。
+#[cfg(not(target_arch = "wasm32"))]
+fn remove_sidecar(path: &std::path::Path) -> io::Result<()> {
+    // 電源断の模擬: 消す file の控えを捨てる (inode の番号は次に作った file に渡る)
+    #[cfg(all(feature = "crashsim", unix))]
+    let r = enchudb_oplog::crashsim::releasing(path, || std::fs::remove_file(path));
+    #[cfg(not(all(feature = "crashsim", unix)))]
+    let r = std::fs::remove_file(path);
+    match r {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// #959 / review987 [1]: 書き出しの lock の外のまとめ直しが、 一時 file `tmp` に `parts` をつないで書く。 `sync` なら書き出す。
+#[cfg(not(target_arch = "wasm32"))]
+fn write_compact_tmp(tmp: &std::path::Path, parts: &[&[u8]], sync: bool) -> io::Result<std::fs::File> {
+    use std::io::Write;
+    enchudb_oplog::io_point("sidecar.compact_write")?;
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(tmp)?;
+    for part in parts {
+        f.write_all(part)?;
+    }
+    if sync {
+        sync_compact_tmp(&f, tmp)?;
+    }
+    Ok(f)
+}
+
+/// まとめ直しの一時 file `f` (`tmp`) を書き出す (置く rename より先に中身を disk へ)。
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_compact_tmp(f: &std::fs::File, tmp: &std::path::Path) -> io::Result<()> {
+    enchudb_oplog::io_point("sidecar.compact_sync")?;
+    f.sync_all()?;
+    #[cfg(all(feature = "crashsim", unix))]
+    enchudb_oplog::crashsim::file_synced(tmp);
+    #[cfg(not(all(feature = "crashsim", unix)))]
+    let _ = tmp;
+    Ok(())
+}
+
+/// まとめ直しの一時 file `tmp` を sidecar `path` に置く (rename)。 置き換える `path` の mode を継ぐ (review987 2 回目 [A]: 呼び手が
+/// 締めた mode が、 rename で umask 由来の mode に戻っていた。 [`crate::db_files::write_atomic_if_changed`] と同じ)。 `path` がまだ
+/// 無ければ (最初のまとめ直しが作る `pkformer`) 同じ記録のもう 1 つの file `sibling` の mode を継ぐ。
+#[cfg(not(target_arch = "wasm32"))]
+fn place_compact_tmp(tmp: &std::path::Path, path: &std::path::Path, sibling: Option<&std::path::Path>) -> io::Result<()> {
+    match sibling {
+        Some(s) if std::fs::symlink_metadata(path).is_err() => crate::db_files::inherit_mode(s, tmp),
+        _ => crate::db_files::inherit_mode(path, tmp),
+    }
+    enchudb_oplog::io_point("sidecar.compact_rename")?;
+    #[cfg(all(feature = "crashsim", unix))]
+    enchudb_oplog::crashsim::releasing(path, || std::fs::rename(tmp, path))?;
+    #[cfg(not(all(feature = "crashsim", unix)))]
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// まとめ直しの残った一時 file を消す (置かずにやめた回。 置いた回は rename で無い)。 crashsim の控えも捨てる (review987 2 回目 [C]:
+/// 一時 file は書き出しで控えを持つ。 Linux は空いた inode の番号をすぐ次に作った file に渡すので、 控えを残すと次の file に写る、 #416)。
+#[cfg(not(target_arch = "wasm32"))]
+fn remove_compact_tmp(tmp: &std::path::Path) {
+    let _ = remove_sidecar(tmp);
+}
+
+/// 開いた file `f` の `[from, to)` を読む (位置を動かす。 まとめ直しの thread だけが使う fd)。 控えた長さより短い (始めた時の disk の
+/// 続きでない) 時は `InvalidData` (memory から書き直す。 review987 2 回目 [E])。
+#[cfg(not(target_arch = "wasm32"))]
+fn read_range(f: &mut std::fs::File, from: u64, to: u64) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    enchudb_oplog::io_point("sidecar.compact_read")?;
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = vec![0u8; (to - from) as usize];
+    f.read_exact(&mut buf).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => io::Error::new(io::ErrorKind::InvalidData, e),
+        _ => e,
+    })?;
+    Ok(buf)
+}
+
+/// 抜ける時 (返る / panic) に必ず走らせる後始末 (review987 2 回目 [F]: まとめ直しの thread が panic すると `running` が立ったまま
+/// 残り、 その記録は二度とまとめ直されなかった)。
+#[cfg(not(target_arch = "wasm32"))]
+struct OnExit<F: FnMut()>(F);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<F: FnMut()> Drop for OnExit<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
+
 /// #513: `pktombs` を読む。 不在なら Ok(None)。 2 つ目は切れた末尾を捨てたか。
 #[cfg(not(target_arch = "wasm32"))]
 fn load_pktombs_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_tombs::PkTombs, bool)>> {
@@ -2480,6 +2584,142 @@ pub mod write_out_hook {
         if let Some(h) = hook {
             h(phase);
         }
+    }
+}
+
+/// review987 [1]: 名前の記録のまとめ直しを走らせる thread (engine の番地ごと、 走っている間だけ居る)。 consumer の周期が始め、 engine の
+/// Drop が終わるのを待つ。 consumer の thread でまとめ直すと、 その間 consumer が WAL の区画を畳めず、 全力の書き手が空きを待って
+/// 止まった (満杯の名前のある表で名前を行き来させる churn、 WAL 256 MiB で書き手の 1 回の最大 50 → 100 ms、 WAL 2 GiB では出ない)。
+/// 欄を engine に足さない (並びが変わる)。
+#[cfg(not(target_arch = "wasm32"))]
+mod name_compactor {
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    static RUNNING: Mutex<Vec<(usize, JoinHandle<()>)>> = Mutex::new(Vec::new());
+    /// まとめ直しが書けなかった engine (番地, 次に試してよい時刻, 続けて書けなかった回数)。 review987 2 回目 [E]: 前は書けない間
+    /// (例: 追記は通るのに一時 file だけ ENOSPC)、 consumer の周期ごとに thread を作って disk の全部を読んで並べ直してから失敗した。
+    static BACKOFF: Mutex<Vec<(usize, Instant, u32)>> = Mutex::new(Vec::new());
+
+    /// 続けて `n` 回書けなかった後に空ける間 (1 秒から倍々、 64 秒まで)。
+    fn backoff_after(n: u32) -> Duration {
+        Duration::from_secs(1u64 << n.saturating_sub(1).min(6))
+    }
+
+    /// engine `addr` のまとめ直しを別の thread で `run` する (その engine の thread が走っていれば何もしない)。 thread を作れなければ
+    /// Err (今回はやめる。 頼まれたまま残り、 次の周期に試す)。
+    pub(super) fn start(addr: usize, run: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        let mut done = Vec::new();
+        let r = {
+            let mut g = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+            let mut i = 0;
+            while i < g.len() {
+                if g[i].1.is_finished() {
+                    done.push(g.swap_remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+            if g.iter().any(|(a, _)| *a == addr) {
+                Ok(())
+            } else {
+                std::thread::Builder::new().name("enchudb-name-compact".into()).spawn(run).map(|h| g.push((addr, h)))
+            }
+        };
+        for h in done {
+            let _ = h.join();
+        }
+        r
+    }
+
+    /// engine `addr` のまとめ直しを、 書けなかった後の間を空けている最中か。
+    pub(super) fn backing_off(addr: usize) -> bool {
+        let g = BACKOFF.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter().any(|&(a, at, _)| a == addr && Instant::now() < at)
+    }
+
+    /// engine `addr` のまとめ直しの結果 (`ok` = 書けた / 書くものが無かった、 false = I/O で書けなかった)。 書けなかった回は次を
+    /// 試すまで間を空ける。
+    pub(super) fn note(addr: usize, ok: bool) {
+        let mut g = BACKOFF.lock().unwrap_or_else(|p| p.into_inner());
+        let i = g.iter().position(|&(a, ..)| a == addr);
+        match (ok, i) {
+            (true, Some(i)) => {
+                g.swap_remove(i);
+            }
+            (true, None) => {}
+            (false, Some(i)) => {
+                let n = g[i].2.saturating_add(1);
+                g[i] = (addr, Instant::now() + backoff_after(n), n);
+            }
+            (false, None) => g.push((addr, Instant::now() + backoff_after(1), 1)),
+        }
+    }
+
+    /// engine `addr` のまとめ直しが続けて書けなかった回数 (書けたら 0)。
+    pub(super) fn failures(addr: usize) -> u32 {
+        let g = BACKOFF.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter().find(|&&(a, ..)| a == addr).map_or(0, |&(_, _, n)| n)
+    }
+
+    /// engine `addr` の覚えを捨てる (engine の Drop。 同じ番地の次の engine に持ち越さない)。
+    pub(super) fn forget(addr: usize) {
+        BACKOFF.lock().unwrap_or_else(|p| p.into_inner()).retain(|&(a, ..)| a != addr);
+    }
+
+    /// engine `addr` のまとめ直しの thread が終わるのを待つ。
+    pub(super) fn join(addr: usize) {
+        let mine: Vec<JoinHandle<()>> = {
+            let mut g = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *g).into_iter().partition(|(a, _)| *a == addr);
+            *g = rest;
+            mine.into_iter().map(|(_, h)| h).collect()
+        };
+        for h in mine {
+            let _ = h.join();
+        }
+    }
+}
+
+/// review987 の試験用 (crashsim feature): 名前の記録の書き出しの lock の外のまとめ直し (`compact_pk_former_files` /
+/// `compact_pk_tombs_file`) の段で呼ぶ hook。 置いている間は consumer の周期はまとめ直しを始めない (試験が呼ぶ
+/// `Engine::compact_name_records_now` だけが走る = 段を踏む thread が決まる)。 process に 1 つ。
+#[cfg(feature = "crashsim")]
+#[doc(hidden)]
+pub mod name_compact_hook {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Phase {
+        /// `pkformer` のまとめ直し: 一時 file を書いて書き出した後、 置くかを書き出しの lock の下で見る前 (lock の外)
+        FormerPrepared,
+        /// `pkformer` のまとめ直し: `pkformer` を置いた後、 log を置く前 (書き出しの lock の下)
+        FormerPlaced,
+        /// `pkformer` のまとめ直し: 置く前の見直しで log が伸びていた後、 伸びた分を読む前 (lock の外、 回ごと。 review987 2 回目 [B]:
+        /// ここで追記すると、 その分は次の回が当てる = 3 回目 (書き出しの lock の下) が当てる伸びた分を作れる)
+        FormerGrown,
+        /// `pktombs` のまとめ直し: 一時 file を書いた後、 伸びた分を見る前 (lock の外、 回ごと)
+        TombsPrepared,
+    }
+
+    type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub fn set(hook: Option<Hook>) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    }
+
+    pub(crate) fn call(phase: Phase) {
+        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(h) = hook {
+            h(phase);
+        }
+    }
+
+    /// hook を置いている (consumer の周期はまとめ直しを始めない)。
+    pub(crate) fn consumer_off() -> bool {
+        HOOK.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }
 }
 
@@ -10635,7 +10875,11 @@ impl Engine {
             pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
             pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
-            pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
+            pk_former: std::sync::RwLock::new(if path.is_empty() || cfg!(target_arch = "wasm32") {
+                crate::pk_former::PkFormer::without_log()
+            } else {
+                crate::pk_former::PkFormer::default()
+            }),
             pk_former_empty: std::sync::atomic::AtomicBool::new(true),
             own_alias_on: std::sync::atomic::AtomicBool::new(false),
             pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -11859,6 +12103,8 @@ impl Engine {
     /// native でも使える（テスト、ファイル丸読みなど）。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
+        // 書き出さない engine: 前の名前の identity の record を作らない (誰も取り出さずに溜まる、 review987 [5])
+        *eng.pk_former.write().unwrap() = crate::pk_former::PkFormer::without_log();
         eng.finish_vocab_refs_at_open();
         eng.rebuild_leaf_free_list().map_err(|e| e.to_string())?;
         Ok(eng)
@@ -16813,7 +17059,11 @@ impl Engine {
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::SidecarsWritten);
         self.prev_persist_end(covered);
-        self.persist_vocab_map_if_dirty()
+        self.persist_vocab_map_if_dirty()?;
+        drop(_guard);
+        // review987 [1]: まとめ直しは書き出しの lock の外 (consumer が居れば consumer の周期)
+        self.compact_name_records_without_consumer();
+        Ok(())
     }
 
     /// `prev.seg`: 書き出していない周期の使い回しの記録があれば sidecar を書き出す (周期を進める、 consumer の暇な周期)。 sidecar は
@@ -16855,8 +17105,9 @@ impl Engine {
 
     /// 主キーの前の名前を、 変わっていれば書き出す。 #720: 変わった slot / identity の今の中身だけを `pkformer.log` に追記する
     /// (前は `pkformer` をまるごと書き直していた。 束ねた行は Leaf の中身ごとカードを持つので、 行の数に比例した)。 log が
-    /// 信用できない / 大きくなった / きれいに閉じる時 (`compact`) は、 まとめ直す (`pkformer` を書き直して log を header だけに
-    /// する。 `pk_former.rs` の `take_for_persist`)。 印を先に下ろしてから取り出すので、 取り出した後に変わった分は印が立ち直り、
+    /// 信用できない / きれいに閉じる時 (`compact`) は、 memory からまとめ直す (`pkformer` を書き直して log を header だけに
+    /// する。 `pk_former.rs` の `take_for_persist`)。 大きくなった時は、 追記した後に disk からまとめ直す (#959、
+    /// [`Self::compact_pk_former_files`])。 印を先に下ろしてから取り出すので、 取り出した後に変わった分は印が立ち直り、
     /// 次に書く。 書けなかったら印を戻し、 次はまとめ直す。 呼び手は `sidecar_persist_lock` を握っている。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_pk_former(&self, compact: bool) -> io::Result<()> {
@@ -16869,24 +17120,13 @@ impl Engine {
         let Some(job) = self.pk_former.write().unwrap().take_for_persist(compact) else { return Ok(()) };
         let (path, log_path) = (pkformer_path_for(&self.path), pkformer_log_path_for(&self.path));
         let r = match &job {
-            // `pkformer` → 空の log の順 (間で落ちても、 header の合わない log は読まれない)
-            Persist::Rewrite { snapshot, log } => {
-                let snap = if snapshot.is_empty() {
-                    // 電源断の模擬: 消す file の控えを捨てる (inode の番号は次に作った file に渡る)
-                    #[cfg(all(feature = "crashsim", unix))]
-                    let r = enchudb_oplog::crashsim::releasing(&path, || std::fs::remove_file(&path));
-                    #[cfg(not(all(feature = "crashsim", unix)))]
-                    let r = std::fs::remove_file(&path);
-                    match r {
-                        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                        _ => Ok(()),
-                    }
-                } else {
-                    crate::db_files::write_atomic_if_changed(&path, snapshot).map(|_| ())
-                };
-                snap.and_then(|()| crate::db_files::write_atomic_if_changed(&log_path, log).map(|_| ()))
-            }
-            Persist::Append { bytes } => crate::db_files::append_synced(&log_path, bytes),
+            Persist::Rewrite { snapshot, log } => write_pkformer_files(&path, &log_path, snapshot, log),
+            Persist::Fresh { records } => remove_sidecar(&path).and_then(|()| {
+                crate::db_files::write_atomic_parts(&log_path, &[&crate::pk_former::log_header(&[]), records])
+            }),
+            Persist::Resume { header, records } => crate::db_files::write_atomic_parts(&log_path, &[header, records]),
+            Persist::Append { bytes, .. } if bytes.is_empty() => Ok(()),
+            Persist::Append { bytes, .. } => crate::db_files::append_synced(&log_path, bytes),
         };
         let mut g = self.pk_former.write().unwrap();
         match &r {
@@ -16899,10 +17139,186 @@ impl Engine {
         r
     }
 
+    /// #959 / review987 [1]: 頼まれていれば、 `pkformer` + `pkformer.log` を、 追記の済んだ disk の中身からまとめ直す。 書き手の lock
+    /// (`pk_former`) の外で、 書き出しの lock (`sidecar_persist_lock`) の外でもある: lock の下では、 始める時に disk の 2 つを開いて長さを
+    /// 控えるのと、 置く時に rename するだけ。 前 (#959 の最初の直し) は書き出しの lock の下で読み直し・並べ直し・書き出しをしていて、
+    /// その間 `oplog_sync()` / `persist_sync_state()` (Syncer の pull) / 枠を足す書き手が待った (master の lock の下の並べ直しより
+    /// 長い: 追記の fsync + 読み直しが足された)。 disk の中身は、 追記の仕事を取り出した時の memory の中身なので、 その時に memory から
+    /// 並べるのと同じ bytes。
+    ///
+    /// 作っている間に log が伸びたら (別の書き出しが追記した)、 伸びた分を作った中身に当てて作り直す (record は slot / identity の中身の
+    /// 置き換えなので、 当てた結果は disk の全部を読むのと同じ)。 伸びた分を新しい log の header の後ろに写して置くのでは、 `pkformer` を
+    /// 置いた後・log を置く前の電源断の像で古い log (header が合わない) を読まず、 書き出しの返った追記を失う。 2 回伸びたら、 最後は
+    /// 書き出しの lock の下で当てて作り直して置く (前の 「lock の下で memory から並べる」 と同じ大きさの仕事)。
+    ///
+    /// 読めない / 続きとして読めない (控えた長さより短い・消えた) 時は、 次の書き出しで memory から書き直す。 書けない (I/O) 時はやめて
+    /// Err を返す (呼び手は間を空けてから始めからやり直す、 review987 2 回目 [E])。 追記は済んでいて、 disk は取り出した時の中身を持つ。
+    /// 呼び手は書き出しの lock を握っていないこと。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compact_pk_former_files(&self) -> io::Result<()> {
+        let (path, log_path) = (pkformer_path_for(&self.path), pkformer_log_path_for(&self.path));
+        let (tmp_snap, tmp_log) =
+            (crate::db_files::compact_tmp_path_for(&path), crate::db_files::compact_tmp_path_for(&log_path));
+        // 始める: disk の 2 つを開いて長さを控える (書き出しの lock の下。 長さの分の中身は以後変わらない: 追記は後ろに足すだけ、
+        // 置き換えは rename = 開いた file は前の中身のまま)
+        let (mark, mut snap_file, mut log_file) = {
+            let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(mark) = self.pk_former.write().unwrap().begin_compact() else { return Ok(()) };
+            let open = || -> io::Result<_> {
+                enchudb_oplog::io_point("sidecar.compact_open")?;
+                let snap = if mark.snapshot_bytes > 0 { Some(std::fs::File::open(&path)?) } else { None };
+                Ok((snap, std::fs::File::open(&log_path)?))
+            };
+            match open() {
+                Ok((snap, log)) => (mark, snap, log),
+                Err(e) => {
+                    let mut g = self.pk_former.write().unwrap();
+                    g.end_compact();
+                    if e.kind() == io::ErrorKind::NotFound {
+                        // 控えた file が無い = disk が memory の思う形でない: 次の書き出しで memory から書き直す
+                        g.compact_unreadable();
+                        self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    drop(g);
+                    drop(_guard);
+                    self.warn_persist_failure_rate_limited(&e);
+                    return if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) };
+                }
+            }
+        };
+        // 抜ける時 (置いた / やめた / panic) に、 残った一時 file を消してから終わりの印 (この順: 印を下ろした後に始まった次のまとめ直しの
+        // 一時 file を消さない)
+        let _end = OnExit(|| {
+            remove_compact_tmp(&tmp_snap);
+            remove_compact_tmp(&tmp_log);
+            self.pk_former.write().unwrap_or_else(|p| p.into_inner()).end_compact();
+        });
+        let r = (|| -> io::Result<()> {
+            let snapshot = match snap_file.as_mut() {
+                Some(f) => Some(read_range(f, 0, mark.snapshot_bytes)?),
+                None => None,
+            };
+            let log = read_range(&mut log_file, 0, mark.log_bytes)?;
+            let mut f = crate::pk_former::PkFormer::compact_read(snapshot.as_deref(), &log)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            drop((snapshot, log));
+            let mut read_to = mark.log_bytes;
+            for round in 0..3 {
+                // 作る (最後の回は書き出しの lock の下)
+                let held = (round == 2).then(|| self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner()));
+                if held.is_some() {
+                    // 最後: lock の下で伸びた分を当ててから作る
+                    let Some(now) = self.pk_former.read().unwrap().compact_check(&mark) else { return Ok(()) };
+                    let tail = read_range(&mut log_file, read_to, now)?;
+                    f.apply_log_tail(&tail).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    read_to = now;
+                }
+                let (snapshot, log) = f.compacted_files();
+                if !snapshot.is_empty() {
+                    write_compact_tmp(&tmp_snap, &[&snapshot], true)?;
+                }
+                // log は header だけ (record 無し) なので書き出さない (review987 2 回目 [I]: 回ごとの F_FULLFSYNC を 1 つ減らす。 3 回目は
+                // 書き出しの lock の下)。 置いた後に中身が disk に届く前に落ちても、 header の合わない (ゼロの / 空の) log は読まれず、 置いた
+                // `pkformer` だけで全部ある (log の無い `pkformer` を読んだ時と同じ = 次の書き出しが続きの log を作る)。 置いた後の追記は
+                // 追記の書き出し (`sync_all`) が header ごと disk に届ける
+                write_compact_tmp(&tmp_log, &[&log], false)?;
+                #[cfg(feature = "crashsim")]
+                if held.is_none() {
+                    name_compact_hook::call(name_compact_hook::Phase::FormerPrepared);
+                }
+                // 置く: 始めた時の disk のままで、 log が伸びていなければ
+                let guard = match held {
+                    Some(g) => g,
+                    None => self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner()),
+                };
+                let Some(now) = self.pk_former.read().unwrap().compact_check(&mark) else { return Ok(()) };
+                if now == read_to {
+                    // `pkformer` → log の順 (間で落ちても、 header の合わない古い log は読まれない。 `pkformer` だけで全部ある)。 最初の
+                    // まとめ直しが作る `pkformer` は log の mode を継ぐ
+                    if snapshot.is_empty() {
+                        remove_sidecar(&path)?;
+                    } else {
+                        place_compact_tmp(&tmp_snap, &path, Some(&log_path))?;
+                    }
+                    #[cfg(feature = "crashsim")]
+                    name_compact_hook::call(name_compact_hook::Phase::FormerPlaced);
+                    if let Err(e) = place_compact_tmp(&tmp_log, &log_path, Some(&path)) {
+                        // `pkformer` は置いた = 古い log は続きでない。 次の書き出しで memory から書き直す
+                        self.pk_former.write().unwrap().compact_unreadable();
+                        self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+                        return Err(e);
+                    }
+                    let mut g = self.pk_former.write().unwrap();
+                    g.compact_installed(&mark, snapshot.len() as u64, log.len() as u64);
+                    g.count_placed(round);
+                    drop(g);
+                    drop(guard);
+                    return Ok(());
+                }
+                drop(guard);
+                // 伸びた: 伸びた分を当てて作り直す (lock の外。 長さの分の中身は以後変わらない)
+                #[cfg(feature = "crashsim")]
+                name_compact_hook::call(name_compact_hook::Phase::FormerGrown);
+                let tail = read_range(&mut log_file, read_to, now)?;
+                f.apply_log_tail(&tail).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                read_to = now;
+            }
+            unreachable!("3 回目は書き出しの lock の下で置く")
+        })();
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                // disk が続きとして読めない: 次の書き出しで memory から書き直す (始めた時の disk のままなら)
+                let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+                let mut g = self.pk_former.write().unwrap();
+                if g.compact_check(&mark).is_some() {
+                    g.compact_unreadable();
+                    self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+                }
+                drop(g);
+                drop(_guard);
+                self.warn_persist_failure_rate_limited(&e);
+                Ok(())
+            }
+            Err(e) => {
+                self.warn_persist_failure_rate_limited(&e);
+                Err(e)
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
     /// [`Self::persist_pk_former`] の、 まとめ直しを求めない形。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_pk_former_if_dirty(&self) -> io::Result<()> {
         self.persist_pk_former(false)
+    }
+
+    /// review987 2 回目 [I]: 名前の記録のまとめ直しを置いた回数を、 何回目で置いたかごとに (`pktombs`, `pkformer`)。 `pktombs` は
+    /// [0] 作る間に伸びなかった / [1] 伸びた分を書き出しの lock の外で 1 回足した / [2] もう一度伸びて lock の下で足して書き出した。
+    /// `pkformer` は [0] 1 回目 / [1] 2 回目 (1 度伸びた分を当てて作り直した) / [2] 3 回目 (書き出しの lock の下で当てて作った)。
+    #[doc(hidden)]
+    pub fn name_compaction_rounds(&self) -> ([u64; 3], [u64; 3]) {
+        (self.pk_tombs.read().unwrap().compact_rounds(), self.pk_former.read().unwrap().compact_rounds())
+    }
+
+    /// review987 2 回目 [E]: 名前の記録のまとめ直しが (I/O で) 続けて書けなかった回数 (書けたら 0)。 書けなかった後は間を空ける。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn name_compaction_failures(&self) -> u32 {
+        name_compactor::failures(self as *const Engine as usize)
+    }
+
+    /// #959 / review987: 書き出した `pktombs` を読み直した中身が、 書き出した分の memory の中身と同じか (まだ書き出していない記録が
+    /// あれば Some)。 まとめ直しが追記を落とす誤りを試験で拾う。 違えば Some(説明)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn pktombs_disk_diff(&self) -> io::Result<Option<String>> {
+        self.flush_pk_pending();
+        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let disk = load_pktombs_from_sidecar(&self.path)?.map(|(t, _)| t.snapshot().0).unwrap_or_default();
+        let mem = self.pk_tombs.read().unwrap().snapshot().0;
+        let disk = if disk.is_empty() { crate::pk_tombs::PkTombs::default().snapshot().0 } else { disk };
+        Ok((disk != mem).then(|| format!("pktombs: disk {} B と memory {} B の中身が違う", disk.len(), mem.len())))
     }
 
     /// #720: 書き出した `pkformer` + `pkformer.log` を読み直した中身が、 memory の中身と同じか。 印の付け忘れ (変えたのに log に
@@ -16946,9 +17362,13 @@ impl Engine {
         {
             return Ok(());
         }
-        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.persist_pk_tombs_if_dirty()?;
-        self.persist_pk_former_if_dirty()
+        let r = {
+            let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.persist_pk_tombs_if_dirty().and_then(|()| self.persist_pk_former_if_dirty())
+        };
+        // review987 [1]: まとめ直しは書き出しの lock の外 (consumer が居れば consumer の周期)
+        self.compact_name_records_without_consumer();
+        r
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -17124,6 +17544,10 @@ impl Engine {
         let path = pktombs_path_for(&self.path);
         let r = match &job {
             Persist::Rewrite { bytes, .. } => crate::db_files::write_atomic_if_changed(&path, bytes).map(|_| ()),
+            Persist::Fresh { bytes, .. } => {
+                crate::db_files::write_atomic_parts(&path, &[&crate::pk_tombs::file_header(), bytes])
+            }
+            Persist::Append { bytes, .. } if bytes.is_empty() => Ok(()),
             Persist::Append { bytes, .. } => crate::db_files::append_synced(&path, bytes),
         };
         let mut g = self.pk_tombs.write().unwrap();
@@ -17135,6 +17559,210 @@ impl Engine {
             }
         }
         r
+    }
+
+    /// #959 / review987 [1]: 頼まれていれば、 `pktombs` を追記の済んだ file の中身からまとめ直す。 書き手の lock (`pk_tombs`) の外で、
+    /// 書き出しの lock (`sidecar_persist_lock`) の外でもある: lock の下では、 始める時に file を開いて長さと record の数を控えるのと、
+    /// 置く時に伸びた分を一時 file に足して rename するだけ (record は順に当てる記録 / 外しなので、 まとめ直した中身の後ろに足しても
+    /// 同じ。 file は 1 つなので、 置き換えの途中の電源断の像は前の file か置いた file のどちらか)。 前は record が増えすぎると、 書き出しが
+    /// `pk_tombs` の書き込みの lock を握ったまま memory の全部を並べ直し (主キー 10 万で 4〜7 ms)、 #959 の最初の直しは書き出しの lock の
+    /// 下で読み直して並べ直した。
+    ///
+    /// 伸びた分は、 lock の外で 1 回足して書き出してから、 lock の下でその後に伸びた分だけを足す (lock の下で書き出すのは、 その間に
+    /// 追記があった時だけ)。 読めない時は、 次の書き出しで memory から書き直す。 書けない (I/O) 時はやめて Err を返す (呼び手は間を
+    /// 空けてから始めからやり直す)。 呼び手は書き出しの lock を握っていないこと。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compact_pk_tombs_file(&self) -> io::Result<()> {
+        use std::io::Write;
+        let path = pktombs_path_for(&self.path);
+        let tmp = crate::db_files::compact_tmp_path_for(&path);
+        let (mark, mut file, len0) = {
+            let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(mark) = self.pk_tombs.write().unwrap().begin_compact() else { return Ok(()) };
+            let open = || -> io::Result<_> {
+                enchudb_oplog::io_point("sidecar.compact_open")?;
+                let f = std::fs::File::open(&path)?;
+                let len = f.metadata()?.len();
+                Ok((f, len))
+            };
+            match open() {
+                Ok((f, len)) => (mark, f, len),
+                Err(e) => {
+                    let mut g = self.pk_tombs.write().unwrap();
+                    g.end_compact();
+                    if e.kind() == io::ErrorKind::NotFound {
+                        // 控えた file が無い: 次の書き出しで memory から書き直す
+                        g.compact_unreadable();
+                        self.pk_tombs_dirty.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    drop(g);
+                    drop(_guard);
+                    self.warn_persist_failure_rate_limited(&e);
+                    return if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) };
+                }
+            }
+        };
+        // 抜ける時 (置いた / やめた / panic) に、 残った一時 file を消してから終わりの印
+        let _end = OnExit(|| {
+            remove_compact_tmp(&tmp);
+            self.pk_tombs.write().unwrap_or_else(|p| p.into_inner()).end_compact();
+        });
+        let r = (|| -> io::Result<()> {
+            let buf = read_range(&mut file, 0, len0)?;
+            let (bytes, mut records, in_buf) = crate::pk_tombs::PkTombs::compact_file(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if in_buf != mark.records {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pktombs: {in_buf} records in the file, {} written", mark.records),
+                ));
+            }
+            drop(buf);
+            let mut out = write_compact_tmp(&tmp, &[&bytes], true)?;
+            drop(bytes);
+            let (mut len, mut n) = (len0, mark.records);
+            for round in 0..2 {
+                #[cfg(feature = "crashsim")]
+                name_compact_hook::call(name_compact_hook::Phase::TombsPrepared);
+                let guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(n_now) = self.pk_tombs.read().unwrap().compact_check(&mark) else { return Ok(()) };
+                let len_now = file.metadata()?.len();
+                // 置いた回の分け方 (伸びなかった / lock の外で 1 回足した / lock の下で足した)
+                let mut placed = round;
+                if len_now > len {
+                    // 伸びた分 (始めた後の追記) を後ろに足す。 最初の回は lock の外で書き出してからもう一度見る
+                    let tail = read_range(&mut file, len, len_now)?;
+                    out.write_all(&tail)?;
+                    records += n_now - n;
+                    (len, n) = (len_now, n_now);
+                    if round == 0 {
+                        drop(guard);
+                        sync_compact_tmp(&out, &tmp)?;
+                        continue;
+                    }
+                    sync_compact_tmp(&out, &tmp)?;
+                    placed = 2;
+                }
+                drop(out);
+                place_compact_tmp(&tmp, &path, None)?;
+                // 見直しの後に忘れていれば信用しない (次の書き出しが memory から書き直す)
+                let mut g = self.pk_tombs.write().unwrap();
+                g.compact_installed(&mark, records);
+                g.count_placed(placed);
+                drop(g);
+                drop(guard);
+                return Ok(());
+            }
+            unreachable!("2 回目は伸びても置く")
+        })();
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+                let mut g = self.pk_tombs.write().unwrap();
+                if g.compact_check(&mark).is_some() {
+                    g.compact_unreadable();
+                    self.pk_tombs_dirty.store(true, std::sync::atomic::Ordering::Release);
+                }
+                drop(g);
+                drop(_guard);
+                self.warn_persist_failure_rate_limited(&e);
+                Ok(())
+            }
+            Err(e) => {
+                self.warn_persist_failure_rate_limited(&e);
+                Err(e)
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    /// #959 / review987 [1]: 頼まれていれば、 名前の記録 (`pktombs` / `pkformer`) を書き出しの lock の外でまとめ直す。 走るのは consumer の
+    /// 周期が始める別の thread ([`Self::start_name_compaction`]。 consumer の居ない engine では、 名前の記録を書き出す公開の入口 =
+    /// `persist_sync_state` / `persist_tables` の後にその場で)。 アプリの thread の `oplog_sync()` は走らせない (その分の時間を足さない)。
+    /// 呼び手は書き出しの lock を握っていないこと。
+    ///
+    /// review987 2 回目 [E]: I/O で書けなかった後は、 間を空ける (1 秒から倍々、 64 秒まで) まで始めない (`force` = 試験の
+    /// [`Self::compact_name_records_now`] は待たない)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compact_name_records(&self, force: bool) {
+        let addr = self as *const Engine as usize;
+        if self.path.is_empty() || (!force && name_compactor::backing_off(addr)) {
+            return;
+        }
+        let mut tried = false;
+        let mut ok = true;
+        if self.pk_tombs.read().unwrap().compact_wanted() {
+            tried = true;
+            ok &= self.compact_pk_tombs_file().is_ok();
+        }
+        if self.pk_former.read().unwrap().compact_wanted() {
+            tried = true;
+            ok &= self.compact_pk_former_files().is_ok();
+        }
+        if tried {
+            name_compactor::note(addr, ok);
+        }
+    }
+
+    /// consumer の周期: 頼まれていれば、 名前の記録のまとめ直しを別の thread で始める ([`name_compactor`])。 consumer の thread で
+    /// まとめ直すと、 その間 WAL の区画を畳めず、 全力の書き手が空きを待って止まる。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_name_compaction(&self) {
+        #[cfg(feature = "crashsim")]
+        if name_compact_hook::consumer_off() {
+            return;
+        }
+        let addr = self as *const Engine as usize;
+        if self.path.is_empty()
+            || !(self.pk_tombs.read().unwrap().compact_wanted() || self.pk_former.read().unwrap().compact_wanted())
+            || name_compactor::backing_off(addr)
+        {
+            return;
+        }
+        let started = name_compactor::start(addr, move || {
+            // SAFETY: engine の Drop は、 consumer を止めた後 (= 新しく始めない) に、 この thread が終わるのを待ってから片付ける
+            // (`name_compactor::join`)。 consumer の居る engine は `Arc` の中で動かない (動かされたら Drop が process を止める、 #833)
+            let engine: &Engine = unsafe { &*(addr as *const Engine) };
+            // panic した回も書けなかった回と同じに間を空ける (周期ごとに panic し直さない。 印は `OnExit` が下ろす)
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.compact_name_records(false))).is_err() {
+                name_compactor::note(addr, false);
+            }
+        });
+        if let Err(e) = started {
+            // thread を作れない: 今回はやめる (頼まれたまま残る)。 間を空け、 知らせは 1 秒に 1 行 (review987 2 回目 [E]、 #52)
+            name_compactor::note(addr, false);
+            self.warn_persist_failure_rate_limited(&e);
+        }
+    }
+
+    /// [`Self::compact_name_records`] を、 consumer の居ない engine でだけ (居れば consumer の周期に任せる)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compact_name_records_without_consumer(&self) {
+        if self.consumer_thread.get().is_none() {
+            self.compact_name_records(false);
+        }
+    }
+
+    /// 試験用: 走っている名前の記録のまとめ直し (consumer の周期) が終わるのを待ってから、 頼まれていればまとめ直す (この thread で)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn compact_name_records_now(&self) {
+        let addr = self as *const Engine as usize;
+        // 書けない (やめて頼んだまま) 時に回り続けない
+        for _ in 0..4 {
+            name_compactor::join(addr);
+            while self.pk_tombs.read().unwrap().compact_running() || self.pk_former.read().unwrap().compact_running() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.compact_name_records(true);
+            name_compactor::join(addr);
+            let busy = |t: bool, f: bool| t || f;
+            let tombs = { let t = self.pk_tombs.read().unwrap(); t.compact_wanted() || t.compact_running() };
+            let former = { let f = self.pk_former.read().unwrap(); f.compact_wanted() || f.compact_running() };
+            if !busy(tombs, former) {
+                return;
+            }
+        }
     }
 
     /// wasm 版 (sidecar を持たないので no-op)。
@@ -20740,9 +21368,7 @@ impl Engine {
                 names.extend(former.names_of(local).map(|(h, k)| (h, Box::from(k))));
             }
             for &(peer, foreign_local) in identities {
-                for (h, k) in &names {
-                    changed |= former.insert_identity(peer, foreign_local, *h, k);
-                }
+                changed |= former.insert_identity_names(peer, foreign_local, names.iter().map(|(h, k)| (*h, &k[..])));
             }
         }
         if former_on {
@@ -20774,9 +21400,7 @@ impl Engine {
         }
         let mut changed = false;
         for &(peer, foreign_local) in identities {
-            for (h, k) in &names {
-                changed |= former.insert_identity(peer, foreign_local, *h, k);
-            }
+            changed |= former.insert_identity_names(peer, foreign_local, names.iter().map(|(h, k)| (*h, &k[..])));
         }
         if changed {
             self.pk_former_empty.store(false, Ordering::Release);
@@ -30924,6 +31548,13 @@ impl Engine {
                             }
                         }
                     }
+                    // review987 [1]: 名前の記録のまとめ直し (頼まれていれば)。 書き出しの lock の外で作り、 lock の下では置くだけ
+                    // (アプリの thread の `oplog_sync()` / pull の書き出しを、 並べ直しの間 待たせない)。 別の thread で走らせる
+                    // (この thread は WAL の区画を畳む)。 止められている周期は始めない (`hold_consumer` は走っている物の終わりを待つ)
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if !held {
+                        engine.start_name_compaction();
+                    }
                     engine.wal_fold_off.fetch_and(!CONSUMER_IN_TICK, Ordering::AcqRel);
 
                     if flag_for_thread.load(Ordering::Acquire) {
@@ -31371,6 +32002,8 @@ impl Engine {
     /// 繰り返していて、 準備が 100 ms より長くかかる負荷では毎回入った、 #735)。
     ///
     /// 持ったまま、 consumer を待つ事 (満杯の WAL の空きを待つ書き込み / engine を落とす) をしない。 入れ子にしない。
+    ///
+    /// review987 [1]: consumer の周期が始めた名前の記録のまとめ直し (別の thread) も、 終わるのを待つ (止めている間は始めない)。
     #[doc(hidden)]
     pub fn hold_consumer(&self) -> ConsumerHold<'_> {
         use std::sync::atomic::Ordering;
@@ -31378,6 +32011,8 @@ impl Engine {
         while self.wal_fold_off.load(Ordering::Acquire) & CONSUMER_IN_TICK != 0 {
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        name_compactor::join(self as *const Engine as usize);
         ConsumerHold { engine: self }
     }
 
@@ -32647,6 +33282,13 @@ impl Drop for Engine {
             if let Some(handle) = h.take() {
                 let _ = handle.join();
             }
+        }
+        // review987 [1]: consumer が始めた名前の記録のまとめ直しの thread (engine を指す) が終わるのを待つ。 consumer は止まった
+        // ので新しく始まらない
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            name_compactor::join(self as *const Engine as usize);
+            name_compactor::forget(self as *const Engine as usize);
         }
         // 通知係は、 consumer の最後の書き出しの後に残りを配って (溜めに移した分も) exit する。 listener が止まって返らなければ
         // 待つのをやめ、 残りは通知係に渡す (#636)
