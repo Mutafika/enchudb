@@ -1735,13 +1735,19 @@ mod tests {
         assert_eq!(old.persist(&mut back, true), Some("rewrite"));
         assert_eq!(old.log.as_ref().unwrap().len(), LOG_HEADER_LEN);
         assert_eq!(PkFormer::deserialize(old.snapshot.as_ref().unwrap()).unwrap().serialize(), back.serialize());
-        // 書けなかった後は memory から (log を新しく作る印も捨てる)
-        let mut back = Disk { snapshot: Some(f.serialize()), log: None }.load();
-        back.insert(3, b"nara", 14);
-        let _lost = back.take_for_persist(false).unwrap();
-        back.persist_failed();
-        back.insert(3, b"kobe", 15);
-        assert!(matches!(back.take_for_persist(false), Some(Persist::Rewrite { .. })), "書けなかった後に後の印だけの log を作った");
+        // 書けなかった後は memory から (log を新しく作る印も捨てる)。 続きの log を作る前に、 きれいに閉じる時の書き直しが書けなかった時も
+        for close_first in [false, true] {
+            let mut back = Disk { snapshot: Some(f.serialize()), log: None }.load();
+            back.insert(3, b"nara", 14);
+            let lost = back.take_for_persist(close_first).unwrap();
+            assert_eq!(matches!(lost, Persist::Rewrite { .. }), close_first);
+            back.persist_failed();
+            back.insert(3, b"kobe", 15);
+            assert!(
+                matches!(back.take_for_persist(false), Some(Persist::Rewrite { .. })),
+                "{close_first}: 書けなかった後に後の印だけの log を作った"
+            );
+        }
         // どちらも無い
         assert!(Disk::default().load().is_empty());
         // 書けなかった後はまとめ直す

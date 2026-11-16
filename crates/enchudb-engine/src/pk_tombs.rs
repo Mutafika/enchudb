@@ -946,8 +946,8 @@ mod tests {
         assert_eq!(write(&mut file, &mut p), None);
         // 切れた file はまとめ直さない (memory から書き直す)
         assert!(PkTombs::compact_file(&file[..file.len() - 2]).is_err());
-        // 間に書き直した (書けなかった / 忘れた) 時は置かない
-        for interrupt in 0..2 {
+        // 間に書き直した (書けなかった / 忘れた / 書けなかった後に memory から書き直した) 時は置かない
+        for interrupt in 0..3 {
             loop {
                 i += 1;
                 p.note(3, b"z", 10 + (i % 3) as u32, hlc(20_000 + i));
@@ -955,18 +955,31 @@ mod tests {
                 apply(&mut file, &job);
                 p.persisted(&job);
                 if let Some(mark) = p.begin_compact() {
-                    if interrupt == 0 {
-                        p.persist_failed();
-                    } else {
-                        p.note(5, b"x", 7, hlc(1));
-                        assert_eq!(p.forget_before(hlc(2)), 1);
+                    match interrupt {
+                        0 => p.persist_failed(),
+                        1 => {
+                            p.note(5, b"x", 7, hlc(1));
+                            assert_eq!(p.forget_before(hlc(2)), 1);
+                        }
+                        _ => {
+                            // file は置き換わって信用し直している (record の数だけでは見分けられない)
+                            p.persist_failed();
+                            p.note(6, b"w", 8, hlc(30_000));
+                            let job = p.take_for_persist().unwrap();
+                            assert!(matches!(job, Persist::Rewrite { .. }));
+                            apply(&mut file, &job);
+                            p.persisted(&job);
+                            assert!(p.in_file.is_some());
+                        }
                     }
                     assert_eq!(p.compact_check(&mark), None, "{interrupt}: 置き換わった file にまとめ直しを置く");
                     p.end_compact();
                     break;
                 }
             }
-            assert_eq!(write(&mut file, &mut p), Some("rewrite"), "{interrupt}");
+            if interrupt < 2 {
+                assert_eq!(write(&mut file, &mut p), Some("rewrite"), "{interrupt}");
+            }
             assert!(same(&PkTombs::load(&file).unwrap().0, &p));
         }
     }
