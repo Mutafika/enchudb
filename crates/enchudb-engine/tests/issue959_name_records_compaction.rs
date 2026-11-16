@@ -225,7 +225,7 @@ fn compaction_outside_the_lock_keeps_up_with_writers_running_alongside() {
                     *name = if *name < total { *name + total } else { *name - total };
                     eng.tie_to_by_id(e, key, *name);
                     *row = e;
-                    if i % 64 == 0
+                    if i.is_multiple_of(64)
                         && let Some(h) = eng.deleted_name_version(key, gone as u64)
                     {
                         lines.lock().unwrap().push(h);
