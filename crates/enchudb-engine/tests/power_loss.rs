@@ -1861,8 +1861,9 @@ fn deleted_primary_keys_survive_power_loss_after_oplog_sync() {
 }
 
 /// #720: `pkformer` の追記 (`pkformer.log`) は、 書き出し (`persist_sync_state`) が返った直後の電源断の像でも残る。 1 回目の
-/// 書き出しは log を作り (#959: disk の無い DB の最初の書き出しは log の header + record だけで、 `pkformer` は作らない)、 2 回目は
-/// 変わった slot の record だけを log に足す (前提)。 像の `pkformer` + log を読んだ中身が、 電源を落とす前の中身と同じで、 像は開ける。
+/// 書き出しは log を作り (#959: disk の無い DB の最初の書き出しは log の header + record だけ。 その後、 書き出しの lock の外のまとめ直しが
+/// `pkformer` に並べる = review987 [3]。 ここでは待って走らせる)、 2 回目は変わった slot の record だけを log に足す (前提)。 像の
+/// `pkformer` + log を読んだ中身が、 電源を落とす前の中身と同じで、 像は開ける。
 #[test]
 fn appended_pkformer_records_survive_power_loss() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -1900,9 +1901,11 @@ fn appended_pkformer_records_survive_power_loss() {
     eng.remote_tie_apply(local, key, 7u32, at(0));
     eng.note_bound_write(local, foreign, key, Some(7), at(0));
     eng.persist_sync_state().unwrap();
+    eng.compact_name_records_now();
     let pkformer = enchudb_engine::db_files::path_for(path, enchudb_engine::db_files::PKFORMER);
     let log = enchudb_engine::db_files::path_for(path, enchudb_engine::db_files::PKFORMER_LOG);
     let snapshot = std::fs::read(&pkformer).ok();
+    assert!(snapshot.is_some(), "前提: 最初の書き出しの後に pkformer にまとめ直した");
     let log_before = std::fs::metadata(&log).expect("前提: 1 回目の書き出しは log を作る").len();
     assert!(eng.remote_tie_apply(local, title, 2u32, at(1)), "前提: 相手の書き換えが当たった");
     eng.note_bound_write(local, foreign, title, Some(2), at(1));
@@ -1919,9 +1922,149 @@ fn appended_pkformer_records_survive_power_loss() {
     let back = Engine::open_concurrent_with_oplog(img_db.to_str().unwrap(), OPLOG_CAP).map(|e| e.pkformer_disk_diff().unwrap());
     let _ = std::fs::remove_dir_all(&root);
     assert!(appended, "前提: 2 回目の書き出しは log への追記 (pkformer は書き直さない)");
+    // review987 [7]: 前は最初の書き出しが log だけで snapshot が空になり、 この前提はいつも真だった (今は 1 回目の中身の `pkformer`)
     assert!(expect != snapshot.unwrap_or_default(), "前提: 追記の分は pkformer だけでは読めない");
     assert!(got.as_deref() == Some(&expect[..]), "書き出しの返った追記が電源断の像で消えた");
     assert_eq!(back.expect("像を開けない"), None);
+}
+
+/// review987 [1]: 名前の記録 (`pkformer`) のまとめ直しは書き出しの lock の外で作り、 作っている間に log が伸びたら (別の書き出しが
+/// 追記した) 伸びた分を作った中身に当てて作り直してから置く。 まとめ直しの途中の電源断の像 (作り終えて置く前 / `pkformer` を置いた後・
+/// log を置く前) でも、 書き出しの返った前の名前 (まとめ直しの間に追記した分も) と消した名前の版数が全部ある。 伸びた分を新しい log に
+/// 写すだけで置くと、 `pkformer` を置いた後の像は古い log (header が合わない) を読まず、 間に追記した分を失う。
+#[test]
+fn name_records_compacted_outside_the_lock_survive_power_loss_mid_compaction() {
+    use enchudb_engine::engine::name_compact_hook::{self, Phase as CPhase};
+    use std::sync::Mutex;
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const ROWS: u32 = 256;
+    let root = scratch("name_compact");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    let path = db.to_str().unwrap().to_string();
+    crashsim::start();
+    // hook を置いている間は consumer の周期はまとめ直さない (この thread の `compact_name_records_now` だけが段を踏む)
+    name_compact_hook::set(Some(Arc::new(|_| {})));
+    let mut eng = Engine::create_with_cell_version(&path, 65_536).unwrap();
+    eng.define_table("t", ROWS).unwrap();
+    eng.define_himo_in("t", "key", ValueType::Number, 0).unwrap();
+    let key = eng.himo_id("t.key").expect("t.key") as u16;
+    eng.set_table_pk("t", key).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let rows: Vec<u64> = (0..ROWS)
+        .map(|i| {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to_by_id(e, key, i);
+            e
+        })
+        .collect();
+    // 満杯の表で消して足す (使い回すたびに前の住人の名前が identity に移る)。 名前は i と i + ROWS を行き来する
+    let state = Arc::new(Mutex::new((rows, (0..ROWS).collect::<Vec<u32>>(), 0u32)));
+    let churn = {
+        let (eng, state) = (eng.clone(), state.clone());
+        move |n: usize| {
+            let mut st = state.lock().unwrap();
+            let (rows, names, round) = &mut *st;
+            for i in 0..n {
+                let at = (i * 2 + *round as usize % 2) % ROWS as usize;
+                eng.delete(rows[at]);
+                let e = eng.entity_in("t").unwrap();
+                names[at] = if names[at] < ROWS { names[at] + ROWS } else { names[at] - ROWS };
+                eng.tie_to_by_id(e, key, names[at]);
+                rows[at] = e;
+            }
+            *round += 1;
+        }
+    };
+    let versions = {
+        let eng = eng.clone();
+        move || (0..2 * ROWS).map(|n| eng.deleted_name_version(key, n as u64)).collect::<Vec<Option<Hlc>>>()
+    };
+    churn(ROWS as usize / 2);
+    eng.persist_sync_state().unwrap();
+    // 最初の書き出し (log だけ) の後のまとめ直しを、 段ごとに撮りながら走らせる。 作り終えた後 (置く前) に別の書き出しが追記する
+    type Shot = (PathBuf, Vec<u8>, Vec<Option<Hlc>>);
+    let shots: Arc<Mutex<Vec<(CPhase, Shot)>>> = Arc::new(Mutex::new(Vec::new()));
+    let appended = Arc::new(AtomicBool::new(false));
+    {
+        let (eng, shots, appended, live, root, path) =
+            (eng.clone(), shots.clone(), appended.clone(), live.clone(), root.clone(), path.clone());
+        let churn = churn.clone();
+        let versions = versions.clone();
+        name_compact_hook::set(Some(Arc::new(move |phase| {
+            if !matches!(phase, CPhase::FormerPrepared | CPhase::FormerPlaced) {
+                return;
+            }
+            let mut shots = shots.lock().unwrap();
+            let n = shots.len();
+            if n >= 4 {
+                return;
+            }
+            // 置く前は、 撮る時の disk の中身 (`pkformer` + log) が像の中身。 置いた後 (lock の下、 disk は途中) は後で最後の中身と比べる
+            let expect = match phase {
+                CPhase::FormerPlaced => Vec::new(),
+                _ => Engine::pkformer_for_bootstrap(&path).unwrap().unwrap(),
+            };
+            let img = root.join(format!("img{n}"));
+            crashsim::capture(&live, &img, Mode::Lost).unwrap();
+            shots.push((phase, (img, expect, versions())));
+            drop(shots);
+            if phase == CPhase::FormerPrepared && !appended.swap(true, Ordering::AcqRel) {
+                // 作り終えた後・置く前に、 書き手が進んで別の書き出しが log に追記する (置く時に当てて作り直す)
+                churn(ROWS as usize / 4);
+                eng.persist_sync_state().unwrap();
+            }
+        })));
+    }
+    eng.compact_name_records_now();
+    name_compact_hook::set(None);
+    let fin = Engine::pkformer_for_bootstrap(&path).unwrap().unwrap();
+    let fin_versions = versions();
+    let shots = std::mem::take(&mut *shots.lock().unwrap());
+    crashsim::stop();
+    let log_len = std::fs::metadata(enchudb_engine::db_files::path_for(&path, enchudb_engine::db_files::PKFORMER_LOG)).unwrap().len();
+    drop(eng);
+    let phases: Vec<CPhase> = shots.iter().map(|s| s.0).collect();
+    let mut failures = Vec::new();
+    for (i, (phase, (img, expect, vers))) in shots.iter().enumerate() {
+        let img_db = img.join("db");
+        let img_path = img_db.to_str().unwrap();
+        let got = Engine::pkformer_for_bootstrap(img_path).unwrap();
+        // 置く前の像は撮った時の中身、 置いた後の像は最後の中身 (間に追記した分を含む)
+        let want = if *phase == CPhase::FormerPlaced { &fin } else { expect };
+        if got.as_deref() != Some(&want[..]) {
+            failures.push(format!("像 {i} ({phase:?}): pkformer の中身が違う ({:?} B, 期待 {} B)", got.map(|g| g.len()), want.len()));
+        }
+        match Engine::open_concurrent_with_oplog(img_path, OPLOG_CAP) {
+            Ok(back) => {
+                let got_v: Vec<Option<Hlc>> = (0..2 * ROWS).map(|n| back.deleted_name_version(key, n as u64)).collect();
+                let want_v = if *phase == CPhase::FormerPlaced { &fin_versions } else { vers };
+                if &got_v != want_v {
+                    failures.push(format!("像 {i} ({phase:?}): 消した名前の版数が違う"));
+                }
+                if let Some(d) = back.pkformer_disk_diff().unwrap() {
+                    failures.push(format!("像 {i} ({phase:?}): 開いた後の disk と memory が違う: {d}"));
+                }
+            }
+            Err(e) => failures.push(format!("像 {i} ({phase:?}): 開けない: {e}")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        phases,
+        vec![CPhase::FormerPrepared, CPhase::FormerPrepared, CPhase::FormerPlaced],
+        "前提: 作り終えた後に追記があり、 当てて作り直してから置いた"
+    );
+    assert_eq!(log_len, 24, "前提: まとめ直した後の log は header だけ");
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// #557: sync の表の無い v9 の DB (cell の版数あり) で、 汚れた終了の後に開いた時、 cell の版数が時計より先にあっても (時計が

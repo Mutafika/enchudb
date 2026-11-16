@@ -73,6 +73,12 @@ pub fn tmp_path_for(sidecar: &Path) -> PathBuf {
     with_suffix(sidecar, ".tmp")
 }
 
+/// #959 / review987 [1]: 書き出しの lock の外のまとめ直しが作る一時 file (`{sidecar}.compact.tmp`)。 lock の下で書き直す
+/// [`tmp_path_for`] と別の名前 (まとめ直しが lock の外で書いている間に、 lock の下の書き直しが同じ一時 file を踏まない)。
+pub fn compact_tmp_path_for(sidecar: &Path) -> PathBuf {
+    with_suffix(sidecar, ".compact.tmp")
+}
+
 /// 破損 sidecar の退避先 (`{sidecar}.corrupt-{unix_ts}`)。 issue #52 の fail-readable。
 pub fn corrupt_backup_path_for(sidecar: &Path, unix_ts: u64) -> PathBuf {
     with_suffix(sidecar, &format!(".corrupt-{unix_ts}"))
@@ -247,6 +253,32 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
     #[cfg(not(all(feature = "crashsim", unix)))]
     std::fs::rename(&tmp_path, sidecar)?;
     Ok(true)
+}
+
+/// [`write_atomic_if_changed`] の、 中身を `parts` の順につないだ形 (つないだ写しを作らない、 #959 / review987 [6])。 読み比べは
+/// しない (いつも書く)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn write_atomic_parts(sidecar: &Path, parts: &[&[u8]]) -> io::Result<()> {
+    use std::io::Write;
+    let tmp_path = tmp_path_for(sidecar);
+    {
+        enchudb_oplog::io_point("sidecar.write")?;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
+        for part in parts {
+            f.write_all(part)?;
+        }
+        enchudb_oplog::io_point("sidecar.sync")?;
+        f.sync_all()?;
+        #[cfg(all(feature = "crashsim", unix))]
+        enchudb_oplog::crashsim::file_synced(&tmp_path);
+    }
+    inherit_mode(sidecar, &tmp_path);
+    enchudb_oplog::io_point("sidecar.rename")?;
+    #[cfg(all(feature = "crashsim", unix))]
+    enchudb_oplog::crashsim::releasing(sidecar, || std::fs::rename(&tmp_path, sidecar))?;
+    #[cfg(not(all(feature = "crashsim", unix)))]
+    std::fs::rename(&tmp_path, sidecar)?;
+    Ok(())
 }
 
 /// #884: `tables` の rename を disk へ送る (親の directory を素の `fsync`)。 他の sidecar は今のまま (呼ばない): checkpoint を進める
