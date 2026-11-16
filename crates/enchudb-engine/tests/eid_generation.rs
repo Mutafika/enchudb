@@ -969,3 +969,148 @@ fn a_standalone_open_that_replays_the_wal_first_still_reconciles_generations() {
 fn a_standalone_open_of_an_unclean_sync_db_still_reconciles_generations() {
     reconcile_through_standalone_open(true);
 }
+
+/// #970 の DB: eid の空間 `cap` を表で使い切る (表 `full` 枠 1 = 最初の使い回し用、 `pad`、 `notes` 枠 4)。 `notes` は gen.seg の
+/// 最初の commit (64 KiB = 場所 24576 まで) より後ろ = `notes` の場所で最初に世代を書く時に gen.seg を伸ばす。 枠を足せないので、 満杯の
+/// `notes` は消えた場所を使い回すしかない。 `full` で 1 回使い回して v15 に移り、 `notes` を埋める。
+fn create_far_notes(path: &str) -> (Engine, Vec<u64>) {
+    const CAP: u32 = 40_000;
+    let mut eng = Engine::create_with_capacity(path, CAP).unwrap();
+    eng.define_table("full", 1).unwrap();
+    eng.define_himo_in("full", "x", ValueType::Number, 0).unwrap();
+    eng.define_table("pad", CAP - 1 - 4).unwrap();
+    eng.define_table("notes", 4).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+    reuse_once(&eng);
+    assert_eq!(eng.slot_bits(), 24, "前提: v15");
+    let rows: Vec<u64> = (0..4u32)
+        .map(|i| {
+            let e = eng.entity_in("notes").unwrap();
+            eng.tie_to(e, "notes.note", i);
+            e
+        })
+        .collect();
+    assert!(rows.iter().all(|&e| slot(e) >= 32_768 && e as u32 == slot(e)), "前提: notes の場所は gen.seg の最初の commit の外、 世代 0");
+    assert_eq!(eng.remaining_eid_capacity(), 0, "前提: 枠を足せない");
+    (eng, rows)
+}
+
+/// 消えた行の eid `old` が、 使い回した行 `new` に当たらない (読み・書き込み・消す)。
+fn stale_eid_misses(eng: &Engine, old: u64, new: u64, col: &str) {
+    assert_ne!(new, old, "使い回した場所に、 消えた行と同じ eid を渡した");
+    eng.tie_to(new, col, 100u32);
+    assert_eq!(eng.get(old, col), None, "消えた行の eid の読みが、 使い回した行を読んだ");
+    eng.tie_to(old, col, 7u32);
+    let hid = eng.himo_id(col).unwrap() as u16;
+    assert!(eng.try_tie_to_by_id(old, hid, 8u32).is_err(), "消えた行の eid への書き込みを通した");
+    eng.delete(old);
+    assert_eq!(eng.get(new, col), Some(100), "消えた行の eid への書き込み / 消すが、 使い回した行に当たった");
+    assert!(eng.is_live(new) && !eng.is_live(old));
+}
+
+/// #970: v15 で行を消す時に gen.seg を伸ばせない (ディスクの空き不足) と、 場所の世代も 「死んでいる」 印も書けない。 前はそれでも
+/// 場所を使い回し、 消えた行と同じ eid (世代 0 | 場所) を渡した (#731 の取り違え)。 空きが無い間は使い回さず (表は満杯で断る)、
+/// 空きが戻ったら世代を上げてから使い回す。 空きの不足は `set_space_margin` で作る。
+///
+/// - `Reopen::No`: 空きが無いまま足しても使い回さない。 空きを戻して足す
+/// - `Reopen::Clean`: 空きを戻した後、 きれいに閉じて開き直してから足す (世代も印も書けていない場所が開き直した後も残る。 きれいに
+///   閉じた DB は開く時の突き合わせを回さない)
+/// - `Reopen::Unclean`: 空きを戻した後、 開いたままの DB の写し (きれいに閉じていない像) を開いて足す。 開く時の突き合わせ
+///   (`reconcile_generations` の 2.) が 「生きていない・印なし」 の場所を削除の完了に寄せる (直す前からの道、 直しの前でも通る)
+#[derive(Clone, Copy, Debug)]
+enum Reopen {
+    No,
+    Clean,
+    Unclean,
+}
+
+fn delete_without_space(reopen: Reopen) {
+    use enchudb_engine::FaultKind;
+    let path = tmp_path(&format!("kill-fail-{reopen:?}"));
+    let image = format!("{path}-img");
+    let _c = [&path, &image].map(|p| Cleanup(p.clone()));
+    let (eng, rows) = create_far_notes(&path);
+    let old = rows[1];
+    eng.set_space_margin(u64::MAX / 2);
+    let faults = eng.fault_count(FaultKind::DiskSpace);
+    eng.delete(old);
+    assert!(!eng.is_live(old), "前提: 消した");
+    assert!(eng.fault_count(FaultKind::DiskSpace) > faults, "前提: gen.seg を伸ばせずに消した");
+    if let Reopen::No = reopen {
+        // 空きが無いまま足す: 世代を上げられないので使い回さない (表は満杯 = 断る)
+        if let Ok(e) = eng.entity_in("notes") {
+            assert_ne!(e, old, "世代を上げられなかった場所を、 消えた行と同じ eid で渡した");
+            assert_ne!(slot(e), slot(old), "世代を上げられなかった場所を使い回した");
+        }
+    }
+    eng.set_space_margin(0);
+    let mut eng = eng;
+    match reopen {
+        Reopen::No => {}
+        Reopen::Clean => {
+            eng.flush().unwrap();
+            drop(eng);
+            eng = Engine::open_standalone(&path).unwrap();
+        }
+        Reopen::Unclean => {
+            copy_dir(std::path::Path::new(&path), std::path::Path::new(&image));
+            drop(eng);
+            eng = Engine::open_standalone(&image).unwrap();
+        }
+    }
+    assert!(!eng.is_live(old));
+    let new = eng.entity_in("notes").unwrap();
+    assert_eq!(slot(new), slot(old), "前提: 満杯の表は消えた場所を使い回す");
+    stale_eid_misses(&eng, old, new, "notes.note");
+}
+
+#[test]
+fn a_slot_whose_generation_could_not_be_raised_on_delete_is_not_reused_with_the_same_eid() {
+    delete_without_space(Reopen::No);
+}
+
+#[test]
+fn a_slot_whose_generation_could_not_be_raised_on_delete_gets_a_new_eid_after_a_clean_reopen() {
+    delete_without_space(Reopen::Clean);
+}
+
+#[test]
+fn a_slot_whose_generation_could_not_be_raised_on_delete_gets_a_new_eid_after_an_unclean_reopen() {
+    delete_without_space(Reopen::Unclean);
+}
+
+/// #970 の anonymous の行 (`entity()`、 表の無い DB): 消す時に世代を上げられなかった場所は空きの山に積まない。 前は積み、 満杯の
+/// DB の `entity()` が取り出して、 そこで上げ直せない (空きがまだ無い) と世代 0 = 消えた行と同じ eid で渡した。
+#[test]
+fn an_anonymous_slot_whose_generation_could_not_be_raised_is_not_handed_out_with_the_same_eid() {
+    use enchudb_engine::FaultKind;
+    const CAP: u32 = 40_000;
+    let path = tmp_path("kill-fail-anon");
+    let _c = Cleanup(path.clone());
+    let mut eng = Engine::create_with_capacity(&path, CAP).unwrap();
+    eng.define_himo("v", ValueType::Number, 0);
+    let rows: Vec<u64> = (0..CAP).map(|_| eng.entity().unwrap()).collect();
+    // 最初の使い回し (v15 に移る) は gen.seg の最初の commit の中の場所で
+    eng.delete(rows[0]);
+    let first = eng.entity().unwrap();
+    assert_eq!(slot(first), 0, "前提: 満杯の DB の entity() は消えた場所を使い回す");
+    assert_eq!(eng.slot_bits(), 24, "前提: v15");
+    let old = rows[39_000];
+    assert_eq!(old as u32, slot(old), "前提: 世代 0");
+    eng.set_space_margin(u64::MAX / 2);
+    let faults = eng.fault_count(FaultKind::DiskSpace);
+    eng.delete(old);
+    assert!(!eng.is_live(old), "前提: 消した");
+    assert!(eng.fault_count(FaultKind::DiskSpace) > faults, "前提: gen.seg を伸ばせずに消した");
+    if let Ok(e) = eng.entity() {
+        assert_ne!(e, old, "世代を上げられなかった場所を、 消えた行と同じ eid で渡した (空きが無い間)");
+    }
+    eng.set_space_margin(0);
+    if let Ok(e) = eng.entity() {
+        assert_ne!(e, old, "世代を上げられなかった場所を、 消えた行と同じ eid で渡した (空きが戻った後)");
+        eng.tie(e, "v", 100u32);
+        eng.tie(old, "v", 7u32);
+        assert_eq!(eng.get(old, "v"), None);
+        assert_eq!(eng.get(e, "v"), Some(100));
+    }
+}
