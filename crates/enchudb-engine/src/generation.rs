@@ -14,7 +14,7 @@
 //!   v15 では行を消す時に上げる (死んだ場所の値 = 次の住人の世代)。 使い回す時・位置から払い出す時は今の値で渡す
 //! - 予約の表 (`_` で始まる、 `_sync_ops` の ring など) は世代を持たない (0 のまま使い回す)
 //! - #970 (案 P): 生かす場所の gen.seg の page は、 生かす前に commit しておく ([`Generations::ensure_slot`]、 払い出しの全部の道。
-//!   commit 済みなら atomic の load 1 回、 伸ばす時は場所の page と [`COMMIT_AHEAD_PAGES`] page 先まで)。 v15 に移る時は払い出し済みの
+//!   commit 済みなら atomic の load 1 回、 伸ばす時は場所の page と先回り ([`COMMIT_AHEAD_MIN`]〜[`COMMIT_AHEAD_MAX`]) まで)。 v15 に移る時は払い出し済みの
 //!   場所まで ([`Generations::ensure_slots`]、 公開する前に [`Generations::commit_unpublished`])、 書き手として開く時も払い出し済みの
 //!   場所まで commit し直す。 commit は縮まないので、 生かした場所の kill / raise は gen.seg を伸ばさない = ディスクの空きの不足で
 //!   落ちない。 前は消す時に場所の page を commit していて、 伸ばせないと世代も 「死んでいる」 印も書けないまま場所を空け、 次の
@@ -97,10 +97,13 @@ fn slot_off(slot: u32) -> usize {
     GEN_HEADER + 2 * slot as usize
 }
 
-/// #970 (案 P): 場所を書く前の commit で、 場所の page の後ろに先回りして commit する page の数 (1 回の伸ばしは最大 4 page = 64 KiB
-/// = 32768 場所)。 `Region::ensure_committed` の ×2 の先回りは使わない: gen.seg の見かけの大きさを払い出した場所の桁に保つ
-/// (APFS は書いた page に隣り合う 16 MiB 未満の穴を実ディスクにする、 #400)。
-const COMMIT_AHEAD_PAGES: u64 = 3;
+/// #970 (案 P): 場所を書く前の commit で、 場所の page の後ろに先回りして commit する量の下限 (3 page = 48 KiB = 24576 場所) と上限
+/// (1 MiB = 524288 場所)。 間は commit 済みの長さ (header の後ろ) と同じ (×2)。 `Region::ensure_committed` の先回り (1 回 16 MiB まで)
+/// は使わない: gen.seg の見かけの大きさを払い出した場所の桁 (最大で 2 倍か +1 MiB) に保つ (APFS は書いた page に隣り合う 16 MiB 未満の
+/// 穴を実ディスクにする、 #400)。 上限を 1 page ずつにしない理由: 伸ばすたびに (ftruncate + mmap) 並んで払い出す書き手が全部待つ。
+/// 3 page 固定では書き手 8 本の insert が master の 1.17〜1.22 倍だった (伸ばしが 8192 × 4 場所ごと)
+const COMMIT_AHEAD_MIN: usize = 3 * (2 << PAGE_SHIFT);
+const COMMIT_AHEAD_MAX: usize = 1 << 20;
 
 /// 場所 `slot` の 2 B を書けるように `r` を commit する ([`Generations::ensure_slot`])。 commit 済みなら atomic の load 1 回。
 #[inline]
@@ -119,7 +122,8 @@ fn commit_slot_in(r: &Region, slot: u32) -> std::io::Result<()> {
         return Ok(());
     }
     // 書くのは場所の page から先 (先回りの page は後の払い出しが書く)。 空きはそこから先の分だけ見る
-    r.ensure_committed_window(page_off(page + 1 + COMMIT_AHEAD_PAGES).max(need), page_off(page))
+    let ahead = r.committed_len().saturating_sub(GEN_HEADER).clamp(COMMIT_AHEAD_MIN, COMMIT_AHEAD_MAX);
+    r.ensure_committed_window((need + ahead).min(r.len()), page_off(page))
 }
 
 /// 場所 `0..end` の 2 B を全部書けるように `r` を commit する。 範囲の外は gen.seg の終わりで切る。
@@ -194,7 +198,7 @@ impl Generations {
     }
 
     /// #970 (案 P): 場所 `slot` の 2 B を書ける (この後の [`Self::kill`] / [`Self::raise`] が commit で落ちない) ように、 場所の page
-    /// の終わりまで gen.seg を commit する (伸ばす時は [`COMMIT_AHEAD_PAGES`] page 先回り)。 commit 済みなら atomic の load 1 回。 場所を
+    /// の終わりまで gen.seg を commit する (伸ばす時は [`COMMIT_AHEAD_MIN`]〜[`COMMIT_AHEAD_MAX`] 先回り)。 commit 済みなら atomic の load 1 回。 場所を
     /// 生かす前に呼ぶ (払い出しの道)。 commit は縮まないので、 生かした場所の kill / raise は空きの不足で落ちない。 gen.seg の無い DB
     /// (v14、 移る手順が公開する前) は何もしない。 gen.seg の範囲の外 (場所の上限の先) と、 書けない時 (ディスクの空き) は Err。
     #[inline]
