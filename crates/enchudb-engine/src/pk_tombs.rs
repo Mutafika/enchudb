@@ -409,11 +409,16 @@ impl PkTombs {
     }
 
     /// まとめ直した file (`records` 個の record) を置いた。 呼び手は書き出しの lock を握り、 置く直前に [`Self::compact_check`] が
-    /// 通った。
-    pub(crate) fn compact_installed(&mut self, records: u64) {
+    /// 通った。 その後に忘れた (`forget_before` は書き出しの lock を取らない) 時は信用せずに false (忘れた時に、 まだ file に書いていない
+    /// 記録も捨てて 「次は memory から書き直す」 にしたので、 置いた file を信用するとその記録が file に書かれない)。
+    pub(crate) fn compact_installed(&mut self, m: &CompactMark, records: u64) -> bool {
+        if self.compact.epoch != m.epoch {
+            return false;
+        }
         self.in_file = Some(records);
         self.compact.epoch += 1;
         self.compact.wanted = false;
+        true
     }
 
     /// まとめ直す file が読めなかった (切れた record がある / 数が合わない): 次の書き出しで memory から書き直す。 呼び手は書き出しの
@@ -720,7 +725,7 @@ mod tests {
         assert_eq!(in_buf, mark.records, "file の record の数が memory の数と違う");
         assert_eq!(p.compact_check(&mark), Some(mark.records));
         *file = bytes;
-        p.compact_installed(records);
+        assert!(p.compact_installed(&mark, records));
         p.end_compact();
         true
     }
@@ -935,7 +940,7 @@ mod tests {
         // lock の下で置く: 伸びた分を後ろに足す
         let n1 = p.compact_check(&mark).expect("追記だけなのに置けない");
         let installed = [&bytes[..], &file[len0..]].concat();
-        p.compact_installed(records + (n1 - mark.records));
+        assert!(p.compact_installed(&mark, records + (n1 - mark.records)));
         p.end_compact();
         file = installed;
         let (back, torn) = PkTombs::load(&file).unwrap();
@@ -982,6 +987,32 @@ mod tests {
             }
             assert!(same(&PkTombs::load(&file).unwrap().0, &p));
         }
+        // 置く直前の見直し (`compact_check`、 書き出しの lock の下) の後、 memory に置いた数を写す前に忘れた (`forget_before` は書き出しの
+        // lock を取らない)。 忘れた時に、 まだ file に書いていない記録も捨てて 「次は memory から書き直す」 にしたので、 置いた file を
+        // 信用すると、 その記録が file に書かれない
+        loop {
+            i += 1;
+            p.note(3, b"z", 10 + (i % 3) as u32, hlc(40_000 + i));
+            let job = p.take_for_persist().unwrap();
+            apply(&mut file, &job);
+            p.persisted(&job);
+            if let Some(mark) = p.begin_compact() {
+                let len0 = file.len();
+                let (bytes, records, _) = PkTombs::compact_file(&file[..len0]).unwrap();
+                p.note(5, b"old", 9, hlc(1));
+                p.note(7, b"not yet written", 11, hlc(50_000));
+                let n1 = p.compact_check(&mark).expect("追記だけ");
+                assert_eq!(p.forget_before(hlc(2)), 1);
+                file = [&bytes[..], &file[len0..]].concat();
+                assert!(!p.compact_installed(&mark, records + (n1 - mark.records)), "忘れた後に置いた file を信用した");
+                p.end_compact();
+                break;
+            }
+        }
+        assert_eq!(write(&mut file, &mut p), Some("rewrite"));
+        let back = PkTombs::load(&file).unwrap().0;
+        assert_eq!(back.tomb_of(7, b"not yet written"), Some(hlc(50_000)), "忘れる前に覚えた記録が file に無い");
+        assert!(same(&back, &p));
     }
 
     /// review987 [2]: 書き直し (file の無い DB の最初の書き出し / memory からの書き直し) を取り出した後、 書いている間に忘れる

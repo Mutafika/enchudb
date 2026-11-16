@@ -16607,7 +16607,7 @@ impl Engine {
                         self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
                         return Err(e);
                     }
-                    self.pk_former.write().unwrap().compact_installed(snapshot.len() as u64, log.len() as u64);
+                    self.pk_former.write().unwrap().compact_installed(&mark, snapshot.len() as u64, log.len() as u64);
                     drop(guard);
                     return Ok(());
                 }
@@ -16957,7 +16957,8 @@ impl Engine {
                 }
                 drop(out);
                 place_compact_tmp(&tmp, &path)?;
-                self.pk_tombs.write().unwrap().compact_installed(records);
+                // 見直しの後に忘れていれば信用しない (次の書き出しが memory から書き直す)
+                self.pk_tombs.write().unwrap().compact_installed(&mark, records);
                 drop(guard);
                 return Ok(());
             }

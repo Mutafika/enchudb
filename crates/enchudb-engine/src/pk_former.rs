@@ -1262,7 +1262,9 @@ impl PkFormer {
 
     /// まとめ直した disk (`pkformer` の長さ `snapshot`、 log の長さ `log`) を置いた。 呼び手は書き出しの lock を握り、 置く直前に
     /// [`Self::compact_check`] が通った。
-    pub(crate) fn compact_installed(&mut self, snapshot: u64, log: u64) {
+    pub(crate) fn compact_installed(&mut self, m: &CompactMark, snapshot: u64, log: u64) {
+        // 見直しの後に disk を置き換えるのは書き出しの lock の下だけ (呼び手が握っている) = ここでも同じ
+        debug_assert_eq!(self.log.compact.epoch, m.epoch);
         self.log.snapshot_bytes = snapshot;
         self.log.log_bytes = log;
         self.log.compact.epoch += 1;
@@ -1546,7 +1548,7 @@ mod tests {
             assert_eq!(cur.len() as u64, now);
             c.apply_log_tail(&cur[mark.log_bytes as usize..]).unwrap();
             let (snapshot, log) = c.compacted_files();
-            f.compact_installed(snapshot.len() as u64, log.len() as u64);
+            f.compact_installed(&mark, snapshot.len() as u64, log.len() as u64);
             f.end_compact();
             self.snapshot = (!snapshot.is_empty()).then_some(snapshot);
             self.log = Some(log);
