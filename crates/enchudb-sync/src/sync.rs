@@ -520,34 +520,33 @@ impl Syncer {
     }
 
     /// #964: WAL の書き出しが返った後に、 写し `mark` の位置までを置き場に書く。 置き場に書いた位置より下げない (並んで書き出した
-    /// 呼び手の写しが前後して届いても、 link × author ごとに大きい方)。 置き場が無い / 位置が上がらなければ何もしない。
+    /// 呼び手の写しが前後して届いても、 link × author ごとに大きい方)。 置き場が無い / 位置が上がらなければ何もしない。 書けなかった
+    /// 回は書いた位置を上げない (review965 F3: 次に呼んだ時、 同じ写しでも書き直す)。
     pub fn save_cursors_through(&self, mark: CursorMark) {
         let Some(path) = self.cursor_path.read().unwrap().clone() else { return };
         // 置き場を書く順もこの lock で並べる
         let mut saved = self.cursors_saved.lock().unwrap();
-        let mut grew = false;
-        for (link, authors) in mark.0 {
-            let into = saved.entry(link).or_default();
-            for (author, h) in authors {
-                let cur = into.entry(author).or_insert(Hlc::ZERO);
-                if h > *cur {
-                    *cur = h;
-                    grew = true;
-                }
-            }
-        }
-        if !grew {
+        let at = |link: &PeerId, author: &PeerId| saved.get(link).and_then(|m| m.get(author)).copied().unwrap_or(Hlc::ZERO);
+        if !mark.0.iter().any(|(link, authors)| authors.iter().any(|(author, h)| *h > at(link, author))) {
             return;
         }
+        let mut next = saved.clone();
+        for (link, authors) in mark.0 {
+            let into = next.entry(link).or_default();
+            for (author, h) in authors {
+                let cur = into.entry(author).or_insert(Hlc::ZERO);
+                *cur = (*cur).max(h);
+            }
+        }
         let mut buf = String::new();
-        for (link, authors) in saved.iter() {
+        for (link, authors) in next.iter() {
             for (author, h) in authors.iter() {
                 buf.push_str(&format!("{} {} {} {} {}\n", link, author, h.wall, h.logical, h.peer));
             }
         }
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, buf).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        if std::fs::write(&tmp, buf).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            *saved = next;
         }
     }
 
@@ -1774,7 +1773,8 @@ impl Syncer {
     /// #955: `filter` が全部を通す時だけ、 transport が送る前に捨てる位置 ([`Transport::publish_floor`]) を宛先ごとに聞き、 書き手ごとに
     /// 全部の宛先の最小を返す (答えない宛先がある → 空 = 絞らない。 どこかの宛先の答えに無い書き手は絞らない)。 その位置以下の record は
     /// transport がどの宛先にも送らないので、 集める時に写さない (送る record は同じ)。 落とす record がありうる filter の時は聞かない
-    /// (聞いて絞ると、 配らなかった記録 #219 から、 その位置以下の record が消える)。
+    /// (聞いて絞ると、 配らなかった記録 #219 から、 その位置以下の record が消える)。 聞くのと、 集めた record を `publish_to` に渡すのは
+    /// 同じ thread で (位置が下がりうる transport は、 thread ごとに聞いた時を控えて、 下がる前に集めた batch を送らない。 review965 F1)。
     fn publish_floor(&self, filter: &dyn SubscriptionFilter, peers: &[PeerId]) -> Vec<(PeerId, Hlc)> {
         if !filter.sends_all() {
             return Vec::new();
@@ -3535,16 +3535,49 @@ mod tests {
         // 別の link だけの写し: 書いた位置は残す
         let only7 = CursorMark([(7, [(7, at(3))].into_iter().collect())].into_iter().collect());
         syncer.save_cursors_through(only7);
+        // 1 つが上がり 1 つが下がる写し: 上がった方を書き、 下がった方は書いた位置を残す
+        let mixed = CursorMark([(1, [(1, at(10)), (3, at(6))].into_iter().collect())].into_iter().collect());
+        syncer.save_cursors_through(mixed);
         drop(syncer);
         let back = Syncer::new(eng.clone(), transport).with_cursor_path(file.clone());
         let mut got = back.cursors_of(1);
         got.sort();
-        assert_eq!(got, vec![(1, at(20)), (3, at(5))], "置き場の位置が下がった / 書いていない");
+        assert_eq!(got, vec![(1, at(20)), (3, at(6))], "置き場の位置が下がった / 書いていない");
         assert_eq!(back.cursors_of(7), vec![(7, at(3))]);
         drop(back);
         drop(eng);
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// review965 F3: 置き場を書けなかった回は、 書いた位置を上げない。 書けるようになったら、 同じ位置の写しでも書く (前は書けなかった
+    /// 位置を 「書いた」 と覚え、 位置が次に上がるまで書き直さなかった)。
+    #[test]
+    fn save_cursors_through_retries_after_a_failed_write() {
+        let path = test_path("cursorfail");
+        let eng = new_eng(&path, 2);
+        let dir = std::path::PathBuf::from(format!("{path}.cursordir"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("cursors");
+        let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+        let syncer = Syncer::new(eng.clone(), transport.clone()).with_cursor_path(file.clone());
+        syncer.hold_cursor_file(true);
+        let at = Hlc { wall: 10, logical: 0, peer: 1 };
+        syncer.last_pulled.lock().unwrap().entry(1).or_default().insert(1, at);
+        let mark = syncer.cursor_mark();
+        // 置き場の directory が無い: 書けない
+        syncer.save_cursors_through(mark.clone());
+        assert!(!file.exists(), "前提: 置き場を書けなかった");
+        std::fs::create_dir_all(&dir).unwrap();
+        syncer.save_cursors_through(mark);
+        drop(syncer);
+        let back = Syncer::new(eng.clone(), transport).with_cursor_path(file.clone());
+        let got = back.cursors_of(1);
+        drop(back);
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&path);
+        assert_eq!(got, vec![(1, at)], "書けなかった位置を書いたと覚え、 書けるようになっても書き直さない");
     }
 
     /// #762: 中継が取り直した state から差分に任せる record を外す時、 外した Vocab を残した Tie が指していれば、 その Vocab は

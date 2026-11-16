@@ -37,7 +37,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use enchudb::Engine;
@@ -760,6 +760,19 @@ impl HttpHost {
     /// 印 (`set_gossip_remote_apply`) を立てる。 `cursor_path` は client ごとの受けた位置の置き場 (無ければ memory だけで、
     /// 開き直すと client の record を当て直す。 当て直しは冪等)。 その横 (`<cursor_path>.clients`) に client ごとの線を置き、
     /// 削除を忘れてよい線を配る (`cursor_path` が無ければ線を配らない = 誰も削除の記録を忘れない)。
+    ///
+    /// 置き場が無いと、 開き直すたびに、 繋いでいる client は ring の自分の record を全部送り直し (前の ack を覚えている同じ process の
+    /// client も、 #961 の `BEHIND` で)、 ホストはそれを全部もう一度中継に載せる (#698: 当たらなかった record も載せる)。 1 client に
+    /// つき開き直し 1 回で、 その client の ring の行の数まで。 受け手は cursor で落とすが、 ホストの ring を埋める。 置き場を付けること。
+    ///
+    /// 控えから戻す時 (#961): 置き場 (`cursor_path`) は DB と同じ時に控えた物か、 それより古い物を使う。 戻す前のホストの置き場 (DB より
+    /// 新しい) を残すと、 ホストの cursor が client の言う 「ホストが受けた位置」 以上になって `BEHIND` を返さず、 client の送り直しを
+    /// cursor で落とす (控えの後に ack した record が、 戻したホストにも他の client にも届かない)。 置き場を消して開くのは安全な側
+    /// (全部の client が送り直す = 上の載せ直し)。
+    ///
+    /// ホストは publish の要求の query (`acked=peer:w.l.p,..`) を percent-decode せずに読む。 query を作り直す proxy (`:` / `,` を
+    /// `%3A` / `%2C` にする等) を挟むと、 読めない `acked` は無いものとして確かめない: 誤って `BEHIND` にはならないが、 作り直した /
+    /// 戻したホストに ack 済みの record を送り直さない (#961 (b) が直らない)。
     pub fn start(bind_addr: &str, engine: Arc<Engine>, cursor_path: Option<PathBuf>) -> io::Result<Self> {
         let host = engine.peer_id();
         if host == 0 {
@@ -990,6 +1003,15 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
 // client
 // ─────────────────────────────────────────────────────────────
 
+/// [`HttpHostTransport`] が覚えている 「ホストが受けた位置」。
+#[derive(Default)]
+struct Acked {
+    /// 書き手ごとの位置。
+    at: Cursors,
+    /// `BEHIND` の返事で `at` を下げた回数 (review965 F1: 下げる前の位置で集めた batch を送らない)。
+    lowered: u64,
+}
+
 /// ホストと話す client の transport。 `Syncer::new(engine, Arc::new(HttpHostTransport::connect(url, me)?))` で使い、
 /// `publish_since` / `pull_once(t.host_id())` を回す。 自分の state をホストに送れるよう、 client も `serve_state()` を呼ぶこと
 /// (ホストが求めた時だけ送る)。
@@ -997,6 +1019,11 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
 /// `Syncer` には cursor の置き場 (`Syncer::with_cursor_path`) を付けること。 無いと受けた位置は memory だけで、 開き直すたびに
 /// 「初めて来た client」 になる: ホストが一度でも回収していれば、 最初の pull は何も当てずに `history_truncated` を返し、 アプリが
 /// 取り直し (`bootstrap_pull_via`) を呼ぶまで受け取りが止まる (#710)。
+///
+/// publish は `publish_since(Hlc::ZERO)` で回すこと (ホストが受けた位置は transport が覚えていて、 それ以下の record は集めない)。
+/// ZERO より後の `since` を渡すと、 ホストを作り直した / 古い控えから戻した時 (#961、 [`BEHIND`]) に、 ホストに足りない record のうち
+/// `since` 以下の物を集めない。 その publish は下がった位置を名乗ってホストに当たるので、 ホストの cursor がその穴を越え、 その
+/// record は新しいホストにも他の client にも届かない。
 pub struct HttpHostTransport {
     http: HttpTransport,
     host: PeerId,
@@ -1008,7 +1035,11 @@ pub struct HttpHostTransport {
     /// ホストの cursor がそこまで届いていなければ (同じ URL の裏でホストを空の DB で作り直した / 古い控えから戻した、 #961)、 ホストの
     /// 返事 (`BEHIND`) の位置に置き換える (下がる)。 0.37.4 以前のホストは `acked` を読まないので、 その相手では上がるだけ (作り直した
     /// ホストに ack 済みの record を、 この process の間は送り直さない)。
-    acked: Mutex<Vec<(PeerId, Hlc)>>,
+    acked: Mutex<Acked>,
+    /// thread ごとに、 `publish_floor` を答えた時の [`Acked::lowered`]。 同じ thread の次の `publish_to` が取り出して比べる (review965
+    /// F1)。 `Syncer` の外から `publish_floor` だけを呼んだ thread も控えが残り、 その間に下げていれば次の `publish_to` を 1 回送らない
+    /// (次の beat が送る)。
+    floor_reads: Mutex<HashMap<ThreadId, u64>>,
     /// 最後の pull の返事にあったホストの floor。
     floors: Mutex<Option<Vec<(PeerId, Hlc)>>>,
     /// 自分の state の配布元 (`serve_state` が登録する)。 ホストが求めた時に送る。
@@ -1038,7 +1069,8 @@ impl HttpHostTransport {
             host,
             me,
             pending_acks: Mutex::new(HashMap::new()),
-            acked: Mutex::new(Vec::new()),
+            acked: Mutex::new(Acked::default()),
+            floor_reads: Mutex::new(HashMap::new()),
             floors: Mutex::new(None),
             own_state: Mutex::new(HashMap::new()),
             through: Mutex::new((None, None)),
@@ -1061,10 +1093,12 @@ impl HttpHostTransport {
         self.host
     }
 
-    /// 送らずに捨てる位置: ホストが受けた位置 (`acked`) の写し。 `publish_to` の捨て ([`above_floor`]) と `publish_floor` はどちらも
-    /// これから作る (#962: `Transport::publish_floor` の約束 = 言う位置以下の record は送らない、 を形で揃える)。
-    fn sent_floor(&self) -> Cursors {
-        self.acked.lock().unwrap().clone()
+    /// 送らずに捨てる位置: ホストが受けた位置 (`acked`) の写しと、 その時の下げた回数 ([`Acked::lowered`])。 `publish_to` の捨て
+    /// ([`above_floor`]) と `publish_floor` はどちらもこれから作る (#962: `Transport::publish_floor` の約束 = 言う位置以下の record は
+    /// 送らない、 を形で揃える)。
+    fn sent_floor(&self) -> (Cursors, u64) {
+        let acked = self.acked.lock().unwrap();
+        (acked.at.clone(), acked.lowered)
     }
 
     /// ホストが求めたので、 自分 (`author`) の state を送る。
@@ -1091,7 +1125,16 @@ impl Transport for HttpHostTransport {
     }
 
     fn publish_to(&self, from: PeerId, _to: PeerId, records: Vec<WireRecord>) {
-        let floor = self.sent_floor();
+        // review965 F1: この thread が record を集める前に `publish_floor` を聞いた後、 並んだ publish が `BEHIND` を受けて覚えを
+        // 下げていたら、 この batch は送らない。 batch は下げる前の位置より後の record だけで、 送ると下がった位置を名乗ってホストに
+        // 当たり、 ホストの cursor が間の record (下がった位置と下げる前の位置の間) を越える (ack で覚えも上がり、 その record を二度と
+        // 集めない)。 次の beat が下がった位置から集め直す (配り終えの線もその beat が言う)。 `publish_floor` を聞いていない publish
+        // (`Syncer` が絞らずに `since` から集めた batch) は確かめない
+        let read_at = self.floor_reads.lock().unwrap().remove(&std::thread::current().id());
+        let (floor, lowered) = self.sent_floor();
+        if read_at.is_some_and(|l| l != lowered) {
+            return;
+        }
         let records: Vec<WireRecord> = records.into_iter().filter(|r| above_floor(&floor, r)).collect();
         // 送る record が無くても、 配り終えの線が進んだら言う (書き込みの無い client が線を止めない)
         let (through, sent) = *self.through.lock().unwrap();
@@ -1116,20 +1159,30 @@ impl Transport for HttpHostTransport {
         }
         if flags & BEHIND != 0 {
             // #961: ホストは言った位置まで受けていない (作り直した / 古い控えから戻した)。 この batch は当たっていない。 覚えをホストの
-            // 今の位置に置き換え (`publish_floor` / 捨ての位置が下がる)、 次の beat で足りない所から送り直す。 前のホストの ack で
-            // 回収を回さない (まだ取り込んでいない分は捨てる)。 配り終えの線は送っていないことにする (次の publish でまた言う)
+            // 今の位置に置き換え (`publish_floor` / 捨ての位置が下がる)、 次の beat で足りない所から送り直す。 下げた回数を上げて、
+            // 下げる前の位置で集めた並んだ publish の batch を送らせない (review965 F1)。 配り終えの線は送っていないことにする (次の
+            // publish でまた言う)。
+            // まだ `Syncer` に渡していない ack は捨てる。 これで止まるのは、 並べて回した publish がこの beat の頭より後に受けた ack
+            // だけ (新しいホストの ack なら、 次の ack が同じ位置以上を運ぶ)。 前のホストの最後の ack は beat の頭 (`absorb_pull_acks`)
+            // で取り込み済みで、 client の ring はその ack で回収されうる (review965 F2: 止めない)。 新しいホストが持たない record を
+            // 回収しても失わない: 回収した beat の頭で floor を言ってから送るので、 ホストは送り直しの代わりに state を求める (差分より
+            // 重いだけ)
             eprintln!(
                 "[enchudb] host {} has not received records it acknowledged before (rebuilt or restored?) — sending them again",
                 self.host
             );
-            *self.acked.lock().unwrap() = ack;
+            {
+                let mut acked = self.acked.lock().unwrap();
+                acked.at = ack;
+                acked.lowered += 1;
+            }
             self.pending_acks.lock().unwrap().remove(&from);
             return;
         }
         if from == self.me {
             self.through.lock().unwrap().1 = through;
         }
-        merge_max(&mut self.acked.lock().unwrap(), &ack);
+        merge_max(&mut self.acked.lock().unwrap().at, &ack);
         merge_max(self.pending_acks.lock().unwrap().entry(from).or_default(), &ack);
         if flags & NEED_STATE != 0 {
             self.push_state(from);
@@ -1141,10 +1194,14 @@ impl Transport for HttpHostTransport {
     /// #962: `publish_to` の捨てと同じ [`HttpHostTransport::sent_floor`] から作る。
     ///
     /// #961: 下がるのは `BEHIND` の返事を読んだ時だけ (ホストを作り直した)。 その返事は publish の最後に読むので、 下がった位置は次の
-    /// beat の `publish_floor` が言う (同じ `Syncer` の publish を並べて回した時だけ、 間の beat が下がる前の位置で集めうる。 その beat で
-    /// 集めなかった record は次の beat で集める)。
+    /// beat の `publish_floor` が言う。 同じ transport の publish を並べて回すと、 間の beat が下がる前の位置で集めうる: その batch は
+    /// `publish_to` が送らない (review965 F1。 送ると下がった位置を名乗って当たり、 ホストの cursor が間の record を越える)。 答えた時の
+    /// 下げた回数を thread ごとに控え、 同じ thread の次の `publish_to` が比べる (`Syncer` は `publish_floor` → 集める → `publish_to` を
+    /// 1 本の thread で呼ぶ)。 送らなかった batch の record は次の beat が下がった位置から集める。
     fn publish_floor(&self, _from: PeerId, _to: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
-        Some(self.sent_floor())
+        let (at, lowered) = self.sent_floor();
+        self.floor_reads.lock().unwrap().insert(std::thread::current().id(), lowered);
+        Some(at)
     }
 
     fn uses_published_through(&self) -> bool {
@@ -1512,7 +1569,7 @@ mod tests {
         while c.transfer_oplog_to_sync_ops() > 0 {}
         let top = c.settled_sync_records(|a, _| a == 1).iter().map(|r| r.hlc).max();
         assert!(top.is_some(), "前提: client の ring に自分の record がある");
-        let acked = |t: &HttpHostTransport| t.sent_floor().iter().find(|(a, _)| *a == 1).map(|(_, h)| *h);
+        let acked = |t: &HttpHostTransport| t.sent_floor().0.iter().find(|(a, _)| *a == 1).map(|(_, h)| *h);
         let pending = |t: &HttpHostTransport| t.pending_acks.lock().unwrap().values().any(|v| !v.is_empty());
 
         host.inner.fail_wal.store(true, Ordering::Release);
@@ -1677,7 +1734,7 @@ mod tests {
             "前提: ホストの memory の cursor は k=2 を越えた"
         );
         let seen = cursor_in(&at_point.lock().unwrap().clone().expect("前提: 割り込み点を通った"), 1, 1);
-        assert!(ta.sent_floor().iter().all(|(x, h)| *x != 1 || *h < top2), "前提: a は k=2 の ack を受けていない");
+        assert!(ta.sent_floor().0.iter().all(|(x, h)| *x != 1 || *h < top2), "前提: a は k=2 の ack を受けていない");
         // 電源が落ちた: 置き場は今 disk にある中身
         std::fs::copy(&cursors, path("img.cursors")).unwrap();
         drop(host);

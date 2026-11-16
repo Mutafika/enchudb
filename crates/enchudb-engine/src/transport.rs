@@ -523,8 +523,11 @@ pub trait Transport: Send + Sync {
     /// #955: `from` が `to` へ送る record のうち、 [`Self::publish_to`] が送らずに捨てる位置 (書き手ごとの版数: その版数以下の
     /// その書き手の record は送らない)。 `Syncer` は、 `SubscriptionFilter` が全部を通す時、 これを先に聞いてその位置以下の record を
     /// 集めない (写して decode しない)。 返す位置は、 この後の `publish_to` が捨てる位置以下である事 (捨てる位置が下がらない transport
-    /// だけが返す)。 既定は `None` (聞かない)。 ホストの client の transport (`HttpHostTransport`) は、 ホストが受けた位置を返す (#961:
-    /// その位置はホストを作り直した時だけ下がる。 下がった位置は次の beat から言うので、 その間に集めなかった record は次の beat で集める)。
+    /// だけが返す。 下がりうる transport は、 下がる前に聞いて集めた batch を送らないこと)。 既定は `None` (聞かない)。 ホストの client
+    /// の transport (`HttpHostTransport`) は、 ホストが受けた位置を返す (#961: その位置はホストを作り直した時だけ下がり、 下がった位置は
+    /// 次の beat から言う。 下がる前に聞いて集めた batch は、 下がった位置との間の record を欠くので `publish_to` が送らずに捨て、 次の
+    /// beat が下がった位置から集める。 `Syncer` は聞く → 集める → 送る を 1 本の thread で呼び、 その transport は thread ごとに聞いた時を
+    /// 控えて比べる)。
     fn publish_floor(&self, _from: PeerId, _to: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
         None
     }
