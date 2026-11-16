@@ -7330,12 +7330,12 @@ fn an_alias_of_a_dead_row_is_evicted_by_the_reuse_after_a_reopened_power_loss() 
 const WORLD_B6: u64 = (2u64 << 32) | 16;
 
 /// 2 回目の読み直しの [3] の引き換えの像 (ホスト = 受けた record を中継して WAL に載せる DB): 名前 7 の自分の行 X に B の行 b を畳み
-/// (b は X の場所の別名、 `eidalias` に書き出す)、 表を使い切って書き出す。 B の b 宛ての書き込み (v = 71) を受けて (X に当たる) 中継し
-/// (WAL の checkpoint の後ろ)、 `oplog_sync` の本体の書き出しで `prev.seg` を書き出した後・生きている印の前 (`PrevWrittenOut`) に X を
-/// 消して Y (v を持たない) で X の場所を使い回し、 残りの列まで書き出した所 (`BeforeVersions`) で電源断。 本体には Y が届き (生きている
-/// 印と gen.seg)、 使い回しの記録・X の削除・Y の record は届かない (review946 [3] の窓)。 WAL の再生する record は中継した b 宛ての
-/// 書き込みだけ。 (X, Y) を返す。
-fn relayed_write_over_reuse_without_record_image(live: &Path, img: &Path) -> (u64, u64) {
+/// (b は X の場所の別名、 `eidalias` に書き出す)、 表を使い切って書き出す。 B の b 宛ての書き込み (v = 71) と削除を受けて (X に当たる、
+/// X は消える) 中継し (WAL の checkpoint の後ろ)、 `oplog_sync` の本体の書き出しで `prev.seg` を書き出した後・生きている印の前
+/// (`PrevWrittenOut`) に Y (v を持たない) で X の場所を使い回し、 残りの列まで書き出した所 (`BeforeVersions`) で電源断。 本体には Y が
+/// 届き (生きている印と gen.seg)、 使い回しの記録・Y の record は届かない (review946 [3] の窓)。 WAL の再生する record は中継した b 宛ての
+/// 書き込みと削除だけ。 (X, Y, b の削除の版数) を返す。
+fn relayed_write_over_reuse_without_record_image(live: &Path, img: &Path) -> (u64, u64, Hlc) {
     let (eng, x) = full_named_table_engine(&live.join("db"));
     let hv = eng.himo_id("t.v").unwrap() as u16;
     let b = eng.resolve_remote_eid(WORLD_B6, hv).unwrap();
@@ -7358,7 +7358,12 @@ fn relayed_write_over_reuse_without_record_image(live: &Path, img: &Path) -> (u6
     assert!(eng.remote_tie_apply(to, hv, 71u32, at), "前提: b 宛ての書き込みが X に当たった");
     let rec = enchudb_engine::transport::WireRecord::unsigned(at, 2, DecodedOp::Tie { eid: WORLD_B6, himo_id: hv, value: 71 });
     assert!(eng.relay_record(&rec), "前提: b 宛ての書き込みを中継して WAL に載せた");
+    let gone = Hlc { wall: at.wall + 1, logical: 0, peer: 2 };
+    assert!(eng.remote_delete_apply_foreign(WORLD_B6, gone), "前提: b 宛ての削除が X を消した");
+    let rec = enchudb_engine::transport::WireRecord::unsigned(gone, 2, DecodedOp::Delete { eid: WORLD_B6 });
+    assert!(eng.relay_record(&rec), "前提: b 宛ての削除を中継して WAL に載せた");
     eng.oplog_commit();
+    assert!(!eng.is_live(x), "前提: X は消えた");
     let y_cell = Arc::new(std::sync::Mutex::new(None));
     let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let (d2, s2, l, i, e2, yc) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone(), y_cell.clone());
@@ -7367,7 +7372,6 @@ fn relayed_write_over_reuse_without_record_image(live: &Path, img: &Path) -> (u6
             let (e3, yc2) = (e2.clone(), yc.clone());
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             std::thread::spawn(move || {
-                e3.delete(x);
                 let y = e3.entity_in("t").unwrap();
                 e3.tie_to(y, "t.k", 9u32);
                 e3.oplog_commit();
@@ -7385,14 +7389,15 @@ fn relayed_write_over_reuse_without_record_image(live: &Path, img: &Path) -> (u6
     assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で使い回して撮った");
     let y = y_cell.lock().unwrap().expect("前提: Y");
     assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y が X の場所を使い回した");
-    (x, y)
+    (x, y, gone)
 }
 
 /// PR #1006 の 2 回目の読み直しの [3] の引き換え (別案): `relayed_write_over_reuse_without_record_image` を開くと、 本体の場所の住人は Y
-/// (X の record は WAL に無い = 再生は X を戻さない)。 `eidalias` の b は X の世代を指し、 使い回しの記録が無く再生する record がある
-/// ので再生の前には外れない (読み直し [3])。 再生する中継の b 宛ての書き込みは、 その古い別名で Y に当てない (Y は v を持たないまま)。
+/// (X の record は WAL に無い)。 `eidalias` の b は X の世代を指し、 使い回しの記録が無く再生する record があるので再生の前には外れない
+/// (読み直し [3])。 再生する中継の b 宛ての書き込みと削除は、 その古い別名で Y に当てない (Y は生きていて v を持たない)。 削除は消えた
+/// identity b の削除として退避表に載る (開いた後の b 宛ての遅れた書き込みは当たらない)。
 ///
-/// 前は再生の全部の間、 古い別名 b で中継の record が Y に当たった (v = 71。 中継された Delete なら Y を消した、 master と同じ)。
+/// 前は再生の全部の間、 古い別名 b で中継の record が Y に当たった (v = 71、 中継された削除が Y を消した。 master と同じ)。
 #[test]
 fn a_relayed_write_to_a_former_alias_does_not_hit_the_new_resident_on_replay() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -7403,7 +7408,7 @@ fn a_relayed_write_to_a_former_alias_does_not_hit_the_new_resident_on_replay() {
     let (live, img) = (root.join("live"), root.join("img"));
     std::fs::create_dir_all(&live).unwrap();
     crashsim::start();
-    let (x, y) = relayed_write_over_reuse_without_record_image(&live, &img);
+    let (x, y, gone) = relayed_write_over_reuse_without_record_image(&live, &img);
     crashsim::stop();
     let db = img.join("db");
     let (ro_b, ro_slot, ro_record, ro_y_alive) = {
@@ -7416,14 +7421,22 @@ fn a_relayed_write_to_a_former_alias_does_not_hit_the_new_resident_on_replay() {
     let (x_alive, y_alive) = (eng.is_live(x), eng.is_live(y));
     let y_v = eng.get(y, "t.v");
     let b_at = eng.resolve_remote_eid_existing(WORLD_B6).map(|e| eng.eid_slot(e));
+    let b_tomb = eng.deleted_before_create(WORLD_B6);
+    let hv = eng.himo_id("t.v").unwrap() as u16;
+    let late = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
+    let t = eng.resolve_remote_eid(WORLD_B6, hv);
+    let landed = (t.is_some_and(|t| eng.remote_tie_apply(t, hv, 4u32, late)), t.is_some_and(|t| eng.is_live(t)));
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(ro_b, Some(ro_slot), "前提: 像の `eidalias` は b → X の場所");
     assert!(ro_y_alive, "前提: 本体の場所の住人は Y");
     assert!(ro_record.is_none_or(|r| r.1 != eid_local(x)), "前提: 使い回しの記録 (前の住人 X) は届いていない: {ro_record:x?}");
-    assert!(!x_alive && y_alive, "前提: 開いた A の場所の住人は Y (X の record は WAL に無い)");
-    assert_ne!(b_at, Some(ro_slot), "前提: 開く道の仕上げが Y より下の世代の b を外した");
+    assert!(!x_alive, "前提: 開いた A で X は消えている");
+    assert!(y_alive, "中継した b 宛ての削除が、 再生で古い別名から使い回した Y を消した");
     assert_eq!(y_v, None, "中継した b 宛ての書き込みが、 再生で古い別名から使い回した Y に当たった");
+    assert_ne!(b_at, Some(ro_slot), "前提: 開く道の仕上げが Y より下の世代の b を外した");
+    assert_eq!(b_tomb, Some(gone), "再生した b 宛ての削除が b の削除として退避表に載らない");
+    assert_eq!(landed, (false, false), "b 宛ての遅れた書き込みが当たった / 生きた行になった (幽霊行)");
 }
 
 /// #994 [C4] の死んだ場所 (PR #1006 の 2 回目の読み直し): 翻訳した行 F (B の行 b を畳んだ) を C の削除で消し、 Y で F の場所を使い回す
