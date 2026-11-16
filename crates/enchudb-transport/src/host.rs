@@ -714,13 +714,13 @@ impl HostInner {
 
     /// ホストの `_sync_ops` に残っている record の HLC の最小 (残っていなければ None)。 F はこれを越えない: 残っている record は
     /// まだ個別に配りうるので、 その削除をホストが忘れた後に誰かが当てると、 名前で束ねた行の答えが割れる。
+    ///
+    /// #985: 前は呼ぶたびに ring の全部の行を写して decode した (`pending_sync_ops(0)`、 100 万行で 1 回 76〜112 ms)。 F が ring の
+    /// 最古の record に留められている間は client の要求のたびに走った。 engine の覚え ([`Engine::sync_ring_min_hlc`]) は、 bridge が
+    /// 足した行と回収で消えた行で直し、 最小以下の行が消えた後だけ ring を読み直す (答えは同じ)。
+    #[cfg(test)]
     fn ring_min(&self) -> Option<Hlc> {
-        self.engine
-            .pending_sync_ops(0)
-            .iter()
-            .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
-            .map(|r| r.hlc)
-            .min()
+        self.engine.sync_ring_min_hlc()
     }
 
     /// 黙ったので外した client か、 外した後に戻ってきた client か (線を持つホストだけ)。
@@ -779,8 +779,9 @@ impl HostInner {
                     hook();
                 }
             }
-            // 登録を外した受信の record は ring にある (外したのは `sync_for_ack` の後) = 登録を読んだ後に ring を読む
-            let f = self.ring_min().map_or(upper, |m| upper.min(m));
+            // 登録を外した受信の record は ring にある (外したのは `sync_for_ack` の後) = 登録を読んだ後に ring を読む。
+            // #985: min(上限, ring の最小)。 ring の最小の覚えの下の境が上限以上なら ring を読まない
+            let f = self.engine.sync_ring_min_below(upper).unwrap_or(upper);
             let current = self.lines.lock().unwrap().forget;
             if f > current {
                 if self.engine.forget_deletes_before(f) > 0 {

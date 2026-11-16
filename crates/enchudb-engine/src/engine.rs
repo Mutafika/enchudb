@@ -111,6 +111,76 @@ impl RingNewest {
     }
 }
 
+/// #985: `_sync_ops` の ring に残る行の版数の最小の覚え ([`Engine::sync_ring_min_hlc`] / [`Engine::sync_ring_min_below`])。
+///
+/// ホスト (`enchudb-transport` の `HttpHost`) は、 削除を忘れてよい線を ring に残るいちばん古い record の版数で抑える。 前は
+/// 線を進めようとする度に ring の全部の行を写して decode した (100 万行で 1 回 76〜112 ms。 線が ring の最古の record に
+/// 留められている間は、 client の要求のたびに)。 覚えは下の境 `min` と、 それが最小そのものか (`exact`):
+///
+/// - bridge が行を足す (lsn を書いた) たびに [`Self::note`] で `min` を下げる。 足した後も `min` は下の境で、 最小そのものなら
+///   足した後も最小そのもの
+/// - 行が消える ([`Engine::purge_sync_ops_row`]) 時、 消える行の版数が `min` 以下 (か読めない) なら `exact` を倒す ([`Self::gone`])。
+///   `min` は下の境のまま (消えると最小は上がる側)。 消える行の版数が `min` より上なら、 最小の行は残っている
+/// - ring を読み直すのは、 最小そのものが要る問い (`exact` でなく、 下の境が問いの境より下) だけ
+///
+/// 読み直す間 (`scanning`) に足された行と消えた行の版数の最小を貯め、 読み直しの答えに足す / 答えが最小そのものかを決める。
+/// 読み直しの前に足された行は読み直しが見る (bridge は lsn を書いてから覚えを触る)。 消えた行は、 消してから覚えを触る
+/// (触る前に問いが来ても、 消えた行の版数を含む = 下の境のまま)。 数える行は前の読み (`pending_sync_ops(0)` を
+/// `decode_sync_ops_payload` で decode できた物) と同じ: lsn が 0 でない全部の行 (配ってよい所 = 組の途中で止まった後ろも、
+/// 書き手 0 も、 Vocab も)、 payload を読めない / decode できない行 (dead row) は数えない。
+struct RingOldest {
+    /// 覚えを作ったか (開いた後の最初の問いが ring を読む)。
+    seeded: bool,
+    /// ring のどの行 (decode できる物) の版数もこれ以上 (下の境)。 None は行が無い。
+    min: Option<enchudb_oplog::Hlc>,
+    /// `min` が最小そのものか。
+    exact: bool,
+    /// ring を読み直している途中なら Some((その間に足された行の版数の最小, その間に消えた行の版数の最小 (読めない行は ZERO)))。
+    scanning: Option<(Option<enchudb_oplog::Hlc>, Option<enchudb_oplog::Hlc>)>,
+}
+
+impl RingOldest {
+    fn new() -> Self {
+        Self { seeded: false, min: None, exact: false, scanning: None }
+    }
+
+    /// 版数 `hlc` の行を ring に足した (lsn を書いた後)。
+    fn note(&mut self, hlc: enchudb_oplog::Hlc) {
+        if self.seeded {
+            self.min = Some(self.min.map_or(hlc, |m| m.min(hlc)));
+        }
+        if let Some((added, _)) = &mut self.scanning {
+            *added = Some(added.map_or(hlc, |m| m.min(hlc)));
+        }
+    }
+
+    /// 版数 `hlc` の行を ring から消した (消した後)。 `None` = 版数を読めなかった (最小の行だったかもしれない)。
+    fn gone(&mut self, hlc: Option<enchudb_oplog::Hlc>) {
+        let h = hlc.unwrap_or(enchudb_oplog::Hlc::ZERO);
+        if self.min.is_none_or(|m| h <= m) {
+            self.exact = false;
+        }
+        if let Some((_, gone)) = &mut self.scanning {
+            *gone = Some(gone.map_or(h, |g| g.min(h)));
+        }
+    }
+
+    /// 覚えだけで答えが決まるなら Some(答え)。 `below` は問いの境 (None = 最小そのもの)。
+    fn answer(&self, below: Option<enchudb_oplog::Hlc>) -> Option<Option<enchudb_oplog::Hlc>> {
+        if !self.seeded {
+            return None;
+        }
+        if self.exact {
+            return Some(self.min.filter(|m| below.is_none_or(|b| *m < b)));
+        }
+        // 下の境が問いの境以上なら、 境より下の行は無い (行が無い (`min` が None) のに最小そのものでない覚えは読み直す)
+        match (self.min, below) {
+            (Some(m), Some(b)) if m >= b => Some(None),
+            _ => None,
+        }
+    }
+}
+
 /// #846: bridge が `_sync_ops` の ring の満杯で止まった所の覚え (`transfer_lock` の下でだけ触る)。
 ///
 /// 止まった bridge は、 cursor の record を ring に置けない。 ring が空く (行が消える / 枠が足される) まで、 何周しても同じ所で
@@ -6991,6 +7061,22 @@ mod settled_read_hook {
     }
 }
 
+/// test 用: #985 の ring の最小の読み直しが行をなめ終えた後・覚えに置く前の割り込み点 (`Engine::ring_oldest_answer`、 WAL ごと)。
+#[cfg(test)]
+mod ring_oldest_scan_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// #955: `_sync_ops` の行の (lsn, 場所) を (lsn, 場所) の順に並べる (`Engine::settled_sync_records` が ring を lsn の順に読むため)。
 ///
 /// 配ってよい行の lsn はほぼ続いている (bridge は lsn を 1 から 1 つずつ振り、 回収は小さい方から消す) ので、 lsn の幅が行の数の 4 倍
@@ -9958,6 +10044,12 @@ pub struct Engine {
     ring_newest: std::sync::Mutex<RingNewest>,
     /// #843: `_sync_ops` の行を消した回数 ([`Self::purge_sync_ops_row`])。 [`RingNewest::last`] が 「行が消えていない」 を見る。
     sync_ops_purges: std::sync::atomic::AtomicU64,
+    /// #985: ring に残る行の版数の最小の覚え ([`RingOldest`])。
+    ring_oldest: std::sync::Mutex<RingOldest>,
+    /// #985: ring を読み直す問いを 1 つずつにする (後から来た問いは、 前の読み直しの答えを使う)。
+    ring_oldest_scan: std::sync::Mutex<()>,
+    /// #985: [`RingOldest`] を作るために ring の行をなめた回数 ([`Self::sync_ring_min_scans`])。
+    ring_oldest_scans: std::sync::atomic::AtomicU64,
     /// #843: [`Self::open_groups_on_ring`] が ring の行をなめた回数 ([`Self::sync_ring_scans`])。
     sync_ring_scans: std::sync::atomic::AtomicU64,
     /// #846: bridge が ring の満杯で止まった所の覚え ([`BridgeStall`]、 `transfer_lock` の下でだけ触る)。
@@ -10437,6 +10529,9 @@ impl Engine {
             sync_settled_known: std::sync::atomic::AtomicBool::new(false),
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
+            ring_oldest: std::sync::Mutex::new(RingOldest::new()),
+            ring_oldest_scan: std::sync::Mutex::new(()),
+            ring_oldest_scans: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
             bridge_stall: std::sync::Mutex::new(None),
             bridge_stalled_from: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -11983,6 +12078,9 @@ impl Engine {
             sync_settled_known: std::sync::atomic::AtomicBool::new(false),
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
+            ring_oldest: std::sync::Mutex::new(RingOldest::new()),
+            ring_oldest_scan: std::sync::Mutex::new(()),
+            ring_oldest_scans: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
             bridge_stall: std::sync::Mutex::new(None),
             bridge_stalled_from: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -12743,6 +12841,8 @@ impl Engine {
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             // #843: ring の行のいちばん新しい版数を覚える (止まった周が ring を読み直さないため)
             self.ring_newest.lock().unwrap_or_else(|p| p.into_inner()).note(rec.hlc);
+            // #985: 版数の最小の覚えも (lsn を書いた後に触る = 触る前に始まった読み直しはこの行を見る)
+            self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).note(rec.hlc);
             self.sync_bridged.fetch_add(1, Ordering::Release);
             done_end = Some(*rec_end);
         }
@@ -14242,6 +14342,20 @@ impl Engine {
                 // `free_locals` を握ったまま (上の doc)
                 self.check_writable();
                 let row_local = self.slot_unchecked(eid);
+                // #985: 消える行の版数 (ring の最小の覚えが要る時だけ読む。 覚えを作る前に消す行は、 作る読み直しが見ない)。 読んだ
+                // 後に覚えを作り始めた時は、 読めなかった行 (最小だったかもしれない) として渡す
+                let gone_hlc = {
+                    let watched = {
+                        let st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
+                        st.seeded || st.scanning.is_some()
+                    };
+                    let hlc = if watched {
+                        self.sync_payload_cols().and_then(|c| self.sync_op_walk_key(eid, &c)).map(|(_, h)| h)
+                    } else {
+                        None
+                    };
+                    (watched, hlc)
+                };
                 let hlc = self.oplog.as_ref().map_or(enchudb_oplog::Hlc::ZERO, |wal| wal.mint_hlc());
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
@@ -14249,6 +14363,13 @@ impl Engine {
                 drop(row);
                 if !applied {
                     self.warn_local_write_rejected(row_local, u16::MAX, hlc);
+                }
+                // #985: 消した後に覚えを触る (触る前の問いは消えた行の版数を含む = 下の境のまま)
+                {
+                    let mut st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
+                    if st.seeded || st.scanning.is_some() {
+                        st.gone(if gone_hlc.0 { gone_hlc.1 } else { None });
+                    }
                 }
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
@@ -15631,6 +15752,75 @@ impl Engine {
     /// 流す」 用途で呼ぶ。 返り値の各 entry は payload (= 完全 wire bytes)。
     pub fn pending_sync_ops(&self, since_lsn: u32) -> Vec<Vec<u8>> {
         self.sync_ops_between(since_lsn, u32::MAX)
+    }
+
+    /// #985: `_sync_ops` の ring に残る行の版数の最小 (行が無ければ None)。 答えは
+    /// `pending_sync_ops(0).iter().filter_map(|p| decode_sync_ops_payload(p)).map(|r| r.hlc).min()` と同じ: lsn が 0 でない全部の
+    /// 行 (配ってよい所の後ろ = 組の途中で止まった行も、 書き手 0 も、 Vocab も)、 payload を読めない / decode できない行は数えない。
+    ///
+    /// ring を毎回読まない ([`RingOldest`]): bridge が足した行と消えた行で覚えを直し、 読み直すのは覚えが最小そのものでない時
+    /// (最小以下の版数の行が消えた後) だけ。 読み直しも payload を写さず、 (書き手, 版数) だけを読む。
+    pub fn sync_ring_min_hlc(&self) -> Option<enchudb_oplog::Hlc> {
+        self.ring_oldest_answer(None)
+    }
+
+    /// #985: [`Self::sync_ring_min_hlc`] が `below` より小さければ Some(それ)、 そうでなければ (行が無い時も) None。
+    /// `min(below, ring の最小)` = `sync_ring_min_below(below).unwrap_or(below)`。 覚えの下の境が `below` 以上なら ring を読まない
+    /// (行が消えて覚えが最小そのものでなくても)。 ホストが削除を忘れてよい線を ring の最古の record で抑えるのに使う。
+    pub fn sync_ring_min_below(&self, below: enchudb_oplog::Hlc) -> Option<enchudb_oplog::Hlc> {
+        self.ring_oldest_answer(Some(below))
+    }
+
+    /// #985: [`RingOldest`] を作るために ring の行をなめた回数 (観測・試験用)。
+    pub fn sync_ring_min_scans(&self) -> u64 {
+        self.ring_oldest_scans.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn ring_oldest_answer(&self, below: Option<enchudb_oplog::Hlc>) -> Option<enchudb_oplog::Hlc> {
+        if let Some(a) = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).answer(below) {
+            return a;
+        }
+        // 読み直しは 1 つずつ (待っていた間に前の読み直しが覚えを作ったら、 それを使う)
+        let _scan = self.ring_oldest_scan.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(a) = st.answer(below) {
+                return a;
+            }
+            st.scanning = Some((None, None));
+        }
+        self.ring_oldest_scans.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let scanned = self.scan_ring_min();
+        // 試験: なめ終えた後・覚えに置く前の割り込み点 (その間に足された / 消えた行)
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            ring_oldest_scan_hook::call(wal);
+        }
+        let mut st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
+        // 読み直しの間に足された行は読み直しが見ていないかもしれない (足す)。 消えた行は読み直しが数えたかもしれない: その版数が
+        // 答え以下なら、 答えは下の境 (最小そのものとは言わない)
+        let (added, gone) = st.scanning.take().unwrap_or((None, Some(enchudb_oplog::Hlc::ZERO)));
+        let min = match (scanned, added) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        st.seeded = true;
+        st.min = min;
+        st.exact = gone.is_none_or(|g| min.is_none_or(|m| g > m));
+        min.filter(|m| below.is_none_or(|b| *m < b))
+    }
+
+    /// #985: ring の行 (lsn が 0 でない) を全部なめた版数の最小。 payload は写さず、 decode と同じ検査で (書き手, 版数) だけを読む。
+    fn scan_ring_min(&self) -> Option<enchudb_oplog::Hlc> {
+        if !self.sync_tables_enabled() {
+            return None;
+        }
+        let cols = self.sync_payload_cols()?;
+        self.table_slots_with_value32(cols.lsn, |lsn| lsn != 0)
+            .into_iter()
+            .filter_map(|(lsn, slot)| self.sync_op_read(slot, lsn, &cols, enchudb_oplog::oplog::sync_ops_payload_walk_key))
+            .map(|(_, h)| h)
+            .min()
     }
 
     /// #828: `_sync_ops` の行のうち **配ってよい物** の payload (lsn の順)。 ring が満杯で bridge が同じ (書き手, 版数) の組の
@@ -32118,6 +32308,238 @@ mod ring_newest_tests {
         assert!(!n.is_newer_than_every_row(at(now + (1 << 32), 3)), "下位 32 bit が同じ鍵");
         n.unknown = true;
         assert!(!n.is_newer_than_every_row(at(now + 1, 0)), "版数の分からない行がある間は使わない");
+    }
+}
+
+/// #985: ring に残る行の版数の最小の覚え ([`RingOldest`]、 [`Engine::sync_ring_min_hlc`] / [`Engine::sync_ring_min_below`]) が、
+/// 直す前の読み (`pending_sync_ops(0)` を全部 decode した最小) と同じ答えを出す。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod ring_oldest_tests {
+    use super::*;
+    use crate::transport::WireRecord;
+    use enchudb_oplog::Hlc;
+    use enchudb_oplog::oplog::DecodedOp;
+    use std::sync::Arc;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        format!("{}/enchudb-issue985-unit-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id())
+    }
+
+    fn engine(path: &str) -> Arc<Engine> {
+        let mut eng = Engine::create_with_capacity(path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        eng
+    }
+
+    /// 直す前の読み (ring の全部の行を写して decode した最小)。
+    fn full(eng: &Engine) -> Option<Hlc> {
+        eng.pending_sync_ops(0).iter().filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p)).map(|r| r.hlc).min()
+    }
+
+    /// 中継の形の record (書き手 `author`、 版数 `hlc`) を WAL に載せて ring まで写す。
+    fn relay(eng: &Engine, author: u32, hlcs: &[Hlc]) {
+        for (i, h) in hlcs.iter().enumerate() {
+            let rec = WireRecord::unsigned(*h, author, DecodedOp::Vocab { vid: 7_000 + i as u32, bytes: b"w".to_vec() });
+            assert!(eng.relay_record(&rec), "前提: record を WAL に載せた");
+        }
+        eng.oplog_commit();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+    }
+
+    /// 自分の書き込みを `n` 個 ring まで写す。
+    fn own(eng: &Engine, n: u32) {
+        for i in 0..n {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.v", i);
+        }
+        eng.oplog_commit();
+        while eng.transfer_oplog_to_sync_ops() > 0 {}
+    }
+
+    /// ring の行のうち版数 `hlc` の物の (eid, lsn)。
+    fn rows_at(eng: &Engine, hlc: Hlc) -> Vec<(u64, u32)> {
+        let cols = eng.sync_payload_cols().unwrap();
+        eng.entities_with_himo(cols.lsn)
+            .into_iter()
+            .filter(|e| {
+                eng.sync_op_payload(*e, &cols)
+                    .and_then(|p| enchudb_oplog::oplog::decode_sync_ops_payload(&p))
+                    .is_some_and(|r| r.hlc == hlc)
+            })
+            .filter_map(|e| Some((e, eng.get_by_id32(e, cols.lsn)?)))
+            .collect()
+    }
+
+    fn purge(eng: &Engine, rows: &[(u64, u32)]) {
+        let lsn = eng.sync_payload_cols().unwrap().lsn;
+        for (e, l) in rows {
+            assert!(eng.purge_sync_ops_row(*e, lsn, *l), "前提: 行を消した");
+        }
+    }
+
+    /// 答えが直す前の読みと同じ (境つきの問いも)。
+    #[track_caller]
+    fn same(eng: &Engine, what: &str) -> Option<Hlc> {
+        let want = full(eng);
+        assert_eq!(eng.sync_ring_min_hlc(), want, "{what}: 直す前の読みと違う");
+        let bounds = [Hlc::ZERO, want.unwrap_or(Hlc::ZERO), Hlc { wall: u64::MAX, logical: 0, peer: 0 }];
+        for b in bounds.into_iter().chain(want.map(|m| Hlc { logical: m.logical + 1, ..m })) {
+            assert_eq!(eng.sync_ring_min_below(b), want.filter(|m| *m < b), "{what}: 境 {b:?}");
+        }
+        want
+    }
+
+    fn at(wall: u64, logical: u32, peer: u32) -> Hlc {
+        Hlc { wall, logical, peer }
+    }
+
+    /// 足す・消す・開き直すの各段で、 直す前の読みと同じ答え。 覚えが最小そのものの間 (行が足されただけ / 最小より上の行が消えた
+    /// だけ) は ring を読まない。
+    ///
+    /// falsify: bridge が覚えを触らない (`note`) と、 覚えを作った後に載った古い版数の record (中継) を数えない。 消した行を覚えに
+    /// 渡さない (`gone`) と、 消えた最小の版数を返す。 `gone` の比べを `h < m` にすると、 同じ版数の 2 行 (組) を消した後に消えた
+    /// 版数を返す。
+    #[test]
+    fn the_ring_min_matches_the_full_decode() {
+        let p = path("same");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        let scans = |e: &Engine| e.sync_ring_min_scans();
+        assert_eq!(same(&eng, "空の ring"), None);
+        own(&eng, 5);
+        let own_min = same(&eng, "自分の書き込み").expect("前提: 自分の行がある");
+        let s0 = scans(&eng);
+        // 覚えを作った後に、 それより古い版数の record が中継で載る (書き手 9、 書き手 0)。 組 = 同じ版数の 2 行
+        let old = at(own_min.wall - 50_000, 0, 9);
+        relay(&eng, 9, &[at(own_min.wall - 10_000, 3, 9), old, old]);
+        assert_eq!(rows_at(&eng, old).len(), 2, "前提: 同じ版数の行が 2 つ");
+        assert_eq!(same(&eng, "古い版数の中継"), Some(old));
+        let zero = at(own_min.wall - 20_000, 1, 0);
+        relay(&eng, 0, &[zero]);
+        assert_eq!(same(&eng, "書き手 0 の中継"), Some(old));
+        own(&eng, 3);
+        assert_eq!(scans(&eng), s0, "行が足されただけなのに ring を読んだ");
+        // 最小より上の行が消えても最小そのもの (読まない)
+        purge(&eng, &rows_at(&eng, zero));
+        assert_eq!(same(&eng, "最小より上の行を消した"), Some(old));
+        assert_eq!(scans(&eng), s0, "最小より上の行が消えただけなのに ring を読んだ");
+        // 最小の組の片方を消す: 最小は残る
+        let pair = rows_at(&eng, old);
+        purge(&eng, &pair[..1]);
+        assert_eq!(same(&eng, "最小の組の片方を消した"), Some(old));
+        // もう片方も消す: 最小が上がる
+        let s1 = scans(&eng);
+        purge(&eng, &pair[1..]);
+        // 境が下の境 (消えた最小) 以下の問いは読まない
+        assert_eq!(eng.sync_ring_min_below(old), None);
+        assert_eq!(scans(&eng), s1, "下の境が問いの境以上なのに ring を読んだ");
+        let next = same(&eng, "最小の組を両方消した");
+        assert!(next > Some(old), "前提: 最小が上がった ({next:?})");
+        // 回収 (ack の後の reclaim) で古い方の行が消える
+        let lsn_mid = eng.current_sync_lsn() / 2;
+        eng.ack_sync(42, lsn_mid).unwrap();
+        assert!(eng.reclaim_sync_ops() > 0, "前提: 回収した");
+        same(&eng, "回収の後");
+        // 読めない行 (lsn はあるが payload の無い行、 #217 の dead row) は数えない
+        let cols = eng.sync_payload_cols().unwrap();
+        let dead = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_to_by_id(dead, cols.lsn, 3_000_000);
+        same(&eng, "読めない行");
+        drop(eng);
+        // 開き直す (覚えは無い = 最初の問いが読む)。 配ってよい所 (#828) の後ろの行も数える
+        let eng = Engine::open_concurrent_with_oplog(&p, 1 << 20).unwrap();
+        let s2 = scans(&eng);
+        {
+            // 配ってよい所の終わりを置く bridge (consumer の周) を止めておく
+            let _no_bridge = eng.transfer_lock_for_fold();
+            eng.sync_settled_known.store(true, std::sync::atomic::Ordering::Release);
+            eng.sync_settled_lsn.store(1, std::sync::atomic::Ordering::Release);
+            assert!(eng.settled_sync_ops().len() < eng.pending_sync_ops(0).len(), "前提: 配ってよい所の後ろに行がある");
+            let m = same(&eng, "開き直した後");
+            assert!(m.is_some() && scans(&eng) == s2 + 1, "前提: 開き直した後の最初の問いが ring を読んだ ({})", scans(&eng) - s2);
+        }
+        relay(&eng, 9, &[at(1_000, 0, 9)]);
+        assert_eq!(same(&eng, "開き直した後の中継"), Some(at(1_000, 0, 9)));
+        assert_eq!(scans(&eng), s2 + 1);
+    }
+
+    /// 読み直しが行をなめ終えた後・覚えに置く前 (`ring_oldest_scan_hook`) に足された行と消えた行。
+    ///
+    /// 足された行 (なめた後に載った、 どの行よりも古い版数の中継) は、 その読み直しの答えに入る。 消えた行 (なめた時に数えた最小の
+    /// 行) を消した後の読み直しの答えは下の境 (消えた版数を含みうる) で、 次の問いは読み直して最小そのものを返す。
+    ///
+    /// falsify: 読み直しの間に足された版数を答えに足さないと、 1 つ目の答えが中継の版数より上。 読み直しの間に消えた版数を見ずに
+    /// 最小そのものとすると、 2 つ目の後の問いが消えた行の版数を返す。
+    #[test]
+    fn rows_added_or_purged_while_the_ring_is_read() {
+        let p = path("window");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        own(&eng, 4);
+        let base = full(&eng).unwrap();
+        let older = at(base.wall - 90_000, 0, 9);
+        {
+            let e = eng.clone();
+            ring_oldest_scan_hook::set(eng.oplog.as_ref().unwrap(), move |_| relay(&e, 9, &[older]));
+        }
+        let got = eng.sync_ring_min_hlc();
+        assert_eq!(full(&eng), Some(older), "前提: 割り込み点で中継の行が載った");
+        assert_eq!(got, Some(older), "読み直しの間に載った、 どの行よりも古い行を数えない");
+        assert_eq!(same(&eng, "読み直しの後"), Some(older));
+
+        // 覚えを最小そのものでなくする (最小の行を消す) → 次の読み直しの間に、 なめた時の最小の行 (`base` の行) を消す
+        purge(&eng, &rows_at(&eng, older));
+        let base_rows = rows_at(&eng, base);
+        assert!(!base_rows.is_empty(), "前提: 自分の最初の行がある");
+        {
+            let e = eng.clone();
+            ring_oldest_scan_hook::set(eng.oplog.as_ref().unwrap(), move |_| purge(&e, &base_rows));
+        }
+        let s = eng.sync_ring_min_scans();
+        let got = eng.sync_ring_min_hlc();
+        assert_eq!(eng.sync_ring_min_scans(), s + 1, "前提: 読み直した");
+        let want = full(&eng);
+        assert!(want > Some(base), "前提: 割り込み点で最小の行が消えた ({want:?})");
+        assert!(got <= want, "読み直しの答えが ring の最小より上 ({got:?} > {want:?})");
+        assert_eq!(eng.sync_ring_min_hlc(), want, "読み直しの間に消えた最小の行の版数を、 最小そのものとして覚えた");
+    }
+
+    /// 覚えの 4 つの形の答え (行を使わない)。
+    #[test]
+    fn the_remembered_bound_answers() {
+        let h = |w| at(w, 0, 1);
+        let mut o = RingOldest::new();
+        assert_eq!(o.answer(None), None, "作る前は読む");
+        o.seeded = true;
+        o.exact = true;
+        assert_eq!(o.answer(None), Some(None), "行の無い ring");
+        o.note(h(50));
+        o.note(h(70));
+        assert_eq!((o.answer(None), o.answer(Some(h(50))), o.answer(Some(h(51)))), (Some(Some(h(50))), Some(None), Some(Some(h(50)))));
+        o.gone(Some(h(70)));
+        assert!(o.exact, "最小より上の行が消えた");
+        o.gone(Some(h(50)));
+        assert!(!o.exact, "最小の行が消えた");
+        assert_eq!(o.answer(Some(h(50))), Some(None), "下の境が問いの境以上");
+        assert_eq!(o.answer(Some(h(51))), None, "下の境が問いの境より下 = 読む");
+        assert_eq!(o.answer(None), None);
+        o.exact = true;
+        o.gone(None);
+        assert!(!o.exact, "版数を読めない行が消えた");
+        o.min = None;
+        assert_eq!(o.answer(Some(h(1))), None, "行の無い覚えが最小そのものでない時は読む");
     }
 }
 
