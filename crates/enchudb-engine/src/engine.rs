@@ -2029,16 +2029,6 @@ impl<'w> ReplayAhead<'w> {
     }
 }
 
-/// WAL 付きにする時の WAL ([`Engine::existing_wal`])。
-#[cfg(not(target_arch = "wasm32"))]
-enum WalAtOpen {
-    /// 既にある (header を書き出した) WAL を開いた。 再生する record がありうる
-    Existing(enchudb_oplog::oplog::OpLog),
-    /// 無い / header を一度も書き出していない (#415: 作った直後に落ちた = record も無い)。 本体を開いた後に作る (開けなかった DB に
-    /// WAL の file を残さない: create の途中で落ちた DB の directory に残すと、 作り直す create が残骸と見ずに断る)
-    Absent,
-}
-
 /// `.db.lock` に flock(LOCK_EX) を取り、 guard を返す。 guard が drop されると
 /// lock も解放。 **別プロセス**が保持中は block する (= sqlite と同様、 取れる
 /// まで待つ)。 **同一プロセス**が既に保持中は block せず即エラー (#80、
@@ -28620,17 +28610,14 @@ impl Engine {
         let lock = Self::writer_lock_for_open(path)?;
         let oplog_path = oplog_path_for(path);
         let wal = Self::existing_wal(&oplog_path)?;
-        let replay = match &wal {
-            WalAtOpen::Existing(w) => ReplayAhead::of(w),
-            WalAtOpen::Absent => ReplayAhead::Nothing,
-        };
+        let replay = wal.as_ref().map_or(ReplayAhead::Nothing, ReplayAhead::of);
         let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, Some(lock), replay)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
         let _ = std::fs::remove_dir_all(&crc_path); // v10: DB は directory
         let _ = std::fs::remove_file(&crc_path);
         let wal = match wal {
-            WalAtOpen::Existing(w) => {
+            Some(w) => {
                 // リカバリ: commit されたレコードを本体に適用
                 // #77-H2 の順序に加えて: **未 commit tail も replay する**。
                 // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
@@ -28670,7 +28657,7 @@ impl Engine {
                 }
                 std::sync::Arc::new(w)
             }
-            WalAtOpen::Absent => {
+            None => {
                 let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
                 // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
                 eng.finish_reconcile(Some(&w));
@@ -28687,17 +28674,18 @@ impl Engine {
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
-    /// WAL 付きにする時の WAL (`oplog_path`): 既にある (header を書き出した) WAL なら開く。 無い / header を一度も書き出していない WAL
-    /// (#415: 作った直後に落ちた = record も無い) は `Absent` (呼び手が作り直す)。 WAL の file があるかを stat で知れなければ Err
-    /// (PR #986 の読み直し 2 の [3]: 前は `Path::exists` が stat の失敗を 「無い」 と読み、 `OpLog::create` (truncate) が再生していない
-    /// record を捨てた)。
+    /// WAL 付きにする時の WAL (`oplog_path`): 既にある (header を書き出した) WAL なら開く (再生する record がありうる)。 無い / header を
+    /// 一度も書き出していない WAL (#415: 作った直後に落ちた = record も無い) は None で、 呼び手が本体を開いた後に作る (開けなかった
+    /// DB に WAL の file を残さない: create の途中で落ちた DB の directory に残すと、 作り直す create が残骸と見ずに断る)。 WAL の file が
+    /// あるかを stat で知れなければ Err (PR #986 の読み直し 2 の [3]: 前は `Path::exists` が stat の失敗を 「無い」 と読み、
+    /// `OpLog::create` (truncate) が再生していない record を捨てた)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn existing_wal(oplog_path: &std::path::Path) -> io::Result<WalAtOpen> {
+    fn existing_wal(oplog_path: &std::path::Path) -> io::Result<Option<enchudb_oplog::oplog::OpLog>> {
         use enchudb_oplog::oplog::OpLog;
         if Self::oplog_file_len(oplog_path)?.is_some() && !OpLog::was_never_written(oplog_path)? {
-            Ok(WalAtOpen::Existing(OpLog::open(oplog_path)?))
+            Ok(Some(OpLog::open(oplog_path)?))
         } else {
-            Ok(WalAtOpen::Absent)
+            Ok(None)
         }
     }
 
@@ -29468,7 +29456,7 @@ impl Engine {
         eng.mark_session_dirty();
         // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
         let wal = match Self::existing_wal(&oplog_path)? {
-            WalAtOpen::Existing(w) => {
+            Some(w) => {
                 // #77-H2 の順序に加えて: **未 commit tail も replay する**。
                 // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
                 // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
@@ -29501,7 +29489,7 @@ impl Engine {
                 }
                 std::sync::Arc::new(w)
             }
-            WalAtOpen::Absent => {
+            None => {
                 let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
                 // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
                 eng.finish_reconcile(Some(&w));
