@@ -338,12 +338,20 @@ struct HostInner {
     lines_path: Option<PathBuf>,
     /// client の沈黙を数える時計 (ホストが動いていた時間、 #713)。
     clock: HostClock,
-    /// client の record を当てる間 (read) と、 F を進めてホストが忘れる間 (write) を分ける。 忘れる前に当てた record と、 忘れた
-    /// 後に当てた record で答えが変わる (忘れた削除より前の作成) ので、 F を配る前に忘れ終え、 その間は当てない。 client は返事の
-    /// F で忘れてから当てる (`Syncer::pull_once`)
+    /// client の record を当てる間 (read: `accept` と、 client が送った state を当てる `POST /v2/state`) と、 F を進めてホストが
+    /// 忘れる間 (write、 `recompute`) を分ける。 忘れる前に当てた record と、 忘れた後に当てた record で答えが変わる (忘れた削除より
+    /// 前の作成) ので、 F を配る前に忘れ終え、 その間は当てない。 当てている途中の record は、 当て終えて ring に写すまで `ring_min`
+    /// に見えないので、 その間も忘れない。 client は返事の F で忘れてから当てる (`Syncer::pull_once`)
     ///
-    /// #753: client が送った state を当てて載せる間 (write) と、 ring を読んで配る間 (read、 `records_for`) も分ける。
+    /// #980: write は待たずに取れる時だけ取る (`try_write`、 取れなければその回は F を進めない)。 当てる間は行の lock を待ちうる
+    /// (アプリが握る行・WAL の空きを待つ書き手の行・同じ stripe の行) ので、 write で待つと、 std の `RwLock` は書き手が待つ間に
+    /// 新しい読み手を通さず、 後から来た全 client の受信が、 その 1 つの受信が行を待つ間ずっと止まった。
     gate: RwLock<()>,
+    /// #753: client が送った state を当てて載せ、 ring に写し終えるまで (write) と、 ring を読んで配る間 (read、 `records_for` /
+    /// `records_since`) を分ける。 state の record は HLC の順に並ばないので、 途中まで載った所を配ると、 受け手の cursor が、
+    /// まだ載っていない (版数の小さい) record を越える。 差分 (`accept`) の record は書き手ごとに HLC の昇順で載るので止めない。
+    /// #980 の前は `gate` と同じ lock で、 F を進める書き手が待つ間 pull も止まった。
+    state_gate: RwLock<()>,
     /// #961: 失敗した WAL の書き出し (`oplog_sync`) の数と、 その後に始めて成功した書き出しが覆った数。 `wal_cleared < wal_failed` の間は、
     /// 新しく載せた record が無くても ack の前に書き出し直す ([`HostInner::sync_for_ack`])。
     wal_failed: AtomicU64,
@@ -456,6 +464,15 @@ impl Lines {
                 quiet != *o || c.last_seen_ms.saturating_sub(o.last_seen_ms) > 3_600_000
             }
         })
+    }
+}
+
+/// `lock` の write を待たずに取る (読み手か書き手が居れば `None`。 毒は無視する、 中身は `()`)。
+fn try_write(lock: &RwLock<()>) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+    match lock.try_write() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
 
@@ -631,6 +648,10 @@ impl HostInner {
 
     /// 黙った client を外し、 忘れてよい線 F を進め、 進んだらホストの削除の記録を捨てる。 F = min([`Lines::forget_candidate`]、
     /// ホストの ring に残る record) で下がらない (pull しかしない client は F を止める)。 置き場が無ければ何もしない。
+    ///
+    /// #980: 受信が当てている間 (`gate` の read) は F を進めずに返る (待たない)。 進めるのは次に来た要求の `touch`: 受信は `gate` を
+    /// 出た後に必ず `touch` を呼ぶので、 最後に出た受信が試し直す。 F が遅れるのは、 当てている受信がいつも居る間 (止まった受信が
+    /// 行を待つ間、 受信が絶えず重なる間) だけで、 遅れは忘れない側。
     fn recompute(&self, now: u64) {
         if self.lines_path.is_none() {
             return;
@@ -650,9 +671,10 @@ impl HostInner {
         for p in drop_peers {
             self.engine.forget_sync_peer(p);
         }
-        if let Some(candidate) = candidate {
-            // 当てる間を止めて (write)、 ring の最小で丸め、 忘れ終えてから F を置く
-            let _gate = self.gate.write().unwrap_or_else(|p| p.into_inner());
+        // 当てる間を止めて (write)、 ring の最小で丸め、 忘れ終えてから F を置く。 当てている受信が居れば今回は進めない (#980)
+        if let Some(candidate) = candidate
+            && let Some(_gate) = try_write(&self.gate)
+        {
             let f = self.ring_min().map_or(candidate, |m| candidate.min(m));
             let current = self.lines.lock().unwrap().forget;
             if f > current {
@@ -690,24 +712,25 @@ impl HostInner {
         // ホストはその順に当てる)。 当てる側は届く順に依らない作り。
         // ring を毎回全部読む (100 万行で重い。 書き手ごとの位置を覚えて途中から読むのは後で)
         //
-        // #753: state を載せている間は読まない (`POST /v2/state` が write で持つ)。 state の record は HLC の順に並ばないので、
-        // 途中まで載った所を配ると、 受け手の cursor が、 まだ載っていない (版数の小さい) record を越える
+        // #753: state を載せている間は読まない (`POST /v2/state` が `state_gate` を write で持つ)。 state の record は HLC の順に
+        // 並ばないので、 途中まで載った所を配ると、 受け手の cursor が、 まだ載っていない (版数の小さい) record を越える。 差分を
+        // 当てている受信 (`gate` の read) と F を進める間 (`gate` の write) は待たない (#980)
         //
-        // #828: gate は ring に写し終えるまで止めるが、 ring が満杯だと bridge は入る所まで写して止まる (#787)。 止まった所が
+        // #828: state_gate は ring に写し終えるまで止めるが、 ring が満杯だと bridge は入る所まで写して止まる (#787)。 止まった所が
         // 同じ (書き手, 版数) の組 (state の Tag の cell の Vocab と Tie、 版数の無い cell の `as_of`) の途中だと、 前半だけ受けた
         // client の cursor がその版数に進み、 後から載る後半が `hlc > cursor` を通らない。 組がそろうまでその組は配らない
         // (`Engine::settled_sync_ops`)
         //
         // #949: (書き手, 版数) で絞ってから写す (前は ring の全部の行を写して decode してから絞った)。 絞りは (書き手, 版数) だけで
         // 決まるので、 上の組は割らない
-        let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
+        let _state = self.state_gate.read().unwrap_or_else(|p| p.into_inner());
         self.engine.settled_sync_records(|author, hlc| author != to && hlc > cursor(author))
     }
 
     /// 古い client (`GET /pull`、 scalar の cursor) に配る record: `records_for(0, &[])` のうち `hlc > since` の物 (書き手 0 は除く)。
     /// #955: 版数で絞ってから写す (前は全部を写して decode してから絞った)。 絞りは (書き手, 版数) だけで決まるので組は割らない。
     fn records_since(&self, since: Hlc) -> Vec<WireRecord> {
-        let _gate = self.gate.read().unwrap_or_else(|p| p.into_inner());
+        let _state = self.state_gate.read().unwrap_or_else(|p| p.into_inner());
         self.engine.settled_sync_records(|author, hlc| author != 0 && hlc > since)
     }
 
@@ -817,6 +840,7 @@ impl HttpHost {
             lines_path,
             clock,
             gate: RwLock::new(()),
+            state_gate: RwLock::new(()),
             wal_failed: AtomicU64::new(0),
             wal_cleared: AtomicU64::new(0),
             #[cfg(test)]
@@ -985,9 +1009,13 @@ fn handle_host_connection(mut stream: TcpStream, host: &HostInner) -> io::Result
             if !host.asked_state.lock().unwrap().remove(&author) {
                 return send_response(&mut stream, 409, b"state not requested");
             }
-            // #753: 当てて、 載せて、 ring に写し終える (`oplog_sync`) まで pull を止める (`records_for` が read で待つ)。
-            // 差分 (`accept`) の record は書き手ごとに HLC の昇順で載るので止めなくてよいが、 state の record はそう並ばない
-            let _gate = host.gate.write().unwrap_or_else(|p| p.into_inner());
+            // 当てる間は F を進めない (`gate` の read、 `accept` と同じ: 当てている途中の record は `ring_min` に見えない)
+            let _gate = host.gate.read().unwrap_or_else(|p| p.into_inner());
+            // #753: 当てて、 載せて、 ring に写し終える (`oplog_sync`) まで pull を止める (`records_for` が `state_gate` の read で待つ)。
+            // 差分 (`accept`) の record は書き手ごとに HLC の昇順で載るので止めなくてよいが、 state の record はそう並ばない。
+            // #980: 差分の受信は止めない (前は `gate` の write で止めていた。 止まっている受信の後ろで write を待つと、 後から来た
+            // 全 client の受信も止まった)
+            let _state = host.state_gate.write().unwrap_or_else(|p| p.into_inner());
             host.loopback.pushed_state.lock().unwrap().insert(author, state);
             let ok = host.syncer.bootstrap_pull_via(author, author).is_some();
             host.loopback.pushed_state.lock().unwrap().remove(&author);
@@ -1808,6 +1836,182 @@ mod tests {
         assert_eq!(mem_c, top_c, "前提: ホストの memory の cursor は c の record を越えた");
         assert_eq!(file[0], top_a, "書き出しの前に当てた a の位置を置き場に書かない");
         assert!(file[1] < top_c, "書き出しの後に当てた c の位置を、 その書き出しの後に書いた ({:?})", file[1]);
+    }
+
+    /// `cond` が真になるまで待つ (上限 `limit`)。 真になったか。
+    fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = std::time::Instant::now() + limit;
+        while !cond() {
+            if std::time::Instant::now() > end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// #980: client a の受信 (`accept`) がホストの行の lock を待つ間 (アプリが同じ行を `write_row` で握っている)、 client b の要求が
+    /// 忘れてよい線を進めようとしても、 client c の publish と pull は返る。
+    ///
+    /// 直す前: a は `gate` の read を持ったまま行を待ち、 b の要求の `touch` → `recompute` が `gate.write()` で待つ。 std の `RwLock`
+    /// は書き手が待つ間に新しい読み手を通さないので、 c の `accept` (read) も pull の `records_for` (read) も、 アプリが行を放すまで
+    /// 返らなかった。 置き場 (`cursor_path`) のあるホストでは、 ring に残る record が F を止めている間 (`ring_min`) は要求のたびに
+    /// F を進めようとする = 普通の運用の形。
+    #[test]
+    fn a_receive_waiting_for_a_row_does_not_stall_other_clients() {
+        use std::sync::mpsc::channel;
+        let dir = std::env::temp_dir().join(format!("enchudb-980-host-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let host_eng = rows_db(&path("host"), 100);
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(path("host.cursors").into())).unwrap();
+        let url = format!("http://{}", host.addr());
+        let client = |name: &str, peer: PeerId| {
+            let e = rows_db(&path(name), peer);
+            let s = Arc::new(Syncer::new(e.clone(), Arc::new(HttpHostTransport::connect(url.clone(), peer).unwrap())));
+            (e, s)
+        };
+        let ((a, sa), (b, sb), (c, sc), (d, sd)) = (client("a", 1), client("b", 2), client("c", 3), client("d", 4));
+        sd.serve_state();
+        let r = a.entity_in("rows").unwrap();
+        a.tie_to(r, "rows.val", 1);
+        let settle = |e: &Engine| {
+            e.oplog_commit();
+            e.oplog_sync().unwrap();
+            while e.transfer_oplog_to_sync_ops() > 0 {}
+        };
+        settle(&a);
+        write_row(&b, 20);
+        write_row(&c, 30);
+        // d はホストに出す前に自分の ring を回収した (ホストの cursor が d の floor に届かない = 最初の publish でホストが state を求める)
+        write_row(&d, 41);
+        d.ack_sync(100, d.current_sync_lsn() + 1).unwrap();
+        assert!(d.reclaim_sync_ops() > 0, "前提: d の ring を回収した");
+        write_row(&d, 42);
+        // 全員が配り終えの線と受け終えの線を言う
+        for _ in 0..3 {
+            for s in [&sa, &sb, &sc] {
+                s.publish_since(Hlc::ZERO);
+                s.pull_once(100);
+            }
+        }
+        let wire_r = a
+            .settled_sync_records(|x, _| x == 1)
+            .iter()
+            .find_map(|rec| match rec.op {
+                DecodedOp::Tie { eid, .. } => Some(eid),
+                _ => None,
+            })
+            .expect("前提: a の ring に r の Tie がある");
+        let local_r = host_eng.resolve_remote_eid_existing(wire_r).expect("前提: ホストに r が当たった");
+        let forget_before = host.forget_line();
+        assert!(
+            host.inner.lines.lock().unwrap().forget_candidate(host.inner.clock.now()).is_some(),
+            "前提: 次の要求は忘れてよい線を進めようとする (F {forget_before:?})"
+        );
+
+        // アプリがホストの r の行を握る。 a が r を書き換えて出すと、 ホストの受信は r の行を待つ
+        a.tie_to(r, "rows.val", 2);
+        settle(&a);
+        let held = host_eng.write_row(local_r);
+        let (a_tx, a_rx) = channel::<()>();
+        {
+            let sa = sa.clone();
+            std::thread::spawn(move || {
+                sa.publish_since(Hlc::ZERO);
+                let _ = a_tx.send(());
+            });
+        }
+        // a の受信が当てる間 (gate の read) に入った (r の行を握れないので、 放すまでそこに居る)
+        let a_inside = wait_until(Duration::from_secs(10), || host.inner.gate.try_write().is_err());
+        // b の要求 (pull = `touch` → `recompute`)。 返ったか、 線を進める書き手として待ち始めたか (待つ書き手の後ろの読み手は入れない)
+        let (b_tx, b_rx) = channel::<()>();
+        {
+            let sb = sb.clone();
+            std::thread::spawn(move || {
+                sb.pull_once(100);
+                let _ = b_tx.send(());
+            });
+        }
+        let mut b_done = false;
+        let b_reached = wait_until(Duration::from_secs(10), || {
+            b_done |= b_rx.try_recv().is_ok();
+            b_done || host.inner.gate.try_read().is_err()
+        });
+        // c が 1 行書いて出し、 pull する
+        write_row(&c, 31);
+        let (c_tx, c_rx) = channel::<()>();
+        {
+            let sc = sc.clone();
+            std::thread::spawn(move || {
+                sc.publish_since(Hlc::ZERO);
+                sc.pull_once(100);
+                let _ = c_tx.send(());
+            });
+        }
+        let c_returned = c_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let c_applied = host_eng.pull_raw("rows.val", 31).len();
+        // 同じ間に d が出す (ホストが state を求め、 d が `POST /v2/state` で送る)。 その後で c がもう 1 行出して pull する。
+        // 直す前は state を当てる間 `gate` の write を持ったので、 a の受信の後ろで待ち、 c の受信もその後ろで止まった
+        let (d_tx, d_rx) = channel::<()>();
+        {
+            let sd = sd.clone();
+            std::thread::spawn(move || {
+                sd.publish_since(Hlc::ZERO);
+                let _ = d_tx.send(());
+            });
+        }
+        let d_returned = d_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let d_applied = [host_eng.pull_raw("rows.val", 41).len(), host_eng.pull_raw("rows.val", 42).len()];
+        write_row(&c, 32);
+        let (c2_tx, c2_rx) = channel::<()>();
+        {
+            let sc = sc.clone();
+            std::thread::spawn(move || {
+                sc.publish_since(Hlc::ZERO);
+                sc.pull_once(100);
+                let _ = c2_tx.send(());
+            });
+        }
+        let c2_returned = c2_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let a_still_inside = host.inner.gate.try_write().is_err();
+        drop(held);
+        let a_back = a_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+        let b_back = b_done || b_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+        let c_back = c_returned || c_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+        let d_back = d_returned || d_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+        let c2_back = c2_returned || c2_rx.recv_timeout(Duration::from_secs(30)).is_ok();
+        // 止まっていた受信が出た後、 線は次の要求で進む (取れなかった分を次に回して、 進まないままにならない)
+        for _ in 0..3 {
+            for s in [&sa, &sb, &sc, &sd] {
+                s.publish_since(Hlc::ZERO);
+                s.pull_once(100);
+            }
+            host_eng.reclaim_sync_ops();
+        }
+        let forget_after = host.forget_line();
+        let applied = [2, 31, 32, 41, 42].map(|v| host_eng.pull_raw("rows.val", v).len());
+        drop(host);
+        drop((sa, sb, sc, sd));
+        drop((a, b, c, d, host_eng));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(a_inside, "前提: a の受信が当てる間に入らない");
+        assert!(b_reached, "前提: b の要求が線を進める所に届かない");
+        assert!(a_still_inside, "前提: c / d が出す間、 a の受信は行を待っていた");
+        assert!(
+            a_back && b_back && c_back && d_back && c2_back,
+            "行を放した後も返らない (a {a_back}, b {b_back}, c {c_back}, d {d_back}, c2 {c2_back})"
+        );
+        assert_eq!(applied, [1; 5], "前提: a / c / d の書き込みがホストに当たった");
+        assert!(
+            c_returned,
+            "a の受信が行を待つ間、 c の publish / pull が返らない (b の線の再計算が gate.write で待ち、 後ろの read が止まった)"
+        );
+        assert_eq!(c_applied, 1, "a の受信が行を待つ間に、 c の record が当たらない");
+        assert!(d_returned && d_applied == [1, 1], "a の受信が行を待つ間、 d の state が当たらない (当たった {d_applied:?})");
+        assert!(c2_returned, "a の受信が行を待つ間、 d の state の後の c の publish / pull が返らない");
+        assert!(forget_after > forget_before, "止まった受信の後も線が進まない ({forget_before:?} → {forget_after:?})");
     }
 
     #[test]
