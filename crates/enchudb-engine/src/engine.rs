@@ -11508,9 +11508,9 @@ impl Engine {
         // #731: gen.seg と生きている印を突き合わせる (きれいに閉じなかった後だけ)。 表・別名 (#612 の畳んだ自分の行)・払い出し位置
         // の後、 WAL の再生の前
         eng.reconcile_generations(readonly, &replay);
-        // #993 / #994: 指す行の世代 (`eidalias` 版 2) が場所の最後の行より下の別名 (使い回した場所の前の住人の別名、 `eidalias` だけが
-        // 使い回しの前のまま届いた像) を外す。 突き合わせの後 (場所の最後の行が決まる)・WAL の再生の前 (再生する中継の record がその
-        // 別名で次の住人に当たらない)。 世代が上の別名 (本体より先に届いた) と、 再生が生かす場所は開く道の仕上げ (`finish_open_restores`)
+        // #993 / #994: 使い回した場所の前の住人の別名 (`eidalias` だけが使い回しの前のまま届いた像) を外す。 突き合わせの後 (場所の
+        // 生死が決まる)・WAL の再生の前 (再生する中継の record がその別名で次の住人に当たらない)。 再生が前の住人を生かし直しうる物
+        // (使い回しの記録が無い、 PR #1006 の読み直し [3])・世代が上の別名 (本体より先に届いた) は開く道の仕上げ (`finish_open_restores`)
         if unclean && !readonly {
             eng.drop_stale_generation_aliases(false, replay.follows());
         }
@@ -20403,8 +20403,8 @@ impl Engine {
     }
 
     /// 開く時の、 前の住人の後始末の仕上げ (再生と後に回した戻しの後、 #451 の作り直しの前。 WAL の無い open は `open_internal` の
-    /// 後): きれいに閉じなかった後の書ける open なら、 指す行の世代が場所の最後の行と合わない別名を外す
-    /// ([`Self::drop_stale_generation_aliases`]、 #993 / #994)。 再生の間の退避表の版数の索引を捨て ([R2])、 開く時から止めていた
+    /// 後): きれいに閉じなかった後の書ける open なら、 指す行が場所の住人でない別名 (生きている場所は世代の合わない物、 死んだ場所は
+    /// 使い回しの記録が場所から離した行の物) を外す ([`Self::drop_stale_generation_aliases`]、 #993 / #994)。 再生の間の退避表の版数の索引を捨て ([R2])、 開く時から止めていた
     /// `prev.seg` の周期を進め始める (`PrevSlots::release_open`、 読み直し 2 [B2])。
     fn finish_open_restores(&self) {
         let gens = self.generations();
@@ -21919,17 +21919,7 @@ impl Engine {
     pub(crate) fn alias_row_gen(&self, slot: u32) -> u32 {
         match self.generations().bits() {
             0 | 32.. => 0,
-            b => {
-                // 開く時の突き合わせが削除を完了させて仕上げ (`finish_reconcile`) を待つ場所は、 消えた行の世代 (世代を 2 つ上げた形が
-                // ある。 仕上げの後は `last_local_of_slot` が relog の世代で読む)。 PR #1006 の読み直し [1] の 「同じ根」: 前は再生の中で
-                // 張る別名 (中継した `Alias` の再生) が今 − 1 (無かった行) を指した
-                if !self.entities.is_live(slot)
-                    && let Some(r) = self.generations().pending_row_gen(slot)
-                {
-                    return r;
-                }
-                self.last_local_of_slot(slot) >> b
-            }
+            b => self.last_local_of_slot(slot) >> b,
         }
     }
 
@@ -36395,7 +36385,7 @@ mod tests {
         assert_eq!(
             eng.get_text_owned(eid, "body"),
             None,
-            "odd agen (進捗なし) は None に落ちること"
+            "odd gen (進捗なし) は None に落ちること"
         );
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(10),
@@ -36422,7 +36412,7 @@ mod tests {
 
         let _held = eng.write_row(other);
         let t0 = std::time::Instant::now();
-        assert_eq!(eng.get_text_owned(eid, "body"), None, "odd agen (進捗なし) は None に落ちること");
+        assert_eq!(eng.get_text_owned(eid, "body"), None, "odd gen (進捗なし) は None に落ちること");
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(10),
             "stall escape が {} ms — hang している",

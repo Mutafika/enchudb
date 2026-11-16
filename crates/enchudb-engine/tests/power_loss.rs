@@ -6285,3 +6285,242 @@ fn a_former_residents_name_goes_to_its_identity_on_redo_without_a_record() {
     }
     a_former_residents_name_goes_to_its_identity("names_redo_no_record", EidaliasBehind::PowerLoss(Phase::BeforeGate));
 }
+
+/// PR #1006 の読み直し [2] の、 C の行 (受けた行) と B の行の世界番号。
+const WORLD_Y2: u64 = (3u64 << 32) | 11;
+const WORLD_C2: u64 = (2u64 << 32) | 12;
+
+/// PR #1006 の読み直し [2] の像: 名前 7 の自分の行 X を消して書き出した後、 C の行 Y (受けた行 = 自分の WAL に載らない) が X の場所を
+/// 使い回し、 B の行 c を Y に畳む (c の世界番号は Y の場所の別名、 指す行の世代は Y の世代)。 sidecar を書き出してから本体を書き出し、
+/// 生きている印の後・世代の前 (`BeforeGenerations`) で電源断 (Y の生きている印は届き、 gen.seg は X の削除のまま = 死の印が残る)。
+/// Y を返す。
+fn killed_resident_alias_image(live: &Path, img: &Path) -> u64 {
+    let (eng, x) = full_named_table_engine(&live.join("db"));
+    let hv = eng.himo_id("t.v").unwrap() as u16;
+    let _hold = eng.hold_consumer();
+    eng.delete(x);
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    let y = eng.resolve_remote_eid(WORLD_Y2, hv).unwrap();
+    assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: 受けた Y が X の場所を使い回した");
+    assert!(eng.remote_tie_apply_result(y, hv, 9u32, Hlc { wall: 1_000, logical: 0, peer: 3 }).applied());
+    let c = eng.resolve_remote_eid(WORLD_C2, hv).unwrap();
+    assert!(eng.remote_tie_apply_result(c, hv, 8u32, Hlc { wall: 1_001, logical: 0, peer: 2 }).applied());
+    eng.merge_entity_into(c, y).unwrap();
+    assert_eq!(
+        eng.resolve_remote_eid_existing(WORLD_C2).map(|e| eng.eid_slot(e)),
+        Some(eng.eid_slot(y)),
+        "前提: c は Y の場所の別名"
+    );
+    eng.persist_tables().unwrap();
+    let shot = Arc::new(AtomicBool::new(false));
+    let (s2, l, i) = (shot.clone(), live.to_path_buf(), img.to_path_buf());
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::BeforeGenerations && !s2.swap(true, Ordering::SeqCst) {
+            let _ = crashsim::capture(&l, &i, Mode::Lost);
+        }
+    })));
+    // 書き出す物を作る (本体の書き出しが段を通る)
+    let z = eng.entity_in("t").unwrap();
+    eng.tie_to(z, "t.k", 3u32);
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    write_out_hook::set(None);
+    assert!(shot.load(Ordering::SeqCst), "前提: 本体の書き出しの途中で撮った");
+    y
+}
+
+/// PR #1006 の読み直し [2]: `killed_resident_alias_image` を開くと、 突き合わせが Y を消す (生きている印と死の印 = 使い回しの像も削除の
+/// 途中の像も 「死が勝つ」、 Y の record は WAL に無い)。 c は消えた Y の別名のまま Y の場所を指し、 B の遅れた書き込み (c 宛て) は死んだ
+/// 場所に当たって捨てられる。 開いた A を kill してもう一度開いても同じ。
+///
+/// 前は開く道の仕上げが c を 「場所の最後の行 (突き合わせが仕上げで覚えた X の世代) より上の世代 = 本体にも WAL にも無い行」 と読んで
+/// 退避なしで外し、 B の遅れた書き込みが c に新しい生きた行を払い出した (master は c を死んだ場所に残し、 書き込みは捨てられた)。
+#[test]
+fn an_alias_of_a_resident_the_open_killed_is_kept() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("killed_resident_alias");
+    let (live, img, img2) = (root.join("live"), root.join("img"), root.join("img2"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let y = killed_resident_alias_image(&live, &img);
+    crashsim::stop();
+    let y_slot = {
+        let ro = Engine::open_readonly(img.join("db").to_str().unwrap()).unwrap();
+        let s = ro.eid_slot(y);
+        assert_eq!(ro.resolve_remote_eid_existing(WORLD_C2).map(|e| ro.eid_slot(e)), Some(s), "前提: 像の `eidalias` は c → Y の場所");
+        s
+    };
+    // (c の行き先の場所, Y が生きているか, 突き合わせの直した数, c 宛ての遅れた書き込み (当たったか, 生きた行になったか))
+    let read = |eng: &Engine, late: bool| {
+        let c_at = eng.resolve_remote_eid_existing(WORLD_C2).map(|e| eng.eid_slot(e));
+        let landed = late.then(|| {
+            let hv = eng.himo_id("t.v").unwrap() as u16;
+            let at = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
+            let t = eng.resolve_remote_eid(WORLD_C2, hv);
+            let applied = t.is_some_and(|t| eng.remote_tie_apply(t, hv, 4u32, at));
+            (applied, t.is_some_and(|t| eng.is_live(t)))
+        });
+        (c_at, eng.is_live(y), eng.generation_repairs(), landed)
+    };
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let first = read(&eng, false);
+    kill_image(&img, &img2);
+    drop(eng);
+    let eng = Engine::open_concurrent_with_oplog(img2.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let second = read(&eng, true);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(first.2 .0, 1, "前提: 突き合わせが Y を消した (生きている印と死の印): {:?}", first.2);
+    assert!(!first.1 && !second.1, "前提: 開いた A で Y は消えている");
+    assert_eq!(first.0, Some(y_slot), "突き合わせが消した Y の別名 c を外した (1 回目の open)");
+    assert_eq!(second.3, Some((false, false)), "c 宛ての遅れた書き込みが当たった / 生きた行になった (幽霊行)");
+    assert_eq!(second.0, Some(y_slot), "突き合わせが消した Y の別名 c を外した (2 回目の open)");
+}
+
+/// 本体より先に `eidalias` が届いた像: 名前 7 の自分の行 X (書き出し済み) を消して、 自分の行 Y で X の場所を使い回し、 B の行 c を Y に
+/// 畳んで (c は Y の場所の別名、 指す行の世代は Y の世代 = X + 1) sidecar だけを書き出し (`persist_tables`、 本体と WAL は書き出さない)、
+/// 電源断。 X を返す。
+fn alias_ahead_of_the_body_image(live: &Path, img: &Path) -> u64 {
+    let (eng, x) = full_named_table_engine(&live.join("db"));
+    let hv = eng.himo_id("t.v").unwrap() as u16;
+    let _hold = eng.hold_consumer();
+    eng.delete(x);
+    eng.oplog_commit();
+    let y = add_seven(&eng, 71);
+    assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y が X の場所を使い回した");
+    let c = eng.resolve_remote_eid(WORLD_C2, hv).unwrap();
+    assert!(eng.remote_tie_apply_result(c, hv, 8u32, Hlc { wall: 1_001, logical: 0, peer: 2 }).applied());
+    eng.merge_entity_into(c, y).unwrap();
+    eng.persist_tables().unwrap();
+    let _ = crashsim::capture(&live, &img, Mode::Lost);
+    x
+}
+
+/// `alias_ahead_of_the_body_image` を開くと、 本体の X は生きている (X の削除と Y は本体にも WAL にも無い)。 c (Y の世代を指す) は X の
+/// 別名でない: 開く道の仕上げが、 生きている場所の住人より上の世代の別名を外す。 B の遅れた書き込み (c 宛て) は X に当たらない。
+/// (読み直し [6]: 前は `eidalias` の世代を手で書き換えた像だけがこの段を確かめていた)
+#[test]
+fn an_alias_ahead_of_the_body_is_dropped_from_the_live_former_resident() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("alias_ahead_of_body");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let x = alias_ahead_of_the_body_image(&live, &img);
+    crashsim::stop();
+    let (ro_c, ro_slot) = {
+        let ro = Engine::open_readonly(img.join("db").to_str().unwrap()).unwrap();
+        (ro.resolve_remote_eid_existing(WORLD_C2).map(|e| ro.eid_slot(e)), ro.eid_slot(x))
+    };
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let x_alive = eng.is_live(x);
+    let c_at = eng.resolve_remote_eid_existing(WORLD_C2).map(|e| eng.eid_slot(e));
+    let hv = eng.himo_id("t.v").unwrap() as u16;
+    let at = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
+    if let Some(t) = eng.resolve_remote_eid(WORLD_C2, hv) {
+        eng.remote_tie_apply(t, hv, 4u32, at);
+    }
+    let x_v = eng.get(x, "t.v");
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(ro_c, Some(ro_slot), "前提: 像の `eidalias` は c → X の場所 (Y の世代)");
+    assert!(x_alive, "前提: 本体の X は生きている");
+    assert_ne!(c_at, Some(ro_slot), "本体に無い Y の別名 c が、 生きている X の別名に残った");
+    assert_eq!(x_v, Some(70), "c 宛ての遅れた書き込みが X に当たった");
+}
+
+/// PR #1006 の読み直し [3] の B の行の世界番号。
+const WORLD_B3: u64 = (2u64 << 32) | 13;
+
+/// PR #1006 の読み直し [3] の像: 名前 7 の自分の行 X に B の行 b を畳み (b は X の場所の別名、 `eidalias` に書き出す)、 X に書いて
+/// (WAL の checkpoint の後ろに X の record)、 `oplog_sync` の本体の書き出しで `prev.seg` を書き出した後・生きている印の前
+/// (`PrevWrittenOut`) に X を消して Y で X の場所を使い回し、 残りの列まで書き出した所 (`BeforeVersions`) で電源断。 本体には Y が
+/// 届き (生きている印と gen.seg)、 使い回しの記録 (`prev.seg`) と X の削除・Y の record (WAL) は届かない (review946 [3] の窓)。 X を返す。
+fn reuse_without_record_image(live: &Path, img: &Path) -> u64 {
+    let (eng, x) = full_named_table_engine(&live.join("db"));
+    let hv = eng.himo_id("t.v").unwrap() as u16;
+    let b = eng.resolve_remote_eid(WORLD_B3, hv).unwrap();
+    assert!(eng.remote_tie_apply_result(b, hv, 8u32, Hlc { wall: 1_001, logical: 0, peer: 2 }).applied());
+    eng.merge_entity_into(b, x).unwrap();
+    // b を受けて伸びた表を使い切る (使い切った表は、 消した場所を次の行に使い回す)
+    let mut n = 300u32;
+    while eng.table_eid_usage("t").is_some_and(|u| u.allocated < u.capacity) {
+        let e = eng.entity_in("t").unwrap();
+        eng.tie_to(e, "t.k", n);
+        n += 1;
+    }
+    eng.oplog_commit();
+    eng.oplog_sync().unwrap();
+    eng.persist_sync_state().unwrap();
+    let _hold = eng.hold_consumer();
+    eng.tie_to(x, "t.v", 71u32);
+    eng.oplog_commit();
+    let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (d2, s2, l, i, e2) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone());
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::PrevWrittenOut && !d2.swap(true, Ordering::SeqCst) {
+            let e3 = e2.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                e3.delete(x);
+                let y = add_seven(&e3, 72);
+                assert_eq!(e3.eid_slot(y), e3.eid_slot(x), "前提: Y が X の場所を使い回した");
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 使い回しが返った");
+        }
+        if p == Phase::BeforeVersions && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
+            let _ = crashsim::capture(&l, &i, Mode::Lost);
+        }
+    })));
+    eng.oplog_sync().unwrap();
+    write_out_hook::set(None);
+    assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で使い回して撮った");
+    x
+}
+
+/// PR #1006 の読み直し [3]: `reuse_without_record_image` を開くと、 WAL の再生が X の record で場所を X に戻す (使い回しの記録が無いので
+/// 再生の守りは当てる。 Y は本体にだけある)。 b は生き返った X の別名のまま。
+///
+/// 前は再生の前の外しが、 本体の場所の住人 Y より下の世代の b を外した (退避もしない): X は生きているのに b だけが写像を失い、 B の
+/// 遅れた書き込み (b 宛て) が新しい行になった。
+#[test]
+fn an_alias_of_a_former_resident_the_replay_brings_back_is_kept() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("reuse_without_record");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let x = reuse_without_record_image(&live, &img);
+    crashsim::stop();
+    let (ro_b, ro_slot, ro_record, ro_x_alive) = {
+        let ro = Engine::open_readonly(img.join("db").to_str().unwrap()).unwrap();
+        let s = ro.eid_slot(x);
+        (ro.resolve_remote_eid_existing(WORLD_B3).map(|e| ro.eid_slot(e)), s, ro.prev_resident_of_slot(s), ro.is_live(x))
+    };
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let x_alive = eng.is_live(x);
+    let x_v = eng.get(x, "t.v");
+    let b_at = eng.resolve_remote_eid_existing(WORLD_B3).map(|e| eng.eid_slot(e));
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(ro_b, Some(ro_slot), "前提: 像の `eidalias` は b → X の場所");
+    assert!(!ro_x_alive, "前提: 本体の場所の住人は Y (X は使い回された)");
+    assert!(ro_record.is_none_or(|r| r.1 != eid_local(x)), "前提: 使い回しの記録 (前の住人 X) は届いていない: {ro_record:x?}");
+    assert!(x_alive && x_v == Some(71), "前提: 再生が X を戻した (v = {x_v:?})");
+    assert_eq!(b_at, Some(ro_slot), "再生が戻した X の別名 b を、 再生の前に外した");
+}

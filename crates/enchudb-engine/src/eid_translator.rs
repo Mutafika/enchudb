@@ -179,7 +179,7 @@ impl EidTranslator {
     /// 写像を登録 (上書き)。 recovery 復元時にも使う。 同 key の上書きで local が
     /// 変わる場合は stale な逆写像 entry を掃除する。
     ///
-    /// `gen` = `local` の今の住人の世代 (#993 / #994)。 使うのは、 `local` の前の逆写像の key が別名になる時 (下の #560) だけ。
+    /// `agen` = `local` の今の住人の世代 (#993 / #994)。 使うのは、 `local` の前の逆写像の key が別名になる時 (下の #560) だけ。
     pub fn insert(&self, author_peer: PeerId, foreign_local: u32, local: u32, agen: u32) {
         let key = (author_peer, foreign_local);
         // lock の順は `inner` → `translated_locals` → `aliases` (`alias` と同じ)
@@ -227,7 +227,7 @@ impl EidTranslator {
     /// forward だけを張り、 `local` の逆写像 (書き戻しの宛名) は変えない。 key が他の local を指していたら外す: その local の
     /// 逆写像だったなら、 その local はもう翻訳先ではない (畳まれた側)。 key が `local` の逆写像そのものなら何もしない。
     ///
-    /// `gen` = 別名が指す行の世代 (張る時の `local` の住人の世代、 #993 / #994)。 同じ local の別名を張り直すと世代も替わる。
+    /// `agen` = 別名が指す行の世代 (張る時の `local` の住人の世代、 #993 / #994)。 同じ local の別名を張り直すと世代も替わる。
     pub fn alias(&self, author_peer: PeerId, foreign_local: u32, local: u32, agen: u32) {
         let key = (author_peer, foreign_local);
         let mut fwd = self.inner.write().unwrap();
@@ -460,8 +460,8 @@ impl EidTranslator {
         out
     }
 
-    /// [`Self::remove_local`] の、 世代 `gen` 以上の行を指す別名を残す形 (#993 / #994): 開く道が使い回しの後始末をやり直す時
-    /// (`Engine::redo_reuse_eviction`)、 `eidalias` が本体より先に届いた像で、 次の住人 (世代 `gen`) に張った別名を外さない。
+    /// [`Self::remove_local`] の、 世代 `agen` 以上の行を指す別名を残す形 (#993 / #994): 開く道が使い回しの後始末をやり直す時
+    /// (`Engine::redo_reuse_eviction`)、 `eidalias` が本体より先に届いた像で、 次の住人 (世代 `agen`) に張った別名を外さない。
     #[must_use = "外した identity の tombstone を退避しないと削除済み entity が復活する (#166)"]
     pub fn remove_local_below(&self, local: u32, agen: u32) -> Vec<Key> {
         let mut fwd = self.inner.write().unwrap();

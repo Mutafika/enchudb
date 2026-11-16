@@ -158,17 +158,15 @@ fn kill_image(from: &Path, to: &Path) {
     }
 }
 
-/// #993 / #994: きれいに閉じなかった後の書ける open は、 `eidalias` (版 2) の別名のうち、 指す行の世代が場所の最後の行の世代と合わない物を
-/// 外す。 下の世代 (使い回した場所の前の住人の別名) は再生の前に、 上の世代 (本体にも WAL にも無い行を指す) は開く道の仕上げで。
-/// 合う別名は残す。 像は kill (使い回しの記録や退避と関わらない形で、 `eidalias` の世代だけを書き換える)。
+/// PR #1006 の読み直し [4]: `bind_remote_eid` に消えた行を渡すと、 束ねた場所を生かす (今の世代の行)。 別名の指す行の世代は、 生かした
+/// 後の住人の世代 (場所の最後の行)。 前は世代を場所を生かす前に決め (消えた行 = 今 − 1)、 生きている場所の別名としては前の住人の物に
+/// 見えた。 きれいに閉じずに開き直しても別名は場所を指す (この像では開く道が X の tombstone の残る場所を消し直す = 死んだ場所の別名)。
 #[test]
-fn an_alias_whose_generation_does_not_match_the_slot_is_dropped_on_unclean_open() {
-    let root = scratch("mismatch");
+fn an_alias_bound_to_a_dead_slot_carries_the_generation_of_the_revived_row() {
+    let root = scratch("bind_dead");
     let (db, img) = (root.join("db"), root.join("img"));
     std::fs::create_dir_all(&root).unwrap();
     let eng = engine(&db);
-    let x = eng.entity_in("t").unwrap();
-    eng.tie_to(x, "t.k", 7u32);
     let w = eng.entity_in("t").unwrap();
     eng.tie_to(w, "t.k", 100u32);
     let mut n = 200u32;
@@ -179,41 +177,28 @@ fn an_alias_whose_generation_does_not_match_the_slot_is_dropped_on_unclean_open(
     }
     eng.delete(w);
     eng.oplog_commit();
-    let y = eng.entity_in("t").unwrap();
-    eng.tie_to(y, "t.k", 11u32);
+    let x = eng.entity_in("t").unwrap();
+    eng.tie_to(x, "t.k", 7u32);
     eng.oplog_commit();
     let bits = eng.slot_bits();
-    assert!(bits > 0 && eid_local(y) >> bits > 0 && eid_local(x) >> bits == 0, "前提: v15、 Y は世代 > 0、 X は世代 0");
-    fold_foreign(&eng, 3, 9, x);
-    fold_foreign(&eng, 4, 2, y);
-    fold_foreign(&eng, 5, 1, y);
+    assert!(bits > 0, "前提: 使い回しで v15 に移った");
+    eng.delete(x);
+    eng.oplog_commit();
+    let world = make_eid(2, 5);
+    let bound = eng.bind_remote_eid(2, world, x);
+    let slot = eng.eid_slot(x);
+    assert_eq!(eng.eid_slot(bound), slot, "前提: 消えた X の場所に束ねた");
+    let snap = eng.eid_translator().alias_snapshot();
+    let agen = snap.iter().find(|a| (a.0, a.1) == (2, 5)).map(|a| a.3);
+    let x_gen = eid_local(x) >> bits;
     eng.oplog_sync().unwrap();
     eng.persist_tables().unwrap();
-    let (x_slot, y_slot, y_gen) = (eng.eid_slot(x), eng.eid_slot(y), eid_local(y) >> bits);
     kill_image(&db, &img);
     drop(eng);
-    // 像の `eidalias` の世代を書き換える: (3, 9) → X は上の世代、 (4, 2) → Y は下の世代、 (5, 1) → Y はそのまま
-    let path = img.join("eidalias");
-    let mut buf = std::fs::read(&path).unwrap();
-    let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-    assert_eq!((&buf[4..8], count), (&2u32.to_le_bytes()[..], 3), "前提: 版 2 の 3 件");
-    for i in 0..count {
-        let o = 12 + i * 16;
-        let rd = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-        let g = match (rd(o), rd(o + 4)) {
-            (3, 9) => 1,
-            (4, 2) => y_gen - 1,
-            _ => continue,
-        };
-        buf[o + 12..o + 16].copy_from_slice(&u32::to_le_bytes(g));
-    }
-    std::fs::write(&path, &buf).unwrap();
     let eng = Engine::open_concurrent_with_oplog(img.to_str().unwrap(), CAP).unwrap();
-    let at = |peer: u32, fl: u32| eng.resolve_remote_eid_existing(make_eid(peer, fl)).map(|e| eng.eid_slot(e));
-    let got = (at(3, 9), at(4, 2), at(5, 1));
+    let after = eng.resolve_remote_eid_existing(world).map(|e| eng.eid_slot(e));
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(got.0, None, "上の世代 (本体に無い行) を指す別名 (3, 9) が X の場所 {x_slot} に残った");
-    assert_eq!(got.1, None, "下の世代 (前の住人) を指す別名 (4, 2) が Y の場所 {y_slot} に残った");
-    assert_eq!(got.2, Some(y_slot), "世代の合う別名 (5, 1) を外した");
+    assert_eq!(agen, Some(x_gen + 1), "別名の世代が生かした行 (X + 1) でない (束ねる前の消えた行 X のまま)");
+    assert_eq!(after, Some(slot), "消えた行に束ねた別名が、 きれいでない open で外れた");
 }

@@ -204,13 +204,7 @@ impl Generations {
         !self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
     }
 
-    /// 開く時の突き合わせで削除を完了させ、 仕上げ (`Engine::finish_reconcile`) を待つ場所 `slot` の消えた行の世代 (#993 / #994:
-    /// 開く道が別名の指す行の世代と比べる。 gen.seg だけ死の完了は世代を 2 つ上げるので、 今 − 1 ではない)。
-    pub(crate) fn pending_row_gen(&self, slot: u32) -> Option<u32> {
-        self.pending.lock().unwrap_or_else(|p| p.into_inner()).iter().rev().find(|e| e.0 == slot).map(|e| e.1)
-    }
-
-    /// #994 [C4]: 開く時に `eidalias` の別名 `key` が `.eidmap` の写像 (場所 `slot`、 その住人の世代 `gen`) を上書きした。
+    /// #994 [C4]: 開く時に `eidalias` の別名 `key` が `.eidmap` の写像 (場所 `slot`、 その住人の世代 `agen`) を上書きした。
     pub(crate) fn note_alias_override(&self, key: (enchudb_oplog::PeerId, u32), slot: u32, agen: u32) {
         self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner()).push((key, slot, agen));
     }
