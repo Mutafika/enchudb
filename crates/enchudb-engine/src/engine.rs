@@ -6638,8 +6638,8 @@ mod floor_write_hook {
     }
 }
 
-/// #955 の test: 配る側の読み (`settled_sync_records`) が ring の行をなめて並べた後、 行を読む前の割り込み点 (その間に場所が
-/// 回収されて別の行に使い回された形を作る)。
+/// #955 の test: 配る側の読み (`settled_sync_records` / `settled_sync_min_hlc`、 #971) が ring の行をなめた後、 行を読む前の割り込み点
+/// (その間に場所が回収されて別の行に使い回された形を作る)。
 #[cfg(test)]
 mod settled_read_hook {
     use enchudb_oplog::oplog::OpLog;
@@ -15322,10 +15322,6 @@ impl Engine {
         // (lsn, 場所) の順に読む: payload の ring も lsn の順なので写しが続く。 前は場所の順に読んでから lsn で安定に並べた = 同じ lsn
         // の行 (無いはず) は場所の順で、 答えの並びは同じ
         let rows = lsn_order(rows);
-        #[cfg(test)]
-        if let Some(wal) = self.oplog.as_ref() {
-            settled_read_hook::call(wal);
-        }
         // header の (書き手, 版数) で絞ってから decode する (header を読めない payload は decode もできない: `sync_ops_payload_author_hlc` は
         // `decode_sync_ops_payload` の検査の前半と同じ。 読めた (書き手, 版数) は decode した record の欄と同じ byte)
         let pick = |b: &[u8]| {
@@ -15371,7 +15367,12 @@ impl Engine {
             return None;
         }
         let cols = self.sync_payload_cols()?;
-        Some((self.table_slots_with_value32(cols.lsn, |lsn| lsn != 0 && lsn <= settled), cols))
+        let rows = self.table_slots_with_value32(cols.lsn, |lsn| lsn != 0 && lsn <= settled);
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            settled_read_hook::call(wal);
+        }
+        Some((rows, cols))
     }
 
     /// #949: 場所 `slot` の行 (lsn の列の値 `lsn`) の payload を `f` で読んだ物 (`sync_op_payload(eid, cols).and_then(|b| f(&b))` と
@@ -15380,6 +15381,12 @@ impl Engine {
     /// lsn は行をなめた時の値を使う (`sync_op_payload` は lsn の列を読み直す)。 なめた後にその場所が回収されて別の行に使い回されると、
     /// ring の entry の lsn が違うので読まない (読み直すと、 lsn で並べて絞った位置に別の record を出しうる)。 `f` は ring の entry を
     /// 読んでいる間に呼ぶので、 書きかけの byte で呼ばれうる (その答えは捨てる、 [`Self::settled_sync_records`] の doc)。
+    ///
+    /// payload が辞書にある行 (ring に入らない大きな payload / ring を持たない DB) は、 読んだ後に lsn の列を読み直し、 なめた時の lsn と
+    /// 同じ時だけ答えを使う (#971)。 辞書の vid には lsn が付いていないので、 比べないと使い回した後の行の record を古い lsn の位置で
+    /// 返す (`settled_sync_records` は lsn で並べるので、 同じ書き手の版数の小さい record より前に出る)。 読み直しで足りるのは:
+    /// bridge は lsn を最後に書き、 回収 (`purge_sync_ops_row`) は lsn の列を消してから場所を空きに戻し、 lsn は同じ値に戻らない。
+    /// 読み直した lsn がなめた時と同じなら、 なめてから読み直すまでその行は消えていない = 先に読んだ vid はその行の物
     fn sync_op_read<T>(&self, slot: u32, lsn: u32, cols: &SyncPayloadCols, f: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
         // `get_by_id32` と同じ cell の読み (場所で引く)
         let cell = |hid: u16| self.himos.get(hid as usize)?.get_value32(slot);
@@ -15389,10 +15396,13 @@ impl Engine {
         {
             return self.payload_ring(false)?.read_with(handle, lsn, f)?;
         }
-        #[cfg(target_arch = "wasm32")]
-        let _ = lsn;
         let vid = cell(cols.legacy?)?;
-        f(self.vocab.get(vid))
+        let got = f(self.vocab.get(vid));
+        // #971: payload を読んだ後に lsn を読み直す (読む前に比べると、 比べた後・読む前に使い回された行を読む)
+        if cell(cols.lsn) != Some(lsn) {
+            return None;
+        }
+        got
     }
 
     /// `_sync_ops` の `since_lsn < lsn <= through_lsn` の行の payload (lsn の順)。
@@ -33028,6 +33038,17 @@ mod settled_records_tests {
     /// ring の枠のうち `fillers(枠)` 個を自分の Tie で埋め、 その後ろに組 (書き手 `group_key.0` の同じ版数の Vocab `group` 本、 中継した
     /// state の形) を WAL に載せて、 bridge を回し切る。
     fn split_group(path: &str, group_key: (PeerId, Hlc), group: usize, fillers: impl Fn(usize) -> usize) -> Arc<Engine> {
+        split_group_of(path, group_key, group, |vid| format!("g{vid}").into_bytes(), fillers)
+    }
+
+    /// [`split_group`] の、 組の `vid` 本目の Vocab の中身を `bytes(vid)` にする形 (#971: ring に入らない大きな payload を混ぜる)。
+    fn split_group_of(
+        path: &str,
+        group_key: (PeerId, Hlc),
+        group: usize,
+        bytes: impl Fn(u32) -> Vec<u8>,
+        fillers: impl Fn(usize) -> usize,
+    ) -> Arc<Engine> {
         let mut eng = Engine::create_with_capacity(path, 1024).unwrap();
         eng.define_table("notes", 8).unwrap();
         eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
@@ -33043,7 +33064,7 @@ mod settled_records_tests {
                 eng.tie_to(e, "notes.note", i);
             }
             for vid in 0..group as u32 {
-                let rec = WireRecord::unsigned(group_key.1, group_key.0, DecodedOp::Vocab { vid, bytes: format!("g{vid}").into_bytes() });
+                let rec = WireRecord::unsigned(group_key.1, group_key.0, DecodedOp::Vocab { vid, bytes: bytes(vid) });
                 assert!(eng.relay_record(&rec), "前提: 組の record を WAL に載せた");
             }
             eng.oplog_commit();
@@ -33159,6 +33180,93 @@ mod settled_records_tests {
         drop(hold);
         drop(eng);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// #971: 上 (F5) の、 使い回した行の payload が辞書にある形 (ring の 1 件の上限を越える大きな payload)。 なめた時に ring に居た
+    /// 自分の Tie の場所が、 読む前に回収されて組の前半 (先頭が大きな Vocab = 辞書の行) に使い回されても、 その record を、 なめた時の
+    /// lsn の位置で配らない。 配る側の読み 2 つ (`settled_sync_records` / `settled_sync_min_hlc`) を、 それぞれ作り直した DB で、 読む前の
+    /// 割り込み点 (`settled_read_hook`) で回収 → bridge が空いた場所に組の前半を置く、 の順に踏む。
+    ///
+    /// falsify: `sync_op_read` の辞書の枝の lsn の読み直しを外すと、 大きな Vocab の record を、 回収した自分の Tie の lsn の位置で配る
+    /// (`settled_sync_min_hlc` は組の版数を最小と答える)。
+    #[test]
+    fn a_slot_reused_by_a_dictionary_payload_is_not_handed_out() {
+        const ME: PeerId = 1;
+        const GROUP: usize = 8;
+        // ring の 1 件の上限 (ring 16 MiB の 1/4) を越える
+        const BIG: usize = (4 << 20) + 4096;
+        let group = (9u32, Hlc { wall: 5_000, logical: 0, peer: 9 });
+        for which in ["settled_sync_records", "settled_sync_min_hlc"] {
+            let path = tmp(&format!("reuse-dict-{which}"));
+            let bytes = |vid: u32| if vid == 0 { vec![0xA5; BIG] } else { format!("g{vid}").into_bytes() };
+            let eng = split_group_of(&path, group, GROUP, bytes, |ring| ring);
+            let hold = eng.hold_consumer();
+            while eng.transfer_oplog_to_sync_ops() > 0 {}
+            let ring = eng.table_eid_usage("_sync_ops").unwrap();
+            assert_eq!(ring.live, ring.capacity, "{which}: 前提: ring が満杯");
+            assert_eq!(on_ring(&eng.pending_sync_ops(0), group), 0, "{which}: 前提: 組は ring に載っていない");
+            let cols = eng.sync_payload_cols().unwrap();
+            let (at, legacy) = (cols.at.expect("前提: payload の ring の列"), cols.legacy.expect("前提: 辞書の payload の列"));
+            let scanned = eng.table_slots_with_value32(cols.lsn, |_| true);
+            let top = scanned.iter().map(|x| x.0).max().unwrap();
+            assert!(
+                scanned.iter().all(|&(_, s)| eng.get_by_id32(eng.slot_eid(s), at).is_some()),
+                "{which}: 前提: なめる行の payload は全部 ring"
+            );
+            let mine: Vec<Hlc> = eng
+                .pending_sync_ops(0)
+                .iter()
+                .filter_map(|p| decode_sync_ops_payload(p))
+                .filter(|r| r.author_peer == ME)
+                .map(|r| r.hlc)
+                .collect();
+            // 自分の Tie の前の数行だけ回収する (組の 8 本のうち前の数本だけが載り、 組は割れたまま = 配ってよい行に入らない)
+            let cut = mine[2];
+            let other = Arc::clone(&eng);
+            settled_read_hook::set(eng.oplog().unwrap(), move |_| {
+                other.ack_sync_up_to_cursors(77, &[(ME, cut)]).unwrap();
+                assert!(other.reclaim_sync_ops() > 0, "前提: 割り込み点で回収した");
+                while other.transfer_oplog_to_sync_ops() > 0 {}
+            });
+            let (got, got_min) = if which == "settled_sync_records" {
+                let got: Vec<Key> = eng.settled_sync_records(|_, _| true).iter().map(key).collect();
+                let min = got.iter().map(|k| k.0).min();
+                (Some(got), min)
+            } else {
+                (None, eng.settled_sync_min_hlc(|_, _| true))
+            };
+            assert_eq!(Arc::strong_count(&eng), 1, "{which}: 前提: 割り込み点が回った");
+            // 前提: なめた場所の 1 つに、 配ってよい行の終わりより後の、 payload が辞書にある行 (組の先頭の大きな Vocab) が載った
+            let dict_rows = eng
+                .table_slots_with_value32(cols.lsn, |l| l > top)
+                .into_iter()
+                .filter(|&(_, s)| scanned.iter().any(|x| x.1 == s))
+                .filter(|&(_, s)| {
+                    let e = eng.slot_eid(s);
+                    eng.get_by_id32(e, legacy).is_some() && eng.get_by_id32(e, at).is_none()
+                })
+                .count();
+            let on_now = on_ring(&eng.pending_sync_ops(0), group);
+            assert!(
+                dict_rows == 1 && on_now > 1 && on_now < GROUP,
+                "{which}: 前提: なめた場所が組の前半に使い回され、 1 つは辞書の payload (辞書の行 {dict_rows}、 組 {on_now} 本)"
+            );
+            let want = full_copy(&eng, &|_, _| true);
+            assert!(want.len() < scanned.len(), "{which}: 前提: 読む前に回収した (行 {} → {})", scanned.len(), want.len());
+            assert_ne!(got_min, Some(group.1), "{which}: 使い回された場所の辞書の payload の record を、 なめた時の lsn の位置で配った");
+            assert_eq!(got_min, want.iter().map(|k| k.0).min(), "{which}: 版数の最小が、 読む前に回収された行を除いた答えと違う");
+            if let Some(got) = got {
+                assert_eq!(
+                    got.iter().filter(|k| (k.1, k.0) == group).count(),
+                    0,
+                    "{which}: 使い回された場所の辞書の payload の record を、 なめた時の lsn の位置で配った"
+                );
+                assert!(got == want, "{which}: 読む前に回収された行を除いた答え (行 {}) と違う (行 {})", want.len(), got.len());
+            }
+            drop(hold);
+            drop(eng);
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 
     /// ring の lsn の列を 1 回の Acquire の読みでなめる 2 か所が、 なめた後に読み直す形と同じ答え。 ring (枠 98) の前に大きな表、
