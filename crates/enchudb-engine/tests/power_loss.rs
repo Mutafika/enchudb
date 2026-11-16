@@ -2915,7 +2915,8 @@ fn a_db_without_a_wal_reconciles_a_delete_after_a_clean_flush() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// 読み直し Q1 / 4: gen.seg だけ死の場所を突き合わせが完了させ、 tombstone は書き出しの版数の段の前で落ちて届いていない (sync の DB)。
+/// 読み直し Q1 / 4: gen.seg だけ死の場所を突き合わせが完了させ、 tombstone は届いていない (sync の DB。 #978 から書き出しは列の段の前に
+/// tomb.seg を書き出すので、 その前 = 残りの列の段の前 `BeforeRest` で落ちる)。
 /// tombstone を新しい HLC で置き、 #451 が Delete を作り直す (相手に配る)。 その Delete の eid は消えた行の世代込み (突き合わせは世代を
 /// 2 つ上げるので、 今 − 1 ではない)。 消えた行への相手の書き込みは弾く (前は `slot_is_dead` が偽で、 新しい世代で生き返った)。
 #[test]
@@ -2949,13 +2950,15 @@ fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid(
         eng.oplog_sync().unwrap();
         let _hold = eng.hold_consumer();
         eng.tie_to(keep, "notes.note", 7u32);
-        let done = delete_during_write_out(&eng, r, Phase::BeforeGenerations, Phase::BeforeVersions, &live, &img);
+        let done = delete_during_write_out(&eng, r, Phase::BeforeGenerations, Phase::BeforeRest, &live, &img);
         eng.oplog_sync().unwrap();
         write_out_hook::set(None);
         assert!(done.load(Ordering::SeqCst), "前提: 書き出しの間に消した");
         (a, r, hid)
     };
     crashsim::stop();
+    let tomb_in_image = Engine::open_readonly(img.join("db").to_str().unwrap()).unwrap().tombstone_hlc(r);
+    assert_eq!(tomb_in_image, Hlc::ZERO, "前提: 像に r の tombstone は届いていない");
     let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.generation_repairs().0, 1, "前提: gen.seg だけ死の場所を突き合わせが完了させた");
     assert!(!eng.is_live(r), "前提: r の Tie は checkpoint の手前 (再生で生き返らない)");
