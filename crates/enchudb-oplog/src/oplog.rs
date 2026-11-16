@@ -191,7 +191,7 @@ pub struct WalReads {
     pub hole_scans: u64,
     /// 「再生する record があるか」 を file に聞いた回数 ([`OpLog::probe_replay`]、 全部は解かない)
     pub probes: u64,
-    /// その問い合わせ ([`OpLog::has_records_to_replay`]) が読んだ record の数 (Commit と、 見つけた 1 件)
+    /// その問い合わせ ([`OpLog::has_records_to_replay`]) が読んだ record の数 (Commit と当てる record。 止まれば当てる record は 1 件)
     pub probe_records: u64,
     /// それぞれの読みにかかった時間の和 (ns。 問い合わせは file を開く所から)
     pub replay_ns: u64,
@@ -4310,14 +4310,15 @@ impl OpLog {
     /// checkpoint から同じ確かめ方で読み、 最初の当てる record (Commit と読み飛ばしてよい op 以外の、 読めた record) で止まる
     /// (record を解いて写すのはその 1 件だけ)。 読むだけ (clock を戻さない)。
     pub fn has_records_to_replay(&self) -> bool {
-        let mut found = false;
+        // 当てる record を見た数 (止まれば 1)
+        let mut seen = 0u64;
         let s = self.scan_range_until(self.checkpoint(), u64::MAX, |_| {
-            found = true;
+            seen += 1;
             std::ops::ControlFlow::<(), ()>::Break(())
         });
-        let read = s.commit_ends.len() as u64 + u64::from(found);
+        let read = s.commit_ends.len() as u64 + seen;
         note_wal_read(|r| r.probe_records += read);
-        found
+        seen > 0
     }
 
     /// #972: `path` の WAL を読むだけで開いて (file には何も書かない)、 開いた時の再生が当てる record があるかを答える
