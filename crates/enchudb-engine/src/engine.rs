@@ -10738,26 +10738,28 @@ impl Engine {
     /// #880: `path` の WAL に再生する record があれば WAL の大きさ (開く側の値は使われないが渡す)。
     /// WAL 自体を読めない (切り詰められた / 壊れた file) 時は、 WAL 付きの open も開けないので None (今までどおり WAL を見ずに開く、
     /// 警告だけ出す)。
+    ///
+    /// #972: 聞くだけなので、 WAL は読むだけで開き (file を書かない)、 checkpoint の後の最初の当てる record で読むのを止める
+    /// ([`enchudb_oplog::oplog::OpLog::probe_replay`])。 前は読み書きで開いて (header の直しを本当の open の前に書いた) 全部を解き、
+    /// 256 MiB の WAL では聞くたびに再生と同じだけ読んで写していた (standalone の open で 2〜5 回)。
     #[cfg(not(target_arch = "wasm32"))]
     fn wal_records_to_replay(path: &str) -> io::Result<Option<usize>> {
+        use enchudb_oplog::oplog::OpLog;
         let oplog_path = oplog_path_for(path);
         if !oplog_path.exists() {
             return Ok(None);
         }
-        let w = match enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)
-            .and_then(|never| if never { Ok(None) } else { enchudb_oplog::oplog::OpLog::open(&oplog_path).map(Some) })
+        let probe = match OpLog::was_never_written(&oplog_path)
+            .and_then(|never| if never { Ok(None) } else { OpLog::probe_replay(&oplog_path).map(Some) })
         {
-            Ok(Some(w)) => w,
+            Ok(Some(p)) => p,
             Ok(None) => return Ok(None),
             Err(e) => {
                 eprintln!("[enchudb] warning: could not read the WAL ({e}) — opening without replaying it (#880)");
                 return Ok(None);
             }
         };
-        if w.is_empty() || w.recover_with_tail().is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(w.capacity() as usize))
+        Ok(probe.records.then_some(probe.capacity as usize))
     }
 
     #[cfg(not(target_arch = "wasm32"))]

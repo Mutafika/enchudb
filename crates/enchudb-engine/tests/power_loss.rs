@@ -3782,7 +3782,9 @@ fn a_former_resident_the_replay_revives_is_not_restored() {
         let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
         ro.prev_resident_of_slot(ro.eid_slot(x))
     };
+    let reads_before = enchudb_oplog::oplog::wal_reads();
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+    let reads = enchudb_oplog::oplog::wal_reads();
     eng.set_peer_id(1);
     let alive = eng.is_live(x);
     let sevens: Vec<u64> = eng.pull_raw("t.k", 7u32).into_iter().filter_map(|e| eng.get(e, "t.v")).collect();
@@ -3805,6 +3807,12 @@ fn a_former_resident_the_replay_revives_is_not_restored() {
     assert!(in_state.is_empty(), "生きている X の Delete を state に出した: {in_state:x?}");
     assert!(bridged.is_empty(), "生きている X の Delete を作り直して配った (差分で受ける peer で X が消える): {bridged:x?}");
     assert_eq!(restored, 0, "再生が生き返らせた X の削除を記録から戻したまま");
+    // #972: 戻すかを再生の後に回すために WAL に再生する record があるかを聞く (`restore_prev_residents`) のは、 最初の 1 件で止まる
+    // 読み。 全部を解くのは再生の 1 回
+    let probes = reads.probes - reads_before.probes;
+    assert!(probes >= 1, "前提: 記録を戻すかを決める前に WAL に聞いた ({reads:?})");
+    assert_eq!(reads.replays - reads_before.replays, 1, "WAL を全部解いたのが再生の 1 回でない ({reads:?})");
+    assert!(reads.probe_records - reads_before.probe_records <= 4 * probes, "聞く読みが最初の数件で止まらない ({reads:?})");
 }
 
 /// review946d [N1] の後に回した戻しも、 再生の前に戻していた時と同じく前の住人の別名を外す: X (名前 7) に B の行 b を畳み (b の世界

@@ -180,6 +180,62 @@ pub const HALF_ALIGN: u64 = 16 * 1024;
 /// record は page に残りうる) を使い直さない。 書き出し (fsync) の間に置く周は高々 1 つ。
 const LAP_SKIP_ON_OPEN: u32 = 16;
 
+/// #972: この thread が WAL を読んだ回数 (試験と測り用、 [`wal_reads`])。 開く道は呼んだ thread で読むので、 開く前後の差が
+/// その open の回数。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalReads {
+    /// checkpoint から読み切って record を全部解いた回数 ([`OpLog::recover`] / [`OpLog::recover_with_tail`])
+    pub replays: u64,
+    /// 開いた時の穴の確かめ ([`OpLog::drop_records_after_a_hole`]) が checkpoint から読み切った回数
+    pub hole_scans: u64,
+    /// 「再生する record があるか」 を file に聞いた回数 ([`OpLog::probe_replay`]、 全部は解かない)
+    pub probes: u64,
+    /// その問い合わせ ([`OpLog::has_records_to_replay`]) が読んだ record の数 (Commit と、 見つけた 1 件)
+    pub probe_records: u64,
+    /// それぞれの読みにかかった時間の和 (ns。 問い合わせは file を開く所から)
+    pub replay_ns: u64,
+    pub hole_scan_ns: u64,
+    pub probe_ns: u64,
+}
+
+thread_local! {
+    static WAL_READS: std::cell::Cell<WalReads> = const {
+        std::cell::Cell::new(WalReads {
+            replays: 0,
+            hole_scans: 0,
+            probes: 0,
+            probe_records: 0,
+            replay_ns: 0,
+            hole_scan_ns: 0,
+            probe_ns: 0,
+        })
+    };
+}
+
+/// #972: この thread が今までに WAL を読んだ回数 ([`WalReads`])。
+#[doc(hidden)]
+pub fn wal_reads() -> WalReads {
+    WAL_READS.with(std::cell::Cell::get)
+}
+
+/// #972: [`OpLog::probe_replay`] の答え。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayProbe {
+    /// 開いた時の再生 ([`OpLog::recover_with_tail`]) が当てる record がある
+    pub records: bool,
+    /// WAL の容量 (byte、 2 区画の和、 [`OpLog::capacity`])
+    pub capacity: u64,
+}
+
+fn note_wal_read(f: impl FnOnce(&mut WalReads)) {
+    WAL_READS.with(|c| {
+        let mut r = c.get();
+        f(&mut r);
+        c.set(r);
+    });
+}
+
 /// WAL の中の位置: `(周 << 32) | 区画の中の offset`。 大小は WAL に積んだ順 (周が 2^32 で回るまで)。 周 0 (v2 の file) は
 /// offset そのもの。 0 と [`HEADER_SIZE`] は 「どの区画よりも前」 (先頭から読む)。
 #[inline]
@@ -4250,6 +4306,45 @@ impl OpLog {
         out
     }
 
+    /// #972: 開いた時の再生 ([`Self::recover_with_tail`]) が当てる record があるか (= `!recover_with_tail().is_empty()`)。
+    /// checkpoint から同じ確かめ方で読み、 最初の当てる record (Commit と読み飛ばしてよい op 以外の、 読めた record) で止まる
+    /// (record を解いて写すのはその 1 件だけ)。 読むだけ (clock を戻さない)。
+    pub fn has_records_to_replay(&self) -> bool {
+        let mut found = false;
+        let s = self.scan_range_until(self.checkpoint(), u64::MAX, |_| {
+            found = true;
+            std::ops::ControlFlow::<(), ()>::Break(())
+        });
+        let read = s.commit_ends.len() as u64 + u64::from(found);
+        note_wal_read(|r| r.probe_records += read);
+        found
+    }
+
+    /// #972: `path` の WAL を読むだけで開いて (file には何も書かない)、 開いた時の再生が当てる record があるかを答える
+    /// ([`Self::has_records_to_replay`])。 engine が 「WAL 付きの open の前に再生が要るか」 を聞くのに使う (前は `open` (読み書き) +
+    /// `recover_with_tail` で、 256 MiB の WAL を聞くたびに全部解いていた)。
+    ///
+    /// file は読むだけで開き、 写しの map (copy-on-write、 swap を確保しない) に置く: 開く時の header の直し ([`read_layout`] が
+    /// 読めない B の header を書き直す / A = 4・B = 5 の B の版を戻す) は写しにだけ入り、 file に届かない (本当の open
+    /// ([`Self::open`]) が同じ直しをする)。 区画と周の形は `open` と同じに決めるので、 答えは `open(path)?.recover_with_tail()`
+    /// が空かと同じ。 書き手の lock は取らない。 [`Self::was_never_written`] の file (header が全部 0) は `open` と同じく
+    /// `bad WAL magic` の Err。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn probe_replay(path: &Path) -> io::Result<ReplayProbe> {
+        crate::io_point("oplog.probe")?;
+        let t0 = std::time::Instant::now();
+        let file = OpenOptions::new().read(true).open(path)?;
+        let mut mmap = unsafe { memmap2::MmapOptions::new().no_reserve_swap().map_copy(&file)? };
+        let layout = read_layout(&mut mmap)?;
+        let wal = Self::assemble(file, mmap, layout);
+        let records = !wal.is_empty() && wal.has_records_to_replay();
+        note_wal_read(|r| {
+            r.probes += 1;
+            r.probe_ns += t0.elapsed().as_nanos() as u64;
+        });
+        Ok(ReplayProbe { records, capacity: wal.capacity() })
+    }
+
     /// 開いた時の再生 (`recover_with_tail`、 checkpoint から読む) が head より手前で止まったら (読めない record = 届かなかった
     /// page)、 そこから先の record を捨てる。 再生は前だけを当てるので、 先の record は本体に当てていない。 開いた直後 (書き手の
     /// 居ない間) に、 再生と同じ所から読んで決める。 戻り値は捨てたか。
@@ -4323,7 +4418,12 @@ impl OpLog {
     /// [`Self::drop_records_after_a_hole`] の前半 (`append_lock` の下)。
     fn drop_after_hole_locked(&self) -> bool {
         let start = self.checkpoint();
+        let t0 = std::time::Instant::now();
         let s = self.scan_from_offset(start);
+        note_wal_read(|r| {
+            r.hole_scans += 1;
+            r.hole_scan_ns += t0.elapsed().as_nanos() as u64;
+        });
         if s.stop == ScanStop::Head {
             return false;
         }
@@ -4366,6 +4466,7 @@ impl OpLog {
     /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
     fn recover_inner(&self) -> (Vec<Record>, Vec<Record>) {
         let start = self.checkpoint();
+        let t0 = std::time::Instant::now();
         let s = self.scan_from_offset(start);
         if s.max_lsn > 0 {
             self.hot.next_lsn.store(s.max_lsn + 1, Ordering::Release);
@@ -4373,7 +4474,12 @@ impl OpLog {
         if s.max_hlc.wall > 0 {
             *self.hot.hlc_state.lock() = (s.max_hlc.wall, s.max_hlc.logical);
         }
-        (strip_offsets(s.out), strip_offsets(s.tail))
+        let out = (strip_offsets(s.out), strip_offsets(s.tail));
+        note_wal_read(|r| {
+            r.replays += 1;
+            r.replay_ns += t0.elapsed().as_nanos() as u64;
+        });
+        out
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
@@ -4402,6 +4508,18 @@ impl OpLog {
 
     /// [`Self::scan_range`] の record 1 件の形を `mk` で決める版 (確かめ方は同じ)。 `mk` は Commit 以外の読めた record ごとに 1 回。
     fn scan_range_with<'s, R>(&'s self, start_offset: u64, upto: u64, mut mk: impl FnMut(RecordRef<'s>) -> R) -> ScanOut<R> {
+        self.scan_range_until(start_offset, upto, |r| std::ops::ControlFlow::Continue(mk(r)))
+    }
+
+    /// [`Self::scan_range_with`] の、 `mk` が `Break` を返したらその record で読むのを止める版 (#972: 再生する record があるかを聞く
+    /// 読みは最初の 1 件で止まる)。 止めた record は返す並びに入れない。 止めた時の `ScanOut` の位置 (`committed_end` / `stop`) は
+    /// 読み切った読みの物ではない (使わないこと)。 確かめ方 (magic / 版 / CRC / 周の印 / op) は同じ 1 本の道。
+    fn scan_range_until<'s, R>(
+        &'s self,
+        start_offset: u64,
+        upto: u64,
+        mut mk: impl FnMut(RecordRef<'s>) -> std::ops::ControlFlow<(), R>,
+    ) -> ScanOut<R> {
         // `out[..committed]` は Commit で閉じた group、 その後ろは閉じていない末尾 (#683: 前は group ごとに別の Vec に積んで Commit で
         // 移していた。 changefeed の記録への写しでは group が 1〜2 件で、 移すのが record ごとの memmove になっていた)
         let mut out = Vec::new();
@@ -4498,10 +4616,12 @@ impl OpLog {
                         commit_ends.push(committed_end);
                     }
                     Some(other) => {
-                        out.push((
-                            mk(RecordRef { lsn, hlc, author_peer, op: other, header, payload: payload_slice }),
-                            wal_pos(lap, (next_off - base) as u64),
-                        ));
+                        let std::ops::ControlFlow::Continue(r) =
+                            mk(RecordRef { lsn, hlc, author_peer, op: other, header, payload: payload_slice })
+                        else {
+                            break 'parts;
+                        };
+                        out.push((r, wal_pos(lap, (next_off - base) as u64)));
                     }
                     // #178: 知らない版が書いた 「読み飛ばしてよい」 op は、 その record だけ飛ばして先を読む (下の打ち切りと違い、
                     // 後ろの record を捨てない)

@@ -392,7 +392,7 @@ fn run_child(db: &Path, envs: &[(&str, String)]) -> (String, Option<String>) {
 /// 印を立てられない像は状態では作れない (`tables` を書けなくする #870 の形では、 往復は印を立てて閉じる: 閉じる時の `tables` の書き込みは
 /// 失敗しても印を止めない。 印を止めるのは本体の書き出し (`write_out_body` / payload の ring) の失敗と consumer の panic だけ)。 なので
 /// I/O の故障 (crashsim の `fault`、 子 process) で作る: 往復の WAL 付きの open が WAL を開いた後から、 往復の後に WAL を見直す前まで
-/// (数えるだけの回の `oplog.open` の 2 回目と 3 回目の間) の点ごとに 1 回 EIO を起こす。 consumer の thread も同じ数を進めるので、
+/// (数えるだけの回の、 往復の `oplog.open` と、 その後の見直しの `oplog.probe` の間) の点ごとに 1 回 EIO を起こす。 consumer の thread も同じ数を進めるので、
 /// 回ごとに当たる点は少しずれうる (窓の点を全部回す)。
 #[test]
 fn a_standalone_open_refuses_when_the_round_trip_cannot_close_cleanly() {
@@ -410,9 +410,14 @@ fn a_standalone_open_refuses_when_the_round_trip_cannot_close_cleanly() {
         .lines()
         .filter_map(|l| l.split_once('\t').map(|(n, s)| (n.parse().unwrap(), s.to_string())))
         .collect();
-    let opens: Vec<u64> = sites.iter().filter(|(_, s)| s == "oplog.open").map(|(n, _)| *n).collect();
-    assert!(opens.len() >= 3, "前提: 単独の open が WAL を 3 回開く (往復の前の見直し・往復・往復の後の見直し): {opens:?}");
-    let window = opens[1] + 1..opens[2];
+    // 往復の前と後の見直しは WAL を読むだけで聞く (`oplog.probe`、 #972)。 往復は読み書きで開く (`oplog.open`)
+    let open = sites.iter().find(|(_, s)| s == "oplog.open").map(|(n, _)| *n);
+    let probe_after = open.and_then(|o| sites.iter().find(|(n, s)| s == "oplog.probe" && *n > o).map(|(n, _)| *n));
+    let (Some(open), Some(probe_after)) = (open, probe_after) else {
+        panic!("前提: 単独の open が往復で WAL を開き、 その後に見直す: {sites:?}");
+    };
+    assert!(sites.iter().any(|(n, s)| s == "oplog.probe" && *n < open), "前提: 往復の前に見直す: {sites:?}");
+    let window = open + 1..probe_after;
     let (mut refused, mut opened_unclean, mut other, mut floored) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for n in window.clone() {
         let img = root.join(format!("n{n}"));
