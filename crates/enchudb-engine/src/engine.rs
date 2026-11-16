@@ -4846,15 +4846,63 @@ mod kill_fail_tests {
         assert!(asked >= grown, "gen.seg を {grown} B 伸ばしたのに、 空きを {asked} B しか数えていない");
     }
 
+    /// 読み直し 4 の [2] の v14 の形: 世代を持たない DB で、 再生の中継した record (満杯の表の新しい行 = v14 の間に消した場所を使い回す
+    /// = 先に v15 に移る) を、 移る手順が gen.seg を commit できずに置けない時も開くのを断る (印は世代を持たない DB でも見る)。
+    ///
+    /// falsify: `settle_replayed_generations` が印を世代を持つ DB でだけ見ると (前の形)、 空きの無い open が通り、 中継した行が無い。
+    #[test]
+    fn a_v14_open_whose_replay_cannot_move_to_place_a_relayed_row_is_refused() {
+        use crate::transport::WireRecord;
+        use enchudb_oplog::oplog::DecodedOp;
+        let p = path("relay979v14");
+        let image = format!("{p}-img");
+        let eng = {
+            let mut eng = Engine::create_with_capacity(&p, 200_000).unwrap();
+            eng.define_table("t", 2).unwrap();
+            eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+            eng.enable_sync_tables().unwrap();
+            let rest = eng.remaining_eid_capacity();
+            eng.define_table("rest", rest).unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            eng.set_peer_id(1);
+            eng
+        };
+        let rows: Vec<u64> = (0..2).map(|_| eng.entity_in("t").unwrap()).collect();
+        eng.delete(rows[0]); // v14 の間に消す (満杯の表の次の行はこの場所を使い回す)
+        assert!(!eng.generations().active() && eng.remaining_eid_capacity() == 0, "前提: v14、 枠を足せない");
+        eng.oplog_sync().unwrap();
+        let hold = eng.hold_consumer();
+        let hid = eng.himo_id("t.a").unwrap() as u16;
+        let foreign = enchudb_oplog::make_eid(9, 5);
+        let hlc = enchudb_oplog::Hlc { wall: Engine::unix_millis(), logical: 0, peer: 9 };
+        assert!(eng.relay_record(&WireRecord::unsigned(hlc, 9, DecodedOp::Tie { eid: foreign, himo_id: hid, value: 7 })));
+        eng.oplog_commit();
+        assert!(std::process::Command::new("cp").arg("-R").arg(&p).arg(&image).status().unwrap().success());
+        drop(hold);
+        cleanup(eng, &p);
+        open_space_margin_hook::set(NO_SPACE);
+        let refused = Engine::open_concurrent_with_oplog(&image, 1 << 20).map(|e| e.resolve_remote_eid_existing(foreign).is_some());
+        let img = Engine::open_concurrent_with_oplog(&image, 1 << 20);
+        let after = img.as_ref().map(|e| (e.slot_bits() > 0, e.resolve_remote_eid_existing(foreign).is_some())).map_err(|e| e.to_string());
+        drop(img);
+        let _ = crate::db_files::remove_db(&image);
+        let e = refused.expect_err("再生が v15 に移れずに中継した行を置けないのに開いた");
+        assert_eq!(e.kind(), io::ErrorKind::StorageFull, "断った理由: {e}");
+        // 空きが戻った open は移って行を置く。 値は見ない: 再生の途中で v15 に移って v14 の間に消した場所を使い回す形は、 master でも
+        // 行が消えた行の eid (世代 0) で生き、 値が残らない (この PR の外の別件、 PR 本文の 「残り」)
+        assert_eq!(after.expect("空きが戻っても開けない"), (true, true), "空きが戻った open が移って中継した行を置いていない");
+    }
+
     /// PR #977 の読み直し 4 の [3]: 消す道の kill を書けなかった場所 (約束の破れ = 守りの道。 試験では `kill_fail_hook` で落とす) は、
     /// 名前のある表の使い回しの全部なめも拾わない (前は守りが空きの山 / 消した行の一覧に積まないだけで、 表が枯渇すると全部なめが
     /// 「生きていない」 場所として拾い、 今の世代 = 消えた行と同じ eid で使い回した)。 閉じる時に kill を書き直す (`closes_writable`)。
     /// 閉じる時も書けなければ gen.seg の汚れた印を残し、 次に開く時の突き合わせ (`reconcile_generations` の 2.) が削除を完了させる。
     /// どちらでも、 開き直した後の使い回しは次の世代。
     ///
-    /// falsify: `Generations::retired` が覚えた場所を見ないと、 枯渇した表への insert が消えた行と同じ eid を返す。 閉じる時の書き直しを
-    /// 外すと 1 つ目 (閉じる時は書ける) の開き直した後の使い回しが同じ eid (突き合わせはきれいに閉じた DB では回らない)。 書けない場所が
-    /// 残った時に印を倒すと 2 つ目が同じ eid。
+    /// falsify: `Generations::retired` が覚えた場所を見ないと、 枯渇した表への insert が消えた行と同じ eid を返す。 書けない場所が
+    /// 残った時に印を倒すと 2 つ目 (閉じる時も書けない) の開き直した後の使い回しが同じ eid (突き合わせはきれいに閉じた DB では回らない)。
+    /// 閉じる時の書き直しを外しても答えは同じ (汚れた印が残り、 次に開く時の突き合わせが完了させる = 書き直しは開く時の突き合わせを
+    /// 省くだけ、 変異は生き残る)。
     #[test]
     fn a_slot_whose_kill_failed_is_not_reused_with_the_same_eid() {
         for closes_writable in [true, false] {
