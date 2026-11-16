@@ -712,17 +712,6 @@ impl HostInner {
         p
     }
 
-    /// ホストの `_sync_ops` に残っている record の HLC の最小 (残っていなければ None)。 F はこれを越えない: 残っている record は
-    /// まだ個別に配りうるので、 その削除をホストが忘れた後に誰かが当てると、 名前で束ねた行の答えが割れる。
-    ///
-    /// #985: 前は呼ぶたびに ring の全部の行を写して decode した (`pending_sync_ops(0)`、 100 万行で 1 回 60〜110 ms)。 F が ring の
-    /// 最古の record に留められている間は client の要求のたびに走った。 engine の覚え ([`Engine::sync_ring_min_hlc`]) は、 bridge が
-    /// 足した行と回収で消えた行で直し、 最小以下の行が消えた後だけ ring を読み直す (答えは同じ)。
-    #[cfg(test)]
-    fn ring_min(&self) -> Option<Hlc> {
-        self.engine.sync_ring_min_hlc()
-    }
-
     /// 黙ったので外した client か、 外した後に戻ってきた client か (線を持つホストだけ)。
     fn is_stale(&self, c: PeerId) -> bool {
         self.lines_path.is_some() && self.lines.lock().unwrap().clients.get(&c).is_some_and(|c| c.dropped || c.returned)
@@ -779,8 +768,12 @@ impl HostInner {
                     hook();
                 }
             }
-            // 登録を外した受信の record は ring にある (外したのは `sync_for_ack` の後) = 登録を読んだ後に ring を読む。
-            // #985: min(上限, ring の最小)。 ring の最小の覚えの下の境が上限以上なら ring を読まない
+            // 登録を外した受信の record は ring にある (外したのは `sync_for_ack` の後) = 登録を読んだ後に ring を読む。 ホストの
+            // `_sync_ops` に残っている record は、 まだ個別に配りうるので F はそれを越えない (その削除をホストが忘れた後に誰かが当てると、
+            // 名前で束ねた行の答えが割れる)。
+            // #985: min(上限, ring の最小)。 前は ring の全部の行を写して decode した (100 万行で 1 回 60〜110 ms、 F が ring の最古の
+            // record に留められている間は要求のたびに)。 engine の覚え (`Engine::sync_ring_min_below`) は、 bridge が足した行と回収で
+            // 消えた行で直し、 下の境が上限以上なら読まない
             let f = self.engine.sync_ring_min_below(upper).unwrap_or(upper);
             let current = self.lines.lock().unwrap().forget;
             if f > current {
@@ -1816,6 +1809,12 @@ mod tests {
         c.settled_sync_records(|x, _| x == me).iter().map(|r| r.hlc).max().unwrap()
     }
 
+    /// ホストの ring に残る record の版数の最小を、 ring の全部の行を写して decode して読む (#985 の覚え
+    /// (`Engine::sync_ring_min_hlc`) と独立の読み。 試験の前提はこれで見る)。
+    fn full_ring_min(e: &Engine) -> Option<Hlc> {
+        e.pending_sync_ops(0).iter().filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p)).map(|r| r.hlc).min()
+    }
+
     /// cursor の置き場の中身 `text` にある (link, 書き手) の位置 (無ければ ZERO)。
     fn cursor_in(text: &str, link: PeerId, author: PeerId) -> Hlc {
         text.lines()
@@ -2195,7 +2194,7 @@ mod tests {
         let forget = host.forget_line();
         assert!(candidate.is_some_and(|c| c > old), "前提: F の候補が n の record より上 ({candidate:?} / {old:?})");
         assert!(forget < old, "前提: F はまだ n の record より下 ({forget:?} / {old:?})");
-        assert!(host.inner.ring_min().is_none_or(|m| m > old), "前提: ホストの ring は n の record より古い物を持たない");
+        assert!(full_ring_min(&host_eng).is_none_or(|m| m > old), "前提: ホストの ring は n の record より古い物を持たない");
         (dir, host, host_eng, ab, n, old)
     }
 
@@ -2212,7 +2211,7 @@ mod tests {
             *host.inner.wal_sync_hook.lock().unwrap() = Some(Box::new(move |after| {
                 let mut g = seen.lock().unwrap();
                 if let (false, None, Some(inner)) = (after, g.as_ref(), inner.upgrade()) {
-                    let ring = inner.ring_min();
+                    let ring = full_ring_min(&inner.engine);
                     inner.recompute(inner.clock.now());
                     *g = Some((ring, inner.lines.lock().unwrap().forget));
                 }
@@ -2250,7 +2249,7 @@ mod tests {
         host.inner.recompute(host.inner.clock.now());
         let forget = host.forget_line();
         let applied = host_eng.pull_raw("rows.val", 900).len();
-        let in_ring = host.inner.ring_min().is_some_and(|m| m <= old);
+        let in_ring = full_ring_min(&host_eng).is_some_and(|m| m <= old);
         drop(host);
         drop((ab, sn, n, host_eng));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2322,10 +2321,7 @@ mod tests {
                 s.pull_once(100);
             }
         };
-        // 直す前の読み
-        let full = |e: &Engine| {
-            e.pending_sync_ops(0).iter().filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p)).map(|r| r.hlc).min()
-        };
+        let full = full_ring_min;
         for v in [10, 20, 30] {
             round(v);
         }

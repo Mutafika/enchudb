@@ -119,7 +119,7 @@ impl RingNewest {
 ///
 /// - bridge が行を足す (lsn を書いた) たびに [`Self::note`] で `min` を下げる。 足した後も `min` は下の境で、 最小そのものなら
 ///   足した後も最小そのもの
-/// - 行が消える ([`Engine::purge_sync_ops_row`]) 時、 消える行の版数が `min` 以下 (か読めない) なら `exact` を倒す ([`Self::gone`])。
+/// - 行が消える ([`Engine::purge_sync_ops_row_at`]、 #858 の `drop_cells_of_dead_ring_slot`) 時、 消える行の版数が `min` 以下 (か読めない) なら `exact` を倒す ([`Self::gone`])。
 ///   `min` は下の境のまま (消えると最小は上がる側)。 消える行の版数が `min` より上なら、 最小の行は残っている
 /// - ring を読み直すのは、 最小そのものが要る問い (`exact` でなく、 下の境が問いの境より下) だけ
 ///
@@ -130,7 +130,11 @@ impl RingNewest {
 /// 書き手 0 も、 Vocab も)、 payload を読めない / decode できない行 (dead row) は数えない。
 ///
 /// 下の境が下の境であるのは、 行を足すのが bridge だけ (lsn の列を書く本番の道は bridge の 1 か所) だから。 lsn の列を書く道を
-/// 足したら、 そこでも `note` を呼ぶこと。
+/// 足したら、 そこでも `note` を呼ぶこと。 bridge は書いた行を読み直しと同じ読みで読めた時だけ `note` する (payload / lsn を
+/// 書けなかった行は読み直しも数えない)。 行を消す道を足したら `gone` を呼ぶこと (呼ばないと、 消えた版数を最小そのものとして
+/// 返し続ける = F が低く留まる側)。
+///
+/// 覚えを作る前 (`ring_oldest_on` が立つ前、 = ホストでない peer はずっと) は bridge も回収もこの lock を取らない。
 struct RingOldest {
     /// 覚えを作ったか (開いた後の最初の問いが ring を読む)。
     seeded: bool,
@@ -2516,6 +2520,50 @@ mod write_out_fault {
     }
 
     pub(super) fn active(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
+/// test 用 (#985): 置いた WAL の engine の bridge が、 行の payload を ring にも辞書にも書かない (payload を書けなかった行)。
+#[cfg(test)]
+mod bridge_payload_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn on(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
+/// test 用 (#985): 置いた WAL の engine が、 payload の ring (`sync.payload.seg`) をまだ開いていなければ開けない (fd が尽きた等)。
+#[cfg(test)]
+mod payload_ring_open_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn on(wal: &OpLog) -> bool {
         ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
     }
 }
@@ -10055,6 +10103,9 @@ pub struct Engine {
     sync_ops_purges: std::sync::atomic::AtomicU64,
     /// #985: ring に残る行の版数の最小の覚え ([`RingOldest`])。
     ring_oldest: std::sync::Mutex<RingOldest>,
+    /// #985: 覚えを作り始めたか (最初の問いが `transfer_lock` と `sync_ops_purge_lock` の下で立てる)。 立つまで bridge と回収は
+    /// 覚えの lock を取らない (ホストでない peer は問わないので、 ずっと取らない)。
+    ring_oldest_on: std::sync::atomic::AtomicBool,
     /// #985: ring を読み直す問いを 1 つずつにする (後から来た問いは、 前の読み直しの答えを使う)。
     ring_oldest_scan: std::sync::Mutex<()>,
     /// #985: [`RingOldest`] を作るために ring の行をなめた回数 ([`Self::sync_ring_min_scans`])。
@@ -10539,6 +10590,7 @@ impl Engine {
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
             ring_oldest: std::sync::Mutex::new(RingOldest::new()),
+            ring_oldest_on: std::sync::atomic::AtomicBool::new(false),
             ring_oldest_scan: std::sync::Mutex::new(()),
             ring_oldest_scans: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
@@ -12101,6 +12153,7 @@ impl Engine {
             ring_newest: std::sync::Mutex::new(RingNewest::new()),
             sync_ops_purges: std::sync::atomic::AtomicU64::new(0),
             ring_oldest: std::sync::Mutex::new(RingOldest::new()),
+            ring_oldest_on: std::sync::atomic::AtomicBool::new(false),
             ring_oldest_scan: std::sync::Mutex::new(()),
             ring_oldest_scans: std::sync::atomic::AtomicU64::new(0),
             sync_ring_scans: std::sync::atomic::AtomicU64::new(0),
@@ -12603,6 +12656,11 @@ impl Engine {
             local_only_ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
         };
 
+        // #985: ring の版数の最小の覚えがある (ホストが一度でも問うた) 時だけ、 足した行をその覚えに入れる。 印は `transfer_lock`
+        // の下で立つので、 この周の間は変わらない
+        let oldest_cols = if self.ring_oldest_on.load(Ordering::Acquire) { self.sync_payload_cols() } else { None };
+        #[cfg(test)]
+        let payload_fault = bridge_payload_fault::on(wal);
         let mut count = 0usize;
         // #152: 「ここまでは処理し切った」record の終端 offset。 挿入した record だけ
         // でなく、 skip した record も「処理し切った」に含める (再訪しても同じく skip
@@ -12833,6 +12891,9 @@ impl Engine {
             self.tie_to_by_id(row_eid, hlc_wall_lo_hid, rec.hlc.wall as u32);
             #[cfg(not(target_arch = "wasm32"))]
             let in_ring = match ring_slot {
+                // 試験: payload をどこにも書けなかった行 (#985: 覚えはその行を数えない)
+                #[cfg(test)]
+                _ if payload_fault => true,
                 Some((r, at_hid, off)) => match r.write(off, lsn, &wire_payload) {
                     Ok(handle) => {
                         self.tie_to_by_id(row_eid, at_hid, handle);
@@ -12863,8 +12924,13 @@ impl Engine {
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             // #843: ring の行のいちばん新しい版数を覚える (止まった周が ring を読み直さないため)
             self.ring_newest.lock().unwrap_or_else(|p| p.into_inner()).note(rec.hlc);
-            // #985: 版数の最小の覚えも (lsn を書いた後に触る = 触る前に始まった読み直しはこの行を見る)
-            self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).note(rec.hlc);
+            // #985: 版数の最小の覚えも (lsn を書いた後に触る = 触る前に始まった読み直しはこの行を見る)。 読み直しと同じ読み (行の
+            // payload から (書き手, 版数) を読めた時だけ) で数える: payload / lsn を書けなかった行は読み直しも数えない
+            if let Some(cols) = &oldest_cols
+                && let Some((_, h)) = self.sync_op_walk_key(row_eid, cols)
+            {
+                self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).note(h);
+            }
             self.sync_bridged.fetch_add(1, Ordering::Release);
             done_end = Some(*rec_end);
         }
@@ -14238,7 +14304,8 @@ impl Engine {
                         self.dead_row_floor_candidate(*eid, known)
                     };
                     // #221: delete + free list push は専用 lock 下で atomic に。
-                    if self.purge_sync_ops_row(*eid, lsn_hid, *lsn) {
+                    // #985: decode できない行 (版数は分からない)
+                    if self.purge_sync_ops_row_at(*eid, lsn_hid, *lsn, None) {
                         let (author, hlc) = cand;
                         let whose = if author == u32::MAX {
                             "all authors (unattributable row)".to_string()
@@ -14336,11 +14403,30 @@ impl Engine {
     ///
     /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
     /// 消した / slot が再利用されて別 row になっていた。
+    #[cfg(test)]
     fn purge_sync_ops_row(
         &self,
         eid: enchudb_oplog::EntityId,
         lsn_hid: u16,
         expected_lsn: u32,
+    ) -> bool {
+        // #985: 版数を持たない呼び手 (試験) の形。 覚えがある時だけ読む
+        let hlc = if self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire) {
+            self.sync_payload_cols().and_then(|c| self.sync_op_walk_key(eid, &c)).map(|(_, h)| h)
+        } else {
+            None
+        };
+        self.purge_sync_ops_row_at(eid, lsn_hid, expected_lsn, hlc)
+    }
+
+    /// [`Self::purge_sync_ops_row`] の本体。 `hlc` = 消える行の版数 (#985 の ring の最小の覚えに渡す。 呼び手が読み済みの物、
+    /// 分からなければ None = 最小だったかもしれない)。
+    fn purge_sync_ops_row_at(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        lsn_hid: u16,
+        expected_lsn: u32,
+        gone_hlc: Option<enchudb_oplog::Hlc>,
     ) -> bool {
         let _guard = self.sync_ops_purge_lock.lock().unwrap();
         if self.get_by_id32(eid, lsn_hid) != Some(expected_lsn) {
@@ -14364,20 +14450,9 @@ impl Engine {
                 // `free_locals` を握ったまま (上の doc)
                 self.check_writable();
                 let row_local = self.slot_unchecked(eid);
-                // #985: 消える行の版数 (ring の最小の覚えが要る時だけ読む。 覚えを作る前に消す行は、 作る読み直しが見ない)。 読んだ
-                // 後に覚えを作り始めた時は、 読めなかった行 (最小だったかもしれない) として渡す
-                let gone_hlc = {
-                    let watched = {
-                        let st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
-                        st.seeded || st.scanning.is_some()
-                    };
-                    let hlc = if watched {
-                        self.sync_payload_cols().and_then(|c| self.sync_op_walk_key(eid, &c)).map(|(_, h)| h)
-                    } else {
-                        None
-                    };
-                    (watched, hlc)
-                };
+                // #985: 覚えを作り始めたか (印は `sync_ops_purge_lock` の下で立つ = この purge の間は変わらない。 立つ前に消した行は、
+                // 印を立てた後の読み直しが見ない)
+                let watched = self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire);
                 let hlc = self.oplog.as_ref().map_or(enchudb_oplog::Hlc::ZERO, |wal| wal.mint_hlc());
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
@@ -14387,11 +14462,8 @@ impl Engine {
                     self.warn_local_write_rejected(row_local, u16::MAX, hlc);
                 }
                 // #985: 消した後に覚えを触る (触る前の問いは消えた行の版数を含む = 下の境のまま)
-                {
-                    let mut st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
-                    if st.seeded || st.scanning.is_some() {
-                        st.gone(if gone_hlc.0 { gone_hlc.1 } else { None });
-                    }
+                if watched {
+                    self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).gone(gone_hlc);
                 }
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
@@ -14720,7 +14792,8 @@ impl Engine {
             // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)。
             // #221: delete + push は専用 lock 下で atomic に (並行 reclaim の二重
             // push = slot 二重払い出し → bridge row の silent 上書き、を塞ぐ)。
-            if self.purge_sync_ops_row(eid, lsn_hid_u16, lsn) {
+            // #985: 版数は上で読んだ物を渡す (読み直さない)
+            if self.purge_sync_ops_row_at(eid, lsn_hid_u16, lsn, decoded.map(|(_, h)| h)) {
                 purged += 1;
             }
         }
@@ -15696,6 +15769,12 @@ impl Engine {
         if let Some(r) = self.sync_payload_ring.get() {
             return Some(r);
         }
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref()
+            && payload_ring_open_fault::on(wal)
+        {
+            return None;
+        }
         let Backing::Segments(set) = &self.backing else { return None };
         let readonly = self.is_readonly();
         let exists = set.dir().join(FILE).exists();
@@ -15804,6 +15883,13 @@ impl Engine {
         }
         // 読み直しは 1 つずつ (待っていた間に前の読み直しが覚えを作ったら、 それを使う)
         let _scan = self.ring_oldest_scan.lock().unwrap_or_else(|p| p.into_inner());
+        // 最初の問い: bridge と回収が覚えを触り始める印を立てる。 bridge の周 (`transfer_lock`) と回収 (`sync_ops_purge_lock`) の
+        // 外で立てる = 立てる前に済んだ周の行と消えた行は読み直しが見て、 立てた後の周と回収は覚えを触る (印の前は誰も lock を取らない)
+        if !self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire) {
+            let _bridge = self.transfer_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _purge = self.sync_ops_purge_lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.ring_oldest_on.store(true, std::sync::atomic::Ordering::Release);
+        }
         {
             let mut st = self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(a) = st.answer(below) {
@@ -15822,6 +15908,11 @@ impl Engine {
         // 読み直しの間に足された行は読み直しが見ていないかもしれない (足す)。 消えた行は読み直しが数えたかもしれない: その版数が
         // 答え以下なら、 答えは下の境 (最小そのものとは言わない)
         let (added, gone) = st.scanning.take().unwrap_or((None, Some(enchudb_oplog::Hlc::ZERO)));
+        let Some(scanned) = scanned else {
+            // ring を開けず、 payload が ring にある行の版数を読めなかった: 覚えを作らない (次の問いが読み直す)。 答えは
+            // 「どの行より上か分からない」 = ZERO (F を進めない側。 前は読めた行だけの最小を返した = 読めない行を越えうる)
+            return Some(enchudb_oplog::Hlc::ZERO).filter(|m| below.is_none_or(|b| *m < b));
+        };
         let min = match (scanned, added) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -15832,17 +15923,28 @@ impl Engine {
         min.filter(|m| below.is_none_or(|b| *m < b))
     }
 
-    /// #985: ring の行 (lsn が 0 でない) を全部なめた版数の最小。 payload は写さず、 decode と同じ検査で (書き手, 版数) だけを読む。
-    fn scan_ring_min(&self) -> Option<enchudb_oplog::Hlc> {
+    /// #985: ring の行 (lsn が 0 でない) を全部なめた版数の最小 (`Some(None)` = 行が無い)。 payload は写さず、 decode と同じ検査で
+    /// (書き手, 版数) だけを読む。 payload が ring にある行があるのに ring を開けない時は None (読めないのは置き場で、 行は壊れて
+    /// いない = 数えないと最小が上に出る。 ack の walk と回収の `sync_payload_unreachable` と同じ見方)。
+    fn scan_ring_min(&self) -> Option<Option<enchudb_oplog::Hlc>> {
         if !self.sync_tables_enabled() {
+            return Some(None);
+        }
+        let Some(cols) = self.sync_payload_cols() else { return Some(None) };
+        let rows = self.table_slots_with_value32(cols.lsn, |lsn| lsn != 0);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(at) = cols.at
+            && self.payload_ring(false).is_none()
+            && rows.iter().any(|&(_, slot)| self.himos.get(at as usize).is_some_and(|h| h.get_value32(slot).is_some()))
+        {
             return None;
         }
-        let cols = self.sync_payload_cols()?;
-        self.table_slots_with_value32(cols.lsn, |lsn| lsn != 0)
-            .into_iter()
-            .filter_map(|(lsn, slot)| self.sync_op_read(slot, lsn, &cols, enchudb_oplog::oplog::sync_ops_payload_walk_key))
-            .map(|(_, h)| h)
-            .min()
+        Some(
+            rows.into_iter()
+                .filter_map(|(lsn, slot)| self.sync_op_read(slot, lsn, &cols, enchudb_oplog::oplog::sync_ops_payload_walk_key))
+                .map(|(_, h)| h)
+                .min(),
+        )
     }
 
     /// #828: `_sync_ops` の行のうち **配ってよい物** の payload (lsn の順)。 ring が満杯で bridge が同じ (書き手, 版数) の組の
@@ -16419,11 +16521,18 @@ impl Engine {
     /// 生きている印の届いていない行は書き出しが済んでおらず、 その record は WAL に残っていて、 開いた後に写し直される。
     /// lock の順は purge と同じ (`free_locals` → 行)。
     fn drop_cells_of_dead_ring_slot(&self, local: u32) {
-        let _row = self.row_locks.write(local);
-        for hid in 0..self.himos.len() {
-            if self.himos[hid].get_value(local).is_some() {
-                self.remove_cell_freeing_leaf(local, hid);
+        {
+            let _row = self.row_locks.write(local);
+            for hid in 0..self.himos.len() {
+                if self.himos[hid].get_value(local).is_some() {
+                    self.remove_cell_freeing_leaf(local, hid);
+                }
             }
+        }
+        // #985: ring の行が 1 つ消えた (版数は読まない = 最小だったかもしれない)。 bridge (`transfer_lock` の下) の払い出しから
+        // 来るので、 覚えの印はこの間変わらない
+        if self.ring_oldest_on.load(std::sync::atomic::Ordering::Acquire) {
+            self.ring_oldest.lock().unwrap_or_else(|p| p.into_inner()).gone(None);
         }
     }
 
@@ -32684,10 +32793,19 @@ mod ring_oldest_tests {
         assert_eq!(scans(&eng), s1, "下の境が問いの境以上なのに ring を読んだ");
         let next = same(&eng, "最小の組を両方消した");
         assert!(next > Some(old), "前提: 最小が上がった ({next:?})");
-        // 回収 (ack の後の reclaim) で古い方の行が消える
-        let lsn_mid = eng.current_sync_lsn() / 2;
+        // 回収 (ack の後の reclaim) で古い方の行が消える。 消える行より lsn が新しく版数の古い行 (中継) が最小なら、 回収は
+        // 最小を消さない = 読み直さない (回収は読んだ版数を渡す)
+        let lsn_mid = eng.current_sync_lsn();
+        let pin = at(old.wall - 1_000, 0, 9);
+        relay(&eng, 9, &[pin]);
+        assert_eq!(same(&eng, "回収の前の中継"), Some(pin));
+        let s3 = scans(&eng);
         eng.ack_sync(42, lsn_mid).unwrap();
         assert!(eng.reclaim_sync_ops() > 0, "前提: 回収した");
+        assert_eq!(same(&eng, "最小より上の行の回収"), Some(pin));
+        assert_eq!(scans(&eng), s3, "回収が最小より上の行だけを消したのに ring を読んだ");
+        // 最小も回収する
+        purge(&eng, &rows_at(&eng, pin));
         same(&eng, "回収の後");
         // 読めない行 (lsn はあるが payload の無い行、 #217 の dead row) は数えない
         let cols = eng.sync_payload_cols().unwrap();
@@ -32699,8 +32817,8 @@ mod ring_oldest_tests {
         let eng = Engine::open_concurrent_with_oplog(&p, 1 << 20).unwrap();
         let s2 = scans(&eng);
         {
-            // 配ってよい所の終わりを置く bridge (consumer の周) を止めておく
-            let _no_bridge = eng.transfer_lock_for_fold();
+            // 配ってよい所の終わりを置く bridge (consumer の周) を止めておく (`transfer_lock` は最初の問いが取るので握らない)
+            let _no_bridge = eng.hold_consumer();
             eng.sync_settled_known.store(true, std::sync::atomic::Ordering::Release);
             eng.sync_settled_lsn.store(1, std::sync::atomic::Ordering::Release);
             assert!(eng.settled_sync_ops().len() < eng.pending_sync_ops(0).len(), "前提: 配ってよい所の後ろに行がある");
@@ -32751,6 +32869,89 @@ mod ring_oldest_tests {
         assert!(want > Some(base), "前提: 割り込み点で最小の行が消えた ({want:?})");
         assert!(got <= want, "読み直しの答えが ring の最小より上 ({got:?} > {want:?})");
         assert_eq!(eng.sync_ring_min_hlc(), want, "読み直しの間に消えた最小の行の版数を、 最小そのものとして覚えた");
+    }
+
+    /// payload の ring を開けない時の読み直し (開き直した後、 ring を開く最初の呼び手が覚えを作る読み直しで、 その 1 回だけ開けない
+    /// = fd が尽きた等)。 ring に payload を持つ行の版数を読めないので、 答えは下の境 (ZERO) で、 覚えは作らない。 開けるように
+    /// なった後の問いは読み直して最小そのものを返す。
+    ///
+    /// falsify: 開けなかった読み直しで覚えを作ると、 読めた行だけの最小 (ここでは行が無い = None) を最小そのものとして覚え、 開ける
+    /// ようになった後も返し続ける (F が ring の行を越える側)。
+    #[test]
+    fn a_ring_that_cannot_be_opened_is_not_remembered() {
+        let p = path("unopened");
+        let _tmp = Tmp(p.clone());
+        {
+            let eng = engine(&p);
+            own(&eng, 3);
+            relay(&eng, 9, &[at(1_000, 0, 9)]);
+            eng.oplog_sync().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&p, 1 << 20).unwrap();
+        let wal = eng.oplog.as_ref().unwrap();
+        payload_ring_open_fault::set(wal, true);
+        assert!(eng.sync_payload_ring.get().is_none(), "前提: 開き直した後、 まだ ring を開いていない");
+        let during = eng.sync_ring_min_hlc();
+        let below = eng.sync_ring_min_below(at(u64::MAX, 0, 0));
+        payload_ring_open_fault::set(wal, false);
+        let want = full(&eng);
+        assert_eq!(want, Some(at(1_000, 0, 9)), "前提: ring に行がある");
+        assert!(during.is_some_and(|d| d <= at(1_000, 0, 9)), "ring を開けない間の答えが ring の最小より上 ({during:?})");
+        assert!(below.is_some(), "ring を開けない間に 「境より下の行は無い」 と答えた");
+        assert_eq!(same(&eng, "開けるようになった後"), want);
+    }
+
+    /// bridge が payload をどこにも書けなかった行 (lsn だけの行 = 読み直しが数えない dead row) は、 覚えにも入れない。 bridge を
+    /// 通る形 (`bridge_payload_fault`)。
+    ///
+    /// falsify: bridge が書いた行を読まずに record の版数で覚えを下げると、 読めない行の版数を最小として返し続ける (F が低く留まる)。
+    #[test]
+    fn rows_the_bridge_could_not_write_are_not_remembered() {
+        let p = path("unwritten");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        own(&eng, 3);
+        let base = same(&eng, "自分の書き込み").unwrap();
+        let wal = eng.oplog.as_ref().unwrap();
+        bridge_payload_fault::set(wal, true);
+        relay(&eng, 9, &[at(base.wall - 5_000, 0, 9)]);
+        bridge_payload_fault::set(wal, false);
+        let cols = eng.sync_payload_cols().unwrap();
+        let rows = eng.table_slots_with_value32(cols.lsn, |l| l != 0).len();
+        assert!(eng.pending_sync_ops(0).len() < rows, "前提: payload の無い行が ring にある");
+        assert_eq!(same(&eng, "payload を書けなかった行"), Some(base));
+    }
+
+    /// #858: 開き直した ring の 「生きていないのに lsn の列に居る」 slot を、 bridge の払い出しが穴として拾って cell を落とす。
+    /// その行が最小なら、 覚えは最小そのものでなくなる。
+    ///
+    /// falsify: cell を落とす道が覚えに知らせないと、 消えた行の版数を返し続ける (F が低く留まる)。
+    #[test]
+    fn a_dead_ring_slot_picked_up_by_the_bridge_leaves_the_remembered_min() {
+        let p = path("dead858");
+        let _tmp = Tmp(p.clone());
+        let eng = engine(&p);
+        own(&eng, 3);
+        let ghost = at(1_000, 0, 9);
+        relay(&eng, 9, &[ghost]);
+        assert_eq!(same(&eng, "最小の行"), Some(ghost));
+        let rows = rows_at(&eng, ghost);
+        assert_eq!(rows.len(), 1, "前提: 最小の行が 1 つ");
+        // 生きている印だけが届かなかった像の slot (cell は残る)
+        eng.entities.free(enchudb_oplog::eid_local(rows[0].0));
+        assert_eq!(full(&eng), Some(ghost), "前提: 直す前の読みも、 生きていない slot の行を数える");
+        // 払い出し切った ring = 次の払い出しが穴を探して、 その slot の cell を落とす
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+        let table = &eng.tables[tid];
+        table.next_local.store(table.capacity(), std::sync::atomic::Ordering::Release);
+        table.free_locals.lock().unwrap().clear();
+        table.free_locals_nonempty.store(false, std::sync::atomic::Ordering::Release);
+        {
+            let _bridge = eng.transfer_lock_for_fold();
+            eng.entity_in("_sync_ops").unwrap();
+        }
+        assert!(full(&eng) > Some(ghost), "前提: 払い出しが slot の cell を落とした ({:?})", full(&eng));
+        same(&eng, "cell を落とした後");
     }
 
     /// 覚えの 4 つの形の答え (行を使わない)。
