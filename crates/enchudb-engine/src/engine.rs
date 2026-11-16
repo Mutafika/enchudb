@@ -31022,6 +31022,15 @@ impl Engine {
         write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
         set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))?;
         let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k) && !prev(k);
+        // #978: 残りのうち削除が落とす cell を持つのは列 (紐の segment) だけ。 列でない物 (header …) は門の外で先に書き出し、 列は
+        // 門の中で並べて msync する (門を閉じている間 = 削除が待つ間を、 列 1 本ずつの msync の和でなく、 いちばん長い 1 本にする)
+        let rest_columns = |k: SegmentKind| rest(k) && matches!(k, SegmentKind::Himo(_));
+        let rest_others = |k: SegmentKind| rest(k) && !matches!(k, SegmentKind::Himo(_));
+        if catch_up {
+            set.flush_all_spread(rest_others)?;
+        } else {
+            set.flush_where(all, rest_others)?;
+        }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeRest);
         {
@@ -31029,9 +31038,9 @@ impl Engine {
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::RestClosed);
             if catch_up {
-                set.flush_all_spread(rest)?;
+                set.flush_all_spread(rest_columns)?;
             } else {
-                set.flush_where(all, rest)?;
+                set.flush_spread(all, rest_columns)?;
             }
         }
         #[cfg(feature = "crashsim")]
@@ -31124,6 +31133,11 @@ impl Engine {
     /// #978: 削除 (tombstone を置いた後に行の cell を落とす所) が、 書き出しが列を msync する間の削除の門で待った回数 (観測用)。
     pub fn delete_gate_waits(&self) -> u64 {
         self.delete_gate.waits()
+    }
+
+    /// #978: 書き出しが削除の門を閉じていた時間の合計 (ns)。 閉じている間、 tombstone を置いた削除は行の cell を落とす前で待つ。
+    pub fn delete_gate_closed_ns(&self) -> u64 {
+        self.delete_gate.closed_ns()
     }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。

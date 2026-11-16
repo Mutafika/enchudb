@@ -32,6 +32,8 @@ pub struct DeleteGate {
     shards: [Shard; SHARDS],
     /// 閉じている門に当たった削除の数 (観測用)
     waits: AtomicU64,
+    /// 門を閉じていた時間の合計 (ns、 観測用。 閉じる側が並んだ区間は、 それぞれの区間を足す)
+    closed_ns: AtomicU64,
 }
 
 impl Default for DeleteGate {
@@ -54,7 +56,7 @@ fn backoff(spins: &mut u32) {
 
 impl DeleteGate {
     pub fn new() -> Self {
-        Self { shards: Default::default(), waits: AtomicU64::new(0) }
+        Self { shards: Default::default(), waits: AtomicU64::new(0), closed_ns: AtomicU64::new(0) }
     }
 
     /// 削除が行 `key` の cell を落とす間持つ。 閉じていれば開くまで待つ。 tombstone はこの前に書くこと (閉じる側は中の削除が出るのを
@@ -79,6 +81,7 @@ impl DeleteGate {
     /// 門を閉じ、 中に居る削除が出るのを待つ。 返った後は、 門の中で落とした cell とその前に書いた tombstone が全部見える。 閉じる側は
     /// 並んでよい (全部が開くまで削除は入れない)。 drop で開く。
     pub fn close(&self) -> DeleteClosed<'_> {
+        let start = std::time::Instant::now();
         for s in &self.shards {
             s.0.fetch_add(CLOSER, Ordering::AcqRel);
         }
@@ -89,12 +92,17 @@ impl DeleteGate {
                 backoff(&mut spins);
             }
         }
-        DeleteClosed { gate: self }
+        DeleteClosed { gate: self, start }
     }
 
     /// 閉じている門に当たった削除の数 (#978、 観測用)。
     pub fn waits(&self) -> u64 {
         self.waits.load(Ordering::Relaxed)
+    }
+
+    /// 門を閉じていた時間の合計 (ns、 #978、 観測用)。
+    pub fn closed_ns(&self) -> u64 {
+        self.closed_ns.load(Ordering::Relaxed)
     }
 }
 
@@ -112,6 +120,7 @@ impl Drop for DeletePass<'_> {
 /// 閉じている間持つ。
 pub struct DeleteClosed<'a> {
     gate: &'a DeleteGate,
+    start: std::time::Instant,
 }
 
 impl Drop for DeleteClosed<'_> {
@@ -119,6 +128,8 @@ impl Drop for DeleteClosed<'_> {
         for s in &self.gate.shards {
             s.0.fetch_sub(CLOSER, Ordering::Release);
         }
+        let ns = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.gate.closed_ns.fetch_add(ns, Ordering::Relaxed);
     }
 }
 

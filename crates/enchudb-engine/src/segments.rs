@@ -623,11 +623,27 @@ impl SegmentSet {
     pub fn flush_all_spread(&self, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
         let segs: Vec<(SegmentKind, Arc<SegmentMap>)> = self.all().into_iter().filter(|(k, _)| pick(*k)).collect();
         let workers = segs.iter().filter(|(_, s)| s.committed() > FLUSH_ALL_SMALL).count().clamp(1, FLUSH_ALL_WORKERS);
+        Self::flush_by_workers(&segs, true, workers)
+    }
+
+    /// `pick` が選んだ segment のうち書くもののある物 (`all` = 全部) を、 [`FLUSH_ALL_WORKERS`] 本までの thread に分けて msync する
+    /// (#978: 削除の門を閉じている間の、 中身を指さない列の書き出し。 閉じている間を列 1 本ずつの msync の和でなく、 長い物に寄せる。
+    /// [`Self::flush_parallel`] は segment ごとに thread を立てるので、 列の多い表では書き出しのたびに列の数だけ立てる)。 書くものの
+    /// 有無は [`Self::flush_parallel`] と同じ (`SegmentMap::flush_pending`)。 印を通さない store (header / entity) は選ばないこと。
+    pub fn flush_spread(&self, all: bool, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
+        let segs: Vec<(SegmentKind, Arc<SegmentMap>)> =
+            self.all().into_iter().filter(|(k, s)| pick(*k) && (all || s.flush_pending())).collect();
+        let workers = segs.len().clamp(1, FLUSH_ALL_WORKERS);
+        Self::flush_by_workers(&segs, all, workers)
+    }
+
+    /// `segs` を `workers` 本の thread (呼んだ thread を含む) が 1 つずつ取って msync する。 どれかが失敗したら Err (残りも試みる)。
+    fn flush_by_workers(segs: &[(SegmentKind, Arc<SegmentMap>)], all: bool, workers: usize) -> io::Result<()> {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let work = || -> io::Result<()> {
             let mut res = Ok(());
             while let Some((k, s)) = segs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                res = res.and(Self::flush_segment(*k, s, true));
+                res = res.and(Self::flush_segment(*k, s, all));
             }
             res
         };
