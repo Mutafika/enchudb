@@ -4338,12 +4338,9 @@ impl OpLog {
     /// checkpoint から同じ確かめ方で読み、 最初の当てる record (Commit と読み飛ばしてよい op 以外の、 読めた record) で止まる
     /// (record を解いて写すのはその 1 件だけ)。 読むだけ (clock を戻さない)。
     pub fn has_records_to_replay(&self) -> bool {
+        let s = self.scan_range_until(self.checkpoint(), u64::MAX, |_| (), || true);
         // 当てる record を見た数 (止まれば 1)
-        let mut seen = 0u64;
-        let s = self.scan_range_until(self.checkpoint(), u64::MAX, |_| {
-            seen += 1;
-            std::ops::ControlFlow::<(), ()>::Break(())
-        });
+        let seen = (s.out.len() + s.tail.len()) as u64;
         let read = s.commit_ends.len() as u64 + seen;
         note_wal_read(|r| r.probe_records += read);
         seen > 0
@@ -4560,18 +4557,21 @@ impl OpLog {
     }
 
     /// [`Self::scan_range`] の record 1 件の形を `mk` で決める版 (確かめ方は同じ)。 `mk` は Commit 以外の読めた record ごとに 1 回。
-    fn scan_range_with<'s, R>(&'s self, start_offset: u64, upto: u64, mut mk: impl FnMut(RecordRef<'s>) -> R) -> ScanOut<R> {
-        self.scan_range_until(start_offset, upto, |r| std::ops::ControlFlow::Continue(mk(r)))
+    fn scan_range_with<'s, R>(&'s self, start_offset: u64, upto: u64, mk: impl FnMut(RecordRef<'s>) -> R) -> ScanOut<R> {
+        self.scan_range_until(start_offset, upto, mk, || false)
     }
 
-    /// [`Self::scan_range_with`] の、 `mk` が `Break` を返したらその record で読むのを止める版 (#972: 再生する record があるかを聞く
-    /// 読みは最初の 1 件で止まる)。 止めた record は返す並びに入れない。 止めた時の `ScanOut` の位置 (`committed_end` / `stop`) は
-    /// 読み切った読みの物ではない (使わないこと)。 確かめ方 (magic / 版 / CRC / 周の印 / op) は同じ 1 本の道。
+    /// [`Self::scan_range_with`] の、 `mk` で record を積んだ後に `stop_after` が true ならそこで読むのを止める版 (#972: 再生する record が
+    /// あるかを聞く読みは最初の 1 件で止まる)。 止めた時の `ScanOut` の位置 (`committed_end` / `stop`) は読み切った読みの物ではない
+    /// (使わないこと)。 確かめ方 (magic / 版 / CRC / 周の印 / op) は同じ 1 本の道。 `stop_after` を `mk` の戻り値 (`ControlFlow<(), R>`) に
+    /// しないのは、 changefeed の記録への写し (#683、 `R` = `RecordRef`) で record ごとに包みを動かす分 1 件 1 ns ほど遅くなったため
+    /// (`|| false` は消える)。
     fn scan_range_until<'s, R>(
         &'s self,
         start_offset: u64,
         upto: u64,
-        mut mk: impl FnMut(RecordRef<'s>) -> std::ops::ControlFlow<(), R>,
+        mut mk: impl FnMut(RecordRef<'s>) -> R,
+        mut stop_after: impl FnMut() -> bool,
     ) -> ScanOut<R> {
         // `out[..committed]` は Commit で閉じた group、 その後ろは閉じていない末尾 (#683: 前は group ごとに別の Vec に積んで Commit で
         // 移していた。 changefeed の記録への写しでは group が 1〜2 件で、 移すのが record ごとの memmove になっていた)
@@ -4669,12 +4669,13 @@ impl OpLog {
                         commit_ends.push(committed_end);
                     }
                     Some(other) => {
-                        let std::ops::ControlFlow::Continue(r) =
-                            mk(RecordRef { lsn, hlc, author_peer, op: other, header, payload: payload_slice })
-                        else {
+                        out.push((
+                            mk(RecordRef { lsn, hlc, author_peer, op: other, header, payload: payload_slice }),
+                            wal_pos(lap, (next_off - base) as u64),
+                        ));
+                        if stop_after() {
                             break 'parts;
-                        };
-                        out.push((r, wal_pos(lap, (next_off - base) as u64)));
+                        }
                     }
                     // #178: 知らない版が書いた 「読み飛ばしてよい」 op は、 その record だけ飛ばして先を読む (下の打ち切りと違い、
                     // 後ろの record を捨てない)
