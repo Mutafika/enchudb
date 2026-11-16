@@ -148,6 +148,10 @@ fn stats_snapshot() {
         e.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
+    // consumer の周期を止める (#981): 周期は head が checkpoint より先にあると自分の Commit (120 B) を積む。 `oplog_sync` の書き出しの
+    // 最中 (Commit を積んで覆う位置を取った後・checkpoint を進める前) に来ると、 その Commit は `oplog_sync` の覆う位置の先に残り、
+    // 返った時に head は checkpoint の 120 B 先 (書き出しが周期 (100 ms) より遅いと毎回)。 止めると WAL に積むのはこの thread だけになる
+    let hold = eng.hold_consumer();
     for i in 0..50u32 {
         let ent = eng.entity().unwrap();
         eng.tie_async(ent, "n", i);
@@ -156,6 +160,7 @@ fn stats_snapshot() {
     eng.oplog_sync().unwrap();
 
     let s = eng.stats();
+    drop(hold);
     assert_eq!(s.entity_count, 50);
     assert!(s.oplog_head > 0);
     assert_eq!(s.oplog_head, s.oplog_checkpoint, "after oplog_sync, checkpoint == head");
