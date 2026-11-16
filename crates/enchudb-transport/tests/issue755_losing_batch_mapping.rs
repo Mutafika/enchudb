@@ -41,13 +41,17 @@ impl Drop for Dir {
 
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        let dst = to.join(e.file_name());
-        if e.file_type().unwrap().is_dir() {
-            copy_dir(&e.path(), &dst);
-        } else {
-            std::fs::copy(e.path(), &dst).unwrap();
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(from).unwrap().map(|e| e.unwrap()).collect();
+    // `pkformer` のまとめ直し (consumer の周期が別の thread で走らせる、 review987 [1]) は `pkformer` → log の順に置き換える。 log を
+    // 先に写せば、 置き換えの途中を写しても 「古い log と新しい pkformer」 (log は読まず、 pkformer に全部ある) にしかならない
+    entries.sort_by_key(|e| e.file_name() == "pkformer");
+    for entry in entries {
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else if !entry.file_name().to_string_lossy().ends_with(".tmp") {
+            // 一時 file (書き出しの途中、 まとめ直しが作って消す) は DB ではない (`db_files::is_copyable_entry`)
+            std::fs::copy(entry.path(), dest).unwrap();
         }
     }
 }
