@@ -572,7 +572,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         drop(first);
-        in_rx.recv().unwrap();
+        in_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("1 本目が開いても、 待っていた削除が入らない (寝た削除を起こし損ねた。 join せずに落とす)");
         out_tx.send(()).unwrap();
         let end = Instant::now() + Duration::from_secs(60);
         while !second.is_finished() {
