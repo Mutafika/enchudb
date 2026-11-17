@@ -55,6 +55,9 @@ pub enum Alloc {
     Skip,
     /// 使い回す場所 (global) の行が他の書き手に握られていた (#974)。 `alloc_lock` を放してから待ち、 もう一度払い出す
     Busy(u32),
+    /// 確保先はあるが今は空きが無い (#970: 場所の世代を書く gen.seg の page を commit できない)。 写像を作らずに `None` (`Skip` と
+    /// 同じ)。 呼び手 (`Engine::try_resolve_remote_eid`) は払い出しの中でこれを見て、 record を落とさず再配送させる
+    Retry,
 }
 
 /// foreign eid → local eid の翻訳テーブル。
@@ -90,6 +93,11 @@ pub struct EidTranslator {
     /// #560: `.eidmap` の中身 (逆写像の組) が変わった key。 engine が書き出しの時に取り出し、 その key の今の中身だけを
     /// `eidmap.log` に追記する。 変えた後に積む (先に積むと、 取り出した書き出しが古い中身を書き、 後の変更に印が無い)
     dirty: std::sync::Mutex<Vec<Key>>,
+    /// PR #977 の読み直し 5 の [A]: 開く時の WAL の再生の間だけ、 写像を載せた ([`Self::insert`]) key を積む
+    /// ([`Self::start_journal`] / [`Self::take_journal`])。 再生が空きの不足で開くのを断る時、 断るまでに再生が払い出した場所の写像を
+    /// `.eidmap` に置くため (engine の `keep_replayed_mappings`)。 普段は `None` (atomic の load 1 回で素通り)。
+    journal: std::sync::Mutex<Option<Vec<Key>>>,
+    journaling: std::sync::atomic::AtomicBool,
 }
 
 impl Default for EidTranslator {
@@ -107,7 +115,24 @@ impl EidTranslator {
             authors: RwLock::new(std::collections::BTreeSet::new()),
             alloc_lock: std::sync::Mutex::new(()),
             dirty: std::sync::Mutex::new(Vec::new()),
+            journal: std::sync::Mutex::new(None),
+            journaling: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// PR #977 の読み直し 5 の [A]: 写像を載せた key を積み始める (開く時の WAL の再生の前)。
+    pub fn start_journal(&self) {
+        *self.journal.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+        self.journaling.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 積むのをやめて、 積んだ key を返す (重ねて積まれた key は 1 つに)。
+    pub fn take_journal(&self) -> Vec<Key> {
+        self.journaling.store(false, std::sync::atomic::Ordering::Release);
+        let mut v = self.journal.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// #560: key の `.eidmap` の中身が変わった印 (engine の削除の版数の変化もここに積む)。
@@ -215,6 +240,11 @@ impl EidTranslator {
         self.mark_dirty(key);
         if let Some(prev) = displaced {
             self.mark_dirty(prev);
+        }
+        if self.journaling.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(j) = self.journal.lock().unwrap_or_else(|p| p.into_inner()).as_mut()
+        {
+            j.push(key);
         }
         // #226: author 索引。 lock は単独で取る (`inner` / `translated_locals` と
         // 同時には保持しないので、 既存の順序制約に影響しない)。
@@ -382,7 +412,7 @@ impl EidTranslator {
                         self.insert(author_peer, foreign_local, local, 0);
                         return Some(local);
                     }
-                    Alloc::Skip => return None,
+                    Alloc::Skip | Alloc::Retry => return None,
                     Alloc::Busy(slot) => slot,
                 }
             };

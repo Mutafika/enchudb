@@ -278,6 +278,15 @@ enum ApplyResult {
     /// #210: **容量が足りず apply を拒否した**。 値は書いていないので、
     /// `SkippedOlder` (再配送不要) ではなく **cursor を止めて再配送させる**。
     RejectedCapacity,
+    /// PR #977 の読み直し 5 の [B]: 当てた (`Applied`) 後の続き (名前の削除優先で、 その名前より後に消された行を消す時の名前の束ねの
+    /// 切り離し) が容量で断られた。 record は当たっているので中継の一覧に当たった物として積み (ホストでない中継も載せる)、 続きを
+    /// 当て直すために cursor だけを止めて再配送させる (届き直した record は同じ版数・同じ中身で LWW が飛ばし、 #614 の確かめが消し
+    /// 直す)。 `RejectedCapacity` (= 何も当てていない、 #210) と分ける: 前は `RejectedCapacity` を返し、 ホストでない中継が当たった
+    /// record を配らず、 届き直した時は LWW で飛ばして配らない = 下流がその行の名前の書き込みを一度も受けなかった。
+    ///
+    /// 今の束ねの規則では起きない (束ねた identity の作成はその名前の書き込みの版数 = 行の名前の cell の版数以下なので、 当たった
+    /// 名前の書き込みより後に消された名前の行に、 その削除より後に作られた identity は居ない = 切り離しは払い出さない) 守り
+    AppliedRedeliver,
 }
 
 impl From<RemoteApply> for ApplyResult {
@@ -2015,7 +2024,9 @@ impl Syncer {
     /// (既に二重化した store の修復も別途必要 — #141 参照)。
     ///
     /// 戻り値: 束ねた / 払い出した local eid (#513: 呼び手はそのまま当て、 写像を引き直さない)。 束ねなかった時と、 PK Tie の
-    /// 書き手が entity の産みの親でない時 (写像の鍵が束ねと引きで違う) は `None` (呼び手が今までどおり引く)。
+    /// 書き手が entity の産みの親でない時 (写像の鍵が束ねと引きで違う) は `Ok(None)` (呼び手が今までどおり引く)。
+    /// #970 (PR #977 の読み直し 4 の [1]): 払い出し / 一緒に消す行の切り離しが空きの不足で断られた時は `Err(RejectedCapacity)`
+    /// (呼び手は record を当てずに再配送させる)。
     fn bind_by_primary_key(
         &self,
         rec: &WireRecord,
@@ -2023,24 +2034,25 @@ impl Syncer {
         pk_ties: &std::collections::HashMap<enchudb_oplog::EntityId, usize>,
         dying: &std::collections::HashMap<enchudb_oplog::EntityId, Hlc>,
         admits: impl Fn(&WireRecord) -> bool,
-    ) -> Option<enchudb_oplog::EntityId> {
+    ) -> Result<Option<enchudb_oplog::EntityId>, RemoteApply> {
         let rec = match &rec.op {
             DecodedOp::Tie { himo_id, .. } if self.engine.is_pk_himo(*himo_id) => rec,
             op => {
-                let row = Self::row_of(op)?;
-                let pk = &batch[*pk_ties.get(&row)?];
+                let Some(row) = Self::row_of(op) else { return Ok(None) };
+                let Some(&at) = pk_ties.get(&row) else { return Ok(None) };
+                let pk = &batch[at];
                 // 写像を先に見る (行の 2 件目からは写像があるので、 PK Tie の署名を確かめ直さない)
                 if self.engine.resolve_remote_eid_existing(row).is_some() || !admits(pk) {
-                    return None;
+                    return Ok(None);
                 }
                 pk
             }
         };
-        let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { return None };
+        let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { return Ok(None) };
         // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。 自分の行も束ねない (#731 段 4: もう無い自分の行の
         // 番号は写像を引けないが、 自分の行を名前で他の行に束ねることは無い)
         if enchudb_oplog::eid_peer(*eid) == self.engine.peer_id() || self.engine.resolve_remote_eid_existing(*eid).is_some() {
-            return None;
+            return Ok(None);
         }
         let own = rec.author_peer == enchudb_oplog::eid_peer(*eid);
         // PK は Tag / Number 想定 (Ref を PK にはしない)。 remote vocab vid を
@@ -2056,20 +2068,22 @@ impl Syncer {
                 // 居るはず。 その bytes で local vocab を引き、 同じ文字列が local に
                 // 既存ならその vid で照合する。 bytes ごと未知なら、 この PK
                 // 文字列を持つ既存 row は存在し得ない → bind せず払い出しに任せる。
-                let bytes = batch.iter().find_map(|r| match &r.op {
+                let Some(bytes) = batch.iter().find_map(|r| match &r.op {
                     DecodedOp::Vocab { vid, bytes } if r.author_peer == rec.author_peer && *vid as u64 == *value => {
                         Some(bytes)
                     }
                     _ => None,
-                })?;
+                }) else {
+                    return Ok(None);
+                };
                 match self.engine.vocab_id_bytes(bytes) {
                     Some(v) => v as u64,
                     None => {
                         // #513: その主キーの行を前に消していれば (辞書の回収で文字列が辞書から消えていても)、 削除を当てる
-                        return self
+                        return Ok(self
                             .engine
-                            .reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Text(bytes), rec.hlc)
-                            .filter(|_| own);
+                            .try_reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Text(bytes), rec.hlc)?
+                            .filter(|_| own));
                     }
                 }
             }
@@ -2079,8 +2093,8 @@ impl Syncer {
         // よらず同じ行にする)。 改名より後に作られた行は、 今その名前の行に束ねる (無ければ新しいデッキ)。 改名の後にその名前で
         // 作られた行が先に届いていても、 改名より前に作られた行はそちらに束ねない
         let created = rec.hlc;
-        let reserve = || {
-            self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Local(local_value), created).filter(|_| own)
+        let reserve = || -> Result<Option<enchudb_oplog::EntityId>, RemoteApply> {
+            Ok(self.engine.try_reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Local(local_value), created)?.filter(|_| own))
         };
         // #939: 引いた行が束ねる前に消えた (場所を使い回された) 時は、 名前で引き直す (引いた後の削除で答えが変わる: 削除より前に
         // 作られた entity は消えたデッキ、 使い回した行が同じ名前なら足し直した行)。 回るのは、 引いてから行の lock までの間に
@@ -2106,7 +2120,7 @@ impl Syncer {
                 // #614: 改名した行は、 その名前を持ち始めた時刻で見る (名前の cell の版数は、 後の改名の版数)
                 if self.engine.name_held_from(l, *himo_id, local_value) > t {
                     // 足し直した行: 束ねない。 消えた entity は死んだ slot、 この batch で消える entity は普通の払い出し (後の削除で消える)
-                    return if dead_at.is_some() { reserve() } else { None };
+                    return if dead_at.is_some() { reserve() } else { Ok(None) };
                 }
                 if dead_at.is_some() {
                     // その削除より前からある行は同じ行: 一緒に消える (先に束ねてから削除を受けた peer と同じ)
@@ -2114,7 +2128,11 @@ impl Syncer {
                     // 場所の最後の行と比べる (前は照合なしで消し、 引いた後に消して場所を使い回した新しい行を消した)
                     #[cfg(test)]
                     apply_hook::call();
-                    self.engine.remote_delete_apply_at(l, enchudb_oplog::eid_local(l), t);
+                    // #970 (読み直し 4 の [1]): 一緒に消す行の切り離しが場所を払い出せなければ、 この record ごと再配送させる (消さずに
+                    // 払い出すと、 消えるはずの行が残る)
+                    if self.engine.remote_delete_apply_at_result(l, enchudb_oplog::eid_local(l), t) == RemoteApply::RejectedCapacity {
+                        return Err(RemoteApply::RejectedCapacity);
+                    }
                     return reserve();
                 }
             }
@@ -2133,7 +2151,7 @@ impl Syncer {
             if let Some(bound) =
                 self.engine.bind_remote_eid_by_pk_at(rec.author_peer, *eid, existing, *himo_id, local_value, created)
             {
-                return own.then_some(bound);
+                return Ok(own.then_some(bound));
             }
         }
     }
@@ -2281,14 +2299,18 @@ impl Syncer {
                 continue;
             }
             // 束ねに使う名前のカードは、 この batch で当たる物だけ (断った物と、 その後ろで飛ばす物は使わない)
-            let bound = self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none() && !behind_refused(r));
-            let result = self.apply_one(&store, rec, bound, &dying);
+            // #970 (PR #977 の読み直し 4 の [1]): 束ねが空きの不足で断られた (払い出せない / 一緒に消す行の切り離しが払い出せない) なら
+            // 当てずに再配送させる
+            let result = match self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none() && !behind_refused(r)) {
+                Ok(bound) => self.apply_one(&store, rec, bound, &dying),
+                Err(r) => ApplyResult::from(r),
+            };
             if let Some(list) = relay_accepted.as_deref_mut() {
                 let relayable = !matches!(rec.op, DecodedOp::Commit) && rec.author_peer != self_peer;
-                let applied = result == ApplyResult::Applied;
+                let applied = matches!(result, ApplyResult::Applied | ApplyResult::AppliedRedeliver);
                 let passed_over = match result {
                     ApplyResult::SkippedOlder | ApplyResult::Dropped | ApplyResult::DroppedVocab => true,
-                    ApplyResult::Applied | ApplyResult::RejectedCapacity => false,
+                    ApplyResult::Applied | ApplyResult::RejectedCapacity | ApplyResult::AppliedRedeliver => false,
                 };
                 if relayable && (applied || passed_over) {
                     list.push((idx, applied));
@@ -2299,8 +2321,12 @@ impl Syncer {
                 ApplyResult::SkippedOlder => out.skipped += 1,
                 ApplyResult::Dropped => out.dropped_unresolved += 1,
                 ApplyResult::DroppedVocab => out.dropped_vocab += 1,
-                ApplyResult::RejectedCapacity => {
-                    // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。
+                ApplyResult::RejectedCapacity | ApplyResult::AppliedRedeliver => {
+                    // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。 読み直し 5 の [B]: 当てた後の続きが断られた
+                    // record も (当てた分は `applied` にも数える = 派生 state を書き出してから cursor を決める)
+                    if result == ApplyResult::AppliedRedeliver {
+                        out.applied += 1;
+                    }
                     out.rejected_capacity += 1;
                     note_reject(&mut out, rec.hlc);
                     if hold_behind_refused {
@@ -2349,7 +2375,7 @@ impl Syncer {
         {
             match &rec.op {
                 DecodedOp::Delete { .. } => {
-                    return ApplyResult::from_lww(self.engine.remote_delete_apply_foreign(eid, rec.hlc));
+                    return ApplyResult::from(self.engine.remote_delete_apply_foreign_result(eid, rec.hlc));
                 }
                 DecodedOp::Tie { himo_id, value, .. } if self.engine.is_pk_himo(*himo_id) => {
                     if let Some(v) = self.engine.try_translate_remote_vid(rec.author_peer, *himo_id, *value) {
@@ -2370,9 +2396,11 @@ impl Syncer {
                 // gossip は default off。
                 // table-less (himo を closed table に解決できない) なら確保先が無いので
                 // skip。 entity / ref value を先に解決してから LWW を更新する。
-                let local_eid = match bound.or_else(|| self.engine.resolve_remote_eid(*eid, *himo_id)) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                // #970: 払い出しが空きの不足で断られた (`RejectedCapacity`) なら落とさず再配送させる (PR #977 の読み直し 3 の [1])
+                let local_eid = match bound.map_or_else(|| self.engine.try_resolve_remote_eid(*eid, *himo_id), |e| Ok(Some(e))) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: 当てる行は引いた直後に取る (#925: 値を引く間に、 その行が消えて場所が使い回されても、 使い回した新しい行を
                 // 取らない。 Ref の値の払い出しが同じ表の、 その行の消えた場所を使い回す事もある)
@@ -2385,9 +2413,10 @@ impl Syncer {
                 let value = if self.engine.himo_is_ref(*himo_id) {
                     // Ref の列は u32 (local eid)。 入らない値は target を導けない
                     let Ok(foreign) = u32::try_from(*value) else { return ApplyResult::Dropped };
-                    match self.engine.resolve_remote_ref_value(rec.author_peer, foreign, *himo_id) {
-                        Some(v) => v as u64,
-                        None => return ApplyResult::Dropped,
+                    match self.engine.try_resolve_remote_ref_value(rec.author_peer, foreign, *himo_id) {
+                        Ok(Some(v)) => v as u64,
+                        Ok(None) => return ApplyResult::Dropped,
+                        Err(r) => return ApplyResult::from(r),
                     }
                 } else {
                     // 未翻訳の生値を書くと**無関係な local 文字列**が cell に入る
@@ -2399,8 +2428,13 @@ impl Syncer {
                 };
                 // 改名の時刻: 名前で束ねた行の名前を書き換える時、 改名より後に作られた identity (改名を先に受けた peer では
                 // 別のデッキ) を切り離してから当てる
+                // #970 (PR #977 の読み直し 4 の [1]): 切り離す先の slot を払い出せない (空きの不足) なら、 改名を当てずに再配送させる
+                // (前は 「切り離さない」 と読んで束ねた行に改名を当てた)
                 let split = if self.engine.is_pk_himo(*himo_id) {
-                    self.engine.split_for_rename(local_eid, *eid, *himo_id, value, rec.hlc)
+                    match self.engine.split_for_rename(local_eid, *eid, *himo_id, value, rec.hlc) {
+                        Ok(s) => s,
+                        Err(r) => return ApplyResult::from(r),
+                    }
                 } else {
                     None
                 };
@@ -2435,7 +2469,12 @@ impl Syncer {
                     // 消える行は畳まない (畳むと、 削除の後に作られた同じ名前の行まで巻き込む)
                     match self.engine.name_deleted_at(*himo_id, PkValue::Local(value)) {
                         Some(t) if t > rec.hlc => {
-                            self.engine.remote_delete_apply_at(local_eid, row, t);
+                            // #970 (読み直し 4 の [1]): 切り離しが場所を払い出せなければ、 この record を再配送させる (届き直すと同じ名前の
+                            // 書き込みとして下の #614 の確かめが消し直す)。 読み直し 5 の [B]: 名前の書き込みは当たっている = `AppliedRedeliver`
+                            // (中継は載せる。 前は `RejectedCapacity` で、 ホストでない中継が配らなかった)
+                            if self.engine.remote_delete_apply_at_result(local_eid, row, t) == RemoteApply::RejectedCapacity {
+                                return ApplyResult::AppliedRedeliver;
+                            }
                         }
                         _ => {
                             self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value, dying.get(eid).copied());
@@ -2458,8 +2497,9 @@ impl Syncer {
                     if let Some(t) = self.engine.name_deleted_at(*himo_id, PkValue::Local(value))
                         && t > rec.hlc
                         && self.engine.is_live_unchecked(local_eid)
+                        && self.engine.remote_delete_apply_at_result(local_eid, row, t) == RemoteApply::RejectedCapacity
                     {
-                        self.engine.remote_delete_apply_at(local_eid, row, t);
+                        return ApplyResult::RejectedCapacity;
                     }
                 }
                 r
@@ -2471,19 +2511,21 @@ impl Syncer {
                 // eid_peer が author) で ref target table 空間の local eid へ翻訳する。
                 // 自分が target の産みの親なら identity、第三者 peer なら target 自身の
                 // Tie と同じ写像に収束する (resolve_remote_ref_value の key 空間共有)。
-                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, *himo_id) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
                 let row = self.engine.remote_row_of(*eid, local_eid);
-                let value = match self.engine.resolve_remote_ref_value(
+                let value = match self.engine.try_resolve_remote_ref_value(
                     enchudb_oplog::eid_peer(*target),
                     enchudb_oplog::eid_local(*target),
                     *himo_id,
                 ) {
-                    Some(v) => v,
-                    None => return ApplyResult::Dropped,
+                    Ok(Some(v)) => v,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: 当てる行は上で引いた直後に取った物 (Ref の的の払い出しがその行の消えた場所を使い回しても、 的の行に当てない)。
                 // lock の下で確かめる。 引いた直後の lock の外の確かめは、 lock の下と同じ事を見るので置かない = 読み直し [P]
@@ -2498,9 +2540,10 @@ impl Syncer {
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
-                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, *himo_id) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
                 let row = self.engine.remote_row_of(*eid, local_eid);
@@ -2522,7 +2565,8 @@ impl Syncer {
                 // #490: 写像が無い (= 作成より先に届いた) Delete も捨てない。 engine が削除版数を退避表に載せ、
                 // 後から作成が届いて slot を払い出す時に書き戻す (捨てると、 cursor が Delete を越えているので
                 // 二度と届かず、 後から届いた作成で行が生き返る)。
-                ApplyResult::from_lww(self.engine.remote_delete_apply_foreign(*eid, rec.hlc))
+                // #970 (PR #977 の読み直し 4 の [1]): 名前の束ねの切り離しが場所を払い出せない (空きの不足) 時は再配送させる
+                ApplyResult::from(self.engine.remote_delete_apply_foreign_result(*eid, rec.hlc))
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
@@ -2533,9 +2577,10 @@ impl Syncer {
                     Ok(h) => h,
                     Err(_) => return ApplyResult::Dropped, // himo 予算枯渇等 — 適用不能
                 };
-                let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, local_hid) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
                 let row = self.engine.remote_row_of(*eid, local_eid);
@@ -2562,9 +2607,10 @@ impl Syncer {
                     Ok(h) => h,
                     Err(_) => return ApplyResult::Dropped,
                 };
-                let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
+                let local_eid = match self.engine.try_resolve_remote_eid(*eid, local_hid) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return ApplyResult::Dropped,
+                    Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
                 let row = self.engine.remote_row_of(*eid, local_eid);
