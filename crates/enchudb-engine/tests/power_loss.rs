@@ -7098,10 +7098,69 @@ fn an_alias_ahead_of_the_body_is_dropped_from_the_live_former_resident() {
 /// PR #1006 の読み直し [3] の B の行の世界番号。
 const WORLD_B3: u64 = (2u64 << 32) | 13;
 
+/// `dir` (DB の directory) の segment のうち、 `prev.seg`・tomb.seg・版数の列 (`ver/`) を除いた全部を 「書き出し済み」 として控える
+/// (crashsim。 OS が msync の前にその page を書き出した像)。
+fn mark_written_early_but_records(dir: &Path) {
+    for ent in std::fs::read_dir(dir).unwrap() {
+        let ent = ent.unwrap();
+        let (path, name) = (ent.path(), ent.file_name().to_string_lossy().into_owned());
+        if ent.file_type().unwrap().is_dir() {
+            if name != "ver" {
+                mark_written_early_but_records(&path);
+            }
+        } else if name.ends_with(".seg") && name != "prev.seg" && name != "tomb.seg" {
+            crashsim::file_synced(&path);
+        }
+    }
+}
+
+/// review946 [3] の窓の像 (PR #1006 の 3 つの像の元): 次の `oplog_sync` の本体の書き出しで `prev.seg` を書き出した後
+/// (`PrevWrittenOut`) に別の thread で `reuse` (場所の使い回し) を走らせ、 返った後に、 OS が `prev.seg`・tomb.seg・版数の列より先に
+/// 残りの segment (生きている印・場所の世代・列 …) の page を書き出した像を撮る (`Mode::Lost`)。 本体には使い回した住人が届き、
+/// 使い回しの記録 (`prev.seg`)・tomb.seg・版数と、 WAL の書き出しの後の record は届かない。 呼び手は consumer を止め、 書き出す物を
+/// 作ってから呼ぶ。 `reuse` の返り値を返す。
+///
+/// 前 (#1006) は `PrevWrittenOut` で使い回して書き出しの段 `BeforeVersions` (残りの列まで書き出した所) で撮った。 #978 (PR #997) から
+/// は、 その間に削除の門を閉じる所 (`close_deletes` → `write_out_tombs`) が `prev.seg` をもう一度書き出すので、 書き出しの段で撮る像
+/// には使い回しの記録も届く。 この窓が書き出しの段の像に現れるのは門を閉じた後 (`DeletesClosed`) の使い回しだけで、 その時は前の
+/// 住人の tombstone も (門を閉じる時の tomb.seg で) 届いている別の像になる (開くと tombstone で使い回した住人が消え、 古い別名を通る
+/// record を見られない)。 前と同じ像 (記録も前の住人の tombstone も届かず、 使い回した住人は届く) は、 この PR の下では OS が msync の
+/// 前に page を書いた像でだけ残るので、 その形で撮る (page を乱数で選ぶ `Mode::Mixed` でなく、 前の書き出しの段の像が届けていた
+/// segment を決めて書き出し済みにする)。
+fn reuse_window_image<T: Send + 'static>(eng: &Arc<Engine>, reuse: impl FnOnce() -> T + Send + 'static, live: &Path, img: &Path) -> T {
+    let out: Arc<std::sync::Mutex<Option<T>>> = Arc::new(std::sync::Mutex::new(None));
+    let shot = Arc::new(AtomicBool::new(false));
+    let (o2, s2, l, i) = (out.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf());
+    let reuse = std::sync::Mutex::new(Some(reuse));
+    let _off = HookOff;
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p != Phase::PrevWrittenOut {
+            return;
+        }
+        let Some(f) = reuse.lock().unwrap().take() else { return };
+        let (tx, rx) = std::sync::mpsc::channel::<std::thread::Result<T>>();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)).expect("前提: 使い回しが 60 秒で返らない") {
+            Ok(v) => *o2.lock().unwrap() = Some(v),
+            Err(p) => std::panic::resume_unwind(p),
+        }
+        mark_written_early_but_records(&l.join("db"));
+        let _ = crashsim::capture(&l, &i, Mode::Lost);
+        s2.store(true, Ordering::SeqCst);
+    })));
+    eng.oplog_sync().unwrap();
+    drop(_off);
+    assert!(shot.load(Ordering::SeqCst), "前提: 書き出しの途中で使い回して撮った");
+    let v = out.lock().unwrap().take();
+    v.expect("前提: 使い回しが返った")
+}
+
 /// PR #1006 の読み直し [3] の像: 名前 7 の自分の行 X に B の行 b を畳み (b は X の場所の別名、 `eidalias` に書き出す)、 X に書いて
-/// (WAL の checkpoint の後ろに X の record)、 `oplog_sync` の本体の書き出しで `prev.seg` を書き出した後・生きている印の前
-/// (`PrevWrittenOut`) に X を消して Y で X の場所を使い回し、 残りの列まで書き出した所 (`BeforeVersions`) で電源断。 本体には Y が
-/// 届き (生きている印と gen.seg)、 使い回しの記録 (`prev.seg`) と X の削除・Y の record (WAL) は届かない (review946 [3] の窓)。 X を返す。
+/// (WAL の checkpoint の後ろに X の record)、 `oplog_sync` の本体の書き出しの途中で X を消して Y で X の場所を使い回した像
+/// ([`reuse_window_image`])。 本体には Y が届き (生きている印と gen.seg)、 使い回しの記録 (`prev.seg`) と X の削除・Y の record (WAL)
+/// は届かない (review946 [3] の窓)。 X を返す。
 fn reuse_without_record_image(live: &Path, img: &Path) -> u64 {
     let (eng, x) = full_named_table_engine(&live.join("db"));
     let hv = eng.himo_id("t.v").unwrap() as u16;
@@ -7121,27 +7180,17 @@ fn reuse_without_record_image(live: &Path, img: &Path) -> u64 {
     let _hold = eng.hold_consumer();
     eng.tie_to(x, "t.v", 71u32);
     eng.oplog_commit();
-    let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    let (d2, s2, l, i, e2) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone());
-    write_out_hook::set(Some(Arc::new(move |p: Phase| {
-        if p == Phase::PrevWrittenOut && !d2.swap(true, Ordering::SeqCst) {
-            let e3 = e2.clone();
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            std::thread::spawn(move || {
-                e3.delete(x);
-                let y = add_seven(&e3, 72);
-                assert_eq!(e3.eid_slot(y), e3.eid_slot(x), "前提: Y が X の場所を使い回した");
-                let _ = tx.send(());
-            });
-            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 使い回しが返った");
-        }
-        if p == Phase::BeforeVersions && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
-            let _ = crashsim::capture(&l, &i, Mode::Lost);
-        }
-    })));
-    eng.oplog_sync().unwrap();
-    write_out_hook::set(None);
-    assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で使い回して撮った");
+    let e2 = eng.clone();
+    let y = reuse_window_image(
+        &eng,
+        move || {
+            e2.delete(x);
+            add_seven(&e2, 72)
+        },
+        live,
+        img,
+    );
+    assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y が X の場所を使い回した");
     x
 }
 
@@ -7488,10 +7537,9 @@ const WORLD_B6: u64 = (2u64 << 32) | 16;
 
 /// 2 回目の読み直しの [3] の引き換えの像 (ホスト = 受けた record を中継して WAL に載せる DB): 名前 7 の自分の行 X に B の行 b を畳み
 /// (b は X の場所の別名、 `eidalias` に書き出す)、 表を使い切って書き出す。 B の b 宛ての書き込み (v = 71) と削除を受けて (X に当たる、
-/// X は消える) 中継し (WAL の checkpoint の後ろ)、 `oplog_sync` の本体の書き出しで `prev.seg` を書き出した後・生きている印の前
-/// (`PrevWrittenOut`) に Y (v を持たない) で X の場所を使い回し、 残りの列まで書き出した所 (`BeforeVersions`) で電源断。 本体には Y が
-/// 届き (生きている印と gen.seg)、 使い回しの記録・Y の record は届かない (review946 [3] の窓)。 WAL の再生する record は中継した b 宛ての
-/// 書き込みと削除だけ。 (X, Y, b の削除の版数) を返す。
+/// X は消える) 中継し (WAL の checkpoint の後ろ)、 `oplog_sync` の本体の書き出しの途中で Y (v を持たない) で X の場所を使い回した
+/// 像 ([`reuse_window_image`])。 本体には Y が届き (生きている印と gen.seg)、 使い回しの記録・Y の record は届かない (review946 [3]
+/// の窓)。 WAL の再生する record は中継した b 宛ての書き込みと削除だけ。 (X, Y, b の削除の版数) を返す。
 ///
 /// `second` (PR #1006 の 3 回目の読み直し [3]): C の行 c (`WORLD_C16`) も X に畳む (c も X の場所の別名)。
 fn relayed_write_over_reuse_without_record_image(live: &Path, img: &Path, second: bool) -> (u64, u64, Hlc) {
@@ -7529,30 +7577,18 @@ fn relayed_write_over_reuse_without_record_image(live: &Path, img: &Path, second
     assert!(eng.relay_record(&rec), "前提: b 宛ての削除を中継して WAL に載せた");
     eng.oplog_commit();
     assert!(!eng.is_live(x), "前提: X は消えた");
-    let y_cell = Arc::new(std::sync::Mutex::new(None));
-    let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    let (d2, s2, l, i, e2, yc) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone(), y_cell.clone());
-    write_out_hook::set(Some(Arc::new(move |p: Phase| {
-        if p == Phase::PrevWrittenOut && !d2.swap(true, Ordering::SeqCst) {
-            let (e3, yc2) = (e2.clone(), yc.clone());
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            std::thread::spawn(move || {
-                let y = e3.entity_in("t").unwrap();
-                e3.tie_to(y, "t.k", 9u32);
-                e3.oplog_commit();
-                *yc2.lock().unwrap() = Some(y);
-                let _ = tx.send(());
-            });
-            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 使い回しが返った");
-        }
-        if p == Phase::BeforeVersions && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
-            let _ = crashsim::capture(&l, &i, Mode::Lost);
-        }
-    })));
-    eng.oplog_sync().unwrap();
-    write_out_hook::set(None);
-    assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で使い回して撮った");
-    let y = y_cell.lock().unwrap().expect("前提: Y");
+    let e2 = eng.clone();
+    let y = reuse_window_image(
+        &eng,
+        move || {
+            let y = e2.entity_in("t").unwrap();
+            e2.tie_to(y, "t.k", 9u32);
+            e2.oplog_commit();
+            y
+        },
+        live,
+        img,
+    );
     assert_eq!(eng.eid_slot(y), eng.eid_slot(x), "前提: Y が X の場所を使い回した");
     (x, y, gone)
 }
@@ -7854,8 +7890,8 @@ const WORLD_B7: u64 = (2u64 << 32) | 17;
 /// Ref `u.r` → t)。 名前 7 の自分の行 X は場所を使い回した行 (世代 1)。 `RefTarget` / `RelayedAlias` は X に B の行 b を畳み (b は X の
 /// 場所の別名)、 `FoldedOwn` は X を名前 1 の自分の行 K に畳む (X の世界番号は K の場所の別名)。 表を使い切って書き出してから、 `path`
 /// の中継の record と、 畳んだ先 (X / K) を消す中継の削除を受けて (当たる) 中継し (WAL の checkpoint の後ろ)、 `oplog_sync` の本体の
-/// 書き出しで `prev.seg` を書き出した後・生きている印の前 (`PrevWrittenOut`) に Y で畳んだ先の場所を使い回し、 残りの列まで書き出した
-/// 所 (`BeforeVersions`) で電源断 (review946 [3] の窓: 本体には Y、 使い回しの記録と Y の record は無い)。 (X, 畳んだ先, Y) を返す。
+/// 書き出しの途中で Y で畳んだ先の場所を使い回した像 ([`reuse_window_image`]、 review946 [3] の窓: 本体には Y、 使い回しの記録と
+/// Y の record は無い)。 (X, 畳んだ先, Y) を返す。
 fn stale_alias_path_image(live: &Path, img: &Path, path: StaleAliasPath) -> (u64, u64, u64) {
     let db = live.join("db");
     let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
@@ -7936,30 +7972,18 @@ fn stale_alias_path_image(live: &Path, img: &Path, path: StaleAliasPath) -> (u64
     assert!(eng.relay_record(&rec), "前提: 削除を中継して WAL に載せた");
     eng.oplog_commit();
     assert!(!eng.is_live(target), "前提: 畳んだ先は消えた");
-    let y_cell = Arc::new(std::sync::Mutex::new(None));
-    let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    let (d2, s2, l, i, e2, yc) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone(), y_cell.clone());
-    write_out_hook::set(Some(Arc::new(move |p: Phase| {
-        if p == Phase::PrevWrittenOut && !d2.swap(true, Ordering::SeqCst) {
-            let (e3, yc2) = (e2.clone(), yc.clone());
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            std::thread::spawn(move || {
-                let y = e3.entity_in("t").unwrap();
-                e3.tie_to(y, "t.k", 9u32);
-                e3.oplog_commit();
-                *yc2.lock().unwrap() = Some(y);
-                let _ = tx.send(());
-            });
-            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 使い回しが返った");
-        }
-        if p == Phase::BeforeVersions && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
-            let _ = crashsim::capture(&l, &i, Mode::Lost);
-        }
-    })));
-    eng.oplog_sync().unwrap();
-    write_out_hook::set(None);
-    assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で使い回して撮った");
-    let y = y_cell.lock().unwrap().expect("前提: Y");
+    let e2 = eng.clone();
+    let y = reuse_window_image(
+        &eng,
+        move || {
+            let y = e2.entity_in("t").unwrap();
+            e2.tie_to(y, "t.k", 9u32);
+            e2.oplog_commit();
+            y
+        },
+        live,
+        img,
+    );
     assert_eq!(eng.eid_slot(y), eng.eid_slot(target), "前提: Y が畳んだ先の場所を使い回した");
     (x, target, y)
 }
