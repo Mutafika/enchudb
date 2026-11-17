@@ -1776,42 +1776,62 @@ fn eidalias_path_for(path: &str) -> std::path::PathBuf {
     crate::db_files::path_for(path, crate::db_files::EIDALIAS)
 }
 
-/// #178: 別名 (`(author_peer, foreign_local, local)`) を binary encode。
-/// layout: magic "EIDA"(4) + version u32=1 + count u32 + (peer u32, foreign u32, local u32) × count
-fn serialize_eidalias(entries: &[(enchudb_oplog::PeerId, u32, u32)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12 + entries.len() * 12);
+/// `eidalias` の 1 件: (author_peer, foreign_local, local (場所), 指す行の世代)。
+type EidaliasEntry = (enchudb_oplog::PeerId, u32, u32, u32);
+
+/// #178: 別名を binary encode。 2 つの形:
+///
+/// - 版 1 (世代を持たない DB = file v14 以下。 0.37.4 と同じ byte): magic "EIDA"(4) + version u32=1 + count u32 +
+///   (peer u32, foreign u32, local u32) × count。 世代は書かない
+/// - 版 2 (世代を持つ DB = file v15、 #993 / #994): magic "EIDA"(4) + version u32=2 + count u32 +
+///   (peer u32, foreign u32, local u32, gen u32) × count。 `gen` = 別名が指す行の世代 (張った時の場所の住人の世代)。
+///   開く時に場所の今の住人の世代と合わない別名 (使い回した場所の前の住人の別名) を外す
+///
+/// `with_gen` = 版 2 で書く (呼び手は v15 に移り終えた DB で真にする。 移る途中の DB の header は v14 のままで、 0.37.4 が開く)。
+fn serialize_eidalias(entries: &[EidaliasEntry], with_gen: bool) -> Vec<u8> {
+    let width = if with_gen { 16 } else { 12 };
+    let mut out = Vec::with_capacity(12 + entries.len() * width);
     out.extend_from_slice(b"EIDA");
-    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(if with_gen { 2u32 } else { 1u32 }).to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for &(peer, foreign_local, local) in entries {
+    for &(peer, foreign_local, local, agen) in entries {
         out.extend_from_slice(&peer.to_le_bytes());
         out.extend_from_slice(&foreign_local.to_le_bytes());
         out.extend_from_slice(&local.to_le_bytes());
+        if with_gen {
+            out.extend_from_slice(&agen.to_le_bytes());
+        }
     }
     out
 }
 
-/// #178: `serialize_eidalias` の逆。 magic / 版の不一致・切れた中身は Err (件数は残りの長さで頭打ち、 `.eidmap` と同じ)。
-fn deserialize_eidalias(buf: &[u8]) -> Result<Vec<(enchudb_oplog::PeerId, u32, u32)>, String> {
+/// #178: `serialize_eidalias` の逆 (版 1 / 2 の両方)。 版 1 の世代は 0 (= v15 に移る前の住人。 版 1 を書いた時の行は全部世代 0)。
+/// magic / 版の不一致・切れた中身は Err (件数は残りの長さで頭打ち、 `.eidmap` と同じ)。
+fn deserialize_eidalias(buf: &[u8]) -> Result<Vec<EidaliasEntry>, String> {
     if buf.len() < 12 || &buf[0..4] != b"EIDA" {
         return Err("eidalias sidecar: bad magic".into());
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != 1 {
-        return Err(format!("eidalias sidecar: unsupported version {version}"));
-    }
+    let width = match version {
+        1 => 12,
+        2 => 16,
+        v => return Err(format!("eidalias sidecar: unsupported version {v}")),
+    };
     let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-    if count != (buf.len() - 12) / 12 || (buf.len() - 12) % 12 != 0 {
+    if count != (buf.len() - 12) / width || !(buf.len() - 12).is_multiple_of(width) {
         return Err(format!("eidalias sidecar: count {count} does not match {} bytes (corrupt/torn)", buf.len()));
     }
     let rd = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-    Ok((0..count).map(|i| 12 + i * 12).map(|o| (rd(o), rd(o + 4), rd(o + 8))).collect())
+    Ok((0..count)
+        .map(|i| 12 + i * width)
+        .map(|o| (rd(o), rd(o + 4), rd(o + 8), if width == 16 { rd(o + 12) } else { 0 }))
+        .collect())
 }
 
 /// #178: 別名を sidecar に atomic 書き換え。 別名が無ければ file を消す (残すと、 畳んだ行の slot が回った後で開き直した
-/// 時に古い別名が戻り、 別名宛ての record が無関係な行に入る)。
+/// 時に古い別名が戻り、 別名宛ての record が無関係な行に入る)。 `with_gen` は [`serialize_eidalias`]。
 #[cfg(not(target_arch = "wasm32"))]
-fn persist_eidalias_to_sidecar(db_path: &str, entries: &[(enchudb_oplog::PeerId, u32, u32)]) -> io::Result<()> {
+fn persist_eidalias_to_sidecar(db_path: &str, entries: &[EidaliasEntry], with_gen: bool) -> io::Result<()> {
     let p = eidalias_path_for(db_path);
     if entries.is_empty() {
         return match std::fs::remove_file(&p) {
@@ -1819,17 +1839,73 @@ fn persist_eidalias_to_sidecar(db_path: &str, entries: &[(enchudb_oplog::PeerId,
             _ => Ok(()),
         };
     }
-    crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries)).map(|_| ())
+    crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries, with_gen)).map(|_| ())
 }
 
 /// #178: 別名の sidecar を読む。 不在なら Ok(None)。
 #[cfg(not(target_arch = "wasm32"))]
-fn load_eidalias_from_sidecar(db_path: &str) -> io::Result<Option<Vec<(enchudb_oplog::PeerId, u32, u32)>>> {
+fn load_eidalias_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidaliasEntry>>> {
     enchudb_oplog::io_point("sidecar.read_eidalias")?;
     match std::fs::read(eidalias_path_for(db_path)) {
         Ok(buf) => deserialize_eidalias(&buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// #993 / #994: `eidalias` の 2 つの形の byte の並び。 版 1 は 0.37.4 と同じ byte (世代を持たない DB はこの形のまま書く)、 版 2 は
+/// 別名ごとに指す行の世代を足す。 読むのは両方 (版 1 の世代は 0)。
+#[cfg(test)]
+mod eidalias_format_tests {
+    use super::{deserialize_eidalias, serialize_eidalias};
+
+    /// 0.37.4 の `serialize_eidalias` (版 1) を写した物 (比べる相手)。
+    fn v1_of_0_37_4(entries: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"EIDA");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for &(p, f, l) in entries {
+            out.extend_from_slice(&p.to_le_bytes());
+            out.extend_from_slice(&f.to_le_bytes());
+            out.extend_from_slice(&l.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn version_1_is_the_0_37_4_bytes() {
+        let entries = [(2u32, 9u32, 5u32, 3u32), (7, 1, 4, 0)];
+        let bytes = serialize_eidalias(&entries, false);
+        assert_eq!(bytes, v1_of_0_37_4(&[(2, 9, 5), (7, 1, 4)]), "世代を持たない DB の `eidalias` が 0.37.4 の byte でない");
+        // 版 1 を読むと世代は 0
+        assert_eq!(deserialize_eidalias(&bytes).unwrap(), vec![(2, 9, 5, 0), (7, 1, 4, 0)]);
+    }
+
+    #[test]
+    fn version_2_carries_the_generation() {
+        let entries = [(2u32, 9u32, 5u32, 3u32), (7, 1, 4, 0)];
+        let bytes = serialize_eidalias(&entries, true);
+        let mut want = Vec::new();
+        want.extend_from_slice(b"EIDA");
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(&2u32.to_le_bytes());
+        for &(p, f, l, g) in &entries {
+            for v in [p, f, l, g] {
+                want.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        assert_eq!(bytes, want, "版 2 の byte の並び");
+        assert_eq!(deserialize_eidalias(&bytes).unwrap(), entries.to_vec(), "版 2 の往復");
+        // 切れた中身 / 知らない版は Err
+        assert!(deserialize_eidalias(&bytes[..bytes.len() - 4]).is_err());
+        let mut v3 = bytes.clone();
+        v3[4] = 3;
+        assert!(deserialize_eidalias(&v3).is_err());
+        // 版 1 の幅で数えると合わない (版を読み違えない)
+        let mut as_v1 = bytes.clone();
+        as_v1[4] = 1;
+        assert!(deserialize_eidalias(&as_v1).is_err());
     }
 }
 
@@ -5681,7 +5757,7 @@ mod slot_claim_tests {
         let x = enchudb_oplog::eid_local(rows[1]);
         let self_peer = eng.peer_id();
         // 畳む時と同じ順: 自分の行 x を here の別名にしてから、 x を落とす (表は満杯なので x は消した行の一覧に載る)
-        eng.eid_translator.alias(self_peer, x, here);
+        eng.alias_slot(self_peer, x, here);
         eng.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
         eng.remove_entity_body(x, enchudb_oplog::Hlc::ZERO);
         assert!(eng.is_folded_own_slot(x) && !eng.entities.is_live(x), "前提: x は畳んだ自分の行");
@@ -11118,7 +11194,7 @@ impl Engine {
         let (eng, wal_len) = Self::open_standalone_after_replay(path)?;
         let eng = eng.relog_before_standalone_session(path, wal_len)?;
         // #976 の読み直し 2 [B2]: WAL を再生しない open は、 記録から戻した所で前の住人の後始末が揃う (`prev.seg` の周期を進め始める)
-        eng.finish_open_restores(false);
+        eng.finish_open_restores();
         Ok(eng)
     }
 
@@ -11501,7 +11577,10 @@ impl Engine {
                         stale_mappings.push((peer, foreign_local, local, tomb));
                         continue;
                     }
-                    eng.eid_translator.insert(peer, foreign_local, local);
+                    // 前の逆写像の key が別名になる時の世代 (`EidTranslator::insert`): 場所の今の住人 (突き合わせの前なので page の印を
+                    // 見ずに読む)
+                    let agen = if eng.generations().active() { eng.last_row_unmarked(local).0 >> eng.generations().bits() } else { 0 };
+                    eng.eid_translator.insert(peer, foreign_local, local, agen);
                     // #9 (H4): `.eidmap` と `.tables` は別々の rename なので crash で
                     // 不整合になりうる。 mapped local を table の next_local が必ず追い
                     // 越すよう前進させ、 stale `.tables` でも mapped slot を再 alloc して
@@ -11530,11 +11609,25 @@ impl Engine {
         }
         // #178: 別名 (`eidmap` の後: 別名は逆写像を変えない forward だけの写像)。 壊れていたら警告して別名なしで続ける
         // (別名宛ての record が新しい行として払い出される = 畳む前と同じ)
+        // #993 / #994: 版 2 (v15 の DB) は別名ごとに指す行の世代を持つ (版 1 は 0 = v15 に移る前の住人)。 世代の合わない別名
+        // (使い回した場所の前の住人の別名) は、 きれいに閉じなかった後の書ける open が突き合わせの後に外す
+        // (`drop_stale_generation_aliases`)
         match load_eidalias_from_sidecar(path) {
             Ok(Some(entries)) => {
                 let self_peer = eng.peer_id();
-                for (peer, foreign_local, local) in entries {
-                    eng.eid_translator.alias(peer, foreign_local, local);
+                let note_overrides = unclean && !readonly && eng.generations().active();
+                for (peer, foreign_local, local, agen) in entries {
+                    // #994 [C4]: `.eidmap` の写像 (面) を別の場所への別名で上書きする = どちらかが古い。 `eidalias` の別名が古い
+                    // (使い回しの前の住人の別名、 `.eidmap` は使い回しの後に払い直した場所) なら、 開く道が別名を外す時に写像を戻す
+                    if note_overrides
+                        && let Some(mapped) = eng.eid_translator.mapped_local(peer, foreign_local)
+                        && mapped != local
+                    {
+                        let mapped_gen = eng.last_row_unmarked(mapped).0 >> eng.generations().bits();
+                        let tomb = eng.tombstone_version_of(mapped);
+                        eng.generations().note_alias_override((peer, foreign_local), mapped, mapped_gen, tomb);
+                    }
+                    eng.eid_translator.alias(peer, foreign_local, local, agen);
                     // #612: 畳んだ自分の行の別名
                     if peer == self_peer {
                         eng.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
@@ -11553,25 +11646,21 @@ impl Engine {
         for &(peer, foreign_local, _, _) in &stale_mappings {
             eng.eid_translator.mark_dirty((peer, foreign_local));
         }
-        // review946 [5]: 戻さなかった写像の場所を指す別名も使い回しの前の物 (`eidalias` は `.eidmap` の後に書くので、 `.eidmap` が
-        // 使い回しの前なら `eidalias` もその前)。 使い回しと同じく外して同じ版数を退避する (残すと別名の peer の書き込みが新しい
-        // 住人に当たり、 その peer の削除が新しい住人を消した)
+        // review946 [5]: 戻さなかった写像の場所を指す別名のうち使い回しの前の住人の物を、 使い回しと同じく外して同じ版数を退避する
+        // (残すと別名の peer の書き込みが新しい住人に当たり、 その peer の削除が新しい住人を消した)。 v15 の DB は指す行の世代
+        // (`eidalias` 版 2) で決める: 生きている場所は住人 (突き合わせの前なので page の印を見ずに読む) より下の世代の別名 (#993 /
+        // #994)、 死んだ場所は使い回しの記録が場所から離した行の別名 (`alias_row_left_slot`、 PR #1006 の読み直し [1])。 本体が古い
+        // 電源断の像で残る物は、 再生の使い回しの移り目と開く道の仕上げが外す。 世代を持たない DB は場所の別名の全部 (`.eidmap` を
+        // 書いてから `eidalias` を書くので、 `.eidmap` が使い回しの前なら `eidalias` もその前)
         if !readonly {
-            let self_peer = eng.peer_id();
             for &(_, _, local, tomb) in &stale_mappings {
-                let mut others: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
-                for (peer, foreign_local) in eng.eid_translator.aliases_of(local) {
-                    if !eng.eid_translator.unalias(peer, foreign_local) {
-                        continue;
-                    }
-                    if peer == self_peer {
-                        // #612: 畳んだ自分の行の世界番号は、 その slot を自分自身の別名にして予約したまま削除の版数を載せる
-                        eng.eid_translator.alias(peer, foreign_local, foreign_local);
-                        eng.set_tombstone_local(foreign_local, tomb);
-                    } else {
-                        others.push((peer, foreign_local));
-                    }
-                }
+                let others = if !eng.generations().active() {
+                    eng.drop_aliases_where(local, |_, _| true, tomb)
+                } else {
+                    let (row, dead) = eng.last_row_unmarked(local);
+                    let live_gen = (!dead).then(|| row >> eng.generations().bits());
+                    eng.drop_aliases_where(local, |_, g| eng.alias_row_left_slot(local, g, live_gen), tomb)
+                };
                 if !others.is_empty() {
                     eng.retreat_removed_keys(&others, tomb);
                 }
@@ -11626,10 +11715,6 @@ impl Engine {
         // (readonly は戻さない: 書き手の DB の tomb.seg に書きうる、 review946 [6])
         if unclean && !readonly {
             eng.restore_prev_residents(&prev_records, &replay);
-            // 読み直し 2 [B1]: 生きている場所を指す別名のうち、 使い回しが外した物 (`eidalias` だけが使い回しの前) を外す。 再生の
-            // 前に (再生する中継の record がその別名で次の住人に当たらない)。 再生が生かす場所は再生の後にもう一度
-            // (`finish_open_restores`)
-            eng.drop_evicted_aliases();
         }
 
         // text 写像 (`(author_peer, remote_vid) → local_vid`) の sidecar 読み込み。
@@ -11668,6 +11753,12 @@ impl Engine {
         // #731: gen.seg と生きている印を突き合わせる (きれいに閉じなかった後だけ)。 表・別名 (#612 の畳んだ自分の行)・払い出し位置
         // の後、 WAL の再生の前
         eng.reconcile_generations(readonly, &replay);
+        // #993 / #994: 使い回した場所の前の住人の別名 (`eidalias` だけが使い回しの前のまま届いた像) を外す。 突き合わせの後 (場所の
+        // 生死が決まる)・WAL の再生の前 (再生する中継の record がその別名で次の住人に当たらない)。 再生が前の住人を生かし直しうる物
+        // (使い回しの記録が無い、 PR #1006 の読み直し [3])・世代が上の別名 (本体より先に届いた) は開く道の仕上げ (`finish_open_restores`)
+        if unclean && !readonly {
+            eng.drop_stale_generation_aliases(Some(&replay));
+        }
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
         // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
@@ -16962,7 +17053,7 @@ impl Engine {
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::EidmapWritten);
         // #178: 別名も同じ trigger で
-        persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot())?;
+        persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot(), self.generations().moved())?;
         // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
         self.persist_pk_tombs_if_dirty()?;
         self.persist_pk_former_if_dirty()?;
@@ -17833,7 +17924,7 @@ impl Engine {
                 #[cfg(feature = "crashsim")]
                 write_out_hook::call(write_out_hook::Phase::EidmapWritten);
                 // #178: 別名も
-                if let Err(e) = persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot()) {
+                if let Err(e) = persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot(), self.generations().moved()) {
                     moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
@@ -18279,7 +18370,7 @@ impl Engine {
                 return false; // 自分の世界番号は写像を持たない (行が無いなら、 消した後)
             }
             let (peer, foreign_local) = (enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w));
-            self.eid_translator.alias(peer, foreign_local, local);
+            self.alias_slot(peer, foreign_local, local);
             // #546: 以後この世界番号の record は写像の速い道で解決され、 作成の時に退避表を見る道 (払い出し / 束ね) を通らない。
             // 先に届いた削除をここで当てる (当てないと、 知らせが作成より先に届いた peer でだけ行が残る)。 主キーの削除の記録も
             // `apply_delete_local` がする
@@ -18417,13 +18508,14 @@ impl Engine {
         // 3. 世界番号を dst へ (以後 src の世界番号宛ての record は dst に当たる)
         // #779: src に書いた、 bridge の前の record の宛名を覚える (src の逆写像はここで外れる)
         self.remember_former_address(s, false);
+        let d_gen = self.alias_row_gen(d);
         for (peer, foreign_local) in self.eid_translator.remove_local(s) {
-            self.eid_translator.alias(peer, foreign_local, d);
+            self.eid_translator.alias(peer, foreign_local, d, d_gen);
         }
         // #612: 自分の行の世界番号 (自分の peer, s) も dst の別名に。 アプリが持つ s の eid も dst に転送する (`forward_eid`)。
         // slot s は使い回さない (`is_folded_own_slot`)
         if own_src {
-            self.eid_translator.alias(self_peer, s, d);
+            self.eid_translator.alias(self_peer, s, d, d_gen);
             self.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
         }
         // 4. src を落として slot を空ける (版数 0 = cell を全部落とす。 削除の印・主キーの記録は残さない)
@@ -18454,6 +18546,14 @@ impl Engine {
         let (local, bound_now) = self.alias_remote_eid(author_peer, foreign_eid, self.slot_unchecked(local_eid), self_peer);
         // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
         self.ensure_live_slot(local);
+        // PR #1006 の読み直し [4]: 別名の指す行の世代は、 生かした後の場所の住人の世代 (前は生かす前に決めたので、 死んだ場所に束ねると
+        // 消えた行 = 今 − 1 を指し、 次のきれいでない open が今の住人の別名として外した)。 `alias_remote_eid` が生かした後の世代で張る
+        // (2 回目の読み直しの窓)。 ここで張り直すのは、 張った後・生かす前に別の書き手が場所を消して世代が進んだ時だけ効く。 この後の
+        // #490 の削除は同じ行を消す (場所の最後の行 = この世代のまま)
+        if bound_now {
+            let agen = self.alias_row_gen(local);
+            self.eid_translator.set_alias_gen(author_peer, enchudb_oplog::eid_local(foreign_eid), local, agen);
+        }
         Self::advance_table_next_local_for(&self.tables, local);
         // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
         // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
@@ -18482,9 +18582,14 @@ impl Engine {
         // identity のまま。 前は束ねた identity に替えていたので、 束ねた後の書き込みが、 その identity の作成を受けていない受け手で
         // 別の行になった。 元の identity の作成は同じ書き手の流れの前にあるので、 受け手は必ず先に受けている
         self.debug_assert_no_user_row("alias_remote_eid");
+        // 世代は写像の lock (`alloc_lock`) の外で決める。 PR #1006 の 2 回目の読み直し [4] の窓: 呼び手 (`bind_remote_eid`) は張った後に
+        // 場所を生かすので、 生かした後の住人の世代 (生かす道は世代を変えない = 場所の今の世代) で張る。 前は生かす前の場所の最後の行
+        // (死んだ場所は消えた行 = 今 − 1) で張って生かした後に張り直し、 その間に並んだ sidecar の書き出しが消えた行の世代を `eidalias`
+        // に書きえた (次のきれいでない open で今の住人の別名として外れる)
+        let agen = self.alias_gen_after_revive(target_local);
         let (local, bound_now) = match self
             .eid_translator
-            .if_unmapped(author_peer, foreign_local, || self.eid_translator.alias(author_peer, foreign_local, target_local))
+            .if_unmapped(author_peer, foreign_local, || self.eid_translator.alias(author_peer, foreign_local, target_local, agen))
         {
             Ok(()) => (target_local, true),
             Err(existing) => (existing, false),
@@ -18642,8 +18747,8 @@ impl Engine {
             // #581: 束ねた identity と作成を覚える (後から届いた削除で、 削除の後に作られた identity を切り離すため)。 写像と同じ行の
             // lock の下 (使い回しは場所の名前の記録も生かす前に外すので、 外した後に覚えると新しい行に残る)
             self.note_bound_identity(row_eid, foreign_eid, created);
-            // #613: 前向きの写像だけ (`alias_remote_eid` と同じ)
-            self.eid_translator.alias(author_peer, foreign_local, target);
+            // #613: 前向きの写像だけ (`alias_remote_eid` と同じ)。 指す行の世代は握った行の今の世代
+            self.alias_slot(author_peer, foreign_local, target);
             Checked::Bound(guard, prior)
         });
         let (guard, prior) = match checked {
@@ -20672,7 +20777,7 @@ impl Engine {
             if peer != self_peer {
                 return true;
             }
-            self.eid_translator.alias(peer, s, s);
+            self.reserve_folded_own_slot(s);
             if tomb != enchudb_oplog::Hlc::ZERO {
                 self.set_tombstone_local(s, tomb);
             }
@@ -20872,13 +20977,12 @@ impl Engine {
     /// - 前の住人の削除が本体に届いていない像 (場所の最後の行が記録の行で生きている、 または記録の行より前の行 = 記録だけが disk に
     ///   届いた電源断、 review946 [1]) は戻さない。 WAL に削除と使い回しが届いていれば、 再生が生かす所でやり直す
     ///   (`redo_reuse_eviction`)
-    /// - 記録の identity の削除が退避表 (`.eidmap` から読んだ) に記録の版数以上で載っていれば、 書き出し済み (戻さない)。 ただし
-    ///   `eidalias` は `.eidmap` の後ろなので届いていないことがあり、 使い回しが外した別名 (退避表に載っている identity) が場所を指して
-    ///   いれば外す (読み直し [A2]、 [`Self::drop_evicted_aliases_at`])。 翻訳した行の identity が写像を持つ (落ちる前に別の場所に
-    ///   払い直した = 削除の版数はその場所) 時も同じく外す (読み直し 2 [B1])。 記録を見ない道で漏れる別名は、 この後の
-    ///   [`Self::drop_evicted_aliases`] が外す
-    /// - 載っていなければ、 退避表に戻し、 場所を指す別名 (`eidalias` は `.eidmap` の後に書くので、 使い回しの前の物) を外して同じ
-    ///   版数を退避する (使い回しが外したのと同じ、 [`Self::drop_unwritten_former_aliases`])
+    /// - 記録の identity の削除が退避表 (`.eidmap` から読んだ) に記録の版数以上で載っていれば、 書き出し済み (戻さない)
+    /// - 載っていなければ、 退避表に戻す
+    /// - どちらでも、 場所を指す別名のうち、 記録の行 (前の住人) とそれより前の行を指す物 (`eidalias` 版 2 の世代で決める、 #993 /
+    ///   #994) を外す ([`Self::drop_aliases_below`])。 退避が書き出されていなければ外した別名にも同じ版数を退避する (使い回しが
+    ///   外したのと同じ)。 次の住人に張った別名 (世代が上) は残す。 記録を見ない道で残る別名は、 突き合わせの後と開く道の仕上げの
+    ///   [`Self::drop_stale_generation_aliases`] が外す
     /// - 名前: 場所の名前の記録 (`pktombs` / `pkformer`) が使い回しの前の物なら identity に移して場所から外す
     ///   ([`Self::move_stale_slot_names`] と同じ決め方。 名前は退避と別の sidecar なので、 退避が書き出し済みでも見る)
     ///
@@ -20890,8 +20994,9 @@ impl Engine {
     /// review946d [N1]: 自分の行の記録で、 前の住人の削除は本体に届き使い回しは届いていない像 (場所の最後の行が記録の行で死んでいる)
     /// は、 WAL に再生する record があれば (`replay`、 呼び手が lock の下で決めた答え) 戻すかを再生の後に決める ([`Self::finish_prev_restores`])。 再生は、 本体にだけ届いた削除を
     /// その行の古い record で取り消す (`replay_slot` の `restore`)。 前は再生の前に戻し、 再生が生き返らせた行の Delete を state に出し、
-    /// #451 の作り直しも配った (A では生きていて、 peer では消える)。 翻訳した行の記録はこの像で写像が場所を指したままなので戻さない
-    /// (下の写像の守り)。
+    /// #451 の作り直しも配った (A では生きていて、 peer では消える)。 翻訳した行の記録は後に回さない (再生の守り `replay_slot` は
+    /// 自分の行の record の道)。 この像で翻訳した行の写像は場所を指したまま (`prev_evicted`) で、 戻す道は写像を残したまま記録の
+    /// identity と外した別名に退避する (PR #1006 の 2 回目の読み直し [A])。
     fn restore_prev_residents(&self, records: &[(u32, crate::prev_slots::PrevRecord)], replay: &ReplayAhead<'_>) {
         let gens = self.generations();
         let prev = &gens.prev;
@@ -20905,12 +21010,10 @@ impl Engine {
                 && replay.follows()
             {
                 // 退避が書き出し済みかは再生の前の退避表で決める (再生の後始末のやり直し `redo_reuse_eviction` が同じ版数を
-                // 退避するので、 再生の後に見ると、 戻す時の別名の外しを飛ばす)。 書き出していなければ外す別名も再生の前に控える
-                // (開いた時の `eidalias` = 使い回しの前の別名。 読み直し 2 [B3]: 再生の後の場所の別名には、 再生が次の住人に張った
-                // 別名 (中継した `Alias` の再生) が入る)
+                // 退避するので、 再生の後に見ると、 戻す時の退避を飛ばす)。 外す別名は世代で決まる (再生が次の住人に張った別名 =
+                // 中継した `Alias` の再生は世代が上で残る。 前は再生の前に場所の別名を控えた、 読み直し 2 [B3])
                 let written = self.prev_delete_written(rec);
-                let aliases = if written { Vec::new() } else { self.eid_translator.aliases_of(slot) };
-                prev.defer_restore(slot, rec, written, aliases);
+                prev.defer_restore(slot, rec, written);
                 continue;
             }
             if self.restore_prev_resident(slot, rec, None) {
@@ -20928,22 +21031,23 @@ impl Engine {
         let restored = prev
             .take_deferred()
             .into_iter()
-            .filter(|(slot, rec, written, aliases)| self.restore_prev_resident(*slot, *rec, Some((*written, aliases))))
+            .filter(|&(slot, rec, written)| self.restore_prev_resident(slot, rec, Some(written)))
             .count();
         prev.note_restored(restored as u32);
     }
 
     /// 開く時の、 前の住人の後始末の仕上げ (再生と後に回した戻しの後、 #451 の作り直しの前。 WAL の無い open は `open_internal` の
-    /// 後): `replayed` (WAL の record を再生した) なら、 再生が次の住人を生かした場所の、 使い回しが外した別名を外す
-    /// ([`Self::drop_evicted_aliases`]、 読み直し 2 [B1])。 再生の間の退避表の版数の索引を捨て ([R2])、 開く時から止めていた
+    /// 後): きれいに閉じなかった後の書ける open なら、 指す行が場所の住人でない別名 (生きている場所は世代の合わない物、 死んだ場所は
+    /// 使い回しの記録が場所から離した行の物) を外す ([`Self::drop_stale_generation_aliases`]、 #993 / #994)。 再生の間の退避表の版数の索引を捨て ([R2])、 開く時から止めていた
     /// `prev.seg` の周期を進め始める (`PrevSlots::release_open`、 読み直し 2 [B2])。
-    fn finish_open_restores(&self, replayed: bool) {
-        let prev = &self.generations().prev;
-        if prev.opening() && replayed {
-            self.drop_evicted_aliases();
+    fn finish_open_restores(&self) {
+        let gens = self.generations();
+        if gens.prev.opening() {
+            self.drop_stale_generation_aliases(None);
         }
-        prev.drop_tomb_index();
-        prev.release_open();
+        gens.take_alias_overrides();
+        gens.prev.drop_tomb_index();
+        gens.prev.release_open();
     }
 
     /// 記録の identity の削除が退避表に記録の版数以上で載っている (書き出し済み、 [`Self::restore_prev_resident`])。
@@ -20951,33 +21055,49 @@ impl Engine {
         self.foreign_tombs.read().unwrap().get(&(rec.peer, rec.number)).is_some_and(|&t| t >= rec.tomb)
     }
 
-    /// 使い回しの後始末が `.eidmap` に届いていない場所 `slot` の、 前の住人 (削除の版数 `tomb`) の別名 (#178 / #612、 名前で畳んだ行の
-    /// 世界番号) を外す (使い回しの `split_removed_keys` と同じ)。 退避が届いていなければ `eidalias` も使い回しの前 (`.eidmap` を
-    /// 書いてから `eidalias` を書くので、 使い回しの後の `eidalias` が届いたなら `.eidmap` も届いている) = 場所を指す別名は前の住人の物。
-    /// 自分の行の別名は、 その slot を自分自身の別名にして予約したまま削除の版数を載せる (#612)。 返すのは外した他の peer の別名
-    /// (呼び手が名前を移して版数を退避する)。 開く時 ([`Self::restore_prev_resident`]) と再生のやり直し ([`Self::redo_reuse_eviction`]、
-    /// #969) だけ。
+    /// #993 / #994: 場所 `slot` を指す別名のうち、 指す行の世代 (`eidalias` 版 2、 張った時の場所の住人の世代) が `below` より下の物
+    /// (使い回した場所の前の住人とそれより前の行の別名) を外す。 開く道 (記録から戻す・再生の後始末のやり直し・再生の使い回しの移り目・
+    /// 突き合わせの後と仕上げのなめ) だけ。 自分の行の別名 (#612、 畳んだ自分の行の世界番号) は、 その slot を自分自身の別名にして予約
+    /// したまま削除の版数 `tomb` (ZERO なら載せない) を載せる (使い回しの `split_removed_keys` と同じ)。 返すのは外した他の peer の
+    /// 別名 (呼び手が名前を移し、 退避が sidecar に無ければ版数を退避する)。
     ///
-    /// `only`: 外す別名をこの中に限る (後に回した戻し = 再生の前に控えた、 開いた時の `eidalias` の別名。 読み直し 2 [B3]: 再生が次の
-    /// 住人に張った別名 (中継した `Alias` の再生) は外さない)。 None = 場所を指す別名の全部。
-    fn drop_unwritten_former_aliases(
+    /// 前 (PR #976) は世代を持たない別名を状態から推した (identity が退避表に居る = 使い回しが外した別名、 退避が書き出されていなければ
+    /// 場所の別名の全部)。 推し方は、 忘れてよい線が退避を忘れた後 (#993)・再生の前に生きている前の住人の別名 (#994 [C1])・突き合わせの
+    /// 前の生死 ([C2])・使い回しの後に次の住人に張った別名 ([B4]) を取り違えた。
+    ///
+    /// 開く道が `eidalias` を読んだ時に `.eidmap` の写像を上書きした別名 ([`Generations::note_alias_override`]) を外したら、 写像を
+    /// 戻す (#994 [C4]: 古い `eidalias` の別名が、 使い回しの後に別の場所へ払い直した `.eidmap` の写像を消していた)。
+    fn drop_aliases_below(&self, slot: u32, below: u32, tomb: enchudb_oplog::Hlc) -> Vec<(enchudb_oplog::PeerId, u32)> {
+        self.drop_aliases_where(slot, |_, g| g < below, tomb)
+    }
+
+    /// [`Self::drop_aliases_below`] の、 外す別名をその identity と指す行の世代 `g` の `pick(identity, g)` で選ぶ形。
+    fn drop_aliases_where(
         &self,
         slot: u32,
+        pick: impl Fn((enchudb_oplog::PeerId, u32), u32) -> bool,
         tomb: enchudb_oplog::Hlc,
-        only: Option<&[(enchudb_oplog::PeerId, u32)]>,
     ) -> Vec<(enchudb_oplog::PeerId, u32)> {
         let self_peer = self.peer_id();
         let mut others = Vec::new();
-        for (peer, foreign_local) in self.eid_translator.aliases_of(slot) {
-            if only.is_some_and(|keys| !keys.contains(&(peer, foreign_local))) {
+        for ((peer, foreign_local), agen) in self.eid_translator.aliases_with_gen_of(slot) {
+            if !pick((peer, foreign_local), agen) || !self.eid_translator.unalias(peer, foreign_local) {
                 continue;
             }
-            if !self.eid_translator.unalias(peer, foreign_local) {
+            // #994 [C4]: 開く時にこの別名が上書きした `.eidmap` の写像 (使い回しの後に別の場所へ払い直した) を戻す
+            if let Some((local, mapped_gen)) = self.generations().take_alias_override((peer, foreign_local))
+                && self.eid_translator.get(peer, foreign_local).is_none()
+                && self.eid_translator.reverse(local).is_none()
+                && self.override_target_kept(local, mapped_gen)
+            {
+                self.eid_translator.insert(peer, foreign_local, local, mapped_gen);
                 continue;
             }
             if peer == self_peer {
-                self.eid_translator.alias(peer, foreign_local, foreign_local);
-                self.set_tombstone_local(foreign_local, tomb);
+                self.reserve_folded_own_slot(foreign_local);
+                if tomb != enchudb_oplog::Hlc::ZERO {
+                    self.set_tombstone_local(foreign_local, tomb);
+                }
             } else {
                 others.push((peer, foreign_local));
             }
@@ -20985,80 +21105,202 @@ impl Engine {
         others
     }
 
-    /// 読み直し 2 [B1]: 場所 `slot` を指す別名のうち、 場所を使い回した時に外した別名 ([`Self::alias_evicted`]) を外す。 `eidalias` は
-    /// `.eidmap` の後ろで別の file (tmp + rename) なので、 `.eidmap` (退避) が届いても `eidalias` は使い回しの前のままでありうる (同じ
-    /// 書き出しの `.eidmap` の後・`eidalias` の rename の前の kill / 電源断。 書く順から言えるのは逆の向きだけ、 読み直し [A2])。 自分の
-    /// 行の別名 (#612) は slot を自分自身の別名に戻す (削除の版数は tomb.seg に載っている)。 返すのは外した他の peer の別名。
+    /// #993 / #994: 再生が場所 `slot` を世代 `row_gen` の行で生かす使い回しの移り目 (`replay_slot` の `g > now`。 前の住人の Delete が WAL に
+    /// 無い = 受けた削除の像) で、 前の住人を指す別名を外す。 外す時点を WAL の中の移り目にする (#994 [C1]、 再生のやり直し
+    /// `redo_reuse_eviction` も同じ): 前は再生の前に外し、 WAL の中で使い回しより前にある中継した `Alias` の再生が、 生きている前の住人
+    /// (自分の Delete より前) をその別名の削除で消した。 再生の後に外すと、 移り目より後の中継した record がその別名で次の住人に当たる
+    /// (読み直し 2 [B1] (b))。
     ///
-    /// 呼び手は、 場所が使い回された (記録から戻す道・再生のやり直し = 次の住人の record で生かす所) か、 場所が生きている
-    /// ([`Self::drop_evicted_aliases`]) と知っている: 使い回されていない死んだ場所には、 退避表の identity の正しい別名がある (#490)。
+    /// PR #1006 の 3 回目の読み直し [2]: 開く時に `eidalias` の別名が上書きした `.eidmap` の写像 (#994 [C4]) の場所を再生が別の行で生かした
+    /// ら、 その写像の覚えを捨てて、 写像の identity をその場所の削除の版数で退避する (使い回しが翻訳した行の写像を外して退避するのと
+    /// 同じ)。 上書きが場所の逆写像を外しているので、 再生のやり直し (`redo_reuse_eviction`) はこの identity を前の住人として読めない。
+    /// 前は覚えが残り、 開く道の仕上げが古い別名を外す時に写像を戻して、 再生が場所に置いた自分の行がその identity の翻訳先になった
+    /// (その行の書き込みが identity 宛てに配られ、 identity 宛ての書き込みがその行に当たる)。 戻す時の世代の比べ
+    /// ([`Self::override_target_kept`]) は生きている場所だけ (死んだ場所の世代は、 突き合わせが削除を完了させた場所で覚えた後に 2 つ
+    /// 上がり、 `relog_gen` は再生の後に置く = 比べると再生が触らない場所でも正しい戻しを止める) なので、 再生が生かして消し直した
+    /// 場所はここで捨てる。
+    fn drop_aliases_at_replayed_reuse(&self, slot: u32, row_gen: u32) {
+        for (key, tomb) in self.generations().take_alias_overrides_left(slot, row_gen) {
+            if tomb != enchudb_oplog::Hlc::ZERO {
+                self.retreat_removed_keys(&[key], tomb);
+            }
+        }
+        if !self.generations().active() || !self.eid_translator.aliases_with_gen_of(slot).iter().any(|&(_, g)| g < row_gen) {
+            return;
+        }
+        self.drop_former_generation_aliases(slot, |g| g < row_gen, None, false);
+    }
+
+    /// #993 / #994: 場所 `slot` を指す別名のうち、 指す行の世代 `g` が `former(g)` の物 (前の住人とそれより前の行の別名) を、 指す行ごとに
+    /// 外す。 前の住人の identity と削除の版数を引いて (`prev.seg` の記録 / 退避表の自分の行 / 場所の削除の版数 = 再生が当てた削除)、
+    /// 名前の記録を移し ([`Self::move_stale_slot_names`]、 #994 [C3]: 前の住人の identity を先頭に)、 退避が sidecar に無い時 (書き出して
+    /// いない周期の記録 / 場所にある削除) だけ外した別名に退避する (書き出した周期の退避は sidecar にあるか、 忘れてよい線が忘れた後 =
+    /// 戻さない、 #993)。
     ///
-    /// 開く時の 1 か所 ([`Self::drop_evicted_aliases`]) が全部の生きている場所をなめて外す。 前の住人の記録を見る道 (記録から戻す・
-    /// 再生のやり直し) もこれを呼ぶ: 外した別名にも前の住人の名前を移す (使い回しと同じ) / 再生の途中で外す (後ろの中継した record
-    /// がその別名で次の住人に当たらない) ため。
-    fn drop_evicted_aliases_at(&self, slot: u32) -> Vec<(enchudb_oplog::PeerId, u32)> {
+    /// `ahead_of` = Some(今の行の世代) なら、 それより上の世代の別名 (本体にも WAL にも無い行を指す) も外す (前の住人ではないので名前も
+    /// 退避も触らない)。
+    ///
+    /// `keep_unknown` (なめの死んだ場所、 PR #1006 の 2 回目の読み直し [B]): 前の住人の削除の版数が引けない (記録の行が別名の指す行と
+    /// 違う = 突き合わせが世代を 2 つ上げた後の使い回しの記録など) 時は、 削除の分かっていない identity の別名 (退避表に居ない他の peer
+    /// の別名 / 版数の無い畳んだ自分の行の別名) を外さずに残す (死んだ場所に当たる受信の書き込みは、 場所に削除の版数があれば捨てられる
+    /// (`slot_is_dead`)。 退避なしで外すと、 その別名宛ての書き込みが新しい生きた行になる)。 届く像は作れていない保険 (PR #1006 の 3 回目の
+    /// 読み直し [5]: 2 回目の直しの 1. = 再生がある時は再生の前に死んだ場所を見ない、 が同じ像を先に受け止め、 外しても落ちる試験が無い)。
+    /// 場所を生かす直前の移り目 (`drop_aliases_at_replayed_reuse`) と生きている場所は偽 (残すと次の住人に当たる)。
+    fn drop_former_generation_aliases(
+        &self,
+        slot: u32,
+        former: impl Fn(u32) -> bool,
+        ahead_of: Option<u32>,
+        keep_unknown: bool,
+    ) {
+        let gens = self.generations();
+        let bits = gens.bits();
         let self_peer = self.peer_id();
-        let mut others = Vec::new();
-        for (peer, foreign_local) in self.eid_translator.aliases_of(slot) {
-            if !self.alias_evicted(peer, foreign_local, slot) || !self.eid_translator.unalias(peer, foreign_local) {
+        let mut rows: Vec<u32> =
+            self.eid_translator.aliases_with_gen_of(slot).into_iter().map(|(_, g)| g).filter(|&g| former(g)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for row_gen in rows {
+            let row = (row_gen << bits) | slot;
+            // 前の住人 (世代 row_gen の行) の identity と削除の版数、 退避が sidecar に無いか
+            let (lead, tomb, retreat) = match gens.prev.record_at(slot, row) {
+                Some((r, written)) => (Some((r.peer, r.number)), r.tomb, !written),
+                None => match self.foreign_tombstone_of(self_peer, row) {
+                    Some(t) => (Some((self_peer, row)), t, false),
+                    // 場所の最後の行が死んだこの行 (使い回しの前): 削除の版数は場所にある
+                    None if self.last_local_of_slot(slot) == row && !self.entities.is_live(slot) => {
+                        (None, self.tombstone_version_of(slot), true)
+                    }
+                    None => (None, enchudb_oplog::Hlc::ZERO, false),
+                },
+            };
+            let keep = keep_unknown && tomb == enchudb_oplog::Hlc::ZERO;
+            let others = self.drop_aliases_where(slot, |key, g| g == row_gen && !(keep && !self.alias_delete_known(key)), tomb);
+            // 名前の版数: 前の住人の削除。 引けなければ外した別名の退避の版数 (前の 1 か所と同じ)
+            let names_tomb = if tomb != enchudb_oplog::Hlc::ZERO {
+                Some(tomb)
+            } else {
+                others.iter().filter_map(|&(p, l)| self.foreign_tombstone_of(p, l)).max()
+            };
+            if let Some(t) = names_tomb {
+                let ids: Vec<_> = lead.into_iter().chain(others.iter().copied()).collect();
+                self.move_stale_slot_names(&ids, slot, t);
+            }
+            if retreat && tomb != enchudb_oplog::Hlc::ZERO && !others.is_empty() {
+                self.retreat_removed_keys(&others, tomb);
+            }
+        }
+        if let Some(now) = ahead_of {
+            self.drop_aliases_where(slot, |_, g| g > now, enchudb_oplog::Hlc::ZERO);
+        }
+    }
+
+    /// 別名の identity `key` の削除が分かっているか ([`Self::drop_former_generation_aliases`] の `keep_unknown`): 他の peer の別名は
+    /// 退避表に居る、 畳んだ自分の行の別名 (#612) はその slot に削除の版数がある。 外しても、 その identity 宛ての受信の書き込みは削除で
+    /// 捨てられる (#166 / #490 の払い出しが場所を殺す / 版数のある slot)。
+    fn alias_delete_known(&self, (peer, foreign_local): (enchudb_oplog::PeerId, u32)) -> bool {
+        if peer == self.peer_id() {
+            self.tombstone_version_of(foreign_local) != enchudb_oplog::Hlc::ZERO
+        } else {
+            self.foreign_tombstone_of(peer, foreign_local).is_some()
+        }
+    }
+
+    /// #994 [C4] の死んだ場所 (PR #1006 の 2 回目の読み直し): 開く時に `.eidmap` の写像を上書きした別名 ([`Generations::note_alias_override`])
+    /// が死んだ場所 `slot` に残っていれば、 外して写像を戻す。 `persist_tables` は `.eidmap` → `eidalias` の順に書くので、 上書きした
+    /// 事が 「別名の方が古い」 の証 (使い回しの記録が無くても)。 前は死んだ場所の別名を使い回しの記録でしか外さず、 記録の無い時は
+    /// 古い別名が残って `.eidmap` の新しい写像 (使い回しの後に払い直した場所) が戻らなかった。 戻す先の場所に別の逆写像がある時は
+    /// 外さない (死んだ場所に残す = 受信の書き込みは、 場所に削除の版数があれば捨てられる)。 再生が戻す先の場所を別の行で生かした
+    /// 時は、 覚えが先に捨てられている (`drop_aliases_at_replayed_reuse`、 PR #1006 の 3 回目の読み直し [2])。 仕上げのなめだけ (覚えは
+    /// 仕上げで捨てる)。
+    fn restore_overridden_aliases(&self, slot: u32) {
+        let gens = self.generations();
+        for ((peer, foreign_local), _) in self.eid_translator.aliases_with_gen_of(slot) {
+            let Some((local, mapped_gen)) = gens.alias_override((peer, foreign_local)) else { continue };
+            if self.eid_translator.reverse(local).is_some()
+                || !self.override_target_kept(local, mapped_gen)
+                || !self.eid_translator.unalias(peer, foreign_local)
+            {
                 continue;
             }
-            if peer == self_peer {
-                self.eid_translator.alias(peer, foreign_local, foreign_local);
-            } else {
-                others.push((peer, foreign_local));
+            if let Some((local, mapped_gen)) = gens.take_alias_override((peer, foreign_local)) {
+                self.eid_translator.insert(peer, foreign_local, local, mapped_gen);
             }
         }
-        others
     }
 
-    /// 読み直し 2 [B1]: 場所 `slot` (使い回された / 生きている) を指す別名 `(peer, foreign_local)` は、 場所を使い回した時に外した別名
-    /// (`eidalias` だけが使い回しの前のまま届いた) か。 使い回しは別名を外す時にだけ、 その identity に前の住人の削除の版数を載せる
-    /// (`split_removed_keys`):
-    ///
-    /// - 他の peer の別名: identity が退避表 (`foreign_tombs`) に載っている。 退避表の identity が生きた行の別名になる道は使い回しの
-    ///   残りの他に無い: 畳む道 (`bind_remote_eid` / `apply_alias`) は退避表に載った identity を束ねると、 その削除を行に当てて行を
-    ///   消す (#490、 削除優先)。 #714 の切り離しは退避表を使わない (消えた identity は死んだ場所に張る)。 払い出し
-    ///   (`restore_foreign_tombstone`) も払い出した場所を殺す
-    /// - 自分の行の別名 (#612、 畳んだ自分の行の世界番号 (自分, s) → 場所): s の tomb.seg に、 退避表のどれかの identity と同じ削除の
-    ///   版数が載っている (使い回しは前の住人 (自分の行 X) の削除を (自分, X) として退避表に載せ、 同じ版数を s の tomb.seg に載せる。
-    ///   畳む道 (`merge_entity_into`) は s の版数を消す。 HLC は書き込みごとに一意なので、 削除の途中で切れた跡 (生き残り) の版数は
-    ///   退避表の版数と重ならない = 読み直し 2 [B5])
-    ///
-    /// 使い回されていない死んだ場所の別名には使わない (#490: 退避表に載った identity を束ねた行は、 その削除で死んでいる = 正しい
-    /// 別名。 別名宛ての書き込みは死んだ場所に当たらない)。
-    fn alias_evicted(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, slot: u32) -> bool {
-        if peer != self.peer_id() {
-            return self.foreign_tombstone_of(peer, foreign_local).is_some();
-        }
-        if foreign_local == slot {
-            return false;
-        }
-        let tomb = self.tombstone_version_of(foreign_local);
-        tomb != enchudb_oplog::Hlc::ZERO
-            && !self.foreign_tombs_empty.load(std::sync::atomic::Ordering::Relaxed)
-            && self.generations().prev.tomb_held(tomb, || self.foreign_tombs.read().unwrap().values().copied().collect())
+    /// PR #1006 の 3 回目の読み直し [2]: #994 [C4] の写像を戻す先 `local` が、 生きていれば、 今の住人が写像の面の住人 (世代 `mapped_gen`)
+    /// のままか。 覚える時と同じく突き合わせの前の読み方 ([`Self::last_row_unmarked`]、 page の印を見ない) で読む。 開く道が場所を別の
+    /// 行で生かした (再生の使い回しの移り目は覚えを先に捨てる = `drop_aliases_at_replayed_reuse`。 それ以外の生かし = 名前で束ねる
+    /// `bind_remote_eid` など) 後に戻すと、 その行が写像の identity の翻訳先になる。 死んだ場所は比べない (突き合わせが削除を完了させた
+    /// 場所の世代は覚えた後に 2 つ上がる、 死の印も生きている印も無い場所の最後の行は読み分けられない = `last_row_unmarked` の doc。
+    /// 比べると正しい戻しを止める)。
+    fn override_target_kept(&self, local: u32, mapped_gen: u32) -> bool {
+        !self.entities.is_live(local) || self.last_row_unmarked(local).0 >> self.generations().bits() == mapped_gen
     }
 
-    /// 読み直し 2 [B1]: きれいに閉じなかった後に開く時、 生きている場所を指す別名のうち、 使い回しが外した物 (`eidalias` だけが使い回しの
-    /// 前のまま、 [`Self::alias_evicted`]) を全部外す。 記録から戻す道 (`restore_prev_resident`) の後 (再生の前) と、 WAL の再生と
-    /// 後に回した戻しの後に呼ぶ ([`Self::finish_open_restores`]、 再生が次の住人を生かした場所)。 外した別名には、 場所の名前の記録が
-    /// 使い回しの前の物なら名前を移す ([`Self::move_stale_slot_names`])。
+    /// #993 / #994: v15 の DB をきれいに閉じなかった後に開いた時 (書ける open)、 別名のうち指す行の世代 (`eidalias` 版 2) が場所の
+    /// 住人と合わない物を外す ([`Self::drop_former_generation_aliases`])。 呼ぶのは突き合わせ (`reconcile_generations`) の後・WAL の
+    /// 再生の前 (`replay` = この open の後の再生) と、 再生と後に回した戻しの後 ([`Self::finish_open_restores`]、 `replay` = None =
+    /// 仕上げ)。 再生する record があるかは、 要る時 (生きている場所に使い回しの記録の無い下の世代の別名がある時と、 死んだ場所に
+    /// 使い回しの記録が離した行の別名がある時) だけ聞く (#972: 聞くのは WAL を読む。 前の住人の別名の無い open は聞かない)。
     ///
-    /// 前は前の住人の記録を見る道 (3 か所) だけが外し、 記録を見ない道で漏れた: 翻訳した前の住人 F の identity が落ちる前に別の場所に
-    /// 払い直された像 (記録から戻す道が何もせずに返った)、 前の住人の削除が本体に届かず使い回しの record で再生が場所の世代を上げる像
-    /// (`replay_slot` の `g > now`、 やり直しを呼ばない)。 v14 の DB (記録なし) も同じ形 (#166 の使い回し) なので、 世代によらず回す。
-    fn drop_evicted_aliases(&self) {
-        let mut slots: Vec<u32> = self.eid_translator.alias_snapshot().into_iter().map(|(_, _, local)| local).collect();
+    /// - 生きている場所: 指す行の世代が住人より下の別名 (使い回した場所の前の住人の別名。 住人が後から来た = 使い回した) を外す。
+    ///   再生の前は、 再生がその行を生かし直せない物だけ (`prev.seg` にその行の使い回しの記録がある = 再生の守りが当てない、 か再生する
+    ///   record が無い。 PR #1006 の読み直し [3]: 記録の無い本体が先の像で、 再生が前の住人を戻すと別名だけが写像を失った)。 記録は
+    ///   再生の守り (`replay_slot` の `g < now`) と同じく指す行そのものの記録 (`record_of` の完全一致。 2 回目の読み直しの疑い: 前は
+    ///   「その世代以上の行の記録」 (`evicted_at_or_after`) で、 記録の行が実在しない番号 (突き合わせが世代を 2 つ上げた後の使い回し)
+    ///   や配列が上書きされた像で、 守りが外れて再生が古い行を戻すのに別名は前に外れていた)。 仕上げは上の世代の別名 (本体にも WAL
+    ///   にも無い行を指す = 本体より先に届いた `eidalias`) も外す
+    /// - 死んだ場所: 使い回しの記録が、 指す行を場所から離した物だけ外す ([`Self::alias_row_left_slot`])。 死んだ場所の世代は使い回し
+    ///   でなくても進む (突き合わせが削除を完了させる時に 2 つ上げる) ので、 世代が下でも前の住人の証にならない (PR #1006 の読み直し [1]:
+    ///   前は 2 回目のきれいでない open が、 1 回目の突き合わせで世代を 2 つ上げた場所の消えた行の正しい別名を外した)。 上の世代も残す
+    ///   (読み直し [2]: 受信の書き込みは死んだ場所に当たり、 場所に削除の版数があれば捨てられる (`slot_is_dead`)。 前は突き合わせで
+    ///   殺した使い回しの住人の別名を退避なしで外し、 その別名宛ての書き込みが新しい生きた行になった)。 再生する record がある時は再生の前に見ない (2 回目の読み直し [B]: 再生の後に
+    ///   回した記録の戻し (`restore_prev_residents` の [N1]) を先取りして外していた。 再生中に死んだ場所へ当たる中継の record は捨てられ、
+    ///   次の住人は再生の移り目とやり直しが外し、 残りは仕上げが外す)。 前の住人の削除の版数が引けない別名は、 削除の分かっていない
+    ///   identity の物を残す (`keep_unknown`)。 仕上げは `.eidmap` の写像を上書きした古い別名も外して写像を戻す
+    ///   ([`Self::restore_overridden_aliases`]、 #994 [C4])
+    fn drop_stale_generation_aliases(&self, replay: Option<&ReplayAhead<'_>>) {
+        let gens = self.generations();
+        if !gens.active() {
+            return;
+        }
+        let final_pass = replay.is_none();
+        let bits = gens.bits();
+        // 再生がその行を生かし直しうるか (仕上げでは無い)。 `ReplayAhead::follows` は 1 回だけ読む
+        let replay_follows = || replay.is_some_and(|r| r.follows());
+        let mut slots: Vec<u32> = self.eid_translator.alias_snapshot().into_iter().map(|(_, _, local, _)| local).collect();
         slots.sort_unstable();
         slots.dedup();
         for slot in slots {
-            if !self.entities.is_live(slot) {
-                continue;
+            if self.entities.is_live(slot) {
+                let now = self.alias_row_gen(slot);
+                let former = |g: u32| {
+                    self.alias_row_left_slot(slot, g, Some(now))
+                        && (final_pass || gens.prev.record_of(slot, (g << bits) | slot).is_some() || !replay_follows())
+                };
+                self.drop_former_generation_aliases(slot, former, final_pass.then_some(now), false);
+            } else {
+                let former = |g: u32| self.alias_row_left_slot(slot, g, None) && (final_pass || !replay_follows());
+                self.drop_former_generation_aliases(slot, former, None, true);
+                if final_pass {
+                    self.restore_overridden_aliases(slot);
+                }
             }
-            let others = self.drop_evicted_aliases_at(slot);
-            let Some(tomb) = others.iter().filter_map(|&(p, l)| self.foreign_tombstone_of(p, l)).max() else { continue };
-            self.move_stale_slot_names(&others, slot, tomb);
+        }
+    }
+
+    /// 場所 `slot` を指す別名の指す行 (世代 `agen`) が、 場所を離れた行 (前の住人とそれより前の行) か。 `live_gen` = 場所の住人の世代
+    /// (生きている場所)。 生きている場所は住人より下の世代 (住人は後から来た = 使い回した)。 死んだ場所は `prev.seg` の使い回しの記録で
+    /// 決める (死んだ場所の世代は、 開く時の突き合わせが削除を完了させる時にも進む = 世代の大小は使い回しの証にならない、
+    /// [`crate::prev_slots::PrevSlots::evicted_at_or_after`])。 記録の無い使い回し (移す削除の無い前の住人 / 生きている印だけ届いた
+    /// 電源断の像、 review946 [3]) の古い別名は残る (死んだ場所に当たる受信の書き込みは、 場所に削除の版数があれば捨てられる
+    /// (`slot_is_dead`)。 版数の無い死んだ場所 (版数なしで消した行など) には当たる。 master は死んだ場所の別名を全部残した)。
+    fn alias_row_left_slot(&self, slot: u32, agen: u32, live_gen: Option<u32>) -> bool {
+        match live_gen {
+            Some(now) => agen < now,
+            None => self.generations().prev.evicted_at_or_after(slot, agen),
         }
     }
 
@@ -21108,6 +21350,13 @@ impl Engine {
 
     /// 場所 `local` の最後の行 (`last_local_of_slot` と同じ決め方を、 page の印を見ずに) と、 死んでいるか。 開く時の突き合わせ
     /// (`reconcile_generations`) が印を立て直す前に読む所用。
+    ///
+    /// 前からのずれ (PR #1006 の 2 回目の読み直しで書いた、 直していない): 死の印が無く生きていない場所を 「今 − 1」 と読む。 突き合わせの
+    /// 2. は同じ場所を 「今」 の行の削除として完了させる。 disk の上では 「消す途中で生きている印だけ届いた」 (最後の行は今) と 「生かす
+    /// 途中で死の印を落とした所だけ届いた」 (今の行はまだ住んでいない) を見分けられない。 開く時にこの値を使う所 (`.eidmap` の前の逆写像の
+    /// key を別名にする世代 = `EidTranslator::insert` の #560、 #994 [C4] の上書きの覚えの世代、 `prev_evicted` と記録から戻す道の
+    /// 「場所の最後の行」) は、 消す途中の像で最後の行を 1 つ前と読む。 その場所に前の使い回しの記録 (前の住人 = 今 − 1) があると、 今の行の
+    /// 別名が前の住人の物と読まれうる (極めて狭い)。
     fn last_row_unmarked(&self, local: u32) -> (u32, bool) {
         let gens = self.generations();
         let (now, dead_mark) = gens.state_unmarked(local);
@@ -21116,13 +21365,8 @@ impl Engine {
     }
 
     /// [`Self::restore_prev_residents`] の 1 場所。 退避を戻したか。 `deferred` = 再生の後に戻す時 ([`Self::finish_prev_restores`]) の、
-    /// 再生の前に決めた (退避が書き出し済みか, 書き出していなければ外す別名)。 None = 今の退避表で決め、 外すのは場所を指す別名の全部。
-    fn restore_prev_resident(
-        &self,
-        slot: u32,
-        rec: crate::prev_slots::PrevRecord,
-        deferred: Option<(bool, &[(enchudb_oplog::PeerId, u32)])>,
-    ) -> bool {
+    /// 再生の前に決めた 「退避が書き出し済みか」。 None = 今の退避表で決める。
+    fn restore_prev_resident(&self, slot: u32, rec: crate::prev_slots::PrevRecord, deferred: Option<bool>) -> bool {
         let id = (rec.peer, rec.number);
         // review946 [1]: 前の住人の削除が本体に届いていない (場所の最後の行が記録の行で生きている / 記録の行より前の行 = 使い回しも
         // 届いていない)。 戻すと生きている行の Delete を state に出す。 届いた削除 (死んでいる) と使い回し (後の行) だけ戻す
@@ -21133,23 +21377,24 @@ impl Engine {
             return false;
         }
         // 翻訳した行の identity が写像を持つ: 落ちる前に別の場所に払い直した (削除の版数はその場所に戻してある)。 読み直し 2 [B1]:
-        // 退避は `.eidmap` に届いている (写像を張り直したのは使い回しの後) ので、 場所を指す別名のうち使い回しが外した物を外し、
-        // 場所の名前の記録 (使い回しの前の物) を identity と外した別名に移す (前は何もせずに返り、 前の住人の別名と名前が次の住人に
-        // 残った)
-        if rec.kind == crate::prev_slots::PrevKind::Translated && self.eid_translator.get(id.0, id.1).is_some() {
+        // 退避は `.eidmap` に届いている (写像を張り直したのは使い回しの後) ので、 場所を指す別名のうち前の住人とそれより前の行の物
+        // (世代で決める) を外し、 場所の名前の記録 (使い回しの前の物) を identity と外した別名に移す。
+        // PR #1006 の 2 回目の読み直し [A]: 写像がこの場所のままなのは払い直しではない (記録だけが disk に届いて使い回しが本体に
+        // 届いていない像で、 `prev_evicted` がわざと残した写像)。 その時は下の道 (外した別名に記録の版数を退避する)。 前はこの枝に
+        // 入り、 退避表に居ない別名 (名前で畳んだ b) を退避なしで外して返った = b 宛ての遅れた書き込みが新しい生きた行になった
+        if rec.kind == crate::prev_slots::PrevKind::Translated
+            && self.eid_translator.get(id.0, id.1).is_some_and(|l| l != slot)
+        {
             let mut ids = vec![id];
-            ids.extend(self.drop_evicted_aliases_at(slot));
+            ids.extend(self.drop_aliases_below(slot, gone_gen + 1, rec.tomb));
             self.move_stale_slot_names(&ids, slot, rec.tomb);
             return false;
         }
-        let written = deferred.map_or_else(|| self.prev_delete_written(rec), |d| d.0);
-        // 場所を指す別名のうち使い回しの前の住人の物も外す (`split_removed_keys` と同じ)。 退避が書き出されていなければ全部 (後に
-        // 回した戻しは再生の前に控えた物)、 書き出されていれば使い回しが外した物 (`eidalias` が届いていない、 読み直し [A2]) だけ
-        let others = if written {
-            self.drop_evicted_aliases_at(slot)
-        } else {
-            self.drop_unwritten_former_aliases(slot, rec.tomb, deferred.map(|d| d.1))
-        };
+        let written = deferred.unwrap_or_else(|| self.prev_delete_written(rec));
+        // 場所を指す別名のうち、 前の住人とそれより前の行の物 (`eidalias` 版 2 の世代、 #993 / #994) を外す (`split_removed_keys` と
+        // 同じ)。 退避が書き出し済みでも外す (`eidalias` は `.eidmap` の後ろの別の file で、 届いていないことがある、 読み直し [A2])。
+        // 次の住人に張った別名 (世代が上) は残す (前は退避が書き出されていないと場所の別名を全部外した、 [B4])
+        let others = self.drop_aliases_below(slot, gone_gen + 1, rec.tomb);
         // 名前 (場所の記録が使い回しの前の物の時だけ移す)。 使い回しと同じく版数の退避の前に
         let mut ids = vec![id];
         ids.extend_from_slice(&others);
@@ -22401,6 +22646,54 @@ impl Engine {
         enchudb_oplog::make_eid(self.peer_id.load(std::sync::atomic::Ordering::Acquire), self.generations().local(slot))
     }
 
+    /// 別名 (#178 / #612) が指す行の世代 (#993 / #994、 `eidalias` 版 2): 場所 `slot` に最後に居た行の世代 ([`Self::last_local_of_slot`]
+    /// の上の bit)。 別名を張る時にその場所の住人の世代として覚え、 開く時に同じ決め方で読んだ今の住人と比べる (合わなければ使い回した
+    /// 場所の前の住人の別名)。 世代を持たない DB は 0。
+    pub(crate) fn alias_row_gen(&self, slot: u32) -> u32 {
+        match self.generations().bits() {
+            0 | 32.. => 0,
+            b => self.last_local_of_slot(slot) >> b,
+        }
+    }
+
+    /// [`Self::alias_row_gen`] の、 場所 `slot` を生かした後 ([`Self::ensure_live_slot`]) の形: 生きている場所は今の住人の世代、 死んだ
+    /// 場所は今の世代 (生かす道 `revive_slot` は 「死んでいる」 印を落とすだけで世代を変えない)。 `bind_remote_eid` が張ってから生かす
+    /// 間に並んだ sidecar の書き出しが、 生かす前の世代を書かないように (PR #1006 の 2 回目の読み直し [4] の窓)。 間に別の書き手が
+    /// その場所を消した時は世代がずれ、 呼び手が生かした後に張り直す。
+    fn alias_gen_after_revive(&self, slot: u32) -> u32 {
+        match self.generations().bits() {
+            0 | 32.. => 0,
+            _ if self.entities.is_live(slot) => self.alias_row_gen(slot),
+            _ => self.generations().get(slot),
+        }
+    }
+
+    /// 別名 `(peer, foreign_local)` → 場所 `slot` を張る ([`EidTranslator::alias`](crate::eid_translator::EidTranslator::alias))。
+    /// 指す行の世代は今の場所の住人の世代 ([`Self::alias_row_gen`])。 写像の lock を持たずに呼ぶ (世代の決め方が写像を引く)。
+    fn alias_slot(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, slot: u32) {
+        let agen = self.alias_row_gen(slot);
+        self.eid_translator.alias(peer, foreign_local, slot, agen);
+    }
+
+    /// #612: 畳んだ自分の行の slot `s` を自分自身の別名にして予約する (残した行の場所を手放した時、 `split_removed_keys` と開く道)。 指す行の
+    /// 世代は、 予約した後の [`Self::alias_row_gen`] と同じ (畳んだ自分の行の場所は 「死んでいる」 印だけで死を読む)。 別名を張る前に
+    /// 決める (張る前は畳んだ場所に見えず、 生きていない場所を消えた行 = 今 − 1 と読む)。
+    fn reserve_folded_own_slot(&self, s: u32) {
+        let g = self.generations();
+        let agen = match g.bits() {
+            0 | 32.. => 0,
+            _ => {
+                let (now, dead) = g.state(s);
+                match g.relog_gen(s).filter(|_| dead) {
+                    Some(r) => r,
+                    None if now > 0 && dead => now - 1,
+                    None => now,
+                }
+            }
+        };
+        self.eid_translator.alias(self.peer_id(), s, s, agen);
+    }
+
     /// 場所 `slot` に最後に居た行 (生きていれば今の住人、 死んでいれば消えた行) の local (世代 | 場所)。 中の道で、 場所から 「その行」
     /// を指す値を作る所 (相手から届いた Ref の先、 作り直す Delete の record)。 v15 では消す時に世代を上げる (死んだ場所の値 = 次の
     /// 住人の世代) ので、 死んだ場所は 今 − 1。 畳んだ自分の行の場所 (#612) は上げないので今のまま。 今の世代を付けると、 その場所を
@@ -23167,17 +23460,18 @@ impl Engine {
         } else {
             ids.iter().filter(|&&((peer, _), _)| peer != self_peer).max_by_key(|&&(id, created)| (created, id)).map(|b| b.0)
         };
+        let agen = self.alias_row_gen(moved);
         for &((peer, fl), _) in ids {
             if peer == self_peer {
                 if fl != moved {
-                    self.eid_translator.alias(peer, fl, moved);
+                    self.eid_translator.alias(peer, fl, moved, agen);
                 }
                 continue;
             }
             if addressee == Some((peer, fl)) {
-                self.eid_translator.insert(peer, fl, moved);
+                self.eid_translator.insert(peer, fl, moved, agen);
             } else {
-                self.eid_translator.alias(peer, fl, moved);
+                self.eid_translator.alias(peer, fl, moved, agen);
             }
         }
     }
@@ -24395,7 +24689,7 @@ impl Engine {
                 if let Some(dead) = self.alloc_translated_local(pk) {
                     self.set_tombstone_local(dead, t);
                     self.live_free(dead, None);
-                    self.eid_translator.insert(peer, fl, dead);
+                    self.eid_translator.insert(peer, fl, dead, self.alias_row_gen(dead));
                 }
             }
             let name = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
@@ -29773,7 +30067,7 @@ impl Engine {
                 eng.finish_prev_restores();
                 // 読み直し 2 [B1] / [B2] / [R2]: 再生が生かした場所の使い回しが外した別名を外し、 版数の索引を捨て、 `prev.seg` の周期を
                 // 進め始める
-                eng.finish_open_restores(!records.is_empty());
+                eng.finish_open_restores();
                 // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
@@ -29800,7 +30094,7 @@ impl Engine {
                 // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();
-                eng.finish_open_restores(false);
+                eng.finish_open_restores();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
                 if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
@@ -30179,6 +30473,10 @@ impl Engine {
         let (slot, g) = gens.split(enchudb_oplog::eid_local(eid));
         let now = gens.get(slot);
         if g > now {
+            // #994 [C1]: 使い回しの移り目。 前の住人を指す別名 (`eidalias` 版 2 の世代) をここで外す (再生の前に外すと、 移り目より
+            // 前の中継した `Alias` の再生が生きている前の住人をその別名の削除で消した。 再生の後に外すと、 移り目より後の中継した
+            // record がその別名で次の住人に当たる)。 前の住人の名前の記録を移すので cell を落とす前に
+            self.drop_aliases_at_replayed_reuse(slot, g);
             if let Some(t) = self.table_of_slot(slot) {
                 self.drop_leftover_cells(slot, t);
             }
@@ -30201,6 +30499,8 @@ impl Engine {
             // 後始末をやり直す (逆写像は前の住人の物 = 守りより先に外す)。 場所の削除の版数は後の行の物でありうるので記録の版数だけ使う
             if makes_live && !self.entities.is_live(slot) {
                 self.redo_reuse_eviction(slot, g, false);
+                // #993 / #994: やり直しが前の住人を読まずに返った形 (記録も場所の削除の版数も無い等) でも、 この行より前の行の別名は外す
+                self.drop_aliases_at_replayed_reuse(slot, g);
             }
             if self.eid_translator.reverse(slot).is_some()
                 && (makes_live || self.last_local_of_slot(slot) != enchudb_oplog::eid_local(eid))
@@ -30213,6 +30513,8 @@ impl Engine {
         } else if g == now && makes_live && !self.entities.is_live(slot) {
             // 死んだ場所を次の住人の record で生かす (本体の削除、 または再生した前の住人の Delete が世代を上げた後)
             self.redo_reuse_eviction(slot, g, true);
+            // #993 / #994: やり直しが前の住人を読まずに返った形でも、 前の住人を指す別名は使い回しの移り目で外す (#994 [C1])
+            self.drop_aliases_at_replayed_reuse(slot, g);
         }
         Some(slot)
     }
@@ -30225,12 +30527,12 @@ impl Engine {
     ///    書き出し済みなら、 自分の行の memory の後始末はやり直さない (sidecar にある、 読み直し [A1])
     /// 2. 記録が無く (WAL の書き出しの後・`prev.seg` の書き出しの前に落ちた)、 場所に写像がある: 翻訳した行
     /// 3. 記録も写像も無い: 自分の行 (自分の peer, 前の住人)。 ただし退避表に同じ版数の identity があれば前の住人を読まない (`.eidmap` が
-    ///    本体より先に届く道で、 翻訳した行の外しが先に届いた像。 HLC は書き込み 1 回ごとに一意)。 その時も、 使い回しが外した別名
-    ///    (退避表に載っている identity、 [`Self::alias_evicted`]) は外す (`eidalias` は `.eidmap` の後ろ、 読み直し [A2])
+    ///    本体より先に届く道で、 翻訳した行の外しが先に届いた像。 HLC は書き込み 1 回ごとに一意)。 その時も、 前の住人の別名は外す
+    ///    (`eidalias` は `.eidmap` の後ろ、 読み直し [A2])
     ///
-    /// 退避が `.eidmap` に届いていれば、 外す別名は使い回しが外した物 ([`Self::drop_evicted_aliases_at`]) だけ、 届いていなければ場所を
-    /// 指す別名の全部 ([`Self::drop_unwritten_former_aliases`])。 ここを通らない場所 (`g > now` の枝など) の別名は開く道の仕上げ
-    /// ([`Self::drop_evicted_aliases`]) が外す。
+    /// 外す別名は、 指す行の世代 (`eidalias` 版 2) が `row_gen` より下の物 ([`Self::drop_aliases_below`]、 #993 / #994)。 次の住人 (この
+    /// record の行) に張った別名は残す (`eidalias` が本体より先に届いた像)。 `g > now` の枝の別名は
+    /// [`Self::drop_aliases_at_replayed_reuse`] が外す。
     ///
     /// 翻訳した行は写像がまだ場所を指す時だけ外して削除の版数を退避し、 自分の行は退避する。 名前は `move_stale_slot_names` と同じ
     /// 決め方で移す。 やり直した後始末は `prev.seg` に書き (書き出す前にもう一度落ちても戻せる。 書き出し済みの記録は書き直さない)、
@@ -30257,9 +30559,14 @@ impl Engine {
                     // [R2]: 退避表の版数の索引で引く (再生の間だけ持つ)。 前は record ごとに退避表の全部をなめた
                     if gens.prev.tomb_held(here, || self.foreign_tombs.read().unwrap().values().copied().collect()) {
                         // 読み直し [A2]: 退避は `.eidmap` に届いた。 `eidalias` は同じ書き出しの後ろなので届いていないことがあり、
-                        // 使い回しが外した別名が場所を指したまま残る。 外す (前は何もせずに返り、 前の住人の別名が次の住人の別名に
-                        // 残った)。 退避はもう載っている
-                        self.drop_evicted_aliases_at(slot);
+                        // 前の住人の別名が場所を指したまま残る。 外す (退避はもう載っている)。 名前の記録 (`pktombs` / `pkformer`) も
+                        // `eidalias` の後ろなので、 場所の記録が使い回しの前の物なら、 前の住人 (自分の行が退避表にこの版数で居れば
+                        // その identity を先頭に、 #994 [C3]) と外した別名に移す (前は移さず、 場所の記録が次の住人の場所に残った)
+                        let others = self.drop_aliases_below(slot, row_gen, here);
+                        let own = (self_peer, prev_row);
+                        let lead = (self.foreign_tombstone_of(own.0, own.1) == Some(here)).then_some(own);
+                        let ids: Vec<_> = lead.into_iter().chain(others).collect();
+                        self.move_stale_slot_names(&ids, slot, here);
                         return;
                     }
                     (PrevKind::Own, (self_peer, prev_row), here, false)
@@ -30272,10 +30579,11 @@ impl Engine {
                     return;
                 }
                 let mut ids: Vec<(enchudb_oplog::PeerId, u32)> = Vec::new();
-                for (peer, foreign_local) in self.eid_translator.remove_local(slot) {
+                // 次の住人 (世代 `row_gen`) に張った別名は残す (#993 / #994)
+                for (peer, foreign_local) in self.eid_translator.remove_local_below(slot, row_gen) {
                     if peer == self_peer {
                         // #612: 畳んだ自分の行の世界番号 (`split_removed_keys` と同じ)
-                        self.eid_translator.alias(peer, foreign_local, foreign_local);
+                        self.reserve_folded_own_slot(foreign_local);
                         self.set_tombstone_local(foreign_local, tomb);
                     } else {
                         ids.push((peer, foreign_local));
@@ -30288,21 +30596,17 @@ impl Engine {
                 self.retreat_removed_keys(&ids, tomb);
             }
             // 読み直し [A1]: 記録の周期が書き出し済み = この使い回しの memory の効果 (退避・名前・外した別名) は sidecar に全部ある
-            // (`PrevSlots::end_persist` は sidecar を全部書いて directory を fsync した後に進む)。 やり直さない: 場所を指す別名は次の
-            // 住人 (この record の行) の物で、 退避表に前の住人が無いのは忘れてよい線 (`forget_deletes_before`) が外した後。 前は退避表
-            // だけを見て 「書き出していない」 と読み、 忘れた前の住人の削除の版数で今の住人の別名を外して消えた identity にし、 忘れた
-            // 削除も退避表に戻した (開く時に記録から戻す道は書き出していない周期の記録しか見ない = review946 [2] と同じ守り)
-            PrevKind::Own if record_written => {}
+            // (`PrevSlots::end_persist` は sidecar を全部書いて directory を fsync した後に進む)。 退避と名前はやり直さない: 退避表に前の
+            // 住人が無いのは忘れてよい線 (`forget_deletes_before`) が外した後 (戻すと忘れた削除が退避表に戻る、 review946 [2] と同じ守り)。
+            // 別名は世代で決まる (次の住人に張った別名は世代が上で残る) ので、 前の住人の別名が残っていれば外すだけ
+            PrevKind::Own if record_written => {
+                self.drop_aliases_below(slot, row_gen, tomb);
+            }
             PrevKind::Own => {
-                // #969: 場所を指す別名 (前の住人に名前で畳んだ行の世界番号) も外す (開く時に記録から戻す道 `restore_prev_resident`
-                // と同じ)。 前は外さず、 前の住人の別名が新しい住人に写った (その別名宛ての書き込みが新しい住人に当たる)。 退避が
-                // `.eidmap` に書き出されていれば、 外すのは使い回しが外した別名だけ (`eidalias` は届いていないことがある、 読み直し [A2])
-                let written = self.prev_delete_written(PrevRecord { kind, gone: prev_row, peer: id.0, number: id.1, tomb });
-                let others = if written {
-                    self.drop_evicted_aliases_at(slot)
-                } else {
-                    self.drop_unwritten_former_aliases(slot, tomb, None)
-                };
+                // #969: 場所を指す別名のうち前の住人とそれより前の行の物 (前の住人に名前で畳んだ行の世界番号) も外す (開く時に記録から
+                // 戻す道 `restore_prev_resident` と同じ)。 前は外さず、 前の住人の別名が新しい住人に写った (その別名宛ての書き込みが
+                // 新しい住人に当たる)。 次の住人に張った別名は世代が上で残る (#993 / #994)
+                let others = self.drop_aliases_below(slot, row_gen, tomb);
                 let mut ids = vec![id];
                 ids.extend_from_slice(&others);
                 self.move_stale_slot_names(&ids, slot, tomb);
@@ -30481,6 +30785,28 @@ impl Engine {
         author: enchudb_oplog::PeerId,
     ) {
         use enchudb_oplog::oplog::DecodedOp;
+        // PR #1006 の 2 回目の読み直し ([3] の引き換えの別案): 宛名が、 生きている場所の今の住人より下の世代の行を指す別名 (使い回した
+        // 場所の前の住人の別名。 開く道の仕上げが外す) なら、 その record は今の住人に当てない。 再生の前に外さなかった古い別名
+        // (使い回しの記録が無く再生する record もある像、 読み直し [3]) で、 中継の record が次の住人に当たっていた (Delete なら消した)。
+        // 消えた identity の削除は退避表に載せる (写像の無い identity の削除と同じ、 #490)
+        let addressed = match op {
+            DecodedOp::Tie { eid, .. }
+            | DecodedOp::TieRef { eid, .. }
+            | DecodedOp::TieNamed { eid, .. }
+            | DecodedOp::TieLeaf { eid, .. }
+            | DecodedOp::Untie { eid, .. }
+            | DecodedOp::Delete { eid }
+            | DecodedOp::Content { eid, .. } => Some(*eid),
+            DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } | DecodedOp::Commit => None,
+        };
+        if let Some(eid) = addressed
+            && let Some((slot, agen)) = self.replayed_stale_alias(eid)
+        {
+            if matches!(op, DecodedOp::Delete { .. }) {
+                self.replayed_delete_via_stale_alias(eid, slot, agen, hlc);
+            }
+            return;
+        }
         match op {
             DecodedOp::Vocab { vid, bytes } => {
                 if !self.has_remote_vocab(author, *vid, bytes) {
@@ -30491,7 +30817,7 @@ impl Engine {
                 let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
                 let v = if self.himo_is_ref(*himo_id) {
                     let Ok(value) = u32::try_from(*value) else { return }; // Ref の列は u32
-                    match self.resolve_remote_ref_value(author, value, *himo_id) {
+                    match self.replayed_ref_value(author, value, *himo_id) {
                         Some(v) => v as u64,
                         None => return,
                     }
@@ -30505,7 +30831,7 @@ impl Engine {
             }
             DecodedOp::TieRef { eid, himo_id, target } => {
                 let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
-                let v = match self.resolve_remote_ref_value(
+                let v = match self.replayed_ref_value(
                     enchudb_oplog::eid_peer(*target),
                     enchudb_oplog::eid_local(*target),
                     *himo_id,
@@ -30539,10 +30865,75 @@ impl Engine {
                 self.remote_content_apply(le, key, data, hlc);
             }
             DecodedOp::Alias { eid, same_as } => {
+                // PR #1006 の 3 回目の読み直し [1]: どちらかの側が古い別名なら当てない (その側の行は場所を離れた。 当てると、 もう一方
+                // の世界番号を場所の今の住人の別名にする / 行を今の住人に畳む)
+                if self.replayed_via_stale_alias(*eid) || self.replayed_via_stale_alias(*same_as) {
+                    return;
+                }
                 self.apply_alias(*eid, *same_as);
             }
             DecodedOp::Commit => {}
         }
+    }
+
+    /// [`Self::replay_relayed_op`] が古い別名 (場所 `slot` の世代 `agen` の行を指す) を宛名とする中継の削除 `eid` を当てない時、 その
+    /// 削除を消えた行の削除として退避表に載せる (写像の無い identity の削除と同じ、 #490)。 宛名の identity と、 同じ行 (世代 `agen`) を
+    /// 指す他の peer の別名 (同じ行に名前で畳んだ他の行。 PR #1006 の 3 回目の読み直し [3]: 前は宛名だけを載せ、 他の別名は開く道の
+    /// 仕上げが前の住人の削除の版数を引けずに退避なしで外して、 その別名宛ての遅れた書き込みが新しい生きた行になった)。 載せた版数が
+    /// 前の版数より新しい identity は、 移した名前の削除の時刻も上げる (#545、 写像の無い identity の削除と同じ)。 自分の peer の
+    /// 宛名 (畳んだ自分の行) と別名は載せない (自分の行の削除の版数は場所で持つ)。
+    fn replayed_delete_via_stale_alias(&self, eid: enchudb_oplog::EntityId, slot: u32, agen: u32, hlc: enchudb_oplog::Hlc) {
+        self.observe_remote_hlc(hlc);
+        let self_peer = self.peer_id();
+        let mut ids: Vec<(enchudb_oplog::PeerId, u32)> = self
+            .eid_translator
+            .aliases_with_gen_of(slot)
+            .into_iter()
+            .filter(|&((peer, _), g)| g == agen && peer != self_peer)
+            .map(|(key, _)| key)
+            .collect();
+        let addressed = (enchudb_oplog::eid_peer(eid), enchudb_oplog::eid_local(eid));
+        if addressed.0 != self_peer && !ids.contains(&addressed) {
+            ids.push(addressed);
+        }
+        for (peer, foreign_local) in ids {
+            let before = self.foreign_tombstone_of(peer, foreign_local);
+            if self.remember_foreign_tombstone(peer, foreign_local, hlc) && before.is_some_and(|t| hlc > t) {
+                self.raise_identity_names(peer, foreign_local, hlc);
+            }
+        }
+    }
+
+    /// [`Self::replay_relayed_op`] の Ref の値 (Ref 列の Tie の値 / TieRef の target、 `author` の世界番号の local `foreign_value`) を
+    /// この DB の値に。 PR #1006 の 3 回目の読み直し [1]: 指す世界番号が古い別名 ([`Self::replayed_stale_alias`]) なら、 その別名が指す
+    /// 行 (場所を離れた消えた行) の番号 (世代 | 場所)。 前は [`Self::resolve_remote_ref_value`] が別名の場所の最後の行 (使い回した次の
+    /// 住人) を指した。
+    fn replayed_ref_value(&self, author: enchudb_oplog::PeerId, foreign_value: u32, himo_id: u16) -> Option<u32> {
+        match self.replayed_stale_alias(enchudb_oplog::make_eid(author, foreign_value)) {
+            Some((slot, agen)) => Some((agen << self.generations().bits()) | slot),
+            None => self.resolve_remote_ref_value(author, foreign_value, himo_id),
+        }
+    }
+
+    /// [`Self::replay_relayed_op`] の宛名 `eid` (世界番号) が、 生きている場所の今の住人より下の世代の行を指す別名か (PR #1006 の
+    /// 2 回目の読み直しの [3] の別案)。 指す行の世代は `eidalias` 版 2 (#993 / #994)。 死んだ場所の別名は当てる (書き込みは場所に削除の
+    /// 版数があれば捨てられ (`slot_is_dead`)、 削除は場所の削除の版数を上げる)。 世代を持たない DB は偽。
+    fn replayed_via_stale_alias(&self, eid: enchudb_oplog::EntityId) -> bool {
+        self.replayed_stale_alias(eid).is_some()
+    }
+
+    /// [`Self::replayed_via_stale_alias`] の、 古い別名なら (別名の場所, 指す行の世代)。 自分の peer の世界番号 (畳んだ自分の行、 #612) は
+    /// 別名の鍵が場所そのもの (世代なし) なので、 番号から世代を外した場所で引く (PR #1006 の 3 回目の読み直し [1]: 前は世代込みの番号で
+    /// 引き、 世代 1 以上の畳んだ行の番号は古い別名と分からず、 中継の record が畳んだ先の場所の次の住人に転送された)。
+    fn replayed_stale_alias(&self, eid: enchudb_oplog::EntityId) -> Option<(u32, u32)> {
+        let gens = self.generations();
+        if !gens.active() {
+            return None;
+        }
+        let peer = enchudb_oplog::eid_peer(eid);
+        let key = if peer == self.peer_id() { gens.split(enchudb_oplog::eid_local(eid)).0 } else { enchudb_oplog::eid_local(eid) };
+        let (slot, agen) = self.eid_translator.alias_target(peer, key)?;
+        (self.entities.is_live(slot) && agen < self.alias_row_gen(slot)).then_some((slot, agen))
     }
 
     /// recover 中、 与えられた global eid を含む table の next_local を
@@ -30654,7 +31045,7 @@ impl Engine {
                 eng.finish_deletes_revived_by_the_replay(!records.is_empty());
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();
-                eng.finish_open_restores(!records.is_empty());
+                eng.finish_open_restores();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
                 let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
@@ -30676,7 +31067,7 @@ impl Engine {
                 // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();
-                eng.finish_open_restores(false);
+                eng.finish_open_restores();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
                 if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
