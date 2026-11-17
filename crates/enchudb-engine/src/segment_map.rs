@@ -283,6 +283,26 @@ pub fn set_default_space_margin(bytes: u64) {
 /// その分は厳しめ、 flush のたびに減る)。
 static UNFLUSHED: AtomicU64 = AtomicU64::new(0);
 
+/// 試験用: この thread で、 伸ばす時に空きを確かめた量 (segment の path, byte)。 PR #977 の読み直し 4 の [5] (伸ばした範囲の全部を
+/// 数えたか) を、 ディスクの実際の空きによらずに見る。
+#[cfg(test)]
+pub(crate) mod space_probe {
+    use std::path::{Path, PathBuf};
+
+    std::thread_local! {
+        static ASKED: std::cell::RefCell<Vec<(PathBuf, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(path: &Path, n: u64) {
+        ASKED.with(|a| a.borrow_mut().push((path.to_path_buf(), n)));
+    }
+
+    /// 溜めた分を取り出して空にする。
+    pub(crate) fn take() -> Vec<(PathBuf, u64)> {
+        ASKED.with(|a| std::mem::take(&mut *a.borrow_mut()))
+    }
+}
+
 /// #317: 空きがこれ (+ まだ flush していない分) を切ったら、 flush で msync の後に fsync して書き出しの失敗を拾う。
 const FSYNC_BELOW: u64 = 1 << 30;
 
@@ -518,6 +538,12 @@ impl SegmentMap {
         self.grow_inner(new_size, Need::Whole)
     }
 
+    /// commit を `new_size` まで伸ばす (先回りしない、 page 切り上げ)。 空きは `write_from` から先の分だけ見る (#970: gen.seg は
+    /// 払い出す場所の page と少しの先だけを commit する。 `grow_amortized` の ×2 の先回りは使わない)。
+    pub fn grow_window(&self, new_size: usize, write_from: usize) -> io::Result<()> {
+        self.grow_inner(new_size, Need::From(write_from))
+    }
+
     /// 疎な書き込み: [start, start + len) だけを書く時 (hash の場所に散る索引の slot)。 見かけは
     /// 伸ばすが、 空きは **初めて触るページの分**だけ見る (#316: 見かけの長さ = 数 GB と比べて断っていた。
     /// #317: 伸ばした先のページを書くたびに数えないと、 空きを超えても気付けない)。
@@ -629,6 +655,8 @@ impl SegmentMap {
                 Need::Nothing => 0,
             };
             if need_bytes > 0 {
+                #[cfg(test)]
+                space_probe::note(&self.path, need_bytes);
                 self.check_space(need_bytes)?;
             }
             enchudb_oplog::io_point("segment.grow")?;

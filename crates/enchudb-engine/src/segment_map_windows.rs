@@ -219,6 +219,11 @@ impl SegmentMap {
         self.grow_to(needed)
     }
 
+    /// unix 版と同じ API (#970)。 Windows は先回りしない `grow_to` と同じ。
+    pub fn grow_window(&self, new_size: usize, _write_from: usize) -> io::Result<()> {
+        self.grow_to(new_size)
+    }
+
     /// unix 版と同じ API (#327)。 Windows は section の commit が実体を持つので見かけの長さで見る。
     pub fn grow_apparent(&self, end: usize) -> io::Result<()> {
         self.grow_to(end)

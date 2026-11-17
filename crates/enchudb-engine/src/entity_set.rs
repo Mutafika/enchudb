@@ -40,6 +40,33 @@ pub struct EntitySet {
 unsafe impl Sync for EntitySet {}
 unsafe impl Send for EntitySet {}
 
+/// [`EntitySet::allocate_or_keep`] の空きの山の場所をどうするか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reuse {
+    /// 生かして返す。
+    Take,
+    /// 山から外して次を見る (二度と渡さない場所)。
+    Discard,
+    /// 山に残したまま返す (`Allocated::Kept`)。
+    Keep,
+}
+
+/// [`EntitySet::allocate_or_keep`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Allocated {
+    /// 位置から払い出した新しい場所。
+    Fresh(u32),
+    /// 空きの山から使い回した場所。
+    Reused(u32),
+    /// 満杯 (max_entities 到達 + 空きの山が空)。
+    Full,
+    /// 空きの山の一番上の場所を `reuse` が残した (取っていない)。
+    Kept(u32),
+    /// 位置から取った新しい場所を `fresh` が断った (#970: 場所の世代を書く gen.seg の page を commit できない)。 生かしていない。
+    /// 位置は戻した (後から誰も進めていなければ) か、 戻せなければ穴として空きの山に積んだ。
+    Refused(u32),
+}
+
 impl EntitySet {
     /// region の大きさ。 `bitset_cap` = bitset が持てる entity 数 (v10 は reservation、
     /// legacy は max_entities)。
@@ -197,44 +224,85 @@ impl EntitySet {
 
     /// `allocate_tracked` + 生きている印を立てる直前に `before(slot)` を呼ぶ (#731: 場所の 「死んでいる」 印を先に落とす)。
     pub fn allocate_tracked_with(&self, before: impl Fn(u32)) -> Option<(u32, bool)> {
+        match self.allocate_or_keep(
+            |slot| {
+                before(slot);
+                true
+            },
+            |slot| {
+                before(slot);
+                Reuse::Take
+            },
+        ) {
+            Allocated::Fresh(e) => Some((e, false)),
+            Allocated::Reused(e) => Some((e, true)),
+            Allocated::Full | Allocated::Kept(_) | Allocated::Refused(_) => None,
+        }
+    }
+
+    /// [`Self::allocate_tracked_with`] の、 払い出す場所を呼び手が決める形 (#970、 anonymous の `Engine::entity`)。 新しい場所 (位置から
+    /// 払い出す) は生きている印を立てる直前に `fresh(slot)` が決める: true = 生かして返す、 false = 生かさずに断る ([`Allocated::Refused`]、
+    /// 位置は戻す / 戻せなければ穴として空きの山に積む)。 空きの山の一番上の場所は `reuse(slot)` が決める (空きの山の lock の下で
+    /// 呼ぶ): [`Reuse::Take`] = 生かして返す (生かす前の仕度は `reuse` の中で)、 [`Reuse::Discard`] = 山から外して次を見る (二度と渡さない
+    /// 場所)、 [`Reuse::Keep`] = 山に残したまま返す ([`Allocated::Kept`]、 呼び手が理由に応じて断る / 仕度してから取り直す)。
+    ///
+    /// 位置の RMW は AcqRel (#970: v15 に移る手順は位置を RMW で読み、 その後に位置から取った書き手は、 移る手順が先に公開した gen.seg
+    /// を見る = 自分で page を commit する。 `Engine::move_to_generations`)。
+    pub(crate) fn allocate_or_keep(&self, fresh: impl Fn(u32) -> bool, reuse: impl Fn(u32) -> Reuse) -> Allocated {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
-        let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
+        let eid = self.next_eid_atomic().fetch_add(1, Ordering::AcqRel);
         if eid < self.max_entities() {
-            before(eid);
+            if !fresh(eid) {
+                // 戻せるのは、 後から誰も進めていない時だけ (表の払い出し位置の #868 と同じ)。 戻せなければ穴 (生きていない場所) として
+                // 空きの山に積む (anonymous は空きの山からしか使い回さない)
+                if self.next_eid_atomic().compare_exchange(eid + 1, eid, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                    self.push_hole(eid);
+                }
+                return Allocated::Refused(eid);
+            }
             self.set_bit(eid, true);
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
             // issue6 (perf 退化対策): writer hot path から mark_dirty を撤廃。
             // EntitySet 全領域は body_msync 内で常時 msync される (固定サイズ
             // で cheap な小領域)。
-            return Some((eid, false));
+            return Allocated::Fresh(eid);
         }
         // 上限到達 → fetch_addを巻き戻してfree stackから再利用
         self.next_eid_atomic().fetch_sub(1, Ordering::Relaxed);
-        self.allocate_from_free_stack(before).map(|eid| (eid, true))
+        self.allocate_from_free_stack(reuse)
     }
 
     /// free stack から pop。上限到達時のみ呼ばれる。
     /// #77-H7: `free_lock` で push と直列化 (旧 CAS pop は push 側の
     /// 「slot 書き → count 書き」非 atomic 複合と混ざると、 eid 未書き込みの
     /// slot を読み得た)。
-    fn allocate_from_free_stack(&self, before: impl Fn(u32)) -> Option<u32> {
+    fn allocate_from_free_stack(&self, reuse: impl Fn(u32) -> Reuse) -> Allocated {
         let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mm = self.region.slice();
         let free_count_off = self.free_offset;
-        let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
-        // #59: 満杯は 「想定内だが続行不能」。 panic せず None を返し、 呼び出し側
-        // (Engine) が fault として記録 + 報告する。
-        if fc == 0 {
-            return None;
+        loop {
+            let mm = self.region.slice();
+            let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
+            // #59: 満杯は 「想定内だが続行不能」。 panic せず返し、 呼び出し側
+            // (Engine) が fault として記録 + 報告する。
+            if fc == 0 {
+                return Allocated::Full;
+            }
+            let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
+            let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
+            match reuse(eid) {
+                Reuse::Keep => return Allocated::Kept(eid),
+                Reuse::Discard => {
+                    self.region.write_at(free_count_off, &(fc - 1).to_le_bytes());
+                }
+                Reuse::Take => {
+                    self.region.write_at(free_count_off, &(fc - 1).to_le_bytes());
+                    self.set_bit(eid, true);
+                    self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+                    // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
+                    return Allocated::Reused(eid);
+                }
+            }
         }
-        let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
-        let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
-        self.region.write_at(free_count_off, &(fc - 1).to_le_bytes());
-        before(eid);
-        self.set_bit(eid, true);
-        self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
-        // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
-        Some(eid)
     }
 
     pub fn free(&self, eid: u32) {
@@ -263,6 +331,28 @@ impl EntitySet {
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
     }
 
+    /// #970: 位置から取ったが生かさなかった場所 (穴) を空きの山に積む ([`Allocated::Refused`] で位置を戻せなかった時)。 生きている印は
+    /// 触らない。 積めなければ (山が満杯 / 山の page を commit できない) 積まない (欠番、 `free` と同じ安全側)。
+    fn push_hole(&self, eid: u32) {
+        let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let free_count_off = self.free_offset;
+        let fc = u32::from_le_bytes(self.region.slice()[free_count_off..free_count_off + 4].try_into().unwrap());
+        if fc < Self::free_cap_for(self.bitset_cap) {
+            let eid_off = self.free_offset + 4 + (fc as usize) * 4;
+            if self.region.ensure_committed(eid_off + 4).is_err() {
+                return;
+            }
+            self.region.write_at(eid_off, &eid.to_le_bytes());
+            self.region.write_at(free_count_off, &(fc + 1).to_le_bytes());
+        }
+    }
+
+    /// #970: 位置 (`next_eid`) を RMW で読む (v15 に移る手順が、 位置から払い出す書き手と揃える: この後に位置から取る書き手は、 この
+    /// 前に公開した gen.seg を見る。 `Engine::move_to_generations`)。
+    pub(crate) fn next_eid_synced(&self) -> u32 {
+        self.next_eid_atomic().fetch_add(0, Ordering::AcqRel)
+    }
+
     /// #731: 生きている印を下ろし、 空きの山には積まない (世代を使い切った場所 = 二度と渡さない)。
     pub fn free_without_reuse(&self, eid: u32) {
         if self.set_bit(eid, false) {
@@ -286,11 +376,9 @@ impl EntitySet {
         if eid >= self.max_entities() { return false; }
         if self.set_bit(eid, true) { return false; } // 既に live
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
-        // next_eid は「これまで allocate した最大 +1」の概念。local を超えていたら進める。
-        let cur = self.next_eid_atomic().load(Ordering::Acquire);
-        if eid >= cur {
-            self.next_eid_atomic().store(eid + 1, Ordering::Release);
-        }
+        // next_eid は「これまで allocate した最大 +1」の概念。local を超えていたら進める。 #970: RMW で (位置から取る書き手の
+        // fetch_add と並んでも戻さない、 v15 に移る手順の位置の RMW の並びを切らない)
+        self.next_eid_atomic().fetch_max(eid + 1, Ordering::AcqRel);
         true
     }
 
@@ -388,6 +476,15 @@ impl EntitySet {
         let mm = self.region.slice();
         let mut e = hi; // exclusive 上端
         while e > lo {
+            // 64 場所 (8 byte) の境目では、 空の 8 byte をまとめて飛ばす (PR #977 の読み直し 4 の [7]: anonymous の DB を開く時に
+            // `max_entities` の全部をなめる。 16M 場所で byte ずつ 2M 回)
+            if e.is_multiple_of(64) && e - lo >= 64 {
+                let at = self.bitset_offset + ((e - 64) / 8) as usize;
+                if mm[at..at + 8] == [0u8; 8] {
+                    e -= 64;
+                    continue;
+                }
+            }
             e -= 1;
             let byte = mm[self.bitset_offset + (e / 8) as usize];
             if byte == 0 {
@@ -493,6 +590,21 @@ mod tests {
         let ptr = Box::leak(buf).as_mut_ptr();
         let region = unsafe { Region::new(ptr, size) };
         Arc::new(EntitySet::init(region, max_entities, max_entities))
+    }
+
+    /// `highest_live_in` (8 byte ずつ飛ばす形、 PR #977 の読み直し 4 の [7]) は、 どの範囲でも素朴になめた答えと同じ。
+    #[test]
+    fn highest_live_in_matches_a_plain_scan() {
+        let set = make_set(1000);
+        for e in [3u32, 63, 64, 65, 127, 128, 500, 511, 512, 700, 999] {
+            set.ensure_live(e);
+        }
+        let plain = |lo: u32, hi: u32| (lo..hi.min(1000)).rev().find(|&e| set.is_live(e));
+        for lo in (0..1000).step_by(7).chain([0, 63, 64, 128, 512]) {
+            for hi in (lo..1001).step_by(13).chain([lo, 64, 128, 192, 512, 1000, u32::MAX]) {
+                assert_eq!(set.highest_live_in(lo, hi), plain(lo, hi), "[{lo}, {hi})");
+            }
+        }
     }
 
     /// #77-H7 regression: 並行 allocate で隣接 eid の live bit が消えないこと。
