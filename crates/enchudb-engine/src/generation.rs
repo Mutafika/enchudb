@@ -89,6 +89,9 @@ fn slot_off(slot: u32) -> usize {
     GEN_HEADER + 2 * slot as usize
 }
 
+/// #994 [C4]: `eidalias` の別名が上書きした `.eidmap` の写像 (identity, 場所, その場所の住人の世代, 場所の削除の版数)。
+type AliasOverride = ((enchudb_oplog::PeerId, u32), u32, u32, enchudb_oplog::Hlc);
+
 pub(crate) struct Generations {
     /// 場所の bit `S`。 0 = 世代を持たない DB (local = 場所)。
     bits: AtomicU32,
@@ -124,6 +127,9 @@ pub(crate) struct Generations {
     missing_tombs: std::sync::Mutex<Vec<u32>>,
     /// 場所を使い回した時の前の住人の記録 (`prev.seg`、 `crate::prev_slots`)。 `gen.seg` と一緒に持つ (v15 の DB だけ)。
     pub(crate) prev: crate::prev_slots::PrevSlots,
+    /// #994 [C4]: きれいに閉じなかった後に開いた時、 `eidalias` の別名が上書きした `.eidmap` の写像 (面) (identity → (場所, その場所の
+    /// 住人の世代))。 開く道が古い世代の別名を外す時に写像を戻す (`Engine::drop_aliases_where`)。 開く道の仕上げで捨てる。
+    alias_overrides: std::sync::Mutex<Vec<AliasOverride>>,
 }
 
 impl Generations {
@@ -144,6 +150,7 @@ impl Generations {
             has_relog_gens: std::sync::atomic::AtomicBool::new(false),
             missing_tombs: std::sync::Mutex::new(Vec::new()),
             prev: crate::prev_slots::PrevSlots::off(),
+            alias_overrides: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -195,6 +202,53 @@ impl Generations {
 
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
+    /// #994 [C4]: 開く時に `eidalias` の別名 `key` が `.eidmap` の写像 (場所 `slot`、 その住人の世代 `agen`、 場所の削除の版数 `tomb`) を
+    /// 上書きした。
+    pub(crate) fn note_alias_override(&self, key: (enchudb_oplog::PeerId, u32), slot: u32, agen: u32, tomb: enchudb_oplog::Hlc) {
+        self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner()).push((key, slot, agen, tomb));
+    }
+
+    /// #994 [C4]: 別名 `key` が上書きした `.eidmap` の写像 (場所, 住人の世代) を見る (取り出さない)。
+    pub(crate) fn alias_override(&self, key: (enchudb_oplog::PeerId, u32)) -> Option<(u32, u32)> {
+        let g = self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter().find(|e| e.0 == key).map(|&(_, slot, agen, _)| (slot, agen))
+    }
+
+    /// #994 [C4]: 別名 `key` が上書きした `.eidmap` の写像 (場所, 住人の世代) を取り出す。
+    pub(crate) fn take_alias_override(&self, key: (enchudb_oplog::PeerId, u32)) -> Option<(u32, u32)> {
+        let mut g = self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_empty() {
+            return None;
+        }
+        let i = g.iter().position(|e| e.0 == key)?;
+        let (_, slot, agen, _) = g.swap_remove(i);
+        Some((slot, agen))
+    }
+
+    /// PR #1006 の 3 回目の読み直し [2]: 開く時の再生が場所 `slot` を世代 `row_gen` の行で生かした (使い回しの移り目)。 その場所への
+    /// 写像の覚えのうち、 面の住人が別の世代の物を取り出す (identity, 場所の削除の版数)。 写像の面の行は場所を離れた (次の住人が来た)
+    /// ので、 写像はもう戻さない (戻すと次の住人がその identity の翻訳先になる)。
+    pub(crate) fn take_alias_overrides_left(&self, slot: u32, row_gen: u32) -> Vec<((enchudb_oplog::PeerId, u32), enchudb_oplog::Hlc)> {
+        let mut g = self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner());
+        if !g.iter().any(|e| e.1 == slot && e.2 != row_gen) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        g.retain(|&(key, s, agen, tomb)| {
+            let left = s == slot && agen != row_gen;
+            if left {
+                out.push((key, tomb));
+            }
+            !left
+        });
+        out
+    }
+
+    /// #994 [C4]: 開く道の仕上げで、 残った上書きの覚えを捨てる (別名の方が新しかった)。
+    pub(crate) fn take_alias_overrides(&self) {
+        self.alias_overrides.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// #451 の作り直しが使う 「消えた行の世代」 を覚える / 引く / 忘れる。
