@@ -144,21 +144,68 @@ fn eidalias_is_written_in_the_form_of_the_db_version() {
     assert_eq!(got, vec![(3, 9, x_slot, 0), (4, 2, y_slot, y_gen.unwrap())], "開き直した別名の世代");
 }
 
-/// directory `from` を `to` に丸ごと写す (kill の像: 開いている engine の page cache の中身も届く。 きれいに閉じた印は立っていない)。
-/// 写す間に消えた file (背景の名前の記録のまとめ直し (#959) の一時 file など) は像に無いだけ。
+/// directory `from` を `to` に丸ごと写す (kill の像: page cache の中身 = 書き出していない mmap の書き込みも届く)。
+///
+/// 写す間に消えた file は像に無いだけ (その file を消す / rename する前に kill した像と同じ)。 開いている engine の背景の名前の記録の
+/// まとめ直し (#959) が一時 file `pkformer.compact.tmp` を置いて rename するので、 開いた engine の kill の像を撮る試験で起きる。
+///
+/// PR #1006 の 3 回目の読み直し [4]: file を 1 つずつ順に写すので、 写す間にまとめ直しが `pkformer` と log を置き換えると、 古い
+/// `pkformer` と新しい log (header だけ) の組になる (本物の kill ではありえない像。 header が合わず log が読まれない)。 写す前と後で
+/// 一覧 (path・inode・mmap でない file の長さ) を比べ、 違えば撮り直す。
 fn kill_image(from: &Path, to: &Path) {
+    for _ in 0..500 {
+        let before = kill_image_state(from);
+        let _ = std::fs::remove_dir_all(to);
+        kill_image_copy(from, to);
+        if kill_image_state(from) == before {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("kill の像: 写す間に {} の file が置き換わり続けた", from.display());
+}
+
+/// [`kill_image`] の 1 回の写し。
+fn kill_image_copy(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let dest = to.join(entry.file_name());
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
-            kill_image(&entry.path(), &dest);
+            kill_image_copy(&entry.path(), &dest);
         } else if let Err(e) = std::fs::copy(entry.path(), &dest) {
             assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{}: {e}", entry.path().display());
             let _ = std::fs::remove_file(&dest);
         }
     }
+}
+
+/// [`kill_image`] の比べる一覧: (path, inode, 長さ)。 mmap で書く file (segment と WAL) の長さは書き手が動かすので比べない
+/// (置き換えは inode で分かる)。
+fn kill_image_state(dir: &Path) -> Vec<(std::path::PathBuf, u64, Option<u64>)> {
+    #[cfg(unix)]
+    let ino = |md: &std::fs::Metadata| std::os::unix::fs::MetadataExt::ino(md);
+    #[cfg(not(unix))]
+    let ino = |_: &std::fs::Metadata| 0u64;
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+            if md.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let mapped = name.ends_with(".seg") || name == "oplog";
+            out.push((p.strip_prefix(dir).unwrap().to_path_buf(), ino(&md), (!mapped).then_some(md.len())));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// PR #1006 の読み直し [4]: `bind_remote_eid` に消えた行を渡すと、 束ねた場所を生かす (今の世代の行)。 別名の指す行の世代は、 生かした
