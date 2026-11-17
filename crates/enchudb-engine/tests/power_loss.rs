@@ -6591,10 +6591,126 @@ fn a_relayed_alias_before_the_reuse_keeps_the_former_resident_until_its_delete()
     assert_eq!(eight, Some(tomb), "X の改名 (名前 8) の後の削除が名前 8 の削除にならない (X が自分の Delete より前に消えた) (名前 50: {seven:x?})");
 }
 
+/// hook を外す guard (panic の巻き戻しでも外す)。
+struct HookOff;
+
+impl Drop for HookOff {
+    fn drop(&mut self) {
+        write_out_hook::set(None);
+    }
+}
+
+thread_local! {
+    /// [`c2_image`] の消す thread の印 (その thread の最初の `DeleteGateLeft` だけ止める)
+    static C2_DELETER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [C2] の像 (PR #1006 の 3 つの像の元): 別の thread の `delete` (sync する DB の行を消す) が消した行の場所の世代 (gen.seg の死の印) と
+/// tomb.seg は届き、 生きている印は届かない像を、 次の `oplog_sync` の本体の書き出しの終わり (`WrittenOut`) で撮る (`Mode::Lost`)。
+/// 呼び手は consumer を止め、 書き出す物を作ってから呼ぶ。 `delete` は撮る前に返る (その後に書いた sidecar も届く)。
+///
+/// #978 (PR #997) から本体の書き出しは、 生きている印・場所の世代・残りの列を書き出す間、 削除の門を閉じる。 前 (#1006) は生きている
+/// 印の後・世代の前 (`BeforeGenerations`、 門の中) に別の thread で消して返るのを 10 秒待ち、 削除が門で待つので hook の中で panic した
+/// (PR #997 に master を取り込んだ所。 hook を外す前の panic が engine を持つ hook を残し、 次の試験の `write_out_hook::set` と互いを
+/// 待って power_loss が止まり続けた)。 門を閉じた後に届く場所の世代の削除は、 閉じる前に門を出た削除の `live_free` (場所の世代を
+/// 上げてから生きている印を下ろす) だけ (`write_out_body` の注釈)。 そこで消す thread を門を閉じる前の段 (`PrevWrittenOut`) で始め、
+/// 門を出た所 (`DeleteGateLeft`、 `live_free` の前) で止め、 生きている印を書き出した後 (`BeforeGenerations`) に放して返るのを待つ。
+/// 消した行の tombstone は門を閉じる時 (`close_deletes`) に、 落とした cell は残りの列の段で書き出す。
+fn c2_image(eng: &Arc<Engine>, delete: impl FnOnce() + Send + 'static, live: &Path, img: &Path) {
+    enum Ev {
+        /// 消す thread が門を出て止まった
+        Left,
+        /// 消す thread が終わった (panic でも)
+        Done,
+    }
+    struct DoneOnDrop(std::sync::mpsc::Sender<Ev>);
+    impl Drop for DoneOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(Ev::Done);
+        }
+    }
+    let wait = std::time::Duration::from_secs(60);
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Ev>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (ev_rx, go_rx, delete) = (std::sync::Mutex::new(ev_rx), std::sync::Mutex::new(go_rx), std::sync::Mutex::new(Some(delete)));
+    let [left, returned, done, shot] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+    let (left2, returned2, done2, shot2) = (left.clone(), returned.clone(), done.clone(), shot.clone());
+    let (l, i) = (live.to_path_buf(), img.to_path_buf());
+    let _off = HookOff;
+    write_out_hook::set(Some(Arc::new(move |p: Phase| match p {
+        Phase::PrevWrittenOut => {
+            let Some(f) = delete.lock().unwrap().take() else { return };
+            let (tx, returned3) = (DoneOnDrop(ev_tx.clone()), returned2.clone());
+            std::thread::spawn(move || {
+                let _done = tx;
+                C2_DELETER.with(|d| d.set(true));
+                f();
+                returned3.store(true, Ordering::SeqCst);
+            });
+            // 門を出て止まるか、 (門を通らずに) 終わるまで
+            if let Ev::Left = ev_rx.lock().unwrap().recv_timeout(wait).expect("消す thread が 60 秒、 門を出ず終わりもしない") {
+                left2.store(true, Ordering::SeqCst);
+            }
+        }
+        Phase::DeleteGateLeft if C2_DELETER.with(|d| d.replace(false)) => {
+            let _ = ev_tx.send(Ev::Left);
+            go_rx.lock().unwrap().recv_timeout(wait).expect("書き出しが 60 秒、 門を出た消す thread を放さない");
+        }
+        Phase::BeforeGenerations if left2.load(Ordering::SeqCst) && !done2.load(Ordering::SeqCst) => {
+            let _ = go_tx.send(());
+            let ev = ev_rx.lock().unwrap().recv_timeout(wait).expect("放した消す thread が 60 秒で終わらない");
+            assert!(matches!(ev, Ev::Done), "消す thread がもう一度止まった");
+            done2.store(true, Ordering::SeqCst);
+        }
+        Phase::WrittenOut if done2.load(Ordering::SeqCst) && !shot2.swap(true, Ordering::SeqCst) => {
+            let _ = crashsim::capture(&l, &i, Mode::Lost);
+        }
+        _ => {}
+    })));
+    eng.oplog_sync().unwrap();
+    drop(_off);
+    assert!(left.load(Ordering::SeqCst), "前提: 消す thread が削除の門を出た所で止まった (書き出しが門を閉じる前に)");
+    assert!(returned.load(Ordering::SeqCst), "前提: 消す thread が (panic せずに) 返った");
+    assert!(done.load(Ordering::SeqCst) && shot.load(Ordering::SeqCst), "前提: 生きている印の書き出しの後に消し終え、 書き出しの終わりで撮った");
+}
+
+/// PR #997 に master (#1006) を取り込んだ所で power_loss が約 21 時間止まった形: hook を外す前に panic した試験は、 engine の `Arc` を
+/// 持つ hook を残す。 次の試験の `write_out_hook::set` がその hook を落とすと engine の最後の `Arc` が落ち、 engine の Drop は consumer を
+/// 待つ。 consumer の最後の書き出しは `write_out_hook::call` で hook の lock を取る。 前の `set` は lock を持ったまま前の hook を落とした
+/// ので互いを待ち、 後の試験は全部 `SERIAL` で待った。 ここでは engine の最後の `Arc` を持つ hook を置いて外す (前の形では外す thread が
+/// 返らない。 60 秒で落とす)。
+#[test]
+fn removing_a_hook_that_holds_the_last_engine_returns() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("hook_holds_last_engine");
+    {
+        let (eng, x) = full_named_table_engine(&root.join("db"));
+        let e2 = eng.clone();
+        write_out_hook::set(Some(Arc::new(move |_p: Phase| {
+            let _ = &e2;
+        })));
+        // consumer の最後の書き出しが段を通るように、 書き出していない物を残す
+        eng.tie_to(x, "t.v", 71u32);
+        eng.oplog_commit();
+    } // ここから hook が engine の最後の `Arc`
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        write_out_hook::set(None);
+        let _ = tx.send(());
+    });
+    let r = rx.recv_timeout(std::time::Duration::from_secs(60));
+    let _ = std::fs::remove_dir_all(&root);
+    r.expect("engine の最後の `Arc` を持つ hook を外す `write_out_hook::set` が返らない (engine の consumer の最後の書き出しと互いを待った)");
+}
+
 /// #994 [C2] / Q6 の像: 名前 7 の自分の行 X と、 作成より先に削除 (t_k) を受けた B の世界番号 K (退避表に居る、 #490)。 K を X に束ねる
 /// (`apply_alias`: K は X の場所の別名になり、 退避表の削除で X が消える = 死んだ場所の正しい別名)。 `power_loss`: 本体の書き出しの
-/// 生きている印の後・世代の前 (`BeforeGenerations`) に束ね、 sidecar を書き出してから、 本体の書き出しの終わり (`WrittenOut`) で電源断
-/// (gen.seg の死の印と tomb.seg は届き、 生きている印は届かない)。 偽なら束ねて書き出した後の kill の像。 (X, K, t_k) を返す。
+/// 途中で束ね (束ねの削除は生きている印の書き出しの後に場所の世代を上げる、 [`c2_image`])、 sidecar を書き出してから、 本体の書き出しの
+/// 終わり (`WrittenOut`) で電源断 (gen.seg の死の印と tomb.seg は届き、 生きている印は届かない)。 偽なら束ねて書き出した後の kill の像。
+/// (X, K, t_k) を返す。
 fn bound_dead_alias_image(live: &Path, img: &Path, power_loss: bool) -> (u64, u64, Hlc) {
     let (eng, x) = full_named_table_engine(&live.join("db"));
     let world_k = enchudb_oplog::make_eid(3, 23);
@@ -6612,30 +6728,11 @@ fn bound_dead_alias_image(live: &Path, img: &Path, power_loss: bool) -> (u64, u6
     };
     if power_loss {
         let _hold = eng.hold_consumer();
-        let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let (d2, s2, l, i) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf());
-        let bind = std::sync::Mutex::new(Some(bind));
-        write_out_hook::set(Some(Arc::new(move |p: Phase| {
-            if p == Phase::BeforeGenerations && !d2.swap(true, Ordering::SeqCst) {
-                let f = bind.lock().unwrap().take().unwrap();
-                let (tx, rx) = std::sync::mpsc::channel::<()>();
-                std::thread::spawn(move || {
-                    f();
-                    let _ = tx.send(());
-                });
-                rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 束ねが返った");
-            }
-            if p == Phase::WrittenOut && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
-                let _ = crashsim::capture(&l, &i, Mode::Lost);
-            }
-        })));
         // 書き出す物を作る (本体の書き出しが段を通る)
         let z = eng.entity_in("t").unwrap();
         eng.tie_to(z, "t.k", 3u32);
         eng.oplog_commit();
-        eng.oplog_sync().unwrap();
-        write_out_hook::set(None);
-        assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で束ねて撮った");
+        c2_image(&eng, bind, live, img);
     } else {
         bind();
         eng.oplog_sync().unwrap();
@@ -6730,34 +6827,17 @@ fn a_bound_alias_of_a_dead_row_is_kept_when_reopened_after_power_loss() {
 }
 
 /// PR #1006 の読み直し [1] の、 別名の identity が退避表に居ない形: 翻訳した行 F (C の行、 B の行 b を名前で畳んだ = b の世界番号は
-/// F の場所の別名) を C の削除で消す。 消す時機は本体の書き出しの生きている印の後・世代の前 (`BeforeGenerations`) で、 書き出しの
-/// 終わり (`WrittenOut`) で電源断 (gen.seg の死の印は届き、 生きている印は届かない)。 F を返す。
+/// F の場所の別名) を C の削除で消す。 消すのは本体の書き出しの途中で、 場所の世代を上げるのは生きている印の書き出しの後
+/// ([`c2_image`])。 書き出しの終わり (`WrittenOut`) で電源断 (gen.seg の死の印は届き、 生きている印は届かない)。 F を返す。
 fn dead_translated_alias_image(live: &Path, img: &Path) -> u64 {
     let (eng, f) = translated_row_with_alias_engine(&live.join("db"));
     let _hold = eng.hold_consumer();
-    let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    let (d2, s2, l, i, e2) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone());
-    write_out_hook::set(Some(Arc::new(move |p: Phase| {
-        if p == Phase::BeforeGenerations && !d2.swap(true, Ordering::SeqCst) {
-            let e3 = e2.clone();
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            std::thread::spawn(move || {
-                assert!(e3.remote_delete_apply_foreign(WORLD_F, F_DELETE), "前提: C の削除が F に当たった");
-                let _ = tx.send(());
-            });
-            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 消すのが返った");
-        }
-        if p == Phase::WrittenOut && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
-            let _ = crashsim::capture(&l, &i, Mode::Lost);
-        }
-    })));
     // 書き出す物を作る (本体の書き出しが段を通る)
     let z = eng.entity_in("t").unwrap();
     eng.tie_to(z, "t.c", 3u32);
     eng.oplog_commit();
-    eng.oplog_sync().unwrap();
-    write_out_hook::set(None);
-    assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で消して撮った");
+    let e2 = eng.clone();
+    c2_image(&eng, move || assert!(e2.remote_delete_apply_foreign(WORLD_F, F_DELETE), "前提: C の削除が F に当たった"), live, img);
     f
 }
 
@@ -7280,8 +7360,8 @@ fn adopt_as_durable(dir: &Path) {
 }
 
 /// PR #1006 の 2 回目の読み直し [B] (b) の像 (2 枚)。 名前 7 の自分の行 X (世代 gx) に B の行 b を畳み (b は X の場所の別名、 退避表に
-/// 居ない)、 表を使い切って書き出す。 X を本体の書き出しの生きている印の後・世代の前 (`BeforeGenerations`) で消し、 書き出しの終わり
-/// (`WrittenOut`) で電源断 (1 枚目 `img`: gen.seg の死の印は届き、 生きている印は届かない = [C2] の像)。 1 枚目を開いた A1 (突き合わせが
+/// 居ない)、 表を使い切って書き出す。 X を本体の書き出しの途中で消し (場所の世代を上げるのは生きている印の書き出しの後、 [`c2_image`])、
+/// 書き出しの終わり (`WrittenOut`) で電源断 (1 枚目 `img`: gen.seg の死の印は届き、 生きている印は届かない = [C2] の像)。 1 枚目を開いた A1 (突き合わせが
 /// X の削除を完了させて場所の世代を 2 つ上げる、 b は残る) で書き出してから、 Y で X の場所を使い回す (開いた後の場所の最後の行は
 /// gx + 1 = 無かった行なので、 使い回しの記録の前の住人は gx + 1)。 その `oplog_sync` の本体の書き出しで `prev.seg` を書き出した後・
 /// 生きている印の前 (`PrevWrittenOut`) に電源断 (2 枚目 `img2`: 場所は死んだまま、 記録 (前の住人 gx + 1) だけが届き、 `eidalias` は
@@ -7311,28 +7391,11 @@ fn reuse_after_reopened_power_loss_image(live: &Path, img: &Path, img2: &Path) -
             "前提: b は X の場所の別名"
         );
         let _hold = eng.hold_consumer();
-        let (done, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let (d2, s2, l, i, e2) = (done.clone(), shot.clone(), live.to_path_buf(), img.to_path_buf(), eng.clone());
-        write_out_hook::set(Some(Arc::new(move |p: Phase| {
-            if p == Phase::BeforeGenerations && !d2.swap(true, Ordering::SeqCst) {
-                let e3 = e2.clone();
-                let (tx, rx) = std::sync::mpsc::channel::<()>();
-                std::thread::spawn(move || {
-                    e3.delete(x);
-                    let _ = tx.send(());
-                });
-                rx.recv_timeout(std::time::Duration::from_secs(10)).expect("前提: 消すのが返った");
-            }
-            if p == Phase::WrittenOut && d2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
-                let _ = crashsim::capture(&l, &i, Mode::Lost);
-            }
-        })));
         // 書き出す物を作る (本体の書き出しが段を通る。 X に書くと WAL の X の record で再生が X を戻すので、 他の行に)
         eng.tie_to(filler, "t.v", 5u32);
         eng.oplog_commit();
-        eng.oplog_sync().unwrap();
-        write_out_hook::set(None);
-        assert!(shot.load(Ordering::SeqCst) && done.load(Ordering::SeqCst), "前提: 書き出しの途中で消して撮った");
+        let e2 = eng.clone();
+        c2_image(&eng, move || e2.delete(x), live, img);
         x
     };
     // 1 枚目を開く (その file は全部書き出し済み = A1 の書き出しの控えはこの上に積む)

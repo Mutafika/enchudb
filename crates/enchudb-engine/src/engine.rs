@@ -2575,6 +2575,10 @@ pub mod write_out_hook {
         DeletesClosed,
         /// #978: 削除 (tombstone を置いた後) が、 閉じている削除の門に当たって待ち始めた (消す thread から、 1 回の削除で 1 度)
         DeleteGateWait,
+        /// #978: 削除が削除の門を出た後、 生きている印を下ろす (`live_free`: 場所の世代を上げてから生きている印を下ろす) 前 (消す
+        /// thread から、 門を通った削除で 1 度)。 門を閉じる前に門を出た削除の `live_free` は、 門を閉じている間の生きている印・場所の
+        /// 世代の書き出しに混ざる (`write_out_body` の注釈) = 「場所の世代は死、 生きている印は生」 の像を書き出しの段で撮る道
+        DeleteGateLeft,
         /// 0.37: `body_msync` が本体を書き出し終えた後 (書き出しが届かせた bridge の位置を置く前)
         WrittenOut,
         /// #731: v15 に移る時、 `gen.seg` を書き出した後 (header に場所の bit と version 15 を書く前)
@@ -2598,7 +2602,13 @@ pub mod write_out_hook {
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
     static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 
+    /// 前の hook は lock を放してから、 新しい hook を置く前に落とす。 hook を外す前に panic した試験は、 engine の `Arc` を持つ hook を
+    /// 残す。 それを落とすと engine の Drop が consumer を待ち、 consumer の最後の書き出しは `call` でこの lock を取る: 前は lock を
+    /// 持ったまま落とし、 互いを待って止まり続けた (PR #997 に master を取り込んだ所で power_loss が約 21 時間止まった)。 新しい hook を
+    /// 置く前に落とすので、 前の engine の最後の書き出しが新しい hook を呼ぶこともない。
     pub fn set(hook: Option<Hook>) {
+        let old = HOOK.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(old);
         *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
     }
 
@@ -2729,8 +2739,11 @@ pub mod name_compact_hook {
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
     static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 
+    /// 前の hook は lock を放してから落とす (`write_out_hook::set` と同じ: hook が engine の最後の `Arc` を持っていると、 その Drop の
+    /// 閉じる時のまとめ直しが `call` / `consumer_off` でこの lock を取る)。
     pub fn set(hook: Option<Hook>) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+        let old = std::mem::replace(&mut *HOOK.lock().unwrap_or_else(|p| p.into_inner()), hook);
+        drop(old);
     }
 
     pub(crate) fn call(phase: Phase) {
@@ -2757,8 +2770,11 @@ pub mod apply_point_hook {
     type Hook = Arc<dyn Fn() + Send + Sync>;
     static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 
+    /// 前の hook は lock を放してから落とす (`write_out_hook::set` と同じ: hook が engine の最後の `Arc` を持っていると、 その Drop が
+    /// 待つ thread の書き込みが `call` でこの lock を取る)。
     pub fn set(hook: Option<Hook>) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+        let old = std::mem::replace(&mut *HOOK.lock().unwrap_or_else(|p| p.into_inner()), hook);
+        drop(old);
     }
 
     pub(crate) fn call() {
@@ -22409,6 +22425,10 @@ impl Engine {
             None => (0..self.himos.len()).for_each(&mut each),
         }
         drop(pass);
+        #[cfg(feature = "crashsim")]
+        if gated {
+            write_out_hook::call(write_out_hook::Phase::DeleteGateLeft);
+        }
         if !survivor {
             self.live_free(local, None);
         }

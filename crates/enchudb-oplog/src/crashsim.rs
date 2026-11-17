@@ -162,8 +162,13 @@ pub fn copy_for_sync(what: Copied, offset: u64, bytes: &[u8]) -> SyncCopy {
 
 /// 試験用: [`copy_for_sync`] が写した直後 (書き出しの前) に、 写したものの種類を渡して呼ぶ hook。 書き出しを重ねる試験が、
 /// 写した後で書き出しを止めるのに使う。 None で外す。
+///
+/// 前の hook は lock を放してから落とす: hook が engine の最後の `Arc` を持っていると、 その Drop は consumer の最後の書き出しを
+/// 待ち、 その書き出しの写し ([`copy_for_sync`]) がこの lock を取る (lock を持ったまま落とすと互いを待つ。 engine の
+/// `write_out_hook::set` で PR #997 の power_loss が止まり続けた形と同じ)。
 pub fn set_after_copy_hook(hook: Option<Hook>) {
-    *AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    let old = std::mem::replace(&mut *AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()), hook);
+    drop(old);
 }
 
 /// [`copy_for_sync`] で写した範囲の書き出しが済んだ (msync 成功)。 page ごとに、 控えより後に写した中身だけ置く。
