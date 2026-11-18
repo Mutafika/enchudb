@@ -766,15 +766,19 @@ impl Database {
 
     /// 0.7.0 (Phase 3): sync 用 reserved table (`_sync_ops` / `_sync_peers`) を
     /// engine に追加する。 build phase で呼ぶこと (= Arc 単一所有のうち)、
-    /// `finish_with_oplog` 後は Arc 共有なので呼べない (= `SchemaError::Internal`)。
+    /// `finish_*` / `open_with_oplog` の後は呼べない (= `SchemaError::Internal`)。
+    ///
+    /// #1024: concurrent の DB は、 `Arc<Database>` を 1 つだけ持っていても断る ([`engine_mut`](Self::engine_mut) と同じ)。 背景の
+    /// thread (consumer) は engine を生のポインタで指すので `Arc` の数に入らず、 前は `Arc::get_mut` が通って、 走っている consumer の
+    /// 横で `&mut Engine` を取った (表の並びへの push などが consumer の読みと data race)。
     ///
     /// idempotent: 既に有効化済みなら何もしない。 sync が要らない単独 DB は
     /// 呼ばなくて OK (= reserved table が物理的に存在しない、 eid 空間も浪費しない)。
     /// 一度有効化すると無効化は不可。
     pub fn enable_sync(&mut self) -> Result<(), SchemaError> {
-        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+        let eng_mut = self.engine_mut().ok_or_else(|| {
             SchemaError::Internal(
-                "Database already shared via Arc — call enable_sync before finish_*".into()
+                "Database is concurrent (finish_* / open_with_oplog) or shared via Arc — call enable_sync before finish_*".into()
             )
         })?;
         eng_mut.enable_sync_tables()
@@ -788,10 +792,13 @@ impl Database {
 
     /// 名前付きの位置を置く表 `_cursors` を作る ([`Engine::prepare_cursors`]、 build phase で 1 回。 何度呼んでもよい)。
     /// 「ここまで処理した」 位置 (changefeed の番号 / 宣言された答えの版) を、 処理の書き込みと同じ DB に置く
-    /// ([`cursor_set`](Self::cursor_set))。 `finish_*` の後は呼べない (`SchemaError::Internal`)。
+    /// ([`cursor_set`](Self::cursor_set))。 `finish_*` / `open_with_oplog` の後は呼べない (`SchemaError::Internal`。 #1024: `Arc<Database>`
+    /// を 1 つだけ持っていても、 concurrent の DB は断る。 [`enable_sync`](Self::enable_sync) の doc)。
     pub fn prepare_cursors(&mut self) -> Result<(), SchemaError> {
-        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
-            SchemaError::Internal("Database already shared via Arc — call prepare_cursors before finish_*".into())
+        let eng_mut = self.engine_mut().ok_or_else(|| {
+            SchemaError::Internal(
+                "Database is concurrent (finish_* / open_with_oplog) or shared via Arc — call prepare_cursors before finish_*".into()
+            )
         })?;
         eng_mut.prepare_cursors().map_err(|e| SchemaError::Internal(format!("prepare_cursors: {e}")))
     }
