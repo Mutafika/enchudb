@@ -2288,9 +2288,13 @@ impl Drop for WriterLock {
 /// 後に聞けずに断る道と、 WAL 付きの open が直しの後に WAL を開けずに返る (Drop が clean の印を立てる) 道があり、 どちらも次の open が
 /// 直した場所を見つけず、 仕上げ (残った cell を落とす・消えた行の世代と tombstone を覚える) が二度と走らなかった。
 enum ReplayAhead<'w> {
-    /// 再生しない: 単独の open (lock の下で聞いて 「無い」 と分かった時だけ開く。 あれば往復し、 聞けなければ断る)・readonly (直しを
-    /// しない)・WAL 付きの open が WAL を作った (無かった / 一度も書き出していない)
+    /// 再生しない: readonly (直しをしない)
     Nothing,
+    /// 再生しない単独の open (lock の下で聞いて 「無い」 と分かった時だけ開く。 あれば往復し、 聞けなければ断る)。 `wal_file` = lock の下で
+    /// 聞いた時に WAL の file があった (#451 の往復 [`Engine::relog_before_standalone_session`] をする条件の片方、 #992)
+    Standalone { wal_file: bool },
+    /// WAL 付きの open が WAL を作る (無かった / 一度も書き出していない)。 再生は無いが、 開いた後に WAL 付きの仕上げ (`finish_reconcile`) が続く
+    NewWal,
     /// WAL 付きの open が lock の下で開いた WAL (再生はこの WAL から)。 当てる record があるかは要る時に 1 回だけ読む (最初の 1 件で止まる)
     Wal(&'w enchudb_oplog::oplog::OpLog, std::cell::OnceCell<bool>),
 }
@@ -2303,9 +2307,21 @@ impl<'w> ReplayAhead<'w> {
     /// この open の後の再生が当てる record がある (`OpLog::recover_with_tail` が空でない)。
     fn follows(&self) -> bool {
         match self {
-            ReplayAhead::Nothing => false,
+            ReplayAhead::Nothing | ReplayAhead::Standalone { .. } | ReplayAhead::NewWal => false,
             ReplayAhead::Wal(w, answer) => *answer.get_or_init(|| !w.is_empty() && w.has_records_to_replay()),
         }
+    }
+
+    /// #992: この open の後に WAL 付きの仕上げ (`finish_reconcile(Some(wal))`) が続く (WAL 付きの open)。 突き合わせは仕上げをそこまで
+    /// 回す: 再生する record が無くても、 仕上げの前に落ちた像に 「残った cell」 (次の open が後始末を見つける印) を残す。
+    fn finishes_later(&self) -> bool {
+        matches!(self, ReplayAhead::NewWal | ReplayAhead::Wal(..))
+    }
+
+    /// #992: 単独の open で、 lock の下で聞いた時に WAL の file があった。 開いた DB がきれいに閉じなかった sync の DB なら、 この engine
+    /// は捨てて WAL 付きの open で往復する ([`Engine::relog_before_standalone_session`])。
+    fn standalone_with_wal_file(&self) -> bool {
+        matches!(self, ReplayAhead::Standalone { wal_file: true })
     }
 }
 
@@ -2593,6 +2609,9 @@ pub mod write_out_hook {
         /// sidecar の書き出し (`persist_tables`) で、 `prev.seg` の周期の約束の sidecar (`eidalias` / `pktombs` / `pkformer` まで) を
         /// 書いた後、 書き出した周期を進める (`prev_persist_end`) 前
         SidecarsWritten,
+        /// #992: WAL 付きの open (`open_concurrent_with_oplog`) で、 開く時の突き合わせが直しを map に書き、 WAL を再生した後、 突き合わせの
+        /// 仕上げ (`finish_reconcile`: 残った cell を落とす・#451 の作り直しの宛名と tombstone) の前。 ここで落ちた (kill の) 像を撮る
+        OpenBeforeFinishReconcile,
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
@@ -8939,18 +8958,19 @@ mod gen_io_fail_hook {
 
 /// #979 の test: この thread の次の open が、 gen.seg を払い出し済みの場所まで commit する直前に engine の空きの余裕 (`set_space_margin`) を置く
 /// (開く前の segment の余裕はプロセス全体の既定なので、 開く途中の他の伸ばし (索引の作り直し) と分けて、 この commit だけを空きの
-/// 不足に当てる)。 1 回だけ。
-#[cfg(test)]
-mod open_space_margin_hook {
+/// 不足に当てる)。 1 回だけ。 #992: 電源断の試験 (crashsim feature、 `tests/power_loss.rs`) も PR #977 の再生の後の断りを起こすのに使う。
+#[cfg(any(test, feature = "crashsim"))]
+#[doc(hidden)]
+pub mod open_space_margin_hook {
     std::thread_local! {
         static NEXT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
-    pub(super) fn set(margin: u64) {
+    pub fn set(margin: u64) {
         NEXT.with(|c| c.set(Some(margin)));
     }
 
-    pub(super) fn take() -> Option<u64> {
+    pub(crate) fn take() -> Option<u64> {
         NEXT.with(|c| c.take())
     }
 }
@@ -12818,7 +12838,8 @@ impl Engine {
                 Self::lock_with_nothing_to_replay(path)?
             }
         };
-        Ok((Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?, wal_len))
+        let replay = ReplayAhead::Standalone { wal_file: wal_len.is_some() };
+        Ok((Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), replay)?, wal_len))
     }
 
     /// #880: 往復 (WAL 付きの open で再生して閉じた) の後に、 単独で開き直すための writer lock を取り、 WAL に再生する record が残って
@@ -12847,6 +12868,14 @@ impl Engine {
         self.himo_reg.rebuilt_on_load && self.has_cell_version() && self.sync_tables_enabled()
     }
 
+    /// #992: この open (`replay`) の engine は捨てて WAL 付きの open で開き直す (#451 の往復、 [`Self::relog_before_standalone_session`]
+    /// と同じ条件: 単独の open で、 lock の下で聞いた時に WAL の file があり、 きれいに閉じなかった sync の DB)。 その時 `open_internal` は
+    /// 開く時の直しを書かない (往復の open が突き合わせから全部をする)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn defers_open_repairs(&self, replay: &ReplayAhead<'_>) -> bool {
+        replay.standalone_with_wal_file() && self.relogs_unlogged_writes_on_open()
+    }
+
     /// #880 (#451): 単独で開いた `self` (`open_internal` の直後) が、 きれいに閉じなかった sync する DB なら、 印を立てずに捨て
     /// (`abandoned`、 #533 の `abandon_open` と同じく Drop は何も書かない)、 WAL 付きの open で #451 の作り直しを走らせて閉じてから、
     /// 単独で開き直す。 そのまま単独で閉じると Drop / `flush` が clean の印を立て、 次の WAL 付きの open が 「きれいに閉じた」 と読んで
@@ -12866,6 +12895,12 @@ impl Engine {
     /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。 ただし header より短い file (作った直後・
     /// `set_len` の前に落ちた = 0 B もある) は、 その大きさでは WAL を作れない (前は `OpLog::create` が header を書く所で範囲外の panic、
     /// 読み直し 3 の [2]) ので [`STANDALONE_RELOG_OPLOG_CAPACITY`] で作る。
+    ///
+    /// #992: 往復する engine (`self`) は、 開く時の直し (gen.seg の突き合わせ・その後の別名の外し・途中で切れた削除の sweep) を書かずに
+    /// 開いてある (`open_internal` の `defer_repairs`、 往復する条件はここと同じ)。 前は突き合わせが直し (死の印・生きている印) を map に
+    /// 書き、 仕上げの後半 (#451 の作り直しの Delete の宛名 = 消えた行の世代、 tombstone の届いていない完了) を memory にだけ持ったまま
+    /// この engine を捨てた: 往復の WAL 付きの open は直した場所を見つけず、 相手にその行の Delete が配られなかった。 今は往復の open が
+    /// 突き合わせから全部をする。
     #[cfg(not(target_arch = "wasm32"))]
     fn relog_before_standalone_session(self, path: &str, wal_len: Option<u64>) -> io::Result<Self> {
         if !self.relogs_unlogged_writes_on_open() {
@@ -12880,8 +12915,10 @@ impl Engine {
         self.abandoned.store(true, std::sync::atomic::Ordering::Release);
         drop(self);
         drop(Self::open_concurrent_with_oplog(path, capacity)?);
-        let (lock, _) = Self::lock_with_nothing_to_replay(path)?;
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?;
+        let (lock, len) = Self::lock_with_nothing_to_replay(path)?;
+        // #992: まだきれいに閉じていない (下で断る) なら、 この engine も開く時の直しを書かない (`open_internal` の `defer_repairs`)
+        let replay = ReplayAhead::Standalone { wal_file: len.is_some() };
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), replay)?;
         if eng.relogs_unlogged_writes_on_open() {
             eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
             return Err(io::Error::other(
@@ -13348,7 +13385,7 @@ impl Engine {
         // 「黙って eid を使い回すより断る」 と同じ)。 断った engine は何も書かない (`abandoned`: 汚れた印を残す = 次の open は
         // きれいに閉じていないと読む)。 再生が払い出し位置の先の場所を生かした分は、 再生の後にもう一度 (`settle_replayed_generations`)。
         // readonly は書かない (世代を書かない、 gen.seg を伸ばさない)
-        #[cfg(test)]
+        #[cfg(any(test, feature = "crashsim"))]
         if let Some(m) = open_space_margin_hook::take() {
             eng.set_space_margin(m);
         }
@@ -13359,19 +13396,26 @@ impl Engine {
             eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
             return Err(e);
         }
+        // #992: この engine を捨てて WAL 付きの open で往復する (#451) なら、 ここから先の開く時の直しを書かない。 往復の open が突き合わせ
+        // から仕上げ (#451 の作り直しの宛名・tombstone の届いていない完了) まで 1 つの engine でする。 前はこの engine の突き合わせが直しを
+        // map に書き、 仕上げの後半を memory にだけ持ったまま捨てた (往復の open は直した場所を見つけない)。 途中で切れた削除の sweep も
+        // 書かない (突き合わせの前に回すと、 突き合わせが完了させる場所 (死の印のある生きている場所) を sweep が消して同じく見失う)
+        let defer_repairs = !readonly && eng.defers_open_repairs(&replay);
         // #731: gen.seg と生きている印を突き合わせる (きれいに閉じなかった後だけ)。 表・別名 (#612 の畳んだ自分の行)・払い出し位置
         // の後、 WAL の再生の前
-        eng.reconcile_generations(readonly, &replay);
+        if !defer_repairs {
+            eng.reconcile_generations(readonly, &replay);
+        }
         // #993 / #994: 使い回した場所の前の住人の別名 (`eidalias` だけが使い回しの前のまま届いた像) を外す。 突き合わせの後 (場所の
         // 生死が決まる)・WAL の再生の前 (再生する中継の record がその別名で次の住人に当たらない)。 再生が前の住人を生かし直しうる物
         // (使い回しの記録が無い、 PR #1006 の読み直し [3])・世代が上の別名 (本体より先に届いた) は開く道の仕上げ (`finish_open_restores`)
-        if unclean && !readonly {
+        if unclean && !readonly && !defer_repairs {
             eng.drop_stale_generation_aliases(Some(&replay));
         }
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
         // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
-        if !readonly {
+        if !readonly && !defer_repairs {
             eng.finish_interrupted_deletes();
         }
 
@@ -24560,19 +24604,29 @@ impl Engine {
     ///    位置より先の場所は、 払い出した事があるかを知る手が無い (`tables` が古いまま落ちて、 最後の行の削除が生きている印だけ届いた形。
     ///    #857 / #870 の残り)
     ///
+    /// 3. (#992) 死んだ場所 (2. の後は 「死んでいる」 印が立つ) に cell が残っていれば、 削除の後始末 (cell を落とす) が済んでいない:
+    ///    前の open が 1. / 2. の直しを map に書いた後・仕上げ ([`Self::finish_reconcile`]) の前に、 落ちた / 開くのを断った (PR #977 の
+    ///    再生の後の断り) / engine を捨てた像 (直しは disk に届き、 仕上げの覚えは memory にだけあった = 1. / 2. はもう見つけない)。 と、
+    ///    削除の途中で落ちて列の page だけ削除の前のまま届いた像 (中身を指す列は entities / gen.seg より先に書き出す)。 仕上げに回す
+    ///    (cell を落とし、 tombstone が届いていなければ置く)。 cell の無い死んだ場所は見分けない: 後始末の済んだ削除と、 cell だけ先に
+    ///    落ちた仕上げ待ちの場所は disk の上で同じ (覚えを disk に置くのは gen.seg の形の変更)
+    ///
     /// 失うのは WAL に届いていない (cut の後の) 操作だけ。 **WAL の再生の前** に回す: 再生は record ごとに場所を正しい状態に動かす
     /// (Delete は消して上げる = 冪等、 行を生かす record は場所の世代がその行より新しければ戻す = ここで完了に寄せた使い回し /
     /// 届いていなかった削除を、 WAL にある分だけ戻す、 `replay_slot`)。 後に回すと、 再生が生かした場所に残った印を読み違える形を
     /// 再生の側で全部消す必要がある。 readonly は書けないので回さない。 表の定義・別名 (`eidalias`)・払い出し位置の後。
     ///
-    /// 仕上げ ([`Self::finish_reconcile`]) は、 この open の後に WAL の再生が当てる record があれば (`replay`、 呼び手が writer lock の下で
-    /// 何かを直す前に決めた答え、 PR #986 の読み直し 2 の [1] [2]) 再生の後、 無ければここで済ませる。
+    /// 仕上げ ([`Self::finish_reconcile`]) は、 WAL 付きの open なら再生の後 (再生する record が無くても、 #992)、 単独の open は
+    /// ここで済ませる (`replay`、 呼び手が writer lock の下で何かを直す前に決めた答え、 PR #986 の読み直し 2 の [1] [2])。 #992: WAL 付きの
+    /// open の再生する record の無い時も仕上げを回すのは、 ここで cell を落としてから仕上げの後半 (`finish_reconcile(Some(wal))`) の前に
+    /// 落ちると、 3. の印 (残った cell) も消えて後始末を見つけられないため。
     fn reconcile_generations(&self, readonly: bool, replay: &ReplayAhead<'_>) {
         let gens = self.generations();
         // WAL の無い engine は session の途中の flush でも紐名の辞書の clean の印が立つ: gen.seg の header の印でも見る (読み直し 2)
         if readonly || !gens.active() || !(self.himo_reg.rebuilt_on_load || gens.session_dirty()) {
             return;
         }
+        let t0 = std::time::Instant::now();
         // 1.
         let mut last: Option<usize> = None;
         let dead_but_live = gens.heal(
@@ -24596,8 +24650,12 @@ impl Engine {
             gens.note_pending(slot, now.saturating_sub(1), true);
         }
         gens.note_repaired(0, dead_but_live.len() as u32);
-        // 2.
+        // 2. と 3.
         let mut completed = 0;
+        let mut leftovers = 0;
+        // 3. が 1. の場所を拾わない (1. は消えた行の世代を今 − 2 で覚えた)
+        let mut healed = dead_but_live;
+        healed.sort_unstable();
         for tid in 0..self.tables.len() {
             if self.tables[tid].is_reserved() {
                 continue;
@@ -24605,6 +24663,18 @@ impl Engine {
             let handed: Vec<(u32, u32)> = self.handed_out_ranges(tid);
             let extents =
                 if tid == ANONYMOUS_TABLE as usize { handed.clone() } else { self.tables[tid].extents() };
+            // 3. で cell を見る列 (この表の紐。 開けない列は見ない = 前の形)。 死んだ場所に最初に当たった時に開く
+            let mut cols: Option<Vec<usize>> = None;
+            let table_cols = || -> Vec<usize> {
+                self.tables[tid]
+                    .himo_ids
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|&h| h as usize)
+                    .filter(|&h| h < self.himos.len() && self.himos[h].ensure_loaded().is_ok())
+                    .collect()
+            };
             for (lo, hi) in extents {
                 let end = handed.iter().find(|&&(l, _)| l == lo).map_or(lo, |&(_, h)| h);
                 let mut slot = lo;
@@ -24614,23 +24684,44 @@ impl Engine {
                         slot = gens.next_page_start(slot).min(hi);
                         continue;
                     }
-                    if !self.entities.is_live(slot)
-                        && !gens.is_dead(slot)
-                        && (slot < end || gens.get(slot) > 0)
-                        && !self.is_folded_own_slot(slot)
-                    {
+                    if self.entities.is_live(slot) || (slot >= end && gens.get(slot) == 0) || self.is_folded_own_slot(slot) {
+                        slot += 1;
+                        continue;
+                    }
+                    if !gens.is_dead(slot) {
                         let row = gens.get(slot);
                         self.kill_generation(slot, row + 1);
                         gens.note_pending(slot, row, false);
                         completed += 1;
+                    } else if healed.binary_search(&slot).is_err()
+                        && cols.get_or_insert_with(&table_cols).iter().any(|&h| self.himos[h].get_value(slot).is_some())
+                    {
+                        // 3. (#992): 死んだ場所に cell が残る = 削除の後始末 (cell を落とす) が済んでいない。 前の open の突き合わせが
+                        // 直しを書いた後・仕上げの前に落ちた / 開くのを断った (#977) / engine を捨てた像と、 削除の途中で落ちて
+                        // 列の page だけが削除の前のまま届いた像。 仕上げに回して cell を落とし、 tombstone が届いていなければ (cell の
+                        // 版数より古い) 新しい HLC で置いて #451 に Delete を作り直させる。 消えた行の世代は今 − 1 (前の open が
+                        // 世代を 2 つ上げた像では今 − 2 が正しい = #1008、 gen.seg の 2 B に印を置かないと分からない)
+                        gens.note_pending(slot, gens.get(slot).saturating_sub(1), true);
+                        leftovers += 1;
                     }
                     slot += 1;
                 }
             }
         }
         gens.note_repaired(1, completed);
-        // 再生する record が WAL に無ければ、 ここで仕上げる (あれば WAL 付きの open が再生の後に仕上げる)
-        if gens.has_pending() && !replay.follows() {
+        gens.note_repaired(2, leftovers);
+        if Self::trace_open_enabled() {
+            eprintln!(
+                "[trace] reconcile: {:.2} ms (gen.seg only {}, entities only {}, leftover cells {} — #992)",
+                t0.elapsed().as_secs_f64() * 1e3,
+                healed.len(),
+                completed,
+                leftovers
+            );
+        }
+        // 仕上げ: 開いた後に WAL 付きの仕上げが続かない open (単独の open) は、 ここで済ませる。 WAL 付きの open は再生の後
+        // (再生する record が無くても回す、 #992: 突き合わせの後・仕上げの前に落ちた像に残った cell を残して、 次の open が 3. で拾える)
+        if gens.has_pending() && !replay.finishes_later() {
             self.finish_reconcile(None);
         }
     }
@@ -24642,19 +24733,20 @@ impl Engine {
     /// - gen.seg だけ死の完了で消えた行の tombstone が無い (書き出しの tombstone の段の前に落ちた = 場所の tombstone が行の cell の版数
     ///   より古い) sync の DB は、 新しい HLC で tombstone を置く:
     ///   #451 が Delete を作り直して相手に配り、 消えた行への相手の書き込みを `slot_is_dead` が弾く (削除優先なので、 新しい HLC でも
-    ///   消した後の書き込みを余分に消す事は無い)。 `wal` = 版数を採る WAL (無い open は tombstone を置かない = 配らない DB)
+    ///   消した後の書き込みを余分に消す事は無い)。 `wal` = 版数を採る WAL (無い open は tombstone を置かない = 配らない DB)。 tombstone を
+    ///   確かめるのは、 gen.seg だけ死の完了 (1.) と、 cell の残った死んだ場所 (3.、 #992: 前の open の仕上げが走らなかった像)
     pub(crate) fn finish_reconcile(&self, wal: Option<&enchudb_oplog::oplog::OpLog>) {
         let gens = self.generations();
         let pending = gens.take_pending();
         if pending.is_empty() {
             return;
         }
-        for (slot, row_gen, gen_only) in pending {
+        for (slot, row_gen, check_tomb) in pending {
             if self.entities.is_live(slot) {
                 continue;
             }
             // 消えた行の削除の tombstone が届いていない = 場所の tombstone (前の住人の物 / 無し) が行の cell の版数より古い
-            let tomb_missing = wal.is_some() && gen_only && self.sync_tables_enabled() && self.has_cell_version() && {
+            let tomb_missing = wal.is_some() && check_tomb && self.sync_tables_enabled() && self.has_cell_version() && {
                 let newest_cell = self.tables[self.table_of_slot(slot).unwrap_or(ANONYMOUS_TABLE as usize)]
                     .himo_ids
                     .read()
@@ -24671,7 +24763,7 @@ impl Engine {
             // WAL の無い仕上げ (再生する record が無い open) は、 後で WAL 付きで開き直す時 (#892 の往復 / `concurrentize_with_oplog`)
             // のために覚えたままにする (tombstone と作り直しの宛名は WAL が要る)
             if wal.is_none() {
-                gens.note_pending(slot, row_gen, gen_only);
+                gens.note_pending(slot, row_gen, check_tomb);
                 continue;
             }
             gens.note_relog_gen(slot, row_gen);
@@ -24685,7 +24777,14 @@ impl Engine {
     /// いた)。 試験用。
     #[doc(hidden)]
     pub fn generation_repairs(&self) -> (u32, u32) {
-        self.generations().repaired()
+        let (gen_only, entities_only, _) = self.generations().repaired();
+        (gen_only, entities_only)
+    }
+
+    /// #992: 開いた時の突き合わせが、 cell の残った死んだ場所を仕上げに回した数 (前の open の仕上げが走らなかった像、 3.)。 試験用。
+    #[doc(hidden)]
+    pub fn leftover_cell_repairs(&self) -> u32 {
+        self.generations().repaired().2
     }
 
     /// 開いた時に `prev.seg` の記録から、 使い回しが identity に移した前の住人の削除の版数を戻した場所の数 (観測・試験用、
@@ -32204,7 +32303,7 @@ impl Engine {
         let lock = Self::writer_lock_for_open(path)?;
         let oplog_path = oplog_path_for(path);
         let wal = Self::existing_wal(&oplog_path)?;
-        let replay = wal.as_ref().map_or(ReplayAhead::Nothing, ReplayAhead::of);
+        let replay = wal.as_ref().map_or(ReplayAhead::NewWal, ReplayAhead::of);
         let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, Some(lock), replay)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
@@ -32229,6 +32328,8 @@ impl Engine {
                 eng.finish_replay_vocab(&mut replay);
                 // #968: 再生が生き返らせた、 tombstone まで本体に届いた削除の行は、 削除を完了させる (再生の前の sweep と同じ決め)
                 eng.finish_deletes_revived_by_the_replay(!records.is_empty());
+                #[cfg(feature = "crashsim")]
+                write_out_hook::call(write_out_hook::Phase::OpenBeforeFinishReconcile);
                 // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
                 eng.finish_reconcile(Some(&w));
                 // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
@@ -32258,7 +32359,17 @@ impl Engine {
                 std::sync::Arc::new(w)
             }
             None => {
-                let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+                // #992: 突き合わせは仕上げをここまで回している (`ReplayAhead::NewWal`)。 WAL を作れなければ、 何も書かずに断る
+                // (`abandoned`: Drop がきれいに閉じた印を立てない = 次の open が突き合わせ直し、 直した場所の残った cell を 3. で拾う)
+                let w = match enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+                        return Err(e);
+                    }
+                };
+                #[cfg(feature = "crashsim")]
+                write_out_hook::call(write_out_hook::Phase::OpenBeforeFinishReconcile);
                 // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();

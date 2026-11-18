@@ -167,13 +167,14 @@ pub(crate) struct Generations {
     /// v15 に移り終えた (`Engine::move_to_generations` の最後 / v15 の DB を開いた時)。 `active` (照合を始めた) とは別: 移る途中
     /// (照合は始めたが、 v14 の間に消した場所をまだ上げていない) に使い回しを始めると、 世代 0 の場所を前と同じ eid で渡す。
     moved: std::sync::atomic::AtomicBool,
-    /// きれいに閉じなかった後に開いた時に削除を完了させた場所の数 (観測・試験用): 0 = gen.seg だけ死んでいた、 1 = entities だけ。
-    repaired: [AtomicU32; 2],
+    /// きれいに閉じなかった後に開いた時に削除を完了させた場所の数 (観測・試験用): 0 = gen.seg だけ死んでいた、 1 = entities だけ、
+    /// 2 = 死んでいて cell が残っていた (#992、 仕上げに回した)。
+    repaired: [AtomicU32; 3],
     /// header の [`OFF_DIRTY`] が立っている (この session で立てた / 開いた時に立っていた)。 立てるのは `dirty_lock` の下。
     session_dirty: std::sync::atomic::AtomicBool,
     pub(crate) dirty_lock: std::sync::Mutex<()>,
-    /// 開く時の突き合わせで削除を完了させた場所 (場所, 消えた行の世代, gen.seg だけ死だったか)。 cell を落とすのは再生の後も死んで
-    /// いる場所だけ (`Engine::finish_reconcile`)。
+    /// 開く時の突き合わせで削除を完了させた場所 (場所, 消えた行の世代, tombstone を確かめるか = gen.seg だけ死だった / cell の残った
+    /// 死んだ場所 (#992))。 cell を落とすのは再生の後も死んでいる場所だけ (`Engine::finish_reconcile`)。
     pending: std::sync::Mutex<Vec<(u32, u32, bool)>>,
     /// 再生の後も死んでいる完了させた場所の 「消えた行の世代」 (#451 の作り直しの Delete が使う、 作り直しの後に忘れる)。
     relog_gens: std::sync::Mutex<std::collections::BTreeMap<u32, u32>>,
@@ -202,7 +203,7 @@ impl Generations {
             move_lock: std::sync::Mutex::new(()),
             replaying: std::sync::atomic::AtomicBool::new(false),
             moved: std::sync::atomic::AtomicBool::new(false),
-            repaired: [AtomicU32::new(0), AtomicU32::new(0)],
+            repaired: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
             session_dirty: std::sync::atomic::AtomicBool::new(false),
             dirty_lock: std::sync::Mutex::new(()),
             pending: std::sync::Mutex::new(Vec::new()),
@@ -683,14 +684,19 @@ impl Generations {
         dead_but_live
     }
 
-    /// 開いた時に削除を完了させた場所を数える (観測・試験用)。 `which` 0 = gen.seg だけ死んでいた、 1 = entities だけ死んでいた。
+    /// 開いた時に削除を完了させた場所を数える (観測・試験用)。 `which` 0 = gen.seg だけ死んでいた、 1 = entities だけ死んでいた、
+    /// 2 = 死んでいて cell が残っていた (#992: 前の open の仕上げが走らなかった像、 仕上げに回した)。
     pub(crate) fn note_repaired(&self, which: usize, n: u32) {
         self.repaired[which].fetch_add(n, Ordering::Relaxed);
     }
 
-    /// きれいに閉じなかった後に開いた時に削除を完了させた場所の数 (gen.seg だけ死んでいた, entities だけ死んでいた)。
-    pub(crate) fn repaired(&self) -> (u32, u32) {
-        (self.repaired[0].load(Ordering::Relaxed), self.repaired[1].load(Ordering::Relaxed))
+    /// きれいに閉じなかった後に開いた時に削除を完了させた場所の数 (gen.seg だけ死んでいた, entities だけ死んでいた, cell が残っていた)。
+    pub(crate) fn repaired(&self) -> (u32, u32, u32) {
+        (
+            self.repaired[0].load(Ordering::Relaxed),
+            self.repaired[1].load(Ordering::Relaxed),
+            self.repaired[2].load(Ordering::Relaxed),
+        )
     }
 
     /// 使える世代の最大 (2^G − 2)。 G ≤ 1 の DB は 0 = 使い回さない。
