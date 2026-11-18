@@ -387,7 +387,10 @@ mod tests {
                 drop(hold);
             })
         };
+        // 止める側が世代を進めるまで (上限は止まらないためだけ)
+        let until = std::time::Instant::now() + Duration::from_secs(20);
         while wal.gate_epoch() == e0 {
+            assert!(std::time::Instant::now() < until, "止める側が門の世代を進めない");
             std::thread::yield_now();
         }
         let b = wal.applying_gated(wal.gate_epoch(), 7);
