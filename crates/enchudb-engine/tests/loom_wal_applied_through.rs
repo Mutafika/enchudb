@@ -18,9 +18,11 @@
 //! 書き出す側が位置を先に読む形、 `written` の読みを Relaxed にした形、 印を外す store を Relaxed にした形、 同じ書き手の 2 件目の
 //! 位置を置く store を Relaxed にした形、 まとめ書きで書き出す側が印を置き場より先に読む形。
 //!
-//! 印を外す store と、 位置を置く store はどちらも Release: 外れたのを読んだ側にも、 同じ書き手の次の位置を読んだ側にも、 その前に
-//! 当てた cell が見える (cell の store 自体は Relaxed でも)。 1 件だけの模型では位置の store が Relaxed でも窓は無い (同じ thread が
-//! その後に `written` を Release で進める) が、 2 件続けると窓がある (`a_relaxed_second_write_position_lets_the_cut_pass`)。
+//! 印を外す store は Release: 外れたのを読んだ側に、 その前に当てた cell が見える (cell の store 自体は Relaxed でも)。 #1016: 位置を
+//! 置く store は Relaxed (前は Release)。 同じ書き手が 2 件続けると、 2 件目の位置 (Relaxed) を読んだだけでは 1 件目の cell が見えない
+//! (`a_relaxed_second_write_position_lets_the_cut_pass`) ので、 書き出す側は `written` 以降の位置を読んだら、 その record の `written`
+//! が進むか印が変わるまで待つ (`OpLog::settled_position`。 位置の store の後、 同じ書き手が `append_lock` の中で `written` を Release で
+//! 進める)。 対照: 位置の store を Relaxed にして待たない形。
 //!
 //! 模型は考え方の写し (実装の行を変えても落ちない)。 実装の窓は engine の `checkpoint_before_apply_tests` (割り込み点) と
 //! oplog の `applied_through_*` / `a_writer_waiting_*` / `checkpoint_and_reset_stops_before_…` が踏む。
@@ -71,6 +73,10 @@ struct Shape {
     served_first: bool,
     /// 当て終えて印を外す store の順序 (Release が正しい)
     clear_order: Ordering,
+    /// 位置を置く store の順序 (#1016: Relaxed + 書き出す側が待つ。 前は Release)
+    pos_order: Ordering,
+    /// 書き出す側が、 `written` 以降の位置を読んだら、 その record の `written` が進むか印が変わるまで待つ (#1016)
+    reader_waits: bool,
 }
 
 const RIGHT: Shape = Shape {
@@ -81,6 +87,8 @@ const RIGHT: Shape = Shape {
     use_marks: true,
     served_first: true,
     clear_order: Ordering::Release,
+    pos_order: Ordering::Relaxed,
+    reader_waits: true,
 };
 
 impl Wal {
@@ -96,25 +104,26 @@ impl Wal {
 
     /// `append_lock` の下で record を書く所: 位置を `at` に置いて `written` を進める。
     fn append(&self, s: Shape, at: &AtomicU64) {
-        // 位置の store は Release (実装と同じ。 1 件だけのこの模型では Relaxed でも窓は無い、 下の 2 件の模型)
+        // 位置の store は Relaxed (実装と同じ、 #1016)
         if s.pos_first {
-            at.store(START, Ordering::Release);
+            at.store(START, s.pos_order);
             self.written.store(END, Ordering::Release);
         } else {
             self.written.store(END, Ordering::Release);
-            at.store(START, Ordering::Release);
+            at.store(START, s.pos_order);
         }
     }
 
     /// 書き出す側: 覆う位置を決めてから本体を書き出す。 (覆う位置, 書き出した cell)
     fn write_out(&self, s: Shape) -> (u64, u64) {
-        let positions = || {
+        let positions = |w: u64| {
+            let read = |c: &AtomicU64| settled(&self.written, c, w, s.reader_waits);
             let (sv, m) = if s.served_first {
-                let sv = self.served.load(Ordering::Acquire);
-                (sv, self.mark.load(Ordering::Acquire))
+                let sv = read(&self.served);
+                (sv, read(&self.mark))
             } else {
-                let m = self.mark.load(Ordering::Acquire);
-                (self.served.load(Ordering::Acquire), m)
+                let m = read(&self.mark);
+                (read(&self.served), m)
             };
             if !s.use_marks {
                 return IDLE;
@@ -123,13 +132,35 @@ impl Wal {
         };
         let through = if s.written_first {
             let w = self.written.load(s.written_order);
-            w.min(positions())
+            w.min(positions(w))
         } else {
-            let p = positions();
+            // 位置を先に読む形 (対照) は、 まだ `written` を読んでいないので待たない
+            let p = positions(u64::MAX);
             self.written.load(s.written_order).min(p)
         };
         (through, self.cell.load(Ordering::Acquire))
     }
+}
+
+/// 書き出す側の印 / 置き場の読み (`OpLog::settled_position`): 読んだ位置が `w` (読んだ `written`) 以降なら、 その record の `written`
+/// が進むか、 印が変わる (外れる / 次の位置) まで待つ。
+fn settled(written: &AtomicU64, c: &AtomicU64, w: u64, waits: bool) -> u64 {
+    let mut at = c.load(Ordering::Acquire);
+    if !waits {
+        return at;
+    }
+    while at >= w && at < ARMED {
+        if written.load(Ordering::Acquire) > at {
+            break;
+        }
+        let now = c.load(Ordering::Acquire);
+        if now >= ARMED {
+            return now;
+        }
+        at = now;
+        thread::yield_now();
+    }
+    at
 }
 
 fn model(s: Shape) {
@@ -234,7 +265,7 @@ fn relaxed_clear_lets_the_cut_pass() {
 /// 1 件目の cell が見えていること。 位置の store が Relaxed だと、 2 件目の位置を読んで 1 件目を越えたのに、 1 件目の cell が
 /// まだ見えない組を読みうる (2 件目の位置の store は、 1 件目を外した Release の後に置いた値だが、 Relaxed の store を読んでも
 /// 同期しない)。
-fn model_two_writes(pos_order: Ordering) {
+fn model_two_writes(pos_order: Ordering, reader_waits: bool) {
     const END2: u64 = 3;
     loom::model(move || {
         let written = Arc::new(AtomicU64::new(START));
@@ -252,7 +283,7 @@ fn model_two_writes(pos_order: Ordering) {
             })
         };
         let w = written.load(Ordering::Acquire);
-        let m = mark.load(Ordering::Acquire);
+        let m = settled(&written, &mark, w, reader_waits);
         let through = w.min(m);
         let c = cell1.load(Ordering::Acquire);
         assert!(through <= START || c == 1, "覆う位置 {through} が、 本体に当たっていない 1 件目を越えた");
@@ -260,17 +291,24 @@ fn model_two_writes(pos_order: Ordering) {
     });
 }
 
-/// 位置の store が Release なら、 2 件目の位置を読んだ書き出しの側には 1 件目の cell が見える。
+/// #1016: 位置の store が Relaxed でも、 書き出す側が `written` 以降の位置を読んだらその record の `written` を待てば、 2 件目の位置を
+/// 読んだ書き出しの側に 1 件目の cell が見える (実装の形)。
 #[test]
-fn a_second_write_position_carries_the_first_apply() {
-    model_two_writes(Ordering::Release);
+fn a_relaxed_second_write_position_with_the_wait_carries_the_first_apply() {
+    model_two_writes(Ordering::Relaxed, true);
 }
 
-/// 対照: 位置の store が Relaxed だと、 2 件目の位置を読んでも 1 件目の cell が見えない組がある。
+/// 位置の store が Release なら、 待たなくても 2 件目の位置を読んだ書き出しの側には 1 件目の cell が見える (#1016 の前の形)。
+#[test]
+fn a_second_write_position_carries_the_first_apply() {
+    model_two_writes(Ordering::Release, false);
+}
+
+/// 対照: 位置の store が Relaxed で書き出す側が待たないと、 2 件目の位置を読んでも 1 件目の cell が見えない組がある。
 #[test]
 #[should_panic]
 fn a_relaxed_second_write_position_lets_the_cut_pass() {
-    model_two_writes(Ordering::Relaxed);
+    model_two_writes(Ordering::Relaxed, false);
 }
 
 /// 対照: まとめ書きで、 書き出す側が印を置き場より先に読むと、 頼んだ書き手が位置を印へ移す間に、 古い印と外れた置き場の組を読む。

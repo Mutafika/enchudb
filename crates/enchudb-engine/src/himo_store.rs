@@ -49,7 +49,7 @@ use crate::column::Column;
 use crate::lockfree_cylinder::{LockFreeCylinder, Part};
 use crate::region::Region;
 use crate::value_locks::{HeldAll, ValueLocks};
-use crate::write_gate::{IntentGate, IntentHold, IntentPass, WriteGate};
+use crate::write_gate::{IntentGate, IntentHold, WriteGate};
 
 /// column region の取得元 (request23 D2)。
 ///
@@ -1222,23 +1222,11 @@ impl HimoStore {
         drop(self.write_guard_inner());
     }
 
-    /// #850 の後: WAL に積んで本体に当てる自分の書き込みが、 **積む前に** 入る ([`IntentGate`])。 この紐を長く止める側が居れば
-    /// 終わるまで待つ。 持っている間 (当て終えるまで) 止める側は始まらない。 当てる前に drop しないこと。
-    #[inline]
-    pub(crate) fn write_intent(&self) -> IntentPass<'_> {
-        self.intent.enter()
-    }
-
-    /// [`write_intent`](Self::write_intent) の待たない版 (いくつもの紐に入る書き手用。 入れなければ入った分を出て
-    /// [`wait_write_intent`](Self::wait_write_intent))。
-    #[inline]
-    pub(crate) fn try_write_intent(&self) -> Option<IntentPass<'_>> {
-        self.intent.try_enter()
-    }
-
-    /// この紐を止めている側が終わるのを待つ。
-    pub(crate) fn wait_write_intent(&self) {
-        self.intent.wait();
+    /// #850 の後: WAL に積んで本体に当てる自分の書き込みの門 ([`IntentGate`])。 書き手は積む前に開いているのを見る (#1016: 積む時に
+    /// WAL の門の世代で確かめ直す、 engine の `LocalApply::arm`)。
+    #[inline(always)]
+    pub(crate) fn intent_gate(&self) -> &IntentGate {
+        &self.intent
     }
 
     /// 門が閉じているか (test 用)。

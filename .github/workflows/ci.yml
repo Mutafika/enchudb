@@ -189,15 +189,17 @@ jobs:
         run: cargo test -p enchudb-engine --test loom_eid_generation_move --release
 
       # #850: 書き出す側が覆う位置を、 WAL に積んだだけでまだ本体に当てていない record の手前で切る。 印を record の位置に
-      # 置き換えるのは `written` を進める前、 書き出す側は `written` を読んでから印を読む。 順を逆にした形・Relaxed の形・印を
-      # 見ない形 (直す前) の対照で、 loom が窓を見つけることも見る。
+      # 置き換えるのは `written` を進める前、 書き出す側は `written` を読んでから印を読む。 #1016: 位置の store は Relaxed で、
+      # 書き出す側は読んだ `written` 以降の位置を見たらその record の `written` を待つ。 順を逆にした形・Relaxed の形 (待たない)・
+      # 印を見ない形 (直す前) の対照で、 loom が窓を見つけることも見る。
       - name: loom model check (当てていない record の手前で checkpoint を切る)
         run: cargo test -p enchudb-engine --test loom_wal_applied_through --release
 
       # #873 のレビュー: WAL に積んで当てる書き込みは、 紐を長く止める側 (円柱を組む / 並びの索引を作る / 列を数える) を積む前に
-      # 待つ (`write_gate::IntentGate`)。 止める側は門を閉じてから `write_lock` を取り、 いくつもの紐に入る書き手 (削除) は 1 つでも
-      # 閉じていれば入った分を出てから待つ。 どの順でも互いに待って止まらないこと、 2 つの対照 (入ったまま待つ削除 / 先に
-      # `write_lock` を取る止める側) では止まることを見る。
+      # 待つ (`write_gate::IntentGate`)。 #1016: 門は積む時に `append_lock` の下で WAL の門の世代で確かめ、 止める側は世代を
+      # 進めてから、 それより前に積まれた書き込みが当て終えるのを待って `write_lock` を取る。 止める側が列をなめる間にその紐の
+      # 書き手が積んでいないこと、 どの順でも止まらないこと、 5 つの対照 (世代を確かめない / lock の外で進める / Relaxed で読む /
+      # 待たない / 先に `write_lock` を取る) では窓 / 止まりを見つけることを見る。
       - name: loom model check (積む前に、 紐を長く止める側を待つ門)
         run: cargo test -p enchudb-engine --test loom_intent_gate --release
 
