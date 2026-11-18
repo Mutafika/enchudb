@@ -2287,6 +2287,9 @@ impl Drop for WriterLock {
 /// 決める (PR #986 の読み直し 2 の [1] [2])。 前は直しの中で WAL の file を開き直して聞いた: 直しを map (gen.seg / entities.seg) に書いた
 /// 後に聞けずに断る道と、 WAL 付きの open が直しの後に WAL を開けずに返る (Drop が clean の印を立てる) 道があり、 どちらも次の open が
 /// 直した場所を見つけず、 仕上げ (残った cell を落とす・消えた行の世代と tombstone を覚える) が二度と走らなかった。
+///
+/// #992: gen.seg の突き合わせは聞かない ([`ReplayAhead::finishes_later`]: WAL 付きの open は再生する record が無くても仕上げを再生の
+/// 後に回す)。 単独の open は往復するか ([`ReplayAhead::standalone_with_wal_file`]) も持つ。
 enum ReplayAhead<'w> {
     /// 再生しない: readonly (直しをしない)
     Nothing,

@@ -1,7 +1,8 @@
 //! #972: きれいに閉じなかった後に開く時、 WAL を全部解くのは本当の再生 (WAL 付きの open の `recover_with_tail`) の 1 回だけ。
 //! 「再生する record があるか」 を聞く道は、 最初の当てる record で止まる: 単独の open が writer lock の下で聞く所 (#880 の往復の前と後)
 //! は WAL を読むだけで開いて聞き (`OpLog::probe_replay`)、 WAL 付きの open は開いた WAL に聞く (`OpLog::has_records_to_replay`、
-//! `reconcile_generations` の仕上げと `restore_prev_residents` が要る時に 1 回。 PR #986 の読み直し 2 の [2])。
+//! `restore_prev_residents` / 別名の外しが要る時に 1 回。 PR #986 の読み直し 2 の [2])。 #992 から `reconcile_generations` は聞かない
+//! (WAL 付きの open は仕上げをいつも再生の後に回す)。
 //!
 //! 前は聞くたびに WAL を読み書きで開いて全部を解き (`OpLog::open` + `recover_with_tail`)、 単独の open (`open_standalone`) は
 //! 1 回の open で 2〜5 回 WAL を全部読んだ (256 MiB の WAL で 1 回 0.3〜1 秒)。
@@ -172,9 +173,10 @@ fn create_v15(path: &str, sync: bool) -> Arc<Engine> {
 }
 
 /// v15 の DB で、 開く時の突き合わせが削除を完了させる像 (`eid_generation.rs` の `reconcile_through_standalone_open` と同じ:
-/// gen.seg は削除の後、 生きている印は削除の前) に、 再生する record を `ROWS` 件足す。 突き合わせは仕上げを再生の後に回すかを
-/// 聞く (`reconcile_generations`)。 WAL 付きの open は開いた WAL に 1 回聞いて 1 回解く。 単独の open は往復の前と後に WAL の file に
-/// 聞き (lock の下、 突き合わせの前)、 往復の WAL 付きの open が開いた WAL に 1 回聞いて、 1 回解く (#972 の前は 3 回全部を解いた)。
+/// gen.seg は削除の後、 生きている印は削除の前) に、 再生する record を `ROWS` 件足す。 WAL 付きの open は聞かずに 1 回解く (#992 の前は
+/// 突き合わせ (`reconcile_generations`) が仕上げを再生の後に回すかを開いた WAL に 1 回聞いた。 今は WAL 付きの open はいつも再生の後に
+/// 仕上げる)。 単独の open は往復の前と後に WAL の file に聞き (lock の下、 突き合わせの前)、 往復の WAL 付きの open が 1 回解く
+/// (#972 の前は 3 回全部を解いた)。
 #[test]
 fn an_open_that_reconciles_generations_decodes_the_wal_once() {
     for sync in [false, true] {
@@ -218,12 +220,12 @@ fn an_open_that_reconciles_generations_decodes_the_wal_once() {
         assert_eq!(eng.get(b, "notes.note"), Some(10 + ROWS as u64 - 1), "前提: 再生した");
         assert!(!eng.is_live(c));
         drop(eng);
-        assert_read_once(r, 0, 1, &format!("突き合わせのある WAL 付きの open (sync = {sync})"));
+        assert_read_once(r, 0, 0, &format!("突き合わせのある WAL 付きの open (sync = {sync})"));
 
         let (eng, r) = reads(|| Engine::open_standalone(&s).unwrap());
         assert_eq!(eng.get(b, "notes.note"), Some(10 + ROWS as u64 - 1), "前提: 往復が再生した");
         assert!(!eng.is_live(c));
         drop(eng);
-        assert_read_once(r, 2, 3, &format!("突き合わせのある単独の open (sync = {sync})"));
+        assert_read_once(r, 2, 2, &format!("突き合わせのある単独の open (sync = {sync})"));
     }
 }
