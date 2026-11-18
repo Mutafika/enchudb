@@ -54,7 +54,8 @@ struct Page {
 static COPY: Mutex<u64> = Mutex::new(0);
 
 type Hook = std::sync::Arc<dyn Fn(Copied) + Send + Sync>;
-static AFTER_COPY: Mutex<Option<Hook>> = Mutex::new(None);
+/// [`set_after_copy_hook`] の hook。 `Arc` で包む: 呼び手が最後の持ち手になったかを `Arc::into_inner` で決める ([`copy_for_sync`])
+static AFTER_COPY: Mutex<Option<std::sync::Arc<Hook>>> = Mutex::new(None);
 
 /// 写したものの種類 ([`copy_for_sync`]、 hook にも渡す)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,17 +154,31 @@ pub fn copy_for_sync(what: Copied, offset: u64, bytes: &[u8]) -> SyncCopy {
         SyncCopy { order: *last, offset, bytes: bytes.to_vec() }
     };
     // 写す係の lock を離してから (止めた書き出しの横で、 他の書き出しが写せるように)
+    // hook は lock の外で呼ぶ (hook の中で止まっても `set_after_copy_hook` を止めない)
     let hook = AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()).clone();
     if let Some(h) = hook {
-        h(what);
+        (**h)(what);
+        // 呼んでいる間に外された hook の最後の持ち手: 落とすのは別の thread で (hook が engine の最後の `Arc` を持っていると、 その
+        // Drop は consumer を join する。 ここが consumer の thread なら自分を join する)。 thread を作れなければ (closure ごと) ここで落ちる
+        if let Some(last) = std::sync::Arc::into_inner(h) {
+            let _ = std::thread::Builder::new().name("enchudb-hook-drop".into()).spawn(move || drop(last));
+        }
     }
     copy
 }
 
 /// 試験用: [`copy_for_sync`] が写した直後 (書き出しの前) に、 写したものの種類を渡して呼ぶ hook。 書き出しを重ねる試験が、
 /// 写した後で書き出しを止めるのに使う。 None で外す。
+///
+/// 前の hook は取り出して lock を放してから落とし、 新しい hook を置く (置く時に間に置かれた hook も lock の外で落とす): hook が engine の
+/// 最後の `Arc` を持っていると、 その Drop は consumer の最後の書き出しを待ち、 その書き出しの写し ([`copy_for_sync`]) がこの lock を取る
+/// (lock を持ったまま落とすと互いを待つ。 engine の `write_out_hook::set` で PR #997 の power_loss が止まり続けた形と同じ)。 新しい hook を
+/// 置く前に落とすので、 前の engine の最後の書き出しは新しい hook を呼ばない。
 pub fn set_after_copy_hook(hook: Option<Hook>) {
-    *AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    let old = AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()).take();
+    drop(old);
+    let between = std::mem::replace(&mut *AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()), hook.map(std::sync::Arc::new));
+    drop(between);
 }
 
 /// [`copy_for_sync`] で写した範囲の書き出しが済んだ (msync 成功)。 page ごとに、 控えより後に写した中身だけ置く。

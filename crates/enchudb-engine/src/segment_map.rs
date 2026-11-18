@@ -968,6 +968,17 @@ impl SegmentMap {
         d & DIRTY_LAST_MASK >= d >> 32
     }
 
+    /// 印の付いた範囲の大きさ (byte、 page 単位。 印が無ければ 0)。 書き出しを thread に分けるかを決める目安 (#978、
+    /// `SegmentSet::flush_spread`)。 別の flush が書き出している最中の分は入らない。
+    pub fn dirty_bytes(&self) -> usize {
+        let d = self.dirty.load(Ordering::Acquire);
+        let (first, last) = (d >> 32, d & DIRTY_LAST_MASK);
+        if last < first {
+            return 0;
+        }
+        ((last - first + 1) as usize).saturating_mul(runtime_page_size())
+    }
+
     /// #801: 書き出す分が残っているか: 印が付いている、 または別の [`Self::flush_dirty`] がこの segment を書き出している最中
     /// (その flush は印を取り出してから msync するので、 その間 [`Self::has_dirty`] は false。 失敗すれば印は戻る)。
     ///
