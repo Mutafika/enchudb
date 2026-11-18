@@ -26,12 +26,18 @@
 //! thread ごとに選ぶこと (書き手どうしが 1 本の cache line を取り合わない)。 loom model:
 //! `tests/loom_lazy_cylinder_build.rs` / `tests/loom_order_index_build.rs` / `tests/loom_live_subscribe.rs`。
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// shard の数 (書き手の thread ごとに 1 つ。 これより多い thread は shard を分け合う)。
 const SHARDS: usize = 16;
 /// shard の最上位 bit = 閉じている。 残りの bit = 中に居る書き手の数。
 const CLOSED: u32 = 1 << 31;
+
+/// test 用: [`WriteGate::close_patiently`] が回った後に待った回数 (process 全体)。
+#[cfg(test)]
+pub(crate) static PATIENT_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// 128 B に揃えて shard ごとに cache line を分ける。
 #[derive(Default)]
@@ -43,9 +49,10 @@ pub(crate) struct WriteGate {
 }
 
 /// この thread が使う shard (全部の門で同じ番号)。 #1016: 中身が定数で始まる thread-local (初めの 1 回だけ番号を引く)。 前の形
-/// (初期化の closure を持つ thread-local) は、 読むたびに 「初期化したか」 を見た。
+/// (初期化の closure を持つ thread-local) は、 読むたびに 「初期化したか」 を見た。 engine の自分の書き込み (`LocalApply`) は、 この
+/// 番号を自分の thread-local に控えて [`IntentGate::try_enter_shard`] に渡す (書き込み 1 回で thread-local を 1 回だけ引く)。
 #[inline]
-fn shard_index() -> usize {
+pub(crate) fn shard_index() -> usize {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         static IDX: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
@@ -76,7 +83,13 @@ impl WriteGate {
     /// 開いていれば入り、 出るまで持つ印を返す。 閉じていれば None (呼び手は `write_lock` の道へ)。
     #[inline]
     pub(crate) fn try_enter(&self) -> Option<Pass<'_>> {
-        let s = &self.shards[shard_index()].0;
+        self.try_enter_shard(shard_index())
+    }
+
+    /// [`Self::try_enter`] の、 この thread の shard の番号 ([`shard_index`]) を呼び手が渡す版。
+    #[inline]
+    fn try_enter_shard(&self, shard: usize) -> Option<Pass<'_>> {
+        let s = &self.shards[shard % SHARDS].0;
         // Acquire: 開けた側の Release と対 (開ける前に置いた購読や索引が見える)
         if s.fetch_add(1, Ordering::Acquire) & CLOSED == 0 {
             Some(Pass { shard: s })
@@ -90,6 +103,27 @@ impl WriteGate {
     /// 門を閉じ、 中に居る書き手が出るのを待つ。 `write_lock` の下で呼ぶ (閉じる側は 1 本)。 返った後は、 門の中で書いた
     /// cell が全部見え、 新しく来る書き手は `write_lock` の道に回る。
     pub(crate) fn close(&self) {
+        self.close_then(|_| std::thread::yield_now());
+    }
+
+    /// [`Self::close`] の、 中の書き手が長く居ることのある版 ([`IntentGate::hold`]: 中の書き手は WAL の空きを待つことがある)。
+    /// 少し回った後は眠る (間は 20 µs から倍々、 上限 1.28 ms)。 前は空きを待つ書き手が出るまで (上限 5 秒) yield で回った (#873 の
+    /// 2 回目のレビュー)。
+    fn close_patiently(&self) {
+        self.close_then(|n| {
+            #[cfg(test)]
+            PATIENT_WAITS.fetch_add(1, Ordering::Relaxed);
+            if n < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(20u64 << (n - 64).min(6)));
+            }
+        });
+    }
+
+    /// 閉じて、 中が空くまで待つ。 `wait(n)` は 64 回回った後の n 回目の待ち。
+    #[inline]
+    fn close_then(&self, mut wait: impl FnMut(u32)) {
         for s in self.shards.iter() {
             s.0.fetch_or(CLOSED, Ordering::AcqRel);
         }
@@ -100,7 +134,7 @@ impl WriteGate {
                 if spins < 64 {
                     std::hint::spin_loop();
                 } else {
-                    std::thread::yield_now();
+                    wait(spins - 64);
                 }
                 spins = spins.saturating_add(1);
             }
@@ -135,41 +169,21 @@ impl Drop for Pass<'_> {
     }
 }
 
-/// #850 の後 (#873 のレビュー): WAL に積んで本体に当てる自分の書き込み (engine の `LocalApply`) の、 紐ごとの門。
+/// #850 の後 (#873 のレビュー): WAL に積んで本体に当てる自分の書き込み (engine の `LocalApply`) が、 積む前に通る門。
 ///
 /// 書き手は WAL に積んでから cell に当て終えるまで印 (`OpLog::applying`) を持ち、 書き出しは checkpoint をその手前で切る。 その間に
 /// 書き手が長く待つと (同じ紐の円柱を組む・並びの索引を作る・列を数える側が `write_lock` を持って列をなめる間)、 WAL のその区画を
 /// 畳めず、 満杯になると全部の書き手が空きを待って、 待ち切れずに record を落とす / 書き込みを断る。 そこで、 紐を長く止める側
-/// ([`IntentGate::hold`]) は `write_lock` を取る **前に** この門を閉じ、 中に居る書き手 (積んでから当て終えるまで) が出るのを待つ。
-/// 閉じた後に来た書き手は、 積む前に (印に位置を持たずに) 止める側が終わるのを待つ。 中に居る書き手は、 当てる間に止める側を
-/// 待たない (止める側はまだ `write_lock` も門も鍵も取っていない)。
+/// ([`IntentGate::hold`]) は `write_lock` を取る **前に** この門を閉じ、 中に居る書き手 (積む前から当て終えるまで) が出るのを待つ。
+/// 閉じている間に来た書き手は、 積む前に (印を持たずに) 止める側が終わるのを待つ ([`IntentGate::enter`])。 中に居る書き手は、
+/// 当てる間に止める側を待たない (止める側はまだ `write_lock` も門も鍵も取っていない)。
 ///
-/// #1016: 門は WAL に積む時に確かめる (前は紐ごと・thread の shard ごとの数を書き込みのたびに足して引いた = RMW 2 回、 列の多い
-/// 行の insert で 1 列 6 ns ほど)。
-///
-/// - 書き手 (engine の `LocalApply::arm`): WAL の門の世代を読み (`OpLog::gate_epoch`、 Acquire)、 書く紐の門が開いているのを見て
-///   ([`Self::is_closed`])、 その世代で印を作って積む (`OpLog::applying_gated`)。 積む時 (`append_lock` の下) に世代が変わって
-///   いれば積まずに返る (`oplog::GateMoved`) ので、 世代を読み直して門を確かめ直す。 閉じていれば [`Self::wait`] で止める側が
-///   終わるのを待つ (印に位置は無い)
-/// - 止める側 ([`Self::hold`]): `closer` を取り、 門の印を立ててから、 `append_lock` の下で世代を進め (`OpLog::close_gate`)、 その時
-///   までに積まれた当てる書き込みが当て終えるのを待つ (`OpLog::wait_applied_before`)。 世代を進めた後に積もうとする書き手は、 世代の
-///   違いで断られるか、 進んだ世代を読んで門の印を見る。 待つのは閉じた紐の書き手に限らない (積まれた当てる書き込み全部、 当てる
-///   間は止める側を待たないので必ず終わる)
-/// - WAL の空きを待つ書き手は積む前 (印に位置が無い) なので、 止める側はその書き手を待たない (#896 で門を一時出ていた所)
-/// - 鍵の順: 行の lock → 門 (止める側は行の lock を取らない)。 止める側は自分の書き込みを当てている途中に呼ばないこと (自分の
-///   印を待って止まる。 debug build は panic)
-///
-/// WAL の無い engine は書き手が門を見ない (印も無い) ので、 止める側は `closer` を取るだけ。 短い barrier (購読の登録の
-/// `write_barrier`) はこの門を閉じない (今まで通り、 当てている書き手が少し待つ)。
+/// 止める側は閉じてから中が空くのを待つので、 中の書き手が WAL の空きを待っていれば、 その間待つ (積む前の書き手は印を持たない
+/// ので、 空きは作られる)。 短い barrier (購読の登録の `write_barrier`) は閉じない (今まで通り、 当てている書き手が少し待つ)。
 pub(crate) struct IntentGate {
-    /// 閉じている (止める側が持つ間 1)。 書き手は WAL の門の世代を Acquire で読んだ後に読む
-    closed: AtomicU32,
+    gate: WriteGate,
     /// 止める側が持つ間持つ (止める側は 1 本ずつ、 閉じられた書き手はこれを待つ)
     closer: parking_lot::Mutex<()>,
-    /// この紐を持つ engine の WAL (WAL 付きの engine が付ける、 [`Self::attach_wal`])。 止める側が門の世代を進め、 当てている書き手を
-    /// 待つ。 engine より長く生かさない (`Weak`)
-    #[cfg(not(target_arch = "wasm32"))]
-    wal: std::sync::OnceLock<(std::sync::Weak<enchudb_oplog::oplog::OpLog>, u64)>,
 }
 
 impl Default for IntentGate {
@@ -180,25 +194,91 @@ impl Default for IntentGate {
 
 impl IntentGate {
     pub(crate) fn new() -> Self {
-        Self {
-            closed: AtomicU32::new(0),
-            closer: parking_lot::Mutex::new(()),
-            #[cfg(not(target_arch = "wasm32"))]
-            wal: std::sync::OnceLock::new(),
+        Self { gate: WriteGate::new(), closer: parking_lot::Mutex::new(()) }
+    }
+
+    /// 入る。 閉じていれば、 止める側が終わるのを待ってから入り直す。 (#1016: engine は shard を控えた [`Self::enter_shard`] を使う)
+    #[cfg(test)]
+    pub(crate) fn enter(&self) -> IntentPass<'_> {
+        loop {
+            if let Some(p) = self.try_enter() {
+                return p;
+            }
+            self.wait();
         }
     }
 
-    /// この紐の書き手が積む WAL を付ける (engine が WAL を付ける時と、 WAL 付きの engine に紐を足す時。 書き手が来る前に)。 `tag` は
-    /// この紐の書き手が印に置く札 (紐の番号、 `OpLog::applying_gated`)。 止める側は、 札がこれか `TAG_ANY` の書き込みだけを待つ。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn attach_wal(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>, tag: u64) {
-        let _ = self.wal.set((std::sync::Arc::downgrade(wal), tag));
+    /// 開いていれば入る (待たない)。 いくつもの門に入る書き手 (delete) は、 1 つでも閉じていれば入った分を出てから待つ
+    /// ([`Self::wait`]、 入ったまま待つと、 止める側が 2 本の紐を順に止める間に互いに待つ)。
+    #[cfg(test)]
+    pub(crate) fn try_enter(&self) -> Option<IntentPass<'_>> {
+        self.try_enter_shard(shard_index())
     }
 
-    /// 閉じているか (書き手: WAL の門の世代を Acquire で読んだ後に見る)。
-    #[inline(always)]
-    pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed) != 0
+    /// [`Self::try_enter`] の、 この thread の shard の番号 ([`shard_index`] の値) を呼び手が渡す版 (#1016: engine の `LocalApply` は
+    /// 番号を自分の thread-local に控え、 書き込みのたびに門の thread-local を引かない)。 別の thread の番号を渡さないこと
+    /// ([`Self::step_out`] / [`Self::try_step_in`] は [`shard_index`] で同じ shard を引く)。
+    #[inline]
+    pub(crate) fn try_enter_shard(&self, shard: usize) -> Option<IntentPass<'_>> {
+        debug_assert_eq!(shard, shard_index(), "IntentGate: 別の thread の shard");
+        let pass = self.gate.try_enter_shard(shard)?;
+        #[cfg(debug_assertions)]
+        held::push(self);
+        Some(IntentPass { _pass: pass, gate: self })
+    }
+
+    /// [`Self::try_enter_shard`] の、 入った印を返さない版 (いくつもの門に入る行の削除、 engine の `RowHids` で門を覚える)。 入れたら
+    /// true: 呼び手は同じ thread・同じ shard の [`Self::leave_shard`] で出る。
+    #[inline]
+    pub(crate) fn try_enter_shard_raw(&self, shard: usize) -> bool {
+        match self.try_enter_shard(shard) {
+            Some(p) => {
+                // 出るのは `leave_shard` (shard の数を下げ、 debug build は入っている門の控えから外す)
+                std::mem::forget(p);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Self::try_enter_shard_raw`] で入った門を出る (`IntentPass` の drop と同じ)。
+    #[inline]
+    pub(crate) fn leave_shard(&self, shard: usize) {
+        #[cfg(debug_assertions)]
+        held::remove(self);
+        // Release: 閉じる側の Acquire と対 (門の中で書いた cell が見える、 `Pass` の drop と同じ)
+        self.gate.shards[shard % SHARDS].0.fetch_sub(1, Ordering::Release);
+    }
+
+    /// [`Self::enter`] の、 shard の番号を呼び手が渡す版 ([`Self::try_enter_shard`])。
+    #[inline]
+    pub(crate) fn enter_shard(&self, shard: usize) -> IntentPass<'_> {
+        loop {
+            if let Some(p) = self.try_enter_shard(shard) {
+                return p;
+            }
+            self.wait();
+        }
+    }
+
+    /// #896: この thread が入っている門を一時出る ([`Self::try_step_in`] で入り直す)。 中でまだ何も積んでいない間だけ呼ぶ (WAL の
+    /// 空きを待つ書き手: 積む record の印は位置を持たない)。 出ている間、 止める側は待たずに始められる。
+    pub(crate) fn step_out(&self) {
+        // Release: 入った時からの読み書きを、 中が空いたのを見た止める側に見せる (`Pass` の drop と同じ)
+        self.gate.shards[shard_index()].0.fetch_sub(1, Ordering::Release);
+    }
+
+    /// [`Self::step_out`] した門に入り直す。 閉じていれば入らずに false (呼び手は出た門を全部出てから [`Self::wait`] して
+    /// やり直す)。
+    pub(crate) fn try_step_in(&self) -> bool {
+        let s = &self.gate.shards[shard_index()].0;
+        // Acquire: 開けた側の Release と対 (`try_enter` と同じ)
+        if s.fetch_add(1, Ordering::Acquire) & CLOSED == 0 {
+            true
+        } else {
+            s.fetch_sub(1, Ordering::Relaxed);
+            false
+        }
     }
 
     /// 止める側が終わるのを待つ (止める側は閉じている間ずっと `closer` を持つ)。
@@ -206,26 +286,35 @@ impl IntentGate {
         drop(self.closer.lock());
     }
 
-    /// 閉じて、 中の書き手 (積んでから当て終えるまでの書き手) が出るのを待つ。 drop で開ける。 `write_lock` を取る前に呼ぶ (中の
-    /// 書き手が当てる間に `write_lock` を待つことがある)。 自分の書き込みを当てている途中の thread が呼ぶと止まる (debug build は
-    /// panic)。
+    /// 閉じて、 中の書き手が出るのを待つ。 drop で開ける。 `write_lock` を取る前に呼ぶ (中の書き手が当てる間に `write_lock` を
+    /// 待つことがある)。 この門に入ったままの thread が呼ぶと止まる (debug build は panic)。
     pub(crate) fn hold(&self) -> IntentHold<'_> {
         #[cfg(debug_assertions)]
-        assert!(
-            !applying_here::get(),
-            "IntentGate::hold: この thread は自分の書き込みを WAL に積んで当てている途中 (自分の印を待って止まる)"
-        );
+        assert!(!held::contains(self), "IntentGate::hold: この thread はこの紐の書き込みの途中 (自分を待って止まる)");
         let closer = self.closer.lock();
-        // 世代を進める (`close_gate` の Release) より前: 進んだ世代を読んだ書き手が見る
-        self.closed.store(1, Ordering::Relaxed);
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some((wal, tag)) = self.wal.get().and_then(|(w, t)| w.upgrade().map(|w| (w, *t))) {
-            let p = wal.close_gate();
-            // この紐を書く書き込み (札がこの紐か、 いくつもの紐を書く行の削除) だけを待つ。 前の形 (紐ごとの門の数) と同じく、 別の紐の
-            // 書き手が当てる途中で長く待っても (書き出しの門など) 止める側は待たない
-            wal.wait_applied_before(p, |t| t == tag || t == enchudb_oplog::oplog::TAG_ANY);
-        }
+        self.gate.close_patiently();
         IntentHold { gate: self, _closer: closer }
+    }
+}
+
+/// [`IntentGate`] の中に居る間持つ。
+pub(crate) struct IntentPass<'a> {
+    _pass: Pass<'a>,
+    gate: &'a IntentGate,
+}
+
+impl<'a> IntentPass<'a> {
+    /// 入った門。
+    #[inline]
+    pub(crate) fn gate(&self) -> &'a IntentGate {
+        self.gate
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for IntentPass<'_> {
+    fn drop(&mut self) {
+        held::remove(self.gate);
     }
 }
 
@@ -237,31 +326,35 @@ pub(crate) struct IntentHold<'a> {
 
 impl Drop for IntentHold<'_> {
     fn drop(&mut self) {
-        // Release: 開いたのを見た書き手に、 止めていた間に置いたもの (組んだ円柱・索引) を見せる (書き手はそれぞれの flag でも見る)
-        self.gate.closed.store(0, Ordering::Release);
+        self.gate.gate.open();
     }
 }
 
-/// debug build: この thread が自分の書き込みを WAL に積んで当てている途中か (engine の `LocalApply`。 止める側を自分で待つ形を
-/// panic にする)。
+/// debug build: この thread が入っている門 (止める側を自分で待つ形を panic にする)。
 #[cfg(debug_assertions)]
-pub(crate) mod applying_here {
-    use std::cell::Cell;
+mod held {
+    use super::IntentGate;
+    use std::cell::RefCell;
 
     thread_local! {
-        static N: Cell<u32> = const { Cell::new(0) };
+        static HELD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     }
 
-    pub(crate) fn enter() {
-        let _ = N.try_with(|n| n.set(n.get() + 1));
+    pub(super) fn push(g: &IntentGate) {
+        let _ = HELD.try_with(|h| h.borrow_mut().push(g as *const _ as usize));
     }
 
-    pub(crate) fn exit() {
-        let _ = N.try_with(|n| n.set(n.get().saturating_sub(1)));
+    pub(super) fn remove(g: &IntentGate) {
+        let _ = HELD.try_with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some(i) = h.iter().rposition(|&p| p == g as *const _ as usize) {
+                h.swap_remove(i);
+            }
+        });
     }
 
-    pub(super) fn get() -> bool {
-        N.try_with(|n| n.get() != 0).unwrap_or(false)
+    pub(super) fn contains(g: &IntentGate) -> bool {
+        HELD.try_with(|h| h.borrow().contains(&(g as *const _ as usize))).unwrap_or(false)
     }
 }
 
@@ -308,25 +401,36 @@ mod tests {
         assert!(p.is_some(), "開けた門に入れない");
     }
 
-    fn tmp_wal(name: &str) -> (String, Arc<enchudb_oplog::oplog::OpLog>) {
-        let p = std::env::temp_dir().join(format!("enchu-write-gate-{name}-{}", std::process::id())).to_string_lossy().into_owned();
-        let _ = std::fs::remove_file(&p);
-        let wal = Arc::new(enchudb_oplog::oplog::OpLog::create(std::path::Path::new(&p), 64 * 1024).unwrap());
-        (p, wal)
+    /// 止める側 (`hold`) は、 中の書き手が長く居る間 (300 ms) CPU を回さない (少し回った後は眠る)。 前は yield で回り続けた (#873 の
+    /// 2 回目のレビュー。 yield で回る形は 300 ms に約 3 万回)。
+    #[test]
+    fn intent_hold_sleeps_while_a_writer_stays_inside() {
+        let gate = std::sync::Arc::new(IntentGate::new());
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let inside = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let _p = gate.enter();
+                in_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        };
+        in_rx.recv().unwrap();
+        let waits = PATIENT_WAITS.load(Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        drop(gate.hold());
+        let (took, waits) = (t.elapsed(), PATIENT_WAITS.load(Ordering::Relaxed) - waits);
+        inside.join().unwrap();
+        assert!(took >= Duration::from_millis(200), "前提: 止める側は中の書き手を待った ({took:?})");
+        // 眠れば 300 ms で数百回 (他の試験が同じ数を足しうるので上限は広め)
+        assert!(waits < 3_000, "止める側が回り続けた (300 ms に {waits} 回)");
     }
 
-    /// #1016: 止める側 (`hold`) は、 閉じる前に積まれて当てている途中の書き込み (印に位置がある) が当て終えるまで返らない。 閉じた後に
-    /// 積もうとする書き手は、 閉じる前に読んだ世代では積めない (`GateMoved`)。 開けた後は積める。
+    /// 止める側 (`hold`) は中の書き手が出るまで返らず、 持っている間に来た書き手は待ち、 放すと入る。
     #[test]
-    fn intent_hold_waits_for_an_applying_writer_and_turns_new_ones_away() {
-        use enchudb_oplog::oplog::{is_gate_moved, Op};
-        let (p, wal) = tmp_wal("hold");
+    fn intent_hold_waits_for_writers_inside_and_holds_new_ones() {
         let gate = Arc::new(IntentGate::new());
-        gate.attach_wal(&wal, 7);
-        // 当てている途中の書き手: 積んだ (印に位置がある)、 まだ外していない
-        let e0 = wal.gate_epoch();
-        let a = wal.applying_gated(e0, 7);
-        wal.append_with_hlc_applying(Op::Tie { eid: 1, himo_id: 0, value: 1 }, &a).unwrap();
+        let inside = gate.enter();
         let held = Arc::new(AtomicBool::new(false));
         let h = {
             let (gate, held) = (gate.clone(), held.clone());
@@ -338,70 +442,16 @@ mod tests {
             })
         };
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!held.load(Ordering::SeqCst), "当てている途中の書き手が居るのに止め始めた");
-        // 閉じる前に読んだ世代の書き手は積めない (積む前に門を確かめ直す)
-        let b = wal.applying_gated(e0, 7);
-        let r = wal.append_with_hlc_applying(Op::Tie { eid: 2, himo_id: 0, value: 1 }, &b);
-        assert!(r.as_ref().is_err_and(is_gate_moved), "閉じる前の世代で積めた ({r:?})");
-        assert!(gate.is_closed(), "閉じている間に門が開いて見える");
-        drop(b);
-        drop(a);
+        assert!(!held.load(Ordering::SeqCst), "中に書き手が居るのに止め始めた");
+        drop(inside);
         while !held.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        assert!(gate.is_closed());
+        assert!(gate.try_enter().is_none(), "止めている間に入れた");
         let t = std::time::Instant::now();
-        gate.wait();
+        let p = gate.enter();
         assert!(t.elapsed() >= Duration::from_millis(30), "止めている間に待たずに入った");
+        drop(p);
         h.join().unwrap();
-        assert!(!gate.is_closed(), "放した後も閉じている");
-        let c = wal.applying_gated(wal.gate_epoch(), 7);
-        wal.append_with_hlc_applying(Op::Tie { eid: 3, himo_id: 0, value: 1 }, &c).unwrap();
-        drop(c);
-        drop(wal);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// #1016: 止める側は、 積む前の書き手 (WAL の空きを待つ書き手など、 印に位置が無い) や、 閉じた後に積まれた書き込みは待たない。
-    /// 世代を進めた時の位置より前に積まれた書き込みだけを待つ。
-    #[test]
-    fn intent_hold_does_not_wait_for_writers_that_appended_after_it_closed() {
-        use enchudb_oplog::oplog::Op;
-        let (p, wal) = tmp_wal("noappend");
-        let gate = Arc::new(IntentGate::new());
-        gate.attach_wal(&wal, 7);
-        // 印を作っただけ (積む前): 止める側は待たない
-        let early = wal.applying_gated(wal.gate_epoch(), 7);
-        drop(gate.hold());
-        drop(early);
-        // 閉じる前に積んだ A を待つ間に、 閉じた後の世代で B が積む。 A を外すと、 B が当てている途中でも止める側は返る
-        let a = wal.applying_gated(wal.gate_epoch(), 7);
-        wal.append_with_hlc_applying(Op::Tie { eid: 1, himo_id: 0, value: 1 }, &a).unwrap();
-        let e0 = wal.gate_epoch();
-        let held = Arc::new(AtomicBool::new(false));
-        let h = {
-            let (gate, held) = (gate.clone(), held.clone());
-            std::thread::spawn(move || {
-                let hold = gate.hold();
-                held.store(true, Ordering::SeqCst);
-                drop(hold);
-            })
-        };
-        // 止める側が世代を進めるまで (上限は止まらないためだけ)
-        let until = std::time::Instant::now() + Duration::from_secs(20);
-        while wal.gate_epoch() == e0 {
-            assert!(std::time::Instant::now() < until, "止める側が門の世代を進めない");
-            std::thread::yield_now();
-        }
-        let b = wal.applying_gated(wal.gate_epoch(), 7);
-        wal.append_with_hlc_applying(Op::Tie { eid: 2, himo_id: 0, value: 1 }, &b).unwrap();
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(!held.load(Ordering::SeqCst), "閉じる前に積んだ書き手が居るのに止め始めた");
-        drop(a);
-        h.join().unwrap();
-        assert!(held.load(Ordering::SeqCst), "閉じた後に積んだ書き手を待った");
-        drop(b);
-        drop(wal);
-        let _ = std::fs::remove_file(&p);
     }
 }

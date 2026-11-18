@@ -49,7 +49,7 @@ use crate::column::Column;
 use crate::lockfree_cylinder::{LockFreeCylinder, Part};
 use crate::region::Region;
 use crate::value_locks::{HeldAll, ValueLocks};
-use crate::write_gate::{IntentGate, IntentHold, WriteGate};
+use crate::write_gate::{IntentGate, IntentHold, IntentPass, WriteGate};
 
 /// column region の取得元 (request23 D2)。
 ///
@@ -1222,11 +1222,38 @@ impl HimoStore {
         drop(self.write_guard_inner());
     }
 
-    /// #850 の後: WAL に積んで本体に当てる自分の書き込みの門 ([`IntentGate`])。 書き手は積む前に開いているのを見る (#1016: 積む時に
-    /// WAL の門の世代で確かめ直す、 engine の `LocalApply::arm`)。
+    /// #850 の後: WAL に積んで本体に当てる自分の書き込みが、 **積む前に** 入る ([`IntentGate`])。 この紐を長く止める側が居れば
+    /// 終わるまで待つ。 持っている間 (当て終えるまで) 止める側は始まらない。 当てる前に drop しないこと。 `shard` はこの thread の
+    /// 門の shard の番号 (`write_gate::shard_index` の値、 #1016: 呼び手が控えた番号を渡す)。
     #[inline(always)]
+    pub(crate) fn write_intent_shard(&self, shard: usize) -> IntentPass<'_> {
+        self.intent.enter_shard(shard)
+    }
+
+    /// [`write_intent_shard`](Self::write_intent_shard) の、 待たず印も返さない版 (いくつもの紐に入る行の削除。 入れなければ入った分を
+    /// [`leave_write_intent_shard`](Self::leave_write_intent_shard) で出て [`wait_write_intent`](Self::wait_write_intent))。 入れたら
+    /// true (呼び手が同じ shard で出る)。
+    #[inline]
+    pub(crate) fn try_write_intent_shard(&self, shard: usize) -> bool {
+        self.intent.try_enter_shard_raw(shard)
+    }
+
+    /// [`try_write_intent_shard`](Self::try_write_intent_shard) で入った門を出る。
+    #[inline]
+    pub(crate) fn leave_write_intent_shard(&self, shard: usize) {
+        self.intent.leave_shard(shard);
+    }
+
+    /// この紐の [`IntentGate`] (#896: WAL の空きを待つ間に書き手が出る門、 engine の `GatesStepOut`)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
     pub(crate) fn intent_gate(&self) -> &IntentGate {
         &self.intent
+    }
+
+    /// この紐を止めている側が終わるのを待つ。
+    pub(crate) fn wait_write_intent(&self) {
+        self.intent.wait();
     }
 
     /// 門が閉じているか (test 用)。
