@@ -18477,7 +18477,8 @@ impl Engine {
                 while let Some(local) = fl.pop() {
                     let Some(g) = table.global_of(local) else { continue };
                     // #731: 世代を使い切った場所は二度と渡さない (印を立てる前に見る)
-                    if self.is_folded_own_slot(g) || self.generations().retired(g) {
+                    // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (後始末が届いてから、 一覧の作り直しが拾う)
+                    if self.is_folded_own_slot(g) || self.generations().withheld(g) {
                         continue;
                     }
                     // #883: 払い出し位置から取った書き手が先に生かした場所は、 後始末の前に飛ばす (後始末の後に生かされた形は下の
@@ -18521,7 +18522,7 @@ impl Engine {
                     // 生きていない」 の読みの後・行を握る前に、 払い出し位置から同じ場所を取った書き手が生かして返し、 その行を消す
                     // 書き手が kill を書けずに覚えて空けると (消す道は行の lock の下)、 ここで今の世代のまま生かして消えた行と同じ eid を
                     // 返した。 行を握った後は消す書き手の覚えが見える (握れたのは消す書き手が lock を放した後)
-                    if row.is_some() && self.generations().retired(g) {
+                    if row.is_some() && self.generations().withheld(g) {
                         continue;
                     }
                     #[cfg(test)]
@@ -18754,7 +18755,7 @@ impl Engine {
             dead.dedup();
             fl.extend(dead.into_iter().filter(|&l| {
                 table.global_of(l).is_some_and(|g| {
-                    !self.is_folded_own_slot(g) && !self.entities.is_live(g) && !self.generations().retired(g)
+                    !self.is_folded_own_slot(g) && !self.entities.is_live(g) && !self.generations().withheld(g)
                 })
             }));
             if !fl.is_empty() {
@@ -18780,7 +18781,7 @@ impl Engine {
                         let global = lo + (l - local);
                         // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
                         // #882: 畳んだかを先に読む (`entity_in` の取り出しと同じ)。 #731: 世代を使い切った場所は二度と渡さない
-                        if !self.is_folded_own_slot(global) && !self.entities.is_live(global) && !self.generations().retired(global) {
+                        if !self.is_folded_own_slot(global) && !self.entities.is_live(global) && !self.generations().withheld(global) {
                             if ring_lsn.is_some_and(|h| self.himos[h].get_value(global).is_some()) {
                                 self.drop_cells_of_dead_ring_slot(global);
                             }
@@ -20868,7 +20869,9 @@ impl Engine {
                 // 生かした) も外す。 PR #977 の読み直し 5 の [D] (a): 生きているかを先に読む (消す道は kill を書けない場所を覚えてから
                 // 生きている印を下ろす = 下りた印を読んだ後に覚えを読めば、 覚えが見える。 逆の順では、 覚える前に読んで、 印が下りた
                 // 後に読んだ 「生きていない」 で取りうる)
-                if self.entities.is_live(slot) || gens.retired(slot) {
+                // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (山から外す。 後始末が残る間だけの形 = WAL の file の無い sync
+                // する DB の単独の session など。 外した場所は開き直すまで anonymous の山に戻らない)
+                if self.entities.is_live(slot) || gens.withheld(slot) {
                     return crate::entity_set::Reuse::Discard;
                 }
                 // 世代 0 = v14 の間に消えた場所 (移る手順の穴埋めと開く時の突き合わせが上げる) か、 位置から取って断った穴
@@ -23647,11 +23650,15 @@ impl Engine {
                 self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
                 self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
             }
-            let mut g = self.pk_tombs.write().unwrap();
-            self.drain_pk_pending(&mut g);
-            self.with_pk_key(himo, PkValue::Local(value), |k| {
-                self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
-            });
+            // #992 の読み直し 4 の細かい 1: 版数の無い死んだ場所 (開く時の突き合わせが使い回しの途中の行を消した場所、 使い回しの印で
+            // 消えた行) は、 名前の削除を版数 0 で覚えない (前の名前だけ足す)
+            if tomb != enchudb_oplog::Hlc::ZERO {
+                let mut g = self.pk_tombs.write().unwrap();
+                self.drain_pk_pending(&mut g);
+                self.with_pk_key(himo, PkValue::Local(value), |k| {
+                    self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
+                });
+            }
             tomb
         };
         Some(self.remove_rows_named(local, himo, value, tomb))
@@ -24907,8 +24914,16 @@ impl Engine {
     /// 生きている印を下ろす前に落ちた (B2 の書き出しの後・本体の entities の書き出しの前の電源断 / kill) か、 その書き出しに失敗して断った
     /// (書いた 2 B は page cache に残る)。 上の 2 つの枝 (前の open の後の使い回し) に当たらなければ、 上げ直さずに前の open の答え (今、
     /// 最後の行 = `dead_row_gen`) を使う。 前は上げた後の世代から決め直し、 削除の途中の像で最後の行を 1 つ上 (無かった行) に読んだ
-    /// (Delete の宛名がずれ、 断るたびに 1 つずつずれた)。 残るのは、 前の open の後の使い回しの記録も届かなかった像 (今の世代 = 前の
-    /// open の上げた世代をもう一度渡す、 下の細かい 8 と同じ窓)
+    /// (Delete の宛名がずれ、 断るたびに 1 つずつずれた)。 この枝の前提 「disk に後始末待ちが立ち、 生きている印も立つ = 前の open の窓」 は、
+    /// 後始末待ちの場所を使い回さない (`Generations::withheld`) と、 後始末待ちを落とした store を書き出してから engine を渡す
+    /// (`settle_finished_reconcile`) の 2 つが守る (#992 の読み直し 4 の B4: 前は前の open の後に場所を使い回し、 その書き出しが切れた像も
+    /// この形になり、 使い回しの記録を書かない使い回し (sync しない DB の全部・使い回しの印の場所・tombstone の無い場所) で世代を上げずに
+    /// 使い回した行の eid をもう一度渡した)
+    ///
+    /// #992 の読み直し 4 の S5 / 細かい 3: 突き合わせの印 (使い回しの印 / 「今 − 2」) が残り、 後始末待ちの無い生きている場所は、 突き合わせ
+    /// (後始末を済ませた後) の後に場所を使い回し、 その書き出しが生きている印と gen.seg の間で切れた像 (印は突き合わせが死の印と一緒にしか
+    /// 立てず、 生かす道が全部落とす)。 最後の行は使い回した行 (今、 記録の無い使い回しの途中の行) で、 1 つ上げる。 前は 3 つ目の枝に落ちて
+    /// 使い回しの印を落とし、 前の住人 (使い回しの途中だった行) に tombstone を作り直して Delete を配った
     ///
     /// 3 つ目の値は 「最後の行は使い回しの途中の行」 (使い回しの 2 つの枝、 gen.seg の [`crate::generation`] の使い回しの印。 後始末待ちの
     /// 枝は前の open の決めを保つ)。
@@ -24920,6 +24935,7 @@ impl Engine {
             Some(g) if g >= now => (g + 2, g + 1, true),
             Some(g) if g == dead_row => (now + 1, now, true),
             _ if gens.pending_mark(slot) => (now, dead_row, gens.mid_reuse(slot)),
+            _ if gens.mid_reuse(slot) || gens.two_up_mark(slot) => (now + 1, now, true),
             _ => (now + 1, now.saturating_sub(1), false),
         }
     }
@@ -24942,11 +24958,24 @@ impl Engine {
     /// #992: 仕上げを済ませた場所の 「後始末待ち」 を落とす。 呼ぶのは、 仕上げ (cell を落とす・tombstone を置く) と #451 の作り直しの
     /// record を書き出した後 (本体の書き出しと WAL の fsync が返った後)。 落とした印は次の本体の書き出しで届く。 届く前に落ちれば次の open が
     /// もう一度仕上げる (cell は落ちていて、 置いた tombstone と作り直した record は届いている = 同じ答え)。
+    ///
+    /// #992 の読み直し 4 の B4 (A2): 落とした印は、 落とした場所を覆う範囲の gen.seg を書き出してから engine を渡す (msync 1 回、 落とした場所が
+    /// ある時だけ)。 書き出せなければ印を立て直す (使い回さない = A1、 次の open がもう一度後始末をする)。 これで 「disk に後始末待ちが立ち、
+    /// 生きている印も立つ」 像は前の open の窓 (生きている印を下ろす前に落ちた / 断った) だけになる (`reconcile_target` の後始末待ちの枝の前提)。
+    /// 前は落とした store が次の本体の書き出しまで memory にだけあり、 その間に場所を使い回して書き出しが生きている印と gen.seg の間で切れると、
+    /// 次の open が後始末待ちの枝で世代を上げず、 使い回した行の eid をもう一度渡した。
     fn settle_finished_reconcile(&self) {
         let gens = self.generations();
-        for slot in gens.take_finished() {
-            if !self.entities.is_live(slot) {
-                gens.clear_pending(slot);
+        let cleared: Vec<u32> =
+            gens.take_finished().into_iter().filter(|&slot| !self.entities.is_live(slot) && gens.clear_pending(slot)).collect();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(&lo), Some(&hi)) = (cleared.iter().min(), cleared.iter().max()) {
+            let (off, _) = crate::generation::Generations::slot_range(lo);
+            let (end, len) = crate::generation::Generations::slot_range(hi);
+            if self.backing.flush_kind(SegmentKind::Gen, off, end + len - off).is_err() {
+                for &slot in &cleared {
+                    gens.remark_pending(slot);
+                }
             }
         }
     }

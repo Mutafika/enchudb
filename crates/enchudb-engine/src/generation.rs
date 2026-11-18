@@ -74,8 +74,9 @@ const MID_REUSE: u16 = 1 << 11;
 
 /// `gen.seg` の先頭の header の長さ。 [`MAGIC`] / 場所の bit / 表ごとの印 (TableId は u16 = 8 KiB) / page ごとの印。
 pub(crate) const GEN_HEADER: usize = 16 * 1024;
-/// 場所ごとの値が 2 B (世代 + 「死んでいる」 印 + 「最後の行は 今 − 2」 [`TWO_UP`] + 「後始末待ち」 [`PENDING`]) の形 (#992 / #1008、
-/// release していない)。 1 B だった形 (`GEN1`) は読まない。 `GEN2` (上の 2 つの bit を使わない前の形、 その bit は 0) は読めて、
+/// 場所ごとの値が 2 B (世代 + 「死んでいる」 印 + 「最後の行は 今 − 2」 [`TWO_UP`] + 「後始末待ち」 [`PENDING`] + 「最後の行は使い回しの
+/// 途中の行」 [`MID_REUSE`]) の形 (#992 / #1008、 release していない)。 1 B だった形 (`GEN1`) は読まない。 `GEN2` (上の 3 つの bit を使わない前の
+/// 形、 その bit は 0) は読めて、
 /// 書き手として開く時に `GEN3` に上げる ([`Generations::upgrade_magic`])。 `GEN2` だけを読む前の binary は `GEN3` を断る。
 const MAGIC: [u8; 4] = *b"GEN3";
 const MAGIC_GEN2: [u8; 4] = *b"GEN2";
@@ -372,7 +373,7 @@ impl Generations {
     }
 
     /// #992 / #1008: `GEN2` の gen.seg の magic を `GEN3` に書き換える (書き手として開く時)。 書き換えたか (呼び手が header を書き出す)。
-    /// `GEN2` は上の bit ([`TWO_UP`] / [`PENDING`]) を使わない形なので、 中身はそのまま。
+    /// `GEN2` は上の bit ([`TWO_UP`] / [`PENDING`] / [`MID_REUSE`]) を使わない形なので、 中身はそのまま。
     pub(crate) fn upgrade_magic(&self) -> bool {
         let Some(r) = self.region.get() else { return false };
         if r.slice()[..4] != MAGIC_GEN2 {
@@ -882,21 +883,49 @@ impl Generations {
         Ok(())
     }
 
-    /// #992: 場所の 「後始末待ち」 を落とす (仕上げを disk に届けた後)。 立っていなければ何もしない。
-    pub(crate) fn clear_pending(&self, slot: u32) {
+    /// #992: 場所の 「後始末待ち」 を落とす (仕上げを disk に届けた後)。 立っていなければ何もしない。 落としたか。
+    pub(crate) fn clear_pending(&self, slot: u32) -> bool {
+        let Some(r) = self.region.get() else { return false };
+        let off = slot_off(slot);
+        if off + 2 > r.len() || !r.is_committed(off + 2) {
+            return false;
+        }
+        let c = r.as_atomic_u16(off);
+        if c.load(Ordering::Acquire) & PENDING == 0 {
+            return false;
+        }
+        let cleared = c.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0;
+        if cleared {
+            self.unmark_pending();
+        }
+        r.mark_dirty(off, 2);
+        cleared
+    }
+
+    /// #992 の読み直し 4 の B4: [`Self::clear_pending`] の取り消し (落とした印を書き出せなかった時)。 死んでいる場所にだけ立て直す。
+    pub(crate) fn remark_pending(&self, slot: u32) {
         let Some(r) = self.region.get() else { return };
         let off = slot_off(slot);
         if off + 2 > r.len() || !r.is_committed(off + 2) {
             return;
         }
         let c = r.as_atomic_u16(off);
-        if c.load(Ordering::Acquire) & PENDING == 0 {
-            return;
+        if c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| (v & DEAD != 0 && v & PENDING == 0).then_some(v | PENDING)).is_ok() {
+            self.pending_marks.fetch_add(1, Ordering::AcqRel);
+            r.mark_dirty(off, 2);
         }
-        if c.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
-            self.unmark_pending();
-        }
-        r.mark_dirty(off, 2);
+    }
+
+    /// #992 の読み直し 4 の B4 (A1): 場所を払い出しの候補から外すか: 引退した場所 ([`Self::retired`]) と、 後始末待ちの場所 (前の open の
+    /// 突き合わせが答えを決め、 後始末が disk に届いていない。 使い回すと、 その書き出しが生きている印と gen.seg の間で切れた像が 「前の open
+    /// の窓」 と同じ形になり、 次の open が世代を上げずに使い回した行の eid をもう一度渡す)。
+    pub(crate) fn withheld(&self, slot: u32) -> bool {
+        self.retired(slot) || self.pending_mark(slot)
+    }
+
+    /// 場所に 「最後の行は 今 − 2」 ([`TWO_UP`]) が立っているか。
+    pub(crate) fn two_up_mark(&self, slot: u32) -> bool {
+        self.region.get().is_some_and(|r| read_raw(r, slot) & TWO_UP != 0)
     }
 
     /// #992: 「後始末待ち」 の数えを 1 つ下げる (0 では止める: 開いた時に数えていない印 (きれいに閉じた後の open は `heal` を通らない) を
@@ -965,7 +994,7 @@ impl Generations {
         }
         let c = r.as_atomic_u16(off);
         if c.load(Ordering::Acquire) & DEAD != 0 {
-            // 生かす = 死んだ場所の印 (最後の行は 今 − 2・後始末待ち) も意味を失う
+            // 生かす = 死んだ場所の印 (最後の行は 今 − 2・後始末待ち・使い回しの途中) も意味を失う
             if c.fetch_and(!(DEAD | TWO_UP | PENDING | MID_REUSE), Ordering::AcqRel) & PENDING != 0 {
                 self.unmark_pending();
             }
