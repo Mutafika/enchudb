@@ -330,6 +330,9 @@ impl Generations {
         if region.committed_len() < GEN_HEADER || s[..4] != MAGIC {
             return Err("gen.seg: not a generation segment".into());
         }
+        if !region_fits_fast_reads(&region) {
+            return Err("gen.seg: the region is not 2-byte aligned".into());
+        }
         let stored = u32::from_le_bytes(s[OFF_BITS..OFF_BITS + 4].try_into().unwrap());
         if stored != bits {
             return Err(format!("gen.seg: slot bits {stored} do not match the header ({bits})"));
@@ -475,6 +478,12 @@ impl Generations {
             r.mark_dirty(OFF_BITS, 4);
             return Ok(());
         }
+        if !region_fits_fast_reads(&region) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "gen.seg: the region is shorter than the header or not 2-byte aligned",
+            ));
+        }
         region.ensure_committed_window(GEN_HEADER, 0)?;
         // 0 でない 4 KiB だけ 0 に戻す (移る手順は払い出し済みの場所まで先に commit するので、 前の残りの無い所は穴のまま。 全部を 0 で
         // 埋めると疎な file の穴を全部書いて実ディスクにする)
@@ -548,6 +557,24 @@ impl Generations {
     #[inline]
     pub(crate) fn bits(&self) -> u32 {
         self.bits.load(Ordering::Acquire)
+    }
+
+    /// [`Self::bits`] を Relaxed で読む (#1015: lock を取らない読みの入口 `Engine::read_app_in`)。 0 でない値を見ても region が見える
+    /// とは限らない (region を置いた後に bit を Release で置く順と対にならない) ので、 region は [`Self::reader_for`] で Acquire で引く。
+    #[inline]
+    pub(crate) fn bits_relaxed(&self) -> u32 {
+        self.bits.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::bits_relaxed`] で読んだ 0 でない場所の bit `bits` の写し。 region がまだ見えなければ None (bit を Relaxed で読んだので、
+    /// 移る手順の公開と並んだ読みでは起きうる。 呼び手は [`Self::reader`] の道で引き直す)。
+    #[inline]
+    pub(crate) fn reader_for(&self, bits: u32) -> Option<GenReader<'_>> {
+        debug_assert!(bits != 0);
+        match bits {
+            32.. => Some(GenReader { bits: 0, region: None }),
+            b => self.region.get().map(|r| GenReader { bits: b, region: Some(r) }),
+        }
     }
 
     #[inline]
@@ -858,21 +885,74 @@ impl Generations {
     }
 }
 
+/// region が照合の速い道の読み ([`read_raw`] / [`GenReader::eids`] の範囲を確かめない読み) の前提を満たすか: header (page の印) が
+/// 全部 region の中にあり、 先頭が 2 byte に揃っている。 [`Generations::attach`] / [`Generations::prepare`] が region を置く前に
+/// 確かめる (置いた region は変わらない)。
+fn region_fits_fast_reads(r: &Region) -> bool {
+    r.len() >= GEN_HEADER && r.base_aligned(2)
+}
+
+/// page `p` (< [`PAGES`]) の印。
+#[inline(always)]
+fn page_bit(r: &Region, p: u32) -> bool {
+    page_bit_with(r, p, Ordering::Acquire)
+}
+
+#[inline(always)]
+fn page_bit_with(r: &Region, p: u32, order: Ordering) -> bool {
+    debug_assert!(p < PAGES);
+    // SAFETY: p < PAGES なので OFF_PAGES + p / 8 < GEN_HEADER <= r.len() (`region_fits_fast_reads`、 置いた region だけを読む)
+    unsafe { r.as_atomic_u8_unchecked(OFF_PAGES + (p / 8) as usize) }.load(order) & (1 << (p % 8)) != 0
+}
+
 #[inline]
 fn page_marked(r: &Region, slot: u32) -> bool {
     let p = slot >> PAGE_SHIFT;
-    p >= PAGES || r.as_atomic_u8(OFF_PAGES + (p / 8) as usize).load(Ordering::Acquire) & (1 << (p % 8)) != 0
+    p >= PAGES || page_bit(r, p)
+}
+
+/// 場所の 2 B を範囲を確かめずに読む。
+///
+/// # Safety
+/// `slot_off(slot) + 2 <= r.len()`、 `r` は置いた region (`region_fits_fast_reads`)。
+#[inline(always)]
+unsafe fn load_cell_with(r: &Region, slot: u32, order: Ordering) -> u16 {
+    // SAFETY: 範囲は呼び手が確かめる。 slot_off は偶数で region の先頭は 2 byte に揃う
+    unsafe { r.as_atomic_u16_unchecked(slot_off(slot)) }.load(order)
 }
 
 /// 場所の 2 B (印の無い page / 範囲の外は 0)。
-#[inline]
+///
+/// #1015: get / 書き込みの入口 / 出口のたびに通る。 page の印 (header の中) と場所の 2 B を範囲の確かめ 1 回で読む (前は印と 2 B の
+/// それぞれに範囲と揃いの確かめ、 その panic の文の引数を hot path で stack に積んでいた)。
+#[inline(always)]
 fn read_raw(r: &Region, slot: u32) -> u16 {
-    if !page_marked(r, slot) {
+    read_raw_with(r, slot, Ordering::Acquire)
+}
+
+/// [`read_raw`] の、 page の印と場所の 2 B の load の順を選ぶ版。
+#[inline(always)]
+fn read_raw_with(r: &Region, slot: u32, cell_order: Ordering) -> u16 {
+    let p = slot >> PAGE_SHIFT;
+    if p >= PAGES {
+        return read_raw_far(r, slot);
+    }
+    if !page_bit_with(r, p, cell_order) {
         return 0;
     }
+    if slot_off(slot) + 2 > r.len() {
+        return 0;
+    }
+    // SAFETY: 範囲は直前に確かめた
+    unsafe { load_cell_with(r, slot, cell_order) }
+}
+
+/// 印の範囲の外の場所 (2^29 以上、 page の印が無い = commit を page ごとに揃えていない) は commit を確かめて読む。
+#[cold]
+#[inline(never)]
+fn read_raw_far(r: &Region, slot: u32) -> u16 {
     let off = slot_off(slot);
-    // 印の範囲の外の場所 (2^29 以上、 page の印が無い = commit を page ごとに揃えていない) は commit を確かめる
-    if off + 2 > r.len() || (slot >> PAGE_SHIFT >= PAGES && !r.is_committed(off + 2)) {
+    if off + 2 > r.len() || !r.is_committed(off + 2) {
         return 0;
     }
     r.as_atomic_u16(off).load(Ordering::Acquire)
@@ -897,12 +977,6 @@ impl GenReader<'_> {
         self.bits != 0
     }
 
-    /// 写した時の場所の bit (読みの間に v15 に移ったかを見る)。
-    #[inline]
-    pub(crate) fn bits(&self) -> u32 {
-        self.bits
-    }
-
     /// local → (場所, 世代) ([`Generations::split`] を写した bit で)。
     #[inline]
     pub(crate) fn split(&self, local: u32) -> (u32, u32) {
@@ -921,6 +995,19 @@ impl GenReader<'_> {
         }
     }
 
+    /// [`Self::current`] の、 page の印と場所の 2 B を Relaxed で読む版。 lock を取らない読みの入口の照合 (`Engine::read_app_in`) 用:
+    /// 照合と読みの順は、 読みの後の照合の前の fence か、 列の cell の Acquire の load が付ける (使い回した後の住人の値を読んだ読みは、
+    /// 後の照合で消す道の印と世代の書きを見る)。 前の照合は結果を変えない (後の照合が兼ねる)。 2 B を読むのは印を見た page だけで、 印は
+    /// その page を commit した後に立つ (`cell_for_write`) ので、 読む page は file の中にある。 #1015: Acquire で読むより get 1 回が
+    /// 0.7〜1.3 ns 速い (M4 Max、 100 万行)。
+    #[inline]
+    pub(crate) fn current_relaxed(&self, slot: u32) -> u32 {
+        match self.region {
+            Some(r) => (read_raw_with(r, slot, Ordering::Relaxed) & GEN_MASK) as u32,
+            None => 0,
+        }
+    }
+
     #[inline]
     pub(crate) fn local(&self, slot: u32) -> u32 {
         match self.region {
@@ -929,34 +1016,84 @@ impl GenReader<'_> {
         }
     }
 
-    /// 場所の並び → eid (出口の写し)。 256 個ずつ、 その範囲の page に印が 1 つも無ければ世代を読まずに写す (使い回しの無い所は
-    /// 1 個ずつの印の読みも無い = master と同じ形の loop)。 範囲が広い (並んでいない) 塊は 1 個ずつ。
+    /// 場所の並び → eid (出口の写し)。 256 個ずつ、 その範囲の page に印が 1 つも無ければ世代を読まない (使い回しの無い所は 1 個ずつの
+    /// 印の読みも無い)。 全部の page に印のある塊は印を見ずに 2 B を読み、 印が混ざる塊と範囲が広い (並んでいない) 塊は 1 個ずつ。
     pub(crate) fn eids(&self, peer: u32, slots: &[u32]) -> Vec<u64> {
-        let plain = |s: u32| enchudb_oplog::make_eid(peer, s);
+        // #1015: 先に世代 0 の eid で全部を写し (この写しは vector の命令になる)、 印のある塊だけ世代の bit を足す。 前は塊ごとに
+        // `extend` していて、 使い回しの無い所の写しも 1 個ずつになり、 1 行使い回した表の pull_raw (1 万件) が 2 倍かかった。
+        // eid = peer << 32 | 世代 << S | 場所 で、 場所は S bit に収まるので、 世代の bit は足すだけ (`(g << S) | s` と同じ値)
+        let mut out: Vec<u64> = slots.iter().map(|&s| enchudb_oplog::make_eid(peer, s)).collect();
         let Some(r) = self.region.filter(|_| self.bits != 0) else {
-            return slots.iter().map(|&s| plain(s)).collect();
+            return out;
         };
-        let mut out = Vec::with_capacity(slots.len());
-        for chunk in slots.chunks(256) {
+        let bits = self.bits;
+        // 場所の 2 B は Relaxed で読む: 出口が付けるのは 「読んだ時の今の世代」 で、 並んで消した / 使い回した書き手とはどちらの世代でも
+        // よい (前と同じ)。 Acquire だと全部の page に印のある表の pull_raw (1 万件) が 1.1 倍かかった。 page の印は塊ごとに Acquire で
+        // 読む (印を見た page の 2 B は、 その後の読み = 印を立てた書き手が commit した後)
+        for (chunk, o) in slots.chunks(256).zip(out.chunks_mut(256)) {
             let (lo, hi) = chunk.iter().fold((u32::MAX, 0u32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
-            if !any_page_marked(r, lo, hi) {
-                out.extend(chunk.iter().map(|&s| plain(s)));
-            } else {
-                out.extend(chunk.iter().map(|&s| plain((read_gen(r, s) << self.bits) | s)));
+            match pages_marked(r, lo, hi) {
+                PageMarks::None => {}
+                // 範囲の page が全部印付き (使い回しの多い表): 場所の 2 B を印を見ずに読む (範囲の確かめは塊に 1 回)。 印の立った page の
+                // 場所は commit 済み (`cell_for_write` が印より先に commit する)
+                PageMarks::All if slot_off(hi) + 2 <= r.len() => {
+                    // 先頭は loop の外で 1 回だけ読む (`r` を通すと out への store の後に毎回読み直す)
+                    let cells = r.base_ptr().wrapping_add(GEN_HEADER) as *const AtomicU16;
+                    let hi_peer = u64::from(peer) << 32;
+                    for (e, &s) in o.iter_mut().zip(chunk) {
+                        // SAFETY: s <= hi で、 slot_off(hi) + 2 <= r.len() を直前に確かめた。 region の先頭は 2 byte に揃う
+                        // (`region_fits_fast_reads`)、 GEN_HEADER は偶数
+                        let g = u32::from(unsafe { &*cells.add(s as usize) }.load(Ordering::Relaxed) & GEN_MASK);
+                        *e = hi_peer | u64::from((g << bits) | s);
+                    }
+                }
+                _ => {
+                    for (e, &s) in o.iter_mut().zip(chunk) {
+                        let g = u32::from(read_raw_with(r, s, Ordering::Relaxed) & GEN_MASK);
+                        *e |= u64::from(g << bits);
+                    }
+                }
             }
         }
         out
     }
 }
 
-/// 場所 `lo..=hi` の page のどれかに印があるか (page が 64 を越える広い範囲は 「ある」 と答える = 1 個ずつ読む)。
+/// [`pages_marked`] の答え。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PageMarks {
+    /// どの page にも印が無い
+    None,
+    /// 全部の page に印
+    All,
+    /// 印のある page と無い page が混ざる / 範囲が広い (page が 64 を越える) / 印の範囲の外 = 1 個ずつ読む
+    Some,
+}
+
+/// 場所 `lo..=hi` の page の印。
 #[inline]
-fn any_page_marked(r: &Region, lo: u32, hi: u32) -> bool {
+fn pages_marked(r: &Region, lo: u32, hi: u32) -> PageMarks {
     let (p0, p1) = (lo >> PAGE_SHIFT, hi >> PAGE_SHIFT);
     if p1 >= PAGES || p1 - p0 > 64 {
-        return true;
+        return PageMarks::Some;
     }
-    (p0..=p1).any(|p| r.as_atomic_u8(OFF_PAGES + (p / 8) as usize).load(Ordering::Acquire) & (1 << (p % 8)) != 0)
+    // 印は 1 byte に 8 page。 byte ごとに範囲の bit だけを見る (#1015: page ごとに 1 byte ずつ読むと、 1000 件の pull で塊ごとに
+    // 30 page ほどを読んでいた)
+    let (mut any, mut all) = (false, true);
+    for b in p0 / 8..=p1 / 8 {
+        let lo_bit = if b == p0 / 8 { p0 % 8 } else { 0 };
+        let hi_bit = if b == p1 / 8 { p1 % 8 } else { 7 };
+        let mask = ((0xFFu32 >> (7 - hi_bit)) & (0xFFu32 << lo_bit)) as u8;
+        // SAFETY: b <= p1 / 8 < PAGES / 8 なので OFF_PAGES + b < GEN_HEADER <= r.len() (`region_fits_fast_reads`)
+        let m = unsafe { r.as_atomic_u8_unchecked(OFF_PAGES + b as usize) }.load(Ordering::Acquire) & mask;
+        any |= m != 0;
+        all &= m == mask;
+    }
+    match (any, all) {
+        (false, _) => PageMarks::None,
+        (true, true) => PageMarks::All,
+        (true, false) => PageMarks::Some,
+    }
 }
 
 #[cfg(test)]
@@ -1097,6 +1234,94 @@ mod tests {
         g.heal(|_| false, |_| None);
         assert!(g.page_has(5), "世代の byte から page の印を立て直さない");
         assert_eq!(g.get(5), 7);
+    }
+
+    /// #1015: 塊の印の形 (`pages_marked`) は、 byte の境目をまたぐ範囲でも範囲の page の印だけを見る。 page が 64 を越える範囲と印の範囲の
+    /// 外は 1 個ずつ (Some)。
+    #[test]
+    fn pages_marked_looks_only_at_the_pages_in_range() {
+        let pages = 70;
+        let mut v = buffer(segment_len(pages << PAGE_SHIFT));
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
+        g.start(24);
+        let r = g.region.get().unwrap();
+        let at = |p: u32| p << PAGE_SHIFT;
+        // 印: page 7 と 8 (byte の境目の両側)、 20..=23
+        for p in [7, 8, 20, 21, 22, 23] {
+            g.raise(at(p) + 1, 1).unwrap();
+        }
+        assert_eq!(pages_marked(r, 0, at(6) + 5), PageMarks::None);
+        assert_eq!(pages_marked(r, at(7), at(8) + 100), PageMarks::All, "byte の境目をまたぐ全部印");
+        assert_eq!(pages_marked(r, at(7) + 3, at(7) + 9), PageMarks::All, "1 page の中");
+        assert_eq!(pages_marked(r, at(6), at(7)), PageMarks::Some);
+        assert_eq!(pages_marked(r, at(8), at(9)), PageMarks::Some);
+        assert_eq!(pages_marked(r, at(9), at(19) + 8191), PageMarks::None, "byte をまたいで印なし");
+        assert_eq!(pages_marked(r, at(20), at(23) + 8191), PageMarks::All);
+        assert_eq!(pages_marked(r, at(16), at(23)), PageMarks::Some, "同じ byte の印の無い page を含む");
+        assert_eq!(pages_marked(r, at(24), at(39)), PageMarks::None);
+        assert_eq!(pages_marked(r, 0, at(64)), PageMarks::Some);
+        assert_eq!(pages_marked(r, at(24), at(24 + 64)), PageMarks::None, "64 page の幅は読む");
+        assert_eq!(pages_marked(r, at(1), at(66)), PageMarks::Some, "64 page を越える幅は 1 個ずつ");
+        assert_eq!(pages_marked(r, at(PAGES - 1), at(PAGES)), PageMarks::Some, "印の範囲の外");
+    }
+
+    /// #1015: 出口の写し (`eids`) は、 塊の印の形 (無い / 全部 / 混ざる / 広い・並んでいない) によらず、 1 個ずつ `local` で写した eid と
+    /// 同じ。 lock を取らない読みの照合の読み (`current_relaxed`) は `current` と同じ値。
+    #[test]
+    fn eids_match_the_per_slot_local_for_every_mark_shape() {
+        let n: u32 = 70 << PAGE_SHIFT;
+        let mut v = buffer(segment_len(n));
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
+        g.start(24);
+        let at = |p: u32| p << PAGE_SHIFT;
+        // page 3..=5 は全部に印 (場所は 3 つに 1 つだけ世代 > 0)、 page 10 は 1 場所、 page 69 は 1 場所
+        for s in (at(3)..at(6)).filter(|s| s % 3 == 0) {
+            g.raise(s, s % 200 + 1).unwrap();
+        }
+        g.raise(at(10) + 17, 5).unwrap();
+        g.raise(at(69) + 1, 254).unwrap();
+        let r = g.reader();
+        let peer = 7;
+        let mut wide: Vec<u32> = (0..n).step_by(4099).collect();
+        wide.reverse();
+        let shapes: Vec<(&str, Vec<u32>)> = vec![
+            ("印なし", (0..at(3)).step_by(37).collect()),
+            ("全部印", (at(3)..at(6)).step_by(5).collect()),
+            ("全部印の境目", (at(3)..at(3) + 300).collect()),
+            ("混ざる", (at(9)..at(12)).step_by(11).collect()),
+            ("広い", wide),
+            ("1 個", vec![at(10) + 17]),
+            ("空", vec![]),
+            ("終わりの page", (at(69)..n).step_by(3).collect()),
+        ];
+        for (name, slots) in shapes {
+            let want: Vec<u64> = slots.iter().map(|&s| enchudb_oplog::make_eid(peer, r.local(s))).collect();
+            assert_eq!(r.eids(peer, &slots), want, "{name}");
+            for &s in &slots {
+                assert_eq!(r.current_relaxed(s), r.current(s), "{name}: 場所 {s}");
+            }
+        }
+        // 世代を持たない写し (region の無い Generations) は場所のまま
+        let off = Generations::off();
+        assert!(off.reader_for(24).is_none(), "region の無い写しを返した");
+        assert_eq!(off.reader().eids(peer, &[1, 2]), vec![enchudb_oplog::make_eid(peer, 1), enchudb_oplog::make_eid(peer, 2)]);
+    }
+
+    /// #1015: 照合の速い道は page の印と場所の 2 B を範囲を確かめずに読むので、 header より短い / 2 byte に揃っていない region は置かない。
+    #[test]
+    fn a_short_or_misaligned_region_is_refused() {
+        let mut v = buffer(segment_len(16) + 8);
+        let base = v.as_mut_ptr() as *mut u8;
+        let g = Generations::off();
+        let odd = unsafe { Region::new(base.add(1), segment_len(16)) };
+        assert!(g.prepare(odd, 24, usize::MAX).is_err(), "揃っていない region を置いた");
+        let short = unsafe { Region::new(base, GEN_HEADER - 2) };
+        assert!(g.prepare(short, 24, usize::MAX).is_err(), "header より短い region を置いた");
+        assert!(!g.has_region());
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
+        assert!(g.has_region());
     }
 
     /// 開く時の突き合わせの 1 つ目: 死んでいる印のある生きている場所 (削除の 印と世代 だけ届いた像 / 使い回しの生きている印だけ届いた像)
