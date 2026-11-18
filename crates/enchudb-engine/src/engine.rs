@@ -4753,67 +4753,76 @@ mod read_fast_path_tests {
         }
     }
 
-    /// 使い回しと並ぶ読み: 書き手が page 2 の 64 行を消して同じ場所を使い回し続け (新しい行の値 = その行の世代 + 1)、 読み手 3 本が
-    /// 持っている eid を get し続ける。 get が返す値は、 いつもその eid の行の値 (世代 + 1) か None (使い回した後の行の値を古い eid に
-    /// 渡さない)。 確率で踏む形 (決まった割り込みは上の 2 本)。
+    /// 使い回しと並ぶ読み: 書き手が page 2 の 1024 行を消して同じ場所を使い回し続け (新しい行の値 = その行の世代 + 1)、 読み手が持って
+    /// いる eid (古い世代と今の世代を混ぜる) を get し続ける。 get が返す値は、 いつもその eid の行の値 (世代 + 1) か None (使い回した後の
+    /// 行の値を古い eid に渡さない)。 読み手は core の数の 2 倍置く: 照合と読み直しの間で OS に止められた読み手の場所を、 書き手がその
+    /// 間に使い回す形を踏ませる (core が余っていると読み手は止まらず、 照合と読みの間の数 ns に書き手の使い回し (µs) は収まらない)。
+    /// 確率で踏む形 (決まった割り込みは上の 2 本)。 検出率は PR #1015 の本文。
     #[test]
     fn gets_racing_reuse_never_return_a_later_resident_value() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         let d = Arc::new(db("race", true));
         let bits = d.eng.slot_bits();
         let gen_of = move |e: u64| u64::from(enchudb_oplog::eid_local(e) >> bits);
-        let pick: Vec<usize> = (0..64).map(|i| (2 * PAGE) as usize + i * 7).collect();
+        let pick: Vec<usize> = (0..1024).map(|i| (2 * PAGE) as usize + i * 7).collect();
         for &k in &pick {
             d.eng.tie_to_by_id(d.rows[k], d.hid, 1u32); // 世代 0 の行の値 = 1
         }
-        let held = Arc::new(std::sync::Mutex::new(pick.iter().map(|&k| d.rows[k]).collect::<Vec<u64>>()));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bad = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let readers: Vec<_> = (0..3)
+        let held: Arc<Vec<AtomicU64>> = Arc::new(pick.iter().map(|&k| AtomicU64::new(d.rows[k])).collect());
+        let stop = Arc::new(AtomicBool::new(false));
+        let bad = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+        let n_readers = 2 * std::thread::available_parallelism().map_or(4, |n| n.get());
+        let readers: Vec<_> = (0..n_readers)
             .map(|t| {
                 let (d, held, stop, bad, reads) = (d.clone(), held.clone(), stop.clone(), bad.clone(), reads.clone());
                 std::thread::spawn(move || {
-                    let mut mine: Vec<u64> = held.lock().unwrap().clone();
-                    let mut i = t;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // 持つ eid: 今の eid を写した物を足していく (古い世代の eid が残る)
+                    let mut mine: Vec<u64> = held.iter().map(|h| h.load(Ordering::Relaxed)).collect();
+                    let mut i = t * 131;
+                    while !stop.load(Ordering::Relaxed) {
                         for _ in 0..4096 {
                             let e = mine[i % mine.len()];
                             i += 1;
                             if let Some(v) = d.eng.get_by_id(e, d.hid)
                                 && v != gen_of(e) + 1
                             {
-                                bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                bad.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        reads.fetch_add(4096, std::sync::atomic::Ordering::Relaxed);
-                        // 古い eid と新しい eid を混ぜて持つ
-                        let now = held.lock().unwrap().clone();
-                        mine.extend_from_slice(&now);
-                        if mine.len() > 4096 {
-                            mine.drain(..mine.len() - 4096);
+                        reads.fetch_add(4096, Ordering::Relaxed);
+                        mine.extend(held.iter().map(|h| h.load(Ordering::Relaxed)));
+                        if mine.len() > 8192 {
+                            mine.drain(..mine.len() - 8192);
                         }
                     }
                 })
             })
             .collect();
-        let rounds = 150; // 1 場所の使い回しは 254 回まで (引退)
-        for _ in 0..rounds {
-            for (n, &k) in pick.iter().enumerate() {
-                let old = held.lock().unwrap()[n];
+        // 書き手: 1 場所の使い回しは 254 回まで (引退) なので 200 周まで、 時間は 0.5 秒まで
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut reused = 0u64;
+        'outer: for _ in 0..200 {
+            for (n, h) in held.iter().enumerate() {
+                if std::time::Instant::now() > until {
+                    break 'outer;
+                }
+                let old = h.load(Ordering::Relaxed);
                 let slot = d.eng.slot_unchecked(old);
                 d.eng.delete(old);
                 let b = d.eng.entity_in("big").unwrap();
-                assert_eq!(d.eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した ({k})");
+                assert_eq!(d.eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した ({})", pick[n]);
                 d.eng.tie_to_by_id(b, d.hid, (gen_of(b) + 1) as u32);
-                held.lock().unwrap()[n] = b;
+                h.store(b, Ordering::Relaxed);
+                reused += 1;
             }
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
         for r in readers {
             r.join().unwrap();
         }
-        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
-        assert_eq!(bad.load(std::sync::atomic::Ordering::Relaxed), 0, "get が使い回した後の行の値を古い eid に返した");
+        assert!(reads.load(Ordering::Relaxed) > 0 && reused > 0);
+        assert_eq!(bad.load(Ordering::Relaxed), 0, "get が使い回した後の行の値を古い eid に返した ({reused} 回使い回した)");
     }
 }
 
