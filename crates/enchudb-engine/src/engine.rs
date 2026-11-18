@@ -18683,8 +18683,10 @@ impl Engine {
 
         // #731: 世代を使い切った場所は渡さない (落ちた後に払い出し位置が引退した場所の手前に戻った時だけ来る)。 PR #977 の読み直し 5 の
         // [G]: kill を書けなかった場所の覚えは見ない (払い出し位置の先は生きたことが無い = 覚えた場所ではありえない。 覚えが 1 つでも
-        // あると `retired` は大域の Mutex と線形探索を通り、 ここは insert の毎回の道)
-        if self.generations().used_up(global) {
+        // あると `retired` は大域の Mutex と線形探索を通り、 ここは insert の毎回の道)。 #992 の読み直し 5 の細かい 1: 後始末待ちの場所も
+        // 渡さない (A1、 突き合わせの 2. が払い出し位置の先の世代 > 0 の場所を完了させた時。 同じ 2 B の読み。 飛ばした場所は払い出し位置の
+        // 手前の穴になり、 後始末が届いた後に一覧の作り直しが拾う)
+        if self.generations().used_up(global) || self.generations().pending_mark(global) {
             return self.entity_in_with(table_name, nowait);
         }
         // #970 (案 P): 生かす前に、 場所の世代を書く gen.seg の page を commit 済みにする (普段は atomic の load 1 回、 page をまたぐ時
@@ -20052,15 +20054,15 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Acquire)
             .min(capacity);
         let live = t.extents().into_iter().map(|(lo, hi)| self.entities.live_count_in(lo, hi)).sum::<u32>();
-        // #731: 世代を使い切った場所 (引退、 二度と渡さない) は空きに数えない。 数えるのは使い回しのある表だけ (払い出し済みの範囲の
-        // 死んだ場所をなめる)
+        // #731: 世代を使い切った場所 (引退、 二度と渡さない) は空きに数えない。 #992 の読み直し 5 の細かい 3: 後始末待ちの場所 (後始末が
+        // 届くまで渡さない、 `Generations::withheld`) も数えない。 数えるのは使い回しのある表だけ (払い出し済みの範囲の死んだ場所をなめる)
         let retired = match self.tables.iter().position(|x| std::ptr::eq(x, t)) {
             Some(tid) if self.generations().active() && !t.is_reserved() && self.generations().table_has(tid as TableId) => {
                 let mut left = allocated;
                 let mut n = 0u32;
                 for (lo, hi) in t.extents() {
                     let take = left.min(hi - lo);
-                    n += (lo..lo + take).filter(|&g| !self.entities.is_live(g) && self.generations().retired(g)).count() as u32;
+                    n += (lo..lo + take).filter(|&g| !self.entities.is_live(g) && self.generations().withheld(g)).count() as u32;
                     left -= take;
                 }
                 n
@@ -20869,8 +20871,9 @@ impl Engine {
                 // 生かした) も外す。 PR #977 の読み直し 5 の [D] (a): 生きているかを先に読む (消す道は kill を書けない場所を覚えてから
                 // 生きている印を下ろす = 下りた印を読んだ後に覚えを読めば、 覚えが見える。 逆の順では、 覚える前に読んで、 印が下りた
                 // 後に読んだ 「生きていない」 で取りうる)
-                // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (山から外す。 後始末が残る間だけの形 = WAL の file の無い sync
-                // する DB の単独の session など。 外した場所は開き直すまで anonymous の山に戻らない)
+                // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (山から外す)。 当たるのは anonymous だけの sync しない DB で、 開く
+                // 道の後始末の書き出し (`body_msync`) か後始末待ちを落とした gen.seg の書き出しに失敗した session だけ (sync する DB は
+                // anonymous の表を閉じている)。 外した場所は山に戻らない (使わない向きの漏れ、 #992 の読み直し 5 の細かい 2)
                 if self.entities.is_live(slot) || gens.withheld(slot) {
                     return crate::entity_set::Reuse::Discard;
                 }

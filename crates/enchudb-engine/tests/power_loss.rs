@@ -4577,6 +4577,8 @@ fn a_slot_waiting_for_its_cleanup_is_not_reused() {
     {
         let eng = Engine::open_standalone(db.to_str().unwrap()).unwrap();
         assert_eq!(eng.generation_repairs(), (1, 0), "前提: 突き合わせが r の場所を完了させた (後始末待ち)");
+        // 後始末待ちの場所は空きに数えない (#992 の読み直し 5 の細かい 3。 表の穴は r の場所だけ)
+        assert_eq!(eng.table_eid_usage("notes").map(|u| u.free), Some(0), "後始末待ちの場所を空きに数えた");
         let n = eng.entity_in("notes").unwrap();
         assert_ne!(eng.eid_slot(n), eng.eid_slot(r), "後始末待ちの場所を使い回した");
     }
