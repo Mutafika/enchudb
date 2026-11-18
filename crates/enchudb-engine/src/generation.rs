@@ -1369,6 +1369,13 @@ mod tests {
         let seen = g.dead_cell(9).unwrap();
         assert!(g.revive_from(9, seen));
         assert!(!g.mid_reuse(9), "生かした場所に使い回しの印が残った");
+        // 他の 2 つの生かす道 (`revive` / 再生の `restore`) も落とす
+        g.kill_reconciled(11, 2, 1, true).unwrap();
+        g.revive(11);
+        assert!(!g.mid_reuse(11), "revive した場所に使い回しの印が残った");
+        g.kill_reconciled(12, 3, 2, true).unwrap();
+        assert!(g.restore(12, 1));
+        assert!(!g.mid_reuse(12), "restore した場所に使い回しの印が残った");
         // 場所 10: 使い回しの印だけが残る (後始末を済ませた) まま、 印を知らない binary が死の印だけを落として生かした
         g.kill_reconciled(10, 2, 1, true).unwrap();
         g.clear_pending(10);
