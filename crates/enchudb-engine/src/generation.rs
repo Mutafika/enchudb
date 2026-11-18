@@ -1625,7 +1625,8 @@ mod tests {
         assert_eq!(r.eids(peer, &far), far.iter().map(|&s| enchudb_oplog::make_eid(peer, r.local(s))).collect::<Vec<_>>());
     }
 
-    /// #1015: 照合の速い道は page の印と場所の 2 B を範囲を確かめずに読むので、 header より短い / 2 byte に揃っていない region は置かない。
+    /// #1015: 照合の速い道は page の印と場所の 2 B を範囲を確かめずに読むので、 header より短い / 2 byte に揃っていない region は置かない
+    /// (作る道 `prepare` も開く道 `attach` も。 開く道は magic を確かめた後、 #1012 の `GEN2` → `GEN3` の書き換えより前)。
     #[test]
     fn a_short_or_misaligned_region_is_refused() {
         let mut v = buffer(segment_len(16) + 8);
@@ -1638,6 +1639,24 @@ mod tests {
         assert!(!g.has_region());
         g.prepare(region(&mut v), 24, usize::MAX).unwrap();
         assert!(g.has_region());
+        // 開く道 (`attach`): magic (GEN3 / GEN2) の合う header でも、 揃っていない region は置かない。 置かなかった region の magic は
+        // `upgrade_magic` が書き換えない (GEN2 のまま)
+        for magic in [MAGIC, MAGIC_GEN2] {
+            let mut w = buffer(segment_len(16) + 8);
+            let base = w.as_mut_ptr() as *mut u8;
+            let header = |at: *mut u8| unsafe {
+                std::ptr::copy_nonoverlapping(magic.as_ptr(), at, 4);
+                std::ptr::copy_nonoverlapping(24u32.to_le_bytes().as_ptr(), at.add(OFF_BITS), 4);
+            };
+            header(unsafe { base.add(1) });
+            let g = Generations::off();
+            assert!(g.attach(unsafe { Region::new(base.add(1), segment_len(16)) }, 24).is_err(), "揃っていない {magic:?} の region を置いた");
+            assert!(!g.has_region() && !g.upgrade_magic(), "置かなかった region の magic を書き換えた");
+            assert_eq!(unsafe { std::slice::from_raw_parts(base.add(1), 4) }, &magic);
+            header(base);
+            assert!(g.attach(region(&mut w), 24).is_ok(), "揃った {magic:?} の region");
+            assert_eq!(g.upgrade_magic(), magic == MAGIC_GEN2);
+        }
     }
 
     /// 開く時の突き合わせの 1 つ目: 死んでいる印のある生きている場所 (削除の 印と世代 だけ届いた像 / 使い回しの生きている印だけ届いた像)
