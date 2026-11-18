@@ -1469,6 +1469,13 @@ impl HimoStore {
         value_at(self.col(), eid)
     }
 
+    /// [`Self::get_value`] の、 呼び手に inline する版 (#1015: `Engine::get` / `get_by_id` の 1 行の読み。 call を省くと get 1 回が
+    /// 0.3 ns ほど速い)。 cell は同じく Acquire で読む (`Engine::read_app_acquired` はこの順に頼る)。
+    #[inline(always)]
+    pub(crate) fn get_value_inline(&self, eid: u32) -> Option<u64> {
+        value_at(self.col(), eid)
+    }
+
     /// u32 の列 (Tag / Leaf / Ref / Number) の値。 vid / leaf offset / local eid を読む engine 内部用。
     ///
     /// # Panics

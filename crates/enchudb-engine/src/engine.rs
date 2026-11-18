@@ -4648,6 +4648,298 @@ mod eid_gen_claim_tests {
     }
 }
 
+/// #1015: lock を取らない読みの入口 (`read_app_in`) の速い道の境目。 get の道 (`read_app_acquired` = 読んだ後の fence なし、 列の cell の
+/// Acquire に頼る) と fence のある道 (`read_app`) の両方で、 照合の後・読み直しの前に行が消えて場所が使い回された読みは None。 場所の
+/// page に 「世代 > 0 がある」 印が無い (照合は世代の 2 B を読まない) まま始まり、 読みの間に印が立つ形 (その page で最初の使い回し) と、
+/// 世代を持たない DB で読みの間に v15 に移る形を見る。 割り込みは `f` の中 (読んだ後・読み直しの前) に置く。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod read_fast_path_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// gen.seg の page (2^13 場所)。
+    const PAGE: u32 = 1 << 13;
+
+    struct Db {
+        path: String,
+        eng: Arc<Engine>,
+        /// 表 `big` の行 (場所の順、 列 `a` = 行の番号 + 1)
+        rows: Vec<u64>,
+        hid: u16,
+    }
+
+    impl Drop for Db {
+        fn drop(&mut self) {
+            let _ = crate::db_files::remove_db(&self.path);
+            let _ = std::fs::remove_file(oplog_path_for(&self.path));
+        }
+    }
+
+    /// 3 page 分の枠を使い切った表 `big` と、 枠 1 の表 `u`。 残りの eid の空間は表 `pad` が取る (満杯の表の使い回しが枠を足さない)。
+    /// `v15`: u の場所を使い回して v15 に移っておく (印は u の場所の page だけ = big の page には印が無い)。
+    fn db(tag: &str, v15: bool) -> Db {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-readfast-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1 << 16).unwrap();
+        eng.define_table("big", 3 * PAGE).unwrap();
+        eng.define_himo_in("big", "a", ValueType::Number, 0).unwrap();
+        eng.define_table("u", 1).unwrap();
+        eng.define_himo_in("u", "a", ValueType::Number, 0).unwrap();
+        let rest = eng.remaining_eid_capacity();
+        if rest > 0 {
+            eng.define_table("pad", rest).unwrap();
+        }
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 24).unwrap();
+        let hid = eng.himo_id("big.a").unwrap() as u16;
+        let rows: Vec<u64> = (0..3 * PAGE)
+            .map(|i| {
+                let r = eng.entity_in("big").unwrap();
+                eng.tie_to_by_id(r, hid, i + 1);
+                r
+            })
+            .collect();
+        assert!(eng.entity_in("big").is_err(), "前提: big は満杯");
+        if v15 {
+            let x = eng.entity_in("u").unwrap();
+            eng.delete(x);
+            eng.entity_in("u").unwrap();
+            assert!(eng.generations().moved(), "前提: v15 に移った");
+            assert!((0..3 * PAGE).all(|s| !eng.generations().page_has(s)), "前提: big の page には印が無い");
+        }
+        Db { path, eng, rows, hid }
+    }
+
+    /// 消して同じ場所を使い回し、 新しい行に `v` を書く。 新しい行の eid。
+    fn reuse(d: &Db, old: u64, v: u32) -> u64 {
+        let slot = d.eng.slot_unchecked(old);
+        d.eng.delete(old);
+        let b = d.eng.entity_in("big").unwrap();
+        assert_eq!(d.eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した");
+        d.eng.tie_to_by_id(b, d.hid, v);
+        b
+    }
+
+    /// 印の無い page の行を読む間に、 その行が消えて場所が使い回された (page に印が立った)。 読んだのが前の行の値でも、 使い回した行の
+    /// 値でも None。 同じ page の他の行 (世代 0) は印が立った後も読める。 出口は使い回した行に新しい世代を付け、 他の行は世代 0 のまま。
+    #[test]
+    fn a_read_on_a_page_marked_meanwhile_returns_none() {
+        for (fenced, read_new) in [(false, false), (false, true), (true, false), (true, true)] {
+            let d = db(&format!("mark{}{}", fenced as u8, read_new as u8), true);
+            let eng = &d.eng;
+            let k = (PAGE + 5) as usize; // page 1
+            let e = d.rows[k];
+            assert_eq!(eng.get_by_id(e, d.hid), Some(k as u64 + 1));
+            let mut b = 0;
+            let f = |slot: u32| {
+                let before = eng.himos[d.hid as usize].get_value_inline(slot);
+                b = reuse(&d, e, 7_000_000);
+                if read_new { eng.himos[d.hid as usize].get_value_inline(slot) } else { before }
+            };
+            let got = if fenced { eng.read_app(e, f) } else { eng.read_app_acquired(e, f) };
+            assert_eq!(got, None, "読みの間に消えて使い回された行の値を返した (fence {fenced}, 使い回した行の値を読んだ {read_new})");
+            let slot = eng.slot_unchecked(e);
+            assert!(eng.generations().page_has(slot), "前提: 読みの間に page に印が立った");
+            assert_eq!(eng.get_by_id(e, d.hid), None, "消えた行の eid の get");
+            assert_eq!(eng.get(e, "big.a"), None, "消えた行の eid の get (名前)");
+            assert_eq!(eng.get_by_id(b, d.hid), Some(7_000_000));
+            for j in [k - 1, k + 1, PAGE as usize, 2 * PAGE as usize - 1] {
+                assert_eq!(eng.get_by_id(d.rows[j], d.hid), Some(j as u64 + 1), "印が立った page の世代 0 の行 {j}");
+            }
+            let all = eng.entities_with_himo(d.hid);
+            assert_eq!(all.len(), 3 * PAGE as usize);
+            assert!(all.contains(&b) && !all.contains(&e), "出口が使い回した行に今の世代を付けない");
+            for j in [0, k - 1, k + 1, 2 * PAGE as usize + 3] {
+                assert!(all.contains(&d.rows[j]), "出口が世代 0 の行 {j} の eid を変えた");
+            }
+            assert_eq!(eng.pull_raw("big.a", 7_000_000u32), vec![b]);
+        }
+    }
+
+    /// 世代を持たない DB (v14) の読みの間に、 その行が消えて場所が使い回された (= v15 に移った)。 get の道も fence のある道も None。
+    #[test]
+    fn a_read_across_the_move_to_v15_returns_none() {
+        for (fenced, read_new) in [(false, false), (false, true), (true, false), (true, true)] {
+            let d = db(&format!("move{}{}", fenced as u8, read_new as u8), false);
+            let eng = &d.eng;
+            assert!(!eng.generations().moved(), "前提: まだ v14");
+            let k = (2 * PAGE + 9) as usize;
+            let e = d.rows[k];
+            let f = |slot: u32| {
+                let before = eng.himos[d.hid as usize].get_value_inline(slot);
+                reuse(&d, e, 7_000_000);
+                assert!(eng.generations().moved(), "前提: 読みの間に v15 に移った");
+                if read_new { eng.himos[d.hid as usize].get_value_inline(slot) } else { before }
+            };
+            let got = if fenced { eng.read_app(e, f) } else { eng.read_app_acquired(e, f) };
+            assert_eq!(got, None, "読みの間に v15 に移って使い回された行の値を返した (fence {fenced}, 使い回した行の値 {read_new})");
+            assert_eq!(eng.get_by_id(e, d.hid), None);
+            assert_eq!(eng.get_by_id(d.rows[k + 1], d.hid), Some(k as u64 + 2));
+        }
+    }
+
+    /// 使い回しと並ぶ読み: 書き手が page 2 の 1024 行を消して同じ場所を使い回し続け (新しい行の値 = その行の世代 + 1)、 読み手が持って
+    /// いる eid (古い世代と今の世代を混ぜる) を get し続ける。 get が返す値は、 いつもその eid の行の値 (世代 + 1) か None:
+    /// - 古い eid に、 使い回した後の住人の値を返さない (読んだ後の照合)
+    /// - 新しい eid に、 前の住人の値を返さない (#1020 の読み直し A: 読む前の照合の世代 ≠ 0 の Acquire)。 書き手は新しい eid を
+    ///   Relaxed の store で読み手に渡す (同期の無い渡し方。 読み手の同期は get の照合だけが付ける)
+    ///
+    /// 読み手は core の数の 2 倍置く: 照合と読み直しの間で OS に止められた読み手の場所を、 書き手がその間に使い回す形を踏ませる (core が
+    /// 余っていると読み手は止まらず、 照合と読みの間の数 ns に書き手の使い回し (µs) は収まらない)。 確率で踏む形 (決まった割り込みは上の
+    /// 2 本。 新しい eid の向きは load の入れ替えが要るので、 x86 では起きず、 ARM でもまず踏まない = loom の
+    /// `loom_read_app_generation` が見る)。 検出率は PR #1020 の本文。
+    #[test]
+    fn gets_racing_reuse_never_return_another_residents_value() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        /// 書き手が assert で落ちても読み手を止める (止めないと読み手が process の終わりまで回り、 `Db` の Drop も走らない)
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let d = Arc::new(db("race", true));
+        let bits = d.eng.slot_bits();
+        let gen_of = move |e: u64| u64::from(enchudb_oplog::eid_local(e) >> bits);
+        let pick: Vec<usize> = (0..1024).map(|i| (2 * PAGE) as usize + i * 7).collect();
+        for &k in &pick {
+            d.eng.tie_to_by_id(d.rows[k], d.hid, 1u32); // 世代 0 の行の値 = 1
+        }
+        let held: Arc<Vec<AtomicU64>> = Arc::new(pick.iter().map(|&k| AtomicU64::new(d.rows[k])).collect());
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop = StopOnDrop(stop.clone());
+        // 前の住人の値 (新しい eid の向き) / 後の住人の値 (古い eid の向き)
+        let earlier = Arc::new(AtomicU64::new(0));
+        let later = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+        let n_readers = 2 * std::thread::available_parallelism().map_or(4, |n| n.get());
+        let readers: Vec<_> = (0..n_readers)
+            .map(|t| {
+                let (d, held, stop) = (d.clone(), held.clone(), stop.clone());
+                let (earlier, later, reads) = (earlier.clone(), later.clone(), reads.clone());
+                std::thread::spawn(move || {
+                    // 持つ eid: 今の eid を写した物を足していく (古い世代の eid が残る)
+                    let mut mine: Vec<u64> = held.iter().map(|h| h.load(Ordering::Relaxed)).collect();
+                    let mut i = t * 131;
+                    while !stop.load(Ordering::Relaxed) {
+                        for _ in 0..4096 {
+                            let e = mine[i % mine.len()];
+                            i += 1;
+                            if let Some(v) = d.eng.get_by_id(e, d.hid) {
+                                let own = gen_of(e) + 1;
+                                if v < own {
+                                    earlier.fetch_add(1, Ordering::Relaxed);
+                                } else if v > own {
+                                    later.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        reads.fetch_add(4096, Ordering::Relaxed);
+                        mine.extend(held.iter().map(|h| h.load(Ordering::Relaxed)));
+                        if mine.len() > 8192 {
+                            mine.drain(..mine.len() - 8192);
+                        }
+                    }
+                })
+            })
+            .collect();
+        // 書き手: 1 場所の使い回しは 254 回まで (引退) なので 200 周まで、 時間は 0.5 秒まで
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut reused = 0u64;
+        'outer: for _ in 0..200 {
+            for (n, h) in held.iter().enumerate() {
+                if std::time::Instant::now() > until {
+                    break 'outer;
+                }
+                let old = h.load(Ordering::Relaxed);
+                let slot = d.eng.slot_unchecked(old);
+                d.eng.delete(old);
+                let b = d.eng.entity_in("big").unwrap();
+                assert_eq!(d.eng.slot_unchecked(b), slot, "前提: 同じ場所を使い回した ({})", pick[n]);
+                d.eng.tie_to_by_id(b, d.hid, (gen_of(b) + 1) as u32);
+                h.store(b, Ordering::Relaxed);
+                reused += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert!(reads.load(Ordering::Relaxed) > 0 && reused > 0);
+        let (earlier, later) = (earlier.load(Ordering::Relaxed), later.load(Ordering::Relaxed));
+        assert_eq!((earlier, later), (0, 0), "get が別の住人の値を返した (前の住人の値 {earlier} 回 / 後の住人の値 {later} 回、 {reused} 回使い回した)");
+    }
+
+    /// 別名をたどる読み (畳んだ自分の行 #612 の eid、 `ReadAppPost::Recheck` → `app_slot_still`) の間に、 読んでいる行 (別名の先) が
+    /// さらに別の行に畳まれた。 読んだのは畳む前の行の値なので None (読んだ後に別名をたどり直す)。 畳んだ後は畳んだ先の値。
+    #[test]
+    fn a_read_through_an_alias_moved_meanwhile_returns_none() {
+        for fenced in [false, true] {
+            let d = db(&format!("alias{}", fenced as u8), true);
+            let eng = &d.eng;
+            let me = eng.peer_id();
+            let [x, here, there] = [d.rows[10], d.rows[11], d.rows[12]];
+            let slot = |e: u64| eng.slot_unchecked(e);
+            // 畳む時と同じ順: x を here の別名にしてから x を落とす
+            eng.alias_slot(me, slot(x), slot(here));
+            eng.own_alias_on.store(true, std::sync::atomic::Ordering::Release);
+            eng.remove_entity_body(slot(x), enchudb_oplog::Hlc::ZERO);
+            assert_eq!(eng.get_by_id(x, d.hid), Some(12), "前提: x は here を読む");
+            let f = |s: u32| {
+                assert_eq!(s, slot(here), "前提: 別名の先を読む");
+                let v = eng.himos[d.hid as usize].get_value_inline(s);
+                // 読んだ後・読み直しの前に、 here を there に畳む
+                eng.alias_slot(me, slot(here), slot(there));
+                eng.remove_entity_body(slot(here), enchudb_oplog::Hlc::ZERO);
+                v
+            };
+            let got = if fenced { eng.read_app(x, f) } else { eng.read_app_acquired(x, f) };
+            assert_eq!(got, None, "読みの間に別名の先が畳まれた行の値を返した (fence {fenced})");
+            assert_eq!(eng.get_by_id(x, d.hid), Some(13), "畳んだ後は畳んだ先を読む");
+        }
+    }
+
+    /// #1020 の読み直し D: 場所の bit が 32 の DB (`max_entities > 2^31`、 eid に世代の bit が無い) で、 消えた行の eid は照合で弾く
+    /// (書き込みは何もしない、 get は None)。 消した場所は v15 に移る時に引退の印 (世代 1) になる (使い回さない)。
+    #[test]
+    fn a_deleted_row_stays_deleted_with_32_slot_bits() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-readfast-wide-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, (1u32 << 31) + 1).unwrap();
+        eng.define_table("t", 4).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        let rest = eng.remaining_eid_capacity();
+        if rest > 0 {
+            eng.define_table("pad", rest).unwrap();
+        }
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 24).unwrap();
+        let d = Db { path, eng, rows: vec![], hid: 0 };
+        let eng = &d.eng;
+        let hid = eng.himo_id("t.a").unwrap() as u16;
+        let rows: Vec<u64> = (0..4).map(|_| eng.entity_in("t").unwrap()).collect();
+        let x = rows[1];
+        let s = eng.slot_unchecked(x);
+        eng.tie_to_by_id(x, hid, 5u32);
+        eng.delete(x);
+        // 満杯の表に足す: 消した場所を使い回そうとして v15 に移る (場所の bit 32 = 世代を使えないので、 場所は引退で使い回さない)
+        let _ = eng.entity_in("t");
+        assert!(eng.generations().moved(), "前提: v15 に移った");
+        assert_eq!(eng.slot_bits(), 32, "前提: 場所の bit 32");
+        assert!(eng.generations().retired(s), "前提: 消した場所は引退");
+        assert_eq!(eng.app_slot(x), None, "消えた行の eid を場所に通した");
+        eng.tie_to_by_id(x, hid, 9u32);
+        assert_eq!(eng.himos[hid as usize].get_value(s), None, "消えた行の eid の書き込みが死んだ場所に通った");
+        assert_eq!(eng.get_by_id(x, hid), None);
+        assert_eq!(eng.get(x, "t.a"), None);
+        eng.tie_to_by_id(rows[2], hid, 7u32);
+        assert_eq!(eng.get_by_id(rows[2], hid), Some(7), "生きている行");
+        assert_eq!(eng.read_app(rows[2], |slot| eng.himos[hid as usize].get_value(slot)), Some(7), "fence のある道");
+    }
+}
+
 /// #970 (PR #977 の 4 回目の形 = 案 P): 生かす場所の gen.seg の page を、 生かす前に commit する (払い出しの全部の道の `gen_slot_ready`、
 /// v15 に移る時と書き手として開く時は払い出し済みの場所まで)。 commit は縮まないので、 生きている / 生きていた行を消す道の kill (断れない
 /// 受信の Delete・開く時の突き合わせも) と使い回しの raise は空きの不足で落ちず、 消す道は前のまま断らない。 commit できなければ払い出す
@@ -24577,12 +24869,27 @@ impl Engine {
     /// [`Self::app_slot_holds`] で確かめ直す (場所を使い回すのは行の lock を一巡して待った後か、 死んだ場所)。
     #[inline]
     pub(crate) fn app_slot(&self, eid: enchudb_oplog::EntityId) -> Option<u32> {
-        let (slot, g) = self.generations().split(enchudb_oplog::eid_local(eid));
+        // #1015: 場所の bit は Relaxed で 1 回だけ読み、 世代を持つ DB だけ region を (Acquire で) 引いて照合する (前は split / active /
+        // get で bit を 2 回 Acquire で・region を 1 回、 registry をたどって読んだ)。 bit を古い 0 と読む窓は、 Acquire で読んでも
+        // 移る手順の公開と並べば同じにある (移る手順は行の lock を待たない。 死んだ場所に書いた書き手の cell は使い回す時に落とす =
+        // `move_to_generations` の 2.)
+        let gens = self.generations();
+        let local = enchudb_oplog::eid_local(eid);
+        let bits = gens.bits_relaxed();
         // 照合を先に: 別名 (#612) は畳んだ行の場所に張るので、 その場所の前の住人 (消えた行、 世代が違う) の eid は転送しない
-        // (畳む時は場所の世代を上げない = 畳んだ行の世代のまま)
-        if self.generations().active() && self.generations().get(slot) != g {
-            return None;
-        }
+        // (畳む時は場所の世代を上げない = 畳んだ行の世代のまま)。 世代の 2 B は Acquire で読む (その世代を書いた消す道 / 使い回す道と
+        // 同期する)
+        let slot = if bits == 0 {
+            local
+        } else if let Some(r) = gens.reader_for(bits) {
+            let (slot, g) = r.split(local);
+            if r.current(slot) != g {
+                return None;
+            }
+            slot
+        } else {
+            self.app_slot_wide(local)?
+        };
         if self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed) && enchudb_oplog::eid_peer(eid) == self.peer_id() {
             return Some(self.forward_local_slow(slot));
         }
@@ -24606,34 +24913,111 @@ impl Engine {
     /// 使い回された = None)。 lock を取らない読み (`get` など) 用。
     #[inline]
     fn read_app<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
+        self.read_app_in::<true, R>(eid, f)
+    }
+
+    /// [`Self::read_app`] の、 `f` が列の cell を Acquire の load で読む時 (`HimoStore::get_value_inline`、 #106) の版。 読んだ後の照合の
+    /// 前の fence を省く: cell の Acquire の load が、 その cell を書いた (使い回した後の住人の) 書き手の Release と対になるので、 使い
+    /// 回した後の値を読んだ読みは、 後の照合で消した側の世代の書きを必ず見る (fence と同じ順)。 #1015: fence を省くと get 1 回が
+    /// 0.5〜0.6 ns 速い (M4 Max、 100 万行)。
+    #[inline]
+    fn read_app_acquired<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
+        self.read_app_in::<false, R>(eid, f)
+    }
+
+    /// lock を取らない読みの入口の本体。 守る事は 2 つ:
+    /// - 古い eid で、 使い回した後の住人の値を返さない: 読んだ後の照合 (`f` の後に世代 / 場所の bit を読み直す)。 順は `FENCE` なら
+    ///   `f` の直後の fence、 そうでなければ `f` の cell の Acquire の load が付ける
+    /// - 新しい世代の eid で、 前の住人の値を返さない (#1020 の読み直し A): 読む前の照合で、 世代 ≠ 0 の eid は世代の 2 B を Acquire で
+    ///   読む (消す道 / 使い回す道の RMW と同期し、 消す道が先に落とした cell が見える。 その eid を同期の無い渡し方で受けた読み手でも)。
+    ///   世代 0 の eid には前の住人が居ないので Relaxed
+    #[inline(always)]
+    fn read_app_in<const FENCE: bool, R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
         // #900: [`Self::app_slot`] を 2 回呼ぶと、 場所の bit を 4 回・region を 2 回 (live の registry をたどって) 読み直していた
         // (v15 の DB の get 1 回 331 命令 → この形で 277、 #885 の前は 204)。 bit と region を 1 回写して照合し、 読んだ後は照合した
-        // 場所の世代だけ読み直す。 照合 (読む前) は読み直しが兼ねるので結果は変わらないが、 別の行の cell を `f` に読ませないために残す
+        // 場所の世代だけ読み直す。 読む前の照合は、 別の行の cell を `f` に読ませないためと、 新しい世代の eid に同期を付けるため
+        //
+        // #1015: よく通る 2 つの道 (世代を持たない DB / 世代を持つ DB の別名の無い行) だけをここで照合し、 別名をたどる読み・region が
+        // まだ見えない読み・場所の bit が 32 の DB の読み・読みの間に v15 に移った読みの照合は外の関数 (cold、 generic でない) に出す。
+        // `f` はそれらに渡さず、 呼ぶ所を 1 つにする (`f` が何か所からも呼ばれると closure が inline されず、 get の列の読みが call の
+        // まま残った)
         let gens = self.generations();
-        let r = gens.reader();
-        let (home, g) = r.split(enchudb_oplog::eid_local(eid));
-        if r.active() && r.current(home) != g {
+        let local = enchudb_oplog::eid_local(eid);
+        let (slot, post) = if self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed)
+            && enchudb_oplog::eid_peer(eid) == self.peer_id()
+        {
+            // 畳んだ自分の行 (#612) は残す行の場所を読む (照合は畳んだ行の場所、 `app_slot` の順)
+            (self.app_slot_cold(eid)?, ReadAppPost::Recheck)
+        } else {
+            // 場所の bit は Relaxed で読む (#1015: Acquire より get 1 回 0.5 ns ほど速い)。 0 と読んで世代を持たない道を通っても、 読んだ
+            // 後に bit を読み直す (その間に移って使い回した住人の値を読んだ読みは、 その値の Acquire / fence の後の読み直しで移ったことを
+            // 必ず見る)
+            match gens.bits_relaxed() {
+                // 世代を持たない DB (v14): local = 場所
+                0 => (local, ReadAppPost::Recheck),
+                bits => match gens.reader_for(bits) {
+                    Some(r) => {
+                        let (slot, g) = r.split(local);
+                        // 世代 0 の eid は Relaxed (順は読んだ後の照合の前の fence / 列の cell の Acquire が付ける)、 世代 ≠ 0 の eid は
+                        // Acquire (上の doc)
+                        let cur = if g == 0 { r.current_relaxed(slot) } else { r.current(slot) };
+                        if cur != g {
+                            return None;
+                        }
+                        (slot, ReadAppPost::Gen(r, g))
+                    }
+                    // region は Acquire で引く。 bit を Relaxed で読んだので、 移る手順の公開と並ぶと region がまだ見えないことがある。
+                    // その時と場所の bit が 32 の DB は、 前後を全部 `app_slot` で照合する
+                    None => (self.app_slot_cold(eid)?, ReadAppPost::Recheck),
+                },
+            }
+        };
+        let out = f(slot);
+        // 読んだ後の照合の load は全部 `f` の後: `FENCE` の道はここで fence を置き、 そうでなければ `f` の cell の Acquire が順を付ける
+        // (#1020 の読み直し C: 前は世代を持たない道の読み直しだけ fence の無いまま場所の bit を Acquire で読んでいた。 Acquire の load は
+        // 前の load を縛らない)
+        if FENCE {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        }
+        let holds = match post {
+            // 場所の bit は一度置いたら変わらない (`Generations::start` / `attach` は 0 から 1 回だけ置く) ので、 読み直しは照合した
+            // 場所の世代だけ (region も一度置いたら変わらない)
+            ReadAppPost::Gen(r, g) => r.current_relaxed(slot) == g,
+            // 世代を持たない DB / 別名をたどった読み (読みの間に別名が変わりうる) / region が見えなかった読み: 読んだ後に場所の bit を
+            // 見て、 世代を持つ DB なら全部を引き直す (読みの間に v15 に移った読みは、 写した bit / region では世代 0 の読みと区別でき
+            // ない。 世代を持たない DB の別名の読みは前と同じく引き直さない)
+            ReadAppPost::Recheck => gens.bits_relaxed() == 0 || self.app_slot_still(eid, slot),
+        };
+        if !holds {
             return None;
         }
-        // 畳んだ自分の行 (#612) は残す行の場所を読む (照合は畳んだ行の場所で、 `app_slot` と同じ順)
-        let forwarded = self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed)
-            && enchudb_oplog::eid_peer(eid) == self.peer_id();
-        let slot = if forwarded { self.forward_local_slow(home) } else { home };
-        let out = f(slot);
-        let bits = gens.bits();
-        if bits != 0 {
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            if forwarded || bits != r.bits() {
-                // 別名をたどった / 読みの間に v15 に移った: 前と同じく全部を引き直す
-                if self.app_slot(eid) != Some(slot) {
-                    return None;
-                }
-            } else if r.current(home) != g {
-                // region は一度置いたら変わらないので、 写した物で読み直す
-                return None;
-            }
-        }
         out
+    }
+
+    /// [`Self::app_slot`] の外の関数版 ([`Self::read_app_in`] の稀な道。 hot path に inline しない)。
+    #[cold]
+    #[inline(never)]
+    fn app_slot_cold(&self, eid: enchudb_oplog::EntityId) -> Option<u32> {
+        self.app_slot(eid)
+    }
+
+    /// [`Self::app_slot`] の稀な道 (`reader_for` が None): region がまだ見えない (場所の bit を Relaxed で読んだ) / 場所の bit が 32
+    /// (`max_entities > 2^31`、 eid に世代の bit が無く、 消した場所は引退の印 = 世代 1)。 場所の bit を Acquire で読み直し、 #885 の
+    /// 形で照合する (bit が 32 の DB の消えた行の eid は、 場所の世代 1 ≠ 0 で弾く)。
+    #[cold]
+    #[inline(never)]
+    fn app_slot_wide(&self, local: u32) -> Option<u32> {
+        let gens = self.generations();
+        let (slot, g) = gens.split(local);
+        (!gens.active() || gens.get(slot) == g).then_some(slot)
+    }
+
+    /// [`Self::read_app_in`] の読んだ後の全部の引き直し: fence の後に `app_slot` を引いて、 まだ `slot` か。
+    #[cold]
+    #[inline(never)]
+    fn app_slot_still(&self, eid: enchudb_oplog::EntityId, slot: u32) -> bool {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        self.app_slot(eid) == Some(slot)
     }
 
     /// 場所 → アプリに渡す eid (今の世代 | 場所)。
@@ -29335,7 +29719,7 @@ impl Engine {
         self.debug_check_in_place();
         let hid = self.himo_id(himo)?;
         // #731: 消えた行 / 場所を使い回す前の eid は None (#612: 畳んだ自分の行の eid は残す行へ)
-        self.read_app(eid, |slot| self.himos[hid].get_value(slot))
+        self.read_app_acquired(eid, |slot| self.himos[hid].get_value_inline(slot))
     }
 
     /// `get` の bindings 版。 schema 等で `himo_id` を起動時に pre-resolve した hot path 用。
@@ -29344,7 +29728,7 @@ impl Engine {
         self.debug_check_in_place();
         let hs = self.himos.get(hid as usize)?;
         // #731: 消えた行 / 場所を使い回す前の eid は None (#612: 畳んだ自分の行の eid は残す行へ)
-        self.read_app(eid, |slot| hs.get_value(slot))
+        self.read_app_acquired(eid, |slot| hs.get_value_inline(slot))
     }
 
     /// u32 の列 (vocab id / ref / engine 内部の table の列) を u32 で読む。 64 bit 列で panic。
@@ -36365,6 +36749,16 @@ struct SyncPayloadCols {
     at: Option<u16>,
     /// 辞書の vid (`payload`、 ring を入れる前の row)。
     legacy: Option<u16>,
+}
+
+/// [`Engine::read_app_in`] の読んだ後の照合の形。
+#[derive(Clone, Copy)]
+enum ReadAppPost<'a> {
+    /// 世代を持つ DB: 照合した場所の世代を読み直す (写し, eid の世代)
+    Gen(crate::generation::GenReader<'a>, u32),
+    /// 場所の bit を読み直し、 世代を持つ DB なら全部を `app_slot` で引き直す (世代を持たない DB の読み / 別名をたどった読み / region が
+    /// 見えなかった読み / 場所の bit が 32 の DB の読み)
+    Recheck,
 }
 
 impl Drop for Engine {
