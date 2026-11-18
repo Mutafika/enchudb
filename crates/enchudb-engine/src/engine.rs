@@ -1469,9 +1469,8 @@ thread_local! {
     static APPLYING_CUT_PACE: std::cell::Cell<(Option<std::time::Instant>, u32)> = const { std::cell::Cell::new((None, 0)) };
     /// この thread が自分の書き込みを WAL に積んでから当て終えるまでの間か ([`LocalApply`] の入れ子の深さ、 下の bit
     /// [`LOCAL_APPLY_DEPTH`])。 その間は辞書と Leaf の旧 slot の書き出し (`settle_retired_words` / `settle_retired_leaves`、
-    /// msync) を当てた後に回す。 書き出しが要ると分かったら [`WORD_SETTLE_AFTER_APPLY`] / [`LEAF_SETTLE_AFTER_APPLY`] を立てる。
-    /// いちばん外の `LocalApply` が入った門も置く (#896、 [`GatesStepOut`])。 中身は定数で始まり Drop が無い (thread が終わるまで
-    /// 動かない。 `LocalApply` は作る時に引いた番地を落とす時まで持つ、 #1016)。
+    /// msync) を当てた後に回す。 書き出しが要ると分かったら [`WORD_SETTLE_AFTER_APPLY`] / [`LEAF_SETTLE_AFTER_APPLY`] を
+    /// 立てる。 いちばん外の `LocalApply` が入った門も置く (#896、 [`GatesStepOut`])。
     static IN_LOCAL_APPLY: std::cell::Cell<LocalApplyTls> = const { std::cell::Cell::new(LocalApplyTls::EMPTY) };
 }
 
@@ -1481,9 +1480,6 @@ thread_local! {
 struct LocalApplyTls {
     /// 入れ子の深さ (下の bit [`LOCAL_APPLY_DEPTH`]) と [`WORD_SETTLE_AFTER_APPLY`] / [`LEAF_SETTLE_AFTER_APPLY`]
     bits: u32,
-    /// #1016: この thread の門の shard の番号 (`write_gate::shard_index` の値。 `u32::MAX` = まだ引いていない)。 書き込みのたびに門の
-    /// thread-local を引かない。 空に戻す時も残す
-    shard: u32,
     /// いちばん外の [`LocalApply`] が入った門: 1 本の紐の書き込みは門 1 つ (`one`)、 行の削除は engine と値のある紐の番号の並び
     /// (`eng` / `row` / `row_len` = [`RowHids`] の中身。 `LocalApply` が借りている間は動かない)。 WAL の空きを待つ間だけ出る
     /// ([`GatesStepOut`])
@@ -1494,14 +1490,7 @@ struct LocalApplyTls {
 }
 
 impl LocalApplyTls {
-    const EMPTY: Self =
-        Self { bits: 0, shard: u32::MAX, one: std::ptr::null(), eng: std::ptr::null(), row: std::ptr::null(), row_len: 0 };
-
-    /// 門を持たない (shard の控えは残す)。
-    #[inline(always)]
-    fn without_gates(self) -> Self {
-        Self { one: std::ptr::null(), eng: std::ptr::null(), row: std::ptr::null(), row_len: 0, ..self }
-    }
+    const EMPTY: Self = Self { bits: 0, one: std::ptr::null(), eng: std::ptr::null(), row: std::ptr::null(), row_len: 0 };
 }
 
 /// `IN_LOCAL_APPLY` の bit: 当てる間に Leaf の旧 slot が書き出しの目安を越えた (`LocalApply` を落とす時に書き出す)。
@@ -1512,25 +1501,10 @@ const WORD_SETTLE_AFTER_APPLY: u32 = 1 << 30;
 /// `IN_LOCAL_APPLY` の、 入れ子の深さの bit。
 const LOCAL_APPLY_DEPTH: u32 = WORD_SETTLE_AFTER_APPLY - 1;
 
-/// この thread の [`IN_LOCAL_APPLY`] の番地 (thread が終わるまで動かない)。
-#[inline(always)]
-fn local_apply_tls() -> *const std::cell::Cell<LocalApplyTls> {
-    IN_LOCAL_APPLY.with(|d| d as *const _)
-}
-
-/// この thread の門の shard の番号 ([`LocalApplyTls::shard`] に控える)。 `t` は呼び手が読んだ [`IN_LOCAL_APPLY`] の中身 (控えたら
-/// 呼び手が書き戻す)。
-#[inline(always)]
-fn local_apply_shard(t: &mut LocalApplyTls) -> usize {
-    if t.shard == u32::MAX {
-        t.shard = crate::write_gate::shard_index() as u32;
-    }
-    t.shard as usize
-}
-
 /// 行の削除 ([`Engine::local_apply_row`]) が入る、 値のある紐の番号の並び。 呼び手の stack に置く (#1016: 前は削除のたびに
 /// `Vec` を 2 つ確保した)。 `LocalApply` が借りている間は動かない ([`GatesStepOut`] が中身の番地を読む)。
 pub(crate) struct RowHids {
+    /// inline に入っている数 (heap に移った後は進めない。 並びは [`Self::as_slice`] で読む)
     len: usize,
     inline: [u16; ROW_HIDS_INLINE],
     /// inline に入らない時だけ (全部をここに移す)
@@ -1627,9 +1601,11 @@ mod row_hids_tests {
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 
-    /// #1016: 行の削除が、 後ろの紐 y の門が閉じているのを見たら、 先に入った紐 x の門を出てから y の止める側を待つ (`Intents::Row` に
+    /// #1016: 行の削除が、 後ろの紐 y の門が閉じているのを見たら、 先に入った紐 x の門を出てから y の止める側を待つ (`RowGates` に
     /// 移した入り方。 入ったまま待つと、 x を止める側が削除を待ち、 削除は y を待つ)。 y を止めている間に x を止める側が始められる
-    /// ことを見る。 削除が x に入って引き返すまでの間は時間で取る (間に合わない回は見逃すだけで、 落ちはしない)。
+    /// ことを見る。 最後に x と y の止める側が上限の内に通ることも見る (引き返す時に入っていない門を出ると、 その門の数えが負になり、
+    /// 止める側が待ち続ける)。 削除が x に入って引き返すまでの間は時間 (200 ms) で取る: 間に合わず x の止める側が先に x を閉じた回は、
+    /// 削除が x の前で待つので素通りで通る (見逃すだけで、 落ちはしない)。 退行した時は join の前に落とす (止まらない)。
     #[test]
     fn a_delete_that_meets_a_closed_gate_leaves_the_gates_it_entered() {
         use std::sync::mpsc::channel;
@@ -1668,6 +1644,8 @@ mod row_hids_tests {
             std::thread::spawn(move || eng.delete(row))
         };
         std::thread::sleep(Duration::from_millis(200));
+        // 前提: 削除は y の門の前で待っている (ここまでの道は y の止める側で止まらない)
+        assert!(!deleter.is_finished(), "前提: 削除が y の止める側を待たずに終わった");
         // y を止めている間に、 x を止める側が始められる
         let (x_tx, x_rx) = channel();
         {
@@ -1677,35 +1655,60 @@ mod row_hids_tests {
                 let _ = x_tx.send(());
             });
         }
-        let x_started = x_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        if x_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+            // 削除が x に入ったまま y を待った。 y を放しても、 削除は閉じた x を待ち、 x の止める側は x の中の削除を待つ (join すると
+            // 止まるので、 thread は残したまま落とす)
+            let _ = release_tx.send(());
+            panic!("y を止めている間に、 削除が x の門に入ったまま待った (x を止める側が始められない)");
+        }
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+        let t0 = std::time::Instant::now();
+        while !deleter.is_finished() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "y を放した後も削除が終わらない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         deleter.join().unwrap();
-        let _ = x_rx.recv_timeout(Duration::from_secs(20));
-        let gone = !eng.is_live(row);
+        assert!(!eng.is_live(row), "止める側が放した後に行が消えていない");
+        // 削除が x と y の門を (入った分だけ) 出ていれば、 どちらの止める側も通る
+        let (g_tx, g_rx) = channel();
+        {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                drop(eng.himos[x].write_guard());
+                drop(eng.himos[y].write_guard());
+                let _ = g_tx.send(());
+            });
+        }
+        assert!(g_rx.recv_timeout(Duration::from_secs(20)).is_ok(), "削除の後も x / y の門の数えが合わない (止める側が待ち続ける)");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
-        assert!(x_started, "y を止めている間に、 削除が x の門に入ったまま待った (x を止める側が始められない)");
-        assert!(gone, "止める側が放した後に行が消えていない");
     }
 }
 
-/// [`LocalApply`] が入った門。 持つだけ (drop で出る)。
+
+/// [`LocalApply`] が入った門 ([`crate::write_gate::IntentGate`])。 持つだけ (drop で出る)。
 enum Intents<'a> {
     None,
     One(#[allow(dead_code, reason = "持つだけ (drop で門を出る)")] crate::write_gate::IntentPass<'a>),
-    /// 行の削除: 値のある紐 (`hids`) の全部の門に shard `shard` で入っている (drop で全部出る)
-    Row { eng: &'a Engine, hids: &'a RowHids, shard: usize },
+    /// 行の削除: 値のある紐の全部の門に入っている (drop で全部出る)
+    Row(RowGates<'a>),
 }
 
-impl Drop for Intents<'_> {
+/// 行の削除 ([`Engine::local_apply_row`]) が入った門: `hids` の先頭 `n` 本 (`HimoStore::try_write_intent_raw`)。 drop で出る
+/// (入る途中で引き返す時も、 入った分だけを出る)。 #1016: 前は入った印を `Vec<IntentPass>` に積んだ (削除のたびに確保)。
+struct RowGates<'a> {
+    eng: &'a Engine,
+    hids: &'a RowHids,
+    n: usize,
+}
+
+impl Drop for RowGates<'_> {
     #[inline]
     fn drop(&mut self) {
-        if let Intents::Row { eng, hids, shard } = self {
-            for &h in hids.as_slice() {
-                eng.himos[h as usize].leave_write_intent_shard(*shard);
-            }
+        for &h in &self.hids.as_slice()[..self.n] {
+            self.eng.himos[h as usize].leave_write_intent_raw();
         }
     }
 }
@@ -1721,58 +1724,54 @@ impl Drop for Intents<'_> {
 ///   落とす時 (印を外した後) に回す (同じ理由。 Leaf は untie / delete が旧 slot を返す所、 #873 の 2 回目のレビュー)
 ///
 /// 落とすと、 印を外して門を出てから、 辞書 / Leaf の書き出しが要れば書き出す。 当て終える前に落とさないこと。
-///
-/// #1016: 書き込み 1 回の値段を減らした。 作る道と落とす道は呼び元に入れ (前は呼び出しと 64 B の struct の受け渡し)、 thread-local は
-/// 作る時に 1 回だけ引く (番地を持ち、 門の shard の番号も同じ thread-local に控える)。 辞書の書き出しは、 当てる間に語を返した時だけ
-/// 見る。
 pub(crate) struct LocalApply<'a> {
     eng: &'a Engine,
     mark: WalApplying<'a>,
     intents: Intents<'a>,
-    /// この thread の `IN_LOCAL_APPLY` (深さを上げた時だけ。 null = 上げていない)。 thread が終わるまで動かない。 `LocalApply` は
-    /// 別の thread へ渡らない (この欄と `mark` の `Applying` が !Send)
-    tls: *const std::cell::Cell<LocalApplyTls>,
+    /// `IN_LOCAL_APPLY` を上げたか
+    counted: bool,
 }
 
 impl<'a> LocalApply<'a> {
-    /// 紐 `hid` 1 本への書き込み ([`Engine::local_apply`])。 門に入ってから (止める側が居れば待ってから) 深さを上げる。
-    #[inline(always)]
-    fn one(eng: &'a Engine, wal: &'a enchudb_oplog::oplog::OpLog, hid: usize) -> Self {
-        let tls = local_apply_tls();
-        // SAFETY: この thread の thread-local (`local_apply_tls`)
-        let d = unsafe { &*tls };
-        let mut t = d.get();
-        let shard = local_apply_shard(&mut t);
-        // 門で待つ間 (止める側の `closer`) この thread は他に何もしないので、 読んだ中身は変わらない
-        let pass = eng.himos[hid].write_intent_shard(shard);
-        if t.bits & LOCAL_APPLY_DEPTH == 0 {
-            t = LocalApplyTls { one: pass.gate(), ..t.without_gates() };
-        }
-        t.bits += 1;
-        d.set(t);
-        Self { eng, mark: Some(wal.applying()), intents: Intents::One(pass), tls }
+    #[inline]
+    fn new(eng: &'a Engine, wal: &'a enchudb_oplog::oplog::OpLog, intents: Intents<'a>) -> Self {
+        IN_LOCAL_APPLY.with(|d| {
+            let mut t = d.get();
+            if t.bits & LOCAL_APPLY_DEPTH == 0 {
+                (t.one, t.eng, t.row, t.row_len) = match &intents {
+                    Intents::None => (std::ptr::null(), std::ptr::null(), std::ptr::null(), 0),
+                    Intents::One(p) => (p.gate() as *const _, std::ptr::null(), std::ptr::null(), 0),
+                    Intents::Row(g) => {
+                        let row = &g.hids.as_slice()[..g.n];
+                        (std::ptr::null(), g.eng as *const Engine, row.as_ptr(), row.len())
+                    }
+                };
+            }
+            t.bits += 1;
+            d.set(t);
+        });
+        Self { eng, mark: Some(wal.applying()), intents, counted: true }
     }
 
     /// WAL の無い engine (印も門も要らない)。
-    #[inline(always)]
+    #[inline]
     fn off(eng: &'a Engine) -> Self {
-        Self { eng, mark: None, intents: Intents::None, tls: std::ptr::null() }
+        Self { eng, mark: None, intents: Intents::None, counted: false }
     }
 
     /// #978: 印も門も持たず、 辞書と Leaf の旧 slot の書き出しを落とす時まで回さないだけの物 (削除の門の中で、 本体の書き出しを
     /// 呼ばない = 門を閉じて自分を待たない)。 自分の書き込みの `LocalApply` の中なら、 書き出しはいちばん外が落ちる時。
     #[inline]
     fn deferring_settles(eng: &'a Engine) -> Self {
-        let tls = local_apply_tls();
-        // SAFETY: この thread の thread-local (`local_apply_tls`)
-        let d = unsafe { &*tls };
-        let mut t = d.get();
-        if t.bits & LOCAL_APPLY_DEPTH == 0 {
-            t = t.without_gates();
-        }
-        t.bits += 1;
-        d.set(t);
-        Self { eng, mark: None, intents: Intents::None, tls }
+        IN_LOCAL_APPLY.with(|d| {
+            let mut t = d.get();
+            if t.bits & LOCAL_APPLY_DEPTH == 0 {
+                (t.one, t.eng, t.row, t.row_len) = (std::ptr::null(), std::ptr::null(), std::ptr::null(), 0);
+            }
+            t.bits += 1;
+            d.set(t);
+        });
+        Self { eng, mark: None, intents: Intents::None, counted: true }
     }
 
     /// `Engine::append_local_op` に渡す印。
@@ -1786,32 +1785,38 @@ impl<'a> LocalApply<'a> {
     #[inline]
     fn row_valued(&self) -> Option<&[u16]> {
         match &self.intents {
-            Intents::Row { hids, .. } => Some(hids.as_slice()),
+            Intents::Row(g) => Some(g.hids.as_slice()),
             _ => None,
         }
     }
 }
 
 impl Drop for LocalApply<'_> {
-    #[inline(always)]
+    #[inline]
     fn drop(&mut self) {
         // 印を外し (書き出しが覆う)、 門を出る (止める側が始められる)
         drop(self.mark.take());
         drop(std::mem::replace(&mut self.intents, Intents::None));
-        if !self.tls.is_null() {
-            // SAFETY: 作った thread の thread-local (`LocalApply` は別の thread へ渡らない)
-            let d = unsafe { &*self.tls };
-            let mut t = d.get();
-            let n = t.bits - 1;
-            if n & LOCAL_APPLY_DEPTH == 0 {
-                d.set(LocalApplyTls { bits: 0, ..t.without_gates() });
-                // 当てる間に回した辞書 / Leaf の書き出し (印を外した後なので、 msync が長くても checkpoint を止めない)
-                if n & (WORD_SETTLE_AFTER_APPLY | LEAF_SETTLE_AFTER_APPLY) != 0 {
-                    self.eng.settle_after_apply(n);
+        if self.counted {
+            // いちばん外の LocalApply なら Some(当てる間に立てた書き出しの bit)
+            let outer = IN_LOCAL_APPLY.with(|d| {
+                let mut t = d.get();
+                let n = t.bits - 1;
+                if n & LOCAL_APPLY_DEPTH == 0 {
+                    d.set(LocalApplyTls::EMPTY);
+                    Some(n)
+                } else {
+                    t.bits = n;
+                    d.set(t);
+                    None
                 }
-            } else {
-                t.bits = n;
-                d.set(t);
+            });
+            // 当てる間に回した辞書 / Leaf の書き出し (印を外した後なので、 msync が長くても checkpoint を止めない)。 #1016: 辞書は
+            // 当てる間に語を返した時だけ見る (前は落とすたびに見た)
+            if let Some(bits) = outer
+                && bits & (WORD_SETTLE_AFTER_APPLY | LEAF_SETTLE_AFTER_APPLY) != 0
+            {
+                self.eng.settle_after_apply(bits);
             }
         }
     }
@@ -1841,7 +1846,7 @@ impl GatesStepOut {
             vec![t.one]
         } else if !t.eng.is_null() && !t.row.is_null() {
             // SAFETY: `eng` / `row` は今この thread で生きている行の削除の `LocalApply` が借りている engine と `RowHids` の中身 (その
-            // append の中から呼ぶ。 落とす時に `IN_LOCAL_APPLY` から外す)。 読むのは門の住所だけ
+            // append の中から呼ぶ。 落とす時に `IN_LOCAL_APPLY` を空にする)。 読むのは門の住所だけ
             let (eng, hids) = unsafe { (&*t.eng, std::slice::from_raw_parts(t.row, t.row_len)) };
             hids.iter().map(|&h| eng.himos[h as usize].intent_gate() as *const _).collect()
         } else {
@@ -21621,10 +21626,10 @@ impl Engine {
     /// #850: これから WAL に積んで本体に当てる、 紐 `hid` 1 本への書き込みの間に持つ物 ([`LocalApply`])。 行の lock を握った後・
     /// 積む前に作り、 当て終えたら落とす。 `hid` を長く止める側 (円柱を組む / 並びの索引を作る / 列を数える) が居れば、 ここで
     /// (印を持つ前に) 終わるのを待つ。 WAL が無ければ何もしない。
-    #[inline(always)]
+    #[inline]
     fn local_apply(&self, hid: usize) -> LocalApply<'_> {
         match self.oplog.as_ref() {
-            Some(wal) => LocalApply::one(self, wal, hid),
+            Some(wal) => LocalApply::new(self, wal, Intents::One(self.himos[hid].write_intent())),
             None => LocalApply::off(self),
         }
     }
@@ -21657,31 +21662,20 @@ impl Engine {
             }
         }
         let hids: &'a RowHids = hids;
-        let tls = local_apply_tls();
-        // SAFETY: この thread の thread-local (`local_apply_tls`)
-        let d = unsafe { &*tls };
-        let mut t = d.get();
-        let shard = local_apply_shard(&mut t);
-        'retry: loop {
-            for (i, &h) in hids.as_slice().iter().enumerate() {
-                if !self.himos[h as usize].try_write_intent_shard(shard) {
-                    for &g in &hids.as_slice()[..i] {
-                        self.himos[g as usize].leave_write_intent_shard(shard);
-                    }
+        let gates = 'retry: loop {
+            let mut g = RowGates { eng: self, hids, n: 0 };
+            for &h in hids.as_slice() {
+                if !self.himos[h as usize].try_write_intent_raw() {
+                    // 入った分 (`hids[..n]`) を出てから待つ
+                    drop(g);
                     self.himos[h as usize].wait_write_intent();
                     continue 'retry;
                 }
+                g.n += 1;
             }
-            break;
-        }
-        // 門で待つ間 (止める側の `closer`) この thread は他に何もしないので、 読んだ中身は変わらない
-        if t.bits & LOCAL_APPLY_DEPTH == 0 {
-            let row = hids.as_slice();
-            t = LocalApplyTls { eng: self as *const Engine, row: row.as_ptr(), row_len: row.len(), ..t.without_gates() };
-        }
-        t.bits += 1;
-        d.set(t);
-        LocalApply { eng: self, mark: Some(wal.applying()), intents: Intents::Row { eng: self, hids, shard }, tls }
+            break g;
+        };
+        LocalApply::new(self, wal, Intents::Row(gates))
     }
 
     /// #553 / #554: WAL に載らなかった書き込みを断る (呼び手は本体に当てない)。 計上して返す。

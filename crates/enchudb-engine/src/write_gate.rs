@@ -48,24 +48,14 @@ pub(crate) struct WriteGate {
     shards: Box<[Shard]>,
 }
 
-/// この thread が使う shard (全部の門で同じ番号)。 #1016: 中身が定数で始まる thread-local (初めの 1 回だけ番号を引く)。 前の形
-/// (初期化の closure を持つ thread-local) は、 読むたびに 「初期化したか」 を見た。 engine の自分の書き込み (`LocalApply`) は、 この
-/// 番号を自分の thread-local に控えて [`IntentGate::try_enter_shard`] に渡す (書き込み 1 回で thread-local を 1 回だけ引く)。
+/// この thread が使う shard (全部の門で同じ番号)。
 #[inline]
-pub(crate) fn shard_index() -> usize {
+fn shard_index() -> usize {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
-        static IDX: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+        static IDX: usize = NEXT.fetch_add(1, Ordering::Relaxed) % SHARDS;
     }
-    IDX.with(|c| {
-        let i = c.get();
-        if i != u32::MAX {
-            return i as usize;
-        }
-        let i = (NEXT.fetch_add(1, Ordering::Relaxed) % SHARDS) as u32;
-        c.set(i);
-        i as usize
-    })
+    IDX.with(|i| *i)
 }
 
 impl Default for WriteGate {
@@ -83,13 +73,7 @@ impl WriteGate {
     /// 開いていれば入り、 出るまで持つ印を返す。 閉じていれば None (呼び手は `write_lock` の道へ)。
     #[inline]
     pub(crate) fn try_enter(&self) -> Option<Pass<'_>> {
-        self.try_enter_shard(shard_index())
-    }
-
-    /// [`Self::try_enter`] の、 この thread の shard の番号 ([`shard_index`]) を呼び手が渡す版。
-    #[inline]
-    fn try_enter_shard(&self, shard: usize) -> Option<Pass<'_>> {
-        let s = &self.shards[shard % SHARDS].0;
+        let s = &self.shards[shard_index()].0;
         // Acquire: 開けた側の Release と対 (開ける前に置いた購読や索引が見える)
         if s.fetch_add(1, Ordering::Acquire) & CLOSED == 0 {
             Some(Pass { shard: s })
@@ -197,8 +181,8 @@ impl IntentGate {
         Self { gate: WriteGate::new(), closer: parking_lot::Mutex::new(()) }
     }
 
-    /// 入る。 閉じていれば、 止める側が終わるのを待ってから入り直す。 (#1016: engine は shard を控えた [`Self::enter_shard`] を使う)
-    #[cfg(test)]
+    /// 入る。 閉じていれば、 止める側が終わるのを待ってから入り直す。
+    #[inline]
     pub(crate) fn enter(&self) -> IntentPass<'_> {
         loop {
             if let Some(p) = self.try_enter() {
@@ -210,30 +194,21 @@ impl IntentGate {
 
     /// 開いていれば入る (待たない)。 いくつもの門に入る書き手 (delete) は、 1 つでも閉じていれば入った分を出てから待つ
     /// ([`Self::wait`]、 入ったまま待つと、 止める側が 2 本の紐を順に止める間に互いに待つ)。
-    #[cfg(test)]
-    pub(crate) fn try_enter(&self) -> Option<IntentPass<'_>> {
-        self.try_enter_shard(shard_index())
-    }
-
-    /// [`Self::try_enter`] の、 この thread の shard の番号 ([`shard_index`] の値) を呼び手が渡す版 (#1016: engine の `LocalApply` は
-    /// 番号を自分の thread-local に控え、 書き込みのたびに門の thread-local を引かない)。 別の thread の番号を渡さないこと
-    /// ([`Self::step_out`] / [`Self::try_step_in`] は [`shard_index`] で同じ shard を引く)。
     #[inline]
-    pub(crate) fn try_enter_shard(&self, shard: usize) -> Option<IntentPass<'_>> {
-        debug_assert_eq!(shard, shard_index(), "IntentGate: 別の thread の shard");
-        let pass = self.gate.try_enter_shard(shard)?;
+    pub(crate) fn try_enter(&self) -> Option<IntentPass<'_>> {
+        let pass = self.gate.try_enter()?;
         #[cfg(debug_assertions)]
         held::push(self);
         Some(IntentPass { _pass: pass, gate: self })
     }
 
-    /// [`Self::try_enter_shard`] の、 入った印を返さない版 (いくつもの門に入る行の削除、 engine の `RowHids` で門を覚える)。 入れたら
-    /// true: 呼び手は同じ thread・同じ shard の [`Self::leave_shard`] で出る。
+    /// [`Self::try_enter`] の、 入った印を返さない版 (いくつもの門に入る行の削除。 engine の `RowHids` で入った門を覚える)。 入れたら
+    /// true: 呼び手は同じ thread の [`Self::leave_raw`] で出る。 #1016: 前は入った印を削除のたびに `Vec` に積んだ。
     #[inline]
-    pub(crate) fn try_enter_shard_raw(&self, shard: usize) -> bool {
-        match self.try_enter_shard(shard) {
+    pub(crate) fn try_enter_raw(&self) -> bool {
+        match self.try_enter() {
             Some(p) => {
-                // 出るのは `leave_shard` (shard の数を下げ、 debug build は入っている門の控えから外す)
+                // 出るのは `leave_raw` (shard の数を下げ、 debug build は入っている門の控えから外す)
                 std::mem::forget(p);
                 true
             }
@@ -241,24 +216,14 @@ impl IntentGate {
         }
     }
 
-    /// [`Self::try_enter_shard_raw`] で入った門を出る (`IntentPass` の drop と同じ)。
+    /// [`Self::try_enter_raw`] で入った門を出る (`IntentPass` の drop と同じ: debug build の控えから外し、 shard の数を下げる)。
+    /// 入った thread で呼ぶ (shard は thread ごと)。
     #[inline]
-    pub(crate) fn leave_shard(&self, shard: usize) {
+    pub(crate) fn leave_raw(&self) {
         #[cfg(debug_assertions)]
         held::remove(self);
         // Release: 閉じる側の Acquire と対 (門の中で書いた cell が見える、 `Pass` の drop と同じ)
-        self.gate.shards[shard % SHARDS].0.fetch_sub(1, Ordering::Release);
-    }
-
-    /// [`Self::enter`] の、 shard の番号を呼び手が渡す版 ([`Self::try_enter_shard`])。
-    #[inline]
-    pub(crate) fn enter_shard(&self, shard: usize) -> IntentPass<'_> {
-        loop {
-            if let Some(p) = self.try_enter_shard(shard) {
-                return p;
-            }
-            self.wait();
-        }
+        self.gate.shards[shard_index()].0.fetch_sub(1, Ordering::Release);
     }
 
     /// #896: この thread が入っている門を一時出る ([`Self::try_step_in`] で入り直す)。 中でまだ何も積んでいない間だけ呼ぶ (WAL の

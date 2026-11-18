@@ -1223,25 +1223,24 @@ impl HimoStore {
     }
 
     /// #850 の後: WAL に積んで本体に当てる自分の書き込みが、 **積む前に** 入る ([`IntentGate`])。 この紐を長く止める側が居れば
-    /// 終わるまで待つ。 持っている間 (当て終えるまで) 止める側は始まらない。 当てる前に drop しないこと。 `shard` はこの thread の
-    /// 門の shard の番号 (`write_gate::shard_index` の値、 #1016: 呼び手が控えた番号を渡す)。
-    #[inline(always)]
-    pub(crate) fn write_intent_shard(&self, shard: usize) -> IntentPass<'_> {
-        self.intent.enter_shard(shard)
+    /// 終わるまで待つ。 持っている間 (当て終えるまで) 止める側は始まらない。 当てる前に drop しないこと。
+    #[inline]
+    pub(crate) fn write_intent(&self) -> IntentPass<'_> {
+        self.intent.enter()
     }
 
-    /// [`write_intent_shard`](Self::write_intent_shard) の、 待たず印も返さない版 (いくつもの紐に入る行の削除。 入れなければ入った分を
-    /// [`leave_write_intent_shard`](Self::leave_write_intent_shard) で出て [`wait_write_intent`](Self::wait_write_intent))。 入れたら
-    /// true (呼び手が同じ shard で出る)。
+    /// [`write_intent`](Self::write_intent) の、 待たず印も返さない版 (いくつもの紐に入る行の削除。 入れなければ入った分を
+    /// [`leave_write_intent_raw`](Self::leave_write_intent_raw) で出て [`wait_write_intent`](Self::wait_write_intent))。 入れたら
+    /// true (呼び手が同じ thread で出る)。
     #[inline]
-    pub(crate) fn try_write_intent_shard(&self, shard: usize) -> bool {
-        self.intent.try_enter_shard_raw(shard)
+    pub(crate) fn try_write_intent_raw(&self) -> bool {
+        self.intent.try_enter_raw()
     }
 
-    /// [`try_write_intent_shard`](Self::try_write_intent_shard) で入った門を出る。
+    /// [`try_write_intent_raw`](Self::try_write_intent_raw) で入った門を出る。
     #[inline]
-    pub(crate) fn leave_write_intent_shard(&self, shard: usize) {
-        self.intent.leave_shard(shard);
+    pub(crate) fn leave_write_intent_raw(&self) {
+        self.intent.leave_raw();
     }
 
     /// この紐の [`IntentGate`] (#896: WAL の空きを待つ間に書き手が出る門、 engine の `GatesStepOut`)。
