@@ -24804,10 +24804,12 @@ impl Engine {
         // (entities) を gen.seg より先に書き出すので、 先に下ろすと、 その間の電源断の像で印 (と上げた世代) だけを失い、 次の open は
         // 「死んでいて生きていない」 場所として何も拾わない (後始末を失い、 使い回しの途中の像では上げた世代を失って番号をもう一度渡す)。
         // 書き出せなければ開くのを断る (生きている印は下ろしていない = 次の open がもう一度ここで拾う)。 拾った場所がある時だけ
+        // 書き出しは拾った場所を覆う 1 つの範囲 (msync 1 回。 間の汚れていない page は書かない)
         #[cfg(not(target_arch = "wasm32"))]
-        for &(slot, _) in &rows {
-            let (off, len) = crate::generation::Generations::slot_range(slot);
-            self.backing.flush_kind(SegmentKind::Gen, off, len)?;
+        if let (Some(&(lo, _)), Some(&(hi, _))) = (rows.iter().min_by_key(|r| r.0), rows.iter().max_by_key(|r| r.0)) {
+            let (off, _) = crate::generation::Generations::slot_range(lo);
+            let (end, len) = crate::generation::Generations::slot_range(hi);
+            self.backing.flush_kind(SegmentKind::Gen, off, end + len - off)?;
         }
         for &(slot, row) in &rows {
             self.live_free(slot, Some(row));
