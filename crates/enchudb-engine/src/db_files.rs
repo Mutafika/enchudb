@@ -369,6 +369,9 @@ pub(crate) fn sync_file(f: &std::fs::File, how: SyncKind) -> io::Result<SyncKind
         }
         // 受けない file system (APFS / HFS の外) と失敗: disk に届くまで書き出す (失敗ならそちらが Err を返す)
     }
+    // 順の印の無い OS は、 どちらを頼まれても disk まで
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = how;
     f.sync_all()?;
     Ok(SyncKind::Durable)
 }
