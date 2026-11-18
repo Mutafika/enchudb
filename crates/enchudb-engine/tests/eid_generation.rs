@@ -177,6 +177,49 @@ fn the_file_moves_to_v15_only_when_a_slot_is_reused() {
     assert!(eng.pull_raw("full.x", 1u32).is_empty());
 }
 
+/// gen.seg の magic (先頭 4 byte)。
+fn gen_magic(db: &str) -> [u8; 4] {
+    let g = std::fs::read(std::path::Path::new(db).join("gen.seg")).unwrap();
+    g[0..4].try_into().unwrap()
+}
+
+/// #992 / #1008: gen.seg の形は `GEN3` (場所ごとの 2 B に 「最後の行は 今 − 2」 と 「後始末待ち」 の印)。 前の形 (`GEN2`、 その bit は
+/// 使わない = 0) の gen.seg は読めて、 書き手として開くと `GEN3` に上げる (印を書く前に。 `GEN2` だけを読む前の binary は上げた DB を
+/// 断る)。 readonly は上げない。 像は今の binary が作った v15 の DB の magic を `GEN2` に書き戻した物 (前の binary の DB と byte で同じ:
+/// 前の binary の作った DB は 2 B の上の 2 つの bit を書かない)。
+#[test]
+fn a_gen2_segment_is_upgraded_to_gen3_by_a_writer_open() {
+    let path = tmp_path("gen2");
+    let _c = Cleanup(path.clone());
+    let (a, b) = {
+        let mut eng = create_standalone(&path, 4);
+        let a = eng.entity_in("full").unwrap();
+        eng.tie_to(a, "full.x", 1u32);
+        eng.delete(a);
+        let b = eng.entity_in("full").unwrap();
+        eng.tie_to(b, "full.x", 2u32);
+        eng.flush().unwrap();
+        (a, b)
+    };
+    assert_eq!(file_version(&path), 15, "前提: 使い回して v15 に移った");
+    assert_eq!(&gen_magic(&path), b"GEN3", "新しく作った gen.seg が GEN3 でない");
+    let seg = std::path::Path::new(&path).join("gen.seg");
+    let mut bytes = std::fs::read(&seg).unwrap();
+    bytes[0..4].copy_from_slice(b"GEN2");
+    std::fs::write(&seg, &bytes).unwrap();
+    {
+        let ro = Engine::open_readonly(&path).unwrap();
+        assert!(ro.is_live(b) && !ro.is_live(a), "GEN2 の gen.seg を読めない");
+    }
+    assert_eq!(&gen_magic(&path), b"GEN2", "readonly の open が gen.seg を書いた");
+    {
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert!(eng.is_live(b) && !eng.is_live(a), "GEN2 の gen.seg を書き手として読めない");
+        assert_eq!(eng.get(b, "full.x"), Some(2));
+    }
+    assert_eq!(&gen_magic(&path), b"GEN3", "書き手の open が GEN2 の gen.seg を GEN3 に上げていない");
+}
+
 /// 世代を持つ前 (v14) は、 消えた行の古い eid への書き込みを断れない (死んだ場所に cell が残る)。 その場所を使い回した行には、
 /// その cell が残らない (使い回す時に落とす)。
 #[test]
