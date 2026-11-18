@@ -2574,7 +2574,7 @@ fn sync_dir(dir: &std::path::Path) {
 #[cfg(feature = "crashsim")]
 #[doc(hidden)]
 pub mod write_out_hook {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Phase {
@@ -2623,22 +2623,61 @@ pub mod write_out_hook {
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static HOOK: super::hook_slot::Slot<dyn Fn(Phase) + Send + Sync> = super::hook_slot::Slot::new();
 
-    /// 前の hook は lock を放してから、 新しい hook を置く前に落とす。 hook を外す前に panic した試験は、 engine の `Arc` を持つ hook を
-    /// 残す。 それを落とすと engine の Drop が consumer を待ち、 consumer の最後の書き出しは `call` でこの lock を取る: 前は lock を
-    /// 持ったまま落とし、 互いを待って止まり続けた (PR #997 に master を取り込んだ所で power_loss が約 21 時間止まった)。 新しい hook を
-    /// 置く前に落とすので、 前の engine の最後の書き出しが新しい hook を呼ぶこともない。
+    /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`])。
     pub fn set(hook: Option<Hook>) {
-        let old = HOOK.lock().unwrap_or_else(|p| p.into_inner()).take();
-        drop(old);
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+        HOOK.set(hook);
     }
 
     pub(crate) fn call(phase: Phase) {
-        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if let Some(h) = hook {
-            h(phase);
+        HOOK.with(|h| h(phase));
+    }
+}
+
+/// 試験の hook (crashsim feature) の置き場。 process に 1 つ (どの engine からも呼ぶ)。
+///
+/// `set` は前の hook を取り出して lock を放してから落とし、 新しい hook を置く (置く時に間に置かれた hook も lock の外で落とす)。 前は
+/// lock を持ったまま落とした: hook を外す前に panic した試験は engine の `Arc` を持つ hook を残し、 次の試験の `set` がそれを落とすと
+/// engine の Drop が consumer を待ち、 consumer の最後の書き出しが `call` で同じ lock を待って止まり続けた (PR #997 に master を取り込んだ
+/// 所で power_loss が約 21 時間止まった)。 新しい hook を置く前に落とすので、 前の engine の最後の書き出しは新しい hook を呼ばない
+/// (下の `with` が最後の持ち手になった時を除く)。
+///
+/// `with` は hook の写し (`Arc`) を持って lock の外で呼ぶ (hook の中で止まっても `set` を止めない)。 その間に `set` が外すと、 最後の
+/// `Arc` は呼んだ thread が持つ。 それが hook の持つ engine の consumer なら、 落とすと engine の Drop が自分を join する。 そこで最後の
+/// 持ち手になった `with` は、 落とすのを別の thread に回す (最後かは `Arc::into_inner` が 1 回の操作で決める)。
+#[cfg(feature = "crashsim")]
+mod hook_slot {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    pub(crate) struct Slot<F: ?Sized>(Mutex<Option<Arc<Arc<F>>>>);
+
+    impl<F: ?Sized + Send + Sync + 'static> Slot<F> {
+        pub(crate) const fn new() -> Self {
+            Slot(Mutex::new(None))
+        }
+
+        pub(crate) fn set(&self, hook: Option<Arc<F>>) {
+            let old = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+            drop(old);
+            let between = std::mem::replace(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner), hook.map(Arc::new));
+            drop(between);
+        }
+
+        pub(crate) fn is_set(&self) -> bool {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+        }
+
+        /// 置いてある hook を lock の外で `f` に渡す。
+        pub(crate) fn with(&self, f: impl FnOnce(&F)) {
+            let hook = self.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            if let Some(h) = hook {
+                f(&**h);
+                if let Some(last) = Arc::into_inner(h) {
+                    // 外された hook の最後の持ち手。 thread を作れなければ (closure ごと) ここで落ちる
+                    let _ = std::thread::Builder::new().name("enchudb-hook-drop".into()).spawn(move || drop(last));
+                }
+            }
         }
     }
 }
@@ -2744,7 +2783,7 @@ mod name_compactor {
 #[cfg(feature = "crashsim")]
 #[doc(hidden)]
 pub mod name_compact_hook {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Phase {
@@ -2760,25 +2799,21 @@ pub mod name_compact_hook {
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static HOOK: super::hook_slot::Slot<dyn Fn(Phase) + Send + Sync> = super::hook_slot::Slot::new();
 
-    /// 前の hook は lock を放してから落とす (`write_out_hook::set` と同じ: hook が engine の最後の `Arc` を持っていると、 その Drop の
-    /// 閉じる時のまとめ直しが `call` / `consumer_off` でこの lock を取る)。
+    /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`]。 hook が engine の最後の `Arc` を
+    /// 持っていると、 その Drop の閉じる時のまとめ直しが `call` / `consumer_off` でこの lock を取る)。
     pub fn set(hook: Option<Hook>) {
-        let old = std::mem::replace(&mut *HOOK.lock().unwrap_or_else(|p| p.into_inner()), hook);
-        drop(old);
+        HOOK.set(hook);
     }
 
     pub(crate) fn call(phase: Phase) {
-        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if let Some(h) = hook {
-            h(phase);
-        }
+        HOOK.with(|h| h(phase));
     }
 
     /// hook を置いている (consumer の周期はまとめ直しを始めない)。
     pub(crate) fn consumer_off() -> bool {
-        HOOK.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+        HOOK.is_set()
     }
 }
 
@@ -2788,23 +2823,19 @@ pub mod name_compact_hook {
 #[cfg(feature = "crashsim")]
 #[doc(hidden)]
 pub mod apply_point_hook {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static HOOK: super::hook_slot::Slot<dyn Fn() + Send + Sync> = super::hook_slot::Slot::new();
 
-    /// 前の hook は lock を放してから落とす (`write_out_hook::set` と同じ: hook が engine の最後の `Arc` を持っていると、 その Drop が
-    /// 待つ thread の書き込みが `call` でこの lock を取る)。
+    /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`]。 hook が engine の最後の `Arc` を
+    /// 持っていると、 その Drop が待つ thread の書き込みが `call` でこの lock を取る)。
     pub fn set(hook: Option<Hook>) {
-        let old = std::mem::replace(&mut *HOOK.lock().unwrap_or_else(|p| p.into_inner()), hook);
-        drop(old);
+        HOOK.set(hook);
     }
 
     pub(crate) fn call() {
-        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if let Some(h) = hook {
-            h();
-        }
+        HOOK.with(|h| h());
     }
 }
 
@@ -34874,9 +34905,12 @@ impl Engine {
         // = tombstone を閉じた時の tomb.seg で書き出した削除だけ
         let live_and_generations = |k: SegmentKind| matches!(k, SegmentKind::Entities | SegmentKind::Gen);
         // 前の住人の記録 (`prev.seg`) は、 使い回しが生かした印 (entities / gen.seg) と 0 にした tomb.seg より先に。 書き出しの
-        // 間に使い回した分は、 tomb.seg の前に門を閉じてもう一度 (下)。 生きている印より先なのは、 この書き出しの前の使い回しだけ:
-        // ここから entities / gen.seg の書き出しまでの間の使い回しは、 生きている印だけが届いて記録が届かない像がある (review946 [3]、
-        // 残す。 閉じるには 「記録 〜 生かす」 を門に入れ、 その門を prev.seg → entities → gen.seg の書き出しの間閉じる = 使い回しが
+        // 間に使い回した分は、 生きている印の前に削除の門を閉じる所 (`close_deletes` → `write_out_tombs`、 #978) でもう一度書き出す。
+        // 書き出しの段の像で記録が届かずに生きている印が届くのは、 その後 (門を閉じてから生きている印を書き出すまで) の使い回しだけで、
+        // その時は前の住人の tombstone が先に届いている (開くと sweep が使い回した行を消す。 その行の作成は WAL の書き出しの後 = 返って
+        // いない書き込み)。 例外は tomb.seg に書く物が無く `write_out_tombs` が早く返る時 (前の住人の tombstone が 0 の場所の使い回し
+        // など)。 記録も前の住人の tombstone も届かずに使い回した行が届く像 (review946 [3]、 残す) は、 他は OS が msync の前に page を
+        // 書いた時だけ (閉じるには 「記録 〜 生かす」 を門に入れ、 その門を prev.seg → entities → gen.seg の書き出しの間閉じる = 使い回しが
         // 3 回の msync を待つ)
         let prev = |k: SegmentKind| matches!(k, SegmentKind::Prev);
         set.flush_where(all || catch_up, prev)?;

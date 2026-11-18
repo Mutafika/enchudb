@@ -6629,6 +6629,22 @@ fn c2_image(eng: &Arc<Engine>, delete: impl FnOnce() + Send + 'static, live: &Pa
             let _ = self.0.send(Ev::Done);
         }
     }
+    type Deleter = Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>;
+    /// 消す thread が終わるのを待って join する (期限付き)。 hook を外した後に落とす = 門を出て止まったままの消す thread は、 放す合図の
+    /// channel が切れて抜ける (失敗した時も、 engine と行の lock を持った thread を次の試験に残さない)
+    struct JoinDeleter(Deleter);
+    impl Drop for JoinDeleter {
+        fn drop(&mut self) {
+            let Some(h) = self.0.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !h.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
+    }
     let wait = std::time::Duration::from_secs(60);
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Ev>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
@@ -6636,39 +6652,50 @@ fn c2_image(eng: &Arc<Engine>, delete: impl FnOnce() + Send + 'static, live: &Pa
     let [left, returned, done, shot] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
     let (left2, returned2, done2, shot2) = (left.clone(), returned.clone(), done.clone(), shot.clone());
     let (l, i) = (live.to_path_buf(), img.to_path_buf());
+    // `PrevWrittenOut` を踏んだ書き出しの thread (他の段はこの thread の物だけ見る: 消す thread の中の書き出しや、 前の試験の残した
+    // engine の書き出しの段で放す / 撮ると、 前提で落ちるか、 消す thread が `ev_rx` を待って止まる)
+    let writer: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>> = Arc::default();
+    let deleter: Deleter = Arc::default();
+    let (writer2, deleter2) = (writer.clone(), deleter.clone());
+    let _join = JoinDeleter(deleter);
     let _off = HookOff;
-    write_out_hook::set(Some(Arc::new(move |p: Phase| match p {
-        Phase::PrevWrittenOut => {
-            let Some(f) = delete.lock().unwrap().take() else { return };
-            let (tx, returned3) = (DoneOnDrop(ev_tx.clone()), returned2.clone());
-            std::thread::spawn(move || {
-                let _done = tx;
-                C2_DELETER.with(|d| d.set(true));
-                f();
-                returned3.store(true, Ordering::SeqCst);
-            });
-            // 門を出て止まるか、 (門を通らずに) 終わるまで
-            if let Ev::Left = ev_rx.lock().unwrap().recv_timeout(wait).expect("消す thread が 60 秒、 門を出ず終わりもしない") {
-                left2.store(true, Ordering::SeqCst);
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        let on_writer = *writer2.lock().unwrap() == Some(std::thread::current().id());
+        match p {
+            Phase::PrevWrittenOut => {
+                let Some(f) = delete.lock().unwrap().take() else { return };
+                *writer2.lock().unwrap() = Some(std::thread::current().id());
+                let (tx, returned3) = (DoneOnDrop(ev_tx.clone()), returned2.clone());
+                *deleter2.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let _done = tx;
+                    C2_DELETER.with(|d| d.set(true));
+                    f();
+                    returned3.store(true, Ordering::SeqCst);
+                }));
+                // 門を出て止まるか、 (門を通らずに) 終わるまで
+                if let Ev::Left = ev_rx.lock().unwrap().recv_timeout(wait).expect("消す thread が 60 秒、 門を出ず終わりもしない") {
+                    left2.store(true, Ordering::SeqCst);
+                }
             }
+            Phase::DeleteGateLeft if C2_DELETER.with(|d| d.replace(false)) => {
+                let _ = ev_tx.send(Ev::Left);
+                go_rx.lock().unwrap().recv_timeout(wait).expect("書き出しが 60 秒、 門を出た消す thread を放さない");
+            }
+            Phase::BeforeGenerations if on_writer && left2.load(Ordering::SeqCst) && !done2.load(Ordering::SeqCst) => {
+                let _ = go_tx.send(());
+                let ev = ev_rx.lock().unwrap().recv_timeout(wait).expect("放した消す thread が 60 秒で終わらない");
+                assert!(matches!(ev, Ev::Done), "消す thread がもう一度止まった");
+                done2.store(true, Ordering::SeqCst);
+            }
+            Phase::WrittenOut if on_writer && done2.load(Ordering::SeqCst) && !shot2.swap(true, Ordering::SeqCst) => {
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+            _ => {}
         }
-        Phase::DeleteGateLeft if C2_DELETER.with(|d| d.replace(false)) => {
-            let _ = ev_tx.send(Ev::Left);
-            go_rx.lock().unwrap().recv_timeout(wait).expect("書き出しが 60 秒、 門を出た消す thread を放さない");
-        }
-        Phase::BeforeGenerations if left2.load(Ordering::SeqCst) && !done2.load(Ordering::SeqCst) => {
-            let _ = go_tx.send(());
-            let ev = ev_rx.lock().unwrap().recv_timeout(wait).expect("放した消す thread が 60 秒で終わらない");
-            assert!(matches!(ev, Ev::Done), "消す thread がもう一度止まった");
-            done2.store(true, Ordering::SeqCst);
-        }
-        Phase::WrittenOut if done2.load(Ordering::SeqCst) && !shot2.swap(true, Ordering::SeqCst) => {
-            let _ = crashsim::capture(&l, &i, Mode::Lost);
-        }
-        _ => {}
     })));
     eng.oplog_sync().unwrap();
     drop(_off);
+    drop(_join);
     assert!(left.load(Ordering::SeqCst), "前提: 消す thread が削除の門を出た所で止まった (書き出しが門を閉じる前に)");
     assert!(returned.load(Ordering::SeqCst), "前提: 消す thread が (panic せずに) 返った");
     assert!(done.load(Ordering::SeqCst) && shot.load(Ordering::SeqCst), "前提: 生きている印の書き出しの後に消し終え、 書き出しの終わりで撮った");
@@ -6678,7 +6705,8 @@ fn c2_image(eng: &Arc<Engine>, delete: impl FnOnce() + Send + 'static, live: &Pa
 /// 持つ hook を残す。 次の試験の `write_out_hook::set` がその hook を落とすと engine の最後の `Arc` が落ち、 engine の Drop は consumer を
 /// 待つ。 consumer の最後の書き出しは `write_out_hook::call` で hook の lock を取る。 前の `set` は lock を持ったまま前の hook を落とした
 /// ので互いを待ち、 後の試験は全部 `SERIAL` で待った。 ここでは engine の最後の `Arc` を持つ hook を置いて外す (前の形では外す thread が
-/// 返らない。 60 秒で落とす)。
+/// 返らない)。 60 秒で返らなければ process ごと落とす (外す thread は hook の lock を持ったまま止まっているので、 試験を落とすだけでは
+/// この binary の後の試験の書き出しが全部 `write_out_hook::call` で止まる = 21 時間止まった形を作り直す)。
 #[test]
 fn removing_a_hook_that_holds_the_last_engine_returns() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -6701,9 +6729,18 @@ fn removing_a_hook_that_holds_the_last_engine_returns() {
         write_out_hook::set(None);
         let _ = tx.send(());
     });
-    let r = rx.recv_timeout(std::time::Duration::from_secs(60));
+    if rx.recv_timeout(std::time::Duration::from_secs(60)).is_err() {
+        // 試験の出力の受け (`eprintln!`) は abort で捨てられるので、 stderr に直に書く
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "removing_a_hook_that_holds_the_last_engine_returns: engine の最後の `Arc` を持つ hook を外す `write_out_hook::set` が 60 秒返らない \
+             (engine の consumer の最後の書き出しと互いを待った)。 外す thread が hook の lock を持ったまま止まっていて、 この binary の後の試験も \
+             止まるので process ごと落とす"
+        );
+        std::process::abort();
+    }
     let _ = std::fs::remove_dir_all(&root);
-    r.expect("engine の最後の `Arc` を持つ hook を外す `write_out_hook::set` が返らない (engine の consumer の最後の書き出しと互いを待った)");
 }
 
 /// #994 [C2] / Q6 の像: 名前 7 の自分の行 X と、 作成より先に削除 (t_k) を受けた B の世界番号 K (退避表に居る、 #490)。 K を X に束ねる
@@ -7612,10 +7649,10 @@ fn a_relayed_write_to_a_former_alias_does_not_hit_the_new_resident_on_replay() {
     let (x, y, gone) = relayed_write_over_reuse_without_record_image(&live, &img, false);
     crashsim::stop();
     let db = img.join("db");
-    let (ro_b, ro_slot, ro_record, ro_y_alive) = {
+    let (ro_b, ro_slot, ro_record, ro_y_alive, ro_tomb) = {
         let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
         let s = ro.eid_slot(x);
-        (ro.resolve_remote_eid_existing(WORLD_B6).map(|e| ro.eid_slot(e)), s, ro.prev_resident_of_slot(s), ro.is_live(y))
+        (ro.resolve_remote_eid_existing(WORLD_B6).map(|e| ro.eid_slot(e)), s, ro.prev_resident_of_slot(s), ro.is_live(y), ro.tombstone_hlc(x))
     };
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     eng.set_peer_id(1);
@@ -7632,6 +7669,8 @@ fn a_relayed_write_to_a_former_alias_does_not_hit_the_new_resident_on_replay() {
     assert_eq!(ro_b, Some(ro_slot), "前提: 像の `eidalias` は b → X の場所");
     assert!(ro_y_alive, "前提: 本体の場所の住人は Y");
     assert!(ro_record.is_none_or(|r| r.1 != eid_local(x)), "前提: 使い回しの記録 (前の住人 X) は届いていない: {ro_record:x?}");
+    // 届いていると、 開く時の sweep が tombstone で Y を消す (中継の削除が Y に当たった時と同じ落ち方になる)
+    assert_eq!(ro_tomb, Hlc::ZERO, "前提: 前の住人 X の tombstone は届いていない (b の削除の版数 {gone:?})");
     assert!(!x_alive, "前提: 開いた A で X は消えている");
     assert!(y_alive, "中継した b 宛ての削除が、 再生で古い別名から使い回した Y を消した");
     assert_eq!(y_v, None, "中継した b 宛ての書き込みが、 再生で古い別名から使い回した Y に当たった");
@@ -8004,9 +8043,9 @@ fn a_relayed_record_does_not_reach_the_new_resident_through_a_stale_alias(tag: &
     let (x, target, y) = stale_alias_path_image(&live, &img, path);
     crashsim::stop();
     let db = img.join("db");
-    let (ro_y_alive, ro_record) = {
+    let (ro_y_alive, ro_record, ro_tomb) = {
         let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
-        (ro.is_live(y), ro.prev_resident_of_slot(ro.eid_slot(target)))
+        (ro.is_live(y), ro.prev_resident_of_slot(ro.eid_slot(target)), ro.tombstone_hlc(target))
     };
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     eng.set_peer_id(1);
@@ -8019,6 +8058,8 @@ fn a_relayed_record_does_not_reach_the_new_resident_through_a_stale_alias(tag: &
     let _ = std::fs::remove_dir_all(&root);
     assert!(ro_y_alive, "前提: 本体の場所の住人は Y ({path:?})");
     assert!(ro_record.is_none_or(|r| r.1 != eid_local(target)), "前提: 使い回しの記録は届いていない: {ro_record:x?} ({path:?})");
+    // 届いていると、 開く時の sweep が tombstone で Y を消す (中継の削除が Y に当たった時と同じ落ち方になる)
+    assert_eq!(ro_tomb, Hlc::ZERO, "前提: 畳んだ先の tombstone は届いていない ({path:?})");
     assert!(!target_alive, "前提: 開いた A で畳んだ先は消えている ({path:?})");
     assert!(y_alive, "中継した削除が、 再生で古い別名から使い回した Y を消した ({path:?})");
     assert_eq!(y_v, None, "中継した書き込みが、 再生で古い別名から使い回した Y に当たった ({path:?})");
@@ -8080,9 +8121,10 @@ fn a_relayed_delete_through_a_stale_alias_evicts_the_other_aliases_of_the_gone_r
     let (x, y, gone) = relayed_write_over_reuse_without_record_image(&live, &img, true);
     crashsim::stop();
     let db = img.join("db");
-    let (ro_c, ro_slot) = {
+    let (ro_c, ro_slot, ro_record, ro_tomb, ro_y_alive) = {
         let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
-        (ro.resolve_remote_eid_existing(WORLD_C16).map(|e| ro.eid_slot(e)), ro.eid_slot(x))
+        let s = ro.eid_slot(x);
+        (ro.resolve_remote_eid_existing(WORLD_C16).map(|e| ro.eid_slot(e)), s, ro.prev_resident_of_slot(s), ro.tombstone_hlc(x), ro.is_live(y))
     };
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     eng.set_peer_id(1);
@@ -8096,6 +8138,10 @@ fn a_relayed_delete_through_a_stale_alias_evicts_the_other_aliases_of_the_gone_r
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(ro_c, Some(ro_slot), "前提: 像の `eidalias` は c → X の場所");
+    assert!(ro_y_alive, "前提: 本体の場所の住人は Y");
+    assert!(ro_record.is_none_or(|r| r.1 != eid_local(x)), "前提: 使い回しの記録 (前の住人 X) は届いていない: {ro_record:x?}");
+    // 届いていると、 開く時の sweep が tombstone で Y を消す (中継の削除が Y に当たった時と同じ落ち方になる)
+    assert_eq!(ro_tomb, Hlc::ZERO, "前提: 前の住人 X の tombstone は届いていない (b の削除の版数 {gone:?})");
     assert!(y_alive, "前提: 中継した b 宛ての削除は Y を消さない");
     assert_eq!(b_tomb, Some(gone), "前提: 再生した b 宛ての削除が b の削除として退避表に載る");
     assert_ne!(c_at, Some(ro_slot), "前提: 開く道の仕上げが Y より下の世代の c を外した");
