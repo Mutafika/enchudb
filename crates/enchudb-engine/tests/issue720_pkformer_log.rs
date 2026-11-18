@@ -304,10 +304,21 @@ fn a_pkformer_without_a_log_or_with_a_stale_log_is_read_as_it_is() {
     assert!(on_disk(&old) == closed);
     let (back, c) = open(&old);
     assert_eq!(back.pkformer_disk_diff().unwrap(), None);
+    // #1023: 続きの log を作った書き出しは、 `pkformer` へのまとめ直しを頼む (review987 2 回目 [D])。 consumer の周期がまとめ直しの
+    // thread を始めると log は header だけに戻り、 `pkformer` も書き直される。 前は書き出しから log の長さを見るまでの間に consumer の
+    // 周期が来ない事に頼っていて、 Linux の CI で時々落ちた。 書き出しの形を見る間は consumer を止める (走っている物は終わりを待つ)
+    let hold = back.hold_consumer();
     retitle(&back, &c, 3, 2);
     back.persist_sync_state().unwrap();
     assert!(len(&old, PKFORMER_LOG) > LOG_HEADER, "log の無い所に、 変わった分の log を作っていない");
     assert!(bytes(&old, PKFORMER) == closed, "log の無い所の最初の書き出しで pkformer を並べ直した");
+    assert_eq!(back.pkformer_disk_diff().unwrap(), None);
+    drop(hold);
+    // その後のまとめ直しで `pkformer` に並べる (log を読まない 0.37.4 以前も読める)
+    let expect = on_disk(&old);
+    back.compact_name_records_now();
+    assert_eq!(len(&old, PKFORMER_LOG), LOG_HEADER, "続きの log を作った後に pkformer にまとめ直さない");
+    assert!(bytes(&old, PKFORMER) == expect, "まとめ直した pkformer が log を当てた中身と違う");
     assert_eq!(back.pkformer_disk_diff().unwrap(), None);
     drop(back);
     // きれいに閉じた後は `pkformer` に全部ある
