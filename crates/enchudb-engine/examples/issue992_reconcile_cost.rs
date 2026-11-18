@@ -94,10 +94,10 @@ fn open(img: &str) {
     let eng = Engine::open_concurrent_with_oplog(img, OPLOG_CAP).unwrap();
     let opened = t0.elapsed();
     println!(
-        "open {:.2} ms (repairs {:?}, leftovers {})",
+        "open {:.2} ms (repairs {:?}, resumed {})",
         opened.as_secs_f64() * 1e3,
         eng.generation_repairs(),
-        eng.leftover_cell_repairs()
+        eng.resumed_cleanups()
     );
     // 閉じる時間は測らない
     std::process::exit(0);
