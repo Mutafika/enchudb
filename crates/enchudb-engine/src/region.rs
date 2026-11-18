@@ -382,4 +382,38 @@ impl Region {
         );
         unsafe { &*(self.ptr.add(offset) as *const AtomicU8) }
     }
+
+    /// region の先頭が `align` byte に揃っているか (範囲を確かめない読み [`Self::as_atomic_u16_unchecked`] の前提を、 region を置く
+    /// 時に確かめる)。
+    #[inline]
+    pub(crate) fn base_aligned(&self, align: usize) -> bool {
+        (self.ptr as usize).is_multiple_of(align)
+    }
+
+    /// region の先頭の address (#1015: 同じ region の並んだ場所を loop で読む所が、 先頭を loop の外で 1 回だけ読むため)。 読み書きは
+    /// 呼び手が範囲を確かめて atomic で行う。
+    #[inline(always)]
+    pub(crate) fn base_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// [`Self::as_atomic_u8`] の、 範囲を確かめない版 (#1015: 照合の速い道で読む `gen.seg` の page の印)。
+    ///
+    /// # Safety
+    /// `offset < self.len()`。
+    #[inline(always)]
+    pub(crate) unsafe fn as_atomic_u8_unchecked(&self, offset: usize) -> &AtomicU8 {
+        debug_assert!(offset < self.len);
+        unsafe { &*(self.ptr.add(offset) as *const AtomicU8) }
+    }
+
+    /// [`Self::as_atomic_u16`] の、 範囲と揃いを確かめない版 (#1015: 照合の速い道で読む `gen.seg` の場所の 2 B)。
+    ///
+    /// # Safety
+    /// `offset + 2 <= self.len()` で、 `ptr + offset` が 2 byte に揃っていること。
+    #[inline(always)]
+    pub(crate) unsafe fn as_atomic_u16_unchecked(&self, offset: usize) -> &std::sync::atomic::AtomicU16 {
+        debug_assert!(offset + 2 <= self.len && (self.ptr as usize + offset).is_multiple_of(2));
+        unsafe { &*(self.ptr.add(offset) as *const std::sync::atomic::AtomicU16) }
+    }
 }
