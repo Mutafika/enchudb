@@ -103,7 +103,7 @@ fn count_before_append_holds_for_every_uncovered_row() {
 
 /// 対照: 積んでから数える形 (#877 の前) は、 数える前に並んだ `oplog_sync` が Delete を越える (loom が窓を見つける)。
 #[test]
-#[should_panic]
+#[should_panic(expected = "止めずに checkpoint が")]
 fn count_after_append_misses_the_hold() {
     model(true);
 }

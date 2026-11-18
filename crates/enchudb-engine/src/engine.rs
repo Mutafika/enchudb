@@ -1213,7 +1213,8 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             extra: std::sync::RwLock::new(Vec::new()),
-            grown: std::sync::atomic::AtomicBool::new(false),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: None,
         });
     }
@@ -7404,8 +7405,9 @@ mod freed_count_tests {
     /// #1017: 数えが `freed_end` を RMW するのは、 止めの答えが変わる時 (sidecar より先・数えた所より先の行) だけ。 他は読むだけ。
     /// 削除 1 回は数えを 2 回通る (積む前と `apply_delete_in`) が、 RMW は高々 1 回。
     ///
-    /// falsify: 「sidecar が覆う行は読むだけ」 を外すと行 3 で RMW が 2 回、 「数えた所より前は読むだけ」 を外すと数える行ごとに
-    /// 2 回・行 11 / 5 でも 2 回。 境目の比べを 1 つずらすと、 行 10 (= sidecar の値) か行 13 (= 数えた所) を数えない。
+    /// falsify: 「sidecar が覆う行は読むだけ」 を外すと、 行 3 で (freed_end, RMW) = (4, 1) (1 回目の数えで上がり、 2 回目は数えた所
+    /// より前なので読むだけ)。 「数えた所より前は読むだけ」 を外すと、 sidecar より先の行は 1 回の削除で RMW 2 回 (行 10 から。 行 11
+    /// も 2 回、 sidecar が覆う行 3 / 5 は 0 回のまま)。 境目の比べを 1 つずらすと、 行 10 (= sidecar の値) か行 13 (= 数えた所) を数えない。
     #[test]
     fn counting_writes_only_when_the_hold_answer_changes() {
         let (path, eng, a) = plain_db("rmw", 100);
@@ -7529,6 +7531,9 @@ mod freed_count_tests {
 
     /// #1017: sidecar が覆う行の削除は数えない (止めない) が、 落ちた後に開いた DB はその行の eid を払い出さない (開いた
     /// `next_local` は sidecar の値以上)。 消すのは表の最後の行 (生きている行の最大 + 1 では覆わない)。
+    ///
+    /// 論の確認 (master でも通る: 前の code もここでは止めなかった)。 この PR の変異を殺す試験ではない。 像は `cp -R` (page cache の像)
+    /// なので、 sidecar を 「rename + directory の fsync の後に置く」 側の電源断は見ていない。
     #[test]
     fn a_deleted_row_the_sidecar_covers_is_not_handed_out_again() {
         let (path, eng, a) = plain_db("covered", 100);
@@ -7623,8 +7628,8 @@ mod cell_version_cache_tests {
     }
 }
 
-/// #1017: extent を足していない表の `local_of` / `global_of` は `extra` の lock を取らない (削除の道が表をなめるたびに、 閉じた
-/// anonymous の表の lock の語を書き手 8 本で取り合っていた)。 足した表は、 足した extent (開き直した後も) を引ける。
+/// #1017: `local_of` / `global_of` は、 先頭 range と足した extent の先頭 [`EXTRA_FAST`] 個を `extra` の lock なしで引く (削除の道が
+/// 表をなめるたびに、 閉じた anonymous の表や枠を足した表の lock の語を書き手 8 本で取り合っていた)。 越えた分も、 開き直した後も引ける。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod extent_lock_tests {
     use super::*;
@@ -7642,55 +7647,106 @@ mod extent_lock_tests {
         Tmp(format!("{}/enchudb-issue1017-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
     }
 
-    /// `extra` の write lock を持ったまま、 別の thread で表の外の eid を引く (lock を取る形は持ち手が離すまで返らない)。
-    ///
-    /// falsify: `local_of` / `global_of` の `grown` の読みを外すと、 5 秒たっても返らない。
-    #[test]
-    fn an_ungrown_table_answers_without_the_extent_lock() {
-        let tmp = tmp("nolock");
+    fn table<'a>(eng: &'a Engine, name: &str) -> &'a TableDef {
+        eng.tables.iter().find(|t| t.name == name).unwrap()
+    }
+
+    /// 表 t と u に、 交互に `grows` 回ずつ 2 eid の extent を足す (t の extent どうしの間に u の extent が挟まる)。
+    fn grown_db(tag: &str, grows: usize) -> (Tmp, Engine) {
+        let tmp = tmp(tag);
         let mut eng = Engine::create_with_capacity(&tmp.0, 4096).unwrap();
-        eng.define_table("t", 10).unwrap();
-        let x = enchudb_oplog::eid_local(eng.entity_in("t").unwrap());
-        let (anon, t) = (&eng.tables[ANONYMOUS_TABLE as usize], eng.tables.iter().find(|t| t.name == "t").unwrap());
-        assert!(!anon.is_open_ended() && !anon.grown.load(std::sync::atomic::Ordering::Acquire), "前提: 閉じた anonymous、 extent なし");
+        eng.define_table("t", 4).unwrap();
+        eng.define_table("u", 4).unwrap();
+        for _ in 0..grows {
+            eng.grow_table("t", 2).unwrap();
+            eng.grow_table("u", 2).unwrap();
+        }
+        (tmp, eng)
+    }
+
+    /// 表の全部の位置の (local → global、 global → local) の答えを、 `extents()` (lock の下で読む全部) から作る。
+    fn expected(t: &TableDef) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut local = 0;
+        for (lo, hi) in t.extents() {
+            for g in lo..hi {
+                out.push((local, g));
+                local += 1;
+            }
+        }
+        out
+    }
+
+    /// 表の全部の位置を `local_of` / `global_of` で引き、 答えの違う位置を返す。 表の外 (u の位置と、 最後の extent の後) も引く。
+    fn wrong_answers(t: &TableDef, want: &[(u32, u32)], outside: &[u32]) -> Vec<String> {
+        let mut bad = Vec::new();
+        for &(local, global) in want {
+            if t.global_of(local) != Some(global) {
+                bad.push(format!("global_of({local}) = {:?}, want {global}", t.global_of(local)));
+            }
+            if t.local_of(global) != Some(local) {
+                bad.push(format!("local_of({global}) = {:?}, want {local}", t.local_of(global)));
+            }
+        }
+        for &g in outside {
+            if t.local_of(g).is_some() {
+                bad.push(format!("local_of({g}) = {:?}, want None (表の外)", t.local_of(g)));
+            }
+        }
+        if t.global_of(want.len() as u32).is_some() {
+            bad.push(format!("global_of({}) = {:?}, want None (枠の外)", want.len(), t.global_of(want.len() as u32)));
+        }
+        bad
+    }
+
+    /// `extra` の write lock を持ったまま、 別の thread で表の外の eid と足した extent の位置を引く (lock を取る形は持ち手が離すまで
+    /// 返らない)。 閉じた anonymous の表 (extent なし) と、 extent を足した表の両方。
+    ///
+    /// falsify: `find_extent` が先頭 [`EXTRA_FAST`] 個も lock の下で読むと、 5 秒たっても返らない。
+    #[test]
+    fn local_of_and_global_of_answer_without_the_extent_lock() {
+        let (_tmp, eng) = grown_db("nolock", 3);
+        let (anon, t, u) = (&eng.tables[ANONYMOUS_TABLE as usize], table(&eng, "t"), table(&eng, "u"));
+        assert!(!anon.is_open_ended() && anon.extra_len.load(std::sync::atomic::Ordering::Acquire) == 0, "前提: 閉じた anonymous、 extent なし");
+        assert_eq!(t.extents().len(), 4, "前提: t は先頭 range + 足した extent 3 つ");
+        let want = expected(t);
+        let u_slots: Vec<u32> = u.extents().iter().flat_map(|&(lo, hi)| lo..hi).collect();
         let got = std::thread::scope(|s| {
-            let held = (anon.extra.write().unwrap(), t.extra.write().unwrap());
+            let held = (anon.extra.write().unwrap(), t.extra.write().unwrap(), u.extra.write().unwrap());
             let (tx, rx) = std::sync::mpsc::channel();
+            let (want, u_slots) = (&want, &u_slots);
             s.spawn(move || {
-                let _ = tx.send((anon.local_of(x), t.global_of(10), t.global_of(u32::MAX - 1), t.local_of(x)));
+                let _ = tx.send((wrong_answers(t, want, u_slots), u_slots.iter().map(|&g| anon.local_of(g)).collect::<Vec<_>>()));
             });
             let got = rx.recv_timeout(std::time::Duration::from_secs(5));
             drop(held);
             got
         });
-        let got = got.expect("extent を足していない表の local_of / global_of が extra の lock を待った");
-        assert_eq!(got, (None, None, None, Some(0)));
+        let (bad, anon_answers) = got.expect("local_of / global_of が extra の lock を待った");
+        assert!(bad.is_empty(), "足した extent の答えが違う: {bad:?}");
+        assert!(anon_answers.iter().all(Option::is_none), "anonymous の表が他の表の eid を自分の物と答えた: {anon_answers:?}");
     }
 
-    /// 枠を使い切った表は extent を足し、 足した extent の行を `local_of` / `global_of` で引ける。 開き直した後 (sidecar から読んだ
-    /// extent) も。
+    /// 足した extent が [`EXTRA_FAST`] 個を越えても、 越えた分 (lock の下) まで全部引ける。 足した直後 (`push_extra`) と、 開き直した後
+    /// (`set_extra`) と、 `Clone` の後。
     ///
-    /// falsify: 足す時 (`push_extra`) / 開く時 (`set_extra`) に `grown` を立てないと、 足した extent の行が表の外になる。
+    /// falsify: 足す時 / 開く時に写し (`extra_fast`) か数 (`extra_len`) を置かないと、 足した extent の位置の答えが違う。 越えた分を
+    /// 読まないと、 [`EXTRA_FAST`] 個目より後の位置の答えが違う。
     #[test]
-    fn a_grown_table_finds_rows_in_its_extents() {
-        let tmp = tmp("grown");
-        let mut eng = Engine::create_with_capacity(&tmp.0, 4096).unwrap();
-        eng.define_table("t", 4).unwrap();
-        eng.define_table("u", 4).unwrap();
-        let rows: Vec<u32> = (0..6).map(|_| enchudb_oplog::eid_local(eng.entity_in("t").unwrap())).collect();
+    fn every_extent_is_found_past_the_fast_slots() {
+        let grows = EXTRA_FAST + 5;
+        let (tmp, mut eng) = grown_db("many", grows);
         let check = |eng: &Engine, when: &str| {
-            let t = eng.tables.iter().find(|t| t.name == "t").unwrap();
-            assert!(t.grown.load(std::sync::atomic::Ordering::Acquire), "{when}: 足した表の印が立っていない");
-            for (i, &g) in rows.iter().enumerate() {
-                assert_eq!(t.local_of(g), Some(i as u32), "{when}: 行 {i} (eid {g})");
-                assert_eq!(t.global_of(i as u32), Some(g), "{when}: 行 {i}");
-            }
-            let u = eng.tables.iter().find(|t| t.name == "u").unwrap();
-            assert!(!u.grown.load(std::sync::atomic::Ordering::Acquire), "{when}: 足していない表に印が立った");
-            assert_eq!(u.local_of(rows[5]), None);
+            let (t, u) = (table(eng, "t"), table(eng, "u"));
+            assert_eq!(t.extents().len(), grows + 1, "{when}: 前提: t は先頭 range + 足した extent {grows} 個");
+            let u_slots: Vec<u32> = u.extents().iter().flat_map(|&(lo, hi)| lo..hi).collect();
+            let bad = wrong_answers(t, &expected(t), &u_slots);
+            assert!(bad.is_empty(), "{when}: 答えの違う位置 {} 個、 最初の 5 つ {:?}", bad.len(), &bad[..bad.len().min(5)]);
         };
-        assert!(rows[4] >= eng.tables.iter().find(|t| t.name == "u").unwrap().eid_range_hi, "前提: 5 行目は足した extent");
         check(&eng, "足した後");
+        let cloned = table(&eng, "t").clone();
+        let bad = wrong_answers(&cloned, &expected(&cloned), &[]);
+        assert!(bad.is_empty(), "Clone の後: 答えの違う位置 {:?}", &bad[..bad.len().min(5)]);
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         drop(eng);
@@ -11801,6 +11857,25 @@ impl SegmentSizes for Layout {
 pub type TableId = u16;
 pub const ANONYMOUS_TABLE: TableId = 0;
 
+/// #1017: 足した extent のうち、 `local_of` / `global_of` が lock なしで読む数 ([`TableDef::extra_fast`])。 schema の表は既定で
+/// 100 万 eid の枠を取り、 足す extent も同じ大きさなので、 3,200 万行までの表は全部 lock なしで引ける。 越えた分は `extra` の
+/// read lock の下で読む (表 1 つに 256 B)。
+const EXTRA_FAST: usize = 32;
+
+fn new_extra_fast() -> Box<[std::sync::atomic::AtomicU64]> {
+    (0..EXTRA_FAST).map(|_| std::sync::atomic::AtomicU64::new(0)).collect()
+}
+
+#[inline]
+fn pack_extent((lo, hi): (u32, u32)) -> u64 {
+    lo as u64 | (hi as u64) << 32
+}
+
+#[inline]
+fn unpack_extent(v: u64) -> (u32, u32) {
+    (v as u32, (v >> 32) as u32)
+}
+
 /// 1 つの table の定義。 名前 (anonymous は空文字)、 所属 himo の id 列、
 /// eid_range (anonymous は open-ended)、 FK 参照 (Ref himo の target table)。
 ///
@@ -11858,13 +11933,16 @@ pub(crate) struct TableDef {
     /// `entity_in` が先頭を使い切ると空き eid 空間から切り足す (auto-grow)。 local id は
     /// 先頭 → extra の順に連結した offset (= `next_local` / `free_locals` はそのまま)。
     /// grow しない table (常態) は空で、 hot path は先頭 range だけ見る。
-    /// 書いたら [`Self::grown`] も立てる ([`Self::set_extra`] / [`Self::push_extra`])。
-    pub extra: std::sync::RwLock<Vec<(u32, u32)>>,
-    /// #1017: [`Self::extra`] に extent がある (足した extent は外さないので、 一度立てたら下ろさない)。 立っていない表 (常態) の
-    /// [`Self::local_of`] / [`Self::global_of`] は `extra` の lock を取らない。 前は先頭 range の外の eid を引くたびに read lock を
-    /// 取り (lock の語の RMW 2 回)、 削除の道で表をなめる所 (#857 の数え 2 回 = #866 / #888 で増えた分・#868 の穴の覚え) が、 先に並ぶ
-    /// 閉じた anonymous の表の lock の語を書き手 8 本で取り合った。
-    pub(crate) grown: std::sync::atomic::AtomicBool,
+    /// 書くのは [`Self::set_extra`] / [`Self::push_extra`] だけ ([`Self::extra_fast`] / [`Self::extra_len`] も一緒に書く)。
+    extra: std::sync::RwLock<Vec<(u32, u32)>>,
+    /// #1017: `extra` の先頭 [`EXTRA_FAST`] 個の写し (`lo | hi << 32`)。 [`Self::local_of`] / [`Self::global_of`] はここを lock なしで
+    /// 読み、 [`EXTRA_FAST`] 個を越えた分だけ `extra` の read lock を取る。 前は先頭 range の外の eid を引くたびに read lock を取り
+    /// (lock の語の RMW 2 回)、 削除の道で表をなめる所 (#857 の数え 2 回 = #866 / #888 で増えた分・#868 の穴の覚え・`table_of_slot`) が、
+    /// 先に並ぶ閉じた anonymous の表や枠を足した表の lock の語を書き手 8 本で取り合った。
+    extra_fast: Box<[std::sync::atomic::AtomicU64]>,
+    /// #1017: 見せた extent の数 (`extra` の長さ)。 extent は外さないので下がらない。 書き手は `extra` の write lock の中で
+    /// `extra_fast` を置いてから Release で進め、 読み手は Acquire で読んでから `extra_fast` を読む。
+    extra_len: std::sync::atomic::AtomicU32,
     /// #141: この table の primary key を成す himo の id。 PK 未指定なら `None`。
     ///
     /// PK 自体は schema 層 (`TableBuilder::primary_key`) の概念だが、 **sync の
@@ -11876,7 +11954,7 @@ pub(crate) struct TableDef {
 
 impl Clone for TableDef {
     fn clone(&self) -> Self {
-        Self {
+        let t = Self {
             name: self.name.clone(),
             himo_ids: std::sync::RwLock::new(self.himo_ids.read().unwrap().clone()),
             eid_range_lo: self.eid_range_lo,
@@ -11894,10 +11972,14 @@ impl Clone for TableDef {
             free_locals: self.free_locals.clone(),
             free_locals_nonempty: self.free_locals_nonempty.clone(),
             dead_locals: self.dead_locals.clone(),
-            extra: std::sync::RwLock::new(self.extra.read().unwrap().clone()),
-            grown: std::sync::atomic::AtomicBool::new(self.grown.load(std::sync::atomic::Ordering::Acquire)),
+            extra: std::sync::RwLock::new(Vec::new()),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: self.pk_himo,
-        }
+        };
+        // 写した `extra` から写しを作る (読んだ時の中身で揃う)
+        t.set_extra(self.extra.read().unwrap().clone());
+        t
     }
 }
 
@@ -11908,21 +11990,48 @@ impl TableDef {
         self.eid_range_hi == u32::MAX
     }
 
-    /// `extra` を置き換える (sidecar から読んだ extent、 開く時)。
+    /// `extra` を置き換える (sidecar から読んだ extent、 開く時と `Clone`)。 まだ誰にも見せていない表にだけ使う (見せた数は下げない)。
     fn set_extra(&self, extents: Vec<(u32, u32)>) {
         let mut extra = self.extra.write().unwrap();
-        *extra = extents;
-        // 下ろさない (extent は外さない): 読み手が立っているのを見て lock を取った時、 中身はいつも空でない
-        if !extra.is_empty() {
-            self.grown.store(true, std::sync::atomic::Ordering::Release);
+        debug_assert_eq!(self.extra_len.load(std::sync::atomic::Ordering::Relaxed), 0, "見せた extent を置き換える");
+        for (i, &ext) in extents.iter().enumerate().take(EXTRA_FAST) {
+            self.extra_fast[i].store(pack_extent(ext), std::sync::atomic::Ordering::Relaxed);
         }
+        *extra = extents;
+        self.extra_len.store(extra.len() as u32, std::sync::atomic::Ordering::Release);
     }
 
-    /// extent を 1 つ足す。 `grown` は `extra` の write lock の中で立てる (立ったのを見た読み手は lock を待ち、 足した extent を見る)。
+    /// extent を 1 つ足す。 写し (`extra_fast`) を置いてから数 (`extra_len`) を Release で進める (`extra` の write lock の中)。
     fn push_extra(&self, ext: (u32, u32)) {
         let mut extra = self.extra.write().unwrap();
+        let i = extra.len();
+        if i < EXTRA_FAST {
+            self.extra_fast[i].store(pack_extent(ext), std::sync::atomic::Ordering::Relaxed);
+        }
         extra.push(ext);
-        self.grown.store(true, std::sync::atomic::Ordering::Release);
+        self.extra_len.store(extra.len() as u32, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 見せた extent を前から順に `f` に渡す (`f` が `Some` を返したら止めてそれを返す)。 先頭 [`EXTRA_FAST`] 個は lock なし、
+    /// その先は `extra` の read lock の下 (#1017)。
+    #[inline]
+    fn find_extent<R>(&self, mut f: impl FnMut(u32, u32) -> Option<R>) -> Option<R> {
+        let n = self.extra_len.load(std::sync::atomic::Ordering::Acquire) as usize;
+        for slot in &self.extra_fast[..n.min(EXTRA_FAST)] {
+            let (lo, hi) = unpack_extent(slot.load(std::sync::atomic::Ordering::Relaxed));
+            if let Some(r) = f(lo, hi) {
+                return Some(r);
+            }
+        }
+        if n > EXTRA_FAST {
+            let extra = self.extra.read().unwrap();
+            for &(lo, hi) in extra.iter().skip(EXTRA_FAST) {
+                if let Some(r) = f(lo, hi) {
+                    return Some(r);
+                }
+            }
+        }
+        None
     }
 
     /// 全 extent (先頭 + `extra`)。 open-ended な anonymous は先頭 1 本。
@@ -11952,24 +12061,23 @@ impl TableDef {
         self.local_of(global).is_some()
     }
 
-    /// global (local eid) → table 内 local offset。 先頭 range と、 extent を足していない表は lock 無し (#1017)。
+    /// global (local eid) → table 内 local offset。 先頭 range と、 足した extent の先頭 [`EXTRA_FAST`] 個は lock 無し (#1017)。
     #[inline]
     pub fn local_of(&self, global: u32) -> Option<u32> {
         if global >= self.eid_range_lo && global < self.eid_range_hi {
             return Some(global - self.eid_range_lo);
         }
-        if self.is_open_ended() || !self.grown.load(std::sync::atomic::Ordering::Acquire) {
+        if self.is_open_ended() {
             return None;
         }
-        let extra = self.extra.read().unwrap();
         let mut base = self.eid_range_hi - self.eid_range_lo;
-        for &(lo, hi) in extra.iter() {
+        self.find_extent(|lo, hi| {
             if global >= lo && global < hi {
                 return Some(base + (global - lo));
             }
             base += hi - lo;
-        }
-        None
+            None
+        })
     }
 
     /// #857: 表の中の行 `idx` を版数なしで消した ([`Engine::note_freed_slot`])。 [`Self::freed_end`] を `idx + 1` まで上げる。
@@ -11977,12 +12085,14 @@ impl TableDef {
     /// #1017: 上げても止めの答え (`freed_end > persisted_next`) が変わらない時は読むだけで返る。 前は数えるたびに RMW をして
     /// (#877 の後は削除 1 回に積む前と `apply_delete_in` の 2 回)、 書き手 8 本が並んで消すと表の定義の cache line (`local_of` が
     /// 読む範囲と同じ line) を取り合った (同じ数えが読む `has_cell_version` と `local_of` の lock の取り合いは [`Engine::cell_version`] /
-    /// [`Self::grown`])。 読むだけで返るのは:
+    /// [`Self::extra_fast`])。 読むだけで返るのは:
     ///
     /// - `idx < persisted_next`: sidecar に置いた `next_local` が既にこの行を覆う (`persisted_next` は書き出しが返った後に置く値。
     ///   落ちた後に開いた `next_local` は disk の sidecar の値以上)。 後の書き出しがこの行より前の値を置くのは、 `next_local` が
-    ///   この行より前に戻った時だけ: 払い出さずに戻した位置 (#868 / #970 の `compare_exchange`) はその位置の行が無いので越えず、
-    ///   越えるのは `clear_local_only_tables` が表を空にした時 = 消した行の eid を払い出し直すのが答え
+    ///   この行より前に戻った時だけ: 払い出さずに戻した位置 (#868 / #970 の `compare_exchange`) はその位置の行が無いので越えない
+    ///   (#883 の窓を除いて: #970 の戻しの前に、 枯渇を見た別の thread の全部なめがその位置を穴として拾って払い出すと、 生きている行が
+    ///   `next_local` の外に出る。 gen.seg を伸ばせない (#970) のが枠の最後の slot で起き、 別の書き手が同じ page の `gen_slot_ready` を
+    ///   通る時だけ)。 越えるのは `clear_local_only_tables` が表を空にした時 = 消した行の eid を払い出し直すのが答え
     /// - `idx < freed_end`: `fetch_max` は何も変えない (`freed_end` は上がるだけ)。 読んだ値が、 この削除の Delete を書き出す
     ///   `oplog_sync` に見えるのは RMW と同じ: この読みは Delete を WAL に積む前 (#877) で、 その `oplog_sync` は WAL の終端を
     ///   Acquire で読んでから止めを読む = 同じ atomic の読みの順 (coherence) で、 ここで読んだ値以上を読む
@@ -12004,20 +12114,17 @@ impl TableDef {
         if self.is_open_ended() || local < first {
             return self.eid_range_lo.checked_add(local);
         }
-        // #1017: extent を足していない表は lock を取らない (枯渇した表では、 削除の道 = #868 の `global_of(next_local)` が毎回ここまで来る)
-        if !self.grown.load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
-        let extra = self.extra.read().unwrap();
+        // #1017: 足した extent の先頭 [`EXTRA_FAST`] 個は lock を取らない (枯渇した表では、 削除の道 = #868 の `global_of(next_local)` が
+        // 毎回ここまで来る)
         let mut rel = local - first;
-        for &(lo, hi) in extra.iter() {
+        self.find_extent(|lo, hi| {
             let len = hi - lo;
             if rel < len {
                 return Some(lo + rel);
             }
             rel -= len;
-        }
-        None
+            None
+        })
     }
 
     /// 起動時の anonymous table。 全 himo / entity の default 受け皿。
@@ -12039,7 +12146,8 @@ impl TableDef {
             dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
             extra: std::sync::RwLock::new(Vec::new()),
-            grown: std::sync::atomic::AtomicBool::new(false),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: None,
         }
     }
@@ -12180,8 +12288,8 @@ pub struct Engine {
     #[allow(dead_code)]
     path: String,
     layout: std::sync::RwLock<Layout>,
-    /// #1017: `layout.has_cell_version()` の写し ([`Engine::has_cell_version`])。 変わるのは作る時と
-    /// [`Engine::add_v9_regions_for_sync`] (`&mut self`) だけ (`grow_entity_cap` / `grow_vocab` は同じ値で作り直す)。 前は読むたびに
+    /// #1017: `layout.has_cell_version()` の写し ([`Engine::has_cell_version`])。 変わるのは作る時・開く時 (header から作った layout)
+    /// と [`Engine::add_v9_regions_for_sync`] (`&mut self`) だけ (`grow_entity_cap` / `grow_vocab` は同じ値で作り直す)。 前は読むたびに
     /// layout の read lock を取り (lock の語の RMW 2 回)、 削除 1 回が 4 回読む (#866 / #888 で 2 回増えた) ので、 書き手 8 本で消すと
     /// その語を取り合った。
     cell_version: bool,
@@ -18800,7 +18908,8 @@ impl Engine {
             dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
             extra: std::sync::RwLock::new(Vec::new()),
-            grown: std::sync::atomic::AtomicBool::new(false),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: None,
         });
         self.note_internal_row_ranges();
