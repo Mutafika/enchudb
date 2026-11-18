@@ -376,6 +376,9 @@ pub struct Database {
     tables: Vec<Arc<TableInner>>,
     /// true なら consumer thread が走ってる (concurrent モード、 &mut 不可)。
     is_concurrent: bool,
+    /// #1024: concurrent の時に `&mut Engine` を取った回数 (`load_schema` が、 engine の知らない表 / relation を足す時だけ取る)。
+    /// 試験が 「普通の開き方では取らない」 ことを見る ([`Database::exclusive_engine_takes_while_concurrent`])。
+    exclusive_while_concurrent: u32,
 }
 
 impl Drop for Database {
@@ -507,6 +510,7 @@ impl Database {
             eng: Arc::new(eng),
             tables: Vec::new(),
             is_concurrent: false,
+            exclusive_while_concurrent: 0,
         })
     }
 
@@ -524,6 +528,7 @@ impl Database {
             eng: Arc::new(eng),
             tables: Vec::new(),
             is_concurrent: false,
+            exclusive_while_concurrent: 0,
         };
         db.load_schema()?;
         Ok(db)
@@ -538,6 +543,7 @@ impl Database {
             eng: Arc::new(eng),
             tables: Vec::new(),
             is_concurrent: false,
+            exclusive_while_concurrent: 0,
         };
         db.load_schema()?;
         Ok(db)
@@ -549,6 +555,7 @@ impl Database {
             eng: Arc::new(eng),
             tables: Vec::new(),
             is_concurrent: false,
+            exclusive_while_concurrent: 0,
         };
         db.load_schema()?;
         Ok(db)
@@ -581,6 +588,7 @@ impl Database {
             eng: arc_eng,
             tables: Vec::new(),
             is_concurrent: true,
+            exclusive_while_concurrent: 0,
         };
         db.load_schema()?;
         Ok(Arc::new(db))
@@ -607,6 +615,7 @@ impl Database {
             eng: arc_eng,
             tables,
             is_concurrent: true,
+            exclusive_while_concurrent: 0,
         }))
     }
 
@@ -634,6 +643,7 @@ impl Database {
             eng: arc_eng,
             tables,
             is_concurrent: true,
+            exclusive_while_concurrent: 0,
         }))
     }
 
@@ -764,17 +774,28 @@ impl Database {
     /// 現在 concurrent モードか (consumer thread が走ってるか)。
     pub fn is_concurrent(&self) -> bool { self.is_concurrent }
 
+    /// #1024 (試験用): concurrent の時に `&mut Engine` を取った回数。 普通の `open_with_oplog` (engine が表・紐・relation を全部
+    /// 知っている) では 0。 足すのは、 `.schema` が engine の `tables` より先にある珍しい形の `load_schema` だけ。
+    #[doc(hidden)]
+    pub fn exclusive_engine_takes_while_concurrent(&self) -> u32 {
+        self.exclusive_while_concurrent
+    }
+
     /// 0.7.0 (Phase 3): sync 用 reserved table (`_sync_ops` / `_sync_peers`) を
     /// engine に追加する。 build phase で呼ぶこと (= Arc 単一所有のうち)、
-    /// `finish_with_oplog` 後は Arc 共有なので呼べない (= `SchemaError::Internal`)。
+    /// `finish_*` / `open_with_oplog` の後は呼べない (= `SchemaError::Internal`)。
+    ///
+    /// #1024: concurrent の DB は、 `Arc<Database>` を 1 つだけ持っていても断る ([`engine_mut`](Self::engine_mut) と同じ)。 背景の
+    /// thread (consumer) は engine を生のポインタで指すので `Arc` の数に入らず、 前は `Arc::get_mut` が通って、 走っている consumer の
+    /// 横で `&mut Engine` を取った (表の並びへの push などが consumer の読みと data race)。
     ///
     /// idempotent: 既に有効化済みなら何もしない。 sync が要らない単独 DB は
     /// 呼ばなくて OK (= reserved table が物理的に存在しない、 eid 空間も浪費しない)。
     /// 一度有効化すると無効化は不可。
     pub fn enable_sync(&mut self) -> Result<(), SchemaError> {
-        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+        let eng_mut = self.engine_mut().ok_or_else(|| {
             SchemaError::Internal(
-                "Database already shared via Arc — call enable_sync before finish_*".into()
+                "Database is concurrent (finish_* / open_with_oplog) or shared via Arc — call enable_sync before finish_*".into()
             )
         })?;
         eng_mut.enable_sync_tables()
@@ -788,10 +809,13 @@ impl Database {
 
     /// 名前付きの位置を置く表 `_cursors` を作る ([`Engine::prepare_cursors`]、 build phase で 1 回。 何度呼んでもよい)。
     /// 「ここまで処理した」 位置 (changefeed の番号 / 宣言された答えの版) を、 処理の書き込みと同じ DB に置く
-    /// ([`cursor_set`](Self::cursor_set))。 `finish_*` の後は呼べない (`SchemaError::Internal`)。
+    /// ([`cursor_set`](Self::cursor_set))。 `finish_*` / `open_with_oplog` の後は呼べない (`SchemaError::Internal`。 #1024: `Arc<Database>`
+    /// を 1 つだけ持っていても、 concurrent の DB は断る。 [`enable_sync`](Self::enable_sync) の doc)。
     pub fn prepare_cursors(&mut self) -> Result<(), SchemaError> {
-        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
-            SchemaError::Internal("Database already shared via Arc — call prepare_cursors before finish_*".into())
+        let eng_mut = self.engine_mut().ok_or_else(|| {
+            SchemaError::Internal(
+                "Database is concurrent (finish_* / open_with_oplog) or shared via Arc — call prepare_cursors before finish_*".into()
+            )
         })?;
         eng_mut.prepare_cursors().map_err(|e| SchemaError::Internal(format!("prepare_cursors: {e}")))
     }
@@ -847,7 +871,9 @@ impl Database {
     /// idempotent) に置き換えたので、 standalone (`Database::open`) だけでなく
     /// concurrent (`open_with_oplog` / `finish_*` 後) の Database でも呼べる。
     /// concurrent 側は `Arc<Database>` の単一所有時に `Arc::get_mut` 経由で
-    /// `&mut Database` を取って呼ぶ (= open 直後の migration window)。
+    /// `&mut Database` を取って呼ぶ (= open 直後の migration window)。 #1024: この時 engine は
+    /// `&self` でしか触らない (`&mut Engine` を取らない、 `flush` もしない。 書き出しは consumer)。
+    /// 新しい表 (`db.table(..).build()`) と Ref 列の追加は concurrent では断る (build phase で)。
     pub fn add_column(
         &mut self,
         table_name: &str,
@@ -865,7 +891,8 @@ impl Database {
     /// himo 定義は `Engine::ensure_himo_dynamic_in` (`&self`, `himo_def_lock` で
     /// 直列化 + idempotent) 経由なので standalone / concurrent 両モードで動く。
     /// Ref column (relation 付き) だけは `define_ref_in` が `&mut Engine` を
-    /// 要求するため build phase (Arc 単一所有) 限定。
+    /// 要求するため build phase (Arc 単一所有) 限定。 #1024: concurrent の DB は
+    /// `Arc<Database>` を 1 つだけ持っていても断る (`engine_mut` と同じ)。
     ///
     /// schema sidecar の persist は **しない** — caller が末尾で 1 回
     /// `persist_schema` を呼ぶこと (N 列追加 = 1 fsync に coalesce)。
@@ -897,7 +924,8 @@ impl Database {
                 }
                 let to_table = to_table.to_string();
                 let table_name_owned = table_inner.name.clone();
-                let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+                // #1024: concurrent の DB は断る (`fk_refs` への push と `tables` の書き出しが、 走っている consumer のなめと重なる)
+                let eng_mut = self.engine_mut().ok_or_else(|| {
                     SchemaError::Internal(
                         "Ref column addition requires exclusive Engine access — \
                          add ref columns on a standalone Database (build phase), \
@@ -1123,7 +1151,10 @@ impl Database {
         // engine 本体 (= body + `.tables` sidecar) も flush。
         // flush は build phase (Arc 単一所有) でのみ可能。 concurrent 後は
         // consumer thread が背景 fsync するので skip。
-        if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
+        // #1024: concurrent は `Arc<Database>` を 1 つだけ持っていても skip する (前は `Arc::get_mut` が通り、 `add_column` のたびに
+        // 走っている consumer の横で `Engine::flush(&mut)` を呼んだ)。 足した紐の定義は `ensure_himo_dynamic_in` が置いてあり、
+        // 書き出しは consumer の周期 (100 ms) と閉じる時が済ませる
+        if let Some(eng_mut) = self.engine_mut() {
             eng_mut.flush().map_err(|e| SchemaError::Io(e.to_string()))?;
         }
         Ok(())
@@ -1170,30 +1201,38 @@ impl Database {
         // 0.7.0: readonly mode では engine 側の write API は panic するので、
         // load_schema は himo_id resolve だけして table register は skip。
         let is_readonly = self.eng.is_readonly();
+        // #1024: concurrent の DB (`open_with_oplog`、 consumer は engine を起こした時から走っている) は、 engine の知らない表 /
+        // relation を足す時だけ `&mut Engine` を取る。 普通の開き方 (engine が全部知っている) では取らない。 前は表と relation ごとに
+        // `Arc::get_mut` を通し、 書く物が無くても consumer の生のポインタと `&mut Engine` が重なった (形式上の UB)。 紐は `&self` の
+        // `ensure_himo_dynamic_in` で足りる (`define_himo_in` はそれに渡すだけ)。 足す物がある形 (`.schema` が engine の `tables` より
+        // 先にある: `persist_schema` の途中で落ちた / 旧 DB) は今も `&mut` を取り、 consumer の周期と重なりうる (PR #1027 の残り)
+        let concurrent = self.is_concurrent;
 
         for raw in parsed {
             // table 自体を engine に再 register (idempotent、 readonly は skip)
-            if !is_readonly {
-                if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
-                    let remaining = eng_mut.remaining_eid_space();
-                    let size_hint = (remaining / 4).max(16).min(1_000_000);
-                    // request19: `_` 始まり (= local-only / reserved) は
-                    // `define_reserved_table` へ振る。 `define_table` は reserved
-                    // namespace を弾くので、 ここを分けないと reopen 時に
-                    // schema blob の再 register で失敗する。
-                    let redefine = if enchudb_engine::engine::is_reserved_table_name(&raw.name) {
-                        eng_mut.define_reserved_table(&raw.name, size_hint)
-                    } else {
-                        eng_mut.define_table(&raw.name, size_hint)
-                    };
-                    match redefine {
-                        Ok(_) => {} // 新規 register (legacy DB か新規 DB の初回 load)
-                        Err(e) if e.contains("already exists") => {} // 既に sidecar から復元済み
-                        Err(e) => {
-                            return Err(SchemaError::Internal(format!(
-                                "define_table({}) failed during load_schema: {}", raw.name, e
-                            )));
-                        }
+            let known_table = concurrent && self.eng.list_tables().iter().any(|(_, n, _, _)| *n == raw.name);
+            if !is_readonly && !known_table && let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
+                if concurrent {
+                    self.exclusive_while_concurrent += 1;
+                }
+                let remaining = eng_mut.remaining_eid_space();
+                let size_hint = (remaining / 4).clamp(16, 1_000_000);
+                // request19: `_` 始まり (= local-only / reserved) は
+                // `define_reserved_table` へ振る。 `define_table` は reserved
+                // namespace を弾くので、 ここを分けないと reopen 時に
+                // schema blob の再 register で失敗する。
+                let redefine = if enchudb_engine::engine::is_reserved_table_name(&raw.name) {
+                    eng_mut.define_reserved_table(&raw.name, size_hint)
+                } else {
+                    eng_mut.define_table(&raw.name, size_hint)
+                };
+                match redefine {
+                    Ok(_) => {} // 新規 register (legacy DB か新規 DB の初回 load)
+                    Err(e) if e.contains("already exists") => {} // 既に sidecar から復元済み
+                    Err(e) => {
+                        return Err(SchemaError::Internal(format!(
+                            "define_table({}) failed during load_schema: {}", raw.name, e
+                        )));
                     }
                 }
             }
@@ -1203,10 +1242,9 @@ impl Database {
                 let himo_name = format!("{}.{}", raw.name, col_name);
                 // himo を table-attached で再 define (idempotent、 readonly は skip)。
                 // relation あり col は後段で fk_refs を再 register。
+                // #1024: `&self` 版で足りる (`define_himo_in` はこれに渡すだけ)。 concurrent の DB でも `&mut` を取らない
                 if !is_readonly {
-                    if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
-                        let _ = eng_mut.define_himo_in(&raw.name, col_name, ty.value_type(), 0);
-                    }
+                    let _ = self.eng.ensure_himo_dynamic_in(&raw.name, col_name, ty.value_type(), 0);
                 }
                 let hid = self.eng.himo_id(&himo_name)
                     .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define / open")))?;
@@ -1220,8 +1258,16 @@ impl Database {
 
             // ref relation を engine 側に再 register (readonly は skip)
             if !is_readonly {
+                // #1024: concurrent の DB は、 engine が既に持つ relation には `&mut` を取らない
+                let known_refs = if concurrent { self.eng.fk_refs_for_table_named(&raw.name) } else { Vec::new() };
                 for (from_col, to_table) in &raw.relations {
+                    if known_refs.iter().any(|(c, t)| c == from_col && t == to_table) {
+                        continue;
+                    }
                     if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
+                        if concurrent {
+                            self.exclusive_while_concurrent += 1;
+                        }
                         // define_ref_in は idempotent
                         let _ = eng_mut.define_ref_in(&raw.name, from_col, to_table);
                     }
@@ -1718,9 +1764,13 @@ impl<'a> TableBuilder<'a> {
 
         // engine table を define + columns を define_himo_in (+ ref は define_ref_in) 経由
         // で attach。 build phase = Arc 単一所有の前提。
-        let eng_mut = Arc::get_mut(&mut db.eng).ok_or_else(|| {
+        // #1024: concurrent の DB は `Arc<Database>` を 1 つだけ持っていても断る (`engine_mut` と同じ)。 前は `Arc::get_mut` が通り、
+        // `Engine::tables` の `Vec` への push (再確保しうる) などが、 走っている consumer の `tables` のなめと重なった。 既にある表の
+        // 再宣言 (superset の migrate) はここより前に返るので、 concurrent の DB でも今まで通り
+        let eng_mut = db.engine_mut().ok_or_else(|| {
             SchemaError::Internal(
-                "Database already shared via Arc — call db.table() before finish_*".into()
+                "Database is concurrent (finish_* / open_with_oplog) or shared via Arc — declare new tables in the build phase \
+                 (Database::create / Database::open, then finish_*)".into()
             )
         })?;
         // 0.7.0: TableBuilder::with_capacity が呼ばれていれば explicit な size_hint
