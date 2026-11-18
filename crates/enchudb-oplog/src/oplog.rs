@@ -1675,23 +1675,19 @@ pub const GATE_NONE: u32 = u32::MAX;
 pub const TAG_ANY: u64 = u64::MAX;
 
 /// #1016: 当てる書き込みの record の印の置き場 (自分で積む時は書き手の印、 頼まれて積む時は頼んだ書き手の置き場の `served`。 None =
-/// 位置を置かない入れ子の内側 = 外側の位置が覆う) と、 印の札 (札の置き場のある印だけ) と、 積む時に確かめる門の世代 (入れ子の内側も
-/// 確かめる)。
+/// 位置を置かない入れ子の内側 = 外側の位置が覆う) と、 積む時に確かめる門の世代 (入れ子の内側も確かめる)。 印の札は印を取る時に置く
+/// (`OpLog::claim_mark`。 ここに持つと append の道に渡す値が大きくなる)。
 #[derive(Clone, Copy)]
 struct Track<'a> {
     at: Option<&'a AtomicU64>,
-    tag: Option<(&'a AtomicU64, u64)>,
     gate: u32,
 }
 
 impl Track<'_> {
-    /// 位置を置く (札があれば位置の前に)。 `order` は位置の store の順序。
+    /// 位置を置く。 `order` は位置の store の順序。
     #[inline(always)]
     fn put(&self, pos: u64, order: Ordering) {
         if let Some(at) = self.at {
-            if let Some((c, tag)) = self.tag {
-                c.store(tag, Ordering::Relaxed);
-            }
             at.store(pos, order);
         }
     }
@@ -3084,19 +3080,24 @@ impl OpLog {
             let c = &wal.inflight.marks[i];
             // 入れ子 (外側が持っている): 位置は外側に任せる (門は確かめる)
             if c.0.load(Ordering::Relaxed) != INFLIGHT_IDLE {
-                return Some(Track { at: None, tag: None, gate: scope.gate });
+                return Some(Track { at: None, gate: scope.gate });
             }
             if i as u32 >= wal.inflight.hw.load(Ordering::Relaxed) {
                 wal.inflight.hw.fetch_max(i as u32 + 1, Ordering::AcqRel);
             }
+            // 札は位置より前に置く (位置を読んだ止める側は、 `append_lock` 越しにこの札も見る)
+            c.1.store(scope.tag, Ordering::Relaxed);
             scope.at.set(MarkAt::Slot(c));
-            return Some(Track { at: Some(&c.0), tag: Some((&c.1, scope.tag)), gate: scope.gate });
+            return Some(Track { at: Some(&c.0), gate: scope.gate });
         }
         let at = wal.borrow_extra_mark(i);
         scope.at.set(at);
         match at {
-            MarkAt::Extra(c) => Some(Track { at: Some(&c.0), tag: Some((&c.1, scope.tag)), gate: scope.gate }),
-            MarkAt::Spill(c) => Some(Track { at: Some(c), tag: None, gate: scope.gate }),
+            MarkAt::Extra(c) => {
+                c.1.store(scope.tag, Ordering::Relaxed);
+                Some(Track { at: Some(&c.0), gate: scope.gate })
+            }
+            MarkAt::Spill(c) => Some(Track { at: Some(c), gate: scope.gate }),
             _ => None,
         }
     }
@@ -3535,7 +3536,7 @@ impl OpLog {
                     req.closes_group,
                     req.relay,
                     req.hlc_override.copied(),
-                    Some(Track { at: req.track.then_some(&slot.served), tag: None, gate: req.gate }),
+                    Some(Track { at: req.track.then_some(&slot.served), gate: req.gate }),
                 );
                 served += 1;
                 guard.finish(out);
@@ -8415,7 +8416,7 @@ mod tests {
         {
             let _held = wal.append_lock.lock();
             let op = Op::Tie { eid: 1, himo_id: 0, value: 1 };
-            wal.append_locked(&op, op.payload_size(), false, None, None, Some(Track { at: Some(served), tag: None, gate: GATE_NONE })).unwrap();
+            wal.append_locked(&op, op.payload_size(), false, None, None, Some(Track { at: Some(served), gate: GATE_NONE })).unwrap();
         }
         wal.append(Op::Commit).unwrap();
         assert!(wal.written_head() > start, "前提: 載った");
@@ -8582,7 +8583,7 @@ mod tests {
         {
             let _held = wal.append_lock.lock();
             let op = Op::Tie { eid: 1, himo_id: 0, value: 1 };
-            wal.append_locked(&op, op.payload_size(), false, None, None, Some(Track { at: Some(served), tag: None, gate: GATE_NONE })).unwrap();
+            wal.append_locked(&op, op.payload_size(), false, None, None, Some(Track { at: Some(served), gate: GATE_NONE })).unwrap();
         }
         wal.append(Op::Commit).unwrap();
         let waits = wal.one_half_waits.load(Ordering::Relaxed);
