@@ -4934,6 +4934,10 @@ mod read_fast_path_tests {
         assert_eq!(eng.himos[hid as usize].get_value(s), None, "消えた行の eid の書き込みが死んだ場所に通った");
         assert_eq!(eng.get_by_id(x, hid), None);
         assert_eq!(eng.get(x, "t.a"), None);
+        // 読む道の照合そのもの (`f` は cell によらず場所を返す = 照合が通せば Some): get の道と fence のある道の両方
+        assert_eq!(eng.read_app_acquired(x, Some), None, "get の道が消えた行の eid を場所に通した");
+        assert_eq!(eng.read_app(x, Some), None, "fence のある道が消えた行の eid を場所に通した");
+        assert_eq!(eng.read_app(x, |s| eng.himos[hid as usize].get_value(s)), None);
         eng.tie_to_by_id(rows[2], hid, 7u32);
         assert_eq!(eng.get_by_id(rows[2], hid), Some(7), "生きている行");
         assert_eq!(eng.read_app(rows[2], |slot| eng.himos[hid as usize].get_value(slot)), Some(7), "fence のある道");
@@ -24872,7 +24876,7 @@ impl Engine {
         // #1015: 場所の bit は Relaxed で 1 回だけ読み、 世代を持つ DB だけ region を (Acquire で) 引いて照合する (前は split / active /
         // get で bit を 2 回 Acquire で・region を 1 回、 registry をたどって読んだ)。 bit を古い 0 と読む窓は、 Acquire で読んでも
         // 移る手順の公開と並べば同じにある (移る手順は行の lock を待たない。 死んだ場所に書いた書き手の cell は使い回す時に落とす =
-        // `move_to_generations` の 2.)
+        // `move_to_generations` の doc の 3.)
         let gens = self.generations();
         let local = enchudb_oplog::eid_local(eid);
         let bits = gens.bits_relaxed();
@@ -24930,7 +24934,9 @@ impl Engine {
     ///   `f` の直後の fence、 そうでなければ `f` の cell の Acquire の load が付ける
     /// - 新しい世代の eid で、 前の住人の値を返さない (#1020 の読み直し A): 読む前の照合で、 世代 ≠ 0 の eid は世代の 2 B を Acquire で
     ///   読む (消す道 / 使い回す道の RMW と同期し、 消す道が先に落とした cell が見える。 その eid を同期の無い渡し方で受けた読み手でも)。
-    ///   世代 0 の eid には前の住人が居ないので Relaxed
+    ///   世代 0 の eid には前の住人が居ないので Relaxed。 例外 (#1025、 #885 の形も同じ): v14 の間 (と移る手順の前後) に消えた行の古い
+    ///   eid で死んだ場所へ書かれた cell は、 使い回す道が生かした**後**で落とす (`drop_leftover_cells`)。 その間に新しい eid を同期の無い
+    ///   渡し方で受けた読み (と、 その間に出口が拾った新しい eid の読み) は、 落とす前のその値を返しうる
     #[inline(always)]
     fn read_app_in<const FENCE: bool, R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
         // #900: [`Self::app_slot`] を 2 回呼ぶと、 場所の bit を 4 回・region を 2 回 (live の registry をたどって) 読み直していた
