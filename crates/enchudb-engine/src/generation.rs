@@ -1017,7 +1017,8 @@ impl GenReader<'_> {
     }
 
     /// 場所の並び → eid (出口の写し)。 256 個ずつ、 その範囲の page に印が 1 つも無ければ世代を読まない (使い回しの無い所は 1 個ずつの
-    /// 印の読みも無い)。 全部の page に印のある塊は印を見ずに 2 B を読み、 印が混ざる塊と範囲が広い (並んでいない) 塊は 1 個ずつ。
+    /// 印の読みも無い)。 全部の page に印のある塊は印を見ずに 2 B を読み、 印が混ざる塊は塊で 1 回読んだ印の並びで印のある page の
+    /// 場所だけ 2 B を読む。 範囲が広い (並んでいない) 塊は 1 個ずつ。
     pub(crate) fn eids(&self, peer: u32, slots: &[u32]) -> Vec<u64> {
         // #1015: 先に世代 0 の eid で全部を写し (この写しは vector の命令になる)、 印のある塊だけ世代の bit を足す。 前は塊ごとに
         // `extend` していて、 使い回しの無い所の写しも 1 個ずつになり、 1 行使い回した表の pull_raw (1 万件) が 2 倍かかった。
@@ -1033,10 +1034,10 @@ impl GenReader<'_> {
         for (chunk, o) in slots.chunks(256).zip(out.chunks_mut(256)) {
             let (lo, hi) = chunk.iter().fold((u32::MAX, 0u32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
             match pages_marked(r, lo, hi) {
-                PageMarks::None => {}
+                Some(m) if m.bits == 0 => {}
                 // 範囲の page が全部印付き (使い回しの多い表): 場所の 2 B を印を見ずに読む (範囲の確かめは塊に 1 回)。 印の立った page の
                 // 場所は commit 済み (`cell_for_write` が印より先に commit する)
-                PageMarks::All if slot_off(hi) + 2 <= r.len() => {
+                Some(m) if m.bits == m.full && slot_off(hi) + 2 <= r.len() => {
                     // 先頭は loop の外で 1 回だけ読む (`r` を通すと out への store の後に毎回読み直す)
                     let cells = r.base_ptr().wrapping_add(GEN_HEADER) as *const AtomicU16;
                     let hi_peer = u64::from(peer) << 32;
@@ -1045,6 +1046,17 @@ impl GenReader<'_> {
                         // (`region_fits_fast_reads`)、 GEN_HEADER は偶数
                         let g = u32::from(unsafe { &*cells.add(s as usize) }.load(Ordering::Relaxed) & GEN_MASK);
                         *e = hi_peer | u64::from((g << bits) | s);
+                    }
+                }
+                // 印のある page と無い page が混ざる (使い回しの少ない表、 1 行使い回しただけでも塊の範囲に入る): 塊で 1 回読んだ印の並びで、
+                // 印のある page の場所だけ 2 B を読む (前は場所ごとに page の印の byte を読み直していた)
+                Some(m) if slot_off(hi) + 2 <= r.len() => {
+                    for (e, &s) in o.iter_mut().zip(chunk) {
+                        if m.has(s) {
+                            // SAFETY: s <= hi で、 slot_off(hi) + 2 <= r.len() を直前に確かめた
+                            let g = u32::from(unsafe { load_cell_with(r, s, Ordering::Relaxed) } & GEN_MASK);
+                            *e |= u64::from(g << bits);
+                        }
                     }
                 }
                 _ => {
@@ -1059,41 +1071,42 @@ impl GenReader<'_> {
     }
 }
 
-/// [`pages_marked`] の答え。
+/// [`pages_marked`] の答え: page `p0..=p1` の印の並び (bit i = page p0 + i)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PageMarks {
-    /// どの page にも印が無い
-    None,
-    /// 全部の page に印
-    All,
-    /// 印のある page と無い page が混ざる / 範囲が広い (page が 64 を越える) / 印の範囲の外 = 1 個ずつ読む
-    Some,
+struct PageMarks {
+    p0: u32,
+    /// 印の並び
+    bits: u128,
+    /// 範囲の page が全部印付きの時の並び
+    full: u128,
 }
 
-/// 場所 `lo..=hi` の page の印。
+impl PageMarks {
+    /// 場所 `s` (範囲の中) の page に印があるか。
+    #[inline(always)]
+    fn has(&self, s: u32) -> bool {
+        (self.bits >> ((s >> PAGE_SHIFT) - self.p0)) & 1 != 0
+    }
+}
+
+/// 場所 `lo..=hi` の page の印。 範囲が広い (page が 64 を越える) / 印の範囲の外は None (1 個ずつ読む)。
 #[inline]
-fn pages_marked(r: &Region, lo: u32, hi: u32) -> PageMarks {
+fn pages_marked(r: &Region, lo: u32, hi: u32) -> Option<PageMarks> {
     let (p0, p1) = (lo >> PAGE_SHIFT, hi >> PAGE_SHIFT);
     if p1 >= PAGES || p1 - p0 > 64 {
-        return PageMarks::Some;
+        return None;
     }
-    // 印は 1 byte に 8 page。 byte ごとに範囲の bit だけを見る (#1015: page ごとに 1 byte ずつ読むと、 1000 件の pull で塊ごとに
-    // 30 page ほどを読んでいた)
-    let (mut any, mut all) = (false, true);
+    // 印は 1 byte に 8 page。 byte ごとに読んで並びに入れる (#1015: page ごとに 1 byte ずつ読むと、 1000 件の pull で塊ごとに 30 page
+    // ほどを読んでいた)。 page p は bit p − p0 (p − p0 <= 64 < 128)
+    let mut bits = 0u128;
     for b in p0 / 8..=p1 / 8 {
-        let lo_bit = if b == p0 / 8 { p0 % 8 } else { 0 };
-        let hi_bit = if b == p1 / 8 { p1 % 8 } else { 7 };
-        let mask = ((0xFFu32 >> (7 - hi_bit)) & (0xFFu32 << lo_bit)) as u8;
         // SAFETY: b <= p1 / 8 < PAGES / 8 なので OFF_PAGES + b < GEN_HEADER <= r.len() (`region_fits_fast_reads`)
-        let m = unsafe { r.as_atomic_u8_unchecked(OFF_PAGES + b as usize) }.load(Ordering::Acquire) & mask;
-        any |= m != 0;
-        all &= m == mask;
+        let m = u128::from(unsafe { r.as_atomic_u8_unchecked(OFF_PAGES + b as usize) }.load(Ordering::Acquire));
+        let first = b * 8;
+        bits |= if first >= p0 { m << (first - p0) } else { m >> (p0 - first) };
     }
-    match (any, all) {
-        (false, _) => PageMarks::None,
-        (true, true) => PageMarks::All,
-        (true, false) => PageMarks::Some,
-    }
+    let full = (1u128 << (p1 - p0 + 1)) - 1;
+    Some(PageMarks { p0, bits: bits & full, full })
 }
 
 #[cfg(test)]
@@ -1236,8 +1249,8 @@ mod tests {
         assert_eq!(g.get(5), 7);
     }
 
-    /// #1015: 塊の印の形 (`pages_marked`) は、 byte の境目をまたぐ範囲でも範囲の page の印だけを見る。 page が 64 を越える範囲と印の範囲の
-    /// 外は 1 個ずつ (Some)。
+    /// #1015: 塊の印の並び (`pages_marked`) は、 byte の境目をまたぐ範囲でも範囲の page の印だけを、 page の順に並べる。 page が 64 を
+    /// 越える範囲と印の範囲の外は並べない (None = 1 個ずつ読む)。
     #[test]
     fn pages_marked_looks_only_at_the_pages_in_range() {
         let pages = 70;
@@ -1251,23 +1264,39 @@ mod tests {
         for p in [7, 8, 20, 21, 22, 23] {
             g.raise(at(p) + 1, 1).unwrap();
         }
-        assert_eq!(pages_marked(r, 0, at(6) + 5), PageMarks::None);
-        assert_eq!(pages_marked(r, at(7), at(8) + 100), PageMarks::All, "byte の境目をまたぐ全部印");
-        assert_eq!(pages_marked(r, at(7) + 3, at(7) + 9), PageMarks::All, "1 page の中");
-        assert_eq!(pages_marked(r, at(6), at(7)), PageMarks::Some);
-        assert_eq!(pages_marked(r, at(8), at(9)), PageMarks::Some);
-        assert_eq!(pages_marked(r, at(9), at(19) + 8191), PageMarks::None, "byte をまたいで印なし");
-        assert_eq!(pages_marked(r, at(20), at(23) + 8191), PageMarks::All);
-        assert_eq!(pages_marked(r, at(16), at(23)), PageMarks::Some, "同じ byte の印の無い page を含む");
-        assert_eq!(pages_marked(r, at(24), at(39)), PageMarks::None);
-        assert_eq!(pages_marked(r, 0, at(64)), PageMarks::Some);
-        assert_eq!(pages_marked(r, at(24), at(24 + 64)), PageMarks::None, "64 page の幅は読む");
-        assert_eq!(pages_marked(r, at(1), at(66)), PageMarks::Some, "64 page を越える幅は 1 個ずつ");
-        assert_eq!(pages_marked(r, at(PAGES - 1), at(PAGES)), PageMarks::Some, "印の範囲の外");
+        let shape = |lo: u32, hi: u32| match pages_marked(r, lo, hi) {
+            None => "wide",
+            Some(m) if m.bits == 0 => "none",
+            Some(m) if m.bits == m.full => "all",
+            Some(_) => "some",
+        };
+        let bits = |lo: u32, hi: u32| pages_marked(r, lo, hi).map(|m| (m.p0, m.bits, m.full));
+        assert_eq!(shape(0, at(6) + 5), "none");
+        assert_eq!(shape(at(7), at(8) + 100), "all", "byte の境目をまたぐ全部印");
+        assert_eq!(shape(at(7) + 3, at(7) + 9), "all", "1 page の中");
+        assert_eq!(shape(at(6), at(7)), "some");
+        assert_eq!(shape(at(8), at(9)), "some");
+        assert_eq!(shape(at(9), at(19) + 8191), "none", "byte をまたいで印なし");
+        assert_eq!(shape(at(20), at(23) + 8191), "all");
+        assert_eq!(shape(at(16), at(23)), "some", "同じ byte の印の無い page を含む");
+        assert_eq!(shape(at(24), at(39)), "none");
+        assert_eq!(shape(0, at(64)), "some");
+        assert_eq!(shape(at(24), at(24 + 64)), "none", "64 page の幅は読む");
+        assert_eq!(shape(at(1), at(66)), "wide", "64 page を越える幅は 1 個ずつ");
+        assert_eq!(shape(at(PAGES - 1), at(PAGES)), "wide", "印の範囲の外");
+        // 印の並び (bit i = page p0 + i): byte の途中から始まる範囲・byte をまたぐ範囲
+        assert_eq!(bits(at(6), at(9)), Some((6, 0b0110, 0b1111)));
+        assert_eq!(bits(at(16), at(23) + 1), Some((16, 0b1111_0000, 0xFF)));
+        assert_eq!(bits(at(5) + 9, at(21)), Some((5, (1 << 2) | (1 << 3) | (1 << 15) | (1 << 16), (1 << 17) - 1)));
+        let m = pages_marked(r, 0, at(64)).unwrap();
+        assert_eq!(m.full, (1u128 << 65) - 1);
+        for p in 0..=64u32 {
+            assert_eq!(m.has(at(p) + 77), [7, 8, 20, 21, 22, 23].contains(&p), "page {p}");
+        }
     }
 
     /// #1015: 出口の写し (`eids`) は、 塊の印の形 (無い / 全部 / 混ざる / 広い・並んでいない) によらず、 1 個ずつ `local` で写した eid と
-    /// 同じ。 lock を取らない読みの照合の読み (`current_relaxed`) は `current` と同じ値。
+    /// 同じ (印の無い page の 2 B は読まない)。 lock を取らない読みの照合の読み (`current_relaxed`) は `current` と同じ値。
     #[test]
     fn eids_match_the_per_slot_local_for_every_mark_shape() {
         let n: u32 = 70 << PAGE_SHIFT;
@@ -1282,6 +1311,9 @@ mod tests {
         }
         g.raise(at(10) + 17, 5).unwrap();
         g.raise(at(69) + 1, 254).unwrap();
+        // 印の無い page (11) に残った 2 B (電源断で世代の byte だけ届いた像、 開く時の heal が印を立て直すまでは読まない) は、 印の
+        // 混ざる塊でも世代 0 と読む (`local` と同じ)
+        g.region.get().unwrap().as_atomic_u16(slot_off(at(11) + 5)).store(9, Ordering::Relaxed);
         let r = g.reader();
         let peer = 7;
         let mut wide: Vec<u32> = (0..n).step_by(4099).collect();
@@ -1291,6 +1323,7 @@ mod tests {
             ("全部印", (at(3)..at(6)).step_by(5).collect()),
             ("全部印の境目", (at(3)..at(3) + 300).collect()),
             ("混ざる", (at(9)..at(12)).step_by(11).collect()),
+            ("混ざる (印の無い page の 2 B)", (at(10)..at(10) + 128).chain(at(11)..at(11) + 128).collect()),
             ("広い", wide),
             ("1 個", vec![at(10) + 17]),
             ("空", vec![]),
