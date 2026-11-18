@@ -6718,9 +6718,10 @@ fn touched_eids(eng: &crate::engine::Engine, peer: Exit<'_>, slots: &[u32], firs
                     }
                 }
             }
-            // 消えた記録が無い: 生きていれば今の住人、 死んでいれば前の poll より前に消えた行 (世代 今 − 1)
+            // 消えた記録が無い: 生きていれば今の住人、 死んでいれば前の poll より前に消えた行 (世代 今 − 1、 #1008: 開く時の突き合わせが
+            // 2 つ上げた場所は 今 − 2)
             _ if live || now == 0 => out.push(peer.eid_at(e, now)),
-            _ => out.push(peer.eid_at(e, now - 1)),
+            _ => out.push(peer.eid_at(e, eng.dead_slot_row_gen(e, now))),
         }
     }
     out
