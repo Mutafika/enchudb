@@ -1869,7 +1869,12 @@ fn deserialize_eidalias(buf: &[u8]) -> Result<Vec<EidaliasEntry>, String> {
 /// #178: 別名を sidecar に atomic 書き換え。 別名が無ければ file を消す (残すと、 畳んだ行の slot が回った後で開き直した
 /// 時に古い別名が戻り、 別名宛ての record が無関係な行に入る)。 `with_gen` は [`serialize_eidalias`]。
 #[cfg(not(target_arch = "wasm32"))]
-fn persist_eidalias_to_sidecar(db_path: &str, entries: &[EidaliasEntry], with_gen: bool) -> io::Result<()> {
+fn persist_eidalias_to_sidecar(
+    db_path: &str,
+    entries: &[EidaliasEntry],
+    with_gen: bool,
+    chain: &mut crate::db_files::SyncChain,
+) -> io::Result<()> {
     let p = eidalias_path_for(db_path);
     if entries.is_empty() {
         return match std::fs::remove_file(&p) {
@@ -1877,7 +1882,10 @@ fn persist_eidalias_to_sidecar(db_path: &str, entries: &[EidaliasEntry], with_ge
             _ => Ok(()),
         };
     }
-    crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries, with_gen)).map(|_| ())
+    if crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries, with_gen))? {
+        chain.wrote_durable();
+    }
+    Ok(())
 }
 
 /// #178: 別名の sidecar を読む。 不在なら Ok(None)。
@@ -6062,6 +6070,145 @@ mod gone_own_delete_tests {
         assert!(t_a.is_some(), "前提: 取り出した削除の名前は載った");
         assert_ne!(t_w, enchudb_oplog::Hlc::ZERO, "前提: W の削除の版数");
         assert_eq!(got, Some(t_w), "載せている最中に積んだ削除の名前が、 印が下りて見えなくなった");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sidecar_chain_tests {
+    //! #1018: 続けて書き出す sidecar の組 (`db_files::SyncChain`)。 数えるのは、 この thread が頼んだ書き出しの強さ
+    //! (`sync_counts`、 disk まで / 順の印)。 consumer は止めておく (止めないと consumer が先に書き出して、 この thread の
+    //! 書き出しが無くなる)。
+    use super::*;
+    use crate::db_files::sync_counts;
+    use std::sync::atomic::Ordering;
+
+    /// 満杯の名前のある表 (枠 2、 sync する DB、 WAL 付き) を作り、 consumer を止めて `f` に (engine, 表の 2 行) を渡す。
+    fn with_full_named_table(tag: &str, f: impl FnOnce(&Engine, [u64; 2])) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-chain-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        {
+            let _hold = eng.hold_consumer();
+            let x = eng.entity_in("t").unwrap();
+            eng.tie_to(x, "t.k", 7u32);
+            let z = eng.entity_in("t").unwrap();
+            eng.tie_to(z, "t.k", 1u32);
+            eng.oplog_sync().unwrap();
+            eng.persist_tables().unwrap();
+            f(&eng, [x, z]);
+        }
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// 行 `gone` を消して、 その場所を名前 `name` の行で使い回す (前の住人の名前を `pkformer` の identity に移す、 #914)。
+    fn delete_and_reuse(eng: &Engine, gone: u64, name: u32) -> u64 {
+        eng.delete(gone);
+        let n = eng.entity_in("t").unwrap();
+        assert_eq!(eng.slot_unchecked(n), eng.slot_unchecked(gone), "前提: 消した行の場所を使い回した");
+        eng.tie_to(n, "t.k", name);
+        n
+    }
+
+    fn assert_on_disk(eng: &Engine, what: &str) {
+        assert_eq!(eng.pktombs_disk_diff().unwrap(), None, "{what}: pktombs が memory と違う");
+        assert_eq!(eng.pkformer_disk_diff().unwrap(), None, "{what}: pkformer が memory と違う");
+    }
+
+    /// `oplog_sync()` は、 `pktombs` と `pkformer.log` の両方に追記する時、 disk まで書き出すのを 1 回にする (`pktombs` は順の印)。
+    /// 前は 2 回 (macOS の F_FULLFSYNC 2 回) で、 使い回し続ける表の `oplog_sync()` が 0.37.4 の 2 倍かかった。
+    #[test]
+    fn oplog_sync_writes_both_name_records_with_one_durable_sync() {
+        with_full_named_table("sync", |eng, [x, z]| {
+            // 1 周目: 2 つの file を作る (無い file はまとめて書く = 追記でない)
+            delete_and_reuse(eng, x, 8);
+            eng.oplog_sync().unwrap();
+            // 2 周目: 両方に追記する
+            delete_and_reuse(eng, z, 9);
+            assert!(eng.pk_former_dirty.load(Ordering::Acquire), "前提: 使い回しが前の住人の名前を pkformer に移した");
+            assert!(
+                eng.pk_tombs_dirty.load(Ordering::Acquire) || eng.pk_pending_nonempty.load(Ordering::Acquire),
+                "前提: 削除が pktombs に名前を足した"
+            );
+            sync_counts::take();
+            eng.oplog_sync().unwrap();
+            assert_eq!(sync_counts::take(), (1, 1), "(disk まで, 順の印): pktombs は順の印、 pkformer.log だけ disk まで");
+            assert_on_disk(eng, "oplog_sync の後");
+        });
+    }
+
+    /// `persist_tables()` の組 (`eidmap.log` → `pktombs` → `pkformer.log`) も、 disk まで書き出すのは最後の 1 回。
+    #[test]
+    fn persist_tables_writes_the_chain_with_one_durable_sync() {
+        with_full_named_table("tables", |eng, [x, z]| {
+            delete_and_reuse(eng, x, 8);
+            eng.persist_tables().unwrap();
+            delete_and_reuse(eng, z, 9);
+            assert!(eng.eid_translator.has_dirty(), "前提: 自分の消えた行の削除を退避した (eidmap.log に追記する)");
+            assert!(eng.pk_former_dirty.load(Ordering::Acquire), "前提: pkformer に名前を移した");
+            sync_counts::take();
+            eng.persist_tables().unwrap();
+            assert_eq!(sync_counts::take(), (1, 2), "(disk まで, 順の印): eidmap.log と pktombs は順の印、 pkformer.log だけ disk まで");
+            assert_on_disk(eng, "persist_tables の後");
+            assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "eidmap が memory と違う");
+        });
+    }
+
+    /// 順の印で書き出した後に、 disk まで書き出す物が続かなかった (続くはずの `pkformer` に書く物が無かった) 時は、 組の終わりに
+    /// 順の印で書いた file を disk まで書き出す。
+    #[test]
+    fn an_ordered_sync_without_a_durable_one_after_it_is_made_durable() {
+        with_full_named_table("tail", |eng, [x, _]| {
+            let y = delete_and_reuse(eng, x, 8);
+            eng.oplog_sync().unwrap();
+            // pktombs にだけ書く物を作り (使い回さずに消す)、 pkformer は書く物が無いのに印だけ立てる
+            eng.delete(y);
+            eng.pk_former_dirty.store(true, Ordering::Release);
+            sync_counts::take();
+            eng.oplog_sync().unwrap();
+            let (durable, ordered) = sync_counts::take();
+            assert_eq!(ordered, 1, "前提: pkformer が続く見込みで pktombs を順の印で書いた");
+            if cfg!(target_vendor = "apple") {
+                assert_eq!(durable, 1, "順の印で書いた pktombs を組の終わりに disk まで書き出さなかった");
+            } else {
+                assert_eq!(durable, 0, "順の印の無い OS は、 順の印を頼んだ書き出しが disk まで書き出す");
+            }
+            assert_on_disk(eng, "oplog_sync の後");
+        });
+    }
+
+    /// 組の途中で失敗して抜けた時 (`pkformer.log` に追記できない) も、 順の印だけで書き出した `pktombs` を disk まで書き出す
+    /// (`pktombs` は memory では書き出した印になっている)。 次の書き出しで `pkformer` も届く。
+    #[test]
+    fn a_chain_that_fails_halfway_still_makes_the_ordered_sync_durable() {
+        with_full_named_table("fail", |eng, [x, z]| {
+            delete_and_reuse(eng, x, 8);
+            eng.oplog_sync().unwrap();
+            delete_and_reuse(eng, z, 9);
+            sync_counts::take();
+            sync_counts::fail_appends_to(Some(crate::db_files::PKFORMER_LOG));
+            let r = eng.persist_name_records();
+            sync_counts::fail_appends_to(None);
+            assert!(r.is_err(), "前提: pkformer.log に追記できなかった");
+            let (durable, ordered) = sync_counts::take();
+            assert_eq!(ordered, 1, "前提: pktombs を順の印で書いた");
+            if cfg!(target_vendor = "apple") {
+                assert_eq!(durable, 1, "失敗して抜けた組が、 順の印で書いた pktombs を disk まで書き出さなかった");
+            } else {
+                assert_eq!(durable, 0);
+            }
+            assert_eq!(eng.pktombs_disk_diff().unwrap(), None, "pktombs は書けている");
+            assert!(eng.pk_former_dirty.load(Ordering::Acquire), "書けなかった pkformer の印を戻していない");
+            eng.oplog_sync().unwrap();
+            assert_on_disk(eng, "書き直した後");
+        });
     }
 }
 
@@ -18891,15 +19038,17 @@ impl Engine {
         // `prev.seg` の周期を進めてから写しを取る (`PrevSlots::begin_persist`)
         let covered = self.generations().prev.begin_persist();
         self.persist_tables_file()?;
+        // #1018: `eidmap.log` → `pktombs` → `pkformer.log` の追記は 1 つの組で書き出す (最後の 1 つだけ disk まで)
+        let mut chain = crate::db_files::SyncChain::default();
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。 #560: 変わった分だけ追記
-        self.persist_eidmap()?;
+        self.persist_eidmap(&mut chain, self.name_records_dirty())?;
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::EidmapWritten);
         // #178: 別名も同じ trigger で
-        persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot(), self.generations().moved())?;
+        persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot(), self.generations().moved(), &mut chain)?;
         // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
-        self.persist_pk_tombs_if_dirty()?;
-        self.persist_pk_former_if_dirty()?;
+        self.persist_name_records_in(&mut chain)?;
+        chain.finish()?;
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::SidecarsWritten);
         self.prev_persist_end(covered);
@@ -18953,8 +19102,10 @@ impl Engine {
     /// する。 `pk_former.rs` の `take_for_persist`)。 大きくなった時は、 追記した後に disk からまとめ直す (#959、
     /// [`Self::compact_pk_former_files`])。 印を先に下ろしてから取り出すので、 取り出した後に変わった分は印が立ち直り、
     /// 次に書く。 書けなかったら印を戻し、 次はまとめ直す。 呼び手は `sidecar_persist_lock` を握っている。
+    ///
+    /// #1018: 組 `chain` の最後の 1 つ (追記は disk まで書き出す = 前に順の印で書いた `eidmap.log` / `pktombs` も届く)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn persist_pk_former(&self, compact: bool) -> io::Result<()> {
+    fn persist_pk_former(&self, compact: bool, chain: &mut crate::db_files::SyncChain) -> io::Result<()> {
         use crate::pk_former::Persist;
         use std::sync::atomic::Ordering;
         let dirty = self.pk_former_dirty.swap(false, Ordering::AcqRel);
@@ -18963,14 +19114,25 @@ impl Engine {
         }
         let Some(job) = self.pk_former.write().unwrap().take_for_persist(compact) else { return Ok(()) };
         let (path, log_path) = (pkformer_path_for(&self.path), pkformer_log_path_for(&self.path));
+        let durable = |r: io::Result<()>, chain: &mut crate::db_files::SyncChain| {
+            if r.is_ok() {
+                chain.wrote_durable();
+            }
+            r
+        };
         let r = match &job {
-            Persist::Rewrite { snapshot, log } => write_pkformer_files(&path, &log_path, snapshot, log),
-            Persist::Fresh { records } => remove_sidecar(&path).and_then(|()| {
-                crate::db_files::write_atomic_parts(&log_path, &[&crate::pk_former::log_header(&[]), records])
-            }),
-            Persist::Resume { header, records } => crate::db_files::write_atomic_parts(&log_path, &[header, records]),
+            Persist::Rewrite { snapshot, log } => durable(write_pkformer_files(&path, &log_path, snapshot, log), chain),
+            Persist::Fresh { records } => durable(
+                remove_sidecar(&path).and_then(|()| {
+                    crate::db_files::write_atomic_parts(&log_path, &[&crate::pk_former::log_header(&[]), records])
+                }),
+                chain,
+            ),
+            Persist::Resume { header, records } => {
+                durable(crate::db_files::write_atomic_parts(&log_path, &[header, records]), chain)
+            }
             Persist::Append { bytes, .. } if bytes.is_empty() => Ok(()),
-            Persist::Append { bytes, .. } => crate::db_files::append_synced(&log_path, bytes),
+            Persist::Append { bytes, .. } => crate::db_files::append_synced_in(&log_path, bytes, chain, false),
         };
         let mut g = self.pk_former.write().unwrap();
         match &r {
@@ -19131,10 +19293,28 @@ impl Engine {
         }
     }
 
-    /// [`Self::persist_pk_former`] の、 まとめ直しを求めない形。
+    /// 消した主キー (`pktombs`) → 主キーの前の名前 (`pkformer`) の順に、 変わっていれば書き出す (まとめ直しは求めない)。 呼び手は
+    /// `sidecar_persist_lock` を握っている。
+    ///
+    /// #1018: 2 つは組 `chain` の中で書き出す。 `pkformer` も書く時、 `pktombs` の追記は順の印だけ (`pkformer` の追記が disk まで
+    /// 書き出す時に一緒に届く。 `pktombs` が `pkformer` より後に届く像は前と同じく無い)。 場所を使い回し続ける名前のある表は、
+    /// 使い回しのたびに前の住人の名前を `pkformer` に移す (#914) ので、 書き出しのたびに 2 つとも書く。 前は 1 つずつ disk まで
+    /// (macOS の F_FULLFSYNC 2 回 = 8〜9 ms) で、 `oplog_sync()` が 0.37.4 の 2 倍かかった。
     #[cfg(not(target_arch = "wasm32"))]
-    fn persist_pk_former_if_dirty(&self) -> io::Result<()> {
-        self.persist_pk_former(false)
+    fn persist_name_records_in(&self, chain: &mut crate::db_files::SyncChain) -> io::Result<()> {
+        let former_follows = self.pk_former_dirty.load(std::sync::atomic::Ordering::Acquire);
+        self.persist_pk_tombs_if_dirty(chain, former_follows)?;
+        self.persist_pk_former(false, chain)
+    }
+
+    /// #1018: 名前の記録 (`pktombs` / `pkformer`) に書き出す物があるか (組の前の sidecar を順の印だけにしてよいか、 の見込み)。
+    /// 外れても正しい: 見込みが立っていて書く物が無かった時は、 組の終わり (`SyncChain::finish`) が disk まで書き出す。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn name_records_dirty(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.pk_tombs_dirty.load(Ordering::Acquire)
+            || self.pk_pending_nonempty.load(Ordering::Acquire)
+            || self.pk_former_dirty.load(Ordering::Acquire)
     }
 
     /// review987 2 回目 [I]: 名前の記録のまとめ直しを置いた回数を、 何回目で置いたかごとに (`pktombs`, `pkformer`)。 `pktombs` は
@@ -19198,17 +19378,14 @@ impl Engine {
     /// (WAL より先に書くと、 電源断で消えた削除の主キーだけが残る)。
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_name_records(&self) -> io::Result<()> {
-        use std::sync::atomic::Ordering;
-        if self.path.is_empty()
-            || !(self.pk_tombs_dirty.load(Ordering::Acquire)
-                || self.pk_pending_nonempty.load(Ordering::Acquire)
-                || self.pk_former_dirty.load(Ordering::Acquire))
-        {
+        if self.path.is_empty() || !self.name_records_dirty() {
             return Ok(());
         }
         let r = {
             let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.persist_pk_tombs_if_dirty().and_then(|()| self.persist_pk_former_if_dirty())
+            // #1018: 返る前に組の全部を disk まで (本体の書き出しより先に届く)。 途中で抜けた時も `Drop` が書き出す
+            let mut chain = crate::db_files::SyncChain::default();
+            self.persist_name_records_in(&mut chain).and_then(|()| chain.finish())
         };
         // review987 [1]: まとめ直しは書き出しの lock の外 (consumer が居れば consumer の周期)
         self.compact_name_records_without_consumer();
@@ -19281,8 +19458,10 @@ impl Engine {
     /// 生きている記録の 2 倍を越えた / 信用できない / きれいに閉じる時は、 まとめ直す (`eidmap` を書き直して log を空にする)。 失敗
     /// したら印を戻し、 次はまとめ直す。 呼び手は `sidecar_persist_lock` を握っている (書き出しを 1 本に並べる)。 写像が無く `eidmap`
     /// も無い DB (sync してない) には file を作らない。
+    ///
+    /// #1018: 追記は組 `chain` の中で書き出す (`more` = この後に同じ組で名前の記録を書く見込み。 あれば順の印だけ)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn persist_eidmap(&self) -> io::Result<()> {
+    fn persist_eidmap(&self, chain: &mut crate::db_files::SyncChain, more: bool) -> io::Result<()> {
         use crate::eidmap_log::{MAPPING_GONE, NO_LOCAL_SLOT as ORPHAN, REWRITE_SLACK, push_record};
         use std::sync::atomic::Ordering;
         let keys = self.eid_translator.take_dirty();
@@ -19301,10 +19480,14 @@ impl Engine {
             }
             let bytes = serialize_eidmap(&entries);
             let log_path = crate::db_files::path_for(&self.path, crate::db_files::EIDMAP_LOG);
-            let r = crate::db_files::write_atomic_if_changed(&eidmap, &bytes)
-                .and_then(|_| crate::db_files::write_atomic_if_changed(&log_path, &crate::eidmap_log::header(&bytes)));
+            let r = crate::db_files::write_atomic_if_changed(&eidmap, &bytes).and_then(|a| {
+                crate::db_files::write_atomic_if_changed(&log_path, &crate::eidmap_log::header(&bytes)).map(|b| a || b)
+            });
             return match r {
-                Ok(_) => {
+                Ok(wrote) => {
+                    if wrote {
+                        chain.wrote_durable();
+                    }
                     *log = crate::eidmap_log::LogState { records: 0, ok: true };
                     Ok(())
                 }
@@ -19331,7 +19514,7 @@ impl Engine {
             }
         }
         let log_path = crate::db_files::path_for(&self.path, crate::db_files::EIDMAP_LOG);
-        match crate::db_files::append_synced(&log_path, &buf) {
+        match crate::db_files::append_synced_in(&log_path, &buf, chain, more) {
             Ok(()) => {
                 log.records += records;
                 Ok(())
@@ -19376,8 +19559,10 @@ impl Engine {
     /// #513: `pktombs` に、 変わった分を追記する (file が無い / 信用できない / record が増えすぎた時はまとめて書き直す、
     /// `pk_tombs.rs`)。 印を先に下ろしてから取り出すので、 取り出した後に覚えた分は印が立ち直り、 次に書く。 書けなかったら
     /// 印を戻し、 次はまとめて書き直す。 呼び手は `sidecar_persist_lock` を握っている (書き出しを 1 本に並べる)。
+    ///
+    /// #1018: 追記は組 `chain` の中で書き出す (`more` = この後に同じ組で `pkformer` を書く見込み。 あれば順の印だけ)。
     #[cfg(not(target_arch = "wasm32"))]
-    fn persist_pk_tombs_if_dirty(&self) -> io::Result<()> {
+    fn persist_pk_tombs_if_dirty(&self, chain: &mut crate::db_files::SyncChain, more: bool) -> io::Result<()> {
         use crate::pk_tombs::Persist;
         use std::sync::atomic::Ordering;
         self.flush_pk_pending();
@@ -19387,12 +19572,17 @@ impl Engine {
         let Some(job) = self.pk_tombs.write().unwrap().take_for_persist() else { return Ok(()) };
         let path = pktombs_path_for(&self.path);
         let r = match &job {
-            Persist::Rewrite { bytes, .. } => crate::db_files::write_atomic_if_changed(&path, bytes).map(|_| ()),
+            Persist::Rewrite { bytes, .. } => crate::db_files::write_atomic_if_changed(&path, bytes).map(|wrote| {
+                if wrote {
+                    chain.wrote_durable();
+                }
+            }),
             Persist::Fresh { bytes, .. } => {
                 crate::db_files::write_atomic_parts(&path, &[&crate::pk_tombs::file_header(), bytes])
+                    .map(|()| chain.wrote_durable())
             }
             Persist::Append { bytes, .. } if bytes.is_empty() => Ok(()),
-            Persist::Append { bytes, .. } => crate::db_files::append_synced(&path, bytes),
+            Persist::Append { bytes, .. } => crate::db_files::append_synced_in(&path, bytes, chain, more),
         };
         let mut g = self.pk_tombs.write().unwrap();
         match &r {
@@ -19758,26 +19948,38 @@ impl Engine {
                         false
                     }
                 };
+                // #1018: `eidmap.log` → `pktombs` → `pkformer.log` の追記は 1 つの組で書き出す (最後の 1 つだけ disk まで)
+                let mut chain = crate::db_files::SyncChain::default();
                 // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
                 // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
-                if let Err(e) = self.persist_eidmap() {
+                if let Err(e) = self.persist_eidmap(&mut chain, self.name_records_dirty()) {
                     moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 #[cfg(feature = "crashsim")]
                 write_out_hook::call(write_out_hook::Phase::EidmapWritten);
                 // #178: 別名も
-                if let Err(e) = persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot(), self.generations().moved()) {
+                if let Err(e) = persist_eidalias_to_sidecar(
+                    &self.path,
+                    &self.eid_translator.alias_snapshot(),
+                    self.generations().moved(),
+                    &mut chain,
+                ) {
                     moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // #513: 消した主キーの記録も。 変わった時だけ書く。
-                if let Err(e) = self.persist_pk_tombs_if_dirty() {
+                if let Err(e) = self.persist_pk_tombs_if_dirty(&mut chain, self.pk_former_dirty.load(std::sync::atomic::Ordering::Acquire)) {
                     moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // 主キーの前の名前も
-                if let Err(e) = self.persist_pk_former_if_dirty() {
+                if let Err(e) = self.persist_pk_former(false, &mut chain) {
+                    moved_ok = false;
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // 組の全部を disk まで (`prev.seg` の周期を進める前に)
+                if let Err(e) = chain.finish() {
                     moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
@@ -19811,7 +20013,8 @@ impl Engine {
             return;
         }
         let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(e) = self.persist_pk_former(true) {
+        let mut chain = crate::db_files::SyncChain::default();
+        if let Err(e) = self.persist_pk_former(true, &mut chain).and_then(|()| chain.finish()) {
             self.warn_persist_failure_rate_limited(&e);
         }
     }

@@ -322,15 +322,144 @@ pub(crate) fn sync_dir_plain(dir: &Path, site: &'static str) -> io::Result<()> {
 /// #513: sidecar に追記して書き出す (`pktombs`)。 file が無ければ Err (追記は、 先にまとめて書いた file にだけ足す)。
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn append_synced(sidecar: &Path, bytes: &[u8]) -> io::Result<()> {
+    append_synced_in(sidecar, bytes, &mut SyncChain::default(), false)
+}
+
+/// #1018: [`append_synced`] の、 続けて書き出す sidecar の組 ([`SyncChain`]) の中の 1 つ。 `more` = この後に同じ組で書き出す
+/// sidecar がある (それが disk まで書き出すので、 この追記は順の印だけでよい)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn append_synced_in(sidecar: &Path, bytes: &[u8], chain: &mut SyncChain, more: bool) -> io::Result<()> {
     use std::io::Write;
     enchudb_oplog::io_point("sidecar.append")?;
+    #[cfg(test)]
+    sync_counts::fail_point(sidecar)?;
     let mut f = std::fs::OpenOptions::new().append(true).open(sidecar)?;
     f.write_all(bytes)?;
     enchudb_oplog::io_point("sidecar.append_sync")?;
-    f.sync_all()?;
+    let done = sync_file(&f, if more { SyncKind::Ordered } else { SyncKind::Durable })?;
     #[cfg(all(feature = "crashsim", unix))]
     enchudb_oplog::crashsim::file_synced(sidecar);
+    chain.wrote(sidecar, done);
     Ok(())
+}
+
+/// #1018: sidecar の書き出しの強さ。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SyncKind {
+    /// disk に届くまで (`File::sync_all`。 macOS は F_FULLFSYNC = drive の cache も吐かせる。 1 回 4〜5 ms)
+    Durable,
+    /// 順だけ (macOS の F_BARRIERFSYNC、 1 回 0.4 ms 前後): この file の中身は、 この後に disk へ送る物より先に disk に届く。 返った
+    /// 時に届いたとは言えないので、 呼び手は同じ組の最後に [`SyncKind::Durable`] を 1 つ置く ([`SyncChain`])。 macOS の
+    /// F_FULLFSYNC は、 前に書き出した物 (同じ device) も届けてから返る (fcntl(2) の F_FULLFSYNC / F_BARRIERFSYNC)。 順の印を
+    /// 持たない OS と、 F_BARRIERFSYNC を受けない file system は [`SyncKind::Durable`] で書き出す
+    Ordered,
+}
+
+/// #1018: `f` を `how` の強さで書き出し、 実際に書き出した強さを返す (順の印の無い OS / file system は `Durable`)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn sync_file(f: &std::fs::File, how: SyncKind) -> io::Result<SyncKind> {
+    #[cfg(test)]
+    sync_counts::note(how);
+    #[cfg(target_vendor = "apple")]
+    if how == SyncKind::Ordered {
+        use std::os::fd::AsRawFd;
+        // SAFETY: 開いている file の fd を渡すだけ
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
+            return Ok(SyncKind::Ordered);
+        }
+        // 受けない file system (APFS / HFS の外) と失敗: disk に届くまで書き出す (失敗ならそちらが Err を返す)
+    }
+    f.sync_all()?;
+    Ok(SyncKind::Durable)
+}
+
+/// #1018: 続けて書き出す sidecar の組 (`eidmap.log` → `pktombs` → `pkformer.log` …、 1 つの書き出しの lock の下) の書き出しを、
+/// 後ろに続く物がある間は順の印だけ ([`SyncKind::Ordered`])、 最後の 1 つを disk まで ([`SyncKind::Durable`]) にする。 組の中の順
+/// (前の file が後の file より先に disk に届く) と、 組を終えた時に全部が disk に届いていることは、 1 つずつ disk まで書き出す時と
+/// 同じ。 前は 1 つずつ F_FULLFSYNC で、 場所を使い回し続ける名前のある表 (使い回しのたびに前の住人の名前を `pkformer` に移す、
+/// #914) の `oplog_sync()` が 0.37.4 の 2 倍かかった (`pktombs` と `pkformer.log` で 2 回)。
+///
+/// 順の印で書き出した後に、 同じ組で disk まで書き出す物が続かなかった時 (続くはずの sidecar に書く物が無かった / 書けなかった) は、
+/// [`Self::finish`] (呼ばずに落とした時は `Drop`) が最後に順の印で書き出した file を disk まで書き出す。
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub(crate) struct SyncChain {
+    /// 順の印だけで書き出し、 その後に disk まで書き出した物が無い file
+    ordered: Option<PathBuf>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SyncChain {
+    /// `path` を `done` の強さで書き出した。 disk まで書き出したなら、 前に順の印で書き出した物も届いている。
+    pub(crate) fn wrote(&mut self, path: &Path, done: SyncKind) {
+        self.ordered = match done {
+            SyncKind::Durable => None,
+            SyncKind::Ordered => Some(path.to_path_buf()),
+        };
+    }
+
+    /// 組の中で、 順の印を使わない書き出し (tmp + rename の `write_atomic_*`) で disk まで書き出した。
+    pub(crate) fn wrote_durable(&mut self) {
+        self.ordered = None;
+    }
+
+    /// 組を終える: 順の印だけで書き出した物が残っていれば、 disk まで書き出す。
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        let Some(path) = self.ordered.take() else { return Ok(()) };
+        enchudb_oplog::io_point("sidecar.chain_sync")?;
+        let f = std::fs::File::open(&path)?;
+        sync_file(&f, SyncKind::Durable)?;
+        #[cfg(all(feature = "crashsim", unix))]
+        enchudb_oplog::crashsim::file_synced(&path);
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SyncChain {
+    /// 途中で失敗して抜けた組 (`?`) も、 順の印だけで書き出した物を disk まで書き出す (書き出した記録は memory で済んだ印になっている)。
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// #1018: 試験用。 この thread の sidecar の書き出しの回数 (disk まで / 順の印) と、 追記を失敗させる file の名前。
+#[cfg(test)]
+pub(crate) mod sync_counts {
+    use super::SyncKind;
+    use std::cell::{Cell, RefCell};
+    use std::io;
+    use std::path::Path;
+
+    thread_local! {
+        static COUNTS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn note(how: SyncKind) {
+        COUNTS.with(|c| {
+            let (d, o) = c.get();
+            c.set(match how {
+                SyncKind::Durable => (d + 1, o),
+                SyncKind::Ordered => (d, o + 1),
+            });
+        });
+    }
+
+    /// この thread で頼んだ (disk まで, 順の印) の数を返して 0 に戻す。
+    pub(crate) fn take() -> (u64, u64) {
+        COUNTS.with(|c| c.replace((0, 0)))
+    }
+
+    /// この thread の、 名前が `name` の sidecar への追記を失敗させる (None で外す)。
+    pub(crate) fn fail_appends_to(name: Option<&str>) {
+        FAIL.with(|f| *f.borrow_mut() = name.map(str::to_string));
+    }
+
+    pub(super) fn fail_point(path: &Path) -> io::Result<()> {
+        let hit = FAIL.with(|f| f.borrow().as_deref().is_some_and(|n| path.file_name().is_some_and(|x| x == n)));
+        if hit { Err(io::Error::other("sync_counts: 試験の失敗")) } else { Ok(()) }
+    }
 }
 
 /// 現行 sidecar が `bytes` と完全一致か。 不在 / 読めない / 長さ違いは false
