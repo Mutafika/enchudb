@@ -95,6 +95,8 @@ pub mod live;
 pub mod row_lock;
 // #419: 中身を指す cell の書き込みと本体の書き出しの順序 (中身を指す列の msync の間だけ書き手を待たせる)。
 pub(crate) mod publish_gate;
+// #978: 削除が落とした cell の書き出しと tombstone (tomb.seg) の順序 (列の msync の間だけ削除を待たせる)。
+pub(crate) mod delete_gate;
 // 円柱を組んでいない紐の書き手は紐の write_lock を取らずに門を通る (組む側・barrier は門を閉じて中の書き手を待つ)。
 pub(crate) mod write_gate;
 // 円柱を組んだ紐の書き手は紐の write_lock を取らずに値ごとの鍵で書く (違う値の書き手どうしは並ばない)。

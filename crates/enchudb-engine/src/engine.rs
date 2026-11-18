@@ -1546,6 +1546,21 @@ impl<'a> LocalApply<'a> {
         Self { eng, mark: None, intents: Intents::None, counted: false }
     }
 
+    /// #978: 印も門も持たず、 辞書と Leaf の旧 slot の書き出しを落とす時まで回さないだけの物 (削除の門の中で、 本体の書き出しを
+    /// 呼ばない = 門を閉じて自分を待たない)。 自分の書き込みの `LocalApply` の中なら、 書き出しはいちばん外が落ちる時。
+    #[inline]
+    fn deferring_settles(eng: &'a Engine) -> Self {
+        IN_LOCAL_APPLY.with(|d| {
+            let mut t = d.get();
+            if t.bits & LOCAL_APPLY_DEPTH == 0 {
+                (t.one, t.many, t.many_len) = (std::ptr::null(), std::ptr::null(), 0);
+            }
+            t.bits += 1;
+            d.set(t);
+        });
+        Self { eng, mark: None, intents: Intents::None, counted: true }
+    }
+
     /// `Engine::append_local_op` に渡す印。
     #[inline]
     fn mark(&self) -> Option<&enchudb_oplog::oplog::Applying<'a>> {
@@ -2578,7 +2593,7 @@ fn sync_dir(dir: &std::path::Path) {
 #[cfg(feature = "crashsim")]
 #[doc(hidden)]
 pub mod write_out_hook {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Phase {
@@ -2594,12 +2609,24 @@ pub mod write_out_hook {
         Column(u16),
         /// #705: 列を全部書き出した後 (版数の列・tombstone を書き出す前)
         BeforeVersions,
+        /// #978: 生きている印・場所の世代を書き出した後、 残りの列 (中身を指さない列) を書き出す前 (削除の門は閉じている。 残りの列でない物
+        /// (header …) は門を閉じる前に書き出してある)
+        BeforeRest,
+        /// #978: `prev.seg` の後に削除の門を閉じて tomb.seg を書き出した後 (生きている印・場所の世代・残りの列を書き出す前、 門は閉じた
+        /// まま)
+        DeletesClosed,
+        /// #978: 削除 (tombstone を置いた後) が、 閉じている削除の門に当たって待ち始めた (消す thread から、 1 回の削除で 1 度)
+        DeleteGateWait,
+        /// #978: 削除が削除の門を出た後、 生きている印を下ろす (`live_free`: 場所の世代を上げてから生きている印を下ろす) 前 (消す
+        /// thread から、 門を通った削除で 1 度)。 門を閉じる前に門を出た削除の `live_free` は、 門を閉じている間の生きている印・場所の
+        /// 世代の書き出しに混ざる (`write_out_body` の注釈) = 「場所の世代は死、 生きている印は生」 の像を書き出しの段で撮る道
+        DeleteGateLeft,
         /// 0.37: `body_msync` が本体を書き出し終えた後 (書き出しが届かせた bridge の位置を置く前)
         WrittenOut,
         /// #731: v15 に移る時、 `gen.seg` を書き出した後 (header に場所の bit と version 15 を書く前)
         GenerationsBeforeHeader,
-        /// #731: 本体の書き出しで、 生きている印 (entities) を書き出した後、 場所の世代 (`gen.seg`) を書き出す前 (消す書き手を
-        /// 止めている間)
+        /// #731: 本体の書き出しで、 生きている印 (entities) を書き出した後、 場所の世代 (`gen.seg`) を書き出す前 (#978: sync する DB では
+        /// 削除の門を閉じている)
         BeforeGenerations,
         /// 本体の書き出しで、 前の住人の記録 (`prev.seg`) を書き出した後、 生きている印 (entities) を書き出す前
         PrevWrittenOut,
@@ -2618,16 +2645,61 @@ pub mod write_out_hook {
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static HOOK: super::hook_slot::Slot<dyn Fn(Phase) + Send + Sync> = super::hook_slot::Slot::new();
 
+    /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`])。
     pub fn set(hook: Option<Hook>) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+        HOOK.set(hook);
     }
 
     pub(crate) fn call(phase: Phase) {
-        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if let Some(h) = hook {
-            h(phase);
+        HOOK.with(|h| h(phase));
+    }
+}
+
+/// 試験の hook (crashsim feature) の置き場。 process に 1 つ (どの engine からも呼ぶ)。
+///
+/// `set` は前の hook を取り出して lock を放してから落とし、 新しい hook を置く (置く時に間に置かれた hook も lock の外で落とす)。 前は
+/// lock を持ったまま落とした: hook を外す前に panic した試験は engine の `Arc` を持つ hook を残し、 次の試験の `set` がそれを落とすと
+/// engine の Drop が consumer を待ち、 consumer の最後の書き出しが `call` で同じ lock を待って止まり続けた (PR #997 に master を取り込んだ
+/// 所で power_loss が約 21 時間止まった)。 新しい hook を置く前に落とすので、 前の engine の最後の書き出しは新しい hook を呼ばない
+/// (下の `with` が最後の持ち手になった時を除く)。
+///
+/// `with` は hook の写し (`Arc`) を持って lock の外で呼ぶ (hook の中で止まっても `set` を止めない)。 その間に `set` が外すと、 最後の
+/// `Arc` は呼んだ thread が持つ。 それが hook の持つ engine の consumer なら、 落とすと engine の Drop が自分を join する。 そこで最後の
+/// 持ち手になった `with` は、 落とすのを別の thread に回す (最後かは `Arc::into_inner` が 1 回の操作で決める)。
+#[cfg(feature = "crashsim")]
+mod hook_slot {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    pub(crate) struct Slot<F: ?Sized>(Mutex<Option<Arc<Arc<F>>>>);
+
+    impl<F: ?Sized + Send + Sync + 'static> Slot<F> {
+        pub(crate) const fn new() -> Self {
+            Slot(Mutex::new(None))
+        }
+
+        pub(crate) fn set(&self, hook: Option<Arc<F>>) {
+            let old = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+            drop(old);
+            let between = std::mem::replace(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner), hook.map(Arc::new));
+            drop(between);
+        }
+
+        pub(crate) fn is_set(&self) -> bool {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+        }
+
+        /// 置いてある hook を lock の外で `f` に渡す。
+        pub(crate) fn with(&self, f: impl FnOnce(&F)) {
+            let hook = self.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            if let Some(h) = hook {
+                f(&**h);
+                if let Some(last) = Arc::into_inner(h) {
+                    // 外された hook の最後の持ち手。 thread を作れなければ (closure ごと) ここで落ちる
+                    let _ = std::thread::Builder::new().name("enchudb-hook-drop".into()).spawn(move || drop(last));
+                }
+            }
         }
     }
 }
@@ -2733,7 +2805,7 @@ mod name_compactor {
 #[cfg(feature = "crashsim")]
 #[doc(hidden)]
 pub mod name_compact_hook {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Phase {
@@ -2749,22 +2821,21 @@ pub mod name_compact_hook {
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static HOOK: super::hook_slot::Slot<dyn Fn(Phase) + Send + Sync> = super::hook_slot::Slot::new();
 
+    /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`]。 hook が engine の最後の `Arc` を
+    /// 持っていると、 その Drop の閉じる時のまとめ直しが `call` / `consumer_off` でこの lock を取る)。
     pub fn set(hook: Option<Hook>) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+        HOOK.set(hook);
     }
 
     pub(crate) fn call(phase: Phase) {
-        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if let Some(h) = hook {
-            h(phase);
-        }
+        HOOK.with(|h| h(phase));
     }
 
     /// hook を置いている (consumer の周期はまとめ直しを始めない)。
     pub(crate) fn consumer_off() -> bool {
-        HOOK.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+        HOOK.is_set()
     }
 }
 
@@ -2774,20 +2845,19 @@ pub mod name_compact_hook {
 #[cfg(feature = "crashsim")]
 #[doc(hidden)]
 pub mod apply_point_hook {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
-    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static HOOK: super::hook_slot::Slot<dyn Fn() + Send + Sync> = super::hook_slot::Slot::new();
 
+    /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`]。 hook が engine の最後の `Arc` を
+    /// 持っていると、 その Drop が待つ thread の書き込みが `call` でこの lock を取る)。
     pub fn set(hook: Option<Hook>) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+        HOOK.set(hook);
     }
 
     pub(crate) fn call() {
-        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if let Some(h) = hook {
-            h();
-        }
+        HOOK.with(|h| h());
     }
 }
 
@@ -11841,6 +11911,9 @@ pub struct Engine {
     /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しがその列を msync する間だけ
     /// 待たせる (`write_out_body`、 `crate::publish_gate`)。
     publish_gate: crate::publish_gate::PublishGate,
+    /// #978: tombstone を置いた削除が行の cell を落とす間を、 書き出しが列を msync する間だけ待たせる (`write_out_body` は門を閉じて
+    /// tomb.seg を書き出してから列を msync する、 `crate::delete_gate`)。
+    delete_gate: crate::delete_gate::DeleteGate,
     /// #656: 開いてから中身 (辞書 / Leaf) の全域を 1 度書き出したか。 前の session が書き出さずに残した page には印が無いので、
     /// それまでは辞書の境目 (`Vocabulary::durable_mark`) を進められない
     content_settled: std::sync::atomic::AtomicBool,
@@ -12474,6 +12547,7 @@ impl Engine {
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
+            delete_gate: crate::delete_gate::DeleteGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
             columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -14175,6 +14249,7 @@ impl Engine {
             answers: std::sync::Mutex::new(Vec::new()),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
+            delete_gate: crate::delete_gate::DeleteGate::new(),
             content_settled: std::sync::atomic::AtomicBool::new(false),
             columns_settled: std::sync::atomic::AtomicBool::new(false),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -16569,7 +16644,9 @@ impl Engine {
                 let hlc = self.oplog.as_ref().map_or(enchudb_oplog::Hlc::ZERO, |wal| wal.mint_hlc());
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
-                let applied = self.apply_delete_in(row.as_ref(), row_local, hlc, None);
+                // #978 (読み直し [3]): 削除の門を通らない (`remove_entity_body_of`)。 空きの一覧の lock を握ったまま門で待つと、 bridge の
+                // 行の払い出し (`entity_in("_sync_ops")`) も本体の書き出しの間止まり、 ring が進まず WAL を畳めない
+                let applied = self.apply_delete_gated(row.as_ref(), row_local, hlc, None, false);
                 drop(row);
                 if !applied {
                     self.warn_local_write_rejected(row_local, u16::MAX, hlc);
@@ -20217,6 +20294,11 @@ impl Engine {
         if tomb != enchudb_oplog::Hlc::ZERO {
             let _row = self.row_locks.write(d);
             self.set_tombstone_local(d, tomb);
+            // #978 (読み直し [7]): tombstone を置いた後に dst の cell を落とす間を削除の門の中にする (`remove_entity_body_of` と同じ。
+            // 落とした cell が tomb.seg より先に disk に届かない)。 門の中では辞書 / Leaf の旧 slot の書き出しを回さない
+            let gated = self.tomb_col.is_some();
+            let _settles = gated.then(|| LocalApply::deferring_settles(self));
+            let _pass = gated.then(|| self.delete_gate.enter(d));
             for hid in 0..self.himos.len() {
                 if self.himos[hid].get_value(d).is_some() && self.version_of(d, hid as u16) <= tomb {
                     self.remove_cell_freeing_leaf(d, hid);
@@ -23822,6 +23904,19 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
         valued: Option<&[usize]>,
     ) -> bool {
+        self.apply_delete_gated(row, local, hlc, valued, true)
+    }
+
+    /// [`Self::apply_delete_in`] の、 削除の門を通るかを選べる形 (`gate` = false は `_sync_ops` の purge だけ、
+    /// [`Self::remove_entity_body_of`])。
+    fn apply_delete_gated(
+        &self,
+        row: Option<&crate::row_lock::RowWrite<'_>>,
+        local: u32,
+        hlc: enchudb_oplog::Hlc,
+        valued: Option<&[usize]>,
+        gate: bool,
+    ) -> bool {
         let _own = row.is_none().then(|| self.row_locks.write(local));
         debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
         let tomb = self.tombstone_version_of(local);
@@ -23840,7 +23935,7 @@ impl Engine {
         // 削除優先 (ユーザの決め、 2026-10-21): 削除より新しい cell も消し、 行を死なせる (消した行の eid 宛ての書き込みは、 削除より
         // 新しくても捨てる。 受け取った書き込みは `slot_is_dead` で弾く)。 前は削除より新しい cell を残し (#514)、 名前の無い塊が
         // 生きた (#547)
-        self.remove_entity_body_of(local, enchudb_oplog::Hlc::ZERO, valued);
+        self.remove_entity_body_of(local, enchudb_oplog::Hlc::ZERO, valued, gate);
         // #720: 消えた行のカードは落とす (束ねた identity ごとの値は、 生きた行を切り離す時にだけ使う。 持ち続けると `pkformer` が
         // 消した行の Leaf の中身ごと残る)。 前の名前・束ねた identity・名前の年表は残す (消えた行にも束ねる / 削除の時刻を上げる)
         self.drop_cards_of_dead_slot(local);
@@ -24168,12 +24263,24 @@ impl Engine {
     /// 行を握って消す (#349): 他の cell の書き手と同じく、 `read_row` に消している途中の行を見せない。
     /// `apply_delete_local` から来た時は入れ子で素通り。
     fn remove_entity_body(&self, local: u32, hlc: enchudb_oplog::Hlc) {
-        self.remove_entity_body_of(local, hlc, None);
+        self.remove_entity_body_of(local, hlc, None, true);
     }
 
     /// [`Self::remove_entity_body`] の、 値のある紐の並び (`valued`、 行の lock の下で数えた物) を渡せる版。 None なら紐を全部なめる。
-    fn remove_entity_body_of(&self, local: u32, hlc: enchudb_oplog::Hlc, valued: Option<&[usize]>) {
+    ///
+    /// #978: sync する DB (tomb.seg がある) は、 cell を落とす間を削除の門 (`crate::delete_gate`) の中にする。 本体の書き出しは門を閉じて
+    /// tomb.seg を書き出してから列を msync するので、 列の msync が拾う落とした cell の tombstone (呼び手が先に置いた物) は、 必ずその前に
+    /// disk に届く。 門の中では辞書 / Leaf の旧 slot の書き出し (`settle_retired_*`、 本体の書き出し = 門を閉じて自分を待つ) を回さず、
+    /// 門を出た後に回す ([`LocalApply::deferring_settles`])。
+    ///
+    /// `gate` = false は門を通らない (engine の内部の表 `_sync_ops` の purge、 読み直し [3]: その行は WAL に載らないので再生で生き返らず、
+    /// #451 も内部の表を見ない。 落とした cell だけ届いても、 ack の walk が行を消し直す。 purge は `_sync_ops` の空きの一覧の lock を
+    /// 握ったまま消すので、 門で待つと bridge の行の払い出しまで止まる)。
+    fn remove_entity_body_of(&self, local: u32, hlc: enchudb_oplog::Hlc, valued: Option<&[usize]>, gate: bool) {
         let _row = self.row_locks.write(local);
+        let gated = gate && self.tomb_col.is_some();
+        let _settles = gated.then(|| LocalApply::deferring_settles(self));
+        let pass = gated.then(|| self.delete_gate.enter(local));
         let mut survivor = false;
         let mut each = |hid: usize| {
             if self.himos[hid].get_value(local).is_none() {
@@ -24188,6 +24295,11 @@ impl Engine {
         match valued {
             Some(v) => v.iter().copied().for_each(&mut each),
             None => (0..self.himos.len()).for_each(&mut each),
+        }
+        drop(pass);
+        #[cfg(feature = "crashsim")]
+        if gated {
+            write_out_hook::call(write_out_hook::Phase::DeleteGateLeft);
         }
         if !survivor {
             self.live_free(local, None);
@@ -34787,7 +34899,13 @@ impl Engine {
     ///    待ち、 開くまで書かせない) → 中身のうち cell が読む分 (辞書の data と offsets / Leaf の slot) をもう一度 (書いた範囲
     ///    だけ) → その列を書き出す → 開く。 閉じている間の書き出しは segment を並べて msync する (`SegmentSet::flush_parallel`)
     /// 3. 残りの中身を指す列を 1 本ずつ: 門を閉じる → (閉じる前に門を通った書き手が居れば) 中身をもう一度 → 列 → 開く
-    /// 4. 残り (header / entity / 中身を指さない列 …)
+    /// 4. 残り: 前の住人の記録 (`prev.seg`) → 列でない物 (header / 紐名の辞書 …) → 生きている印 (entity) → 場所の世代 → 中身を指さない列
+    ///    → 版数の列 → tomb.seg
+    ///
+    /// #978: 2 / 3 の列と、 4 の生きている印・場所の世代・列を msync する前ごとに、 削除の門を閉じて tomb.seg を書き出す
+    /// ([`Self::close_deletes`]。 削除が落とした cell と下ろした生きている印・上げた世代は tombstone より先に disk に届かない)。 tomb.seg は
+    /// 最後 (版数の列の後) にも書き出す。 削除の触らない物 (中身・`prev.seg`・列でない物・版数の列) は門の外で書き出す (閉じている間 =
+    /// 削除が待つ間に入れない)。
     ///
     /// #801: 書き出しは並んで走る (consumer の周期 / `oplog_sync` の呼び手 / 書き手の `body_msync`)。 返った時 「呼ぶ前に印を
     /// 付けた page は全部届いた」 を守るため、 書くものの無い segment を飛ばす所は `SegmentMap::flush_pending` で見る
@@ -34848,7 +34966,14 @@ impl Engine {
             SegmentKind::Himo(h) => h as u16,
             _ => unreachable!("中身を指す列は紐の segment"),
         };
+        // #978: 列を msync する段 (2 / 3 / 残りの列) の前ごとに削除の門を閉じ、 tomb.seg を書き出してから msync して開く
+        // ([`Self::close_deletes`])。 最初の 1 回の tomb.seg は `all` なら全域 (前の process が書き出さずに落ちた tombstone の page)
+        let tombs_full = std::cell::Cell::new(all);
         {
+            // 削除の門を先に閉じる (tomb.seg の msync を、 書き出しの門を閉じる前に済ませる = Tag の書き手を待たせる間に入れない。
+            // どちらの門も相手を待たない: 削除の門の中で cell を落とす削除は書き出しの門を通らず、 書き出しの門の中の書き手は削除の
+            // 門を通らない)
+            let _deletes = if fresh.is_empty() { None } else { self.close_deletes(set, &tombs_full)? };
             let _closed = self.publish_gate.close(fresh.iter().map(|(k, _)| column(*k)));
             #[cfg(feature = "crashsim")]
             write_out_hook::call(write_out_hook::Phase::Closed);
@@ -34872,6 +34997,7 @@ impl Engine {
             if !all && !seg.flush_pending() {
                 continue;
             }
+            let _deletes = self.close_deletes(set, &tombs_full)?;
             let _closed = self.publish_gate.close([column(*k)]);
             if self.publish_gate.take_written(column(*k)) {
                 rewrite_content()?;
@@ -34886,28 +35012,59 @@ impl Engine {
         let version = |k: SegmentKind| matches!(k, SegmentKind::Ver(_) | SegmentKind::Tomb);
         // #841: きれいに閉じなかった後の最初の書き出し (`catch_up`) は、 印の無い segment も全部、 全域で書き出す。 全域の msync は
         // 汚れた page が無くても segment 1 つごとに時間がかかるので、 段の中で並べる (段の順は同じ: 版数は列の後)
-        // #731 (F1): 生きている印 (entities) と場所の世代 (`gen.seg`) は残りの先頭に続けて書き出す。 消す書き手は止めない: 2 つの
-        // 書き出しの間に消すと 「生きている、 世代は上がって死んでいる印」 の像が届き、 OS が page を先に書き出せば逆の像も届く。 どちらも
-        // 開く時の突き合わせ (`reconcile_generations`、 gen.seg の 「死んでいる」 印と生きている印) が 「消す前」 か 「消した後」 に揃える
+        // #731 (F1): 生きている印 (entities) と場所の世代 (`gen.seg`) は残りの先頭に続けて書き出す。 2 つの書き出しの間に消す (印と
+        // 世代 → 生きている印) と 「生きている、 世代は上がって死んでいる印」 の像が届き、 OS が page を先に書き出せば逆の像も届く。 どちらも
+        // 開く時の突き合わせ (`reconcile_generations`、 gen.seg の 「死んでいる」 印と生きている印) が 「消す前」 か 「消した後」 に揃える。
+        // sync する DB では、 その間は削除の門を閉じている (下、 #978): 門の外で消し終える (`live_free`) のは、 門を閉じる前に門を出た
+        // = tombstone を閉じた時の tomb.seg で書き出した削除だけ
         let live_and_generations = |k: SegmentKind| matches!(k, SegmentKind::Entities | SegmentKind::Gen);
         // 前の住人の記録 (`prev.seg`) は、 使い回しが生かした印 (entities / gen.seg) と 0 にした tomb.seg より先に。 書き出しの
-        // 間に使い回した分は、 tomb.seg の前に門を閉じてもう一度 (下)。 生きている印より先なのは、 この書き出しの前の使い回しだけ:
-        // ここから entities / gen.seg の書き出しまでの間の使い回しは、 生きている印だけが届いて記録が届かない像がある (review946 [3]、
-        // 残す。 閉じるには 「記録 〜 生かす」 を門に入れ、 その門を prev.seg → entities → gen.seg の書き出しの間閉じる = 使い回しが
+        // 間に使い回した分は、 生きている印の前に削除の門を閉じる所 (`close_deletes` → `write_out_tombs`、 #978) でもう一度書き出す。
+        // 書き出しの段の像で記録が届かずに生きている印が届くのは、 その後 (門を閉じてから生きている印を書き出すまで) の使い回しだけで、
+        // その時は前の住人の tombstone が先に届いている (開くと sweep が使い回した行を消す。 その行の作成は WAL の書き出しの後 = 返って
+        // いない書き込み)。 例外は tomb.seg に書く物が無く `write_out_tombs` が早く返る時 (前の住人の tombstone が 0 の場所の使い回し
+        // など)。 記録も前の住人の tombstone も届かずに使い回した行が届く像 (review946 [3]、 残す) は、 他は OS が msync の前に page を
+        // 書いた時だけ (閉じるには 「記録 〜 生かす」 を門に入れ、 その門を prev.seg → entities → gen.seg の書き出しの間閉じる = 使い回しが
         // 3 回の msync を待つ)
         let prev = |k: SegmentKind| matches!(k, SegmentKind::Prev);
         set.flush_where(all || catch_up, prev)?;
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::PrevWrittenOut);
-        set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Entities))?;
-        #[cfg(feature = "crashsim")]
-        write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
-        set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))?;
         let rest = |k: SegmentKind| !content(k) && !points(k) && !version(k) && !live_and_generations(k) && !prev(k);
+        let rest_columns = |k: SegmentKind| rest(k) && matches!(k, SegmentKind::Himo(_));
+        let rest_others = |k: SegmentKind| rest(k) && !matches!(k, SegmentKind::Himo(_));
+        // 残りの列でない物 (header / 紐名の辞書 / 凍結した旧 content の region) は削除が触らないので、 門を閉じる前に書き出す (読み直し 2
+        // [B]: 門を閉じている間 = 削除が待つ間に入れない。 `catch_up` / `all` の書き出しは全域の msync になる)
         if catch_up {
-            set.flush_all_spread(rest)?;
+            set.flush_all_spread(rest_others)?;
         } else {
-            set.flush_where(all, rest)?;
+            set.flush_where(all, rest_others)?;
+        }
+        {
+            // #978: 生きている印・場所の世代・残りの列を書き出す間、 削除の門を閉じる (閉じて tomb.seg を書き出してから)。 削除は
+            // tombstone を置いて門に入り、 cell を落として門を出てから生きている印を下ろす (`remove_entity_body_of` → `live_free`)。
+            // 門を閉じた後に届く生きている印・世代・列の削除は、 閉じる前に門を出た削除の物 = その tombstone はここで書き出してある。
+            // 前 (読み直し [1]) は残りの列の前にだけ閉じていて、 生きている印と gen.seg が tomb.seg より先に届いた: 削除の record が WAL に
+            // 無い行 (checkpoint の後ろに record の無い行) は、 開くと再生も突き合わせも sweep も #451 も削除を知らず、 手元でだけ黙って
+            // 消えて Delete を配らなかった
+            let _deletes = self.close_deletes(set, &tombs_full)?;
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::DeletesClosed);
+            set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Entities))?;
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::BeforeGenerations);
+            set.flush_where(all || catch_up, |k| matches!(k, SegmentKind::Gen))?;
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::BeforeRest);
+            // 残りの列は、 門を閉じている間 (sync する DB) だけ並べて msync する (閉じている間 = 削除が待つ間を、 列 1 本ずつの
+            // msync の和でなく長い物に寄せる。 sync しない DB は誰も待たないので 1 本ずつ = 書き出しのたびに thread を立てない)
+            if catch_up {
+                set.flush_all_spread(rest_columns)?;
+            } else if _deletes.is_some() {
+                set.flush_spread(all, rest_columns)?;
+            } else {
+                set.flush_where(all, rest_columns)?;
+            }
         }
         #[cfg(feature = "crashsim")]
         write_out_hook::call(write_out_hook::Phase::BeforeVersions);
@@ -34917,11 +35074,56 @@ impl Engine {
         } else {
             set.flush_where(all, ver_columns)?;
         }
-        // tomb.seg: 使い回しは前の住人を `prev.seg` に書いてから門の中で tomb.seg を 0 にする。 門を閉じ、 門を通った使い回しが
-        // 居れば (記録を書いたのは門に入る前) `prev.seg` をもう一度書き出してから tomb.seg を書き出す = 0 にした tomb.seg が届いた
-        // 像には、 その記録も届いている (`crate::prev_slots`)。 閉じている間に来た使い回しは開くまで待つ (行を握ったまま、
-        // `free_locals` は放して)
+        // tomb.seg (列の段の後に置いた tombstone と、 使い回しが 0 にした所)
+        self.write_out_tombs(set, all, true)?;
+        if all {
+            self.columns_settled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// #978: 本体の書き出しが列を msync する段の前に呼ぶ: 削除の門 (`crate::delete_gate`) を閉じ、 中の削除が出た後に tomb.seg を
+    /// 書き出す。 返した物を持っている間に列 (と、 最後の段では生きている印・場所の世代) を msync し、 落として開く。 sync しない DB
+    /// (tomb.seg が無い) は何もしない。 書き出しの門 (`publish_gate`) より先に閉じる (tomb.seg の msync を、 Tag の書き手を止める間に
+    /// 入れない)。
+    ///
+    /// 削除は tombstone を置いてから門に入り、 門の中で行の cell を落とす (`remove_entity_body_of`)。 閉じている間に来た削除は開くまで
+    /// 待つ。 = 列の msync が拾う落とした cell の tombstone は、 必ずその前に disk に届いている。 前は tomb.seg を版数の列の後 (書き出しの
+    /// 最後) にだけ書き出し、 列 (落とした名前の cell) が届いて tomb.seg が届く前の電源断の像で、 削除の record が WAL に無い (本体は WAL の
+    /// 書き出しの後に書き出す、 #451) と、 開いた再生が checkpoint の後ろの record で行を名前の無い行として生かし直した。 tombstone も
+    /// 無いので #451 の作り直しも開く時の sweep も削除を知らず、 相手と永久に食い違った。 tombstone が届いていれば、 再生の後の sweep
+    /// (`finish_deletes_revived_by_the_replay`) が削除を完了させ、 #451 の作り直しが Delete を配る (削除は 「あった」)。 逆の像 (tombstone は
+    /// 届き cell は残る) も同じ sweep (死が勝つ) が完了させる。
+    ///
+    /// `full` (書き出しの最初の 1 回だけ真、 呼ぶと偽にする): tomb.seg を全域で書き出す (`all` / `catch_up` の書き出し)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn close_deletes(
+        &self,
+        set: &SegmentSet,
+        full: &std::cell::Cell<bool>,
+    ) -> io::Result<Option<crate::delete_gate::DeleteClosed<'_>>> {
+        if self.tomb_col.is_none() {
+            return Ok(None);
+        }
+        let closed = self.delete_gate.close();
+        self.write_out_tombs(set, full.replace(false), false)?;
+        Ok(Some(closed))
+    }
+
+    /// tomb.seg を書き出す (`full` = 全域)。 `last` = 書き出しの最後の段 (書くものが無くても使い回しの門の手順を通る。 でなければ、
+    /// 印のある page も msync 中の page も無い時は何もしない)。
+    ///
+    /// 使い回しは前の住人を `prev.seg` に書いてから門の中で tomb.seg を 0 にする。 門を閉じ、 門を通った使い回しが居れば (記録を
+    /// 書いたのは門に入る前) `prev.seg` をもう一度書き出してから tomb.seg を書き出す = 0 にした tomb.seg が届いた像には、 その記録も
+    /// 届いている (`crate::prev_slots`)。 閉じている間に来た使い回しは開くまで待つ (行を握ったまま、 `free_locals` は放して)。 #978 で
+    /// 列の段の前にも書き出す (`close_deletes`) ので、 そこでも同じ手順。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_out_tombs(&self, set: &SegmentSet, full: bool, last: bool) -> io::Result<()> {
         let tomb = |k: SegmentKind| matches!(k, SegmentKind::Tomb);
+        let prev = |k: SegmentKind| matches!(k, SegmentKind::Prev);
+        if !last && !full && !set.segment(SegmentKind::Tomb).is_some_and(|s| s.flush_pending()) {
+            return Ok(());
+        }
         let prev_slots = &self.generations().prev;
         if prev_slots.active() {
             // 閉じる前に、 ここまでの記録を書き出す (閉じている間の書き出しを、 その間に入った使い回しの記録だけにする。 前は
@@ -34932,13 +35134,12 @@ impl Engine {
                 set.flush_where(false, prev)?;
             }
             #[cfg(feature = "crashsim")]
-            write_out_hook::call(write_out_hook::Phase::BeforeTomb);
-            set.flush_where(all || catch_up, tomb)?;
+            if last {
+                write_out_hook::call(write_out_hook::Phase::BeforeTomb);
+            }
+            set.flush_where(full, tomb)?;
         } else {
-            set.flush_where(all || catch_up, tomb)?;
-        }
-        if all {
-            self.columns_settled.store(true, Ordering::Release);
+            set.flush_where(full, tomb)?;
         }
         Ok(())
     }
@@ -34952,6 +35153,27 @@ impl Engine {
     /// #656: 書き出しが門を閉じていた時間の合計 (ns)。 閉じている間、 その列に新しい語 / Leaf の値を書く書き手は待つ。
     pub fn publish_gate_closed_ns(&self) -> u64 {
         self.publish_gate.closed_ns()
+    }
+
+    /// #978: 削除 (tombstone を置いた後に行の cell を落とす所) が、 書き出しが列を msync する間の削除の門で待った回数 (観測用)。
+    pub fn delete_gate_waits(&self) -> u64 {
+        self.delete_gate.waits()
+    }
+
+    /// #978: 削除が削除の門で待った時間の最大 (ns、 観測用。 待った削除が無ければ 0)。
+    pub fn delete_gate_wait_max_ns(&self) -> u64 {
+        self.delete_gate.wait_max_ns()
+    }
+
+    /// #978: 本体の書き出しが削除の門を閉じる前に、 閉じた門で待っている削除を先に通すために待った回数 (観測用。 書き出しが重なる形で
+    /// 削除を飢えさせない phase-fair の待ち、 `crate::delete_gate`)。
+    pub fn delete_gate_yields(&self) -> u64 {
+        self.delete_gate.yields()
+    }
+
+    /// #978: 書き出しが削除の門を閉じていた時間の合計 (ns)。 閉じている間、 tombstone を置いた削除は行の cell を落とす前で待つ。
+    pub fn delete_gate_closed_ns(&self) -> u64 {
+        self.delete_gate.closed_ns()
     }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。
@@ -43634,5 +43856,164 @@ mod prev_seg_open_failure_tests {
         assert!(failed, "前提: 開く時に `prev.seg` を開けなかった");
         assert!(!active, "開けなかった `prev.seg` を後で作り直して使った");
         assert!(before == after, "開けなかった `prev.seg` の中身を 0 に戻した");
+    }
+}
+
+/// #978 の読み直し [3] [4] [7]: 削除の門 (`crate::delete_gate`) を通る道と通らない道。
+#[cfg(test)]
+mod delete_gate_path_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn path(tag: &str) -> String {
+        let p = format!("{}/enchudb-dgate-{tag}-{}", std::env::temp_dir().display(), std::process::id());
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// sync する DB (tomb.seg がある = 削除は門を通る): 表 t (Number 列 n、 Leaf 列 z)。
+    fn sync_engine(p: &str, build: impl FnOnce(&mut Engine)) -> Arc<Engine> {
+        let mut eng = Engine::create_with_cell_version(p, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.define_himo_in("t", "n", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("t", "z", ValueType::Leaf, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        build(&mut eng);
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        assert!(eng.tomb_col.is_some(), "前提: tomb.seg のある DB (削除は門を通る)");
+        eng
+    }
+
+    /// `f` (`what`) を別の thread で回す。 終わるか `blocked` が真になるまで待ち、 その時に終わっていたかを返す。 `release` を呼んでから
+    /// join する (待っていた道を通す)。 60 秒経っても終わらず `blocked` も真にならなければ、 join せずに panic する (読み直し 2 [D]: 止まった
+    /// thread を join すると試験も止まり続ける。 thread は残したまま落とす)。
+    fn run_until<T: Send + 'static>(
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+        blocked: impl Fn() -> bool,
+        release: impl FnOnce(),
+    ) -> (bool, std::thread::Result<T>) {
+        let h = std::thread::spawn(f);
+        let end = Instant::now() + Duration::from_secs(60);
+        while !h.is_finished() && !blocked() {
+            assert!(Instant::now() < end, "{what} が 60 秒返らない (止まっている。 join せずに落とす)");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let finished = h.is_finished();
+        release();
+        (finished, h.join())
+    }
+
+    /// [4]: 門を通る削除のうち、 自分の書き込みの `LocalApply` の外 (深さ 0) から来る受信の Delete が、 大きい Leaf (書き出しを待つ旧 slot
+    /// が目安を越える) を持つ行を消す。 Leaf の旧 slot の書き出し (= 本体の書き出し、 削除の門を閉じて中の削除が出るのを待つ) は門を出た
+    /// 後に回す (`LocalApply::deferring_settles`)。 門の中で回すと、 閉じる側が自分の退出を待って止まり続ける (debug build は
+    /// `DeleteGate::close` の `debug_assert` が panic)。
+    #[test]
+    fn a_received_delete_of_a_big_leaf_settles_outside_the_gate() {
+        let p = path("leaf");
+        let mut x = 0;
+        let eng = sync_engine(&p, |eng| {
+            let z = eng.himo_id("t.z").unwrap() as u16;
+            x = eng.entity_in("t").unwrap();
+            eng.try_tie_text_to_by_id(x, z, &"a".repeat(4 * 1024 * 1024 + 1)).unwrap();
+        });
+        let _hold = eng.hold_consumer();
+        let (e2, done) = (eng.clone(), Arc::new(AtomicBool::new(false)));
+        let done2 = done.clone();
+        let (finished, out) = run_until(
+            "受けた Delete (削除の門の中で本体の書き出しを呼び、 自分の退出を待って止まった)",
+            move || {
+                let seen: Arc<Mutex<Option<bool>>> = Arc::default();
+                let s2 = seen.clone();
+                settle_call_hook::set_leaf(move || *s2.lock().unwrap() = Some(crate::delete_gate::inside_on_this_thread()));
+                let later = enchudb_oplog::Hlc { wall: Engine::unix_millis() + 1000, logical: 0, peer: 2 };
+                let applied = e2.remote_delete_apply(x, later);
+                done2.store(true, Ordering::SeqCst);
+                let inside = seen.lock().unwrap().take();
+                (applied, inside)
+            },
+            || false,
+            || {},
+        );
+        let alive = eng.is_live(x);
+        drop(_hold);
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&p);
+        assert!(finished, "受けた Delete が 60 秒返らない (削除の門の中で本体の書き出しを呼び、 自分の退出を待って止まった)");
+        let (applied, inside) = out.expect("受けた Delete が panic した (削除の門の中で本体の書き出しを呼んだ)");
+        assert!(applied && !alive && done.load(Ordering::SeqCst), "前提: 受けた Delete が行を消した");
+        assert_eq!(inside, Some(false), "Leaf の旧 slot の書き出しを削除の門の中で回した (None = 前提: 書き出しを回していない)");
+    }
+
+    /// [3]: `_sync_ops` の purge は削除の門を通らない (閉じていても待たない)。 purge は ring の空きの一覧の lock を握ったまま消すので、
+    /// 門で待つと bridge の行の払い出しまで本体の書き出しの間止まる。
+    #[test]
+    fn a_purge_does_not_wait_for_the_delete_gate() {
+        let p = path("purge");
+        let eng = sync_engine(&p, |_| {});
+        let lsn = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let row = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_to_by_id(row, lsn, 1u32);
+        let waits = eng.delete_gate_waits();
+        let closed = eng.delete_gate.close();
+        let e2 = eng.clone();
+        let (finished, out) = run_until(
+            "purge",
+            move || e2.purge_sync_ops_row(row, lsn, 1),
+            || eng.delete_gate_waits() != waits,
+            move || drop(closed),
+        );
+        let waited = eng.delete_gate_waits() - waits;
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&p);
+        assert!(out.expect("purge が panic した"), "前提: purge が行を消した");
+        assert!(finished && waited == 0, "閉じた削除の門で purge が待った (待った回数 {waited})");
+    }
+
+    /// [7]: 畳む (`merge_entity_into`) の 1 段目 (src の削除の版数を dst に当てて、 それより古い dst の cell を落とす) も、 tombstone を
+    /// 置いてから削除の門の中で cell を落とす (門を閉じている間は、 dst の cell を落とす前で待つ)。
+    #[test]
+    fn a_merge_drops_the_kept_rows_cells_inside_the_delete_gate() {
+        let p = path("merge");
+        let (mut s, mut d) = (0, 0);
+        let eng = sync_engine(&p, |eng| {
+            let n = eng.himo_id("t.n").unwrap() as u16;
+            s = eng.entity_in("t").unwrap();
+            d = eng.entity_in("t").unwrap();
+            eng.tie_to_by_id(d, n, 7u32); // 版数なし (build の間) = src の削除より古い
+        });
+        assert!(eng.set_tombstone(s, eng.oplog.as_ref().unwrap().mint_hlc()), "前提: src に削除の版数を置いた");
+        let waits = eng.delete_gate_waits();
+        let closed = eng.delete_gate.close();
+        let cell_when_blocked: Arc<Mutex<Option<Option<u64>>>> = Arc::default();
+        let (e2, e3, c2) = (eng.clone(), eng.clone(), cell_when_blocked.clone());
+        let (finished, out) = run_until(
+            "畳む",
+            move || e2.merge_entity_into(s, d),
+            move || {
+                let blocked = e3.delete_gate_waits() != waits;
+                if blocked {
+                    *c2.lock().unwrap() = Some(e3.get(d, "t.n"));
+                }
+                blocked
+            },
+            move || drop(closed),
+        );
+        let after = eng.get(d, "t.n");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&p);
+        out.expect("merge が panic した").expect("前提: 畳めた");
+        assert!(!finished, "閉じた削除の門で畳むのが待たなかった");
+        assert_eq!(
+            *cell_when_blocked.lock().unwrap(),
+            Some(Some(7)),
+            "門で待つ前に dst の cell を落とした (1 段目が門の外)"
+        );
+        assert_eq!(after, None, "前提: 1 段目が src の削除より古い dst の cell を落とした");
     }
 }

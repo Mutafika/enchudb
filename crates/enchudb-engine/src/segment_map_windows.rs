@@ -319,6 +319,11 @@ impl SegmentMap {
         self.dirty_hi.load(Ordering::Acquire) > self.dirty_lo.load(Ordering::Acquire)
     }
 
+    /// 印の付いた範囲の大きさ (byte。 unix 版と同じ口)。
+    pub fn dirty_bytes(&self) -> usize {
+        self.dirty_hi.load(Ordering::Acquire).saturating_sub(self.dirty_lo.load(Ordering::Acquire))
+    }
+
     /// 書き出す分が残っているか (unix 版の `flush_pending` と同じ口)。 こちらの `flush_dirty` は flush を 1 本に並べて
     /// いないので、 印だけを見る (別の flush が書き出している最中の segment は見えない)。
     pub fn flush_pending(&self) -> bool {
