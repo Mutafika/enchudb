@@ -2302,10 +2302,17 @@ impl Drop for WriterLock {
 /// 決める (PR #986 の読み直し 2 の [1] [2])。 前は直しの中で WAL の file を開き直して聞いた: 直しを map (gen.seg / entities.seg) に書いた
 /// 後に聞けずに断る道と、 WAL 付きの open が直しの後に WAL を開けずに返る (Drop が clean の印を立てる) 道があり、 どちらも次の open が
 /// 直した場所を見つけず、 仕上げ (残った cell を落とす・消えた行の世代と tombstone を覚える) が二度と走らなかった。
+///
+/// #992: gen.seg の突き合わせは聞かない ([`ReplayAhead::finishes_later`]: WAL 付きの open は再生する record が無くても仕上げを再生の
+/// 後に回す)。 単独の open は往復するか ([`ReplayAhead::standalone_with_wal_file`]) も持つ。
 enum ReplayAhead<'w> {
-    /// 再生しない: 単独の open (lock の下で聞いて 「無い」 と分かった時だけ開く。 あれば往復し、 聞けなければ断る)・readonly (直しを
-    /// しない)・WAL 付きの open が WAL を作った (無かった / 一度も書き出していない)
+    /// 再生しない: readonly (直しをしない)
     Nothing,
+    /// 再生しない単独の open (lock の下で聞いて 「無い」 と分かった時だけ開く。 あれば往復し、 聞けなければ断る)。 `wal_file` = lock の下で
+    /// 聞いた時に WAL の file があった (#451 の往復 [`Engine::relog_before_standalone_session`] をする条件の片方、 #992)
+    Standalone { wal_file: bool },
+    /// WAL 付きの open が WAL を作る (無かった / 一度も書き出していない)。 再生は無いが、 開いた後に WAL 付きの仕上げ (`finish_reconcile`) が続く
+    NewWal,
     /// WAL 付きの open が lock の下で開いた WAL (再生はこの WAL から)。 当てる record があるかは要る時に 1 回だけ読む (最初の 1 件で止まる)
     Wal(&'w enchudb_oplog::oplog::OpLog, std::cell::OnceCell<bool>),
 }
@@ -2318,9 +2325,21 @@ impl<'w> ReplayAhead<'w> {
     /// この open の後の再生が当てる record がある (`OpLog::recover_with_tail` が空でない)。
     fn follows(&self) -> bool {
         match self {
-            ReplayAhead::Nothing => false,
+            ReplayAhead::Nothing | ReplayAhead::Standalone { .. } | ReplayAhead::NewWal => false,
             ReplayAhead::Wal(w, answer) => *answer.get_or_init(|| !w.is_empty() && w.has_records_to_replay()),
         }
+    }
+
+    /// #992: この open の後に WAL 付きの仕上げ (`finish_reconcile(Some(wal))`) が続く (WAL 付きの open)。 突き合わせは仕上げをそこまで
+    /// 回す (再生する record が無くても)。 仕上げの前に落ちた像は、 gen.seg の 「後始末待ち」 の印から次の open が拾う。
+    fn finishes_later(&self) -> bool {
+        matches!(self, ReplayAhead::NewWal | ReplayAhead::Wal(..))
+    }
+
+    /// #992: 単独の open で、 lock の下で聞いた時に WAL の file があった。 開いた DB がきれいに閉じなかった sync の DB なら、 この engine
+    /// は捨てて WAL 付きの open で往復する ([`Engine::relog_before_standalone_session`])。
+    fn standalone_with_wal_file(&self) -> bool {
+        matches!(self, ReplayAhead::Standalone { wal_file: true })
     }
 }
 
@@ -2620,6 +2639,13 @@ pub mod write_out_hook {
         /// sidecar の書き出し (`persist_tables`) で、 `prev.seg` の周期の約束の sidecar (`eidalias` / `pktombs` / `pkformer` まで) を
         /// 書いた後、 書き出した周期を進める (`prev_persist_end`) 前
         SidecarsWritten,
+        /// #992: WAL 付きの open (`open_concurrent_with_oplog`) で、 開く時の突き合わせが直しを map に書き、 WAL を再生した後、 突き合わせの
+        /// 仕上げ (`finish_reconcile`: 残った cell を落とす・#451 の作り直しの宛名と tombstone) の前。 ここで落ちた (kill の) 像を撮る
+        OpenBeforeFinishReconcile,
+        /// #992: 同じ open の、 仕上げの後・#451 の作り直し (tombstone の届いていない場所に tombstone を置いて cell を落とす) の前
+        OpenAfterFinishReconcile,
+        /// #992: 同じ open の、 #451 の作り直しの後・書き出して 「後始末待ち」 を落とす前
+        OpenBeforeSettle,
     }
 
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
@@ -9009,18 +9035,19 @@ mod gen_io_fail_hook {
 
 /// #979 の test: この thread の次の open が、 gen.seg を払い出し済みの場所まで commit する直前に engine の空きの余裕 (`set_space_margin`) を置く
 /// (開く前の segment の余裕はプロセス全体の既定なので、 開く途中の他の伸ばし (索引の作り直し) と分けて、 この commit だけを空きの
-/// 不足に当てる)。 1 回だけ。
-#[cfg(test)]
-mod open_space_margin_hook {
+/// 不足に当てる)。 1 回だけ。 #992: 電源断の試験 (crashsim feature、 `tests/power_loss.rs`) も PR #977 の再生の後の断りを起こすのに使う。
+#[cfg(any(test, feature = "crashsim"))]
+#[doc(hidden)]
+pub mod open_space_margin_hook {
     std::thread_local! {
         static NEXT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
-    pub(super) fn set(margin: u64) {
+    pub fn set(margin: u64) {
         NEXT.with(|c| c.set(Some(margin)));
     }
 
-    pub(super) fn take() -> Option<u64> {
+    pub(crate) fn take() -> Option<u64> {
         NEXT.with(|c| c.take())
     }
 }
@@ -12864,7 +12891,7 @@ impl Engine {
     /// #880 / #989 / PR #986 の読み直し 2 の [1]: 単独の open の本体。 writer lock を取った直後、 開く時の直し (`prev.seg` の記録の戻し・
     /// gen.seg の突き合わせ) が何かを書く前に、 WAL に再生していない record (checkpoint より後、 閉じていない末尾も含む = WAL 付きの open が
     /// 当てる物) があるかを一度だけ聞く ([`Self::wal_records_to_replay`])。
-    /// - 無い: 単独の open は再生しないので、 直しはその場で仕上げる (`ReplayAhead::Nothing`)
+    /// - 無い: 単独の open は再生しないので、 直しはその場で仕上げる (`ReplayAhead::Standalone`)
     /// - ある: lock を放し、 WAL 付きの open で再生して閉じ (Drop が書き出して checkpoint を進め、 畳む)、 lock を取り直して聞き直す。 まだ
     ///   残っていれば (書き出し / `tables` を書けない、 #870) 断る
     /// - 聞けない (一時の I/O の失敗・資源不足・権限、 #989): 何も書かずに断る。 呼び手が開き直せば聞き直す
@@ -12892,7 +12919,8 @@ impl Engine {
                 Self::lock_with_nothing_to_replay(path)?
             }
         };
-        Ok((Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?, wal_len))
+        let replay = ReplayAhead::Standalone { wal_file: wal_len.is_some() };
+        Ok((Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), replay)?, wal_len))
     }
 
     /// #880: 往復 (WAL 付きの open で再生して閉じた) の後に、 単独で開き直すための writer lock を取り、 WAL に再生する record が残って
@@ -12921,6 +12949,14 @@ impl Engine {
         self.himo_reg.rebuilt_on_load && self.has_cell_version() && self.sync_tables_enabled()
     }
 
+    /// #992: この open (`replay`) の engine は捨てて WAL 付きの open で開き直す (#451 の往復、 [`Self::relog_before_standalone_session`]
+    /// と同じ条件: 単独の open で、 lock の下で聞いた時に WAL の file があり、 きれいに閉じなかった sync の DB)。 その時 `open_internal` は
+    /// 開く時の直しを書かない (往復の open が突き合わせから全部をする)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn defers_open_repairs(&self, replay: &ReplayAhead<'_>) -> bool {
+        replay.standalone_with_wal_file() && self.relogs_unlogged_writes_on_open()
+    }
+
     /// #880 (#451): 単独で開いた `self` (`open_internal` の直後) が、 きれいに閉じなかった sync する DB なら、 印を立てずに捨て
     /// (`abandoned`、 #533 の `abandon_open` と同じく Drop は何も書かない)、 WAL 付きの open で #451 の作り直しを走らせて閉じてから、
     /// 単独で開き直す。 そのまま単独で閉じると Drop / `flush` が clean の印を立て、 次の WAL 付きの open が 「きれいに閉じた」 と読んで
@@ -12940,6 +12976,12 @@ impl Engine {
     /// header を一度も書き出していない WAL (#415) は file の大きさのまま作り直させる。 ただし header より短い file (作った直後・
     /// `set_len` の前に落ちた = 0 B もある) は、 その大きさでは WAL を作れない (前は `OpLog::create` が header を書く所で範囲外の panic、
     /// 読み直し 3 の [2]) ので [`STANDALONE_RELOG_OPLOG_CAPACITY`] で作る。
+    ///
+    /// #992: 往復する engine (`self`) は、 開く時の直し (gen.seg の突き合わせ・その後の別名の外し・途中で切れた削除の sweep) を書かずに
+    /// 開いてある (`open_internal` の `defer_repairs`、 往復する条件はここと同じ)。 前は突き合わせが直し (死の印・生きている印) を map に
+    /// 書き、 仕上げの後半 (#451 の作り直しの Delete の宛名 = 消えた行の世代、 tombstone の届いていない完了) を memory にだけ持ったまま
+    /// この engine を捨てた: 往復の WAL 付きの open は直した場所を見つけず、 相手にその行の Delete が配られなかった。 今は往復の open が
+    /// 突き合わせから全部をする。
     #[cfg(not(target_arch = "wasm32"))]
     fn relog_before_standalone_session(self, path: &str, wal_len: Option<u64>) -> io::Result<Self> {
         if !self.relogs_unlogged_writes_on_open() {
@@ -12954,8 +12996,10 @@ impl Engine {
         self.abandoned.store(true, std::sync::atomic::Ordering::Release);
         drop(self);
         drop(Self::open_concurrent_with_oplog(path, capacity)?);
-        let (lock, _) = Self::lock_with_nothing_to_replay(path)?;
-        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), ReplayAhead::Nothing)?;
+        let (lock, len) = Self::lock_with_nothing_to_replay(path)?;
+        // #992: まだきれいに閉じていない (下で断る) なら、 この engine も開く時の直しを書かない (`open_internal` の `defer_repairs`)
+        let replay = ReplayAhead::Standalone { wal_file: len.is_some() };
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, Some(lock), replay)?;
         if eng.relogs_unlogged_writes_on_open() {
             eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
             return Err(io::Error::other(
@@ -13081,8 +13125,9 @@ impl Engine {
     /// `writer_lock` は書き手の open が mmap の前に取った `.db.lock` の flock(LOCK_EX) ([`Self::writer_lock_for_open`]、 Engine 寿命中
     /// 保持)。 None は readonly の open (lock を取らず、 開く時の直しも書かない)。
     ///
-    /// `replay` は、 この open の後に WAL の再生が当てる record があるか (開く時の `prev.seg` の記録の戻しと gen.seg の突き合わせが、 仕上げを
-    /// 再生の後に回すか)。 呼び手が writer lock の下で、 何かを直す前に決める (PR #986 の読み直し 2 の [1] [2])。
+    /// `replay` は、 この open の後に WAL の再生が当てる record があるか (開く時の `prev.seg` の記録の戻しが、 仕上げを再生の後に回すか) と、
+    /// WAL 付きの仕上げが続くか (gen.seg の突き合わせ、 #992 の [`ReplayAhead::finishes_later`])。 呼び手が writer lock の下で、 何かを直す前に
+    /// 決める (PR #986 の読み直し 2 の [1] [2])。
     #[cfg(not(target_arch = "wasm32"))]
     fn open_internal(
         path: &str,
@@ -13154,10 +13199,13 @@ impl Engine {
             // 開く時間: きれいに閉じた時に残した空き一覧 (`leaf.free`、 紐名の辞書の印が CLEAN_LEAF の時だけ信じる) が今の
             // store と合えば列から作り直さない (Leaf の region を読まない)。 合わなければ (kill / 電源断 / 知らない binary が
             // 閉じた / file が無い・壊れた) 今まで通り列から作り直す
-            if eng.himo_reg.leaf_free_on_load() && eng.load_leaf_free_list() {
-                eng.ensure_leaf_columns_loaded()?;
-            } else {
-                eng.rebuild_leaf_free_list()?;
+            // #992 の読み直し S2: 断る時は何も書かない (`abandoned`。 Drop がきれいに閉じた印を立てると、 次の open が突き合わせ・#451 の
+            // 作り直しを飛ばす)
+            let loaded =
+                if eng.himo_reg.leaf_free_on_load() && eng.load_leaf_free_list() { eng.ensure_leaf_columns_loaded() } else { eng.rebuild_leaf_free_list() };
+            if let Err(e) = loaded {
+                eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
             }
         }
 
@@ -13422,7 +13470,7 @@ impl Engine {
         // 「黙って eid を使い回すより断る」 と同じ)。 断った engine は何も書かない (`abandoned`: 汚れた印を残す = 次の open は
         // きれいに閉じていないと読む)。 再生が払い出し位置の先の場所を生かした分は、 再生の後にもう一度 (`settle_replayed_generations`)。
         // readonly は書かない (世代を書かない、 gen.seg を伸ばさない)
-        #[cfg(test)]
+        #[cfg(any(test, feature = "crashsim"))]
         if let Some(m) = open_space_margin_hook::take() {
             eng.set_space_margin(m);
         }
@@ -13433,25 +13481,38 @@ impl Engine {
             eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
             return Err(e);
         }
+        // #992: この engine を捨てて WAL 付きの open で往復する (#451) なら、 ここから先の開く時の直しを書かない。 往復の open が突き合わせ
+        // から仕上げ (#451 の作り直しの宛名・tombstone の届いていない完了) まで 1 つの engine でする。 前はこの engine の突き合わせが直しを
+        // map に書き、 仕上げの後半を memory にだけ持ったまま捨てた (往復の open は直した場所を見つけない)。 途中で切れた削除の sweep も
+        // 書かない (突き合わせの前に回すと、 突き合わせが完了させる場所 (死の印のある生きている場所) を sweep が消して同じく見失う)
+        let defer_repairs = !readonly && eng.defers_open_repairs(&replay);
         // #731: gen.seg と生きている印を突き合わせる (きれいに閉じなかった後だけ)。 表・別名 (#612 の畳んだ自分の行)・払い出し位置
         // の後、 WAL の再生の前
-        eng.reconcile_generations(readonly, &replay);
+        // #992 の読み直し 2 の B2: 突き合わせが上げた世代を書き出せなければ、 何も書かずに断る
+        if !defer_repairs && let Err(e) = eng.reconcile_generations(readonly, &replay) {
+            eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+            return Err(e);
+        }
         // #993 / #994: 使い回した場所の前の住人の別名 (`eidalias` だけが使い回しの前のまま届いた像) を外す。 突き合わせの後 (場所の
         // 生死が決まる)・WAL の再生の前 (再生する中継の record がその別名で次の住人に当たらない)。 再生が前の住人を生かし直しうる物
         // (使い回しの記録が無い、 PR #1006 の読み直し [3])・世代が上の別名 (本体より先に届いた) は開く道の仕上げ (`finish_open_restores`)
-        if unclean && !readonly {
+        if unclean && !readonly && !defer_repairs {
             eng.drop_stale_generation_aliases(Some(&replay));
         }
 
         // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
         // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
-        if !readonly {
+        if !readonly && !defer_repairs {
             eng.finish_interrupted_deletes();
         }
 
         if verify_region_crc {
-            // .crc ファイルがあれば全 region CRC 検証
-            eng.verify_region_crcs()?;
+            // .crc ファイルがあれば全 region CRC 検証。 #992 の読み直し S2: 断る時は何も書かない (`abandoned`。 往復する engine は開く時の
+            // 直しを書いていないので、 Drop がきれいに閉じた印を立てると直していない状態が残る)
+            if let Err(e) = eng.verify_region_crcs() {
+                eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+                return Err(e);
+            }
         }
         Ok(eng)
     }
@@ -14133,6 +14194,20 @@ impl Engine {
                 }
             }
             generations.attach(backing.region(SegmentKind::Gen, &layout), u32::from(layout.gen_bits))?;
+            // #992 / #1008: 前の形 (`GEN2`) の gen.seg は、 書き手として開く時に `GEN3` に上げる (header を書き出す。 上げた後は `GEN2`
+            // だけを読む前の binary が断る)。 readonly は書かない
+            // 書き出せなければ magic を戻して断る (#992 の読み直し 2 の細かい 6: 開き続けると印の bit が GEN2 の magic のまま disk に届き、
+            // GEN2 だけを読む binary が印を知らずに生かす)。 断る前に上の `prev.seg` の header の写し (前の形からの写し・0 からの作り直し) は
+            // 書き出してある (「何も書かずに断る」 ではない。 写しは冪等で、 次の open が同じ物を書く、 #992 の読み直し 3 の細かい 8)
+            #[cfg(not(target_arch = "wasm32"))]
+            if !readonly
+                && generations.upgrade_magic()
+                && let Backing::Segments(set) = &backing
+                && let Err(e) = set.flush_kind(SegmentKind::Gen, 0, crate::generation::GEN_HEADER)
+            {
+                generations.downgrade_magic();
+                return Err(format!("gen.seg header (GEN3) could not be written out: {e}"));
+            }
         }
         // #899: Ref の紐の円柱は場所の bit を読む (世代を持つ DB では鍵を場所にする)
         for (h, &ht) in himos.iter().zip(value_types.iter()) {
@@ -18402,7 +18477,8 @@ impl Engine {
                 while let Some(local) = fl.pop() {
                     let Some(g) = table.global_of(local) else { continue };
                     // #731: 世代を使い切った場所は二度と渡さない (印を立てる前に見る)
-                    if self.is_folded_own_slot(g) || self.generations().retired(g) {
+                    // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (後始末が届いてから、 一覧の作り直しが拾う)
+                    if self.is_folded_own_slot(g) || self.generations().withheld(g) {
                         continue;
                     }
                     // #883: 払い出し位置から取った書き手が先に生かした場所は、 後始末の前に飛ばす (後始末の後に生かされた形は下の
@@ -18446,7 +18522,7 @@ impl Engine {
                     // 生きていない」 の読みの後・行を握る前に、 払い出し位置から同じ場所を取った書き手が生かして返し、 その行を消す
                     // 書き手が kill を書けずに覚えて空けると (消す道は行の lock の下)、 ここで今の世代のまま生かして消えた行と同じ eid を
                     // 返した。 行を握った後は消す書き手の覚えが見える (握れたのは消す書き手が lock を放した後)
-                    if row.is_some() && self.generations().retired(g) {
+                    if row.is_some() && self.generations().withheld(g) {
                         continue;
                     }
                     #[cfg(test)]
@@ -18607,8 +18683,10 @@ impl Engine {
 
         // #731: 世代を使い切った場所は渡さない (落ちた後に払い出し位置が引退した場所の手前に戻った時だけ来る)。 PR #977 の読み直し 5 の
         // [G]: kill を書けなかった場所の覚えは見ない (払い出し位置の先は生きたことが無い = 覚えた場所ではありえない。 覚えが 1 つでも
-        // あると `retired` は大域の Mutex と線形探索を通り、 ここは insert の毎回の道)
-        if self.generations().used_up(global) {
+        // あると `retired` は大域の Mutex と線形探索を通り、 ここは insert の毎回の道)。 #992 の読み直し 5 の細かい 1: 後始末待ちの場所も
+        // 渡さない (A1、 突き合わせの 2. が払い出し位置の先の世代 > 0 の場所を完了させた時。 同じ 2 B の読み。 飛ばした場所は払い出し位置の
+        // 手前の穴になり、 後始末が届いた後に一覧の作り直しが拾う)
+        if self.generations().used_up(global) || self.generations().pending_mark(global) {
             return self.entity_in_with(table_name, nowait);
         }
         // #970 (案 P): 生かす前に、 場所の世代を書く gen.seg の page を commit 済みにする (普段は atomic の load 1 回、 page をまたぐ時
@@ -18679,7 +18757,7 @@ impl Engine {
             dead.dedup();
             fl.extend(dead.into_iter().filter(|&l| {
                 table.global_of(l).is_some_and(|g| {
-                    !self.is_folded_own_slot(g) && !self.entities.is_live(g) && !self.generations().retired(g)
+                    !self.is_folded_own_slot(g) && !self.entities.is_live(g) && !self.generations().withheld(g)
                 })
             }));
             if !fl.is_empty() {
@@ -18705,7 +18783,7 @@ impl Engine {
                         let global = lo + (l - local);
                         // #612: 畳んだ自分の行の slot は使い回さない (その世界番号宛ての record は残す行に転送する)
                         // #882: 畳んだかを先に読む (`entity_in` の取り出しと同じ)。 #731: 世代を使い切った場所は二度と渡さない
-                        if !self.is_folded_own_slot(global) && !self.entities.is_live(global) && !self.generations().retired(global) {
+                        if !self.is_folded_own_slot(global) && !self.entities.is_live(global) && !self.generations().withheld(global) {
                             if ring_lsn.is_some_and(|h| self.himos[h].get_value(global).is_some()) {
                                 self.drop_cells_of_dead_ring_slot(global);
                             }
@@ -19976,15 +20054,15 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Acquire)
             .min(capacity);
         let live = t.extents().into_iter().map(|(lo, hi)| self.entities.live_count_in(lo, hi)).sum::<u32>();
-        // #731: 世代を使い切った場所 (引退、 二度と渡さない) は空きに数えない。 数えるのは使い回しのある表だけ (払い出し済みの範囲の
-        // 死んだ場所をなめる)
+        // #731: 世代を使い切った場所 (引退、 二度と渡さない) は空きに数えない。 #992 の読み直し 5 の細かい 3: 後始末待ちの場所 (後始末が
+        // 届くまで渡さない、 `Generations::withheld`) も数えない。 数えるのは使い回しのある表だけ (払い出し済みの範囲の死んだ場所をなめる)
         let retired = match self.tables.iter().position(|x| std::ptr::eq(x, t)) {
             Some(tid) if self.generations().active() && !t.is_reserved() && self.generations().table_has(tid as TableId) => {
                 let mut left = allocated;
                 let mut n = 0u32;
                 for (lo, hi) in t.extents() {
                     let take = left.min(hi - lo);
-                    n += (lo..lo + take).filter(|&g| !self.entities.is_live(g) && self.generations().retired(g)).count() as u32;
+                    n += (lo..lo + take).filter(|&g| !self.entities.is_live(g) && self.generations().withheld(g)).count() as u32;
                     left -= take;
                 }
                 n
@@ -20793,7 +20871,10 @@ impl Engine {
                 // 生かした) も外す。 PR #977 の読み直し 5 の [D] (a): 生きているかを先に読む (消す道は kill を書けない場所を覚えてから
                 // 生きている印を下ろす = 下りた印を読んだ後に覚えを読めば、 覚えが見える。 逆の順では、 覚える前に読んで、 印が下りた
                 // 後に読んだ 「生きていない」 で取りうる)
-                if self.entities.is_live(slot) || gens.retired(slot) {
+                // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (山から外す)。 当たるのは anonymous だけの sync しない DB で、 開く
+                // 道の後始末の書き出し (`body_msync`) か後始末待ちを落とした gen.seg の書き出しに失敗した session だけ (sync する DB は
+                // anonymous の表を閉じている)。 外した場所は山に戻らない (使わない向きの漏れ、 #992 の読み直し 5 の細かい 2)
+                if self.entities.is_live(slot) || gens.withheld(slot) {
                     return crate::entity_set::Reuse::Discard;
                 }
                 // 世代 0 = v14 の間に消えた場所 (移る手順の穴埋めと開く時の突き合わせが上げる) か、 位置から取って断った穴
@@ -23237,7 +23318,7 @@ impl Engine {
         let gens = self.generations();
         let (now, dead_mark) = gens.state_unmarked(local);
         let dead = dead_mark || !self.entities.is_live(local);
-        (((if now > 0 && dead { now - 1 } else { now }) << gens.bits()) | local, dead)
+        (((if now > 0 && dead { gens.dead_row_gen_unmarked(local, now) } else { now }) << gens.bits()) | local, dead)
     }
 
     /// [`Self::restore_prev_residents`] の 1 場所。 退避を戻したか。 `deferred` = 再生の後に戻す時 ([`Self::finish_prev_restores`]) の、
@@ -23572,11 +23653,15 @@ impl Engine {
                 self.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
                 self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
             }
-            let mut g = self.pk_tombs.write().unwrap();
-            self.drain_pk_pending(&mut g);
-            self.with_pk_key(himo, PkValue::Local(value), |k| {
-                self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
-            });
+            // #992 の読み直し 4 の細かい 1: 版数の無い死んだ場所 (開く時の突き合わせが使い回しの途中の行を消した場所、 使い回しの印で
+            // 消えた行) は、 名前の削除を版数 0 で覚えない (前の名前だけ足す)
+            if tomb != enchudb_oplog::Hlc::ZERO {
+                let mut g = self.pk_tombs.write().unwrap();
+                self.drain_pk_pending(&mut g);
+                self.with_pk_key(himo, PkValue::Local(value), |k| {
+                    self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
+                });
+            }
             tomb
         };
         Some(self.remove_rows_named(local, himo, value, tomb))
@@ -23916,9 +24001,14 @@ impl Engine {
 
     /// 削除優先: 消えた行 (削除の版数があり、 生きていない) か。 受け取った書き込み (`remote_*_apply`) は版数によらず捨てる。
     /// 自分の書き込みと WAL の再生は今まで通り版数で決める (自分の消えた行の slot を使い回した後の書き込みを WAL から当て直すため)。
+    ///
+    /// #992 の PR #1012 の残り 1 (user の決定 11-18): 開く時の突き合わせが使い回しの途中の行を消した場所 (gen.seg の使い回しの印) も、
+    /// tombstone は無いが消えた行として弾く。 tombstone を置くと #451 と state (#766) がその行の Delete を配る (受けた行なら、 その peer で
+    /// 生きている行を全部の peer で消す) ので、 置かずに印で弾く。 前はこの場所に遅れた受信の書き込みが当たり、 死んだ場所の cell になった
     #[inline]
     fn slot_is_dead(&self, local: u32) -> bool {
-        !self.entities.is_live(local) && self.tombstone_version_of(local) != enchudb_oplog::Hlc::ZERO
+        !self.entities.is_live(local)
+            && (self.tombstone_version_of(local) != enchudb_oplog::Hlc::ZERO || self.generations().mid_reuse(local))
     }
 
     /// 途中で切れた delete の跡を **数えるだけ** (修復しない)。 readonly でも呼べる。
@@ -24592,7 +24682,7 @@ impl Engine {
                 let (now, dead) = g.state(s);
                 match g.relog_gen(s).filter(|_| dead) {
                     Some(r) => r,
-                    None if now > 0 && dead => now - 1,
+                    None if now > 0 && dead => g.dead_row_gen(s, now),
                     None => now,
                 }
             }
@@ -24615,13 +24705,20 @@ impl Engine {
         let (now, dead_mark) = g.state(slot);
         // 「死んでいる」 印 (消す道が世代と一緒に立てる) は、 生きている印を下ろす前の一瞬も消えた行を指す
         let dead = dead_mark || (!self.entities.is_live(slot) && !self.is_folded_own_slot(slot));
-        // 開く時の突き合わせで完了させた削除は、 覚えた 「消えた行の世代」 (世代を 2 つ上げた形がある)
+        // 開く時の突き合わせで完了させた削除は、 覚えた 「消えた行の世代」 / gen.seg の 「最後の行は 今 − 2」 の印 (#1008、 世代を 2 つ
+        // 上げた形がある。 印は開いた後も残る)
         let row_gen = match g.relog_gen(slot).filter(|_| dead) {
             Some(r) => r,
-            None if now > 0 && dead => now - 1,
+            None if now > 0 && dead => g.dead_row_gen(slot, now),
             None => now,
         };
         (row_gen << b) | slot
+    }
+
+    /// #1008: 死んだ場所 `slot` (今の世代 `now`) の最後の行の世代 (gen.seg の 「最後の行は 今 − 2」 の印があれば 今 − 2、 なければ 今 − 1)。
+    /// 購読の見直しの出口 (`live::touched_eids`) が消えた行の eid を作る所。
+    pub(crate) fn dead_slot_row_gen(&self, slot: u32, now: u32) -> u32 {
+        self.generations().dead_row_gen(slot, now)
     }
 
     /// 中の道: eid の世代を外して場所に (照合しない)。 WAL の record の eid (再生)、 中で作った eid。
@@ -24662,32 +24759,43 @@ impl Engine {
     /// 消す道 (印と世代 → 生きている印) と使い回し (印を落とす → 生きている印) の片方だけが届いた像がある。 **死が勝つ**:
     ///
     /// 1. gen.seg の全部をなめて、 世代 > 0 の場所の page / 表の印を立て直す (印と世代は別の page)。 「死んでいる」 印があるのに生きて
-    ///    いる場所 (削除の 印と世代 だけ届いた / 使い回しの生きている印だけ届いた) は、 削除を完了させる (行の cell を落とし、 世代を
-    ///    もう 1 つ上げて生きている印を下ろす)。 「削除が届いていない」 と読んで世代を戻すと、 使い回しの像で消えた行の eid が生きている
+    ///    いる場所 (削除の 印と世代 だけ届いた / 使い回しの生きている印だけ届いた) は、 削除を完了させる (世代をもう 1 つ上げて生きて
+    ///    いる印を下ろす。 行の cell は仕上げが落とす)。 「削除が届いていない」 と読んで世代を戻すと、 使い回しの像で消えた行の eid が生きている
     ///    行になる (generation.rs の module doc)
     /// 2. 世代を持つ表の払い出し済みの範囲で、 生きていないのに 「死んでいる」 印の無い場所 = 削除の生きている印だけ届いた (または
-    ///    使い回しの、 印を落とした store だけ届いた) → 削除を完了させる (世代を上げて印を立て、 残った cell を落とす)。 使い回しの像を
+    ///    使い回しの、 印を落とした store だけ届いた) → 削除を完了させる (世代を上げて印を立てる。 残った cell は仕上げが落とす)。 使い回しの像を
     ///    完了に寄せると世代が 1 つ無駄になるだけ。 畳んだ自分の行の場所 (#612、 消す時に上げない) は飛ばす。 払い出し位置 (`tables` と
     ///    生きている印から戻した値) より先も、 世代 > 0 の場所 (使い回した事がある = 払い出した事がある) は同じに見る。 世代 0 で払い出し
     ///    位置より先の場所は、 払い出した事があるかを知る手が無い (`tables` が古いまま落ちて、 最後の行の削除が生きている印だけ届いた形。
     ///    #857 / #870 の残り)
+    ///
+    /// 3. (#992) 前の open が立てた 「後始末待ち」 (gen.seg の 2 B の印、 `GEN3`) の残る死んだ場所を仕上げに回す。 前の open の突き合わせが
+    ///    1. / 2. で削除を完了させた後・仕上げ ([`Self::finish_reconcile`]) を disk に届ける前に、 落ちた / 開くのを断った (PR #977 の再生の
+    ///    後の断り) / engine を捨てた像 (前は仕上げの覚えを memory にだけ持ち、 1. / 2. は直した場所をもう見つけないので二度と走らなかった)。
+    ///    印は 1. / 2. の完了と同じ 1 回の store で立て、 開く道が仕上げを書き出した後に落とす (`settle_finished_reconcile`)。 印は 1 のなめ
+    ///    (gen.seg の全部) で拾う = 開く時の値段は前のまま
+    ///
+    /// #1008: 1. で世代を 2 つ上げた場所には 「最後の行は 今 − 2」 の印も立てる (`last_local_of_slot` が読む、 開いた後も)。 sync する DB は
+    /// 場所の使い回しの記録 (`prev.seg`) から最後の住人を引き、 2 回使い回した像 (gen.seg の書き出しの間に Y を生かして消し、 Z を生かした)
+    /// では Z の番号の次まで上げる (前の +2 は Z の番号を次の使い回しに渡した)。
     ///
     /// 失うのは WAL に届いていない (cut の後の) 操作だけ。 **WAL の再生の前** に回す: 再生は record ごとに場所を正しい状態に動かす
     /// (Delete は消して上げる = 冪等、 行を生かす record は場所の世代がその行より新しければ戻す = ここで完了に寄せた使い回し /
     /// 届いていなかった削除を、 WAL にある分だけ戻す、 `replay_slot`)。 後に回すと、 再生が生かした場所に残った印を読み違える形を
     /// 再生の側で全部消す必要がある。 readonly は書けないので回さない。 表の定義・別名 (`eidalias`)・払い出し位置の後。
     ///
-    /// 仕上げ ([`Self::finish_reconcile`]) は、 この open の後に WAL の再生が当てる record があれば (`replay`、 呼び手が writer lock の下で
-    /// 何かを直す前に決めた答え、 PR #986 の読み直し 2 の [1] [2]) 再生の後、 無ければここで済ませる。
-    fn reconcile_generations(&self, readonly: bool, replay: &ReplayAhead<'_>) {
+    /// 仕上げ ([`Self::finish_reconcile`]) は、 WAL 付きの open なら再生の後 (再生する record が無くても)、 単独の open はここで済ませる
+    /// (`replay`、 呼び手が writer lock の下で何かを直す前に決めた答え、 PR #986 の読み直し 2 の [1] [2])。
+    fn reconcile_generations(&self, readonly: bool, replay: &ReplayAhead<'_>) -> io::Result<()> {
         let gens = self.generations();
         // WAL の無い engine は session の途中の flush でも紐名の辞書の clean の印が立つ: gen.seg の header の印でも見る (読み直し 2)
         if readonly || !gens.active() || !(self.himo_reg.rebuilt_on_load || gens.session_dirty()) {
-            return;
+            return Ok(());
         }
+        let t0 = std::time::Instant::now();
         // 1.
         let mut last: Option<usize> = None;
-        let dead_but_live = gens.heal(
+        let (dead_but_live, marked) = gens.heal(
             |slot| self.entities.is_live(slot),
             |slot| {
                 let i = match last {
@@ -24698,14 +24806,34 @@ impl Engine {
                 Some(i as TableId)
             },
         );
+        // 世代をもう 1 つ上げる: 生きている印が使い回しの物なら、 今の世代の eid はアプリに渡っている (落ちた後に同じ eid で
+        // 別の行を渡さない)。 削除の途中の像なら 1 つ無駄にするだけ。 購読には消えた行の世代を渡す。 cell はここでは落とさない
+        // (再生がその行を生かし直すと、 書き出しの返った列が消える = 読み直し 1)。 `finish_reconcile`
+        let mut rows = Vec::with_capacity(dead_but_live.len());
         for &slot in &dead_but_live {
-            // 世代をもう 1 つ上げる: 生きている印が使い回しの物なら、 今の世代の eid はアプリに渡っている (落ちた後に同じ eid で
-            // 別の行を渡さない)。 削除の途中の像なら 1 つ無駄にするだけ。 購読には今 − 1 (消えた行の世代、 削除の途中の像) を渡す。
-            // cell はここでは落とさない (再生がその行を生かし直すと、 書き出しの返った列が消える = 読み直し 1)。 `finish_reconcile`
             let now = gens.get(slot);
-            self.kill_generation(slot, now + 1);
-            self.live_free(slot, Some(now.saturating_sub(1)));
-            gens.note_pending(slot, now.saturating_sub(1), true);
+            let (target, row, mid_reuse) = self.reconcile_target(slot, now);
+            // 書けなければ断る (#992 の読み直し 3 の細かい 4: 書けないまま生きている印を下ろすと、 世代を上げずに場所を空ける)
+            self.kill_generation_reconciled(slot, target, row, mid_reuse)?;
+            rows.push((slot, row));
+        }
+        // #992 の読み直し 2 の B2: 上げた世代と後始末待ちを disk に届けてから生きている印を下ろす。 本体の書き出しは生きている印
+        // (entities) を gen.seg より先に書き出すので、 先に下ろすと、 その間の電源断の像で印 (と上げた世代) だけを失い、 次の open は
+        // 「死んでいて生きていない」 場所として何も拾わない (後始末を失い、 使い回しの途中の像では上げた世代を失って番号をもう一度渡す)。
+        // 書き出せなければ開くのを断る (生きている印は下ろしていない = 次の open がもう一度ここで拾う)。 拾った場所がある時だけ
+        // 書き出しは拾った場所を覆う 1 つの範囲 (msync 1 回。 間の汚れていない page は書かない)。 断った後の open は、 書いた 2 B (page
+        // cache に残る) を前の open の答えとして拾い直す (`reconcile_target` の後始末待ちの枝 = 上げ直さない、 #992 の読み直し 3 の B3)
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(&(lo, _)), Some(&(hi, _))) = (rows.iter().min_by_key(|r| r.0), rows.iter().max_by_key(|r| r.0)) {
+            // 試験の故障の点 (`ENCHU_FAULT_AT`、 この書き出しの失敗を起こす。 crashsim の build の外では何もしない)
+            enchudb_oplog::io_point("gen.reconcile.msync")?;
+            let (off, _) = crate::generation::Generations::slot_range(lo);
+            let (end, len) = crate::generation::Generations::slot_range(hi);
+            self.backing.flush_kind(SegmentKind::Gen, off, end + len - off)?;
+        }
+        for &(slot, row) in &rows {
+            self.live_free(slot, Some(row));
+            gens.note_pending(slot, row);
         }
         gens.note_repaired(0, dead_but_live.len() as u32);
         // 2.
@@ -24732,8 +24860,8 @@ impl Engine {
                         && !self.is_folded_own_slot(slot)
                     {
                         let row = gens.get(slot);
-                        self.kill_generation(slot, row + 1);
-                        gens.note_pending(slot, row, false);
+                        self.kill_generation_reconciled(slot, row + 1, row, false)?;
+                        gens.note_pending(slot, row);
                         completed += 1;
                     }
                     slot += 1;
@@ -24741,63 +24869,224 @@ impl Engine {
             }
         }
         gens.note_repaired(1, completed);
-        // 再生する record が WAL に無ければ、 ここで仕上げる (あれば WAL 付きの open が再生の後に仕上げる)
-        if gens.has_pending() && !replay.follows() {
+        // 3. 前の open の後始末待ち (1. で今完了させた場所は除く。 生きている場所は生かす道が印を落とす = ここには来ない)
+        let mut resumed = 0;
+        let mut healed = dead_but_live;
+        healed.sort_unstable();
+        for slot in marked {
+            if healed.binary_search(&slot).is_ok() || self.entities.is_live(slot) {
+                continue;
+            }
+            let now = gens.get(slot);
+            gens.note_pending(slot, gens.dead_row_gen(slot, now));
+            resumed += 1;
+        }
+        gens.note_repaired(2, resumed);
+        if Self::trace_open_enabled() {
+            eprintln!(
+                "[trace] reconcile: {:.2} ms (gen.seg only {}, entities only {}, resumed cleanups {} — #992)",
+                t0.elapsed().as_secs_f64() * 1e3,
+                healed.len(),
+                completed,
+                resumed
+            );
+        }
+        // 仕上げ: 開いた後に WAL 付きの仕上げが続かない open (単独の open) は、 ここで済ませる。 WAL 付きの open は再生の後
+        if gens.has_pending() && !replay.finishes_later() {
             self.finish_reconcile(None);
+            // #992: 配らない DB は仕上げ (cell を落とす) が後始末の全部: 書き出してから後始末待ちを落とす。 配る DB は tombstone と #451 の
+            // 作り直しに WAL が要るので、 後で WAL 付きの仕上げ (`concurrentize_with_oplog` / 次の open) が落とす
+            if !self.sync_tables_enabled() && self.body_msync().is_ok() {
+                self.settle_finished_reconcile();
+            }
+        }
+        Ok(())
+    }
+
+    /// #1008: 1. (gen.seg だけ死・生きている場所 `slot`、 今の世代 `now`) を完了させる世代と、 場所の最後の行の世代。 削除の途中 (最後の行
+    /// = 今 − 1) と使い回しの生かす途中 (最後の行 = 今、 アプリに渡った) を disk の上で見分けられない時は、 前と同じく 今 + 1 まで上げる
+    /// (どちらの行の番号も次の住人に渡さない、 最後の行は 今 − 1 と読んで 「今 − 2」 の印を立てる)。 sync する DB は場所の使い回しの記録
+    /// (`prev.seg`、 最後の使い回しが場所から離した前の住人の行) で見分ける:
+    /// - 前の住人が今の死の印の行 (場所の最後の行: 今 − 1、 「今 − 2」 の印があれば 今 − 2) = その行を離した使い回しの生かす途中。
+    ///   最後の行は今 (使い回した行の世代は場所の今の世代。 前の住人 + 1 ではない: 突き合わせが 2 つ上げた場所の使い回しは 1 つ飛ぶ)
+    /// - 前の住人が今以上 = gen.seg の書き出しの間に 2 回以上使い回した (Y を生かして消し、 Z を生かした)。 最後の行は前の住人の次
+    ///   (普通の削除は世代を 1 つ上げる)、 その次まで上げる (前は 今 + 1 = Z の番号を次の使い回しに渡した)
+    /// - 記録が無い / 古い: 見分けられない
+    ///
+    /// #992 の読み直し 3 の B3: 場所に 「後始末待ち」 が既に立っている = 前の open の 1. / 2. がこの場所の答えを決めて gen.seg に書いた後、
+    /// 生きている印を下ろす前に落ちた (B2 の書き出しの後・本体の entities の書き出しの前の電源断 / kill) か、 その書き出しに失敗して断った
+    /// (書いた 2 B は page cache に残る)。 上の 2 つの枝 (前の open の後の使い回し) に当たらなければ、 上げ直さずに前の open の答え (今、
+    /// 最後の行 = `dead_row_gen`) を使う。 前は上げた後の世代から決め直し、 削除の途中の像で最後の行を 1 つ上 (無かった行) に読んだ
+    /// (Delete の宛名がずれ、 断るたびに 1 つずつずれた)。 この枝の前提 「disk に後始末待ちが立ち、 生きている印も立つ = 前の open の窓」 は、
+    /// 後始末待ちの場所を使い回さない (`Generations::withheld`) と、 後始末待ちを落とした store を書き出してから engine を渡す
+    /// (`settle_finished_reconcile`) の 2 つが守る (#992 の読み直し 4 の B4: 前は前の open の後に場所を使い回し、 その書き出しが切れた像も
+    /// この形になり、 使い回しの記録を書かない使い回し (sync しない DB の全部・使い回しの印の場所・tombstone の無い場所) で世代を上げずに
+    /// 使い回した行の eid をもう一度渡した)
+    ///
+    /// #992 の読み直し 4 の S5 / 細かい 3: 突き合わせの印 (使い回しの印 / 「今 − 2」) が残り、 後始末待ちの無い生きている場所は、 突き合わせ
+    /// (後始末を済ませた後) の後に場所を使い回し、 その書き出しが生きている印と gen.seg の間で切れた像 (印は突き合わせが死の印と一緒にしか
+    /// 立てず、 生かす道が全部落とす)。 最後の行は使い回した行 (今、 記録の無い使い回しの途中の行) で、 1 つ上げる。 前は 3 つ目の枝に落ちて
+    /// 使い回しの印を落とし、 前の住人 (使い回しの途中だった行) に tombstone を作り直して Delete を配った
+    ///
+    /// 3 つ目の値は 「最後の行は使い回しの途中の行」 (使い回しの 2 つの枝、 gen.seg の [`crate::generation`] の使い回しの印。 後始末待ちの
+    /// 枝は前の open の決めを保つ)。
+    fn reconcile_target(&self, slot: u32, now: u32) -> (u32, u32, bool) {
+        let gens = self.generations();
+        let gone = gens.prev.read(slot).map(|r| gens.split(r.gone)).filter(|&(s, _)| s == slot).map(|(_, g)| g);
+        let dead_row = gens.dead_row_gen(slot, now);
+        match gone {
+            Some(g) if g >= now => (g + 2, g + 1, true),
+            Some(g) if g == dead_row => (now + 1, now, true),
+            _ if gens.pending_mark(slot) => (now, dead_row, gens.mid_reuse(slot)),
+            _ if gens.mid_reuse(slot) || gens.two_up_mark(slot) => (now + 1, now, true),
+            _ => (now + 1, now.saturating_sub(1), false),
+        }
+    }
+
+    /// [`Self::kill_generation`] の、 開く時の突き合わせの完了 (#992 / #1008): 「後始末待ち」 と、 書いた世代が場所の最後の行 `row` の
+    /// 2 つ上なら 「最後の行は 今 − 2」 を、 `mid_reuse` なら 「最後の行は使い回しの途中の行」 を、 世代と死の印と同じ store で立てる。
+    fn kill_generation_reconciled(&self, slot: u32, g: u32, row: u32, mid_reuse: bool) -> io::Result<()> {
+        if !self.generations().active() {
+            return Ok(());
+        }
+        if let Some(t) = self.table_of_slot(slot) {
+            self.generations().mark_table(t as TableId);
+        }
+        self.mark_gen_session_dirty();
+        self.generations().kill_reconciled(slot, g, row, mid_reuse).inspect_err(|_| {
+            self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 場所の世代を上げられない");
+        })
+    }
+
+    /// #992: 仕上げを済ませた場所の 「後始末待ち」 を落とす。 呼ぶのは、 仕上げ (cell を落とす・tombstone を置く) と #451 の作り直しの
+    /// record を書き出した後 (本体の書き出しと WAL の fsync が返った後)。 落とした印は次の本体の書き出しで届く。 届く前に落ちれば次の open が
+    /// もう一度仕上げる (cell は落ちていて、 置いた tombstone と作り直した record は届いている = 同じ答え)。
+    ///
+    /// #992 の読み直し 4 の B4 (A2): 落とした印は、 落とした場所を覆う範囲の gen.seg を書き出してから engine を渡す (msync 1 回、 落とした場所が
+    /// ある時だけ)。 書き出せなければ印を立て直す (使い回さない = A1、 次の open がもう一度後始末をする)。 これで 「disk に後始末待ちが立ち、
+    /// 生きている印も立つ」 像は前の open の窓 (生きている印を下ろす前に落ちた / 断った) だけになる (`reconcile_target` の後始末待ちの枝の前提)。
+    /// 前は落とした store が次の本体の書き出しまで memory にだけあり、 その間に場所を使い回して書き出しが生きている印と gen.seg の間で切れると、
+    /// 次の open が後始末待ちの枝で世代を上げず、 使い回した行の eid をもう一度渡した。
+    fn settle_finished_reconcile(&self) {
+        let gens = self.generations();
+        let cleared: Vec<u32> =
+            gens.take_finished().into_iter().filter(|&slot| !self.entities.is_live(slot) && gens.clear_pending(slot)).collect();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(&lo), Some(&hi)) = (cleared.iter().min(), cleared.iter().max()) {
+            let (off, _) = crate::generation::Generations::slot_range(lo);
+            let (end, len) = crate::generation::Generations::slot_range(hi);
+            if self.backing.flush_kind(SegmentKind::Gen, off, end + len - off).is_err() {
+                for &slot in &cleared {
+                    gens.remark_pending(slot);
+                }
+            }
         }
     }
 
     /// #731 (PR #885 の読み直し 1 / 4 / Q1): 開く時の突き合わせで削除を完了させた場所の仕上げ (WAL の再生の後、 #451 の作り直しの前)。
-    /// 再生がその行を生かし直した場所 (`replay_slot` の `restore`) は触らない。 まだ死んでいる場所は:
-    /// - 残った cell を落とす (突き合わせでは落とさない: 落としてから再生が行を生かすと、 書き出しの返った列が消えた)
-    /// - 「消えた行の世代」 を覚える (#451 の作り直しの Delete の宛名。 gen.seg だけ死の完了は世代を 2 つ上げるので、 今 − 1 ではない)
-    /// - gen.seg だけ死の完了で消えた行の tombstone が無い (書き出しの tombstone の段の前に落ちた = 場所の tombstone が行の cell の版数
-    ///   より古い) sync の DB は、 新しい HLC で tombstone を置く:
-    ///   #451 が Delete を作り直して相手に配り、 消えた行への相手の書き込みを `slot_is_dead` が弾く (削除優先なので、 新しい HLC でも
-    ///   消した後の書き込みを余分に消す事は無い)。 `wal` = 版数を採る WAL (無い open は tombstone を置かない = 配らない DB)
+    /// 再生がその行を生かし直した場所 (`replay_slot` の `restore`、 生かす道が後始末待ちも落とす) は触らない。 まだ死んでいる場所は
+    /// 「消えた行の世代」 を覚え (#451 の作り直しの Delete の宛名、 gen.seg の 「今 − 2」 の印と同じ値)、 残った cell を落とす。
+    ///
+    /// **tombstone を作り直すのは、 突き合わせが場所の最後の行の削除を完了させた場所 (gen.seg の 「最後の行は 今 − 2」 の印 / 引退した場所で、
+    /// 使い回しの印 (最後の行は使い回しの途中の行) の無い場所、 [`crate::generation::Generations::last_row_was_deleted`]) で、 tombstone が
+    /// 届いていない時だけ**。 使い回しの印の場所は tombstone を置かずに、 受信の書き込みを印で弾く ([`Self::slot_is_dead`])。 作り直しは新しい HLC で tombstone を
+    /// 置き、 名前の削除を覚えてから cell を落とし、 Delete を作り直して相手に配る (#992 の読み直し S1: 先に cell を落とすと名前を読めない)。
+    /// - 「届いていない」 = 場所の tombstone が 0 か、 場所の使い回しの記録 (`prev.seg`) の前の住人の削除の版数と同じ (使い回しが tomb.seg を
+    ///   0 にした page が届かなかった、 #992 の読み直し B1)。 cell の版数では見分けない (受けた削除の前に行の cell が全部書き直されていれば、
+    ///   版数の最小も削除の版数より新しい。 前は受けた削除を届いていないと読み、 自分を author とする今の時刻の Delete を配った)
+    /// - 他の完了 (2. の 「生きている印だけ死」、 1. の使い回しの途中の像) は作り直さない (#992 の読み直し 2 の細かい 3)。 2. の
+    ///   tombstone の無い像には、 版数なしの削除 (sync する DB の単独の session の削除)・`merge_entity_into` の src・`Split::NoRoom` の空の行
+    ///   (どれも tomb.seg に何も置かない) が入り、 作り直すと一度も配っていない削除が今の時刻で配られる (受け手の名前の削除優先が、
+    ///   同じ名前で足し直した行を消す = #923 の形)。 使い回しの途中の像の行は record が WAL に無い (あれば再生が生かす)。 決め方は gen.seg の
+    ///   印から = 1 回の open でも、 突き合わせと仕上げの間で落ちて 3. で拾い直しても同じ (読み直しの S4)。 引き換え: 生きている印だけが
+    ///   届いて WAL の Delete も tomb.seg も届かなかった普通の削除 (OS が entities の page を先に書いた像) は Delete を作り直さない (master と同じ)
+    /// - 名前の削除は、 届いている tombstone の版数で覚える (0 / 前の住人の物なら覚えない)
+    ///
+    /// WAL の無い仕上げ (`wal` が None = 単独の open) は覚えたままにする (後で WAL 付きで仕上げる `concurrentize_with_oplog` / 次の open が
+    /// tombstone を作り直し、 #451 が Delete を作り直す。 配らない DB は cell を落とせば済む)。 cell はその場で落とす (#992 の読み直し 2 の
+    /// 細かい 2: 前は tombstone を作り直す場所の cell を WAL 付きの仕上げまで残し、 WAL の file の無い DB を単独でだけ使うと毎回の session で
+    /// 消えた行の cell が値の引きに出た): 作り直す場所の名前は、 行の cell の版数の最大で仮に覚える (削除はそれより後 = 早めに覚えるのは
+    /// 名前の削除優先が消す行を減らす向き)。 WAL 付きの仕上げが置く tombstone で覚え直す (名前の記録は場所でも引ける、 版は単調な max)。
     pub(crate) fn finish_reconcile(&self, wal: Option<&enchudb_oplog::oplog::OpLog>) {
         let gens = self.generations();
         let pending = gens.take_pending();
         if pending.is_empty() {
             return;
         }
-        for (slot, row_gen, gen_only) in pending {
+        let versioned = self.sync_tables_enabled() && self.has_cell_version();
+        for (slot, row_gen) in pending {
             if self.entities.is_live(slot) {
                 continue;
             }
-            // 消えた行の削除の tombstone が届いていない = 場所の tombstone (前の住人の物 / 無し) が行の cell の版数より古い
-            let tomb_missing = wal.is_some() && gen_only && self.sync_tables_enabled() && self.has_cell_version() && {
-                let newest_cell = self.tables[self.table_of_slot(slot).unwrap_or(ANONYMOUS_TABLE as usize)]
-                    .himo_ids
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .map(|&h| self.cell_hlc_local(slot, h as u16))
-                    .max()
-                    .unwrap_or(enchudb_oplog::Hlc::ZERO);
-                self.tombstone_version_of(slot) <= newest_cell
-            };
-            if let Some(t) = self.table_of_slot(slot) {
-                self.drop_leftover_cells(slot, t);
+            let tomb = self.tombstone_version_of(slot);
+            let stale = tomb == enchudb_oplog::Hlc::ZERO || gens.prev.read(slot).is_some_and(|r| r.tomb == tomb);
+            let missing = versioned && stale && gens.last_row_was_deleted(slot);
+            if missing && wal.is_some() {
+                // cell を落とし後始末待ちを落とすのは、 作り直しが tombstone を置いた後 (`relog_unlogged_writes`)
+                gens.note_relog_gen(slot, row_gen);
+                gens.note_missing_tombstone(slot);
+                continue;
             }
-            // WAL の無い仕上げ (再生する record が無い open) は、 後で WAL 付きで開き直す時 (#892 の往復 / `concurrentize_with_oplog`)
-            // のために覚えたままにする (tombstone と作り直しの宛名は WAL が要る)
+            let name_at = if missing {
+                self.newest_cell_version(slot)
+            } else if versioned && !stale {
+                tomb
+            } else {
+                enchudb_oplog::Hlc::ZERO
+            };
+            self.drop_cells_remembering_name(slot, name_at);
             if wal.is_none() {
-                gens.note_pending(slot, row_gen, gen_only);
+                gens.note_pending(slot, row_gen);
+                // 配らない DB は cell を落とせば後始末の全部 (書き出した後に後始末待ちを落とす)
+                if !versioned {
+                    gens.note_finished(slot);
+                }
                 continue;
             }
             gens.note_relog_gen(slot, row_gen);
-            if tomb_missing {
-                gens.note_missing_tombstone(slot);
-            }
+            gens.note_finished(slot);
         }
+    }
+
+    /// #992: 死んだ場所 `slot` の名前の削除を `at` で覚え (0 なら覚えない)、 残った cell を落とす (名前の cell を落とす前に覚える、 読み直しの
+    /// 細かい 1)。 呼び手は仕上げ / 作り直し (tombstone を置いた後)。
+    fn drop_cells_remembering_name(&self, slot: u32, at: enchudb_oplog::Hlc) {
+        let _row = self.row_locks.write(slot);
+        if self.entities.is_live(slot) {
+            return;
+        }
+        if at != enchudb_oplog::Hlc::ZERO {
+            self.remember_pk_tombstone(slot, at);
+        }
+        if let Some(t) = self.table_of_slot(slot) {
+            self.drop_leftover_cells(slot, t);
+        }
+    }
+
+    /// 場所 `slot` の表の列に残った cell の版数の最大 (無ければ 0)。 tombstone を置けない仕上げが名前の削除を仮に覚える版数 (#992)。
+    fn newest_cell_version(&self, slot: u32) -> enchudb_oplog::Hlc {
+        let Some(t) = self.table_of_slot(slot) else { return enchudb_oplog::Hlc::ZERO };
+        let hids: Vec<u32> = self.tables[t].himo_ids.read().unwrap().clone();
+        hids.into_iter()
+            .map(|h| h as usize)
+            .filter(|&h| h < self.himos.len() && self.himos[h].get_value(slot).is_some())
+            .map(|h| self.version_of(slot, h as u16))
+            .max()
+            .unwrap_or(enchudb_oplog::Hlc::ZERO)
     }
 
     /// #731: 開いた時の突き合わせ (`reconcile_generations`) で削除を完了させた場所の数 (gen.seg だけ死んでいた, entities だけ死んで
     /// いた)。 試験用。
     #[doc(hidden)]
     pub fn generation_repairs(&self) -> (u32, u32) {
-        self.generations().repaired()
+        let (gen_only, entities_only, _) = self.generations().repaired();
+        (gen_only, entities_only)
+    }
+
+    /// #992: 開いた時の突き合わせが、 前の open の 「後始末待ち」 の印の残る場所を仕上げに回した数 (3.)。 試験用。
+    #[doc(hidden)]
+    pub fn resumed_cleanups(&self) -> u32 {
+        self.generations().repaired().2
     }
 
     /// 開いた時に `prev.seg` の記録から、 使い回しが identity に移した前の住人の削除の版数を戻した場所の数 (観測・試験用、
@@ -25158,7 +25447,8 @@ impl Engine {
             }
         }
         let _l = gens.dirty_lock.lock().unwrap_or_else(|p| p.into_inner());
-        if gens.has_unkilled() {
+        // #992: 後始末待ちの残る場所があれば倒さない (次の open の突き合わせが拾う)
+        if gens.has_unkilled() || gens.has_pending_marks() {
             return;
         }
         gens.write_dirty_flag(false);
@@ -25441,7 +25731,7 @@ impl Engine {
         // `last_local_of_slot` と同じ引き方。 逆写像が外れるだけ (畳む) の時は今の行
         let gens = self.generations();
         let row_gen = if reused {
-            gens.relog_gen(local).unwrap_or_else(|| gens.get(local).saturating_sub(1))
+            gens.relog_gen(local).unwrap_or_else(|| gens.dead_row_gen(local, gens.get(local)))
         } else {
             gens.split(self.last_local_of_slot(local)).1
         };
@@ -32316,7 +32606,7 @@ impl Engine {
         let lock = Self::writer_lock_for_open(path)?;
         let oplog_path = oplog_path_for(path);
         let wal = Self::existing_wal(&oplog_path)?;
-        let replay = wal.as_ref().map_or(ReplayAhead::Nothing, ReplayAhead::of);
+        let replay = wal.as_ref().map_or(ReplayAhead::NewWal, ReplayAhead::of);
         let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, Some(lock), replay)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
@@ -32341,8 +32631,12 @@ impl Engine {
                 eng.finish_replay_vocab(&mut replay);
                 // #968: 再生が生き返らせた、 tombstone まで本体に届いた削除の行は、 削除を完了させる (再生の前の sweep と同じ決め)
                 eng.finish_deletes_revived_by_the_replay(!records.is_empty());
+                #[cfg(feature = "crashsim")]
+                write_out_hook::call(write_out_hook::Phase::OpenBeforeFinishReconcile);
                 // #731: 突き合わせで完了させた削除の仕上げ (再生の後、 作り直しの前)
                 eng.finish_reconcile(Some(&w));
+                #[cfg(feature = "crashsim")]
+                write_out_hook::call(write_out_hook::Phase::OpenAfterFinishReconcile);
                 // review946d [N1]: 再生の後に回した `prev.seg` の記録を戻す (再生が生き返らせた行の記録は戻さない)
                 eng.finish_prev_restores();
                 // 読み直し 2 [B1] / [B2] / [R2]: 再生が生かした場所の使い回しが外した別名を外し、 版数の索引を捨て、 `prev.seg` の周期を
@@ -32351,6 +32645,8 @@ impl Engine {
                 // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
+                #[cfg(feature = "crashsim")]
+                write_out_hook::call(write_out_hook::Phase::OpenBeforeSettle);
                 let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
                 // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
                 // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
@@ -32360,25 +32656,43 @@ impl Engine {
                 // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
                 // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
                 // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
-                if eng.persist_name_records().is_ok()
-                    && eng.body_msync().is_ok()
-                    && (wal_untouched || w.fsync().is_ok())
-                    && !eng.checkpoint_held_for_freed_slots()
-                {
-                    w.advance_checkpoint(w.head());
+                // #992: 書き出しが返ったら、 仕上げた場所の後始末待ちを落とす (落とした印は次の書き出しで届く)
+                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+                    eng.settle_finished_reconcile();
+                    if !eng.checkpoint_held_for_freed_slots() {
+                        w.advance_checkpoint(w.head());
+                    }
                 }
                 std::sync::Arc::new(w)
             }
             None => {
-                let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+                // #992: 突き合わせは仕上げをここまで回している (`ReplayAhead::NewWal`)。 WAL を作れなければ、 何も書かずに断る
+                // (`abandoned`: Drop がきれいに閉じた印を立てない = 次の open が突き合わせ直し、 直した場所の残った cell を 3. で拾う)
+                let w = match enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+                        return Err(e);
+                    }
+                };
+                #[cfg(feature = "crashsim")]
+                write_out_hook::call(write_out_hook::Phase::OpenBeforeFinishReconcile);
                 // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();
                 eng.finish_open_restores();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
-                if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
-                    w.advance_checkpoint(w.head());
+                // #992: 仕上げた場所があれば書き出して後始末待ちを落とす
+                if (relogged || eng.generations().has_finished())
+                    && eng.persist_name_records().is_ok()
+                    && eng.body_msync().is_ok()
+                    && w.fsync().is_ok()
+                {
+                    eng.settle_finished_reconcile();
+                    if relogged {
+                        w.advance_checkpoint(w.head());
+                    }
                 }
                 std::sync::Arc::new(w)
             }
@@ -32482,6 +32796,11 @@ impl Engine {
             wal.observe_hlc(m.hlc);
         }
         if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() {
+            // #992: tombstone を置けない形でも、 仕上げが後に回した cell は落とす (後始末待ちの印は落とさない = 作り直せる open が拾う)。
+            // 名前の削除は行の cell の版数の最大で仮に覚える (読み直し 2 の細かい 5、 作り直す open が tombstone の版数で覚え直す)
+            for slot in self.generations().take_missing_tombstones() {
+                self.drop_cells_remembering_name(slot, self.newest_cell_version(slot));
+            }
             return false;
         }
         if !self.sync_tables_enabled() {
@@ -32553,10 +32872,15 @@ impl Engine {
         let reached = known.iter().copied().max().unwrap_or(Hlc::ZERO).max(floor).max(w);
         // #731 (PR #885 の読み直し Q1): 開く時の突き合わせが完了させた削除で tombstone が届いていない場所に、 配った版数より後の新しい
         // HLC で tombstone を置く (下の削除のなめが作り直して配る)
+        // #992 (読み直し S1): tombstone を置いてから名前の削除を覚えて cell を落とす (仕上げは tombstone の届いていない場所の cell を落とさずに
+        // 回した)。 cell の版数のなめ (下) の前に落とす (落としていないと消えた行の Tie を作り直す)
         for slot in self.generations().take_missing_tombstones() {
             wal.set_peer_id(me);
             wal.observe_hlc(reached);
-            self.set_tombstone_local(slot, wal.mint_hlc());
+            let h = wal.mint_hlc();
+            self.set_tombstone_local(slot, h);
+            self.drop_cells_remembering_name(slot, h);
+            self.generations().note_finished(slot);
         }
         let lower = floor.max(w);
         let unlogged = |h: Hlc| h != Hlc::ZERO && h.peer == me && h > lower && !known.contains(&h);
@@ -32948,7 +33272,12 @@ impl Engine {
         if row_gen == 0 || !gens.prev.active() || !self.sync_tables_on() || !self.slot_is_generational(slot) {
             return;
         }
-        let prev_row = ((row_gen - 1) << gens.bits()) | slot;
+        // #1008 (#992 の読み直し 2 の S2): 場所の今の世代の行を生かす record (場所はまだ死んでいる、 `replay_slot` の `g == now` の枝) なら、
+        // 前の住人は場所の最後の行 (開く時の突き合わせが世代を 2 つ上げた場所は 今 − 2)。 使い回しの道 (`prepare_reuse`) も同じ読みで
+        // 記録を書く。 場所の世代が record の行より新しい時 (`g < now` の枝) の前の住人は分からないので、 前と同じ 1 つ下
+        let prev_gen =
+            if gens.get(slot) == row_gen && gens.is_dead(slot) { gens.dead_row_gen(slot, row_gen) } else { row_gen - 1 };
+        let prev_row = (prev_gen << gens.bits()) | slot;
         let here = if slot_tomb { self.tombstone_version_of(slot) } else { enchudb_oplog::Hlc::ZERO };
         let self_peer = self.peer_id();
         // `record_written` = 記録の周期が書き出し済み (読み直し [A1]、 下の自分の行の枝)
@@ -33510,12 +33839,12 @@ impl Engine {
                 // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
                 // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
                 // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
-                if eng.persist_name_records().is_ok()
-                    && eng.body_msync().is_ok()
-                    && (wal_untouched || w.fsync().is_ok())
-                    && !eng.checkpoint_held_for_freed_slots()
-                {
-                    w.advance_checkpoint(w.head());
+                // #992: 書き出しが返ったら、 仕上げた場所の後始末待ちを落とす (落とした印は次の書き出しで届く)
+                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+                    eng.settle_finished_reconcile();
+                    if !eng.checkpoint_held_for_freed_slots() {
+                        w.advance_checkpoint(w.head());
+                    }
                 }
                 std::sync::Arc::new(w)
             }
@@ -33527,8 +33856,16 @@ impl Engine {
                 eng.finish_open_restores();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
-                if relogged && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
-                    w.advance_checkpoint(w.head());
+                // #992: 仕上げた場所があれば書き出して後始末待ちを落とす
+                if (relogged || eng.generations().has_finished())
+                    && eng.persist_name_records().is_ok()
+                    && eng.body_msync().is_ok()
+                    && w.fsync().is_ok()
+                {
+                    eng.settle_finished_reconcile();
+                    if relogged {
+                        w.advance_checkpoint(w.head());
+                    }
                 }
                 std::sync::Arc::new(w)
             }
@@ -35770,7 +36107,11 @@ impl Engine {
         } else {
             self.vocab.mark_index_clean(true);
         }
-        if closing && self.persist_leaf_free_list().unwrap_or(false) {
+        // #992: 配る DB で後始末待ち (tombstone と #451 の作り直しの済んでいない場所) が残る間は、 紐名の辞書の印 (= 「きれいに閉じた」) を
+        // 立てない: 次の open が #451 の作り直しを飛ばさない (WAL の無い単独の session が後始末待ちを持ったまま閉じる形)
+        let pending_relog = self.sync_tables_enabled() && self.generations().has_pending_marks();
+        if pending_relog {
+        } else if closing && self.persist_leaf_free_list().unwrap_or(false) {
             self.himo_reg.mark_index_clean_leaf();
         } else if closing || self.oplog.is_none() {
             self.himo_reg.mark_index_clean(true);
