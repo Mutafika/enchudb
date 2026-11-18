@@ -1229,7 +1229,8 @@ impl GenReader<'_> {
     ///
     /// 世代 ≠ 0 の eid の読む前の照合には使わない (#1020 の読み直し A): その eid を同期の無い渡し方で受けた読み手が、 2 B の新しい
     /// 世代を Relaxed で読んで通ると、 cell の load は前の住人の値 (消す道が落とす前の値) を読んでよく、 読んだ後の照合も通る。
-    /// [`Self::current`] (Acquire) で読めば、 2 B を書いた消す道 / 使い回す道の RMW と同期し、 その前に落とした cell が見える。
+    /// [`Self::current`] (Acquire) で読めば、 2 B を書いた消す道 / 使い回す道の RMW と同期し、 その前に落とした cell が見える。 ただし
+    /// 使い回す道が生かした後に落とす cell (v14 の間に死んだ場所へ書かれた分、 `Engine::drop_leftover_cells`) は見えないことがある (#1025)。
     /// #1015: Acquire で読むより get 1 回が 0.7〜1.3 ns 速い (M4 Max、 100 万行)。
     #[inline]
     pub(crate) fn current_relaxed(&self, slot: u32) -> u32 {

@@ -188,9 +188,11 @@ jobs:
       - name: loom model check (eid の世代、 v15 に移る手順と消す道)
         run: cargo test -p enchudb-engine --test loom_eid_generation_move --release
 
-      # #1015: lock を取らない読み (get) の照合の読みを Relaxed にし、 get の道は読んだ後の fence を省いた。 順は列の cell の
-      # Acquire (get) か fence (get_text など) が付ける。 cell を Relaxed で読んで fence も無い形・読んだ後の照合を外した形の対照で、
-      # loom が使い回した後の住人の値を返す道を見つけることも見る。
+      # #1015 / #1020: lock を取らない読み (get) と出口の世代の照合の順。 古い eid の向き: 読んだ後の照合は Relaxed で、 順は列の cell の
+      # Acquire (get の道) か `f` の直後の fence (get_text_owned の道) が付ける。 新しい世代の eid を同期の無い渡し方で受けた向き: 世代 ≠ 0
+      # の eid の読む前の照合は Acquire。 出口 (eids) は 2 B を Relaxed で読んで返す前に fence。 順を外した対照 7 本 (fence も無い /
+      # 読んだ後の照合を外す / bit を読み直さない / bit を fence の前に読む / 読む前の照合を Relaxed (2 つの始めの形) / 出口の fence を
+      # 外す) は、 loom が別の住人の値を返す道を見つける。
       - name: loom model check (lock を取らない読みの世代の照合の順)
         run: cargo test -p enchudb-engine --test loom_read_app_generation --release
 

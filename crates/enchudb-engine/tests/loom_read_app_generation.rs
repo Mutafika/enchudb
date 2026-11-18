@@ -25,7 +25,8 @@
 //! - **出口が新しい世代を付けて返した eid の後の読みは、 前の住人の値を見ない** (出口は 2 B を Relaxed で読み、 返す前に fence(Acquire))
 //!
 //! 対照 (should_panic): 順を外した形は loom が窓を見つける — cell を Relaxed で読んで fence も無い / 読んだ後の照合を外す / 世代を
-//! 持たない道で読んだ後に場所の bit を見ない / 世代 ≠ 0 の eid の読む前の照合を Relaxed にする (#1020 の前の形) / 出口の fence を外す。
+//! 持たない道で読んだ後に場所の bit を見ない / fence のある道で場所の bit を fence の前に読む (#1020 の 1 回目の版の形) / 世代 ≠ 0 の
+//! eid の読む前の照合を Relaxed にする (#1020 の 1 回目の版の形) / 出口の fence を外す。
 //!
 //! ## 実行
 //! ```sh
@@ -75,6 +76,9 @@ enum Post {
     Skip,
     /// 対照: 世代を持たない道 (`Recheck`) で場所の bit を読み直さない (移ったことを見落とす)
     NoBitsRecheck,
+    /// 対照 (#1020 の 1 回目の版の形、 読み直し C): 世代を持たない道の読み直しの場所の bit を、 `f` の後・fence の **前** に Acquire で
+    /// 読む (Acquire の load は前の load = cell の Relaxed の load を縛らない)
+    BitsBeforeFence,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +142,7 @@ impl Slot {
             Read::Acquired => self.cell.load(Ordering::Acquire),
             Read::Fenced | Read::RelaxedNoFence => self.cell.load(Ordering::Relaxed),
         };
+        let early_bits = (rd.post == Post::BitsBeforeFence && !gen_path).then(|| self.bits.load(Ordering::Acquire));
         if rd.how == Read::Fenced {
             fence(Ordering::Acquire);
         }
@@ -151,7 +156,11 @@ impl Slot {
             }
             post => {
                 // ReadAppPost::Recheck
-                let now = if post == Post::NoBitsRecheck { 0 } else { self.bits.load(Ordering::Relaxed) };
+                let now = match post {
+                    Post::NoBitsRecheck => 0,
+                    Post::BitsBeforeFence => early_bits.unwrap(),
+                    _ => self.bits.load(Ordering::Relaxed),
+                };
                 if now != 0 {
                     // `app_slot_still`: fence → `app_slot` (場所の bit・印・2 B を Acquire で)
                     fence(Ordering::Acquire);
@@ -299,6 +308,15 @@ fn without_the_check_after_the_read_returns_the_next_residents_value() {
 #[should_panic(expected = "使い回した後の住人の値")]
 fn without_the_bits_recheck_a_read_across_the_move_returns_the_next_residents_value() {
     old_eid(V14, Reader { post: Post::NoBitsRecheck, ..CODE });
+}
+
+/// 対照 (#1020 の読み直し C、 1 回目の版の形): fence のある道で、 世代を持たない道の読み直しの場所の bit を fence の前に読むと、 cell を
+/// Relaxed で読んで次の住人の値を得た読みが、 古い 0 の bit を読んで引き直さずに返す (fence は前の bit の load を縛らない)。 code は
+/// fence を `f` の直後に置き、 読んだ後の照合の load を全部その後にする。
+#[test]
+#[should_panic(expected = "使い回した後の住人の値")]
+fn the_fenced_path_reading_the_bits_before_the_fence_returns_the_next_residents_value() {
+    old_eid(V14, Reader { post: Post::BitsBeforeFence, ..CODE_FENCED });
 }
 
 /// 対照 (#1020 の読み直し A、 #1020 の前の形): 世代 ≠ 0 の eid の読む前の照合を Relaxed で読むと、 cell の Acquire の load は前の住人の
