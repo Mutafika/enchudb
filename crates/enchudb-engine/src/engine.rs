@@ -23991,9 +23991,14 @@ impl Engine {
 
     /// 削除優先: 消えた行 (削除の版数があり、 生きていない) か。 受け取った書き込み (`remote_*_apply`) は版数によらず捨てる。
     /// 自分の書き込みと WAL の再生は今まで通り版数で決める (自分の消えた行の slot を使い回した後の書き込みを WAL から当て直すため)。
+    ///
+    /// #992 の PR #1012 の残り 1 (user の決定 11-18): 開く時の突き合わせが使い回しの途中の行を消した場所 (gen.seg の使い回しの印) も、
+    /// tombstone は無いが消えた行として弾く。 tombstone を置くと #451 と state (#766) がその行の Delete を配る (受けた行なら、 その peer で
+    /// 生きている行を全部の peer で消す) ので、 置かずに印で弾く。 前はこの場所に遅れた受信の書き込みが当たり、 死んだ場所の cell になった
     #[inline]
     fn slot_is_dead(&self, local: u32) -> bool {
-        !self.entities.is_live(local) && self.tombstone_version_of(local) != enchudb_oplog::Hlc::ZERO
+        !self.entities.is_live(local)
+            && (self.tombstone_version_of(local) != enchudb_oplog::Hlc::ZERO || self.generations().mid_reuse(local))
     }
 
     /// 途中で切れた delete の跡を **数えるだけ** (修復しない)。 readonly でも呼べる。
@@ -24797,9 +24802,9 @@ impl Engine {
         let mut rows = Vec::with_capacity(dead_but_live.len());
         for &slot in &dead_but_live {
             let now = gens.get(slot);
-            let (target, row) = self.reconcile_target(slot, now);
+            let (target, row, mid_reuse) = self.reconcile_target(slot, now);
             // 書けなければ断る (#992 の読み直し 3 の細かい 4: 書けないまま生きている印を下ろすと、 世代を上げずに場所を空ける)
-            self.kill_generation_reconciled(slot, target, row)?;
+            self.kill_generation_reconciled(slot, target, row, mid_reuse)?;
             rows.push((slot, row));
         }
         // #992 の読み直し 2 の B2: 上げた世代と後始末待ちを disk に届けてから生きている印を下ろす。 本体の書き出しは生きている印
@@ -24845,7 +24850,7 @@ impl Engine {
                         && !self.is_folded_own_slot(slot)
                     {
                         let row = gens.get(slot);
-                        self.kill_generation_reconciled(slot, row + 1, row)?;
+                        self.kill_generation_reconciled(slot, row + 1, row, false)?;
                         gens.note_pending(slot, row);
                         completed += 1;
                     }
@@ -24904,21 +24909,24 @@ impl Engine {
     /// 最後の行 = `dead_row_gen`) を使う。 前は上げた後の世代から決め直し、 削除の途中の像で最後の行を 1 つ上 (無かった行) に読んだ
     /// (Delete の宛名がずれ、 断るたびに 1 つずつずれた)。 残るのは、 前の open の後の使い回しの記録も届かなかった像 (今の世代 = 前の
     /// open の上げた世代をもう一度渡す、 下の細かい 8 と同じ窓)
-    fn reconcile_target(&self, slot: u32, now: u32) -> (u32, u32) {
+    ///
+    /// 3 つ目の値は 「最後の行は使い回しの途中の行」 (使い回しの 2 つの枝、 gen.seg の [`crate::generation`] の使い回しの印。 後始末待ちの
+    /// 枝は前の open の決めを保つ)。
+    fn reconcile_target(&self, slot: u32, now: u32) -> (u32, u32, bool) {
         let gens = self.generations();
         let gone = gens.prev.read(slot).map(|r| gens.split(r.gone)).filter(|&(s, _)| s == slot).map(|(_, g)| g);
         let dead_row = gens.dead_row_gen(slot, now);
         match gone {
-            Some(g) if g >= now => (g + 2, g + 1),
-            Some(g) if g == dead_row => (now + 1, now),
-            _ if gens.pending_mark(slot) => (now, dead_row),
-            _ => (now + 1, now.saturating_sub(1)),
+            Some(g) if g >= now => (g + 2, g + 1, true),
+            Some(g) if g == dead_row => (now + 1, now, true),
+            _ if gens.pending_mark(slot) => (now, dead_row, gens.mid_reuse(slot)),
+            _ => (now + 1, now.saturating_sub(1), false),
         }
     }
 
     /// [`Self::kill_generation`] の、 開く時の突き合わせの完了 (#992 / #1008): 「後始末待ち」 と、 書いた世代が場所の最後の行 `row` の
-    /// 2 つ上なら 「最後の行は 今 − 2」 を、 世代と死の印と同じ store で立てる。
-    fn kill_generation_reconciled(&self, slot: u32, g: u32, row: u32) -> io::Result<()> {
+    /// 2 つ上なら 「最後の行は 今 − 2」 を、 `mid_reuse` なら 「最後の行は使い回しの途中の行」 を、 世代と死の印と同じ store で立てる。
+    fn kill_generation_reconciled(&self, slot: u32, g: u32, row: u32, mid_reuse: bool) -> io::Result<()> {
         if !self.generations().active() {
             return Ok(());
         }
@@ -24926,7 +24934,7 @@ impl Engine {
             self.generations().mark_table(t as TableId);
         }
         self.mark_gen_session_dirty();
-        self.generations().kill_reconciled(slot, g, row).inspect_err(|_| {
+        self.generations().kill_reconciled(slot, g, row, mid_reuse).inspect_err(|_| {
             self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 場所の世代を上げられない");
         })
     }
@@ -24947,8 +24955,9 @@ impl Engine {
     /// 再生がその行を生かし直した場所 (`replay_slot` の `restore`、 生かす道が後始末待ちも落とす) は触らない。 まだ死んでいる場所は
     /// 「消えた行の世代」 を覚え (#451 の作り直しの Delete の宛名、 gen.seg の 「今 − 2」 の印と同じ値)、 残った cell を落とす。
     ///
-    /// **tombstone を作り直すのは、 突き合わせが場所の最後の行の削除を完了させた場所 (gen.seg の 「最後の行は 今 − 2」 の印 / 引退した場所、
-    /// [`crate::generation::Generations::last_row_was_deleted`]) で、 tombstone が届いていない時だけ**。 作り直しは新しい HLC で tombstone を
+    /// **tombstone を作り直すのは、 突き合わせが場所の最後の行の削除を完了させた場所 (gen.seg の 「最後の行は 今 − 2」 の印 / 引退した場所で、
+    /// 使い回しの印 (最後の行は使い回しの途中の行) の無い場所、 [`crate::generation::Generations::last_row_was_deleted`]) で、 tombstone が
+    /// 届いていない時だけ**。 使い回しの印の場所は tombstone を置かずに、 受信の書き込みを印で弾く ([`Self::slot_is_dead`])。 作り直しは新しい HLC で tombstone を
     /// 置き、 名前の削除を覚えてから cell を落とし、 Delete を作り直して相手に配る (#992 の読み直し S1: 先に cell を落とすと名前を読めない)。
     /// - 「届いていない」 = 場所の tombstone が 0 か、 場所の使い回しの記録 (`prev.seg`) の前の住人の削除の版数と同じ (使い回しが tomb.seg を
     ///   0 にした page が届かなかった、 #992 の読み直し B1)。 cell の版数では見分けない (受けた削除の前に行の cell が全部書き直されていれば、

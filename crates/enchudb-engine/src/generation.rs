@@ -8,7 +8,8 @@
 //!   いちばん上の世代を使わないので、 local の最大は 2^32 − 2^S − 1 で、 cell の空の印 (u32::MAX) や写像の番兵に届かない
 //! - 場所ごとに 2 B (`gen.seg` = 先頭 [`GEN_HEADER`] byte の header + 2 B / 場所): 下の byte = 世代、 上の byte の bit 0 = 「死んで
 //!   いる」 印 ([`DEAD`])、 bit 1 = 「場所の最後の行は 今 − 2」 ([`TWO_UP`]、 #1008)、 bit 2 = 「後始末待ち」 ([`PENDING`]、 #992)。
-//!   bit 1 / 2 は開く時の突き合わせが削除を完了させる時にだけ立ち、 死んでいる場所でだけ意味を持つ (magic `GEN3`)。 header には表ごとの 「世代 > 0 の場所がある」 印 (出口で、 使い回しの無い表は世代を読まない) と page
+//!   bit 3 = 「場所の最後の行は使い回しの途中の行だった」 ([`MID_REUSE`])。 bit 1〜3 は開く時の突き合わせが削除を完了させる時にだけ立ち、
+//!   死んでいる場所でだけ意味を持つ (magic `GEN3`)。 header には表ごとの 「世代 > 0 の場所がある」 印 (出口で、 使い回しの無い表は世代を読まない) と page
 //!   ごとの印
 //! - 上げる時: 世代を持たない DB (file version 14 以下) は最初の使い回しで v15 に移る ([`crate::engine::Engine`] の
 //!   `move_to_generations`)。 その時に、 世代を持つ表の死んだ場所 (v14 の間に消した場所) を全部 「世代 1、 死んでいる」 にする。
@@ -65,6 +66,11 @@ const TWO_UP: u16 = 1 << 9;
 /// 次の open の突き合わせは、 この印の立った死んだ場所を仕上げに回す (前は後始末の覚えを memory にだけ持ち、 仕上げの前に落ちる / 断る /
 /// engine を捨てると二度と走らなかった)。 生かす時に落とす
 const PENDING: u16 = 1 << 10;
+/// #992 の読み直し 3 の S3 / PR #1012 の残り 1 (`GEN3`、 上の byte の bit 3、 user の決定 11-18): 「場所の最後の行は使い回しの途中の行だった
+/// (相手に配っていない)」。 開く時の突き合わせ 1. が使い回しの枝 (`Engine::reconcile_target` の 1・2 つ目) で場所を完了させた時に、 世代・
+/// 死・後始末待ちと同じ 1 回の store で立てる。 仕上げはこの場所に tombstone を作り直さず (Delete を配らない)、 受信の書き込みは tombstone
+/// の無いこの死んだ場所を死んだ行として弾く (`Engine::slot_is_dead`)。 生かす時に落とす (場所を使い回すまで残す)
+const MID_REUSE: u16 = 1 << 11;
 
 /// `gen.seg` の先頭の header の長さ。 [`MAGIC`] / 場所の bit / 表ごとの印 (TableId は u16 = 8 KiB) / page ごとの印。
 pub(crate) const GEN_HEADER: usize = 16 * 1024;
@@ -745,17 +751,15 @@ impl Generations {
             if v & DEAD != 0 && is_live(slot) {
                 dead_but_live.push(slot);
             }
-            if v & PENDING != 0 {
-                if v & DEAD == 0 {
-                    // 印の約束 (後始末待ち ⇒ 死んでいる) の破れ: 印を知らない binary (`GEN2` だけを読む dev の binary) が生かす時に死の印だけを
-                    // 落とした。 生きている場所の後始末待ちは意味を持たないので落とす (数えない。 数えると 3. が生きている場所を飛ばして数えが
-                    // 下がらず、 DB が 「きれいに閉じた」 に戻らない、 #992 の読み直し 2 の細かい 6)
-                    let c = r.as_atomic_u16(slot_off(slot));
-                    let _ = c.compare_exchange(v, v & !(PENDING | TWO_UP), Ordering::AcqRel, Ordering::Acquire);
-                    r.mark_dirty(slot_off(slot), 2);
-                } else {
-                    pending.push(slot);
-                }
+            if v & (PENDING | MID_REUSE) != 0 && v & DEAD == 0 {
+                // 印の約束 (後始末待ち / 使い回しの途中 ⇒ 死んでいる) の破れ: 印を知らない binary (`GEN2` だけを読む dev の binary、 bit 3 を
+                // 知らない前の GEN3 の head) が生かす時に死の印だけを落とした。 生きている場所の印は意味を持たないので落とす (数えない。
+                // 数えると 3. が生きている場所を飛ばして数えが下がらず、 DB が 「きれいに閉じた」 に戻らない、 #992 の読み直し 2 の細かい 6)
+                let c = r.as_atomic_u16(slot_off(slot));
+                let _ = c.compare_exchange(v, v & !(PENDING | TWO_UP | MID_REUSE), Ordering::AcqRel, Ordering::Acquire);
+                r.mark_dirty(slot_off(slot), 2);
+            } else if v & PENDING != 0 {
+                pending.push(slot);
             }
         }
         self.pending_marks.fetch_add(pending.len() as u32, Ordering::AcqRel);
@@ -856,14 +860,17 @@ impl Generations {
     /// #992 / #1008: 開く時の突き合わせが削除を完了させる: [`Self::kill`] と同じ 1 回の store で 「後始末待ち」 ([`PENDING`]) を立て、
     /// 書いた世代が場所の最後の行 `row` の 2 つ上なら 「最後の行は 今 − 2」 ([`TWO_UP`]) も立てる (でなければ落とす)。 印は引退の印で切った
     /// 後の世代で決める (#992 の読み直し 2 の S1: 引退する場所は世代を 1 つしか上げられない = 最後の行は 今 − 1)。
-    pub(crate) fn kill_reconciled(&self, slot: u32, g: u32, row: u32) -> std::io::Result<()> {
+    ///
+    /// `mid_reuse`: 場所の最後の行は使い回しの途中の行 ([`MID_REUSE`] を立てる。 偽なら落とす)。
+    pub(crate) fn kill_reconciled(&self, slot: u32, g: u32, row: u32, mid_reuse: bool) -> std::io::Result<()> {
         let Some(r) = self.region.get() else { return Ok(()) };
         let g = g.min(self.retired_mark()) as u16;
         let c = self.cell_for_write(r, slot)?;
         let before = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
             let raised = (v & GEN_MASK).max(g);
             let two_up = u32::from(raised) == row + 2;
-            let new = (v & !(GEN_MASK | TWO_UP)) | raised | DEAD | PENDING | if two_up { TWO_UP } else { 0 };
+            let marks = DEAD | PENDING | if two_up { TWO_UP } else { 0 } | if mid_reuse { MID_REUSE } else { 0 };
+            let new = (v & !(GEN_MASK | TWO_UP | MID_REUSE)) | raised | marks;
             (new != v).then_some(new)
         });
         if let Ok(v) = before
@@ -901,8 +908,14 @@ impl Generations {
     /// #1008: 開く時の突き合わせが場所の最後の行の削除を完了させた (「最後の行は 今 − 2」 の印がある) か、 場所が引退している (使い回さない
     /// = 最後の行は消した行)。 仕上げが消えた行の tombstone を作り直すかを決める (`Engine::finish_reconcile`)。
     pub(crate) fn last_row_was_deleted(&self, slot: u32) -> bool {
-        let two_up = self.region.get().is_some_and(|r| read_raw(r, slot) & TWO_UP != 0);
-        two_up || self.used_up(slot)
+        let v = self.region.get().map_or(0, |r| read_raw(r, slot));
+        // #992 の読み直し 3 の S3: 引退する場所でも、 使い回しの途中の行 ([`MID_REUSE`]) は消した行でない
+        (v & TWO_UP != 0 || self.used_up(slot)) && v & MID_REUSE == 0
+    }
+
+    /// 場所の最後の行は使い回しの途中の行だった ([`MID_REUSE`]、 開く時の突き合わせが立てた)。
+    pub(crate) fn mid_reuse(&self, slot: u32) -> bool {
+        self.region.get().is_some_and(|r| read_raw(r, slot) & MID_REUSE != 0)
     }
 
     /// #992 の読み直し 3 の B3: 場所に 「後始末待ち」 が立っているか (前の open の突き合わせが答えを決めた)。
@@ -953,7 +966,7 @@ impl Generations {
         let c = r.as_atomic_u16(off);
         if c.load(Ordering::Acquire) & DEAD != 0 {
             // 生かす = 死んだ場所の印 (最後の行は 今 − 2・後始末待ち) も意味を失う
-            if c.fetch_and(!(DEAD | TWO_UP | PENDING), Ordering::AcqRel) & PENDING != 0 {
+            if c.fetch_and(!(DEAD | TWO_UP | PENDING | MID_REUSE), Ordering::AcqRel) & PENDING != 0 {
                 self.unmark_pending();
             }
             r.mark_dirty(off, 2);
@@ -984,7 +997,7 @@ impl Generations {
         }
         let done = r
             .as_atomic_u16(off)
-            .compare_exchange(seen, seen & !(DEAD | TWO_UP | PENDING), Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(seen, seen & !(DEAD | TWO_UP | PENDING | MID_REUSE), Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if done {
             if seen & PENDING != 0 {
@@ -1006,7 +1019,7 @@ impl Generations {
         }
         let g = g.min(self.retired_mark()) as u16;
         let before = r.as_atomic_u16(off).fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-            (v & GEN_MASK > g).then_some((v & !(GEN_MASK | DEAD | TWO_UP | PENDING)) | g)
+            (v & GEN_MASK > g).then_some((v & !(GEN_MASK | DEAD | TWO_UP | PENDING | MID_REUSE)) | g)
         });
         if let Ok(v) = before {
             if v & PENDING != 0 {
@@ -1303,11 +1316,11 @@ mod tests {
         g.start(24);
         // 場所 3: gen.seg だけ死 (世代 2 = 世代 1 の行を消す途中) を 2 つ上げて完了
         g.kill(3, 2).unwrap();
-        g.kill_reconciled(3, 3, 1).unwrap();
+        g.kill_reconciled(3, 3, 1, false).unwrap();
         assert_eq!((g.get(3), g.is_dead(3), g.dead_row_gen(3, 3)), (3, true, 1), "2 つ上げた場所の最後の行は 今 − 2");
         assert!(g.has_pending_marks());
         // 場所 4: entities だけ死を 1 つ上げて完了
-        g.kill_reconciled(4, 1, 0).unwrap();
+        g.kill_reconciled(4, 1, 0, false).unwrap();
         assert_eq!(g.dead_row_gen(4, 1), 0);
         // 開き直した形: 数えを 0 に戻してなめる
         g.pending_marks.store(0, Ordering::Release);
@@ -1341,17 +1354,35 @@ mod tests {
         g.raise(6, max).unwrap();
         g.kill(6, max + 1).unwrap();
         assert!(g.used_up(6), "前提: 引退の印");
-        g.kill_reconciled(6, max + 2, max).unwrap();
+        g.kill_reconciled(6, max + 2, max, false).unwrap();
         assert_eq!((g.get(6), g.dead_row_gen(6, g.get(6))), (max + 1, max), "引退した場所の最後の行を 1 つ下に読んだ");
         assert!(g.last_row_was_deleted(6), "引退した場所の最後の行は消した行");
-        // 場所 7: 後始末待ちだが死んでいない (印を知らない binary が死の印だけを落として生かした)
-        g.kill_reconciled(7, 2, 0).unwrap();
+        // 場所 8 (読み直し 3 の S3): 最後の世代で使い回しの途中の行 (使い回しの印) を引退の印にした = 消した行でない
+        g.raise(8, max).unwrap();
+        g.kill_reconciled(8, max + 1, max, true).unwrap();
+        assert!(g.used_up(8) && g.mid_reuse(8), "前提: 引退の印・使い回しの途中");
+        assert!(!g.last_row_was_deleted(8), "引退した場所の使い回しの途中の行を消した行と読んだ");
+        // 場所 9: 使い回しの印は世代の変わる kill でも残り、 生かす道が落とす
+        g.kill_reconciled(9, 2, 1, true).unwrap();
+        g.kill(9, 3).unwrap();
+        assert!(g.mid_reuse(9), "kill が使い回しの印を落とした");
+        let seen = g.dead_cell(9).unwrap();
+        assert!(g.revive_from(9, seen));
+        assert!(!g.mid_reuse(9), "生かした場所に使い回しの印が残った");
+        // 場所 10: 使い回しの印だけが残る (後始末を済ませた) まま、 印を知らない binary が死の印だけを落として生かした
+        g.kill_reconciled(10, 2, 1, true).unwrap();
+        g.clear_pending(10);
+        let c10 = g.cell_for_write(g.region.get().unwrap(), 10).unwrap();
+        c10.fetch_and(!DEAD, Ordering::AcqRel);
+        // 場所 7: 後始末待ち・使い回しの途中だが死んでいない (印を知らない binary が死の印だけを落として生かした)
+        g.kill_reconciled(7, 2, 0, true).unwrap();
         let c = g.cell_for_write(g.region.get().unwrap(), 7).unwrap();
         c.fetch_and(!DEAD, Ordering::AcqRel);
         g.pending_marks.store(0, Ordering::Release);
-        let (_, pending) = g.heal(|_| true, |_| None);
-        assert_eq!(pending, vec![6], "生きている場所の後始末待ちを拾った");
-        assert_eq!(c.load(Ordering::Acquire) & (PENDING | TWO_UP), 0, "生きている場所の後始末待ちを落とさない");
+        let (_, pending) = g.heal(|s| s == 7 || s == 10, |_| None);
+        assert_eq!(pending, vec![6, 8], "生きている場所の後始末待ちを拾った");
+        assert_eq!(c.load(Ordering::Acquire) & (PENDING | TWO_UP | MID_REUSE), 0, "生きている場所の後始末待ち / 使い回しの印を落とさない");
+        assert_eq!(c10.load(Ordering::Acquire) & MID_REUSE, 0, "生きている場所の使い回しの印を落とさない");
         assert!(g.has_pending_marks());
         // 数えていない印を落としても 0 で止まる
         g.pending_marks.store(0, Ordering::Release);
