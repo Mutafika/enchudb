@@ -376,6 +376,16 @@ impl Generations {
         true
     }
 
+    /// [`Self::upgrade_magic`] の取り消し (`GEN3` の header を書き出せずに開くのを断る時)。
+    pub(crate) fn downgrade_magic(&self) {
+        if let Some(r) = self.region.get()
+            && r.slice()[..4] == MAGIC
+        {
+            r.write_at(0, &MAGIC_GEN2);
+            r.mark_dirty(0, 4);
+        }
+    }
+
     /// header の 「きれいに閉じた後に kill / revive した」 印が立っているか (開いた時の値 / この session で立てた)。
     #[inline]
     pub(crate) fn session_dirty(&self) -> bool {
@@ -735,7 +745,16 @@ impl Generations {
                 dead_but_live.push(slot);
             }
             if v & PENDING != 0 {
-                pending.push(slot);
+                if v & DEAD == 0 {
+                    // 印の約束 (後始末待ち ⇒ 死んでいる) の破れ: 印を知らない binary (`GEN2` だけを読む dev の binary) が生かす時に死の印だけを
+                    // 落とした。 生きている場所の後始末待ちは意味を持たないので落とす (数えない。 数えると 3. が生きている場所を飛ばして数えが
+                    // 下がらず、 DB が 「きれいに閉じた」 に戻らない、 #992 の読み直し 2 の細かい 6)
+                    let c = r.as_atomic_u16(slot_off(slot));
+                    let _ = c.compare_exchange(v, v & !(PENDING | TWO_UP), Ordering::AcqRel, Ordering::Acquire);
+                    r.mark_dirty(slot_off(slot), 2);
+                } else {
+                    pending.push(slot);
+                }
             }
         }
         self.pending_marks.fetch_add(pending.len() as u32, Ordering::AcqRel);
@@ -834,13 +853,15 @@ impl Generations {
     }
 
     /// #992 / #1008: 開く時の突き合わせが削除を完了させる: [`Self::kill`] と同じ 1 回の store で 「後始末待ち」 ([`PENDING`]) を立て、
-    /// `two_up` なら 「最後の行は 今 − 2」 ([`TWO_UP`]) も立てる (でなければ落とす)。
-    pub(crate) fn kill_reconciled(&self, slot: u32, g: u32, two_up: bool) -> std::io::Result<()> {
+    /// 書いた世代が場所の最後の行 `row` の 2 つ上なら 「最後の行は 今 − 2」 ([`TWO_UP`]) も立てる (でなければ落とす)。 印は引退の印で切った
+    /// 後の世代で決める (#992 の読み直し 2 の S1: 引退する場所は世代を 1 つしか上げられない = 最後の行は 今 − 1)。
+    pub(crate) fn kill_reconciled(&self, slot: u32, g: u32, row: u32) -> std::io::Result<()> {
         let Some(r) = self.region.get() else { return Ok(()) };
         let g = g.min(self.retired_mark()) as u16;
         let c = self.cell_for_write(r, slot)?;
         let before = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
             let raised = (v & GEN_MASK).max(g);
+            let two_up = u32::from(raised) == row + 2;
             let new = (v & !(GEN_MASK | TWO_UP)) | raised | DEAD | PENDING | if two_up { TWO_UP } else { 0 };
             (new != v).then_some(new)
         });
@@ -865,9 +886,27 @@ impl Generations {
             return;
         }
         if c.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
-            self.pending_marks.fetch_sub(1, Ordering::AcqRel);
+            self.unmark_pending();
         }
         r.mark_dirty(off, 2);
+    }
+
+    /// #992: 「後始末待ち」 の数えを 1 つ下げる (0 では止める: 開いた時に数えていない印 (きれいに閉じた後の open は `heal` を通らない) を
+    /// 生かす道が落とした時、 #992 の読み直し 2 の細かい 7)。
+    fn unmark_pending(&self) {
+        let _ = self.pending_marks.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+
+    /// #1008: 開く時の突き合わせが場所の最後の行の削除を完了させた (「最後の行は 今 − 2」 の印がある) か、 場所が引退している (使い回さない
+    /// = 最後の行は消した行)。 仕上げが消えた行の tombstone を作り直すかを決める (`Engine::finish_reconcile`)。
+    pub(crate) fn last_row_was_deleted(&self, slot: u32) -> bool {
+        let two_up = self.region.get().is_some_and(|r| read_raw(r, slot) & TWO_UP != 0);
+        two_up || self.used_up(slot)
+    }
+
+    /// #992 の読み直し 2 の B2: 場所の 2 B の gen.seg の中の範囲 (書き出す範囲)。
+    pub(crate) fn slot_range(slot: u32) -> (usize, usize) {
+        (slot_off(slot), 2)
     }
 
     /// #992: 「後始末待ち」 の立った場所が残っているか (開いた時に見つけた分 + この session で立てた分 − 落とした分)。 残っている間は
@@ -909,7 +948,7 @@ impl Generations {
         if c.load(Ordering::Acquire) & DEAD != 0 {
             // 生かす = 死んだ場所の印 (最後の行は 今 − 2・後始末待ち) も意味を失う
             if c.fetch_and(!(DEAD | TWO_UP | PENDING), Ordering::AcqRel) & PENDING != 0 {
-                self.pending_marks.fetch_sub(1, Ordering::AcqRel);
+                self.unmark_pending();
             }
             r.mark_dirty(off, 2);
         }
@@ -943,7 +982,7 @@ impl Generations {
             .is_ok();
         if done {
             if seen & PENDING != 0 {
-                self.pending_marks.fetch_sub(1, Ordering::AcqRel);
+                self.unmark_pending();
             }
             r.mark_dirty(off, 2);
         }
@@ -965,7 +1004,7 @@ impl Generations {
         });
         if let Ok(v) = before {
             if v & PENDING != 0 {
-                self.pending_marks.fetch_sub(1, Ordering::AcqRel);
+                self.unmark_pending();
             }
             r.mark_dirty(off, 2);
         }
@@ -1258,11 +1297,11 @@ mod tests {
         g.start(24);
         // 場所 3: gen.seg だけ死 (世代 2 = 世代 1 の行を消す途中) を 2 つ上げて完了
         g.kill(3, 2).unwrap();
-        g.kill_reconciled(3, 3, true).unwrap();
+        g.kill_reconciled(3, 3, 1).unwrap();
         assert_eq!((g.get(3), g.is_dead(3), g.dead_row_gen(3, 3)), (3, true, 1), "2 つ上げた場所の最後の行は 今 − 2");
         assert!(g.has_pending_marks());
         // 場所 4: entities だけ死を 1 つ上げて完了
-        g.kill_reconciled(4, 1, false).unwrap();
+        g.kill_reconciled(4, 1, 0).unwrap();
         assert_eq!(g.dead_row_gen(4, 1), 0);
         // 開き直した形: 数えを 0 に戻してなめる
         g.pending_marks.store(0, Ordering::Release);
@@ -1280,6 +1319,38 @@ mod tests {
         assert!(g.revive_from(4, seen));
         assert!(!g.has_pending_marks(), "生かした場所の後始末待ちが数えに残った");
         assert_eq!(g.heal(|_| false, |_| None).1, Vec::<u32>::new(), "落とした / 生かした場所の後始末待ちが残った");
+    }
+
+    /// #992 の読み直し 2 の S1: 引退する場所 (最後の行が世代を使い切った) は引退の印より上に上げられないので、 突き合わせが 「2 つ上げる」
+    /// と頼んでも 1 つしか上がらない = 「最後の行は 今 − 2」 を立てない (立てると最後の行を 1 つ下に読む)。 細かい 6 / 7: 印の約束 (後始末
+    /// 待ち ⇒ 死) の破れた場所 (`GEN2` だけを読む binary が生かした) は `heal` が落として数えない。 数えは 0 で止まる。
+    #[test]
+    fn a_retired_slot_gets_no_two_up_mark_and_heal_drops_a_live_pending_mark() {
+        let mut v = buffer(segment_len(16));
+        let g = Generations::off();
+        g.prepare(region(&mut v), 24, usize::MAX).unwrap();
+        g.start(24);
+        let max = g.max_gen();
+        // 場所 6: 最後の行 (世代 max) の削除の途中 = 引退の印・死
+        g.raise(6, max).unwrap();
+        g.kill(6, max + 1).unwrap();
+        assert!(g.used_up(6), "前提: 引退の印");
+        g.kill_reconciled(6, max + 2, max).unwrap();
+        assert_eq!((g.get(6), g.dead_row_gen(6, g.get(6))), (max + 1, max), "引退した場所の最後の行を 1 つ下に読んだ");
+        assert!(g.last_row_was_deleted(6), "引退した場所の最後の行は消した行");
+        // 場所 7: 後始末待ちだが死んでいない (印を知らない binary が死の印だけを落として生かした)
+        g.kill_reconciled(7, 2, 0).unwrap();
+        let c = g.cell_for_write(g.region.get().unwrap(), 7).unwrap();
+        c.fetch_and(!DEAD, Ordering::AcqRel);
+        g.pending_marks.store(0, Ordering::Release);
+        let (_, pending) = g.heal(|_| true, |_| None);
+        assert_eq!(pending, vec![6], "生きている場所の後始末待ちを拾った");
+        assert_eq!(c.load(Ordering::Acquire) & (PENDING | TWO_UP), 0, "生きている場所の後始末待ちを落とさない");
+        assert!(g.has_pending_marks());
+        // 数えていない印を落としても 0 で止まる
+        g.pending_marks.store(0, Ordering::Release);
+        g.clear_pending(6);
+        assert!(!g.has_pending_marks(), "数えが 0 を下回った");
     }
 
     /// #992 / #1008: `GEN2` (上の bit を使わない前の形) の gen.seg も開け、 `upgrade_magic` が `GEN3` に上げる。 他の magic は断る。

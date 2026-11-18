@@ -3637,7 +3637,7 @@ const TORN992_NAME: u32 = 5;
 /// [`Torn992::GateRemote`] の受けた削除の版数 (r のどの cell より古い)。
 const TORN992_REMOTE_DELETE: Hlc = Hlc { wall: 1, logical: 0, peer: 2 };
 
-/// #992 の像を `root` の下に作る。 sync の DB、 表 `notes` (枠 2、 Number `note` (名前) / Tag `tag`)・`pad`・`far` (枠 16、 Number `a`、 場所は
+/// #992 の像を `root` の下に作る。 sync の DB、 表 `notes` (枠 2、 Number `note` (名前) / Tag `tag` / Leaf `body`)・`pad`・`far` (枠 16、 Number `a`、 場所は
 /// v15 に移る時の gen.seg の commit の外)。 r の名前は [`TORN992_NAME`]。 戻り値は (像の DB, 先に消した a, r)。
 fn torn992_image(root: &Path, kind: Torn992) -> (PathBuf, u64, u64) {
     use enchudb_engine::transport::WireRecord;
@@ -3650,6 +3650,7 @@ fn torn992_image(root: &Path, kind: Torn992) -> (PathBuf, u64, u64) {
         eng.define_table("notes", 2).unwrap();
         eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
         eng.define_himo_in("notes", "tag", ValueType::Tag, 0).unwrap();
+        eng.define_himo_in("notes", "body", ValueType::Leaf, 0).unwrap();
         let note = eng.himo_id("notes.note").unwrap() as u16;
         eng.set_table_pk("notes", note).unwrap();
         eng.define_table("pad", 100_000).unwrap();
@@ -3674,6 +3675,7 @@ fn torn992_image(root: &Path, kind: Torn992) -> (PathBuf, u64, u64) {
         assert!(r != a && eng.eid_slot(r) == eng.eid_slot(a), "前提: v15 で a の場所を使い回した");
         eng.tie_to(r, "notes.note", TORN992_NAME);
         eng.tie_text_to(r, "notes.tag", "torn");
+        eng.tie_text_to(r, "notes.body", "torn body");
         eng.persist_tables().unwrap();
         eng.oplog_sync().unwrap(); // r の列は書き出し済み (checkpoint を越えた)
         // もう 1 度: 進めた checkpoint を WAL の header ごと書き出す (でないと、 header の page が書き出し済みの中身の像で再生が r の Tie を
@@ -3731,8 +3733,7 @@ fn torn992_image(root: &Path, kind: Torn992) -> (PathBuf, u64, u64) {
 /// - r の Delete を r の世代込みの宛名で配る分 (`_sync_ops`) に載せた (相手でも r が消える。 #1008: 前の open が世代を 2 つ上げた
 ///   場所も、 gen.seg の 「最後の行は 今 − 2」 の印で r の世代を読む)
 fn assert_torn_delete_cleaned(eng: &Engine, a: u64, r: u64, named: bool, what: &str) {
-    let vid = eng.vocab_id("torn").expect("前提: 語は辞書に残る");
-    assert_eq!(eng.pull_raw("notes.tag", vid), Vec::<u64>::new(), "{what}: 消えた行 r の Tag の cell が残り、 値の引きに出る");
+    assert_torn_cells_dropped(eng, what);
     let deletes = r_deletes(eng, a, r);
     assert_eq!(deletes.len(), 1, "{what}: 消えた行 r の Delete を作り直して配っていない ({deletes:x?})");
     assert_eq!(eid_local(deletes[0]), eid_local(r), "{what}: 作り直した Delete が r の世代込みの eid でない");
@@ -3743,6 +3744,14 @@ fn assert_torn_delete_cleaned(eng: &Engine, a: u64, r: u64, named: bool, what: &
     let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
     let slot = eng.eid_slot(r);
     assert!(!eng.remote_tie_apply(enchudb_oplog::make_eid(1, slot), note, 9u32, later), "{what}: 消えた行への相手の書き込みで行が生き返った");
+}
+
+/// #992: 消えた行 r の cell が値の引きに出ない: Tag (中身を指す列、 本体の書き出しで生きている印より先に書き出す) と Number の名前
+/// (残りの列、 gen.seg の後に書き出す。 #992 の読み直し 2: 前は Tag だけを見て、 書き出しの途中の像で Number だけ残る形を見逃した)。
+fn assert_torn_cells_dropped(eng: &Engine, what: &str) {
+    let vid = eng.vocab_id("torn").expect("前提: 語は辞書に残る");
+    assert_eq!(eng.pull_raw("notes.tag", vid), Vec::<u64>::new(), "{what}: 消えた行 r の Tag の cell が残り、 値の引きに出る");
+    assert_eq!(eng.pull_raw("notes.note", TORN992_NAME), Vec::<u64>::new(), "{what}: 消えた行 r の名前 (Number) の cell が残り、 値の引きに出る");
 }
 
 /// 配る分 (`_sync_ops`) の、 自分 (peer 1) が author の r の場所の Delete (先に消した a の物は除く)。
@@ -3762,6 +3771,21 @@ fn r_deletes(eng: &Engine, a: u64, r: u64) -> Vec<u64> {
 /// 名前の削除の記録 (`pktombs`) は consumer の周期の書き出しの前 = 開く道が名前を読めない。 この PR の外の形)。
 fn torn992_named(kind: Torn992) -> bool {
     matches!(kind, Torn992::GenPage | Torn992::OldTomb | Torn992::LivePage)
+}
+
+/// 配る分の、 自分 (peer 1) が author の場所 `slot` の Delete の (宛名の local, 版数)。 同じ record の重複 (落ちた後に bridge が WAL から写し
+/// 直す = 前からの at-least-once、 相手は中身で重複を落とす) は 1 つにする。
+fn slot_deletes(eng: &Engine, slot: u32) -> Vec<(u32, Hlc)> {
+    let mut v: Vec<(u32, Hlc)> = distributed(eng)
+        .into_iter()
+        .filter_map(|rec| match rec.op {
+            DecodedOp::Delete { eid } if rec.author_peer == 1 && eng.eid_slot(eid) == slot => Some((eid_local(eid), rec.hlc)),
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// gen.seg だけ死の 3 つの像 (tombstone が届いていない (0 / 前の住人の物) / 届いた)。
@@ -3797,10 +3821,11 @@ fn a_torn_delete_with_a_tag_cell_is_cleaned_up_by_one_open() {
     }
 }
 
-/// #992 の読み直し S4: 生きている印だけ死の像 ([`Torn992::LivePage`]、 tombstone 無し) は突き合わせの 2. が削除を完了させる。 仕上げの
-/// tombstone の照合は 1. / 3. と同じ: tombstone が届いていないので置いて r の Delete を作り直す。 突き合わせと仕上げの間で落ちて次の
-/// open が後始末待ちから拾っても同じ答え。 前は 2. の場所を照合せず (1 回の open なら Delete を配らない)、 間で落ちて 3. で拾うと
-/// 照合した (Delete を配る) = 落ちたかで答えが変わった。
+/// #992 の読み直し S4 / 読み直し 2 の細かい 3: 生きている印だけ死の像 ([`Torn992::LivePage`]、 tombstone 無し) は突き合わせの 2. が削除を
+/// 完了させる。 2. の完了は tombstone を作り直さない (版数なしの削除・`merge_entity_into` の src・`Split::NoRoom` の空の行も tomb.seg に何も
+/// 置かず、 見分けられない。 作り直すと一度も配っていない削除を今の時刻で配る)。 突き合わせと仕上げの間で落ちて次の open が後始末待ちから
+/// 拾っても同じ答え (決め方は gen.seg の印から)。 cell はどちらでも落とす。 最初の head は 2. の場所を照合せず、 3. で拾うと照合した (落ちたか
+/// で答えが変わった)、 2 つ目の head は両方で作り直した。
 #[test]
 fn an_entities_only_torn_delete_is_finished_the_same_with_or_without_a_kill() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -3836,7 +3861,9 @@ fn an_entities_only_torn_delete_is_finished_the_same_with_or_without_a_kill() {
         assert_eq!(eng.generation_repairs(), if kill { (0, 0) } else { (0, 1) }, "前提: 突き合わせの 2. の像 (kill {kill})");
         assert_eq!(eng.resumed_cleanups(), u32::from(kill), "前提: kill の後は後始末待ちから拾う");
         assert!(!eng.is_live(r));
-        assert_torn_delete_cleaned(&eng, a, r, true, &format!("生きている印だけ死 (kill {kill})"));
+        let what = format!("生きている印だけ死 (kill {kill})");
+        assert_torn_cells_dropped(&eng, &what);
+        assert_eq!(r_deletes(&eng, a, r), Vec::<u64>::new(), "{what}: 2. の完了で r の Delete を作り直した");
         drop(eng);
     }
 }
@@ -3893,10 +3920,10 @@ fn the_standalone_round_trip_finishes_the_reconcile_of_a_torn_delete() {
 }
 
 /// #992 の往復の条件の対照: WAL の file の無い sync の DB は往復しない (`relog_before_standalone_session`) ので、 単独の open が自分で
-/// 突き合わせる (`defer_repairs` は WAL の file がある時だけ)。 tombstone の届いていない場所の仕上げ (tombstone を置き、 名前の削除を
-/// 覚えてから cell を落とし、 #451 で Delete を作り直す) は WAL が要るので、 「後始末待ち」 の印を残し、 単独の session をきれいに閉じても
-/// DB を 「きれいに閉じた」 にしない: 次の WAL 付きの open が拾って仕上げる。 cell はそれまで残す (先に落とすと名前を読めない。 その単独の
-/// session では消えた行の Tag の cell が値の引きに出る)。
+/// 突き合わせる (`defer_repairs` は WAL の file がある時だけ)。 tombstone の作り直し (#451 で Delete を作り直す) は WAL が要るので、
+/// 「後始末待ち」 の印を残し、 単独の session をきれいに閉じても DB を 「きれいに閉じた」 にしない: 次の WAL 付きの open が拾って仕上げる。
+/// cell は単独の session でその場で落とす (名前の削除は行の cell の版数の最大で仮に覚え、 WAL 付きの仕上げが置く tombstone で覚え直す。
+/// #992 の読み直し 2 の細かい 2: 前は cell を WAL 付きの open まで残し、 単独の session で消えた行の cell が値の引きに出た)。
 #[test]
 fn a_standalone_open_without_a_wal_file_reconciles_by_itself() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -3910,7 +3937,11 @@ fn a_standalone_open_without_a_wal_file_reconciles_by_itself() {
     let eng = Engine::open_standalone(db.to_str().unwrap()).unwrap();
     assert_eq!(eng.generation_repairs(), (1, 0), "WAL の file の無い単独の open が突き合わせなかった");
     assert!(!eng.is_live(r));
+    assert_torn_cells_dropped(&eng, "WAL の file の無い単独の session");
     drop(eng); // きれいに閉じる
+    let eng = Engine::open_standalone(db.to_str().unwrap()).unwrap();
+    assert_torn_cells_dropped(&eng, "WAL の file の無い単独の session (2 回目)");
+    drop(eng);
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.resumed_cleanups(), 1, "単独の session の後始末待ちを WAL 付きの open が拾わない");
     assert_torn_delete_cleaned(&eng, a, r, true, "WAL の file の無い単独の open の後の WAL 付きの open");
@@ -4017,6 +4048,114 @@ fn a_standalone_open_refused_by_the_crc_check_leaves_the_db_unclean() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// #992 の読み直し 2 の S1: 世代を使い切る場所 (最後の行 r の世代がいちばん上) の削除の途中の像 (gen.seg だけ死 = 引退の印)。 突き合わせは
+/// 引退の印より上に上げられないので、 「最後の行は 今 − 2」 の印を立てない (立てると次の open が最後の行を r の 1 つ前と読む)。 突き合わせと
+/// 仕上げの間の kill の後の open が後始末待ちから拾い、 r の Delete を r の世代で作り直す (前の住人宛てに作らない)。
+#[test]
+fn a_torn_delete_of_the_last_generation_keeps_the_last_row() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("torn992_retired");
+    let _rm = Torn992Root(root.clone());
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let (r, prev) = {
+        let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        // 世代 = local の上 8 bit (場所の bit 24)。 いちばん上の世代 (254) の行まで使い回す
+        let (mut prev, mut i) = (0u64, 0u32);
+        let r = loop {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.v", i);
+            if eid_local(e) >> 24 == 254 {
+                break e;
+            }
+            assert!(i < 300, "前提: 枠 1 の表は場所を使い回す");
+            eng.delete(e);
+            prev = e;
+            i += 1;
+        };
+        eng.persist_tables().unwrap();
+        eng.oplog_sync().unwrap();
+        eng.oplog_sync().unwrap();
+        let _hold = eng.hold_consumer();
+        // 削除の前 (書き出し済み) の写しに、 削除の後の gen.seg だけを置く (gen.seg だけ死 = 引退の印)
+        let (before, after) = (root.join("before"), root.join("after"));
+        copy_tree(&live, &before);
+        eng.delete(r);
+        copy_tree(&live, &after);
+        copy_tree(&before, &img);
+        std::fs::copy(after.join("db").join("gen.seg"), img.join("db").join("gen.seg")).unwrap();
+        (r, prev)
+    };
+    crashsim::stop();
+    let db = img.join("db");
+    let killed = root.join("killed");
+    std::fs::create_dir_all(&killed).unwrap();
+    let (d2, k2) = (db.clone(), killed.join("db"));
+    let shot = Arc::new(AtomicBool::new(false));
+    let shot2 = shot.clone();
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::OpenBeforeFinishReconcile && !shot2.swap(true, Ordering::SeqCst) {
+            copy_tree(&d2, &k2);
+        }
+    })));
+    let first = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP);
+    write_out_hook::set(None);
+    let first = first.unwrap();
+    assert!(shot.load(Ordering::SeqCst), "前提: 仕上げの前で像を撮った");
+    assert_eq!(first.generation_repairs(), (1, 0), "前提: 突き合わせが引退する場所を完了させた");
+    drop(first);
+    let eng = Engine::open_concurrent_with_oplog(killed.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.resumed_cleanups(), 1, "前提: 後始末待ちから拾った");
+    let slot = eng.eid_slot(r);
+    let deletes: Vec<u32> = slot_deletes(&eng, slot).into_iter().map(|(d, _)| d).collect();
+    let count = |e: u64| deletes.iter().filter(|&&d| d == eid_local(e)).count();
+    assert_eq!((count(r), count(prev)), (1, 1), "r の Delete が r の世代で 1 つでない / 前の住人宛てを作り直した ({deletes:x?}、 r {r:#x} 前 {prev:#x})");
+    drop(eng);
+}
+
+/// #992 の読み直し 2 の S2 / 変異 N12: 単独の open が Leaf の空き一覧の作り直し (Leaf の列を読む) で断る時も何も書かない (`abandoned`)。 Leaf の
+/// 列の segment の file を行き先の無い symlink にして起こす。 往復する engine は開く時の直しを書いていないので、 前は Drop がきれいに閉じた
+/// 印を立て、 直していない状態がきれいに閉じた DB として残った (次の open は突き合わせも #451 の照合もしない)。
+#[test]
+fn a_standalone_open_refused_by_the_leaf_columns_leaves_the_db_unclean() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("torn992_leaf");
+    let _rm = Torn992Root(root.clone());
+    let (db, a, r) = torn992_image(&root, Torn992::GenPage);
+    let body = {
+        let ro = Engine::open_readonly(db.to_str().unwrap()).unwrap();
+        ro.himo_id("notes.body").unwrap()
+    };
+    let seg = db.join("himo").join(format!("{body:04}.seg"));
+    assert!(seg.is_file(), "前提: Leaf の列の segment がある ({})", seg.display());
+    let kept = root.join("body.seg");
+    std::fs::rename(&seg, &kept).unwrap();
+    std::os::unix::fs::symlink(root.join("missing").join("body.seg"), &seg).unwrap();
+    let refused = Engine::open_standalone(db.to_str().unwrap()).map(|_| ());
+    std::fs::remove_file(&seg).unwrap();
+    std::fs::rename(&kept, &seg).unwrap();
+    refused.expect_err("前提: Leaf の列を読めずに断る");
+    let eng = Engine::open_standalone(db.to_str().unwrap()).unwrap();
+    assert!(!eng.is_live(r));
+    assert_torn_delete_cleaned(&eng, a, r, true, "Leaf の列で断った後の単独の open");
+    drop(eng);
+}
+
 /// #992 の入口 3 (PR #977): WAL の再生が空きの不足で他の peer の新しい行を置けず、 開くのを断る (`settle_replayed_generations`)。
 /// 断る前に突き合わせは直しを map に書いている (page cache に残り、 OS の書き出しや断る前の `keep_replayed_mappings` の書き出しで disk
 /// にも届く)。 空きを作って開き直すと、 直した場所は突き合わせの 1. / 2. に当たらない。 後始末待ちの印から仕上げに回す。 前は空き不足で
@@ -4045,21 +4184,12 @@ fn an_open_refused_after_the_replay_leaves_the_cleanup_findable() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// #1008: 突き合わせが世代を 2 つ上げて完了させた場所 (「最後の行は 今 − 2」 の印) を、 開いた後に Y で使い回し、 その本体の書き出しの
-/// 途中で電源が落ちた像: 使い回しは書き出しの段の間 (`PrevWrittenOut`、 Y の record は WAL の fsync の後 = 届かない) に走り、 使い回しの
-/// 記録 (前の住人 r) と生きている印 (Y) は届き、 gen.seg (死の印・「今 − 2」 のまま) は届かない (`BeforeGenerations` で撮る)。 開くと
-/// 突き合わせは gen.seg だけ死の場所として完了させる。 最後の行は Y (使い回した行の世代は場所の今の世代 = r + 2): Y の Delete を
-/// 作り直す。 前は記録の前の住人 + 1 (r + 1、 無かった行) を最後の住人と読み、 削除の途中と取り違えて 今 − 1 (= r + 1) 宛ての Delete を
-/// 作った。
-#[test]
-fn a_reuse_of_a_slot_finished_with_two_raises_is_its_last_row_after_power_loss() {
-    if std::env::var(VERIFY_ENV).is_ok() {
-        return;
-    }
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let root = scratch("torn992_reuse_two_up");
-    let _rm = Torn992Root(root.clone());
-    let (db, a, r) = torn992_image(&root, Torn992::GenPage);
+/// #1008 の像 (`root` の下に作る): 突き合わせが世代を 2 つ上げて完了させた場所 (「最後の行は 今 − 2」 の印) を、 開いた後 (A1) に Y で
+/// 使い回し、 その本体の書き出しの途中で電源が落ちた像: 使い回しは書き出しの段の間 (`PrevWrittenOut`、 Y の record は WAL の fsync の後 =
+/// 届かない) に走り、 使い回しの記録 (前の住人 r) と生きている印 (Y) は届き、 gen.seg (死の印・「今 − 2」 のまま) は届かない
+/// (`BeforeGenerations` で撮る)。 戻り値は (像の directory (中に `db`), 先に消した a, r, Y)。
+fn two_raises_reuse_image(root: &Path) -> (PathBuf, u64, u64, u64) {
+    let (db, a, r) = torn992_image(root, Torn992::GenPage);
     let (img, img2) = (root.join("img"), root.join("img2"));
     crashsim::start();
     // 1 枚目は全部書き出し済み (A1 の書き出しの控えはこの上に積む)
@@ -4080,7 +4210,7 @@ fn a_reuse_of_a_slot_finished_with_two_raises_is_its_last_row_after_power_loss()
                 let e3 = e2.clone();
                 let h = std::thread::spawn(move || {
                     let y = e3.entity_in("notes").unwrap();
-                    e3.tie_to(y, "notes.note", 9u32);
+                    e3.tie_to(y, "notes.note", TORN992_Y_NAME);
                     y
                 });
                 let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -4105,17 +4235,150 @@ fn a_reuse_of_a_slot_finished_with_two_raises_is_its_last_row_after_power_loss()
         y
     };
     crashsim::stop();
+    (img2, a, r, y)
+}
+
+/// [`two_raises_reuse_image`] の Y の名前。
+const TORN992_Y_NAME: u32 = 9;
+
+/// #1008: [`two_raises_reuse_image`] の像を開く。 突き合わせは gen.seg だけ死の場所として完了させる。 最後の行は Y (使い回した行の世代は
+/// 場所の今の世代 = r + 2)。 次の使い回しは r / Y の eid を渡さない。 Y の record は WAL に無い (相手は Y を知らない) ので、 Y の Delete は
+/// 作らない (#992 の読み直し 2 の細かい 3)。 r の Delete も新しく作らない (A1 が作り直した 1 つだけ)。 前は記録の前の住人 + 1 (r + 1、 無かった
+/// 行) を最後の住人と読み、 削除の途中と取り違えて 今 − 1 (= r + 1) 宛ての Delete を作った。
+#[test]
+fn a_reuse_of_a_slot_finished_with_two_raises_is_its_last_row_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("torn992_reuse_two_up");
+    let _rm = Torn992Root(root.clone());
+    let (img2, a, r, y) = two_raises_reuse_image(&root);
     let eng = Engine::open_concurrent_with_oplog(img2.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.generation_repairs(), (1, 0), "前提: 生きている印は Y、 gen.seg は使い回しの前 (死・「今 − 2」) の像");
     assert!(!eng.is_live(y), "前提: Y の record は WAL に届いていない");
-    let deletes = r_deletes(&eng, a, r);
-    assert!(deletes.iter().any(|&d| eid_local(d) == eid_local(y)), "最後の行 Y の Delete を作り直していない ({deletes:x?}、 Y {y:#x})");
-    assert!(
-        deletes.iter().all(|&d| eid_local(d) == eid_local(y) || eid_local(d) == eid_local(r)),
-        "r と Y のどちらでもない (無かった行の) 宛名の Delete を作った ({deletes:x?}、 r {r:#x} Y {y:#x})"
-    );
+    assert_two_raises_reuse_finished(&eng, a, r, y, "1 回の open");
+    drop(eng);
+}
+
+/// [`two_raises_reuse_image`] の像の後始末: Y の名前の cell が値の引きに出ない、 配る Delete は A1 が作り直した r の 1 つだけ (Y 宛て・
+/// 無かった行宛て・r 宛ての 2 つ目を作らない)、 次の使い回しは r / Y の eid を渡さない。
+fn assert_two_raises_reuse_finished(eng: &Engine, a: u64, r: u64, y: u64, what: &str) {
+    assert_eq!(eng.pull_raw("notes.note", TORN992_Y_NAME), Vec::<u64>::new(), "{what}: 消えた行 Y の名前の cell が値の引きに出る");
+    let deletes: Vec<u32> =
+        slot_deletes(eng, eng.eid_slot(r)).into_iter().map(|(d, _)| d).filter(|&d| d != eid_local(a)).collect();
+    assert_eq!(deletes, vec![eid_local(r)], "{what}: 配る Delete が A1 の作り直した r の 1 つでない ({deletes:x?}、 r {r:#x} Y {y:#x})");
     let n = eng.entity_in("notes").unwrap();
-    assert!(n != y && n != r, "使い回しが前の住人の eid を渡した ({n:#x})");
+    assert!(n != y && n != r, "{what}: 使い回しが前の住人の eid を渡した ({n:#x})");
+}
+
+/// #992 の読み直し 2 の B2 の像: `dir` (中に `db`) の像を開く道の、 突き合わせの後の最初の本体の書き出しの `at` で電源断の像 (`Mode::Lost`) を
+/// `out` に撮る。 開いた engine は突き合わせの 1. が場所を 1 つ完了させた事を確かめて捨てる。
+fn cut_the_write_out_of_an_open(dir: &Path, out: &Path, at: Phase) {
+    crashsim::start();
+    adopt_as_durable(dir);
+    let (armed, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (a2, s2, l, i) = (armed.clone(), shot.clone(), dir.to_path_buf(), out.to_path_buf());
+    let off = HookOff;
+    write_out_hook::set(Some(Arc::new(move |p: Phase| {
+        if p == Phase::OpenBeforeFinishReconcile {
+            a2.store(true, Ordering::SeqCst);
+        }
+        if p == at && a2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
+            crashsim::capture(&l, &i, Mode::Lost).unwrap();
+        }
+    })));
+    let eng = Engine::open_concurrent_with_oplog(dir.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    drop(off);
+    assert!(shot.load(Ordering::SeqCst), "前提: 開く道の突き合わせの後の書き出しの途中で撮った");
+    assert_eq!(eng.generation_repairs(), (1, 0), "前提: 開く道の突き合わせが gen.seg だけ死の場所を完了させた");
+    drop(eng);
+    crashsim::stop();
+}
+
+/// #992 の読み直し 2 の B2: 開く道 (O1) の突き合わせが gen.seg だけ死の場所を完了させ (世代を上げて死・後始末待ちの印を gen.seg に書き、
+/// 生きている印を下ろす)、 その後の最初の本体の書き出しの生きている印の後・gen.seg の前 (`BeforeGenerations`) で電源が落ちた像を開く (O2)。
+/// O1 は gen.seg を書き出してから生きている印を下ろすので、 O2 は後始末待ちの印から仕上げに回す。 前は生きている印 (先に書き出す) だけが
+/// 届き、 O2 は 「死んでいて生きていない」 場所として何も拾わなかった:
+/// - GenPage (削除の途中の像): 名前 (Number、 gen.seg の後に書き出す列) の cell が値の引きに出続けた
+/// - 「今 − 2」 の場所の使い回しの像: O1 が上げた世代を失い、 次の使い回しが Y の番号をもう一度渡した
+#[test]
+fn a_power_loss_in_the_first_write_out_after_the_reconcile_keeps_the_cleanup_findable() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let root = scratch("torn992_b2_genpage");
+        let _rm = Torn992Root(root.clone());
+        let (_, a, r) = torn992_image(&root, Torn992::GenPage);
+        let (img, cut) = (root.join("img"), root.join("cut"));
+        cut_the_write_out_of_an_open(&img, &cut, Phase::BeforeGenerations);
+        let eng = Engine::open_concurrent_with_oplog(cut.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert!(!eng.is_live(r));
+        assert_eq!(eng.resumed_cleanups(), 1, "O1 の後始末待ちを O2 が拾わない (GenPage)");
+        assert_torn_delete_cleaned(&eng, a, r, true, "開く道の書き出しの途中の電源断 (GenPage)");
+        drop(eng);
+    }
+    {
+        let root = scratch("torn992_b2_two_up");
+        let _rm = Torn992Root(root.clone());
+        let (img2, a, r, y) = two_raises_reuse_image(&root);
+        let cut = root.join("cut");
+        cut_the_write_out_of_an_open(&img2, &cut, Phase::BeforeGenerations);
+        let eng = Engine::open_concurrent_with_oplog(cut.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert!(!eng.is_live(y));
+        assert_eq!(eng.resumed_cleanups(), 1, "O1 の後始末待ちを O2 が拾わない (「今 − 2」 の場所の使い回し)");
+        assert_two_raises_reuse_finished(&eng, a, r, y, "開く道の書き出しの途中の電源断 (「今 − 2」 の場所の使い回し)");
+        drop(eng);
+    }
+}
+
+/// #992 の読み直し 2 の S2: [`two_raises_reuse_image`] の A1 と同じく 「今 − 2」 の場所を Y で使い回し、 WAL の fsync の後・本体の `prev.seg`
+/// の書き出しの前 (`BeforeGate`) で電源が落ちた像を開く。 再生が Y の record で場所を生かす時、 使い回しの後始末のやり直し
+/// (`redo_reuse_eviction`) は前の住人を場所の最後の行 r (「今 − 2」 の印) と読み、 記録に r を書く (使い回しの道 `prepare_reuse` と同じ)。
+/// 前は 1 つ下 (r + 1、 無かった行) と決め打ちし、 r の削除の版数と名前を無かった行の identity に退避した。
+#[test]
+fn a_replayed_reuse_of_a_slot_finished_with_two_raises_records_the_last_row_as_the_former_resident() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("torn992_redo_two_up");
+    let _rm = Torn992Root(root.clone());
+    let (db, _a, r) = torn992_image(&root, Torn992::GenPage);
+    let (img, img2) = (root.join("img"), root.join("img2"));
+    crashsim::start();
+    adopt_as_durable(&img);
+    let y = {
+        let a1 = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert_eq!(a1.generation_repairs(), (1, 0), "前提: A1 の突き合わせが r の場所を完了させた (世代を 2 つ上げた)");
+        a1.oplog_sync().unwrap();
+        a1.persist_sync_state().unwrap();
+        let _hold = a1.hold_consumer();
+        let y = a1.entity_in("notes").unwrap();
+        a1.tie_to(y, "notes.note", TORN992_Y_NAME);
+        assert!(a1.eid_slot(y) == a1.eid_slot(r) && y != r, "前提: Y は r の場所を使い回した");
+        assert_eq!(a1.prev_resident_of_slot(a1.eid_slot(r)).map(|p| p.1), Some(eid_local(r)), "前提: 使い回しの道は前の住人を r と記録する");
+        let shot = Arc::new(AtomicBool::new(false));
+        let (s2, l, i) = (shot.clone(), img.clone(), img2.clone());
+        let _off = HookOff;
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && !s2.swap(true, Ordering::SeqCst) {
+                crashsim::capture(&l, &i, Mode::Lost).unwrap();
+            }
+        })));
+        a1.oplog_sync().unwrap();
+        drop(_off);
+        assert!(shot.load(Ordering::SeqCst), "前提: WAL の fsync の後・本体の書き出しの初めで撮った");
+        y
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img2.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert!(eng.is_live(y), "前提: 再生が Y を生かした");
+    let slot = eng.eid_slot(r);
+    let rec = eng.prev_resident_of_slot(slot);
+    assert_eq!(rec.map(|p| (p.1, p.3)), Some((eid_local(r), true)), "使い回しのやり直しが前の住人を r と記録しない: {rec:x?} (r {r:#x})");
     drop(eng);
 }
 
@@ -4198,6 +4461,13 @@ fn a_slot_reused_twice_during_a_write_out_does_not_hand_out_the_last_residents_e
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.generation_repairs(), (1, 0), "前提: 生きている印は z、 gen.seg は x の削除の後 (y / z の前) の像");
     assert!(!eng.is_live(z) && !eng.is_live(y), "前提: y と z の record は WAL に届いていない");
+    // y / z の record は WAL に無い (相手は知らない) ので Delete を作り直さない。 無かった行宛ての Delete も作らない (#992 の読み直し 2)
+    let slot = eng.eid_slot(x);
+    let deletes: Vec<u32> = slot_deletes(&eng, slot).into_iter().map(|(d, _)| d).collect();
+    assert!(
+        deletes.iter().all(|&d| d < eid_local(y)),
+        "x の後の行 (y / z / 無かった行) 宛ての Delete を作った ({deletes:x?}、 x {x:#x} y {y:#x} z {z:#x})"
+    );
     let n = eng.entity_in("t").unwrap();
     assert_eq!(eng.eid_slot(n), eng.eid_slot(x), "前提: 同じ場所を使い回す");
     assert!(![x, y, z].contains(&n), "使い回しが前の住人の eid ({n:#x}、 x {x:#x} y {y:#x} z {z:#x}) を渡した");
@@ -7635,8 +7905,13 @@ fn killed_resident_alias_image(live: &Path, img: &Path) -> u64 {
 }
 
 /// PR #1006 の読み直し [2]: `killed_resident_alias_image` を開くと、 突き合わせが Y を消す (生きている印と死の印 = 使い回しの像も削除の
-/// 途中の像も 「死が勝つ」、 Y の record は WAL に無い)。 c は消えた Y の別名のまま Y の場所を指し、 B の遅れた書き込み (c 宛て) は死んだ
-/// 場所に当たって捨てられる。 開いた A を kill してもう一度開いても同じ。
+/// 途中の像も 「死が勝つ」、 Y の record は WAL に無い)。 c は消えた Y の別名のまま Y の場所を指し、 B の遅れた書き込み (c 宛て) は新しい
+/// 生きた行を払い出さない。 開いた A を kill してもう一度開いても同じ。
+///
+/// #992 の読み直し 2 の細かい 3 (PR #1012): 突き合わせは使い回しの途中の像 (Y = 場所を使い回して生かす途中の行) に tombstone を作り直さない
+/// (Y の Delete を配らない: Y は C の行で C では生きている。 自分の時計の tombstone は自分の state に 「他の peer の行の削除」 (#766) として
+/// 出る)。 tombstone の無い死んだ場所なので、 遅れた書き込みは死んだ場所の cell には当たる (版数なしで消した行と同じ形)。 前 (master /
+/// PR #1012 の最初の 2 つの head) は tombstone を今の時刻で置き、 Delete を前の住人 X (master) / Y の世界番号 (PR の 2 つ目) 宛てに配った。
 ///
 /// 前は開く道の仕上げが c を 「場所の最後の行 (突き合わせが仕上げで覚えた X の世代) より上の世代 = 本体にも WAL にも無い行」 と読んで
 /// 退避なしで外し、 B の遅れた書き込みが c に新しい生きた行を払い出した (master は c を死んだ場所に残し、 書き込みは捨てられた)。
@@ -7683,7 +7958,7 @@ fn an_alias_of_a_resident_the_open_killed_is_kept() {
     assert_eq!(first.2 .0, 1, "前提: 突き合わせが Y を消した (生きている印と死の印): {:?}", first.2);
     assert!(!first.1 && !second.1, "前提: 開いた A で Y は消えている");
     assert_eq!(first.0, Some(y_slot), "突き合わせが消した Y の別名 c を外した (1 回目の open)");
-    assert_eq!(second.3, Some((false, false)), "c 宛ての遅れた書き込みが当たった / 生きた行になった (幽霊行)");
+    assert_eq!(second.3.map(|(_, live)| live), Some(false), "c 宛ての遅れた書き込みが生きた行になった (幽霊行)");
     assert_eq!(second.0, Some(y_slot), "突き合わせが消した Y の別名 c を外した (2 回目の open)");
 }
 
