@@ -202,6 +202,30 @@ impl IntentGate {
         Some(IntentPass { _pass: pass, gate: self })
     }
 
+    /// [`Self::try_enter`] の、 入った印を返さない版 (いくつもの門に入る行の削除。 engine の `RowHids` で入った門を覚える)。 入れたら
+    /// true: 呼び手は同じ thread の [`Self::leave_raw`] で出る。 #1016: 前は入った印を削除のたびに `Vec` に積んだ。
+    #[inline]
+    pub(crate) fn try_enter_raw(&self) -> bool {
+        match self.try_enter() {
+            Some(p) => {
+                // 出るのは `leave_raw` (shard の数を下げ、 debug build は入っている門の控えから外す)
+                std::mem::forget(p);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Self::try_enter_raw`] で入った門を出る (`IntentPass` の drop と同じ: debug build の控えから外し、 shard の数を下げる)。
+    /// 入った thread で呼ぶ (shard は thread ごと)。
+    #[inline]
+    pub(crate) fn leave_raw(&self) {
+        #[cfg(debug_assertions)]
+        held::remove(self);
+        // Release: 閉じる側の Acquire と対 (門の中で書いた cell が見える、 `Pass` の drop と同じ)
+        self.gate.shards[shard_index()].0.fetch_sub(1, Ordering::Release);
+    }
+
     /// #896: この thread が入っている門を一時出る ([`Self::try_step_in`] で入り直す)。 中でまだ何も積んでいない間だけ呼ぶ (WAL の
     /// 空きを待つ書き手: 積む record の印は位置を持たない)。 出ている間、 止める側は待たずに始められる。
     pub(crate) fn step_out(&self) {

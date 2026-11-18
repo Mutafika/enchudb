@@ -1469,8 +1469,8 @@ thread_local! {
     static APPLYING_CUT_PACE: std::cell::Cell<(Option<std::time::Instant>, u32)> = const { std::cell::Cell::new((None, 0)) };
     /// この thread が自分の書き込みを WAL に積んでから当て終えるまでの間か ([`LocalApply`] の入れ子の深さ、 下の bit
     /// [`LOCAL_APPLY_DEPTH`])。 その間は辞書と Leaf の旧 slot の書き出し (`settle_retired_words` / `settle_retired_leaves`、
-    /// msync) を当てた後に回す。 Leaf の書き出しが要ると分かったら [`LEAF_SETTLE_AFTER_APPLY`] を立てる。 いちばん外の
-    /// `LocalApply` が入った門も置く (#896、 [`GatesStepOut`])。
+    /// msync) を当てた後に回す。 書き出しが要ると分かったら [`WORD_SETTLE_AFTER_APPLY`] / [`LEAF_SETTLE_AFTER_APPLY`] を
+    /// 立てる。 いちばん外の `LocalApply` が入った門も置く (#896、 [`GatesStepOut`])。
     static IN_LOCAL_APPLY: std::cell::Cell<LocalApplyTls> = const { std::cell::Cell::new(LocalApplyTls::EMPTY) };
 }
 
@@ -1478,29 +1478,239 @@ thread_local! {
 #[derive(Clone, Copy)]
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "門を出る道 (`GatesStepOut`) は WAL の空きを待つ所だけ"))]
 struct LocalApplyTls {
-    /// 入れ子の深さ (下の bit [`LOCAL_APPLY_DEPTH`]) と [`LEAF_SETTLE_AFTER_APPLY`]
+    /// 入れ子の深さ (下の bit [`LOCAL_APPLY_DEPTH`]) と [`WORD_SETTLE_AFTER_APPLY`] / [`LEAF_SETTLE_AFTER_APPLY`]
     bits: u32,
-    /// いちばん外の [`LocalApply`] が入った門: 1 本の紐の書き込みは門 1 つ (`one`)、 行の削除は入った印の並び (`many` = `Vec` の
-    /// 中身。 `LocalApply` が動いても動かない)。 WAL の空きを待つ間だけ出る ([`GatesStepOut`])
+    /// いちばん外の [`LocalApply`] が入った門: 1 本の紐の書き込みは門 1 つ (`one`)、 行の削除は engine と値のある紐の番号の並び
+    /// (`eng` / `row` / `row_len` = [`RowHids`] の中身。 `LocalApply` が借りている間は動かない)。 WAL の空きを待つ間だけ出る
+    /// ([`GatesStepOut`])
     one: *const crate::write_gate::IntentGate,
-    many: *const crate::write_gate::IntentPass<'static>,
-    many_len: usize,
+    eng: *const Engine,
+    row: *const u16,
+    row_len: usize,
 }
 
 impl LocalApplyTls {
-    const EMPTY: Self = Self { bits: 0, one: std::ptr::null(), many: std::ptr::null(), many_len: 0 };
+    const EMPTY: Self = Self { bits: 0, one: std::ptr::null(), eng: std::ptr::null(), row: std::ptr::null(), row_len: 0 };
 }
 
 /// `IN_LOCAL_APPLY` の bit: 当てる間に Leaf の旧 slot が書き出しの目安を越えた (`LocalApply` を落とす時に書き出す)。
 const LEAF_SETTLE_AFTER_APPLY: u32 = 1 << 31;
+/// `IN_LOCAL_APPLY` の bit: 当てる間に辞書の語を返した (`LocalApply` を落とす時に辞書の書き出しを見る、 `settle_retired_words`)。
+/// #1016: 前は落とすたびに見た (返した語が無い書き込みも)
+const WORD_SETTLE_AFTER_APPLY: u32 = 1 << 30;
 /// `IN_LOCAL_APPLY` の、 入れ子の深さの bit。
-const LOCAL_APPLY_DEPTH: u32 = LEAF_SETTLE_AFTER_APPLY - 1;
+const LOCAL_APPLY_DEPTH: u32 = WORD_SETTLE_AFTER_APPLY - 1;
+
+/// 行の削除 ([`Engine::local_apply_row`]) が入る、 値のある紐の番号の並び。 呼び手の stack に置く (#1016: 前は削除のたびに
+/// `Vec` を 2 つ確保した)。 `LocalApply` が借りている間は動かない ([`GatesStepOut`] が中身の番地を読む)。
+pub(crate) struct RowHids {
+    /// inline に入っている数 (heap に移った後は進めない。 並びは [`Self::as_slice`] で読む)
+    len: usize,
+    inline: [u16; ROW_HIDS_INLINE],
+    /// inline に入らない時だけ (全部をここに移す)
+    heap: Vec<u16>,
+}
+
+/// [`RowHids`] が確保せずに持てる紐の数。
+const ROW_HIDS_INLINE: usize = 48;
+
+impl RowHids {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self { len: 0, inline: [0; ROW_HIDS_INLINE], heap: Vec::new() }
+    }
+
+    #[inline]
+    fn push(&mut self, hid: u16) {
+        if self.heap.is_empty() && self.len < ROW_HIDS_INLINE {
+            self.inline[self.len] = hid;
+            self.len += 1;
+        } else {
+            if self.heap.is_empty() {
+                self.heap.extend_from_slice(&self.inline[..self.len]);
+            }
+            self.heap.push(hid);
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u16] {
+        if self.heap.is_empty() { &self.inline[..self.len] } else { &self.heap }
+    }
+}
+
+#[cfg(test)]
+mod row_hids_tests {
+    use super::*;
+
+    /// #1016: `RowHids` は inline に入る数までは確保せず、 越えたら全部を heap に移して続ける (並びの順は足した順のまま)。
+    #[test]
+    fn row_hids_keeps_every_hid_past_the_inline_storage() {
+        for n in [0usize, 1, ROW_HIDS_INLINE - 1, ROW_HIDS_INLINE, ROW_HIDS_INLINE + 1, 3 * ROW_HIDS_INLINE] {
+            let mut h = RowHids::new();
+            for i in 0..n {
+                h.push((i * 3) as u16);
+            }
+            let want: Vec<u16> = (0..n).map(|i| (i * 3) as u16).collect();
+            assert_eq!(h.as_slice(), &want[..], "{n} 本");
+            assert_eq!(h.heap.is_empty(), n <= ROW_HIDS_INLINE, "{n} 本: inline に入る間は確保しない");
+        }
+    }
+
+    /// #1016: 値のある列が inline に入る数より多い行を、 WAL 付きの engine で消す (値のある紐の並びが heap に移る形)。 全部の列が
+    /// 外れ、 行が消え、 別の行は残る。 消した後に止める側 (`write_guard`) が全部の紐の門を閉じられる (削除が門を全部出ている)。
+    #[test]
+    fn deleting_a_row_with_more_columns_than_the_inline_storage_clears_every_column() {
+        let cols = ROW_HIDS_INLINE + 12;
+        let path = std::env::temp_dir().join(format!("enchu-row-hids-{}", std::process::id())).to_string_lossy().into_owned();
+        let _ = crate::db_files::remove_db(&path);
+        {
+            let mut e = Engine::create_standalone(&path).unwrap();
+            e.define_table("t", 64).unwrap();
+            for c in 0..cols {
+                e.define_himo_in("t", &format!("c{c}"), ValueType::Number, 0).unwrap();
+            }
+            e.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 1 << 20).unwrap();
+        let hids: Vec<u16> = (0..cols).map(|c| eng.himo_id(&format!("t.c{c}")).unwrap() as u16).collect();
+        let (a, b) = (eng.entity_in("t").unwrap(), eng.entity_in("t").unwrap());
+        for (i, &h) in hids.iter().enumerate() {
+            eng.try_tie_to_by_id(a, h, i as u32 + 1).unwrap();
+            eng.try_tie_to_by_id(b, h, i as u32 + 7).unwrap();
+        }
+        eng.delete(a);
+        let left: Vec<usize> = (0..cols).filter(|&i| eng.get_by_id(a, hids[i]).is_some()).collect();
+        assert!(left.is_empty(), "消した行に値が残った列 {left:?}");
+        assert!(!eng.is_live(a), "行が消えていない");
+        assert!(hids.iter().enumerate().all(|(i, &h)| eng.get_by_id(b, h) == Some(i as u64 + 7)), "別の行が変わった");
+        // 削除が全部の門を出ていなければ、 止める側は待ち続ける (上限は止まらないためだけ)
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (eng, hids) = (eng.clone(), hids.clone());
+            std::thread::spawn(move || {
+                for &h in &hids {
+                    drop(eng.himos[h as usize].write_guard());
+                }
+                let _ = tx.send(());
+            });
+        }
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(), "削除の後も門に誰かが居る");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// #1016: 行の削除が、 後ろの紐 y の門が閉じているのを見たら、 先に入った紐 x の門を出てから y の止める側を待つ (`RowGates` に
+    /// 移した入り方。 入ったまま待つと、 x を止める側が削除を待ち、 削除は y を待つ)。 y を止めている間に x を止める側が始められる
+    /// ことを見る。 最後に x と y の止める側が上限の内に通ることも見る (引き返す時に入っていない門を出ると、 その門の数えが負になり、
+    /// 止める側が待ち続ける)。 削除が x に入って引き返すまでの間は時間 (200 ms) で取る: 間に合わず x の止める側が先に x を閉じた回は、
+    /// 削除が x の前で待つので素通りで通る (見逃すだけで、 落ちはしない)。 退行した時は join の前に落とす (止まらない)。
+    #[test]
+    fn a_delete_that_meets_a_closed_gate_leaves_the_gates_it_entered() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let path = std::env::temp_dir().join(format!("enchu-row-backoff-{}", std::process::id())).to_string_lossy().into_owned();
+        let _ = crate::db_files::remove_db(&path);
+        {
+            let mut e = Engine::create_standalone(&path).unwrap();
+            e.define_table("t", 64).unwrap();
+            e.define_himo_in("t", "x", ValueType::Number, 0).unwrap();
+            e.define_himo_in("t", "y", ValueType::Number, 0).unwrap();
+            e.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 1 << 20).unwrap();
+        let (x, y) = (eng.himo_id("t.x").unwrap(), eng.himo_id("t.y").unwrap());
+        assert!(x < y, "前提: 削除は x の門に先に入る");
+        let row = eng.entity_in("t").unwrap();
+        eng.try_tie_to_by_id(row, x as u16, 1u32).unwrap();
+        eng.try_tie_to_by_id(row, y as u16, 1u32).unwrap();
+        // y を止める
+        let (held_tx, held_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let holder = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                let g = eng.himos[y].write_guard();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                drop(g);
+            })
+        };
+        held_rx.recv().unwrap();
+        // 削除は x に入り、 y で引き返して y の止める側を待つ
+        let deleter = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.delete(row))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        // 前提: 削除は y の門の前で待っている (ここまでの道は y の止める側で止まらない)
+        assert!(!deleter.is_finished(), "前提: 削除が y の止める側を待たずに終わった");
+        // y を止めている間に、 x を止める側が始められる
+        let (x_tx, x_rx) = channel();
+        {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                drop(eng.himos[x].write_guard());
+                let _ = x_tx.send(());
+            });
+        }
+        if x_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+            // 削除が x に入ったまま y を待った。 y を放しても、 削除は閉じた x を待ち、 x の止める側は x の中の削除を待つ (join すると
+            // 止まるので、 thread は残したまま落とす)
+            let _ = release_tx.send(());
+            panic!("y を止めている間に、 削除が x の門に入ったまま待った (x を止める側が始められない)");
+        }
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let t0 = std::time::Instant::now();
+        while !deleter.is_finished() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "y を放した後も削除が終わらない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        deleter.join().unwrap();
+        assert!(!eng.is_live(row), "止める側が放した後に行が消えていない");
+        // 削除が x と y の門を (入った分だけ) 出ていれば、 どちらの止める側も通る
+        let (g_tx, g_rx) = channel();
+        {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                drop(eng.himos[x].write_guard());
+                drop(eng.himos[y].write_guard());
+                let _ = g_tx.send(());
+            });
+        }
+        assert!(g_rx.recv_timeout(Duration::from_secs(20)).is_ok(), "削除の後も x / y の門の数えが合わない (止める側が待ち続ける)");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
 
 /// [`LocalApply`] が入った門 ([`crate::write_gate::IntentGate`])。 持つだけ (drop で出る)。
 enum Intents<'a> {
     None,
     One(#[allow(dead_code, reason = "持つだけ (drop で門を出る)")] crate::write_gate::IntentPass<'a>),
-    Many(#[allow(dead_code, reason = "持つだけ (drop で門を出る)")] Vec<crate::write_gate::IntentPass<'a>>),
+    /// 行の削除: 値のある紐の全部の門に入っている (drop で全部出る)
+    Row(RowGates<'a>),
+}
+
+/// 行の削除 ([`Engine::local_apply_row`]) が入った門: `hids` の先頭 `n` 本 (`HimoStore::try_write_intent_raw`)。 drop で出る
+/// (入る途中で引き返す時も、 入った分だけを出る)。 #1016: 前は入った印を `Vec<IntentPass>` に積んだ (削除のたびに確保)。
+struct RowGates<'a> {
+    eng: &'a Engine,
+    hids: &'a RowHids,
+    n: usize,
+}
+
+impl Drop for RowGates<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        for &h in &self.hids.as_slice()[..self.n] {
+            self.eng.himos[h as usize].leave_write_intent_raw();
+        }
+    }
 }
 
 /// #850: 自分の書き込みを WAL に積んでから本体 (cell) に当て終えるまで持つ物 ([`Engine::local_apply`])。
@@ -1528,10 +1738,13 @@ impl<'a> LocalApply<'a> {
         IN_LOCAL_APPLY.with(|d| {
             let mut t = d.get();
             if t.bits & LOCAL_APPLY_DEPTH == 0 {
-                (t.one, t.many, t.many_len) = match &intents {
-                    Intents::None => (std::ptr::null(), std::ptr::null(), 0),
-                    Intents::One(p) => (p.gate() as *const _, std::ptr::null(), 0),
-                    Intents::Many(v) => (std::ptr::null(), v.as_ptr().cast(), v.len()),
+                (t.one, t.eng, t.row, t.row_len) = match &intents {
+                    Intents::None => (std::ptr::null(), std::ptr::null(), std::ptr::null(), 0),
+                    Intents::One(p) => (p.gate() as *const _, std::ptr::null(), std::ptr::null(), 0),
+                    Intents::Row(g) => {
+                        let row = &g.hids.as_slice()[..g.n];
+                        (std::ptr::null(), g.eng as *const Engine, row.as_ptr(), row.len())
+                    }
                 };
             }
             t.bits += 1;
@@ -1553,7 +1766,7 @@ impl<'a> LocalApply<'a> {
         IN_LOCAL_APPLY.with(|d| {
             let mut t = d.get();
             if t.bits & LOCAL_APPLY_DEPTH == 0 {
-                (t.one, t.many, t.many_len) = (std::ptr::null(), std::ptr::null(), 0);
+                (t.one, t.eng, t.row, t.row_len) = (std::ptr::null(), std::ptr::null(), std::ptr::null(), 0);
             }
             t.bits += 1;
             d.set(t);
@@ -1566,6 +1779,16 @@ impl<'a> LocalApply<'a> {
     fn mark(&self) -> Option<&enchudb_oplog::oplog::Applying<'a>> {
         self.mark.as_ref()
     }
+
+    /// 行の削除 ([`Engine::local_apply_row`]) の、 行の lock の下で数えた値のある紐の並び。 WAL の無い engine は None (消す所が紐を
+    /// 全部なめる)。
+    #[inline]
+    fn row_valued(&self) -> Option<&[u16]> {
+        match &self.intents {
+            Intents::Row(g) => Some(g.hids.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 impl Drop for LocalApply<'_> {
@@ -1575,25 +1798,25 @@ impl Drop for LocalApply<'_> {
         drop(self.mark.take());
         drop(std::mem::replace(&mut self.intents, Intents::None));
         if self.counted {
-            // いちばん外の LocalApply なら Some(当てる間に Leaf の書き出しを回したか)
+            // いちばん外の LocalApply なら Some(当てる間に立てた書き出しの bit)
             let outer = IN_LOCAL_APPLY.with(|d| {
                 let mut t = d.get();
                 let n = t.bits - 1;
                 if n & LOCAL_APPLY_DEPTH == 0 {
                     d.set(LocalApplyTls::EMPTY);
-                    Some(n & LEAF_SETTLE_AFTER_APPLY != 0)
+                    Some(n)
                 } else {
                     t.bits = n;
                     d.set(t);
                     None
                 }
             });
-            // 当てる間に回した辞書 / Leaf の書き出し (印を外した後なので、 msync が長くても checkpoint を止めない)
-            if let Some(leaf) = outer {
-                self.eng.settle_retired_words();
-                if leaf {
-                    self.eng.settle_retired_leaves_after_apply();
-                }
+            // 当てる間に回した辞書 / Leaf の書き出し (印を外した後なので、 msync が長くても checkpoint を止めない)。 #1016: 辞書は
+            // 当てる間に語を返した時だけ見る (前は落とすたびに見た)
+            if let Some(bits) = outer
+                && bits & (WORD_SETTLE_AFTER_APPLY | LEAF_SETTLE_AFTER_APPLY) != 0
+            {
+                self.eng.settle_after_apply(bits);
             }
         }
     }
@@ -1621,11 +1844,11 @@ impl GatesStepOut {
         }
         let gates: Vec<*const crate::write_gate::IntentGate> = if !t.one.is_null() {
             vec![t.one]
-        } else if !t.many.is_null() {
-            // SAFETY: `many` は今この thread で生きている `LocalApply` の `Vec<IntentPass>` の中身 (その append の中から呼ぶ。 落とす
-            // 時に `IN_LOCAL_APPLY` を空にする)。 読むのは門の住所だけ
-            let passes = unsafe { std::slice::from_raw_parts(t.many, t.many_len) };
-            passes.iter().map(|p| p.gate() as *const _).collect()
+        } else if !t.eng.is_null() && !t.row.is_null() {
+            // SAFETY: `eng` / `row` は今この thread で生きている行の削除の `LocalApply` が借りている engine と `RowHids` の中身 (その
+            // append の中から呼ぶ。 落とす時に `IN_LOCAL_APPLY` を空にする)。 読むのは門の住所だけ
+            let (eng, hids) = unsafe { (&*t.eng, std::slice::from_raw_parts(t.row, t.row_len)) };
+            hids.iter().map(|&h| eng.himos[h as usize].intent_gate() as *const _).collect()
         } else {
             Vec::new()
         };
@@ -21724,27 +21947,31 @@ impl Engine {
 
     /// [`Self::local_apply`] の、 行 `local` の削除の版: 値のある紐の全部に入る。 1 つでも止められていれば、 入った分を出て待ち、
     /// 入り直す (入ったまま待つと、 2 本の紐を順に止める側 (並びの索引) と互いに待つ)。 行の lock を握って呼ぶ (値のある紐が
-    /// 当てるまで変わらない)。 値のある紐の並び (WAL が無ければ None) も返す: 消す所 (`remove_entity_body_of`) は同じ並びを使い、
-    /// 紐を全部なめ直さない (#873 の 2 回目のレビュー)。
-    fn local_apply_row(&self, local: u32) -> (LocalApply<'_>, Option<Vec<usize>>) {
-        let Some(wal) = self.oplog.as_ref() else { return (LocalApply::off(self), None) };
-        let mut hids: Vec<usize> = Vec::with_capacity(self.himos.len());
-        hids.extend((0..self.himos.len()).filter(|&h| self.himos[h].get_value(local).is_some()));
-        let passes = 'retry: loop {
-            let mut passes = Vec::with_capacity(hids.len());
-            for &h in &hids {
-                match self.himos[h].try_write_intent() {
-                    Some(p) => passes.push(p),
-                    None => {
-                        drop(passes);
-                        self.himos[h].wait_write_intent();
-                        continue 'retry;
-                    }
-                }
+    /// 当てるまで変わらない)。 値のある紐の並びは `hids` (呼び手の stack) に置き、 [`LocalApply::row_valued`] で読める (WAL が
+    /// 無ければ None): 消す所 (`remove_entity_body_of`) は同じ並びを使い、 紐を全部なめ直さない (#873 の 2 回目のレビュー)。
+    /// #1016: 前は並びと入った印を `Vec` 2 つに確保した (削除のたびに確保と解放 2 回)。
+    fn local_apply_row<'a>(&'a self, local: u32, hids: &'a mut RowHids) -> LocalApply<'a> {
+        let Some(wal) = self.oplog.as_ref() else { return LocalApply::off(self) };
+        for h in 0..self.himos.len() {
+            if self.himos[h].get_value(local).is_some() {
+                hids.push(h as u16);
             }
-            break passes;
+        }
+        let hids: &'a RowHids = hids;
+        let gates = 'retry: loop {
+            let mut g = RowGates { eng: self, hids, n: 0 };
+            for &h in hids.as_slice() {
+                if !self.himos[h as usize].try_write_intent_raw() {
+                    // 入った分 (`hids[..n]`) を出てから待つ
+                    drop(g);
+                    self.himos[h as usize].wait_write_intent();
+                    continue 'retry;
+                }
+                g.n += 1;
+            }
+            break g;
         };
-        (LocalApply::new(self, wal, Intents::Many(passes)), Some(hids))
+        LocalApply::new(self, wal, Intents::Row(gates))
     }
 
     /// #553 / #554: WAL に載らなかった書き込みを断る (呼び手は本体に当てない)。 計上して返す。
@@ -22217,8 +22444,30 @@ impl Engine {
     /// 回す (`LocalApply` を落とす時に呼ぶ)。 msync は長いことがあり、 その間 WAL の印が checkpoint を止める (#873 のレビュー)。
     #[inline]
     fn settle_retired_words_after_apply(&self) {
-        if IN_LOCAL_APPLY.with(|d| d.get().bits) & LOCAL_APPLY_DEPTH == 0 {
+        // 当てる間なら印を立てて、 落とす時に見る (#1016: 前は落とすたびに見た)
+        let deferred = IN_LOCAL_APPLY.with(|d| {
+            let mut t = d.get();
+            let inside = t.bits & LOCAL_APPLY_DEPTH != 0;
+            if inside {
+                t.bits |= WORD_SETTLE_AFTER_APPLY;
+                d.set(t);
+            }
+            inside
+        });
+        if !deferred {
             self.settle_retired_words();
+        }
+    }
+
+    /// [`LocalApply`] を落とす時: 当てる間に回した辞書 / Leaf の書き出し (`bits` は落とした時の [`IN_LOCAL_APPLY`] の bit)。
+    #[cold]
+    #[inline(never)]
+    fn settle_after_apply(&self, bits: u32) {
+        if bits & WORD_SETTLE_AFTER_APPLY != 0 {
+            self.settle_retired_words();
+        }
+        if bits & LEAF_SETTLE_AFTER_APPLY != 0 {
+            self.settle_retired_leaves_after_apply();
         }
     }
 
@@ -24236,7 +24485,7 @@ impl Engine {
         row: Option<&crate::row_lock::RowWrite<'_>>,
         local: u32,
         hlc: enchudb_oplog::Hlc,
-        valued: Option<&[usize]>,
+        valued: Option<&[u16]>,
     ) -> bool {
         self.apply_delete_gated(row, local, hlc, valued, true)
     }
@@ -24248,7 +24497,7 @@ impl Engine {
         row: Option<&crate::row_lock::RowWrite<'_>>,
         local: u32,
         hlc: enchudb_oplog::Hlc,
-        valued: Option<&[usize]>,
+        valued: Option<&[u16]>,
         gate: bool,
     ) -> bool {
         let _own = row.is_none().then(|| self.row_locks.write(local));
@@ -24615,7 +24864,7 @@ impl Engine {
     /// `gate` = false は門を通らない (engine の内部の表 `_sync_ops` の purge、 読み直し [3]: その行は WAL に載らないので再生で生き返らず、
     /// #451 も内部の表を見ない。 落とした cell だけ届いても、 ack の walk が行を消し直す。 purge は `_sync_ops` の空きの一覧の lock を
     /// 握ったまま消すので、 門で待つと bridge の行の払い出しまで止まる)。
-    fn remove_entity_body_of(&self, local: u32, hlc: enchudb_oplog::Hlc, valued: Option<&[usize]>, gate: bool) {
+    fn remove_entity_body_of(&self, local: u32, hlc: enchudb_oplog::Hlc, valued: Option<&[u16]>, gate: bool) {
         let _row = self.row_locks.write(local);
         let gated = gate && self.tomb_col.is_some();
         let _settles = gated.then(|| LocalApply::deferring_settles(self));
@@ -24632,7 +24881,7 @@ impl Engine {
             self.remove_cell_freeing_leaf(local, hid);
         };
         match valued {
-            Some(v) => v.iter().copied().for_each(&mut each),
+            Some(v) => v.iter().for_each(|&h| each(h as usize)),
             None => (0..self.himos.len()).for_each(&mut each),
         }
         drop(pass);
@@ -29018,7 +29267,8 @@ impl Engine {
         let Some(row) = self.lock_app_row(app, eid) else { return };
         let row = Some(row);
         let oplog_eid = self.oplog_eid(eid);
-        let (applying, valued) = self.local_apply_row(eid);
+        let mut hids = RowHids::new();
+        let applying = self.local_apply_row(eid, &mut hids);
         // #877: 版数の無い DB は、 消す行を WAL に積む前に数える (#857 の止め)。 積んだ後・`apply_delete_in` の中で数える前に
         // 並んだ `oplog_sync` が checkpoint を Delete の後ろへ進めると、 その行の Tie も Delete も再生されず、 落ちた後に
         // `next_local` が消した行の手前に戻った。 先に数えて積めなかった (断った) 時は、 止めが次に `tables` を置くまで延びるだけ。
@@ -29030,7 +29280,7 @@ impl Engine {
             return;
         };
         self.at_apply_point(true);
-        let applied = self.apply_delete_in(row.as_ref(), eid, hlc, valued.as_deref());
+        let applied = self.apply_delete_in(row.as_ref(), eid, hlc, applying.row_valued());
         drop(applying);
         // 前の名前は行の lock の下で取る (review930 [4]、 `remove_rows_holding_names`)
         let names = if applied { self.former_names_of_slot(eid) } else { Vec::new() };

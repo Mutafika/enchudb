@@ -1229,11 +1229,25 @@ impl HimoStore {
         self.intent.enter()
     }
 
-    /// [`write_intent`](Self::write_intent) の待たない版 (いくつもの紐に入る書き手用。 入れなければ入った分を出て
-    /// [`wait_write_intent`](Self::wait_write_intent))。
+    /// [`write_intent`](Self::write_intent) の、 待たず印も返さない版 (いくつもの紐に入る行の削除。 入れなければ入った分を
+    /// [`leave_write_intent_raw`](Self::leave_write_intent_raw) で出て [`wait_write_intent`](Self::wait_write_intent))。 入れたら
+    /// true (呼び手が同じ thread で出る)。
     #[inline]
-    pub(crate) fn try_write_intent(&self) -> Option<IntentPass<'_>> {
-        self.intent.try_enter()
+    pub(crate) fn try_write_intent_raw(&self) -> bool {
+        self.intent.try_enter_raw()
+    }
+
+    /// [`try_write_intent_raw`](Self::try_write_intent_raw) で入った門を出る。
+    #[inline]
+    pub(crate) fn leave_write_intent_raw(&self) {
+        self.intent.leave_raw();
+    }
+
+    /// この紐の [`IntentGate`] (#896: WAL の空きを待つ間に書き手が出る門、 engine の `GatesStepOut`)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    pub(crate) fn intent_gate(&self) -> &IntentGate {
+        &self.intent
     }
 
     /// この紐を止めている側が終わるのを待つ。
