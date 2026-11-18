@@ -1213,6 +1213,8 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             extra: std::sync::RwLock::new(Vec::new()),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: None,
         });
     }
@@ -1271,7 +1273,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
                     extents.push((lo, hi));
                 }
                 if let Some(t) = tables.get_mut(idx) {
-                    *t.extra.write().unwrap() = extents;
+                    t.set_extra(extents);
                 }
             }
         } else if magic == b"DIA1" {
@@ -3305,6 +3307,26 @@ mod cut_retry_count {
     pub(super) fn get(wal: &OpLog) -> u64 {
         let key = wal as *const OpLog as usize;
         COUNTS.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(k, _)| *k == key).map_or(0, |(_, n)| *n)
+    }
+}
+
+/// test 用: この thread が #857 の数え ([`TableDef::note_freed`]) で `freed_end` を RMW した回数 (#1017: 答えの変わらない数えは
+/// 読むだけで返ることを見る)。
+#[cfg(test)]
+mod freed_rmw_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static N: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        N.with(|n| n.set(n.get() + 1));
+    }
+
+    /// 今までの回数を返して 0 に戻す。
+    pub(super) fn take() -> u64 {
+        N.with(|n| n.replace(0))
     }
 }
 
@@ -7832,6 +7854,7 @@ mod slot_claim_tests {
 }
 
 /// #877: 消す行を WAL に積んだ後・数える前に並んだ `oplog_sync` が checkpoint を進めない (割り込み点 `cell_append_hook`)。
+/// #1017: 数えが RMW するのは止めの答えが変わる時だけ / 並んだ書き手で最大を数える / sidecar が覆う行は数えずに済む。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod freed_count_tests {
     use super::*;
@@ -7873,6 +7896,382 @@ mod freed_count_tests {
             let _ = std::fs::remove_file(oplog_path_for(p));
         }
         assert_ne!(y, x, "落ちた後に、 消した行の eid {x:#x} をもう一度払い出した");
+    }
+
+    fn plain_db(tag: &str, capacity: u32) -> (String, Arc<Engine>, u16) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-freedcount-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, capacity + 1024).unwrap();
+        eng.define_table("t", capacity).unwrap();
+        let a = eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        // consumer を止めて書くので、 畳まずに全部載る大きさ
+        (path.clone(), Engine::concurrentize_with_oplog(eng, 1 << 26).unwrap(), a)
+    }
+
+    fn remove(paths: &[&str]) {
+        for p in paths {
+            let _ = crate::db_files::remove_db(p);
+            let _ = std::fs::remove_file(oplog_path_for(p));
+        }
+    }
+
+    fn table_t(eng: &Engine) -> &TableDef {
+        eng.tables.iter().find(|t| t.name == "t").unwrap()
+    }
+
+    /// #1017: 数えが `freed_end` を RMW するのは、 止めの答えが変わる時 (sidecar より先・数えた所より先の行) だけ。 他は読むだけ。
+    /// 削除 1 回は数えを 2 回通る (積む前と `apply_delete_in`) が、 RMW は高々 1 回。
+    ///
+    /// falsify: 「sidecar が覆う行は読むだけ」 を外すと、 行 3 で (freed_end, RMW) = (4, 1) (1 回目の数えで上がり、 2 回目は数えた所
+    /// より前なので読むだけ)。 「数えた所より前は読むだけ」 を外すと、 sidecar より先の行は 1 回の削除で RMW 2 回 (行 10 から。 行 11
+    /// も 2 回、 sidecar が覆う行 3 / 5 は 0 回のまま)。 境目の比べを 1 つずらすと、 行 10 (= sidecar の値) か行 13 (= 数えた所) を数えない。
+    #[test]
+    fn counting_writes_only_when_the_hold_answer_changes() {
+        let (path, eng, a) = plain_db("rmw", 100);
+        // consumer の周期は `tables` を書くので止める (sidecar の値を試験が決める)
+        let hold = eng.hold_consumer();
+        let mut rows = Vec::new();
+        for i in 0..20u32 {
+            rows.push(eng.entity_in("t").unwrap());
+            eng.tie_to_by_id(rows[i as usize], a, i);
+            if i == 9 {
+                eng.persist_tables().unwrap();
+            }
+        }
+        let t = table_t(&eng);
+        let (persisted, freed) = (t.persisted_next.load(std::sync::atomic::Ordering::Acquire), &t.freed_end);
+        assert_eq!(persisted, 10, "前提: sidecar の next_local は 10");
+        assert_eq!(rows.iter().map(|&r| t.local_of(enchudb_oplog::eid_local(r))).collect::<Vec<_>>(), (0..20).map(Some).collect::<Vec<_>>());
+        freed_rmw_count::take();
+        let mut seen = Vec::new();
+        for (row, want_end, want_rmw) in [(3usize, 0u32, 0u64), (10, 11, 1), (12, 13, 1), (11, 13, 0), (13, 14, 1), (5, 14, 0)] {
+            eng.delete(rows[row]);
+            let got = (freed.load(std::sync::atomic::Ordering::Acquire), freed_rmw_count::take(), eng.checkpoint_held_for_freed_slots());
+            seen.push((row, got));
+            assert_eq!(got, (want_end, want_rmw, want_end > persisted), "行 {row} を消した後 (freed_end, RMW の回数, 止め)。 ここまで {seen:?}");
+        }
+        // 止めは `oplog_sync` に効き、 sidecar を置き直すと解ける
+        eng.oplog_sync().unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        assert!(wal.checkpoint() < wal.written_head(), "sidecar より先の行を消した後の `oplog_sync` が checkpoint を進めた");
+        eng.persist_tables().unwrap();
+        assert!(!eng.checkpoint_held_for_freed_slots(), "sidecar を置き直した後も止めている");
+        drop(hold);
+        drop((wal, eng));
+        remove(&[&path]);
+    }
+
+    /// #1017: 8 本が並んで消しても、 `freed_end` は消した行の最大 + 1 (読むだけで返る道が上げ損ねない)。 回ごとに sidecar より先に
+    /// 64 行を足し、 8 本が 8 行ずつ大きい方から消す (どの書き手も最初の削除で数えた所を越える = 8 本が同じ境目を取り合う)。 最大の
+    /// 行を持つ書き手は回ごとに替える。
+    ///
+    /// 削除の道ごとの試験 (止めも見る)。 削除 1 回は 2 回数えるので、 片方で上げ損ねてももう片方が直す: RMW を 「読んでから store」 に
+    /// した変異は、 この試験では 5 回とも通った (拾うのは数えだけを叩く `the_count_keeps_the_largest_row_under_contention`)。
+    #[test]
+    fn parallel_deletes_count_the_largest_row() {
+        const ROUNDS: u32 = 300;
+        const BATCH: u32 = 64;
+        let (path, eng, a) = plain_db("par", ROUNDS * BATCH + 16);
+        let hold = eng.hold_consumer();
+        assert_eq!(table_t(&eng).persisted_next.load(std::sync::atomic::Ordering::Acquire), 0, "前提: 足す行は全部 sidecar より先");
+        let mut wrong = Vec::new();
+        for round in 0..ROUNDS {
+            let rows: Vec<u64> = (0..BATCH)
+                .map(|i| {
+                    let r = eng.entity_in("t").unwrap();
+                    eng.tie_to_by_id(r, a, i);
+                    r
+                })
+                .collect();
+            let bar = std::sync::Barrier::new(8);
+            std::thread::scope(|s| {
+                for k in 0..8u32 {
+                    let (eng, rows, bar) = (&eng, &rows, &bar);
+                    s.spawn(move || {
+                        // 書き手 k は (k + round) % 8 番目からの 8 行おき、 大きい方から
+                        let mine: Vec<u64> = (0..BATCH).filter(|i| i % 8 == (k + round) % 8).rev().map(|i| rows[i as usize]).collect();
+                        bar.wait();
+                        for r in mine {
+                            eng.delete(r);
+                        }
+                    });
+                }
+            });
+            let got = table_t(&eng).freed_end.load(std::sync::atomic::Ordering::Acquire);
+            if got != (round + 1) * BATCH {
+                wrong.push((round, got));
+            }
+        }
+        let held = eng.checkpoint_held_for_freed_slots();
+        drop(hold);
+        drop(eng);
+        remove(&[&path]);
+        assert!(wrong.is_empty(), "消した行の最大 + 1 でない回 (回, freed_end): {wrong:?}");
+        assert!(held, "sidecar より先の行を消したのに止めていない");
+    }
+
+    /// #1017: 数え ([`TableDef::note_freed`]) だけを 8 本で叩く (engine の削除は 1 回に 2 回数えるので、 片方で上げ損ねてももう片方が
+    /// 直してしまう)。 回ごとに 64 行を 8 本が大きい方から数え、 最大 + 1 になること。
+    ///
+    /// falsify: RMW を 「読んでから store」 にすると、 遅れた書き手が小さい値で上書きする。
+    #[test]
+    fn the_count_keeps_the_largest_row_under_contention() {
+        const ROUNDS: u32 = 2000;
+        let mut t = TableDef::anonymous();
+        t.name = "t".into();
+        let bar = std::sync::Barrier::new(8);
+        let wrong = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for k in 0..8u32 {
+                let (t, bar, wrong) = (&t, &bar, &wrong);
+                s.spawn(move || {
+                    for round in 0..ROUNDS {
+                        let base = round * 64;
+                        bar.wait();
+                        for i in (0..64u32).filter(|i| i % 8 == (k + round) % 8).rev() {
+                            t.note_freed(base + i);
+                        }
+                        bar.wait();
+                        if k == 0 {
+                            let got = t.freed_end.load(std::sync::atomic::Ordering::Acquire);
+                            if got != base + 64 {
+                                wrong.lock().unwrap().push((round, got));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let wrong = wrong.into_inner().unwrap();
+        assert!(wrong.is_empty(), "最大 + 1 でない回 ({} 回、 最初の 5 つ (回, freed_end)): {:?}", wrong.len(), &wrong[..wrong.len().min(5)]);
+    }
+
+    /// #1017: sidecar が覆う行の削除は数えない (止めない) が、 落ちた後に開いた DB はその行の eid を払い出さない (開いた
+    /// `next_local` は sidecar の値以上)。 消すのは表の最後の行 (生きている行の最大 + 1 では覆わない)。
+    ///
+    /// 論の確認 (master でも通る: 前の code もここでは止めなかった)。 この PR の変異を殺す試験ではない。 像は `cp -R` (page cache の像)
+    /// なので、 sidecar を 「rename + directory の fsync の後に置く」 側の電源断は見ていない。
+    #[test]
+    fn a_deleted_row_the_sidecar_covers_is_not_handed_out_again() {
+        let (path, eng, a) = plain_db("covered", 100);
+        let image = format!("{path}.image");
+        let hold = eng.hold_consumer();
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to_by_id(y, a, 1u32);
+        let x = eng.entity_in("t").unwrap();
+        eng.tie_to_by_id(x, a, 2u32);
+        eng.persist_tables().unwrap();
+        eng.oplog_sync().unwrap();
+        eng.delete(x);
+        assert!(!eng.checkpoint_held_for_freed_slots(), "前提: sidecar が覆う行の削除は止めない");
+        eng.oplog_sync().unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        assert_eq!(wal.checkpoint(), wal.written_head(), "前提: checkpoint は Delete の後ろまで進んだ (再生されない)");
+        assert!(std::process::Command::new("cp").arg("-R").arg(&path).arg(&image).status().unwrap().success());
+        drop(hold);
+        drop((wal, eng));
+        let reopened = Engine::open_concurrent_with_oplog(&image, 1 << 26).unwrap();
+        let z = reopened.entity_in("t").unwrap();
+        drop(reopened);
+        remove(&[&path, &image]);
+        assert_ne!(z, x, "落ちた後に、 sidecar が覆っていた消した行の eid {x:#x} をもう一度払い出した");
+        assert_ne!(z, y);
+    }
+}
+
+/// #1017: `has_cell_version` は layout の lock を取らない写しを読む (削除 1 回が 4 回読み、 書き手 8 本が layout の read lock の語を
+/// 取り合っていた)。 写しは作る時・開く時・`enable_sync_tables` の後に layout と揃う。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cell_version_cache_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = crate::db_files::remove_db(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-issue1017-cv-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    fn both(eng: &Engine) -> (bool, bool) {
+        (eng.has_cell_version(), eng.layout.read().unwrap().has_cell_version())
+    }
+
+    /// falsify: `add_v9_regions_for_sync` で写しを置き直さないと、 `enable_sync_tables` の後に false のまま (開き直すと揃う)。
+    #[test]
+    fn the_cached_flag_follows_the_layout() {
+        for versioned in [true, false] {
+            let tmp = tmp(if versioned { "with" } else { "without" });
+            let mut eng = if versioned {
+                Engine::create_with_cell_version(&tmp.0, 1024).unwrap()
+            } else {
+                Engine::create_without_cell_version(&tmp.0, 1024).unwrap()
+            };
+            assert_eq!(both(&eng), (versioned, versioned), "作った時");
+            if !versioned {
+                eng.enable_sync_tables().unwrap();
+                assert_eq!(both(&eng), (true, true), "enable_sync_tables の後");
+            }
+            eng.flush().unwrap();
+            drop(eng);
+            let eng = Engine::open_standalone(&tmp.0).unwrap();
+            assert_eq!(both(&eng), (true, true), "開き直した後");
+        }
+    }
+
+    /// layout の write lock を持ったまま、 別の thread で `has_cell_version` を読む (lock を取る形は持ち手が離すまで返らない)。
+    ///
+    /// falsify: 写しでなく layout を読むと、 5 秒たっても返らない。
+    #[test]
+    fn has_cell_version_does_not_wait_for_the_layout_lock() {
+        let tmp = tmp("nolock");
+        let eng = Engine::create_without_cell_version(&tmp.0, 1024).unwrap();
+        let got = std::thread::scope(|s| {
+            let held = eng.layout.write().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let eng = &eng;
+            s.spawn(move || {
+                let _ = tx.send(eng.has_cell_version());
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held);
+            got
+        });
+        assert_eq!(got, Ok(false), "has_cell_version が layout の lock を待った");
+    }
+}
+
+/// #1017: `local_of` / `global_of` は、 先頭 range と足した extent の先頭 [`EXTRA_FAST`] 個を `extra` の lock なしで引く (削除の道が
+/// 表をなめるたびに、 閉じた anonymous の表や枠を足した表の lock の語を書き手 8 本で取り合っていた)。 越えた分も、 開き直した後も引ける。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod extent_lock_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = crate::db_files::remove_db(&self.0);
+            let _ = std::fs::remove_file(oplog_path_for(&self.0));
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-issue1017-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    fn table<'a>(eng: &'a Engine, name: &str) -> &'a TableDef {
+        eng.tables.iter().find(|t| t.name == name).unwrap()
+    }
+
+    /// 表 t と u に、 交互に `grows` 回ずつ 2 eid の extent を足す (t の extent どうしの間に u の extent が挟まる)。
+    fn grown_db(tag: &str, grows: usize) -> (Tmp, Engine) {
+        let tmp = tmp(tag);
+        let mut eng = Engine::create_with_capacity(&tmp.0, 4096).unwrap();
+        eng.define_table("t", 4).unwrap();
+        eng.define_table("u", 4).unwrap();
+        for _ in 0..grows {
+            eng.grow_table("t", 2).unwrap();
+            eng.grow_table("u", 2).unwrap();
+        }
+        (tmp, eng)
+    }
+
+    /// 表の全部の位置の (local → global、 global → local) の答えを、 `extents()` (lock の下で読む全部) から作る。
+    fn expected(t: &TableDef) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut local = 0;
+        for (lo, hi) in t.extents() {
+            for g in lo..hi {
+                out.push((local, g));
+                local += 1;
+            }
+        }
+        out
+    }
+
+    /// 表の全部の位置を `local_of` / `global_of` で引き、 答えの違う位置を返す。 表の外 (u の位置と、 最後の extent の後) も引く。
+    fn wrong_answers(t: &TableDef, want: &[(u32, u32)], outside: &[u32]) -> Vec<String> {
+        let mut bad = Vec::new();
+        for &(local, global) in want {
+            if t.global_of(local) != Some(global) {
+                bad.push(format!("global_of({local}) = {:?}, want {global}", t.global_of(local)));
+            }
+            if t.local_of(global) != Some(local) {
+                bad.push(format!("local_of({global}) = {:?}, want {local}", t.local_of(global)));
+            }
+        }
+        for &g in outside {
+            if t.local_of(g).is_some() {
+                bad.push(format!("local_of({g}) = {:?}, want None (表の外)", t.local_of(g)));
+            }
+        }
+        if t.global_of(want.len() as u32).is_some() {
+            bad.push(format!("global_of({}) = {:?}, want None (枠の外)", want.len(), t.global_of(want.len() as u32)));
+        }
+        bad
+    }
+
+    /// `extra` の write lock を持ったまま、 別の thread で表の外の eid と足した extent の位置を引く (lock を取る形は持ち手が離すまで
+    /// 返らない)。 閉じた anonymous の表 (extent なし) と、 extent を足した表の両方。
+    ///
+    /// falsify: `find_extent` が先頭 [`EXTRA_FAST`] 個も lock の下で読むと、 5 秒たっても返らない。
+    #[test]
+    fn local_of_and_global_of_answer_without_the_extent_lock() {
+        let (_tmp, eng) = grown_db("nolock", 3);
+        let (anon, t, u) = (&eng.tables[ANONYMOUS_TABLE as usize], table(&eng, "t"), table(&eng, "u"));
+        assert!(!anon.is_open_ended() && anon.extra_len.load(std::sync::atomic::Ordering::Acquire) == 0, "前提: 閉じた anonymous、 extent なし");
+        assert_eq!(t.extents().len(), 4, "前提: t は先頭 range + 足した extent 3 つ");
+        let want = expected(t);
+        let u_slots: Vec<u32> = u.extents().iter().flat_map(|&(lo, hi)| lo..hi).collect();
+        let got = std::thread::scope(|s| {
+            let held = (anon.extra.write().unwrap(), t.extra.write().unwrap(), u.extra.write().unwrap());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (want, u_slots) = (&want, &u_slots);
+            s.spawn(move || {
+                let _ = tx.send((wrong_answers(t, want, u_slots), u_slots.iter().map(|&g| anon.local_of(g)).collect::<Vec<_>>()));
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held);
+            got
+        });
+        let (bad, anon_answers) = got.expect("local_of / global_of が extra の lock を待った");
+        assert!(bad.is_empty(), "足した extent の答えが違う: {bad:?}");
+        assert!(anon_answers.iter().all(Option::is_none), "anonymous の表が他の表の eid を自分の物と答えた: {anon_answers:?}");
+    }
+
+    /// 足した extent が [`EXTRA_FAST`] 個を越えても、 越えた分 (lock の下) まで全部引ける。 足した直後 (`push_extra`) と、 開き直した後
+    /// (`set_extra`) と、 `Clone` の後。
+    ///
+    /// falsify: 足す時 (`push_extra`) に写し (`extra_fast`) か数 (`extra_len`) を置かないと 「足した後」 の答えが違う。 `set_extra`
+    /// (開く時と `Clone`) で置かないと 「Clone の後」 の答えが違う (開き直した後も同じ `set_extra` を通る)。 越えた分を読まないと、
+    /// [`EXTRA_FAST`] 個目より後の位置の答えが違う。
+    #[test]
+    fn every_extent_is_found_past_the_fast_slots() {
+        let grows = EXTRA_FAST + 5;
+        let (tmp, mut eng) = grown_db("many", grows);
+        let check = |eng: &Engine, when: &str| {
+            let (t, u) = (table(eng, "t"), table(eng, "u"));
+            assert_eq!(t.extents().len(), grows + 1, "{when}: 前提: t は先頭 range + 足した extent {grows} 個");
+            let u_slots: Vec<u32> = u.extents().iter().flat_map(|&(lo, hi)| lo..hi).collect();
+            let bad = wrong_answers(t, &expected(t), &u_slots);
+            assert!(bad.is_empty(), "{when}: 答えの違う位置 {} 個、 最初の 5 つ {:?}", bad.len(), &bad[..bad.len().min(5)]);
+        };
+        check(&eng, "足した後");
+        let cloned = table(&eng, "t").clone();
+        let bad = wrong_answers(&cloned, &expected(&cloned), &[]);
+        assert!(bad.is_empty(), "Clone の後: 答えの違う位置 {:?}", &bad[..bad.len().min(5)]);
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+        let eng = Engine::open_standalone(&tmp.0).unwrap();
+        check(&eng, "開き直した後");
     }
 }
 
@@ -11978,6 +12377,25 @@ impl SegmentSizes for Layout {
 pub type TableId = u16;
 pub const ANONYMOUS_TABLE: TableId = 0;
 
+/// #1017: 足した extent のうち、 `local_of` / `global_of` が lock なしで読む数 ([`TableDef::extra_fast`])。 schema の表は既定で
+/// 100 万 eid の枠を取り、 足す extent も同じ大きさなので、 3,200 万行までの表は全部 lock なしで引ける。 越えた分は `extra` の
+/// read lock の下で読む (表 1 つに 256 B)。
+const EXTRA_FAST: usize = 32;
+
+fn new_extra_fast() -> Box<[std::sync::atomic::AtomicU64]> {
+    (0..EXTRA_FAST).map(|_| std::sync::atomic::AtomicU64::new(0)).collect()
+}
+
+#[inline]
+fn pack_extent((lo, hi): (u32, u32)) -> u64 {
+    lo as u64 | (hi as u64) << 32
+}
+
+#[inline]
+fn unpack_extent(v: u64) -> (u32, u32) {
+    (v as u32, (v >> 32) as u32)
+}
+
 /// 1 つの table の定義。 名前 (anonymous は空文字)、 所属 himo の id 列、
 /// eid_range (anonymous は open-ended)、 FK 参照 (Ref himo の target table)。
 ///
@@ -12035,7 +12453,16 @@ pub(crate) struct TableDef {
     /// `entity_in` が先頭を使い切ると空き eid 空間から切り足す (auto-grow)。 local id は
     /// 先頭 → extra の順に連結した offset (= `next_local` / `free_locals` はそのまま)。
     /// grow しない table (常態) は空で、 hot path は先頭 range だけ見る。
-    pub extra: std::sync::RwLock<Vec<(u32, u32)>>,
+    /// 書くのは [`Self::set_extra`] / [`Self::push_extra`] だけ ([`Self::extra_fast`] / [`Self::extra_len`] も一緒に書く)。
+    extra: std::sync::RwLock<Vec<(u32, u32)>>,
+    /// #1017: `extra` の先頭 [`EXTRA_FAST`] 個の写し (`lo | hi << 32`)。 [`Self::local_of`] / [`Self::global_of`] はここを lock なしで
+    /// 読み、 [`EXTRA_FAST`] 個を越えた分だけ `extra` の read lock を取る。 前は先頭 range の外の eid を引くたびに read lock を取り
+    /// (lock の語の RMW 2 回)、 削除の道で表をなめる所 (#857 の数え 2 回 = #866 / #888 で増えた分・#868 の穴の覚え・`table_of_slot`) が、
+    /// 先に並ぶ閉じた anonymous の表や枠を足した表の lock の語を書き手 8 本で取り合った。
+    extra_fast: Box<[std::sync::atomic::AtomicU64]>,
+    /// #1017: 見せた extent の数 (`extra` の長さ)。 extent は外さないので下がらない。 書き手は `extra` の write lock の中で
+    /// `extra_fast` を置いてから Release で進め、 読み手は Acquire で読んでから `extra_fast` を読む。
+    extra_len: std::sync::atomic::AtomicU32,
     /// #141: この table の primary key を成す himo の id。 PK 未指定なら `None`。
     ///
     /// PK 自体は schema 層 (`TableBuilder::primary_key`) の概念だが、 **sync の
@@ -12047,7 +12474,7 @@ pub(crate) struct TableDef {
 
 impl Clone for TableDef {
     fn clone(&self) -> Self {
-        Self {
+        let t = Self {
             name: self.name.clone(),
             himo_ids: std::sync::RwLock::new(self.himo_ids.read().unwrap().clone()),
             eid_range_lo: self.eid_range_lo,
@@ -12065,9 +12492,14 @@ impl Clone for TableDef {
             free_locals: self.free_locals.clone(),
             free_locals_nonempty: self.free_locals_nonempty.clone(),
             dead_locals: self.dead_locals.clone(),
-            extra: std::sync::RwLock::new(self.extra.read().unwrap().clone()),
+            extra: std::sync::RwLock::new(Vec::new()),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: self.pk_himo,
-        }
+        };
+        // 写した `extra` から写しを作る (読んだ時の中身で揃う)
+        t.set_extra(self.extra.read().unwrap().clone());
+        t
     }
 }
 
@@ -12076,6 +12508,50 @@ impl TableDef {
     #[inline]
     fn is_open_ended(&self) -> bool {
         self.eid_range_hi == u32::MAX
+    }
+
+    /// `extra` を置き換える (sidecar から読んだ extent、 開く時と `Clone`)。 まだ誰にも見せていない表にだけ使う (見せた数は下げない)。
+    fn set_extra(&self, extents: Vec<(u32, u32)>) {
+        let mut extra = self.extra.write().unwrap();
+        debug_assert_eq!(self.extra_len.load(std::sync::atomic::Ordering::Relaxed), 0, "見せた extent を置き換える");
+        for (i, &ext) in extents.iter().enumerate().take(EXTRA_FAST) {
+            self.extra_fast[i].store(pack_extent(ext), std::sync::atomic::Ordering::Relaxed);
+        }
+        *extra = extents;
+        self.extra_len.store(extra.len() as u32, std::sync::atomic::Ordering::Release);
+    }
+
+    /// extent を 1 つ足す。 写し (`extra_fast`) を置いてから数 (`extra_len`) を Release で進める (`extra` の write lock の中)。
+    fn push_extra(&self, ext: (u32, u32)) {
+        let mut extra = self.extra.write().unwrap();
+        let i = extra.len();
+        if i < EXTRA_FAST {
+            self.extra_fast[i].store(pack_extent(ext), std::sync::atomic::Ordering::Relaxed);
+        }
+        extra.push(ext);
+        self.extra_len.store(extra.len() as u32, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 見せた extent を前から順に `f` に渡す (`f` が `Some` を返したら止めてそれを返す)。 先頭 [`EXTRA_FAST`] 個は lock なし、
+    /// その先は `extra` の read lock の下 (#1017)。
+    #[inline]
+    fn find_extent<R>(&self, mut f: impl FnMut(u32, u32) -> Option<R>) -> Option<R> {
+        let n = self.extra_len.load(std::sync::atomic::Ordering::Acquire) as usize;
+        for slot in &self.extra_fast[..n.min(EXTRA_FAST)] {
+            let (lo, hi) = unpack_extent(slot.load(std::sync::atomic::Ordering::Relaxed));
+            if let Some(r) = f(lo, hi) {
+                return Some(r);
+            }
+        }
+        if n > EXTRA_FAST {
+            let extra = self.extra.read().unwrap();
+            for &(lo, hi) in extra.iter().skip(EXTRA_FAST) {
+                if let Some(r) = f(lo, hi) {
+                    return Some(r);
+                }
+            }
+        }
+        None
     }
 
     /// 全 extent (先頭 + `extra`)。 open-ended な anonymous は先頭 1 本。
@@ -12105,7 +12581,7 @@ impl TableDef {
         self.local_of(global).is_some()
     }
 
-    /// global (local eid) → table 内 local offset。 先頭 range は lock 無し。
+    /// global (local eid) → table 内 local offset。 先頭 range と、 足した extent の先頭 [`EXTRA_FAST`] 個は lock 無し (#1017)。
     #[inline]
     pub fn local_of(&self, global: u32) -> Option<u32> {
         if global >= self.eid_range_lo && global < self.eid_range_hi {
@@ -12114,15 +12590,41 @@ impl TableDef {
         if self.is_open_ended() {
             return None;
         }
-        let extra = self.extra.read().unwrap();
         let mut base = self.eid_range_hi - self.eid_range_lo;
-        for &(lo, hi) in extra.iter() {
+        self.find_extent(|lo, hi| {
             if global >= lo && global < hi {
                 return Some(base + (global - lo));
             }
             base += hi - lo;
+            None
+        })
+    }
+
+    /// #857: 表の中の行 `idx` を版数なしで消した ([`Engine::note_freed_slot`])。 [`Self::freed_end`] を `idx + 1` まで上げる。
+    ///
+    /// #1017: 上げても止めの答え (`freed_end > persisted_next`) が変わらない時は読むだけで返る。 前は数えるたびに RMW をして
+    /// (#877 の後は削除 1 回に積む前と `apply_delete_in` の 2 回)、 書き手 8 本が並んで消すと表の定義の cache line (`local_of` が
+    /// 読む範囲と同じ line) を取り合った (同じ数えが読む `has_cell_version` と `local_of` の lock の取り合いは [`Engine::cell_version`] /
+    /// [`Self::extra_fast`])。 読むだけで返るのは:
+    ///
+    /// - `idx < persisted_next`: sidecar に置いた `next_local` が既にこの行を覆う (`persisted_next` は書き出しが返った後に置く値。
+    ///   落ちた後に開いた `next_local` は disk の sidecar の値以上)。 後の書き出しがこの行より前の値を置くのは、 `next_local` が
+    ///   この行より前に戻った時だけ: 払い出さずに戻した位置 (#868 / #970 の `compare_exchange`) はその位置の行が無いので越えない
+    ///   (#883 の窓を除いて: #970 の戻しの前に、 枯渇を見た別の thread の全部なめがその位置を穴として拾って払い出すと、 生きている行が
+    ///   `next_local` の外に出る。 gen.seg を伸ばせない (#970) のが枠の最後の slot で起き、 別の書き手が同じ page の `gen_slot_ready` を
+    ///   通る時だけ)。 越えるのは `clear_local_only_tables` が表を空にした時 = 消した行の eid を払い出し直すのが答え
+    /// - `idx < freed_end`: `fetch_max` は何も変えない (`freed_end` は上がるだけ)。 読んだ値が、 この削除の Delete を書き出す
+    ///   `oplog_sync` に見えるのは RMW と同じ: この読みは Delete を WAL に積む前 (#877) で、 その `oplog_sync` は WAL の終端を
+    ///   Acquire で読んでから止めを読む = 同じ atomic の読みの順 (coherence) で、 ここで読んだ値以上を読む
+    #[inline]
+    fn note_freed(&self, idx: u32) {
+        use std::sync::atomic::Ordering;
+        if idx < self.persisted_next.load(Ordering::Acquire) || idx < self.freed_end.load(Ordering::Acquire) {
+            return;
         }
-        None
+        #[cfg(test)]
+        freed_rmw_count::bump();
+        self.freed_end.fetch_max(idx.saturating_add(1), Ordering::AcqRel);
     }
 
     /// table 内 local offset → global (local eid)。 extent の外なら `None` (= 枯渇)。
@@ -12132,16 +12634,17 @@ impl TableDef {
         if self.is_open_ended() || local < first {
             return self.eid_range_lo.checked_add(local);
         }
-        let extra = self.extra.read().unwrap();
+        // #1017: 足した extent の先頭 [`EXTRA_FAST`] 個は lock を取らない (枯渇した表では、 削除の道 = #868 の `global_of(next_local)` が
+        // 毎回ここまで来る)
         let mut rel = local - first;
-        for &(lo, hi) in extra.iter() {
+        self.find_extent(|lo, hi| {
             let len = hi - lo;
             if rel < len {
                 return Some(lo + rel);
             }
             rel -= len;
-        }
-        None
+            None
+        })
     }
 
     /// 起動時の anonymous table。 全 himo / entity の default 受け皿。
@@ -12163,6 +12666,8 @@ impl TableDef {
             dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
             extra: std::sync::RwLock::new(Vec::new()),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: None,
         }
     }
@@ -12303,6 +12808,11 @@ pub struct Engine {
     #[allow(dead_code)]
     path: String,
     layout: std::sync::RwLock<Layout>,
+    /// #1017: `layout.has_cell_version()` の写し ([`Engine::has_cell_version`])。 変わるのは作る時・開く時 (header から作った layout)
+    /// と [`Engine::add_v9_regions_for_sync`] (`&mut self`) だけ (`grow_entity_cap` / `grow_vocab` は同じ値で作り直す)。 前は読むたびに
+    /// layout の read lock を取り (lock の語の RMW 2 回)、 削除 1 回が 4 回読む (#866 / #888 で 2 回増えた) ので、 書き手 8 本で消すと
+    /// その語を取り合った。
+    cell_version: bool,
     /// v10 Phase 3: 現在の entity 上限。 `grow_entity_cap` で伸びる (reservation まで)。
     entity_cap: std::sync::atomic::AtomicU32,
     /// v10 Phase 3: table extent の追加 (`grow_table` / auto-grow) を直列化する。
@@ -13020,7 +13530,9 @@ impl Engine {
 
         let generations = std::sync::Arc::new(crate::generation::Generations::off());
         generations.raise_floor(max_entities);
+        let cell_version = layout.has_cell_version();
         let eng = Self {
+            cell_version,
             path: path.to_string(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
@@ -14341,7 +14853,9 @@ impl Engine {
         for hid in 0..self.himos.len() {
             self.backing.ensure_ver(hid as u32, &v9)?;
         }
+        let versioned = v9.has_cell_version();
         *self.layout.write().unwrap() = v9;
+        self.cell_version = versioned;
         for hid in 0..self.himos.len() {
             let ver = ver_column_from_region(
                 self.backing.region(SegmentKind::Ver(hid as u32), &*self.layout.read().unwrap()),
@@ -14750,7 +15264,9 @@ impl Engine {
             let _ = initial_himo_to_table.push(std::sync::atomic::AtomicU16::new(ANONYMOUS_TABLE));
         }
 
+        let cell_version = layout.has_cell_version();
         let eng = Self {
+            cell_version,
             path: String::new(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
@@ -18912,6 +19428,8 @@ impl Engine {
             dead_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
             extra: std::sync::RwLock::new(Vec::new()),
+            extra_fast: new_extra_fast(),
+            extra_len: std::sync::atomic::AtomicU32::new(0),
             pk_himo: None,
         });
         self.note_internal_row_ranges();
@@ -20217,7 +20735,6 @@ impl Engine {
     /// 版数の列のある DB (sync の DB) で版数つきの削除は、 tombstone が本体の書き出しで届き、 開く時にその local を払い出し
     /// 済みと数える (`scan_interrupted_deletes`) ので、 ここでは数えない。
     fn note_freed_slot(&self, local: u32, hlc: enchudb_oplog::Hlc) {
-        use std::sync::atomic::Ordering;
         if hlc != enchudb_oplog::Hlc::ZERO && self.has_cell_version() {
             return;
         }
@@ -20226,7 +20743,7 @@ impl Engine {
                 // #878: anonymous の表は数えない (`entity()` は `EntitySet` から払い出し、 `next_local` も `tables` も使わない。
                 // 数えると `persisted_next` が 0 のままなので、 anonymous だけの DB では `oplog_sync` が checkpoint を止め続けた)
                 if !t.name.is_empty() {
-                    t.freed_end.fetch_max(idx.saturating_add(1), Ordering::AcqRel);
+                    t.note_freed(idx);
                 }
                 return;
             }
@@ -20544,7 +21061,7 @@ impl Engine {
             }
             Some(guard)
         };
-        self.tables[tid].extra.write().unwrap().push(ext);
+        self.tables[tid].push_extra(ext);
         // 内部の表の行は別の stripe を使う。 足した範囲の eid を払い出す前に教える
         if is_engine_internal_table(&self.tables[tid].name) {
             self.row_locks.add_internal_range(ext.0, ext.1);
@@ -21803,7 +22320,7 @@ impl Engine {
     /// 有効化していない create では false で、 `cell_hlc` は常に `Hlc::ZERO`
     /// (= 版数不明) を返す (A-1 の漸進的移行)。
     pub fn has_cell_version(&self) -> bool {
-        self.layout.read().unwrap().has_cell_version()
+        self.cell_version
     }
 
     #[inline]
