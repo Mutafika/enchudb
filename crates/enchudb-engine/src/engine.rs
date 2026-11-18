@@ -7730,8 +7730,9 @@ mod extent_lock_tests {
     /// 足した extent が [`EXTRA_FAST`] 個を越えても、 越えた分 (lock の下) まで全部引ける。 足した直後 (`push_extra`) と、 開き直した後
     /// (`set_extra`) と、 `Clone` の後。
     ///
-    /// falsify: 足す時 / 開く時に写し (`extra_fast`) か数 (`extra_len`) を置かないと、 足した extent の位置の答えが違う。 越えた分を
-    /// 読まないと、 [`EXTRA_FAST`] 個目より後の位置の答えが違う。
+    /// falsify: 足す時 (`push_extra`) に写し (`extra_fast`) か数 (`extra_len`) を置かないと 「足した後」 の答えが違う。 `set_extra`
+    /// (開く時と `Clone`) で置かないと 「Clone の後」 の答えが違う (開き直した後も同じ `set_extra` を通る)。 越えた分を読まないと、
+    /// [`EXTRA_FAST`] 個目より後の位置の答えが違う。
     #[test]
     fn every_extent_is_found_past_the_fast_slots() {
         let grows = EXTRA_FAST + 5;
