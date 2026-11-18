@@ -559,7 +559,7 @@ impl Generations {
         self.bits.load(Ordering::Acquire)
     }
 
-    /// [`Self::bits`] を Relaxed で読む (#1015: lock を取らない読みの入口 `Engine::read_app_in`)。 0 でない値を見ても region が見える
+    /// [`Self::bits`] を Relaxed で読む (#1015: 読みの入口 `Engine::read_app_in` / `Engine::app_slot`)。 0 でない値を見ても region が見える
     /// とは限らない (region を置いた後に bit を Release で置く順と対にならない) ので、 region は [`Self::reader_for`] で Acquire で引く。
     #[inline]
     pub(crate) fn bits_relaxed(&self) -> u32 {
