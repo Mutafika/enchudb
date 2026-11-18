@@ -2229,14 +2229,18 @@ fn load_pkformer_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_for
 
 /// `pkformer` を `snapshot` に書き直し (空なら file を消す)、 `pkformer.log` を `log` (header だけ) に置き換える。 `pkformer` → 空の
 /// log の順 (間で落ちても、 header の合わない log は読まれない)。
+///
+/// #1018: 戻り値は disk まで書き出した file があったか (無い `pkformer` を消すだけ / 2 つとも disk と同じ中身なら false)。 組
+/// (`db_files::SyncChain`) に 「disk まで書き出した」 と伝えてよいのは true の時だけ (false の時に伝えると、 前に順の印で書いた
+/// file を組の終わりに書き出さない)。
 #[cfg(not(target_arch = "wasm32"))]
-fn write_pkformer_files(path: &std::path::Path, log_path: &std::path::Path, snapshot: &[u8], log: &[u8]) -> io::Result<()> {
+fn write_pkformer_files(path: &std::path::Path, log_path: &std::path::Path, snapshot: &[u8], log: &[u8]) -> io::Result<bool> {
     let snap = if snapshot.is_empty() {
-        remove_sidecar(path)
+        remove_sidecar(path).map(|()| false)
     } else {
-        crate::db_files::write_atomic_if_changed(path, snapshot).map(|_| ())
+        crate::db_files::write_atomic_if_changed(path, snapshot)
     };
-    snap.and_then(|()| crate::db_files::write_atomic_if_changed(log_path, log).map(|_| ()))
+    snap.and_then(|a| crate::db_files::write_atomic_if_changed(log_path, log).map(|b| a || b))
 }
 
 /// sidecar を消す (無ければ何もしない)。
@@ -6594,12 +6598,15 @@ mod gone_own_delete_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sidecar_chain_tests {
-    //! #1018: 続けて書き出す sidecar の組 (`db_files::SyncChain`)。 数えるのは、 この thread が頼んだ書き出しの強さ
-    //! (`sync_counts`、 disk まで / 順の印)。 consumer は止めておく (止めないと consumer が先に書き出して、 この thread の
-    //! 書き出しが無くなる)。
+    //! #1018: 続けて書き出す sidecar の組 (`db_files::SyncChain`)。 数えるのは、 この thread が実際に出した書き出しの syscall の並び
+    //! (`sync_counts::Issued`: macOS は F_BARRIERFSYNC / F_FULLFSYNC、 他の OS は `sync_all`、 directory の素の fsync)。 consumer は止めて
+    //! おく (止めないと consumer が先に書き出して、 この thread の書き出しが無くなる)。 macOS の形 (順の印) は macOS でしか回らない
+    //! (CI は Linux。 Linux では順の印を頼んでも `sync_all` = disk まで)。
     use super::*;
-    use crate::db_files::sync_counts;
+    use crate::db_files::sync_counts::{self, Issued};
     use std::sync::atomic::Ordering;
+
+    const APPLE: bool = cfg!(target_vendor = "apple");
 
     /// 満杯の名前のある表 (枠 2、 sync する DB、 WAL 付き) を作り、 consumer を止めて `f` に (engine, 表の 2 行) を渡す。
     fn with_full_named_table(tag: &str, f: impl FnOnce(&Engine, [u64; 2])) {
@@ -6641,8 +6648,44 @@ mod sidecar_chain_tests {
         assert_eq!(eng.pkformer_disk_diff().unwrap(), None, "{what}: pkformer が memory と違う");
     }
 
-    /// `oplog_sync()` は、 `pktombs` と `pkformer.log` の両方に追記する時、 disk まで書き出すのを 1 回にする (`pktombs` は順の印)。
-    /// 前は 2 回 (macOS の F_FULLFSYNC 2 回) で、 使い回し続ける表の `oplog_sync()` が 0.37.4 の 2 倍かかった。
+    /// 組の syscall の並び (順の印 `ordered` 個 → disk まで 1 個) の期待。 順の印の無い OS は全部 disk まで。
+    fn chain(ordered: usize) -> Vec<Issued> {
+        let mut v = vec![if APPLE { Issued::Barrier } else { Issued::Full }; ordered];
+        v.push(Issued::Full);
+        v
+    }
+
+    /// 順の印の後に disk までの書き出しが無いまま終わる並びでないか (組の最後に出した書き出しが disk まで)。
+    fn assert_closed(log: &[Issued], what: &str) {
+        let syncs: Vec<Issued> = log.iter().copied().filter(|i| !matches!(i, Issued::DirSync(_))).collect();
+        assert_eq!(syncs.last(), Some(&Issued::Full), "{what}: 組の最後の書き出しが disk まで (F_FULLFSYNC) でない: {log:?}");
+    }
+
+    /// 前の住人の名前を移す前の、 `pkformer` と `pkformer.log` の (inode, 長さ)。 何も書かなかったかを見る (`write_atomic_*` は
+    /// 書くと rename で inode が替わる)。
+    fn pkformer_files(eng: &Engine) -> [(u64, u64); 2] {
+        use std::os::unix::fs::MetadataExt;
+        let m = |p: std::path::PathBuf| std::fs::metadata(p).map(|m| (m.ino(), m.len())).unwrap_or((0, 0));
+        [m(pkformer_path_for(&eng.path)), m(pkformer_log_path_for(&eng.path))]
+    }
+
+    /// `pkformer` を memory から書き直して (Rewrite) disk を memory と同じにした後、 書けなかった書き出しが残す形 (`persist_pk_former`
+    /// の Err の道と同じ 2 つ: log を信用しない + 印) にする。 次の書き出しは Rewrite で、 disk と同じ中身なので何も書かない。
+    fn rewrite_will_write_nothing(eng: &Engine) {
+        {
+            let _g = eng.sidecar_persist_lock.lock().unwrap();
+            let mut c = crate::db_files::SyncChain::default();
+            eng.persist_pk_former(true, &mut c).unwrap();
+            c.finish().unwrap();
+        }
+        assert!(pkformer_files(eng)[0].1 > 0, "前提: pkformer を memory から書き直した");
+        eng.pk_former.write().unwrap().persist_failed();
+        eng.pk_former_dirty.store(true, Ordering::Release);
+    }
+
+    /// `oplog_sync()` は、 `pktombs` と `pkformer.log` の両方に追記する時、 disk まで書き出すのを 1 回にする (macOS は `pktombs` が
+    /// F_BARRIERFSYNC、 `pkformer.log` が F_FULLFSYNC)。 前は 2 回 F_FULLFSYNC で、 使い回し続ける表の `oplog_sync()` が 0.37.4 の 2 倍
+    /// かかった。
     #[test]
     fn oplog_sync_writes_both_name_records_with_one_durable_sync() {
         with_full_named_table("sync", |eng, [x, z]| {
@@ -6658,12 +6701,15 @@ mod sidecar_chain_tests {
             );
             sync_counts::take();
             eng.oplog_sync().unwrap();
-            assert_eq!(sync_counts::take(), (1, 1), "(disk まで, 順の印): pktombs は順の印、 pkformer.log だけ disk まで");
+            let log = sync_counts::take();
+            assert_eq!(log, chain(1), "pktombs → pkformer.log の書き出しの syscall (macOS: 順の印 → disk まで / 他: disk まで 2 回)");
+            assert_closed(&log, "oplog_sync");
             assert_on_disk(eng, "oplog_sync の後");
         });
     }
 
-    /// `persist_tables()` の組 (`eidmap.log` → `pktombs` → `pkformer.log`) も、 disk まで書き出すのは最後の 1 回。
+    /// `persist_tables()` の組 (`eidmap.log` → `pktombs` → `pkformer.log`) も、 disk まで書き出すのは最後の 1 回。 組を閉じてから
+    /// `prev.seg` の周期を進める (directory の素の fsync はその後)。
     #[test]
     fn persist_tables_writes_the_chain_with_one_durable_sync() {
         with_full_named_table("tables", |eng, [x, z]| {
@@ -6674,14 +6720,21 @@ mod sidecar_chain_tests {
             assert!(eng.pk_former_dirty.load(Ordering::Acquire), "前提: pkformer に名前を移した");
             sync_counts::take();
             eng.persist_tables().unwrap();
-            assert_eq!(sync_counts::take(), (1, 2), "(disk まで, 順の印): eidmap.log と pktombs は順の印、 pkformer.log だけ disk まで");
+            let log = sync_counts::take();
+            let prev = log.iter().position(|i| *i == Issued::DirSync("prev.dir_sync")).expect("前提: prev.seg の周期を進めた");
+            // `tables` を書き直した時は、 その書き出しと directory の fsync が組の前に来る
+            let from = log.iter().position(|i| *i == Issued::DirSync("tables.dir_sync")).map_or(0, |i| i + 1);
+            assert_eq!(log[from..prev], chain(2)[..], "eidmap.log → pktombs → pkformer.log の syscall: {log:?}");
+            assert!(log[prev + 1..].iter().all(|i| *i == Issued::Full), "prev.seg の周期の後に順の印を出した: {log:?}");
             assert_on_disk(eng, "persist_tables の後");
             assert_eq!(eng.eidmap_disk_diff().unwrap(), None, "eidmap が memory と違う");
         });
     }
 
     /// 順の印で書き出した後に、 disk まで書き出す物が続かなかった (続くはずの `pkformer` に書く物が無かった) 時は、 組の終わりに
-    /// 順の印で書いた file を disk まで書き出す。
+    /// 順の印で書いた file を disk まで書き出す。 印は手で立てる: 印が立っていて書く物が無いのは、 書き手が `pk_former` を変えた後・
+    /// 印を立てる前に、 別の thread の書き出しがその変化を取り出した時 (印は後から立つ)。 決まった順では作れない (下の 2 本は、
+    /// 書けなかった書き出しの後の Rewrite で同じ形を作る)。
     #[test]
     fn an_ordered_sync_without_a_durable_one_after_it_is_made_durable() {
         with_full_named_table("tail", |eng, [x, _]| {
@@ -6692,14 +6745,65 @@ mod sidecar_chain_tests {
             eng.pk_former_dirty.store(true, Ordering::Release);
             sync_counts::take();
             eng.oplog_sync().unwrap();
-            let (durable, ordered) = sync_counts::take();
-            assert_eq!(ordered, 1, "前提: pkformer が続く見込みで pktombs を順の印で書いた");
-            if cfg!(target_vendor = "apple") {
-                assert_eq!(durable, 1, "順の印で書いた pktombs を組の終わりに disk まで書き出さなかった");
-            } else {
-                assert_eq!(durable, 0, "順の印の無い OS は、 順の印を頼んだ書き出しが disk まで書き出す");
-            }
+            let log = sync_counts::take();
+            // macOS: pktombs の順の印 → 組の終わりの F_FULLFSYNC。 他: pktombs を disk まで (組の終わりは何もしない)
+            let want = if APPLE { vec![Issued::Barrier, Issued::Full] } else { vec![Issued::Full] };
+            assert_eq!(log, want, "順の印で書いた pktombs を組の終わりに disk まで書き出さなかった");
+            assert_closed(&log, "oplog_sync");
             assert_on_disk(eng, "oplog_sync の後");
+        });
+    }
+
+    /// #1018 の読み直し 2-1: `pkformer` の Rewrite が何も書かなかった (disk と同じ中身) 時は 「disk まで書いた」 と組に伝えない。 伝えると
+    /// 前に順の印で書いた `pktombs` を組の終わりに書き出さないまま `oplog_sync()` が返った。
+    #[test]
+    fn a_rewrite_that_writes_nothing_does_not_close_the_chain() {
+        with_full_named_table("rewrite", |eng, [x, _]| {
+            let y = delete_and_reuse(eng, x, 8);
+            eng.oplog_sync().unwrap();
+            rewrite_will_write_nothing(eng);
+            eng.delete(y);
+            let before = pkformer_files(eng);
+            sync_counts::take();
+            eng.oplog_sync().unwrap();
+            let log = sync_counts::take();
+            assert_eq!(pkformer_files(eng), before, "前提: pkformer の Rewrite は何も書かなかった");
+            let want = if APPLE { vec![Issued::Barrier, Issued::Full] } else { vec![Issued::Full] };
+            assert_eq!(log, want, "何も書かなかった Rewrite の後に、 順の印で書いた pktombs を disk まで書き出さなかった");
+            assert_closed(&log, "oplog_sync");
+            assert_on_disk(eng, "oplog_sync の後");
+        });
+    }
+
+    /// consumer の組 (`try_persist_tables`) も、 組を閉じて (順の印で書いた物を disk まで書き出して) から `prev.seg` の周期を進める。 見込み
+    /// (`pkformer` を書く) が外れる形で見る (外れなければ組は最後の書き出しで閉じる)。 明示の `finish` を消すと、 組は block の終わりの
+    /// `Drop` で閉じる = 周期を進めた後。
+    #[test]
+    fn the_consumer_closes_the_chain_before_advancing_the_prev_epoch() {
+        with_full_named_table("consumer", |eng, [x, z]| {
+            delete_and_reuse(eng, x, 8);
+            // `eidmap` / `eidmap.log` を作る (次は追記)
+            eng.persist_tables().unwrap();
+            let w = delete_and_reuse(eng, z, 9);
+            // 名前の記録だけ書き出す (`eidmap.log` と `prev.seg` の周期は consumer の組に残る)
+            eng.persist_name_records().unwrap();
+            rewrite_will_write_nothing(eng);
+            eng.delete(w);
+            assert!(eng.eid_translator.has_dirty(), "前提: eidmap.log に追記する");
+            sync_counts::take();
+            assert!(eng.try_persist_tables(), "前提: tables を置けた");
+            let log = sync_counts::take();
+            let prev = log.iter().position(|i| *i == Issued::DirSync("prev.dir_sync")).expect("前提: prev.seg の周期を進めた");
+            assert_closed(&log[..prev], "prev.seg の周期の前");
+            if APPLE {
+                let barriers = log[..prev].iter().filter(|i| **i == Issued::Barrier).count();
+                assert_eq!(barriers, 2, "前提: eidmap.log と pktombs を順の印で書いた: {log:?}");
+            }
+            assert!(
+                !log[prev + 1..].iter().any(|i| matches!(i, Issued::Barrier | Issued::Full)),
+                "組を prev.seg の周期を進めた後に閉じた: {log:?}"
+            );
+            assert_on_disk(eng, "try_persist_tables の後");
         });
     }
 
@@ -6716,15 +6820,30 @@ mod sidecar_chain_tests {
             let r = eng.persist_name_records();
             sync_counts::fail_appends_to(None);
             assert!(r.is_err(), "前提: pkformer.log に追記できなかった");
-            let (durable, ordered) = sync_counts::take();
-            assert_eq!(ordered, 1, "前提: pktombs を順の印で書いた");
-            if cfg!(target_vendor = "apple") {
-                assert_eq!(durable, 1, "失敗して抜けた組が、 順の印で書いた pktombs を disk まで書き出さなかった");
-            } else {
-                assert_eq!(durable, 0);
-            }
+            let log = sync_counts::take();
+            let want = if APPLE { vec![Issued::Barrier, Issued::Full] } else { vec![Issued::Full] };
+            assert_eq!(log, want, "失敗して抜けた組が、 順の印で書いた pktombs を disk まで書き出さなかった");
             assert_eq!(eng.pktombs_disk_diff().unwrap(), None, "pktombs は書けている");
             assert!(eng.pk_former_dirty.load(Ordering::Acquire), "書けなかった pkformer の印を戻していない");
+            eng.oplog_sync().unwrap();
+            assert_on_disk(eng, "書き直した後");
+        });
+    }
+
+    /// #1018 の読み直し (前からの穴): consumer の組は、 `pktombs` が書けなければ `pkformer` も書かない (`persist_name_records` と同じ)。
+    /// 前は続けて書き、 `pkformer` だけが届く像を作りえた。
+    #[test]
+    fn the_consumer_does_not_write_pkformer_after_pktombs_failed() {
+        with_full_named_table("consumer-fail", |eng, [x, z]| {
+            delete_and_reuse(eng, x, 8);
+            eng.oplog_sync().unwrap();
+            delete_and_reuse(eng, z, 9);
+            let before = pkformer_files(eng);
+            sync_counts::fail_appends_to(Some(crate::db_files::PKTOMBS));
+            eng.try_persist_tables();
+            sync_counts::fail_appends_to(None);
+            assert_eq!(pkformer_files(eng), before, "pktombs が書けなかったのに pkformer を書いた");
+            assert!(eng.pk_former_dirty.load(Ordering::Acquire), "書かなかった pkformer の印を下ろした");
             eng.oplog_sync().unwrap();
             assert_on_disk(eng, "書き直した後");
         });
@@ -19640,7 +19759,12 @@ impl Engine {
             r
         };
         let r = match &job {
-            Persist::Rewrite { snapshot, log } => durable(write_pkformer_files(&path, &log_path, snapshot, log), chain),
+            // #1018: 書いた時だけ 「disk まで」 (何も書かなかった Rewrite は、 前に順の印で書いた file を組の終わりに残す)
+            Persist::Rewrite { snapshot, log } => write_pkformer_files(&path, &log_path, snapshot, log).map(|wrote| {
+                if wrote {
+                    chain.wrote_durable();
+                }
+            }),
             Persist::Fresh { records } => durable(
                 remove_sidecar(&path).and_then(|()| {
                     crate::db_files::write_atomic_parts(&log_path, &[&crate::pk_former::log_header(&[]), records])
@@ -20487,13 +20611,9 @@ impl Engine {
                     moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }
-                // #513: 消した主キーの記録も。 変わった時だけ書く。
-                if let Err(e) = self.persist_pk_tombs_if_dirty(&mut chain, self.pk_former_dirty.load(std::sync::atomic::Ordering::Acquire)) {
-                    moved_ok = false;
-                    self.warn_persist_failure_rate_limited(&e);
-                }
-                // 主キーの前の名前も
-                if let Err(e) = self.persist_pk_former(false, &mut chain) {
+                // #513: 消した主キーの記録と主キーの前の名前も。 変わった時だけ書く。 #1018 の読み直し: `pktombs` が書けなければ
+                // `pkformer` も書かない (`persist_name_records` / `persist_tables` と同じ。 前は続けて書き、 `pkformer` だけが届く像を作りえた)
+                if let Err(e) = self.persist_name_records_in(&mut chain) {
                     moved_ok = false;
                     self.warn_persist_failure_rate_limited(&e);
                 }

@@ -241,7 +241,7 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
             .open(&tmp_path)?;
         f.write_all(bytes)?;
         enchudb_oplog::io_point("sidecar.sync")?;
-        f.sync_all()?;
+        sync_file(&f, SyncKind::Durable)?;
         #[cfg(all(feature = "crashsim", unix))]
         enchudb_oplog::crashsim::file_synced(&tmp_path);
     }
@@ -268,7 +268,7 @@ pub(crate) fn write_atomic_parts(sidecar: &Path, parts: &[&[u8]]) -> io::Result<
             f.write_all(part)?;
         }
         enchudb_oplog::io_point("sidecar.sync")?;
-        f.sync_all()?;
+        sync_file(&f, SyncKind::Durable)?;
         #[cfg(all(feature = "crashsim", unix))]
         enchudb_oplog::crashsim::file_synced(&tmp_path);
     }
@@ -309,6 +309,8 @@ pub(crate) fn sync_dir_plain(dir: &Path, site: &'static str) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         enchudb_oplog::io_point(site)?;
         let f = std::fs::File::open(dir)?;
+        #[cfg(test)]
+        sync_counts::issued(sync_counts::Issued::DirSync(site));
         // SAFETY: 開いている file の fd を渡すだけ
         if unsafe { libc::fsync(f.as_raw_fd()) } != 0 {
             return Err(io::Error::last_os_error());
@@ -346,34 +348,72 @@ pub(crate) fn append_synced_in(sidecar: &Path, bytes: &[u8], chain: &mut SyncCha
 /// #1018: sidecar の書き出しの強さ。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SyncKind {
-    /// disk に届くまで (`File::sync_all`。 macOS は F_FULLFSYNC = drive の cache も吐かせる。 1 回 4〜5 ms)
+    /// disk に届くまで (macOS は fcntl の F_FULLFSYNC = drive の cache も吐かせる、 1 回 4〜5 ms。 他は `File::sync_all`)
     Durable,
     /// 順だけ (macOS の F_BARRIERFSYNC、 1 回 0.4 ms 前後): この file の中身は、 この後に disk へ送る物より先に disk に届く。 返った
     /// 時に届いたとは言えないので、 呼び手は同じ組の最後に [`SyncKind::Durable`] を 1 つ置く ([`SyncChain`])。 macOS の
     /// F_FULLFSYNC は、 前に書き出した物 (同じ device) も届けてから返る (fcntl(2) の F_FULLFSYNC / F_BARRIERFSYNC)。 順の印を
-    /// 持たない OS と、 F_BARRIERFSYNC を受けない file system は [`SyncKind::Durable`] で書き出す
+    /// 持たない OS は [`SyncKind::Durable`] で書き出す。 F_BARRIERFSYNC を受けない file system (APFS / HFS の外) は、 macOS 14 以降は
+    /// kernel が F_FULLFSYNC に上げて呼び直し、 13 以前は ENOTTY / ENOTSUP / EINVAL を返すので [`sync_file`] が F_FULLFSYNC を出す。
+    /// 順の印は drive の対応が要る (fcntl(2): 「Apple SSDs are guaranteed to provide」。 外付けの drive が受けない時の順は file system の
+    /// 作り次第)
     Ordered,
 }
 
 /// #1018: `f` を `how` の強さで書き出し、 実際に書き出した強さを返す (順の印の無い OS / file system は `Durable`)。
+///
+/// macOS で F_BARRIERFSYNC が失敗した時、 disk まで書き出し直すのは file system が受けない時 (ENOTTY / ENOTSUP / EINVAL、 kernel が
+/// F_FULLFSYNC に上げるのと同じ集合。 macOS 13 以前) だけ。 他の失敗 (EIO / ENOSPC …) は Err で返す: 書き戻しに失敗した page を
+/// kernel が捨てていれば、 2 回目の書き出しは書く物が無いまま成功を返し、 失った中身を 「書けた」 と覚える (fsyncgate の形)。
+/// EINTR は同じ syscall を出し直す (`File::sync_all` と同じ)。
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn sync_file(f: &std::fs::File, how: SyncKind) -> io::Result<SyncKind> {
-    #[cfg(test)]
-    sync_counts::note(how);
     #[cfg(target_vendor = "apple")]
-    if how == SyncKind::Ordered {
-        use std::os::fd::AsRawFd;
-        // SAFETY: 開いている file の fd を渡すだけ
-        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
-            return Ok(SyncKind::Ordered);
+    {
+        if how == SyncKind::Ordered {
+            match fcntl_sync(f, libc::F_BARRIERFSYNC) {
+                Ok(()) => return Ok(SyncKind::Ordered),
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::ENOTSUP | libc::EINVAL)) => {}
+                Err(e) => return Err(e),
+            }
         }
-        // 受けない file system (APFS / HFS の外) と失敗: disk に届くまで書き出す (失敗ならそちらが Err を返す)
+        fcntl_sync(f, libc::F_FULLFSYNC)?;
+        Ok(SyncKind::Durable)
     }
     // 順の印の無い OS は、 どちらを頼まれても disk まで
     #[cfg(not(target_vendor = "apple"))]
-    let _ = how;
-    f.sync_all()?;
-    Ok(SyncKind::Durable)
+    {
+        let _ = how;
+        #[cfg(test)]
+        sync_counts::issued(sync_counts::Issued::Full);
+        f.sync_all()?;
+        Ok(SyncKind::Durable)
+    }
+}
+
+/// #1018: macOS の書き出しの fcntl (`cmd` = F_FULLFSYNC / F_BARRIERFSYNC) を 1 つ出す。 EINTR は出し直す (`File::sync_all` と同じ)。
+/// 試験は出した `cmd` と結果をここで数える (`sync_counts`)。
+#[cfg(all(not(target_arch = "wasm32"), target_vendor = "apple"))]
+fn fcntl_sync(f: &std::fs::File, cmd: libc::c_int) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        #[cfg(test)]
+        let injected = sync_counts::injected_error(cmd);
+        #[cfg(not(test))]
+        let injected: Option<i32> = None;
+        let r = match injected {
+            Some(e) => Err(io::Error::from_raw_os_error(e)),
+            // SAFETY: 開いている file の fd を渡すだけ
+            None if unsafe { libc::fcntl(f.as_raw_fd(), cmd) } == -1 => Err(io::Error::last_os_error()),
+            None => Ok(()),
+        };
+        #[cfg(test)]
+        sync_counts::issued_fcntl(cmd, r.as_ref().err().and_then(io::Error::raw_os_error));
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            r => return r,
+        }
+    }
 }
 
 /// #1018: 続けて書き出す sidecar の組 (`eidmap.log` → `pktombs` → `pkformer.log` …、 1 つの書き出しの lock の下) の書き出しを、
@@ -401,19 +441,30 @@ impl SyncChain {
         };
     }
 
-    /// 組の中で、 順の印を使わない書き出し (tmp + rename の `write_atomic_*`) で disk まで書き出した。
+    /// 組の中で、 順の印を使わない書き出し (tmp + rename の `write_atomic_*`) で disk まで書き出した。 確かに書き出した時だけ呼ぶ
+    /// (中身が同じで書かなかった時に呼ぶと、 前に順の印で書いた file を組の終わりに書き出さない)。
     pub(crate) fn wrote_durable(&mut self) {
         self.ordered = None;
     }
 
     /// 組を終える: 順の印だけで書き出した物が残っていれば、 disk まで書き出す。
     pub(crate) fn finish(&mut self) -> io::Result<()> {
+        self.finish_with(true)
+    }
+
+    /// `sim` = I/O の点と電源断の模擬の控え (crashsim) を通す。 panic の巻き戻しの途中 (`Drop`) は通さない (控えの lock が毒されていると
+    /// その中で panic し、 巻き戻しの中の panic で process が止まる)。
+    fn finish_with(&mut self, sim: bool) -> io::Result<()> {
         let Some(path) = self.ordered.take() else { return Ok(()) };
-        enchudb_oplog::io_point("sidecar.chain_sync")?;
+        if sim {
+            enchudb_oplog::io_point("sidecar.chain_sync")?;
+        }
         let f = std::fs::File::open(&path)?;
         sync_file(&f, SyncKind::Durable)?;
         #[cfg(all(feature = "crashsim", unix))]
-        enchudb_oplog::crashsim::file_synced(&path);
+        if sim {
+            enchudb_oplog::crashsim::file_synced(&path);
+        }
         Ok(())
     }
 }
@@ -421,37 +472,61 @@ impl SyncChain {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for SyncChain {
     /// 途中で失敗して抜けた組 (`?`) も、 順の印だけで書き出した物を disk まで書き出す (書き出した記録は memory で済んだ印になっている)。
+    /// panic の巻き戻しの途中は、 書き出すだけで電源断の模擬の控えには触らない。
     fn drop(&mut self) {
-        let _ = self.finish();
+        let _ = self.finish_with(!std::thread::panicking());
     }
 }
 
-/// #1018: 試験用。 この thread の sidecar の書き出しの回数 (disk まで / 順の印) と、 追記を失敗させる file の名前。
+/// #1018: 試験用。 この thread が出した書き出しの syscall の並びと、 追記を失敗させる file の名前・F_BARRIERFSYNC に返させる errno。
 #[cfg(test)]
 pub(crate) mod sync_counts {
-    use super::SyncKind;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::io;
     use std::path::Path;
 
-    thread_local! {
-        static COUNTS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
-        static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// 出した書き出しの syscall。
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    pub(crate) enum Issued {
+        /// disk まで (macOS は fcntl の F_FULLFSYNC、 他は `File::sync_all`)
+        Full,
+        /// macOS の F_FULLFSYNC が失敗した (errno)
+        FullFailed(i32),
+        /// macOS の F_BARRIERFSYNC (順の印)
+        Barrier,
+        /// macOS の F_BARRIERFSYNC が失敗した (errno)
+        BarrierFailed(i32),
+        /// directory の素の fsync (I/O の点の名前)
+        DirSync(&'static str),
     }
 
-    pub(crate) fn note(how: SyncKind) {
-        COUNTS.with(|c| {
-            let (d, o) = c.get();
-            c.set(match how {
-                SyncKind::Durable => (d + 1, o),
-                SyncKind::Ordered => (d, o + 1),
-            });
+    thread_local! {
+        static ISSUED: RefCell<Vec<Issued>> = const { RefCell::new(Vec::new()) };
+        static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    #[cfg(target_vendor = "apple")]
+    thread_local! {
+        static BARRIER_ERRORS: RefCell<std::collections::VecDeque<i32>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    }
+
+    pub(crate) fn issued(i: Issued) {
+        ISSUED.with(|v| v.borrow_mut().push(i));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn issued_fcntl(cmd: libc::c_int, err: Option<i32>) {
+        issued(match (cmd == libc::F_BARRIERFSYNC, err) {
+            (true, None) => Issued::Barrier,
+            (true, Some(e)) => Issued::BarrierFailed(e),
+            (false, None) => Issued::Full,
+            (false, Some(e)) => Issued::FullFailed(e),
         });
     }
 
-    /// この thread で頼んだ (disk まで, 順の印) の数を返して 0 に戻す。
-    pub(crate) fn take() -> (u64, u64) {
-        COUNTS.with(|c| c.replace((0, 0)))
+    /// この thread が出した syscall の並びを返して空にする。
+    pub(crate) fn take() -> Vec<Issued> {
+        ISSUED.with(|v| std::mem::take(&mut *v.borrow_mut()))
     }
 
     /// この thread の、 名前が `name` の sidecar への追記を失敗させる (None で外す)。
@@ -462,6 +537,20 @@ pub(crate) mod sync_counts {
     pub(super) fn fail_point(path: &Path) -> io::Result<()> {
         let hit = FAIL.with(|f| f.borrow().as_deref().is_some_and(|n| path.file_name().is_some_and(|x| x == n)));
         if hit { Err(io::Error::other("sync_counts: 試験の失敗")) } else { Ok(()) }
+    }
+
+    /// この thread の次の F_BARRIERFSYNC を、 呼ばずに `errnos` を順に返す形にする (尽きたら本物を呼ぶ)。
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn fail_barriers_with(errnos: &[i32]) {
+        BARRIER_ERRORS.with(|q| *q.borrow_mut() = errnos.iter().copied().collect());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn injected_error(cmd: libc::c_int) -> Option<i32> {
+        if cmd != libc::F_BARRIERFSYNC {
+            return None;
+        }
+        BARRIER_ERRORS.with(|q| q.borrow_mut().pop_front())
     }
 }
 
@@ -591,5 +680,71 @@ mod tests {
         remove_db(&v9).unwrap();
         assert_eq!(disk_usage(&v9), DiskUsage::default());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// #1018 の読み直し: `sync_file` が強さごとに出す syscall (試験は出した syscall を数える。 頼んだ強さでなく)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sync_file_tests {
+    use super::sync_counts::{self, Issued};
+    use super::{SyncKind, sync_file};
+
+    fn file(tag: &str) -> (std::path::PathBuf, std::fs::File) {
+        use std::io::Write;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let p = std::env::temp_dir().join(format!("enchudb-syncfile-{tag}-{}-{nanos}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).unwrap();
+        f.write_all(b"x").unwrap();
+        (p, f)
+    }
+
+    /// disk まで = F_FULLFSYNC (macOS) / `sync_all` を 1 回。 順の印 = macOS は F_BARRIERFSYNC を 1 回 (他の OS は disk まで)。
+    #[test]
+    fn each_strength_issues_its_own_syscall() {
+        let (p, f) = file("kinds");
+        sync_counts::take();
+        assert_eq!(sync_file(&f, SyncKind::Durable).unwrap(), SyncKind::Durable);
+        assert_eq!(sync_counts::take(), vec![Issued::Full], "disk までの書き出しが F_FULLFSYNC / sync_all でない");
+        let done = sync_file(&f, SyncKind::Ordered).unwrap();
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(done, SyncKind::Ordered);
+            assert_eq!(sync_counts::take(), vec![Issued::Barrier], "順の印が F_BARRIERFSYNC でない");
+        } else {
+            assert_eq!(done, SyncKind::Durable, "順の印の無い OS は disk まで書き出したと答える");
+            assert_eq!(sync_counts::take(), vec![Issued::Full]);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// F_BARRIERFSYNC を受けない file system (ENOTTY / ENOTSUP / EINVAL、 kernel が F_FULLFSYNC に上げるのと同じ集合) だけ disk まで書き出し
+    /// 直す。 EINTR は F_BARRIERFSYNC を出し直す。 他の失敗 (EIO など) は書き出し直さずに Err (書き戻しに失敗した page を kernel が捨てて
+    /// いれば、 2 回目の書き出しは成功を返してしまう)。
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_failed_barrier_falls_back_only_when_the_file_system_does_not_take_it() {
+        let (p, f) = file("fallback");
+        for e in [libc::ENOTTY, libc::ENOTSUP, libc::EINVAL] {
+            sync_counts::take();
+            sync_counts::fail_barriers_with(&[e]);
+            assert_eq!(sync_file(&f, SyncKind::Ordered).unwrap(), SyncKind::Durable, "errno {e}: 受けない file system");
+            assert_eq!(sync_counts::take(), vec![Issued::BarrierFailed(e), Issued::Full], "errno {e}: disk まで書き出し直さない");
+        }
+        for e in [libc::EIO, libc::ENOSPC, libc::EBADF] {
+            sync_counts::take();
+            sync_counts::fail_barriers_with(&[e]);
+            let r = sync_file(&f, SyncKind::Ordered);
+            assert_eq!(r.err().and_then(|x| x.raw_os_error()), Some(e), "errno {e}: 失敗を返さない");
+            assert_eq!(sync_counts::take(), vec![Issued::BarrierFailed(e)], "errno {e}: 失敗の後に書き出し直した (fsyncgate の形)");
+        }
+        sync_counts::take();
+        sync_counts::fail_barriers_with(&[libc::EINTR, libc::EINTR]);
+        assert_eq!(sync_file(&f, SyncKind::Ordered).unwrap(), SyncKind::Ordered, "EINTR の後に順の印を出し直さない");
+        assert_eq!(
+            sync_counts::take(),
+            vec![Issued::BarrierFailed(libc::EINTR), Issued::BarrierFailed(libc::EINTR), Issued::Barrier],
+            "EINTR は F_BARRIERFSYNC を出し直す"
+        );
+        sync_counts::fail_barriers_with(&[]);
+        let _ = std::fs::remove_file(&p);
     }
 }
