@@ -1626,6 +1626,69 @@ mod row_hids_tests {
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
+
+    /// #1016: 行の削除が、 後ろの紐 y の門が閉じているのを見たら、 先に入った紐 x の門を出てから y の止める側を待つ (`Intents::Row` に
+    /// 移した入り方。 入ったまま待つと、 x を止める側が削除を待ち、 削除は y を待つ)。 y を止めている間に x を止める側が始められる
+    /// ことを見る。 削除が x に入って引き返すまでの間は時間で取る (間に合わない回は見逃すだけで、 落ちはしない)。
+    #[test]
+    fn a_delete_that_meets_a_closed_gate_leaves_the_gates_it_entered() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let path = std::env::temp_dir().join(format!("enchu-row-backoff-{}", std::process::id())).to_string_lossy().into_owned();
+        let _ = crate::db_files::remove_db(&path);
+        {
+            let mut e = Engine::create_standalone(&path).unwrap();
+            e.define_table("t", 64).unwrap();
+            e.define_himo_in("t", "x", ValueType::Number, 0).unwrap();
+            e.define_himo_in("t", "y", ValueType::Number, 0).unwrap();
+            e.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 1 << 20).unwrap();
+        let (x, y) = (eng.himo_id("t.x").unwrap(), eng.himo_id("t.y").unwrap());
+        assert!(x < y, "前提: 削除は x の門に先に入る");
+        let row = eng.entity_in("t").unwrap();
+        eng.try_tie_to_by_id(row, x as u16, 1u32).unwrap();
+        eng.try_tie_to_by_id(row, y as u16, 1u32).unwrap();
+        // y を止める
+        let (held_tx, held_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let holder = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                let g = eng.himos[y].write_guard();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                drop(g);
+            })
+        };
+        held_rx.recv().unwrap();
+        // 削除は x に入り、 y で引き返して y の止める側を待つ
+        let deleter = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.delete(row))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        // y を止めている間に、 x を止める側が始められる
+        let (x_tx, x_rx) = channel();
+        {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                drop(eng.himos[x].write_guard());
+                let _ = x_tx.send(());
+            });
+        }
+        let x_started = x_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        deleter.join().unwrap();
+        let _ = x_rx.recv_timeout(Duration::from_secs(20));
+        let gone = !eng.is_live(row);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert!(x_started, "y を止めている間に、 削除が x の門に入ったまま待った (x を止める側が始められない)");
+        assert!(gone, "止める側が放した後に行が消えていない");
+    }
 }
 
 /// [`LocalApply`] が入った門。 持つだけ (drop で出る)。
