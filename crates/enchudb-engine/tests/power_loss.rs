@@ -4126,10 +4126,12 @@ fn a_torn_delete_of_the_last_generation_keeps_the_last_row() {
 }
 
 /// #992 の読み直し 2 の S2 / 変異 N12: 単独の open が Leaf の空き一覧の作り直し (Leaf の列を読む) で断る時も何も書かない (`abandoned`)。 Leaf の
-/// 列の segment の file を行き先の無い symlink にして起こす。 往復する engine は開く時の直しを書いていないので、 前は Drop がきれいに閉じた
-/// 印を立て、 直していない状態がきれいに閉じた DB として残った (次の open は突き合わせも #451 の照合もしない)。
+/// 列の segment の file を読めなくして (権限を外す。 file はあるので segment の数えの確かめは通る) 起こす。 往復する engine は開く時の直しを
+/// 書いていないので、 前は Drop がきれいに閉じた印を立て、 直していない状態がきれいに閉じた DB として残った (次の open は突き合わせも #451 の
+/// 照合もしない)。
 #[test]
 fn a_standalone_open_refused_by_the_leaf_columns_leaves_the_db_unclean() {
+    use std::os::unix::fs::PermissionsExt;
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
@@ -4142,14 +4144,12 @@ fn a_standalone_open_refused_by_the_leaf_columns_leaves_the_db_unclean() {
         ro.himo_id("notes.body").unwrap()
     };
     let seg = db.join("himo").join(format!("{body:04}.seg"));
-    assert!(seg.is_file(), "前提: Leaf の列の segment がある ({})", seg.display());
-    let kept = root.join("body.seg");
-    std::fs::rename(&seg, &kept).unwrap();
-    std::os::unix::fs::symlink(root.join("missing").join("body.seg"), &seg).unwrap();
+    let mode = std::fs::metadata(&seg).expect("前提: Leaf の列の segment がある").permissions().mode();
+    std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(0)).unwrap();
     let refused = Engine::open_standalone(db.to_str().unwrap()).map(|_| ());
-    std::fs::remove_file(&seg).unwrap();
-    std::fs::rename(&kept, &seg).unwrap();
-    refused.expect_err("前提: Leaf の列を読めずに断る");
+    std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(mode)).unwrap();
+    let e = refused.expect_err("前提: Leaf の列を読めずに断る");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "前提: Leaf の列を開く所で断った: {e}");
     let eng = Engine::open_standalone(db.to_str().unwrap()).unwrap();
     assert!(!eng.is_live(r));
     assert_torn_delete_cleaned(&eng, a, r, true, "Leaf の列で断った後の単独の open");
