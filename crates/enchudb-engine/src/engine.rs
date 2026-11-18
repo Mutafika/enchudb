@@ -3953,6 +3953,212 @@ mod room_write_out_hook {
     }
 }
 
+/// test 用の割り込み点: changefeed の配る分の取り出し (`take_changes`、 記録の無い時) が渡す相手 (listener の一覧) を写した後・
+/// WAL を読む前 (#1031)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod change_take_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `add_change_listener` (記録の無い時) が listener を一覧に足した後・初回の cursor を合わせる前 (#1031)。
+/// 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod listener_add_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// #1031: listener を足すのと、 配る分の取り出し (`take_changes`) が重なっても、 足した listener には足した後の commit が届き、
+/// 初めの listener には足す前の commit が届かない。
+///
+/// 前は取り出しが渡す相手を `change_emit` の外で写してから lock を取って WAL を読み、 足す側は一覧に足すのを lock の外で
+/// していた。 写した後・WAL を読む前に足して書いて閉じると、 その record は写した一覧 (足した listener が居ない) にだけ渡り、
+/// cursor はその先へ進んだ (足した listener には二度と届かない)。 master の CI で Drop の試験
+/// (`drop_waits_for_slow_listeners_that_keep_returning`) が落ちた形 (受け手 3 つを足す間に、 1 つ目を足して起きた通知係の最初の
+/// 取り出しが割り込み、 1 つ目にだけ渡った) と合う。 Drop は配り終えた通知係を待って閉じていた。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod listener_add_race_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-issue1031-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 試験が途中で落ちても、 置いた割り込み点を外す (後で同じ番地に作られた別の試験の WAL で呼ばれないように)。
+    struct Unhook(Arc<enchudb_oplog::oplog::OpLog>);
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            change_take_hook::set(&self.0, |_| {});
+            listener_add_hook::set(&self.0, |_| {});
+        }
+    }
+
+    /// 受けた Tie の値を順に控える。
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<u64>>);
+    impl crate::changefeed::ChangeListener for Rec {
+        fn on_changes(&self, records: &[crate::transport::WireRecord]) {
+            let mut seen = self.0.lock().unwrap();
+            for r in records {
+                if let enchudb_oplog::oplog::DecodedOp::Tie { value, .. } = r.op {
+                    seen.push(value);
+                }
+            }
+        }
+    }
+
+    impl Rec {
+        /// `n` 件受けるまで待つ (最大 `limit`)。 受けた値の列を返す。
+        fn wait_for(&self, n: usize, limit: Duration) -> Vec<u64> {
+            let until = Instant::now() + limit;
+            while self.0.lock().unwrap().len() < n && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// 割り込み点で止まって知らせ、 `go` が来るまで (最大 30 秒) 待つ closure と、 その組。
+    fn pause() -> (impl FnOnce(&enchudb_oplog::oplog::OpLog) + Send + 'static, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (paused_tx, paused_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let hook = move |_: &enchudb_oplog::oplog::OpLog| {
+            let _ = paused_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(30));
+        };
+        (hook, paused_rx, go_tx)
+    }
+
+    /// 通知係の最初の取り出しが 1 つ目の listener を写した所で止まっている間に、 別の thread が 2 つ目を足して 1 を書いて閉じる。
+    /// 2 つ目にも 1 が届く。
+    ///
+    /// falsify (各 1 回): 取り出しが渡す相手を `change_emit` の外で写すと、 2 つ目には何も届かずに落ちる。 足す側を前の形 (一覧に
+    /// 足すのは lock の外、 lock を取るのは初回の cursor 合わせだけ) に戻しても同じく落ちる。
+    #[test]
+    fn a_listener_added_while_changes_are_taken_gets_the_commits_after_it() {
+        let dir = tmp("take");
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 1 << 20).unwrap();
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        change_take_hook::set(&wal, hook);
+        // 1 つ目を足すと通知係が起き、 最初の取り出しが渡す相手 (1 つ目だけ) を写した所で止まる
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: 通知係の取り出しが渡す相手を写した所で止まった");
+        let b = Arc::new(Rec::default());
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let writer = {
+            let (eng, b) = (eng.clone(), b.clone());
+            std::thread::spawn(move || {
+                eng.add_change_listener(b);
+                eng.tie_to_by_id(e, ts, 1u64);
+                eng.oplog_commit();
+                let _ = done_tx.send(());
+            })
+        };
+        // 直す前は、 書き手が取り出しの止まっている間に足して書いて閉じ終える。 直した後は、 足す所で取り出しが終わるのを待つ
+        // (ここで 0.5 秒待ってから取り出しを進める)
+        let wrote_during_take = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        go.send(()).unwrap();
+        writer.join().unwrap();
+        eng.oplog_sync().unwrap();
+        let (got_a, got_b) = (a.wait_for(1, Duration::from_secs(5)), b.wait_for(1, Duration::from_secs(5)));
+        drop(eng);
+        assert_eq!(got_a, vec![1], "1 つ目の listener");
+        assert_eq!(
+            got_b,
+            vec![1],
+            "取り出しの途中で足した listener に、 足した後の commit が届かない (書き手が取り出しの止まっている間に終えた: {wrote_during_take})"
+        );
+    }
+
+    /// listener の居ない間に 7 を書いて書き出しておく。 初めの listener を足す途中 (一覧に足した後・cursor を合わせる前) に別の
+    /// thread が `oplog_sync()` で配る分を取り出しても、 その listener に 7 (足す前の commit) は渡らず、 足した後の 8 だけが届く。
+    ///
+    /// falsify (各 1 回): 足す側が一覧に足すのを `change_emit` の外ですると (lock は足した後に取って cursor を合わせる形でも、
+    /// 前の形でも)、 取り出しが前の位置から読んで 7 を渡し、 落ちる。 上の試験は 「足した後に lock を取る」 形では落ちない (足す側が
+    /// 取り出しの終わりを待ってから返るので、 書き手の 1 は次の取り出しに入る) ので、 この形はこの試験だけが見る。
+    #[test]
+    fn the_first_listener_gets_no_commit_from_before_it_while_changes_are_taken() {
+        let dir = tmp("first");
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 1 << 20).unwrap();
+        // 7 を WAL に残す (畳むと、 前の位置から読んでも 7 が無く、 試したい形にならない)
+        eng.set_wal_fold_on_tick(false);
+        eng.set_wal_fold_on_switch(false);
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        eng.tie_to_by_id(e, ts, 7u64);
+        eng.oplog_sync().unwrap();
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        listener_add_hook::set(&wal, hook);
+        let a = Arc::new(Rec::default());
+        let adder = {
+            let (eng, a) = (eng.clone(), a.clone());
+            std::thread::spawn(move || eng.add_change_listener(a))
+        };
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: listener を一覧に足した所で止まった");
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let syncer = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                eng.oplog_sync().unwrap();
+                let _ = done_tx.send(());
+            })
+        };
+        // 直す前は、 足す途中に取り出しが前の位置から読んで渡し終える。 直した後は、 取り出しが足し終えるのを待つ
+        let took_during_add = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        go.send(()).unwrap();
+        adder.join().unwrap();
+        syncer.join().unwrap();
+        eng.tie_to_by_id(e, ts, 8u64);
+        eng.oplog_sync().unwrap();
+        let got = a.wait_for(1, Duration::from_secs(5));
+        // 8 の後に遅れて何か届かないかも見る
+        std::thread::sleep(Duration::from_millis(200));
+        let got_late = a.0.lock().unwrap().clone();
+        drop(eng);
+        assert_eq!(got, vec![8], "足す前の commit が初めの listener に渡った (取り出しが足す途中に終えた: {took_during_add})");
+        assert_eq!(got_late, vec![8], "後から足す前の commit が渡った");
+    }
+}
+
 /// #662: 畳む時に changefeed の record を写している間も、 書き手が WAL に積めること。
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fold_copy_tests {
@@ -30291,19 +30497,25 @@ impl Engine {
             self.ensure_notifier();
             return;
         }
+        // #1031: 足すのは `change_emit` の下 (配る分の取り出し `take_changes` は、 渡す相手をこの lock の下で写してから WAL を
+        // 読む)。 足した後に閉じた record は、 足した後に始まった取り出しが読み、 その時の一覧にこの listener が居る。 初回の
+        // cursor 合わせも同じ lock の下なので、 足した直後の取り出しが前の位置から読んで過去 record を渡すこともない
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         let was_empty = {
-            let mut guard = self.change_listeners.write().unwrap();
+            let mut guard = self.change_listeners.write().unwrap_or_else(|p| p.into_inner());
             let was_empty = guard.is_empty();
             guard.push(listener);
             was_empty
         };
-        // 初回登録時は cursor を現在の wal.head() に揃える(過去 record を流さない)
-        if was_empty {
-            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(wal) = self.oplog.as_ref() {
-                c.offset = wal.head();
-            }
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            listener_add_hook::call(wal);
         }
+        // 初回登録時は cursor を現在の wal.head() に揃える(過去 record を流さない)
+        if was_empty && let Some(wal) = self.oplog.as_ref() {
+            c.offset = wal.head();
+        }
+        drop(c);
         self.ensure_notifier();
     }
 
@@ -35409,11 +35621,16 @@ impl Engine {
         }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
         // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
+        // #1031: 渡す相手は `change_emit` の下で写し、 そのまま WAL を読んで cursor を進める ([`Self::add_change_listener`] も同じ
+        // lock の下で足す)。 前は lock の外で写してから lock を取って WAL を読んだので、 その間に足した listener は、 足した後に
+        // 閉じた record をこの回で渡されず (写した一覧に居ない)、 cursor はその record の先へ進んだ = 二度と届かなかった
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
         let listeners = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
         if listeners.is_empty() {
             return Some((out, false));
         }
-        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        change_take_hook::call(wal);
         // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
         // 恒久 skip (listener への通知漏れ) を起こしていた。
         let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
