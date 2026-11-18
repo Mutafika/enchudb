@@ -7,7 +7,8 @@
 //!   bit `G` = 32 − S。 世代は 0..=2^G − 2。 2^G − 1 は 「引退した場所」 の印 (世代を使い切った場所は二度と渡さない)。
 //!   いちばん上の世代を使わないので、 local の最大は 2^32 − 2^S − 1 で、 cell の空の印 (u32::MAX) や写像の番兵に届かない
 //! - 場所ごとに 2 B (`gen.seg` = 先頭 [`GEN_HEADER`] byte の header + 2 B / 場所): 下の byte = 世代、 上の byte の bit 0 = 「死んで
-//!   いる」 印 ([`DEAD`])。 header には表ごとの 「世代 > 0 の場所がある」 印 (出口で、 使い回しの無い表は世代を読まない) と page
+//!   いる」 印 ([`DEAD`])、 bit 1 = 「場所の最後の行は 今 − 2」 ([`TWO_UP`]、 #1008)、 bit 2 = 「後始末待ち」 ([`PENDING`]、 #992)。
+//!   bit 1 / 2 は開く時の突き合わせが削除を完了させる時にだけ立ち、 死んでいる場所でだけ意味を持つ (magic `GEN3`)。 header には表ごとの 「世代 > 0 の場所がある」 印 (出口で、 使い回しの無い表は世代を読まない) と page
 //!   ごとの印
 //! - 上げる時: 世代を持たない DB (file version 14 以下) は最初の使い回しで v15 に移る ([`crate::engine::Engine`] の
 //!   `move_to_generations`)。 その時に、 世代を持つ表の死んだ場所 (v14 の間に消した場所) を全部 「世代 1、 死んでいる」 にする。
@@ -902,6 +903,11 @@ impl Generations {
     pub(crate) fn last_row_was_deleted(&self, slot: u32) -> bool {
         let two_up = self.region.get().is_some_and(|r| read_raw(r, slot) & TWO_UP != 0);
         two_up || self.used_up(slot)
+    }
+
+    /// #992 の読み直し 3 の B3: 場所に 「後始末待ち」 が立っているか (前の open の突き合わせが答えを決めた)。
+    pub(crate) fn pending_mark(&self, slot: u32) -> bool {
+        self.region.get().is_some_and(|r| read_raw(r, slot) & PENDING != 0)
     }
 
     /// #992 の読み直し 2 の B2: 場所の 2 B の gen.seg の中の範囲 (書き出す範囲)。

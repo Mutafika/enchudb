@@ -14197,7 +14197,8 @@ impl Engine {
             // #992 / #1008: 前の形 (`GEN2`) の gen.seg は、 書き手として開く時に `GEN3` に上げる (header を書き出す。 上げた後は `GEN2`
             // だけを読む前の binary が断る)。 readonly は書かない
             // 書き出せなければ magic を戻して断る (#992 の読み直し 2 の細かい 6: 開き続けると印の bit が GEN2 の magic のまま disk に届き、
-            // GEN2 だけを読む binary が印を知らずに生かす)
+            // GEN2 だけを読む binary が印を知らずに生かす)。 断る前に上の `prev.seg` の header の写し (前の形からの写し・0 からの作り直し) は
+            // 書き出してある (「何も書かずに断る」 ではない。 写しは冪等で、 次の open が同じ物を書く、 #992 の読み直し 3 の細かい 8)
             #[cfg(not(target_arch = "wasm32"))]
             if !readonly
                 && generations.upgrade_magic()
@@ -24797,16 +24798,20 @@ impl Engine {
         for &slot in &dead_but_live {
             let now = gens.get(slot);
             let (target, row) = self.reconcile_target(slot, now);
-            self.kill_generation_reconciled(slot, target, row);
+            // 書けなければ断る (#992 の読み直し 3 の細かい 4: 書けないまま生きている印を下ろすと、 世代を上げずに場所を空ける)
+            self.kill_generation_reconciled(slot, target, row)?;
             rows.push((slot, row));
         }
         // #992 の読み直し 2 の B2: 上げた世代と後始末待ちを disk に届けてから生きている印を下ろす。 本体の書き出しは生きている印
         // (entities) を gen.seg より先に書き出すので、 先に下ろすと、 その間の電源断の像で印 (と上げた世代) だけを失い、 次の open は
         // 「死んでいて生きていない」 場所として何も拾わない (後始末を失い、 使い回しの途中の像では上げた世代を失って番号をもう一度渡す)。
         // 書き出せなければ開くのを断る (生きている印は下ろしていない = 次の open がもう一度ここで拾う)。 拾った場所がある時だけ
-        // 書き出しは拾った場所を覆う 1 つの範囲 (msync 1 回。 間の汚れていない page は書かない)
+        // 書き出しは拾った場所を覆う 1 つの範囲 (msync 1 回。 間の汚れていない page は書かない)。 断った後の open は、 書いた 2 B (page
+        // cache に残る) を前の open の答えとして拾い直す (`reconcile_target` の後始末待ちの枝 = 上げ直さない、 #992 の読み直し 3 の B3)
         #[cfg(not(target_arch = "wasm32"))]
         if let (Some(&(lo, _)), Some(&(hi, _))) = (rows.iter().min_by_key(|r| r.0), rows.iter().max_by_key(|r| r.0)) {
+            // 試験の故障の点 (`ENCHU_FAULT_AT`、 この書き出しの失敗を起こす。 crashsim の build の外では何もしない)
+            enchudb_oplog::io_point("gen.reconcile.msync")?;
             let (off, _) = crate::generation::Generations::slot_range(lo);
             let (end, len) = crate::generation::Generations::slot_range(hi);
             self.backing.flush_kind(SegmentKind::Gen, off, end + len - off)?;
@@ -24840,7 +24845,7 @@ impl Engine {
                         && !self.is_folded_own_slot(slot)
                     {
                         let row = gens.get(slot);
-                        self.kill_generation_reconciled(slot, row + 1, row);
+                        self.kill_generation_reconciled(slot, row + 1, row)?;
                         gens.note_pending(slot, row);
                         completed += 1;
                     }
@@ -24892,31 +24897,38 @@ impl Engine {
     /// - 前の住人が今以上 = gen.seg の書き出しの間に 2 回以上使い回した (Y を生かして消し、 Z を生かした)。 最後の行は前の住人の次
     ///   (普通の削除は世代を 1 つ上げる)、 その次まで上げる (前は 今 + 1 = Z の番号を次の使い回しに渡した)
     /// - 記録が無い / 古い: 見分けられない
+    ///
+    /// #992 の読み直し 3 の B3: 場所に 「後始末待ち」 が既に立っている = 前の open の 1. / 2. がこの場所の答えを決めて gen.seg に書いた後、
+    /// 生きている印を下ろす前に落ちた (B2 の書き出しの後・本体の entities の書き出しの前の電源断 / kill) か、 その書き出しに失敗して断った
+    /// (書いた 2 B は page cache に残る)。 上の 2 つの枝 (前の open の後の使い回し) に当たらなければ、 上げ直さずに前の open の答え (今、
+    /// 最後の行 = `dead_row_gen`) を使う。 前は上げた後の世代から決め直し、 削除の途中の像で最後の行を 1 つ上 (無かった行) に読んだ
+    /// (Delete の宛名がずれ、 断るたびに 1 つずつずれた)。 残るのは、 前の open の後の使い回しの記録も届かなかった像 (今の世代 = 前の
+    /// open の上げた世代をもう一度渡す、 下の細かい 8 と同じ窓)
     fn reconcile_target(&self, slot: u32, now: u32) -> (u32, u32) {
         let gens = self.generations();
         let gone = gens.prev.read(slot).map(|r| gens.split(r.gone)).filter(|&(s, _)| s == slot).map(|(_, g)| g);
+        let dead_row = gens.dead_row_gen(slot, now);
         match gone {
             Some(g) if g >= now => (g + 2, g + 1),
-            Some(g) if g == gens.dead_row_gen(slot, now) => (now + 1, now),
+            Some(g) if g == dead_row => (now + 1, now),
+            _ if gens.pending_mark(slot) => (now, dead_row),
             _ => (now + 1, now.saturating_sub(1)),
         }
     }
 
     /// [`Self::kill_generation`] の、 開く時の突き合わせの完了 (#992 / #1008): 「後始末待ち」 と、 書いた世代が場所の最後の行 `row` の
     /// 2 つ上なら 「最後の行は 今 − 2」 を、 世代と死の印と同じ store で立てる。
-    fn kill_generation_reconciled(&self, slot: u32, g: u32, row: u32) -> bool {
+    fn kill_generation_reconciled(&self, slot: u32, g: u32, row: u32) -> io::Result<()> {
         if !self.generations().active() {
-            return true;
+            return Ok(());
         }
         if let Some(t) = self.table_of_slot(slot) {
             self.generations().mark_table(t as TableId);
         }
         self.mark_gen_session_dirty();
-        if self.generations().kill_reconciled(slot, g, row).is_err() {
+        self.generations().kill_reconciled(slot, g, row).inspect_err(|_| {
             self.record_fault(FaultKind::DiskSpace, "gen.seg の commit を伸ばせない — 場所の世代を上げられない");
-            return false;
-        }
-        true
+        })
     }
 
     /// #992: 仕上げを済ませた場所の 「後始末待ち」 を落とす。 呼ぶのは、 仕上げ (cell を落とす・tombstone を置く) と #451 の作り直しの

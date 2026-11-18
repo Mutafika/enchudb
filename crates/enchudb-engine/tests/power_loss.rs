@@ -3826,6 +3826,10 @@ fn a_torn_delete_with_a_tag_cell_is_cleaned_up_by_one_open() {
 /// 置かず、 見分けられない。 作り直すと一度も配っていない削除を今の時刻で配る)。 突き合わせと仕上げの間で落ちて次の open が後始末待ちから
 /// 拾っても同じ答え (決め方は gen.seg の印から)。 cell はどちらでも落とす。 最初の head は 2. の場所を照合せず、 3. で拾うと照合した (落ちたか
 /// で答えが変わった)、 2 つ目の head は両方で作り直した。
+///
+/// **「Delete を作らない」 は受け入れた残りの形** (#992 の読み直し 3 の細かい 5): LivePage は、 OS が entities の page を先に書き、 WAL の Delete も
+/// tomb.seg も届かなかった普通の削除の像でもある (その削除は相手に配られない、 PR #1012 の残り)。 この残りを塞ぐ時は、 版数なしの削除などと
+/// 見分ける手を足して、 この試験の主張を変える。
 #[test]
 fn an_entities_only_torn_delete_is_finished_the_same_with_or_without_a_kill() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -3945,6 +3949,13 @@ fn a_standalone_open_without_a_wal_file_reconciles_by_itself() {
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.resumed_cleanups(), 1, "単独の session の後始末待ちを WAL 付きの open が拾わない");
     assert_torn_delete_cleaned(&eng, a, r, true, "WAL の file の無い単独の open の後の WAL 付きの open");
+    // 単独の session が仮に覚えた名前の削除 (行の cell の版数の最大) を、 作り直した tombstone (= 配った Delete) の版数で覚え直した
+    // (#992 の読み直し 3 の細かい 1)
+    let made: Vec<Hlc> =
+        slot_deletes(&eng, eng.eid_slot(r)).into_iter().filter(|&(d, _)| d == eid_local(r)).map(|(_, h)| h).collect();
+    let note = eng.himo_id("notes.note").unwrap() as u16;
+    assert_eq!(made.len(), 1, "前提: r の Delete は 1 つ");
+    assert_eq!(eng.deleted_name_version(note, TORN992_NAME as u64), Some(made[0]), "名前の削除を作り直した Delete の版数で覚え直していない");
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -4146,6 +4157,12 @@ fn a_standalone_open_refused_by_the_leaf_columns_leaves_the_db_unclean() {
     let seg = db.join("himo").join(format!("{body:04}.seg"));
     let mode = std::fs::metadata(&seg).expect("前提: Leaf の列の segment がある").permissions().mode();
     std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(0)).unwrap();
+    if std::fs::File::open(&seg).is_ok() {
+        // 権限を外しても開ける (root): 断る形を作れないので飛ばす (#992 の読み直し 3 の細かい 3)
+        std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(mode)).unwrap();
+        eprintln!("skip: 権限を外した Leaf の列の segment を開けた (root で回している)");
+        return;
+    }
     let refused = Engine::open_standalone(db.to_str().unwrap()).map(|_| ());
     std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(mode)).unwrap();
     let e = refused.expect_err("前提: Leaf の列を読めずに断る");
@@ -4296,40 +4313,79 @@ fn cut_the_write_out_of_an_open(dir: &Path, out: &Path, at: Phase) {
     crashsim::stop();
 }
 
-/// #992 の読み直し 2 の B2: 開く道 (O1) の突き合わせが gen.seg だけ死の場所を完了させ (世代を上げて死・後始末待ちの印を gen.seg に書き、
-/// 生きている印を下ろす)、 その後の最初の本体の書き出しの生きている印の後・gen.seg の前 (`BeforeGenerations`) で電源が落ちた像を開く (O2)。
-/// O1 は gen.seg を書き出してから生きている印を下ろすので、 O2 は後始末待ちの印から仕上げに回す。 前は生きている印 (先に書き出す) だけが
-/// 届き、 O2 は 「死んでいて生きていない」 場所として何も拾わなかった:
-/// - GenPage (削除の途中の像): 名前 (Number、 gen.seg の後に書き出す列) の cell が値の引きに出続けた
-/// - 「今 − 2」 の場所の使い回しの像: O1 が上げた世代を失い、 次の使い回しが Y の番号をもう一度渡した
+/// #992 の読み直し 2 の B2 / 読み直し 3 の B3: 開く道 (O1) の突き合わせが gen.seg だけ死の場所を完了させ (世代を上げて死・後始末待ちの印を
+/// gen.seg に書いて書き出し、 生きている印を下ろす)、 その後の最初の本体の書き出しの途中で電源が落ちた像を開く (O2)。 撮る点は 3 つ:
+/// - 生きている印の後・gen.seg の前 (`BeforeGenerations`): O2 は後始末待ちの印から仕上げに回す (3.)。 前 (B2) は生きている印 (先に書き出す)
+///   だけが届き、 O2 は何も拾わなかった (GenPage: 名前 (Number、 gen.seg の後に書き出す列) の cell が値の引きに出続けた / 「今 − 2」 の場所の
+///   使い回し: O1 が上げた世代を失い、 次の使い回しが Y の番号をもう一度渡した)
+/// - 生きている印の前 (`DeletesClosed` = tomb.seg の後 / `BeforeGate` = 本体の書き出しの初め): gen.seg は上げた・死・後始末待ち、 生きている印は
+///   残る = O2 の 1. が拾い直す。 前の open の答え (後始末待ちの印) を使い、 上げ直さない。 前 (B3) は上げた後の世代から決め直し、 削除の途中の
+///   像で最後の行を r の 1 つ上 (無かった行) に読んで、 その宛名の Delete を作った
 #[test]
 fn a_power_loss_in_the_first_write_out_after_the_reconcile_keeps_the_cleanup_findable() {
     if std::env::var(VERIFY_ENV).is_ok() {
         return;
     }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    {
+    // (撮る点, O2 の突き合わせ (1. で拾い直す / 3. で拾う))
+    let points = [(Phase::BeforeGate, (1, 0)), (Phase::DeletesClosed, (1, 0)), (Phase::BeforeGenerations, (0, 1))];
+    for (at, (again, resumed)) in points {
         let root = scratch("torn992_b2_genpage");
         let _rm = Torn992Root(root.clone());
         let (_, a, r) = torn992_image(&root, Torn992::GenPage);
         let (img, cut) = (root.join("img"), root.join("cut"));
-        cut_the_write_out_of_an_open(&img, &cut, Phase::BeforeGenerations);
+        cut_the_write_out_of_an_open(&img, &cut, at);
         let eng = Engine::open_concurrent_with_oplog(cut.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
         assert!(!eng.is_live(r));
-        assert_eq!(eng.resumed_cleanups(), 1, "O1 の後始末待ちを O2 が拾わない (GenPage)");
-        assert_torn_delete_cleaned(&eng, a, r, true, "開く道の書き出しの途中の電源断 (GenPage)");
+        let what = format!("開く道の書き出しの途中の電源断 (GenPage、 {at:?})");
+        assert_eq!((eng.generation_repairs().0, eng.resumed_cleanups()), (again, resumed), "前提: O2 の拾い方 ({what})");
+        assert_torn_delete_cleaned(&eng, a, r, true, &what);
         drop(eng);
     }
-    {
+    for (at, (again, resumed)) in [(Phase::DeletesClosed, (1, 0)), (Phase::BeforeGenerations, (0, 1))] {
         let root = scratch("torn992_b2_two_up");
         let _rm = Torn992Root(root.clone());
         let (img2, a, r, y) = two_raises_reuse_image(&root);
         let cut = root.join("cut");
-        cut_the_write_out_of_an_open(&img2, &cut, Phase::BeforeGenerations);
+        cut_the_write_out_of_an_open(&img2, &cut, at);
         let eng = Engine::open_concurrent_with_oplog(cut.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
         assert!(!eng.is_live(y));
-        assert_eq!(eng.resumed_cleanups(), 1, "O1 の後始末待ちを O2 が拾わない (「今 − 2」 の場所の使い回し)");
-        assert_two_raises_reuse_finished(&eng, a, r, y, "開く道の書き出しの途中の電源断 (「今 − 2」 の場所の使い回し)");
+        let what = format!("開く道の書き出しの途中の電源断 (「今 − 2」 の場所の使い回し、 {at:?})");
+        assert_eq!((eng.generation_repairs().0, eng.resumed_cleanups()), (again, resumed), "前提: O2 の拾い方 ({what})");
+        assert_two_raises_reuse_finished(&eng, a, r, y, &what);
+        drop(eng);
+    }
+}
+
+/// #992 の読み直し 3 の B3 の断る道: 開く道の突き合わせが gen.seg を書き出せずに断る (子 process で `gen.reconcile.msync` の点に EIO を
+/// 起こす)。 書いた 2 B (上げた世代・死・後始末待ち) は map (page cache) に残り、 生きている印は下ろしていない。 次の open の 1. は拾い直し、
+/// 後始末待ちの印から前の open の答えを使う (上げ直さない): r の Delete は r の世代で 1 つ。 前は断るたびに世代を 1 つ上げ直し、 最後の行を
+/// 1 つずつずらした (電源断なしで、 Delete が無かった行宛てになった)。
+#[test]
+fn an_open_refused_by_the_reconcile_write_out_reconciles_the_same_way_again() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("torn992_reconcile_msync");
+    let _rm = Torn992Root(root.clone());
+    let e = u64::from(TORN992_NAME);
+    // 1 回断ってから開く / 2 回断ってから開く
+    for refusals in [1, 2] {
+        let img_root = root.join(format!("r{refusals}"));
+        let (db, a, r) = torn992_image(&img_root, Torn992::GenPage);
+        let mut at = db;
+        for n in 0..refusals {
+            let after = img_root.join(format!("after{n}"));
+            let (clean, refused) = open_with_fault(&img_root, &at, "writer_gen", e, "gen.reconcile.msync", 1, &after);
+            assert!(clean.starts_with("OK 0 (1, 0)"), "前提: 故障なしの open は r の場所を拾って片付ける: {clean}");
+            assert!(refused.starts_with("ERR"), "前提: gen.seg を書き出せずに断る ({n}): {refused}");
+            at = after;
+        }
+        let eng = Engine::open_concurrent_with_oplog(at.to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert!(!eng.is_live(r));
+        assert_eq!(eng.generation_repairs().0, 1, "前提: 断った open が直した場所を 1. が拾い直す ({refusals} 回)");
+        assert_torn_delete_cleaned(&eng, a, r, true, &format!("突き合わせの書き出しで {refusals} 回断った後の open"));
         drop(eng);
     }
 }
