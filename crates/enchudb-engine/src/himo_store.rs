@@ -1229,11 +1229,25 @@ impl HimoStore {
         self.intent.enter()
     }
 
-    /// [`write_intent`](Self::write_intent) の待たない版 (いくつもの紐に入る書き手用。 入れなければ入った分を出て
-    /// [`wait_write_intent`](Self::wait_write_intent))。
+    /// [`write_intent`](Self::write_intent) の、 待たず印も返さない版 (いくつもの紐に入る行の削除。 入れなければ入った分を
+    /// [`leave_write_intent_raw`](Self::leave_write_intent_raw) で出て [`wait_write_intent`](Self::wait_write_intent))。 入れたら
+    /// true (呼び手が同じ thread で出る)。
     #[inline]
-    pub(crate) fn try_write_intent(&self) -> Option<IntentPass<'_>> {
-        self.intent.try_enter()
+    pub(crate) fn try_write_intent_raw(&self) -> bool {
+        self.intent.try_enter_raw()
+    }
+
+    /// [`try_write_intent_raw`](Self::try_write_intent_raw) で入った門を出る。
+    #[inline]
+    pub(crate) fn leave_write_intent_raw(&self) {
+        self.intent.leave_raw();
+    }
+
+    /// この紐の [`IntentGate`] (#896: WAL の空きを待つ間に書き手が出る門、 engine の `GatesStepOut`)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    pub(crate) fn intent_gate(&self) -> &IntentGate {
+        &self.intent
     }
 
     /// この紐を止めている側が終わるのを待つ。
@@ -1466,6 +1480,13 @@ impl HimoStore {
     pub fn get_value(&self, eid: u32) -> Option<u64> {
         // #106: Acquire load。 writer の `store_u32_release` と対で、 leaf offset を
         // 掴んだら対応する LeafStore slot の payload/gen も必ず観測できるようにする。
+        value_at(self.col(), eid)
+    }
+
+    /// [`Self::get_value`] の、 呼び手に inline する版 (#1015: `Engine::get` / `get_by_id` の 1 行の読み。 call を省くと get 1 回が
+    /// 0.3 ns ほど速い)。 cell は同じく Acquire で読む (`Engine::read_app_acquired` はこの順に頼る)。
+    #[inline(always)]
+    pub(crate) fn get_value_inline(&self, eid: u32) -> Option<u64> {
         value_at(self.col(), eid)
     }
 
