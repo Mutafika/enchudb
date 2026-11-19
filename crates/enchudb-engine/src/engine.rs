@@ -8231,6 +8231,41 @@ mod slot_claim_tests {
         assert!(live_mine && live_theirs);
     }
 
+    /// review038 の A4: anonymous の `entity()` の払い出し位置の道も、 後始末待ち (`PENDING`) と引退した場所を渡さない (表の位置の道と
+    /// 同じ、 #992 の読み直し 4 の B4)。 前は `gen_slot_ready` と死の印を落とすだけで渡し、 後始末待ちを落として生かした。
+    ///
+    /// 状態は直接作る: 開く時の突き合わせ 1. が anonymous の高水位 (entities の header の page) の先の場所の削除を完了させた
+    /// (生きている印の page だけが新しい像) 後、 開く道の後始末の書き出し (`body_msync` / 後始末待ちを落とす gen.seg の書き出し) に失敗した
+    /// session の形 = 「高水位の先の、 生きていない・死・後始末待ち (世代 2、 最後の行は 今 − 2)」。
+    ///
+    /// falsify: `entity()` の位置の道の `used_up || pending_mark` を外すと (master)、 後始末待ちの場所を世代 2 で渡す。
+    #[test]
+    fn an_anonymous_fresh_slot_waiting_for_its_cleanup_is_not_given_out() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-a4anon-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 2).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let _b = eng.entity().unwrap();
+        eng.delete(a);
+        let c = eng.entity().unwrap(); // 場所 a を使い回す = v15
+        assert!(eng.generations().moved() && c != a, "前提: v15");
+        assert_eq!(eng.grow_entity_cap(4).unwrap(), 4, "前提: 枠を 2 つ広げた");
+        // 高水位 (2) の先の場所 2: 突き合わせが完了させた削除 (世代 0 の行を 2 つ上げて死・後始末待ち)
+        let pending = eng.entities.next_eid();
+        assert_eq!(pending, 2, "前提: 高水位");
+        eng.gen_slot_ready(pending).unwrap();
+        eng.generations().kill_reconciled(pending, 2, 0, false).unwrap();
+        assert!(eng.generations().pending_mark(pending) && !eng.entities.is_live(pending), "前提: 後始末待ちの死んだ場所");
+        let got = eng.entity().unwrap();
+        let (slot_got, still_pending) = (eng.slot_unchecked(got), eng.generations().pending_mark(pending));
+        cleanup(&path, eng);
+        assert_ne!(slot_got, pending, "後始末待ちの場所 {pending} を渡した ({got:#x})");
+        assert!(still_pending, "払い出しが後始末待ちの印を落とした");
+    }
+
     /// v15 の DB (表 u で 1 回使い回して移る) の、 枠 4 の表 t (3 行)。
     fn v15_engine(tag: &str) -> (String, Arc<Engine>) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -22497,6 +22532,13 @@ impl Engine {
             |slot| {
                 if self.gen_slot_ready(slot).is_err() {
                     return crate::entity_set::Fresh::Refuse;
+                }
+                // review038 の A4: 世代を使い切った場所と後始末待ちの場所は渡さない (表の位置の道と同じ、 #992 の読み直し 4 の B4)。 位置の
+                // 先にこれらが来るのは、 落ちた後に高水位 (entities の header の page) が生きている印より古い像で、 突き合わせ 1. がその先の
+                // 場所の削除を完了させた時 (と、 その後に `grow_entity_cap` で枠を広げた時)。 飛ばして穴として空きの山に積む (山から取る
+                // 時に `reuse` が見直す = 後始末が届いていれば使い回す)。 同じ 2 B の読み (`gen_slot_ready` が page を commit した後)
+                if gens.used_up(slot) || gens.pending_mark(slot) {
+                    return crate::entity_set::Fresh::Skip;
                 }
                 // A1: 行を握る。 この thread がユーザの行を握っていて待てない時は、 この場所を穴にして取り直す
                 match self.claim_position_row(slot, false) {
