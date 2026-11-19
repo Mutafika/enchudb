@@ -671,16 +671,17 @@ pub(crate) trait CellReader {
     fn has_order(&self, _via: u16, _key: u16) -> bool {
         false
     }
-    /// 並びの索引から、 `via` で `target` を指していて `key` の値が `lo..=hi` の帯に居る entity を `out` の後ろに足す
-    /// (stale は確かめ済み、 順不同。 `sorted` なら帯ごとの一覧を混ぜ合わせて番号の昇順に近い形で)。 返り値 = 帯が範囲と
-    /// ちょうど一致するか (一致すれば範囲の条件は確かめなくてよい、 しなければ帯の分だけ広い)。 索引が無い / 使えない時は
-    /// None (何も足さない、 呼び手は `pull` を使う)。
+    /// 並びの索引から、 `via` の値が `val` で `key` の値が `lo..=hi` の帯に居る entity を `out` の後ろに足す (stale は確かめ済み、
+    /// 順不同。 `sorted` なら帯ごとの一覧を混ぜ合わせて番号の昇順に近い形で)。 `val` は Ref の値 (世代 | 場所): 場所の今の住人を
+    /// 指す値なら [`Self::ref_val`]、 group の eid の行を指す値ならその eid の local。 返り値 = 帯が範囲とちょうど一致するか (一致
+    /// すれば範囲の条件は確かめなくてよい、 しなければ帯の分だけ広い)。 索引が無い / 使えない時は None (何も足さない、 呼び手は
+    /// `pull` を使う)。
     #[allow(clippy::too_many_arguments)]
     fn order_arc_into(
         &self,
         _via: u16,
         _key: u16,
-        _target: u32,
+        _val: u32,
         _lo: u64,
         _hi: u64,
         _sorted: bool,
@@ -688,8 +689,8 @@ pub(crate) trait CellReader {
     ) -> Option<bool> {
         None
     }
-    /// 並びの索引の帯が範囲とちょうど一致する時、 その件数 (O(帯の数))。 それ以外は None。
-    fn order_arc_len(&self, _via: u16, _key: u16, _target: u32, _lo: u64, _hi: u64) -> Option<usize> {
+    /// 並びの索引の帯が範囲とちょうど一致する時、 `via` の値が `val` の entity の件数 (O(帯の数))。 それ以外は None。
+    fn order_arc_len(&self, _via: u16, _key: u16, _val: u32, _lo: u64, _hi: u64) -> Option<usize> {
         None
     }
 }
@@ -2540,6 +2541,15 @@ impl Exit<'_> {
         }
     }
 
+    /// local (世代 | 場所) の eid (照合しない)。
+    #[inline]
+    pub(crate) fn eid_of_local(self, local: u32) -> EntityId {
+        match self {
+            Exit::Raw => local as EntityId,
+            Exit::App { peer, .. } => enchudb_oplog::make_eid(peer, local),
+        }
+    }
+
     /// 世代 `g` の、 場所 `slot` の eid。
     #[inline]
     fn eid_at(self, slot: u32, g: u32) -> EntityId {
@@ -4311,7 +4321,7 @@ impl Family {
             for &e in &ents {
                 // #731: 使い回した場所は前の世代を指す ref も伝える (索引の速い道は今の世代だけ)
                 let from_order = !r.ref_reused(e)
-                    && arc.is_some_and(|(key, lo, hi)| r.order_arc_into(via, key, e, lo, hi, false, &mut up).is_some());
+                    && arc.is_some_and(|(key, lo, hi)| r.order_arc_into(via, key, r.ref_val(e) as u32, lo, hi, false, &mut up).is_some());
                 if !from_order {
                     r.pull_ref_into(via, e, &mut up);
                 }
@@ -4790,7 +4800,7 @@ impl Family {
                     let up = match order_range {
                         Some((key, lo, hi)) if parent == 0 && single_child == Some(n) => {
                             let mut up = Vec::new();
-                            match r.order_arc_into(via, key, e, lo, hi, false, &mut up) {
+                            match r.order_arc_into(via, key, r.ref_val(e) as u32, lo, hi, false, &mut up) {
                                 Some(_) => up,
                                 None => r.pull(via, r.ref_val(e)),
                             }
@@ -6490,7 +6500,8 @@ impl GroupedLiveQuery {
         if !self.inner.contains(eng, group) {
             return Vec::new();
         }
-        let mut out = self.members_one(eng, self.inner.registry.exit().split(group).0);
+        group_check_hook();
+        let mut out = self.members_one(eng, group_val(group));
         sort_members(&mut out);
         self.eids_of(&out)
     }
@@ -6515,7 +6526,7 @@ impl GroupedLiveQuery {
                     return Vec::new();
                 }
                 buf.clear();
-                self.members_into(eng, self.inner.registry.exit().split(g).0, &tests, ord, &mut buf);
+                self.members_into(eng, group_val(g), &tests, ord, &mut buf);
                 sort_members(&mut buf);
                 self.eids_of(&buf)
             })
@@ -6527,14 +6538,15 @@ impl GroupedLiveQuery {
         if !self.inner.contains(eng, group) {
             return 0;
         }
-        self.count_one(eng, self.inner.registry.exit().split(group).0)
+        group_check_hook();
+        self.count_one(eng, group_val(group))
     }
 
-    /// group `g` (local eid) の members の数 (group が居るかは見ない)。 根への条件が並びの索引の範囲 1 本だけで帯と
-    /// ちょうど合えば、 帯の件数の和 (O(帯の数))。
+    /// group の行を指す via の値 `g` ([`group_val`]) の members の数 (group が居るかは見ない)。 根への条件が並びの索引の範囲
+    /// 1 本だけで帯とちょうど合えば、 帯の件数の和 (O(帯の数))。
     fn count_one(&self, eng: &crate::engine::Engine, g: u32) -> usize {
         if self.filter.is_empty() {
-            return CellReader::pull_len(eng, self.via, CellReader::ref_val(eng, g));
+            return CellReader::pull_len(eng, self.via, u64::from(g));
         }
         if let Some(n) = self.order_count(eng, g, self.order_range(eng)) {
             return n;
@@ -6551,7 +6563,7 @@ impl GroupedLiveQuery {
         self.inner
             .members(eng)
             .iter()
-            .map(|&g| self.count_of(eng, self.inner.registry.exit().split(g).0, &tests, ord, &mut buf))
+            .map(|&g| self.count_of(eng, group_val(g), &tests, ord, &mut buf))
             .sum()
     }
 
@@ -6561,7 +6573,7 @@ impl GroupedLiveQuery {
         let ord = self.order_range(eng);
         let mut out = Vec::new();
         for g in self.inner.members(eng) {
-            self.members_into(eng, self.inner.registry.exit().split(g).0, &tests, ord, &mut out);
+            self.members_into(eng, group_val(g), &tests, ord, &mut out);
         }
         out.sort_unstable();
         // 1 entity の ref は 1 つなので、 止まっている時は重ならない。 並行の付け替えで 2 つの group の一覧に
@@ -6589,7 +6601,7 @@ impl GroupedLiveQuery {
         })
     }
 
-    /// 根への条件が並びの索引の範囲 1 本だけで、 帯と範囲がちょうど合えば、 group `g` の数 (帯の件数の和)。
+    /// 根への条件が並びの索引の範囲 1 本だけで、 帯と範囲がちょうど合えば、 group の行を指す via の値 `g` の数 (帯の件数の和)。
     fn order_count(&self, eng: &crate::engine::Engine, g: u32, ord: Option<(usize, u16, u64, u64)>) -> Option<usize> {
         match ord {
             Some((0, key, lo, hi)) if self.filter.len() == 1 => CellReader::order_arc_len(eng, self.via, key, g, lo, hi),
@@ -6597,7 +6609,7 @@ impl GroupedLiveQuery {
         }
     }
 
-    /// group `g` (local eid) の members を 1 つだけ読む (順不同)。 条件は組み立てずに [`matches_leaf`] で当てる
+    /// group の行を指す via の値 `g` ([`group_val`]) の members を 1 つだけ読む (順不同)。 条件は組み立てずに [`matches_leaf`] で当てる
     /// (0.31.4 までの `members_of` と同じ読み方)。 並びの索引があれば範囲の帯だけ読む。
     fn members_one(&self, eng: &crate::engine::Engine, g: u32) -> Vec<u32> {
         if let Some((i, key, lo, hi)) = self.order_range(eng) {
@@ -6611,14 +6623,14 @@ impl GroupedLiveQuery {
             }
         }
         let mut out = Vec::new();
-        CellReader::pull_into(eng, self.via, CellReader::ref_val(eng, g), &mut out);
+        CellReader::pull_into(eng, self.via, u64::from(g), &mut out);
         if !self.filter.is_empty() {
             out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
         }
         out
     }
 
-    /// group `g` (local eid) を指していて `tests` を満たす entity を `out` の後ろに足す (順不同)。 `ord` (並びの索引の
+    /// via の値が `g` ([`group_val`]) で `tests` を満たす entity を `out` の後ろに足す (順不同)。 `ord` (並びの索引の
     /// 範囲) があれば範囲の帯だけ読み、 帯が範囲とちょうど合えばその範囲の条件は確かめない。
     fn members_into(
         &self,
@@ -6641,7 +6653,7 @@ impl GroupedLiveQuery {
             None => false,
         };
         if !from_order {
-            CellReader::pull_into(eng, self.via, CellReader::ref_val(eng, g), out);
+            CellReader::pull_into(eng, self.via, u64::from(g), out);
         }
         if tests.len() <= usize::from(skip.is_some()) {
             return;
@@ -6657,7 +6669,7 @@ impl GroupedLiveQuery {
         out.truncate(w);
     }
 
-    /// group `g` (local eid) の members の数。 `buf` は読むための使い回しの buffer。
+    /// via の値 `g` ([`group_val`]) の members の数。 `buf` は読むための使い回しの buffer。
     fn count_of(
         &self,
         eng: &crate::engine::Engine,
@@ -6667,7 +6679,7 @@ impl GroupedLiveQuery {
         buf: &mut Vec<u32>,
     ) -> usize {
         if tests.is_empty() {
-            return CellReader::pull_len(eng, self.via, CellReader::ref_val(eng, g));
+            return CellReader::pull_len(eng, self.via, u64::from(g));
         }
         if let Some(n) = self.order_count(eng, g, ord) {
             return n;
@@ -6696,6 +6708,35 @@ impl std::fmt::Debug for GroupedLiveQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupedLiveQuery").field("inner", &self.inner).field("via", &self.via).finish()
     }
+}
+
+/// group の eid → その行を指す via (Ref の列) の値 (= eid の local、 世代 | 場所)。 group の中身はこの値で引く (#1039: 前は eid から
+/// 場所だけを取って場所の今の世代を付け直したので、 消えた group の eid で引くと、 その場所を使い回した後の住人の配下を返した。
+/// 見直しの購読の `members` は 「居るか」 を最後の poll で渡した集合で決めるので、 poll の後に消えた group の eid が来る)。
+#[inline]
+fn group_val(group: EntityId) -> u32 {
+    enchudb_oplog::eid_local(group)
+}
+
+/// test 用の割り込み点 (#1039): group の購読の読み (`members` / `count_in` / `group_of`) が group を確かめた後・中身を引く前。
+#[inline(always)]
+fn group_check_hook() {
+    #[cfg(test)]
+    if let Some(f) = GROUP_CHECK_HOOK.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`group_check_hook`] で 1 回だけ走らせる処理 (呼んだ thread だけ)。
+    static GROUP_CHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// test 用: 呼んだ thread の次の [`group_check_hook`] で `f` を 1 回走らせる。
+#[cfg(test)]
+pub(crate) fn set_group_check_hook(f: impl FnOnce() + 'static) {
+    GROUP_CHECK_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
 }
 
 /// #731: 見直しの購読の `touched` の eid。 場所ごとに、 最後の poll 以降に消えた行の世代 (`first`) から今の住人の世代までを出す
@@ -6774,10 +6815,15 @@ impl TouchedLiveQuery {
     /// 根の entity `eid` が答えに居るなら、 その group (ref の 1 段目の先)。 ref と根への条件は今の値、 group が居るかは
     /// 最後の poll で渡した集合で決める (型の doc)。 居なければ None (削除された entity も None)。
     pub fn group_of(&self, eng: &crate::engine::Engine, eid: EntityId) -> Option<EntityId> {
-        let e = self.g.inner.registry.exit().slot(eid)?;
-        let g = CellReader::ref_cell(eng, self.g.via, e)?;
         let peer = self.g.inner.registry.exit();
-        let ge = peer.eid(g);
+        let e = peer.slot(eid)?;
+        // ref の値 (世代 | 場所) を 1 回だけ読み、 その値で 「今の住人を指すか」 (消えた行を指す ref は None) と group の eid の
+        // 両方を決める (#1039: 前は今の住人かを確かめた後に場所の今の世代で eid を作り直したので、 間で会社が消えて場所が使い回されると
+        // 新しい住人の eid を返しうった)
+        let v = u32::try_from(CellReader::cell(eng, self.g.via, e)?).ok()?;
+        let ge = peer.eid_of_local(v);
+        peer.slot(ge)?;
+        group_check_hook();
         (self.g.inner.reported_many(eng, &[ge])[0] && self.g.root_holds(eng, e)).then_some(ge)
     }
 
@@ -6792,6 +6838,9 @@ impl TouchedLiveQuery {
     }
 
     /// `group` を指していて根への条件を満たす entity (eid 昇順)。 `group` が最後の poll で渡した集合に居なければ空。
+    ///
+    /// 「`group` を指す」 は `group` の eid の行 (その世代) を指す ref (#1039)。 最後の poll の後に `group` が消えていれば、 それを
+    /// 指したままの entity (場所を使い回した後の住人を指す entity は入らない)。
     pub fn members(&self, eng: &crate::engine::Engine, group: EntityId) -> Vec<EntityId> {
         self.members_many(eng, &[group]).pop().unwrap_or_default()
     }
@@ -6806,7 +6855,7 @@ impl TouchedLiveQuery {
         if !self.g.inner.reported_many(eng, &[group])[0] {
             return 0;
         }
-        self.g.count_one(eng, self.g.inner.registry.exit().split(group).0)
+        self.g.count_one(eng, group_val(group))
     }
 
     /// [`GroupedLiveQuery::count`] と同じ。

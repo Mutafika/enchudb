@@ -5235,6 +5235,148 @@ mod eid_gen_claim_tests {
     }
 }
 
+/// 0.38 前 review D: group の購読の読みの世代 (#1039)、 見直しの購読の消す途中の poll (#1040)、 copy で読む入口の読んだ後の照合 (#1041)。
+/// 割り込み点で 「確かめた後・読む前」 / 「消す道の世代を上げた後・生きている印を下ろす前」 に行を消して場所を使い回す (時間で待たない)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod review038_d_tests {
+    use super::*;
+    use crate::live::LivePred;
+    use std::sync::Arc;
+
+    /// 枠 2 の会社の表 `c` (city)、 社員の表 `u` (company → c、 age)、 枠 1 の表 `s` (a、 先に使い回して v15 に移す) を持つ engine と、
+    /// `s` の生きている行。
+    struct World {
+        path: String,
+        eng: Arc<Engine>,
+        city: u16,
+        company: u16,
+        s_row: enchudb_oplog::EntityId,
+    }
+
+    fn world(tag: &str) -> World {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-rev038d-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("c", 2).unwrap();
+        eng.define_himo_in("c", "city", ValueType::Number, 0).unwrap();
+        eng.define_table("u", 8).unwrap();
+        eng.define_ref_in("u", "company", "c").unwrap();
+        eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
+        eng.define_table("s", 1).unwrap();
+        eng.define_himo_in("s", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        // 枠 1 の表で使い回して v15 (世代を持つ DB) に移る
+        let x = eng.entity_in("s").unwrap();
+        eng.delete(x);
+        let s_row = eng.entity_in("s").unwrap();
+        assert_eq!(eng.slot_unchecked(s_row), eng.slot_unchecked(x), "前提: 使い回した");
+        assert!(eng.generations().active() && s_row != x, "前提: v15");
+        let city = eng.himo_id("c.city").unwrap() as u16;
+        let company = eng.himo_id("u.company").unwrap() as u16;
+        World { path, eng, city, company, s_row }
+    }
+
+    impl World {
+        fn finish(self) {
+            let World { path, eng, .. } = self;
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+
+        /// city = 1 の会社の購読の条件。
+        fn tokyo(&self) -> Vec<LivePred> {
+            vec![LivePred::Via { path: vec![self.company], pred: Box::new(LivePred::Eq { himo_id: self.city, value: 1 }) }]
+        }
+
+        /// 会社 (city = `city`) を足す。
+        fn company_in(&self, city: u32) -> enchudb_oplog::EntityId {
+            let c = self.eng.entity_in("c").unwrap();
+            self.eng.tie_to_by_id(c, self.city, city);
+            c
+        }
+
+        /// 会社 `c` の社員を足す。
+        fn staff_of(&self, c: enchudb_oplog::EntityId) -> enchudb_oplog::EntityId {
+            let u = self.eng.entity_in("u").unwrap();
+            self.eng.tie_ref_to_by_id(u, self.company, c);
+            u
+        }
+    }
+
+    /// 会社 `c0` を消し、 その場所を使い回した会社 (city = 1) に社員を 1 人足す。 返り値 = (新しい会社, その社員)。
+    fn reuse_company(eng: &Arc<Engine>, city: u16, company: u16, c0: enchudb_oplog::EntityId) -> (enchudb_oplog::EntityId, enchudb_oplog::EntityId) {
+        eng.delete(c0);
+        let d = eng.entity_in("c").unwrap();
+        assert_eq!(eng.slot_unchecked(d), eng.slot_unchecked(c0), "前提: 消えた会社の場所を使い回した");
+        assert_ne!(d, c0);
+        eng.tie_to_by_id(d, city, 1u32);
+        let u = eng.entity_in("u").unwrap();
+        eng.tie_ref_to_by_id(u, company, d);
+        (d, u)
+    }
+
+    /// #1039: 会社単位の購読 (`subscribe_grouped`) の `members` / `count_in` は、 group が今居るかを確かめた後に、 その group の
+    /// 行を指す ref で中身を引く。 前は場所の今の世代を付け直して引いたので、 確かめた後・引く前に会社が消えて場所が使い回されると、
+    /// 新しい住人の社員を返した (数も新しい住人の社員の数)。
+    #[test]
+    fn grouped_members_of_a_group_deleted_and_reused_meanwhile_are_not_the_new_residents() {
+        for count in [false, true] {
+            let w = world("grouped");
+            let c0 = w.company_in(1);
+            w.company_in(2); // 表を埋める (次の会社は消えた会社の場所を使い回す)
+            let staff: Vec<_> = (0..2).map(|_| w.staff_of(c0)).collect();
+            let g = w.eng.subscribe_grouped(w.tokyo()).unwrap();
+            assert_eq!(g.poll(&w.eng).added, vec![c0]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (e2, city, company) = (w.eng.clone(), w.city, w.company);
+            crate::live::set_group_check_hook(move || {
+                tx.send(reuse_company(&e2, city, company, c0)).unwrap();
+            });
+            if count {
+                let n = g.count_in(&w.eng, c0);
+                rx.try_recv().expect("前提: 割り込み点で使い回した");
+                assert_eq!(n, staff.len(), "count_in: 確かめた後に消えて使い回された会社の数が、 新しい住人の社員の数になった");
+            } else {
+                let got = g.members(&w.eng, c0);
+                let (_, newcomer) = rx.try_recv().expect("前提: 割り込み点で使い回した");
+                assert!(!got.contains(&newcomer), "members: 確かめた後に消えて使い回された会社の中身に、 新しい住人の社員が入った: {got:?}");
+                assert_eq!(got, staff, "members: 会社を指したままの社員");
+            }
+            w.finish();
+        }
+    }
+
+    /// #1039: 見直しの購読の `group_of` は、 社員の ref の値 (世代 | 場所) を 1 回だけ読んで、 今の住人を指すかと group の eid の両方を
+    /// 決める。 前は今の住人かを確かめた後に場所の今の世代で eid を作り直したので、 間で会社が消えて場所が使い回され (poll もされ) ると、
+    /// 社員が指したことの無い新しい住人を group として返した。
+    #[test]
+    fn touched_group_of_never_answers_a_group_the_row_does_not_point_to() {
+        let w = world("groupof");
+        let c0 = w.company_in(1);
+        w.company_in(2);
+        let u1 = w.staff_of(c0);
+        let t = Arc::new(w.eng.subscribe_touched(w.tokyo()).unwrap());
+        assert_eq!(t.poll(&w.eng).added, vec![c0]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (e2, t2, city, company) = (w.eng.clone(), t.clone(), w.city, w.company);
+        crate::live::set_group_check_hook(move || {
+            let (d, _) = reuse_company(&e2, city, company, c0);
+            let delta = t2.poll(&e2);
+            assert!(delta.added.contains(&d) && delta.removed.contains(&c0), "前提: poll が使い回しを渡した");
+            tx.send(d).unwrap();
+        });
+        let got = t.group_of(&w.eng, u1);
+        let d = rx.try_recv().expect("前提: 割り込み点で使い回した");
+        assert_ne!(got, Some(d), "社員 u1 が指したことの無い会社 (消えた会社の場所を使い回した住人) を group として返した");
+        drop(t);
+        w.finish();
+    }
+
+}
+
 /// #1015: lock を取らない読みの入口 (`read_app_in`) の速い道の境目。 get の道 (`read_app_acquired` = 読んだ後の fence なし、 列の cell の
 /// Acquire に頼る) と fence のある道 (`read_app`) の両方で、 照合の後・読み直しの前に行が消えて場所が使い回された読みは None。 場所の
 /// page に 「世代 > 0 がある」 印が無い (照合は世代の 2 B を読まない) まま始まり、 読みの間に印が立つ形 (その page で最初の使い回し) と、
@@ -38119,7 +38261,7 @@ impl crate::live::CellReader for Engine {
         &self,
         via: u16,
         key: u16,
-        target: u32,
+        val: u32,
         lo: u64,
         hi: u64,
         sorted: bool,
@@ -38133,11 +38275,11 @@ impl crate::live::CellReader for Engine {
             return None;
         }
         let bands = o.bands_of(lo, hi);
-        // #731: 並びの索引の鍵は via の列の値 (= 今の世代 | 場所)
-        self.order_read_into(o, self.generations().local(target), bands, sorted, out)?;
+        // #731: 並びの索引の鍵は via の列の値 (= 世代 | 場所)。 どの行の値かは呼び手が決める (場所の今の住人 / group の eid の行)
+        self.order_read_into(o, val, bands, sorted, out)?;
         Some(bands.exact)
     }
-    fn order_arc_len(&self, via: u16, key: u16, target: u32, lo: u64, hi: u64) -> Option<usize> {
+    fn order_arc_len(&self, via: u16, key: u16, val: u32, lo: u64, hi: u64) -> Option<usize> {
         let o = self.live.order_for(via, key)?;
         if lo > hi {
             return Some(0);
@@ -38149,7 +38291,7 @@ impl crate::live::CellReader for Engine {
         if !bands.exact {
             return None;
         }
-        o.arc_len(self.generations().local(target), bands)
+        o.arc_len(val, bands)
     }
     fn with_himo(&self, himo_id: u16) -> Vec<u32> {
         match self.himos.get(himo_id as usize) {
