@@ -4136,6 +4136,72 @@ fn a_torn_delete_of_the_last_generation_keeps_the_last_row() {
     drop(eng);
 }
 
+/// #1047 (review038 の A3): [`an_entities_only_torn_delete_is_finished_the_same_with_or_without_a_kill`] (突き合わせの 2. = 生きている印だけ死、
+/// tombstone 無し、 Delete を作り直さない) を、 世代を使い切る場所の最後の世代 (254) の行 r で。 2. の完了は世代を 255 (引退の印) に
+/// 切るので、 仕上げの 「最後の行の削除を完了させた場所か」 (`last_row_was_deleted` = 「今 − 2」 の印か **引退**) が真になり、 一度も
+/// 配っていない r の削除を今の時刻で作り直して配る (2. の完了は作り直さないと決めた形、 #992 の読み直し 2 の細かい 3)。
+///
+/// 直すには、 引退の場所で 1. (gen.seg だけ死) の完了と 2. の完了を gen.seg の 2 B で見分ける手が要る (今の 2 B はどちらも
+/// 「255・死・後始末待ち」)。 bit を足す (file の形の変更) か、 2. の引退に使い回しの印を流用する (受信の書き込みも弾く = LWW の形) ので、
+/// 直さずに user の決め待ち。 今の壊れ方を示す。
+#[test]
+#[ignore = "#1047 (review038 の A3): 直すには gen.seg の形 / 受信の扱いを変える。 user の決め待ち"]
+fn an_entities_only_torn_delete_of_the_last_generation_relogs_no_delete() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("a3_retired_live_page");
+    let _rm = Torn992Root(root.clone());
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let r = {
+        let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        // 世代 = local の上 8 bit (場所の bit 24)。 いちばん上の世代 (254) の行まで使い回す
+        let mut i = 0u32;
+        let r = loop {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.v", i);
+            if eid_local(e) >> 24 == 254 {
+                break e;
+            }
+            assert!(i < 300, "前提: 枠 1 の表は場所を使い回す");
+            eng.delete(e);
+            i += 1;
+        };
+        eng.persist_tables().unwrap();
+        eng.oplog_sync().unwrap();
+        eng.oplog_sync().unwrap();
+        let _hold = eng.hold_consumer();
+        // 削除の前 (書き出し済み) の写しに、 削除の後の生きている印 (entities.seg) だけを置く (生きている印だけ死・gen.seg は生きている・
+        // tombstone 無し = 突き合わせの 2.)
+        let (before, after) = (root.join("before"), root.join("after"));
+        copy_tree(&live, &before);
+        eng.delete(r);
+        copy_tree(&live, &after);
+        copy_tree(&before, &img);
+        std::fs::copy(after.join("db").join("entities.seg"), img.join("db").join("entities.seg")).unwrap();
+        r
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.generation_repairs(), (0, 1), "前提: 突き合わせの 2. が r の場所を完了させた");
+    assert!(!eng.is_live(r), "前提: r は消えた");
+    let slot = eng.eid_slot(r);
+    let deletes: Vec<u32> = slot_deletes(&eng, slot).into_iter().map(|(d, _)| d).filter(|&d| d == eid_local(r)).collect();
+    drop(eng);
+    assert_eq!(deletes, Vec::<u32>::new(), "2. の完了 (世代 254 の行) で r {r:#x} の Delete を作り直して配った");
+}
+
 /// #992 の読み直し 3 の S3 (user の決定 11-18): 世代を使い切る場所の最後の世代 (254) での使い回しの途中の像。 最後の行 (世代 253) を消して
 /// 書き出した後、 本体の書き出しの段の間 (`PrevWrittenOut`) に Y でその場所を使い回し (Y の record は WAL の fsync の後 = 届かない)、
 /// 生きている印 (Y) と使い回しの記録は届き、 gen.seg (253 の削除の後 = 254・死) は届かない像 (`BeforeGenerations` で撮る)。 突き合わせは
