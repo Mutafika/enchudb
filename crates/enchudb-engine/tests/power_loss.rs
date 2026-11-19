@@ -7533,8 +7533,25 @@ fn a_former_alias_of_a_translated_row_alive_in_the_body_is_dropped_after_forgett
     a_former_alias_of_a_translated_row_is_dropped("translated_alias_no_record_forgot", TranslatedBehind::PowerLoss(Phase::BeforeGate), true);
 }
 
+/// [`write_out_hook::skip_himo_definition_write_out`] を立てている間の guard (試験が panic しても下ろす)。
+struct SkipHimoDefinition;
+
+impl SkipHimoDefinition {
+    fn on() -> Self {
+        write_out_hook::skip_himo_definition_write_out(true);
+        SkipHimoDefinition
+    }
+}
+
+impl Drop for SkipHimoDefinition {
+    fn drop(&mut self) {
+        write_out_hook::skip_himo_definition_write_out(false);
+    }
+}
+
 /// 読み直し 2 [B2]: X (名前 7) に B の行 b を畳み (b の世界番号は X の場所の別名)、 書き出した後、 名前 1 の行に新しい content の列
-/// (`t._c_memo`) で書き (WAL に TieLeaf、 列の定義は header / 紐名の辞書と一緒に次の本体の書き出しの残りの段で届く)、 X を消して Y で
+/// (`t._c_memo`) で書き (WAL に TieLeaf、 列の定義は header / 紐名の辞書と一緒に次の本体の書き出しの残りの段で届く = #1043 の前の形。
+/// 今はその場で書き出すので、 試験は `SkipHimoDefinition` で書き出さない)、 X を消して Y で
 /// X の場所を使い回し、 `oplog_sync` の本体の書き出しの `prev.seg` の後・生きている印の前 (`PrevWrittenOut`) に電源が落ちる。 像は
 /// 「本体に X が生きていて列の定義が無く、 場所の記録 (前の住人 X) は書き出していない周期、 WAL に [列の書き込み, X の Delete, Y]」。
 ///
@@ -7571,7 +7588,11 @@ fn a_persist_during_the_replay_does_not_skip_the_redo_of_the_reuse() {
         let keep = eng.pull_raw("t.k", 1u32);
         assert_eq!(keep.len(), 1, "前提: 名前 1 の行");
         let _hold = eng.hold_consumer();
+        // #1043 から、 WAL を持つ engine で足した列の定義はその場で書き出す。 列の定義が本体に無い像 (前の binary が書いた DB / 定義の
+        // 書き出しに失敗した時) を作るため、 この列だけ書き出さない
+        let skip = SkipHimoDefinition::on();
         eng.content(keep[0], "memo", b"hello");
+        drop(skip);
         eng.oplog_commit();
         assert!(eng.himo_id("t._c_memo").is_some(), "前提: 新しい content の列");
         eng.delete(x);

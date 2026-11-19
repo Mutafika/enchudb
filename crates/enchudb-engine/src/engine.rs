@@ -2888,6 +2888,20 @@ pub mod write_out_hook {
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
     static HOOK: super::hook_slot::Slot<dyn Fn(Phase) + Send + Sync> = super::hook_slot::Slot::new();
 
+    /// #1043: 立っている間、 WAL を持つ engine で足した紐の定義をその場で書き出さない (`define_himo_slot_locked`)。 process に 1 つ。
+    /// 「WAL に紐の record があって本体にその紐の定義が無い」 像 (前の binary が書いた DB、 定義の書き出しに失敗した時) を作り、 開く時の
+    /// 再生が紐を定義する道を試験するため。
+    static SKIP_HIMO_DEFINITION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// [`SKIP_HIMO_DEFINITION`] を立てる / 下ろす。
+    pub fn skip_himo_definition_write_out(on: bool) {
+        SKIP_HIMO_DEFINITION.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn skips_himo_definition_write_out() -> bool {
+        SKIP_HIMO_DEFINITION.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`])。
     pub fn set(hook: Option<Hook>) {
         HOOK.set(hook);
@@ -34590,8 +34604,12 @@ impl Engine {
         // 周期 / `oplog_sync` の本体の書き出し (WAL の fsync の後) に任せたので、 その間の電源断の像では header の紐の数が足りず、 WAL の
         // 再生はこの紐への Tie を黙って捨てた (同じ group の他の列は戻る)。 WAL の無い engine (build phase / standalone) は再生が無いので
         // 書き出しは `flush` に任せる。 書き出せなければ fault を数えて続ける (定義は消さない = 前と同じく次の本体の書き出しが届ける)
+        #[cfg(feature = "crashsim")]
+        let skip = write_out_hook::skips_himo_definition_write_out();
+        #[cfg(not(feature = "crashsim"))]
+        let skip = false;
         #[cfg(not(target_arch = "wasm32"))]
-        if self.oplog.is_some() && self.write_out_himo_definition(hid as u32).is_err() {
+        if self.oplog.is_some() && !skip && self.write_out_himo_definition(hid as u32).is_err() {
             self.record_fault(
                 FaultKind::DiskSpace,
                 "足した紐の定義を書き出せない — その紐への書き込みは、 次の本体の書き出しの前に落ちると再生で戻らない",
