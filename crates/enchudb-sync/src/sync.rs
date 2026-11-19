@@ -2404,6 +2404,8 @@ impl Syncer {
                 };
                 // #917: 当てる行は引いた直後に取る (#925: 値を引く間に、 その行が消えて場所が使い回されても、 使い回した新しい行を
                 // 取らない。 Ref の値の払い出しが同じ表の、 その行の消えた場所を使い回す事もある)
+                #[cfg(test)]
+                resolved_hook::call();
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 // #9: entity 写像ができたので、 この foreign entity 宛に Tie より先に届いて
                 // 退避していた Content を drain して apply する (= 配送順序ロス防止)。
@@ -2517,6 +2519,8 @@ impl Syncer {
                     Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
+                #[cfg(test)]
+                resolved_hook::call();
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 let value = match self.engine.try_resolve_remote_ref_value(
                     enchudb_oplog::eid_peer(*target),
@@ -2546,6 +2550,8 @@ impl Syncer {
                     Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
+                #[cfg(test)]
+                resolved_hook::call();
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 #[cfg(test)]
                 apply_hook::call();
@@ -2583,6 +2589,8 @@ impl Syncer {
                     Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行は引いた直後に取り、 lock の下で確かめる)
+                #[cfg(test)]
+                resolved_hook::call();
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)。
                 // Tie と同じく、 翻訳できないなら書かない (`SyncOutcome::dropped_vocab`)。
@@ -2613,6 +2621,8 @@ impl Syncer {
                     Err(r) => return ApplyResult::from(r),
                 };
                 // #917: Tie と同じ (当てる行を lock の下で確かめる、 読み直し [P])
+                #[cfg(test)]
+                resolved_hook::call();
                 let row = self.engine.remote_row_of(*eid, local_eid);
                 #[cfg(test)]
                 apply_hook::call();
@@ -2676,6 +2686,27 @@ impl Syncer {
 /// (`bind_by_primary_key`) に消える行を引いた後・消す前 (読み直し [B4])。 この thread で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod apply_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
+/// test 用の割り込み点: 受信の当て込み (`apply_one`) が宛名を写像で引いた後・当てる行 (`remote_row_of`) を取る前 (0.38 前 review の B3)。
+/// この thread で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod resolved_hook {
     use std::cell::RefCell;
 
     thread_local! {
@@ -2832,6 +2863,67 @@ mod tests {
                 assert_eq!(eng.get(y, "t.r"), Some(eng.ref_value(z2)), "X 宛ての受信が Y の Ref に当たった ({case})");
             }
         }
+    }
+
+    /// 0.38 前 review の B3: 受信の当て込みが翻訳した行 F (peer 2 の行) 宛ての record の宛名を写像で引いた後・当てる行 (`remote_row_of`)
+    /// を取る前に、 アプリが F を消して場所を Y が使い回す。 F 宛ての Tie / Untie / TieNamed / TieLeaf / TieRef は Y に当たらない。
+    ///
+    /// 前は `remote_row_of` が使い回した後の場所の最後の行 = Y を取り、 行の lock の下の照合 (Y がまだ場所の最後の行か) も通って Y に
+    /// 書いた / 外した (#917 の試験 `a_received_write_does_not_hit_the_row_that_reused_the_slot_after_resolving` の割り込み点は
+    /// `remote_row_of` の後で、 この窓を通らない)。
+    ///
+    /// falsify: engine の `remote_row_of` の、 世代を読んだ後に写像がまだ場所を指すかの引き直しを外すと、 Y が書き換わる。
+    #[test]
+    fn b3_a_received_write_resolved_before_the_slot_is_reused_does_not_hit_the_new_row() {
+        let mut hit = Vec::new();
+        for kind in ["tie", "untie", "named", "leaf", "ref"] {
+            let (_rm, eng, syncer) = reuse_engine(&format!("b3{kind}"), false);
+            let (v, w) = (eng.himo_id("t.v").unwrap() as u16, eng.himo_id("t.w").unwrap() as u16);
+            let f = enchudb_oplog::make_eid(2, 100);
+            let t0 = Hlc { wall: 1_000_000, logical: 0, peer: 2 };
+            let out = syncer.apply_records(&[
+                WireRecord::unsigned(t0, 2, DecodedOp::Tie { eid: f, himo_id: v, value: 1 }),
+                WireRecord::unsigned(t0, 2, DecodedOp::Tie { eid: f, himo_id: w, value: 1 }),
+                WireRecord::unsigned(t0, 2, DecodedOp::TieLeaf { eid: f, himo_name: "t.n".into(), himo_kind: 3, bytes: b"f".to_vec() }),
+            ]);
+            assert_eq!(out.applied, 3, "前提: F を受けた ({out:?})");
+            let app_f = eng.slot_eid(slot24(eng.resolve_remote_eid_existing(f).unwrap()));
+            let (z1, z2) = (eng.entity_in("u").unwrap(), eng.entity_in("u").unwrap());
+            let y = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let (e, yy) = (eng.clone(), y.clone());
+            resolved_hook::set(move || {
+                e.delete(app_f);
+                let y = e.entity_in("t").unwrap();
+                e.tie_to(y, "t.v", 2u32);
+                e.tie_to(y, "t.w", 2u32);
+                e.tie_text_to(y, "t.n", "y");
+                e.tie_ref_to(y, "t.r", z2);
+                yy.set(y);
+            });
+            let r = eng.himo_id("t.r").unwrap() as u16;
+            let op = match kind {
+                "tie" => DecodedOp::Tie { eid: f, himo_id: v, value: 9 },
+                "untie" => DecodedOp::Untie { eid: f, himo_id: v },
+                "named" => DecodedOp::TieNamed { eid: f, himo_name: "t.v".into(), himo_kind: 1, value: 9 },
+                "ref" => DecodedOp::TieRef { eid: f, himo_id: r, target: z1 },
+                _ => DecodedOp::TieLeaf { eid: f, himo_name: "t.n".into(), himo_kind: 3, bytes: b"z".to_vec() },
+            };
+            // Y の書き込みより新しい版数 (版数では弾かれない)
+            let after = now_ns() + 10_000_000_000;
+            let out = syncer.apply_records(&[WireRecord::unsigned(Hlc { wall: after, logical: 0, peer: 3 }, 3, op)]);
+            let y = y.get();
+            assert_ne!(y, 0, "前提: 割り込み点を通った ({kind})");
+            assert_eq!(slot24(y), slot24(app_f), "前提: Y は F の場所を使い回した ({kind})");
+            // 全部の形を見てから落とす (どの形が当たったかを 1 回で出す)
+            if out.applied != 0
+                || eng.get(y, "t.v") != Some(2)
+                || eng.get_text_owned(y, "t.n").as_deref() != Some(&b"y"[..])
+                || eng.get(y, "t.r") != Some(eng.ref_value(z2))
+            {
+                hit.push(kind);
+            }
+        }
+        assert!(hit.is_empty(), "F 宛ての受信が、 写像を引いた後に場所を使い回した Y に当たった: {hit:?}");
     }
 
     /// review919-922 の [B3] (#925 の C2 の後に安全になった所): 受信の当て込みが、 消えた翻訳した行 F0 (C の行) 宛ての改名を引いた後・
