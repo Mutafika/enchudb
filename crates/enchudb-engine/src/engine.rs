@@ -27612,14 +27612,24 @@ impl Engine {
     /// 行の古い eid を的にした ref、 または覚えの無い時 (開き直した後 / 上限を越えた) の、 使い回す前の行宛ての record)、 今の逆写像を
     /// 使わない: 覚えを世代で引き、 無ければ None (WAL の eid / 値のまま = 自分の世界番号で出る)。 前は今の逆写像で出し、 消えた自分の
     /// 行宛ての record や ref が、 その場所を使い回した他の peer の行に当たった
+    ///
+    /// #1036: 覚えにも無く場所の最後の行でもない行は、 `prev.seg` の記録 (場所を使い回した時の前の住人) で引く
+    /// ([`Self::bridge_row_address`] / state の #924 と同じ): 翻訳した行なら記録の identity、 自分の行なら None。 前は覚えが無いと
+    /// (bridge が使い回しの所の後ろを読んだ後 / 開き直した後) None を返し、 消えた受けた行を指す ref を自分の世界番号で配って、 受け手に
+    /// 幻の行を作った。 記録でも分からない行 (同じ場所を 2 回以上使い回した前の住人) は今まで通り None。
     fn bridge_address(&self, local: u32, hlc: enchudb_oplog::Hlc) -> Option<(enchudb_oplog::PeerId, u32)> {
         use std::sync::atomic::Ordering;
         let gens = self.generations();
         let (slot, row_gen) = gens.split(local);
         let now = self.eid_translator.reverse(slot);
         let is_last_row = || row_gen == gens.split(self.last_local_of_slot(slot)).1;
+        let recorded = || {
+            gens.prev
+                .record_of(slot, local)
+                .and_then(|r| (r.kind == crate::prev_slots::PrevKind::Translated).then_some((r.peer, r.number)))
+        };
         if !self.former_addresses_on.load(Ordering::Acquire) {
-            return now.filter(|_| is_last_row());
+            return if is_last_row() { now } else { recorded() };
         }
         let fa = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
         let last = enchudb_oplog::Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX };
@@ -27631,8 +27641,11 @@ impl Engine {
             None if is_last_row() => return now,
             None => {}
         }
-        // 書いた時にもう場所の住人でなかった行: その行の世代の変わり目
-        fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen).and_then(|(_, v)| address(v.0))
+        // 書いた時にもう場所の住人でなかった行: その行の世代の変わり目 (覚えに無ければ記録)
+        match fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen) {
+            Some((_, v)) => address(v.0),
+            None => recorded(),
+        }
     }
 
     /// #916 (読み直し A2): bridge が自分の record の**行**の宛名を引く ([`Self::bridge_address`] と同じ引き方)。 `None` = 分からない:

@@ -292,6 +292,76 @@ fn a_ref_to_a_gone_translated_row_does_not_make_a_phantom_row() {
     }
 }
 
+/// 0.38 前 review の B1: 上の試験の、 前の宛名の覚え (`FormerAddresses`) が無くなった後に ref を張る形。 `prev.seg` (#946) の使い回しの
+/// 記録が F0 (C の行) を前の住人として持つので、 bridge は Ref の値の宛名をそこから引き、 C の W は F0 (C の消えた行) を指す (state の
+/// #924 と同じ答え)。 幻の行 (A の世界番号の空の行) を作らない。
+///
+/// - `pruned`: bridge が使い回しの所の後ろを読んで覚えを外した後 (#952 の境目)
+/// - `reopened`: A を閉じて開き直した後 (覚えは memory だけ)
+///
+/// 前は覚えが無いと Ref の値の宛名を引けず、 素の Tie (A の世界番号) で配った (行の宛名 `bridge_row_address` は記録を引くのに、 値の宛名
+/// `bridge_address` は引かなかった)。
+///
+/// falsify: `bridge_address` の、 覚えの無い時に `prev.seg` の記録を引く所を外すと、 C の W が F0 を指さない (A の世界番号の行を指す)。
+#[test]
+fn a_ref_to_a_gone_translated_row_without_the_former_address_does_not_make_a_phantom_row() {
+    let mut wrong = Vec::new();
+    for reopened in [false, true] {
+        let (pa, pc) = (tmp_path("b1a"), tmp_path("b1c"));
+        let _c = Cleanup(vec![pa.clone(), pc.clone()]);
+        let transport = transport(&[1, 3]);
+        let mut eng_a = make_refs(&pa, 1, 1);
+        let eng_c = make_refs(&pc, 3, 100);
+        let mut sync_a = Syncer::new(eng_a.clone(), transport.clone());
+        let sync_c = Syncer::new(eng_c.clone(), transport.clone());
+        let f0 = eng_c.entity_in("companies").unwrap();
+        eng_c.tie_to(f0, "companies.name", 40u32);
+        eng_c.oplog_sync().unwrap();
+        sync_c.publish_since(Hlc::ZERO);
+        sync_a.pull_once(3);
+        let on_a = eng_a.pull_raw("companies.name", 40u32);
+        assert_eq!(on_a.len(), 1, "前提: A に F0 がある");
+        let f0_on_a = on_a[0];
+        eng_c.delete(f0);
+        eng_c.oplog_sync().unwrap();
+        sync_c.publish_since(Hlc::ZERO);
+        sync_a.pull_once(3);
+        assert!(eng_a.pull_raw("companies.name", 40u32).is_empty(), "前提: A で F0 が消えた");
+        let w = eng_a.entity_in("users").unwrap();
+        eng_a.tie_to(w, "users.uid", 7u32);
+        let y = eng_a.entity_in("companies").unwrap();
+        eng_a.tie_to(y, "companies.name", 60u32);
+        assert_eq!(slot(y), slot(f0_on_a), "前提: Y は F0 の場所を使い回した");
+        assert_ne!(y, f0_on_a, "前提: 使い回した場所の世代は F0 より新しい");
+        if reopened {
+            drop(sync_a);
+            drop(eng_a);
+            eng_a = Engine::open_concurrent_with_oplog(&pa, WAL).unwrap();
+            eng_a.set_peer_id(1);
+            sync_a = Syncer::new(eng_a.clone(), transport.clone());
+        } else {
+            eng_a.oplog_sync().unwrap();
+            eng_a.oplog_sync().unwrap();
+        }
+        assert_eq!(eng_a.former_addresses_len(), 0, "前提: 前の宛名の覚えが無い (reopened = {reopened})");
+        eng_a.tie_ref_to(w, "users.company", f0_on_a);
+        eng_a.oplog_sync().unwrap();
+        sync_a.publish_since(Hlc::ZERO);
+        for _ in 0..3 {
+            sync_c.pull_once(1);
+        }
+        let ws = eng_c.pull_raw("users.uid", 7u32);
+        assert_eq!(ws.len(), 1, "前提: C に W が届いた");
+        assert_eq!(eng_c.pull_raw("companies.name", 60u32).len(), 1, "前提: C に Y が届いた");
+        let c_val = eng_c.get(ws[0], "users.company");
+        // 両方の形を見てから落とす
+        if c_val != Some(u64::from(eid_local(f0))) {
+            wrong.push((reopened, c_val));
+        }
+    }
+    assert!(wrong.is_empty(), "C の W が F0 (C の消えた行) を指さない = A の世界番号の幻の行を指す ((reopened, C の W の値)): {wrong:?}");
+}
+
 /// 読み直し A2: A が受けた C の行 F0 に書き (bridge の前)、 C が F0 を消して F1 を作り、 A が受けて F1 が F0 の場所を使い回した所で落ちた
 /// 像 (page cache は残る = 写し) を開く。 前の宛名の覚えはメモリだけなので無い。 A の F0 への書き込みは、 宛名が分からない (場所の最後の
 /// 行でない) ので配らない。 自分の世界番号で配ると、 C で A の行と読まれて幻の行 (F0 に書いた値の行) ができた。
