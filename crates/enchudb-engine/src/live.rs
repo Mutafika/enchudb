@@ -6833,7 +6833,7 @@ impl TouchedLiveQuery {
         let e = peer.slot(eid)?;
         // ref の値 (世代 | 場所) を 1 回だけ読み、 その値で 「今の住人を指すか」 (消えた行を指す ref は None) と group の eid の
         // 両方を決める (#1039: 前は今の住人かを確かめた後に場所の今の世代で eid を作り直したので、 間で会社が消えて場所が使い回されると
-        // 新しい住人の eid を返しうった)
+        // 新しい住人の eid を返しえた)
         let v = u32::try_from(CellReader::cell(eng, self.g.via, e)?).ok()?;
         let ge = peer.eid_of_local(v);
         peer.slot(ge)?;

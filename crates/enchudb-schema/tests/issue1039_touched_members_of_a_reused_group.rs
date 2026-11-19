@@ -74,7 +74,12 @@ fn members_of_a_deleted_and_reused_group(order: bool, ranged: bool) {
     let newcomer = users.insert().set("id", 9i64).set("age", 40i64).set("company", Value::Ref(d)).commit().unwrap();
 
     // 次の poll の前: 消えた会社 c は最後の poll の集合に居る (型の doc)。 中身は c を指したままの社員で、 d の社員ではない
+    let index_reads = || db.engine().order_stats().iter().map(|s| s.2).sum::<u64>();
+    let before = index_reads();
     let m = t.members(c);
+    if order && ranged {
+        assert!(index_reads() > before, "{when}: 前提: 並びの索引の道で引いた");
+    }
     assert!(!m.contains(&newcomer), "{when}: members(消えた会社) が、 場所を使い回した会社の社員を返した: {m:?}");
     assert_eq!(m, staff, "{when}: members(消えた会社) は、 その会社を指したままの社員");
     assert_eq!(t.members_many(&[c]), vec![staff.clone()], "{when}: members_many");
