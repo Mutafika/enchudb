@@ -925,13 +925,7 @@ impl Database {
                 let to_table = to_table.to_string();
                 let table_name_owned = table_inner.name.clone();
                 // #1024: concurrent の DB は断る (`fk_refs` への push と `tables` の書き出しが、 走っている consumer のなめと重なる)
-                let eng_mut = self.engine_mut().ok_or_else(|| {
-                    SchemaError::Internal(
-                        "Ref column addition requires exclusive Engine access — \
-                         add ref columns on a standalone Database (build phase), \
-                         not on a shared / concurrent one".into()
-                    )
-                })?;
+                let eng_mut = self.engine_mut().ok_or_else(ref_column_needs_exclusive_engine)?;
                 let hid = eng_mut.define_ref_in(&table_name_owned, col_name, &to_table)
                     .map_err(|e| SchemaError::Internal(format!(
                         "define_ref_in({table_name_owned}.{col_name} -> {to_table}) failed: {e}"
@@ -1054,12 +1048,30 @@ impl Database {
 
         // 4. trailing 新列を auto-migrate (#73 の本命)。 himo は
         //    ensure_himo_dynamic_in (&self) 経由なので concurrent でも通る。
+        //    #1044: 1 列も足す前に、 断る列が無いか全部確かめる (`add_column_to_table` が断る形: 列の名前の形・Ref 列の先の表が無い・
+        //    `&mut Engine` を取れない DB (concurrent / 共有) で Ref 列を足す)。 前は 1 列ずつ足して途中の列で断ったので、 前の列だけが
+        //    紐と memory の表にできて `.schema` には書かれず (書くのは全部通った時、 concurrent の DB は Drop でも書かない)、 開き直すと
+        //    その列が表に無かった。 read-only の DB は最初の列で断る (何も足さない) ので確かめない
+        let new_cols = &col_specs[existing.cols.len()..];
+        let ref_target_of = |cn: &str| relations.iter()
+            .find(|(c, _)| c.eq_ignore_ascii_case(cn))
+            .map(|(_, t)| t.as_str());
+        if !self.eng.is_readonly() {
+            for (cn, _, _) in new_cols {
+                validate_column_name(cn)?;
+                if let Some(to) = ref_target_of(cn) {
+                    if to != tname && self.find_table_inner(to).is_none() {
+                        return Err(SchemaError::UnknownTable(to.to_string()));
+                    }
+                }
+            }
+            if new_cols.iter().any(|(cn, _, _)| ref_target_of(cn).is_some()) && self.engine_mut().is_none() {
+                return Err(ref_column_needs_exclusive_engine());
+            }
+        }
         let mut changed = false;
-        for (cn, ct, card) in &col_specs[existing.cols.len()..] {
-            let ref_target = relations.iter()
-                .find(|(c, _)| c.eq_ignore_ascii_case(cn))
-                .map(|(_, t)| t.as_str());
-            self.add_column_to_table(&tname, cn, *ct, *card, ref_target)?;
+        for (cn, ct, card) in new_cols {
+            self.add_column_to_table(&tname, cn, *ct, *card, ref_target_of(cn))?;
             changed = true;
         }
 
@@ -1369,6 +1381,15 @@ impl Database {
 #[cfg(not(target_arch = "wasm32"))]
 fn schema_sidecar_path_for(db_path: &str) -> std::path::PathBuf {
     enchudb_engine::db_files::path_for(db_path, enchudb_engine::db_files::SCHEMA)
+}
+
+/// 既にある表に Ref 列を足すのに `&mut Engine` が要る時の断り (#1024: concurrent / 共有の DB)。
+fn ref_column_needs_exclusive_engine() -> SchemaError {
+    SchemaError::Internal(
+        "Ref column addition requires exclusive Engine access — \
+         add ref columns on a standalone Database (build phase), \
+         not on a shared / concurrent one".into()
+    )
 }
 
 /// 0.8.7: tables の serialize_schema 出力を `.schema` sidecar に atomic write。
