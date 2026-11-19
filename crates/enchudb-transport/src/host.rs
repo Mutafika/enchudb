@@ -390,6 +390,11 @@ struct HostInner {
     /// 試験: 忘れている間に待った受信の数。
     #[cfg(test)]
     waited: AtomicU64,
+    /// 置き場 (`.clients`) を書くのを 1 本ずつにする ([`HostInner::save_lines`])。
+    save_lock: Mutex<()>,
+    /// 試験: `recompute` が削除の記録を忘れて disk に書いた (`persist_sync_state`) 直後の割り込み点 (0.38 前 review の B4)。
+    #[cfg(test)]
+    forgot_hook: Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// 試験: `recompute` が登録を読む (`applying` の lock を取る) 直前の割り込み点 (1 回だけ呼ぶ)。
     #[cfg(test)]
     lock_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -776,32 +781,48 @@ impl HostInner {
             // 消えた行で直し、 下の境が上限以上なら読まない
             let f = self.engine.sync_ring_min_below(upper).unwrap_or(upper);
             let current = self.lines.lock().unwrap().forget;
-            if f > current {
+            // #966 (0.38 前 review B4): F を進める (削除の記録を忘れる・F を配る) 前に、 外した印と client の一覧を置き場に書いて disk に
+            // 届ける。 前は忘れた後に fsync なしで書き、 忘れた削除だけが disk に届いて置き場が空 / 古い像で開き直すと、 外した client が
+            // 外した印の無い client に戻って publish が当たり、 消えた行が生き返った。 書けなければこの回は進めない
+            if f > current && self.save_lines(true, true) {
                 if self.engine.forget_deletes_before(f) > 0 {
                     let _ = self.engine.persist_sync_state();
+                    #[cfg(test)]
+                    if let Some(hook) = self.forgot_hook.lock().unwrap().as_mut() {
+                        hook();
+                    }
                 }
                 self.lines.lock().unwrap().forget = f;
             }
         }
-        self.save_lines(false);
+        self.save_lines(false, false);
     }
 
-    /// client の状態とホストの時計を置き場に書く。 `force` でなければ、 前に書いた中身から変わった時だけ。
-    fn save_lines(&self, force: bool) {
-        let Some(path) = &self.lines_path else { return };
-        let text = {
-            let mut l = self.lines.lock().unwrap();
-            (force || l.changed()).then(|| {
-                l.saved = Some((l.clients.clone(), l.forget));
-                l.encode(self.clock.now())
-            })
+    /// client の状態とホストの時計を置き場に書く。 `force` でなければ、 前に書いた中身から変わった時だけ。 書けたか (置き場が無い・
+    /// 書く物が無ければ true)。
+    ///
+    /// #966 (0.38 前 review B4): 中身を fsync してから rename する (`db_files::write_atomic_if_changed`、 電源断で中身の無い / 途中の
+    /// 置き場に置き換わらない)。 `durable` なら directory も fsync して rename を disk に届ける (F を進める前の `recompute` と止める時)。
+    /// 書くのは 1 本ずつ (`save_lock`)、 中身はその下で作る: 先に作った古い中身 (外した印の無い物) が後から rename されて、 後に作った
+    /// 中身を上書きしない。 書けた中身だけを 「書いた中身」 にする (前は書く前に置き、 書けなかった中身を次の回も書き直さなかった)。
+    fn save_lines(&self, force: bool, durable: bool) -> bool {
+        let Some(path) = &self.lines_path else { return true };
+        let _one = self.save_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshot = {
+            let l = self.lines.lock().unwrap();
+            (force || l.changed()).then(|| (l.clients.clone(), l.forget, l.encode(self.clock.now())))
         };
-        if let Some(text) = text {
-            let tmp = path.with_extension("tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
+        let Some((clients, forget, text)) = snapshot else { return true };
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => std::path::Path::new("."),
+        };
+        let written = enchudb::db_files::write_atomic_if_changed(path, text.as_bytes()).is_ok()
+            && (!durable || enchudb::db_files::sync_dir(dir).is_ok());
+        if written {
+            self.lines.lock().unwrap().saved = Some((clients, forget));
         }
+        written
     }
 
     /// client `to` に配る record: ホストの `_sync_ops` のうち、 書き手ごとの cursor より後 (to 自身の record は除く)。
@@ -953,6 +974,9 @@ impl HttpHost {
             forget_hook: Mutex::new(None),
             #[cfg(test)]
             waited: AtomicU64::new(0),
+            save_lock: Mutex::new(()),
+            #[cfg(test)]
+            forgot_hook: Mutex::new(None),
             #[cfg(test)]
             lock_hook: Mutex::new(None),
         });
@@ -1018,7 +1042,7 @@ impl Drop for HttpHost {
             let _ = h.join();
         }
         // #713: 止まる時点のホストの時計を残す (開き直すと続きから数える)
-        self.inner.save_lines(true);
+        self.inner.save_lines(true, true);
     }
 }
 
@@ -2230,6 +2254,66 @@ mod tests {
         let (ring, forget) = seen.expect("前提: 書き出しの前の割り込み点を通った");
         assert!(ring.is_none_or(|m| m > old), "前提: 割り込み点で n の record はまだ ring に無い ({ring:?})");
         assert!(forget <= old, "F が当てている途中の n の record を越えた ({forget:?} > {old:?})");
+    }
+
+    /// 0.38 前 review の B4 (#966 の電源断の入口): 黙った client P を外して F を進め、 ホストが削除の記録を忘れて disk に書いた時
+    /// (`persist_sync_state` の直後) に電源が落ちても、 置き場 (`.clients`) には P を外した印がもう disk にある (開き直したホストは戻った P
+    /// の publish を `STALE` で断る)。 忘れる前に置き場を書き出す (中身の fsync → rename → directory の fsync)。
+    ///
+    /// 前は置き場を書くのが忘れた後で、 書き方も fsync しない (`fs::write` + `rename`) ので、 忘れた削除だけが disk に届いて置き場が空 /
+    /// 古い像がありえた (開き直したホストで P は外した印の無い client になり、 戻った P の publish が当たって、 忘れた削除より前の作成で
+    /// 消えた行が生き返る)。 この試験が見るのは順 (忘れた時に disk の置き場に印がある) だけ。 fsync は電源断の模擬 (crashsim) が transport
+    /// に無いので試験にかけていない。
+    ///
+    /// falsify: `recompute` の、 F を進める前の置き場の書き出しを外すと、 割り込み点で読む置き場に P の印が無い。
+    #[test]
+    fn a_dropped_client_is_on_disk_before_the_host_forgets_deletes() {
+        let dir = std::env::temp_dir().join(format!("enchudb-b4-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let host_eng = rows_db(dir.join("host").to_str().unwrap(), 100);
+        // 忘れる削除: 写像の無い相手の行の削除 (退避表に載る、 ring に record を作らない)
+        let deleted = Hlc { wall: 1_000, logical: 0, peer: 7 };
+        assert!(host_eng.remote_delete_apply_foreign(enchudb_oplog::make_eid(7, 5), deleted), "前提: 削除を退避表に載せた");
+        let cursors = dir.join("host.cursors");
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(cursors.clone())).unwrap();
+        let clients_file = {
+            let mut s = cursors.clone().into_os_string();
+            s.push(".clients");
+            std::path::PathBuf::from(s)
+        };
+        let now = host.inner.clock.now();
+        let line = Hlc { wall: 5_000, logical: 0, peer: 4 };
+        {
+            let mut l = host.inner.lines.lock().unwrap();
+            l.silence = Some(Duration::from_secs(60));
+            // P (3): 黙った client (この回で外す)。 Q (4): 数える client (線は削除より上)
+            l.clients.insert(3, ClientState { last_seen_ms: now.saturating_sub(120_000), through: Some(line), caught_up: line, ..ClientState::default() });
+            l.clients.insert(4, ClientState { last_seen_ms: now, through: Some(line), caught_up: line, ..ClientState::default() });
+        }
+        let on_disk: Arc<Mutex<Option<Lines>>> = Arc::default();
+        {
+            let (on_disk, path) = (on_disk.clone(), clients_file.clone());
+            *host.inner.forgot_hook.lock().unwrap() = Some(Box::new(move || {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                *on_disk.lock().unwrap() = Some(Lines::decode(&text));
+            }));
+        }
+        host.inner.recompute(now);
+        *host.inner.forgot_hook.lock().unwrap() = None;
+        let forget = host.forget_line();
+        let on_disk = on_disk.lock().unwrap().take();
+        drop(host);
+        drop(host_eng);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(forget > deleted, "前提: F が削除の先へ進んだ (F {forget:?})");
+        // 割り込み点は忘れた数が 0 でない時だけ呼ぶ
+        let on_disk = on_disk.expect("前提: 削除を忘れて書いた所の割り込み点を通った");
+        assert!(
+            on_disk.clients.get(&3).is_some_and(|c| c.dropped),
+            "削除を忘れて disk に書いた時、 置き場に P を外した印が無い (この時に落ちると、 開き直したホストが戻った P を断らない): {:?}",
+            on_disk.clients.get(&3)
+        );
     }
 
     /// #980 の 2 回目の読み直し: `recompute` は登録を読んでから `ring_min` を読む。 逆だと、 `ring_min` を読んだ後に n の受信が当て終えて
