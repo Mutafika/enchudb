@@ -34584,10 +34584,43 @@ impl Engine {
             let _ = std::fs::remove_file(&crc_path);
         }
 
+        // #1043: WAL を持つ engine (並行の形) で足した紐は、 名前を見せる前 (= この紐への書き込みが WAL に載る前) に定義を書き出す。
+        // WAL の record は紐を番号で運び、 定義 (header の紐の数・型、 紐名の辞書、 列の header) は運ばない。 前は書き出しを consumer の
+        // 周期 / `oplog_sync` の本体の書き出し (WAL の fsync の後) に任せたので、 その間の電源断の像では header の紐の数が足りず、 WAL の
+        // 再生はこの紐への Tie を黙って捨てた (同じ group の他の列は戻る)。 WAL の無い engine (build phase / standalone) は再生が無いので
+        // 書き出しは `flush` に任せる。 書き出せなければ fault を数えて続ける (定義は消さない = 前と同じく次の本体の書き出しが届ける)
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.oplog.is_some() && self.write_out_himo_definition(hid as u32).is_err() {
+            self.record_fault(
+                FaultKind::DiskSpace,
+                "足した紐の定義を書き出せない — その紐への書き込みは、 次の本体の書き出しの前に落ちると再生で戻らない",
+            );
+        }
+
         // 最後に名前を publish (この時点で hid の全 metadata が可視)
         let _ = self.himo_names.push(himo.to_string());
 
         Ok(hid as u16)
+    }
+
+    /// #1043: 紐 `hid` の定義を書き出す ([`Self::define_himo_slot_locked`]、 WAL を持つ engine)。 順は 列と版数の列の header → 紐名の辞書
+    /// → DB の header (header が紐の数を言う時には、 それが指す物が disk にある。 列の header が届いていない像は開く時に書かれていない
+    /// 列として組む #414 ので必須ではないが、 1 page なので一緒に)。 `himo_def_lock` の下で呼ぶ (紐を足す書き手だけが待つ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_out_himo_definition(&self, hid: u32) -> io::Result<()> {
+        let Backing::Segments(set) = &self.backing else { return Ok(()) };
+        let (header_size, versions) = {
+            let layout = self.layout.read().unwrap();
+            (layout.header_size, layout.has_cell_version())
+        };
+        set.flush_kind(SegmentKind::Himo(hid), 0, crate::column::HEADER_BYTES)?;
+        if versions {
+            set.flush_kind(SegmentKind::Ver(hid), 0, crate::column::HEADER_BYTES)?;
+        }
+        set.flush_where(false, |k| {
+            matches!(k, SegmentKind::HimoregData | SegmentKind::HimoregOffsets | SegmentKind::HimoregIndex)
+        })?;
+        self.backing.flush_header(header_size)
     }
 
     // ──── 並行書き込み ────

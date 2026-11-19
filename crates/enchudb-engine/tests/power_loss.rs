@@ -1461,6 +1461,66 @@ fn write_during_write_out(stop_at: Phase, himo: &'static str) {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// #1043: WAL を持つ (並行の形の) engine に足した紐 (schema の `add_column` の道 = `ensure_himo_dynamic_in`) に書いた値は、 WAL の
+/// fsync の後・本体の書き出しの前の電源断の像からも、 WAL の再生で戻る。
+///
+/// WAL の record は紐を番号で運び、 紐の定義 (DB の header の紐の数・型、 紐名の辞書、 列の header) は運ばない。 前は定義を mmap に
+/// 書くだけで、 書き出すのは consumer の周期 / `oplog_sync` の本体の書き出し (WAL の fsync の後) だったので、 その間の像では header の
+/// 紐の数が足りず、 再生はその紐への Tie を黙って捨てた (同じ group の他の列の値は戻る = 1 回の書き込みの組が半分だけ戻る)。 開き
+/// 直した schema は `.schema` から同じ名前の紐を作り直すので、 値は空のまま。 #1027 で、 `Arc<Database>` を 1 つだけ持つ形の
+/// `add_column` も engine を flush しなくなり、 この形に入った (2 つ以上持つ形は 0.9.0 から)。
+///
+/// falsify: `define_himo_slot_locked` の定義の書き出し (`write_out_himo_definition`) を外すと、 像の `t.n` が None になる。
+#[test]
+fn a_column_added_to_a_running_engine_is_replayed_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("column_on_running");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 100).unwrap();
+    eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    let e = eng.entity_in("t").unwrap();
+    eng.tie_to(e, "t.a", 7u32);
+    eng.oplog_sync().unwrap(); // 列を足す前の状態は書き出してある
+    let img = root.join("img");
+    {
+        // consumer の周期の書き出しが、 下の oplog_sync より先に header を届けないように止める
+        let _hold = eng.hold_consumer();
+        // 走っている engine に列を足して書く (足す前の列も同じ group で書き換える)
+        let n = eng.ensure_himo_dynamic_in("t", "n", ValueType::Number, 0).unwrap();
+        eng.tie_to_by_id(e, n, 42u32);
+        eng.tie_to(e, "t.a", 8u32);
+        // oplog_sync の WAL の fsync の後・本体の書き出しの途中 (header より前の段) で電源断の像を撮る
+        let (from, to) = (live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && !to.exists() {
+                crashsim::capture(&from, &to, Mode::Lost).unwrap();
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+    }
+    crashsim::stop();
+    drop(eng);
+    assert!(img.exists(), "前提: 本体の書き出しの途中で像を撮った");
+    let (a, n) = {
+        let opened = Engine::open_standalone(img.join("db").to_str().unwrap()).unwrap();
+        (opened.get(e, "t.a"), opened.get(e, "t.n"))
+    };
+    assert_eq!(a, Some(8), "前提: WAL の再生が足す前の列の書き込みを戻した");
+    assert_eq!(n, Some(42), "走っている engine に足した列の書き込みが、 WAL にあるのに再生で戻らなかった (紐の定義が届いていない)");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// #656: 書き出しの済んだ語を指す Tag の cell は、 その列の門が閉じていても待たずに書ける (先に届いても語はディスクに
 /// ある)。 新しい語を指す cell は門で待つ。 門を閉じた所で書き出しを止め、 その間に両方を書かせて、 書き出しの後の
 /// 電源断の像でどの cell も前の値か中身ごと届いた値。 旧: 1 つの門を中身を指す列の全部の msync の間閉じていて、 済んだ語を
