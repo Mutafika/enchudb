@@ -16,6 +16,10 @@
 //! - **重複・欠け**: 1 つの process の中で同じ record を 2 度は渡さない。 WAL が満杯で載らなかった write (#57) は渡らない
 //!   (sync の DB は相手に floor で知らせて取り直させる。 listener には知らせない)。 再起動を跨いで漏れなく受けたいなら、
 //!   渡された最後の HLC を控えて `audit` で resume する (再起動の前後で同じ record をもう一度受けうる = at-least-once)
+//! - **付けた後の record**: `add_change_listener` が返った後に WAL に積んだ record は、 その group が閉じた後に、 その listener に
+//!   届く。 通知係が配る分を取り出している最中や、 `enable_change_log` と重なって付けても同じ (#1031: 前はその回の取り出しが写した
+//!   一覧に居ないまま cursor が先へ進み、 二度と届かないことがあった)。 付けた時に開いていた group は、 記録の無い時の初めの
+//!   listener には付けた後に積んだ分だけが渡る
 //! - **durability 後**: 渡された record はディスクに fsync 済み。
 //!   listener crash → restart で `audit(AuditFilter { from_hlc: ..., .. })` で
 //!   resume できる
