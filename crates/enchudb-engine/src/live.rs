@@ -2541,6 +2541,15 @@ impl Exit<'_> {
         }
     }
 
+    /// 場所の (今の世代, 「死んでいる」 印) を 2 B の 1 回の読みで (`Raw` は (0, false))。
+    #[inline]
+    fn state_now(self, slot: u32) -> (u32, bool) {
+        match self {
+            Exit::Raw => (0, false),
+            Exit::App { gens, .. } => gens.state(slot),
+        }
+    }
+
     /// local (世代 | 場所) の eid (照合しない)。
     #[inline]
     pub(crate) fn eid_of_local(self, local: u32) -> EntityId {
@@ -6749,8 +6758,13 @@ fn touched_eids(eng: &crate::engine::Engine, peer: Exit<'_>, slots: &[u32], firs
     }
     let mut out = Vec::with_capacity(slots.len());
     for &e in slots {
-        let now = peer.gen_now(e);
-        let live = eng.slot_is_live(e);
+        // 世代と 「死んでいる」 印は同じ 2 B (1 回で読む)。 #1040: 消す道は 世代と死の印 (1 回の store) → 生きている印を下ろす →
+        // 解放の印 (`Registry::freed`、 `first` に入る) の順なので、 その間に poll すると、 生きている印は立ったまま世代はもう次の住人
+        // の物で、 消えた行の記録 (`first`) もまだ無い。 生きている印だけで 「生きている」 と読むと、 今の世代 (どの行でもない次の住人)
+        // の eid を出して消えた行の eid を出さず、 次の poll は解放の印だけで見直しの印が無い場所を回らないので、 アプリは消えた行を
+        // 外せなかった。 死の印のある場所は消えた行として出す (`Engine::last_local_of_slot` と同じ読み)
+        let (now, dead) = peer.state_now(e);
+        let live = !dead && eng.slot_is_live(e);
         match first.get(&e) {
             Some(&f) if f < now => {
                 for g in f..=now {

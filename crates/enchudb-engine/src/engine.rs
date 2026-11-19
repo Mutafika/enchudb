@@ -5375,6 +5375,39 @@ mod review038_d_tests {
         w.finish();
     }
 
+    /// #1040: 行を消す道 (`live_free`) が世代と死の印を書いた後・生きている印を下ろす前に見直しの購読を poll しても、 その poll か次の
+    /// poll の `touched` に、 アプリが持つ消えた行の eid が出る。 前はその poll が次の住人 (まだ居ない世代) の eid を出し、 次の poll は
+    /// 解放の印だけで見直しの印の無い場所を回らないので、 消えた行の eid はどこにも出なかった (アプリは会社 → 社員の表から外せない)。
+    #[test]
+    fn touched_polled_while_a_row_is_being_deleted_reports_the_eid_the_app_holds() {
+        let w = world("touchedgap");
+        let c0 = w.company_in(1);
+        let e = w.staff_of(c0);
+        let t = Arc::new(w.eng.subscribe_touched(w.tokyo()).unwrap());
+        assert_eq!(t.poll(&w.eng).added, vec![c0]);
+        assert_eq!(t.members(&w.eng, c0), vec![e], "前提: アプリは社員 e を持つ");
+        let slot = w.eng.slot_unchecked(e);
+        let wal = w.eng.oplog.as_ref().unwrap().clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (e2, t2) = (w.eng.clone(), t.clone());
+        free_gap_hook::set(&wal, move |_| {
+            // 消す書き手は世代と死の印を書いた後・生きている印を下ろす前。 別の thread が poll する
+            let midway = e2.generations().is_dead(slot) && e2.entities.is_live(slot);
+            let h = std::thread::spawn(move || t2.poll(&e2).touched);
+            tx.send((midway, h.join().unwrap())).unwrap();
+        });
+        w.eng.delete(e);
+        let (midway, gap) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("前提: 消す道の割り込み点を通った");
+        assert!(midway, "前提: 割り込み点は消す途中 (死の印あり・生きている印あり)");
+        let next = t.poll(&w.eng).touched;
+        assert!(
+            gap.contains(&e) || next.contains(&e),
+            "消す途中の poll と次の poll のどちらの touched にも、 アプリが持つ消えた行の eid {e:#x} が無い: 途中 {gap:x?} / 次 {next:x?}"
+        );
+        drop(t);
+        w.finish();
+    }
+
 }
 
 /// #1015: lock を取らない読みの入口 (`read_app_in`) の速い道の境目。 get の道 (`read_app_acquired` = 読んだ後の fence なし、 列の cell の
