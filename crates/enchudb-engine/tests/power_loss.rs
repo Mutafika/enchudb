@@ -5534,6 +5534,103 @@ fn a_restored_own_delete_missing_from_the_wal_is_relogged() {
     assert!(bridged.contains(&(x, tomb)), "WAL に無い X の Delete を作り直して配らない (差分で受ける peer に届かない): {bridged:x?}");
 }
 
+/// 0.38 前 review の B2 (review946c [E] の翻訳した行の形): 本体の書き出しの WAL の書き出しの後に A のアプリが C の行 F (受けた行) を
+/// 消して Y で場所を使い回し、 本体の書き出し (記録・生きている印・0 にした tomb.seg) が返った後・次の WAL の書き出しの前に電源が落ちる。
+/// 開いた A は記録から F の削除 (A が消した = 版数は A の時計) を戻し (`.eidmap` に残った写像 (C, f) → 場所を読む所の `prev_evicted`)、
+/// #451 の作り直しが F の Delete を WAL に載せて、 bridge が持ち主の世界番号 (C, f) 宛てに配る。
+///
+/// 前は作り直しに渡すのが自分の行の記録 (`PrevKind::Own`、 `restore_prev_resident`) だけで、 F の Delete は state にしか無かった (ホストを
+/// 置く形でホストが A の state を求めるのは A の floor がホストの cursor を越えた時だけ = 差分で受ける peer では F が生きたまま、 A でだけ
+/// 消えている)。
+///
+/// falsify: `.eidmap` を読む所の、 記録から戻した削除の作り直しへの渡しを外すと、 bridge が F の Delete を配らない。
+#[test]
+fn a_restored_delete_of_a_translated_row_missing_from_the_wal_is_relogged() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("prev_restored_relog_translated");
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let world_f = enchudb_oplog::make_eid(3, 7);
+    let (f, tomb) = {
+        let db = live.join("db");
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 2).unwrap();
+        eng.define_himo_in("t", "c", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        // 自分の行 W と C の行 F (受けた行) で表の枠 2 つを埋め、 W を消して X で使い回す (v15 にする)
+        let w = eng.entity_in("t").unwrap();
+        eng.tie_to(w, "t.c", 100u32);
+        let hid = eng.himo_id("t.c").unwrap() as u16;
+        let t = eng.resolve_remote_eid(world_f, hid).unwrap();
+        assert!(eng.remote_tie_apply_result(t, hid, 5u32, Hlc { wall: 1_000, logical: 0, peer: 3 }).applied());
+        eng.delete(w);
+        let x = eng.entity_in("t").unwrap();
+        assert_eq!(eng.eid_slot(x), eng.eid_slot(w), "前提: 使い回した (v15)");
+        eng.tie_to(x, "t.c", 1u32);
+        eng.oplog_commit();
+        eng.oplog_sync().unwrap();
+        eng.persist_sync_state().unwrap();
+        let f = eng.pull_raw("t.c", 5u32);
+        assert_eq!(f.len(), 1, "前提: A に F がある");
+        let f = f[0];
+        let _hold = eng.hold_consumer();
+        // WAL に書き出す物を置く (書き出しが走る)
+        eng.tie_to(x, "t.c", 2u32);
+        eng.oplog_commit();
+        let reused: Arc<std::sync::Mutex<Option<(u64, Hlc)>>> = Arc::new(std::sync::Mutex::new(None));
+        let shot = Arc::new(AtomicBool::new(false));
+        let (e2, r2, s2, l, i) = (eng.clone(), reused.clone(), shot.clone(), live.clone(), img.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::BeforeGate && r2.lock().unwrap().is_none() {
+                e2.delete(f);
+                e2.oplog_commit();
+                let tomb = e2.tombstone_hlc(f);
+                let y = e2.entity_in("t").unwrap();
+                e2.tie_to(y, "t.c", 9u32);
+                e2.oplog_commit();
+                *r2.lock().unwrap() = Some((y, tomb));
+            }
+            if p == Phase::WrittenOut && !s2.swap(true, Ordering::SeqCst) {
+                // 外した写像と退避した削除は `.eidmap` に届いていない (consumer の次の周期の前)
+                assert!(e2.eidmap_disk_diff().unwrap().is_some(), "前提: 外した写像は `.eidmap` に届いていない");
+                let _ = crashsim::capture(&l, &i, Mode::Lost);
+            }
+        })));
+        eng.oplog_sync().unwrap();
+        write_out_hook::set(None);
+        let (y, tomb) = reused.lock().unwrap().expect("前提: 書き出しの途中で使い回した");
+        assert_eq!(eng.eid_slot(y), eng.eid_slot(f), "前提: Y は F の場所を使い回した");
+        assert_eq!(tomb.peer, 1, "前提: F を消したのは A");
+        assert!(shot.load(Ordering::SeqCst), "前提: 本体の書き出しの後で撮った");
+        (f, tomb)
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    let alive = eng.is_live(f);
+    let ys = eng.pull_raw("t.c", 9u32).len();
+    let mapped = eng.resolve_remote_eid_existing(world_f);
+    let in_state = eng.state_records().0.iter().any(|r| matches!(r.op, DecodedOp::Delete { eid } if eid == world_f) && r.hlc == tomb);
+    let bridged = bridged_deletes(&eng);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(!alive && ys == 1, "前提: 像では F が消えて Y が生きている (本体が届いた): alive {alive}, Y {ys}");
+    assert_eq!(mapped, None, "前提: 開いた A で F の写像は戻らない");
+    assert!(in_state, "前提: 記録から F の削除を戻した (state に (C, f) 宛ての Delete がある)");
+    assert!(
+        bridged.contains(&(world_f, tomb)),
+        "WAL に無い F の Delete を作り直して (C, f) 宛てに配らない (差分で受ける peer に届かない): {bridged:x?}"
+    );
+}
+
 /// 像を開いて、 bridge が配る Delete (宛名, 版数) を返す (WAL の record を `_sync_ops` に写してから読む)。
 fn bridged_deletes(eng: &Engine) -> Vec<(u64, Hlc)> {
     eng.transfer_oplog_to_sync_ops();

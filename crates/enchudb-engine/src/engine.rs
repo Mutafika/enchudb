@@ -14902,8 +14902,11 @@ impl Engine {
                     // 落ちる前に場所を使い回して外した写像 (`prev.seg` の記録の前の住人がこの identity): 戻さず、 記録の削除の版数を
                     // identity に退避する (下の #925 の推測より先に、 記録で決める。 面の削除の版数が無い = 削除を書き出す前の面でも
                     // 決まる)。 名前の記録は `pktombs` / `pkformer` を読んだ後に移す
-                    if let Some(t) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
-                        let tomb = tomb.max(t);
+                    if let Some(rec) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
+                        // #1035: 記録から戻した削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (自分が消した受けた行。
+                        // `restore_prev_resident` と同じ。 前はこの道で戻した削除が state にしか入らず、 差分で受ける peer に届かなかった)
+                        eng.generations().prev.note_restored_delete(rec.gone, rec.tomb);
+                        let tomb = tomb.max(rec.tomb);
                         eng.remember_foreign_tombstone(peer, foreign_local, tomb);
                         stale_mappings.push((peer, foreign_local, local, tomb));
                         continue;
@@ -24616,7 +24619,7 @@ impl Engine {
     }
 
     /// `.eidmap` の写像の面 (`peer`, `foreign_local`) → 場所 `local` が、 落ちる前に場所を使い回した時に外した写像か: `prev.seg` の
-    /// 場所の記録の前の住人がその identity (翻訳した行) なら、 記録の削除の版数。 開く時 (`.eidmap` を読む所) だけ。
+    /// 場所の記録の前の住人がその identity (翻訳した行) なら、 その記録 (削除の版数と前の住人の行)。 開く時 (`.eidmap` を読む所) だけ。
     ///
     /// 記録は使い回した時にしか書かない (前の住人を消して、 写像を外して、 場所を次の行に渡した)。 記録の identity と面の identity が
     /// 同じで、 使い回しが本体に届いている (場所の最後の行が記録の行でない) なら、 面は使い回しの前の物 = 戻すと新しい住人がその
@@ -24637,7 +24640,7 @@ impl Engine {
         local: u32,
         peer: enchudb_oplog::PeerId,
         foreign_local: u32,
-    ) -> Option<enchudb_oplog::Hlc> {
+    ) -> Option<crate::prev_slots::PrevRecord> {
         let gens = self.generations();
         let mut found: Option<crate::prev_slots::PrevRecord> = None;
         let mut last: Option<u32> = None;
@@ -24651,7 +24654,7 @@ impl Engine {
                 found = Some(rec);
             }
         });
-        found.map(|r| r.tomb)
+        found
     }
 
     /// きれいに閉じなかった後に開いた時 (sidecar を読んだ後、 突き合わせと WAL の再生の前)、 `prev.seg` の記録で、 使い回しが
@@ -25095,11 +25098,10 @@ impl Engine {
         if !others.is_empty() {
             self.retreat_removed_keys(&others, rec.tomb);
         }
-        // review946c [E]: 戻した自分の行の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
-        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)
-        if rec.kind == crate::prev_slots::PrevKind::Own {
-            self.generations().prev.note_restored_own(rec.gone, rec.tomb);
-        }
+        // review946c [E]: 戻した前の住人の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
+        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)。 #1035: 翻訳した
+        // 行も (自分が消した受けた行。 作り直しは版数が自分の時計の物だけ載せ、 bridge は宛名を記録から引く)
+        self.generations().prev.note_restored_delete(rec.gone, rec.tomb);
         true
     }
 
@@ -34821,9 +34823,9 @@ impl Engine {
                 }
             }
         }
-        // review946c [E]: 開く時に `prev.seg` の記録から戻した自分の行の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
-        // 前の住人の番号で載せる (bridge は記録から自分の世界番号と引く)
-        for (gone, h) in self.generations().prev.take_restored_own() {
+        // review946c [E]: 開く時に `prev.seg` の記録から戻した前の住人の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
+        // 前の住人の番号で載せる (bridge は記録から自分の世界番号 / 翻訳した行の持ち主の世界番号 (#1035) と引く)
+        for (gone, h) in self.generations().prev.take_restored_deletes() {
             if unlogged(h) {
                 deletes.push((h, gone));
             }

@@ -313,9 +313,10 @@ pub(crate) struct PrevSlots {
     /// 開く時に読んだ記録 ((場所, 前の住人の行) の順、 記録の周期と。 log に残る全部と、 書き出していない周期の配列の件)。 WAL の
     /// 再生・bridge が、 場所ごとの配列で上書きされた前の住人 (同じ場所を 2 回使い回した 1 回目) も引く ([`Self::record_of`])
     replay: std::sync::Mutex<Vec<(u32, PrevRecord, u64)>>,
-    /// 開く時に記録から戻した自分の行の削除 (前の住人の行, 削除の版数)。 #451 の作り直しが WAL に無い Delete を載せる
-    /// ([`Self::take_restored_own`]、 review946c [E])
-    restored_own: std::sync::Mutex<Vec<(u32, Hlc)>>,
+    /// 開く時に記録から戻した前の住人の削除 (前の住人の行, 削除の版数)。 #451 の作り直しが WAL に無い Delete を載せる
+    /// ([`Self::take_restored_deletes`]、 review946c [E]。 #1035: 自分の行だけでなく翻訳した行も。 作り直しが載せるのは版数が自分の
+    /// 時計の物 = 自分が消した行だけ)
+    restored_deletes: std::sync::Mutex<Vec<(u32, Hlc)>>,
     /// 開く時に戻すかを WAL の再生の後に回した記録 (場所, 記録, 退避が書き出し済みか)。 review946d [N1]
     /// (`Engine::finish_prev_restores`)
     deferred: std::sync::Mutex<Vec<Deferred>>,
@@ -346,7 +347,7 @@ impl PrevSlots {
             restored: AtomicU32::new(0),
             log_full: AtomicU64::new(0),
             replay: std::sync::Mutex::new(Vec::new()),
-            restored_own: std::sync::Mutex::new(Vec::new()),
+            restored_deletes: std::sync::Mutex::new(Vec::new()),
             deferred: std::sync::Mutex::new(Vec::new()),
             open_hold: std::sync::atomic::AtomicBool::new(false),
             tomb_index: std::sync::Mutex::new(None),
@@ -501,15 +502,15 @@ impl PrevSlots {
         self.restored.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// 開く時に記録から自分の行 `gone` の削除 (版数 `tomb`) を戻した。
-    pub(crate) fn note_restored_own(&self, gone: u32, tomb: Hlc) {
-        self.restored_own.lock().unwrap_or_else(|p| p.into_inner()).push((gone, tomb));
+    /// 開く時に記録から前の住人の行 `gone` の削除 (版数 `tomb`) を戻した (自分の行・翻訳した行、 #1035)。
+    pub(crate) fn note_restored_delete(&self, gone: u32, tomb: Hlc) {
+        self.restored_deletes.lock().unwrap_or_else(|p| p.into_inner()).push((gone, tomb));
     }
 
-    /// 開く時に記録から戻した自分の行の削除 (取り出す)。 tomb.seg のなめと同じ (版数, 行) を含みうる (呼び手の #451 の作り直しが
+    /// 開く時に記録から戻した前の住人の削除 (取り出す)。 tomb.seg のなめと同じ (版数, 行) を含みうる (呼び手の #451 の作り直しが
     /// 重ねを落とす、 review946d [N2])。
-    pub(crate) fn take_restored_own(&self) -> Vec<(u32, Hlc)> {
-        std::mem::take(&mut *self.restored_own.lock().unwrap_or_else(|p| p.into_inner()))
+    pub(crate) fn take_restored_deletes(&self) -> Vec<(u32, Hlc)> {
+        std::mem::take(&mut *self.restored_deletes.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// 開く時に戻すかを WAL の再生の後に回す (review946d [N1])。 外す別名は戻す時に世代で決める (#993 / #994。 前は再生の前の場所の
