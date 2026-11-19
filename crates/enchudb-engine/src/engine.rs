@@ -26571,7 +26571,8 @@ impl Engine {
     /// [`Self::read_app`] の、 `f` が列の cell を Acquire の load で読む時 (`HimoStore::get_value_inline`、 #106) の版。 読んだ後の照合の
     /// 前の fence を省く: cell の Acquire の load が、 その cell を書いた (使い回した後の住人の) 書き手の Release と対になるので、 使い
     /// 回した後の値を読んだ読みは、 後の照合で消した側の世代の書きを必ず見る (fence と同じ順)。 #1015: fence を省くと get 1 回が
-    /// 0.5〜0.6 ns 速い (M4 Max、 100 万行)。
+    /// 0.5〜0.6 ns 速い (M4 Max、 100 万行)。 #1041: eid の並びを受ける集計のうち `get_value` / `get_value32` (同じ Acquire の
+    /// `value_at`) で読む物もこの版 (列の生の並び `stored_slice` を読む物は fence のある [`Self::read_app`])。
     #[inline]
     fn read_app_acquired<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
         self.read_app_in::<false, R>(eid, f)
@@ -31627,7 +31628,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut total: u64 = 0;
         for &eid in eids {
-            if let Some(v) = self.read_app(eid, |l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 total += v as u64;
             }
         }
@@ -32314,7 +32315,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = self.read_app(eid, |l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 result = Some(result.map_or(v, |cur: u32| cur.min(v)));
             }
         }
@@ -32327,7 +32328,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = self.read_app(eid, |l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 result = Some(result.map_or(v, |cur: u32| cur.max(v)));
             }
         }
@@ -32341,7 +32342,7 @@ impl Engine {
         let mut total: u64 = 0;
         let mut count: u64 = 0;
         for &eid in eids {
-            if let Some(v) = self.read_app(eid, |l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 total += v as u64;
                 count += 1;
             }
@@ -32355,7 +32356,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut n: u32 = 0;
         for &eid in eids {
-            if self.read_app(eid, |l| hs.get_value(l)).is_some() { n += 1; }
+            if self.read_app_acquired(eid, |l| hs.get_value(l)).is_some() { n += 1; }
         }
         n
     }
@@ -32376,7 +32377,7 @@ impl Engine {
             let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -32393,7 +32394,7 @@ impl Engine {
             let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
                     *map.entry(group).or_insert(0) += val as u64;
                 }
             }
@@ -32465,7 +32466,7 @@ impl Engine {
             let mut counts: Vec<u32> = vec![0; cap];
             let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                if let Some(group) = self.read_app(eid, |l| gs.get_value32(l)) {
+                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
                     match counts.get_mut(group as usize) {
                         Some(c) => *c += 1,
                         None => *spill.entry(group).or_insert(0) += 1,
@@ -32478,7 +32479,7 @@ impl Engine {
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                if let Some(group) = self.read_app(eid, |l| gs.get_value32(l)) {
+                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
                     *map.entry(group).or_insert(0) += 1;
                 }
             }
@@ -32498,7 +32499,7 @@ impl Engine {
             let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         if val < mins[i] { mins[i] = val; }
@@ -32516,7 +32517,7 @@ impl Engine {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let entry = map.entry(group).or_insert(u32::MAX);
                     if val < *entry { *entry = val; }
                 }
@@ -32537,7 +32538,7 @@ impl Engine {
             let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         if val > maxs[i] { maxs[i] = val; }
@@ -32555,7 +32556,7 @@ impl Engine {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let entry = map.entry(group).or_insert(0);
                     if val > *entry { *entry = val; }
                 }
@@ -32576,7 +32577,7 @@ impl Engine {
             let mut spill: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -32595,7 +32596,7 @@ impl Engine {
             let mut acc: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
             for &eid in eids {
                 // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let e = acc.entry(group).or_insert((0, 0));
                     e.0 += val as u64;
                     e.1 += 1;
@@ -32655,7 +32656,7 @@ impl Engine {
         let mut result: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for &eid in eids {
-            if let Some(v) = self.read_app(eid, |l| hs.get_value32(l))
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l))
                 && seen.insert(v)
             {
                 result.push(v);
@@ -33145,19 +33146,19 @@ impl Engine {
     pub fn sum64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u128 {
         let Some(hid) = self.himo_id(himo) else { return 0 };
         let hs = &self.himos[hid];
-        eids.iter().filter_map(|&e| self.read_app(e, |l| hs.get_value(l))).map(|v| v as u128).sum()
+        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).map(|v| v as u128).sum()
     }
 
     /// 64 bit の最小値 (どの列でも)。
     pub fn min64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
         let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.read_app(e, |l| hs.get_value(l))).min()
+        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).min()
     }
 
     /// 64 bit の最大値 (どの列でも)。
     pub fn max64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
         let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.read_app(e, |l| hs.get_value(l))).max()
+        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).max()
     }
 
     /// eid の範囲 `lo..hi` での 64 bit の (件数, 合計, 最小, 最大) (table の全 row の集計用、 どの列でも)。

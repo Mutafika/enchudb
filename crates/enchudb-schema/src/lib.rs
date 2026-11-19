@@ -1059,10 +1059,11 @@ impl Database {
         if !self.eng.is_readonly() {
             for (cn, _, _) in new_cols {
                 validate_column_name(cn)?;
-                if let Some(to) = ref_target_of(cn) {
-                    if to != tname && self.find_table_inner(to).is_none() {
-                        return Err(SchemaError::UnknownTable(to.to_string()));
-                    }
+                if let Some(to) = ref_target_of(cn)
+                    && to != tname
+                    && self.find_table_inner(to).is_none()
+                {
+                    return Err(SchemaError::UnknownTable(to.to_string()));
                 }
             }
             if new_cols.iter().any(|(cn, _, _)| ref_target_of(cn).is_some()) && self.engine_mut().is_none() {
