@@ -3833,6 +3833,26 @@ mod revive_gap_hook {
     }
 }
 
+/// test 用の割り込み点 (#1041 の読み直し B): アプリの eid を照合した後・場所を読む前 (`app_slot` が場所を返す所と、 `read_app_in` が
+/// `f` を呼ぶ前)。 照合を読む前にだけする読み (`app_slot` → 読む) と、 読んだ後にも照合する読み (`read_app`) のどちらも通る。 置いた
+/// thread で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod checked_read_hook {
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 /// test 用の割り込み点 (#1041): copy で読む text の本体 (`text_owned_by_id`、 `get_text_owned` / `get_content_owned` / `get_entity_owned`)
 /// が列を読む前。 置いた thread で 1 回だけ呼ぶ (読みの入口の照合の後・読んだ後の照合の前に、 行を消して場所を使い回すため)。
 #[cfg(test)]
@@ -5552,6 +5572,55 @@ mod review038_d_tests {
         );
         drop(t);
         w.finish();
+    }
+
+    /// #1041 の読み直し B: eid の並びを受ける集計も、 照合の後・列を読む前に行が消えて場所が使い回され、 新しい住人が書いても、 古い
+    /// eid の値として新しい住人の値を数えない (消えた行 = 何も数えない)。 前は照合を読む前にだけしたので、 新しい住人の値を数えた。
+    /// 代表: `sum` / `group_sum` / `count` / `min64` (列の cell を Acquire で読む `read_app_acquired` の道) と `histogram_eids` (列の生の
+    /// 並びを読む `read_app` の道)。 `*_eids_par` は数が閾値より少ないと同じ順の版に落ちる (並列の版の割り込み点は rayon の worker に
+    /// 置けない)。
+    #[test]
+    fn aggregates_over_a_row_deleted_and_reused_meanwhile_count_nothing() {
+        for which in ["sum", "group_sum", "count", "min64", "histogram_eids", "sum_eids_par"] {
+            let w = world("aggregates");
+            let a = w.s_row;
+            let id = |n: &str| w.eng.himo_id(n).unwrap() as u16;
+            let (sa, sg, sw) = (id("s.a"), id("s.g"), id("s.w"));
+            w.eng.tie_to_by_id(a, sa, 7u32);
+            w.eng.tie_to_by_id(a, sg, 3u32);
+            w.eng.tie_to_by_id(a, sw, 70u64);
+            assert_eq!(w.eng.sum("s.a", &[a]), 7, "前提");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let e2 = w.eng.clone();
+            checked_read_hook::set(move || {
+                // 照合の後・列を読む前に、 a を消して同じ場所を使い回し (枠 1 の表)、 新しい住人 b が同じ列に書く
+                e2.delete(a);
+                let b = e2.entity_in("s").unwrap();
+                assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(a), "前提: 同じ場所を使い回した");
+                e2.tie_to_by_id(b, sa, 8u32);
+                e2.tie_to_by_id(b, sg, 4u32);
+                e2.tie_to_by_id(b, sw, 80u64);
+                tx.send(()).unwrap();
+            });
+            let got = match which {
+                "sum" => format!("{}", w.eng.sum("s.a", &[a])),
+                "group_sum" => format!("{:?}", w.eng.group_sum("s.g", "s.a", &[a])),
+                "count" => format!("{}", w.eng.count("s.a", &[a])),
+                "min64" => format!("{:?}", w.eng.min64("s.w", &[a])),
+                "histogram_eids" => format!("{:?}", w.eng.histogram_eids("s.a", &[a], 0, 9, 10)),
+                "sum_eids_par" => format!("{}", w.eng.sum_eids_par("s.a", &[a])),
+                _ => unreachable!(),
+            };
+            rx.try_recv().unwrap_or_else(|_| panic!("{which}: 前提: 割り込み点で使い回した"));
+            let want = match which {
+                "group_sum" => "[]".to_string(),
+                "min64" => "None".to_string(),
+                "histogram_eids" => format!("{:?}", vec![0u32; 10]),
+                _ => "0".to_string(),
+            };
+            assert_eq!(got, want, "{which}: 読みの間に消えて使い回された行の値 (新しい住人の値) を数えた");
+            w.finish();
+        }
     }
 
 }
@@ -26639,8 +26708,13 @@ impl Engine {
             self.app_slot_wide(local)?
         };
         if self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed) && enchudb_oplog::eid_peer(eid) == self.peer_id() {
-            return Some(self.forward_local_slow(slot));
+            let slot = self.forward_local_slow(slot);
+            #[cfg(test)]
+            checked_read_hook::call();
+            return Some(slot);
         }
+        #[cfg(test)]
+        checked_read_hook::call();
         Some(slot)
     }
 
@@ -26723,6 +26797,8 @@ impl Engine {
                 },
             }
         };
+        #[cfg(test)]
+        checked_read_hook::call();
         let out = f(slot);
         // 読んだ後の照合の load は全部 `f` の後: `FENCE` の道はここで fence を置き、 そうでなければ `f` の cell の Acquire が順を付ける
         // (#1020 の読み直し C: 前は世代を持たない道の読み直しだけ fence の無いまま場所の bit を Acquire で読んでいた。 Acquire の load は
