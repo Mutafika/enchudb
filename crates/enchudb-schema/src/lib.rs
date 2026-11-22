@@ -1069,6 +1069,19 @@ impl Database {
             if new_cols.iter().any(|(cn, _, _)| ref_target_of(cn).is_some()) && self.engine_mut().is_none() {
                 return Err(ref_column_needs_exclusive_engine());
             }
+            // 紐の上限 (engine の `define_himo_slot_locked` の 「too many himos」) も数えられるので先に見る。 先に確かめられない断り
+            // (紐名の辞書を伸ばせない・segment を作れない I/O・`define_ref_in` の Err・並んで紐を足す別の書き手) は残る
+            let fresh = new_cols
+                .iter()
+                .filter(|(cn, _, _)| self.eng.himo_id(&format!("{tname}.{cn}")).is_none())
+                .count();
+            let room = self.eng.himo_room();
+            if fresh > room {
+                return Err(SchemaError::Internal(format!(
+                    "table {tname}: the redeclaration adds {fresh} columns but only {room} more himos fit \
+                     (max_himos) — nothing was added. create the DB with a larger GrowableOptions {{ max_himos, .. }}"
+                )));
+            }
         }
         let mut changed = false;
         for (cn, ct, card) in new_cols {

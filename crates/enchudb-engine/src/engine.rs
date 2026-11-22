@@ -22870,6 +22870,12 @@ impl Engine {
         self.himo_names.len()
     }
 
+    /// あと何本の紐を足せるか (`max_himos` と紐の番号の上限 (u16) まで)。 schema の再宣言が、 列を足す前に断るかを決めるのに使う
+    /// (#1044)。 並んで紐を足す書き手が居れば、 返った後に減りうる。
+    pub fn himo_room(&self) -> usize {
+        (self.max_himos as usize).min(u16::MAX as usize).saturating_sub(self.himos.len())
+    }
+
     /// 0.8.7: index 直で himo の full name (= `{table}.{col}` or anonymous) を返す。
     pub fn himo_name_at(&self, idx: usize) -> Option<&str> {
         self.himo_names.get(idx).map(|s| s.as_str())

@@ -103,3 +103,33 @@ fn the_build_phase_adds_both_columns() {
     let db = Database::open(&path).unwrap();
     assert_eq!(columns(&db, "kv"), ["id", "v", "n", "owner"]);
 }
+
+/// 紐の上限 (`max_himos`) で engine が断る列も、 1 列も足す前に断る (残りの紐の数は前もって数えられる)。 前は残りの本数まで列を足して
+/// 次の列で engine の 「too many himos」 を返し、 前の列が半端に残った (build phase の DB では Drop が `.schema` に書いた)。
+#[test]
+fn a_redeclaration_past_the_himo_limit_adds_no_column() {
+    use enchudb_schema::GrowableOptions;
+    let path = tmp("himolimit");
+    let _c = Cleanup(path.clone());
+    {
+        let mut db = Database::create_growable_with(&path, GrowableOptions { max_himos: 8, ..Default::default() }).unwrap();
+        db.table("kv").number("id").number("v").primary_key("id").build().unwrap();
+    }
+    let room = {
+        let mut db = Database::open(&path).unwrap();
+        let room = db.engine().himo_room();
+        assert!(room >= 1, "前提: まだ紐を足せる ({room})");
+        let mut t = db.table("kv").number("id").number("v");
+        for i in 0..=room {
+            t = t.number(&format!("n{i}"));
+        }
+        let built = t.primary_key("id").build().map(|_| ());
+        assert!(matches!(built, Err(SchemaError::Internal(_))), "前提: 紐の上限を越える再宣言は断る ({built:?})");
+        assert_eq!(columns(&db, "kv"), ["id", "v"], "断った再宣言の前の列が memory の表にできた");
+        assert_eq!(db.engine().himo_room(), room, "断った再宣言の前の列の紐が engine にできた");
+        room
+    };
+    let db = Database::open(&path).unwrap();
+    assert_eq!(columns(&db, "kv"), ["id", "v"], "断った再宣言の前の列が .schema に書かれた");
+    assert_eq!(db.engine().himo_room(), room);
+}
