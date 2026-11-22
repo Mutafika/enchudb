@@ -19984,7 +19984,18 @@ impl Engine {
     /// 伸ばせない時と同じ棚)。 `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は前者を
     /// `SchemaError::WriteRejected(TieRejected::Fault(DiskSpace))` にする。
     pub fn try_entity_in(&self, table_name: &str) -> Result<enchudb_oplog::EntityId, (Option<FaultKind>, String)> {
-        self.entity_in_with(table_name, false).map_err(|e| match e {
+        self.try_entity_in_row(table_name).map(|(eid, _)| eid)
+    }
+
+    /// [`Self::try_entity_in`] の、 払い出した行の lock ([`Self::write_row`] と同じ) を握ったまま返す形 (review038 の A1)。 払い出しの道は
+    /// 場所の行を握ってから生かすので、 続けて行の列を書く呼び手 (schema の insert) は握り直さずにこの lock の下で書ける (握り直すまでの間に、
+    /// 出口 (`entities()`) で新しい行を見た書き手が消す窓も無い)。 予約の表 (`_` で始まる) の行は握らない (`None`、 要るなら
+    /// [`Self::write_row`])。
+    pub fn try_entity_in_row(
+        &self,
+        table_name: &str,
+    ) -> Result<(enchudb_oplog::EntityId, Option<crate::row_lock::RowWrite<'_>>), (Option<FaultKind>, String)> {
+        self.entity_in_held(table_name, false).map_err(|e| match e {
             // 待つ形 (`nowait` が偽) は返さない
             EntityInError::Busy(slot) => (None, format!("table '{table_name}': slot {slot} is held by a writer")),
             EntityInError::Space(why) => (Some(FaultKind::DiskSpace), why),
@@ -19995,6 +20006,16 @@ impl Engine {
     /// [`Self::entity_in`] の中身。 `nowait` なら、 空きの一覧の場所が全部 (行を握れずに) 握られていた時に探し直さず `Busy(場所)`
     /// を返す (#974: 受信の払い出しは `alloc_lock` を握っているので、 放してから待つ。 [`Self::wait_busy_slot`])。
     fn entity_in_with(&self, table_name: &str, nowait: bool) -> Result<enchudb_oplog::EntityId, EntityInError> {
+        self.entity_in_held(table_name, nowait).map(|(eid, _)| eid)
+    }
+
+    /// [`Self::entity_in_with`] の、 払い出した行の lock を握ったまま返す形 (review038 の A1: 払い出しの道は場所の行を握ってから生かし、
+    /// eid を作るまで握る。 予約の表の行は握らない = `None`)。
+    fn entity_in_held(
+        &self,
+        table_name: &str,
+        nowait: bool,
+    ) -> Result<(enchudb_oplog::EntityId, Option<crate::row_lock::RowWrite<'_>>), EntityInError> {
         use std::sync::atomic::Ordering;
         self.check_writable();
         if table_name.is_empty() {
@@ -20160,8 +20181,7 @@ impl Engine {
                     if !table.is_reserved() {
                         self.drop_leftover_cells(global, tid);
                     }
-                    drop(row);
-                    return Ok(eid);
+                    return Ok((eid, row));
                 }
                 drop(fl);
                 if no_room_only {
@@ -20195,7 +20215,7 @@ impl Engine {
         // もう一度払い出す。 その前でも、 穴の無い時に足す extent を伸びた分まで大きくした (回した回数の分の eid 空間を取る)
         let exhausted = table.global_of(table.next_local.load(Ordering::Acquire)).is_none();
         if exhausted && self.rebuild_free_locals(tid) {
-            return self.entity_in_with(table_name, nowait);
+            return self.entity_in_held(table_name, nowait);
         }
         // capacity check (= fetch_add 後の変換で extent の外なら枯渇)
         let cur = table.next_local.fetch_add(1, Ordering::AcqRel);
@@ -20212,7 +20232,7 @@ impl Engine {
                 if !exhausted && self.rebuild_free_locals(tid) {
                     // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
                     // 再構築後も枯渇なら fl が空のままなので次は grow / Err に落ちる。
-                    return self.entity_in_with(table_name, nowait);
+                    return self.entity_in_held(table_name, nowait);
                 }
                 // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
                 match self.grow_table_extent_for(tid, cur) {
@@ -20255,7 +20275,7 @@ impl Engine {
         // 渡さない (A1、 突き合わせの 2. が払い出し位置の先の世代 > 0 の場所を完了させた時。 同じ 2 B の読み。 飛ばした場所は払い出し位置の
         // 手前の穴になり、 後始末が届いた後に一覧の作り直しが拾う)
         if self.generations().used_up(global) || self.generations().pending_mark(global) {
-            return self.entity_in_with(table_name, nowait);
+            return self.entity_in_held(table_name, nowait);
         }
         // #970 (案 P): 生かす前に、 場所の世代を書く gen.seg の page を commit 済みにする (普段は atomic の load 1 回、 page をまたぐ時
         // だけ伸ばす)。 commit は縮まないので、 この行を消す時の kill は空きの不足で落ちない。 できなければ払い出し位置を戻して断る
@@ -20302,7 +20322,7 @@ impl Engine {
                         return Err(EntityInError::Busy(skip));
                     }
                     // この thread がユーザの行を握っている (待つと、 その行を待つ書き手と互いを待ちうる): この場所は穴にして次へ
-                    return self.entity_in_with(table_name, nowait);
+                    return self.entity_in_held(table_name, nowait);
                 }
             }
         };
@@ -20310,7 +20330,7 @@ impl Engine {
         // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す
         if self.entities.allocate_at(global) {
             drop(row);
-            return self.entity_in_with(table_name, nowait);
+            return self.entity_in_held(table_name, nowait);
         }
         #[cfg(test)]
         if let Some(wal) = self.oplog.as_ref() {
@@ -20318,8 +20338,7 @@ impl Engine {
         }
         self.settle_claim(global);
         let eid = self.eid_of_slot(global); // #731: 今の世代を付ける
-        drop(row);
-        Ok(eid)
+        Ok((eid, row))
     }
 
     /// review038 の A1: 払い出す場所 `slot` の行を握る (生きている印を立てる前に。 eid を作るまで握る)。 待たずに握れなければ、 待って

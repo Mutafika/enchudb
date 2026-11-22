@@ -2308,14 +2308,15 @@ impl<'a> RowBuilder<'a> {
         let names = name_set.into_iter().filter(|_| target_eid.is_none());
         let resolved = names.chain(resolved.filter(move |(c, _)| !is_name(c)));
 
-        let eid = match target_eid {
-            Some(e) => e,
+        let (eid, held) = match target_eid {
+            Some(e) => (e, None),
             None => {
                 // 0.7.0: 各 table 内の eid_range から払出。 entity_in は &self で
                 // 動く (next_local は AtomicU32、 CAS で並行 safe)。
                 // #970 (PR #977 の読み直し 4 の [9]): 場所の世代を書く gen.seg を伸ばせない (ディスクの空き) 断りは、 列を伸ばせない
                 // 時と同じ `WriteRejected(Fault(DiskSpace))`
-                eng.try_entity_in(&self.table.name).map_err(|(fault, e)| match fault {
+                // review038 の A1 (#1037): 払い出しは新しい行の lock を握って返す (握り直さずにその下で列を書く)
+                eng.try_entity_in_row(&self.table.name).map_err(|(fault, e)| match fault {
                     Some(k) => SchemaError::WriteRejected(enchudb_engine::TieRejected::Fault(k)),
                     None => SchemaError::Internal(format!("entity_in({}) failed: {e}", self.table.name)),
                 })?
@@ -2325,10 +2326,12 @@ impl<'a> RowBuilder<'a> {
         // 個別 row への marker tie は不要。 query 側も marker cond なしで
         // 当該 table の column を持つ entity のみ取れる。
 
-        // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)。 当たった行は上で握った lock のまま
-        let _row = match target {
-            Some((_, row)) => row,
-            None => eng.write_row(eid),
+        // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)。 当たった行は上で握った lock のまま、 新しい行は
+        // 払い出しが握った lock のまま (予約の表の行は握って返らないので握る)
+        let _row = match (target, held) {
+            (Some((_, row)), _) => row,
+            (None, Some(row)) => row,
+            (None, None) => eng.write_row(eid),
         };
         for (cd, v) in resolved {
             if let Err(e) = tie_value(eng, eid, cd, v) {
