@@ -27981,11 +27981,11 @@ impl Engine {
                     // 今の住人を指さない)
                     return Ok(Some(foreign_value));
                 };
+                let to = self.forward_local(slot);
                 #[cfg(test)]
                 if let Some(wal) = self.oplog.as_ref() {
                     resolved_row_hook::call(wal);
                 }
-                let to = self.forward_local(slot);
                 if to == slot {
                     // 畳んでいない行は確かめた番号そのもの (`own_world_slot` は場所の最後の行がこの番号の時だけ返す。 場所を読み直すと、
                     // 確かめた後に消えて使い回した新しい行を指す)
@@ -46088,6 +46088,67 @@ mod remote_row_tests {
         let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
         assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
         assert_eq!(value, Ok(Some(enchudb_oplog::eid_local(x))), "X を指す Ref の値が、 確かめた後に場所を使い回した Y を指した");
+    }
+
+    /// `ref_engine` の DB を v15 にし、 自分の行 X を自分の行 K に畳む (#612、 X の世界番号は K の別名)。 (X, K) を返す。
+    fn folded_own_row(eng: &Arc<Engine>) -> (u64, u64) {
+        let a = eng.entity_in("t").unwrap();
+        eng.delete(a);
+        let x = eng.entity_in("t").unwrap();
+        assert_ne!(x, a, "前提: 場所を使い回して v15 に移った");
+        eng.tie_to(x, "t.v", 1u32);
+        let k = eng.entity_in("t").unwrap();
+        eng.tie_to(k, "t.v", 2u32);
+        eng.merge_entity_into(x, k).expect("前提: X を K に畳んだ");
+        (x, k)
+    }
+
+    /// 割り込み点で K を消して、 K の場所を新しい行 W (v = 7) に使い回させる (畳んだ X の場所は使い回さない)。 W の eid を返す入れ物。
+    fn reuse_fold_target_in_hook(eng: &Arc<Engine>, k: u64) -> Arc<Mutex<Option<u64>>> {
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            e.delete(k);
+            let w = e.entity_in("t").unwrap();
+            e.tie_to(w, "t.v", 7u32);
+            *m.lock().unwrap() = Some(w);
+        });
+        made
+    }
+
+    /// #1034 の読み直し [F2] (畳んだ自分の行の枝): 受信の Delete (畳んだ自分の行 X の世界番号宛て = 畳んだ先 K に当たる) を引いた後・
+    /// 世代を読む前に、 アプリが K を消して K の場所を W が使い回す。 W は残る (`remote_row_of` の畳んだ先を読む枝の引き直し)。
+    ///
+    /// falsify: `remote_row_of` の写像 (畳んだ先) の引き直しを外すと、 W が消える。
+    #[test]
+    fn f2_a_delete_of_a_folded_own_row_resolved_before_its_target_is_reused_does_not_delete_the_new_row() {
+        let (_rm, eng, _r) = ref_engine("f2del");
+        let (x, k) = folded_own_row(&eng);
+        assert_eq!(eng.resolve_remote_eid_existing(x).map(|e| slot(e)), Some(slot(k)), "前提: X の世界番号は K に当たる");
+        let made = reuse_fold_target_in_hook(&eng, k);
+        let later = enchudb_oplog::Hlc { wall: eng.cell_hlc(k, eng.himo_id("t.v").unwrap() as u16).wall + 10_000_000_000, logical: 0, peer: 2 };
+        let _ = eng.remote_delete_apply_foreign_result(x, later);
+        let w = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(w), slot(k), "前提: W は K の場所を使い回した");
+        assert!(eng.is_live(w), "畳んだ X 宛ての Delete が、 畳んだ先 K の場所を使い回した W を消した");
+        assert_eq!(eng.get(w, "t.v"), Some(7));
+    }
+
+    /// #1034 の読み直し [F2] (Ref の値の畳んだ自分の行の枝): 受信の Ref の値 (畳んだ自分の行 X を指す) の畳んだ先 K を引いた後・K の場所の
+    /// 最後の行を読む前に、 アプリが K を消して K の場所を W が使い回す。 値は W を指さない。
+    ///
+    /// falsify: `try_resolve_remote_ref_value` の畳んだ先の引き直し (`forward_local(slot) == to`) を外すと、 値が W になる。
+    #[test]
+    fn f2_a_ref_value_to_a_folded_own_row_resolved_before_its_target_is_reused_does_not_point_at_the_new_row() {
+        let (_rm, eng, r) = ref_engine("f2ref");
+        let (x, k) = folded_own_row(&eng);
+        let made = reuse_fold_target_in_hook(&eng, k);
+        let value = eng.try_resolve_remote_ref_value(1, enchudb_oplog::eid_local(x), r);
+        let w = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(w), slot(k), "前提: W は K の場所を使い回した");
+        let value = value.expect("前提: 払い出せた").expect("前提: 的の表がある");
+        assert_ne!(value, enchudb_oplog::eid_local(w), "畳んだ X を指す Ref の値が、 畳んだ先を引いた後に場所を使い回した W を指した");
     }
 }
 
