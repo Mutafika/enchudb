@@ -196,6 +196,10 @@ fn wait_slot(flag: &std::sync::atomic::AtomicU8) {
         }
     }
 }
+/// #1042: `Vocabulary::acquire` が、 取られている最中 (`CLAIMED`) の場所の番号で、 取った側が決めるのを待つ上限。 越えたら false
+/// (#1042 の前と同じ断り)。
+const ACQUIRE_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// index header の中の今の表 (`Gen`) の位置 (8 byte、 atomic)。
 const GEN_OFF: usize = 8;
 /// 最初の表の slot 数 (13 KB)。
@@ -955,10 +959,14 @@ impl Vocabulary {
     /// 回収が無効なら常に true。
     ///
     /// 場所が取られている最中 (`CLAIMED`) なら、 取った側が決めるまで待つ (#1042)。 取った側は、 書き出しを待つ場所 (#708) なら
-    /// 参照 0 に戻し、 回収するなら世代を進めてから参照を戻す (どちらも lock も I/O の待ちも無い短い間)。 戻した後は今まで通り取り、
-    /// 回収された後は世代が合わずに false。 前は `CLAIMED` を見たら false を返したので、 #708 で入った 「取りかけて戻す」 間 (と、
-    /// data の上限 / 空き不足で取った場所を使えずに戻す `unclaim` の間) に、 まだ生きている語の番号での正しい書き込みが
-    /// `StaleValue` で断られた。
+    /// 参照 0 に戻し (`claim`、 待ち行列の Mutex を持ったまま)、 回収するなら data を書いて世代を進めてから参照を戻す (`fill_claimed`、
+    /// data の commit を伸ばす `ensure_committed` = 伸ばす lock と file の長さの syscall を通りうる)。 どちらも行の lock など書き手が持つ
+    /// lock は取らない。 戻した後は今まで通り取り、 回収された後は世代が合わずに false。 前は `CLAIMED` を見たら false を返したので、
+    /// #708 で入った 「取りかけて戻す」 間 (と、 data の上限 / 空き不足で取った場所を使えずに戻す `unclaim` の間) に、 まだ生きている
+    /// 語の番号での正しい書き込みが `StaleValue` で断られた。
+    ///
+    /// 待つのは [`ACQUIRE_CLAIM_WAIT`] まで。 越えたら前と同じく false (取った側が CLAIMED のまま戻らない形 = panic で残した場所を
+    /// 開き直した後に参照数を信じた時など、 で書き手が止まり続けないため。 普段の取りかけは µs 未満)。
     pub fn acquire(&self, vid: u32) -> bool {
         let Some(r) = self.reclaim.get() else { return true };
         let slot = vid_slot(vid);
@@ -968,6 +976,7 @@ impl Vocabulary {
         let Some(c) = r.refs.at(slot) else { return false };
         let mut cur = c.load(Ordering::Acquire);
         let mut spins = 0u32;
+        let mut since: Option<std::time::Instant> = None;
         loop {
             if cur == CLAIMED {
                 // 取った側が決めた後に回収されていれば (世代が進んだ) 待たずに断る
@@ -977,6 +986,11 @@ impl Vocabulary {
                 if spins < 64 {
                     std::hint::spin_loop();
                 } else {
+                    // 時計は spin の後だけ読む (普段の取りかけは spin の間に解ける)
+                    let t = *since.get_or_insert_with(std::time::Instant::now);
+                    if t.elapsed() > ACQUIRE_CLAIM_WAIT {
+                        return false;
+                    }
                     std::thread::yield_now();
                 }
                 spins = spins.saturating_add(1);
@@ -2250,8 +2264,8 @@ mod tests {
     /// #1042: 新しい語を足す書き手が待ち行列の古い entry で場所を取りかけて (参照 0 → CLAIMED)、 書き出しを待つ印を見て戻す間に、
     /// 別の書き手がその場所の生きている語の番号を取る (`acquire`) と、 取れる (取った側が戻すまで待つ)。 前は CLAIMED を見て false を
     /// 返したので、 回収されていない正しい番号の書き込みが `StaleValue` で断られた。 取りかけた側は割り込み点で止め、 番号を取る側が
-    /// 返るか (前の形) 300 ms 待つ (直した形: 取った側が戻すまで待っている) まで止めてから続ける (時間は答えを決めない: どちらでも最後に
-    /// 取れたかを見る)。
+    /// 返るか (前の形) 100 ms 待つ (直した形: 取った側が戻すまで待っている) まで止めてから続ける (時間は答えを決めない: どちらでも最後に
+    /// 取れたかを見る。 100 ms は待ちの上限 `ACQUIRE_CLAIM_WAIT` より十分短い)。
     #[test]
     fn acquire_while_a_claim_backs_off_takes_the_live_word() {
         use std::sync::mpsc;
@@ -2271,10 +2285,10 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         AFTER_CLAIM_CAS.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
-                // 取りかけた (CLAIMED) 所で止まり、 番号を取る側が取り終える (前の形) か 300 ms たつまで戻さない
+                // 取りかけた (CLAIMED) 所で止まり、 番号を取る側が取り終える (前の形) か 100 ms たつまで戻さない
                 claimed_tx.send(()).unwrap();
                 started_rx.recv().unwrap();
-                let _ = done_rx.recv_timeout(std::time::Duration::from_millis(300));
+                let _ = done_rx.recv_timeout(std::time::Duration::from_millis(100));
             }))
         });
         let vr = &v;
@@ -2292,6 +2306,48 @@ mod tests {
         });
         assert!(took, "取りかけて戻す間に、 回収されていない語の番号を取れなかった (書き込みが StaleValue で断られる)");
         assert_eq!(v.get_checked(a), Some(&b"alpha"[..]), "前提: 語は回収されていない");
+        v.release(a);
+    }
+
+    /// #1042 の読み直し D: 取った側が CLAIMED のまま戻らなければ、 `acquire` は上限 (`ACQUIRE_CLAIM_WAIT`) まで待って false を返す
+    /// (書き手が止まり続けない)。 取りかけた側は割り込み点で、 番号を取る側が返るまで戻さない。
+    #[test]
+    fn acquire_gives_up_on_a_claim_that_never_backs_off() {
+        use std::sync::mpsc;
+        let (_r, v) = reclaiming(64);
+        v.defer_reuse();
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.finish_refs();
+        v.release(a);
+        let t = v.durable_begin();
+        v.durable_end(t);
+        assert!(v.acquire(a));
+        v.release(a);
+        let (claimed_tx, claimed_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        AFTER_CLAIM_CAS.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                claimed_tx.send(()).unwrap();
+                // 番号を取る側が返るまで戻さない (上限の 10 倍で前提の崩れとして放す)
+                let _ = done_rx.recv_timeout(ACQUIRE_CLAIM_WAIT * 10);
+            }))
+        });
+        let vr = &v;
+        let (took, waited) = std::thread::scope(|sc| {
+            let acq = sc.spawn(move || {
+                claimed_rx.recv().unwrap();
+                let t0 = std::time::Instant::now();
+                let ok = vr.acquire(a);
+                let waited = t0.elapsed();
+                let _ = done_tx.send(());
+                (ok, waited)
+            });
+            let _ = vr.try_get_or_insert_pinned(b"beta").unwrap();
+            acq.join().unwrap()
+        });
+        assert!(!took, "戻らない取りかけで、 上限を過ぎても取れたと返した");
+        assert!(waited >= ACQUIRE_CLAIM_WAIT, "上限より前に諦めた: {waited:?}");
+        assert!(v.acquire(a), "取りかけが戻った後は取れる");
         v.release(a);
     }
 
