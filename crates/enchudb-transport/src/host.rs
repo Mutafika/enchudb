@@ -523,17 +523,24 @@ impl Lines {
         l
     }
 
-    /// 前に書いた中身から、 書き直すほど変わったか (last_seen だけの変化は 1 時間まで書かない)。
+    /// 前に書いた中身から、 書き直すほど変わったか: client の出入りと外した / 戻った印 (F を進める前に disk にあるべき物)、 last_seen の
+    /// 1 時間を越える変化 (last_seen だけの変化は 1 時間まで書かない)。
+    ///
+    /// #966 (0.38 前 review B4): 線 (through / caught_up) と F の変化だけでは書かない。 書くたびに中身と directory を fsync するので、
+    /// 要求のたびに線が動くと要求ごとに fsync が乗った (前は fsync せずに書き、 線と F の変化でも書いた)。 落ちた後に開くと、 線・F・
+    /// ホストの時計は最後に書いた時点に戻る = 低い / 古い側 (F を低く決め、 沈黙を短く数える = 削除を早く忘れない側)。 きれいに止めた時は
+    /// 全部書く (`Drop`)。
     fn changed(&self) -> bool {
-        let Some((clients, forget)) = &self.saved else { return true };
-        if *forget != self.forget || clients.len() != self.clients.len() {
+        let Some((clients, _)) = &self.saved else { return true };
+        if clients.len() != self.clients.len() {
             return true;
         }
         self.clients.iter().any(|(id, c)| match clients.get(id) {
             None => true,
             Some(o) => {
-                let quiet = ClientState { last_seen_ms: o.last_seen_ms, ..*c };
-                quiet != *o || c.last_seen_ms.saturating_sub(o.last_seen_ms) > 3_600_000
+                c.dropped != o.dropped
+                    || c.returned != o.returned
+                    || c.last_seen_ms.saturating_sub(o.last_seen_ms) > 3_600_000
             }
         })
     }
@@ -782,9 +789,10 @@ impl HostInner {
             let f = self.engine.sync_ring_min_below(upper).unwrap_or(upper);
             let current = self.lines.lock().unwrap().forget;
             // #966 (0.38 前 review B4): F を進める (削除の記録を忘れる・F を配る) 前に、 外した印と client の一覧を置き場に書いて disk に
-            // 届ける。 前は忘れた後に fsync なしで書き、 忘れた削除だけが disk に届いて置き場が空 / 古い像で開き直すと、 外した client が
-            // 外した印の無い client に戻って publish が当たり、 消えた行が生き返った。 書けなければこの回は進めない
-            if f > current && self.save_lines(true, true) {
+            // 届ける (変わっていなければ前に書いた物が disk にある)。 前は忘れた後に fsync なしで書き、 忘れた削除だけが disk に届いて
+            // 置き場が空 / 古い像で開き直すと、 外した client が外した印の無い client に戻って publish が当たり、 消えた行が生き返った。
+            // 書けなければこの回は進めない
+            if f > current && self.save_lines(false) {
                 if self.engine.forget_deletes_before(f) > 0 {
                     let _ = self.engine.persist_sync_state();
                     #[cfg(test)]
@@ -795,17 +803,17 @@ impl HostInner {
                 self.lines.lock().unwrap().forget = f;
             }
         }
-        self.save_lines(false, false);
+        self.save_lines(false);
     }
 
-    /// client の状態とホストの時計を置き場に書く。 `force` でなければ、 前に書いた中身から変わった時だけ。 書けたか (置き場が無い・
-    /// 書く物が無ければ true)。
+    /// client の状態とホストの時計を置き場に書く。 `force` でなければ、 前に書いた中身から変わった時だけ ([`Lines::changed`])。
+    /// 書けたか (置き場が無い・書く物が無ければ true)。
     ///
-    /// #966 (0.38 前 review B4): 中身を fsync してから rename する (`db_files::write_atomic_if_changed`、 電源断で中身の無い / 途中の
-    /// 置き場に置き換わらない)。 `durable` なら directory も fsync して rename を disk に届ける (F を進める前の `recompute` と止める時)。
-    /// 書くのは 1 本ずつ (`save_lock`)、 中身はその下で作る: 先に作った古い中身 (外した印の無い物) が後から rename されて、 後に作った
-    /// 中身を上書きしない。 書けた中身だけを 「書いた中身」 にする (前は書く前に置き、 書けなかった中身を次の回も書き直さなかった)。
-    fn save_lines(&self, force: bool, durable: bool) -> bool {
+    /// #966 (0.38 前 review B4): 中身を fsync してから rename し (`db_files::write_atomic_if_changed`、 電源断で中身の無い / 途中の
+    /// 置き場に置き換わらない)、 directory も fsync して rename を disk に届ける (返った時に disk にある = F を進めてよい)。 書くのは
+    /// 1 本ずつ (`save_lock`)、 中身はその下で作る: 先に作った古い中身 (外した印の無い物) が後から rename されて、 後に作った中身を
+    /// 上書きしない。 書けた中身だけを 「書いた中身」 にする (前は書く前に置き、 書けなかった中身を次の回も書き直さなかった)。
+    fn save_lines(&self, force: bool) -> bool {
         let Some(path) = &self.lines_path else { return true };
         let _one = self.save_lock.lock().unwrap_or_else(|p| p.into_inner());
         let snapshot = {
@@ -818,7 +826,7 @@ impl HostInner {
             _ => std::path::Path::new("."),
         };
         let written = enchudb::db_files::write_atomic_if_changed(path, text.as_bytes()).is_ok()
-            && (!durable || enchudb::db_files::sync_dir(dir).is_ok());
+            && enchudb::db_files::sync_dir(dir).is_ok();
         if written {
             self.lines.lock().unwrap().saved = Some((clients, forget));
         }
@@ -1023,7 +1031,7 @@ impl HttpHost {
     ///
     /// 長さは **ホストが動いていた時間**で数える (#713): ホストが止まっていた間 (と、 壁時計が飛んだ分) は client の沈黙に
     /// 数えない。 `cursor_path` の横の置き場に時計を残し、 開き直すと続きから数える。 きれいに止めた (drop した) 時はその時点
-    /// まで、 落ちた時は最後に置き場を書いた時点 (client の出入り・線の変化、 遅くとも 1 時間ごと) までを数える。
+    /// まで、 落ちた時は最後に置き場を書いた時点 (client の出入り・外した / 戻った印の変化、 遅くとも 1 時間ごと) までを数える。
     pub fn set_silence_limit(&self, limit: Duration) {
         self.inner.lines.lock().unwrap().silence = Some(limit);
         self.inner.recompute(self.inner.clock.now());
@@ -1042,7 +1050,7 @@ impl Drop for HttpHost {
             let _ = h.join();
         }
         // #713: 止まる時点のホストの時計を残す (開き直すと続きから数える)
-        self.inner.save_lines(true, true);
+        self.inner.save_lines(true);
     }
 }
 
