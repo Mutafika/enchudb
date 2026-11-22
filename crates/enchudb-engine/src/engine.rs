@@ -3900,6 +3900,22 @@ mod ensure_live_gap_hook {
     }
 }
 
+/// test 用の割り込み点: 消す道 (`live_free`) が世代と死の印を書く前 (cell は外し終えた後、 #1040 の読み直し A)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod kill_start_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: 消す道 (`live_free`) が世代と死の印を書いた後・生きている印を下ろす前 (#901)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod free_gap_hook {
@@ -5297,6 +5313,11 @@ mod review038_d_tests {
         eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
         eng.define_table("s", 1).unwrap();
         eng.define_himo_in("s", "a", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("s", "g", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("s", "w", ValueType::Number64, 0).unwrap();
+        // 枠 1 の社員の表 (使い回した行 = 世代 ≥ 1 の社員を作る)
+        eng.define_table("w", 1).unwrap();
+        eng.define_ref_in("w", "company", "c").unwrap();
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
@@ -5476,6 +5497,63 @@ mod review038_d_tests {
             w.finish();
         }
     }
+
+    /// #1040 の読み直し A: 使い回した場所の行 (世代 g ≥ 1) を消す道の kill と free が、 見直しの購読の `touched_eids` の 2 つの読み
+    /// (生きている印と世代の 2 B) の間に入っても、 その poll か次の poll の `touched` に消えた行の eid (g | 場所) が出る。 前は世代を
+    /// 先に読んだので (g, 死の印なし) → (生きている印なし) になり、 死んだ場所として g − 1 (前の住人) の eid を出して、 消えた行の eid は
+    /// どこにも出なかった (世代 0 の行は 「今 = 0」 の枝に入るので出る = 前の試験は通った)。
+    #[test]
+    fn touched_polled_across_a_delete_of_a_reused_row_reports_the_eid_the_app_holds() {
+        let w = world("touchedreused");
+        let c0 = w.company_in(1);
+        let via = w.eng.himo_id("w.company").unwrap() as u16;
+        // 枠 1 の表 w で場所を使い回した社員 e (世代 ≥ 1)
+        let x = w.eng.entity_in("w").unwrap();
+        w.eng.tie_ref_to_by_id(x, via, c0);
+        w.eng.delete(x);
+        let e = w.eng.entity_in("w").unwrap();
+        w.eng.tie_ref_to_by_id(e, via, c0);
+        let slot = w.eng.slot_unchecked(e);
+        assert!(slot == w.eng.slot_unchecked(x) && w.eng.generations().get(slot) >= 1, "前提: 使い回した場所の行");
+        let pred = vec![LivePred::Via { path: vec![via], pred: Box::new(LivePred::Eq { himo_id: w.city, value: 1 }) }];
+        let t = w.eng.subscribe_touched(pred).unwrap();
+        assert_eq!(t.poll(&w.eng).added, vec![c0]);
+        assert_eq!(t.members(&w.eng, c0), vec![e], "前提: アプリは社員 e を持つ");
+        // 消す書き手: cell を外した (見直しの印が付いた) 後・kill の前で止まる
+        let wal = w.eng.oplog.as_ref().unwrap().clone();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        kill_start_hook::set(&wal, move |_| {
+            stopped_tx.send(()).unwrap();
+            let _ = go_rx.recv();
+        });
+        let deleter = {
+            let eng = w.eng.clone();
+            std::thread::spawn(move || eng.delete(e))
+        };
+        stopped_rx.recv_timeout(std::time::Duration::from_secs(30)).expect("前提: 消す道が kill の前に来た");
+        // poll: settle が外した cell の見直しの印を取り、 touched_eids の 2 つの読みの間で消す書き手に kill と free まで進めさせる
+        let e2 = w.eng.clone();
+        crate::live::set_touched_read_hook(move || {
+            go_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            while e2.entities.is_live(slot) {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(30), "前提: 消す道が生きている印を下ろさない");
+                std::thread::yield_now();
+            }
+        });
+        let gap = t.poll(&w.eng).touched;
+        deleter.join().unwrap();
+        let next = t.poll(&w.eng).touched;
+        assert!(!w.eng.is_live(e), "前提: e は消えた");
+        assert!(
+            gap.contains(&e) || next.contains(&e),
+            "消す道が 2 つの読みの間に入った poll と次の poll のどちらの touched にも、 アプリが持つ消えた行の eid {e:#x} が無い: 途中 {gap:x?} / 次 {next:x?}"
+        );
+        drop(t);
+        w.finish();
+    }
+
 }
 
 /// #1015: lock を取らない読みの入口 (`read_app_in`) の速い道の境目。 get の道 (`read_app_acquired` = 読んだ後の fence なし、 列の cell の
@@ -23982,6 +24060,10 @@ impl Engine {
         // PR #977 の読み直し 4 の [3]: 書けなかった場所は覚えて、 名前のある表の使い回し (全部なめも) が飛ばす (`Generations::retired`)。
         // 閉じる時に書き直し、 書けなければ次に開く時の突き合わせが完了させる
         let mut unkilled = false;
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            kill_start_hook::call(wal);
+        }
         if on
             && (row_gen.is_some() || was_live)
             && !replaying
@@ -27546,10 +27628,11 @@ impl Engine {
         self.slot_unchecked(eid)
     }
 
-    /// 場所に行が生きているか (live の出口で使う、 照合しない)。
+    /// 場所に行が生きているか (live の出口で使う、 照合しない)。 印は Acquire で読む (印を下ろした消す道の kill を、 この後の世代の
+    /// 読みで必ず見る。 #1040)。
     #[inline]
-    pub(crate) fn slot_is_live(&self, slot: u32) -> bool {
-        self.entities.is_live(slot)
+    pub(crate) fn slot_is_live_acquire(&self, slot: u32) -> bool {
+        self.entities.is_live_acquire(slot)
     }
 
     /// #731: 場所の今の住人の eid (今の世代)。

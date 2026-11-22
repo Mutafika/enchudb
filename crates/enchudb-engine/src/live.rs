@@ -6748,6 +6748,27 @@ pub(crate) fn set_group_check_hook(f: impl FnOnce() + 'static) {
     GROUP_CHECK_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
 }
 
+/// test 用の割り込み点 (#1040 の読み直し A): `touched_eids` が場所の生きている印を読んだ後・世代と死の印を読む前。
+#[inline(always)]
+fn touched_read_hook() {
+    #[cfg(test)]
+    if let Some(f) = TOUCHED_READ_HOOK.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`touched_read_hook`] で 1 回だけ走らせる処理 (呼んだ thread だけ)。
+    static TOUCHED_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// test 用: 呼んだ thread の次の [`touched_read_hook`] で `f` を 1 回走らせる。
+#[cfg(test)]
+pub(crate) fn set_touched_read_hook(f: impl FnOnce() + 'static) {
+    TOUCHED_READ_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
 /// #731: 見直しの購読の `touched` の eid。 場所ごとに、 最後の poll 以降に消えた行の世代 (`first`) から今の住人の世代までを出す
 /// (アプリは前の poll / `members` で受けた eid を持つ。 消して使い回した後でも、 その eid を外せる)。 死んだ場所の今の世代は次の住人
 /// なので出さない (v15 に移る前に消えた場所は、 移る時に [`Registry::note_gen`] で世代 0 を覚える)。 余分な eid は `group_of` が None
@@ -6758,13 +6779,19 @@ fn touched_eids(eng: &crate::engine::Engine, peer: Exit<'_>, slots: &[u32], firs
     }
     let mut out = Vec::with_capacity(slots.len());
     for &e in slots {
-        // 世代と 「死んでいる」 印は同じ 2 B (1 回で読む)。 #1040: 消す道は 世代と死の印 (1 回の store) → 生きている印を下ろす →
-        // 解放の印 (`Registry::freed`、 `first` に入る) の順なので、 その間に poll すると、 生きている印は立ったまま世代はもう次の住人
-        // の物で、 消えた行の記録 (`first`) もまだ無い。 生きている印だけで 「生きている」 と読むと、 今の世代 (どの行でもない次の住人)
-        // の eid を出して消えた行の eid を出さず、 次の poll は解放の印だけで見直しの印が無い場所を回らないので、 アプリは消えた行を
-        // 外せなかった。 死の印のある場所は消えた行として出す (`Engine::last_local_of_slot` と同じ読み)
+        // #1040: 消す道は 世代と死の印 (1 回の store) → 生きている印を下ろす (AcqRel の RMW) → 解放の印 (`Registry::freed`、 `first` に
+        // 入る) の順なので、 その間に poll すると、 生きている印は立ったまま世代はもう次の住人の物で、 消えた行の記録 (`first`) もまだ
+        // 無い。 生きている印だけで 「生きている」 と読むと、 今の世代 (どの行でもない次の住人) の eid を出して消えた行の eid を出さず、
+        // 次の poll は解放の印だけで見直しの印が無い場所を回らないので、 アプリは消えた行を外せなかった。 死の印のある場所は消えた行と
+        // して出す。
+        //
+        // 読む順は 生きている印 (Acquire) → 世代と死の印 (同じ 2 B を 1 回)。 逆の順 (世代を先に) では、 2 つの読みの間に消す道の kill と
+        // free が入ると (古い世代 g, 死の印なし, 生きている印なし) になり、 死んだ場所として g − 1 (前の住人) を出して、 消えた行 g を出さ
+        // なかった (#1040 の読み直し A、 世代 ≥ 1 の行)。 下りた印を Acquire で見た読みは、 その前の kill を後の 2 B の読みで必ず見る
+        let marked = eng.slot_is_live_acquire(e);
+        touched_read_hook();
         let (now, dead) = peer.state_now(e);
-        let live = !dead && eng.slot_is_live(e);
+        let live = !dead && marked;
         match first.get(&e) {
             Some(&f) if f < now => {
                 for g in f..=now {

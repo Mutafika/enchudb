@@ -391,6 +391,19 @@ impl EntitySet {
         (mm[byte_off] & bit) != 0
     }
 
+    /// [`Self::is_live`] の、 印の byte を Acquire で読む版。 印を下ろした (立てた) RMW (`set_bit`、 AcqRel) より前の書き込みを、 この後の
+    /// 読みで必ず見る (#1040 の読み直し A: 消す道の kill の後の印を見た読みが、 kill を見る)。
+    #[inline]
+    pub fn is_live_acquire(&self, eid: u32) -> bool {
+        if eid >= self.max_entities() { return false; }
+        let mm = self.region.slice();
+        let byte_off = self.bitset_offset + (eid / 8) as usize;
+        let Some(b) = mm.get(byte_off) else { return false };
+        // SAFETY: 範囲は直前に確かめた。 印の byte は `set_bit` が AtomicU8 で書く
+        let byte = unsafe { &*(b as *const u8 as *const std::sync::atomic::AtomicU8) };
+        byte.load(Ordering::Acquire) & (1u8 << (eid % 8)) != 0
+    }
+
     /// #77-H7: bit を atomic に立てる/落とす。 変更前にその bit が立っていたか
     /// を返す。 旧実装の `mm[byte_off] |= bit` は非 atomic RMW で、 隣接 eid を
     /// 払い出された並行スレッドと同一バイトを書き合うと片方の bit が消えた。
