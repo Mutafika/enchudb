@@ -392,6 +392,8 @@ struct HostInner {
     waited: AtomicU64,
     /// 置き場 (`.clients`) を書くのを 1 本ずつにする ([`HostInner::save_lines`])。
     save_lock: Mutex<()>,
+    /// 置き場を書けなかった (書けるまで、 失敗を 1 回だけ言う)。
+    save_failing: AtomicBool,
     /// 試験: `recompute` が削除の記録を忘れて disk に書いた (`persist_sync_state`) 直後の割り込み点 (0.38 前 review の B4)。
     #[cfg(test)]
     forgot_hook: Mutex<Option<Box<dyn FnMut() + Send>>>,
@@ -524,25 +526,33 @@ impl Lines {
     }
 
     /// 前に書いた中身から、 書き直すほど変わったか: client の出入りと外した / 戻った印 (F を進める前に disk にあるべき物)、 last_seen の
-    /// 1 時間を越える変化 (last_seen だけの変化は 1 時間まで書かない)。
+    /// 間引きの幅 ([`Lines::last_seen_slack_ms`]) を越える変化。
     ///
     /// #966 (0.38 前 review B4): 線 (through / caught_up) と F の変化だけでは書かない。 書くたびに中身と directory を fsync するので、
-    /// 要求のたびに線が動くと要求ごとに fsync が乗った (前は fsync せずに書き、 線と F の変化でも書いた)。 落ちた後に開くと、 線・F・
-    /// ホストの時計は最後に書いた時点に戻る = 低い / 古い側 (F を低く決め、 沈黙を短く数える = 削除を早く忘れない側)。 きれいに止めた時は
+    /// 要求のたびに線が動くと要求ごとに fsync が乗った (前は fsync せずに書き、 線と F の変化でも書いた)。 落ちた後に開くと、 線と F は
+    /// 最後に書いた時点に戻る = 低い側 (F を低く決める = 削除を早く忘れない側)。 last_seen は、 最後に書いた後の訪れを失うので、 沈黙を
+    /// 最大で間引きの幅だけ長く数えうる (ホストの時計も最後に書いた時点に戻り、 その後に動いていた時間は数えない)。 きれいに止めた時は
     /// 全部書く (`Drop`)。
     fn changed(&self) -> bool {
         let Some((clients, _)) = &self.saved else { return true };
         if clients.len() != self.clients.len() {
             return true;
         }
+        let slack = self.last_seen_slack_ms();
         self.clients.iter().any(|(id, c)| match clients.get(id) {
             None => true,
             Some(o) => {
-                c.dropped != o.dropped
-                    || c.returned != o.returned
-                    || c.last_seen_ms.saturating_sub(o.last_seen_ms) > 3_600_000
+                c.dropped != o.dropped || c.returned != o.returned || c.last_seen_ms.saturating_sub(o.last_seen_ms) > slack
             }
         })
+    }
+
+    /// last_seen だけの変化を書かない幅 (ms): min(1 時間, 沈黙の上限 / 4)。 落ちた後に開くと、 client の沈黙を最大でこの幅だけ長く
+    /// 数えうる (#966 の読み直し [F5]: 幅を 1 時間に決めていると、 沈黙の上限が 1 時間前後以下の時、 落ちる前に来ていた生きている
+    /// client を開いた後に外しうる = 戻った client は publish を断られて作り直しになる)。 上限の 4 分の 1 なら、 上限の 4 分の 3 より
+    /// 短い間隔で来る client は外さない。
+    fn last_seen_slack_ms(&self) -> u64 {
+        (self.silence().as_millis() as u64 / 4).min(3_600_000)
     }
 }
 
@@ -815,6 +825,11 @@ impl HostInner {
     /// 上書きしない。 書けた中身だけを 「書いた中身」 にする (前は書く前に置き、 書けなかった中身を次の回も書き直さなかった)。
     fn save_lines(&self, force: bool) -> bool {
         let Some(path) = &self.lines_path else { return true };
+        // #966 の読み直し [F6]: 書く物が無ければ書き手の lock を待たない (変わっていない = 前に書けた中身が disk にある。 `saved` は
+        // 書けた後にしか変わらない)。 前は他の要求が置き場を fsync している間、 全部の要求の `recompute` の最後がここで待った
+        if !force && !self.lines.lock().unwrap().changed() {
+            return true;
+        }
         let _one = self.save_lock.lock().unwrap_or_else(|p| p.into_inner());
         let snapshot = {
             let l = self.lines.lock().unwrap();
@@ -825,12 +840,25 @@ impl HostInner {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => std::path::Path::new("."),
         };
-        let written = enchudb::db_files::write_atomic_if_changed(path, text.as_bytes()).is_ok()
-            && enchudb::db_files::sync_dir(dir).is_ok();
-        if written {
-            self.lines.lock().unwrap().saved = Some((clients, forget));
+        let written = enchudb::db_files::write_atomic_if_changed(path, text.as_bytes())
+            .and_then(|_| enchudb::db_files::sync_dir(dir));
+        match written {
+            Ok(()) => {
+                self.lines.lock().unwrap().saved = Some((clients, forget));
+                self.save_failing.store(false, Ordering::Release);
+                true
+            }
+            Err(e) => {
+                // #966 の読み直し [F6]: 書けない間は F を進めない (呼び手)。 続けて書けない間は 1 回だけ言う
+                if !self.save_failing.swap(true, Ordering::AcqRel) {
+                    eprintln!(
+                        "[enchudb] host: could not write the client state file {} ({e}); not advancing the forget line until it can be written (#966)",
+                        path.display()
+                    );
+                }
+                false
+            }
         }
-        written
     }
 
     /// client `to` に配る record: ホストの `_sync_ops` のうち、 書き手ごとの cursor より後 (to 自身の record は除く)。
@@ -943,7 +971,9 @@ impl HttpHost {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|t| Lines::decode(&t))
             .unwrap_or_default();
-        lines.saved = Some((lines.clients.clone(), lines.forget));
+        // #966 の読み直し [F6]: 開いた後の最初の回に置き場を書き直す (書いた中身を 「disk にある」 とは扱わない)。 前の binary は置き場を
+        // fsync せずに書いたので、 読んだ中身がまだ disk に無いことがある (その中身のまま F を進めて電源が落ちると、 外した印を失う)
+        lines.saved = None;
         let clock = HostClock::resume(&lines, now_ms());
         if let Some(p) = cursor_path {
             syncer = syncer.with_cursor_path(p);
@@ -983,6 +1013,7 @@ impl HttpHost {
             #[cfg(test)]
             waited: AtomicU64::new(0),
             save_lock: Mutex::new(()),
+            save_failing: AtomicBool::new(false),
             #[cfg(test)]
             forgot_hook: Mutex::new(None),
             #[cfg(test)]
@@ -2276,29 +2307,8 @@ mod tests {
     /// falsify: `recompute` の、 F を進める前の置き場の書き出しを外すと、 割り込み点で読む置き場に P の印が無い。
     #[test]
     fn a_dropped_client_is_on_disk_before_the_host_forgets_deletes() {
-        let dir = std::env::temp_dir().join(format!("enchudb-b4-host-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let host_eng = rows_db(dir.join("host").to_str().unwrap(), 100);
-        // 忘れる削除: 写像の無い相手の行の削除 (退避表に載る、 ring に record を作らない)
-        let deleted = Hlc { wall: 1_000, logical: 0, peer: 7 };
-        assert!(host_eng.remote_delete_apply_foreign(enchudb_oplog::make_eid(7, 5), deleted), "前提: 削除を退避表に載せた");
-        let cursors = dir.join("host.cursors");
-        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(cursors.clone())).unwrap();
-        let clients_file = {
-            let mut s = cursors.clone().into_os_string();
-            s.push(".clients");
-            std::path::PathBuf::from(s)
-        };
+        let (dir, host, host_eng, clients_file, deleted) = host_with_a_silent_client("order");
         let now = host.inner.clock.now();
-        let line = Hlc { wall: 5_000, logical: 0, peer: 4 };
-        {
-            let mut l = host.inner.lines.lock().unwrap();
-            l.silence = Some(Duration::from_secs(60));
-            // P (3): 黙った client (この回で外す)。 Q (4): 数える client (線は削除より上)
-            l.clients.insert(3, ClientState { last_seen_ms: now.saturating_sub(120_000), through: Some(line), caught_up: line, ..ClientState::default() });
-            l.clients.insert(4, ClientState { last_seen_ms: now, through: Some(line), caught_up: line, ..ClientState::default() });
-        }
         let on_disk: Arc<Mutex<Option<Lines>>> = Arc::default();
         {
             let (on_disk, path) = (on_disk.clone(), clients_file.clone());
@@ -2321,6 +2331,117 @@ mod tests {
             on_disk.clients.get(&3).is_some_and(|c| c.dropped),
             "削除を忘れて disk に書いた時、 置き場に P を外した印が無い (この時に落ちると、 開き直したホストが戻った P を断らない): {:?}",
             on_disk.clients.get(&3)
+        );
+    }
+
+    /// B4 の試験の仕度: 置き場ありのホスト (沈黙の上限 60 s) に、 黙った client P (3、 次の `recompute` で外す) と数える client Q (4、
+    /// 線は削除より上)、 忘れる削除 (写像の無い相手の行の削除 = 退避表に載る、 ring に record を作らない) を置く。
+    /// (directory, ホスト, ホストの engine, 置き場の path, 削除の版数) を返す。
+    #[allow(clippy::type_complexity)]
+    fn host_with_a_silent_client(tag: &str) -> (std::path::PathBuf, HttpHost, Arc<Engine>, std::path::PathBuf, Hlc) {
+        let dir = std::env::temp_dir().join(format!("enchudb-b4-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let host_eng = rows_db(dir.join("host").to_str().unwrap(), 100);
+        let deleted = Hlc { wall: 1_000, logical: 0, peer: 7 };
+        assert!(host_eng.remote_delete_apply_foreign(enchudb_oplog::make_eid(7, 5), deleted), "前提: 削除を退避表に載せた");
+        let cursors = dir.join("host.cursors");
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(cursors.clone())).unwrap();
+        let clients_file = {
+            let mut s = cursors.into_os_string();
+            s.push(".clients");
+            std::path::PathBuf::from(s)
+        };
+        let now = host.inner.clock.now();
+        let line = Hlc { wall: 5_000, logical: 0, peer: 4 };
+        {
+            let mut l = host.inner.lines.lock().unwrap();
+            l.silence = Some(Duration::from_secs(60));
+            l.clients.insert(3, ClientState { last_seen_ms: now.saturating_sub(120_000), through: Some(line), caught_up: line, ..ClientState::default() });
+            l.clients.insert(4, ClientState { last_seen_ms: now, through: Some(line), caught_up: line, ..ClientState::default() });
+        }
+        (dir, host, host_eng, clients_file, deleted)
+    }
+
+    /// #966 の読み直し [F6] / [F2]: 置き場を書けない間は F を進めない (削除の記録を忘れない)。 書けるようになったら進む。 書けない形は、
+    /// 置き場の一時 file の名前に directory を置いて作る。
+    ///
+    /// falsify: `recompute` の 「書けなければ進めない」 (`f > current && self.save_lines(false)` の後ろ半分) を外すと、 書けないまま F が
+    /// 削除の先へ進み、 削除の記録を忘れる。
+    #[test]
+    fn the_forget_line_does_not_move_while_the_client_file_cannot_be_written() {
+        let (dir, host, host_eng, clients_file, deleted) = host_with_a_silent_client("unwritable");
+        let blocker = enchudb::db_files::tmp_path_for(&clients_file);
+        std::fs::create_dir_all(&blocker).unwrap();
+        let forgot = Arc::new(AtomicU64::new(0));
+        {
+            let forgot = forgot.clone();
+            *host.inner.forgot_hook.lock().unwrap() = Some(Box::new(move || {
+                forgot.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
+        host.inner.recompute(host.inner.clock.now());
+        let (forget_blocked, forgot_blocked) = (host.forget_line(), forgot.load(Ordering::Acquire));
+        let dropped_in_memory = host.inner.lines.lock().unwrap().clients.get(&3).is_some_and(|c| c.dropped);
+        std::fs::remove_dir_all(&blocker).unwrap();
+        host.inner.recompute(host.inner.clock.now());
+        let (forget_after, forgot_after) = (host.forget_line(), forgot.load(Ordering::Acquire));
+        *host.inner.forgot_hook.lock().unwrap() = None;
+        let on_disk = Lines::decode(&std::fs::read_to_string(&clients_file).unwrap_or_default());
+        drop(host);
+        drop(host_eng);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dropped_in_memory, "前提: P を外した (memory)");
+        assert!(
+            forget_blocked < deleted && forgot_blocked == 0,
+            "置き場を書けないのに F を進めた / 削除の記録を忘れた (F {forget_blocked:?}, 忘れた回 {forgot_blocked})"
+        );
+        assert!(forget_after > deleted && forgot_after == 1, "書けるようになった後に F が進まない (F {forget_after:?}, 忘れた回 {forgot_after})");
+        assert!(on_disk.clients.get(&3).is_some_and(|c| c.dropped), "書けるようになった後の置き場に P を外した印が無い");
+    }
+
+    /// #966 の読み直し [F5]: 置き場は last_seen だけの変化を、 沈黙の上限の 4 分の 1 (と 1 時間の小さい方) を越えたら書く。 落ちた後に
+    /// 開くと置き場の last_seen から数えるので、 上限 60 s で 20 s 後に来た client の last_seen は disk に届いている。
+    ///
+    /// 前は幅が 1 時間に決まっていて、 上限が短いと、 落ちる前に来ていた生きている client を開いた後に外しえた (戻った client は publish を
+    /// 断られて作り直しになる)。
+    ///
+    /// falsify: `Lines::last_seen_slack_ms` を 1 時間に戻すと、 disk の last_seen が 20 s 前のまま。
+    #[test]
+    fn a_client_visit_beyond_a_quarter_of_the_silence_limit_reaches_the_client_file() {
+        let dir = std::env::temp_dir().join(format!("enchudb-f5-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let host_eng = rows_db(dir.join("host").to_str().unwrap(), 100);
+        let cursors = dir.join("host.cursors");
+        let host = HttpHost::start("127.0.0.1:0", host_eng.clone(), Some(cursors.clone())).unwrap();
+        let now = host.inner.clock.now();
+        {
+            let mut l = host.inner.lines.lock().unwrap();
+            l.silence = Some(Duration::from_secs(60));
+            l.clients.insert(3, ClientState { last_seen_ms: now, ..ClientState::default() });
+        }
+        assert!(host.inner.save_lines(false), "前提: 置き場を書いた");
+        let read = || {
+            let mut s = cursors.clone().into_os_string();
+            s.push(".clients");
+            Lines::decode(&std::fs::read_to_string(std::path::PathBuf::from(s)).unwrap_or_default())
+        };
+        // 5 s 後に来た (幅 15 s の内 = 書かない)、 20 s 後に来た (幅を越える = 書く)
+        host.inner.lines.lock().unwrap().clients.get_mut(&3).unwrap().last_seen_ms = now + 5_000;
+        assert!(host.inner.save_lines(false));
+        let within = read().clients.get(&3).map(|c| c.last_seen_ms);
+        host.inner.lines.lock().unwrap().clients.get_mut(&3).unwrap().last_seen_ms = now + 20_000;
+        assert!(host.inner.save_lines(false));
+        let beyond = read().clients.get(&3).map(|c| c.last_seen_ms);
+        drop(host);
+        drop(host_eng);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(within, Some(now), "前提: 幅の内の last_seen の変化は書かない (書くたびに fsync)");
+        assert_eq!(
+            beyond,
+            Some(now + 20_000),
+            "上限 60 s の 4 分の 1 を越えて来た client の last_seen が disk に無い (落ちた後に開くと 20 s 長く黙っていたと数える)"
         );
     }
 
