@@ -5623,6 +5623,37 @@ mod review038_d_tests {
         }
     }
 
+    /// #1043 の読み直し C: WAL を持つ engine で紐を足す時、 列の file を作った directory (`{db}/himo`) を、 header (紐の数) を書き出す
+    /// 前に fsync する (header が紐の数を言う時には、 その file の entry が disk にある。 開く時は header の本数だけ file を探す)。 順は、
+    /// header を書き出す msync の所 (`segment_map` の試験の割り込み点) で、 その thread がもう directory を fsync したかで見る (crashsim は
+    /// directory の entry を模さない)。
+    #[test]
+    fn a_column_added_on_a_wal_engine_syncs_its_directory_before_the_header() {
+        use crate::db_files::sync_counts::{self, Issued};
+        let w = world("himodir");
+        let header = std::path::Path::new(&w.path).join(SegmentKind::Header.rel_path());
+        let me = std::thread::current().id();
+        let seen: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+        {
+            let seen = seen.clone();
+            crate::segment_map::tests::set_flush_hook(&header, move || {
+                if std::thread::current().id() == me {
+                    let issued = sync_counts::take();
+                    seen.lock().unwrap().push(issued.contains(&Issued::DirSync(HIMO_DIR_SYNC)));
+                }
+                Ok(())
+            });
+        }
+        let _hold = w.eng.hold_consumer();
+        let _ = sync_counts::take();
+        w.eng.ensure_himo_dynamic_in("u", "added", ValueType::Number, 0).unwrap();
+        crate::segment_map::tests::clear_flush_hook(&header);
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "前提: 紐を足す道が header を書き出した");
+        assert!(seen[0], "header (紐の数) を、 列の file の directory を fsync する前に書き出した");
+        drop(_hold);
+        w.finish();
+    }
 }
 
 /// #1015: lock を取らない読みの入口 (`read_app_in`) の速い道の境目。 get の道 (`read_app_acquired` = 読んだ後の fence なし、 列の cell の
@@ -34781,9 +34812,10 @@ impl Engine {
         Ok(hid as u16)
     }
 
-    /// #1043: 紐 `hid` の定義を書き出す ([`Self::define_himo_slot_locked`]、 WAL を持つ engine)。 順は 列と版数の列の header → 紐名の辞書
-    /// → DB の header (header が紐の数を言う時には、 それが指す物が disk にある。 列の header が届いていない像は開く時に書かれていない
-    /// 列として組む #414 ので必須ではないが、 1 page なので一緒に)。 `himo_def_lock` の下で呼ぶ (紐を足す書き手だけが待つ)。
+    /// #1043: 紐 `hid` の定義を書き出す ([`Self::define_himo_slot_locked`]、 WAL を持つ engine)。 順は 列と版数の列の header → 列の file
+    /// の directory の entry → 紐名の辞書 → DB の header (header が紐の数を言う時には、 それが指す物が disk にある。 列の header が届いて
+    /// いない像は開く時に書かれていない列として組む #414 ので必須ではないが、 1 page なので一緒に)。 `himo_def_lock` の下で呼ぶ (紐を
+    /// 足す書き手だけが待つ)。
     #[cfg(not(target_arch = "wasm32"))]
     fn write_out_himo_definition(&self, hid: u32) -> io::Result<()> {
         let Backing::Segments(set) = &self.backing else { return Ok(()) };
@@ -34794,6 +34826,12 @@ impl Engine {
         set.flush_kind(SegmentKind::Himo(hid), 0, crate::column::HEADER_BYTES)?;
         if versions {
             set.flush_kind(SegmentKind::Ver(hid), 0, crate::column::HEADER_BYTES)?;
+        }
+        // #1043 の読み直し C: 列の file を作った directory の entry も header より先に届ける (開く時は header の紐の数だけ
+        // `himo/NNNN.seg` を探し、 無ければ開けない。 page の像を撮る crashsim は directory の entry を模さない)
+        crate::db_files::sync_dir_plain(&set.dir().join("himo"), HIMO_DIR_SYNC)?;
+        if versions {
+            crate::db_files::sync_dir_plain(&set.dir().join("ver"), VER_DIR_SYNC)?;
         }
         set.flush_where(false, |k| {
             matches!(k, SegmentKind::HimoregData | SegmentKind::HimoregOffsets | SegmentKind::HimoregIndex)
@@ -38627,6 +38665,12 @@ fn map_vocab_refs(dir: &std::path::Path, size: usize) -> io::Result<Arc<crate::s
 /// #385: 参照数の file の名前 (DB の directory の中、 manifest には載せない = 無くても数え直すだけ)。
 #[cfg(not(target_arch = "wasm32"))]
 const VOCAB_REFS_FILE: &str = "vocab.refs.seg";
+
+/// #1043: 紐を足す時に `{db}/himo` / `{db}/ver` を fsync する I/O の点の名前 (`Engine::write_out_himo_definition`)。
+#[cfg(not(target_arch = "wasm32"))]
+const HIMO_DIR_SYNC: &str = "himo.dir.sync";
+#[cfg(not(target_arch = "wasm32"))]
+const VER_DIR_SYNC: &str = "ver.dir.sync";
 
 /// `_sync_ops` の row が payload の ring 上の位置 (handle) を持つ列。 ring を入れる前の row は持たない。
 const SYNC_PAYLOAD_AT: &str = "_sync_ops.payload_at";
