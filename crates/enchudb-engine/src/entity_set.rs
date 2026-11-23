@@ -51,6 +51,18 @@ pub(crate) enum Reuse {
     Keep,
 }
 
+/// [`EntitySet::allocate_or_keep`] の、 位置から取った新しい場所をどうするか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fresh {
+    /// 生かして返す。
+    Take,
+    /// 生かさずに断る ([`Allocated::Refused`]。 位置は戻す / 戻せなければ穴として空きの山に積む)。
+    Refuse,
+    /// 生かさずに飛ばす ([`Allocated::Skipped`]、 呼び手は取り直す)。 位置は戻さない (戻すと取り直しがまた同じ場所を取る)。 場所は
+    /// 穴として空きの山に積む (空きの山から取る時に `reuse` が見直す)。
+    Skip,
+}
+
 /// [`EntitySet::allocate_or_keep`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Allocated {
@@ -65,6 +77,8 @@ pub(crate) enum Allocated {
     /// 位置から取った新しい場所を `fresh` が断った (#970: 場所の世代を書く gen.seg の page を commit できない)。 生かしていない。
     /// 位置は戻した (後から誰も進めていなければ) か、 戻せなければ穴として空きの山に積んだ。
     Refused(u32),
+    /// 位置から取った新しい場所を `fresh` が飛ばした ([`Fresh::Skip`])。 生かしていない。 位置は戻さず、 穴として空きの山に積んだ。
+    Skipped(u32),
 }
 
 impl EntitySet {
@@ -227,7 +241,7 @@ impl EntitySet {
         match self.allocate_or_keep(
             |slot| {
                 before(slot);
-                true
+                Fresh::Take
             },
             |slot| {
                 before(slot);
@@ -236,29 +250,37 @@ impl EntitySet {
         ) {
             Allocated::Fresh(e) => Some((e, false)),
             Allocated::Reused(e) => Some((e, true)),
-            Allocated::Full | Allocated::Kept(_) | Allocated::Refused(_) => None,
+            Allocated::Full | Allocated::Kept(_) | Allocated::Refused(_) | Allocated::Skipped(_) => None,
         }
     }
 
     /// [`Self::allocate_tracked_with`] の、 払い出す場所を呼び手が決める形 (#970、 anonymous の `Engine::entity`)。 新しい場所 (位置から
-    /// 払い出す) は生きている印を立てる直前に `fresh(slot)` が決める: true = 生かして返す、 false = 生かさずに断る ([`Allocated::Refused`]、
-    /// 位置は戻す / 戻せなければ穴として空きの山に積む)。 空きの山の一番上の場所は `reuse(slot)` が決める (空きの山の lock の下で
+    /// 払い出す) は生きている印を立てる直前に `fresh(slot)` が決める ([`Fresh`]: 生かして返す / 生かさずに断る ([`Allocated::Refused`]、
+    /// 位置は戻す / 戻せなければ穴として空きの山に積む) / 飛ばす ([`Allocated::Skipped`]、 位置は戻さずに穴として空きの山に積む))。
+    /// 空きの山の一番上の場所は `reuse(slot)` が決める (空きの山の lock の下で
     /// 呼ぶ): [`Reuse::Take`] = 生かして返す (生かす前の仕度は `reuse` の中で)、 [`Reuse::Discard`] = 山から外して次を見る (二度と渡さない
     /// 場所)、 [`Reuse::Keep`] = 山に残したまま返す ([`Allocated::Kept`]、 呼び手が理由に応じて断る / 仕度してから取り直す)。
     ///
     /// 位置の RMW は AcqRel (#970: v15 に移る手順は位置を RMW で読み、 その後に位置から取った書き手は、 移る手順が先に公開した gen.seg
     /// を見る = 自分で page を commit する。 `Engine::move_to_generations`)。
-    pub(crate) fn allocate_or_keep(&self, fresh: impl Fn(u32) -> bool, reuse: impl Fn(u32) -> Reuse) -> Allocated {
+    pub(crate) fn allocate_or_keep(&self, fresh: impl Fn(u32) -> Fresh, reuse: impl Fn(u32) -> Reuse) -> Allocated {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
         let eid = self.next_eid_atomic().fetch_add(1, Ordering::AcqRel);
         if eid < self.max_entities() {
-            if !fresh(eid) {
-                // 戻せるのは、 後から誰も進めていない時だけ (表の払い出し位置の #868 と同じ)。 戻せなければ穴 (生きていない場所) として
-                // 空きの山に積む (anonymous は空きの山からしか使い回さない)
-                if self.next_eid_atomic().compare_exchange(eid + 1, eid, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-                    self.push_hole(eid);
+            match fresh(eid) {
+                Fresh::Take => {}
+                Fresh::Refuse => {
+                    // 戻せるのは、 後から誰も進めていない時だけ (表の払い出し位置の #868 と同じ)。 戻せなければ穴 (生きていない場所)
+                    // として空きの山に積む (anonymous は空きの山からしか使い回さない)
+                    if self.next_eid_atomic().compare_exchange(eid + 1, eid, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                        self.push_hole(eid);
+                    }
+                    return Allocated::Refused(eid);
                 }
-                return Allocated::Refused(eid);
+                Fresh::Skip => {
+                    self.push_hole(eid);
+                    return Allocated::Skipped(eid);
+                }
             }
             self.set_bit(eid, true);
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
