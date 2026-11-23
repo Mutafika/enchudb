@@ -3851,6 +3851,11 @@ mod checked_read_hook {
             f();
         }
     }
+
+    /// 鳴らなかった割り込み点を外す (この thread)。
+    pub(super) fn take() -> bool {
+        HOOK.with(|h| h.borrow_mut().take()).is_some()
+    }
 }
 
 /// test 用の割り込み点 (#1041): copy で読む text の本体 (`text_owned_by_id`、 `get_text_owned` / `get_content_owned` / `get_entity_owned`)
@@ -5673,7 +5678,8 @@ mod aggregate_fast_path_tests {
         let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
         eng.define_table("s", 1).unwrap();
         eng.define_himo_in("s", "a", ValueType::Number, 0).unwrap();
-        eng.define_himo_in("s", "g", ValueType::Number, 0).unwrap();
+        // group の紐は値の上限を宣言する (並列の `group_sum_eids_par` は dense の時だけ並列の道)
+        eng.define_himo_in("s", "g", ValueType::Number, 16).unwrap();
         eng.define_himo_in("s", "w", ValueType::Number64, 0).unwrap();
         eng.define_table("spare", 1).unwrap();
         eng.define_himo_in("spare", "a", ValueType::Number, 0).unwrap();
@@ -5705,6 +5711,7 @@ mod aggregate_fast_path_tests {
                 assert_eq!(eng.generations().active(), v15, "前提");
                 let (tx, rx) = std::sync::mpsc::channel();
                 let e2 = eng.clone();
+                let _ = fast_read_hook::take_redos();
                 fast_read_hook::set(move || {
                     // 速い道が照合せずに場所を読む前に、 a を消して同じ場所を使い回し (枠 1 の表。 v14 なら v15 に移る)、 新しい住人 b が書く
                     e2.delete(a);
@@ -5726,6 +5733,7 @@ mod aggregate_fast_path_tests {
                 };
                 rx.try_recv().unwrap_or_else(|_| panic!("v15={v15} {which}: 前提: 速い道の割り込み点で使い回した"));
                 assert!(eng.generations().table_has(tid), "v15={v15} {which}: 前提: 使い回しで s に印が立った");
+                assert_eq!(fast_read_hook::take_redos(), 1, "v15={v15} {which}: 終わりの確かめで照合つきの道にやり直していない");
                 let want = match which {
                     "group_sum" => "[]".to_string(),
                     "min64" => "None".to_string(),
@@ -5740,7 +5748,7 @@ mod aggregate_fast_path_tests {
         }
     }
 
-    /// 対照: 使い回しの無い集計は速い道のまま (割り込み点を通る) で、 照合つきの道と同じ答え。
+    /// 対照: 印の無い表の集計は速い道のまま (割り込み点を通る) で、 やり直さない (終わりの確かめがいつも外れる退行を拾う)。
     #[test]
     fn aggregates_on_a_table_without_reuse_take_the_fast_path() {
         let (path, eng, a) = engine("fast", true);
@@ -5748,9 +5756,104 @@ mod aggregate_fast_path_tests {
         eng.tie_to_by_id(a, sa, 7u32);
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let f2 = fired.clone();
+        let _ = fast_read_hook::take_redos();
         fast_read_hook::set(move || f2.store(true, std::sync::atomic::Ordering::SeqCst));
         assert_eq!(eng.sum("s.a", &[a]), 7);
-        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "使い回しの無い表の集計が速い道を通らなかった");
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "印の無い表の集計が速い道を通らなかった");
+        assert_eq!(fast_read_hook::take_redos(), 0, "印の無い表の集計がやり直した");
+        // 並列の版も
+        let many = vec![a; 64_000];
+        assert_eq!(eng.sum_eids_par("s.a", &many), 7 * 64_000);
+        assert_eq!(fast_read_hook::take_redos(), 0, "印の無い表の並列の集計がやり直した");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// 並列の版 (`par_fold_eids`、 eid が `PAR_RANGE_THRESHOLD` (64,000) 以上 = schema の `Query::sum` / `count` / `group_sum` の道) も、
+    /// 速い道で読む途中に使い回しが入れば、 終わりの確かめで照合つきの道にやり直す。 割り込み点は rayon の worker のどれかで 1 回だけ鳴る
+    /// (engine ごとの global)。 枠 1 の表の同じ eid を 64,000 並べ、 割り込みで a を消して使い回した b が書く。 v14 / v15 の両方。
+    #[test]
+    fn parallel_aggregates_redo_with_checks_when_a_slot_is_reused_meanwhile() {
+        for v15 in [false, true] {
+            for which in ["sum_eids_par", "count_eids_par", "group_sum_eids_par", "min_eids_par", "histogram_eids_par"] {
+                let (path, eng, a) = engine("parredo", v15);
+                let id = |n: &str| eng.himo_id(n).unwrap() as u16;
+                let (sa, sg) = (id("s.a"), id("s.g"));
+                eng.tie_to_by_id(a, sa, 7u32);
+                eng.tie_to_by_id(a, sg, 3u32);
+                let tid = eng.himo_to_table[sa as usize].load(std::sync::atomic::Ordering::Relaxed);
+                assert!(!eng.generations().table_has(tid), "前提: 速い道で始まる");
+                let many = vec![a; 64_000];
+                let (tx, rx) = std::sync::mpsc::channel();
+                let e2 = eng.clone();
+                let _ = fast_read_hook::take_redos();
+                fast_read_hook::set_par(Arc::as_ptr(&eng) as usize, move || {
+                    e2.delete(a);
+                    let b = e2.entity_in("s").unwrap();
+                    assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(a), "前提: 同じ場所を使い回した");
+                    e2.tie_to_by_id(b, sa, 8u32);
+                    e2.tie_to_by_id(b, sg, 4u32);
+                    tx.send(()).unwrap();
+                });
+                let got = match which {
+                    "sum_eids_par" => format!("{}", eng.sum_eids_par("s.a", &many)),
+                    "count_eids_par" => format!("{}", eng.count_eids_par("s.a", &many)),
+                    "group_sum_eids_par" => format!("{:?}", eng.group_sum_eids_par("s.g", "s.a", &many)),
+                    "min_eids_par" => format!("{:?}", eng.min_eids_par("s.a", &many)),
+                    "histogram_eids_par" => format!("{:?}", eng.histogram_eids_par("s.a", &many, 0, 9, 10)),
+                    _ => unreachable!(),
+                };
+                rx.try_recv().unwrap_or_else(|_| panic!("v15={v15} {which}: 前提: 並列の速い道の割り込み点で使い回した"));
+                assert!(eng.generations().table_has(tid), "v15={v15} {which}: 前提: 使い回しで s に印が立った");
+                assert_eq!(fast_read_hook::take_redos(), 1, "v15={v15} {which}: 終わりの確かめで照合つきの道にやり直していない");
+                let want = match which {
+                    "group_sum_eids_par" => "[]".to_string(),
+                    "min_eids_par" => "None".to_string(),
+                    "histogram_eids_par" => format!("{:?}", vec![0u32; 10]),
+                    _ => "0".to_string(),
+                };
+                assert_eq!(got, want, "v15={v15} {which}: 並列の速い道が読みの間に使い回された行の値を数えた");
+                drop(eng);
+                let _ = crate::db_files::remove_db(&path);
+                let _ = std::fs::remove_file(oplog_path_for(&path));
+            }
+        }
+    }
+
+    /// 畳んだ自分の行の別名 (#612、 照合が別名をたどる) があれば、 集計は照合つきの道 (速い道の割り込み点を通らず、 照合つきの道の割り込み点
+    /// `checked_read_hook` を通る)。 速い道の途中で別名ができれば (`own_alias_on` が立つ)、 終わりの確かめでやり直す。
+    #[test]
+    fn own_aliases_keep_aggregates_on_the_checked_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // 始めから別名がある
+        let (path, eng, a) = engine("alias", true);
+        let sa = eng.himo_id("s.a").unwrap() as u16;
+        eng.tie_to_by_id(a, sa, 7u32);
+        eng.own_alias_on.store(true, Ordering::Release);
+        let (fast, checked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (f2, c2) = (fast.clone(), checked.clone());
+        fast_read_hook::set(move || f2.store(true, Ordering::SeqCst));
+        checked_read_hook::set(move || c2.store(true, Ordering::SeqCst));
+        let _ = fast_read_hook::take_redos();
+        assert_eq!(eng.sum("s.a", &[a]), 7);
+        assert!(!fast.load(Ordering::SeqCst), "別名のある engine の集計が速い道を通った");
+        assert!(checked.load(Ordering::SeqCst), "別名のある engine の集計が照合つきの道を通らなかった");
+        assert_eq!(fast_read_hook::take_redos(), 0);
+        let _ = fast_read_hook::take();
+        let _ = checked_read_hook::take();
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+
+        // 速い道の途中で別名ができる
+        let (path, eng, a) = engine("aliasmid", true);
+        eng.tie_to_by_id(a, sa, 7u32);
+        let e2 = eng.clone();
+        fast_read_hook::set(move || e2.own_alias_on.store(true, Ordering::Release));
+        let _ = fast_read_hook::take_redos();
+        assert_eq!(eng.sum("s.a", &[a]), 7);
+        assert_eq!(fast_read_hook::take_redos(), 1, "速い道の途中で別名ができたのにやり直さなかった");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
@@ -32920,7 +33023,7 @@ impl Engine {
     ///
     /// - 速い道 ([`Self::fast_eid_reads`] が始めに許した時): eid の local が表の最初の枠の中 (= 世代 0 の場所) ならその場所を照合せずに
     ///   読む (枠の外の eid だけ照合つき、 loop の外の関数)。 終わりに [`Self::fast_eid_reads_held`] が許し続けているかを見て、 だめなら
-    ///   (途中で表に世代 > 0 の場所ができた = 使い回しが入りえた) 照合つきの道でやり直す
+    ///   (途中で表の印が立った = 行が消えて場所の世代が上がり、 使い回しが入りえた / 別名ができた) 照合つきの道でやり直す
     /// - 照合つきの道 ([`Self::fold_eids_checked`]): eid ごとに読む前と後に世代を照合する (#1041)。 `ACQ` = `read` が列の cell を
     ///   Acquire で読む (`get_value` / `get_value32`、 fence の無い `read_app_acquired`)、 でなければ fence のある `read_app` (列の生の並び
     ///   `stored_slice`)
@@ -32954,6 +33057,8 @@ impl Engine {
             if self.fast_eid_reads_held(fast) {
                 return acc;
             }
+            #[cfg(test)]
+            fast_read_hook::note_redo();
         }
         self.fold_eids_checked::<ACQ, A, V>(eids, init(), &read, &add)
     }
@@ -32996,7 +33101,11 @@ impl Engine {
                     let mut acc = init();
                     for &eid in chunk {
                         let v = match fast.slot(eid) {
-                            Some(slot) => read(slot),
+                            Some(slot) => {
+                                #[cfg(test)]
+                                fast_read_hook::call_par(self as *const Engine as usize);
+                                read(slot)
+                            }
                             None => self.read_app_outlined::<ACQ, V>(eid, &read),
                         };
                         if let Some(v) = v {
@@ -33012,6 +33121,8 @@ impl Engine {
             if self.fast_eid_reads_held(fast) {
                 return acc;
             }
+            #[cfg(test)]
+            fast_read_hook::note_redo();
         }
         eids.par_chunks(Self::PAR_RANGE_CHUNK)
             .map(|chunk| self.fold_eids_checked::<ACQ, A, V>(chunk, init(), &read, &add))
@@ -33026,20 +33137,25 @@ impl Engine {
     }
 
     /// 集計の速い道 ([`Self::fold_eids`]) を始めてよいか。 よいのは、 読む紐 `hids` が全部同じ名前のある表 T の物で (anonymous の紐は
-    /// 照合つき)、 T に世代 > 0 の場所が無く (`Generations::table_has`、 世代を持たない DB はいつも無い)、 畳んだ自分の行の別名 (#612、
-    /// 照合が別名をたどる) が無い時。
+    /// 照合つき)、 T に世代 > 0 の場所が無く (`Generations::table_has` の印が立っていない)、 畳んだ自分の行の別名 (#612、 照合が別名を
+    /// たどる) が無い時。 印は場所の世代を上げる時に立つので、 v15 の DB では **1 行でも消した表** (消す道の kill が世代を上げる) と、 v15 に
+    /// 移る手順の 4. で v14 の間に消した場所のある表は、 以後ずっと照合つきの道。 速い道に乗るのは、 v14 の DB の表 (消しても印を立てない) と、
+    /// v15 の DB で消したことの無い表。 速い道で読むのは、 その表の最初の枠の中の eid だけ (足した枠・世代 > 0・別の表の eid は 1 つずつ照合つき)。
     ///
     /// 速い道の正しさ (終わりに [`Self::fast_eid_reads_held`] が同じことを確かめた時):
-    /// - T の場所を別の行が使い回すのは、 前の住人の世代を上げた後だけ: v15 の消す道の kill (`live_free` → `kill_generation`)、 v15 に移る
-    ///   手順 (`move_to_generations`) の 4. (v14 の間に消えた場所を世代 1 に)。 世代を上げる道はどれも、 上げる前に T の印を立てる
-    ///   (`mark_table`、 AcqRel の RMW、 印は下ろさない)。 v14 の DB は使い回す前に必ず移る手順を通る (最初の使い回しが移らせる) ので、
-    ///   v14 の間 (印が無い・gen.seg が無い) に使い回しは無い
-    /// - 使い回した後の住人の書き込みは印より後: 印 → 世代 → 生きている印を下ろす (AcqRel) → 空きの一覧 / 払い出し位置 → 生かす →
-    ///   cell を書く (Release)。 速い道がその値を読んだなら、 その読み (`ACQ` は cell の Acquire、 でなければ終わりの fence) が書き手と
-    ///   同期し、 終わりの印の読み (Acquire) は立っているのを見る = やり直す
-    /// - 終わりまで印が無ければ、 読んだ値は全部その eid の行の物か、 消えた行の外した cell (= 無し)。 これは照合つきの道と同じ答え
-    ///   (照合つきの道も、 読みの間に消えただけの行の値は、 読んだ後の照合までに世代が上がらなければ数える)
-    /// - 予約の表 (`_sync_ops` など) は世代を持たず印も立たない。 照合つきの道も使い回しを見分けられない (前と同じ)
+    /// - 印は、 場所の世代を上げる書きの全部 (`kill_generation` / `raise_generation` / `kill_generation_reconciled`、 `Generations::kill` /
+    ///   `raise` / `kill_reconciled` を呼ぶのはこの 3 つだけ) の前に、 同じ thread で立つ (`mark_table`、 AcqRel の RMW、 印を下ろす道は無い)。
+    ///   gen.seg の 2 B を変える他の書き (`revive` / `restore` / 開く時の `heal` / `prepare`) は世代を上げない
+    /// - #1041 の 「読んだ後の照合」 が正しいのは、 使い回した後の住人の書き込みが、 前の住人の世代を上げた書きより hb で後だから
+    ///   ([`Self::read_app_acquired`])。 印はその書きより前 (同じ thread) なので、 同じ前提から、 その書き込みは印より hb で後 (払い出しの道も、
+    ///   値を書いてから生かす受信の道も)。 速い道がその値を読んだなら、 その読み (`ACQ` は cell の Acquire、 でなければ終わりの fence。 並列の
+    ///   版は worker の chunk の終わりの fence と rayon の合流) が書き手と同期し、 終わりの印の読み (Acquire) は立っているのを見る → やり直す。
+    ///   = 速い道の終わりの確かめは、 照合つきの道の読んだ後の照合が見つける使い回しを全部見つける
+    /// - 読む前に消えていた行は、 消すのが集計より hb で前なら始めの印の読みが印を見て照合つきの道に行く。 hb で前でなければ並んだ削除で、
+    ///   どちらの答えでもよい
+    /// - 世代を上げずに場所を使い回す形 (v14 の DB の束ね / 受信の `ensure_live_slot` が死んだ場所を世代 0 のまま生かす、 予約の表、 v15 に
+    ///   移れない DB = packed / wasm) は印も立たないが、 照合つきの道も世代で見分けられない = 照合つきの道と同じ答え
+    /// - v14 の DB で集計の途中に v15 に移っても同じ (移る手順は 4. で `kill_generation` を通り、 使い回すのは移り終えた後)
     #[inline]
     fn fast_eid_reads(&self, hids: &[usize]) -> Option<FastEidReads> {
         use std::sync::atomic::Ordering;
@@ -38836,12 +38952,21 @@ impl FastEidReads {
     }
 }
 
-/// test 用の割り込み点: 集計の速い道 (`Engine::fold_eids`) が照合せずに場所を読む前。 置いた thread で 1 回だけ呼ぶ。
+/// test 用の割り込み点: 集計の速い道 (`Engine::fold_eids`) が照合せずに場所を読む前。 置いた thread で 1 回だけ呼ぶ。 並列の版
+/// (`Engine::par_fold_eids`) は rayon の worker が読むので、 engine ごとの global の割り込み点 (`set_par` / `call_par`、 どの worker からでも
+/// 1 回だけ)。 あわせて、 速い道の終わりの確かめが外れて照合つきでやり直した回数を数える (やり直しを決めるのは呼んだ thread)。
 #[cfg(test)]
 mod fast_read_hook {
+    type ParHook = Box<dyn FnOnce() + Send>;
+
     thread_local! {
         static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+        static REDOS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
+
+    /// (engine の番地, 処理)。 並んで走る他の試験の engine の並列の集計では呼ばない。
+    static PAR: std::sync::Mutex<Vec<(usize, ParHook)>> = std::sync::Mutex::new(Vec::new());
+    static PAR_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     pub(super) fn set(f: impl FnOnce() + 'static) {
         HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
@@ -38851,6 +38976,42 @@ mod fast_read_hook {
         if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
             f();
         }
+    }
+
+    pub(super) fn set_par(engine: usize, f: impl FnOnce() + Send + 'static) {
+        PAR.lock().unwrap_or_else(|p| p.into_inner()).push((engine, Box::new(f)));
+        PAR_ARMED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn call_par(engine: usize) {
+        if !PAR_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let f = {
+            let mut h = PAR.lock().unwrap_or_else(|p| p.into_inner());
+            let f = h.iter().position(|(e, _)| *e == engine).map(|i| h.remove(i).1);
+            if h.is_empty() {
+                PAR_ARMED.store(false, std::sync::atomic::Ordering::Release);
+            }
+            f
+        };
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    pub(super) fn note_redo() {
+        REDOS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// 鳴らなかった割り込み点を外す (この thread)。
+    pub(super) fn take() -> bool {
+        HOOK.with(|h| h.borrow_mut().take()).is_some()
+    }
+
+    /// この thread の集計が速い道の終わりの確かめでやり直した回数 (読んで 0 に戻す)。
+    pub(super) fn take_redos() -> u32 {
+        REDOS.with(|c| c.replace(0))
     }
 }
 
