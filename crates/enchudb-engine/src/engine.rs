@@ -28185,9 +28185,18 @@ impl Engine {
                 continue;
             }
             let tomb = self.tombstone_version_of(slot);
-            let stale = tomb == enchudb_oplog::Hlc::ZERO || gens.prev.read(slot).is_some_and(|r| r.tomb == tomb);
-            let lower = if versioned && stale && !gens.mid_reuse(slot) { self.delete_lower_bound(slot) } else { enchudb_oplog::Hlc::ZERO };
-            let missing = lower != enchudb_oplog::Hlc::ZERO;
+            // #1068 の読み直し F2: 作り直すのは自分の行の場所だけ。 翻訳した (他の peer の) 行の場所は、 2. の像に 「畳んだ翻訳した行
+            // (`merge_entity_into` の src、 `.eidmap` が本体より遅れた像)」 が入り、 作り直すと state がその行の持ち主の生きている行の
+            // Delete を自分の書き込みとして出す。 user の決定 (11-23) の 「翻訳した行の場所は今のまま」 (1. の今の時刻の作り直しもやめる)
+            let own = self.eid_translator.reverse(slot).is_none();
+            let lower = if versioned && own && !gens.mid_reuse(slot) { self.delete_lower_bound(slot) } else { enchudb_oplog::Hlc::ZERO };
+            // #1068 の読み直し F1: 前の open の作り直しが置いた下限の tombstone だけが disk に届き、 その floor (本体の `_sync_peers`) が
+            // 届かなかった像 (開く道の本体の書き出しの途中の電源断。 tomb.seg は列より先に書き出す) も 「届いていない」 = 作り直す
+            // (tombstone は同じ値、 floor をもう一度上げるだけ = 冪等)。 下限は配った版数以下なので、 #451 の tomb.seg のなめは拾わない
+            let stale = tomb == enchudb_oplog::Hlc::ZERO
+                || gens.prev.read(slot).is_some_and(|r| r.tomb == tomb)
+                || (lower != enchudb_oplog::Hlc::ZERO && tomb == lower);
+            let missing = stale && lower != enchudb_oplog::Hlc::ZERO;
             if missing && wal.is_some() {
                 // cell を落とし後始末待ちを落とすのは、 作り直しが tombstone を置いた後 (`relog_unlogged_writes`)
                 gens.note_relog_gen(slot, row_gen);
@@ -36239,10 +36248,12 @@ impl Engine {
         wal.set_peer_id(me);
         let mut relogged = 0u64;
         let mut fallback = deletes.iter().any(|(h, _)| *h <= reached);
+        // 新しい HLC は、 作り直す版数と配った版数より後に採番する。 #1068 の読み直し F4: floor を上げる枝でも時計に入れる (本体にだけ届いた
+        // cell の版数より前に戻った時計で、 この session の書き込み (削除) がその版数より古く採番されると、 突き合わせの下限 (行の cell の
+        // 版数の最大の直後) が本当の削除の時刻を越える)
+        let top = cells.iter().map(|c| c.0).chain(deletes.iter().map(|d| d.0)).max().unwrap_or(Hlc::ZERO);
+        wal.observe_hlc(top.max(reached));
         if !fallback {
-            // 新しい HLC は、 作り直す版数と配った版数より後に採番する
-            let top = cells.iter().map(|c| c.0).chain(deletes.iter().map(|d| d.0)).max().unwrap_or(Hlc::ZERO);
-            wal.observe_hlc(top.max(reached));
             deletes.sort_unstable();
             cells.sort_unstable();
             for (h, gone) in &deletes {

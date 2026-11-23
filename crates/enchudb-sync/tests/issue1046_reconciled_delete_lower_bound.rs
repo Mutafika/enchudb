@@ -113,6 +113,9 @@ fn entities_only_image(
         eng_a.oplog_sync().unwrap();
         copy_dir(Path::new(pa), Path::new(&before));
         eng_a.delete(x);
+        // #1047: 下限は本当の削除の版数以下 (名前の削除優先が、 本当の削除の後に同じ名前で足し直した行を消さない)
+        let deleted_at = eng_a.tombstone_hlc(x);
+        assert!(lower_bound_of(newest) <= deleted_at, "下限 {:?} が本当の削除の版数 {deleted_at:?} より後", lower_bound_of(newest));
         if deliver {
             eng_a.oplog_sync().unwrap();
             eng_a.transfer_oplog_to_sync_ops();
@@ -187,7 +190,11 @@ fn a_row_renamed_after_reconcile_step_2_survives_a_state_refetch() {
     eng_a.tie_to(x2, "notes.v", 9u32);
     eng_a.oplog_sync().unwrap();
     assert_eq!(eng_c.pull_raw("notes.name", 5u32).len(), 1, "前提: C に X がある");
-    // C が A の state で取り直す
+    // A は X の削除を下限の版数で置き、 floor を上げた (配った版数以下 = record を載せない)。 C は差分で受けると抜けを言われ、 A の state で
+    // 取り直す
+    sync_a.publish_since(Hlc::ZERO);
+    let out = sync_c.pull_once(1);
+    assert!(out.history_truncated, "A の floor で C が抜けを言われない: {out:?}");
     sync_c.bootstrap_pull(1).expect("serve_state 済み");
     let named_on_c: Vec<(u64, Option<u64>)> =
         eng_c.pull_raw("notes.name", 5u32).into_iter().filter(|&e| eng_c.is_live(e)).map(|e| (e, eng_c.get(e, "notes.v"))).collect();
@@ -228,4 +235,66 @@ fn a_lower_bound_delete_does_nothing_where_the_delete_already_arrived() {
     drop(sync_a);
     drop(eng_a);
     assert_eq!(after, c_tomb, "下限の Delete が C の tombstone を変えた");
+}
+
+/// #1068 の読み直し F2: 名前で畳んだ翻訳した行 (`fold_rows_with_same_pk` → `merge_entity_into` の src) の、 畳んだ後の生きている印だけが
+/// 届いた像 (`.eidmap` は畳む前 = その場所は翻訳した行のまま)。 突き合わせの 2. がその場所を完了させても、 翻訳した行の場所には tombstone を
+/// 置かず、 A の state は行の持ち主 B の行の Delete を A の書き込みとして出さない (出すと B が自分の生きている行を消す)。
+///
+/// falsify: 作り直しを自分の行の場所に限らないと、 畳んだ src の場所に下限の tombstone を置き、 A の state が `Delete (B, x)` を出す。
+#[test]
+fn a_folded_translated_row_finished_by_reconcile_step_2_is_not_deleted_for_its_owner() {
+    let (pa, pb, img) = (tmp_path("a"), tmp_path("b"), tmp_path("img"));
+    let (before, after) = (format!("{img}-before"), format!("{img}-after"));
+    let _c = Cleanup(vec![pa.clone(), pb.clone(), img.clone(), before.clone(), after.clone()]);
+    let transport = transport(&[1, 2]);
+    let eng_b = make(&pb, 2);
+    let sync_b = Syncer::new(eng_b.clone(), transport.clone());
+    let (s_on_a, x) = {
+        let eng_a = make(&pa, 1);
+        let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+        // B の行 x (名前 7) を A が受ける (翻訳した行 s)
+        let x = eng_b.entity_in("notes").unwrap();
+        eng_b.tie_to(x, "notes.name", 7u32);
+        eng_b.tie_to(x, "notes.v", 1u32);
+        eng_b.oplog_sync().unwrap();
+        sync_b.publish_since(Hlc::ZERO);
+        sync_a.pull_once(2);
+        let s_on_a = eng_a.pull_raw("notes.name", 7u32)[0];
+        // A の自分の行 d (名前 5)。 s の後ろに生きた行がある (払い出し位置が開く時に s の手前へ戻らない)
+        let d = eng_a.entity_in("notes").unwrap();
+        eng_a.tie_to(d, "notes.name", 5u32);
+        eng_a.oplog_sync().unwrap();
+        eng_a.persist_sync_state().unwrap();
+        {
+            let _hold = eng_a.hold_consumer();
+            eng_a.oplog_sync().unwrap();
+            copy_dir(Path::new(&pa), Path::new(&before));
+            // B が x を 5 に改名し、 A が当てて s を d に畳む
+            eng_b.tie_to(x, "notes.name", 5u32);
+            eng_b.oplog_sync().unwrap();
+            sync_b.publish_since(Hlc::ZERO);
+            sync_a.pull_once(2);
+            assert!(!eng_a.is_live_unchecked(s_on_a), "前提: A は s を d に畳んだ");
+            copy_dir(Path::new(&pa), Path::new(&after));
+        }
+        drop(sync_a);
+        (s_on_a, x)
+    };
+    copy_dir(Path::new(&before), Path::new(&img));
+    std::fs::copy(Path::new(&after).join("entities.seg"), Path::new(&img).join("entities.seg")).unwrap();
+    let eng_a = Engine::open_concurrent_with_oplog(&img, WAL).unwrap();
+    eng_a.set_peer_id(1);
+    assert_eq!(eng_a.generation_repairs(), (0, 1), "前提: 突き合わせの 2. が畳んだ s の場所を完了させた");
+    let tomb = eng_a.tombstone_hlc(s_on_a);
+    let deletes_x: Vec<Hlc> = eng_a
+        .state_records()
+        .0
+        .into_iter()
+        .filter(|r| r.author_peer == 1 && matches!(r.op, enchudb_oplog::oplog::DecodedOp::Delete { eid } if eid == x))
+        .map(|r| r.hlc)
+        .collect();
+    drop(eng_a);
+    assert_eq!(tomb, Hlc::ZERO, "畳んだ翻訳した行の場所に tombstone を置いた");
+    assert_eq!(deletes_x, Vec::<Hlc>::new(), "A の state が B の行 x の Delete を A の書き込みとして出した");
 }
