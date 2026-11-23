@@ -34,7 +34,7 @@ fn a_sync_db_writes_rows_only_with_the_wal() {
     let _rm = Rm(path.clone());
     // build phase: sync を有効にした後は行を書けない
     let mut db = Database::create(&path).unwrap();
-    db.table("notes").number("id").tag("body").primary_key("id").build().unwrap();
+    db.table("notes").number("id").tag("body").ref_to("link", "notes").primary_key("id").build().unwrap();
     db.enable_sync().unwrap();
     let in_build = refused(db.get_table("notes").unwrap().insert().set("id", 1i64).set("body", "a").commit());
     assert!(in_build, "build phase の sync する DB で insert が断られない");
@@ -53,6 +53,7 @@ fn a_sync_db_writes_rows_only_with_the_wal() {
         let refusals = [
             ("insert", refused(notes.insert().set("id", 2i64).set("body", "b").commit())),
             ("update", refused(notes.entity(x).set("body", "c").commit())),
+            ("update of a ref", refused(notes.entity(x).set("link", Value::Ref(x)).commit())),
             ("delete", refused(notes.entity(x).delete())),
         ];
         for (what, ok) in &refusals {
@@ -60,6 +61,7 @@ fn a_sync_db_writes_rows_only_with_the_wal() {
         }
         assert_eq!(notes.all().count().unwrap(), 1, "断った書き込みが行を増やした / 消した");
         assert_eq!(notes.entity(x).get("body"), Some(Value::Text("a".into())), "断った update が値を変えた");
+        assert_eq!(notes.entity(x).get("link"), None, "断った ref の update が値を変えた");
     }
     // WAL 付きで開き直すと書ける
     let db = Database::open_with_oplog(&path, WAL).unwrap();

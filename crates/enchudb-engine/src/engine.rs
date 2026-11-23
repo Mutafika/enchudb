@@ -724,7 +724,8 @@ pub enum FaultKind {
     WalSpace,
     /// #1066: sync する DB (sync の表がある) を WAL なしで開いた session (`open_standalone` / schema の `Database::open` /
     /// `finish_concurrent` / build phase) の、 ユーザの表への書き込み。 版数 (WAL の時計) が付かず相手に配れないので、 何も変えずに断る。
-    /// WAL 付きで開き直す (`open_concurrent_with_oplog` / schema の `open_with_oplog`、 build phase は `finish_with_oplog` の後) と書ける
+    /// WAL 付きで開き直す (`open_concurrent_with_oplog` / schema の `open_with_oplog`、 build phase は `finish_with_oplog` の後) と書ける。
+    /// WAL を持てない engine (`from_bytes` の Memory backing / wasm) の sync する DB は、 ユーザの表に書けない (読みだけ)
     NoWal,
 }
 
@@ -5860,6 +5861,8 @@ mod wal_reject_tests {
         let faults = eng.fault_count(FaultKind::WalSpace);
         eng.untie_by_id(kept, v);
         eng.delete(kept);
+        // #1066 の読み直し F5: `try_delete` は WAL に載らない断りを返す (前は NoWal の他は `Ok` を返した)
+        assert_eq!(eng.try_delete(kept), Err(TieRejected::Fault(FaultKind::WalSpace)), "WAL に載らない削除を try_delete が断りとして返さない");
         assert_eq!(eng.get_by_id(kept, v), Some(1), "WAL に載らなかった untie / delete が本体を変えた");
         assert!(eng.fault_count(FaultKind::WalSpace) >= faults + 2, "untie / delete を断った数が増えない");
         write_out_fault::set(&wal, false);
@@ -17643,6 +17646,9 @@ impl Engine {
 
     /// Vec<u8> からエンジンを構築。WASM ではこれが唯一のエントリポイント。
     /// native でも使える（テスト、ファイル丸読みなど）。
+    ///
+    /// この engine は WAL (oplog) を持てない。 #1066: sync の表のある DB (relay の bootstrap を開いた物など) は、 ユーザの表の行を書けない
+    /// (読みだけ。 相手から受けた書き込みと予約の表は通る)。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
         // file の無い engine (書き出しは何もしない)
@@ -18332,6 +18338,10 @@ impl Engine {
     ///
     /// 0.7.0 では opt-in 方針。 一度有効化すると無効化は不可 (= reserved table
     /// は close できない、 ただし himo は最小)。
+    ///
+    /// #1066: 有効にした後は、 WAL 付きの session (`concurrentize_with_oplog` の後 / `open_concurrent_with_oplog`) でしか、 ユーザの表の行を
+    /// 書けない (この build phase の残り・`open_standalone`・`concurrentize` (WAL なし)・`from_bytes` / wasm の書き込みは
+    /// `FaultKind::NoWal` で断る)。 版数の無い初期の行が要るなら、 有効にする前に書く。
     pub fn enable_sync_tables(&mut self) -> Result<(), String> {
         self.check_writable();
 
@@ -22220,10 +22230,14 @@ impl Engine {
         self.try_entity_in(table_name).map_err(|(_, why)| why)
     }
 
-    /// [`Self::entity_in`] の、 断りの種類を分ける形 (#970、 PR #977 の読み直し 4 の [9])。 `Err((Some(FaultKind::DiskSpace), why))` =
-    /// ディスクの空きの不足 (払い出す場所の世代を書く gen.seg の page を commit できない / v15 に移れない。 空きが戻れば通る、 列を
-    /// 伸ばせない時と同じ棚)。 `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は前者を
-    /// `SchemaError::WriteRejected(TieRejected::Fault(DiskSpace))` にする。
+    /// [`Self::entity_in`] の、 断りの種類を分ける形 (#970、 PR #977 の読み直し 4 の [9])。 `Err((Some(kind), why))` は fault に数える断り:
+    ///
+    /// - `Some(FaultKind::DiskSpace)`: ディスクの空きの不足 (払い出す場所の世代を書く gen.seg の page を commit できない / v15 に移れない。
+    ///   空きが戻れば通る、 列を伸ばせない時と同じ棚)
+    /// - `Some(FaultKind::NoWal)` (#1066): sync する DB を WAL なしで開いた session (build phase を含む) のユーザの表。 WAL 付きで開き直すと通る
+    ///
+    /// `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は `Some(kind)` を
+    /// `SchemaError::WriteRejected(TieRejected::Fault(kind))` にする。
     pub fn try_entity_in(&self, table_name: &str) -> Result<enchudb_oplog::EntityId, (Option<FaultKind>, String)> {
         self.try_entity_in_row(table_name).map(|(eid, _)| eid)
     }
@@ -32907,38 +32921,32 @@ impl Engine {
 
     // ──── delete ────
 
-    /// [`Self::delete`] の、 #1066 の断りを返す形: WAL なしで開いた sync する DB のユーザの表の行は消さずに
-    /// `Err(TieRejected::Fault(FaultKind::NoWal))`。 他は [`Self::delete`] と同じ (消えた行 / 場所を使い回す前の eid は何もせず `Ok`)。
+    /// 行 `eid` を消す。 消せなかった時は理由を返し、 何も変えない (`try_tie_*` と同じ形、 #1066 の読み直し F5):
+    ///
+    /// - `DeadRow`: 消えた行 / 場所を使い回す前の eid (#731)
+    /// - `Fault(NoWal)`: WAL なしで開いた sync する DB のユーザの表の行 (#1066)
+    /// - `Fault(SegmentIo)`: 開けない列がある (#534。 途中まで消さない)
+    /// - `Fault(WalSpace)`: WAL に載らない (#553 / #554)
+    /// - `OlderThanCell`: cell に今より新しい版数がある (時計が戻った)
     pub fn try_delete(&self, eid: enchudb_oplog::EntityId) -> Result<(), TieRejected> {
-        if let Some(local) = self.app_slot(eid)
-            && self.refuses_walless_sync_write(local)
-        {
-            return Err(TieRejected::Fault(FaultKind::NoWal));
-        }
-        self.delete(eid);
-        Ok(())
-    }
-
-    pub fn delete(&self, eid: enchudb_oplog::EntityId) {
         let app = eid;
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は何もしない (#612: 畳んだ自分の行の eid は残す行へ)
-        let Some(eid) = self.app_slot(app) else { return };
+        let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
         // #1066: WAL なしで開いた sync する DB のユーザの表の行は消さない (tombstone なしで死ぬ = #1046)
         if self.refuses_walless_sync_write(eid) {
-            return;
+            return Err(TieRejected::Fault(FaultKind::NoWal));
         }
         // #534: 消すには全部の列の古い値を読む (索引と Leaf の領域の片付け)。 開けない列があれば何も積まずに断る (途中まで
         // 消さない。 WAL に積んでから断ると、 配った相手でだけ消える)
-        if (0..self.himos.len()).any(|hid| self.load_column(hid).is_err()) {
-            return;
+        for hid in 0..self.himos.len() {
+            self.load_column(hid)?;
         }
         // request17 step 4 (A-5): 削除は himo を持たないので eid 空間の tombstone
         // column に版数を記録する。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 行を握ってから積む (`append_local_op` の doc)
-        let Some(row) = self.lock_app_row(app, eid) else { return };
-        let row = Some(row);
+        let row = Some(self.lock_app_row(app, eid).ok_or(TieRejected::DeadRow)?);
         let oplog_eid = self.oplog_eid(eid);
         let mut hids = RowHids::new();
         let applying = self.local_apply_row(eid, &mut hids);
@@ -32949,9 +32957,7 @@ impl Engine {
         if !self.has_cell_version() {
             self.note_freed_slot(eid, enchudb_oplog::Hlc::ZERO);
         }
-        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark()) else {
-            return;
-        };
+        let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark())?;
         self.at_apply_point(true);
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc, applying.row_valued());
         drop(applying);
@@ -32964,9 +32970,16 @@ impl Engine {
                 names_taken_hook::call(wal);
             }
             self.remove_rows_holding_names(eid, names, hlc);
+            Ok(())
         } else {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
+            Err(TieRejected::OlderThanCell)
         }
+    }
+
+    /// 行 `eid` を消す。 消せなかった時は何もしない (理由は [`Self::try_delete`]、 容量の断りは `fault_count` にも数える)。
+    pub fn delete(&self, eid: enchudb_oplog::EntityId) {
+        let _ = self.try_delete(eid);
     }
 
     // ──── トランザクション ────

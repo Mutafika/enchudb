@@ -28,12 +28,13 @@ fn tmp(tag: &str) -> String {
         .to_string()
 }
 
-/// 表 t (列 v = Number、 n = Leaf) の sync する DB を WAL 付きで作り、 行 X (v = 1、 n = "x") を書いて閉じる。 X を返す。
+/// 表 t (列 v = Number、 n = Leaf、 r = t を指す Ref) の sync する DB を WAL 付きで作り、 行 X (v = 1、 n = "x") を書いて閉じる。 X を返す。
 fn sync_db_with_a_row(path: &str) -> u64 {
     let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
     eng.define_table("t", 16).unwrap();
     eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
     eng.define_himo_in("t", "n", ValueType::Leaf, 0).unwrap();
+    eng.define_ref_in("t", "r", "t").unwrap();
     eng.enable_sync_tables().unwrap();
     let eng = Engine::concurrentize_with_oplog(eng, WAL).unwrap();
     eng.set_peer_id(1);
@@ -44,13 +45,24 @@ fn sync_db_with_a_row(path: &str) -> u64 {
     x
 }
 
-/// 行の見える物 (生きているか、 v、 n、 削除の版数、 content)。
-type RowState = (bool, Option<u64>, Option<Vec<u8>>, Hlc, Option<Vec<u8>>);
+/// 行の見える物 (生きているか、 v、 n、 r、 削除の版数、 content の memo / memo2)。
+type RowState = (bool, Option<u64>, Option<Vec<u8>>, Option<u64>, Hlc, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// 行 X の見える物。 世代は eid に入っている (X の eid のまま引けるか)。
 fn state(eng: &Engine, x: u64) -> RowState {
-    (eng.is_live(x), eng.get(x, "t.v"), eng.get_text_owned(x, "t.n"), eng.tombstone_hlc(x), eng.get_content_owned(x, "memo"))
+    (
+        eng.is_live(x),
+        eng.get(x, "t.v"),
+        eng.get_text_owned(x, "t.n"),
+        eng.get(x, "t.r"),
+        eng.tombstone_hlc(x),
+        eng.get_content_owned(x, "memo"),
+        eng.get_content_owned(x, "memo2"),
+    )
 }
+
+/// 断った書き込みが生やしてはいけない紐 (名前の道で、 まだ無い名前を渡したもの。 content の紐は `表._c_鍵`)。
+const MUST_NOT_GROW: [&str; 6] = ["t.new", "t.newtext", "t.newref", "t._c_memo", "t._c_memo2", "_c_memo"];
 
 /// WAL なしで開いた sync する DB: ユーザの表への書き込みは全部断られ、 何も変わらない (行・cell・Leaf・削除の版数・世代)。 読みはできる。
 /// 相手から受けた書き込み (版数を持つ) と予約の表 (`_cursors`) の書き込みは通る。 WAL 付きで開き直すと書ける。
@@ -63,34 +75,48 @@ fn a_sync_db_opened_without_the_wal_refuses_user_writes() {
         let mut eng = Engine::open_standalone(&path).unwrap();
         eng.set_peer_id(1);
         let before = state(&eng, x);
-        assert_eq!(before, (true, Some(1), Some(b"x".to_vec()), Hlc::ZERO, None), "前提: X が読める");
+        assert_eq!(before, (true, Some(1), Some(b"x".to_vec()), None, Hlc::ZERO, None, None), "前提: X が読める");
+        assert!(MUST_NOT_GROW.iter().all(|h| eng.himo_id(h).is_none()), "前提: まだ無い紐");
         let v = eng.himo_id("t.v").unwrap() as u16;
         let n = eng.himo_id("t.n").unwrap() as u16;
+        let r = eng.himo_id("t.r").unwrap() as u16;
         let faults = eng.fault_count(FaultKind::NoWal);
+        let no_wal = Err(TieRejected::Fault(FaultKind::NoWal));
+        // 断りの入口ごとに、 そこへ直に届く呼び出しを 1 つ以上置く (1 か所の断りを外すと、 その呼び出しが X を変えるか紐を生やす)
         let refused = [
             ("entity_in", eng.entity_in("t").is_err()),
-            ("try_tie_to_by_id", eng.try_tie_to_by_id(x, v, 2u32) == Err(TieRejected::Fault(FaultKind::NoWal))),
-            ("try_tie_text_to_by_id", eng.try_tie_text_to_by_id(x, n, "y") == Err(TieRejected::Fault(FaultKind::NoWal))),
-            ("try_delete", eng.try_delete(x) == Err(TieRejected::Fault(FaultKind::NoWal))),
+            ("try_tie_to_by_id", eng.try_tie_to_by_id(x, v, 2u32) == no_wal),
+            ("try_tie_text_to_by_id", eng.try_tie_text_to_by_id(x, n, "y") == no_wal),
+            ("try_tie_ref_to_by_id", eng.try_tie_ref_to_by_id(x, r, x) == no_wal),
+            ("try_delete", eng.try_delete(x) == no_wal),
         ];
         eng.tie_to(x, "t.v", 3u32);
         eng.tie_text_to(x, "t.n", "z");
+        eng.tie_ref_to(x, "t.r", x);
+        eng.tie_bytes_to_by_id(x, n, b"b");
+        eng.tie_text_async(x, "t.n", "a");
         eng.untie(x, "t.v");
         eng.content(x, "memo", b"m");
+        eng.content_async(x, "memo2", b"m2");
         eng.delete(x);
-        // build phase の形 (`&mut self`) も
+        // build phase の形 (`&mut self`): 名前の道 (まだ無い名前 = 紐を生やす前に断る) と、 紐の id を直に渡す道
         eng.tie(x, "t.v", 4u32);
         eng.tie(x, "t.new", 4u32);
         eng.tie_text(x, "t.n", "w");
+        eng.tie_text(x, "t.newtext", "w");
+        eng.tie_ref(x, "t.newref", x);
+        eng.tie_by_id(x, v, 5u32);
+        eng.tie_text_by_id(x, n, "w");
+        eng.tie_ref_by_id(x, r, x);
         let after = state(&eng, x);
         let counted = eng.fault_count(FaultKind::NoWal) - faults;
-        let grew_himo = eng.himo_id("t.new").is_some() || eng.himo_id("_c_memo").is_some();
+        let grown: Vec<&str> = MUST_NOT_GROW.iter().copied().filter(|h| eng.himo_id(h).is_some()).collect();
         for (what, ok) in &refused {
             assert!(ok, "WAL なしで開いた sync する DB で {what} が断られない");
         }
         assert_eq!(after, before, "WAL なしで開いた sync する DB の書き込みが X を変えた");
-        assert!(!grew_himo, "断った書き込みが紐を生やした");
-        assert!(counted >= 11, "断った書き込みを fault に数えない ({counted})");
+        assert!(grown.is_empty(), "断った書き込みが紐を生やした: {grown:?}");
+        assert!(counted >= 20, "断った書き込みを fault に数えない ({counted})");
         // 相手から受けた書き込み (版数を持つ) は当たる (#1066 の対象外)
         let f = eng.resolve_remote_eid(enchudb_oplog::make_eid(2, 7), v).expect("前提: 受けた行の場所");
         assert!(
@@ -161,4 +187,22 @@ fn a_db_without_sync_tables_still_writes_without_the_wal() {
     assert_eq!(eng.get(x, "t.v"), Some(1));
     assert!(!eng.is_live(y));
     assert_eq!(eng.fault_count(FaultKind::NoWal), 0);
+}
+
+/// #1066 の読み直し F6: REPL の言語 (`query_lang`、 CLI は `open_standalone` で開く) の `~` / `-` は、 WAL なしで開いた sync する DB で
+/// 断られたら成功と言わない (前は `Updated` / `Deleted` を返して行は変わらなかった)。
+///
+/// falsify: `exec_update` の断りの数の確かめ / `exec_delete` の `try_delete` を `delete` に戻すと、 成功と言う。
+#[test]
+fn the_query_language_reports_refused_edits_on_a_walless_sync_db() {
+    use enchudb_engine::query_lang::{QueryResult, execute};
+    let path = tmp("querylang");
+    let _rm = Rm(path.clone());
+    let x = sync_db_with_a_row(&path);
+    let mut eng = Engine::open_standalone(&path).unwrap();
+    let update = execute(&mut eng, &format!("~ {x} t.v:9"));
+    let delete = execute(&mut eng, &format!("- {x}"));
+    assert!(matches!(update, QueryResult::Error(_)), "断られた `~` を成功と言った: {update:?}");
+    assert!(matches!(delete, QueryResult::Error(_)), "断られた `-` を成功と言った: {delete:?}");
+    assert_eq!((eng.is_live(x), eng.get(x, "t.v")), (true, Some(1)), "前提: 断られて X は変わらない");
 }

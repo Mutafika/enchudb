@@ -998,18 +998,19 @@ fn reconcile_through_standalone_open(sync: bool) {
     assert_eq!(eng.get(b, "notes.note"), Some(7), "前提: 往復の open が WAL を再生した");
     assert!(!eng.is_live(c));
     assert!(!eng.is_live(eng.slot_eid(slot(c))), "往復の open で突き合わせが回らず、 消した行の場所が生きている (sync = {sync})");
-    // #1066: sync する DB は WAL なしで開いた engine で行を足せない。 使い回しは WAL 付きで開き直して見る
-    let reused = |eng: &Engine| {
+    if sync {
+        // #1066: sync する DB は WAL なしで開いた engine でユーザの表に行を足せない。 単独の session の払い出しは受信の道 (その
+        // session の memory の世代を見る) で見る: 消した場所を次の世代で使い回す
+        assert!(eng.entity_in("notes").is_err(), "WAL なしで開いた sync する DB で行を足せた (#1066)");
+        let note = eng.himo_id("notes.note").unwrap() as u16;
+        let received = eng.resolve_remote_eid(enchudb_oplog::make_eid(9, 1), note).expect("前提: 受けた行の場所を払い出した");
+        assert_eq!(slot(received), slot(c), "前提: 消した場所を使い回す");
+        let received = eng.slot_eid(slot(received));
+        assert!(received != c && received != a, "単独の session の払い出しが消えた行の番号を渡した ({received:#x})");
+    } else {
         let n = eng.entity_in("notes").unwrap();
         assert_eq!(slot(n), slot(c), "前提: 消した場所を使い回す");
         assert!(n != c && n != a);
-    };
-    if sync {
-        assert!(eng.entity_in("notes").is_err(), "WAL なしで開いた sync する DB で行を足せた (#1066)");
-        drop(eng);
-        reused(&Engine::open_concurrent_with_oplog(&img, WAL).unwrap());
-    } else {
-        reused(&eng);
     }
 }
 

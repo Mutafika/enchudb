@@ -232,7 +232,8 @@ sync を有効にした DB は、 **WAL 付きの session でしか ユーザの
 `open_concurrent_with_oplog` で開くか、 build phase なら `finish_with_oplog` / `concurrentize_with_oplog` の後に書く。 WAL なしで
 開いた engine (`open_standalone` / schema の `Database::open` / `finish_concurrent` / build phase) の書き込みは版数 (WAL の時計) が
 付かず相手に配れないので、 行の払い出し / tie / untie / delete / content を何も変えずに断る (`FaultKind::NoWal`、 schema は
-`WriteRejected`)。 予約の表 (`_` で始まる表)・相手から受けた書き込み・読みは今まで通り。
+`WriteRejected`)。 予約の表 (`_` で始まる表)・相手から受けた書き込み・読みは今まで通り。 WAL を持てない engine (`from_bytes` の
+Memory backing / wasm) の sync する DB は、 ユーザの表に書けない (読みだけ)。 版数の無い初期の行が要るなら、 sync を有効にする前に書く。
 
 ### peer-to-peer sync
 
