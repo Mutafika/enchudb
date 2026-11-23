@@ -1895,6 +1895,12 @@ const CONSUMER_HELD: u8 = 4;
 /// この bit を立てる `fetch_or` の戻りで [`CONSUMER_HELD`] を見る (止める側は `CONSUMER_HELD` を立てる `fetch_or` の後、 この
 /// bit が下りるのを待つ。 同じ 1 語への 2 つの RMW なので、 どちらが先でも 「止めた後に周期の仕事が始まる」 順は無い)。
 const CONSUMER_IN_TICK: u8 = 8;
+/// `Engine::wal_fold_off` の bit (#1023): consumer の thread を作る engine。 作る側 (`spawn_consumer_with_oplog`) が thread を作る前に
+/// 立てる (下ろさない)。 前は 「consumer が居ない」 を `consumer_thread` が無いことで決めていたが、 それは thread が動き出してから自分で
+/// 置くので、 開いた直後・consumer の thread が動き出す前の書き出しが 「consumer の居ない engine」 として名前の記録をその場でまとめ
+/// 直した (log を header だけに戻し、 アプリの thread がまとめ直しの時間を払った)。 Engine に欄を足さない (足すと欄の並びが変わる、
+/// `wal_fold_off` の doc)
+const CONSUMER_SPAWNED: u8 = 16;
 
 /// #451 (段階 1): 配り済みの印の候補 = 切れ目 (`Engine::take_durable_cut`)。 置く時 (`Engine::end_durable_cut`) に S を決める。
 struct DurableCut {
@@ -3952,6 +3958,42 @@ mod free_gap_hook {
     }
 }
 
+/// test 用の割り込み点 (#1023): consumer の thread が動き出した所 (`consumer_thread` に自分の id を置く前)。 DB の path ごとに 1 回だけ
+/// 呼ぶ (consumer の thread を作る前に置く = WAL を作る前なので WAL の番地では見分けられない)。 あわせて、 名前の記録のまとめ直し
+/// (`compact_name_records`) をこの thread で始めた回数を数える。
+#[cfg(test)]
+mod consumer_start_hook {
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: std::sync::Mutex<Vec<(String, Hook)>> = std::sync::Mutex::new(Vec::new());
+
+    thread_local! {
+        static COMPACTIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn set(path: &str, f: impl FnOnce() + Send + 'static) {
+        HOOKS.lock().unwrap_or_else(|p| p.into_inner()).push((path.to_string(), Box::new(f)));
+    }
+
+    pub(super) fn call(path: &str) {
+        let f = {
+            let mut h = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+            h.iter().position(|(p, _)| p == path).map(|i| h.remove(i).1)
+        };
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    pub(super) fn note_compaction() {
+        COMPACTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// この thread で `compact_name_records` を始めた回数 (読んで 0 に戻す)。
+    pub(super) fn take_compactions() -> u32 {
+        COMPACTIONS.with(|c| c.replace(0))
+    }
+}
+
 /// test 用の割り込み点: changefeed の record を記録 (`pump_change_log`) / 溜め (`move_changes_to_backlog`) に写し始める所 (#662)。
 /// 畳む時の写しが書き手を止めないこと (`append_lock` の外で写す) を、 写している間に別の thread が WAL に積めるかで確かめるため。
 /// 置いた WAL で 1 回だけ呼ぶ (続けて呼ばせるには、 呼ばれた中で置き直す)。
@@ -5653,6 +5695,66 @@ mod review038_d_tests {
         assert!(seen[0], "header (紐の数) を、 列の file の directory を fsync する前に書き出した");
         drop(_hold);
         w.finish();
+    }
+}
+
+/// #1023: consumer の thread が動き出す前 (`consumer_thread` に自分の id を置く前) の書き出しも、 名前の記録のまとめ直しを consumer に
+/// 任せる (書き出した thread がその場でまとめ直さない)。 consumer の thread の頭の割り込み点 (`consumer_start_hook`) で止めて書き出す。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod consumer_start_tests {
+    use super::*;
+
+    fn standalone(tag: &str) -> (String, Engine) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-consumerstart-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("t", 8).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        (path, eng)
+    }
+
+    fn cleanup(path: &str) {
+        let _ = crate::db_files::remove_db(path);
+        let _ = std::fs::remove_file(oplog_path_for(path));
+    }
+
+    #[test]
+    fn a_write_out_before_the_consumer_thread_starts_leaves_name_compaction_to_the_consumer() {
+        let (path, eng) = standalone("held");
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        consumer_start_hook::set(&path, move || {
+            started_tx.send(()).unwrap();
+            let _ = go_rx.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        started_rx.recv_timeout(std::time::Duration::from_secs(30)).expect("前提: consumer の thread が頭で止まった");
+        let not_yet = eng.consumer_thread.get().is_none();
+        // consumer の thread はまだ自分の id を置いていない (開いた直後の形)。 この間にアプリの thread が書き出す
+        let _ = consumer_start_hook::take_compactions();
+        eng.persist_tables().unwrap();
+        let ran_here = consumer_start_hook::take_compactions();
+        go_tx.send(()).unwrap();
+        drop(eng);
+        cleanup(&path);
+        assert!(not_yet, "前提: consumer の thread が自分の id を置く前に書き出した");
+        assert_eq!(ran_here, 0, "consumer の thread が動き出す前の書き出しが、 名前の記録をその場でまとめ直した (consumer の居ない engine と読んだ)");
+    }
+
+    /// 対照: consumer の居ない engine (WAL の無い並行の形) の書き出しは、 その場でまとめ直す (前と同じ)。
+    #[test]
+    fn a_write_out_without_a_consumer_compacts_in_place() {
+        let (path, eng) = standalone("none");
+        let eng = Engine::concurrentize(eng);
+        assert!(!eng.has_background_threads(), "前提: consumer の居ない engine");
+        let _ = consumer_start_hook::take_compactions();
+        eng.persist_tables().unwrap();
+        let ran_here = consumer_start_hook::take_compactions();
+        drop(eng);
+        cleanup(&path);
+        assert_eq!(ran_here, 1, "consumer の居ない engine の書き出しが、 その場でまとめ直さなかった");
     }
 }
 
@@ -13930,7 +14032,8 @@ pub struct Engine {
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// #388: WAL が満杯にぶつかった書き手が、 consumer に畳むよう頼んでいる (`wait_for_wal_room`)。
     wal_room_wanted: std::sync::atomic::AtomicBool,
-    /// #388: consumer thread の id (待ち手が consumer 自身なら待たない = 自分を待つと止まる)。
+    /// #388: consumer thread の id (待ち手が consumer 自身なら待たない = 自分を待つと止まる)。 consumer の thread が動き出してから自分で
+    /// 置く (それより前は None)。 「consumer が居るか」 には使わない (#1023、 `wal_fold_off` の [`CONSUMER_SPAWNED`])。
     consumer_thread: std::sync::OnceLock<std::thread::ThreadId>,
     /// #388: 満杯に近づいて consumer が書き出し + 畳みをした回数 (観測用)。
     wal_room_folds: std::sync::atomic::AtomicU64,
@@ -13939,7 +14042,7 @@ pub struct Engine {
     /// 試験で切った consumer の畳み (bit、 既定 0 = 全部畳む)。 [`WAL_FOLD_OFF_SWITCH`] = 書き手が区画を移った時に待たずに古い区画を
     /// 畳む (#667、 [`Self::set_wal_fold_on_switch`])、 [`WAL_FOLD_OFF_TICK`] = 周期の書き出しの後に畳む (#676、
     /// [`Self::set_wal_fold_on_tick`])。 [`CONSUMER_HELD`] / [`CONSUMER_IN_TICK`] = 試験が consumer の周期の仕事を止める
-    /// ([`Self::hold_consumer`])。 1 byte のまま (欄を足すと並びが変わる)
+    /// ([`Self::hold_consumer`])。 [`CONSUMER_SPAWNED`] = consumer の thread を作る engine (#1023)。 1 byte のまま (欄を足すと並びが変わる)
     wal_fold_off: std::sync::atomic::AtomicU8,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
@@ -21631,6 +21734,8 @@ impl Engine {
     /// [`Self::compact_name_records_now`] は待たない)。
     #[cfg(not(target_arch = "wasm32"))]
     fn compact_name_records(&self, force: bool) {
+        #[cfg(test)]
+        consumer_start_hook::note_compaction();
         let addr = self as *const Engine as usize;
         if self.path.is_empty() || (!force && name_compactor::backing_off(addr)) {
             return;
@@ -21681,10 +21786,11 @@ impl Engine {
         }
     }
 
-    /// [`Self::compact_name_records`] を、 consumer の居ない engine でだけ (居れば consumer の周期に任せる)。
+    /// [`Self::compact_name_records`] を、 consumer の居ない engine でだけ (居れば consumer の周期に任せる)。 #1023: 「居る」 は consumer の
+    /// thread を作る側が作る前に立てる印で決める (thread が動き出す前の書き出しも consumer に任せる)。
     #[cfg(not(target_arch = "wasm32"))]
     fn compact_name_records_without_consumer(&self) {
-        if self.consumer_thread.get().is_none() {
+        if self.wal_fold_off.load(std::sync::atomic::Ordering::Acquire) & CONSUMER_SPAWNED == 0 {
             self.compact_name_records(false);
         }
     }
@@ -36620,6 +36726,9 @@ impl Engine {
         eng.consumer_waker = Some(waker.clone());
         eng.shutdown_flag = Some(shutdown.clone());
 
+        // #1023: consumer の thread を作る前に 「consumer が居る」 の印を立てる (thread が動き出して `consumer_thread` を置くまでの間の
+        // 書き出しも、 名前の記録のまとめ直しを consumer の周期に任せる)
+        eng.wal_fold_off.fetch_or(CONSUMER_SPAWNED, std::sync::atomic::Ordering::AcqRel);
         let arc = Arc::new(eng);
         // ここから住所が動かない (通知係の thread がこの engine を指してよい)
         arc.pinned.store(true, std::sync::atomic::Ordering::Release);
@@ -36677,6 +36786,8 @@ impl Engine {
                 use std::time::{Duration, Instant};
                 let _poison_guard = PoisonOnPanic { flag: poisoned_for_thread };
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
+                #[cfg(test)]
+                consumer_start_hook::call(&engine.path);
                 let _ = engine.consumer_thread.set(std::thread::current().id());
                 waker.register_current();
                 let fsync_interval = Duration::from_millis(100);
