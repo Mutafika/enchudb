@@ -400,6 +400,9 @@ fn exec_update(eng: &mut Engine, input: &str) -> QueryResult {
     let tokens = parse_kv_tokens(rest);
     if tokens.is_empty() { return QueryResult::Error("update: nothing to set".into()); }
 
+    // #1066: WAL なしで開いた sync する DB (CLI は `open_standalone` で開く) はユーザの表の行を書けない。 断られたら成功と言わない
+    // (名前の道の `tie` / `tie_text` は戻り値が無いので、 断りの数で見る。 同じ行への書き込みは全部同じ理由で断られる)
+    let refused_before = eng.fault_count(crate::engine::FaultKind::NoWal);
     for (himo, val) in &tokens {
         if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
             let text = &val[1..val.len() - 1];
@@ -411,6 +414,12 @@ fn exec_update(eng: &mut Engine, input: &str) -> QueryResult {
             }
         }
     }
+    if eng.fault_count(crate::engine::FaultKind::NoWal) > refused_before {
+        return QueryResult::Error(format!(
+            "update of entity {eid} refused: {} (#1066)",
+            crate::engine::FaultKind::NoWal.as_str()
+        ));
+    }
     QueryResult::Updated(eid)
 }
 
@@ -421,7 +430,11 @@ fn exec_delete(eng: &mut Engine, input: &str) -> QueryResult {
         Ok(eid) if !eng.is_live(eid) => {
             QueryResult::Error(format!("entity {eid} does not exist"))
         }
-        Ok(eid) => { eng.delete(eid); QueryResult::Deleted }
+        // #1066 の読み直し F6: 断られた削除 (WAL なしで開いた sync する DB など) を成功と言わない
+        Ok(eid) => match eng.try_delete(eid) {
+            Ok(()) => QueryResult::Deleted,
+            Err(r) => QueryResult::Error(format!("delete of entity {eid} refused: {r}")),
+        },
         Err(_) => QueryResult::Error(format!("invalid id: {input}")),
     }
 }

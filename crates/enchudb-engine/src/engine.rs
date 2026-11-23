@@ -390,6 +390,8 @@ struct ChangeBatch {
     /// `records[0]` の番号
     first: u64,
     records: Vec<crate::transport::WireRecord>,
+    /// 記録がある時: 取り出した時に写した記録の終わり (次の番号)。 この配りはここまで渡したら返る (#1055)
+    log_end: u64,
 }
 
 /// #779: slot の前の宛名。 bridge (`transfer_oplog_to_sync_ops`) は、 自分が書いた record の宛名 (行の世界番号) を **bridge する時の**
@@ -473,11 +475,24 @@ impl ChangeBatch {
     }
 }
 
+/// changefeed: 記録の無い時に溜めへ移す範囲 ([`Engine::move_changes_to_backlog`])。
+#[derive(Clone, Copy)]
+enum BacklogUpto {
+    /// 畳む区画の終わり (`append_lock` の下、 区画は全部書き出してある): 閉じていない末尾も移す
+    FoldEnd(u64),
+    /// 書き出した所 (畳む前に lock の外で): そこまでに Commit で閉じた group だけ (#1053)
+    Written(u64),
+}
+
 /// 記録 (`changefeed.seg`) がある時の配信 1 回分 (#636): listener ごとに位置から読んだ entry と、 読めずに外した listener。
 #[derive(Default)]
 struct LogWork {
     reads: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, u64, Vec<crate::change_log::Entry>)>,
     broken: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+    /// #1055: この回を渡した後、 読み手全員の位置が配りの始めに決めた終わり (`until`) に届く
+    caught_up: bool,
+    /// この回を渡した後も、 記録の今の終わりより手前に居る読み手がある (始めの後に写し足された分)
+    more: bool,
 }
 
 impl ChangeNotifier {
@@ -557,19 +572,26 @@ impl ChangeNotifier {
             Some(None) => return true,
             Some(Some(x)) => x,
         };
+        let until = batch.log_end;
         let panicked = batch.run(&self.progress);
         self.detach_panicked(src, panicked);
         if !log {
             return true;
         }
-        // 記録がある時は、 listener ごとの位置から読んで渡す
+        // 記録がある時は、 listener ごとの位置から読んで渡す。 #1055: 配るのは取り出した時に写した記録の終わり (`until`、 呼び手の
+        // `oplog_sync` の commit を含む) まで。 その後に写し足された分は通知係が配る (残っていれば頼む)。 前は読み手全員に新しい entry
+        // が無くなるまで回り、 遅い listener と休まない書き手が居ると (consumer が 100 ms ごとに写し足す) `oplog_sync()` が書き手の
+        // 止まるまで返らなかった (通知係がこの loop の中に居れば、 `oplog_sync()` は deliver_lock を 5 秒待って配らずに返った)
         loop {
-            let Some(work) = src.with(Engine::take_log_work) else { return false };
+            let Some(work) = src.with(|e| e.take_log_work(until)) else { return false };
             for l in work.broken {
                 let _ = listener_panicked(|| l.on_detached(enchudb_oplog::Hlc::ZERO));
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
             if work.reads.is_empty() {
+                if work.more {
+                    self.ask_notifier();
+                }
                 return true;
             }
             let mut panicked = PanickedListeners::new();
@@ -590,6 +612,12 @@ impl ChangeNotifier {
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
             self.detach_panicked(src, panicked);
+            if work.caught_up {
+                if work.more {
+                    self.ask_notifier();
+                }
+                return true;
+            }
         }
     }
 
@@ -694,10 +722,15 @@ pub enum FaultKind {
     /// #553 / #554: 書き込みが WAL に載らない (WAL より大きい record、 または sync の表の無い DB で満杯の WAL を畳めない)。
     /// 本体にも当てずに断る
     WalSpace,
+    /// #1066: sync する DB (sync の表がある) を WAL なしで開いた session (`open_standalone` / schema の `Database::open` /
+    /// `finish_concurrent` / build phase) の、 ユーザの表への書き込み。 版数 (WAL の時計) が付かず相手に配れないので、 何も変えずに断る。
+    /// WAL 付きで開き直す (`open_concurrent_with_oplog` / schema の `open_with_oplog`、 build phase は `finish_with_oplog` の後) と書ける。
+    /// WAL を持てない engine (`from_bytes` の Memory backing / wasm) の sync する DB は、 ユーザの表に書けない (読みだけ)
+    NoWal,
 }
 
 impl FaultKind {
-    pub(crate) const COUNT: usize = 8;
+    pub(crate) const COUNT: usize = 9;
     pub(crate) fn index(self) -> usize {
         match self {
             FaultKind::EntitySpace => 0,
@@ -708,6 +741,7 @@ impl FaultKind {
             FaultKind::StaleValue => 5,
             FaultKind::SegmentIo => 6,
             FaultKind::WalSpace => 7,
+            FaultKind::NoWal => 8,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -720,6 +754,7 @@ impl FaultKind {
             FaultKind::StaleValue => "stale value id (reclaimed)",
             FaultKind::SegmentIo => "column segment could not be opened",
             FaultKind::WalSpace => "the write does not fit in the oplog (WAL)",
+            FaultKind::NoWal => "a sync-enabled DB opened without the oplog (WAL) cannot write user rows",
         }
     }
 }
@@ -1330,7 +1365,8 @@ fn cleanup_tables_tmp(db_path: &str) {
     let sidecar = tables_path_for(db_path);
     let tmp_path = crate::db_files::tmp_path_for(&sidecar);
     if tmp_path.exists() {
-        if let Err(e) = std::fs::remove_file(&tmp_path) {
+        // 書き出した一時 file は crashsim の控えを持つ: 消す時に捨てる (`remove_sidecar`、 #1060、 #416 の形)
+        if let Err(e) = remove_sidecar(&tmp_path) {
             eprintln!(
                 "warning: failed to remove stale tables tmp {}: {}",
                 tmp_path.display(),
@@ -2110,10 +2146,9 @@ fn persist_eidalias_to_sidecar(
 ) -> io::Result<()> {
     let p = eidalias_path_for(db_path);
     if entries.is_empty() {
-        return match std::fs::remove_file(&p) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
+        // 電源断の模擬の控えも捨てる (`remove_sidecar`、 #1060: 前は素の remove_file で、 Linux は空いた inode の番号を次に作った
+        // file に渡すので、 消した `eidalias` の控えがその file の像に写った = #416 の形)
+        return remove_sidecar(&p);
     }
     if crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries, with_gen))? {
         chain.wrote_durable();
@@ -3260,6 +3295,60 @@ mod write_out_fault {
     }
 }
 
+/// test 用 (#1057): この thread の次の `mark_session_dirty` の書き出しが失敗する (1 回だけ)。
+#[cfg(test)]
+mod session_dirty_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn fail_next() {
+        NEXT.with(|c| c.set(true));
+    }
+
+    pub(super) fn take() -> bool {
+        NEXT.with(|c| c.replace(false))
+    }
+}
+
+/// test 用 (#991 の C1): 置いた WAL の engine の、 動いている間の WAL の fsync (`Engine::wal_fsync`) が失敗する。 開く道 (WAL を
+/// `Arc` に入れる前で番地が決まらない) は、 この thread の次の 1 回を失敗させる (`fail_next_on_this_thread`)。
+#[cfg(test)]
+mod wal_fsync_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        static NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn fail_next_on_this_thread() {
+        NEXT.with(|c| c.set(true));
+    }
+
+    pub(super) fn take_on_this_thread() -> bool {
+        NEXT.with(|c| c.replace(false))
+    }
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn active(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
 /// test 用 (#985): 置いた WAL の engine の bridge が、 行の payload を ring にも辞書にも書かない (payload を書けなかった行)。
 #[cfg(test)]
 mod bridge_payload_fault {
@@ -3308,6 +3397,38 @@ mod payload_ring_open_fault {
 /// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
 #[cfg(test)]
 mod cell_append_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `oplog_sync` が自分の Commit を打った直後・書き出す位置を読む前 (#1054)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod sync_commit_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `oplog_sync` が、 前に積んで当てている途中の書き手を待ち始める所 (#1054)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod sync_apply_wait_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -3937,6 +4058,11 @@ mod checked_read_hook {
             f();
         }
     }
+
+    /// 鳴らなかった割り込み点を外す (この thread)。
+    pub(super) fn take() -> bool {
+        HOOK.with(|h| h.borrow_mut().take()).is_some()
+    }
 }
 
 /// test 用の割り込み点 (#1041): copy で読む text の本体 (`text_owned_by_id`、 `get_text_owned` / `get_content_owned` / `get_entity_owned`)
@@ -4471,6 +4597,649 @@ mod listener_add_race_tests {
         drop(eng);
         assert_eq!(got, vec![8], "付ける前の commit が渡った (取り出しが止まっている間に付け終えた: {added_during_take})");
         assert_eq!(got_late, vec![8], "後から付ける前の commit / 同じ record が渡った");
+    }
+}
+
+/// changefeed が渡す record は書き出した物だけ (記録の無い道も、 #1053)・`oplog_sync()` は自分の commit を配ってから返る (#1054)・
+/// 記録のある道の `oplog_sync()` は休まない書き手の後ろで返らなくならない (#1055)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod change_delivery_bound_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-review038c-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 試験が途中で落ちても、 置いた割り込み点を外す。
+    struct Unhook(Arc<enchudb_oplog::oplog::OpLog>);
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            cell_append_hook::set(&self.0, |_| {});
+            sync_apply_wait_hook::set(&self.0, |_| {});
+            sync_commit_hook::set(&self.0, |_| {});
+        }
+    }
+
+    /// 受けた Tie の値を順に控える。
+    #[derive(Default)]
+    struct Rec {
+        seen: Mutex<Vec<u64>>,
+    }
+    impl crate::changefeed::ChangeListener for Rec {
+        fn on_changes(&self, records: &[crate::transport::WireRecord]) {
+            let mut seen = self.seen.lock().unwrap();
+            for r in records {
+                if let enchudb_oplog::oplog::DecodedOp::Tie { value, .. } = r.op {
+                    seen.push(value);
+                }
+            }
+        }
+    }
+
+    impl Rec {
+        fn now(&self) -> Vec<u64> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// `v` を受けるまで待つ (最大 `limit`)。 受けた値の列を返す。
+        fn wait_for_value(&self, v: u64, limit: Duration) -> Vec<u64> {
+            let until = Instant::now() + limit;
+            while !self.seen.lock().unwrap().contains(&v) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.now()
+        }
+    }
+
+    /// 割り込み点で止まって知らせ、 `go` が来るまで (最大 30 秒) 待つ closure と、 その組。
+    fn pause() -> (impl FnOnce(&enchudb_oplog::oplog::OpLog) + Send + 'static, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (paused_tx, paused_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let hook = move |_: &enchudb_oplog::oplog::OpLog| {
+            let _ = paused_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(30));
+        };
+        (hook, paused_rx, go_tx)
+    }
+
+    fn engine(dir: &Tmp, log: bool) -> (Arc<Engine>, u16, enchudb_oplog::EntityId) {
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 1 << 22).unwrap();
+        if log {
+            eng.enable_change_log(1 << 22).unwrap();
+        }
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        (eng, ts, e)
+    }
+
+    /// #1053: 記録の無い changefeed は、 書き出していない (WAL を fsync しておらず本体も書き出していない) commit を渡さない。
+    ///
+    /// 形: consumer を止めて 1 を書いて `oplog_commit()` (Commit で閉じるだけ、 書き出さない) → 配る分を取り出す (通知係が前の
+    /// 書き出しの後の頼みで起きた時 / 別の thread の `oplog_sync()` が自分の書き出しの後に配る時と同じ取り出し)。 前は Commit で
+    /// 閉じた group の終わりまで読み、 1 を渡した (落ちると listener の先にあって DB に無い)。 記録のある道は #873 / #889 で書き出した所
+    /// (`change_log_upto`) で切っていた。
+    ///
+    /// falsify: 記録の無い取り出し (`take_changes`) を上限なしの読み (`iter_committed_from_with_end`) に戻すと 1 が渡って落ちる。
+    #[test]
+    fn a_commit_that_is_not_written_out_is_not_delivered_without_the_change_log() {
+        let dir = tmp("unwritten");
+        let (eng, ts, e) = engine(&dir, false);
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let hold = eng.hold_consumer();
+        eng.tie_to_by_id(e, ts, 1u64);
+        eng.oplog_commit();
+        let pre = wal.written_head() > eng.change_log_upto(&wal);
+        eng.deliver_changes(true);
+        let got = a.now();
+        drop(hold);
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(1, Duration::from_secs(5));
+        drop(eng);
+        assert!(pre, "前提: 1 の commit は書き出していない");
+        assert!(got.is_empty(), "書き出していない commit を listener に渡した: {got:?}");
+        assert_eq!(after, vec![1], "書き出した後は渡る");
+    }
+
+    /// #1053: 畳む前に溜めへ移す道 (記録の無い時の `move_changes_before_fold`) も、 書き出していない commit を移さない (移すと
+    /// 通知係がそのまま渡す)。
+    ///
+    /// 形: 区画を移るまで書いて書き出し (古い区画は畳める) → consumer を止めて 999 を書いて `oplog_commit()` (今の区画、 書き出さない)
+    /// → 畳む → 配る分を取り出す。 前は畳む前に Commit で閉じた group を上限なしで溜めへ移し、 999 を渡した。
+    ///
+    /// falsify: 溜めへ移す道 (`BacklogUpto::Written`) を上限なしの読みに戻すと 999 が渡って落ちる (取り出しの上限だけでは塞がらない)。
+    #[test]
+    fn a_commit_that_is_not_written_out_is_not_moved_to_the_backlog_before_a_fold() {
+        let dir = tmp("fold");
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 256 << 10).unwrap();
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        assert!(wal.two_halves(), "前提: WAL が 2 区画");
+        let hold = eng.hold_consumer();
+        let switches = wal.switches();
+        let mut v = 1u64;
+        while wal.switches() == switches && v < 100_000 {
+            eng.tie_to_by_id(e, ts, v);
+            eng.oplog_sync().unwrap();
+            v += 1;
+        }
+        let switched = wal.switches() != switches;
+        eng.tie_to_by_id(e, ts, 999u64);
+        eng.oplog_commit();
+        let pre = wal.written_head() > eng.change_log_upto(&wal);
+        let folded = {
+            let _g = eng.transfer_lock_for_fold();
+            eng.try_fold_with_changes(&wal)
+        };
+        eng.deliver_changes(true);
+        let got = a.now();
+        drop(hold);
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(999, Duration::from_secs(5));
+        drop(eng);
+        assert!(switched && pre && folded, "前提: 区画を移った {switched}・999 は書き出していない {pre}・古い区画を畳んだ {folded}");
+        assert!(!got.contains(&999), "書き出していない commit を畳む前に溜めへ移して渡した");
+        assert_eq!(after.last(), Some(&999), "書き出した後は渡る");
+    }
+
+    /// #1053: 記録の無い changefeed は、 他の書き手が WAL に積んでまだ本体に当てていない record も渡さない (#850 と同じ形)。
+    ///
+    /// 形: 書き手 B が 2 を積んで当てる前に止まる → この thread が 3 を書いて `oplog_sync()` (B の手前で書き出しを切る) → 返った時に
+    /// listener に 2 が無い。 前は Commit で閉じた group の終わりまで読み、 当てていない 2 を (3 と一緒に) 渡した。
+    ///
+    /// falsify: 上と同じ変異で 2 が渡って落ちる。
+    #[test]
+    fn a_record_that_is_not_applied_yet_is_not_delivered_without_the_change_log() {
+        let dir = tmp("unapplied");
+        let (eng, ts, e) = engine(&dir, false);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let b = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64))
+        };
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が 2 を積んで当てる前に止まった");
+        eng.tie_to_by_id(e, ts, 3u64);
+        eng.oplog_sync().unwrap();
+        let got = a.now();
+        go.send(()).unwrap();
+        b.join().unwrap();
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(3, Duration::from_secs(5));
+        drop(eng);
+        assert!(!got.contains(&2), "本体に当てていない record を listener に渡した: {got:?}");
+        assert_eq!(after, vec![2, 3], "当て終えて書き出した後は WAL の順に渡る");
+    }
+
+    /// #1054: `oplog_sync()` は、 前に積んで当てている途中の他の書き手が居ても、 自分の commit を listener に配ってから返る
+    /// (記録あり / 無しの両方)。
+    ///
+    /// 形: 書き手 B が 2 を積んで当てる前に止まる → 別の thread A が 3 を書いて `oplog_sync()`。 A が B を待ち始めたら B を放す
+    /// (割り込み点 `sync_apply_wait_hook`)。 A が返った時点で listener に 3 がある。 前は書き出しを B の手前で切り、 3 を配らずに
+    /// 返った (渡るのは次の consumer の周期)。
+    ///
+    /// falsify: `oplog_sync` の待ち (`wait_applied_for_changefeed`) を外すと、 A は B を放す前に 3 を配らずに返って落ちる。
+    fn own_commit_is_delivered_past_an_applying_writer(log: bool) {
+        let dir = tmp(if log { "own-log" } else { "own" });
+        let (eng, ts, e) = engine(&dir, log);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let b = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64))
+        };
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が 2 を積んで当てる前に止まった");
+        let (waiting_tx, waiting_rx) = mpsc::channel::<()>();
+        sync_apply_wait_hook::set(&wal, move |_| {
+            let _ = waiting_tx.send(());
+        });
+        let (done_tx, done_rx) = mpsc::channel::<Vec<u64>>();
+        let syncer = {
+            let (eng, a) = (eng.clone(), a.clone());
+            std::thread::spawn(move || {
+                eng.tie_to_by_id(e, ts, 3u64);
+                eng.oplog_sync().unwrap();
+                let _ = done_tx.send(a.now());
+            })
+        };
+        // A が B を待ち始めた (直した形) か、 待たずに返った (前の形) か
+        let mut got = None;
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            if waiting_rx.try_recv().is_ok() {
+                break;
+            }
+            if let Ok(g) = done_rx.try_recv() {
+                got = Some(g);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        go.send(()).unwrap();
+        b.join().unwrap();
+        let got = got.unwrap_or_else(|| done_rx.recv_timeout(Duration::from_secs(20)).expect("A の oplog_sync が返らない"));
+        syncer.join().unwrap();
+        drop(eng);
+        assert!(got.contains(&3), "oplog_sync() が自分の commit を配らずに返った (受けた {got:?}、 記録 {log})");
+        assert_eq!(got, vec![2, 3], "WAL の順に渡る");
+    }
+
+    #[test]
+    fn oplog_sync_delivers_its_own_commit_past_an_applying_writer() {
+        own_commit_is_delivered_past_an_applying_writer(false);
+    }
+
+    #[test]
+    fn oplog_sync_delivers_its_own_commit_past_an_applying_writer_with_the_change_log() {
+        own_commit_is_delivered_past_an_applying_writer(true);
+    }
+
+    /// #1055 の試験の listener: 受けた Tie の値と、 呼ばれた thread を控える。 呼ばれるたびに (`left` 回まで) 1 件書いて書き出し、
+    /// 記録へ写させる (= 配っている間も記録が伸び続ける、 休まない書き手の代わり)。
+    struct Echo {
+        seen: Mutex<Vec<u64>>,
+        threads: Mutex<Vec<std::thread::ThreadId>>,
+        left: std::sync::atomic::AtomicU64,
+        eng: std::sync::OnceLock<std::sync::Weak<Engine>>,
+        at: (enchudb_oplog::EntityId, u16),
+    }
+    impl crate::changefeed::ChangeListener for Echo {
+        fn on_changes(&self, records: &[crate::transport::WireRecord]) {
+            {
+                let mut seen = self.seen.lock().unwrap();
+                for r in records {
+                    if let enchudb_oplog::oplog::DecodedOp::Tie { value, .. } = r.op {
+                        seen.push(value);
+                    }
+                }
+            }
+            self.threads.lock().unwrap().push(std::thread::current().id());
+            // 残りの数を 1 つ減らす (減らせたら減らす前の数)
+            let mut n = self.left.load(std::sync::atomic::Ordering::Acquire);
+            let took = loop {
+                if n == 0 {
+                    break None;
+                }
+                match self.left.compare_exchange_weak(n, n - 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+                    Ok(_) => break Some(n),
+                    Err(now) => n = now,
+                }
+            };
+            if let (Some(n), Some(eng)) = (took, self.eng.get().and_then(|w| w.upgrade())) {
+                eng.tie_to_by_id(self.at.0, self.at.1, 10_000 + n);
+                // 中からの `oplog_sync` は書き出すだけで配らずに返る。 書き出した分を記録へ写す
+                eng.oplog_sync().unwrap();
+                let _ = eng.change_log_range();
+            }
+        }
+    }
+
+    /// #1055: 記録のある DB で、 配っている間も記録が伸び続けても、 `oplog_sync()` は自分の commit を配ったら返る。 残り (始めに写した
+    /// 所の後に写し足された分) は通知係が全部配る。
+    ///
+    /// 形: listener が呼ばれるたびに 1 件書いて記録へ写させる (50 回まで)。 consumer を止めて 7 を書いて `oplog_sync()`。 この thread の
+    /// 上で listener が呼ばれた回数を数える (時間に頼らない)。 前は 「読み手全員に新しい entry が無くなるまで」 回ったので、 呼び手の
+    /// thread の上で 50 回呼ばれた (遅い listener と休まない書き手の後ろで、 書き手が止まるまで返らなかった形。 通知係が loop の中なら
+    /// `oplog_sync()` は deliver_lock を 5 秒待って配らずに返った)。
+    ///
+    /// falsify: `deliver` の記録の道の loop の終わりを前の形 (`work.reads` が空になるまで) に戻すと、 呼び手の thread の上で 50 回
+    /// 呼ばれて落ちる。 `more` の時に通知係に頼むのをやめると、 残りが届かずに落ちる。
+    #[test]
+    fn oplog_sync_returns_after_its_own_commit_while_the_change_log_keeps_growing() {
+        const ECHOES: u64 = 50;
+        let dir = tmp("echo");
+        let (eng, ts, e) = engine(&dir, true);
+        let a = Arc::new(Echo {
+            seen: Mutex::default(),
+            threads: Mutex::default(),
+            left: std::sync::atomic::AtomicU64::new(ECHOES),
+            eng: std::sync::OnceLock::new(),
+            at: (e, ts),
+        });
+        let _ = a.eng.set(Arc::downgrade(&eng));
+        eng.add_change_listener(a.clone());
+        let me = std::thread::current().id();
+        let on_me = |a: &Echo| a.threads.lock().unwrap().iter().filter(|t| **t == me).count();
+        let hold = eng.hold_consumer();
+        let e2 = eng.entity().unwrap();
+        eng.tie_to_by_id(e2, ts, 7u64);
+        eng.oplog_sync().unwrap();
+        let (calls_here, got) = (on_me(&a), a.seen.lock().unwrap().clone());
+        drop(hold);
+        // 残りは通知係が配る (listener が書いた 50 件と 7)
+        let until = Instant::now() + Duration::from_secs(20);
+        while a.seen.lock().unwrap().len() < ECHOES as usize + 1 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut all = a.seen.lock().unwrap().clone();
+        drop(eng);
+        assert!(got.contains(&7), "oplog_sync() が自分の commit を配らずに返った: {got:?}");
+        assert!(calls_here <= 2, "oplog_sync() を呼んだ thread が自分の commit の後も配り続けた ({calls_here} 回)");
+        all.sort_unstable();
+        // listener は残りの数 (50 → 1) を足して書く
+        let mut want: Vec<u64> = (1..=ECHOES).map(|n| 10_000 + n).collect();
+        want.push(7);
+        want.sort_unstable();
+        assert_eq!(all, want, "始めに写した所の後に写し足された分が、 通知係から全部 1 回ずつ届かない");
+    }
+
+    /// #1054: `oplog_sync()` は、 自分の Commit の後に積まれた書き手は待たない (自分の commit を配るのに関係ない)。
+    ///
+    /// 形: `oplog_sync()` が Commit を打った直後 (割り込み点 `sync_commit_hook`) に、 書き手 B が 2 を積んで当てる前に止まる → この
+    /// `oplog_sync()` は待ちに入らず (`sync_apply_wait_hook` が呼ばれない)、 返った時に自分の 3 は届いている (2 は当てていないので
+    /// 届かない)。 前は `written_head` (B の後ろ) まで待ち、 上限 (100 ms) まで待ってから返った。
+    ///
+    /// falsify: 待つ位置を自分の Commit の位置でなく `written_head` にすると、 待ちに入って落ちる。
+    #[test]
+    fn oplog_sync_does_not_wait_for_a_writer_after_its_own_commit() {
+        let dir = tmp("after");
+        let (eng, ts, e) = engine(&dir, true);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        // 自分の 3 は割り込み点を置く前に書く (置いた後の最初の書き込みが止まる)
+        eng.tie_to_by_id(e, ts, 3u64);
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let waited = waited.clone();
+            sync_apply_wait_hook::set(&wal, move |_| waited.store(true, std::sync::atomic::Ordering::SeqCst));
+        }
+        let b: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        {
+            let (eng, b) = (eng.clone(), b.clone());
+            sync_commit_hook::set(&wal, move |_| {
+                let h = std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64));
+                paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が自分の Commit の後に 2 を積んで当てる前に止まった");
+                *b.lock().unwrap() = Some(h);
+            });
+        }
+        eng.oplog_sync().unwrap();
+        let got = a.now();
+        let was_waiting = waited.load(std::sync::atomic::Ordering::SeqCst);
+        go.send(()).unwrap();
+        let h = b.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        h.join().unwrap();
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(2, Duration::from_secs(5));
+        drop(eng);
+        assert!(!was_waiting, "自分の Commit の後に積まれた書き手を待った");
+        assert_eq!(got, vec![3], "自分の commit は届き、 当てていない 2 は届かない");
+        assert_eq!(after, vec![3, 2], "当て終えた後は 2 も届く");
+    }
+}
+
+/// #991 の別の入口 (0.38 前 review C1): session の間に WAL の fsync が失敗した engine を閉じても、 「きれいに閉じた」 の印
+/// (紐名の辞書の clean) を立てない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod close_after_wal_sync_failure_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// sync する DB に 1 を書いて書き出す → WAL の fsync が失敗するようにして 2 を書く → 閉じる (consumer の最後の書き出しの
+    /// WAL の fsync が失敗し、 本体だけ書き出す) → 開き直すと 「きれいに閉じなかった」 と読む (#451 の作り直しを飛ばさない)。
+    /// 失敗させない回は 「きれいに閉じた」 と読む (対照)。
+    ///
+    /// 前は Drop が consumer の最後の書き出しの成否を見ずに印を立て、 次の open が #451 を飛ばした。 その後に電源が落ちる (失敗した
+    /// fsync の page は kernel が捨てうる) と、 本体にある値の record が WAL にも `_sync_ops` にも無いまま、 相手に配られない。
+    ///
+    /// falsify: `sync_and_mark_clean_with` の `wal_unsynced` を外すと、 失敗させた回も 「きれいに閉じた」 と読んで落ちる。
+    #[test]
+    fn a_session_whose_wal_fsync_failed_does_not_close_clean() {
+        for fault in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = Tmp(format!(
+                "{}/enchudb-review038c-close-{fault}-{}-{nanos}",
+                std::env::temp_dir().display(),
+                std::process::id()
+            ));
+            let (e, v) = {
+                let mut eng = Engine::create_with_cell_version(&dir.0, 4096).unwrap();
+                eng.define_table("t", 100).unwrap();
+                let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+                eng.enable_sync_tables().unwrap();
+                eng.flush().unwrap();
+                eng.persist_tables().unwrap();
+                let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+                let e = eng.entity_in("t").unwrap();
+                eng.try_tie_to_by_id(e, v, 1u32).unwrap();
+                eng.oplog_sync().unwrap();
+                let wal = eng.oplog().unwrap().clone();
+                wal_fsync_fault::set(&wal, fault);
+                eng.try_tie_to_by_id(e, v, 2u32).unwrap();
+                drop(eng);
+                // WAL の番地は持っている間に外す (後で同じ番地に作られた別の試験の WAL に残さない)
+                wal_fsync_fault::set(&wal, false);
+                (e, v)
+            };
+            let eng = Engine::open_concurrent_with_oplog(&dir.0, 1 << 20).unwrap();
+            let dirty = eng.himo_index_rebuilt_on_load();
+            let got = eng.get_by_id(e, v);
+            drop(eng);
+            assert_eq!(got, Some(2), "前提: 値は残っている (fsync の失敗は模しただけ、 page は届いている)");
+            assert_eq!(dirty, fault, "WAL の fsync が失敗した session か: {fault}、 開き直して 「きれいに閉じなかった」 と読んだか: {dirty}");
+        }
+    }
+
+    /// OpLog の中の書き出し (区画を移る時の古い区画の header の page、 `switch_locked` の `sync_half_header`) の失敗は OpLog の中で
+    /// 捨てられ、 engine の fsync には見えない (その後の fsync は成功する)。 その session も閉じる時に 「きれいに閉じた」 の印を立て
+    /// ない (`OpLog::sync_failed` を見る)。 失敗させない回は 「きれいに閉じた」 (対照)。
+    ///
+    /// falsify: `sync_and_mark_clean_with` で `OpLog::sync_failed` を見ないと、 失敗させた回も 「きれいに閉じた」 と読んで落ちる。
+    /// header の書き出しの失敗で印を立てないと、 前提 (`sync_failed`) で落ちる。
+    #[test]
+    fn a_failed_header_sync_inside_the_wal_does_not_close_clean() {
+        for fault in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = Tmp(format!(
+                "{}/enchudb-review1061-switch-{fault}-{}-{nanos}",
+                std::env::temp_dir().display(),
+                std::process::id()
+            ));
+            let (e, v, last, switched, failed_inside, engine_flag) = {
+                let eng = Engine::create_concurrent_with_oplog(&dir.0, 256 << 10).unwrap();
+                eng.ensure_himo_dynamic("v", ValueType::Number64, 0).unwrap();
+                let v = eng.himo_id("v").unwrap() as u16;
+                let e = eng.entity().unwrap();
+                let wal = eng.oplog().unwrap().clone();
+                // consumer の書き出しが先に失敗を使わないよう止める (区画を移るのは書き手が積む時)
+                let hold = eng.hold_consumer();
+                let switches = wal.switches();
+                if fault {
+                    wal.fail_next_syncs(1);
+                }
+                let mut n = 0u64;
+                while wal.switches() == switches && n < 100_000 {
+                    n += 1;
+                    eng.tie_to_by_id(e, v, n);
+                    eng.oplog_commit();
+                }
+                let switched = wal.switches() != switches;
+                let failed_inside = wal.sync_failed();
+                drop(hold);
+                eng.oplog_sync().unwrap();
+                let engine_flag = eng.wal_sync_failed.load(std::sync::atomic::Ordering::Acquire);
+                drop(eng);
+                (e, v, n, switched, failed_inside, engine_flag)
+            };
+            let eng = Engine::open_concurrent_with_oplog(&dir.0, 256 << 10).unwrap();
+            let (dirty, got) = (eng.himo_index_rebuilt_on_load(), eng.get_by_id(e, v));
+            drop(eng);
+            assert!(switched, "前提: 区画を移った");
+            assert_eq!(failed_inside, fault, "前提: 区画を移る時の header の書き出しが失敗した (OpLog の印): {fault}");
+            assert!(!engine_flag, "前提: engine の fsync は失敗を見ていない (OpLog の中で捨てた)");
+            assert_eq!(got, Some(last), "前提: 値は残っている");
+            assert_eq!(dirty, fault, "OpLog の中の書き出しが失敗した session か: {fault}、 開き直して 「きれいに閉じなかった」 と読んだか: {dirty}");
+        }
+    }
+
+    /// 開いたままの DB の directory を写す (閉じる処理を通らない像)。 `oplog` (WAL) と `lock` は写さない = 本体にある値の record が
+    /// WAL にも `_sync_ops` にも無い像 (#451 の作り直しが走る)。
+    fn copy_without_wal(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let dst = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_without_wal(&e.path(), &dst);
+            } else if e.file_name() != "oplog" && e.file_name() != "lock" {
+                std::fs::copy(e.path(), &dst).unwrap();
+            }
+        }
+    }
+
+    /// 開く道 (#991 の別入口、 PR #1061 の読み): #451 の作り直しが record を積んだ後の WAL の fsync (`open_concurrent_with_oplog` と
+    /// `concurrentize_with_oplog` の再生の後) が失敗した session も、 閉じる時に 「きれいに閉じた」 の印を立てない。 前はその 4 箇所が
+    /// `wal_fsync` を通らず、 失敗が印に残らなかった (後の fsync が成功すると clean で閉じ、 次の open が作り直しを飛ばす)。
+    ///
+    /// 形: sync する DB に consumer を止めて 5 を書き、 開いたまま WAL を除いて写す (本体に値と版数があり、 record は無い) → 写しを
+    /// 開く時の最初の WAL の fsync を失敗させる → 作り直しが走ったのを確かめて閉じる → 開き直すと 「きれいに閉じなかった」 と読む。
+    /// 失敗させない回は 「きれいに閉じた」 (対照)。 開く道は `open_concurrent_with_oplog` と `open_standalone` → `concurrentize_with_oplog`。
+    ///
+    /// falsify: 開く道の fsync を素の `w.fsync()` に戻すと (失敗が印に残らない)、 失敗させた回も 「きれいに閉じた」 と読んで落ちる。
+    #[test]
+    fn a_failed_wal_fsync_after_relog_at_open_does_not_close_clean() {
+        for standalone in [false, true] {
+            for fault in [false, true] {
+                let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let base = format!(
+                    "{}/enchudb-review1061-open-{standalone}-{fault}-{}-{nanos}",
+                    std::env::temp_dir().display(),
+                    std::process::id()
+                );
+                let (live, image) = (Tmp(format!("{base}-live")), Tmp(format!("{base}-img")));
+                let (e, v) = {
+                    let mut eng = Engine::create_with_cell_version(&live.0, 4096).unwrap();
+                    eng.define_table("t", 100).unwrap();
+                    let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+                    eng.enable_sync_tables().unwrap();
+                    eng.flush().unwrap();
+                    eng.persist_tables().unwrap();
+                    let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+                    eng.set_peer_id(1);
+                    let e = eng.entity_in("t").unwrap();
+                    let hold = eng.hold_consumer();
+                    eng.try_tie_to_by_id(e, v, 5u32).unwrap();
+                    eng.oplog_commit();
+                    copy_without_wal(std::path::Path::new(&live.0), std::path::Path::new(&image.0));
+                    drop(hold);
+                    (e, v)
+                };
+                if fault {
+                    wal_fsync_fault::fail_next_on_this_thread();
+                }
+                let relogged = if standalone {
+                    let eng = Engine::open_standalone(&image.0).unwrap();
+                    let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+                    eng.unlogged_writes_relogged()
+                } else {
+                    Engine::open_concurrent_with_oplog(&image.0, 1 << 20).unwrap().unlogged_writes_relogged()
+                };
+                let left = wal_fsync_fault::take_on_this_thread();
+                let eng = Engine::open_concurrent_with_oplog(&image.0, 1 << 20).unwrap();
+                let (dirty, got) = (eng.himo_index_rebuilt_on_load(), eng.get_by_id(e, v));
+                drop(eng);
+                let tag = if standalone { "open_standalone → concurrentize" } else { "open_concurrent_with_oplog" };
+                assert!(relogged > 0 && !left, "{tag}: 前提: 開く時に作り直した ({relogged})・失敗させる fsync を通った ({})", !left);
+                assert_eq!(got, Some(5), "{tag}: 前提: 値は残っている");
+                assert_eq!(dirty, fault, "{tag}: 開く時の WAL の fsync が失敗した session か: {fault}、 開き直して 「きれいに閉じなかった」 と読んだか: {dirty}");
+            }
+        }
+    }
+}
+
+/// #1057: 書き始める前に倒す 「きれいに閉じた」 の印を disk に置けなければ、 書き始めない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod session_dirty_mark_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-review038c-dirty-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 書く open (`open_standalone`) で印の書き出しが失敗したら Err を返す (開いた engine で書き始めない)。 断った open は何も
+    /// 書かず (`abandoned`)、 次の open は普通に開ける。
+    ///
+    /// falsify: `open_internal` の Err の道を前の形 (`let _ = eng.mark_session_dirty();`) に戻すと、 開けてしまって落ちる。
+    #[test]
+    fn an_open_that_cannot_write_the_dirty_mark_refuses() {
+        let dir = tmp("open");
+        let (e, v) = {
+            let mut eng = Engine::create_standalone(&dir.0).unwrap();
+            eng.define_himo("v", ValueType::Number, 0);
+            let v = eng.himo_id("v").unwrap() as u16;
+            let e = eng.entity().unwrap();
+            eng.tie(e, "v", 7u32);
+            eng.flush().unwrap();
+            (e, v)
+        };
+        session_dirty_fault::fail_next();
+        let refused = Engine::open_standalone(&dir.0).err();
+        let _ = session_dirty_fault::take();
+        let eng = Engine::open_standalone(&dir.0).unwrap();
+        let got = eng.get_by_id(e, v);
+        drop(eng);
+        assert!(refused.is_some(), "印を置けないまま開いた (書き始める)");
+        assert_eq!(got, Some(7), "断った open の後も開ける");
+    }
+
+    /// 並行の形にする時 (`concurrentize_with_oplog`) も、 印を置けなければ WAL の session を始めない。
+    ///
+    /// falsify: `concurrentize_with_oplog` の `?` を外すと (結果を捨てる) 並行の形になって落ちる。
+    #[test]
+    fn concurrentize_that_cannot_write_the_dirty_mark_refuses() {
+        let dir = tmp("conc");
+        let mut eng = Engine::create_standalone(&dir.0).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        eng.flush().unwrap();
+        session_dirty_fault::fail_next();
+        let r = Engine::concurrentize_with_oplog(eng, 1 << 20);
+        let _ = session_dirty_fault::take();
+        assert!(r.is_err(), "印を置けないまま WAL の session を始めた");
     }
 }
 
@@ -5092,6 +5861,8 @@ mod wal_reject_tests {
         let faults = eng.fault_count(FaultKind::WalSpace);
         eng.untie_by_id(kept, v);
         eng.delete(kept);
+        // #1066 の読み直し F5: `try_delete` は WAL に載らない断りを返す (前は NoWal の他は `Ok` を返した)
+        assert_eq!(eng.try_delete(kept), Err(TieRejected::Fault(FaultKind::WalSpace)), "WAL に載らない削除を try_delete が断りとして返さない");
         assert_eq!(eng.get_by_id(kept, v), Some(1), "WAL に載らなかった untie / delete が本体を変えた");
         assert!(eng.fault_count(FaultKind::WalSpace) >= faults + 2, "untie / delete を断った数が増えない");
         write_out_fault::set(&wal, false);
@@ -5775,6 +6546,389 @@ mod review038_d_tests {
         assert!(seen[0], "header (紐の数) を、 列の file の directory を fsync する前に書き出した");
         drop(_hold);
         w.finish();
+    }
+}
+
+/// 集計の速い道 (`Engine::fold_eids`、 #1041 の照合を loop の外に出した道): 始めに表に世代 > 0 の場所が無ければ eid ごとに照合せずに
+/// 読み、 終わりに表の印を見直して、 途中で使い回しが入りえたら照合つきでやり直す。 割り込み点 `fast_read_hook` (速い道が照合せずに場所を
+/// 読む前) で行を消して場所を使い回し、 新しい住人が同じ列に書く。 v14 の DB (使い回しが v15 に移らせる) と、 v15 の DB で印の無い表
+/// (別の表で使い回して v15 に移った) の両方で、 集計が消えた行を何も数えない (やり直しの道の答え)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod aggregate_fast_path_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// 枠 1 の表 `s` (a / g / w = 64 bit) と枠 1 の表 `spare` を持つ engine (v14)。 `v15` なら `spare` で使い回して v15 に移す (`s` は
+    /// 使い回しの無いまま)。 返り値の 2 つ目は `s` の生きている行。
+    fn engine(tag: &str, v15: bool) -> (String, Arc<Engine>, enchudb_oplog::EntityId) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-aggfast-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("s", 1).unwrap();
+        eng.define_himo_in("s", "a", ValueType::Number, 0).unwrap();
+        // group の紐は値の上限を宣言する (並列の `group_sum_eids_par` は dense の時だけ並列の道)
+        eng.define_himo_in("s", "g", ValueType::Number, 16).unwrap();
+        eng.define_himo_in("s", "w", ValueType::Number64, 0).unwrap();
+        eng.define_table("spare", 1).unwrap();
+        eng.define_himo_in("spare", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        if v15 {
+            let x = eng.entity_in("spare").unwrap();
+            eng.delete(x);
+            let y = eng.entity_in("spare").unwrap();
+            assert_ne!(x, y, "前提: spare で使い回して v15 に移った");
+        }
+        let a = eng.entity_in("s").unwrap();
+        (path, eng, a)
+    }
+
+    #[test]
+    fn aggregates_redo_with_checks_when_a_slot_is_reused_meanwhile() {
+        for v15 in [false, true] {
+            for which in ["sum", "group_sum", "count", "min64", "histogram_eids", "sum_eids_par"] {
+                let (path, eng, a) = engine("redo", v15);
+                let id = |n: &str| eng.himo_id(n).unwrap() as u16;
+                let (sa, sg, sw) = (id("s.a"), id("s.g"), id("s.w"));
+                eng.tie_to_by_id(a, sa, 7u32);
+                eng.tie_to_by_id(a, sg, 3u32);
+                eng.tie_to_by_id(a, sw, 70u64);
+                let tid = eng.himo_to_table[sa as usize].load(std::sync::atomic::Ordering::Relaxed);
+                assert!(!eng.generations().table_has(tid), "前提: s に世代 > 0 の場所が無い (速い道で始まる)");
+                assert_eq!(eng.generations().active(), v15, "前提");
+                let (tx, rx) = std::sync::mpsc::channel();
+                let e2 = eng.clone();
+                let _ = fast_read_hook::take_redos();
+                fast_read_hook::set(move || {
+                    // 速い道が照合せずに場所を読む前に、 a を消して同じ場所を使い回し (枠 1 の表。 v14 なら v15 に移る)、 新しい住人 b が書く
+                    e2.delete(a);
+                    let b = e2.entity_in("s").unwrap();
+                    assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(a), "前提: 同じ場所を使い回した");
+                    e2.tie_to_by_id(b, sa, 8u32);
+                    e2.tie_to_by_id(b, sg, 4u32);
+                    e2.tie_to_by_id(b, sw, 80u64);
+                    tx.send(()).unwrap();
+                });
+                let got = match which {
+                    "sum" => format!("{}", eng.sum("s.a", &[a])),
+                    "group_sum" => format!("{:?}", eng.group_sum("s.g", "s.a", &[a])),
+                    "count" => format!("{}", eng.count("s.a", &[a])),
+                    "min64" => format!("{:?}", eng.min64("s.w", &[a])),
+                    "histogram_eids" => format!("{:?}", eng.histogram_eids("s.a", &[a], 0, 9, 10)),
+                    "sum_eids_par" => format!("{}", eng.sum_eids_par("s.a", &[a])),
+                    _ => unreachable!(),
+                };
+                rx.try_recv().unwrap_or_else(|_| panic!("v15={v15} {which}: 前提: 速い道の割り込み点で使い回した"));
+                assert!(eng.generations().table_has(tid), "v15={v15} {which}: 前提: 使い回しで s に印が立った");
+                assert_eq!(fast_read_hook::take_redos(), 1, "v15={v15} {which}: 終わりの確かめで照合つきの道にやり直していない");
+                let want = match which {
+                    "group_sum" => "[]".to_string(),
+                    "min64" => "None".to_string(),
+                    "histogram_eids" => format!("{:?}", vec![0u32; 10]),
+                    _ => "0".to_string(),
+                };
+                assert_eq!(got, want, "v15={v15} {which}: 速い道が読みの間に使い回された行の値 (新しい住人の値) を数えた (終わりの確かめでやり直していない)");
+                drop(eng);
+                let _ = crate::db_files::remove_db(&path);
+                let _ = std::fs::remove_file(oplog_path_for(&path));
+            }
+        }
+    }
+
+    /// 対照: 印の無い表の集計は速い道のまま (割り込み点を通る) で、 やり直さない (終わりの確かめがいつも外れる退行を拾う)。
+    #[test]
+    fn aggregates_on_a_table_without_reuse_take_the_fast_path() {
+        let (path, eng, a) = engine("fast", true);
+        let sa = eng.himo_id("s.a").unwrap() as u16;
+        eng.tie_to_by_id(a, sa, 7u32);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = fired.clone();
+        let _ = fast_read_hook::take_redos();
+        fast_read_hook::set(move || f2.store(true, std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(eng.sum("s.a", &[a]), 7);
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "印の無い表の集計が速い道を通らなかった");
+        assert_eq!(fast_read_hook::take_redos(), 0, "印の無い表の集計がやり直した");
+        // 並列の版も
+        let many = vec![a; 64_000];
+        assert_eq!(eng.sum_eids_par("s.a", &many), 7 * 64_000);
+        assert_eq!(fast_read_hook::take_redos(), 0, "印の無い表の並列の集計がやり直した");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// 並列の版 (`par_fold_eids`、 eid が `PAR_RANGE_THRESHOLD` (64,000) 以上 = schema の `Query::sum` / `count` / `group_sum` の道) も、
+    /// 速い道で読む途中に使い回しが入れば、 終わりの確かめで照合つきの道にやり直す。 割り込み点は rayon の worker のどれかで 1 回だけ鳴る
+    /// (engine ごとの global)。 枠 1 の表の同じ eid を 64,000 並べ、 割り込みで a を消して使い回した b が書く。 v14 / v15 の両方。
+    #[test]
+    fn parallel_aggregates_redo_with_checks_when_a_slot_is_reused_meanwhile() {
+        for v15 in [false, true] {
+            for which in ["sum_eids_par", "count_eids_par", "group_sum_eids_par", "min_eids_par", "histogram_eids_par"] {
+                let (path, eng, a) = engine("parredo", v15);
+                let id = |n: &str| eng.himo_id(n).unwrap() as u16;
+                let (sa, sg) = (id("s.a"), id("s.g"));
+                eng.tie_to_by_id(a, sa, 7u32);
+                eng.tie_to_by_id(a, sg, 3u32);
+                let tid = eng.himo_to_table[sa as usize].load(std::sync::atomic::Ordering::Relaxed);
+                assert!(!eng.generations().table_has(tid), "前提: 速い道で始まる");
+                let many = vec![a; 64_000];
+                let (tx, rx) = std::sync::mpsc::channel();
+                let e2 = eng.clone();
+                let _ = fast_read_hook::take_redos();
+                fast_read_hook::set_par(Arc::as_ptr(&eng) as usize, move || {
+                    e2.delete(a);
+                    let b = e2.entity_in("s").unwrap();
+                    assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(a), "前提: 同じ場所を使い回した");
+                    e2.tie_to_by_id(b, sa, 8u32);
+                    e2.tie_to_by_id(b, sg, 4u32);
+                    tx.send(()).unwrap();
+                });
+                let got = match which {
+                    "sum_eids_par" => format!("{}", eng.sum_eids_par("s.a", &many)),
+                    "count_eids_par" => format!("{}", eng.count_eids_par("s.a", &many)),
+                    "group_sum_eids_par" => format!("{:?}", eng.group_sum_eids_par("s.g", "s.a", &many)),
+                    "min_eids_par" => format!("{:?}", eng.min_eids_par("s.a", &many)),
+                    "histogram_eids_par" => format!("{:?}", eng.histogram_eids_par("s.a", &many, 0, 9, 10)),
+                    _ => unreachable!(),
+                };
+                rx.try_recv().unwrap_or_else(|_| panic!("v15={v15} {which}: 前提: 並列の速い道の割り込み点で使い回した"));
+                assert!(eng.generations().table_has(tid), "v15={v15} {which}: 前提: 使い回しで s に印が立った");
+                assert_eq!(fast_read_hook::take_redos(), 1, "v15={v15} {which}: 終わりの確かめで照合つきの道にやり直していない");
+                let want = match which {
+                    "group_sum_eids_par" => "[]".to_string(),
+                    "min_eids_par" => "None".to_string(),
+                    "histogram_eids_par" => format!("{:?}", vec![0u32; 10]),
+                    _ => "0".to_string(),
+                };
+                assert_eq!(got, want, "v15={v15} {which}: 並列の速い道が読みの間に使い回された行の値を数えた");
+                drop(eng);
+                let _ = crate::db_files::remove_db(&path);
+                let _ = std::fs::remove_file(oplog_path_for(&path));
+            }
+        }
+    }
+
+    /// 畳んだ自分の行の別名 (#612、 照合が別名をたどる) があれば、 集計は照合つきの道 (速い道の割り込み点を通らず、 照合つきの道の割り込み点
+    /// `checked_read_hook` を通る)。 速い道の途中で別名ができれば (`own_alias_on` が立つ)、 終わりの確かめでやり直す。
+    #[test]
+    fn own_aliases_keep_aggregates_on_the_checked_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // 始めから別名がある
+        let (path, eng, a) = engine("alias", true);
+        let sa = eng.himo_id("s.a").unwrap() as u16;
+        eng.tie_to_by_id(a, sa, 7u32);
+        eng.own_alias_on.store(true, Ordering::Release);
+        let (fast, checked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (f2, c2) = (fast.clone(), checked.clone());
+        fast_read_hook::set(move || f2.store(true, Ordering::SeqCst));
+        checked_read_hook::set(move || c2.store(true, Ordering::SeqCst));
+        let _ = fast_read_hook::take_redos();
+        assert_eq!(eng.sum("s.a", &[a]), 7);
+        assert!(!fast.load(Ordering::SeqCst), "別名のある engine の集計が速い道を通った");
+        assert!(checked.load(Ordering::SeqCst), "別名のある engine の集計が照合つきの道を通らなかった");
+        assert_eq!(fast_read_hook::take_redos(), 0);
+        let _ = fast_read_hook::take();
+        let _ = checked_read_hook::take();
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+
+        // 速い道の途中で別名ができる
+        let (path, eng, a) = engine("aliasmid", true);
+        eng.tie_to_by_id(a, sa, 7u32);
+        let e2 = eng.clone();
+        fast_read_hook::set(move || e2.own_alias_on.store(true, Ordering::Release));
+        let _ = fast_read_hook::take_redos();
+        assert_eq!(eng.sum("s.a", &[a]), 7);
+        assert_eq!(fast_read_hook::take_redos(), 1, "速い道の途中で別名ができたのにやり直さなかった");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// 枠 2 の表 `e` と `f` を交互に 6 行ずつ足した engine (`e` の足した枠は `f` の枠と交互に並ぶ)。 `v15` なら `spare` で使い回して v15 に
+    /// 移す。 返り値の 2 つ目は `e` の行 (値 `e.v` = 1..=6)。
+    fn grown(tag: &str, v15: bool) -> (String, Arc<Engine>, Vec<enchudb_oplog::EntityId>) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-aggext-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        for t in ["e", "f"] {
+            eng.define_table(t, 2).unwrap();
+            eng.define_himo_in(t, "v", ValueType::Number, 0).unwrap();
+        }
+        eng.define_table("spare", 1).unwrap();
+        eng.define_himo_in("spare", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        if v15 {
+            let x = eng.entity_in("spare").unwrap();
+            eng.delete(x);
+            let y = eng.entity_in("spare").unwrap();
+            assert_ne!(x, y, "前提: v15");
+        }
+        assert_eq!(eng.generations().bits() != 0, v15, "前提: v15={v15}");
+        let mut rows = Vec::new();
+        for i in 1..=6u32 {
+            let e = eng.entity_in("e").unwrap();
+            eng.tie_to(e, "e.v", i);
+            rows.push(e);
+            let f = eng.entity_in("f").unwrap();
+            eng.tie_to(f, "f.v", 100 + i);
+        }
+        let ext = eng.tables.iter().find(|t| t.name == "e").unwrap().extents();
+        assert!(ext.len() >= 3, "前提: e は枠を足した ({ext:?})");
+        assert!(ext.windows(2).any(|w| w[0].1 != w[1].0), "前提: e の枠は f の枠と交互に並ぶ ({ext:?})");
+        (path, eng, rows)
+    }
+
+    /// F3 (#1064 の残り): 枠を足した表の、 足した枠の eid も速い道で読む (1 つずつ照合つきの out of line の読みを呼ばない)。 他の表と交互に
+    /// 伸びて枠が続かない表で、 v14 / v15 の両方。 前は最初の枠の外の eid が全部 out of line の照合つきの読みを呼び、 枠を足した表の集計が
+    /// #1041 の前の 2.5 倍遅かった。
+    #[test]
+    fn aggregates_read_added_extents_on_the_fast_path() {
+        for v15 in [false, true] {
+            let (path, eng, rows) = grown("fast", v15);
+            let _ = fast_read_hook::take_outlined();
+            let _ = fast_read_hook::take_redos();
+            assert_eq!(eng.sum("e.v", &rows), 21, "v15={v15}");
+            assert_eq!(fast_read_hook::take_outlined(), 0, "v15={v15}: 足した枠の eid を 1 つずつ照合つきで読んだ");
+            assert_eq!(fast_read_hook::take_redos(), 0, "v15={v15}");
+            // 別の表の eid は枠の外 = 照合つき (値は無い)
+            let mut mixed = rows.clone();
+            mixed.push(eng.entity_in("f").unwrap());
+            assert_eq!(eng.sum("e.v", &mixed), 21, "v15={v15}");
+            assert_eq!(fast_read_hook::take_outlined(), if v15 { 1 } else { 0 }, "v15={v15}: 別の表の eid の読み");
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+    }
+
+    /// F3: 足した枠の行を速い道で読む途中に消して使い回しても、 終わりの確かめでやり直す (足した枠の場所の世代を上げる書きも、 その表の
+    /// 印を立てる)。
+    #[test]
+    fn aggregates_over_added_extents_redo_when_a_slot_is_reused_meanwhile() {
+        for v15 in [false, true] {
+            let (path, eng, rows) = grown("extredo", v15);
+            // 最後の行は足した枠にある
+            let last = *rows.last().unwrap();
+            let ext0 = eng.tables.iter().find(|t| t.name == "e").unwrap().extents()[0];
+            assert!(!(ext0.0..ext0.1).contains(&eng.slot_unchecked(last)), "前提: 足した枠の行");
+            let e2 = eng.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = fast_read_hook::take_redos();
+            fast_read_hook::set(move || {
+                e2.delete(last);
+                let b = e2.entity_in("e").unwrap();
+                assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(last), "前提: 足した枠の場所を使い回した");
+                e2.tie_to(b, "e.v", 1000u32);
+                tx.send(()).unwrap();
+            });
+            let got = eng.sum("e.v", &rows);
+            rx.try_recv().unwrap_or_else(|_| panic!("v15={v15}: 前提: 割り込み点で使い回した"));
+            assert_eq!(fast_read_hook::take_redos(), 1, "v15={v15}: やり直していない");
+            assert_eq!(got, 15, "v15={v15}: 消えた行 (6) も使い回した行 (1000) も数えない");
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+    }
+
+    /// F3: 速い道が照合せずに読む local は、 v15 の DB では表の枠の中とちょうど同じ (他の表と交互に伸びて枠が続かない表 `e` と、 1 つだけ
+    /// 伸びて足した枠が続く表 `c` = 続いた枠をまとめる形)。 local を昇順・降順・飛び飛びに 1 つの `cur` で引く (前の範囲を先に見る形)。 世代 > 0 の
+    /// local (2^S 以上) はどの枠の外。 v14 の DB はどの local も読む。
+    #[test]
+    fn fast_reads_cover_exactly_the_tables_extents() {
+        for v15 in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = format!("/tmp/enchudb-aggext-cover-{}-{nanos}.db", std::process::id());
+            let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+            for (t, cap) in [("e", 2), ("f", 2), ("spare", 1), ("c", 2)] {
+                eng.define_table(t, cap).unwrap();
+                eng.define_himo_in(t, "v", ValueType::Number, 0).unwrap();
+            }
+            eng.flush().unwrap();
+            eng.persist_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            if v15 {
+                let x = eng.entity_in("spare").unwrap();
+                eng.delete(x);
+                let y = eng.entity_in("spare").unwrap();
+                assert_ne!(x, y, "前提: v15");
+            }
+            assert_eq!(eng.generations().bits() != 0, v15, "前提: v15={v15}");
+            // e と f は交互に伸びる (e の枠は続かない)
+            for _ in 0..6 {
+                eng.entity_in("e").unwrap();
+                eng.entity_in("f").unwrap();
+            }
+            // その後で c だけが伸びる (c の足した枠は前の枠のすぐ後ろ)
+            for _ in 0..7 {
+                eng.entity_in("c").unwrap();
+            }
+            let top = eng.tables.iter().map(|t| t.last_hi()).max().unwrap();
+            let peer = eng.peer_id();
+            for name in ["e", "c"] {
+                let t = eng.tables.iter().find(|t| t.name == name).unwrap();
+                let ext = t.extents();
+                assert!(ext.len() >= 3, "前提: {name} は枠を足した ({ext:?})");
+                let contiguous = ext[1..].windows(2).all(|w| w[0].1 == w[1].0);
+                assert_eq!(contiguous, name == "c", "前提: e の足した枠は続かず、 c の足した枠は続く ({name}: {ext:?})");
+                let hid = eng.himo_id(&format!("{name}.v")).unwrap();
+                let fast = eng.fast_eid_reads(&[hid]).expect("前提: 速い道");
+                let mut locals: Vec<u32> = (0..top + 4).collect();
+                let rev: Vec<u32> = locals.iter().rev().copied().collect();
+                let hop: Vec<u32> = (0..top + 4).map(|i| (i * 7) % (top + 4)).collect();
+                locals.extend(rev);
+                locals.extend(hop);
+                let mut cur = fast.first();
+                for local in locals {
+                    let got = fast.slot(enchudb_oplog::make_eid(peer, local), &mut cur).is_some();
+                    let want = !v15 || t.contains(local);
+                    assert_eq!(got, want, "v15={v15} {name}: local {local} ({ext:?})");
+                }
+                if v15 {
+                    let g1 = 1u32 << eng.generations().bits();
+                    for slot in 0..top {
+                        assert!(fast.slot(enchudb_oplog::make_eid(peer, g1 | slot), &mut cur).is_none(), "v15 {name}: 世代 1 の local {slot}");
+                    }
+                }
+            }
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+    }
+
+    /// F3: anonymous の紐 (engine の `entity()`、 query_lang の `| sum`) の集計も速い道で読む (閉じていない anonymous の枠は 2^S で切る)。
+    #[test]
+    fn aggregates_on_anonymous_himos_take_the_fast_path() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-aggext-anon-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let rows: Vec<_> = (1..=5u32)
+            .map(|i| {
+                let e = eng.entity().unwrap();
+                eng.tie_to(e, "v", i);
+                e
+            })
+            .collect();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = fired.clone();
+        fast_read_hook::set(move || f2.store(true, std::sync::atomic::Ordering::SeqCst));
+        let _ = fast_read_hook::take_outlined();
+        assert_eq!(eng.sum("v", &rows), 15);
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "anonymous の紐の集計が速い道を通らなかった");
+        assert_eq!(fast_read_hook::take_outlined(), 0, "anonymous の行を 1 つずつ照合つきで読んだ");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 }
 
@@ -7354,6 +8508,9 @@ mod gone_own_delete_tests {
     /// #921 の読み直し [8]: 世代を持てない DB (packed を開いた Memory backing、 wasm と同じ) で消して足すと、 新しい住人は消えた行と同じ番号 (場所)。
     /// その番号を消えた行の identity として退避表に載せない (載せると state の自分の削除として出て、 受け手が新しい住人を消す)。 packed は表の
     /// 定義を運ばないので、 sync の表は開いた後に作る。 消えた行の削除は受信の道で当てる (WAL の無い Memory backing の自分の削除は版数を持たない)。
+    ///
+    /// #1066: WAL の無い sync する DB はユーザの表に行を足せない (自分の行は sync の表を作る前に書く)。 使い回すのは受けた行の払い出し
+    /// (相手の行の写像を作る受信の道)。
     #[test]
     fn a_db_without_generations_does_not_move_the_new_residents_number() {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -7363,13 +8520,13 @@ mod gone_own_delete_tests {
         Engine::pack_dir(&path, std::path::Path::new(&packed)).unwrap();
         let mut mem = Engine::from_bytes(std::fs::read(&packed).unwrap()).unwrap();
         mem.define_table("t", 2).unwrap();
-        mem.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
-        mem.enable_sync_tables().unwrap();
+        let a = mem.define_himo_in("t", "a", ValueType::Number, 0).unwrap() as u16;
         mem.set_peer_id(1);
         let x = mem.entity_in("t").unwrap();
         mem.tie_to(x, "t.a", 1u32);
         let y = mem.entity_in("t").unwrap();
         mem.tie_to(y, "t.a", 2u32);
+        mem.enable_sync_tables().unwrap();
         // 相手の peer が消した (受信の道、 版数は相手の時計)
         let t = enchudb_oplog::Hlc { wall: 1_800_000_000_000, logical: 0, peer: 2 };
         assert!(mem.remote_delete_apply(x, t), "前提: 削除を当てた");
@@ -7377,7 +8534,7 @@ mod gone_own_delete_tests {
         assert_eq!(mem.slot_bits(), 0, "前提: 世代を持たない DB");
         assert!(mem.sync_tables_on(), "前提: sync の表のある DB");
         assert_ne!(mem.tombstone_version_of(gone), enchudb_oplog::Hlc::ZERO, "前提: 消えた行の削除の版数がある");
-        let again = mem.entity_in("t").unwrap();
+        let again = mem.resolve_remote_eid(enchudb_oplog::make_eid(3, 9), a).expect("前提: 受けた行の場所を払い出した");
         assert_eq!(mem.slot_unchecked(again), gone, "前提: 消えた行の場所を使い回した");
         assert!(
             !mem.orphan_foreign_tombstones().iter().any(|&(peer, l, _)| peer == 1 && l == gone),
@@ -13146,6 +14303,11 @@ const WAL_ROOM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// #560: `oplog_sync()` が、 配っている最中の listener (通知係が呼んでいる) を待つ上限。 #636: Drop が、 返らない listener を待つ
 /// 上限 (listener が返るたびに数え直す)。
 const LISTENER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// #1054: listener が居る時、 `oplog_sync()` が自分の commit より前に積んで当てている途中の他の書き手を待つ上限。 越えたら今まで
+/// どおりその手前で書き出しを切って返る (自分の commit は consumer の周期の書き出しの後に通知係が配る)。
+const SYNC_APPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// #1054: そのうち、 回って待つ (`spin_loop`) 間。 その後は yield / 寝て待つ。
+const SYNC_APPLY_SPIN: std::time::Duration = std::time::Duration::from_micros(20);
 
 /// sync の DB で満杯の時に、 閉じの Commit を打ち直して畳み直す回数の上限 (`make_wal_room_inner`)。
 const WAL_ROOM_FOLD_ROUNDS: usize = 4;
@@ -14982,6 +16144,10 @@ pub struct Engine {
     /// #533: 開くのをやめた engine (open の途中で sidecar を読めなかった等)。 Drop は何も書かずに閉じる (書くと、 読めなかった
     /// sidecar を空の中身で上書きする)。
     abandoned: std::sync::atomic::AtomicBool,
+    /// #991 (C1、 0.38 前 review): この session で WAL の fsync が 1 度でも失敗した。 Drop は 「きれいに閉じた」 の印 (紐名の辞書の clean)
+    /// を立てない (次の open が #451 の作り直しを飛ばさない)。 失敗した fsync の page は kernel が捨てうる (後の fsync が成功しても
+    /// 戻らない) ので、 最後の書き出しだけでなく session の間ずっと覚える。
+    wal_sync_failed: std::sync::atomic::AtomicBool,
     /// PR #977 の読み直し 5 の値段 [7]: きれいに閉じなかった後に開いた時の、 anonymous の生きている印の最大 + 1 (0 = 無い / きれいに
     /// 閉じた後)。 開く時に 1 回だけなめて覚え、 払い出し済みの場所の上限 ([`Self::given_out_slot_end`]) が読む (前は開く時の commit・
     /// 再生の後・v15 に移る 1a のたびに予約の全部をなめた)。
@@ -15459,6 +16625,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_failed: std::sync::atomic::AtomicBool::new(false),
             anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
@@ -15953,6 +17120,16 @@ impl Engine {
         )?;
         let mut eng = Self::load_from_backing(Backing::Segments(Arc::new(set)), readonly)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // clean flag を倒して書き出す (`load_from_backing` の終わりの説明)。 #1057: 倒した印を disk に置けなければ
+        // 開かない。 Drop は何も書かない (`abandoned`、 書くと前の session の後始末をせずに 「きれいに閉じた」 の印を立てる = #991 と
+        // 同じ形)。 前は書き出しの失敗を捨てて書き始めた
+        if !readonly && let Err(e) = eng.mark_session_dirty() {
+            eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot write the session's dirty mark, refusing to open for writing (try again): {e}"),
+            ));
+        }
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
 
@@ -16653,8 +17830,13 @@ impl Engine {
 
     /// Vec<u8> からエンジンを構築。WASM ではこれが唯一のエントリポイント。
     /// native でも使える（テスト、ファイル丸読みなど）。
+    ///
+    /// この engine は WAL (oplog) を持てない。 #1066: sync の表のある DB (relay の bootstrap を開いた物など) は、 ユーザの表の行を書けない
+    /// (読みだけ。 相手から受けた書き込みと予約の表は通る)。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
+        // file の無い engine (書き出しは何もしない)
+        eng.mark_session_dirty().map_err(|e| e.to_string())?;
         // 書き出さない engine: 前の名前の identity の record を作らない (誰も取り出さずに溜まる、 review987 [5])
         *eng.pk_former.write().unwrap() = crate::pk_former::PkFormer::without_log();
         eng.finish_vocab_refs_at_open();
@@ -17188,6 +18370,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_failed: std::sync::atomic::AtomicBool::new(false),
             anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
@@ -17231,7 +18414,7 @@ impl Engine {
             if vocab_reclaim && !eng.attach_vocab_refs() {
                 eng.vocab_recount_pending.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            eng.mark_session_dirty();
+            // 印を倒して書き出すのは呼び手 (`mark_session_dirty`、 失敗を I/O の失敗として返すため。 ここの Err は壊れた中身の印)
         }
 
         Ok(eng)
@@ -17339,6 +18522,10 @@ impl Engine {
     ///
     /// 0.7.0 では opt-in 方針。 一度有効化すると無効化は不可 (= reserved table
     /// は close できない、 ただし himo は最小)。
+    ///
+    /// #1066: 有効にした後は、 WAL 付きの session (`concurrentize_with_oplog` の後 / `open_concurrent_with_oplog`) でしか、 ユーザの表の行を
+    /// 書けない (この build phase の残り・`open_standalone`・`concurrentize` (WAL なし)・`from_bytes` / wasm の書き込みは
+    /// `FaultKind::NoWal` で断る)。 版数の無い初期の行が要るなら、 有効にする前に書く。
     pub fn enable_sync_tables(&mut self) -> Result<(), String> {
         self.check_writable();
 
@@ -18980,11 +20167,16 @@ impl Engine {
     /// 打たなかったのと同じで、 「打てなかった Commit」 にも警告にも入れない (満杯以外の失敗は数える)。 Commit は payload 0
     /// = 最小の record (閉じの Commit の分の空き `commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯 (`append_dead`) と同値。
     fn append_commit_marker_with(&self, wal: &enchudb_oplog::oplog::OpLog, count_full: bool) -> std::io::Result<()> {
+        self.append_commit_marker_lsn(wal, count_full).map(|_| ())
+    }
+
+    /// [`Self::append_commit_marker_with`] の、 打った Commit の LSN を返す版 (#1054: `oplog_sync` が自分の Commit の位置を引く)。
+    fn append_commit_marker_lsn(&self, wal: &enchudb_oplog::oplog::OpLog, count_full: bool) -> std::io::Result<u64> {
         use std::sync::atomic::Ordering;
         match wal.append(enchudb_oplog::oplog::Op::Commit) {
-            Ok(_) => {
+            Ok(lsn) => {
                 self.wal_append_warned.store(false, Ordering::Relaxed);
-                Ok(())
+                Ok(lsn)
             }
             Err(e) if !count_full && e.kind() == io::ErrorKind::OutOfMemory => Err(e),
             Err(e) => {
@@ -21222,10 +22414,14 @@ impl Engine {
         self.try_entity_in(table_name).map_err(|(_, why)| why)
     }
 
-    /// [`Self::entity_in`] の、 断りの種類を分ける形 (#970、 PR #977 の読み直し 4 の [9])。 `Err((Some(FaultKind::DiskSpace), why))` =
-    /// ディスクの空きの不足 (払い出す場所の世代を書く gen.seg の page を commit できない / v15 に移れない。 空きが戻れば通る、 列を
-    /// 伸ばせない時と同じ棚)。 `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は前者を
-    /// `SchemaError::WriteRejected(TieRejected::Fault(DiskSpace))` にする。
+    /// [`Self::entity_in`] の、 断りの種類を分ける形 (#970、 PR #977 の読み直し 4 の [9])。 `Err((Some(kind), why))` は fault に数える断り:
+    ///
+    /// - `Some(FaultKind::DiskSpace)`: ディスクの空きの不足 (払い出す場所の世代を書く gen.seg の page を commit できない / v15 に移れない。
+    ///   空きが戻れば通る、 列を伸ばせない時と同じ棚)
+    /// - `Some(FaultKind::NoWal)` (#1066): sync する DB を WAL なしで開いた session (build phase を含む) のユーザの表。 WAL 付きで開き直すと通る
+    ///
+    /// `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は `Some(kind)` を
+    /// `SchemaError::WriteRejected(TieRejected::Fault(kind))` にする。
     pub fn try_entity_in(&self, table_name: &str) -> Result<enchudb_oplog::EntityId, (Option<FaultKind>, String)> {
         self.try_entity_in_row(table_name).map(|(eid, _)| eid)
     }
@@ -21238,6 +22434,17 @@ impl Engine {
         &self,
         table_name: &str,
     ) -> Result<(enchudb_oplog::EntityId, Option<crate::row_lock::RowWrite<'_>>), (Option<FaultKind>, String)> {
+        // #1066: WAL なしで開いた sync する DB は、 ユーザの表に行を払い出さない (払い出した行に何も書けない。 予約の表は払い出す)
+        if self.oplog.is_none()
+            && self.sync_tables_on()
+            && self.tables.iter().any(|t| t.name == table_name && !t.is_reserved())
+        {
+            self.record_fault(FaultKind::NoWal, "a sync-enabled DB opened without the oplog (WAL) refused to add a user row (#1066)");
+            return Err((
+                Some(FaultKind::NoWal),
+                format!("table '{table_name}': a sync-enabled DB must be opened with the oplog (WAL) to add rows"),
+            ));
+        }
         self.entity_in_held(table_name, false).map_err(|e| match e {
             // 待つ形 (`nowait` が偽) は返さない
             EntityInError::Busy(slot) => (None, format!("table '{table_name}': slot {slot} is held by a writer")),
@@ -31130,6 +32337,10 @@ impl Engine {
 
         let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
+        // #1066: 断る書き込みで紐を生やさない
+        if self.app_slot(eid).is_some_and(|l| self.refuses_walless_sync_write(l)) {
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Tag, 0);
         self.tie_text_by_id(eid, hid as u16, value);
     }
@@ -31148,6 +32359,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(eid) else { return };
+        // #1066: build phase / WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
@@ -31206,6 +32421,10 @@ impl Engine {
         if !self.fits(self.himo_id(himo).unwrap_or(usize::MAX), value) {
             return;
         }
+        // #1066: 断る書き込みで紐を生やさない
+        if self.app_slot(eid).is_some_and(|l| self.refuses_walless_sync_write(l)) {
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Number, 0);
         self.tie_by_id(eid, hid as u16, value);
     }
@@ -31216,6 +32435,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(eid) else { return };
+        // #1066: build phase / WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         let Some(value) = self.cell_value(value) else { return };
         if !self.fits(hid, value) {
@@ -31243,6 +32466,10 @@ impl Engine {
         if self.reject_sentinel(target_local, "tie_ref target_eid >= u32::MAX (sentinel reserved)") {
             return;
         }
+        // #1066: 断る書き込みで紐を生やさない
+        if self.app_slot(eid).is_some_and(|l| self.refuses_walless_sync_write(l)) {
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Ref, 0);
         self.tie_ref_by_id(eid, hid as u16, target_eid);
     }
@@ -31258,6 +32485,10 @@ impl Engine {
         self.check_writable();
         // #731: 行の側は消えた行 / 場所を使い回す前の eid なら書かない。 的の側 (Ref の値) の世代は段 2 (今は場所)
         let Some(eid) = self.app_slot(eid) else { return };
+        // #1066: build phase / WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let target_eid = enchudb_oplog::eid_local(self.forward_eid(target_eid));
         if self.reject_sentinel(target_eid, "tie_ref target_eid >= u32::MAX (sentinel reserved)") {
             return;
@@ -31319,6 +32550,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -31532,6 +32767,26 @@ impl Engine {
         self.tables.iter().any(|t| is_engine_internal_table(&t.name) && t.contains(local))
     }
 
+    /// #1066 (#1046 の (1)): sync する DB (sync の表がある) を WAL なしで開いた session (`open_standalone` / schema の
+    /// `Database::open` / `finish_concurrent` / build phase = `concurrentize_with_oplog` の前) の、 ユーザの表の行 (場所 `local`) への
+    /// 書き込みなら断る (fault を数えて true、 呼び手は何も変えずに返る)。 WAL が無いと版数 (WAL の時計) が付かず、 書き込みは bridge にも
+    /// #451 の作り直しにも拾われず相手に配られない。 消した行は tombstone なしで死に、 遅れた受信で次の世代に生き返り (#1046)、 削除が
+    /// state に載らないので受け手の亡霊掃除が同じ名前の行まで消した (#923 の形)。
+    ///
+    /// 断らないのは予約の表 (`_` で始まる: `_sync_ops` / `_sync_peers` / `_cursors` / `define_reserved_table` の local-only の表) の行、
+    /// WAL 付きの session、 sync の表の無い DB。 開く時の修復・WAL の再生・相手から受けた書き込み (版数を持つ) は、 この入口を通らない。
+    #[inline]
+    fn refuses_walless_sync_write(&self, local: u32) -> bool {
+        if self.oplog.is_some() || !self.sync_tables_on() || self.tables.iter().any(|t| t.is_reserved() && t.contains(local)) {
+            return false;
+        }
+        self.record_fault(
+            FaultKind::NoWal,
+            "a sync-enabled DB opened without the oplog (WAL) refused a write to a user row — open it with the oplog (#1066)",
+        );
+        true
+    }
+
     /// 0.7.0: `tie_text_to_by_id` の binary 版。 任意 byte slice を vocab に
     /// insert (Leaf なら dedupe なし) し、 himo に紐付ける。 `_sync_ops.payload`
     /// (= oplog record の生 wire bytes) 等、 UTF-8 制約を持たない data を書く用。
@@ -31540,6 +32795,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(app) else { return };
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない (`_sync_ops` の payload は予約の表 = 通る)
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -31685,6 +32944,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         let hid = himo_id as usize;
         // #59: 列の幅に入らない値 (sentinel 含む) は cell に入らない。 panic せず write を拒否 + 計上。
         // WAL に載せる前に弾く
@@ -31773,6 +33036,10 @@ impl Engine {
         // #731: 行の側は消えた行 / 場所を使い回す前の eid なら書かない。 的の側は eid の local (世代 | 場所) をそのまま Ref の値に
         // する (消えた行を指す ref は、 場所が使い回されても新しい行を指さない)
         let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         let target_eid = enchudb_oplog::eid_local(target_eid);
         if target_eid == u32::MAX {
             self.record_fault(
@@ -31851,6 +33118,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は何もしない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(app) else { return };
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は外さない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -31881,22 +33152,32 @@ impl Engine {
 
     // ──── delete ────
 
-    pub fn delete(&self, eid: enchudb_oplog::EntityId) {
+    /// 行 `eid` を消す。 消せなかった時は理由を返し、 何も変えない (`try_tie_*` と同じ形、 #1066 の読み直し F5):
+    ///
+    /// - `DeadRow`: 消えた行 / 場所を使い回す前の eid (#731)
+    /// - `Fault(NoWal)`: WAL なしで開いた sync する DB のユーザの表の行 (#1066)
+    /// - `Fault(SegmentIo)`: 開けない列がある (#534。 途中まで消さない)
+    /// - `Fault(WalSpace)`: WAL に載らない (#553 / #554)
+    /// - `OlderThanCell`: cell に今より新しい版数がある (時計が戻った)
+    pub fn try_delete(&self, eid: enchudb_oplog::EntityId) -> Result<(), TieRejected> {
         let app = eid;
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は何もしない (#612: 畳んだ自分の行の eid は残す行へ)
-        let Some(eid) = self.app_slot(app) else { return };
+        let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は消さない (tombstone なしで死ぬ = #1046)
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         // #534: 消すには全部の列の古い値を読む (索引と Leaf の領域の片付け)。 開けない列があれば何も積まずに断る (途中まで
         // 消さない。 WAL に積んでから断ると、 配った相手でだけ消える)
-        if (0..self.himos.len()).any(|hid| self.load_column(hid).is_err()) {
-            return;
+        for hid in 0..self.himos.len() {
+            self.load_column(hid)?;
         }
         // request17 step 4 (A-5): 削除は himo を持たないので eid 空間の tombstone
         // column に版数を記録する。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 行を握ってから積む (`append_local_op` の doc)
-        let Some(row) = self.lock_app_row(app, eid) else { return };
-        let row = Some(row);
+        let row = Some(self.lock_app_row(app, eid).ok_or(TieRejected::DeadRow)?);
         let oplog_eid = self.oplog_eid(eid);
         let mut hids = RowHids::new();
         let applying = self.local_apply_row(eid, &mut hids);
@@ -31907,9 +33188,7 @@ impl Engine {
         if !self.has_cell_version() {
             self.note_freed_slot(eid, enchudb_oplog::Hlc::ZERO);
         }
-        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark()) else {
-            return;
-        };
+        let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark())?;
         self.at_apply_point(true);
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc, applying.row_valued());
         drop(applying);
@@ -31922,9 +33201,16 @@ impl Engine {
                 names_taken_hook::call(wal);
             }
             self.remove_rows_holding_names(eid, names, hlc);
+            Ok(())
         } else {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
+            Err(TieRejected::OlderThanCell)
         }
+    }
+
+    /// 行 `eid` を消す。 消せなかった時は何もしない (理由は [`Self::try_delete`]、 容量の断りは `fault_count` にも数える)。
+    pub fn delete(&self, eid: enchudb_oplog::EntityId) {
+        let _ = self.try_delete(eid);
     }
 
     // ──── トランザクション ────
@@ -32016,6 +33302,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない
         let Some(local) = self.app_slot(eid) else { return };
+        // #1066: content の紐を生やす前に断る
+        if self.refuses_walless_sync_write(local) {
+            return;
+        }
         let hid = self.ensure_content_himo(local, key);
         self.tie_bytes_to_by_id(eid, hid, data);
     }
@@ -32387,8 +33677,8 @@ impl Engine {
 
     /// changefeed: 記録がある時の配信 1 回分を取り出す (#636: listener は呼び手が engine の外で呼ぶ)。 listener ごとに位置から
     /// 読み、 位置は渡す前に進める (畳む側の写しが、 渡した分を 「まだ読んでいない」 と見て外さないように)。 読めない listener
-    /// は外す。
-    fn take_log_work(&self) -> LogWork {
+    /// は外す。 `until` は配りの始めに写した記録の終わり (#1055: 読み手全員がそこへ届いたら、 その配りは返る)。
+    fn take_log_work(&self, until: u64) -> LogWork {
         /// 1 回に 1 listener へ渡す量の目安。
         const CHUNK: usize = 4 << 20;
         let mut work = LogWork::default();
@@ -32414,6 +33704,9 @@ impl Engine {
                 .retain(|l| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
             self.change_listeners_detached.fetch_add(broken.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        let next = log.range().1;
+        work.caught_up = c.readers.iter().all(|(_, p)| *p >= until);
+        work.more = c.readers.iter().any(|(_, p)| *p < next);
         work
     }
 
@@ -32857,13 +34150,7 @@ impl Engine {
     pub fn sum(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u64 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
-        let mut total: u64 = 0;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                total += v as u64;
-            }
-        }
-        total
+        self.fold_eids::<true, u64, u32>(&[hid], eids, || 0, |l| hs.get_value32(l), |t, v| *t += v as u64)
     }
 
     /// 0.8.6: himo 値が `[lo, hi]` (両端含む) の範囲に入る entity 全件を、
@@ -33544,40 +34831,28 @@ impl Engine {
     pub fn min(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
-        let mut result: Option<u32> = None;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                result = Some(result.map_or(v, |cur: u32| cur.min(v)));
-            }
-        }
-        result
+        self.fold_eids::<true, Option<u32>, u32>(&[hid], eids, || None, |l| hs.get_value32(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.min(v)));
+        })
     }
 
     /// 最大値
     pub fn max(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
-        let mut result: Option<u32> = None;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                result = Some(result.map_or(v, |cur: u32| cur.max(v)));
-            }
-        }
-        result
+        self.fold_eids::<true, Option<u32>, u32>(&[hid], eids, || None, |l| hs.get_value32(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.max(v)));
+        })
     }
 
     /// 平均（整数除算）
     pub fn avg(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
-        let mut total: u64 = 0;
-        let mut count: u64 = 0;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                total += v as u64;
-                count += 1;
-            }
-        }
+        let (total, count) = self.fold_eids::<true, (u64, u64), u32>(&[hid], eids, || (0, 0), |l| hs.get_value32(l), |a, v| {
+            a.0 += v as u64;
+            a.1 += 1;
+        });
         if count == 0 { None } else { Some(total / count) }
     }
 
@@ -33585,11 +34860,7 @@ impl Engine {
     pub fn count(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u32 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
-        let mut n: u32 = 0;
-        for &eid in eids {
-            if self.read_app_acquired(eid, |l| hs.get_value(l)).is_some() { n += 1; }
-        }
-        n
+        self.fold_eids::<true, u32, u64>(&[hid], eids, || 0, |l| hs.get_value(l), |n, _| *n += 1)
     }
 
     /// GROUP BY + SUM — group_himo の値でグループ化し、sum_himo の値を合計
@@ -33601,14 +34872,14 @@ impl Engine {
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let ss = &self.himos[sid];
-        let cap = self.group_dense_cap(gid);
-        if let Some(cap) = cap {
-            let mut sums: Vec<u64> = vec![0; cap];
-            let mut seen: Vec<bool> = vec![false; cap];
-            let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
+        let read = |l: u32| gs.get_value32(l).zip(ss.get_value32(l));
+        if let Some(cap) = self.group_dense_cap(gid) {
+            let (sums, seen, spill) = self.fold_eids::<true, (Vec<u64>, Vec<bool>, std::collections::HashMap<u32, u64>), (u32, u32)>(
+                &[gid, sid],
+                eids,
+                || (vec![0; cap], vec![false; cap], std::collections::HashMap::new()),
+                read,
+                |(sums, seen, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -33616,19 +34887,15 @@ impl Engine {
                     } else {
                         *spill.entry(group).or_insert(0) += val as u64;
                     }
-                }
-            }
+                },
+            );
             let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, sums[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
-                    *map.entry(group).or_insert(0) += val as u64;
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u64>, (u32, u32)>(&[gid, sid], eids, std::collections::HashMap::new, read, |map, (group, val)| {
+                *map.entry(group).or_insert(0) += val as u64;
+            });
             map.into_iter().collect()
         }
     }
@@ -33693,27 +34960,25 @@ impl Engine {
     pub fn group_count(&self, group_himo: &str, eids: &[enchudb_oplog::EntityId]) -> Vec<(u32, u32)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
+        let read = |l: u32| gs.get_value32(l);
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut counts: Vec<u32> = vec![0; cap];
-            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
-                    match counts.get_mut(group as usize) {
-                        Some(c) => *c += 1,
-                        None => *spill.entry(group).or_insert(0) += 1,
-                    }
-                }
-            }
+            let (counts, spill) = self.fold_eids::<true, (Vec<u32>, std::collections::HashMap<u32, u32>), u32>(
+                &[gid],
+                eids,
+                || (vec![0; cap], std::collections::HashMap::new()),
+                read,
+                |(counts, spill), group| match counts.get_mut(group as usize) {
+                    Some(c) => *c += 1,
+                    None => *spill.entry(group).or_insert(0) += 1,
+                },
+            );
             let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| counts[i] > 0).map(|i| (i as u32, counts[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
-                    *map.entry(group).or_insert(0) += 1;
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u32>, u32>(&[gid], eids, std::collections::HashMap::new, read, |map, group| {
+                *map.entry(group).or_insert(0) += 1;
+            });
             map.into_iter().collect()
         }
     }
@@ -33724,13 +34989,14 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
+        let read = |l: u32| gs.get_value32(l).zip(vs.get_value32(l));
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut mins: Vec<u32> = vec![u32::MAX; cap];
-            let mut seen: Vec<bool> = vec![false; cap];
-            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+            let (mins, seen, spill) = self.fold_eids::<true, (Vec<u32>, Vec<bool>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+                &[gid, vid],
+                eids,
+                || (vec![u32::MAX; cap], vec![false; cap], std::collections::HashMap::new()),
+                read,
+                |(mins, seen, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
                         if val < mins[i] { mins[i] = val; }
@@ -33739,20 +35005,16 @@ impl Engine {
                         let entry = spill.entry(group).or_insert(u32::MAX);
                         if val < *entry { *entry = val; }
                     }
-                }
-            }
+                },
+            );
             let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, mins[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
-                    let entry = map.entry(group).or_insert(u32::MAX);
-                    if val < *entry { *entry = val; }
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u32>, (u32, u32)>(&[gid, vid], eids, std::collections::HashMap::new, read, |map, (group, val)| {
+                let entry = map.entry(group).or_insert(u32::MAX);
+                if val < *entry { *entry = val; }
+            });
             map.into_iter().collect()
         }
     }
@@ -33763,35 +35025,32 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
+        let read = |l: u32| gs.get_value32(l).zip(vs.get_value32(l));
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut maxs: Vec<u32> = vec![0; cap];
-            let mut seen: Vec<bool> = vec![false; cap];
-            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+            let (mins, seen, spill) = self.fold_eids::<true, (Vec<u32>, Vec<bool>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+                &[gid, vid],
+                eids,
+                || (vec![0; cap], vec![false; cap], std::collections::HashMap::new()),
+                read,
+                |(mins, seen, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
-                        if val > maxs[i] { maxs[i] = val; }
+                        if val > mins[i] { mins[i] = val; }
                         seen[i] = true;
                     } else {
                         let entry = spill.entry(group).or_insert(0);
                         if val > *entry { *entry = val; }
                     }
-                }
-            }
-            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, maxs[i])).collect();
+                },
+            );
+            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, mins[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
-                    let entry = map.entry(group).or_insert(0);
-                    if val > *entry { *entry = val; }
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u32>, (u32, u32)>(&[gid, vid], eids, std::collections::HashMap::new, read, |map, (group, val)| {
+                let entry = map.entry(group).or_insert(0);
+                if val > *entry { *entry = val; }
+            });
             map.into_iter().collect()
         }
     }
@@ -33802,13 +35061,14 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
+        let read = |l: u32| gs.get_value32(l).zip(vs.get_value32(l));
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut sums: Vec<u64> = vec![0; cap];
-            let mut cnts: Vec<u64> = vec![0; cap];
-            let mut spill: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+            let (sums, cnts, spill) = self.fold_eids::<true, (Vec<u64>, Vec<u64>, std::collections::HashMap<u32, (u64, u64)>), (u32, u32)>(
+                &[gid, vid],
+                eids,
+                || (vec![0; cap], vec![0; cap], std::collections::HashMap::new()),
+                read,
+                |(sums, cnts, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -33818,21 +35078,17 @@ impl Engine {
                         e.0 += val as u64;
                         e.1 += 1;
                     }
-                }
-            }
+                },
+            );
             let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| cnts[i] > 0).map(|i| (i as u32, sums[i] / cnts[i])).collect();
             Self::push_spilled(&mut out, spill.into_iter().map(|(k, (s, n))| (k, s / n)));
             out
         } else {
-            let mut acc: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
-                    let e = acc.entry(group).or_insert((0, 0));
-                    e.0 += val as u64;
-                    e.1 += 1;
-                }
-            }
+            let acc = self.fold_eids::<true, std::collections::HashMap<u32, (u64, u64)>, (u32, u32)>(&[gid, vid], eids, std::collections::HashMap::new, read, |acc, (group, val)| {
+                let e = acc.entry(group).or_insert((0, 0));
+                e.0 += val as u64;
+                e.1 += 1;
+            });
             acc.into_iter().map(|(k, (s, n))| (k, s / n)).collect()
         }
     }
@@ -33871,6 +35127,224 @@ impl Engine {
         if v > *entry { *entry = v; }
     }
 
+    // ──── eid の並びを受ける集計の読み (#1041 の照合を loop の外に出す) ────
+
+    /// eid の並びを受ける集計の本体: eid ごとに `read(場所)` で読み、 読めた値を `add` で `init()` の上に積む。 読みは 2 つの道:
+    ///
+    /// - 速い道 ([`Self::fast_eid_reads`] が始めに許した時): eid の local が表の枠の中 (= 世代 0 の場所。 v14 の DB は全部の eid) なら
+    ///   その場所を照合せずに読む (枠の外の eid だけ照合つき、 loop の外の関数)。 終わりに [`Self::fast_eid_reads_held`] が許し続けている
+    ///   かを見て、 だめなら (途中で表の印が立った = 行が消えて場所の世代が上がり、 使い回しが入りえた / v15 に移った / 別名ができた)
+    ///   照合つきの道でやり直す
+    /// - 照合つきの道 ([`Self::fold_eids_checked`]): eid ごとに読む前と後に世代を照合する (#1041)。 `ACQ` = `read` が列の cell を
+    ///   Acquire で読む (`get_value` / `get_value32`、 fence の無い `read_app_acquired`)、 でなければ fence のある `read_app` (列の生の並び
+    ///   `stored_slice`)
+    ///
+    /// 照合の 3 つの道 (`read_app_in`) を速い道の loop に展開しない (#1041 の値段: 展開すると v14 の DB でも loop が太り、 列の pointer を
+    /// 毎回 stack から読み直して 15〜28% 遅くなった)。
+    #[inline(always)]
+    fn fold_eids<const ACQ: bool, A, V>(
+        &self,
+        hids: &[usize],
+        eids: &[enchudb_oplog::EntityId],
+        init: impl Fn() -> A,
+        read: impl Fn(u32) -> Option<V>,
+        add: impl Fn(&mut A, V),
+    ) -> A {
+        if let Some(fast) = self.fast_eid_reads(hids) {
+            let mut acc = init();
+            let mut cur = fast.first();
+            for &eid in eids {
+                let v = match fast.slot(eid, &mut cur) {
+                    Some(slot) => {
+                        #[cfg(test)]
+                        fast_read_hook::call();
+                        read(slot)
+                    }
+                    None => self.read_app_outlined::<ACQ, V>(eid, &read),
+                };
+                if let Some(v) = v {
+                    add(&mut acc, v);
+                }
+            }
+            if self.fast_eid_reads_held(&fast) {
+                return acc;
+            }
+            #[cfg(test)]
+            fast_read_hook::note_redo();
+        }
+        self.fold_eids_checked::<ACQ, A, V>(eids, init(), &read, &add)
+    }
+
+    /// [`Self::fold_eids`] の照合つきの道 (eid ごとに読む前と後に照合する)。 loop の外の関数。
+    #[inline(never)]
+    fn fold_eids_checked<const ACQ: bool, A, V>(
+        &self,
+        eids: &[enchudb_oplog::EntityId],
+        mut acc: A,
+        read: &impl Fn(u32) -> Option<V>,
+        add: &impl Fn(&mut A, V),
+    ) -> A {
+        for &eid in eids {
+            let v = if ACQ { self.read_app_acquired(eid, read) } else { self.read_app(eid, read) };
+            if let Some(v) = v {
+                add(&mut acc, v);
+            }
+        }
+        acc
+    }
+
+    /// [`Self::fold_eids`] の並列の版 (`eids` を `PAR_RANGE_CHUNK` ずつ rayon で、 chunk の答えを `merge` でまとめる)。 速い道の
+    /// 終わりの確かめは全部の chunk の後に 1 回 (`ACQ` でない読みは chunk の終わりに fence を置く: 列の生の並びを読んだ worker の読みを、
+    /// 終わりの確かめより前に揃える)。
+    fn par_fold_eids<const ACQ: bool, A: Send, V>(
+        &self,
+        hids: &[usize],
+        eids: &[enchudb_oplog::EntityId],
+        init: impl Fn() -> A + Sync + Send,
+        read: impl Fn(u32) -> Option<V> + Sync,
+        add: impl Fn(&mut A, V) + Sync,
+        merge: impl Fn(A, A) -> A + Sync + Send,
+    ) -> A {
+        use rayon::prelude::*;
+        if let Some(fast) = self.fast_eid_reads(hids) {
+            let acc = eids
+                .par_chunks(Self::PAR_RANGE_CHUNK)
+                .map(|chunk| {
+                    let mut acc = init();
+                    let mut cur = fast.first();
+                    for &eid in chunk {
+                        let v = match fast.slot(eid, &mut cur) {
+                            Some(slot) => {
+                                #[cfg(test)]
+                                fast_read_hook::call_par(self as *const Engine as usize);
+                                read(slot)
+                            }
+                            None => self.read_app_outlined::<ACQ, V>(eid, &read),
+                        };
+                        if let Some(v) = v {
+                            add(&mut acc, v);
+                        }
+                    }
+                    if !ACQ {
+                        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                    }
+                    acc
+                })
+                .reduce(&init, &merge);
+            if self.fast_eid_reads_held(&fast) {
+                return acc;
+            }
+            #[cfg(test)]
+            fast_read_hook::note_redo();
+        }
+        eids.par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| self.fold_eids_checked::<ACQ, A, V>(chunk, init(), &read, &add))
+            .reduce(&init, &merge)
+    }
+
+    /// 照合つきの読み 1 つ (速い道の、 表の枠の外の eid 用)。 loop に展開しない。
+    #[cold]
+    #[inline(never)]
+    fn read_app_outlined<const ACQ: bool, V>(&self, eid: enchudb_oplog::EntityId, read: &impl Fn(u32) -> Option<V>) -> Option<V> {
+        #[cfg(test)]
+        fast_read_hook::note_outlined();
+        if ACQ { self.read_app_acquired(eid, read) } else { self.read_app(eid, read) }
+    }
+
+    /// 集計の速い道 ([`Self::fold_eids`]) を始めてよいか。 よいのは、 読む紐 `hids` が全部同じ表 T の物で (anonymous の表も)、 T に世代 > 0 の
+    /// 場所が無く (`Generations::table_has` の印が立っていない)、 畳んだ自分の行の別名 (#612、 照合が別名をたどる) が無い時。 印は場所の世代
+    /// を上げる時に立つので、 v15 の DB では **1 行でも消した表** (消す道の kill が世代を上げる) と、 v15 に移る手順の 4. で v14 の間に消した場所
+    /// のある表は、 以後ずっと照合つきの道。 速い道に乗るのは、 v14 の DB の表 (消しても印を立てない) と、 v15 の DB で消したことの無い表。
+    ///
+    /// 速い道で照合せずに読む eid ([`FastEidReads`]):
+    /// - v14 の DB (世代を持たない、 始めに場所の bit が 0): 全部の eid (local = 場所)。 照合つきの道も v14 の DB では local をそのまま読み、
+    ///   読んだ後に場所の bit が 0 のままかだけを見る ([`Self::read_app_in`] の `Recheck`)。 速い道は同じことを終わりに 1 回見る (下の 2 つ目の
+    ///   根拠の 「印」 を 「場所の bit」 に読み替える: 使い回すのは v15 に移った後 = 場所の bit を置いた後)
+    /// - v15 の DB: 始めた時の T の枠 (最初の枠と足した枠、 [`FAST_EXTENTS`] 個まで) の中の eid (世代 > 0・別の表・途中で足した枠・数を越えた
+    ///   枠の eid は 1 つずつ照合つき)。 T の場所は T の枠の中だけにある (表の枠は重ならず、 足すだけで外さない。 名前のある表と予約の表を
+    ///   作ると anonymous の枠は閉じる) ので、 枠の中の場所の世代を上げる書きは T の印を立てる (`table_of_slot` が T を返す)。 anonymous の
+    ///   閉じていない枠 (上が `u32::MAX`) は 2^S で切る (世代の付いた local を枠の中と読まない。 守りで、 閉じていない anonymous の他に表は
+    ///   無いので世代の付いた eid は anonymous の物 = 印が立っている)
+    ///
+    /// 速い道の正しさ (終わりに [`Self::fast_eid_reads_held`] が同じことを確かめた時。 書き手と読み手の順は loom の model
+    /// `tests/loom_aggregate_fast_path.rs` が、 順を外した対照と一緒に確かめる):
+    /// - 印は、 場所の世代を上げる書きの全部 (`kill_generation` / `raise_generation` / `kill_generation_reconciled`、 `Generations::kill` /
+    ///   `raise` / `kill_reconciled` を呼ぶのはこの 3 つだけ) の前に、 同じ thread で立つ (`mark_table`、 AcqRel の RMW、 印を下ろす道は無い)。
+    ///   gen.seg の 2 B を変える他の書き (`revive` / `restore` / 開く時の `heal` / `prepare`) は世代を上げない
+    /// - #1041 の 「読んだ後の照合」 が正しいのは、 使い回した後の住人の書き込みが、 前の住人の世代を上げた書きより hb で後だから
+    ///   ([`Self::read_app_acquired`])。 印はその書きより前 (同じ thread) なので、 同じ前提から、 その書き込みは印より hb で後 (払い出しの道も、
+    ///   値を書いてから生かす受信の道も)。 速い道がその値を読んだなら、 その読み (`ACQ` は cell の Acquire、 でなければ終わりの fence。 並列の
+    ///   版は worker の chunk の終わりの fence と rayon の合流) が書き手と同期し、 終わりの印の読み (Acquire) は立っているのを見る → やり直す。
+    ///   = 速い道の終わりの確かめは、 照合つきの道の読んだ後の照合が見つける使い回しを全部見つける
+    /// - 読む前に消えていた行は、 消すのが集計より hb で前なら始めの印の読みが印を見て照合つきの道に行く。 hb で前でなければ並んだ削除で、
+    ///   どちらの答えでもよい
+    /// - 世代を上げずに場所を使い回す形 (v14 の DB の束ね / 受信の `ensure_live_slot` が死んだ場所を世代 0 のまま生かす、 予約の表、 v15 に
+    ///   移れない DB = packed / wasm) は印も立たないが、 照合つきの道も世代で見分けられない = 照合つきの道と同じ答え
+    /// - v14 の DB で集計の途中に v15 に移っても同じ (移る手順は 4. で `kill_generation` を通り、 使い回すのは移り終えた後)
+    #[inline]
+    fn fast_eid_reads(&self, hids: &[usize]) -> Option<FastEidReads> {
+        use std::sync::atomic::Ordering;
+        if self.own_alias_on.load(Ordering::Relaxed) {
+            return None;
+        }
+        let tid = self.himo_to_table[*hids.first()?].load(Ordering::Relaxed);
+        if hids[1..].iter().any(|&h| self.himo_to_table[h].load(Ordering::Relaxed) != tid) {
+            return None;
+        }
+        if self.generations().table_has(tid) {
+            return None;
+        }
+        let t = self.tables.get(tid as usize)?;
+        let mut fast = FastEidReads { any_local: false, tid, ext: [(0, 0); FAST_EXTENTS], n: 0 };
+        if self.generations().bits() == 0 {
+            // 世代を持たない DB: どの場所も使い回されていない (使い回すのは v15 に移った後) ので、 表の枠を見ない
+            fast.any_local = true;
+            fast.ext[0] = (0, u32::MAX);
+            fast.n = 1;
+            return Some(fast);
+        }
+        // 枠を 1 つ足す (足せなければ true)。 続いている枠 (足した枠が前の枠のすぐ後ろ = 他の表が間に枠を取らなかった) は 1 つにまとめる
+        // (1 つの表だけが伸びる DB は最初の枠の後ろの枠が全部 1 つになる)
+        let mut add = |lo: u32, hi: u32| -> bool {
+            let span = hi.saturating_sub(lo);
+            if fast.n > 0 && fast.ext[fast.n - 1].0 + fast.ext[fast.n - 1].1 == lo {
+                fast.ext[fast.n - 1].1 += span;
+                return false;
+            }
+            if fast.n == FAST_EXTENTS {
+                return true;
+            }
+            fast.ext[fast.n] = (lo, span);
+            fast.n += 1;
+            false
+        };
+        if t.is_open_ended() {
+            // 閉じていない anonymous の枠の上は 2^S (世代 0 の local の上限) で切る (足した枠は無い)
+            add(t.eid_range_lo, self.dense_local_limit().max(t.eid_range_lo));
+        } else {
+            add(t.eid_range_lo, t.eid_range_hi);
+            // 足した枠は lock を取らずに写す (`find_extent`、 先頭の 32 個)
+            t.find_extent(|lo, hi| add(lo, hi).then_some(()));
+        }
+        Some(fast)
+    }
+
+    /// 集計の速い道の終わり: 始めの許しがまだ成り立つか (表に世代 > 0 の場所ができていない、 別名ができていない)。 fence の後に読む
+    /// (速い道の読みより後に揃える)。
+    #[inline]
+    fn fast_eid_reads_held(&self, fast: &FastEidReads) -> bool {
+        use std::sync::atomic::Ordering;
+        std::sync::atomic::fence(Ordering::Acquire);
+        if self.own_alias_on.load(Ordering::Relaxed) {
+            return false;
+        }
+        if fast.any_local {
+            // まだ v15 に移っていない (移る手順は照合を始める 2. で場所の bit を Release で置き、 使い回すのはその後)
+            return self.generations().bits() == 0;
+        }
+        !self.generations().table_has(fast.tid)
+    }
+
     /// dense の道で `cap` 以上の group を受けた分を、 group の昇順にして答えの後ろに足す (#474)。
     /// dense の分は `0..cap` の昇順で、 回した分は全部 `cap` 以上なので、 足した後も group の昇順のまま。
     fn push_spilled<T>(out: &mut Vec<(u32, T)>, spill: impl IntoIterator<Item = (u32, T)>) {
@@ -33884,15 +35358,17 @@ impl Engine {
     pub fn distinct(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Vec<u32> {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let hs = &self.himos[hid];
-        let mut result: Vec<u32> = Vec::new();
-        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l))
-                && seen.insert(v)
-            {
-                result.push(v);
-            }
-        }
+        let (result, _) = self.fold_eids::<true, (Vec<u32>, std::collections::HashSet<u32>), u32>(
+            &[hid],
+            eids,
+            || (Vec::new(), std::collections::HashSet::new()),
+            |l| hs.get_value32(l),
+            |(result, seen), v| {
+                if seen.insert(v) {
+                    result.push(v);
+                }
+            },
+        );
         result
     }
 
@@ -33915,29 +35391,24 @@ impl Engine {
 
     /// 0.8.10: `sum(himo, eids)` の並列版。 stored_slice の indirect access。
     pub fn sum_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u64 {
-        use rayon::prelude::*;
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
             return self.sum(himo, eids);
         }
         let values = hs.stored_slice();
-        eids.par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut total: u64 = 0;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    total += stored.saturating_sub(1) as u64;
-                }
-                total
-            })
-            .sum()
+        self.par_fold_eids::<false, u64, u32>(
+            &[hid],
+            eids,
+            || 0,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |t, stored| *t += (stored - 1) as u64,
+            |a, b| a + b,
+        )
     }
 
     /// 0.8.10: `count(himo, eids)` の並列版。
     pub fn count_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u32 {
-        use rayon::prelude::*;
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         // 64 bit 列は u32 の生の配列を持たない (件数は幅によらない数え方で)
@@ -33945,76 +35416,58 @@ impl Engine {
             return self.count(himo, eids);
         }
         let values = hs.stored_slice();
-        eids.par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut n: u32 = 0;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    if self.read_app(eid, |l| values.get(l as usize).copied()).is_some_and(|stored| stored != 0) {
-                        n += 1;
-                    }
-                }
-                n
-            })
-            .sum()
+        self.par_fold_eids::<false, u32, u32>(
+            &[hid],
+            eids,
+            || 0,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |n, _| *n += 1,
+            |a, b| a + b,
+        )
     }
 
     /// 0.8.10: `min(himo, eids)` の並列版。
     pub fn min_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
-        use rayon::prelude::*;
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
             return self.min(himo, eids);
         }
         let values = hs.stored_slice();
-        let result = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut best: u32 = u32::MAX;
-                let mut hit = false;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    if stored != 0 {
-                        hit = true;
-                        if stored < best { best = stored; }
-                    }
-                }
-                if hit { Some(best) } else { None }
-            })
-            .reduce(|| None, |a, b| match (a, b) {
+        let best = self.par_fold_eids::<false, Option<u32>, u32>(
+            &[hid],
+            eids,
+            || None,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |b, stored| *b = Some(b.map_or(stored, |cur| cur.min(stored))),
+            |a, b| match (a, b) {
                 (None, x) | (x, None) => x,
                 (Some(x), Some(y)) => Some(x.min(y)),
-            });
-        result.map(|stored| stored - 1)
+            },
+        );
+        best.map(|stored| stored - 1)
     }
 
     /// 0.8.10: `max(himo, eids)` の並列版。
     pub fn max_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
-        use rayon::prelude::*;
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
             return self.max(himo, eids);
         }
         let values = hs.stored_slice();
-        let result = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut best: u32 = 0;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    if stored > best { best = stored; }
-                }
-                if best > 0 { Some(best) } else { None }
-            })
-            .reduce(|| None, |a, b| match (a, b) {
+        let best = self.par_fold_eids::<false, Option<u32>, u32>(
+            &[hid],
+            eids,
+            || None,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |b, stored| *b = Some(b.map_or(stored, |cur| cur.max(stored))),
+            |a, b| match (a, b) {
                 (None, x) | (x, None) => x,
                 (Some(x), Some(y)) => Some(x.max(y)),
-            });
-        result.map(|stored| stored - 1)
+            },
+        );
+        best.map(|stored| stored - 1)
     }
 
     /// 0.8.10: `group_sum(group, sum, eids)` の並列版。 dense path のみ並列、
@@ -34025,7 +35478,6 @@ impl Engine {
         sum_himo: &str,
         eids: &[enchudb_oplog::EntityId],
     ) -> Vec<(u32, u64)> {
-        use rayon::prelude::*;
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
@@ -34034,39 +35486,29 @@ impl Engine {
         let Some(cap) = self.group_dense_cap(gid) else {
             return self.group_sum(group_himo, sum_himo, eids);
         };
-        let gs = &self.himos[gid];
-        let ss = &self.himos[sid];
-        let groups = gs.stored_slice();
-        let sums = ss.stored_slice();
-        let (result, spill) = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut acc: Vec<u64> = vec![0; cap];
-                let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some((g_stored, s_stored)) =
-                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *sums.get(l as usize)?)))
-                    else {
-                        continue;
-                    };
-                    if g_stored == 0 || s_stored == 0 { continue; }
-                    let g = (g_stored - 1) as usize;
-                    if g < cap {
-                        acc[g] = (acc[g] + (s_stored - 1) as u64) | Self::GROUP_SEEN;
-                    } else {
-                        Self::spill_sum(&mut spill, g as u32, (s_stored - 1) as u64);
-                    }
+        let groups = self.himos[gid].stored_slice();
+        let sums = self.himos[sid].stored_slice();
+        let (result, spill) = self.par_fold_eids::<false, (Vec<u64>, std::collections::HashMap<u32, u64>), (u32, u32)>(
+            &[gid, sid],
+            eids,
+            || (vec![0u64; cap], std::collections::HashMap::new()),
+            |l| Some((*groups.get(l as usize)?, *sums.get(l as usize)?)).filter(|&(g, s)| g != 0 && s != 0),
+            |(acc, spill), (g_stored, s_stored)| {
+                let g = (g_stored - 1) as usize;
+                if g < cap {
+                    acc[g] = (acc[g] + (s_stored - 1) as u64) | Self::GROUP_SEEN;
+                } else {
+                    Self::spill_sum(spill, g as u32, (s_stored - 1) as u64);
                 }
-                (acc, spill)
-            })
-            .reduce(|| (vec![0u64; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+            },
+            |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     a[i] = ((a[i] & !Self::GROUP_SEEN) + (v & !Self::GROUP_SEEN)) | ((a[i] | v) & Self::GROUP_SEEN);
                 }
                 for (g, v) in b_spill { *a_spill.entry(g).or_insert(0) += v; }
                 (a, a_spill)
-            });
+            },
+        );
         let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] & Self::GROUP_SEEN != 0).map(|i| (i as u32, result[i] & !Self::GROUP_SEEN)).collect();
         Self::push_spilled(&mut out, spill);
         out
@@ -34079,7 +35521,6 @@ impl Engine {
         val_himo: &str,
         eids: &[enchudb_oplog::EntityId],
     ) -> Vec<(u32, u32)> {
-        use rayon::prelude::*;
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
@@ -34088,33 +35529,22 @@ impl Engine {
         let Some(cap) = self.group_dense_cap(gid) else {
             return self.group_min(group_himo, val_himo, eids);
         };
-        let gs = &self.himos[gid];
-        let vs = &self.himos[vid];
-        let groups = gs.stored_slice();
-        let vals = vs.stored_slice();
-        let (result, spill) = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut mins: Vec<u32> = vec![u32::MAX; cap];
-                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some((g_stored, v_stored)) =
-                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)))
-                    else {
-                        continue;
-                    };
-                    if g_stored == 0 || v_stored == 0 { continue; }
-                    let g = (g_stored - 1) as usize;
-                    if g < cap {
-                        if v_stored < mins[g] { mins[g] = v_stored; }
-                    } else {
-                        Self::spill_min(&mut spill, g as u32, v_stored);
-                    }
+        let groups = self.himos[gid].stored_slice();
+        let vals = self.himos[vid].stored_slice();
+        let (result, spill) = self.par_fold_eids::<false, (Vec<u32>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+            &[gid, vid],
+            eids,
+            || (vec![u32::MAX; cap], std::collections::HashMap::new()),
+            |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)).filter(|&(g, v)| g != 0 && v != 0),
+            |(best, spill), (g_stored, v_stored)| {
+                let g = (g_stored - 1) as usize;
+                if g < cap {
+                    if v_stored < best[g] { best[g] = v_stored; }
+                } else {
+                    Self::spill_min(spill, g as u32, v_stored);
                 }
-                (mins, spill)
-            })
-            .reduce(|| (vec![u32::MAX; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+            },
+            |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v < a[i] { a[i] = v; }
                 }
@@ -34123,7 +35553,8 @@ impl Engine {
                     if v < *entry { *entry = v; }
                 }
                 (a, a_spill)
-            });
+            },
+        );
         let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != u32::MAX)
             .map(|i| (i as u32, result[i] - 1)).collect();
         Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
@@ -34137,7 +35568,6 @@ impl Engine {
         val_himo: &str,
         eids: &[enchudb_oplog::EntityId],
     ) -> Vec<(u32, u32)> {
-        use rayon::prelude::*;
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
@@ -34146,33 +35576,22 @@ impl Engine {
         let Some(cap) = self.group_dense_cap(gid) else {
             return self.group_max(group_himo, val_himo, eids);
         };
-        let gs = &self.himos[gid];
-        let vs = &self.himos[vid];
-        let groups = gs.stored_slice();
-        let vals = vs.stored_slice();
-        let (result, spill) = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut maxs: Vec<u32> = vec![0; cap];
-                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some((g_stored, v_stored)) =
-                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)))
-                    else {
-                        continue;
-                    };
-                    if g_stored == 0 || v_stored == 0 { continue; }
-                    let g = (g_stored - 1) as usize;
-                    if g < cap {
-                        if v_stored > maxs[g] { maxs[g] = v_stored; }
-                    } else {
-                        Self::spill_max(&mut spill, g as u32, v_stored);
-                    }
+        let groups = self.himos[gid].stored_slice();
+        let vals = self.himos[vid].stored_slice();
+        let (result, spill) = self.par_fold_eids::<false, (Vec<u32>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+            &[gid, vid],
+            eids,
+            || (vec![0u32; cap], std::collections::HashMap::new()),
+            |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)).filter(|&(g, v)| g != 0 && v != 0),
+            |(best, spill), (g_stored, v_stored)| {
+                let g = (g_stored - 1) as usize;
+                if g < cap {
+                    if v_stored > best[g] { best[g] = v_stored; }
+                } else {
+                    Self::spill_max(spill, g as u32, v_stored);
                 }
-                (maxs, spill)
-            })
-            .reduce(|| (vec![0u32; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+            },
+            |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v > a[i] { a[i] = v; }
                 }
@@ -34181,7 +35600,8 @@ impl Engine {
                     if v > *entry { *entry = v; }
                 }
                 (a, a_spill)
-            });
+            },
+        );
         let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != 0)
             .map(|i| (i as u32, result[i] - 1)).collect();
         Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
@@ -34204,20 +35624,21 @@ impl Engine {
         let hs = &self.himos[hid];
         let values = hs.stored_slice();
         let n = n_buckets as usize;
-        let mut hist: Vec<u32> = vec![0; n];
-        if eids.is_empty() { return hist; }
+        if eids.is_empty() { return vec![0; n]; }
         let span = (vmax as u64 - vmin as u64) + 1;
         let n_u64 = n_buckets as u64;
-        for &eid in eids {
-            // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-            let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-            if stored == 0 { continue; }
-            let val = stored - 1;
-            if val < vmin || val > vmax { continue; }
-            let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
-            hist[idx.min(n - 1)] += 1;
-        }
-        hist
+        self.fold_eids::<false, Vec<u32>, u32>(
+            &[hid],
+            eids,
+            || vec![0; n],
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |hist, stored| {
+                let val = stored - 1;
+                if val < vmin || val > vmax { return; }
+                let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+                hist[idx.min(n - 1)] += 1;
+            },
+        )
     }
 
     /// 0.8.10: `histogram_eids` の並列版。
@@ -34229,7 +35650,6 @@ impl Engine {
         vmax: u32,
         n_buckets: u32,
     ) -> Vec<u32> {
-        use rayon::prelude::*;
         if n_buckets == 0 || vmin > vmax { return vec![]; }
         let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![0; n_buckets as usize] };
         let hs = &self.himos[hid];
@@ -34240,24 +35660,22 @@ impl Engine {
         let values = hs.stored_slice();
         let span = (vmax as u64 - vmin as u64) + 1;
         let n_u64 = n_buckets as u64;
-        eids.par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut hist: Vec<u32> = vec![0; n];
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    if stored == 0 { continue; }
-                    let val = stored - 1;
-                    if val < vmin || val > vmax { continue; }
-                    let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
-                    hist[idx.min(n - 1)] += 1;
-                }
-                hist
-            })
-            .reduce(|| vec![0u32; n], |mut a, b| {
+        self.par_fold_eids::<false, Vec<u32>, u32>(
+            &[hid],
+            eids,
+            || vec![0u32; n],
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |hist, stored| {
+                let val = stored - 1;
+                if val < vmin || val > vmax { return; }
+                let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+                hist[idx.min(n - 1)] += 1;
+            },
+            |mut a, b| {
                 for (i, &v) in b.iter().enumerate() { a[i] += v; }
                 a
-            })
+            },
+        )
     }
 
     // ──── 範囲クエリ ────
@@ -34377,19 +35795,25 @@ impl Engine {
     pub fn sum64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u128 {
         let Some(hid) = self.himo_id(himo) else { return 0 };
         let hs = &self.himos[hid];
-        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).map(|v| v as u128).sum()
+        self.fold_eids::<true, u128, u64>(&[hid], eids, || 0, |l| hs.get_value(l), |t, v| *t += v as u128)
     }
 
     /// 64 bit の最小値 (どの列でも)。
     pub fn min64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
-        let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).min()
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        self.fold_eids::<true, Option<u64>, u64>(&[hid], eids, || None, |l| hs.get_value(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.min(v)));
+        })
     }
 
     /// 64 bit の最大値 (どの列でも)。
     pub fn max64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
-        let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).max()
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        self.fold_eids::<true, Option<u64>, u64>(&[hid], eids, || None, |l| hs.get_value(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.max(v)));
+        })
     }
 
     /// eid の範囲 `lo..hi` での 64 bit の (件数, 合計, 最小, 最大) (table の全 row の集計用、 どの列でも)。
@@ -35989,7 +37413,7 @@ impl Engine {
                 // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
                 // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
                 // #992: 書き出しが返ったら、 仕上げた場所の後始末待ちを落とす (落とした印は次の書き出しで届く)
-                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || eng.wal_fsync(&w).is_ok()) {
                     eng.settle_finished_reconcile();
                     if !eng.checkpoint_held_for_freed_slots() {
                         w.advance_checkpoint(w.head());
@@ -36019,7 +37443,7 @@ impl Engine {
                 if (relogged || eng.generations().has_finished())
                     && eng.persist_name_records().is_ok()
                     && eng.body_msync().is_ok()
-                    && w.fsync().is_ok()
+                    && eng.wal_fsync(&w).is_ok()
                 {
                     eng.settle_finished_reconcile();
                     if relogged {
@@ -36072,14 +37496,23 @@ impl Engine {
     /// と読んで、 辞書の索引の作り直し (#101) と、 本体にあって oplog に無い write の照合 (#451) を飛ばす。 立てるのは
     /// `sync_and_mark_clean_with` だけで、 紐名の辞書の印 (#451 の照合が見る方) は、 oplog 付きの engine では閉じる時だけ (#709)。 該当 page (辞書 / 紐名の data の header) だけ書き出すので
     /// 1 ms 以下。
-    fn mark_session_dirty(&self) {
+    ///
+    /// 倒した印の書き出しに失敗したら Err (#1057): 呼び手は書き始めない。 前は失敗を捨てて書き始め、 その後に本体の
+    /// 列の page だけが disk に届いて落ちると、 disk の印は前の 「きれいに閉じた」 のままで、 次の open が #451 の作り直しと突き合わせを
+    /// 飛ばした。
+    fn mark_session_dirty(&self) -> io::Result<()> {
         self.vocab.mark_index_clean(false);
         self.himo_reg.mark_index_clean(false);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = self.backing.flush_kind(SegmentKind::VocabData, 0, 16);
-            let _ = self.backing.flush_kind(SegmentKind::HimoregData, 0, 16);
+            #[cfg(test)]
+            if session_dirty_fault::take() {
+                return Err(io::Error::other("session_dirty_fault"));
+            }
+            self.backing.flush_kind(SegmentKind::VocabData, 0, 16)?;
+            self.backing.flush_kind(SegmentKind::HimoregData, 0, 16)?;
         }
+        Ok(())
     }
 
     /// #451: きれいに閉じなかった後に開く時 (oplog の再生の後、 consumer を起こす前)、 本体にあって oplog / `_sync_ops`
@@ -37145,8 +38578,9 @@ impl Engine {
         let _ = std::fs::remove_file(&crc_path);
         // #451: clean flag を倒してから書き始める (writer の open と同じ)。 create → flush → ここ、 の DB は flag が立った
         // まま (倒すのは open と辞書への insert だけ) で、 辞書に書かずに落ちると次の open が 「きれいに閉じた」 と読み、
-        // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)
-        eng.mark_session_dirty();
+        // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)。 #1057: 倒した印を disk に置けなければ書き始めない
+        // (ここで返すと engine は単独の形のまま閉じる = まだ WAL の session を始めていないので、 普通の閉じ方でよい)
+        eng.mark_session_dirty()?;
         // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
         let wal = match Self::existing_wal(&oplog_path)? {
             Some(w) => {
@@ -37177,7 +38611,7 @@ impl Engine {
                 // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
                 // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
                 // #992: 書き出しが返ったら、 仕上げた場所の後始末待ちを落とす (落とした印は次の書き出しで届く)
-                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || eng.wal_fsync(&w).is_ok()) {
                     eng.settle_finished_reconcile();
                     if !eng.checkpoint_held_for_freed_slots() {
                         w.advance_checkpoint(w.head());
@@ -37197,7 +38631,7 @@ impl Engine {
                 if (relogged || eng.generations().has_finished())
                     && eng.persist_name_records().is_ok()
                     && eng.body_msync().is_ok()
-                    && w.fsync().is_ok()
+                    && eng.wal_fsync(&w).is_ok()
                 {
                     eng.settle_finished_reconcile();
                     if relogged {
@@ -37264,6 +38698,7 @@ impl Engine {
                 }
             }
             out.detached.extend(std::mem::take(&mut c.log_detached));
+            out.log_end = log.range().1;
             return Some((out, true));
         }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
@@ -37279,7 +38714,10 @@ impl Engine {
         change_take_hook::call(wal);
         // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
         // 恒久 skip (listener への通知漏れ) を起こしていた。
-        let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
+        // #1053: 読むのは書き出した所 (`change_log_upto`、 記録のある道と同じ) までに閉じた group だけ。 前は Commit で閉じた group の
+        // 終わりまで上限なしで読み、 WAL を fsync していない record (書き出しの後に閉じた commit) と、 他の書き手が積んでまだ本体に
+        // 当てていない record (#850 の形) を渡した (落ちると listener の先にあって DB に無い)
+        let (recs, committed_end) = wal.iter_committed_from_with_end_upto(c.offset, self.change_log_upto(wal));
         let mut batch = std::mem::take(&mut c.committed);
         if committed_end > c.offset {
             let recs = self.keep_for_changefeed(recs, |r| &r.op);
@@ -37324,7 +38762,7 @@ impl Engine {
         if c.offset >= through {
             return Some(0);
         }
-        Some(self.move_changes_to_backlog(wal, c, Some(through)))
+        Some(self.move_changes_to_backlog(wal, c, BacklogUpto::FoldEnd(through)))
     }
 
     /// changefeed (#662): 畳む前に、 `append_lock` の外で (呼び手が `change_emit` を持って)、 listener に配っていない Commit で閉じた
@@ -37334,31 +38772,34 @@ impl Engine {
     fn move_changes_before_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, written: u64) -> usize {
         match self.change_log.get() {
             Some(log) => self.pump_change_log(wal, log, c, written, false).unwrap_or(0),
-            None => self.move_changes_to_backlog(wal, c, None),
+            // #1053: 溜めにも書き出した所までだけ (溜めは後で listener に渡す。 前は上限なしで、 書き出していない record も移した)
+            None => self.move_changes_to_backlog(wal, c, BacklogUpto::Written(written)),
         }
     }
 
     /// changefeed: cursor から先の record を溜めに移す (呼び手が `change_emit` を持って)。 Commit で閉じた分は `committed` に (前に
-    /// 閉じていなかった末尾を頭に付けて)。 `tail_upto` が Some なら、 その位置 (畳む区画の終わり) までに止めて、 閉じていない末尾も
-    /// `open_tail` に足す。 cursor は読み終えた終端に進める
+    /// 閉じていなかった末尾を頭に付けて)。 [`BacklogUpto::FoldEnd`] なら、 その位置 (畳む区画の終わり、 書き出し済み) までに止めて、
+    /// 閉じていない末尾も `open_tail` に足す。 [`BacklogUpto::Written`] なら、 その位置 (書き出した所) までに Commit で閉じた分だけ
+    /// (#1053)。 cursor は読み終えた終端に進める
     /// (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。 listener が居なければ何もしない。 戻り値は移した
     /// record の数。
     ///
     /// #560: 移すと溜めが上限 (`change_backlog_limit`) を越えるなら、 移さずに溜めごと捨て、 listener を全部外す (止まった・遅すぎる
     /// listener のために書き手を止めない・メモリを使い切らない。 前は上限が無く、 止まった listener の間は畳むたびに ring の
     /// 全部を `append_lock` の下で写して溜め続けた)。 外した listener には通知係が `on_detached` で知らせる。
-    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, tail_upto: Option<u64>) -> usize {
+    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, upto: BacklogUpto) -> usize {
         use std::sync::atomic::Ordering;
         if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
             return 0;
         }
         #[cfg(test)]
         change_copy_hook::call(wal);
-        let (recs, committed_end, tail, end) = if let Some(upto) = tail_upto {
-            wal.iter_from_with_tail_upto(c.offset, upto)
-        } else {
-            let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
-            (recs, committed_end, Vec::new(), committed_end)
+        let (recs, committed_end, tail, end) = match upto {
+            BacklogUpto::FoldEnd(through) => wal.iter_from_with_tail_upto(c.offset, through),
+            BacklogUpto::Written(written) => {
+                let (recs, committed_end) = wal.iter_committed_from_with_end_upto(c.offset, written);
+                (recs, committed_end, Vec::new(), committed_end)
+            }
         };
         let recs = self.keep_for_changefeed(recs, |r| &r.op);
         let tail = self.keep_for_changefeed(tail, |r| &r.op);
@@ -38391,6 +39832,23 @@ impl Engine {
         }
     }
 
+    /// engine の WAL の fsync (開く時の再生の後 / consumer の周期 / 閉じる時 / `oplog_sync` / 空け作り)。 失敗したら覚える (#991 の
+    /// C1: 覚えた session は Drop が 「きれいに閉じた」 の印を立てない、 `wal_sync_failed`)。
+    fn wal_fsync(&self, wal: &enchudb_oplog::oplog::OpLog) -> io::Result<()> {
+        #[cfg(test)]
+        let r = if wal_fsync_fault::active(wal) || wal_fsync_fault::take_on_this_thread() {
+            Err(io::Error::other("wal_fsync_fault"))
+        } else {
+            wal.fsync()
+        };
+        #[cfg(not(test))]
+        let r = wal.fsync();
+        if r.is_err() {
+            self.wal_sync_failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        r
+    }
+
     /// checkpoint を進める前の oplog fsync + 本体の書き出し。 どちらかが失敗したら false (#317: 空き不足で
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
@@ -38398,7 +39856,7 @@ impl Engine {
         if write_out_fault::active(wal) {
             return false;
         }
-        let wal_ok = wal.fsync().is_ok();
+        let wal_ok = self.wal_fsync(wal).is_ok();
         // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
         // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
         let names_ok = !wal_ok || self.persist_name_records().is_ok();
@@ -38769,7 +40227,11 @@ impl Engine {
             // の正体だったので、 呼び出し側に伝える (死区間を除く。 下の `commit_res?`)。
             // #451 (段階 1): 配り済みの印の候補は Commit を打つ前に切る
             let cut = self.take_durable_cut(wal);
-            let commit_res = self.append_commit_marker(wal);
+            // #1054: 自分の Commit の位置を引く始まり (打つ前の書き終えた所)
+            let before_commit = wal.written_head();
+            let commit_res = self.append_commit_marker_lsn(wal, true);
+            #[cfg(test)]
+            sync_commit_hook::call(wal);
             // 満杯で打てなかったか (= その瞬間の `append_dead`) は失敗の種類で決める。 Commit は
             // 最小の record (`commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
             // `append_dead()` を読み直すと、 間に consumer が畳んで満杯が解けていれば Err を返してしまう (#407)
@@ -38779,10 +40241,16 @@ impl Engine {
             // #850: 書き手が積んだだけでまだ cell に当てていない record の手前で切る (consumer の周期と同じ)。 その書き込みは
             // まだ返っていない = この `oplog_sync` が約束する書き込みではない。 返った書き込みの cell は下の msync に入り、 record は
             // fsync に入る (checkpoint が手前に残る分は、 落ちた後に再生し直すだけ)
-            let durable_head = wal.applied_through(wal.written_head());
+            let written_head = wal.written_head();
+            // #1054: listener が居れば、 切る前に、 自分の Commit より前に積んで当てている途中の書き手が当て終えるのを少し待つ (切ると、
+            // 自分の commit も切った位置の先に入り、 下の配りが渡さない)。 Commit を打てなかった時は配る物が無いので待たない
+            if let Ok(&lsn) = commit_res.as_ref() {
+                self.wait_applied_for_changefeed(wal, written_head, before_commit, lsn);
+            }
+            let durable_head = wal.applied_through(written_head);
             let durable_lsn = wal.next_lsn().saturating_sub(1);
             // #550: 消した主キーの記録は WAL の後・本体より先に
-            let written = wal.fsync().and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
+            let written = self.wal_fsync(wal).and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
             if let Err(e) = written {
                 // #451 (段階 1): 書き出せなかったので印は置かない (切れ目の登録だけ外す)
                 if let Some(c) = cut {
@@ -38837,6 +40305,51 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// #1054: `oplog_sync` が書き出す前に、 自分の Commit (LSN `lsn`、 `before` は打つ前の書き終えた所) より前に積まれて当てている
+    /// 途中の他の書き手が当て終えるのを待つ (上限 [`SYNC_APPLY_WAIT`])。 listener が居る時だけ (居なければ配る物が無い)。
+    ///
+    /// 書き出しは当てていない record の手前で切る (#850 / #873)。 切った位置は changefeed へ渡してよい位置でもある (#889 / #1053)
+    /// ので、 前に積んだ書き手が 1 人でも当てている途中だと、 その後ろに居る自分の commit (の group を閉じる Commit) が切った位置の
+    /// 先に入り、 `oplog_sync()` が自分の commit を配らずに返った (渡るのは次の consumer の周期)。 待つのは自分の Commit の始まりより
+    /// 前に積んだ・当てる前の書き手だけ (普段は µs)。 Commit は印を持たないので、 その前が全部当たっていれば切る位置は Commit の後ろ
+    /// になる。 後に積まれた書き手は待たない (自分の commit を配るのに関係ない。 前は `written_head` まで待ち、 同じまとめ書きの束で
+    /// 後ろに積まれた書き手まで待った)。 Commit の位置を引けなければ (区画が畳まれた等) `written_head` まで。 待つ間は lock を持たない
+    /// (その書き手は `append_lock` も行の lock もこちらに頼らない)。
+    fn wait_applied_for_changefeed(&self, wal: &enchudb_oplog::oplog::OpLog, written_head: u64, before: u64, lsn: u64) {
+        if wal.applied_before(written_head) || self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+            return;
+        }
+        let pos = wal.position_of_lsn(before, lsn).unwrap_or(written_head);
+        if wal.applied_before(pos) {
+            return;
+        }
+        #[cfg(test)]
+        sync_apply_wait_hook::call(wal);
+        // 当てる途中の書き手は普段 µs で抜けるので、 まず [`SYNC_APPLY_SPIN`] の間は回って待つ (yield は混んだ機械で自分が長く
+        // 外される)。 回数でなく時間で切る (`spin_loop` 1 回の長さは CPU で 10 倍以上違う: x86 の PAUSE は約 140 cycle)。 抜けなければ
+        // (その書き手が CPU を外されている) yield を数回、 その後は寝て待つ
+        let start = std::time::Instant::now();
+        let mut yields = 0u32;
+        while !wal.applied_before(pos) {
+            let waited = start.elapsed();
+            if waited < SYNC_APPLY_SPIN {
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+            if waited >= SYNC_APPLY_WAIT {
+                return;
+            }
+            if yields < 8 {
+                yields += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(20));
+            }
+        }
     }
 
     /// 現在耐久化されている LSN(Commit を含む最後の WAL fsync 到達位置)。
@@ -39351,6 +40864,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない
         let Some(local) = self.app_slot(eid) else { return };
+        // #1066: content の紐を生やす前に断る
+        if self.refuses_walless_sync_write(local) {
+            return;
+        }
         let hid = self.ensure_content_himo(local, key);
         self.tie_bytes_async_by_id(eid, hid, data);
     }
@@ -39458,7 +40975,15 @@ impl Engine {
         // #992: 配る DB で後始末待ち (tombstone と #451 の作り直しの済んでいない場所) が残る間は、 紐名の辞書の印 (= 「きれいに閉じた」) を
         // 立てない: 次の open が #451 の作り直しを飛ばさない (WAL の無い単独の session が後始末待ちを持ったまま閉じる形)
         let pending_relog = self.sync_tables_enabled() && self.generations().has_pending_marks();
-        if pending_relog {
+        // #991 (C1): この session で WAL の fsync が失敗していたら、 閉じる時も印を立てない。 閉じる時の consumer の最後の書き出しは
+        // WAL の fsync が失敗しても本体を書き出し、 ここ (Drop) は WAL を fsync しない。 印を立てると、 本体にあって WAL (と
+        // `_sync_ops`) に無い write を次の open が調べず (#451 の作り直しを飛ばす)、 相手に配らなかった
+        // OpLog の中の書き出し (区画を移る / 畳む時の header の page) の失敗も同じ (`OpLog::sync_failed`、 中で失敗を捨てても、 その後の
+        // engine の fsync が成功して見えるだけ)
+        let wal_unsynced = closing
+            && (self.wal_sync_failed.load(std::sync::atomic::Ordering::Acquire)
+                || self.oplog.as_ref().is_some_and(|w| w.sync_failed()));
+        if pending_relog || wal_unsynced {
         } else if closing && self.persist_leaf_free_list().unwrap_or(false) {
             self.himo_reg.mark_index_clean_leaf();
         } else if closing || self.oplog.is_none() {
@@ -39681,6 +41206,133 @@ impl crate::live::CellReader for Engine {
         let Some(h) = self.himos.get(himo_id as usize) else { return Vec::new() };
         // 索引の範囲を引いて Column で確かめる (dense は範囲の bucket、 大きな値は run の二分探索)
         h.pull_range(lo, hi)
+    }
+}
+
+/// 集計の速い道で場所を照合せずに読む表の枠の数の上限 ([`FastEidReads`])。 枠は最初の枠と同じ大きさで足すので (`grow_table_extent_for`)、
+/// 最初の枠の 16 倍までの行の表は全部の枠が入る。 その先の枠の eid は 1 つずつ照合つき (正しさは同じ)。
+const FAST_EXTENTS: usize = 16;
+
+/// 集計の速い道の許し ([`Engine::fast_eid_reads`])。 照合せずに読む local の範囲 `ext` ((lo, 長さ)、 lo の昇順) と、 終わりの確かめの形。
+/// 2 つの形:
+///
+/// - 世代を持たない DB (v14、 `any_local` が真): どの eid も local = 場所として読む (照合つきの道 [`Engine::read_app`] も v14 の DB では
+///   local をそのまま読む)。 範囲は `(0, u32::MAX)` 1 つ (local `u32::MAX` だけ外 = 照合つきの道、 読みは同じ)。 終わりにまだ世代を
+///   持たない (v15 に移っていない) なら、 どの場所も使い回されていない
+/// - 世代を持つ DB (v15): 読む紐の表 `tid` の枠 (始めた時の、 最初の枠から [`FAST_EXTENTS`] 個まで、 続いた枠はまとめて) の中の eid だけ
+///   その場所を読む。 終わりに表の印が立っていなければ、 その表の場所は使い回されていない
+#[derive(Clone, Copy)]
+struct FastEidReads {
+    any_local: bool,
+    tid: TableId,
+    ext: [(u32, u32); FAST_EXTENTS],
+    n: usize,
+}
+
+impl FastEidReads {
+    /// 読みの loop が最初に持つ範囲 ([`Self::slot`] の `cur`)。
+    #[inline(always)]
+    fn first(&self) -> (u32, u32) {
+        self.ext[0]
+    }
+
+    /// eid の local が速い道で読める場所なら、 その場所 (照合しない)。 世代 > 0 の eid の local は 2^S 以上 = どの枠の外 (anonymous の
+    /// 閉じていない枠は 2^S で切ってある)。 前の eid が入った範囲 (`cur`、 loop ごとに持つ = register に置ける) を先に見て、 外れたら
+    /// 二分探索 (他の表と交互に伸びた表は枠が続かない。 集計の eid はたいてい昇順なので、 ほとんど前の範囲で当たる)。
+    #[inline(always)]
+    fn slot(&self, eid: enchudb_oplog::EntityId, cur: &mut (u32, u32)) -> Option<u32> {
+        let local = enchudb_oplog::eid_local(eid);
+        if local.wrapping_sub(cur.0) < cur.1 {
+            return Some(local);
+        }
+        // `cur` の番地を外の関数に渡さない (渡すと loop の `cur` が register に乗らず、 eid ごとに読み直す)
+        let range = self.range_of(local)?;
+        *cur = range;
+        Some(local)
+    }
+
+    /// [`Self::slot`] の、 前の範囲に入らなかった local の二分探索 (loop に展開しない): local を含む範囲。 `cold` は loop の中の置き場所の
+    /// ため (前の範囲に入った eid の読みが、 分岐を飛ばずにそのまま読む形にする。 cold でないと、 当たった eid が毎回この呼び出しを
+    /// 飛び越える形に置かれ、 1 eid あたり 1 cycle ほど遅かった)。
+    #[cold]
+    #[inline(never)]
+    fn range_of(&self, local: u32) -> Option<(u32, u32)> {
+        let ext = &self.ext[..self.n];
+        let i = ext.partition_point(|&(lo, _)| lo <= local);
+        (i > 0 && local - ext[i - 1].0 < ext[i - 1].1).then(|| ext[i - 1])
+    }
+}
+
+/// test 用の割り込み点: 集計の速い道 (`Engine::fold_eids`) が照合せずに場所を読む前。 置いた thread で 1 回だけ呼ぶ。 並列の版
+/// (`Engine::par_fold_eids`) は rayon の worker が読むので、 engine ごとの global の割り込み点 (`set_par` / `call_par`、 どの worker からでも
+/// 1 回だけ)。 あわせて、 速い道の終わりの確かめが外れて照合つきでやり直した回数を数える (やり直しを決めるのは呼んだ thread)。
+#[cfg(test)]
+mod fast_read_hook {
+    type ParHook = Box<dyn FnOnce() + Send>;
+
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+        static REDOS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static OUTLINED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// (engine の番地, 処理)。 並んで走る他の試験の engine の並列の集計では呼ばない。
+    static PAR: std::sync::Mutex<Vec<(usize, ParHook)>> = std::sync::Mutex::new(Vec::new());
+    static PAR_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    pub(super) fn set_par(engine: usize, f: impl FnOnce() + Send + 'static) {
+        PAR.lock().unwrap_or_else(|p| p.into_inner()).push((engine, Box::new(f)));
+        PAR_ARMED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn call_par(engine: usize) {
+        if !PAR_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let f = {
+            let mut h = PAR.lock().unwrap_or_else(|p| p.into_inner());
+            let f = h.iter().position(|(e, _)| *e == engine).map(|i| h.remove(i).1);
+            if h.is_empty() {
+                PAR_ARMED.store(false, std::sync::atomic::Ordering::Release);
+            }
+            f
+        };
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    pub(super) fn note_redo() {
+        REDOS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn note_outlined() {
+        OUTLINED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// この thread の集計の速い道が、 枠の外の eid を 1 つずつ照合つきで読んだ回数 (読んで 0 に戻す)。
+    pub(super) fn take_outlined() -> u32 {
+        OUTLINED.with(|c| c.replace(0))
+    }
+
+    /// 鳴らなかった割り込み点を外す (この thread)。
+    pub(super) fn take() -> bool {
+        HOOK.with(|h| h.borrow_mut().take()).is_some()
+    }
+
+    /// この thread の集計が速い道の終わりの確かめでやり直した回数 (読んで 0 に戻す)。
+    pub(super) fn take_redos() -> u32 {
+        REDOS.with(|c| c.replace(0))
     }
 }
 
@@ -47635,14 +49287,15 @@ mod delete_gate_path_tests {
         p
     }
 
-    /// sync する DB (tomb.seg がある = 削除は門を通る): 表 t (Number 列 n、 Leaf 列 z)。
+    /// sync する DB (tomb.seg がある = 削除は門を通る): 表 t (Number 列 n、 Leaf 列 z)。 `build` は sync の表を作る前に呼ぶ (版数の無い
+    /// 書き込み。 #1066: sync の表を作った後の build phase はユーザの表の行を書けない)。
     fn sync_engine(p: &str, build: impl FnOnce(&mut Engine)) -> Arc<Engine> {
         let mut eng = Engine::create_with_cell_version(p, 4096).unwrap();
         eng.define_table("t", 100).unwrap();
         eng.define_himo_in("t", "n", ValueType::Number, 0).unwrap();
         eng.define_himo_in("t", "z", ValueType::Leaf, 0).unwrap();
-        eng.enable_sync_tables().unwrap();
         build(&mut eng);
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();

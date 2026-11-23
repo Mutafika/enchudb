@@ -1435,6 +1435,8 @@ pub struct OpLog {
     /// #268: テスト用 fault injection。 残り回数ぶん Commit の append を満杯として
     /// 失敗させる。 0 (既定) で何もしない。 `fail_next_commits` の doc を参照。
     fail_next_commits: std::sync::atomic::AtomicU32,
+    /// test 用: 次の n 回の書き出し (`fsync` / 区画の header の page) を失敗させる。 0 (既定) で何もしない ([`OpLog::fail_next_syncs`])。
+    fail_next_syncs: std::sync::atomic::AtomicU32,
     /// group を閉じない record が残す、 閉じの Commit の分の空き (`alloc`)。 普段は `REC_HEADER_SIZE`。 test だけが 0 にする
     /// ([`OpLog::keep_commit_room_for_test`])。
     commit_room: std::sync::atomic::AtomicU64,
@@ -1478,6 +1480,9 @@ pub struct OpLog {
     /// `append_lock` の下)。 一度立てたら倒さない。 lock を取らない読み手は周より先に読む (`read_plan`): 書き手は周を置いてから
     /// 立てるので、 立っているのを見た読み手は新しい周を見る (前の周の旧い形の record を 「結んだ形でない」 と読まない)
     strict: [std::sync::atomic::AtomicBool; 2],
+    /// #991: この OpLog の書き出し (`fsync`、 区画の header の page) が 1 度でも失敗した ([`OpLog::sync_failed`])。 失敗した書き出しの
+    /// page は後の書き出しが成功しても届いているとは限らない (Linux は失敗を file ごとに 1 回しか返さない) ので、 倒さない。
+    sync_failed: std::sync::atomic::AtomicBool,
     /// 試験: 次の `bind_locked` の header の書き出しを失敗させる
     #[cfg(test)]
     fail_bind_sync: std::sync::atomic::AtomicBool,
@@ -2045,6 +2050,7 @@ impl OpLog {
             pending_shards: (0..COMBINE_SLOTS).map(|_| PendingShard(std::sync::atomic::AtomicU32::new(0))).collect(),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
+            fail_next_syncs: std::sync::atomic::AtomicU32::new(0),
             commit_room: std::sync::atomic::AtomicU64::new((REC_HEADER_SIZE + l.trailer) as u64),
             fold_pending: [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)],
             stale_tail: [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)],
@@ -2061,6 +2067,7 @@ impl OpLog {
             trailer: std::sync::atomic::AtomicUsize::new(l.trailer),
             bound: std::sync::atomic::AtomicBool::new(l.bound),
             strict: l.strict.map(std::sync::atomic::AtomicBool::new),
+            sync_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_bind_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -2423,13 +2430,14 @@ impl OpLog {
             let sim = crate::crashsim::active().then(|| {
                 crate::crashsim::copy_for_sync(crate::crashsim::Copied::OplogHeader, b as u64, &self.mmap[b..b + len])
             });
-            if crate::io_point(io).is_ok() && self.mmap.flush_range(b, len).is_ok() {
+            if !self.take_sync_fault() && crate::io_point(io).is_ok() && self.mmap.flush_range(b, len).is_ok() {
                 #[cfg(all(feature = "crashsim", unix))]
                 if let Some(copy) = sim {
                     crate::crashsim::data_synced(&self._file, copy);
                 }
                 return true;
             }
+            self.sync_failed.store(true, Ordering::Release);
             false
         }
         #[cfg(target_arch = "wasm32")]
@@ -3085,6 +3093,56 @@ impl OpLog {
     ///   (か、 当て終えて外した後) が必ず見える
     /// - 待たない。 まだ積んでいない書き手 (`append_lock` / 満杯の WAL の空きを待っている) の印は位置を持たないので数えない
     pub fn applied_through(&self, pos: u64) -> u64 {
+        let through = self.applied_through_quiet(pos);
+        if through != pos {
+            self.inflight.cuts.0.fetch_add(1, Ordering::Relaxed);
+        }
+        through
+    }
+
+    /// #1054: `pos` より前に積んだ record が全部本体に当たったか ([`Self::applied_through`] と同じ読みで、 切った回数を数えない)。
+    /// 当て終えるのを待つ側 (`oplog_sync` が自分の commit を listener に配る前) が繰り返し聞くため: 数えると、 空きを作る側の
+    /// 「当てている途中の書き手が居たから畳めなかった」 の見分け ([`Self::applying_cuts`]) を狂わせる。
+    pub fn applied_before(&self, pos: u64) -> bool {
+        self.applied_through_quiet(pos) == pos
+    }
+
+    /// #991: この OpLog の書き出し ([`Self::fsync`] と、 区画を移る / 畳む / 2 区画にする時の header の page の書き出し) が 1 度でも
+    /// 失敗したか。 engine は、 立っていれば閉じる時に 「きれいに閉じた」 の印を立てない (中で失敗を捨てる書き出しがあっても、 その
+    /// 後の engine の fsync が成功して見えるだけで、 page が届いたとは限らない)。
+    pub fn sync_failed(&self) -> bool {
+        self.sync_failed.load(Ordering::Acquire)
+    }
+
+    /// #1054: `from` (積む前に読んだ [`Self::written_head`]) から書き終えた所までで、 LSN が `lsn` の record の始まりの位置
+    /// ([`wal_pos`])。 無ければ None (区画が畳まれた等)。 読むだけ。 `oplog_sync` が自分の Commit の位置を知るため (自分の Commit より
+    /// 前の record が当たったかだけを待つ: 後に積まれた書き手は自分の commit を配るのに関係ない)。
+    pub fn position_of_lsn(&self, from: u64, lsn: u64) -> Option<u64> {
+        let mmap = self.mmap_slice();
+        let trailer = self.trailer.load(Ordering::Acquire) as u64;
+        for part in self.read_plan(from, false).into_iter().flatten() {
+            let mut off = part.start;
+            while off < part.end {
+                let at = part.base + off as usize;
+                let header = mmap.get(at..at + REC_HEADER_SIZE)?;
+                if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC {
+                    return None;
+                }
+                let l = u64::from_le_bytes(header[OFF_LSN..OFF_LSN + 8].try_into().unwrap());
+                if l == lsn {
+                    return Some(wal_pos(part.lap, off));
+                }
+                if l > lsn {
+                    return None;
+                }
+                let len = u64::from(u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()));
+                off += REC_HEADER_SIZE as u64 + len + trailer;
+            }
+        }
+        None
+    }
+
+    fn applied_through_quiet(&self, pos: u64) -> u64 {
         let mut through = pos;
         let n = (self.inflight.hw.load(Ordering::Acquire) as usize).min(COMBINE_SLOTS);
         for (m, s) in self.inflight.marks[..n].iter().zip(&self.combine_slots[..n]) {
@@ -3097,11 +3155,7 @@ impl OpLog {
             }
         }
         // 置き場の無い thread の cell
-        through = self.inflight.extra.through(through);
-        if through != pos {
-            self.inflight.cuts.0.fetch_add(1, Ordering::Relaxed);
-        }
-        through
+        self.inflight.extra.through(through)
     }
 
     /// [`Self::applied_through`] の、 書き手が自分の印に受け取った位置だけを見る版 (頼まれて積まれただけで、 まだ受け取っていない
@@ -3828,6 +3882,27 @@ impl OpLog {
         self.fail_next_commits.store(n, Ordering::Release);
     }
 
+    /// test 用 (#991): 次の `n` 回の書き出し ([`Self::fsync`] と、 区画を移る / 畳む / 2 区画にする時の header の page の書き出し) を
+    /// 失敗させる ([`Self::sync_failed`] が立つ)。 区画を移る時の header の書き出しは失敗を OpLog の中で捨てるので、 engine が見る
+    /// 失敗の印はこの OpLog の印だけ。 製品の道からは呼ばない。 書き出しの回にだけ読む (append には何も足さない)。
+    #[doc(hidden)]
+    pub fn fail_next_syncs(&self, n: u32) {
+        self.fail_next_syncs.store(n, Ordering::Release);
+    }
+
+    /// [`Self::fail_next_syncs`] の 1 回分を使う (使えたら true)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn take_sync_fault(&self) -> bool {
+        let mut n = self.fail_next_syncs.load(Ordering::Relaxed);
+        while n != 0 {
+            match self.fail_next_syncs.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
+    }
+
     /// test 用: この WAL で、 group を閉じない record が閉じの Commit の分の空きを残すか (`alloc`、 既定は残す)。 残さないと、
     /// group の途中で Commit も入らない満杯 (`append_dead`) を作れる。 その形は普通の append では作れなくなったが、 前の版の
     /// binary が書いた WAL や別の fd の append では残りうるので、 畳む時の死区間の例外 (engine の `wal_fold_safe`、 #450) の
@@ -4148,8 +4223,11 @@ impl OpLog {
 
         #[cfg(all(feature = "crashsim", unix))]
         let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, 0, &self.mmap));
-        crate::io_point("oplog.fsync")?;
-        self.mmap.flush()?;
+        let injected = || if self.take_sync_fault() { Err(io::Error::other("fail_next_syncs")) } else { Ok(()) };
+        if let Err(e) = injected().and_then(|()| crate::io_point("oplog.fsync")).and_then(|()| self.mmap.flush()) {
+            self.sync_failed.store(true, Ordering::Release);
+            return Err(e);
+        }
         #[cfg(all(feature = "crashsim", unix))]
         if let Some(copy) = sim {
             crate::crashsim::data_synced(&self._file, copy);
@@ -4256,6 +4334,14 @@ impl OpLog {
     pub fn iter_committed_from_with_end(&self, start_offset: u64) -> (Vec<Record>, u64) {
         let s = self.scan_from_offset(start_offset);
         (strip_offsets(s.out), s.committed_end)
+    }
+
+    /// [`Self::iter_committed_from_with_end`] を位置 `limit` (書き出した所) で切る版: `limit` までに Commit で閉じた group だけを返し、
+    /// `limit` より先は読まない (#1053: 記録の無い changefeed が、 書き出していない record を listener に渡さないため。 記録のある道の
+    /// [`Self::scan_for_change_log`] と同じ切り方)。 `limit` が `start_offset` より前なら何も返さず、 終端は `start_offset`。
+    pub fn iter_committed_from_with_end_upto(&self, start_offset: u64, limit: u64) -> (Vec<Record>, u64) {
+        let (recs, end) = self.change_log_scan(start_offset, limit, false, RecordRef::to_record);
+        (strip_offsets(recs), end)
     }
 
     /// changefeed の溜め用 (engine が ring を畳む直前、 `append_lock` の下で呼ぶ): `iter_committed_from_with_end` に加えて、
@@ -6455,6 +6541,31 @@ mod tests {
         assert!(wal.append(Op::Commit).is_err(), "Commit が落ちていない");
         assert!(wal.append(Op::Commit).is_ok(), "残数 0 になっても落ち続けている");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// #991 (PR #1061 の読み直しの残り): `fsync` の失敗で [`OpLog::sync_failed`] が立ち、 その後の `fsync` が成功しても倒れない
+    /// (失敗した書き出しの page は、 後の書き出しが成功しても届いているとは限らない。 engine は閉じる時にこの印を見て 「きれいに
+    /// 閉じた」 の印を立てない)。 engine の試験は失敗を `wal_fsync` (OpLog の外) か header の page の書き出しで入れるので、 `fsync` の
+    /// 道はここで見る。
+    ///
+    /// falsify: `fsync` の失敗で印を立てないと 2 つ目の assert で、 成功した `fsync` で印を倒すと最後の assert で落ちる。
+    #[test]
+    fn a_failed_fsync_sets_sync_failed_and_a_later_success_keeps_it() {
+        let p = tmp("sync-failed");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        assert!(wal.fsync().is_ok() && !wal.sync_failed(), "前提: 失敗させない書き出しは成功し、 印は立たない");
+        wal.fail_next_syncs(1);
+        let failed = wal.fsync().is_err();
+        let set = wal.sync_failed();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 2 }).unwrap();
+        let later_ok = wal.fsync().is_ok();
+        let kept = wal.sync_failed();
+        let _ = std::fs::remove_file(&p);
+        assert!(failed, "前提: 失敗させた fsync が Err を返す");
+        assert!(set, "fsync の失敗で sync_failed が立たない");
+        assert!(later_ok, "前提: 失敗させるのは 1 回だけ (次の fsync は成功する)");
+        assert!(kept, "後の fsync が成功したら sync_failed が倒れた");
     }
 
     /// #552 の残り: 満杯で載らなかった後、 空きを見る前に他の thread が畳んで空いていたら、 書き直す (前は入口で空きを見て

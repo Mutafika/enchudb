@@ -196,6 +196,13 @@ jobs:
       - name: loom model check (lock を取らない読みの世代の照合の順)
         run: cargo test -p enchudb-engine --test loom_read_app_generation --release
 
+      # #1064 の残り F6: eid の並びを受ける集計の速い道は照合せずに場所を読み、 終わりに 1 回だけ確かめる (fence → 表の印、 v14 の形は
+      # 場所の bit)。 書き手は 印 → 世代 → 生きている印を下ろす / 生かす → 次の住人の値 (Release) の順 (使い回す側が別の thread・値を
+      # 書いてから生かす受信の道も)。 順を外した対照 6 本 (Relaxed の読みで fence も無い (v15 / v14) / 印を fence の前に読む / 値を Relaxed
+      # で書く / 印を値の後に立てる / v14 の形で場所の bit を見ない) は、 loom が窓を見つける。
+      - name: loom model check (集計の速い道の終わりの確かめ)
+        run: cargo test -p enchudb-engine --test loom_aggregate_fast_path --release
+
       # #850: 書き出す側が覆う位置を、 WAL に積んだだけでまだ本体に当てていない record の手前で切る。 印を record の位置に
       # 置き換えるのは `written` を進める前、 書き出す側は `written` を読んでから印を読む。 順を逆にした形・Relaxed の形・印を
       # 見ない形 (直す前) の対照で、 loom が窓を見つけることも見る。

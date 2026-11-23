@@ -52,6 +52,12 @@ pub fn set_default_space_margin(bytes: u64) {
 }
 const GRANULARITY: usize = 64 * 1024;
 
+/// `mark_dirty` が範囲を持つ単位 (page = 4 KiB)。
+const DIRTY_PAGE_SHIFT: u32 = 12;
+/// 印が無い (first = u32::MAX > last = 0)。
+const DIRTY_NONE: u64 = (u32::MAX as u64) << 32;
+const DIRTY_LAST_MASK: u64 = u32::MAX as u64;
+
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
@@ -98,8 +104,13 @@ pub struct SegmentMap {
     reserved: usize,
     committed: AtomicUsize,
     readonly: bool,
-    dirty_lo: AtomicUsize,
-    dirty_hi: AtomicUsize,
+    /// 書いた範囲 (`mark_dirty`)。 unix 版と同じく page 番号の [first, last] (両端を含む) を 1 語に詰める (上位 32 bit = first、
+    /// 下位 32 bit = last、 空は `DIRTY_NONE`)。 前は lo / hi を別々の atomic に置いて `flush_dirty` が別々に swap していたので、
+    /// 間に入った `mark_dirty` の片方だけを取り出し、 残りが 「空」 に化けた (unix 版は #421 で直した形、 Windows 版に無かった、 #1058)
+    dirty: AtomicU64,
+    /// `flush_dirty` を 1 本ずつにする (unix 版の #421 / #801)。 後から来た flush が、 前の flush が取り出して書き出している最中の
+    /// 範囲を 「空」 と見て返ると、 呼び側がまだディスクに届いていない page を前提に checkpoint を進める
+    flush_lock: std::sync::Mutex<()>,
     space_margin: AtomicU64,
     space_denials: AtomicU64,
 }
@@ -170,8 +181,8 @@ impl SegmentMap {
             reserved: reserve,
             committed: AtomicUsize::new(len),
             readonly,
-            dirty_lo: AtomicUsize::new(usize::MAX),
-            dirty_hi: AtomicUsize::new(0),
+            dirty: AtomicU64::new(DIRTY_NONE),
+            flush_lock: std::sync::Mutex::new(()),
             space_margin: AtomicU64::new(DEFAULT_SPACE_MARGIN.load(Ordering::Relaxed)),
             space_denials: AtomicU64::new(0),
         })
@@ -304,38 +315,77 @@ impl SegmentMap {
         if len == 0 {
             return;
         }
-        const PAGE: usize = 4096;
-        let lo = offset & !(PAGE - 1);
-        let hi = (offset + len + PAGE - 1) & !(PAGE - 1);
-        if self.dirty_lo.load(Ordering::Relaxed) <= lo && self.dirty_hi.load(Ordering::Relaxed) >= hi {
+        let first = (offset >> DIRTY_PAGE_SHIFT) as u64;
+        let last = ((offset + len - 1) >> DIRTY_PAGE_SHIFT) as u64;
+        let cur = self.dirty.load(Ordering::Relaxed);
+        if cur >> 32 <= first && cur & DIRTY_LAST_MASK >= last {
             return;
         }
-        self.dirty_lo.fetch_min(lo, Ordering::Release);
-        self.dirty_hi.fetch_max(hi, Ordering::Release);
+        self.widen_dirty(cur, first, last);
     }
 
-    /// `mark_dirty` の印が付いているか (unix 版と同じ)。
+    /// `mark_dirty` の範囲を page [first, last] まで広げる (unix 版と同じ、 1 語の CAS)。
+    #[cold]
+    #[inline(never)]
+    fn widen_dirty(&self, mut cur: u64, first: u64, last: u64) {
+        debug_assert!(last < u64::from(u32::MAX), "segment の page 番号が 32 bit を越えた");
+        loop {
+            let (cfirst, clast) = (cur >> 32, cur & DIRTY_LAST_MASK);
+            // 空 (clast < cfirst) の時、 min / max は [first, last] そのものになる
+            let next = if clast < cfirst { (first << 32) | last } else { (cfirst.min(first) << 32) | clast.max(last) };
+            if next == cur {
+                return;
+            }
+            match self.dirty.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// `mark_dirty` の印が付いているか (unix 版と同じ)。 書き出す segment を選ぶ時は [`Self::flush_pending`] を使うこと。
     pub fn has_dirty(&self) -> bool {
-        self.dirty_hi.load(Ordering::Acquire) > self.dirty_lo.load(Ordering::Acquire)
+        let d = self.dirty.load(Ordering::Acquire);
+        d & DIRTY_LAST_MASK >= d >> 32
     }
 
     /// 印の付いた範囲の大きさ (byte。 unix 版と同じ口)。
     pub fn dirty_bytes(&self) -> usize {
-        self.dirty_hi.load(Ordering::Acquire).saturating_sub(self.dirty_lo.load(Ordering::Acquire))
+        let d = self.dirty.load(Ordering::Acquire);
+        let (first, last) = (d >> 32, d & DIRTY_LAST_MASK);
+        if last < first {
+            return 0;
+        }
+        ((last - first + 1) as usize).saturating_mul(1 << DIRTY_PAGE_SHIFT)
     }
 
-    /// 書き出す分が残っているか (unix 版の `flush_pending` と同じ口)。 こちらの `flush_dirty` は flush を 1 本に並べて
-    /// いないので、 印だけを見る (別の flush が書き出している最中の segment は見えない)。
+    /// 書き出す分が残っているか (unix 版の `flush_pending` と同じ、 #801): 印が付いている、 または別の [`Self::flush_dirty`] が
+    /// この segment を書き出している最中 (その flush は印を取り出してから書き出すので、 その間 `has_dirty` は false)。
     pub fn flush_pending(&self) -> bool {
-        self.has_dirty()
+        match self.flush_lock.try_lock() {
+            Ok(_none_in_flight) => self.has_dirty(),
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let _none_in_flight = p.into_inner();
+                self.has_dirty()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => true,
+        }
     }
 
+    /// 印の範囲だけ書き出して印を消す (unix 版と同じ約束、 #421)。 返った時、 呼ぶ前に印を付けた page は全部書き出してある
+    /// (同時に走る別の flush が取り出していても、 それが終わるまで待つ)。 書き出しに失敗した範囲は印に戻す。
     pub fn flush_dirty(&self) -> io::Result<()> {
-        let lo = self.dirty_lo.swap(usize::MAX, Ordering::AcqRel);
-        let hi = self.dirty_hi.swap(0, Ordering::AcqRel);
-        if hi <= lo {
+        let _one_at_a_time = self.flush_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let d = self.dirty.swap(DIRTY_NONE, Ordering::AcqRel);
+        let (first, last) = (d >> 32, d & DIRTY_LAST_MASK);
+        if last < first {
             return Ok(());
         }
-        self.flush_aligned(lo, hi - lo)
+        let (lo, hi) = ((first as usize) << DIRTY_PAGE_SHIFT, (last as usize + 1) << DIRTY_PAGE_SHIFT);
+        let res = self.flush_aligned(lo, hi - lo);
+        if res.is_err() {
+            self.mark_dirty(lo, hi - lo);
+        }
+        res
     }
 }

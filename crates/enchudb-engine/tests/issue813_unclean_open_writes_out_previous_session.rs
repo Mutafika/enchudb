@@ -102,13 +102,13 @@ fn child_entry() {
             eng.enable_sync_tables().unwrap();
             eng.define_table("t", 30_000).unwrap();
             let k = eng.define_himo_in("t", "k", ValueType::Tag, 0).unwrap() as u16;
-            // e0 は e1 より後ろの、 離れた page に置く (列の書いた範囲の印は 1 本の区間なので、 親が e1 に書いた時の印が
-            // e0 の page を覆わないように)
-            let e1 = eng.entity_in("t").unwrap();
-            let e0 = (0..FAR).map(|_| eng.entity_in("t").unwrap()).last().unwrap();
             eng.flush().unwrap();
             eng.persist_tables().unwrap();
             let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+            // e0 は e1 より後ろの、 離れた page に置く (列の書いた範囲の印は 1 本の区間なので、 親が e1 に書いた時の印が
+            // e0 の page を覆わないように)。 行は WAL 付きになってから足す (#1066: sync する DB の build phase は行を足せない)
+            let e1 = eng.entity_in("t").unwrap();
+            let e0 = (0..FAR).map(|_| eng.entity_in("t").unwrap()).last().unwrap();
             eng.try_tie_text_to_by_id(e0, k, OLD).unwrap();
             eng.oplog_sync().unwrap();
             std::fs::write(ids_file(&db), format!("{e0} {e1} {k}")).unwrap();
@@ -136,13 +136,14 @@ fn child_entry() {
             eng.define_table("t", 30_000).unwrap();
             let ns: Vec<u32> =
                 (0..NUM_COLS).map(|c| eng.define_himo_in("t", &format!("n{c}"), ValueType::Number, 0).unwrap()).collect();
-            // x0 は s の列の 2 page 目 (16 KiB の page でも 4 KiB の page でも、 header の page ではない)
-            let x0 = (0..S_ROW).map(|_| eng.entity_in("s").unwrap()).last().unwrap();
-            let e1 = eng.entity_in("t").unwrap();
-            let e0 = (0..FAR).map(|_| eng.entity_in("t").unwrap()).last().unwrap();
             eng.flush().unwrap();
             eng.persist_tables().unwrap();
             let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+            // x0 は s の列の 2 page 目 (16 KiB の page でも 4 KiB の page でも、 header の page ではない)。 行は WAL 付きになってから
+            // 足す (#1066)
+            let x0 = (0..S_ROW).map(|_| eng.entity_in("s").unwrap()).last().unwrap();
+            let e1 = eng.entity_in("t").unwrap();
+            let e0 = (0..FAR).map(|_| eng.entity_in("t").unwrap()).last().unwrap();
             for &n in &ns {
                 eng.try_tie_to_by_id(e0, n as u16, NUM_OLD).unwrap();
             }
