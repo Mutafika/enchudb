@@ -369,3 +369,66 @@ fn an_own_row_folded_into_another_own_row_is_not_deleted_by_reconcile_step_2() {
     assert_eq!(tomb, Hlc::ZERO, "畳んだ自分の行 (src {src:#x}) の場所に tombstone を置いた");
     assert_eq!(deletes, Vec::<Hlc>::new(), "A の state が畳んだ src の Delete を出した");
 }
+
+/// #1068 の読み直し 3: 上の逆向き。 A の自分の行 X に B の同じ名前の行を名前で束ねた (X が束ね先 = 名前の記録の束ねに X 自身の identity も
+/// 入る) 後、 A が X を本当に消した 2. の像。 X は 「別の行に束ねられた自分の行 (畳んだ src)」 ではないので、 下限の tombstone と Delete を
+/// 作り直す。
+///
+/// falsify: 「別の行が束ねている」 の見分けで、 束ねている行が自分自身の場所の時を除かない (`*s != d` を外す) と、 束ね先の X の削除を
+/// 作り直さない。
+#[test]
+fn a_deleted_own_row_that_binds_a_remote_row_is_still_relogged() {
+    let (pa, pb, img) = (tmp_path("a"), tmp_path("b"), tmp_path("img"));
+    let (before, after) = (format!("{img}-before"), format!("{img}-after"));
+    let _c = Cleanup(vec![pa.clone(), pb.clone(), img.clone(), before.clone(), after.clone()]);
+    let transport = transport(&[1, 2]);
+    let eng_b = make(&pb, 2);
+    let sync_b = Syncer::new(eng_b.clone(), transport.clone());
+    let (x, newest) = {
+        let eng_a = make(&pa, 1);
+        let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+        // A と B が同じ名前 5 の行を別々に作り、 A が B の行を名前で X に束ねる
+        let x = eng_a.entity_in("notes").unwrap();
+        eng_a.tie_to(x, "notes.name", 5u32);
+        eng_a.tie_to(x, "notes.v", 1u32);
+        let keep = eng_a.entity_in("notes").unwrap();
+        eng_a.tie_to(keep, "notes.name", 1000u32);
+        let y = eng_b.entity_in("notes").unwrap();
+        eng_b.tie_to(y, "notes.name", 5u32);
+        eng_b.tie_to(y, "notes.v", 2u32);
+        eng_a.oplog_sync().unwrap();
+        eng_b.oplog_sync().unwrap();
+        sync_b.publish_since(Hlc::ZERO);
+        sync_a.pull_once(2);
+        assert_eq!(eng_a.pull_raw("notes.name", 5u32).into_iter().filter(|&e| eng_a.is_live(e)).count(), 1, "前提: A は B の行を X に束ねた");
+        eng_a.persist_sync_state().unwrap();
+        let hv = eng_a.himo_id("notes.v").unwrap() as u16;
+        let hn = eng_a.himo_id("notes.name").unwrap() as u16;
+        let newest = eng_a.cell_hlc(x, hv).max(eng_a.cell_hlc(x, hn));
+        {
+            let _hold = eng_a.hold_consumer();
+            eng_a.oplog_sync().unwrap();
+            copy_dir(Path::new(&pa), Path::new(&before));
+            eng_a.delete(x);
+            copy_dir(Path::new(&pa), Path::new(&after));
+        }
+        drop(sync_a);
+        (x, newest)
+    };
+    copy_dir(Path::new(&before), Path::new(&img));
+    std::fs::copy(Path::new(&after).join("entities.seg"), Path::new(&img).join("entities.seg")).unwrap();
+    let eng_a = Engine::open_concurrent_with_oplog(&img, WAL).unwrap();
+    eng_a.set_peer_id(1);
+    assert_eq!(eng_a.generation_repairs(), (0, 1), "前提: 突き合わせの 2. が X の場所を完了させた");
+    let tomb = eng_a.tombstone_hlc(x);
+    let deletes: Vec<Hlc> = eng_a
+        .state_records()
+        .0
+        .into_iter()
+        .filter(|r| r.author_peer == 1 && matches!(r.op, enchudb_oplog::oplog::DecodedOp::Delete { eid } if eid == x))
+        .map(|r| r.hlc)
+        .collect();
+    drop(eng_a);
+    assert_eq!(tomb, lower_bound_of(newest), "B の行を束ねた自分の行 X の削除を、 下限の tombstone で作り直さない");
+    assert_eq!(deletes, vec![lower_bound_of(newest)], "A の state が X の Delete を下限の版数で出さない");
+}

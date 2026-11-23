@@ -28180,6 +28180,9 @@ impl Engine {
             return;
         }
         let versioned = self.sync_tables_enabled() && self.has_cell_version();
+        // #1068 の読み直し 3 の P1: 他の行が束ねている自分の場所 (自分の行どうしの畳みの src) は 1 回だけ集める (場所ごとに束ねを全部なめると
+        // 後始末待ちの数 × 束ねの数 = まとめて消した直後に落ちた像で、 開く時間が束ねの多い DB で分単位になった)
+        let folded_own = if versioned { self.own_slots_bound_elsewhere() } else { Vec::new() };
         for (slot, row_gen) in pending {
             if self.entities.is_live(slot) {
                 continue;
@@ -28192,7 +28195,7 @@ impl Engine {
             // ので 1. には来ないが、 別名 (`eidalias`、 本体の後に書く) が遅れた像の 2. はその場所を自分の行の死として拾う。 作り直すと
             // (自分, src) の Delete を配り、 相手でも同じ改名で畳んでいれば相手の残す行を消した。 自分の行どうしの畳みは名前で畳む時だけで、
             // その時必ず残す行が (自分, src) を束ねる記録 (`pkformer`、 本体より先に disk まで書く) を残す = それで見分ける
-            let own = self.eid_translator.reverse(slot).is_none() && !self.own_slot_bound_elsewhere(slot);
+            let own = self.eid_translator.reverse(slot).is_none() && folded_own.binary_search(&slot).is_err();
             let lower = if versioned && own && !gens.mid_reuse(slot) { self.delete_lower_bound(slot) } else { enchudb_oplog::Hlc::ZERO };
             // #1068 の読み直し F1: 前の open の作り直しが置いた下限の tombstone だけが disk に届き、 その floor (本体の `_sync_peers`) が
             // 届かなかった像 (開く道の本体の書き出しの途中の電源断。 tomb.seg は列より先に書き出す) も 「届いていない」 = 作り直す
@@ -28243,16 +28246,23 @@ impl Engine {
         }
     }
 
-    /// #1068 の読み直し 2 (#1071): 自分の行の場所 `slot` の identity (自分, slot) を、 別の行が束ねているか (名前の記録 `pkformer`)。 自分の行
-    /// どうしの畳み (#612) の src の印 (`merge_entity_into` が残す行に `add_bound` する)。 束ねた行が無ければ atomic 1 回。
-    fn own_slot_bound_elsewhere(&self, slot: u32) -> bool {
+    /// #1068 の読み直し 2 (#1071): 自分の行の identity (自分, 場所) を別の行が束ねている場所 (名前の記録 `pkformer`) の並び (昇順)。 自分の行
+    /// どうしの畳み (#612) の src の印 (`merge_entity_into` が残す行に `add_bound` する。 残す行は自分の identity も束ねるので、 自分の場所を
+    /// 束ねている行は数えない)。 束ねた行が無ければ atomic 1 回。 束ねの総数に比例 (開く時に 1 回)。
+    fn own_slots_bound_elsewhere(&self) -> Vec<u32> {
         if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
+            return Vec::new();
         }
-        let me = (self.peer_id(), slot);
+        let me = self.peer_id();
         let f = self.pk_former.read().unwrap();
-        let bound = f.bound_slots().any(|d| d != slot && f.bound_of(d).iter().any(|(id, _)| *id == me));
-        bound
+        let mut v: Vec<u32> = f
+            .bound_slots()
+            .flat_map(|d| f.bound_of(d).iter().filter(move |((p, s), _)| *p == me && *s != d).map(|((_, s), _)| *s))
+            .collect();
+        drop(f);
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// #1047 / #1046 の (2): 開く時の突き合わせが完了させた削除の時刻の下限 = 場所 `slot` の表の列の cell の版数の最大 (値を外した cell も、
