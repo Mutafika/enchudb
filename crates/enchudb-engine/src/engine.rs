@@ -6875,7 +6875,7 @@ mod aggregate_fast_path_tests {
                 locals.extend(rev);
                 locals.extend(hop);
                 let mut cur = fast.first();
-                                for local in locals {
+                for local in locals {
                     let got = fast.slot(enchudb_oplog::make_eid(peer, local), &mut cur).is_some();
                     let want = !v15 || t.contains(local);
                     assert_eq!(got, want, "v15={v15} {name}: local {local} ({ext:?})");
@@ -35150,7 +35150,7 @@ impl Engine {
         if let Some(fast) = self.fast_eid_reads(hids) {
             let mut acc = init();
             let mut cur = fast.first();
-                        for &eid in eids {
+            for &eid in eids {
                 let v = match fast.slot(eid, &mut cur) {
                     Some(slot) => {
                         #[cfg(test)]
@@ -35209,7 +35209,7 @@ impl Engine {
                 .map(|chunk| {
                     let mut acc = init();
                     let mut cur = fast.first();
-                                        for &eid in chunk {
+                    for &eid in chunk {
                         let v = match fast.slot(eid, &mut cur) {
                             Some(slot) => {
                                 #[cfg(test)]

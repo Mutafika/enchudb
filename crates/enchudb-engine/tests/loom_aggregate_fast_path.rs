@@ -12,8 +12,8 @@
 //! - 使い回す側が別の thread の形 (`Split`): 消す側の最後の RMW (生きている印を下ろす) を Acquire で見た thread が使い回す (払い出しの
 //!   空きの列 / 受信の `ensure_live_slot` の 「生きていない」 の読み)。 受信の道は値を書いてから生かす (`Receive`)
 //! - 場所が別の表 U の物の形 (`cross`、 #1072 の読み F4): T の列に U の行の値がある (表をまたいだ tie)。 世代を上げる書きが立てるのは U の
-//!   印 (`table_of_slot` が U を返す) で、 T の印は立たない。 v15 の形は T の枠の外の eid を照合つきで読むので、 この形を速い道で読むのは
-//!   v14 の形 (どの local も読む) だけ
+//!   印 (`table_of_slot` が U を返す) で、 T の印は立たない。 v15 の形は T の枠の外の eid を照合つきで読むので (`aggregate` は v15 の形で
+//!   始めた読みを照合つき = `None` にする、 #1073 の読みの G1)、 この形を速い道で読むのは v14 の形 (どの local も読む) だけ
 //!
 //! 読み手 (集計の速い道、 code と同じ):
 //! - 始め (`fast_eid_reads`): 表の印を Acquire で読み、 立っていれば照合つきの道 (この model の外、 `loom_read_app_generation`)。 場所の
@@ -31,6 +31,10 @@
 //! する / fence を外す。 v15 と v14 の形) / 終わりの印を fence の前に読む / 書き手が次の住人の値を Relaxed で書く / 印を値の後に立てる /
 //! v14 の形で終わりに場所の bit でなく読む紐の表 T の印を見る (場所が別の表の物の形で窓がある。 場所が T の物なら移る手順の 4. が T の印を
 //! 立てるので窓は無い = 単体の試験 `the_v14_shape_rechecks_the_slot_bits_not_the_table_flag` も表をまたいだ tie の場所で見る)。
+//!
+//! 書き手が全部終わってから読み手が始める順は、 loom 0.7 がこの model の並びの試験で作らない (読み手の始めの読みが書き手の最後まで見る順。
+//! 2026-11-23 に、 始めに v15 の形を見たら panic する印を置いて確かめた) ので、 join の後に読む試験 (`check_after`) を別に置く。 G1 の行を
+//! 外すとこの試験が落ちる。
 //!
 //! 入れていない対照: 並列の版で worker の chunk の終わりの fence を外す形。 C++ の model では、 呼び手の fence は別の thread (worker) の
 //! Relaxed の読みと書き手を同期させない (fence と同期するのは同じ thread の前の読み) ので窓があるが、 loom 0.7 は join を通した後の
@@ -203,6 +207,10 @@ impl Slot {
 /// なら `None`。
 fn aggregate(slot: &Arc<Slot>, rd: Reader) -> Option<u32> {
     let any_local = slot.start()?;
+    if slot.cross && !any_local {
+        // v15 の形は T の枠の外 (別の表 U の場所) を照合つきで読む = 速い道の答えにならない (この model の外)
+        return None;
+    }
     let v = match rd {
         Reader::Par => {
             let worker = {
@@ -235,6 +243,26 @@ fn aggregate(slot: &Arc<Slot>, rd: Reader) -> Option<u32> {
 
 fn check(bits: u32, w: Writer, rd: Reader) {
     check_in(bits, false, w, rd);
+}
+
+/// 書き手が全部終わってから (join の後に) 読み手が始める順。 loom 0.7 はこの model で、 読み手の始めの読み (印・場所の bit) が書き手の
+/// 最後まで見る順を並びの中で作らない (2026-11-23 に確かめた: 読み手の始めに 「v15 の形」 を見たら panic する印を置いても落ちなかった)
+/// ので、 その順は join で作る。
+fn check_after(bits: u32, cross: bool, w: Writer, rd: Reader) {
+    loom::model(move || {
+        let slot = Arc::new(Slot::new(bits, cross));
+        {
+            let slot = slot.clone();
+            thread::spawn(move || {
+                slot.delete(w);
+                slot.reuse(w);
+            })
+            .join()
+            .unwrap();
+        }
+        let got = aggregate(&slot, rd);
+        assert_ne!(got, Some(NEW), "速い道が、 使い回した後の住人の値を読んだまま答えを返した");
+    });
 }
 
 /// `cross`: 場所が別の表 U の物 (T の列に U の行の値がある)。
@@ -344,6 +372,17 @@ fn the_v14_shape_over_another_tables_slot_never_returns_the_next_residents_value
     check_in(0, true, Writer::Code, Reader::Fenced);
     check_in(0, true, Writer::Code, Reader::Par);
     check_in(0, true, Writer::Split, Reader::Fenced);
+}
+
+/// 書き手が全部終わってから始めた読み (上の並びの試験が作らない順、 [`check_after`])。 場所が別の表 U の物の形では、 読み手は v15 の形で
+/// 始め、 U の場所を T の枠の外として照合つきで読む (#1073 の読みの G1: model がそれを写していないと、 T の印 0 のまま次の住人の値を返す)。
+#[test]
+fn reads_started_after_the_writer_never_return_the_next_residents_value() {
+    for rd in [Reader::Acquired, Reader::Fenced, Reader::Par] {
+        check_after(BITS, false, Writer::Code, rd);
+        check_after(0, false, Writer::Code, rd);
+        check_after(0, true, Writer::Code, rd);
+    }
 }
 
 /// 対照 (#1072 の読み F4): v14 の形で終わりに場所の bit でなく読む紐の表 T の印を見ると、 移る手順の前に始めた読みが、 移って別の表 U の
