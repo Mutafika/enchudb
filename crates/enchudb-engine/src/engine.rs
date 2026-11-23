@@ -46125,7 +46125,7 @@ mod remote_row_tests {
     fn f2_a_delete_of_a_folded_own_row_resolved_before_its_target_is_reused_does_not_delete_the_new_row() {
         let (_rm, eng, _r) = ref_engine("f2del");
         let (x, k) = folded_own_row(&eng);
-        assert_eq!(eng.resolve_remote_eid_existing(x).map(|e| slot(e)), Some(slot(k)), "前提: X の世界番号は K に当たる");
+        assert_eq!(eng.resolve_remote_eid_existing(x).map(slot), Some(slot(k)), "前提: X の世界番号は K に当たる");
         let made = reuse_fold_target_in_hook(&eng, k);
         let later = enchudb_oplog::Hlc { wall: eng.cell_hlc(k, eng.himo_id("t.v").unwrap() as u16).wall + 10_000_000_000, logical: 0, peer: 2 };
         let _ = eng.remote_delete_apply_foreign_result(x, later);
