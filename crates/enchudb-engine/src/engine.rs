@@ -6737,6 +6737,190 @@ mod aggregate_fast_path_tests {
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
     }
+
+    /// 枠 2 の表 `e` と `f` を交互に 6 行ずつ足した engine (`e` の足した枠は `f` の枠と交互に並ぶ)。 `v15` なら `spare` で使い回して v15 に
+    /// 移す。 返り値の 2 つ目は `e` の行 (値 `e.v` = 1..=6)。
+    fn grown(tag: &str, v15: bool) -> (String, Arc<Engine>, Vec<enchudb_oplog::EntityId>) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-aggext-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        for t in ["e", "f"] {
+            eng.define_table(t, 2).unwrap();
+            eng.define_himo_in(t, "v", ValueType::Number, 0).unwrap();
+        }
+        eng.define_table("spare", 1).unwrap();
+        eng.define_himo_in("spare", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        if v15 {
+            let x = eng.entity_in("spare").unwrap();
+            eng.delete(x);
+            let y = eng.entity_in("spare").unwrap();
+            assert_ne!(x, y, "前提: v15");
+        }
+        assert_eq!(eng.generations().bits() != 0, v15, "前提: v15={v15}");
+        let mut rows = Vec::new();
+        for i in 1..=6u32 {
+            let e = eng.entity_in("e").unwrap();
+            eng.tie_to(e, "e.v", i);
+            rows.push(e);
+            let f = eng.entity_in("f").unwrap();
+            eng.tie_to(f, "f.v", 100 + i);
+        }
+        let ext = eng.tables.iter().find(|t| t.name == "e").unwrap().extents();
+        assert!(ext.len() >= 3, "前提: e は枠を足した ({ext:?})");
+        assert!(ext.windows(2).any(|w| w[0].1 != w[1].0), "前提: e の枠は f の枠と交互に並ぶ ({ext:?})");
+        (path, eng, rows)
+    }
+
+    /// F3 (#1064 の残り): 枠を足した表の、 足した枠の eid も速い道で読む (1 つずつ照合つきの out of line の読みを呼ばない)。 他の表と交互に
+    /// 伸びて枠が続かない表で、 v14 / v15 の両方。 前は最初の枠の外の eid が全部 out of line の照合つきの読みを呼び、 枠を足した表の集計が
+    /// #1041 の前の 2.5 倍遅かった。
+    #[test]
+    fn aggregates_read_added_extents_on_the_fast_path() {
+        for v15 in [false, true] {
+            let (path, eng, rows) = grown("fast", v15);
+            let _ = fast_read_hook::take_outlined();
+            let _ = fast_read_hook::take_redos();
+            assert_eq!(eng.sum("e.v", &rows), 21, "v15={v15}");
+            assert_eq!(fast_read_hook::take_outlined(), 0, "v15={v15}: 足した枠の eid を 1 つずつ照合つきで読んだ");
+            assert_eq!(fast_read_hook::take_redos(), 0, "v15={v15}");
+            // 別の表の eid は枠の外 = 照合つき (値は無い)
+            let mut mixed = rows.clone();
+            mixed.push(eng.entity_in("f").unwrap());
+            assert_eq!(eng.sum("e.v", &mixed), 21, "v15={v15}");
+            assert_eq!(fast_read_hook::take_outlined(), if v15 { 1 } else { 0 }, "v15={v15}: 別の表の eid の読み");
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+    }
+
+    /// F3: 足した枠の行を速い道で読む途中に消して使い回しても、 終わりの確かめでやり直す (足した枠の場所の世代を上げる書きも、 その表の
+    /// 印を立てる)。
+    #[test]
+    fn aggregates_over_added_extents_redo_when_a_slot_is_reused_meanwhile() {
+        for v15 in [false, true] {
+            let (path, eng, rows) = grown("extredo", v15);
+            // 最後の行は足した枠にある
+            let last = *rows.last().unwrap();
+            let ext0 = eng.tables.iter().find(|t| t.name == "e").unwrap().extents()[0];
+            assert!(!(ext0.0..ext0.1).contains(&eng.slot_unchecked(last)), "前提: 足した枠の行");
+            let e2 = eng.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = fast_read_hook::take_redos();
+            fast_read_hook::set(move || {
+                e2.delete(last);
+                let b = e2.entity_in("e").unwrap();
+                assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(last), "前提: 足した枠の場所を使い回した");
+                e2.tie_to(b, "e.v", 1000u32);
+                tx.send(()).unwrap();
+            });
+            let got = eng.sum("e.v", &rows);
+            rx.try_recv().unwrap_or_else(|_| panic!("v15={v15}: 前提: 割り込み点で使い回した"));
+            assert_eq!(fast_read_hook::take_redos(), 1, "v15={v15}: やり直していない");
+            assert_eq!(got, 15, "v15={v15}: 消えた行 (6) も使い回した行 (1000) も数えない");
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+    }
+
+    /// F3: 速い道が照合せずに読む local は、 v15 の DB では表の枠の中とちょうど同じ (他の表と交互に伸びて枠が続かない表 `e` と、 1 つだけ
+    /// 伸びて足した枠が続く表 `c` = 続いた枠をまとめる形)。 local を昇順・降順・飛び飛びに 1 つの `cur` で引く (前の範囲を先に見る形)。 世代 > 0 の
+    /// local (2^S 以上) はどの枠の外。 v14 の DB はどの local も読む。
+    #[test]
+    fn fast_reads_cover_exactly_the_tables_extents() {
+        for v15 in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = format!("/tmp/enchudb-aggext-cover-{}-{nanos}.db", std::process::id());
+            let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+            for (t, cap) in [("e", 2), ("f", 2), ("spare", 1), ("c", 2)] {
+                eng.define_table(t, cap).unwrap();
+                eng.define_himo_in(t, "v", ValueType::Number, 0).unwrap();
+            }
+            eng.flush().unwrap();
+            eng.persist_tables().unwrap();
+            let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+            if v15 {
+                let x = eng.entity_in("spare").unwrap();
+                eng.delete(x);
+                let y = eng.entity_in("spare").unwrap();
+                assert_ne!(x, y, "前提: v15");
+            }
+            assert_eq!(eng.generations().bits() != 0, v15, "前提: v15={v15}");
+            // e と f は交互に伸びる (e の枠は続かない)
+            for _ in 0..6 {
+                eng.entity_in("e").unwrap();
+                eng.entity_in("f").unwrap();
+            }
+            // その後で c だけが伸びる (c の足した枠は前の枠のすぐ後ろ)
+            for _ in 0..7 {
+                eng.entity_in("c").unwrap();
+            }
+            let top = eng.tables.iter().map(|t| t.last_hi()).max().unwrap();
+            let peer = eng.peer_id();
+            for name in ["e", "c"] {
+                let t = eng.tables.iter().find(|t| t.name == name).unwrap();
+                let ext = t.extents();
+                assert!(ext.len() >= 3, "前提: {name} は枠を足した ({ext:?})");
+                let contiguous = ext[1..].windows(2).all(|w| w[0].1 == w[1].0);
+                assert_eq!(contiguous, name == "c", "前提: e の足した枠は続かず、 c の足した枠は続く ({name}: {ext:?})");
+                let hid = eng.himo_id(&format!("{name}.v")).unwrap();
+                let fast = eng.fast_eid_reads(&[hid]).expect("前提: 速い道");
+                let mut locals: Vec<u32> = (0..top + 4).collect();
+                let rev: Vec<u32> = locals.iter().rev().copied().collect();
+                let hop: Vec<u32> = (0..top + 4).map(|i| (i * 7) % (top + 4)).collect();
+                locals.extend(rev);
+                locals.extend(hop);
+                let mut cur = fast.first();
+                for local in locals {
+                    let got = fast.slot(enchudb_oplog::make_eid(peer, local), &mut cur).is_some();
+                    let want = !v15 || t.contains(local);
+                    assert_eq!(got, want, "v15={v15} {name}: local {local} ({ext:?})");
+                }
+                if v15 {
+                    let g1 = 1u32 << eng.generations().bits();
+                    for slot in 0..top {
+                        assert!(fast.slot(enchudb_oplog::make_eid(peer, g1 | slot), &mut cur).is_none(), "v15 {name}: 世代 1 の local {slot}");
+                    }
+                }
+            }
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+    }
+
+    /// F3: anonymous の紐 (engine の `entity()`、 query_lang の `| sum`) の集計も速い道で読む (閉じていない anonymous の枠は 2^S で切る)。
+    #[test]
+    fn aggregates_on_anonymous_himos_take_the_fast_path() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-aggext-anon-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let rows: Vec<_> = (1..=5u32)
+            .map(|i| {
+                let e = eng.entity().unwrap();
+                eng.tie_to(e, "v", i);
+                e
+            })
+            .collect();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = fired.clone();
+        fast_read_hook::set(move || f2.store(true, std::sync::atomic::Ordering::SeqCst));
+        let _ = fast_read_hook::take_outlined();
+        assert_eq!(eng.sum("v", &rows), 15);
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "anonymous の紐の集計が速い道を通らなかった");
+        assert_eq!(fast_read_hook::take_outlined(), 0, "anonymous の行を 1 つずつ照合つきで読んだ");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
 }
 
 /// #1023: consumer の thread が動き出す前 (`consumer_thread` に自分の id を置く前) の書き出しも、 名前の記録のまとめ直しを consumer に
@@ -34783,9 +34967,10 @@ impl Engine {
 
     /// eid の並びを受ける集計の本体: eid ごとに `read(場所)` で読み、 読めた値を `add` で `init()` の上に積む。 読みは 2 つの道:
     ///
-    /// - 速い道 ([`Self::fast_eid_reads`] が始めに許した時): eid の local が表の最初の枠の中 (= 世代 0 の場所) ならその場所を照合せずに
-    ///   読む (枠の外の eid だけ照合つき、 loop の外の関数)。 終わりに [`Self::fast_eid_reads_held`] が許し続けているかを見て、 だめなら
-    ///   (途中で表の印が立った = 行が消えて場所の世代が上がり、 使い回しが入りえた / 別名ができた) 照合つきの道でやり直す
+    /// - 速い道 ([`Self::fast_eid_reads`] が始めに許した時): eid の local が表の枠の中 (= 世代 0 の場所。 v14 の DB は全部の eid) なら
+    ///   その場所を照合せずに読む (枠の外の eid だけ照合つき、 loop の外の関数)。 終わりに [`Self::fast_eid_reads_held`] が許し続けている
+    ///   かを見て、 だめなら (途中で表の印が立った = 行が消えて場所の世代が上がり、 使い回しが入りえた / v15 に移った / 別名ができた)
+    ///   照合つきの道でやり直す
     /// - 照合つきの道 ([`Self::fold_eids_checked`]): eid ごとに読む前と後に世代を照合する (#1041)。 `ACQ` = `read` が列の cell を
     ///   Acquire で読む (`get_value` / `get_value32`、 fence の無い `read_app_acquired`)、 でなければ fence のある `read_app` (列の生の並び
     ///   `stored_slice`)
@@ -34803,8 +34988,9 @@ impl Engine {
     ) -> A {
         if let Some(fast) = self.fast_eid_reads(hids) {
             let mut acc = init();
+            let mut cur = fast.first();
             for &eid in eids {
-                let v = match fast.slot(eid) {
+                let v = match fast.slot(eid, &mut cur) {
                     Some(slot) => {
                         #[cfg(test)]
                         fast_read_hook::call();
@@ -34816,7 +35002,7 @@ impl Engine {
                     add(&mut acc, v);
                 }
             }
-            if self.fast_eid_reads_held(fast) {
+            if self.fast_eid_reads_held(&fast) {
                 return acc;
             }
             #[cfg(test)]
@@ -34861,8 +35047,9 @@ impl Engine {
                 .par_chunks(Self::PAR_RANGE_CHUNK)
                 .map(|chunk| {
                     let mut acc = init();
+                    let mut cur = fast.first();
                     for &eid in chunk {
-                        let v = match fast.slot(eid) {
+                        let v = match fast.slot(eid, &mut cur) {
                             Some(slot) => {
                                 #[cfg(test)]
                                 fast_read_hook::call_par(self as *const Engine as usize);
@@ -34880,7 +35067,7 @@ impl Engine {
                     acc
                 })
                 .reduce(&init, &merge);
-            if self.fast_eid_reads_held(fast) {
+            if self.fast_eid_reads_held(&fast) {
                 return acc;
             }
             #[cfg(test)]
@@ -34891,20 +35078,32 @@ impl Engine {
             .reduce(&init, &merge)
     }
 
-    /// 照合つきの読み 1 つ (速い道の、 表の最初の枠の外の eid 用)。 loop に展開しない。
+    /// 照合つきの読み 1 つ (速い道の、 表の枠の外の eid 用)。 loop に展開しない。
     #[cold]
     #[inline(never)]
     fn read_app_outlined<const ACQ: bool, V>(&self, eid: enchudb_oplog::EntityId, read: &impl Fn(u32) -> Option<V>) -> Option<V> {
+        #[cfg(test)]
+        fast_read_hook::note_outlined();
         if ACQ { self.read_app_acquired(eid, read) } else { self.read_app(eid, read) }
     }
 
-    /// 集計の速い道 ([`Self::fold_eids`]) を始めてよいか。 よいのは、 読む紐 `hids` が全部同じ名前のある表 T の物で (anonymous の紐は
-    /// 照合つき)、 T に世代 > 0 の場所が無く (`Generations::table_has` の印が立っていない)、 畳んだ自分の行の別名 (#612、 照合が別名を
-    /// たどる) が無い時。 印は場所の世代を上げる時に立つので、 v15 の DB では **1 行でも消した表** (消す道の kill が世代を上げる) と、 v15 に
-    /// 移る手順の 4. で v14 の間に消した場所のある表は、 以後ずっと照合つきの道。 速い道に乗るのは、 v14 の DB の表 (消しても印を立てない) と、
-    /// v15 の DB で消したことの無い表。 速い道で読むのは、 その表の最初の枠の中の eid だけ (足した枠・世代 > 0・別の表の eid は 1 つずつ照合つき)。
+    /// 集計の速い道 ([`Self::fold_eids`]) を始めてよいか。 よいのは、 読む紐 `hids` が全部同じ表 T の物で (anonymous の表も)、 T に世代 > 0 の
+    /// 場所が無く (`Generations::table_has` の印が立っていない)、 畳んだ自分の行の別名 (#612、 照合が別名をたどる) が無い時。 印は場所の世代
+    /// を上げる時に立つので、 v15 の DB では **1 行でも消した表** (消す道の kill が世代を上げる) と、 v15 に移る手順の 4. で v14 の間に消した場所
+    /// のある表は、 以後ずっと照合つきの道。 速い道に乗るのは、 v14 の DB の表 (消しても印を立てない) と、 v15 の DB で消したことの無い表。
     ///
-    /// 速い道の正しさ (終わりに [`Self::fast_eid_reads_held`] が同じことを確かめた時):
+    /// 速い道で照合せずに読む eid ([`FastEidReads`]):
+    /// - v14 の DB (世代を持たない、 始めに場所の bit が 0): 全部の eid (local = 場所)。 照合つきの道も v14 の DB では local をそのまま読み、
+    ///   読んだ後に場所の bit が 0 のままかだけを見る ([`Self::read_app_in`] の `Recheck`)。 速い道は同じことを終わりに 1 回見る (下の 2 つ目の
+    ///   根拠の 「印」 を 「場所の bit」 に読み替える: 使い回すのは v15 に移った後 = 場所の bit を置いた後)
+    /// - v15 の DB: 始めた時の T の枠 (最初の枠と足した枠、 [`FAST_EXTENTS`] 個まで) の中の eid (世代 > 0・別の表・途中で足した枠・数を越えた
+    ///   枠の eid は 1 つずつ照合つき)。 T の場所は T の枠の中だけにある (表の枠は重ならず、 足すだけで外さない。 名前のある表と予約の表を
+    ///   作ると anonymous の枠は閉じる) ので、 枠の中の場所の世代を上げる書きは T の印を立てる (`table_of_slot` が T を返す)。 anonymous の
+    ///   閉じていない枠 (上が `u32::MAX`) は 2^S で切る (世代の付いた local を枠の中と読まない。 守りで、 閉じていない anonymous の他に表は
+    ///   無いので世代の付いた eid は anonymous の物 = 印が立っている)
+    ///
+    /// 速い道の正しさ (終わりに [`Self::fast_eid_reads_held`] が同じことを確かめた時。 書き手と読み手の順は loom の model
+    /// `tests/loom_aggregate_fast_path.rs` が、 順を外した対照と一緒に確かめる):
     /// - 印は、 場所の世代を上げる書きの全部 (`kill_generation` / `raise_generation` / `kill_generation_reconciled`、 `Generations::kill` /
     ///   `raise` / `kill_reconciled` を呼ぶのはこの 3 つだけ) の前に、 同じ thread で立つ (`mark_table`、 AcqRel の RMW、 印を下ろす道は無い)。
     ///   gen.seg の 2 B を変える他の書き (`revive` / `restore` / 開く時の `heal` / `prepare`) は世代を上げない
@@ -34925,23 +35124,61 @@ impl Engine {
             return None;
         }
         let tid = self.himo_to_table[*hids.first()?].load(Ordering::Relaxed);
-        if tid == ANONYMOUS_TABLE || hids[1..].iter().any(|&h| self.himo_to_table[h].load(Ordering::Relaxed) != tid) {
+        if hids[1..].iter().any(|&h| self.himo_to_table[h].load(Ordering::Relaxed) != tid) {
             return None;
         }
         if self.generations().table_has(tid) {
             return None;
         }
         let t = self.tables.get(tid as usize)?;
-        Some(FastEidReads { tid, lo: t.eid_range_lo, span: t.eid_range_hi.saturating_sub(t.eid_range_lo) })
+        let mut fast = FastEidReads { any_local: false, tid, ext: [(0, 0); FAST_EXTENTS], n: 0 };
+        if self.generations().bits() == 0 {
+            // 世代を持たない DB: どの場所も使い回されていない (使い回すのは v15 に移った後) ので、 表の枠を見ない
+            fast.any_local = true;
+            fast.ext[0] = (0, u32::MAX);
+            fast.n = 1;
+            return Some(fast);
+        }
+        // 枠を 1 つ足す (足せなければ true)。 続いている枠 (足した枠が前の枠のすぐ後ろ = 他の表が間に枠を取らなかった) は 1 つにまとめる
+        // (1 つの表だけが伸びる DB は最初の枠の後ろの枠が全部 1 つになる)
+        let mut add = |lo: u32, hi: u32| -> bool {
+            let span = hi.saturating_sub(lo);
+            if fast.n > 0 && fast.ext[fast.n - 1].0 + fast.ext[fast.n - 1].1 == lo {
+                fast.ext[fast.n - 1].1 += span;
+                return false;
+            }
+            if fast.n == FAST_EXTENTS {
+                return true;
+            }
+            fast.ext[fast.n] = (lo, span);
+            fast.n += 1;
+            false
+        };
+        if t.is_open_ended() {
+            // 閉じていない anonymous の枠の上は 2^S (世代 0 の local の上限) で切る (足した枠は無い)
+            add(t.eid_range_lo, self.dense_local_limit().max(t.eid_range_lo));
+        } else {
+            add(t.eid_range_lo, t.eid_range_hi);
+            // 足した枠は lock を取らずに写す (`find_extent`、 先頭の 32 個)
+            t.find_extent(|lo, hi| add(lo, hi).then_some(()));
+        }
+        Some(fast)
     }
 
     /// 集計の速い道の終わり: 始めの許しがまだ成り立つか (表に世代 > 0 の場所ができていない、 別名ができていない)。 fence の後に読む
     /// (速い道の読みより後に揃える)。
     #[inline]
-    fn fast_eid_reads_held(&self, fast: FastEidReads) -> bool {
+    fn fast_eid_reads_held(&self, fast: &FastEidReads) -> bool {
         use std::sync::atomic::Ordering;
         std::sync::atomic::fence(Ordering::Acquire);
-        !self.own_alias_on.load(Ordering::Relaxed) && !self.generations().table_has(fast.tid)
+        if self.own_alias_on.load(Ordering::Relaxed) {
+            return false;
+        }
+        if fast.any_local {
+            // まだ v15 に移っていない (移る手順は照合を始める 2. で場所の bit を Release で置き、 使い回すのはその後)
+            return self.generations().bits() == 0;
+        }
+        !self.generations().table_has(fast.tid)
     }
 
     /// dense の道で `cap` 以上の group を受けた分を、 group の昇順にして答えの後ろに足す (#474)。
@@ -40799,20 +41036,57 @@ impl crate::live::CellReader for Engine {
     }
 }
 
-/// 集計の速い道の許し ([`Engine::fast_eid_reads`]): 読む紐の表と、 その表の最初の枠。
+/// 集計の速い道で場所を照合せずに読む表の枠の数の上限 ([`FastEidReads`])。 枠は最初の枠と同じ大きさで足すので (`grow_table_extent_for`)、
+/// 最初の枠の 16 倍までの行の表は全部の枠が入る。 その先の枠の eid は 1 つずつ照合つき (正しさは同じ)。
+const FAST_EXTENTS: usize = 16;
+
+/// 集計の速い道の許し ([`Engine::fast_eid_reads`])。 照合せずに読む local の範囲 `ext` ((lo, 長さ)、 lo の昇順) と、 終わりの確かめの形。
+/// 2 つの形:
+///
+/// - 世代を持たない DB (v14、 `any_local` が真): どの eid も local = 場所として読む (照合つきの道 [`Engine::read_app`] も v14 の DB では
+///   local をそのまま読む)。 範囲は `(0, u32::MAX)` 1 つ (local `u32::MAX` だけ外 = 照合つきの道、 読みは同じ)。 終わりにまだ世代を
+///   持たない (v15 に移っていない) なら、 どの場所も使い回されていない
+/// - 世代を持つ DB (v15): 読む紐の表 `tid` の枠 (始めた時の、 最初の枠から [`FAST_EXTENTS`] 個まで、 続いた枠はまとめて) の中の eid だけ
+///   その場所を読む。 終わりに表の印が立っていなければ、 その表の場所は使い回されていない
 #[derive(Clone, Copy)]
 struct FastEidReads {
+    any_local: bool,
     tid: TableId,
-    lo: u32,
-    span: u32,
+    ext: [(u32, u32); FAST_EXTENTS],
+    n: usize,
 }
 
 impl FastEidReads {
-    /// eid の local が表の最初の枠の中なら、 その場所 (照合しない)。 世代 > 0 の eid の local は枠の外 (2^S 以上)。
+    /// 読みの loop が最初に持つ範囲 ([`Self::slot`] の `cur`)。
     #[inline(always)]
-    fn slot(self, eid: enchudb_oplog::EntityId) -> Option<u32> {
+    fn first(&self) -> (u32, u32) {
+        self.ext[0]
+    }
+
+    /// eid の local が速い道で読める場所なら、 その場所 (照合しない)。 世代 > 0 の eid の local は 2^S 以上 = どの枠の外 (anonymous の
+    /// 閉じていない枠は 2^S で切ってある)。 前の eid が入った範囲 (`cur`、 loop ごとに持つ = register に置ける) を先に見て、 外れたら
+    /// 二分探索 (他の表と交互に伸びた表は枠が続かない。 集計の eid はたいてい昇順なので、 ほとんど前の範囲で当たる)。
+    #[inline(always)]
+    fn slot(&self, eid: enchudb_oplog::EntityId, cur: &mut (u32, u32)) -> Option<u32> {
         let local = enchudb_oplog::eid_local(eid);
-        (local.wrapping_sub(self.lo) < self.span).then_some(local)
+        if local.wrapping_sub(cur.0) < cur.1 {
+            return Some(local);
+        }
+        // `cur` の番地を外の関数に渡さない (渡すと loop の `cur` が register に乗らず、 eid ごとに読み直す)
+        let range = self.range_of(local)?;
+        *cur = range;
+        Some(local)
+    }
+
+    /// [`Self::slot`] の、 前の範囲に入らなかった local の二分探索 (loop に展開しない): local を含む範囲。 `cold` は loop の中の置き場所の
+    /// ため (前の範囲に入った eid の読みが、 分岐を飛ばずにそのまま読む形にする。 cold でないと、 当たった eid が毎回この呼び出しを
+    /// 飛び越える形に置かれ、 1 eid あたり 1 cycle ほど遅かった)。
+    #[cold]
+    #[inline(never)]
+    fn range_of(&self, local: u32) -> Option<(u32, u32)> {
+        let ext = &self.ext[..self.n];
+        let i = ext.partition_point(|&(lo, _)| lo <= local);
+        (i > 0 && local - ext[i - 1].0 < ext[i - 1].1).then(|| ext[i - 1])
     }
 }
 
@@ -40826,6 +41100,7 @@ mod fast_read_hook {
     thread_local! {
         static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
         static REDOS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static OUTLINED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     /// (engine の番地, 処理)。 並んで走る他の試験の engine の並列の集計では呼ばない。
@@ -40866,6 +41141,15 @@ mod fast_read_hook {
 
     pub(super) fn note_redo() {
         REDOS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn note_outlined() {
+        OUTLINED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// この thread の集計の速い道が、 枠の外の eid を 1 つずつ照合つきで読んだ回数 (読んで 0 に戻す)。
+    pub(super) fn take_outlined() -> u32 {
+        OUTLINED.with(|c| c.replace(0))
     }
 
     /// 鳴らなかった割り込み点を外す (この thread)。
