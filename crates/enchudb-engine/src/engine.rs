@@ -390,6 +390,8 @@ struct ChangeBatch {
     /// `records[0]` の番号
     first: u64,
     records: Vec<crate::transport::WireRecord>,
+    /// 記録がある時: 取り出した時に写した記録の終わり (次の番号)。 この配りはここまで渡したら返る (#1055)
+    log_end: u64,
 }
 
 /// #779: slot の前の宛名。 bridge (`transfer_oplog_to_sync_ops`) は、 自分が書いた record の宛名 (行の世界番号) を **bridge する時の**
@@ -473,11 +475,24 @@ impl ChangeBatch {
     }
 }
 
+/// changefeed: 記録の無い時に溜めへ移す範囲 ([`Engine::move_changes_to_backlog`])。
+#[derive(Clone, Copy)]
+enum BacklogUpto {
+    /// 畳む区画の終わり (`append_lock` の下、 区画は全部書き出してある): 閉じていない末尾も移す
+    FoldEnd(u64),
+    /// 書き出した所 (畳む前に lock の外で): そこまでに Commit で閉じた group だけ (#1053)
+    Written(u64),
+}
+
 /// 記録 (`changefeed.seg`) がある時の配信 1 回分 (#636): listener ごとに位置から読んだ entry と、 読めずに外した listener。
 #[derive(Default)]
 struct LogWork {
     reads: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, u64, Vec<crate::change_log::Entry>)>,
     broken: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+    /// #1055: この回を渡した後、 読み手全員の位置が配りの始めに決めた終わり (`until`) に届く
+    caught_up: bool,
+    /// この回を渡した後も、 記録の今の終わりより手前に居る読み手がある (始めの後に写し足された分)
+    more: bool,
 }
 
 impl ChangeNotifier {
@@ -557,19 +572,26 @@ impl ChangeNotifier {
             Some(None) => return true,
             Some(Some(x)) => x,
         };
+        let until = batch.log_end;
         let panicked = batch.run(&self.progress);
         self.detach_panicked(src, panicked);
         if !log {
             return true;
         }
-        // 記録がある時は、 listener ごとの位置から読んで渡す
+        // 記録がある時は、 listener ごとの位置から読んで渡す。 #1055: 配るのは取り出した時に写した記録の終わり (`until`、 呼び手の
+        // `oplog_sync` の commit を含む) まで。 その後に写し足された分は通知係が配る (残っていれば頼む)。 前は読み手全員に新しい entry
+        // が無くなるまで回り、 遅い listener と休まない書き手が居ると (consumer が 100 ms ごとに写し足す) `oplog_sync()` が書き手の
+        // 止まるまで返らなかった (通知係がこの loop の中に居れば、 `oplog_sync()` は deliver_lock を 5 秒待って配らずに返った)
         loop {
-            let Some(work) = src.with(Engine::take_log_work) else { return false };
+            let Some(work) = src.with(|e| e.take_log_work(until)) else { return false };
             for l in work.broken {
                 let _ = listener_panicked(|| l.on_detached(enchudb_oplog::Hlc::ZERO));
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
             if work.reads.is_empty() {
+                if work.more {
+                    self.ask_notifier();
+                }
                 return true;
             }
             let mut panicked = PanickedListeners::new();
@@ -590,6 +612,12 @@ impl ChangeNotifier {
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
             self.detach_panicked(src, panicked);
+            if work.caught_up {
+                if work.more {
+                    self.ask_notifier();
+                }
+                return true;
+            }
         }
     }
 
@@ -1328,7 +1356,8 @@ fn cleanup_tables_tmp(db_path: &str) {
     let sidecar = tables_path_for(db_path);
     let tmp_path = crate::db_files::tmp_path_for(&sidecar);
     if tmp_path.exists() {
-        if let Err(e) = std::fs::remove_file(&tmp_path) {
+        // 書き出した一時 file は crashsim の控えを持つ: 消す時に捨てる (`remove_sidecar`、 #1060、 #416 の形)
+        if let Err(e) = remove_sidecar(&tmp_path) {
             eprintln!(
                 "warning: failed to remove stale tables tmp {}: {}",
                 tmp_path.display(),
@@ -2102,10 +2131,9 @@ fn persist_eidalias_to_sidecar(
 ) -> io::Result<()> {
     let p = eidalias_path_for(db_path);
     if entries.is_empty() {
-        return match std::fs::remove_file(&p) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
+        // 電源断の模擬の控えも捨てる (`remove_sidecar`、 #1060: 前は素の remove_file で、 Linux は空いた inode の番号を次に作った
+        // file に渡すので、 消した `eidalias` の控えがその file の像に写った = #416 の形)
+        return remove_sidecar(&p);
     }
     if crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries, with_gen))? {
         chain.wrote_durable();
@@ -3238,6 +3266,46 @@ mod write_out_fault {
     }
 }
 
+/// test 用 (#1057): この thread の次の `mark_session_dirty` の書き出しが失敗する (1 回だけ)。
+#[cfg(test)]
+mod session_dirty_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn fail_next() {
+        NEXT.with(|c| c.set(true));
+    }
+
+    pub(super) fn take() -> bool {
+        NEXT.with(|c| c.replace(false))
+    }
+}
+
+/// test 用 (#991 の C1): 置いた WAL の engine の、 動いている間の WAL の fsync (`Engine::wal_fsync`) が失敗する。
+#[cfg(test)]
+mod wal_fsync_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn active(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
 /// test 用 (#985): 置いた WAL の engine の bridge が、 行の payload を ring にも辞書にも書かない (payload を書けなかった行)。
 #[cfg(test)]
 mod bridge_payload_fault {
@@ -3286,6 +3354,22 @@ mod payload_ring_open_fault {
 /// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
 #[cfg(test)]
 mod cell_append_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `oplog_sync` が、 前に積んで当てている途中の書き手を待ち始める所 (#1054)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod sync_apply_wait_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -4280,6 +4364,432 @@ mod listener_add_race_tests {
         drop(eng);
         assert_eq!(got, vec![8], "付ける前の commit が渡った (取り出しが止まっている間に付け終えた: {added_during_take})");
         assert_eq!(got_late, vec![8], "後から付ける前の commit / 同じ record が渡った");
+    }
+}
+
+/// changefeed が渡す record は書き出した物だけ (記録の無い道も、 #1053)・`oplog_sync()` は自分の commit を配ってから返る (#1054)・
+/// 記録のある道の `oplog_sync()` は休まない書き手の後ろで返らなくならない (#1055)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod change_delivery_bound_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-review038c-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 試験が途中で落ちても、 置いた割り込み点を外す。
+    struct Unhook(Arc<enchudb_oplog::oplog::OpLog>);
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            cell_append_hook::set(&self.0, |_| {});
+            sync_apply_wait_hook::set(&self.0, |_| {});
+        }
+    }
+
+    /// 受けた Tie の値を順に控える。 `delay` があれば callback 1 回ごとに寝る (遅い listener)。
+    #[derive(Default)]
+    struct Rec {
+        seen: Mutex<Vec<u64>>,
+        delay: Option<Duration>,
+    }
+    impl crate::changefeed::ChangeListener for Rec {
+        fn on_changes(&self, records: &[crate::transport::WireRecord]) {
+            {
+                let mut seen = self.seen.lock().unwrap();
+                for r in records {
+                    if let enchudb_oplog::oplog::DecodedOp::Tie { value, .. } = r.op {
+                        seen.push(value);
+                    }
+                }
+            }
+            if let Some(d) = self.delay {
+                std::thread::sleep(d);
+            }
+        }
+    }
+
+    impl Rec {
+        fn now(&self) -> Vec<u64> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// `v` を受けるまで待つ (最大 `limit`)。 受けた値の列を返す。
+        fn wait_for_value(&self, v: u64, limit: Duration) -> Vec<u64> {
+            let until = Instant::now() + limit;
+            while !self.seen.lock().unwrap().contains(&v) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.now()
+        }
+    }
+
+    /// 割り込み点で止まって知らせ、 `go` が来るまで (最大 30 秒) 待つ closure と、 その組。
+    fn pause() -> (impl FnOnce(&enchudb_oplog::oplog::OpLog) + Send + 'static, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (paused_tx, paused_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let hook = move |_: &enchudb_oplog::oplog::OpLog| {
+            let _ = paused_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(30));
+        };
+        (hook, paused_rx, go_tx)
+    }
+
+    fn engine(dir: &Tmp, log: bool) -> (Arc<Engine>, u16, enchudb_oplog::EntityId) {
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 1 << 22).unwrap();
+        if log {
+            eng.enable_change_log(1 << 22).unwrap();
+        }
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        (eng, ts, e)
+    }
+
+    /// #1053: 記録の無い changefeed は、 書き出していない (WAL を fsync しておらず本体も書き出していない) commit を渡さない。
+    ///
+    /// 形: consumer を止めて 1 を書いて `oplog_commit()` (Commit で閉じるだけ、 書き出さない) → 配る分を取り出す (通知係が前の
+    /// 書き出しの後の頼みで起きた時 / 別の thread の `oplog_sync()` が自分の書き出しの後に配る時と同じ取り出し)。 前は Commit で
+    /// 閉じた group の終わりまで読み、 1 を渡した (落ちると listener の先にあって DB に無い)。 記録のある道は #873 / #889 で書き出した所
+    /// (`change_log_upto`) で切っていた。
+    ///
+    /// falsify: 記録の無い取り出し (`take_changes`) を上限なしの読み (`iter_committed_from_with_end`) に戻すと 1 が渡って落ちる。
+    #[test]
+    fn a_commit_that_is_not_written_out_is_not_delivered_without_the_change_log() {
+        let dir = tmp("unwritten");
+        let (eng, ts, e) = engine(&dir, false);
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let hold = eng.hold_consumer();
+        eng.tie_to_by_id(e, ts, 1u64);
+        eng.oplog_commit();
+        let pre = wal.written_head() > eng.change_log_upto(&wal);
+        eng.deliver_changes(true);
+        let got = a.now();
+        drop(hold);
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(1, Duration::from_secs(5));
+        drop(eng);
+        assert!(pre, "前提: 1 の commit は書き出していない");
+        assert!(got.is_empty(), "書き出していない commit を listener に渡した: {got:?}");
+        assert_eq!(after, vec![1], "書き出した後は渡る");
+    }
+
+    /// #1053: 畳む前に溜めへ移す道 (記録の無い時の `move_changes_before_fold`) も、 書き出していない commit を移さない (移すと
+    /// 通知係がそのまま渡す)。
+    ///
+    /// 形: 区画を移るまで書いて書き出し (古い区画は畳める) → consumer を止めて 999 を書いて `oplog_commit()` (今の区画、 書き出さない)
+    /// → 畳む → 配る分を取り出す。 前は畳む前に Commit で閉じた group を上限なしで溜めへ移し、 999 を渡した。
+    ///
+    /// falsify: 溜めへ移す道 (`BacklogUpto::Written`) を上限なしの読みに戻すと 999 が渡って落ちる (取り出しの上限だけでは塞がらない)。
+    #[test]
+    fn a_commit_that_is_not_written_out_is_not_moved_to_the_backlog_before_a_fold() {
+        let dir = tmp("fold");
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 256 << 10).unwrap();
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        assert!(wal.two_halves(), "前提: WAL が 2 区画");
+        let hold = eng.hold_consumer();
+        let switches = wal.switches();
+        let mut v = 1u64;
+        while wal.switches() == switches && v < 100_000 {
+            eng.tie_to_by_id(e, ts, v);
+            eng.oplog_sync().unwrap();
+            v += 1;
+        }
+        let switched = wal.switches() != switches;
+        eng.tie_to_by_id(e, ts, 999u64);
+        eng.oplog_commit();
+        let pre = wal.written_head() > eng.change_log_upto(&wal);
+        let folded = {
+            let _g = eng.transfer_lock_for_fold();
+            eng.try_fold_with_changes(&wal)
+        };
+        eng.deliver_changes(true);
+        let got = a.now();
+        drop(hold);
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(999, Duration::from_secs(5));
+        drop(eng);
+        assert!(switched && pre && folded, "前提: 区画を移った {switched}・999 は書き出していない {pre}・古い区画を畳んだ {folded}");
+        assert!(!got.contains(&999), "書き出していない commit を畳む前に溜めへ移して渡した");
+        assert_eq!(after.last(), Some(&999), "書き出した後は渡る");
+    }
+
+    /// #1053: 記録の無い changefeed は、 他の書き手が WAL に積んでまだ本体に当てていない record も渡さない (#850 と同じ形)。
+    ///
+    /// 形: 書き手 B が 2 を積んで当てる前に止まる → この thread が 3 を書いて `oplog_sync()` (B の手前で書き出しを切る) → 返った時に
+    /// listener に 2 が無い。 前は Commit で閉じた group の終わりまで読み、 当てていない 2 を (3 と一緒に) 渡した。
+    ///
+    /// falsify: 上と同じ変異で 2 が渡って落ちる。
+    #[test]
+    fn a_record_that_is_not_applied_yet_is_not_delivered_without_the_change_log() {
+        let dir = tmp("unapplied");
+        let (eng, ts, e) = engine(&dir, false);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let b = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64))
+        };
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が 2 を積んで当てる前に止まった");
+        eng.tie_to_by_id(e, ts, 3u64);
+        eng.oplog_sync().unwrap();
+        let got = a.now();
+        go.send(()).unwrap();
+        b.join().unwrap();
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(3, Duration::from_secs(5));
+        drop(eng);
+        assert!(!got.contains(&2), "本体に当てていない record を listener に渡した: {got:?}");
+        assert_eq!(after, vec![2, 3], "当て終えて書き出した後は WAL の順に渡る");
+    }
+
+    /// #1054: `oplog_sync()` は、 前に積んで当てている途中の他の書き手が居ても、 自分の commit を listener に配ってから返る
+    /// (記録あり / 無しの両方)。
+    ///
+    /// 形: 書き手 B が 2 を積んで当てる前に止まる → 別の thread A が 3 を書いて `oplog_sync()`。 A が B を待ち始めたら B を放す
+    /// (割り込み点 `sync_apply_wait_hook`)。 A が返った時点で listener に 3 がある。 前は書き出しを B の手前で切り、 3 を配らずに
+    /// 返った (渡るのは次の consumer の周期)。
+    ///
+    /// falsify: `oplog_sync` の待ち (`wait_applied_for_changefeed`) を外すと、 A は B を放す前に 3 を配らずに返って落ちる。
+    fn own_commit_is_delivered_past_an_applying_writer(log: bool) {
+        let dir = tmp(if log { "own-log" } else { "own" });
+        let (eng, ts, e) = engine(&dir, log);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let b = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64))
+        };
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が 2 を積んで当てる前に止まった");
+        let (waiting_tx, waiting_rx) = mpsc::channel::<()>();
+        sync_apply_wait_hook::set(&wal, move |_| {
+            let _ = waiting_tx.send(());
+        });
+        let (done_tx, done_rx) = mpsc::channel::<Vec<u64>>();
+        let syncer = {
+            let (eng, a) = (eng.clone(), a.clone());
+            std::thread::spawn(move || {
+                eng.tie_to_by_id(e, ts, 3u64);
+                eng.oplog_sync().unwrap();
+                let _ = done_tx.send(a.now());
+            })
+        };
+        // A が B を待ち始めた (直した形) か、 待たずに返った (前の形) か
+        let mut got = None;
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            if waiting_rx.try_recv().is_ok() {
+                break;
+            }
+            if let Ok(g) = done_rx.try_recv() {
+                got = Some(g);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        go.send(()).unwrap();
+        b.join().unwrap();
+        let got = got.unwrap_or_else(|| done_rx.recv_timeout(Duration::from_secs(20)).expect("A の oplog_sync が返らない"));
+        syncer.join().unwrap();
+        drop(eng);
+        assert!(got.contains(&3), "oplog_sync() が自分の commit を配らずに返った (受けた {got:?}、 記録 {log})");
+        assert_eq!(got, vec![2, 3], "WAL の順に渡る");
+    }
+
+    #[test]
+    fn oplog_sync_delivers_its_own_commit_past_an_applying_writer() {
+        own_commit_is_delivered_past_an_applying_writer(false);
+    }
+
+    #[test]
+    fn oplog_sync_delivers_its_own_commit_past_an_applying_writer_with_the_change_log() {
+        own_commit_is_delivered_past_an_applying_writer(true);
+    }
+
+    /// #1055: 記録のある DB で、 遅い listener (callback 1 回に 150 ms) と休まない書き手が居ても、 `oplog_sync()` は自分の commit を
+    /// 配ったら返る。 前は `deliver` が 「読み手全員に新しい entry が無くなるまで」 回り、 consumer が 100 ms ごとに写し足すので、
+    /// 書き手が止まるまで返らなかった (通知係がその loop の中なら 5 秒待って配らずに返った)。
+    ///
+    /// falsify: `deliver` の記録の道の loop の終わりを前の形 (`work.reads` が空になるまで) に戻すと、 書き手の止まる 4 秒後か
+    /// 5 秒後に返って落ちる。
+    #[test]
+    fn oplog_sync_returns_behind_a_slow_listener_and_a_busy_writer() {
+        let dir = tmp("slow");
+        let (eng, ts, e) = engine(&dir, true);
+        let a = Arc::new(Rec { seen: Mutex::default(), delay: Some(Duration::from_millis(150)) });
+        eng.add_change_listener(a.clone());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (eng, stop) = (eng.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                let mut v = 1_000u64;
+                while Instant::now() < deadline && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    eng.tie_to_by_id(e, ts, v);
+                    eng.oplog_commit();
+                    v += 1;
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+        // listener が書き手を追いかけている所で
+        std::thread::sleep(Duration::from_millis(500));
+        let e2 = eng.entity().unwrap();
+        eng.tie_to_by_id(e2, ts, 7u64);
+        let t0 = Instant::now();
+        eng.oplog_sync().unwrap();
+        let took = t0.elapsed();
+        let got = a.now();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        drop(eng);
+        assert!(took < Duration::from_secs(2), "oplog_sync() が休まない書き手の後ろで {took:?} 返らなかった");
+        assert!(got.contains(&7), "oplog_sync() が自分の commit を配らずに返った ({took:?})");
+    }
+}
+
+/// #991 の別の入口 (0.38 前 review C1): session の間に WAL の fsync が失敗した engine を閉じても、 「きれいに閉じた」 の印
+/// (紐名の辞書の clean) を立てない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod close_after_wal_sync_failure_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// sync する DB に 1 を書いて書き出す → WAL の fsync が失敗するようにして 2 を書く → 閉じる (consumer の最後の書き出しの
+    /// WAL の fsync が失敗し、 本体だけ書き出す) → 開き直すと 「きれいに閉じなかった」 と読む (#451 の作り直しを飛ばさない)。
+    /// 失敗させない回は 「きれいに閉じた」 と読む (対照)。
+    ///
+    /// 前は Drop が consumer の最後の書き出しの成否を見ずに印を立て、 次の open が #451 を飛ばした。 その後に電源が落ちる (失敗した
+    /// fsync の page は kernel が捨てうる) と、 本体にある値の record が WAL にも `_sync_ops` にも無いまま、 相手に配られない。
+    ///
+    /// falsify: `sync_and_mark_clean_with` の `wal_unsynced` を外すと、 失敗させた回も 「きれいに閉じた」 と読んで落ちる。
+    #[test]
+    fn a_session_whose_wal_fsync_failed_does_not_close_clean() {
+        for fault in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = Tmp(format!(
+                "{}/enchudb-review038c-close-{fault}-{}-{nanos}",
+                std::env::temp_dir().display(),
+                std::process::id()
+            ));
+            let (e, v) = {
+                let mut eng = Engine::create_with_cell_version(&dir.0, 4096).unwrap();
+                eng.define_table("t", 100).unwrap();
+                let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+                eng.enable_sync_tables().unwrap();
+                eng.flush().unwrap();
+                eng.persist_tables().unwrap();
+                let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+                let e = eng.entity_in("t").unwrap();
+                eng.try_tie_to_by_id(e, v, 1u32).unwrap();
+                eng.oplog_sync().unwrap();
+                let wal = eng.oplog().unwrap().clone();
+                wal_fsync_fault::set(&wal, fault);
+                eng.try_tie_to_by_id(e, v, 2u32).unwrap();
+                drop(eng);
+                // WAL の番地は持っている間に外す (後で同じ番地に作られた別の試験の WAL に残さない)
+                wal_fsync_fault::set(&wal, false);
+                (e, v)
+            };
+            let eng = Engine::open_concurrent_with_oplog(&dir.0, 1 << 20).unwrap();
+            let dirty = eng.himo_index_rebuilt_on_load();
+            let got = eng.get_by_id(e, v);
+            drop(eng);
+            assert_eq!(got, Some(2), "前提: 値は残っている (fsync の失敗は模しただけ、 page は届いている)");
+            assert_eq!(dirty, fault, "WAL の fsync が失敗した session か: {fault}、 開き直して 「きれいに閉じなかった」 と読んだか: {dirty}");
+        }
+    }
+}
+
+/// #1057: 書き始める前に倒す 「きれいに閉じた」 の印を disk に置けなければ、 書き始めない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod session_dirty_mark_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-review038c-dirty-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 書く open (`open_standalone`) で印の書き出しが失敗したら Err を返す (開いた engine で書き始めない)。 断った open は何も
+    /// 書かず (`abandoned`)、 次の open は普通に開ける。
+    ///
+    /// falsify: `load_from_backing` の終わりの Err の道を前の形 (`let _ = eng.mark_session_dirty();`) に戻すと、 開けてしまって落ちる。
+    #[test]
+    fn an_open_that_cannot_write_the_dirty_mark_refuses() {
+        let dir = tmp("open");
+        let (e, v) = {
+            let mut eng = Engine::create_standalone(&dir.0).unwrap();
+            eng.define_himo("v", ValueType::Number, 0);
+            let v = eng.himo_id("v").unwrap() as u16;
+            let e = eng.entity().unwrap();
+            eng.tie(e, "v", 7u32);
+            eng.flush().unwrap();
+            (e, v)
+        };
+        session_dirty_fault::fail_next();
+        let refused = Engine::open_standalone(&dir.0).err();
+        let _ = session_dirty_fault::take();
+        let eng = Engine::open_standalone(&dir.0).unwrap();
+        let got = eng.get_by_id(e, v);
+        drop(eng);
+        assert!(refused.is_some(), "印を置けないまま開いた (書き始める)");
+        assert_eq!(got, Some(7), "断った open の後も開ける");
+    }
+
+    /// 並行の形にする時 (`concurrentize_with_oplog`) も、 印を置けなければ WAL の session を始めない。
+    ///
+    /// falsify: `concurrentize_with_oplog` の `?` を外すと (結果を捨てる) 並行の形になって落ちる。
+    #[test]
+    fn concurrentize_that_cannot_write_the_dirty_mark_refuses() {
+        let dir = tmp("conc");
+        let mut eng = Engine::create_standalone(&dir.0).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        eng.flush().unwrap();
+        session_dirty_fault::fail_next();
+        let r = Engine::concurrentize_with_oplog(eng, 1 << 20);
+        let _ = session_dirty_fault::take();
+        assert!(r.is_err(), "印を置けないまま WAL の session を始めた");
     }
 }
 
@@ -11972,6 +12482,9 @@ const WAL_ROOM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// #560: `oplog_sync()` が、 配っている最中の listener (通知係が呼んでいる) を待つ上限。 #636: Drop が、 返らない listener を待つ
 /// 上限 (listener が返るたびに数え直す)。
 const LISTENER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// #1054: listener が居る時、 `oplog_sync()` が自分の commit より前に積んで当てている途中の他の書き手を待つ上限。 越えたら今まで
+/// どおりその手前で書き出しを切って返る (自分の commit は consumer の周期の書き出しの後に通知係が配る)。
+const SYNC_APPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// sync の DB で満杯の時に、 閉じの Commit を打ち直して畳み直す回数の上限 (`make_wal_room_inner`)。
 const WAL_ROOM_FOLD_ROUNDS: usize = 4;
@@ -13807,6 +14320,10 @@ pub struct Engine {
     /// #533: 開くのをやめた engine (open の途中で sidecar を読めなかった等)。 Drop は何も書かずに閉じる (書くと、 読めなかった
     /// sidecar を空の中身で上書きする)。
     abandoned: std::sync::atomic::AtomicBool,
+    /// #991 (C1、 0.38 前 review): この session で WAL の fsync が 1 度でも失敗した。 Drop は 「きれいに閉じた」 の印 (紐名の辞書の clean)
+    /// を立てない (次の open が #451 の作り直しを飛ばさない)。 失敗した fsync の page は kernel が捨てうる (後の fsync が成功しても
+    /// 戻らない) ので、 最後の書き出しだけでなく session の間ずっと覚える。
+    wal_sync_failed: std::sync::atomic::AtomicBool,
     /// PR #977 の読み直し 5 の値段 [7]: きれいに閉じなかった後に開いた時の、 anonymous の生きている印の最大 + 1 (0 = 無い / きれいに
     /// 閉じた後)。 開く時に 1 回だけなめて覚え、 払い出し済みの場所の上限 ([`Self::given_out_slot_end`]) が読む (前は開く時の commit・
     /// 再生の後・v15 に移る 1a のたびに予約の全部をなめた)。
@@ -14284,6 +14801,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_failed: std::sync::atomic::AtomicBool::new(false),
             anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
@@ -14778,6 +15296,16 @@ impl Engine {
         )?;
         let mut eng = Self::load_from_backing(Backing::Segments(Arc::new(set)), readonly)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // clean flag を倒して書き出す (`load_from_backing` の終わりの説明)。 #1057: 倒した印を disk に置けなければ
+        // 開かない。 Drop は何も書かない (`abandoned`、 書くと前の session の後始末をせずに 「きれいに閉じた」 の印を立てる = #991 と
+        // 同じ形)。 前は書き出しの失敗を捨てて書き始めた
+        if !readonly && let Err(e) = eng.mark_session_dirty() {
+            eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot write the session's dirty mark, refusing to open for writing (try again): {e}"),
+            ));
+        }
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
 
@@ -15477,6 +16005,8 @@ impl Engine {
     /// native でも使える（テスト、ファイル丸読みなど）。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
+        // file の無い engine (書き出しは何もしない)
+        eng.mark_session_dirty().map_err(|e| e.to_string())?;
         // 書き出さない engine: 前の名前の identity の record を作らない (誰も取り出さずに溜まる、 review987 [5])
         *eng.pk_former.write().unwrap() = crate::pk_former::PkFormer::without_log();
         eng.finish_vocab_refs_at_open();
@@ -16010,6 +16540,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_failed: std::sync::atomic::AtomicBool::new(false),
             anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
@@ -16053,7 +16584,7 @@ impl Engine {
             if vocab_reclaim && !eng.attach_vocab_refs() {
                 eng.vocab_recount_pending.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            eng.mark_session_dirty();
+            // 印を倒して書き出すのは呼び手 (`mark_session_dirty`、 失敗を I/O の失敗として返すため。 ここの Err は壊れた中身の印)
         }
 
         Ok(eng)
@@ -30921,8 +31452,8 @@ impl Engine {
 
     /// changefeed: 記録がある時の配信 1 回分を取り出す (#636: listener は呼び手が engine の外で呼ぶ)。 listener ごとに位置から
     /// 読み、 位置は渡す前に進める (畳む側の写しが、 渡した分を 「まだ読んでいない」 と見て外さないように)。 読めない listener
-    /// は外す。
-    fn take_log_work(&self) -> LogWork {
+    /// は外す。 `until` は配りの始めに写した記録の終わり (#1055: 読み手全員がそこへ届いたら、 その配りは返る)。
+    fn take_log_work(&self, until: u64) -> LogWork {
         /// 1 回に 1 listener へ渡す量の目安。
         const CHUNK: usize = 4 << 20;
         let mut work = LogWork::default();
@@ -30948,6 +31479,9 @@ impl Engine {
                 .retain(|l| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
             self.change_listeners_detached.fetch_add(broken.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        let next = log.range().1;
+        work.caught_up = c.readers.iter().all(|(_, p)| *p >= until);
+        work.more = c.readers.iter().any(|(_, p)| *p < next);
         work
     }
 
@@ -34565,14 +35099,23 @@ impl Engine {
     /// と読んで、 辞書の索引の作り直し (#101) と、 本体にあって oplog に無い write の照合 (#451) を飛ばす。 立てるのは
     /// `sync_and_mark_clean_with` だけで、 紐名の辞書の印 (#451 の照合が見る方) は、 oplog 付きの engine では閉じる時だけ (#709)。 該当 page (辞書 / 紐名の data の header) だけ書き出すので
     /// 1 ms 以下。
-    fn mark_session_dirty(&self) {
+    ///
+    /// 倒した印の書き出しに失敗したら Err (#1057): 呼び手は書き始めない。 前は失敗を捨てて書き始め、 その後に本体の
+    /// 列の page だけが disk に届いて落ちると、 disk の印は前の 「きれいに閉じた」 のままで、 次の open が #451 の作り直しと突き合わせを
+    /// 飛ばした。
+    fn mark_session_dirty(&self) -> io::Result<()> {
         self.vocab.mark_index_clean(false);
         self.himo_reg.mark_index_clean(false);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = self.backing.flush_kind(SegmentKind::VocabData, 0, 16);
-            let _ = self.backing.flush_kind(SegmentKind::HimoregData, 0, 16);
+            #[cfg(test)]
+            if session_dirty_fault::take() {
+                return Err(io::Error::other("session_dirty_fault"));
+            }
+            self.backing.flush_kind(SegmentKind::VocabData, 0, 16)?;
+            self.backing.flush_kind(SegmentKind::HimoregData, 0, 16)?;
         }
+        Ok(())
     }
 
     /// #451: きれいに閉じなかった後に開く時 (oplog の再生の後、 consumer を起こす前)、 本体にあって oplog / `_sync_ops`
@@ -35633,8 +36176,9 @@ impl Engine {
         let _ = std::fs::remove_file(&crc_path);
         // #451: clean flag を倒してから書き始める (writer の open と同じ)。 create → flush → ここ、 の DB は flag が立った
         // まま (倒すのは open と辞書への insert だけ) で、 辞書に書かずに落ちると次の open が 「きれいに閉じた」 と読み、
-        // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)
-        eng.mark_session_dirty();
+        // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)。 #1057: 倒した印を disk に置けなければ書き始めない
+        // (ここで返すと engine は単独の形のまま閉じる = まだ WAL の session を始めていないので、 普通の閉じ方でよい)
+        eng.mark_session_dirty()?;
         // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
         let wal = match Self::existing_wal(&oplog_path)? {
             Some(w) => {
@@ -35752,6 +36296,7 @@ impl Engine {
                 }
             }
             out.detached.extend(std::mem::take(&mut c.log_detached));
+            out.log_end = log.range().1;
             return Some((out, true));
         }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
@@ -35767,7 +36312,10 @@ impl Engine {
         change_take_hook::call(wal);
         // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
         // 恒久 skip (listener への通知漏れ) を起こしていた。
-        let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
+        // #1053: 読むのは書き出した所 (`change_log_upto`、 記録のある道と同じ) までに閉じた group だけ。 前は Commit で閉じた group の
+        // 終わりまで上限なしで読み、 WAL を fsync していない record (書き出しの後に閉じた commit) と、 他の書き手が積んでまだ本体に
+        // 当てていない record (#850 の形) を渡した (落ちると listener の先にあって DB に無い)
+        let (recs, committed_end) = wal.iter_committed_from_with_end_upto(c.offset, self.change_log_upto(wal));
         let mut batch = std::mem::take(&mut c.committed);
         if committed_end > c.offset {
             let recs = self.keep_for_changefeed(recs, |r| &r.op);
@@ -35812,7 +36360,7 @@ impl Engine {
         if c.offset >= through {
             return Some(0);
         }
-        Some(self.move_changes_to_backlog(wal, c, Some(through)))
+        Some(self.move_changes_to_backlog(wal, c, BacklogUpto::FoldEnd(through)))
     }
 
     /// changefeed (#662): 畳む前に、 `append_lock` の外で (呼び手が `change_emit` を持って)、 listener に配っていない Commit で閉じた
@@ -35822,31 +36370,34 @@ impl Engine {
     fn move_changes_before_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, written: u64) -> usize {
         match self.change_log.get() {
             Some(log) => self.pump_change_log(wal, log, c, written, false).unwrap_or(0),
-            None => self.move_changes_to_backlog(wal, c, None),
+            // #1053: 溜めにも書き出した所までだけ (溜めは後で listener に渡す。 前は上限なしで、 書き出していない record も移した)
+            None => self.move_changes_to_backlog(wal, c, BacklogUpto::Written(written)),
         }
     }
 
     /// changefeed: cursor から先の record を溜めに移す (呼び手が `change_emit` を持って)。 Commit で閉じた分は `committed` に (前に
-    /// 閉じていなかった末尾を頭に付けて)。 `tail_upto` が Some なら、 その位置 (畳む区画の終わり) までに止めて、 閉じていない末尾も
-    /// `open_tail` に足す。 cursor は読み終えた終端に進める
+    /// 閉じていなかった末尾を頭に付けて)。 [`BacklogUpto::FoldEnd`] なら、 その位置 (畳む区画の終わり、 書き出し済み) までに止めて、
+    /// 閉じていない末尾も `open_tail` に足す。 [`BacklogUpto::Written`] なら、 その位置 (書き出した所) までに Commit で閉じた分だけ
+    /// (#1053)。 cursor は読み終えた終端に進める
     /// (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。 listener が居なければ何もしない。 戻り値は移した
     /// record の数。
     ///
     /// #560: 移すと溜めが上限 (`change_backlog_limit`) を越えるなら、 移さずに溜めごと捨て、 listener を全部外す (止まった・遅すぎる
     /// listener のために書き手を止めない・メモリを使い切らない。 前は上限が無く、 止まった listener の間は畳むたびに ring の
     /// 全部を `append_lock` の下で写して溜め続けた)。 外した listener には通知係が `on_detached` で知らせる。
-    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, tail_upto: Option<u64>) -> usize {
+    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, upto: BacklogUpto) -> usize {
         use std::sync::atomic::Ordering;
         if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
             return 0;
         }
         #[cfg(test)]
         change_copy_hook::call(wal);
-        let (recs, committed_end, tail, end) = if let Some(upto) = tail_upto {
-            wal.iter_from_with_tail_upto(c.offset, upto)
-        } else {
-            let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
-            (recs, committed_end, Vec::new(), committed_end)
+        let (recs, committed_end, tail, end) = match upto {
+            BacklogUpto::FoldEnd(through) => wal.iter_from_with_tail_upto(c.offset, through),
+            BacklogUpto::Written(written) => {
+                let (recs, committed_end) = wal.iter_committed_from_with_end_upto(c.offset, written);
+                (recs, committed_end, Vec::new(), committed_end)
+            }
         };
         let recs = self.keep_for_changefeed(recs, |r| &r.op);
         let tail = self.keep_for_changefeed(tail, |r| &r.op);
@@ -36876,12 +37427,25 @@ impl Engine {
 
     /// checkpoint を進める前の oplog fsync + 本体の書き出し。 どちらかが失敗したら false (#317: 空き不足で
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
+    /// 動いている engine の WAL の fsync (consumer の周期 / 閉じる時 / `oplog_sync` / 空け作り)。 失敗したら覚える (#991 の C1:
+    /// 覚えた session は Drop が 「きれいに閉じた」 の印を立てない、 `wal_sync_failed`)。
+    fn wal_fsync(&self, wal: &enchudb_oplog::oplog::OpLog) -> io::Result<()> {
+        #[cfg(test)]
+        let r = if wal_fsync_fault::active(wal) { Err(io::Error::other("wal_fsync_fault")) } else { wal.fsync() };
+        #[cfg(not(test))]
+        let r = wal.fsync();
+        if r.is_err() {
+            self.wal_sync_failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        r
+    }
+
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         #[cfg(test)]
         if write_out_fault::active(wal) {
             return false;
         }
-        let wal_ok = wal.fsync().is_ok();
+        let wal_ok = self.wal_fsync(wal).is_ok();
         // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
         // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
         let names_ok = !wal_ok || self.persist_name_records().is_ok();
@@ -37262,10 +37826,14 @@ impl Engine {
             // #850: 書き手が積んだだけでまだ cell に当てていない record の手前で切る (consumer の周期と同じ)。 その書き込みは
             // まだ返っていない = この `oplog_sync` が約束する書き込みではない。 返った書き込みの cell は下の msync に入り、 record は
             // fsync に入る (checkpoint が手前に残る分は、 落ちた後に再生し直すだけ)
-            let durable_head = wal.applied_through(wal.written_head());
+            let written_head = wal.written_head();
+            // #1054: listener が居れば、 切る前にその書き手が当て終えるのを少し待つ (切ると、 自分の commit も切った位置の先に入り、
+            // 下の配りが渡さない)
+            self.wait_applied_for_changefeed(wal, written_head);
+            let durable_head = wal.applied_through(written_head);
             let durable_lsn = wal.next_lsn().saturating_sub(1);
             // #550: 消した主キーの記録は WAL の後・本体より先に
-            let written = wal.fsync().and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
+            let written = self.wal_fsync(wal).and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
             if let Err(e) = written {
                 // #451 (段階 1): 書き出せなかったので印は置かない (切れ目の登録だけ外す)
                 if let Some(c) = cut {
@@ -37320,6 +37888,42 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// #1054: `oplog_sync` が書き出す前に、 `pos` より前に積まれて当てている途中の他の書き手が当て終えるのを待つ (上限
+    /// [`SYNC_APPLY_WAIT`])。 listener が居る時だけ (居なければ配る物が無い)。
+    ///
+    /// 書き出しは当てていない record の手前で切る (#850 / #873)。 切った位置は changefeed へ渡してよい位置でもある (#889 / #1053)
+    /// ので、 前に積んだ書き手が 1 人でも当てている途中だと、 その後ろに居る自分の commit (の group を閉じる Commit) が切った位置の
+    /// 先に入り、 `oplog_sync()` が自分の commit を配らずに返った (渡るのは次の consumer の周期)。 待つのは積んだ後・当てる前の
+    /// 書き手だけ (普段は µs)。 待つ間は lock を持たない (その書き手は `append_lock` も行の lock もこちらに頼らない)。
+    fn wait_applied_for_changefeed(&self, wal: &enchudb_oplog::oplog::OpLog, pos: u64) {
+        if wal.applied_before(pos) || self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        sync_apply_wait_hook::call(wal);
+        // 当てる途中の書き手は普段 µs で抜けるので、 まず回って待つ (yield は混んだ機械で自分が長く外される)。 抜けなければ
+        // (その書き手が CPU を外されている) 寝て待つ
+        let start = std::time::Instant::now();
+        let mut round = 0u32;
+        while !wal.applied_before(pos) {
+            round += 1;
+            if round <= 256 {
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+            if start.elapsed() >= SYNC_APPLY_WAIT {
+                return;
+            }
+            if round <= 264 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(20));
+            }
+        }
     }
 
     /// 現在耐久化されている LSN(Commit を含む最後の WAL fsync 到達位置)。
@@ -37941,7 +38545,11 @@ impl Engine {
         // #992: 配る DB で後始末待ち (tombstone と #451 の作り直しの済んでいない場所) が残る間は、 紐名の辞書の印 (= 「きれいに閉じた」) を
         // 立てない: 次の open が #451 の作り直しを飛ばさない (WAL の無い単独の session が後始末待ちを持ったまま閉じる形)
         let pending_relog = self.sync_tables_enabled() && self.generations().has_pending_marks();
-        if pending_relog {
+        // #991 (C1): この session で WAL の fsync が失敗していたら、 閉じる時も印を立てない。 閉じる時の consumer の最後の書き出しは
+        // WAL の fsync が失敗しても本体を書き出し、 ここ (Drop) は WAL を fsync しない。 印を立てると、 本体にあって WAL (と
+        // `_sync_ops`) に無い write を次の open が調べず (#451 の作り直しを飛ばす)、 相手に配らなかった
+        let wal_unsynced = closing && self.wal_sync_failed.load(std::sync::atomic::Ordering::Acquire);
+        if pending_relog || wal_unsynced {
         } else if closing && self.persist_leaf_free_list().unwrap_or(false) {
             self.himo_reg.mark_index_clean_leaf();
         } else if closing || self.oplog.is_none() {

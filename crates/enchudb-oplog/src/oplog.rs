@@ -3085,6 +3085,21 @@ impl OpLog {
     ///   (か、 当て終えて外した後) が必ず見える
     /// - 待たない。 まだ積んでいない書き手 (`append_lock` / 満杯の WAL の空きを待っている) の印は位置を持たないので数えない
     pub fn applied_through(&self, pos: u64) -> u64 {
+        let through = self.applied_through_quiet(pos);
+        if through != pos {
+            self.inflight.cuts.0.fetch_add(1, Ordering::Relaxed);
+        }
+        through
+    }
+
+    /// #1054: `pos` より前に積んだ record が全部本体に当たったか ([`Self::applied_through`] と同じ読みで、 切った回数を数えない)。
+    /// 当て終えるのを待つ側 (`oplog_sync` が自分の commit を listener に配る前) が繰り返し聞くため: 数えると、 空きを作る側の
+    /// 「当てている途中の書き手が居たから畳めなかった」 の見分け ([`Self::applying_cuts`]) を狂わせる。
+    pub fn applied_before(&self, pos: u64) -> bool {
+        self.applied_through_quiet(pos) == pos
+    }
+
+    fn applied_through_quiet(&self, pos: u64) -> u64 {
         let mut through = pos;
         let n = (self.inflight.hw.load(Ordering::Acquire) as usize).min(COMBINE_SLOTS);
         for (m, s) in self.inflight.marks[..n].iter().zip(&self.combine_slots[..n]) {
@@ -3097,11 +3112,7 @@ impl OpLog {
             }
         }
         // 置き場の無い thread の cell
-        through = self.inflight.extra.through(through);
-        if through != pos {
-            self.inflight.cuts.0.fetch_add(1, Ordering::Relaxed);
-        }
-        through
+        self.inflight.extra.through(through)
     }
 
     /// [`Self::applied_through`] の、 書き手が自分の印に受け取った位置だけを見る版 (頼まれて積まれただけで、 まだ受け取っていない
@@ -4256,6 +4267,14 @@ impl OpLog {
     pub fn iter_committed_from_with_end(&self, start_offset: u64) -> (Vec<Record>, u64) {
         let s = self.scan_from_offset(start_offset);
         (strip_offsets(s.out), s.committed_end)
+    }
+
+    /// [`Self::iter_committed_from_with_end`] を位置 `limit` (書き出した所) で切る版: `limit` までに Commit で閉じた group だけを返し、
+    /// `limit` より先は読まない (#1053: 記録の無い changefeed が、 書き出していない record を listener に渡さないため。 記録のある道の
+    /// [`Self::scan_for_change_log`] と同じ切り方)。 `limit` が `start_offset` より前なら何も返さず、 終端は `start_offset`。
+    pub fn iter_committed_from_with_end_upto(&self, start_offset: u64, limit: u64) -> (Vec<Record>, u64) {
+        let (recs, end) = self.change_log_scan(start_offset, limit, false, RecordRef::to_record);
+        (strip_offsets(recs), end)
     }
 
     /// changefeed の溜め用 (engine が ring を畳む直前、 `append_lock` の下で呼ぶ): `iter_committed_from_with_end` に加えて、
