@@ -3633,6 +3633,23 @@ mod bind_lock_hook {
     }
 }
 
+/// test 用の割り込み点: 受信の当て込みが宛名を写像で引いた後・その場所の最後の行 (世代) を読む前 (`remote_row_of` の入口と、 Ref の値の
+/// `try_resolve_remote_ref_value`)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod resolved_row_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: 受信の当て込みが宛名を引いた後・行の lock を取る前 (#917)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod remote_row_hook {
@@ -15306,8 +15323,11 @@ impl Engine {
                     // 落ちる前に場所を使い回して外した写像 (`prev.seg` の記録の前の住人がこの identity): 戻さず、 記録の削除の版数を
                     // identity に退避する (下の #925 の推測より先に、 記録で決める。 面の削除の版数が無い = 削除を書き出す前の面でも
                     // 決まる)。 名前の記録は `pktombs` / `pkformer` を読んだ後に移す
-                    if let Some(t) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
-                        let tomb = tomb.max(t);
+                    if let Some(rec) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
+                        // #1035: 記録から戻した削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (自分が消した受けた行。
+                        // `restore_prev_resident` と同じ。 前はこの道で戻した削除が state にしか入らず、 差分で受ける peer に届かなかった)
+                        eng.generations().prev.note_restored_delete(rec.gone, rec.tomb);
+                        let tomb = tomb.max(rec.tomb);
                         eng.remember_foreign_tombstone(peer, foreign_local, tomb);
                         stale_mappings.push((peer, foreign_local, local, tomb));
                         continue;
@@ -25030,7 +25050,7 @@ impl Engine {
     }
 
     /// `.eidmap` の写像の面 (`peer`, `foreign_local`) → 場所 `local` が、 落ちる前に場所を使い回した時に外した写像か: `prev.seg` の
-    /// 場所の記録の前の住人がその identity (翻訳した行) なら、 記録の削除の版数。 開く時 (`.eidmap` を読む所) だけ。
+    /// 場所の記録の前の住人がその identity (翻訳した行) なら、 その記録 (削除の版数と前の住人の行)。 開く時 (`.eidmap` を読む所) だけ。
     ///
     /// 記録は使い回した時にしか書かない (前の住人を消して、 写像を外して、 場所を次の行に渡した)。 記録の identity と面の identity が
     /// 同じで、 使い回しが本体に届いている (場所の最後の行が記録の行でない) なら、 面は使い回しの前の物 = 戻すと新しい住人がその
@@ -25051,7 +25071,7 @@ impl Engine {
         local: u32,
         peer: enchudb_oplog::PeerId,
         foreign_local: u32,
-    ) -> Option<enchudb_oplog::Hlc> {
+    ) -> Option<crate::prev_slots::PrevRecord> {
         let gens = self.generations();
         let mut found: Option<crate::prev_slots::PrevRecord> = None;
         let mut last: Option<u32> = None;
@@ -25065,7 +25085,7 @@ impl Engine {
                 found = Some(rec);
             }
         });
-        found.map(|r| r.tomb)
+        found
     }
 
     /// きれいに閉じなかった後に開いた時 (sidecar を読んだ後、 突き合わせと WAL の再生の前)、 `prev.seg` の記録で、 使い回しが
@@ -25509,11 +25529,10 @@ impl Engine {
         if !others.is_empty() {
             self.retreat_removed_keys(&others, rec.tomb);
         }
-        // review946c [E]: 戻した自分の行の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
-        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)
-        if rec.kind == crate::prev_slots::PrevKind::Own {
-            self.generations().prev.note_restored_own(rec.gone, rec.tomb);
-        }
+        // review946c [E]: 戻した前の住人の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
+        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)。 #1035: 翻訳した
+        // 行も (自分が消した受けた行。 作り直しは版数が自分の時計の物だけ載せ、 bridge は宛名を記録から引く)
+        self.generations().prev.note_restored_delete(rec.gone, rec.tomb);
         true
     }
 
@@ -26646,8 +26665,19 @@ impl Engine {
     ///
     /// 自分の行 (畳んで別の行に転送していない) は宛名の番号そのもの (引く時に照合した番号。 引いた後に変わっていても lock の下で
     /// 外れる)。 他の peer の行と転送した自分の行は、 引いた直後の場所の最後の行。
+    ///
+    /// #1034: 他の peer の行と転送した自分の行は、 場所の最後の行を読んだ後に、 宛名の写像がまだその場所を指すかを引き直す。 宛名を
+    /// 写像で引いた後・世代を読む前に、 その行が消えて場所が使い回されると、 読んだのは使い回した新しい行で、 lock の下の照合 (その行が
+    /// まだ場所の最後の行か) も通った (前は引き直さず、 遅れた Delete / Tie が新しい行を消した / 書き換えた)。 使い回す道は写像を外して
+    /// から場所を生かす ([`Self::prepare_reuse`]) ので、 読んだ後に写像がまだ場所を指していれば、 読んだ行は写像の行 (使い回しの前)。
+    /// 指していなければ、 どの行とも合わない番号 ([`Self::no_row`]) を返す: 呼び手は lock の下の照合で外れ、 引く前に使い回されていた
+    /// 時と同じ道 (写像の無い行) へ進む。
     #[inline]
     pub fn remote_row_of(&self, world: enchudb_oplog::EntityId, internal: enchudb_oplog::EntityId) -> u32 {
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            resolved_row_hook::call(wal);
+        }
         // 場所の bit は 1 回だけ読む (`slot_unchecked` と自分の行の照合で 2 回たどっていた、 [P])
         let r = self.generations().reader();
         let slot = r.split(enchudb_oplog::eid_local(internal)).0;
@@ -26662,7 +26692,27 @@ impl Engine {
                 return local;
             }
         }
-        self.last_local_of_slot(slot)
+        let row = self.last_local_of_slot(slot);
+        if self.world_maps_to_slot(world, slot) { row } else { Self::no_row(row) }
+    }
+
+    /// #1034: 宛名 `world` (他の peer の行は写像、 自分の行は畳んだ先) が今も場所 `slot` を指すか ([`Self::remote_row_of`] /
+    /// [`Self::try_resolve_remote_ref_value`] が場所の最後の行を読んだ後の引き直し)。
+    fn world_maps_to_slot(&self, world: enchudb_oplog::EntityId, slot: u32) -> bool {
+        let peer = enchudb_oplog::eid_peer(world);
+        let to = if peer == self.peer_id() {
+            self.own_world_to_internal(world).map(enchudb_oplog::eid_local)
+        } else {
+            self.eid_translator.get(peer, enchudb_oplog::eid_local(world))
+        };
+        to.is_some_and(|l| self.generations().split(l).0 == slot)
+    }
+
+    /// #1034: 行の番号 `row` (世代 | 場所) の場所の bit を 1 つ変えた番号。 `row` の場所の最後の行とは決して合わない (場所の bit は 24 以上)
+    /// ので、 [`Self::remote_row_of`] が 「引いた行はもう場所に居ない」 を呼び手 (lock の下の照合) に渡すのに使う。
+    #[inline]
+    fn no_row(row: u32) -> u32 {
+        row ^ 1
     }
 
     /// #917: 中の eid `internal` の場所に、 [`Self::remote_row_of`] で取った行 `row` がまだ居るか (場所の最後の行か)。 lock の外で
@@ -28002,14 +28052,24 @@ impl Engine {
     /// 行の古い eid を的にした ref、 または覚えの無い時 (開き直した後 / 上限を越えた) の、 使い回す前の行宛ての record)、 今の逆写像を
     /// 使わない: 覚えを世代で引き、 無ければ None (WAL の eid / 値のまま = 自分の世界番号で出る)。 前は今の逆写像で出し、 消えた自分の
     /// 行宛ての record や ref が、 その場所を使い回した他の peer の行に当たった
+    ///
+    /// #1036: 覚えにも無く場所の最後の行でもない行は、 `prev.seg` の記録 (場所を使い回した時の前の住人) で引く
+    /// ([`Self::bridge_row_address`] / state の #924 と同じ): 翻訳した行なら記録の identity、 自分の行なら None。 前は覚えが無いと
+    /// (bridge が使い回しの所の後ろを読んだ後 / 開き直した後) None を返し、 消えた受けた行を指す ref を自分の世界番号で配って、 受け手に
+    /// 幻の行を作った。 記録でも分からない行 (同じ場所を 2 回以上使い回した前の住人) は今まで通り None。
     fn bridge_address(&self, local: u32, hlc: enchudb_oplog::Hlc) -> Option<(enchudb_oplog::PeerId, u32)> {
         use std::sync::atomic::Ordering;
         let gens = self.generations();
         let (slot, row_gen) = gens.split(local);
         let now = self.eid_translator.reverse(slot);
         let is_last_row = || row_gen == gens.split(self.last_local_of_slot(slot)).1;
+        let recorded = || {
+            gens.prev
+                .record_of(slot, local)
+                .and_then(|r| (r.kind == crate::prev_slots::PrevKind::Translated).then_some((r.peer, r.number)))
+        };
         if !self.former_addresses_on.load(Ordering::Acquire) {
-            return now.filter(|_| is_last_row());
+            return if is_last_row() { now } else { recorded() };
         }
         let fa = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
         let last = enchudb_oplog::Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX };
@@ -28021,8 +28081,11 @@ impl Engine {
             None if is_last_row() => return now,
             None => {}
         }
-        // 書いた時にもう場所の住人でなかった行: その行の世代の変わり目
-        fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen).and_then(|(_, v)| address(v.0))
+        // 書いた時にもう場所の住人でなかった行: その行の世代の変わり目 (覚えに無ければ記録)
+        match fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen) {
+            Some((_, v)) => address(v.0),
+            None => recorded(),
+        }
     }
 
     /// #916 (読み直し A2): bridge が自分の record の**行**の宛名を引く ([`Self::bridge_address`] と同じ引き方)。 `None` = 分からない:
@@ -28346,44 +28409,73 @@ impl Engine {
     ) -> Result<Option<u32>, RemoteApply> {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
-        // #731: 返すのは Ref の cell に置く値 = 指す行の 世代 | 場所。 段 4: wire の自分の世界番号は世代込み
-        if author_peer == self_peer {
-            // identity: 自分が author (#612: 畳んだ行は残す行へ)
-            return Ok(Some(match self.own_world_slot(foreign_value) {
-                Some(slot) => self.last_local_of_slot(self.forward_local(slot)),
-                // もう無い行 (場所を使い回した前の住人) を指す ref: その番号のまま置く = 消えた行を指す ref (読みは中身の無い行、
-                // 今の住人を指さない)
-                None => foreign_value,
-            }));
-        }
-        // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
-        // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
-        // target table を導けなければ None (caller が op を skip)。
-        self.debug_no_row_before_alloc(author_peer, foreign_value, "resolve_remote_ref_value");
-        let no_room = std::cell::Cell::new(false);
-        let slot = self.eid_translator.get_or_insert_waiting(
-            author_peer,
-            foreign_value,
-            || match self.alloc_translated_local_in_target_table(ref_himo_id) {
-                crate::eid_translator::Alloc::Got(local) => {
-                    // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
-                    // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
-                    self.restore_foreign_tombstone(author_peer, foreign_value, local);
-                    crate::eid_translator::Alloc::Got(local)
+        // #1034: 場所 (写像 / 畳んだ先) を引いた後に場所の最後の行を読む所は、 読んだ後に引き直す (`remote_row_of` と同じ)。 引いた
+        // 後・読む前に、 その行が消えて場所が使い回されると、 読んだのは使い回した新しい行。 引き直して外れていれば頭からもう一度
+        // (使い回しの後に届いた時と同じ道: 他の peer の行は写像の無い行の払い出し = 退避した削除を書き戻した死んだ場所)
+        loop {
+            // #731: 返すのは Ref の cell に置く値 = 指す行の 世代 | 場所。 段 4: wire の自分の世界番号は世代込み
+            if author_peer == self_peer {
+                // identity: 自分が author (#612: 畳んだ行は残す行へ)
+                let Some(slot) = self.own_world_slot(foreign_value) else {
+                    // もう無い行 (場所を使い回した前の住人) を指す ref: その番号のまま置く = 消えた行を指す ref (読みは中身の無い行、
+                    // 今の住人を指さない)
+                    return Ok(Some(foreign_value));
+                };
+                let to = self.forward_local(slot);
+                #[cfg(test)]
+                if let Some(wal) = self.oplog.as_ref() {
+                    resolved_row_hook::call(wal);
                 }
-                crate::eid_translator::Alloc::Retry => {
-                    no_room.set(true);
-                    crate::eid_translator::Alloc::Retry
+                if to == slot {
+                    // 畳んでいない行は確かめた番号そのもの (`own_world_slot` は場所の最後の行がこの番号の時だけ返す。 場所を読み直すと、
+                    // 確かめた後に消えて使い回した新しい行を指す)
+                    return Ok(Some(foreign_value));
                 }
-                other => other,
-            },
-            |slot| self.wait_busy_slot(slot),
-        );
-        match slot {
-            // 死んだ場所 (相手の削除を先に当てた / 作成より先に削除が届いた) は消えた行の世代 (次の住人を指さない)
-            Some(slot) => Ok(Some(self.last_local_of_slot(slot))),
-            None if no_room.get() => Err(RemoteApply::RejectedCapacity),
-            None => Ok(None),
+                let row = self.last_local_of_slot(to);
+                if self.forward_local(slot) == to {
+                    return Ok(Some(row));
+                }
+                continue;
+            }
+            // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
+            // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
+            // target table を導けなければ None (caller が op を skip)。
+            self.debug_no_row_before_alloc(author_peer, foreign_value, "resolve_remote_ref_value");
+            let no_room = std::cell::Cell::new(false);
+            let slot = self.eid_translator.get_or_insert_waiting(
+                author_peer,
+                foreign_value,
+                || match self.alloc_translated_local_in_target_table(ref_himo_id) {
+                    crate::eid_translator::Alloc::Got(local) => {
+                        // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
+                        // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
+                        self.restore_foreign_tombstone(author_peer, foreign_value, local);
+                        crate::eid_translator::Alloc::Got(local)
+                    }
+                    crate::eid_translator::Alloc::Retry => {
+                        no_room.set(true);
+                        crate::eid_translator::Alloc::Retry
+                    }
+                    other => other,
+                },
+                |slot| self.wait_busy_slot(slot),
+            );
+            return match slot {
+                // 死んだ場所 (相手の削除を先に当てた / 作成より先に削除が届いた) は消えた行の世代 (次の住人を指さない)
+                Some(slot) => {
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        resolved_row_hook::call(wal);
+                    }
+                    let row = self.last_local_of_slot(slot);
+                    if self.eid_translator.get(author_peer, foreign_value) != Some(slot) {
+                        continue;
+                    }
+                    Ok(Some(row))
+                }
+                None if no_room.get() => Err(RemoteApply::RejectedCapacity),
+                None => Ok(None),
+            };
         }
     }
 
@@ -29724,44 +29816,52 @@ impl Engine {
         foreign_eid: enchudb_oplog::EntityId,
         hlc: enchudb_oplog::Hlc,
     ) -> RemoteApply {
-        if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
-            // #917: 引いた行を、 行の lock の下でもう一度確かめる。 引いた後にその行が消えて場所が使い回されていれば、 引く前に
-            // 消えていた時と同じ下の道へ: 自分の行はもう無い自分の行の削除、 他の peer の行は写像の無い行の削除 (#925 の [B3]:
-            // 使い回す道が写像を場所を生かす前に外すので、 使い回された場所の写像はもう無い。 前は何もせずに捨て、 引いた時刻で
-            // #545 の名前の削除の時刻を上げるかが変わった)
-            let row = self.remote_row_of(foreign_eid, local_eid);
-            let r = self.remote_delete_apply_at_result(local_eid, row, hlc);
-            if r != RemoteApply::Stale || self.remote_row_holds(local_eid, row) {
-                return r;
-            }
-        }
-        self.observe_remote_hlc(hlc);
-        let owner = enchudb_oplog::eid_peer(foreign_eid);
-        let lww = |applied: bool| if applied { RemoteApply::Applied } else { RemoteApply::Stale };
-        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除。 その行は消えている。 #915: 使い回す時に移した削除の
-        // 版数より新しければ、 名前の削除の時刻を上げる
-        if owner == self.peer_id.load(std::sync::atomic::Ordering::Acquire) {
-            return lww(self.raise_gone_own_delete(enchudb_oplog::eid_local(foreign_eid), hlc));
-        }
-        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        let before = self.foreign_tombstone_of(owner, foreign_local);
-        self.debug_assert_no_user_row("remote_delete_apply_foreign");
-        match self
-            .eid_translator
-            .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
-        {
-            Ok(accepted) => {
-                // #545: 消えた行の slot を使い回して写像が外れた entity に、 より新しい削除が届いた。 その行の名前の削除の時刻を上げ、
-                // その名前を今持つ行のうち、 この削除より前にその名前になった行を消す (`remote_delete_apply` の 2 人目の削除と同じ)
-                if accepted && before.is_some_and(|t| hlc > t) {
-                    self.raise_identity_names(owner, foreign_local, hlc);
+        // #1034: 下の写像のある枝で引いた行が、 引いた後に消えて場所を使い回されていれば (`remote_row_of` が写像を引き直して外す)、
+        // 頭からもう一度 (写像の無い行の削除へ)。 回るのは、 写像を引いてから世代を読むまでの間に使い回しが重なった時だけ
+        loop {
+            if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
+                // #917: 引いた行を、 行の lock の下でもう一度確かめる。 引いた後にその行が消えて場所が使い回されていれば、 引く前に
+                // 消えていた時と同じ下の道へ: 自分の行はもう無い自分の行の削除、 他の peer の行は写像の無い行の削除 (#925 の [B3]:
+                // 使い回す道が写像を場所を生かす前に外すので、 使い回された場所の写像はもう無い。 前は何もせずに捨て、 引いた時刻で
+                // #545 の名前の削除の時刻を上げるかが変わった)
+                let row = self.remote_row_of(foreign_eid, local_eid);
+                let r = self.remote_delete_apply_at_result(local_eid, row, hlc);
+                if r != RemoteApply::Stale || self.remote_row_holds(local_eid, row) {
+                    return r;
                 }
-                lww(accepted)
             }
-            Err(local) => {
-                let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-                let local_eid = enchudb_oplog::make_eid(self_peer, local);
-                self.remote_delete_apply_at_result(local_eid, self.remote_row_of(foreign_eid, local_eid), hlc)
+            self.observe_remote_hlc(hlc);
+            let owner = enchudb_oplog::eid_peer(foreign_eid);
+            let lww = |applied: bool| if applied { RemoteApply::Applied } else { RemoteApply::Stale };
+            // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除。 その行は消えている。 #915: 使い回す時に移した削除の
+            // 版数より新しければ、 名前の削除の時刻を上げる
+            if owner == self.peer_id.load(std::sync::atomic::Ordering::Acquire) {
+                return lww(self.raise_gone_own_delete(enchudb_oplog::eid_local(foreign_eid), hlc));
+            }
+            let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+            let before = self.foreign_tombstone_of(owner, foreign_local);
+            self.debug_assert_no_user_row("remote_delete_apply_foreign");
+            match self
+                .eid_translator
+                .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
+            {
+                Ok(accepted) => {
+                    // #545: 消えた行の slot を使い回して写像が外れた entity に、 より新しい削除が届いた。 その行の名前の削除の時刻を上げ、
+                    // その名前を今持つ行のうち、 この削除より前にその名前になった行を消す (`remote_delete_apply` の 2 人目の削除と同じ)
+                    if accepted && before.is_some_and(|t| hlc > t) {
+                        self.raise_identity_names(owner, foreign_local, hlc);
+                    }
+                    return lww(accepted);
+                }
+                Err(local) => {
+                    let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+                    let local_eid = enchudb_oplog::make_eid(self_peer, local);
+                    let row = self.remote_row_of(foreign_eid, local_eid);
+                    let r = self.remote_delete_apply_at_result(local_eid, row, hlc);
+                    if r != RemoteApply::Stale || self.remote_row_holds(local_eid, row) {
+                        return r;
+                    }
+                }
             }
         }
     }
@@ -35222,9 +35322,9 @@ impl Engine {
                 }
             }
         }
-        // review946c [E]: 開く時に `prev.seg` の記録から戻した自分の行の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
-        // 前の住人の番号で載せる (bridge は記録から自分の世界番号と引く)
-        for (gone, h) in self.generations().prev.take_restored_own() {
+        // review946c [E]: 開く時に `prev.seg` の記録から戻した前の住人の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
+        // 前の住人の番号で載せる (bridge は記録から自分の世界番号 / 翻訳した行の持ち主の世界番号 (#1035) と引く)
+        for (gone, h) in self.generations().prev.take_restored_deletes() {
             if unlogged(h) {
                 deletes.push((h, gone));
             }
@@ -46370,6 +46470,177 @@ mod remote_row_tests {
         assert_eq!(eng.remote_tieleaf_apply(f, n, b"f", t0), RemoteApply::Applied);
         assert!(eng.entities.is_live(slot(f)), "TieLeaf だけで届いた行が生きていない");
         assert_eq!(eng.get_text_owned(f, "t.n").as_deref(), Some(&b"f"[..]));
+    }
+
+    /// 枠 1 の表 t (列 v) と、 t を指す Ref の列 r を持つ表 s の sync の DB。
+    fn ref_engine(tag: &str) -> (Rm, Arc<Engine>, u16) {
+        let path = std::env::temp_dir()
+            .join(format!("enchudb-r038b3-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&path);
+        let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.define_table("s", 4).unwrap();
+        let r = eng.define_ref_in("s", "r", "t").unwrap() as u16;
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        (Rm(path), eng, r)
+    }
+
+    /// 0.38 前 review の B3 (Delete): peer 2 の行 F (受けて写像のある翻訳した行) を peer 2 の削除で消した後、 別の peer のより新しい
+    /// 削除 (2 人目) を当てる受信が、 写像で場所を引いた後・場所の最後の行 (世代) を読む前に、 アプリが枠の満杯な表に足して F の場所を
+    /// Y が使い回す。 Y は残る (2 人目の削除は消えた F の物)。
+    ///
+    /// 前は `remote_row_of` が使い回した後の場所の最後の行 = Y を 「その行」 として取り、 行の lock の下の照合 (Y がまだ場所の最後の行か)
+    /// も通って Y を消した (#917 / #925 の割り込み点は全部 `remote_row_of` の後で、 写像を引いてから世代を読むまでの窓が残っていた)。
+    ///
+    /// falsify: `remote_row_of` の、 世代を読んだ後に写像がまだ場所を指すかの引き直しを外すと、 Y が消える。
+    #[test]
+    fn b3_a_second_delete_resolved_before_the_slot_is_reused_does_not_delete_the_new_row() {
+        let (_rm, eng) = engine("b3del");
+        let v = eng.himo_id("t.v").unwrap() as u16;
+        let world = enchudb_oplog::make_eid(2, 100);
+        let f = eng.resolve_remote_eid(world, v).unwrap();
+        let t0 = enchudb_oplog::Hlc { wall: 1_000_000, logical: 0, peer: 2 };
+        assert!(eng.remote_tie_apply_result(f, v, 1u32, t0).applied(), "前提: F を受けた");
+        let first = enchudb_oplog::Hlc { wall: 2_000_000, logical: 0, peer: 2 };
+        assert_eq!(eng.remote_delete_apply_foreign_result(world, first), RemoteApply::Applied, "前提: F を消した");
+        assert_eq!(eng.resolve_remote_eid_existing(world), Some(f), "前提: 写像は使い回すまで残る");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(&eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            *m.lock().unwrap() = Some(y);
+        });
+        let second = enchudb_oplog::Hlc { wall: 3_000_000, logical: 0, peer: 3 };
+        let _ = eng.remote_delete_apply_foreign_result(world, second);
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(f), "前提: Y は F の場所を使い回した");
+        assert!(eng.is_live(y), "F 宛ての 2 人目の削除が、 写像を引いた後に場所を使い回した Y を消した");
+        assert_eq!(eng.get(y, "t.v"), Some(2));
+        assert!(eng.resolve_remote_eid_existing(world).is_none(), "使い回しが F の写像を外していない");
+    }
+
+    /// 0.38 前 review の B3 (Ref の値): 受信の Ref の値 (peer 2 の行 F = 消えた行を指す) を写像で引いた後・場所の最後の行を読む前に、
+    /// アプリが F の場所を Y で使い回す。 値は Y を指さない (使い回しの後に届いた時と同じく、 消えた F を指す)。
+    ///
+    /// falsify: `try_resolve_remote_ref_value` の、 世代を読んだ後に写像がまだ場所を指すかの引き直しを外すと、 値が Y になる。
+    #[test]
+    fn b3_a_ref_value_resolved_before_the_slot_is_reused_does_not_point_at_the_new_row() {
+        let (_rm, eng, r) = ref_engine("refv");
+        let v = eng.himo_id("t.v").unwrap() as u16;
+        let world = enchudb_oplog::make_eid(2, 100);
+        let f = eng.resolve_remote_eid(world, v).unwrap();
+        let t0 = enchudb_oplog::Hlc { wall: 1_000_000, logical: 0, peer: 2 };
+        assert!(eng.remote_tie_apply_result(f, v, 1u32, t0).applied(), "前提: F を受けた");
+        let gone = enchudb_oplog::Hlc { wall: 2_000_000, logical: 0, peer: 2 };
+        assert_eq!(eng.remote_delete_apply_foreign_result(world, gone), RemoteApply::Applied, "前提: F を消した");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(&eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            *m.lock().unwrap() = Some(y);
+        });
+        let value = eng.try_resolve_remote_ref_value(2, 100, r);
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(f), "前提: Y は F の場所を使い回した");
+        let value = value.expect("前提: 払い出せた").expect("前提: 的の表がある");
+        assert_ne!(value, enchudb_oplog::eid_local(y), "消えた F を指す Ref の値が、 写像を引いた後に場所を使い回した Y を指した");
+        assert!(!eng.is_live(enchudb_oplog::make_eid(1, value)), "Ref の値が生きた行を指した");
+    }
+
+    /// 0.38 前 review の B3 (Ref の値、 自分の行): 受信の Ref の値 (自分の行 X を指す、 世界番号は世代込み) の行を確かめた後・場所の最後の
+    /// 行を読む前に、 アプリが X を消して場所を Y で使い回す。 値は Y を指さない (確かめた X の番号)。
+    ///
+    /// falsify: 自分の行の枝で場所の最後の行を読み直すと (前の形)、 値が Y になる。
+    #[test]
+    fn b3_an_own_ref_value_checked_before_the_slot_is_reused_does_not_point_at_the_new_row() {
+        let (_rm, eng, r) = ref_engine("refown");
+        let x0 = eng.entity_in("t").unwrap();
+        eng.delete(x0);
+        let x = eng.entity_in("t").unwrap();
+        assert_ne!(x, x0, "前提: 場所を使い回して v15 に移った");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(&eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            e.delete(x);
+            let y = e.entity_in("t").unwrap();
+            *m.lock().unwrap() = Some(y);
+        });
+        let value = eng.try_resolve_remote_ref_value(1, enchudb_oplog::eid_local(x), r);
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
+        assert_eq!(value, Ok(Some(enchudb_oplog::eid_local(x))), "X を指す Ref の値が、 確かめた後に場所を使い回した Y を指した");
+    }
+
+    /// `ref_engine` の DB を v15 にし、 自分の行 X を自分の行 K に畳む (#612、 X の世界番号は K の別名)。 (X, K) を返す。
+    fn folded_own_row(eng: &Arc<Engine>) -> (u64, u64) {
+        let a = eng.entity_in("t").unwrap();
+        eng.delete(a);
+        let x = eng.entity_in("t").unwrap();
+        assert_ne!(x, a, "前提: 場所を使い回して v15 に移った");
+        eng.tie_to(x, "t.v", 1u32);
+        let k = eng.entity_in("t").unwrap();
+        eng.tie_to(k, "t.v", 2u32);
+        eng.merge_entity_into(x, k).expect("前提: X を K に畳んだ");
+        (x, k)
+    }
+
+    /// 割り込み点で K を消して、 K の場所を新しい行 W (v = 7) に使い回させる (畳んだ X の場所は使い回さない)。 W の eid を返す入れ物。
+    fn reuse_fold_target_in_hook(eng: &Arc<Engine>, k: u64) -> Arc<Mutex<Option<u64>>> {
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            e.delete(k);
+            let w = e.entity_in("t").unwrap();
+            e.tie_to(w, "t.v", 7u32);
+            *m.lock().unwrap() = Some(w);
+        });
+        made
+    }
+
+    /// #1034 の読み直し [F2] (畳んだ自分の行の枝): 受信の Delete (畳んだ自分の行 X の世界番号宛て = 畳んだ先 K に当たる) を引いた後・
+    /// 世代を読む前に、 アプリが K を消して K の場所を W が使い回す。 W は残る (`remote_row_of` の畳んだ先を読む枝の引き直し)。
+    ///
+    /// falsify: `remote_row_of` の写像 (畳んだ先) の引き直しを外すと、 W が消える。
+    #[test]
+    fn f2_a_delete_of_a_folded_own_row_resolved_before_its_target_is_reused_does_not_delete_the_new_row() {
+        let (_rm, eng, _r) = ref_engine("f2del");
+        let (x, k) = folded_own_row(&eng);
+        assert_eq!(eng.resolve_remote_eid_existing(x).map(slot), Some(slot(k)), "前提: X の世界番号は K に当たる");
+        let made = reuse_fold_target_in_hook(&eng, k);
+        let later = enchudb_oplog::Hlc { wall: eng.cell_hlc(k, eng.himo_id("t.v").unwrap() as u16).wall + 10_000_000_000, logical: 0, peer: 2 };
+        let _ = eng.remote_delete_apply_foreign_result(x, later);
+        let w = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(w), slot(k), "前提: W は K の場所を使い回した");
+        assert!(eng.is_live(w), "畳んだ X 宛ての Delete が、 畳んだ先 K の場所を使い回した W を消した");
+        assert_eq!(eng.get(w, "t.v"), Some(7));
+    }
+
+    /// #1034 の読み直し [F2] (Ref の値の畳んだ自分の行の枝): 受信の Ref の値 (畳んだ自分の行 X を指す) の畳んだ先 K を引いた後・K の場所の
+    /// 最後の行を読む前に、 アプリが K を消して K の場所を W が使い回す。 値は W を指さない。
+    ///
+    /// falsify: `try_resolve_remote_ref_value` の畳んだ先の引き直し (`forward_local(slot) == to`) を外すと、 値が W になる。
+    #[test]
+    fn f2_a_ref_value_to_a_folded_own_row_resolved_before_its_target_is_reused_does_not_point_at_the_new_row() {
+        let (_rm, eng, r) = ref_engine("f2ref");
+        let (x, k) = folded_own_row(&eng);
+        let made = reuse_fold_target_in_hook(&eng, k);
+        let value = eng.try_resolve_remote_ref_value(1, enchudb_oplog::eid_local(x), r);
+        let w = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(w), slot(k), "前提: W は K の場所を使い回した");
+        let value = value.expect("前提: 払い出せた").expect("前提: 的の表がある");
+        assert_ne!(value, enchudb_oplog::eid_local(w), "畳んだ X を指す Ref の値が、 畳んだ先を引いた後に場所を使い回した W を指した");
     }
 }
 
