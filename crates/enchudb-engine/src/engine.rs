@@ -5656,6 +5656,107 @@ mod review038_d_tests {
     }
 }
 
+/// 集計の速い道 (`Engine::fold_eids`、 #1041 の照合を loop の外に出した道): 始めに表に世代 > 0 の場所が無ければ eid ごとに照合せずに
+/// 読み、 終わりに表の印を見直して、 途中で使い回しが入りえたら照合つきでやり直す。 割り込み点 `fast_read_hook` (速い道が照合せずに場所を
+/// 読む前) で行を消して場所を使い回し、 新しい住人が同じ列に書く。 v14 の DB (使い回しが v15 に移らせる) と、 v15 の DB で印の無い表
+/// (別の表で使い回して v15 に移った) の両方で、 集計が消えた行を何も数えない (やり直しの道の答え)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod aggregate_fast_path_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// 枠 1 の表 `s` (a / g / w = 64 bit) と枠 1 の表 `spare` を持つ engine (v14)。 `v15` なら `spare` で使い回して v15 に移す (`s` は
+    /// 使い回しの無いまま)。 返り値の 2 つ目は `s` の生きている行。
+    fn engine(tag: &str, v15: bool) -> (String, Arc<Engine>, enchudb_oplog::EntityId) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-aggfast-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("s", 1).unwrap();
+        eng.define_himo_in("s", "a", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("s", "g", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("s", "w", ValueType::Number64, 0).unwrap();
+        eng.define_table("spare", 1).unwrap();
+        eng.define_himo_in("spare", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        if v15 {
+            let x = eng.entity_in("spare").unwrap();
+            eng.delete(x);
+            let y = eng.entity_in("spare").unwrap();
+            assert_ne!(x, y, "前提: spare で使い回して v15 に移った");
+        }
+        let a = eng.entity_in("s").unwrap();
+        (path, eng, a)
+    }
+
+    #[test]
+    fn aggregates_redo_with_checks_when_a_slot_is_reused_meanwhile() {
+        for v15 in [false, true] {
+            for which in ["sum", "group_sum", "count", "min64", "histogram_eids", "sum_eids_par"] {
+                let (path, eng, a) = engine("redo", v15);
+                let id = |n: &str| eng.himo_id(n).unwrap() as u16;
+                let (sa, sg, sw) = (id("s.a"), id("s.g"), id("s.w"));
+                eng.tie_to_by_id(a, sa, 7u32);
+                eng.tie_to_by_id(a, sg, 3u32);
+                eng.tie_to_by_id(a, sw, 70u64);
+                let tid = eng.himo_to_table[sa as usize].load(std::sync::atomic::Ordering::Relaxed);
+                assert!(!eng.generations().table_has(tid), "前提: s に世代 > 0 の場所が無い (速い道で始まる)");
+                assert_eq!(eng.generations().active(), v15, "前提");
+                let (tx, rx) = std::sync::mpsc::channel();
+                let e2 = eng.clone();
+                fast_read_hook::set(move || {
+                    // 速い道が照合せずに場所を読む前に、 a を消して同じ場所を使い回し (枠 1 の表。 v14 なら v15 に移る)、 新しい住人 b が書く
+                    e2.delete(a);
+                    let b = e2.entity_in("s").unwrap();
+                    assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(a), "前提: 同じ場所を使い回した");
+                    e2.tie_to_by_id(b, sa, 8u32);
+                    e2.tie_to_by_id(b, sg, 4u32);
+                    e2.tie_to_by_id(b, sw, 80u64);
+                    tx.send(()).unwrap();
+                });
+                let got = match which {
+                    "sum" => format!("{}", eng.sum("s.a", &[a])),
+                    "group_sum" => format!("{:?}", eng.group_sum("s.g", "s.a", &[a])),
+                    "count" => format!("{}", eng.count("s.a", &[a])),
+                    "min64" => format!("{:?}", eng.min64("s.w", &[a])),
+                    "histogram_eids" => format!("{:?}", eng.histogram_eids("s.a", &[a], 0, 9, 10)),
+                    "sum_eids_par" => format!("{}", eng.sum_eids_par("s.a", &[a])),
+                    _ => unreachable!(),
+                };
+                rx.try_recv().unwrap_or_else(|_| panic!("v15={v15} {which}: 前提: 速い道の割り込み点で使い回した"));
+                assert!(eng.generations().table_has(tid), "v15={v15} {which}: 前提: 使い回しで s に印が立った");
+                let want = match which {
+                    "group_sum" => "[]".to_string(),
+                    "min64" => "None".to_string(),
+                    "histogram_eids" => format!("{:?}", vec![0u32; 10]),
+                    _ => "0".to_string(),
+                };
+                assert_eq!(got, want, "v15={v15} {which}: 速い道が読みの間に使い回された行の値 (新しい住人の値) を数えた (終わりの確かめでやり直していない)");
+                drop(eng);
+                let _ = crate::db_files::remove_db(&path);
+                let _ = std::fs::remove_file(oplog_path_for(&path));
+            }
+        }
+    }
+
+    /// 対照: 使い回しの無い集計は速い道のまま (割り込み点を通る) で、 照合つきの道と同じ答え。
+    #[test]
+    fn aggregates_on_a_table_without_reuse_take_the_fast_path() {
+        let (path, eng, a) = engine("fast", true);
+        let sa = eng.himo_id("s.a").unwrap() as u16;
+        eng.tie_to_by_id(a, sa, 7u32);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = fired.clone();
+        fast_read_hook::set(move || f2.store(true, std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(eng.sum("s.a", &[a]), 7);
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "使い回しの無い表の集計が速い道を通らなかった");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
 /// #1015: lock を取らない読みの入口 (`read_app_in`) の速い道の境目。 get の道 (`read_app_acquired` = 読んだ後の fence なし、 列の cell の
 /// Acquire に頼る) と fence のある道 (`read_app`) の両方で、 照合の後・読み直しの前に行が消えて場所が使い回された読みは None。 場所の
 /// page に 「世代 > 0 がある」 印が無い (照合は世代の 2 B を読まない) まま始まり、 読みの間に印が立つ形 (その page で最初の使い回し) と、
@@ -31836,13 +31937,7 @@ impl Engine {
     pub fn sum(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u64 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
-        let mut total: u64 = 0;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                total += v as u64;
-            }
-        }
-        total
+        self.fold_eids::<true, u64, u32>(&[hid], eids, || 0, |l| hs.get_value32(l), |t, v| *t += v as u64)
     }
 
     /// 0.8.6: himo 値が `[lo, hi]` (両端含む) の範囲に入る entity 全件を、
@@ -32523,40 +32618,28 @@ impl Engine {
     pub fn min(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
-        let mut result: Option<u32> = None;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                result = Some(result.map_or(v, |cur: u32| cur.min(v)));
-            }
-        }
-        result
+        self.fold_eids::<true, Option<u32>, u32>(&[hid], eids, || None, |l| hs.get_value32(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.min(v)));
+        })
     }
 
     /// 最大値
     pub fn max(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
-        let mut result: Option<u32> = None;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                result = Some(result.map_or(v, |cur: u32| cur.max(v)));
-            }
-        }
-        result
+        self.fold_eids::<true, Option<u32>, u32>(&[hid], eids, || None, |l| hs.get_value32(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.max(v)));
+        })
     }
 
     /// 平均（整数除算）
     pub fn avg(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
-        let mut total: u64 = 0;
-        let mut count: u64 = 0;
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
-                total += v as u64;
-                count += 1;
-            }
-        }
+        let (total, count) = self.fold_eids::<true, (u64, u64), u32>(&[hid], eids, || (0, 0), |l| hs.get_value32(l), |a, v| {
+            a.0 += v as u64;
+            a.1 += 1;
+        });
         if count == 0 { None } else { Some(total / count) }
     }
 
@@ -32564,11 +32647,7 @@ impl Engine {
     pub fn count(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u32 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
-        let mut n: u32 = 0;
-        for &eid in eids {
-            if self.read_app_acquired(eid, |l| hs.get_value(l)).is_some() { n += 1; }
-        }
-        n
+        self.fold_eids::<true, u32, u64>(&[hid], eids, || 0, |l| hs.get_value(l), |n, _| *n += 1)
     }
 
     /// GROUP BY + SUM — group_himo の値でグループ化し、sum_himo の値を合計
@@ -32580,14 +32659,14 @@ impl Engine {
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let ss = &self.himos[sid];
-        let cap = self.group_dense_cap(gid);
-        if let Some(cap) = cap {
-            let mut sums: Vec<u64> = vec![0; cap];
-            let mut seen: Vec<bool> = vec![false; cap];
-            let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
+        let read = |l: u32| gs.get_value32(l).zip(ss.get_value32(l));
+        if let Some(cap) = self.group_dense_cap(gid) {
+            let (sums, seen, spill) = self.fold_eids::<true, (Vec<u64>, Vec<bool>, std::collections::HashMap<u32, u64>), (u32, u32)>(
+                &[gid, sid],
+                eids,
+                || (vec![0; cap], vec![false; cap], std::collections::HashMap::new()),
+                read,
+                |(sums, seen, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -32595,19 +32674,15 @@ impl Engine {
                     } else {
                         *spill.entry(group).or_insert(0) += val as u64;
                     }
-                }
-            }
+                },
+            );
             let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, sums[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
-                    *map.entry(group).or_insert(0) += val as u64;
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u64>, (u32, u32)>(&[gid, sid], eids, std::collections::HashMap::new, read, |map, (group, val)| {
+                *map.entry(group).or_insert(0) += val as u64;
+            });
             map.into_iter().collect()
         }
     }
@@ -32672,27 +32747,25 @@ impl Engine {
     pub fn group_count(&self, group_himo: &str, eids: &[enchudb_oplog::EntityId]) -> Vec<(u32, u32)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
+        let read = |l: u32| gs.get_value32(l);
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut counts: Vec<u32> = vec![0; cap];
-            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
-                    match counts.get_mut(group as usize) {
-                        Some(c) => *c += 1,
-                        None => *spill.entry(group).or_insert(0) += 1,
-                    }
-                }
-            }
+            let (counts, spill) = self.fold_eids::<true, (Vec<u32>, std::collections::HashMap<u32, u32>), u32>(
+                &[gid],
+                eids,
+                || (vec![0; cap], std::collections::HashMap::new()),
+                read,
+                |(counts, spill), group| match counts.get_mut(group as usize) {
+                    Some(c) => *c += 1,
+                    None => *spill.entry(group).or_insert(0) += 1,
+                },
+            );
             let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| counts[i] > 0).map(|i| (i as u32, counts[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
-                    *map.entry(group).or_insert(0) += 1;
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u32>, u32>(&[gid], eids, std::collections::HashMap::new, read, |map, group| {
+                *map.entry(group).or_insert(0) += 1;
+            });
             map.into_iter().collect()
         }
     }
@@ -32703,13 +32776,14 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
+        let read = |l: u32| gs.get_value32(l).zip(vs.get_value32(l));
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut mins: Vec<u32> = vec![u32::MAX; cap];
-            let mut seen: Vec<bool> = vec![false; cap];
-            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+            let (mins, seen, spill) = self.fold_eids::<true, (Vec<u32>, Vec<bool>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+                &[gid, vid],
+                eids,
+                || (vec![u32::MAX; cap], vec![false; cap], std::collections::HashMap::new()),
+                read,
+                |(mins, seen, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
                         if val < mins[i] { mins[i] = val; }
@@ -32718,20 +32792,16 @@ impl Engine {
                         let entry = spill.entry(group).or_insert(u32::MAX);
                         if val < *entry { *entry = val; }
                     }
-                }
-            }
+                },
+            );
             let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, mins[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
-                    let entry = map.entry(group).or_insert(u32::MAX);
-                    if val < *entry { *entry = val; }
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u32>, (u32, u32)>(&[gid, vid], eids, std::collections::HashMap::new, read, |map, (group, val)| {
+                let entry = map.entry(group).or_insert(u32::MAX);
+                if val < *entry { *entry = val; }
+            });
             map.into_iter().collect()
         }
     }
@@ -32742,35 +32812,32 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
+        let read = |l: u32| gs.get_value32(l).zip(vs.get_value32(l));
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut maxs: Vec<u32> = vec![0; cap];
-            let mut seen: Vec<bool> = vec![false; cap];
-            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+            let (mins, seen, spill) = self.fold_eids::<true, (Vec<u32>, Vec<bool>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+                &[gid, vid],
+                eids,
+                || (vec![0; cap], vec![false; cap], std::collections::HashMap::new()),
+                read,
+                |(mins, seen, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
-                        if val > maxs[i] { maxs[i] = val; }
+                        if val > mins[i] { mins[i] = val; }
                         seen[i] = true;
                     } else {
                         let entry = spill.entry(group).or_insert(0);
                         if val > *entry { *entry = val; }
                     }
-                }
-            }
-            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, maxs[i])).collect();
+                },
+            );
+            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, mins[i])).collect();
             Self::push_spilled(&mut out, spill);
             out
         } else {
-            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
-                    let entry = map.entry(group).or_insert(0);
-                    if val > *entry { *entry = val; }
-                }
-            }
+            let map = self.fold_eids::<true, std::collections::HashMap<u32, u32>, (u32, u32)>(&[gid, vid], eids, std::collections::HashMap::new, read, |map, (group, val)| {
+                let entry = map.entry(group).or_insert(0);
+                if val > *entry { *entry = val; }
+            });
             map.into_iter().collect()
         }
     }
@@ -32781,13 +32848,14 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
+        let read = |l: u32| gs.get_value32(l).zip(vs.get_value32(l));
         if let Some(cap) = self.group_dense_cap(gid) {
-            let mut sums: Vec<u64> = vec![0; cap];
-            let mut cnts: Vec<u64> = vec![0; cap];
-            let mut spill: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
+            let (sums, cnts, spill) = self.fold_eids::<true, (Vec<u64>, Vec<u64>, std::collections::HashMap<u32, (u64, u64)>), (u32, u32)>(
+                &[gid, vid],
+                eids,
+                || (vec![0; cap], vec![0; cap], std::collections::HashMap::new()),
+                read,
+                |(sums, cnts, spill), (group, val)| {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -32797,21 +32865,17 @@ impl Engine {
                         e.0 += val as u64;
                         e.1 += 1;
                     }
-                }
-            }
+                },
+            );
             let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| cnts[i] > 0).map(|i| (i as u32, sums[i] / cnts[i])).collect();
             Self::push_spilled(&mut out, spill.into_iter().map(|(k, (s, n))| (k, s / n)));
             out
         } else {
-            let mut acc: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
-            for &eid in eids {
-                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
-                    let e = acc.entry(group).or_insert((0, 0));
-                    e.0 += val as u64;
-                    e.1 += 1;
-                }
-            }
+            let acc = self.fold_eids::<true, std::collections::HashMap<u32, (u64, u64)>, (u32, u32)>(&[gid, vid], eids, std::collections::HashMap::new, read, |acc, (group, val)| {
+                let e = acc.entry(group).or_insert((0, 0));
+                e.0 += val as u64;
+                e.1 += 1;
+            });
             acc.into_iter().map(|(k, (s, n))| (k, s / n)).collect()
         }
     }
@@ -32850,6 +32914,158 @@ impl Engine {
         if v > *entry { *entry = v; }
     }
 
+    // ──── eid の並びを受ける集計の読み (#1041 の照合を loop の外に出す) ────
+
+    /// eid の並びを受ける集計の本体: eid ごとに `read(場所)` で読み、 読めた値を `add` で `init()` の上に積む。 読みは 2 つの道:
+    ///
+    /// - 速い道 ([`Self::fast_eid_reads`] が始めに許した時): eid の local が表の最初の枠の中 (= 世代 0 の場所) ならその場所を照合せずに
+    ///   読む (枠の外の eid だけ照合つき、 loop の外の関数)。 終わりに [`Self::fast_eid_reads_held`] が許し続けているかを見て、 だめなら
+    ///   (途中で表に世代 > 0 の場所ができた = 使い回しが入りえた) 照合つきの道でやり直す
+    /// - 照合つきの道 ([`Self::fold_eids_checked`]): eid ごとに読む前と後に世代を照合する (#1041)。 `ACQ` = `read` が列の cell を
+    ///   Acquire で読む (`get_value` / `get_value32`、 fence の無い `read_app_acquired`)、 でなければ fence のある `read_app` (列の生の並び
+    ///   `stored_slice`)
+    ///
+    /// 照合の 3 つの道 (`read_app_in`) を速い道の loop に展開しない (#1041 の値段: 展開すると v14 の DB でも loop が太り、 列の pointer を
+    /// 毎回 stack から読み直して 15〜28% 遅くなった)。
+    #[inline(always)]
+    fn fold_eids<const ACQ: bool, A, V>(
+        &self,
+        hids: &[usize],
+        eids: &[enchudb_oplog::EntityId],
+        init: impl Fn() -> A,
+        read: impl Fn(u32) -> Option<V>,
+        add: impl Fn(&mut A, V),
+    ) -> A {
+        if let Some(fast) = self.fast_eid_reads(hids) {
+            let mut acc = init();
+            for &eid in eids {
+                let v = match fast.slot(eid) {
+                    Some(slot) => {
+                        #[cfg(test)]
+                        fast_read_hook::call();
+                        read(slot)
+                    }
+                    None => self.read_app_outlined::<ACQ, V>(eid, &read),
+                };
+                if let Some(v) = v {
+                    add(&mut acc, v);
+                }
+            }
+            if self.fast_eid_reads_held(fast) {
+                return acc;
+            }
+        }
+        self.fold_eids_checked::<ACQ, A, V>(eids, init(), &read, &add)
+    }
+
+    /// [`Self::fold_eids`] の照合つきの道 (eid ごとに読む前と後に照合する)。 loop の外の関数。
+    #[inline(never)]
+    fn fold_eids_checked<const ACQ: bool, A, V>(
+        &self,
+        eids: &[enchudb_oplog::EntityId],
+        mut acc: A,
+        read: &impl Fn(u32) -> Option<V>,
+        add: &impl Fn(&mut A, V),
+    ) -> A {
+        for &eid in eids {
+            let v = if ACQ { self.read_app_acquired(eid, read) } else { self.read_app(eid, read) };
+            if let Some(v) = v {
+                add(&mut acc, v);
+            }
+        }
+        acc
+    }
+
+    /// [`Self::fold_eids`] の並列の版 (`eids` を `PAR_RANGE_CHUNK` ずつ rayon で、 chunk の答えを `merge` でまとめる)。 速い道の
+    /// 終わりの確かめは全部の chunk の後に 1 回 (`ACQ` でない読みは chunk の終わりに fence を置く: 列の生の並びを読んだ worker の読みを、
+    /// 終わりの確かめより前に揃える)。
+    fn par_fold_eids<const ACQ: bool, A: Send, V>(
+        &self,
+        hids: &[usize],
+        eids: &[enchudb_oplog::EntityId],
+        init: impl Fn() -> A + Sync + Send,
+        read: impl Fn(u32) -> Option<V> + Sync,
+        add: impl Fn(&mut A, V) + Sync,
+        merge: impl Fn(A, A) -> A + Sync + Send,
+    ) -> A {
+        use rayon::prelude::*;
+        if let Some(fast) = self.fast_eid_reads(hids) {
+            let acc = eids
+                .par_chunks(Self::PAR_RANGE_CHUNK)
+                .map(|chunk| {
+                    let mut acc = init();
+                    for &eid in chunk {
+                        let v = match fast.slot(eid) {
+                            Some(slot) => read(slot),
+                            None => self.read_app_outlined::<ACQ, V>(eid, &read),
+                        };
+                        if let Some(v) = v {
+                            add(&mut acc, v);
+                        }
+                    }
+                    if !ACQ {
+                        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                    }
+                    acc
+                })
+                .reduce(&init, &merge);
+            if self.fast_eid_reads_held(fast) {
+                return acc;
+            }
+        }
+        eids.par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| self.fold_eids_checked::<ACQ, A, V>(chunk, init(), &read, &add))
+            .reduce(&init, &merge)
+    }
+
+    /// 照合つきの読み 1 つ (速い道の、 表の最初の枠の外の eid 用)。 loop に展開しない。
+    #[cold]
+    #[inline(never)]
+    fn read_app_outlined<const ACQ: bool, V>(&self, eid: enchudb_oplog::EntityId, read: &impl Fn(u32) -> Option<V>) -> Option<V> {
+        if ACQ { self.read_app_acquired(eid, read) } else { self.read_app(eid, read) }
+    }
+
+    /// 集計の速い道 ([`Self::fold_eids`]) を始めてよいか。 よいのは、 読む紐 `hids` が全部同じ名前のある表 T の物で (anonymous の紐は
+    /// 照合つき)、 T に世代 > 0 の場所が無く (`Generations::table_has`、 世代を持たない DB はいつも無い)、 畳んだ自分の行の別名 (#612、
+    /// 照合が別名をたどる) が無い時。
+    ///
+    /// 速い道の正しさ (終わりに [`Self::fast_eid_reads_held`] が同じことを確かめた時):
+    /// - T の場所を別の行が使い回すのは、 前の住人の世代を上げた後だけ: v15 の消す道の kill (`live_free` → `kill_generation`)、 v15 に移る
+    ///   手順 (`move_to_generations`) の 4. (v14 の間に消えた場所を世代 1 に)。 世代を上げる道はどれも、 上げる前に T の印を立てる
+    ///   (`mark_table`、 AcqRel の RMW、 印は下ろさない)。 v14 の DB は使い回す前に必ず移る手順を通る (最初の使い回しが移らせる) ので、
+    ///   v14 の間 (印が無い・gen.seg が無い) に使い回しは無い
+    /// - 使い回した後の住人の書き込みは印より後: 印 → 世代 → 生きている印を下ろす (AcqRel) → 空きの一覧 / 払い出し位置 → 生かす →
+    ///   cell を書く (Release)。 速い道がその値を読んだなら、 その読み (`ACQ` は cell の Acquire、 でなければ終わりの fence) が書き手と
+    ///   同期し、 終わりの印の読み (Acquire) は立っているのを見る = やり直す
+    /// - 終わりまで印が無ければ、 読んだ値は全部その eid の行の物か、 消えた行の外した cell (= 無し)。 これは照合つきの道と同じ答え
+    ///   (照合つきの道も、 読みの間に消えただけの行の値は、 読んだ後の照合までに世代が上がらなければ数える)
+    /// - 予約の表 (`_sync_ops` など) は世代を持たず印も立たない。 照合つきの道も使い回しを見分けられない (前と同じ)
+    #[inline]
+    fn fast_eid_reads(&self, hids: &[usize]) -> Option<FastEidReads> {
+        use std::sync::atomic::Ordering;
+        if self.own_alias_on.load(Ordering::Relaxed) {
+            return None;
+        }
+        let tid = self.himo_to_table[*hids.first()?].load(Ordering::Relaxed);
+        if tid == ANONYMOUS_TABLE || hids[1..].iter().any(|&h| self.himo_to_table[h].load(Ordering::Relaxed) != tid) {
+            return None;
+        }
+        if self.generations().table_has(tid) {
+            return None;
+        }
+        let t = self.tables.get(tid as usize)?;
+        Some(FastEidReads { tid, lo: t.eid_range_lo, span: t.eid_range_hi.saturating_sub(t.eid_range_lo) })
+    }
+
+    /// 集計の速い道の終わり: 始めの許しがまだ成り立つか (表に世代 > 0 の場所ができていない、 別名ができていない)。 fence の後に読む
+    /// (速い道の読みより後に揃える)。
+    #[inline]
+    fn fast_eid_reads_held(&self, fast: FastEidReads) -> bool {
+        use std::sync::atomic::Ordering;
+        std::sync::atomic::fence(Ordering::Acquire);
+        !self.own_alias_on.load(Ordering::Relaxed) && !self.generations().table_has(fast.tid)
+    }
+
     /// dense の道で `cap` 以上の group を受けた分を、 group の昇順にして答えの後ろに足す (#474)。
     /// dense の分は `0..cap` の昇順で、 回した分は全部 `cap` 以上なので、 足した後も group の昇順のまま。
     fn push_spilled<T>(out: &mut Vec<(u32, T)>, spill: impl IntoIterator<Item = (u32, T)>) {
@@ -32863,15 +33079,17 @@ impl Engine {
     pub fn distinct(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Vec<u32> {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let hs = &self.himos[hid];
-        let mut result: Vec<u32> = Vec::new();
-        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for &eid in eids {
-            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l))
-                && seen.insert(v)
-            {
-                result.push(v);
-            }
-        }
+        let (result, _) = self.fold_eids::<true, (Vec<u32>, std::collections::HashSet<u32>), u32>(
+            &[hid],
+            eids,
+            || (Vec::new(), std::collections::HashSet::new()),
+            |l| hs.get_value32(l),
+            |(result, seen), v| {
+                if seen.insert(v) {
+                    result.push(v);
+                }
+            },
+        );
         result
     }
 
@@ -32894,29 +33112,24 @@ impl Engine {
 
     /// 0.8.10: `sum(himo, eids)` の並列版。 stored_slice の indirect access。
     pub fn sum_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u64 {
-        use rayon::prelude::*;
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
             return self.sum(himo, eids);
         }
         let values = hs.stored_slice();
-        eids.par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut total: u64 = 0;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    total += stored.saturating_sub(1) as u64;
-                }
-                total
-            })
-            .sum()
+        self.par_fold_eids::<false, u64, u32>(
+            &[hid],
+            eids,
+            || 0,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |t, stored| *t += (stored - 1) as u64,
+            |a, b| a + b,
+        )
     }
 
     /// 0.8.10: `count(himo, eids)` の並列版。
     pub fn count_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u32 {
-        use rayon::prelude::*;
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         // 64 bit 列は u32 の生の配列を持たない (件数は幅によらない数え方で)
@@ -32924,76 +33137,58 @@ impl Engine {
             return self.count(himo, eids);
         }
         let values = hs.stored_slice();
-        eids.par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut n: u32 = 0;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    if self.read_app(eid, |l| values.get(l as usize).copied()).is_some_and(|stored| stored != 0) {
-                        n += 1;
-                    }
-                }
-                n
-            })
-            .sum()
+        self.par_fold_eids::<false, u32, u32>(
+            &[hid],
+            eids,
+            || 0,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |n, _| *n += 1,
+            |a, b| a + b,
+        )
     }
 
     /// 0.8.10: `min(himo, eids)` の並列版。
     pub fn min_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
-        use rayon::prelude::*;
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
             return self.min(himo, eids);
         }
         let values = hs.stored_slice();
-        let result = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut best: u32 = u32::MAX;
-                let mut hit = false;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    if stored != 0 {
-                        hit = true;
-                        if stored < best { best = stored; }
-                    }
-                }
-                if hit { Some(best) } else { None }
-            })
-            .reduce(|| None, |a, b| match (a, b) {
+        let best = self.par_fold_eids::<false, Option<u32>, u32>(
+            &[hid],
+            eids,
+            || None,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |b, stored| *b = Some(b.map_or(stored, |cur| cur.min(stored))),
+            |a, b| match (a, b) {
                 (None, x) | (x, None) => x,
                 (Some(x), Some(y)) => Some(x.min(y)),
-            });
-        result.map(|stored| stored - 1)
+            },
+        );
+        best.map(|stored| stored - 1)
     }
 
     /// 0.8.10: `max(himo, eids)` の並列版。
     pub fn max_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
-        use rayon::prelude::*;
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
             return self.max(himo, eids);
         }
         let values = hs.stored_slice();
-        let result = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut best: u32 = 0;
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    if stored > best { best = stored; }
-                }
-                if best > 0 { Some(best) } else { None }
-            })
-            .reduce(|| None, |a, b| match (a, b) {
+        let best = self.par_fold_eids::<false, Option<u32>, u32>(
+            &[hid],
+            eids,
+            || None,
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |b, stored| *b = Some(b.map_or(stored, |cur| cur.max(stored))),
+            |a, b| match (a, b) {
                 (None, x) | (x, None) => x,
                 (Some(x), Some(y)) => Some(x.max(y)),
-            });
-        result.map(|stored| stored - 1)
+            },
+        );
+        best.map(|stored| stored - 1)
     }
 
     /// 0.8.10: `group_sum(group, sum, eids)` の並列版。 dense path のみ並列、
@@ -33004,7 +33199,6 @@ impl Engine {
         sum_himo: &str,
         eids: &[enchudb_oplog::EntityId],
     ) -> Vec<(u32, u64)> {
-        use rayon::prelude::*;
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
@@ -33013,39 +33207,29 @@ impl Engine {
         let Some(cap) = self.group_dense_cap(gid) else {
             return self.group_sum(group_himo, sum_himo, eids);
         };
-        let gs = &self.himos[gid];
-        let ss = &self.himos[sid];
-        let groups = gs.stored_slice();
-        let sums = ss.stored_slice();
-        let (result, spill) = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut acc: Vec<u64> = vec![0; cap];
-                let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some((g_stored, s_stored)) =
-                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *sums.get(l as usize)?)))
-                    else {
-                        continue;
-                    };
-                    if g_stored == 0 || s_stored == 0 { continue; }
-                    let g = (g_stored - 1) as usize;
-                    if g < cap {
-                        acc[g] = (acc[g] + (s_stored - 1) as u64) | Self::GROUP_SEEN;
-                    } else {
-                        Self::spill_sum(&mut spill, g as u32, (s_stored - 1) as u64);
-                    }
+        let groups = self.himos[gid].stored_slice();
+        let sums = self.himos[sid].stored_slice();
+        let (result, spill) = self.par_fold_eids::<false, (Vec<u64>, std::collections::HashMap<u32, u64>), (u32, u32)>(
+            &[gid, sid],
+            eids,
+            || (vec![0u64; cap], std::collections::HashMap::new()),
+            |l| Some((*groups.get(l as usize)?, *sums.get(l as usize)?)).filter(|&(g, s)| g != 0 && s != 0),
+            |(acc, spill), (g_stored, s_stored)| {
+                let g = (g_stored - 1) as usize;
+                if g < cap {
+                    acc[g] = (acc[g] + (s_stored - 1) as u64) | Self::GROUP_SEEN;
+                } else {
+                    Self::spill_sum(spill, g as u32, (s_stored - 1) as u64);
                 }
-                (acc, spill)
-            })
-            .reduce(|| (vec![0u64; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+            },
+            |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     a[i] = ((a[i] & !Self::GROUP_SEEN) + (v & !Self::GROUP_SEEN)) | ((a[i] | v) & Self::GROUP_SEEN);
                 }
                 for (g, v) in b_spill { *a_spill.entry(g).or_insert(0) += v; }
                 (a, a_spill)
-            });
+            },
+        );
         let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] & Self::GROUP_SEEN != 0).map(|i| (i as u32, result[i] & !Self::GROUP_SEEN)).collect();
         Self::push_spilled(&mut out, spill);
         out
@@ -33058,7 +33242,6 @@ impl Engine {
         val_himo: &str,
         eids: &[enchudb_oplog::EntityId],
     ) -> Vec<(u32, u32)> {
-        use rayon::prelude::*;
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
@@ -33067,33 +33250,22 @@ impl Engine {
         let Some(cap) = self.group_dense_cap(gid) else {
             return self.group_min(group_himo, val_himo, eids);
         };
-        let gs = &self.himos[gid];
-        let vs = &self.himos[vid];
-        let groups = gs.stored_slice();
-        let vals = vs.stored_slice();
-        let (result, spill) = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut mins: Vec<u32> = vec![u32::MAX; cap];
-                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some((g_stored, v_stored)) =
-                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)))
-                    else {
-                        continue;
-                    };
-                    if g_stored == 0 || v_stored == 0 { continue; }
-                    let g = (g_stored - 1) as usize;
-                    if g < cap {
-                        if v_stored < mins[g] { mins[g] = v_stored; }
-                    } else {
-                        Self::spill_min(&mut spill, g as u32, v_stored);
-                    }
+        let groups = self.himos[gid].stored_slice();
+        let vals = self.himos[vid].stored_slice();
+        let (result, spill) = self.par_fold_eids::<false, (Vec<u32>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+            &[gid, vid],
+            eids,
+            || (vec![u32::MAX; cap], std::collections::HashMap::new()),
+            |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)).filter(|&(g, v)| g != 0 && v != 0),
+            |(best, spill), (g_stored, v_stored)| {
+                let g = (g_stored - 1) as usize;
+                if g < cap {
+                    if v_stored < best[g] { best[g] = v_stored; }
+                } else {
+                    Self::spill_min(spill, g as u32, v_stored);
                 }
-                (mins, spill)
-            })
-            .reduce(|| (vec![u32::MAX; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+            },
+            |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v < a[i] { a[i] = v; }
                 }
@@ -33102,7 +33274,8 @@ impl Engine {
                     if v < *entry { *entry = v; }
                 }
                 (a, a_spill)
-            });
+            },
+        );
         let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != u32::MAX)
             .map(|i| (i as u32, result[i] - 1)).collect();
         Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
@@ -33116,7 +33289,6 @@ impl Engine {
         val_himo: &str,
         eids: &[enchudb_oplog::EntityId],
     ) -> Vec<(u32, u32)> {
-        use rayon::prelude::*;
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         if eids.len() < Self::PAR_RANGE_THRESHOLD {
@@ -33125,33 +33297,22 @@ impl Engine {
         let Some(cap) = self.group_dense_cap(gid) else {
             return self.group_max(group_himo, val_himo, eids);
         };
-        let gs = &self.himos[gid];
-        let vs = &self.himos[vid];
-        let groups = gs.stored_slice();
-        let vals = vs.stored_slice();
-        let (result, spill) = eids
-            .par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut maxs: Vec<u32> = vec![0; cap];
-                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some((g_stored, v_stored)) =
-                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)))
-                    else {
-                        continue;
-                    };
-                    if g_stored == 0 || v_stored == 0 { continue; }
-                    let g = (g_stored - 1) as usize;
-                    if g < cap {
-                        if v_stored > maxs[g] { maxs[g] = v_stored; }
-                    } else {
-                        Self::spill_max(&mut spill, g as u32, v_stored);
-                    }
+        let groups = self.himos[gid].stored_slice();
+        let vals = self.himos[vid].stored_slice();
+        let (result, spill) = self.par_fold_eids::<false, (Vec<u32>, std::collections::HashMap<u32, u32>), (u32, u32)>(
+            &[gid, vid],
+            eids,
+            || (vec![0u32; cap], std::collections::HashMap::new()),
+            |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)).filter(|&(g, v)| g != 0 && v != 0),
+            |(best, spill), (g_stored, v_stored)| {
+                let g = (g_stored - 1) as usize;
+                if g < cap {
+                    if v_stored > best[g] { best[g] = v_stored; }
+                } else {
+                    Self::spill_max(spill, g as u32, v_stored);
                 }
-                (maxs, spill)
-            })
-            .reduce(|| (vec![0u32; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+            },
+            |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v > a[i] { a[i] = v; }
                 }
@@ -33160,7 +33321,8 @@ impl Engine {
                     if v > *entry { *entry = v; }
                 }
                 (a, a_spill)
-            });
+            },
+        );
         let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != 0)
             .map(|i| (i as u32, result[i] - 1)).collect();
         Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
@@ -33183,20 +33345,21 @@ impl Engine {
         let hs = &self.himos[hid];
         let values = hs.stored_slice();
         let n = n_buckets as usize;
-        let mut hist: Vec<u32> = vec![0; n];
-        if eids.is_empty() { return hist; }
+        if eids.is_empty() { return vec![0; n]; }
         let span = (vmax as u64 - vmin as u64) + 1;
         let n_u64 = n_buckets as u64;
-        for &eid in eids {
-            // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-            let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-            if stored == 0 { continue; }
-            let val = stored - 1;
-            if val < vmin || val > vmax { continue; }
-            let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
-            hist[idx.min(n - 1)] += 1;
-        }
-        hist
+        self.fold_eids::<false, Vec<u32>, u32>(
+            &[hid],
+            eids,
+            || vec![0; n],
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |hist, stored| {
+                let val = stored - 1;
+                if val < vmin || val > vmax { return; }
+                let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+                hist[idx.min(n - 1)] += 1;
+            },
+        )
     }
 
     /// 0.8.10: `histogram_eids` の並列版。
@@ -33208,7 +33371,6 @@ impl Engine {
         vmax: u32,
         n_buckets: u32,
     ) -> Vec<u32> {
-        use rayon::prelude::*;
         if n_buckets == 0 || vmin > vmax { return vec![]; }
         let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![0; n_buckets as usize] };
         let hs = &self.himos[hid];
@@ -33219,24 +33381,22 @@ impl Engine {
         let values = hs.stored_slice();
         let span = (vmax as u64 - vmin as u64) + 1;
         let n_u64 = n_buckets as u64;
-        eids.par_chunks(Self::PAR_RANGE_CHUNK)
-            .map(|chunk| {
-                let mut hist: Vec<u32> = vec![0; n];
-                for &eid in chunk {
-                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
-                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
-                    if stored == 0 { continue; }
-                    let val = stored - 1;
-                    if val < vmin || val > vmax { continue; }
-                    let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
-                    hist[idx.min(n - 1)] += 1;
-                }
-                hist
-            })
-            .reduce(|| vec![0u32; n], |mut a, b| {
+        self.par_fold_eids::<false, Vec<u32>, u32>(
+            &[hid],
+            eids,
+            || vec![0u32; n],
+            |l| values.get(l as usize).copied().filter(|&s| s != 0),
+            |hist, stored| {
+                let val = stored - 1;
+                if val < vmin || val > vmax { return; }
+                let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+                hist[idx.min(n - 1)] += 1;
+            },
+            |mut a, b| {
                 for (i, &v) in b.iter().enumerate() { a[i] += v; }
                 a
-            })
+            },
+        )
     }
 
     // ──── 範囲クエリ ────
@@ -33356,19 +33516,25 @@ impl Engine {
     pub fn sum64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u128 {
         let Some(hid) = self.himo_id(himo) else { return 0 };
         let hs = &self.himos[hid];
-        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).map(|v| v as u128).sum()
+        self.fold_eids::<true, u128, u64>(&[hid], eids, || 0, |l| hs.get_value(l), |t, v| *t += v as u128)
     }
 
     /// 64 bit の最小値 (どの列でも)。
     pub fn min64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
-        let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).min()
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        self.fold_eids::<true, Option<u64>, u64>(&[hid], eids, || None, |l| hs.get_value(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.min(v)));
+        })
     }
 
     /// 64 bit の最大値 (どの列でも)。
     pub fn max64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
-        let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).max()
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        self.fold_eids::<true, Option<u64>, u64>(&[hid], eids, || None, |l| hs.get_value(l), |r, v| {
+            *r = Some(r.map_or(v, |cur| cur.max(v)));
+        })
     }
 
     /// eid の範囲 `lo..hi` での 64 bit の (件数, 合計, 最小, 最大) (table の全 row の集計用、 どの列でも)。
@@ -38650,6 +38816,41 @@ impl crate::live::CellReader for Engine {
         let Some(h) = self.himos.get(himo_id as usize) else { return Vec::new() };
         // 索引の範囲を引いて Column で確かめる (dense は範囲の bucket、 大きな値は run の二分探索)
         h.pull_range(lo, hi)
+    }
+}
+
+/// 集計の速い道の許し ([`Engine::fast_eid_reads`]): 読む紐の表と、 その表の最初の枠。
+#[derive(Clone, Copy)]
+struct FastEidReads {
+    tid: TableId,
+    lo: u32,
+    span: u32,
+}
+
+impl FastEidReads {
+    /// eid の local が表の最初の枠の中なら、 その場所 (照合しない)。 世代 > 0 の eid の local は枠の外 (2^S 以上)。
+    #[inline(always)]
+    fn slot(self, eid: enchudb_oplog::EntityId) -> Option<u32> {
+        let local = enchudb_oplog::eid_local(eid);
+        (local.wrapping_sub(self.lo) < self.span).then_some(local)
+    }
+}
+
+/// test 用の割り込み点: 集計の速い道 (`Engine::fold_eids`) が照合せずに場所を読む前。 置いた thread で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod fast_read_hook {
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
     }
 }
 
