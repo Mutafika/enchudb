@@ -1034,7 +1034,7 @@ impl Drop for SegmentMap {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// #317: 書いた時点でブロックを予約する filesystem では、 まだ flush していない分を数えない。
@@ -1072,13 +1072,13 @@ mod tests {
         hook()
     }
 
-    fn set_flush_hook(path: &Path, hook: impl Fn() -> io::Result<()> + Send + Sync + 'static) {
+    pub(crate) fn set_flush_hook(path: &Path, hook: impl Fn() -> io::Result<()> + Send + Sync + 'static) {
         let mut hooks = FLUSH_HOOKS.lock().unwrap_or_else(|p| p.into_inner());
         hooks.retain(|(p, _)| p != path);
         hooks.push((path.to_path_buf(), std::sync::Arc::new(hook)));
     }
 
-    fn clear_flush_hook(path: &Path) {
+    pub(crate) fn clear_flush_hook(path: &Path) {
         FLUSH_HOOKS.lock().unwrap_or_else(|p| p.into_inner()).retain(|(p, _)| p != path);
     }
 
