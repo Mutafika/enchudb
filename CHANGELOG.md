@@ -7,7 +7,7 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 
 minor。 **本体の DB の file が v15 になりうる** (最初に消えた行の場所を使い回した時。 0.37.4 で開けない) のと、 **oplog (WAL) の
 file が v5 になる** (0.37.x 以前で開けない) のが大きい変化。 v15 の DB は `gen.seg` (形 `GEN3`)・`prev.seg` (sync する DB)・
-`eidalias` 版 2 を持つ (v14 以下の DB の形は変わらない)。 wire の batch の形は同じで、 ホストとの間に 2 つ印が増えた
+`eidalias` 版 2 を持つ (v14 以下の DB の本体の file の形は変わらない)。 wire の batch の形は同じで、 ホストとの間に 2 つ印が増えた
 (publish の query `acked` と返事の印 `BEHIND`、 pull の返事の後ろの `STALE` 1 byte)。 どちらも古い相手は読まないだけで、
 0.37.4 の peer / ホストと混ぜて sync できる (下の 「切る前の確かめ」 で 8 通り × 2 つの筋書きを回した)。 使い方の変化で大きいのは、
 **sync を有効にした DB は WAL 付きの session でしかユーザの表の行を書けなくなる** こと (#1066、 下の 「上げる時の注意」 の頭)。
@@ -27,12 +27,12 @@ v0.37.4 の後に master へ入った PR 157 本 (#721〜#1073)。 最後の 12 
   上がる、 下の 「値段」)
 - WAL 付きの open が、 WAL の file の stat の一時の失敗を 「WAL が無い」 と読み、 WAL を作り直して再生していない record を黙って捨てていた
   (0.37.x 以前から、 #986)
-- sync の ring (`_sync_ops`) を読む道を表の枠だけにし、 配る側を (書き手, 版数) で先に絞る (ring 60 万行で peer 30 本の beat 1.3 s → 23 ms)
+- sync の ring (`_sync_ops`) を読む道を表の枠だけにし、 配る側を (書き手, 版数) で先に絞る (ring 100 万行・生きている行 60 万の DB で、 最後の 1 万件を配る beat が peer 30 本で 1.3 s → 23 ms)
 - 0.38 を切る前の読み直しで、 この版で入った道 (場所の使い回し・受信・changefeed・開く道) の穴 20 件ほどを直した (#1032 #1048 #1049
-  #1051 #1061 #1065 #1068 #1069)。 sync する DB の WAL なしの書き込み (版数が付かず相手に配られない) を断り (#1066)、 開く時の突き合わせが
-  完了させた削除を削除の時刻の下限の tombstone で配る (#1046 / #1047)
-- この版の途中で入った退行のうち、 `get` (v14 の DB)・書き手 8 本の削除・満杯の名前のある表の `persist_sync_state` を 0.37.4 に戻した
-  (#1020 / #1022 / #1028)。 eid の並びを受ける集計は、 v14 の表と v15 で消したことの無い表では eid ごとの照合を省く (#1064 / #1072 / #1073)。
+  #1051 #1061 #1065 #1068 #1069)。 sync する DB の WAL なしの書き込み (版数が付かず相手に配られない) を断り (#1066)、 開く時の突き合わせ (v15 の DB)
+  が完了させた削除を削除の時刻の下限の tombstone で配る (#1046 / #1047)
+- この版の途中で入った退行のうち、 `get` (v14 の DB) と書き手 8 本の削除を 0.37.4 に戻し (#1020 / #1022)、 満杯の名前のある表の名前の記録の
+  書き出しを一部戻した (#1028、 残りは下の 「値段」)。 eid の並びを受ける集計は、 v14 の表と v15 で消したことの無い表では eid ごとの照合を省く (#1064 / #1072 / #1073)。
   書き手 1 本の書き込みと、 場所を使い回した DB (v15) の読みと集計は 0.37.4 より遅いまま (下の 「値段」)
 
 **上げる時の注意 (互換)**:
@@ -48,12 +48,14 @@ v0.37.4 の後に master へ入った PR 157 本 (#721〜#1073)。 最後の 12 
   生き返った)。 **初期の行は `finish_with_oplog` / `open_with_oplog` の後に書くこと**。 断らないもの: 予約の表 (`_sync_ops` / `_sync_peers` /
   `_cursors` / `define_reserved_table`)・相手から受けた書き込み・開く時の修復と WAL の再生・sync の表の無い DB・読み。 query_lang の
   `~` / `-` は断られたら `Error` を返す (前は偽の成功。 CLI は `open_standalone` で開く)
-- **電源断の後に開いて自分の行の削除を仕上げた時、 相手はその書き手の state を取り直す** (#1046 / #1047、 PR #1068、 user が 11-23 に
-  受け入れた)。 開く時の突き合わせが完了させた削除は、 tombstone を削除の時刻の下限 (その行の cell の版数の最大の直後) で置き、 #451 が
-  作り直す。 下限は配った版数以下のことが多いので record を載せずに floor を上げ、 相手は floor で抜けを知って `bootstrap_pull` で
+- **場所を使い回した sync の DB (v15) が電源断の後に開いて、 自分の行の削除を仕上げた時、 相手はその書き手の state を取り直す** (#1046 /
+  #1047、 PR #1068)。 開く時の突き合わせ (`gen.seg` と生きている印を比べる、 v15 の DB だけ = 場所を使い回したことの無い v14 の DB では起きない)
+  が完了させた削除 (`gen.seg` だけ死んでいた削除 / 生きている印だけ届いた削除) は、 tombstone を削除の時刻の下限 (その行の cell の版数の最大の
+  直後) で置き、 #451 が作り直す。 下限は配った版数以下のことが多いので record を載せずに floor を上げ、 相手は floor で抜けを知って `bootstrap_pull` で
   state 全体を取り直す (ホストの形では、 ホストが書き手の state を受けて下の client 全員に floor を配る = 全員が取り直す)。 **0.37.4 の
-  ホストは floor を下の client に配らないので、 その下の client にこの削除は届かない。 ホストから先に上げる**。 前は 1. の完了を今の時刻の
-  Delete 1 件で配り (名前の削除優先で、 本当の削除の後に同じ名前で足し直した行まで消しえた = #923 の形)、 2. の完了は何も配らなかった
+  ホストは floor を下の client に配らないので、 その下の client にこの削除は届かない。 ホストから先に上げる**。 (0.37.4 にはこの突き合わせ
+  自体が無い。 この版の途中の開発版は、 `gen.seg` だけ死んでいた削除を今の時刻の Delete 1 件で配り (名前の削除優先で、 本当の削除の後に同じ名前で
+  足し直した行まで消しえた = #923 の形)、 生きている印だけ届いた削除は何も配らなかった)
 
 形式の変化と、 0.37.4 に下げる手順 (「切る前の確かめ」 で 0.37.4 と 0.38 の binary で確かめた所に (確かめた) と書いた):
 
@@ -65,6 +67,10 @@ v0.37.4 の後に master へ入った PR 157 本 (#721〜#1073)。 最後の 12 
 | `prev.seg` (#946) | sync する v15 の DB だけ (使い回した場所の前の住人の記録) | (v15 なので開けない) | 戻せない (v15 と同じ) |
 | `eidalias` 版 2 (#1006) | v15 に移り終えた DB だけ。 v14 以下の DB は版 1 のまま (0.37.4 と同じ byte) | (v15 なので開けない) | 戻せない (v15 と同じ)。 v15 に移る途中で落ちた DB (header が v14) は版 1 のまま |
 | `pkformer.log` (#750 / #987) | 名前のある表の名前の記録 (`pkformer`) が変わった時 (v14 の DB でもできる) | 開ける。 log の分を読まない (落ちた後の DB を 0.37.4 で開くと前の名前の一部を失い、 0.37.4 が `pkformer` を書き直すと log の分は消える) | **0.38 で一度開いてきれいに閉じてから** (log が header だけ 24 B になり、 中身は `pkformer` に移る。 確かめた)、 `{db}/oplog` を消して 0.37.4 で開く |
+
+v15 に上がるのを止める設定は無い。 場所を使い回す (= v15 に上がる) のは、 枠を使い切った表 (と `max_entities` に届いた anonymous の `entity()`)
+に消した場所がある時だけで、 枠に余地があれば消した場所は使い回さない。 0.37.4 に下げる道を残したいなら、 枠を使い切る前に足しておく
+(`grow_table` / schema の `with_capacity`)。
 
 本体の file (DB の directory):
 
@@ -80,8 +86,8 @@ v0.37.4 の後に master へ入った PR 157 本 (#721〜#1073)。 最後の 12 
   場所ごとの配列 32 B) ができる。 v14 以下・packed・sync しない DB には作らない
 - **`eidalias` 版 2 (#1006、 #993 / #994)**: v15 の DB の sidecar `eidalias` (名前で畳んだ他の peer の行の別名) は、 別名ごとに指す行の世代を
   持つ (1 件 12 → 16 B)。 新しい binary は両方を読む
-- HTTP の `GET /bootstrap` (DB の file を丸ごと写して replica を始める) は、 元の DB が v15 なら 0.37.4 の replica が開く時にエラーになる
-  (黙らない) (#885)
+- HTTP の `GET /bootstrap` (DB の file を丸ごと写して replica を始める) は、 元の DB が v15 なら 0.37.4 の replica が開く時にエラーになるはず
+  (黙らない。 確かめていない) (#885)
 - **`pkformer.log` (#750、 #987)**: 名前の記録 `pkformer` の変わった分の追記 (`pkformer` 自身の形 (版 4) は同じ)。 きれいに閉じると header だけに
   なる。 `/bootstrap/pkformer` は log を当てた形を配る
   - #987 から、 `pkformer` の無い DB の最初の書き出しは `pkformer.log` だけを書き、 consumer の次の周期 (≤ 100 ms) で `pkformer` に
@@ -126,10 +132,10 @@ wire とホスト (上げる順は **ホストから**):
 | 直し | 直るのは |
 |---|---|
 | ホストが負けた record も中継する (#698)、 replica の state の `as_of` (#710)、 別の peer が書き換えた Tag の cell (#711)、 求めていない state を断る (#699)、 抜けを floor で知らせる (#783 の 2 つ目)、 何も当たっていない行を掃除で消さない (#923 の一部) | ホストを上げた時 (client は 0.37.4 でよい) |
-| state に他の peer の行への書き込み・外した cell・自分の行の削除・他の peer が消した自分の行の削除を入れる (#761 #766 #784 #800 #923) | state を作る書き手 (author) を上げた時 (ホストの版は問わない) |
+| state に他の peer の行への書き込み・外した cell・自分の行の削除・他の peer が消した自分の行の削除を入れる (#761 #766 #784 #800 #923) | state を作る書き手 (author) を上げた時 (0.37.4 のホストでは、 下の 「ホストから先に上げる」 の形が残る) |
 | 使い回した行が相手に現れる (#863)、 消えた行を指す ref が使い回した行を指さない (#731)、 使い回した自分の消えた行の削除と名前 (#914 #915) | 使い回す書き手を上げた時 (ホスト・受け手は 0.37.4 でよい) |
 | 作り直した / 戻したホストに送り直す (#961)、 外された client の `STALE` (#712) | 両方を上げた時 |
-| 開く時の突き合わせが仕上げた削除が下の client に届く (#1046 / #1047。 floor で取り直させる) | 書き手とホストの両方を上げた時 (0.37.4 のホストは floor を下に配らない) |
+| v15 の DB で開く時の突き合わせが仕上げた削除が下の client に届く (#1046 / #1047。 floor で取り直させる) | 書き手とホストの両方を上げた時 (0.37.4 のホストは floor を下に配らない) |
 
 - 混ぜた sync で、 どの組み合わせでもエラー・拒否・panic は出ていない (各 PR 本文の #860 の 8 通り、 #910 / #921 の 5 通り、 #942 / #951 の
   6 通り、 #963 / #965 の 4〜6 通りと、 この版を切る前の 8 通り × 2 つの筋書き)
@@ -197,7 +203,8 @@ engine / schema の API の約束が変わる所:
   `company is null` は偽 = 0.37.4 の消した行を指す ref と同じ)。 `table_eid_usage().free` は世代を使い切って引退した場所と、 開く時の突き合わせの
   後始末待ちの場所を数えない (#885、 #1012)
 - engine を直に使う時、 世代を持つ DB の Ref の紐を u32 を越える値で引くと空 / 0 (`pull_raw` / `pull` / `query_by_id64` / `count_value_by_id`、
-  query_lang。 schema からは届かない) (#907)
+  query_lang。 schema からは届かない) (#907)。 Ref の cell の値は v15 では 世代 | 場所 なので、 行の eid と Ref の値を行き来するには
+  `eid_local(eid)` でなく `Engine::ref_value(eid)` / `ref_eid(value)` を使う (#885。 schema は内部でこれに替えた)
 - `Engine::set_cell` / `clear_cell` / `remote_*_apply` の LWW が 「同じ HLC は不採用」 から 「同じ HLC で中身も同じなら不採用」 になる (#747、 #705)
 - `add_change_listener` は、 changefeed の配る分の取り出しや WAL の畳み (`change_emit` を書き出しの間も持つ) の最中なら、 それが終わるまで待つ
   (前も初めの 1 つは同じ lock を取っていた) (#1032、 #1031)
@@ -234,7 +241,8 @@ engine / schema の API の約束が変わる所:
     本体を開く前に `Err` (何も書かない)
   - 単独の open (`open_standalone` / schema の `Database::open`) は 「WAL に再生する record があるか」 を聞けない時 (一時の I/O の失敗・権限) に
     何も書かずに `Err` (開き直せばよい)。 壊れた / 切り詰められた WAL (`InvalidData`) は今まで通り警告して WAL を見ずに開く
-  - **WAL の file だけ書けない DB** (権限など) を単独で開くと `Err` になる (前は WAL を黙って無視して開けた)
+  - WAL に再生する record が残っている (または、 きれいに閉じなかった sync の) DB で、 **WAL の file だけ書けない** (権限など) と、 単独の open が
+    `Err` になる (前は WAL を黙って無視して開けた。 きれいに閉じた DB は今まで通り開ける)
   - header (32 B) より短い WAL の file の sync する DB を単独で開くと panic した (WAL 付きにする途中で落ちた形)。 既定の容量 (16 MiB) で作り直す。
     `OpLog::create` は header より小さい capacity を `InvalidInput` で断る (前は panic)
 - 名前の記録 (`pktombs` / `pkformer`) のまとめ直しは consumer の周期が始める別の thread で非同期に走る: 記録が増えすぎた書き出しの後、 file が
@@ -268,20 +276,23 @@ engine / schema の API の約束が変わる所:
 
 - **`FaultKind` に `NoWal` (#1069)、 `TieRejected` に `DeadRow` (#885) が増えた**。 どちらの enum も `#[non_exhaustive]` でないので、 網羅的に
   `match` しているアプリは腕を足さないと組めない
-- `EntitySet::ensure_live` は 「生きている印を立てたのがこの呼び出しか」 を `bool` で返す (#918)
+- **`EidTranslator::alias` / `insert` に引数 `agen: u32` (張った時の住人の世代) が増え、 `alias_snapshot` は `Vec<(PeerId, u32, u32, u32)>` を返す**
+  (#1006)。 この 3 つを呼ぶ code は組めなくなる
+- `EntitySet::ensure_live` は 「生きている印を立てたのがこの呼び出しか」 を `bool` で返す (#918)。 `EntitySet::allocate_at` も `bool` を返す (#887)
 - `Engine::former_pk_holder` は行の eid を世代込み (`query_by_id64` と同じ形) で返す (前は場所だけ) (#928)
 - `Engine::name_given_to_dead_row(eid, himo, value) -> usize` は `(eid, row, himo, value) -> Option<usize>` に (#930)
 - `Engine::split_for_rename` は `Result<Option<EntityId>, RemoteApply>` を返す (#977)
 - `DecodedOp` が `Hash` を持つ (#829)
 - `Transport` trait に既定の実装付きの `publish_floor` / `publish_to_refs` (#957)。 今の実装はそのまま組める
-- crashsim の `Phase` に `BeforeVersions` (#747)・`PrevWrittenOut` / `BeforeTomb` (#946)・`DeleteGateLeft` (#997)・`OpenBeforeFinishReconcile` /
-  `OpenAfterFinishReconcile` / `OpenBeforeSettle` (#1012)、 `SegmentKind::Prev` (#946)。 `crashsim::Copied` に `OplogHeader` (区画の header の page
-  だけの書き出し。 `Copied::Oplog` は WAL 全体の fsync だけ) (#1004)。 I/O の点 (`fault`) は聞く道が `oplog.probe` (前は `oplog.open`)、 WAL の
-  file の stat に `oplog.stat` (#986)、 開く時の突き合わせの書き出しに `gen.reconcile.msync` (#1012)
+- crashsim / 試験の口 (crashsim feature か test だけ): `write_out_hook::Phase` に段が増え (#747 #946 #997 #1012 ほか)、 hook の module
+  (`name_compact_hook` / `apply_point_hook` / `open_space_margin_hook`)、 `SegmentKind::Prev` (#946)、 `crashsim::Copied::OplogHeader` (#1004) が増えた。
+  I/O の点 (`fault`) は聞く道が `oplog.probe` (前は `oplog.open`)、 ほかに `oplog.stat`・`gen.reconcile.msync`・`sidecar.chain_sync`・`sidecar.compact_*` が増えた
 - `OpLog::set_sync_on_reset` は何もしない関数として残る (#729)
 - `enchudb-oplog` の memmap2 の下限を 0.9.8 に (#986)
 
 増えた公開 API: `Engine::try_delete` (#1069)、 `Engine::himo_room` (#1049)、 `Engine::try_entity_in_row` (#1048)、 `EntitySet::is_live_acquire` (#1049)、
+`Engine::ref_value` / `ref_eid` / `eid_slot` / `slot_eid` (#885)、 `Engine::is_gone_own_eid` (#910)、 `Engine::remote_row_holds` (#922)、
+`Syncer::own_state` (#804)、 `enchudb_sync::CursorMark` (#965、 `cursor_mark` の戻り値)、
 `OpLog::sync_failed` / `applied_before` / `position_of_lsn` / `iter_committed_from_with_end_upto` (#1061)、 `db_files::sync_dir` (#1051)、
 `Engine::remote_row_of` / `remote_tie_apply_at` / `remote_untie_apply_at` / `remote_tieleaf_apply_at` /
 `remote_delete_apply_at` (#922)、 `Engine::name_given_to_gone_own_row` (#921)、 `Engine::settled_sync_ops` (#832)、
@@ -294,11 +305,13 @@ engine / schema の API の約束が変わる所:
 `SegmentSet::flush_all_spread` (#845)、
 `Engine::try_entity_in` (空きの不足を `FaultKind::DiskSpace` で分ける) / `try_resolve_remote_eid` / `try_resolve_remote_ref_value` /
 `try_reserve_remote_eid_for_pk` / `remote_delete_apply_at_result` / `remote_delete_apply_foreign_result` (`RemoteApply::RejectedCapacity`) (#977)、
-`enchudb_engine::eid_translator::Alloc` (`Got` / `Skip` / `Busy`) / `EidTranslator::get_or_insert_waiting` / `RowLocks::wait_released` /
+`enchudb_engine::eid_translator::Alloc` (`Got` / `Skip` / `Busy` / `Retry`、 `Retry` は #977) / `EidTranslator::get_or_insert_waiting` / `RowLocks::wait_released` /
 `RowLocks::holds_user_row_by_me` (#975)、 `OpLog::probe_replay(path) -> ReplayProbe` / `OpLog::has_records_to_replay` (#986)、
 `Engine::sync_ring_min_hlc` / `sync_ring_min_below` (#995)、
 観測用の `Engine::wal_drop_bridge_holds` (#820) / `sync_ring_scans` (#848) / `bridge_wal_records_read` (#852) / `Syncer::late_state_floors` (#822) /
 `Engine::sync_ring_min_scans` (#995) / `delete_gate_waits` / `delete_gate_wait_max_ns` / `delete_gate_yields` / `delete_gate_closed_ns` (#997)。
+低い層の pub module (`segments` / `segment_map` / `vocabulary` / `eid_translator` / `entity_set` / `himo_store` / `row_lock` / `sync_payload_ring` /
+`oplog` / `db_files` / `change_log`) に、 engine の中で使う pub fn と定数が増えた (名前は省く)。
 `#[doc(hidden)]`: `Table::upsert_relookups` (#724)、 `LiveCounts::handed` (#727)、 `Engine::cursor_create_races` (#737)、 `Engine::pkformer_disk_diff` (#750)、
 `Engine::bind_remote_eid_by_pk_at` / `slot_untouched` (#942)、 `oplog::wal_reads` (#986)、 試験用の `Engine::hold_consumer` (#853) / `set_relay_hook` (#867) /
 `set_state_scan_hook` (#895) / `himo_index_rebuilt_on_load` (#894) / `free_slot_scans` (#872) / `compact_name_records_now` / `pktombs_disk_diff` /
@@ -306,12 +319,13 @@ engine / schema の API の約束が変わる所:
 
 **値段 (遅くなった所)**:
 
-0.37.4 と 0.38 (master a5578d51 = この PR の base) を同じ bench で交互に測った数 (Apple M4 Max、 他の build / test / bench なし、 1 本ごとに
-他の組の rustc / cargo / test binary が居ないことと 1 分の負荷 < 6 を待ってから回した = 負荷 2.3〜6.0、 交互 5 回 (版の順は回ごとに入れ替え) の
-「同じ回の比」 の中央値、 括弧は 5 回の幅)。 時間の比は 1 より大きいと 0.38 が遅い、 処理量の比は 1 より小さいと 0.38 が遅い。 各 PR の項に書いた
+0.37.4 と 0.38 (master a5578d51) を同じ bench で交互に測った数 (Apple M4 Max、 他の build / test / bench なし、 1 本ごとに
+他の組の rustc / cargo / test binary が居ないことと 1 分の負荷 < 6 を待ってから回した = 負荷 2.2〜6.0、 交互 5 回 (版の順は回ごとに入れ替え。
+ホストに削除を送る形だけ 1 回を捨てて 4 回) の 「同じ回の比」 の中央値、 括弧は回の幅)。 時間の比は 1 より大きいと 0.38 が遅い、 処理量の比は 1 より小さいと 0.38 が遅い。 各 PR の項に書いた
 数は、 その PR とその時の master の比べ。
 
-- **書き手 1 本の書き込みは 0.37.4 の 1.06〜1.23 倍の時間 (処理量 0.78〜0.91 倍)**。 WAL の有無・sync の有無によらない
+- **書き手 1 本の書き込みは 0.37.4 の 1.06〜1.23 倍の時間 (処理量 0.78〜0.91 倍)**。 WAL の有無によらない (どれも sync の表の無い DB で測った。
+  sync の表のある DB の書き込みは測り直していない、 下の #818 の測りは 0.84〜0.87 倍)
 
   | 1 回の時間 | 0.37.4 → 0.38 | 比 |
   |---|---|---|
@@ -321,16 +335,16 @@ engine / schema の API の約束が変わる所:
   | schema の insert 5 列 + `commit()` (WAL あり / なし) | 755 → 842 ns / 443 → 489 ns | 1.11 / 1.11 |
   | 既にある行への upsert 1 列 + `commit()` (WAL) | 349 → 405 ns | 1.12 |
 
-  - 処理量: dbw (社員 100 万人、 1 行 1 列 1 commit) の書き手 1 本は WAL なし 0.79 倍 (15.5 → 12.0 M/s) / WAL あり 0.82 倍 (7.4 → 6.2 M/s)。
-    書き手 8 本は WAL なし 0.83 倍、 WAL あり 1.13 倍 (速い)。 live の購読のある書き込み (w1、 社員 100 万人、
+  - 処理量: 社員 100 万人の表を 1 行 1 列 1 commit で書き換える書き手 1 本は WAL なし 0.79 倍 (15.5 → 12.0 M/s) / WAL あり 0.82 倍 (7.4 → 6.2 M/s)。
+    書き手 8 本は WAL なし 0.83 倍、 WAL あり 1.13 倍 (速い)。 live の購読のある書き込み (社員 100 万人、
     書き手 1 本 2000 万回、 購読なし / 会社単位 / 社員単位) は 0.78 / 0.91 / 0.81 倍、 購読なしの書き手 8 本は 0.84 倍
   - 原因は #873 (#850 の紐の門と積んだ位置の印) と #885 (#731 の eid の世代の照合)。 #1021 は削除の確保と辞書の書き出しの見張りだけを戻した。
     門と印を丸ごと外しても取り戻せるのは 5〜7% まで (#1021 の測り)。 残りは #1016。 #1048 (払い出しが場所の行の lock を握る) は 1 回 +4〜5 ns
-- **`get` は v14 の DB で 0.37.4 と同じか速い** (`get_by_id` 0.91 倍、 名前で 0.89 倍、 #1020)
+- **`get` は v14 の DB で 0.37.4 と同じか速い** (`get_by_id` 0.86 倍、 名前で 0.91 倍。 #1020 で戻した)
   - **一度でも消えた行の場所を使い回した DB (v15) では遅い**: 1 行使い回した DB で `get_by_id` 5.2 → 7.5 ns (1.43 倍、 1.28〜1.63)。 全部の page で
     使い回した DB は #1020 の測りで 1.8〜2.0 倍 (命令 76 → 143)
-  - v14 の DB の円柱から引く `pull_raw` / `query` (2 条件) は 0.81〜0.99 倍。 4% を消した後の `pull_raw` は 1.12 倍
-  - 主キーで引いて列を読む負荷 (relw: schema の表 100 万行、 書き換え 9 割 + 読み 1 割、 20 秒。 枠を使い切った表で消して足すので、 すぐに全部の
+  - v14 の DB の円柱から引く `pull_raw` / `query` (2 条件) は 0.78〜0.99 倍。 4% を消した後の `pull_raw` は 1.12 倍
+  - 主キーで引いて列を読む負荷 (schema の表 100 万行、 書き換え 9 割 + 読み 1 割、 20 秒。 枠を使い切った表で消して足すので、 すぐに全部の
     page で使い回した v15 になる) は処理量 0.84 倍 (0.82〜0.84)、 書き込み 1 回 1.12 倍、 読み 1 回 1.24 倍
   - 原因は #885 (場所ごとの世代の照合と、 出口で場所ごとに今の世代を付ける写し)。 #1020 が約半分を戻した。 残りは file の形か円柱の形を
     変える (#1015)
@@ -338,13 +352,14 @@ engine / schema の API の約束が変わる所:
   並列の版、 schema の `Query::sum` / `count` / `group_*` の道) (#1041 の照合、 #1064 / #1072 / #1073 の速い道):
   - **v14 の表と、 v15 の DB で消したことの無い表は速い道** (eid ごとに照合しない): 0.37.4 の 0.84〜1.19 倍 (`sum` 1.00、 `count` 0.84、 `min` /
     `max` 1.06〜1.07、 `group_sum` / `group_avg` 1.19)。 並列の版は 1.15〜1.5 倍 (`sum_eids_par` 1.18、 `group_sum_eids_par` 1.51、 幅が広い)
-  - **v15 の DB で 1 行でも消した表は照合つき**: 1 行だけ消して足した表で 1.4〜2.2 倍 (`sum` 1.90、 `count` 1.68、 `group_sum` 1.70、 `histogram_eids`
-    1.39)、 全部の行を使い回した表で 1.6〜2.4 倍。 並列の版は 2.5〜4.1 倍。 (照合を eid ごとにしていた #1041 の前の master = 369ab950 との比では
-    +16〜45%、 #1064 の測り)
+  - **v15 の DB で 1 行でも消した表は照合つき**: 1 行だけ消して足した表で 1.2〜2.2 倍 (`sum` 1.90、 `count` 1.68、 `group_sum` 1.70、 `histogram_eids`
+    1.39、 `distinct` 1.22)、 全部の行を使い回した表で 1.3〜2.4 倍 (`distinct` 1.26)。 並列の版は 2.5〜4.1 倍。 (照合を eid ごとにしていた #1041 の前の
+    master との比では +16〜45%、 #1064 の測り)
   - anonymous の表が速い道に乗るのは v14 の DB と、 v15 では消したことの無い閉じた anonymous。 表に足した枠の 33 個目より先の行は照合つき
-    (schema の既定の枠 100 万なら 3,300 万行まで当たらない)
-- **sync しない DB の削除**: 書き手 1 本は 1.14 倍 (p50、 幅 0.78〜1.33、 #873)。 書き手 8 本は 0.37.4 より速い (処理量 1.06 倍、 #1022)。 満杯の表で
-  消して足す書き手 1 本は処理量 0.74 倍 (1 本の 「足す」 側 = #873 / #885)、 8 本は 1.02 倍 (p99 1.45 倍)
+    (最初の枠 + 足した枠 32 個まで。 schema の既定の枠 100 万の表なら 3,300 万行まで当たらない)
+- **sync しない DB の削除**: 書き手 1 本は 1.14 倍 (p50、 幅 0.78〜1.33、 #873)。 書き手 8 本は 0.37.4 より速い (処理量 1.06 倍、 #1022)。 枠に余地の
+  ある表で消して足す書き手 1 本 (使い回しなし) は処理量 0.74 倍 (1 本の 「足す」 側 = #873 / #885)、 8 本 (終わりの 1 割は枠を使い切って消した
+  場所を使い回す) は 1.02 倍 (p99 1.45 倍)
 - **値のある列の多い行の削除** (#873): 削除は値のある紐の全部の門に入る。 #873 の測りで値のある列 100 の行 2.71 → 4.15 µs (1.53 倍)、
   10 列 0.77 → 0.85 µs (1.11 倍)、 1 列 0.65 → 0.68 µs (1.04 倍)
 - **sync する DB の削除** (#997、 削除の門): 本体の書き出しと重なる形で **p99 が 0.37.4 の 2〜5 倍**
@@ -380,7 +395,7 @@ engine / schema の API の約束が変わる所:
 - **v15 の DB の払い出しと開き直し** (#977 / #1048): 余地のある表への `entity_in` + tie (v15、 書き手 1 本) 76 → 104 ns (1.31 倍。 上の書き込みの
   値段を含む)、 書き手 8 本は 1.10 倍速い。 きれいに閉じた v15 の DB を開くのは、 WAL 付きで 1.22 → 0.66 ms (速い)、 `open_standalone` で
   0.78 → 0.82 ms (1.06 倍、 揺れ 0.86〜1.23)。 満杯の表の消して足す 1 回は 741 → 0.63 µs (速い)
-- **開く時間** (11-19 の測り、 0.37.4 と master 65ef3e91 = #1028 の後。 この版では測り直していない): 書きかけで kill した DB を書き手が開くのは 1.03〜1.06 倍 (10 万行 × 3 列 sync あり 116 →
+- **開く時間** (11-19 の測り、 0.37.4 と #1028 の後の master。 この版では測り直していない): 書きかけで kill した DB を書き手が開くのは 1.03〜1.06 倍 (10 万行 × 3 列 sync あり 116 →
   124 ms)。 きれいに閉じた DB を書き手が開くのは 0.61〜0.66 倍 (warm、 当てる record の無い DB は WAL を fsync しない #796 / #817。 その分、 開いた
   後の最初の書き込みが header の page の msync を払う 54 → 873 µs)。 暇にして kill した DB は 0.94〜0.99 倍。 きれいに閉じなかった後の最初の
   書き出し 1 回は全域の msync (#814)。 落ちた後の単独の open は WAL 付きの open と閉じる分が足される (#892)。 `prev.seg` の記録が残っている時の
@@ -393,7 +408,7 @@ engine / schema の API の約束が変わる所:
 - **ホスト**: ring に載る行が増える (LWW で負けた record (#740)、 Tag を書くたびの Vocab (#781))。 ホストが書き手の行の無い DB で state を作る
   時、 全部の cell の版数を見る (0.19 → 4.9〜5.0 ms、 #822。 #842 で他の行の cell を hash と lock なしで外す)。 client の置き場 (`.clients`) を
   client の出入りと last_seen の幅ごとに fsync で書く (#1051、 往復は master と区別つかず)
-- 切る前に測り直していない物 (各 PR の本文が 0.37.4 と測った数): sync の表のある DB の update (relbench `w 1 8`) 0.84〜0.87 倍 (#818 の測り、
+- 切る前に測り直していない物 (各 PR の本文が 0.37.4 と測った数): sync の表のある DB の update (書き手 1 本 / 8 本) 0.84〜0.87 倍 (#818 の測り、
   原因未特定)、 Tag の列のある表の `state_records()` 0.79〜0.88 倍 (#816 / #842)、 `_sync_ops` の ring と WAL が満杯で落ちた DB の、 開いた後の
   最初の `oplog_sync()` 93.7 → 116.6 ms (#848)、 開く時間 (上の 11-19 の数)。 Linux・遅いディスクでは測っていない (msync の遅いディスクでは
   削除の門の待ちが伸びる)
@@ -476,8 +491,9 @@ engine / schema の API の約束が変わる所:
   - 受信が他の peer の行の宛名を写像で引いた後・世代を読む前に場所が使い回されると、 新しい行に当たった (#1034)。 自分が消した受けた行の
     削除が、 使い回した直後の電源断で WAL から落ちると相手に届かなかった (#1035)。 Ref の値の宛名が `prev.seg` を見ず、 覚えの無い時に幻の行を
     作った (#1036) (#1051)
-  - 開く時の突き合わせ 2. の完了 (生きている印だけ届いた削除) が tombstone を置かず、 遅れた受信が次の世代で行を生き返らせた (#1046 の (2))。
-    最後の世代の場所の 2. の完了が今の時刻で Delete を作り直した (#1047) → 1. も 2. も削除の時刻の下限で tombstone と Delete (#1068、 上の互換)。
+  - 開く時の突き合わせが、 生きている印だけ届いた削除を完了させる時に tombstone を置かず、 遅れた受信が次の世代で行を生き返らせた (#1046)。
+    最後の世代の場所でそれを完了させると今の時刻で Delete を作り直した (#1047) → `gen.seg` だけ死んでいた削除も生きている印だけ届いた削除も、
+    削除の時刻の下限で tombstone と Delete (#1068、 上の互換)。
     作り直すのは自分の行の場所だけ (翻訳した行の場所と、 自分の行どうしの畳み #612 の src は作らない)
 - 世代を持たない物: `define_reserved_table` で作った表、 packed / wasm の v14 の DB (#731 が残る)。 readonly の open は突き合わせない
 
@@ -682,14 +698,14 @@ WAL なしの書き込み:
 
 - **get と行ごとの読みの世代の照合** (#1020、 #1015): `get_by_id` は v14 の DB で 0.37.4 の 1.31 → 1.01 倍、 1 行使い回した v15 で 2.17 → 1.35 倍、
   全部の page に印のある v15 で 2.98 → 1.98 倍 (命令 105 / 157 / 182 → 87 / 130 / 143、 0.37.4 は 76)。 v15 の `pull_raw` 1 万件 2.20 → 1.30 倍、
-  relw の処理量 0.75 → 0.84 倍。 file の形・wire は同じ
+  主キーで引いて列を読む負荷の処理量 0.75 → 0.84 倍。 file の形・wire は同じ
 - **行の削除の確保** (#1021、 #1016): 削除のたびに値のある紐の並びと入った門を `Vec` 2 つに確保していたのを stack に置く。 辞書の書き出しの見張りは
   語を返した時だけ。 #1021 の測りで engine の delete 0.93 倍、 schema の insert (WAL 付き) 0.97 倍 (master 比)。 1 列の書き込みの道は変えていない
 - **消す書き手を並べた時の取り合い** (#1022、 #1017): sync しない DB で書き手 8 本が並んで消すと処理量が 0.37.4 の 0.69 倍・1 回の中央値 1.5 →
   4.5 µs だった。 削除 1 回に layout の read lock (`has_cell_version()`) を 4 回・表の extent の read lock (`TableDef::local_of`) を 3 回取り、 数えの
   RMW と合わせて 8 本が同じ cache line を取り合っていた。 写しを lock なしで読み、 答えの変わらない数えは読むだけにした (#857 / #870 / #877 /
-  #878 の約束は同じ)。 0.37.4 と同じ速さに戻った (この版の 0.37.4 の分の lock も取らなくなった)。 extent を 32 個越えて足した表 (schema の既定の
-  枠で 3,200 万行を越えた表) は 33 個目から今まで通り lock を取る
+  #878 の約束は同じ)。 0.37.4 と同じ速さに戻った (この版の 0.37.4 の分の lock も取らなくなった)。 extent を 32 個越えて足した表 (最初の枠 + 32 個。
+  schema の既定の枠 100 万の表なら 3,300 万行を越えた表) は 33 個目から今まで通り lock を取る
 - **満杯の名前のある表の名前の記録の書き出し** (#1028、 #1018): 場所を使い回すたびに前の住人の名前を移すので、 `oplog_sync` の中の名前の記録が
   `pktombs` と `pkformer.log` の 2 つとも disk まで書き出していた (macOS の `F_FULLFSYNC` 1 回 4〜5 ms)。 組の途中を `F_BARRIERFSYNC` に (上の互換)。
   `oplog_sync` p50 は 0.37.4 の 2.04 → 1.36 倍、 `persist_sync_state` p50 1.62 → 1.02 倍 (#1028 の測り)
@@ -718,7 +734,8 @@ WAL なしの書き込み:
 
 ### Performance — その他
 
-- 満杯の表の消して足す: 0.37.4 の 1 回 731 µs → 0.56 µs (#872。 0.37.4 は足すたびに枠をなめていた)
+- 満杯の表の消して足す: 0.37.4 の 1 回 741 µs → 0.63 µs (切る前の測り、 上の 「値段」。 0.37.4 は足すたびに枠をなめていた。 #872 の測りは上の
+  「engine のその他」)
 - state を作る走査で、 出さない行の cell を hash と lock なしで外す: ホストが 1 人分の state を作る 3.49 (0.37.4) → 2.95 ms、 client の
   `state_records()` 3.96 (0.37.4) → 3.08 ms (#838 / #839、 #842)。 外した cell の走査で値のある cell を握らずに落とす (#794、 #816)
 - 自分の名前の書き込みで #751 の判定を通らない: sync の表のある DB の書き手 8 本の insert 0.93〜0.96 → 0.994〜1.001 (0.37.4 比) (#793、 #818)
@@ -757,7 +774,8 @@ WAL なしの書き込み:
 
 ### 既知の残り
 
-利用者に関わる物 (開いている issue):
+利用者に関わる物 (開いている issue)。 括弧の 「読み」 = コードを読んで見つけ、 まだ再現していない / 「推測」 = 起きうる道を考えたが確かめて
+いない / 「疑い」 = 怪しいが本物か決まっていない:
 
 - 電源断・落ちた後に開く時:
   - 開く時の再生が自分の TieLeaf の容量の断り (Leaf / 列 / `gen.seg` の空き不足) を捨て、 書き出しの返った値を失いうる (#1009、 読み)。
@@ -810,7 +828,7 @@ WAL なしの書き込み:
   5 秒の上限に当たりうる (#847)。 Tag の辞書は語を回収しない (#381、 opt-in の回収あり)。 古い版から持ち越した DB の `entity_count()` が実数より
   大きいまま直らない (#1050)
 - 値段: 書き手 1 本の書き込み 1.06〜1.23 倍 (#873 / #885、 #1016)。 v15 の DB の `get` 1.4〜2.0 倍 (#885、 #1015)、 v15 で消したことのある表の集計
-  1.4〜2.4 倍 (並列の版 2.5〜4 倍)。 sync する DB の削除の p99 2〜5 倍 (#997)。 満杯の名前のある表の `oplog_sync` 1.40 倍 (`prev.seg` と bridge、 #1018)。
+  1.2〜2.4 倍 (並列の版 2.5〜4 倍)。 sync する DB の削除の p99 2〜5 倍 (#997)。 満杯の名前のある表の `oplog_sync` 1.40 倍 (`prev.seg` と bridge、 #1018)。
   受信の当て込み v15 1.20 倍 (#1051)。 ホストの publish p50 1.09 倍 (#984)
 - 試験: CI で確率的に落ちる試験の記録 (#735、 #1011)。 `power_loss` の `writes_dropped_from_a_full_wal_...` が前提 (残り 100 B) で落ちることがある
   (#1005)。 `issue806_vocab_reclaim_replay` の 1 本が #880 の後の前提で落ちる (CI の段に入っていない、 #1001)
@@ -823,7 +841,7 @@ WAL なしの書き込み:
   `power_loss` 153・`changefeed_log_power_loss` 5 (+1 ignored)・`issue813_unclean_open_writes_out_previous_session` 4・`issue880_standalone_open_replays_wal` 10・
   `issue902_tables_dir_sync_failure` 3・`issue884_tables_dir_sync_order` 1・`prev_seg_dir_sync_order` 1・`fault_matrix` 8 (`--test-threads=1`) が全部通過。
   master a5578d51 の CI 10 本と coverage は 1 回目で通過
-- 版の比べ: 上の 「値段」 (0.37.4 と a5578d51 を交互に 5 回)。 答え合わせ (dbw の mismatch・wb / pb の bad・st4 の fails) は全部 0、 失敗した run は 0
+- 版の比べ: 上の 「値段」 (0.37.4 と a5578d51 を交互に 5 回)。 答え合わせ (書いた値と読んだ値の不一致など) は全部 0、 失敗した run は 0
 - 版を混ぜた sync (実 process + HTTP のホスト、 置き場あり、 毎回開き直す。 0.37.4 = tag v0.37.4、 0.38 = この版。 sync の表は build phase で作り、
   行は `finish_with_oplog` の後に書く):
   - 筋書き 1 (使い回しを含む): client A が表 (枠 4、 名前・Tag・Leaf・Ref) に 4 行を作り、 B が受けて書き換え・足す。 A が 1 を消して 9 を足す
