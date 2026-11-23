@@ -208,10 +208,11 @@ fn version_columns_are_padded_too() {
         .unwrap();
         eng.define_table("t", 1_000).unwrap();
         eng.define_himo_in("t", "x", ValueType::Number, 0).unwrap();
-        eng.enable_sync_tables().unwrap();
         hid = eng.himo_id("t.x").unwrap() as u16;
+        // 行は sync の表を作る前に払い出す (#1066: sync の表を作った後の build phase はユーザの表に行を足せない)。 版数は受信の道で置く
         e = eng.entity_in("t").unwrap();
         gone = eng.entity_in("t").unwrap();
+        eng.enable_sync_tables().unwrap();
         assert!(eng.remote_tie_apply(e, hid, 5, at(100)));
         assert!(eng.set_tombstone(gone, at(200)));
         eng.flush().unwrap();

@@ -722,10 +722,15 @@ pub enum FaultKind {
     /// #553 / #554: 書き込みが WAL に載らない (WAL より大きい record、 または sync の表の無い DB で満杯の WAL を畳めない)。
     /// 本体にも当てずに断る
     WalSpace,
+    /// #1066: sync する DB (sync の表がある) を WAL なしで開いた session (`open_standalone` / schema の `Database::open` /
+    /// `finish_concurrent` / build phase) の、 ユーザの表への書き込み。 版数 (WAL の時計) が付かず相手に配れないので、 何も変えずに断る。
+    /// WAL 付きで開き直す (`open_concurrent_with_oplog` / schema の `open_with_oplog`、 build phase は `finish_with_oplog` の後) と書ける。
+    /// WAL を持てない engine (`from_bytes` の Memory backing / wasm) の sync する DB は、 ユーザの表に書けない (読みだけ)
+    NoWal,
 }
 
 impl FaultKind {
-    pub(crate) const COUNT: usize = 8;
+    pub(crate) const COUNT: usize = 9;
     pub(crate) fn index(self) -> usize {
         match self {
             FaultKind::EntitySpace => 0,
@@ -736,6 +741,7 @@ impl FaultKind {
             FaultKind::StaleValue => 5,
             FaultKind::SegmentIo => 6,
             FaultKind::WalSpace => 7,
+            FaultKind::NoWal => 8,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -748,6 +754,7 @@ impl FaultKind {
             FaultKind::StaleValue => "stale value id (reclaimed)",
             FaultKind::SegmentIo => "column segment could not be opened",
             FaultKind::WalSpace => "the write does not fit in the oplog (WAL)",
+            FaultKind::NoWal => "a sync-enabled DB opened without the oplog (WAL) cannot write user rows",
         }
     }
 }
@@ -5854,6 +5861,8 @@ mod wal_reject_tests {
         let faults = eng.fault_count(FaultKind::WalSpace);
         eng.untie_by_id(kept, v);
         eng.delete(kept);
+        // #1066 の読み直し F5: `try_delete` は WAL に載らない断りを返す (前は NoWal の他は `Ok` を返した)
+        assert_eq!(eng.try_delete(kept), Err(TieRejected::Fault(FaultKind::WalSpace)), "WAL に載らない削除を try_delete が断りとして返さない");
         assert_eq!(eng.get_by_id(kept, v), Some(1), "WAL に載らなかった untie / delete が本体を変えた");
         assert!(eng.fault_count(FaultKind::WalSpace) >= faults + 2, "untie / delete を断った数が増えない");
         write_out_fault::set(&wal, false);
@@ -8499,6 +8508,9 @@ mod gone_own_delete_tests {
     /// #921 の読み直し [8]: 世代を持てない DB (packed を開いた Memory backing、 wasm と同じ) で消して足すと、 新しい住人は消えた行と同じ番号 (場所)。
     /// その番号を消えた行の identity として退避表に載せない (載せると state の自分の削除として出て、 受け手が新しい住人を消す)。 packed は表の
     /// 定義を運ばないので、 sync の表は開いた後に作る。 消えた行の削除は受信の道で当てる (WAL の無い Memory backing の自分の削除は版数を持たない)。
+    ///
+    /// #1066: WAL の無い sync する DB はユーザの表に行を足せない (自分の行は sync の表を作る前に書く)。 使い回すのは受けた行の払い出し
+    /// (相手の行の写像を作る受信の道)。
     #[test]
     fn a_db_without_generations_does_not_move_the_new_residents_number() {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -8508,13 +8520,13 @@ mod gone_own_delete_tests {
         Engine::pack_dir(&path, std::path::Path::new(&packed)).unwrap();
         let mut mem = Engine::from_bytes(std::fs::read(&packed).unwrap()).unwrap();
         mem.define_table("t", 2).unwrap();
-        mem.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
-        mem.enable_sync_tables().unwrap();
+        let a = mem.define_himo_in("t", "a", ValueType::Number, 0).unwrap() as u16;
         mem.set_peer_id(1);
         let x = mem.entity_in("t").unwrap();
         mem.tie_to(x, "t.a", 1u32);
         let y = mem.entity_in("t").unwrap();
         mem.tie_to(y, "t.a", 2u32);
+        mem.enable_sync_tables().unwrap();
         // 相手の peer が消した (受信の道、 版数は相手の時計)
         let t = enchudb_oplog::Hlc { wall: 1_800_000_000_000, logical: 0, peer: 2 };
         assert!(mem.remote_delete_apply(x, t), "前提: 削除を当てた");
@@ -8522,7 +8534,7 @@ mod gone_own_delete_tests {
         assert_eq!(mem.slot_bits(), 0, "前提: 世代を持たない DB");
         assert!(mem.sync_tables_on(), "前提: sync の表のある DB");
         assert_ne!(mem.tombstone_version_of(gone), enchudb_oplog::Hlc::ZERO, "前提: 消えた行の削除の版数がある");
-        let again = mem.entity_in("t").unwrap();
+        let again = mem.resolve_remote_eid(enchudb_oplog::make_eid(3, 9), a).expect("前提: 受けた行の場所を払い出した");
         assert_eq!(mem.slot_unchecked(again), gone, "前提: 消えた行の場所を使い回した");
         assert!(
             !mem.orphan_foreign_tombstones().iter().any(|&(peer, l, _)| peer == 1 && l == gone),
@@ -17818,6 +17830,9 @@ impl Engine {
 
     /// Vec<u8> からエンジンを構築。WASM ではこれが唯一のエントリポイント。
     /// native でも使える（テスト、ファイル丸読みなど）。
+    ///
+    /// この engine は WAL (oplog) を持てない。 #1066: sync の表のある DB (relay の bootstrap を開いた物など) は、 ユーザの表の行を書けない
+    /// (読みだけ。 相手から受けた書き込みと予約の表は通る)。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
         // file の無い engine (書き出しは何もしない)
@@ -18507,6 +18522,10 @@ impl Engine {
     ///
     /// 0.7.0 では opt-in 方針。 一度有効化すると無効化は不可 (= reserved table
     /// は close できない、 ただし himo は最小)。
+    ///
+    /// #1066: 有効にした後は、 WAL 付きの session (`concurrentize_with_oplog` の後 / `open_concurrent_with_oplog`) でしか、 ユーザの表の行を
+    /// 書けない (この build phase の残り・`open_standalone`・`concurrentize` (WAL なし)・`from_bytes` / wasm の書き込みは
+    /// `FaultKind::NoWal` で断る)。 版数の無い初期の行が要るなら、 有効にする前に書く。
     pub fn enable_sync_tables(&mut self) -> Result<(), String> {
         self.check_writable();
 
@@ -22395,10 +22414,14 @@ impl Engine {
         self.try_entity_in(table_name).map_err(|(_, why)| why)
     }
 
-    /// [`Self::entity_in`] の、 断りの種類を分ける形 (#970、 PR #977 の読み直し 4 の [9])。 `Err((Some(FaultKind::DiskSpace), why))` =
-    /// ディスクの空きの不足 (払い出す場所の世代を書く gen.seg の page を commit できない / v15 に移れない。 空きが戻れば通る、 列を
-    /// 伸ばせない時と同じ棚)。 `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は前者を
-    /// `SchemaError::WriteRejected(TieRejected::Fault(DiskSpace))` にする。
+    /// [`Self::entity_in`] の、 断りの種類を分ける形 (#970、 PR #977 の読み直し 4 の [9])。 `Err((Some(kind), why))` は fault に数える断り:
+    ///
+    /// - `Some(FaultKind::DiskSpace)`: ディスクの空きの不足 (払い出す場所の世代を書く gen.seg の page を commit できない / v15 に移れない。
+    ///   空きが戻れば通る、 列を伸ばせない時と同じ棚)
+    /// - `Some(FaultKind::NoWal)` (#1066): sync する DB を WAL なしで開いた session (build phase を含む) のユーザの表。 WAL 付きで開き直すと通る
+    ///
+    /// `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は `Some(kind)` を
+    /// `SchemaError::WriteRejected(TieRejected::Fault(kind))` にする。
     pub fn try_entity_in(&self, table_name: &str) -> Result<enchudb_oplog::EntityId, (Option<FaultKind>, String)> {
         self.try_entity_in_row(table_name).map(|(eid, _)| eid)
     }
@@ -22411,6 +22434,17 @@ impl Engine {
         &self,
         table_name: &str,
     ) -> Result<(enchudb_oplog::EntityId, Option<crate::row_lock::RowWrite<'_>>), (Option<FaultKind>, String)> {
+        // #1066: WAL なしで開いた sync する DB は、 ユーザの表に行を払い出さない (払い出した行に何も書けない。 予約の表は払い出す)
+        if self.oplog.is_none()
+            && self.sync_tables_on()
+            && self.tables.iter().any(|t| t.name == table_name && !t.is_reserved())
+        {
+            self.record_fault(FaultKind::NoWal, "a sync-enabled DB opened without the oplog (WAL) refused to add a user row (#1066)");
+            return Err((
+                Some(FaultKind::NoWal),
+                format!("table '{table_name}': a sync-enabled DB must be opened with the oplog (WAL) to add rows"),
+            ));
+        }
         self.entity_in_held(table_name, false).map_err(|e| match e {
             // 待つ形 (`nowait` が偽) は返さない
             EntityInError::Busy(slot) => (None, format!("table '{table_name}': slot {slot} is held by a writer")),
@@ -32256,6 +32290,10 @@ impl Engine {
 
         let eid = self.forward_eid(eid); // #612: 畳んだ自分の行の eid は残す行へ
         self.check_writable();
+        // #1066: 断る書き込みで紐を生やさない
+        if self.app_slot(eid).is_some_and(|l| self.refuses_walless_sync_write(l)) {
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Tag, 0);
         self.tie_text_by_id(eid, hid as u16, value);
     }
@@ -32274,6 +32312,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(eid) else { return };
+        // #1066: build phase / WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
@@ -32332,6 +32374,10 @@ impl Engine {
         if !self.fits(self.himo_id(himo).unwrap_or(usize::MAX), value) {
             return;
         }
+        // #1066: 断る書き込みで紐を生やさない
+        if self.app_slot(eid).is_some_and(|l| self.refuses_walless_sync_write(l)) {
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Number, 0);
         self.tie_by_id(eid, hid as u16, value);
     }
@@ -32342,6 +32388,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(eid) else { return };
+        // #1066: build phase / WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         let Some(value) = self.cell_value(value) else { return };
         if !self.fits(hid, value) {
@@ -32369,6 +32419,10 @@ impl Engine {
         if self.reject_sentinel(target_local, "tie_ref target_eid >= u32::MAX (sentinel reserved)") {
             return;
         }
+        // #1066: 断る書き込みで紐を生やさない
+        if self.app_slot(eid).is_some_and(|l| self.refuses_walless_sync_write(l)) {
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Ref, 0);
         self.tie_ref_by_id(eid, hid as u16, target_eid);
     }
@@ -32384,6 +32438,10 @@ impl Engine {
         self.check_writable();
         // #731: 行の側は消えた行 / 場所を使い回す前の eid なら書かない。 的の側 (Ref の値) の世代は段 2 (今は場所)
         let Some(eid) = self.app_slot(eid) else { return };
+        // #1066: build phase / WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let target_eid = enchudb_oplog::eid_local(self.forward_eid(target_eid));
         if self.reject_sentinel(target_eid, "tie_ref target_eid >= u32::MAX (sentinel reserved)") {
             return;
@@ -32445,6 +32503,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -32658,6 +32720,26 @@ impl Engine {
         self.tables.iter().any(|t| is_engine_internal_table(&t.name) && t.contains(local))
     }
 
+    /// #1066 (#1046 の (1)): sync する DB (sync の表がある) を WAL なしで開いた session (`open_standalone` / schema の
+    /// `Database::open` / `finish_concurrent` / build phase = `concurrentize_with_oplog` の前) の、 ユーザの表の行 (場所 `local`) への
+    /// 書き込みなら断る (fault を数えて true、 呼び手は何も変えずに返る)。 WAL が無いと版数 (WAL の時計) が付かず、 書き込みは bridge にも
+    /// #451 の作り直しにも拾われず相手に配られない。 消した行は tombstone なしで死に、 遅れた受信で次の世代に生き返り (#1046)、 削除が
+    /// state に載らないので受け手の亡霊掃除が同じ名前の行まで消した (#923 の形)。
+    ///
+    /// 断らないのは予約の表 (`_` で始まる: `_sync_ops` / `_sync_peers` / `_cursors` / `define_reserved_table` の local-only の表) の行、
+    /// WAL 付きの session、 sync の表の無い DB。 開く時の修復・WAL の再生・相手から受けた書き込み (版数を持つ) は、 この入口を通らない。
+    #[inline]
+    fn refuses_walless_sync_write(&self, local: u32) -> bool {
+        if self.oplog.is_some() || !self.sync_tables_on() || self.tables.iter().any(|t| t.is_reserved() && t.contains(local)) {
+            return false;
+        }
+        self.record_fault(
+            FaultKind::NoWal,
+            "a sync-enabled DB opened without the oplog (WAL) refused a write to a user row — open it with the oplog (#1066)",
+        );
+        true
+    }
+
     /// 0.7.0: `tie_text_to_by_id` の binary 版。 任意 byte slice を vocab に
     /// insert (Leaf なら dedupe なし) し、 himo に紐付ける。 `_sync_ops.payload`
     /// (= oplog record の生 wire bytes) 等、 UTF-8 制約を持たない data を書く用。
@@ -32666,6 +32748,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(app) else { return };
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない (`_sync_ops` の payload は予約の表 = 通る)
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -32811,6 +32897,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない (#612: 畳んだ自分の行の eid は残す行へ)
         let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         let hid = himo_id as usize;
         // #59: 列の幅に入らない値 (sentinel 含む) は cell に入らない。 panic せず write を拒否 + 計上。
         // WAL に載せる前に弾く
@@ -32899,6 +32989,10 @@ impl Engine {
         // #731: 行の側は消えた行 / 場所を使い回す前の eid なら書かない。 的の側は eid の local (世代 | 場所) をそのまま Ref の値に
         // する (消えた行を指す ref は、 場所が使い回されても新しい行を指さない)
         let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は書かない
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         let target_eid = enchudb_oplog::eid_local(target_eid);
         if target_eid == u32::MAX {
             self.record_fault(
@@ -32977,6 +33071,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は何もしない (#612: 畳んだ自分の行の eid は残す行へ)
         let Some(eid) = self.app_slot(app) else { return };
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は外さない
+        if self.refuses_walless_sync_write(eid) {
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -33007,22 +33105,32 @@ impl Engine {
 
     // ──── delete ────
 
-    pub fn delete(&self, eid: enchudb_oplog::EntityId) {
+    /// 行 `eid` を消す。 消せなかった時は理由を返し、 何も変えない (`try_tie_*` と同じ形、 #1066 の読み直し F5):
+    ///
+    /// - `DeadRow`: 消えた行 / 場所を使い回す前の eid (#731)
+    /// - `Fault(NoWal)`: WAL なしで開いた sync する DB のユーザの表の行 (#1066)
+    /// - `Fault(SegmentIo)`: 開けない列がある (#534。 途中まで消さない)
+    /// - `Fault(WalSpace)`: WAL に載らない (#553 / #554)
+    /// - `OlderThanCell`: cell に今より新しい版数がある (時計が戻った)
+    pub fn try_delete(&self, eid: enchudb_oplog::EntityId) -> Result<(), TieRejected> {
         let app = eid;
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は何もしない (#612: 畳んだ自分の行の eid は残す行へ)
-        let Some(eid) = self.app_slot(app) else { return };
+        let eid = self.app_slot(app).ok_or(TieRejected::DeadRow)?;
+        // #1066: WAL なしで開いた sync する DB のユーザの表の行は消さない (tombstone なしで死ぬ = #1046)
+        if self.refuses_walless_sync_write(eid) {
+            return Err(TieRejected::Fault(FaultKind::NoWal));
+        }
         // #534: 消すには全部の列の古い値を読む (索引と Leaf の領域の片付け)。 開けない列があれば何も積まずに断る (途中まで
         // 消さない。 WAL に積んでから断ると、 配った相手でだけ消える)
-        if (0..self.himos.len()).any(|hid| self.load_column(hid).is_err()) {
-            return;
+        for hid in 0..self.himos.len() {
+            self.load_column(hid)?;
         }
         // request17 step 4 (A-5): 削除は himo を持たないので eid 空間の tombstone
         // column に版数を記録する。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 行を握ってから積む (`append_local_op` の doc)
-        let Some(row) = self.lock_app_row(app, eid) else { return };
-        let row = Some(row);
+        let row = Some(self.lock_app_row(app, eid).ok_or(TieRejected::DeadRow)?);
         let oplog_eid = self.oplog_eid(eid);
         let mut hids = RowHids::new();
         let applying = self.local_apply_row(eid, &mut hids);
@@ -33033,9 +33141,7 @@ impl Engine {
         if !self.has_cell_version() {
             self.note_freed_slot(eid, enchudb_oplog::Hlc::ZERO);
         }
-        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark()) else {
-            return;
-        };
+        let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }, applying.mark())?;
         self.at_apply_point(true);
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc, applying.row_valued());
         drop(applying);
@@ -33048,9 +33154,16 @@ impl Engine {
                 names_taken_hook::call(wal);
             }
             self.remove_rows_holding_names(eid, names, hlc);
+            Ok(())
         } else {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
+            Err(TieRejected::OlderThanCell)
         }
+    }
+
+    /// 行 `eid` を消す。 消せなかった時は何もしない (理由は [`Self::try_delete`]、 容量の断りは `fault_count` にも数える)。
+    pub fn delete(&self, eid: enchudb_oplog::EntityId) {
+        let _ = self.try_delete(eid);
     }
 
     // ──── トランザクション ────
@@ -33142,6 +33255,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない
         let Some(local) = self.app_slot(eid) else { return };
+        // #1066: content の紐を生やす前に断る
+        if self.refuses_walless_sync_write(local) {
+            return;
+        }
         let hid = self.ensure_content_himo(local, key);
         self.tie_bytes_to_by_id(eid, hid, data);
     }
@@ -40695,6 +40812,10 @@ impl Engine {
         self.check_writable();
         // #731: 消えた行 / 場所を使い回す前の eid は書かない
         let Some(local) = self.app_slot(eid) else { return };
+        // #1066: content の紐を生やす前に断る
+        if self.refuses_walless_sync_write(local) {
+            return;
+        }
         let hid = self.ensure_content_himo(local, key);
         self.tie_bytes_async_by_id(eid, hid, data);
     }
@@ -49114,14 +49235,15 @@ mod delete_gate_path_tests {
         p
     }
 
-    /// sync する DB (tomb.seg がある = 削除は門を通る): 表 t (Number 列 n、 Leaf 列 z)。
+    /// sync する DB (tomb.seg がある = 削除は門を通る): 表 t (Number 列 n、 Leaf 列 z)。 `build` は sync の表を作る前に呼ぶ (版数の無い
+    /// 書き込み。 #1066: sync の表を作った後の build phase はユーザの表の行を書けない)。
     fn sync_engine(p: &str, build: impl FnOnce(&mut Engine)) -> Arc<Engine> {
         let mut eng = Engine::create_with_cell_version(p, 4096).unwrap();
         eng.define_table("t", 100).unwrap();
         eng.define_himo_in("t", "n", ValueType::Number, 0).unwrap();
         eng.define_himo_in("t", "z", ValueType::Leaf, 0).unwrap();
-        eng.enable_sync_tables().unwrap();
         build(&mut eng);
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();

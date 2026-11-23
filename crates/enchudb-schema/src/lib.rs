@@ -7346,9 +7346,14 @@ impl<'a> EntityRef<'a> {
         }
     }
 
+    /// 行を消す。 消せなかった時は `WriteRejected` (engine の [`enchudb_engine::Engine::try_delete`] の理由): #1066 の sync する DB を
+    /// WAL なしで開いた (`Database::open` / build phase) 時は `Fault(NoWal)` (WAL 付きで開き直す: `open_with_oplog` /
+    /// `finish_with_oplog` の後)、 WAL に載らない時は `Fault(WalSpace)` など。 もう消えた行は今まで通り `Ok` (何もしない)。
     pub fn delete(self) -> Result<(), SchemaError> {
-        self.db.engine().delete(self.eid);
-        Ok(())
+        match self.db.engine().try_delete(self.eid) {
+            Ok(()) | Err(enchudb_engine::TieRejected::DeadRow) => Ok(()),
+            Err(r) => Err(SchemaError::WriteRejected(r)),
+        }
     }
 }
 

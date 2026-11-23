@@ -55,13 +55,14 @@ fn db_sized(path: &str, peer: PeerId, seed: std::ops::Range<u32>, rows: u32) -> 
         e.define_himo_in("notes", "v", ValueType::Number, 0).unwrap();
         let k = e.himo_id("notes.k").unwrap() as u16;
         e.set_table_pk("notes", k).unwrap();
-        e.enable_sync_tables().unwrap();
         e.set_peer_id(peer);
+        // 版数の無い cell は sync の表を作る前に書く (#1066: sync の表を作った後の build phase はユーザの表の行を書けない)
         for key in seed {
             let row = e.entity_in("notes").unwrap();
             e.tie(row, "notes.k", key);
             e.tie(row, "notes.v", key);
         }
+        e.enable_sync_tables().unwrap();
         e.flush().unwrap();
     }
     let e = Engine::open_concurrent_with_oplog(path, 64 << 20).unwrap();

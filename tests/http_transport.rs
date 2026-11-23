@@ -227,10 +227,12 @@ fn fresh_replica_bootstraps_then_syncs() {
         let mut eng = Engine::create_compact(&origin_path).unwrap();
         eng.define_table(TABLE, 1000).unwrap();
         eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
-        eng.enable_sync_tables().unwrap();
+        // 初期データは sync の表を作る前に書く (#1066: sync の表を作った後の build phase はユーザの表の行を書けない。
+        // replica は bootstrap で DB ごと受ける)
         let e1 = eng.entity_in(TABLE).unwrap();
         eng.tie(e1, &q("val"), 42);
         let _e1_id = e1;
+        eng.enable_sync_tables().unwrap();
         eng.rebuild();
         eng.flush().unwrap();
     }

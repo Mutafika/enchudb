@@ -4623,7 +4623,11 @@ fn a_reuse_after_the_reconcile_torn_again_does_not_hand_out_the_reused_eid() {
 
 /// #992 の読み直し 4 の B4 (A1): 後始末待ちの残る場所は使い回さない。 WAL の file の無い sync する DB の単独の session は、 tombstone の作り直しを
 /// WAL 付きの open まで待つので、 後始末待ちが session の間ずっと残る。 その場所を使い回すと、 生かす道が後始末待ちを落とし (r の Delete を
-/// 作り直さなくなる、 前の残り 7)、 書き出しが切れた像では次の open が世代を上げない。 表を広げて新しい場所を払い出す。
+/// 作り直さなくなる、 前の残り 7)、 書き出しが切れた像では次の open が世代を上げない。
+///
+/// #1066 の後: WAL なしで開いた sync する DB はユーザの表に行を足せない (アプリの払い出しは断る)。 後始末待ちの場所を使い回さない守りは、
+/// WAL なしの session でも受信の払い出し (`resolve_remote_eid` → `entity_in_held`) が使うので、 その道で見る (表を広げて新しい場所を
+/// 払い出す)。 後始末待ちは残り、 次の WAL 付きの open が拾う。
 #[test]
 fn a_slot_waiting_for_its_cleanup_is_not_reused() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -4639,8 +4643,11 @@ fn a_slot_waiting_for_its_cleanup_is_not_reused() {
         assert_eq!(eng.generation_repairs(), (1, 0), "前提: 突き合わせが r の場所を完了させた (後始末待ち)");
         // 後始末待ちの場所は空きに数えない (#992 の読み直し 5 の細かい 3。 表の穴は r の場所だけ)
         assert_eq!(eng.table_eid_usage("notes").map(|u| u.free), Some(0), "後始末待ちの場所を空きに数えた");
-        let n = eng.entity_in("notes").unwrap();
-        assert_ne!(eng.eid_slot(n), eng.eid_slot(r), "後始末待ちの場所を使い回した");
+        assert!(eng.entity_in("notes").is_err(), "WAL なしで開いた sync する DB で行を足せた (#1066)");
+        // 受信の払い出し (相手の行 (9, 1) の場所) は後始末待ちの場所を使い回さない
+        let note = eng.himo_id("notes.note").unwrap() as u16;
+        let received = eng.resolve_remote_eid(enchudb_oplog::make_eid(9, 1), note).expect("前提: 受けた行の場所を払い出した");
+        assert_ne!(eng.eid_slot(received), eng.eid_slot(r), "後始末待ちの場所を受信の払い出しが使い回した");
     }
     let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.resumed_cleanups(), 1, "単独の session の後始末待ちを WAL 付きの open が拾わない");
