@@ -2888,6 +2888,20 @@ pub mod write_out_hook {
     type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
     static HOOK: super::hook_slot::Slot<dyn Fn(Phase) + Send + Sync> = super::hook_slot::Slot::new();
 
+    /// #1043: 立っている間、 WAL を持つ engine で足した紐の定義をその場で書き出さない (`define_himo_slot_locked`)。 process に 1 つ。
+    /// 「WAL に紐の record があって本体にその紐の定義が無い」 像 (前の binary が書いた DB、 定義の書き出しに失敗した時) を作り、 開く時の
+    /// 再生が紐を定義する道を試験するため。
+    static SKIP_HIMO_DEFINITION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// [`SKIP_HIMO_DEFINITION`] を立てる / 下ろす。
+    pub fn skip_himo_definition_write_out(on: bool) {
+        SKIP_HIMO_DEFINITION.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn skips_himo_definition_write_out() -> bool {
+        SKIP_HIMO_DEFINITION.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// 前の hook を外して置き換える (前の hook は lock の外で落とす、 [`super::hook_slot::Slot::set`])。
     pub fn set(hook: Option<Hook>) {
         HOOK.set(hook);
@@ -3819,6 +3833,45 @@ mod revive_gap_hook {
     }
 }
 
+/// test 用の割り込み点 (#1041 の読み直し B): アプリの eid を照合した後・場所を読む前 (`app_slot` が場所を返す所と、 `read_app_in` が
+/// `f` を呼ぶ前)。 照合を読む前にだけする読み (`app_slot` → 読む) と、 読んだ後にも照合する読み (`read_app`) のどちらも通る。 置いた
+/// thread で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod checked_read_hook {
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
+/// test 用の割り込み点 (#1041): copy で読む text の本体 (`text_owned_by_id`、 `get_text_owned` / `get_content_owned` / `get_entity_owned`)
+/// が列を読む前。 置いた thread で 1 回だけ呼ぶ (読みの入口の照合の後・読んだ後の照合の前に、 行を消して場所を使い回すため)。
+#[cfg(test)]
+mod owned_read_hook {
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn call() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 /// test 用の割り込み点: `revive_slot` が場所の 2 B と生きている印を読んだ後・死の印を落とす前 (#901)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod revive_read_hook {
@@ -3854,6 +3907,22 @@ mod ensure_live_settle_hook {
 /// test 用の割り込み点: `ensure_live_slot` が死の印を落とした後・生きている印を立てる前 (#913)。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod ensure_live_gap_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 消す道 (`live_free`) が世代と死の印を書く前 (cell は外し終えた後、 #1040 の読み直し A)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod kill_start_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -5232,6 +5301,358 @@ mod eid_gen_claim_tests {
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
+/// 0.38 前 review D: group の購読の読みの世代 (#1039)、 見直しの購読の消す途中の poll (#1040)、 copy で読む入口の読んだ後の照合 (#1041)。
+/// 割り込み点で 「確かめた後・読む前」 / 「消す道の世代を上げた後・生きている印を下ろす前」 に行を消して場所を使い回す (時間で待たない)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod review038_d_tests {
+    use super::*;
+    use crate::live::LivePred;
+    use std::sync::Arc;
+
+    /// 枠 2 の会社の表 `c` (city)、 社員の表 `u` (company → c、 age)、 枠 1 の表 `s` (a、 先に使い回して v15 に移す) を持つ engine と、
+    /// `s` の生きている行。
+    struct World {
+        path: String,
+        eng: Arc<Engine>,
+        city: u16,
+        company: u16,
+        s_row: enchudb_oplog::EntityId,
+    }
+
+    fn world(tag: &str) -> World {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-rev038d-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("c", 2).unwrap();
+        eng.define_himo_in("c", "city", ValueType::Number, 0).unwrap();
+        eng.define_table("u", 8).unwrap();
+        eng.define_ref_in("u", "company", "c").unwrap();
+        eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
+        eng.define_table("s", 1).unwrap();
+        eng.define_himo_in("s", "a", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("s", "g", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("s", "w", ValueType::Number64, 0).unwrap();
+        // 枠 1 の社員の表 (使い回した行 = 世代 ≥ 1 の社員を作る)
+        eng.define_table("w", 1).unwrap();
+        eng.define_ref_in("w", "company", "c").unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        // 枠 1 の表で使い回して v15 (世代を持つ DB) に移る
+        let x = eng.entity_in("s").unwrap();
+        eng.delete(x);
+        let s_row = eng.entity_in("s").unwrap();
+        assert_eq!(eng.slot_unchecked(s_row), eng.slot_unchecked(x), "前提: 使い回した");
+        assert!(eng.generations().active() && s_row != x, "前提: v15");
+        let city = eng.himo_id("c.city").unwrap() as u16;
+        let company = eng.himo_id("u.company").unwrap() as u16;
+        World { path, eng, city, company, s_row }
+    }
+
+    impl World {
+        fn finish(self) {
+            let World { path, eng, .. } = self;
+            drop(eng);
+            let _ = crate::db_files::remove_db(&path);
+            let _ = std::fs::remove_file(oplog_path_for(&path));
+        }
+
+        /// city = 1 の会社の購読の条件。
+        fn tokyo(&self) -> Vec<LivePred> {
+            vec![LivePred::Via { path: vec![self.company], pred: Box::new(LivePred::Eq { himo_id: self.city, value: 1 }) }]
+        }
+
+        /// 会社 (city = `city`) を足す。
+        fn company_in(&self, city: u32) -> enchudb_oplog::EntityId {
+            let c = self.eng.entity_in("c").unwrap();
+            self.eng.tie_to_by_id(c, self.city, city);
+            c
+        }
+
+        /// 会社 `c` の社員を足す。
+        fn staff_of(&self, c: enchudb_oplog::EntityId) -> enchudb_oplog::EntityId {
+            let u = self.eng.entity_in("u").unwrap();
+            self.eng.tie_ref_to_by_id(u, self.company, c);
+            u
+        }
+    }
+
+    /// 会社 `c0` を消し、 その場所を使い回した会社 (city = 1) に社員を 1 人足す。 返り値 = (新しい会社, その社員)。
+    fn reuse_company(eng: &Arc<Engine>, city: u16, company: u16, c0: enchudb_oplog::EntityId) -> (enchudb_oplog::EntityId, enchudb_oplog::EntityId) {
+        eng.delete(c0);
+        let d = eng.entity_in("c").unwrap();
+        assert_eq!(eng.slot_unchecked(d), eng.slot_unchecked(c0), "前提: 消えた会社の場所を使い回した");
+        assert_ne!(d, c0);
+        eng.tie_to_by_id(d, city, 1u32);
+        let u = eng.entity_in("u").unwrap();
+        eng.tie_ref_to_by_id(u, company, d);
+        (d, u)
+    }
+
+    /// #1039: 会社単位の購読 (`subscribe_grouped`) の `members` / `count_in` は、 group が今居るかを確かめた後に、 その group の
+    /// 行を指す ref で中身を引く。 前は場所の今の世代を付け直して引いたので、 確かめた後・引く前に会社が消えて場所が使い回されると、
+    /// 新しい住人の社員を返した (数も新しい住人の社員の数)。
+    #[test]
+    fn grouped_members_of_a_group_deleted_and_reused_meanwhile_are_not_the_new_residents() {
+        for count in [false, true] {
+            let w = world("grouped");
+            let c0 = w.company_in(1);
+            w.company_in(2); // 表を埋める (次の会社は消えた会社の場所を使い回す)
+            let staff: Vec<_> = (0..2).map(|_| w.staff_of(c0)).collect();
+            let g = w.eng.subscribe_grouped(w.tokyo()).unwrap();
+            assert_eq!(g.poll(&w.eng).added, vec![c0]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (e2, city, company) = (w.eng.clone(), w.city, w.company);
+            crate::live::set_group_check_hook(move || {
+                tx.send(reuse_company(&e2, city, company, c0)).unwrap();
+            });
+            if count {
+                let n = g.count_in(&w.eng, c0);
+                rx.try_recv().expect("前提: 割り込み点で使い回した");
+                assert_eq!(n, staff.len(), "count_in: 確かめた後に消えて使い回された会社の数が、 新しい住人の社員の数になった");
+            } else {
+                let got = g.members(&w.eng, c0);
+                let (_, newcomer) = rx.try_recv().expect("前提: 割り込み点で使い回した");
+                assert!(!got.contains(&newcomer), "members: 確かめた後に消えて使い回された会社の中身に、 新しい住人の社員が入った: {got:?}");
+                assert_eq!(got, staff, "members: 会社を指したままの社員");
+            }
+            w.finish();
+        }
+    }
+
+    /// #1039: 見直しの購読の `group_of` は、 社員の ref の値 (世代 | 場所) を 1 回だけ読んで、 今の住人を指すかと group の eid の両方を
+    /// 決める。 前は今の住人かを確かめた後に場所の今の世代で eid を作り直したので、 間で会社が消えて場所が使い回され (poll もされ) ると、
+    /// 社員が指したことの無い新しい住人を group として返した。
+    #[test]
+    fn touched_group_of_never_answers_a_group_the_row_does_not_point_to() {
+        let w = world("groupof");
+        let c0 = w.company_in(1);
+        w.company_in(2);
+        let u1 = w.staff_of(c0);
+        let t = Arc::new(w.eng.subscribe_touched(w.tokyo()).unwrap());
+        assert_eq!(t.poll(&w.eng).added, vec![c0]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (e2, t2, city, company) = (w.eng.clone(), t.clone(), w.city, w.company);
+        crate::live::set_group_check_hook(move || {
+            let (d, _) = reuse_company(&e2, city, company, c0);
+            let delta = t2.poll(&e2);
+            assert!(delta.added.contains(&d) && delta.removed.contains(&c0), "前提: poll が使い回しを渡した");
+            tx.send(d).unwrap();
+        });
+        let got = t.group_of(&w.eng, u1);
+        let d = rx.try_recv().expect("前提: 割り込み点で使い回した");
+        assert_ne!(got, Some(d), "社員 u1 が指したことの無い会社 (消えた会社の場所を使い回した住人) を group として返した");
+        drop(t);
+        w.finish();
+    }
+
+    /// #1040: 行を消す道 (`live_free`) が世代と死の印を書いた後・生きている印を下ろす前に見直しの購読を poll しても、 その poll か次の
+    /// poll の `touched` に、 アプリが持つ消えた行の eid が出る。 前はその poll が次の住人 (まだ居ない世代) の eid を出し、 次の poll は
+    /// 解放の印だけで見直しの印の無い場所を回らないので、 消えた行の eid はどこにも出なかった (アプリは会社 → 社員の表から外せない)。
+    #[test]
+    fn touched_polled_while_a_row_is_being_deleted_reports_the_eid_the_app_holds() {
+        let w = world("touchedgap");
+        let c0 = w.company_in(1);
+        let e = w.staff_of(c0);
+        let t = Arc::new(w.eng.subscribe_touched(w.tokyo()).unwrap());
+        assert_eq!(t.poll(&w.eng).added, vec![c0]);
+        assert_eq!(t.members(&w.eng, c0), vec![e], "前提: アプリは社員 e を持つ");
+        let slot = w.eng.slot_unchecked(e);
+        let wal = w.eng.oplog.as_ref().unwrap().clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (e2, t2) = (w.eng.clone(), t.clone());
+        free_gap_hook::set(&wal, move |_| {
+            // 消す書き手は世代と死の印を書いた後・生きている印を下ろす前。 別の thread が poll する
+            let midway = e2.generations().is_dead(slot) && e2.entities.is_live(slot);
+            let h = std::thread::spawn(move || t2.poll(&e2).touched);
+            tx.send((midway, h.join().unwrap())).unwrap();
+        });
+        w.eng.delete(e);
+        let (midway, gap) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("前提: 消す道の割り込み点を通った");
+        assert!(midway, "前提: 割り込み点は消す途中 (死の印あり・生きている印あり)");
+        let next = t.poll(&w.eng).touched;
+        assert!(
+            gap.contains(&e) || next.contains(&e),
+            "消す途中の poll と次の poll のどちらの touched にも、 アプリが持つ消えた行の eid {e:#x} が無い: 途中 {gap:x?} / 次 {next:x?}"
+        );
+        drop(t);
+        w.finish();
+    }
+
+    /// #1041: copy で読む入口 (`get_content_owned` / `get_entity_owned`) は、 読んだ後にも世代を照合する (`get_text_owned` と同じ
+    /// `read_app`)。 前は読む前だけ照合したので、 読みの間に行が消えて場所が使い回されると、 新しい住人の content / 列 (`get_entity_owned`
+    /// は消えた行の列と新しい住人の列が混ざった組) を、 古い eid の値として返した。
+    #[test]
+    fn owned_reads_whose_row_is_deleted_and_reused_meanwhile_return_nothing() {
+        for entity in [false, true] {
+            let w = world("ownedread");
+            let a = w.s_row;
+            let s_a = w.eng.himo_id("s.a").unwrap() as u16;
+            w.eng.tie_to_by_id(a, s_a, 7u32);
+            w.eng.content(a, "memo", b"row a");
+            assert_eq!(w.eng.get_content_owned(a, "memo").as_deref(), Some(&b"row a"[..]), "前提");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let e2 = w.eng.clone();
+            owned_read_hook::set(move || {
+                // 読む前の照合の後・列を読む前に、 a を消して同じ場所を使い回し (枠 1 の表)、 新しい住人が content と列を書く
+                e2.delete(a);
+                let b = e2.entity_in("s").unwrap();
+                assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(a), "前提: 同じ場所を使い回した");
+                e2.tie_to_by_id(b, s_a, 8u32);
+                e2.content(b, "memo", b"row b");
+                tx.send(()).unwrap();
+            });
+            if entity {
+                let got = w.eng.get_entity_owned(a);
+                rx.try_recv().expect("前提: 割り込み点で使い回した");
+                assert!(got.is_empty(), "get_entity_owned: 読みの間に消えて使い回された行の列を返した: {got:?}");
+            } else {
+                let got = w.eng.get_content_owned(a, "memo");
+                rx.try_recv().expect("前提: 割り込み点で使い回した");
+                assert_eq!(got, None, "get_content_owned: 読みの間に消えて使い回された行の content を返した");
+            }
+            w.finish();
+        }
+    }
+
+    /// #1040 の読み直し A: 使い回した場所の行 (世代 g ≥ 1) を消す道の kill と free が、 見直しの購読の `touched_eids` の 2 つの読み
+    /// (生きている印と世代の 2 B) の間に入っても、 その poll か次の poll の `touched` に消えた行の eid (g | 場所) が出る。 前は世代を
+    /// 先に読んだので (g, 死の印なし) → (生きている印なし) になり、 死んだ場所として g − 1 (前の住人) の eid を出して、 消えた行の eid は
+    /// どこにも出なかった (世代 0 の行は 「今 = 0」 の枝に入るので出る = 前の試験は通った)。
+    #[test]
+    fn touched_polled_across_a_delete_of_a_reused_row_reports_the_eid_the_app_holds() {
+        let w = world("touchedreused");
+        let c0 = w.company_in(1);
+        let via = w.eng.himo_id("w.company").unwrap() as u16;
+        // 枠 1 の表 w で場所を使い回した社員 e (世代 ≥ 1)
+        let x = w.eng.entity_in("w").unwrap();
+        w.eng.tie_ref_to_by_id(x, via, c0);
+        w.eng.delete(x);
+        let e = w.eng.entity_in("w").unwrap();
+        w.eng.tie_ref_to_by_id(e, via, c0);
+        let slot = w.eng.slot_unchecked(e);
+        assert!(slot == w.eng.slot_unchecked(x) && w.eng.generations().get(slot) >= 1, "前提: 使い回した場所の行");
+        let pred = vec![LivePred::Via { path: vec![via], pred: Box::new(LivePred::Eq { himo_id: w.city, value: 1 }) }];
+        let t = w.eng.subscribe_touched(pred).unwrap();
+        assert_eq!(t.poll(&w.eng).added, vec![c0]);
+        assert_eq!(t.members(&w.eng, c0), vec![e], "前提: アプリは社員 e を持つ");
+        // 消す書き手: cell を外した (見直しの印が付いた) 後・kill の前で止まる
+        let wal = w.eng.oplog.as_ref().unwrap().clone();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        kill_start_hook::set(&wal, move |_| {
+            stopped_tx.send(()).unwrap();
+            let _ = go_rx.recv();
+        });
+        let deleter = {
+            let eng = w.eng.clone();
+            std::thread::spawn(move || eng.delete(e))
+        };
+        stopped_rx.recv_timeout(std::time::Duration::from_secs(30)).expect("前提: 消す道が kill の前に来た");
+        // poll: settle が外した cell の見直しの印を取り、 touched_eids の 2 つの読みの間で消す書き手に kill と free まで進めさせる
+        let e2 = w.eng.clone();
+        crate::live::set_touched_read_hook(move || {
+            go_tx.send(()).unwrap();
+            let t0 = std::time::Instant::now();
+            while e2.entities.is_live(slot) {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(30), "前提: 消す道が生きている印を下ろさない");
+                std::thread::yield_now();
+            }
+        });
+        let gap = t.poll(&w.eng).touched;
+        deleter.join().unwrap();
+        let next = t.poll(&w.eng).touched;
+        assert!(!w.eng.is_live(e), "前提: e は消えた");
+        assert!(
+            gap.contains(&e) || next.contains(&e),
+            "消す道が 2 つの読みの間に入った poll と次の poll のどちらの touched にも、 アプリが持つ消えた行の eid {e:#x} が無い: 途中 {gap:x?} / 次 {next:x?}"
+        );
+        drop(t);
+        w.finish();
+    }
+
+    /// #1041 の読み直し B: eid の並びを受ける集計も、 照合の後・列を読む前に行が消えて場所が使い回され、 新しい住人が書いても、 古い
+    /// eid の値として新しい住人の値を数えない (消えた行 = 何も数えない)。 前は照合を読む前にだけしたので、 新しい住人の値を数えた。
+    /// 代表: `sum` / `group_sum` / `count` / `min64` (列の cell を Acquire で読む `read_app_acquired` の道) と `histogram_eids` (列の生の
+    /// 並びを読む `read_app` の道)。 `*_eids_par` は数が閾値より少ないと同じ順の版に落ちる (並列の版の割り込み点は rayon の worker に
+    /// 置けない)。
+    #[test]
+    fn aggregates_over_a_row_deleted_and_reused_meanwhile_count_nothing() {
+        for which in ["sum", "group_sum", "count", "min64", "histogram_eids", "sum_eids_par"] {
+            let w = world("aggregates");
+            let a = w.s_row;
+            let id = |n: &str| w.eng.himo_id(n).unwrap() as u16;
+            let (sa, sg, sw) = (id("s.a"), id("s.g"), id("s.w"));
+            w.eng.tie_to_by_id(a, sa, 7u32);
+            w.eng.tie_to_by_id(a, sg, 3u32);
+            w.eng.tie_to_by_id(a, sw, 70u64);
+            assert_eq!(w.eng.sum("s.a", &[a]), 7, "前提");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let e2 = w.eng.clone();
+            checked_read_hook::set(move || {
+                // 照合の後・列を読む前に、 a を消して同じ場所を使い回し (枠 1 の表)、 新しい住人 b が同じ列に書く
+                e2.delete(a);
+                let b = e2.entity_in("s").unwrap();
+                assert_eq!(e2.slot_unchecked(b), e2.slot_unchecked(a), "前提: 同じ場所を使い回した");
+                e2.tie_to_by_id(b, sa, 8u32);
+                e2.tie_to_by_id(b, sg, 4u32);
+                e2.tie_to_by_id(b, sw, 80u64);
+                tx.send(()).unwrap();
+            });
+            let got = match which {
+                "sum" => format!("{}", w.eng.sum("s.a", &[a])),
+                "group_sum" => format!("{:?}", w.eng.group_sum("s.g", "s.a", &[a])),
+                "count" => format!("{}", w.eng.count("s.a", &[a])),
+                "min64" => format!("{:?}", w.eng.min64("s.w", &[a])),
+                "histogram_eids" => format!("{:?}", w.eng.histogram_eids("s.a", &[a], 0, 9, 10)),
+                "sum_eids_par" => format!("{}", w.eng.sum_eids_par("s.a", &[a])),
+                _ => unreachable!(),
+            };
+            rx.try_recv().unwrap_or_else(|_| panic!("{which}: 前提: 割り込み点で使い回した"));
+            let want = match which {
+                "group_sum" => "[]".to_string(),
+                "min64" => "None".to_string(),
+                "histogram_eids" => format!("{:?}", vec![0u32; 10]),
+                _ => "0".to_string(),
+            };
+            assert_eq!(got, want, "{which}: 読みの間に消えて使い回された行の値 (新しい住人の値) を数えた");
+            w.finish();
+        }
+    }
+
+    /// #1043 の読み直し C: WAL を持つ engine で紐を足す時、 列の file を作った directory (`{db}/himo`) を、 header (紐の数) を書き出す
+    /// 前に fsync する (header が紐の数を言う時には、 その file の entry が disk にある。 開く時は header の本数だけ file を探す)。 順は、
+    /// header を書き出す msync の所 (`segment_map` の試験の割り込み点) で、 その thread がもう directory を fsync したかで見る (crashsim は
+    /// directory の entry を模さない)。
+    #[test]
+    fn a_column_added_on_a_wal_engine_syncs_its_directory_before_the_header() {
+        use crate::db_files::sync_counts::{self, Issued};
+        let w = world("himodir");
+        let header = std::path::Path::new(&w.path).join(SegmentKind::Header.rel_path());
+        let me = std::thread::current().id();
+        let seen: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+        {
+            let seen = seen.clone();
+            crate::segment_map::tests::set_flush_hook(&header, move || {
+                if std::thread::current().id() == me {
+                    let issued = sync_counts::take();
+                    seen.lock().unwrap().push(issued.contains(&Issued::DirSync(HIMO_DIR_SYNC)));
+                }
+                Ok(())
+            });
+        }
+        let _hold = w.eng.hold_consumer();
+        let _ = sync_counts::take();
+        w.eng.ensure_himo_dynamic_in("u", "added", ValueType::Number, 0).unwrap();
+        crate::segment_map::tests::clear_flush_hook(&header);
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "前提: 紐を足す道が header を書き出した");
+        assert!(seen[0], "header (紐の数) を、 列の file の directory を fsync する前に書き出した");
+        drop(_hold);
+        w.finish();
     }
 }
 
@@ -22449,6 +22870,12 @@ impl Engine {
         self.himo_names.len()
     }
 
+    /// あと何本の紐を足せるか (`max_himos` と紐の番号の上限 (u16) まで)。 schema の再宣言が、 列を足す前に断るかを決めるのに使う
+    /// (#1044)。 並んで紐を足す書き手が居れば、 返った後に減りうる。
+    pub fn himo_room(&self) -> usize {
+        (self.max_himos as usize).min(u16::MAX as usize).saturating_sub(self.himos.len())
+    }
+
     /// 0.8.7: index 直で himo の full name (= `{table}.{col}` or anonymous) を返す。
     pub fn himo_name_at(&self, idx: usize) -> Option<&str> {
         self.himo_names.get(idx).map(|s| s.as_str())
@@ -23739,6 +24166,10 @@ impl Engine {
         // PR #977 の読み直し 4 の [3]: 書けなかった場所は覚えて、 名前のある表の使い回し (全部なめも) が飛ばす (`Generations::retired`)。
         // 閉じる時に書き直し、 書けなければ次に開く時の突き合わせが完了させる
         let mut unkilled = false;
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            kill_start_hook::call(wal);
+        }
         if on
             && (row_gen.is_some() || was_live)
             && !replaying
@@ -26314,8 +26745,13 @@ impl Engine {
             self.app_slot_wide(local)?
         };
         if self.own_alias_on.load(std::sync::atomic::Ordering::Relaxed) && enchudb_oplog::eid_peer(eid) == self.peer_id() {
-            return Some(self.forward_local_slow(slot));
+            let slot = self.forward_local_slow(slot);
+            #[cfg(test)]
+            checked_read_hook::call();
+            return Some(slot);
         }
+        #[cfg(test)]
+        checked_read_hook::call();
         Some(slot)
     }
 
@@ -26342,7 +26778,8 @@ impl Engine {
     /// [`Self::read_app`] の、 `f` が列の cell を Acquire の load で読む時 (`HimoStore::get_value_inline`、 #106) の版。 読んだ後の照合の
     /// 前の fence を省く: cell の Acquire の load が、 その cell を書いた (使い回した後の住人の) 書き手の Release と対になるので、 使い
     /// 回した後の値を読んだ読みは、 後の照合で消した側の世代の書きを必ず見る (fence と同じ順)。 #1015: fence を省くと get 1 回が
-    /// 0.5〜0.6 ns 速い (M4 Max、 100 万行)。
+    /// 0.5〜0.6 ns 速い (M4 Max、 100 万行)。 #1041: eid の並びを受ける集計のうち `get_value` / `get_value32` (同じ Acquire の
+    /// `value_at`) で読む物もこの版 (列の生の並び `stored_slice` を読む物は fence のある [`Self::read_app`])。
     #[inline]
     fn read_app_acquired<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnOnce(u32) -> Option<R>) -> Option<R> {
         self.read_app_in::<false, R>(eid, f)
@@ -26397,6 +26834,8 @@ impl Engine {
                 },
             }
         };
+        #[cfg(test)]
+        checked_read_hook::call();
         let out = f(slot);
         // 読んだ後の照合の load は全部 `f` の後: `FENCE` の道はここで fence を置き、 そうでなければ `f` の cell の Acquire が順を付ける
         // (#1020 の読み直し C: 前は世代を持たない道の読み直しだけ fence の無いまま場所の bit を Acquire で読んでいた。 Acquire の load は
@@ -27302,10 +27741,11 @@ impl Engine {
         self.slot_unchecked(eid)
     }
 
-    /// 場所に行が生きているか (live の出口で使う、 照合しない)。
+    /// 場所に行が生きているか (live の出口で使う、 照合しない)。 印は Acquire で読む (印を下ろした消す道の kill を、 この後の世代の
+    /// 読みで必ず見る。 #1040)。
     #[inline]
-    pub(crate) fn slot_is_live(&self, slot: u32) -> bool {
-        self.entities.is_live(slot)
+    pub(crate) fn slot_is_live_acquire(&self, slot: u32) -> bool {
+        self.entities.is_live_acquire(slot)
     }
 
     /// #731: 場所の今の住人の eid (今の世代)。
@@ -30583,8 +31023,13 @@ impl Engine {
     /// 旧 content region (pre-0.9) は 0.9.0 以降 **凍結アーカイブで書き込みゼロ** なので
     /// copy のみ (verify 不要)。
     pub fn get_content_owned(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<Vec<u8>> {
-        // #731: 消えた行 / 場所を使い回す前の eid は None
-        let local = self.app_slot(eid)?;
+        // #731: 消えた行 / 場所を使い回す前の eid は None。 #1041: 読んだ後にも世代を照合する (`read_app`、 `get_text_owned` と同じ。
+        // 前は読む前だけで、 読みの間に消えて場所が使い回されると新しい住人の content を返した)
+        self.read_app(eid, |local| self.content_owned_at(local, key))
+    }
+
+    /// [`Self::get_content_owned`] の本体 (照合済みの場所 `local`)。
+    fn content_owned_at(&self, local: u32, key: &str) -> Option<Vec<u8>> {
         if let Some(hid) = self.content_himo_id(local, key) {
             // cell が設定されていれば新経路の結果をそのまま返す。 `text_owned_by_id` の
             // **retry 枯渇 (None)** で legacy region に fallback すると、 0.9.0 以降凍結して
@@ -31062,6 +31507,8 @@ impl Engine {
     ///   slot gen 変化、 の両方を検出する。
     /// - **Tag / reserved Leaf**: append-only vocab は不変なので copy のみ (retry 不要)。
     fn text_owned_by_id(&self, hid: usize, eid_local: u32) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        owned_read_hook::call();
         match self.value_types[hid] {
             ValueType::Tag | ValueType::Leaf => match self.leaf_for(hid) {
                 // routed-Leaf: seqlock verify で torn read / stale を排除。
@@ -31391,7 +31838,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut total: u64 = 0;
         for &eid in eids {
-            if let Some(v) = self.app_slot(eid).and_then(|l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 total += v as u64;
             }
         }
@@ -32078,7 +32525,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = self.app_slot(eid).and_then(|l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 result = Some(result.map_or(v, |cur: u32| cur.min(v)));
             }
         }
@@ -32091,7 +32538,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = self.app_slot(eid).and_then(|l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 result = Some(result.map_or(v, |cur: u32| cur.max(v)));
             }
         }
@@ -32105,7 +32552,7 @@ impl Engine {
         let mut total: u64 = 0;
         let mut count: u64 = 0;
         for &eid in eids {
-            if let Some(v) = self.app_slot(eid).and_then(|l| hs.get_value32(l)) {
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l)) {
                 total += v as u64;
                 count += 1;
             }
@@ -32119,7 +32566,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut n: u32 = 0;
         for &eid in eids {
-            if self.app_slot(eid).and_then(|l| hs.get_value(l)).is_some() { n += 1; }
+            if self.read_app_acquired(eid, |l| hs.get_value(l)).is_some() { n += 1; }
         }
         n
     }
@@ -32139,8 +32586,8 @@ impl Engine {
             let mut seen: Vec<bool> = vec![false; cap];
             let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), ss.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -32156,8 +32603,8 @@ impl Engine {
         } else {
             let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), ss.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(ss.get_value32(l))) {
                     *map.entry(group).or_insert(0) += val as u64;
                 }
             }
@@ -32229,7 +32676,7 @@ impl Engine {
             let mut counts: Vec<u32> = vec![0; cap];
             let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                if let Some(group) = self.app_slot(eid).and_then(|l| gs.get_value32(l)) {
+                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
                     match counts.get_mut(group as usize) {
                         Some(c) => *c += 1,
                         None => *spill.entry(group).or_insert(0) += 1,
@@ -32242,7 +32689,7 @@ impl Engine {
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                if let Some(group) = self.app_slot(eid).and_then(|l| gs.get_value32(l)) {
+                if let Some(group) = self.read_app_acquired(eid, |l| gs.get_value32(l)) {
                     *map.entry(group).or_insert(0) += 1;
                 }
             }
@@ -32261,8 +32708,8 @@ impl Engine {
             let mut seen: Vec<bool> = vec![false; cap];
             let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         if val < mins[i] { mins[i] = val; }
@@ -32279,8 +32726,8 @@ impl Engine {
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let entry = map.entry(group).or_insert(u32::MAX);
                     if val < *entry { *entry = val; }
                 }
@@ -32300,8 +32747,8 @@ impl Engine {
             let mut seen: Vec<bool> = vec![false; cap];
             let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         if val > maxs[i] { maxs[i] = val; }
@@ -32318,8 +32765,8 @@ impl Engine {
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let entry = map.entry(group).or_insert(0);
                     if val > *entry { *entry = val; }
                 }
@@ -32339,8 +32786,8 @@ impl Engine {
             let mut cnts: Vec<u64> = vec![0; cap];
             let mut spill: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let i = group as usize;
                     if i < cap {
                         sums[i] += val as u64;
@@ -32358,8 +32805,8 @@ impl Engine {
         } else {
             let mut acc: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
             for &eid in eids {
-                let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
+                // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                if let Some((group, val)) = self.read_app_acquired(eid, |l| gs.get_value32(l).zip(vs.get_value32(l))) {
                     let e = acc.entry(group).or_insert((0, 0));
                     e.0 += val as u64;
                     e.1 += 1;
@@ -32419,7 +32866,7 @@ impl Engine {
         let mut result: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for &eid in eids {
-            if let Some(v) = self.app_slot(eid).and_then(|l| hs.get_value32(l))
+            if let Some(v) = self.read_app_acquired(eid, |l| hs.get_value32(l))
                 && seen.insert(v)
             {
                 result.push(v);
@@ -32458,11 +32905,9 @@ impl Engine {
             .map(|chunk| {
                 let mut total: u64 = 0;
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local < values.len() {
-                        total += values[local].saturating_sub(1) as u64;
-                    }
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
+                    total += stored.saturating_sub(1) as u64;
                 }
                 total
             })
@@ -32483,9 +32928,8 @@ impl Engine {
             .map(|chunk| {
                 let mut n: u32 = 0;
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local < values.len() && values[local] != 0 {
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    if self.read_app(eid, |l| values.get(l as usize).copied()).is_some_and(|stored| stored != 0) {
                         n += 1;
                     }
                 }
@@ -32509,14 +32953,11 @@ impl Engine {
                 let mut best: u32 = u32::MAX;
                 let mut hit = false;
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local < values.len() {
-                        let stored = values[local];
-                        if stored != 0 {
-                            hit = true;
-                            if stored < best { best = stored; }
-                        }
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
+                    if stored != 0 {
+                        hit = true;
+                        if stored < best { best = stored; }
                     }
                 }
                 if hit { Some(best) } else { None }
@@ -32542,12 +32983,9 @@ impl Engine {
             .map(|chunk| {
                 let mut best: u32 = 0;
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local < values.len() {
-                        let stored = values[local];
-                        if stored > best { best = stored; }
-                    }
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
+                    if stored > best { best = stored; }
                 }
                 if best > 0 { Some(best) } else { None }
             })
@@ -32585,11 +33023,12 @@ impl Engine {
                 let mut acc: Vec<u64> = vec![0; cap];
                 let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local >= groups.len() || local >= sums.len() { continue; }
-                    let g_stored = groups[local];
-                    let s_stored = sums[local];
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    let Some((g_stored, s_stored)) =
+                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *sums.get(l as usize)?)))
+                    else {
+                        continue;
+                    };
                     if g_stored == 0 || s_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
                     if g < cap {
@@ -32638,11 +33077,12 @@ impl Engine {
                 let mut mins: Vec<u32> = vec![u32::MAX; cap];
                 let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local >= groups.len() || local >= vals.len() { continue; }
-                    let g_stored = groups[local];
-                    let v_stored = vals[local];
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    let Some((g_stored, v_stored)) =
+                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)))
+                    else {
+                        continue;
+                    };
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
                     if g < cap {
@@ -32695,11 +33135,12 @@ impl Engine {
                 let mut maxs: Vec<u32> = vec![0; cap];
                 let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local >= groups.len() || local >= vals.len() { continue; }
-                    let g_stored = groups[local];
-                    let v_stored = vals[local];
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    let Some((g_stored, v_stored)) =
+                        self.read_app(eid, |l| Some((*groups.get(l as usize)?, *vals.get(l as usize)?)))
+                    else {
+                        continue;
+                    };
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
                     if g < cap {
@@ -32747,10 +33188,8 @@ impl Engine {
         let span = (vmax as u64 - vmin as u64) + 1;
         let n_u64 = n_buckets as u64;
         for &eid in eids {
-            let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-            if local >= values.len() { continue; }
-            let stored = values[local];
+            // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+            let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
             if stored == 0 { continue; }
             let val = stored - 1;
             if val < vmin || val > vmax { continue; }
@@ -32784,10 +33223,8 @@ impl Engine {
             .map(|chunk| {
                 let mut hist: Vec<u32> = vec![0; n];
                 for &eid in chunk {
-                    let Some(local) = self.app_slot(eid) else { continue }; // #731: 消えた行の eid は数えない
-                    let local = local as usize;
-                    if local >= values.len() { continue; }
-                    let stored = values[local];
+                    // #731: 消えた行の eid は数えない (#1041: 読んだ後にも照合する = 読みの間に場所を使い回した行の値を入れない)
+                    let Some(stored) = self.read_app(eid, |l| values.get(l as usize).copied()) else { continue };
                     if stored == 0 { continue; }
                     let val = stored - 1;
                     if val < vmin || val > vmax { continue; }
@@ -32919,19 +33356,19 @@ impl Engine {
     pub fn sum64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u128 {
         let Some(hid) = self.himo_id(himo) else { return 0 };
         let hs = &self.himos[hid];
-        eids.iter().filter_map(|&e| self.app_slot(e).and_then(|l| hs.get_value(l))).map(|v| v as u128).sum()
+        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).map(|v| v as u128).sum()
     }
 
     /// 64 bit の最小値 (どの列でも)。
     pub fn min64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
         let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.app_slot(e).and_then(|l| hs.get_value(l))).min()
+        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).min()
     }
 
     /// 64 bit の最大値 (どの列でも)。
     pub fn max64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
         let hs = &self.himos[self.himo_id(himo)?];
-        eids.iter().filter_map(|&e| self.app_slot(e).and_then(|l| hs.get_value(l))).max()
+        eids.iter().filter_map(|&e| self.read_app_acquired(e, |l| hs.get_value(l))).max()
     }
 
     /// eid の範囲 `lo..hi` での 64 bit の (件数, 合計, 最小, 最大) (table の全 row の集計用、 どの列でも)。
@@ -33064,10 +33501,15 @@ impl Engine {
     /// するので、 書き手が同時に動いていても壊れた中身を掴まない (`open_readonly` の表示用 process など)。
     ///
     /// 列ごとに読むので、 列をまたいだ 1 つの版ではない (揃った組が要るなら [`Engine::read_row`] の中で)。
-    /// 読んでいる間に外れた列は入らない。
+    /// 読んでいる間に外れた列は入らない。 読んでいる間に行が消えて場所が使い回されたら空 (使い回した後の住人の列を混ぜない)。
     pub fn get_entity_owned(&self, eid: enchudb_oplog::EntityId) -> Vec<(&str, EntityValueOwned)> {
-        // #731: 消えた行 / 場所を使い回す前の eid は空 (#612: 畳んだ自分の行の eid は残す行へ)
-        let Some(eid) = self.app_slot(eid) else { return Vec::new() };
+        // #731: 消えた行 / 場所を使い回す前の eid は空 (#612: 畳んだ自分の行の eid は残す行へ)。 #1041: 読んだ後にも世代を照合する
+        // (`read_app`、 `get_text_owned` と同じ。 前は読む前だけで、 読みの間に消えて使い回されると新しい住人の列を返した)
+        self.read_app(eid, |slot| Some(self.entity_fields_owned(slot))).unwrap_or_default()
+    }
+
+    /// [`Self::get_entity_owned`] の本体 (照合済みの場所 `eid`)。
+    fn entity_fields_owned(&self, eid: u32) -> Vec<(&str, EntityValueOwned)> {
         let mut fields = Vec::with_capacity(self.himos.len());
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
@@ -34353,10 +34795,54 @@ impl Engine {
             let _ = std::fs::remove_file(&crc_path);
         }
 
+        // #1043: WAL を持つ engine (並行の形) で足した紐は、 名前を見せる前 (= この紐への書き込みが WAL に載る前) に定義を書き出す。
+        // WAL の record は紐を番号で運び、 定義 (header の紐の数・型、 紐名の辞書、 列の header) は運ばない。 前は書き出しを consumer の
+        // 周期 / `oplog_sync` の本体の書き出し (WAL の fsync の後) に任せたので、 その間の電源断の像では header の紐の数が足りず、 WAL の
+        // 再生はこの紐への Tie を黙って捨てた (同じ group の他の列は戻る)。 WAL の無い engine (build phase / standalone) は再生が無いので
+        // 書き出しは `flush` に任せる。 書き出せなければ fault を数えて続ける (定義は消さない = 前と同じく次の本体の書き出しが届ける)
+        #[cfg(feature = "crashsim")]
+        let skip = write_out_hook::skips_himo_definition_write_out();
+        #[cfg(not(feature = "crashsim"))]
+        let skip = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.oplog.is_some() && !skip && self.write_out_himo_definition(hid as u32).is_err() {
+            self.record_fault(
+                FaultKind::DiskSpace,
+                "足した紐の定義を書き出せない — その紐への書き込みは、 次の本体の書き出しの前に落ちると再生で戻らない",
+            );
+        }
+
         // 最後に名前を publish (この時点で hid の全 metadata が可視)
         let _ = self.himo_names.push(himo.to_string());
 
         Ok(hid as u16)
+    }
+
+    /// #1043: 紐 `hid` の定義を書き出す ([`Self::define_himo_slot_locked`]、 WAL を持つ engine)。 順は 列と版数の列の header → 列の file
+    /// の directory の entry → 紐名の辞書 → DB の header (header が紐の数を言う時には、 それが指す物が disk にある。 列の header が届いて
+    /// いない像は開く時に書かれていない列として組む #414 ので必須ではないが、 1 page なので一緒に)。 `himo_def_lock` の下で呼ぶ (紐を
+    /// 足す書き手だけが待つ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_out_himo_definition(&self, hid: u32) -> io::Result<()> {
+        let Backing::Segments(set) = &self.backing else { return Ok(()) };
+        let (header_size, versions) = {
+            let layout = self.layout.read().unwrap();
+            (layout.header_size, layout.has_cell_version())
+        };
+        set.flush_kind(SegmentKind::Himo(hid), 0, crate::column::HEADER_BYTES)?;
+        if versions {
+            set.flush_kind(SegmentKind::Ver(hid), 0, crate::column::HEADER_BYTES)?;
+        }
+        // #1043 の読み直し C: 列の file を作った directory の entry も header より先に届ける (開く時は header の紐の数だけ
+        // `himo/NNNN.seg` を探し、 無ければ開けない。 page の像を撮る crashsim は directory の entry を模さない)
+        crate::db_files::sync_dir_plain(&set.dir().join("himo"), HIMO_DIR_SYNC)?;
+        if versions {
+            crate::db_files::sync_dir_plain(&set.dir().join("ver"), VER_DIR_SYNC)?;
+        }
+        set.flush_where(false, |k| {
+            matches!(k, SegmentKind::HimoregData | SegmentKind::HimoregOffsets | SegmentKind::HimoregIndex)
+        })?;
+        self.backing.flush_header(header_size)
     }
 
     // ──── 並行書き込み ────
@@ -38119,7 +38605,7 @@ impl crate::live::CellReader for Engine {
         &self,
         via: u16,
         key: u16,
-        target: u32,
+        val: u32,
         lo: u64,
         hi: u64,
         sorted: bool,
@@ -38133,11 +38619,11 @@ impl crate::live::CellReader for Engine {
             return None;
         }
         let bands = o.bands_of(lo, hi);
-        // #731: 並びの索引の鍵は via の列の値 (= 今の世代 | 場所)
-        self.order_read_into(o, self.generations().local(target), bands, sorted, out)?;
+        // #731: 並びの索引の鍵は via の列の値 (= 世代 | 場所)。 どの行の値かは呼び手が決める (場所の今の住人 / group の eid の行)
+        self.order_read_into(o, val, bands, sorted, out)?;
         Some(bands.exact)
     }
-    fn order_arc_len(&self, via: u16, key: u16, target: u32, lo: u64, hi: u64) -> Option<usize> {
+    fn order_arc_len(&self, via: u16, key: u16, val: u32, lo: u64, hi: u64) -> Option<usize> {
         let o = self.live.order_for(via, key)?;
         if lo > hi {
             return Some(0);
@@ -38149,7 +38635,7 @@ impl crate::live::CellReader for Engine {
         if !bands.exact {
             return None;
         }
-        o.arc_len(self.generations().local(target), bands)
+        o.arc_len(val, bands)
     }
     fn with_himo(&self, himo_id: u16) -> Vec<u32> {
         match self.himos.get(himo_id as usize) {
@@ -38185,6 +38671,12 @@ fn map_vocab_refs(dir: &std::path::Path, size: usize) -> io::Result<Arc<crate::s
 /// #385: 参照数の file の名前 (DB の directory の中、 manifest には載せない = 無くても数え直すだけ)。
 #[cfg(not(target_arch = "wasm32"))]
 const VOCAB_REFS_FILE: &str = "vocab.refs.seg";
+
+/// #1043: 紐を足す時に `{db}/himo` / `{db}/ver` を fsync する I/O の点の名前 (`Engine::write_out_himo_definition`)。
+#[cfg(not(target_arch = "wasm32"))]
+const HIMO_DIR_SYNC: &str = "himo.dir.sync";
+#[cfg(not(target_arch = "wasm32"))]
+const VER_DIR_SYNC: &str = "ver.dir.sync";
 
 /// `_sync_ops` の row が payload の ring 上の位置 (handle) を持つ列。 ring を入れる前の row は持たない。
 const SYNC_PAYLOAD_AT: &str = "_sync_ops.payload_at";
