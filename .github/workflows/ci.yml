@@ -199,7 +199,7 @@ jobs:
       # #1064 の残り F6: eid の並びを受ける集計の速い道は照合せずに場所を読み、 終わりに 1 回だけ確かめる (fence → 表の印、 v14 の形は
       # 場所の bit)。 書き手は 印 → 世代 → 生きている印を下ろす / 生かす → 次の住人の値 (Release) の順 (使い回す側が別の thread・値を
       # 書いてから生かす受信の道も)。 順を外した対照 6 本 (Relaxed の読みで fence も無い (v15 / v14) / 印を fence の前に読む / 値を Relaxed
-      # で書く / 印を値の後に立てる / v14 の形で場所の bit を見ない) は、 loom が窓を見つける。
+      # で書く / 印を値の後に立てる / v14 の形で場所の bit でなく表の印を見る (表をまたいだ tie の場所)) は、 loom が窓を見つける。
       - name: loom model check (集計の速い道の終わりの確かめ)
         run: cargo test -p enchudb-engine --test loom_aggregate_fast_path --release
 

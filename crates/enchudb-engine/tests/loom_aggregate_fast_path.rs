@@ -11,6 +11,9 @@
 //!   Release で置き、 v14 の間に消した場所を移る手順の 4. で kill (印 → 世代の RMW) してから使い回す
 //! - 使い回す側が別の thread の形 (`Split`): 消す側の最後の RMW (生きている印を下ろす) を Acquire で見た thread が使い回す (払い出しの
 //!   空きの列 / 受信の `ensure_live_slot` の 「生きていない」 の読み)。 受信の道は値を書いてから生かす (`Receive`)
+//! - 場所が別の表 U の物の形 (`cross`、 #1072 の読み F4): T の列に U の行の値がある (表をまたいだ tie)。 世代を上げる書きが立てるのは U の
+//!   印 (`table_of_slot` が U を返す) で、 T の印は立たない。 v15 の形は T の枠の外の eid を照合つきで読むので、 この形を速い道で読むのは
+//!   v14 の形 (どの local も読む) だけ
 //!
 //! 読み手 (集計の速い道、 code と同じ):
 //! - 始め (`fast_eid_reads`): 表の印を Acquire で読み、 立っていれば照合つきの道 (この model の外、 `loom_read_app_generation`)。 場所の
@@ -26,7 +29,8 @@
 //!
 //! 対照 (should_panic): 順を外した形は loom が窓を見つける — cell を Relaxed で読んで終わりの fence も無い (`ACQ` の道で cell を Relaxed に
 //! する / fence を外す。 v15 と v14 の形) / 終わりの印を fence の前に読む / 書き手が次の住人の値を Relaxed で書く / 印を値の後に立てる /
-//! v14 の形で終わりに場所の bit を見ない。
+//! v14 の形で終わりに場所の bit でなく読む紐の表 T の印を見る (場所が別の表の物の形で窓がある。 場所が T の物なら移る手順の 4. が T の印を
+//! 立てるので窓は無い = 単体の試験 `the_v14_shape_rechecks_the_slot_bits_not_the_table_flag` も表をまたいだ tie の場所で見る)。
 //!
 //! 入れていない対照: 並列の版で worker の chunk の終わりの fence を外す形。 C++ の model では、 呼び手の fence は別の thread (worker) の
 //! Relaxed の読みと書き手を同期させない (fence と同期するのは同じ thread の前の読み) ので窓があるが、 loom 0.7 は join を通した後の
@@ -54,7 +58,11 @@ const NEW: u32 = 20;
 const BITS: u32 = 24;
 
 struct Slot {
+    /// 読む紐の表 T の印
     flag: AtomicU8,
+    /// 場所が別の表 U の物の形 (`cross`) で、 世代を上げる書きが立てる U の印
+    other: AtomicU8,
+    cross: bool,
     bits: AtomicU32,
     slot_gen: AtomicU16,
     live: AtomicBool,
@@ -89,14 +97,16 @@ enum Reader {
     RelaxedNoFence,
     /// 対照: 終わりの印 (Acquire) を fence の前に読む (Acquire の load は前の cell の Relaxed の load を縛らない)
     FlagBeforeFence,
-    /// 対照: v14 の形で終わりに場所の bit を見ない (印だけを見る)
+    /// 対照: v14 の形で終わりに場所の bit でなく、 読む紐の表 T の印を見る
     NoBitsRecheck,
 }
 
 impl Slot {
-    fn new(bits: u32) -> Self {
+    fn new(bits: u32, cross: bool) -> Self {
         Slot {
             flag: AtomicU8::new(0),
+            other: AtomicU8::new(0),
+            cross,
             bits: AtomicU32::new(bits),
             slot_gen: AtomicU16::new(0),
             live: AtomicBool::new(true),
@@ -104,10 +114,11 @@ impl Slot {
         }
     }
 
-    /// `Generations::mark_table`: Acquire の load で見て、 無ければ AcqRel の fetch_or。
+    /// `Generations::mark_table`: Acquire の load で見て、 無ければ AcqRel の fetch_or。 立てるのは場所の表の印 (`cross` なら U)。
     fn mark_table(&self) {
-        if self.flag.load(Ordering::Acquire) == 0 {
-            self.flag.fetch_or(1, Ordering::AcqRel);
+        let flag = if self.cross { &self.other } else { &self.flag };
+        if flag.load(Ordering::Acquire) == 0 {
+            flag.fetch_or(1, Ordering::AcqRel);
         }
     }
 
@@ -180,11 +191,10 @@ impl Slot {
 
     /// 速い道の終わり (`fast_eid_reads_held`) の、 fence の後の読み。
     fn held_after_fence(&self, any_local: bool, rd: Reader) -> bool {
-        if any_local {
-            // 対照 (`NoBitsRecheck`): v14 の形は表の枠を見ずに読むので、 読んだ場所は読む紐の表 T の物とは限らない。 別の表の場所の世代を
-            // 上げる書きは T の印を立てない = T の印だけを見る形は、 誰も立てない印を見るのと同じ
-            return rd == Reader::NoBitsRecheck || self.bits.load(Ordering::Acquire) == 0;
+        if any_local && rd != Reader::NoBitsRecheck {
+            return self.bits.load(Ordering::Acquire) == 0;
         }
+        // v15 の形 (と、 対照 `NoBitsRecheck` の v14 の形): 読む紐の表 T の印
         self.flag.load(Ordering::Acquire) == 0
     }
 }
@@ -224,8 +234,13 @@ fn aggregate(slot: &Arc<Slot>, rd: Reader) -> Option<u32> {
 }
 
 fn check(bits: u32, w: Writer, rd: Reader) {
+    check_in(bits, false, w, rd);
+}
+
+/// `cross`: 場所が別の表 U の物 (T の列に U の行の値がある)。
+fn check_in(bits: u32, cross: bool, w: Writer, rd: Reader) {
     loom::model(move || {
-        let slot = Arc::new(Slot::new(bits));
+        let slot = Arc::new(Slot::new(bits, cross));
         let writers = match w {
             Writer::Split | Writer::Receive => {
                 let d = {
@@ -322,10 +337,25 @@ fn marking_the_table_after_the_value_reaches_the_answer() {
     check(BITS, Writer::MarkAfterValue, Reader::Acquired);
 }
 
-/// 対照: v14 の形で終わりに場所の bit を見ないと (読む紐の表の印だけ)、 移る手順の前に始めた読みが、 移って別の表の場所を使い回した後の
-/// 値を返す (移る手順の 4. はその場所の表の印を立てるが、 v14 の形は表の枠を見ずに別の表の場所も読む)。
+/// v14 の形は表の枠を見ずに読むので、 場所が別の表 U の物 (表をまたいだ tie) でも、 終わりの場所の bit が移ったことを見る。
+#[test]
+fn the_v14_shape_over_another_tables_slot_never_returns_the_next_residents_value() {
+    check_in(0, true, Writer::Code, Reader::Acquired);
+    check_in(0, true, Writer::Code, Reader::Fenced);
+    check_in(0, true, Writer::Code, Reader::Par);
+    check_in(0, true, Writer::Split, Reader::Fenced);
+}
+
+/// 対照 (#1072 の読み F4): v14 の形で終わりに場所の bit でなく読む紐の表 T の印を見ると、 移る手順の前に始めた読みが、 移って別の表 U の
+/// 場所を使い回した後の値を返す (移る手順の 4. と使い回しが立てるのは U の印)。
 #[test]
 #[should_panic(expected = "使い回した後の住人の値")]
-fn the_v14_shape_without_the_bits_recheck_returns_the_next_residents_value() {
+fn the_v14_shape_checking_the_table_flag_returns_the_next_residents_value() {
+    check_in(0, true, Writer::Code, Reader::NoBitsRecheck);
+}
+
+/// 同じ形 (T の印を見る) でも、 場所が T の物なら移る手順の 4. が T の印を立てるので窓は無い (対照が表をまたいだ場所を要る理由)。
+#[test]
+fn the_table_flag_suffices_when_the_slot_is_the_tables_own() {
     check(0, Writer::Code, Reader::NoBitsRecheck);
 }
