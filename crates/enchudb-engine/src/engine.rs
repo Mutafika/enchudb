@@ -28188,7 +28188,11 @@ impl Engine {
             // #1068 の読み直し F2: 作り直すのは自分の行の場所だけ。 翻訳した (他の peer の) 行の場所は、 2. の像に 「畳んだ翻訳した行
             // (`merge_entity_into` の src、 `.eidmap` が本体より遅れた像)」 が入り、 作り直すと state がその行の持ち主の生きている行の
             // Delete を自分の書き込みとして出す。 user の決定 (11-23) の 「翻訳した行の場所は今のまま」 (1. の今の時刻の作り直しもやめる)
-            let own = self.eid_translator.reverse(slot).is_none();
+            // #1068 の読み直し 2 (#1071): 自分の行どうしの畳み (#612) の src も除く。 畳んだ src の場所は世代を上げない (gen.seg で死なない)
+            // ので 1. には来ないが、 別名 (`eidalias`、 本体の後に書く) が遅れた像の 2. はその場所を自分の行の死として拾う。 作り直すと
+            // (自分, src) の Delete を配り、 相手でも同じ改名で畳んでいれば相手の残す行を消した。 自分の行どうしの畳みは名前で畳む時だけで、
+            // その時必ず残す行が (自分, src) を束ねる記録 (`pkformer`、 本体より先に disk まで書く) を残す = それで見分ける
+            let own = self.eid_translator.reverse(slot).is_none() && !self.own_slot_bound_elsewhere(slot);
             let lower = if versioned && own && !gens.mid_reuse(slot) { self.delete_lower_bound(slot) } else { enchudb_oplog::Hlc::ZERO };
             // #1068 の読み直し F1: 前の open の作り直しが置いた下限の tombstone だけが disk に届き、 その floor (本体の `_sync_peers`) が
             // 届かなかった像 (開く道の本体の書き出しの途中の電源断。 tomb.seg は列より先に書き出す) も 「届いていない」 = 作り直す
@@ -28237,6 +28241,18 @@ impl Engine {
         if let Some(t) = self.table_of_slot(slot) {
             self.drop_leftover_cells(slot, t);
         }
+    }
+
+    /// #1068 の読み直し 2 (#1071): 自分の行の場所 `slot` の identity (自分, slot) を、 別の行が束ねているか (名前の記録 `pkformer`)。 自分の行
+    /// どうしの畳み (#612) の src の印 (`merge_entity_into` が残す行に `add_bound` する)。 束ねた行が無ければ atomic 1 回。
+    fn own_slot_bound_elsewhere(&self, slot: u32) -> bool {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let me = (self.peer_id(), slot);
+        let f = self.pk_former.read().unwrap();
+        let bound = f.bound_slots().any(|d| d != slot && f.bound_of(d).iter().any(|(id, _)| *id == me));
+        bound
     }
 
     /// #1047 / #1046 の (2): 開く時の突き合わせが完了させた削除の時刻の下限 = 場所 `slot` の表の列の cell の版数の最大 (値を外した cell も、

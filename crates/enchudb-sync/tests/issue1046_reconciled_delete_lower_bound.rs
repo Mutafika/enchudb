@@ -298,3 +298,74 @@ fn a_folded_translated_row_finished_by_reconcile_step_2_is_not_deleted_for_its_o
     assert_eq!(tomb, Hlc::ZERO, "畳んだ翻訳した行の場所に tombstone を置いた");
     assert_eq!(deletes_x, Vec::<Hlc>::new(), "A の state が B の行 x の Delete を A の書き込みとして出した");
 }
+
+/// #1068 の読み直し 2 (#1071): 自分の行どうしの畳み (#612) の src の、 畳んだ後の生きている印と名前の記録 (`pkformer`、 本体より先に書く) は
+/// 届き、 別名 (`eidalias`、 本体の後に書く) は届いていない像 (畳んだ後の最初の本体の書き出しの途中の電源断)。 突き合わせの 2. は src の
+/// 場所を自分の行の死として拾うが、 残す行が (自分, src) を束ねているので作り直さない (tombstone を置かず、 state に (自分, src) の Delete を
+/// 出さない)。 出すと、 相手でも同じ改名で畳んでいれば相手の残す行 (同じデッキ) が消える。
+///
+/// falsify: 作り直しの 「(自分, 場所) を別の行が束ねていれば除く」 を外すと、 src の場所に下限の tombstone を置き、 state が Delete を出す。
+#[test]
+fn an_own_row_folded_into_another_own_row_is_not_deleted_by_reconcile_step_2() {
+    let (pa, pb, img) = (tmp_path("a"), tmp_path("b"), tmp_path("img"));
+    let (before, after) = (format!("{img}-before"), format!("{img}-after"));
+    let _c = Cleanup(vec![pa.clone(), pb.clone(), img.clone(), before.clone(), after.clone()]);
+    let transport = transport(&[1, 2]);
+    let eng_b = make(&pb, 2);
+    let sync_b = Syncer::new(eng_b.clone(), transport.clone());
+    let (src, src_world) = {
+        let eng_a = make(&pa, 1);
+        let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+        // A の自分の行 s (名前 7) と d (名前 5)、 その後ろに生きた行
+        let s = eng_a.entity_in("notes").unwrap();
+        eng_a.tie_to(s, "notes.name", 7u32);
+        eng_a.tie_to(s, "notes.v", 1u32);
+        let d = eng_a.entity_in("notes").unwrap();
+        eng_a.tie_to(d, "notes.name", 5u32);
+        eng_a.tie_to(d, "notes.v", 2u32);
+        let keep = eng_a.entity_in("notes").unwrap();
+        eng_a.tie_to(keep, "notes.name", 1000u32);
+        eng_a.oplog_sync().unwrap();
+        sync_a.publish_since(Hlc::ZERO);
+        sync_b.pull_once(1);
+        let s_on_b = eng_b.pull_raw("notes.name", 7u32)[0];
+        eng_a.persist_sync_state().unwrap();
+        let src = {
+            let _hold = eng_a.hold_consumer();
+            eng_a.oplog_sync().unwrap();
+            copy_dir(Path::new(&pa), Path::new(&before));
+            // B が A の行 s を名前 5 に改名し、 A が当てて s と d を畳む (どちらも自分の行)
+            eng_b.tie_to(s_on_b, "notes.name", 5u32);
+            eng_b.oplog_sync().unwrap();
+            sync_b.publish_since(Hlc::ZERO);
+            sync_a.pull_once(2);
+            eng_a.persist_sync_state().unwrap();
+            let src = [s, d].into_iter().find(|&e| !eng_a.is_live_unchecked(e)).expect("前提: A は s と d を畳んだ");
+            copy_dir(Path::new(&pa), Path::new(&after));
+            src
+        };
+        drop(sync_a);
+        (src, src)
+    };
+    // 像: 畳む前の写しに、 畳んだ後の生きている印と名前の記録だけを置く (別名 `eidalias` は畳む前)
+    copy_dir(Path::new(&before), Path::new(&img));
+    for f in ["entities.seg", "pkformer", "pkformer.log"] {
+        if Path::new(&after).join(f).exists() {
+            std::fs::copy(Path::new(&after).join(f), Path::new(&img).join(f)).unwrap();
+        }
+    }
+    let eng_a = Engine::open_concurrent_with_oplog(&img, WAL).unwrap();
+    eng_a.set_peer_id(1);
+    assert_eq!(eng_a.generation_repairs(), (0, 1), "前提: 突き合わせの 2. が畳んだ src の場所を完了させた");
+    let tomb = eng_a.tombstone_hlc(src);
+    let deletes: Vec<Hlc> = eng_a
+        .state_records()
+        .0
+        .into_iter()
+        .filter(|r| r.author_peer == 1 && matches!(r.op, enchudb_oplog::oplog::DecodedOp::Delete { eid } if eid == src_world))
+        .map(|r| r.hlc)
+        .collect();
+    drop(eng_a);
+    assert_eq!(tomb, Hlc::ZERO, "畳んだ自分の行 (src {src:#x}) の場所に tombstone を置いた");
+    assert_eq!(deletes, Vec::<Hlc>::new(), "A の state が畳んだ src の Delete を出した");
+}
