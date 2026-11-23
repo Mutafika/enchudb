@@ -7346,9 +7346,10 @@ impl<'a> EntityRef<'a> {
         }
     }
 
+    /// 行を消す。 #1066: sync する DB を WAL なしで開いた (`Database::open` / build phase) 時は消さずに
+    /// `WriteRejected(Fault(NoWal))` (WAL 付きで開き直す: `open_with_oplog` / `finish_with_oplog` の後)。
     pub fn delete(self) -> Result<(), SchemaError> {
-        self.db.engine().delete(self.eid);
-        Ok(())
+        self.db.engine().try_delete(self.eid).map_err(SchemaError::WriteRejected)
     }
 }
 

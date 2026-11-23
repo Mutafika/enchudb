@@ -228,6 +228,12 @@ ring buffer 構造 (= 固定容量、 checkpoint 済みの後ろを再利用)。
 食わない)。 詳細: [`migration-0.7.0-to-0.8.0.md`](migration-0.7.0-to-0.8.0.md)
  / [`migration-0.6.0-to-0.7.0.md`](migration-0.6.0-to-0.7.0.md)。
 
+sync を有効にした DB は、 **WAL 付きの session でしか ユーザの表の行を書けない** (#1066): `open_with_oplog` /
+`open_concurrent_with_oplog` で開くか、 build phase なら `finish_with_oplog` / `concurrentize_with_oplog` の後に書く。 WAL なしで
+開いた engine (`open_standalone` / schema の `Database::open` / `finish_concurrent` / build phase) の書き込みは版数 (WAL の時計) が
+付かず相手に配れないので、 行の払い出し / tie / untie / delete / content を何も変えずに断る (`FaultKind::NoWal`、 schema は
+`WriteRejected`)。 予約の表 (`_` で始まる表)・相手から受けた書き込み・読みは今まで通り。
+
 ### peer-to-peer sync
 
 `enchudb-sync` crate が `_sync_ops` を peer 間で relay (= 0.8.0 で oplog 直読み
