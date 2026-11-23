@@ -965,14 +965,6 @@ impl Generations {
         let _ = self.pending_marks.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
-    /// #1008: 開く時の突き合わせが場所の最後の行の削除を完了させた (「最後の行は 今 − 2」 の印がある) か、 場所が引退している (使い回さない
-    /// = 最後の行は消した行)。 仕上げが消えた行の tombstone を作り直すかを決める (`Engine::finish_reconcile`)。
-    pub(crate) fn last_row_was_deleted(&self, slot: u32) -> bool {
-        let v = self.region.get().map_or(0, |r| read_raw(r, slot));
-        // #992 の読み直し 3 の S3: 引退する場所でも、 使い回しの途中の行 ([`MID_REUSE`]) は消した行でない
-        (v & TWO_UP != 0 || self.used_up(slot)) && v & MID_REUSE == 0
-    }
-
     /// 場所の最後の行は使い回しの途中の行だった ([`MID_REUSE`]、 開く時の突き合わせが立てた)。
     pub(crate) fn mid_reuse(&self, slot: u32) -> bool {
         self.region.get().is_some_and(|r| read_raw(r, slot) & MID_REUSE != 0)
@@ -1726,12 +1718,11 @@ mod tests {
         assert!(g.used_up(6), "前提: 引退の印");
         g.kill_reconciled(6, max + 2, max, false).unwrap();
         assert_eq!((g.get(6), g.dead_row_gen(6, g.get(6))), (max + 1, max), "引退した場所の最後の行を 1 つ下に読んだ");
-        assert!(g.last_row_was_deleted(6), "引退した場所の最後の行は消した行");
+        assert!(!g.mid_reuse(6), "引退した場所の最後の行 (消した行) に使い回しの印が付いた");
         // 場所 8 (読み直し 3 の S3): 最後の世代で使い回しの途中の行 (使い回しの印) を引退の印にした = 消した行でない
         g.raise(8, max).unwrap();
         g.kill_reconciled(8, max + 1, max, true).unwrap();
-        assert!(g.used_up(8) && g.mid_reuse(8), "前提: 引退の印・使い回しの途中");
-        assert!(!g.last_row_was_deleted(8), "引退した場所の使い回しの途中の行を消した行と読んだ");
+        assert!(g.used_up(8) && g.mid_reuse(8), "引退の印・使い回しの途中の印が残らない");
         // 場所 9: 使い回しの印は世代の変わる kill でも残り、 生かす道が落とす
         g.kill_reconciled(9, 2, 1, true).unwrap();
         g.kill(9, 3).unwrap();
