@@ -390,6 +390,8 @@ struct ChangeBatch {
     /// `records[0]` の番号
     first: u64,
     records: Vec<crate::transport::WireRecord>,
+    /// 記録がある時: 取り出した時に写した記録の終わり (次の番号)。 この配りはここまで渡したら返る (#1055)
+    log_end: u64,
 }
 
 /// #779: slot の前の宛名。 bridge (`transfer_oplog_to_sync_ops`) は、 自分が書いた record の宛名 (行の世界番号) を **bridge する時の**
@@ -473,11 +475,24 @@ impl ChangeBatch {
     }
 }
 
+/// changefeed: 記録の無い時に溜めへ移す範囲 ([`Engine::move_changes_to_backlog`])。
+#[derive(Clone, Copy)]
+enum BacklogUpto {
+    /// 畳む区画の終わり (`append_lock` の下、 区画は全部書き出してある): 閉じていない末尾も移す
+    FoldEnd(u64),
+    /// 書き出した所 (畳む前に lock の外で): そこまでに Commit で閉じた group だけ (#1053)
+    Written(u64),
+}
+
 /// 記録 (`changefeed.seg`) がある時の配信 1 回分 (#636): listener ごとに位置から読んだ entry と、 読めずに外した listener。
 #[derive(Default)]
 struct LogWork {
     reads: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, u64, Vec<crate::change_log::Entry>)>,
     broken: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+    /// #1055: この回を渡した後、 読み手全員の位置が配りの始めに決めた終わり (`until`) に届く
+    caught_up: bool,
+    /// この回を渡した後も、 記録の今の終わりより手前に居る読み手がある (始めの後に写し足された分)
+    more: bool,
 }
 
 impl ChangeNotifier {
@@ -557,19 +572,26 @@ impl ChangeNotifier {
             Some(None) => return true,
             Some(Some(x)) => x,
         };
+        let until = batch.log_end;
         let panicked = batch.run(&self.progress);
         self.detach_panicked(src, panicked);
         if !log {
             return true;
         }
-        // 記録がある時は、 listener ごとの位置から読んで渡す
+        // 記録がある時は、 listener ごとの位置から読んで渡す。 #1055: 配るのは取り出した時に写した記録の終わり (`until`、 呼び手の
+        // `oplog_sync` の commit を含む) まで。 その後に写し足された分は通知係が配る (残っていれば頼む)。 前は読み手全員に新しい entry
+        // が無くなるまで回り、 遅い listener と休まない書き手が居ると (consumer が 100 ms ごとに写し足す) `oplog_sync()` が書き手の
+        // 止まるまで返らなかった (通知係がこの loop の中に居れば、 `oplog_sync()` は deliver_lock を 5 秒待って配らずに返った)
         loop {
-            let Some(work) = src.with(Engine::take_log_work) else { return false };
+            let Some(work) = src.with(|e| e.take_log_work(until)) else { return false };
             for l in work.broken {
                 let _ = listener_panicked(|| l.on_detached(enchudb_oplog::Hlc::ZERO));
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
             if work.reads.is_empty() {
+                if work.more {
+                    self.ask_notifier();
+                }
                 return true;
             }
             let mut panicked = PanickedListeners::new();
@@ -590,6 +612,12 @@ impl ChangeNotifier {
                 self.progress.fetch_add(1, Ordering::Relaxed);
             }
             self.detach_panicked(src, panicked);
+            if work.caught_up {
+                if work.more {
+                    self.ask_notifier();
+                }
+                return true;
+            }
         }
     }
 
@@ -754,6 +782,8 @@ enum KeptFor {
     Move,
     /// 場所の世代を上げる gen.seg の page を commit できない (断る)。
     Space,
+    /// review038 の A1: 場所の行 (の stripe) を他の書き手が握っていた (空きの山の lock の下では待たない。 放してから待って取り直す)。
+    Busy,
 }
 
 /// #513: 削除の道で積む、 消した主キーの行 (`Engine::pk_pending`)。 値は local な値 (Tag は辞書の番号。 辞書を回収する DB
@@ -1328,7 +1358,8 @@ fn cleanup_tables_tmp(db_path: &str) {
     let sidecar = tables_path_for(db_path);
     let tmp_path = crate::db_files::tmp_path_for(&sidecar);
     if tmp_path.exists() {
-        if let Err(e) = std::fs::remove_file(&tmp_path) {
+        // 書き出した一時 file は crashsim の控えを持つ: 消す時に捨てる (`remove_sidecar`、 #1060、 #416 の形)
+        if let Err(e) = remove_sidecar(&tmp_path) {
             eprintln!(
                 "warning: failed to remove stale tables tmp {}: {}",
                 tmp_path.display(),
@@ -1895,6 +1926,12 @@ const CONSUMER_HELD: u8 = 4;
 /// この bit を立てる `fetch_or` の戻りで [`CONSUMER_HELD`] を見る (止める側は `CONSUMER_HELD` を立てる `fetch_or` の後、 この
 /// bit が下りるのを待つ。 同じ 1 語への 2 つの RMW なので、 どちらが先でも 「止めた後に周期の仕事が始まる」 順は無い)。
 const CONSUMER_IN_TICK: u8 = 8;
+/// `Engine::wal_fold_off` の bit (#1023): consumer の thread を作る engine。 作る側 (`spawn_consumer_with_oplog`) が thread を作る前に
+/// 立てる (下ろさない)。 前は 「consumer が居ない」 を `consumer_thread` が無いことで決めていたが、 それは thread が動き出してから自分で
+/// 置くので、 開いた直後・consumer の thread が動き出す前の書き出しが 「consumer の居ない engine」 として名前の記録をその場でまとめ
+/// 直した (log を header だけに戻し、 アプリの thread がまとめ直しの時間を払った)。 Engine に欄を足さない (足すと欄の並びが変わる、
+/// `wal_fold_off` の doc)
+const CONSUMER_SPAWNED: u8 = 16;
 
 /// #451 (段階 1): 配り済みの印の候補 = 切れ目 (`Engine::take_durable_cut`)。 置く時 (`Engine::end_durable_cut`) に S を決める。
 struct DurableCut {
@@ -2102,10 +2139,9 @@ fn persist_eidalias_to_sidecar(
 ) -> io::Result<()> {
     let p = eidalias_path_for(db_path);
     if entries.is_empty() {
-        return match std::fs::remove_file(&p) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
+        // 電源断の模擬の控えも捨てる (`remove_sidecar`、 #1060: 前は素の remove_file で、 Linux は空いた inode の番号を次に作った
+        // file に渡すので、 消した `eidalias` の控えがその file の像に写った = #416 の形)
+        return remove_sidecar(&p);
     }
     if crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries, with_gen))? {
         chain.wrote_durable();
@@ -3252,6 +3288,60 @@ mod write_out_fault {
     }
 }
 
+/// test 用 (#1057): この thread の次の `mark_session_dirty` の書き出しが失敗する (1 回だけ)。
+#[cfg(test)]
+mod session_dirty_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn fail_next() {
+        NEXT.with(|c| c.set(true));
+    }
+
+    pub(super) fn take() -> bool {
+        NEXT.with(|c| c.replace(false))
+    }
+}
+
+/// test 用 (#991 の C1): 置いた WAL の engine の、 動いている間の WAL の fsync (`Engine::wal_fsync`) が失敗する。 開く道 (WAL を
+/// `Arc` に入れる前で番地が決まらない) は、 この thread の次の 1 回を失敗させる (`fail_next_on_this_thread`)。
+#[cfg(test)]
+mod wal_fsync_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        static NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn fail_next_on_this_thread() {
+        NEXT.with(|c| c.set(true));
+    }
+
+    pub(super) fn take_on_this_thread() -> bool {
+        NEXT.with(|c| c.replace(false))
+    }
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn active(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
 /// test 用 (#985): 置いた WAL の engine の bridge が、 行の payload を ring にも辞書にも書かない (payload を書けなかった行)。
 #[cfg(test)]
 mod bridge_payload_fault {
@@ -3300,6 +3390,38 @@ mod payload_ring_open_fault {
 /// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
 #[cfg(test)]
 mod cell_append_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `oplog_sync` が自分の Commit を打った直後・書き出す位置を読む前 (#1054)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod sync_commit_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: `oplog_sync` が、 前に積んで当てている途中の書き手を待ち始める所 (#1054)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod sync_apply_wait_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -3480,6 +3602,67 @@ mod claim_gap_hook {
     }
 }
 
+/// test 用の割り込み点 (#1048 の読み直し 2 の (a)): v15 に移る手順の 4. (v14 の間に消した場所を埋める) の後・移り終える前。 置いた WAL で
+/// 1 回だけ呼ぶ。
+#[cfg(test)]
+mod move_filled_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点 (review038 の A1): `entity_in` が払い出し位置から取った場所に生きている印を立てた後・eid を作る前
+/// (`settle_claim` の前)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod claim_live_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// test 用: この thread の anonymous の `entity()` が、 空きの山の一番上の場所の行を握れずに離すのを待って取り直した回数
+    /// (#1048 の読み直し [1])。 thread ごと (並んだ他の試験の数を混ぜない、 読み直し 2 の (c))。
+    static ANON_BUSY_RETRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// test 用: この thread の受信の払い出し (`nowait`) が、 位置の場所の行を握れず位置も戻せずに、 `alloc_lock` を持ったまま行を待った
+    /// 回数 (#1048 の読み直し 2 の (b))。
+    static NOWAIT_HELD_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// test 用の割り込み点 (review038 の A1): anonymous の `entity()` が払い出し位置から取った新しい場所に生きている印を立てた後・eid を
+/// 作る前 (空きの山から使い回した場所は `anon_reuse_hook`)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod anon_fresh_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点 (PR #977 の読み直し 4 の [4] / [11]): `entity_in` が払い出し位置から取った場所の gen.seg の page を commit
 /// できずに断った後・払い出し位置を戻す (CAS) 前。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
@@ -3620,6 +3803,23 @@ mod dead_name_hook {
 /// [A1])。 置いた WAL で 1 回だけ呼ぶ。
 #[cfg(test)]
 mod bind_lock_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点: 受信の当て込みが宛名を写像で引いた後・その場所の最後の行 (世代) を読む前 (`remote_row_of` の入口と、 Ref の値の
+/// `try_resolve_remote_ref_value`)。 置いた WAL で 1 回だけ呼ぶ。
+#[cfg(test)]
+mod resolved_row_hook {
     use enchudb_oplog::oplog::OpLog;
 
     static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
@@ -3954,6 +4154,42 @@ mod free_gap_hook {
 
     pub(super) fn call(wal: &OpLog) {
         HOOK.call(wal);
+    }
+}
+
+/// test 用の割り込み点 (#1023): consumer の thread が動き出した所 (`consumer_thread` に自分の id を置く前)。 DB の path ごとに 1 回だけ
+/// 呼ぶ (consumer の thread を作る前に置く = WAL を作る前なので WAL の番地では見分けられない)。 あわせて、 名前の記録のまとめ直し
+/// (`compact_name_records`) をこの thread で始めた回数を数える。
+#[cfg(test)]
+mod consumer_start_hook {
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: std::sync::Mutex<Vec<(String, Hook)>> = std::sync::Mutex::new(Vec::new());
+
+    thread_local! {
+        static COMPACTIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn set(path: &str, f: impl FnOnce() + Send + 'static) {
+        HOOKS.lock().unwrap_or_else(|p| p.into_inner()).push((path.to_string(), Box::new(f)));
+    }
+
+    pub(super) fn call(path: &str) {
+        let f = {
+            let mut h = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+            h.iter().position(|(p, _)| p == path).map(|i| h.remove(i).1)
+        };
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    pub(super) fn note_compaction() {
+        COMPACTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// この thread で `compact_name_records` を始めた回数 (読んで 0 に戻す)。
+    pub(super) fn take_compactions() -> u32 {
+        COMPACTIONS.with(|c| c.replace(0))
     }
 }
 
@@ -4354,6 +4590,649 @@ mod listener_add_race_tests {
         drop(eng);
         assert_eq!(got, vec![8], "付ける前の commit が渡った (取り出しが止まっている間に付け終えた: {added_during_take})");
         assert_eq!(got_late, vec![8], "後から付ける前の commit / 同じ record が渡った");
+    }
+}
+
+/// changefeed が渡す record は書き出した物だけ (記録の無い道も、 #1053)・`oplog_sync()` は自分の commit を配ってから返る (#1054)・
+/// 記録のある道の `oplog_sync()` は休まない書き手の後ろで返らなくならない (#1055)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod change_delivery_bound_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-review038c-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 試験が途中で落ちても、 置いた割り込み点を外す。
+    struct Unhook(Arc<enchudb_oplog::oplog::OpLog>);
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            cell_append_hook::set(&self.0, |_| {});
+            sync_apply_wait_hook::set(&self.0, |_| {});
+            sync_commit_hook::set(&self.0, |_| {});
+        }
+    }
+
+    /// 受けた Tie の値を順に控える。
+    #[derive(Default)]
+    struct Rec {
+        seen: Mutex<Vec<u64>>,
+    }
+    impl crate::changefeed::ChangeListener for Rec {
+        fn on_changes(&self, records: &[crate::transport::WireRecord]) {
+            let mut seen = self.seen.lock().unwrap();
+            for r in records {
+                if let enchudb_oplog::oplog::DecodedOp::Tie { value, .. } = r.op {
+                    seen.push(value);
+                }
+            }
+        }
+    }
+
+    impl Rec {
+        fn now(&self) -> Vec<u64> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// `v` を受けるまで待つ (最大 `limit`)。 受けた値の列を返す。
+        fn wait_for_value(&self, v: u64, limit: Duration) -> Vec<u64> {
+            let until = Instant::now() + limit;
+            while !self.seen.lock().unwrap().contains(&v) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.now()
+        }
+    }
+
+    /// 割り込み点で止まって知らせ、 `go` が来るまで (最大 30 秒) 待つ closure と、 その組。
+    fn pause() -> (impl FnOnce(&enchudb_oplog::oplog::OpLog) + Send + 'static, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (paused_tx, paused_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let hook = move |_: &enchudb_oplog::oplog::OpLog| {
+            let _ = paused_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(30));
+        };
+        (hook, paused_rx, go_tx)
+    }
+
+    fn engine(dir: &Tmp, log: bool) -> (Arc<Engine>, u16, enchudb_oplog::EntityId) {
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 1 << 22).unwrap();
+        if log {
+            eng.enable_change_log(1 << 22).unwrap();
+        }
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        (eng, ts, e)
+    }
+
+    /// #1053: 記録の無い changefeed は、 書き出していない (WAL を fsync しておらず本体も書き出していない) commit を渡さない。
+    ///
+    /// 形: consumer を止めて 1 を書いて `oplog_commit()` (Commit で閉じるだけ、 書き出さない) → 配る分を取り出す (通知係が前の
+    /// 書き出しの後の頼みで起きた時 / 別の thread の `oplog_sync()` が自分の書き出しの後に配る時と同じ取り出し)。 前は Commit で
+    /// 閉じた group の終わりまで読み、 1 を渡した (落ちると listener の先にあって DB に無い)。 記録のある道は #873 / #889 で書き出した所
+    /// (`change_log_upto`) で切っていた。
+    ///
+    /// falsify: 記録の無い取り出し (`take_changes`) を上限なしの読み (`iter_committed_from_with_end`) に戻すと 1 が渡って落ちる。
+    #[test]
+    fn a_commit_that_is_not_written_out_is_not_delivered_without_the_change_log() {
+        let dir = tmp("unwritten");
+        let (eng, ts, e) = engine(&dir, false);
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let hold = eng.hold_consumer();
+        eng.tie_to_by_id(e, ts, 1u64);
+        eng.oplog_commit();
+        let pre = wal.written_head() > eng.change_log_upto(&wal);
+        eng.deliver_changes(true);
+        let got = a.now();
+        drop(hold);
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(1, Duration::from_secs(5));
+        drop(eng);
+        assert!(pre, "前提: 1 の commit は書き出していない");
+        assert!(got.is_empty(), "書き出していない commit を listener に渡した: {got:?}");
+        assert_eq!(after, vec![1], "書き出した後は渡る");
+    }
+
+    /// #1053: 畳む前に溜めへ移す道 (記録の無い時の `move_changes_before_fold`) も、 書き出していない commit を移さない (移すと
+    /// 通知係がそのまま渡す)。
+    ///
+    /// 形: 区画を移るまで書いて書き出し (古い区画は畳める) → consumer を止めて 999 を書いて `oplog_commit()` (今の区画、 書き出さない)
+    /// → 畳む → 配る分を取り出す。 前は畳む前に Commit で閉じた group を上限なしで溜めへ移し、 999 を渡した。
+    ///
+    /// falsify: 溜めへ移す道 (`BacklogUpto::Written`) を上限なしの読みに戻すと 999 が渡って落ちる (取り出しの上限だけでは塞がらない)。
+    #[test]
+    fn a_commit_that_is_not_written_out_is_not_moved_to_the_backlog_before_a_fold() {
+        let dir = tmp("fold");
+        let eng = Engine::create_concurrent_with_oplog(&dir.0, 256 << 10).unwrap();
+        eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+        let ts = eng.himo_id("ts").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        assert!(wal.two_halves(), "前提: WAL が 2 区画");
+        let hold = eng.hold_consumer();
+        let switches = wal.switches();
+        let mut v = 1u64;
+        while wal.switches() == switches && v < 100_000 {
+            eng.tie_to_by_id(e, ts, v);
+            eng.oplog_sync().unwrap();
+            v += 1;
+        }
+        let switched = wal.switches() != switches;
+        eng.tie_to_by_id(e, ts, 999u64);
+        eng.oplog_commit();
+        let pre = wal.written_head() > eng.change_log_upto(&wal);
+        let folded = {
+            let _g = eng.transfer_lock_for_fold();
+            eng.try_fold_with_changes(&wal)
+        };
+        eng.deliver_changes(true);
+        let got = a.now();
+        drop(hold);
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(999, Duration::from_secs(5));
+        drop(eng);
+        assert!(switched && pre && folded, "前提: 区画を移った {switched}・999 は書き出していない {pre}・古い区画を畳んだ {folded}");
+        assert!(!got.contains(&999), "書き出していない commit を畳む前に溜めへ移して渡した");
+        assert_eq!(after.last(), Some(&999), "書き出した後は渡る");
+    }
+
+    /// #1053: 記録の無い changefeed は、 他の書き手が WAL に積んでまだ本体に当てていない record も渡さない (#850 と同じ形)。
+    ///
+    /// 形: 書き手 B が 2 を積んで当てる前に止まる → この thread が 3 を書いて `oplog_sync()` (B の手前で書き出しを切る) → 返った時に
+    /// listener に 2 が無い。 前は Commit で閉じた group の終わりまで読み、 当てていない 2 を (3 と一緒に) 渡した。
+    ///
+    /// falsify: 上と同じ変異で 2 が渡って落ちる。
+    #[test]
+    fn a_record_that_is_not_applied_yet_is_not_delivered_without_the_change_log() {
+        let dir = tmp("unapplied");
+        let (eng, ts, e) = engine(&dir, false);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let b = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64))
+        };
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が 2 を積んで当てる前に止まった");
+        eng.tie_to_by_id(e, ts, 3u64);
+        eng.oplog_sync().unwrap();
+        let got = a.now();
+        go.send(()).unwrap();
+        b.join().unwrap();
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(3, Duration::from_secs(5));
+        drop(eng);
+        assert!(!got.contains(&2), "本体に当てていない record を listener に渡した: {got:?}");
+        assert_eq!(after, vec![2, 3], "当て終えて書き出した後は WAL の順に渡る");
+    }
+
+    /// #1054: `oplog_sync()` は、 前に積んで当てている途中の他の書き手が居ても、 自分の commit を listener に配ってから返る
+    /// (記録あり / 無しの両方)。
+    ///
+    /// 形: 書き手 B が 2 を積んで当てる前に止まる → 別の thread A が 3 を書いて `oplog_sync()`。 A が B を待ち始めたら B を放す
+    /// (割り込み点 `sync_apply_wait_hook`)。 A が返った時点で listener に 3 がある。 前は書き出しを B の手前で切り、 3 を配らずに
+    /// 返った (渡るのは次の consumer の周期)。
+    ///
+    /// falsify: `oplog_sync` の待ち (`wait_applied_for_changefeed`) を外すと、 A は B を放す前に 3 を配らずに返って落ちる。
+    fn own_commit_is_delivered_past_an_applying_writer(log: bool) {
+        let dir = tmp(if log { "own-log" } else { "own" });
+        let (eng, ts, e) = engine(&dir, log);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let b = {
+            let eng = eng.clone();
+            std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64))
+        };
+        paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が 2 を積んで当てる前に止まった");
+        let (waiting_tx, waiting_rx) = mpsc::channel::<()>();
+        sync_apply_wait_hook::set(&wal, move |_| {
+            let _ = waiting_tx.send(());
+        });
+        let (done_tx, done_rx) = mpsc::channel::<Vec<u64>>();
+        let syncer = {
+            let (eng, a) = (eng.clone(), a.clone());
+            std::thread::spawn(move || {
+                eng.tie_to_by_id(e, ts, 3u64);
+                eng.oplog_sync().unwrap();
+                let _ = done_tx.send(a.now());
+            })
+        };
+        // A が B を待ち始めた (直した形) か、 待たずに返った (前の形) か
+        let mut got = None;
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            if waiting_rx.try_recv().is_ok() {
+                break;
+            }
+            if let Ok(g) = done_rx.try_recv() {
+                got = Some(g);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        go.send(()).unwrap();
+        b.join().unwrap();
+        let got = got.unwrap_or_else(|| done_rx.recv_timeout(Duration::from_secs(20)).expect("A の oplog_sync が返らない"));
+        syncer.join().unwrap();
+        drop(eng);
+        assert!(got.contains(&3), "oplog_sync() が自分の commit を配らずに返った (受けた {got:?}、 記録 {log})");
+        assert_eq!(got, vec![2, 3], "WAL の順に渡る");
+    }
+
+    #[test]
+    fn oplog_sync_delivers_its_own_commit_past_an_applying_writer() {
+        own_commit_is_delivered_past_an_applying_writer(false);
+    }
+
+    #[test]
+    fn oplog_sync_delivers_its_own_commit_past_an_applying_writer_with_the_change_log() {
+        own_commit_is_delivered_past_an_applying_writer(true);
+    }
+
+    /// #1055 の試験の listener: 受けた Tie の値と、 呼ばれた thread を控える。 呼ばれるたびに (`left` 回まで) 1 件書いて書き出し、
+    /// 記録へ写させる (= 配っている間も記録が伸び続ける、 休まない書き手の代わり)。
+    struct Echo {
+        seen: Mutex<Vec<u64>>,
+        threads: Mutex<Vec<std::thread::ThreadId>>,
+        left: std::sync::atomic::AtomicU64,
+        eng: std::sync::OnceLock<std::sync::Weak<Engine>>,
+        at: (enchudb_oplog::EntityId, u16),
+    }
+    impl crate::changefeed::ChangeListener for Echo {
+        fn on_changes(&self, records: &[crate::transport::WireRecord]) {
+            {
+                let mut seen = self.seen.lock().unwrap();
+                for r in records {
+                    if let enchudb_oplog::oplog::DecodedOp::Tie { value, .. } = r.op {
+                        seen.push(value);
+                    }
+                }
+            }
+            self.threads.lock().unwrap().push(std::thread::current().id());
+            // 残りの数を 1 つ減らす (減らせたら減らす前の数)
+            let mut n = self.left.load(std::sync::atomic::Ordering::Acquire);
+            let took = loop {
+                if n == 0 {
+                    break None;
+                }
+                match self.left.compare_exchange_weak(n, n - 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+                    Ok(_) => break Some(n),
+                    Err(now) => n = now,
+                }
+            };
+            if let (Some(n), Some(eng)) = (took, self.eng.get().and_then(|w| w.upgrade())) {
+                eng.tie_to_by_id(self.at.0, self.at.1, 10_000 + n);
+                // 中からの `oplog_sync` は書き出すだけで配らずに返る。 書き出した分を記録へ写す
+                eng.oplog_sync().unwrap();
+                let _ = eng.change_log_range();
+            }
+        }
+    }
+
+    /// #1055: 記録のある DB で、 配っている間も記録が伸び続けても、 `oplog_sync()` は自分の commit を配ったら返る。 残り (始めに写した
+    /// 所の後に写し足された分) は通知係が全部配る。
+    ///
+    /// 形: listener が呼ばれるたびに 1 件書いて記録へ写させる (50 回まで)。 consumer を止めて 7 を書いて `oplog_sync()`。 この thread の
+    /// 上で listener が呼ばれた回数を数える (時間に頼らない)。 前は 「読み手全員に新しい entry が無くなるまで」 回ったので、 呼び手の
+    /// thread の上で 50 回呼ばれた (遅い listener と休まない書き手の後ろで、 書き手が止まるまで返らなかった形。 通知係が loop の中なら
+    /// `oplog_sync()` は deliver_lock を 5 秒待って配らずに返った)。
+    ///
+    /// falsify: `deliver` の記録の道の loop の終わりを前の形 (`work.reads` が空になるまで) に戻すと、 呼び手の thread の上で 50 回
+    /// 呼ばれて落ちる。 `more` の時に通知係に頼むのをやめると、 残りが届かずに落ちる。
+    #[test]
+    fn oplog_sync_returns_after_its_own_commit_while_the_change_log_keeps_growing() {
+        const ECHOES: u64 = 50;
+        let dir = tmp("echo");
+        let (eng, ts, e) = engine(&dir, true);
+        let a = Arc::new(Echo {
+            seen: Mutex::default(),
+            threads: Mutex::default(),
+            left: std::sync::atomic::AtomicU64::new(ECHOES),
+            eng: std::sync::OnceLock::new(),
+            at: (e, ts),
+        });
+        let _ = a.eng.set(Arc::downgrade(&eng));
+        eng.add_change_listener(a.clone());
+        let me = std::thread::current().id();
+        let on_me = |a: &Echo| a.threads.lock().unwrap().iter().filter(|t| **t == me).count();
+        let hold = eng.hold_consumer();
+        let e2 = eng.entity().unwrap();
+        eng.tie_to_by_id(e2, ts, 7u64);
+        eng.oplog_sync().unwrap();
+        let (calls_here, got) = (on_me(&a), a.seen.lock().unwrap().clone());
+        drop(hold);
+        // 残りは通知係が配る (listener が書いた 50 件と 7)
+        let until = Instant::now() + Duration::from_secs(20);
+        while a.seen.lock().unwrap().len() < ECHOES as usize + 1 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut all = a.seen.lock().unwrap().clone();
+        drop(eng);
+        assert!(got.contains(&7), "oplog_sync() が自分の commit を配らずに返った: {got:?}");
+        assert!(calls_here <= 2, "oplog_sync() を呼んだ thread が自分の commit の後も配り続けた ({calls_here} 回)");
+        all.sort_unstable();
+        // listener は残りの数 (50 → 1) を足して書く
+        let mut want: Vec<u64> = (1..=ECHOES).map(|n| 10_000 + n).collect();
+        want.push(7);
+        want.sort_unstable();
+        assert_eq!(all, want, "始めに写した所の後に写し足された分が、 通知係から全部 1 回ずつ届かない");
+    }
+
+    /// #1054: `oplog_sync()` は、 自分の Commit の後に積まれた書き手は待たない (自分の commit を配るのに関係ない)。
+    ///
+    /// 形: `oplog_sync()` が Commit を打った直後 (割り込み点 `sync_commit_hook`) に、 書き手 B が 2 を積んで当てる前に止まる → この
+    /// `oplog_sync()` は待ちに入らず (`sync_apply_wait_hook` が呼ばれない)、 返った時に自分の 3 は届いている (2 は当てていないので
+    /// 届かない)。 前は `written_head` (B の後ろ) まで待ち、 上限 (100 ms) まで待ってから返った。
+    ///
+    /// falsify: 待つ位置を自分の Commit の位置でなく `written_head` にすると、 待ちに入って落ちる。
+    #[test]
+    fn oplog_sync_does_not_wait_for_a_writer_after_its_own_commit() {
+        let dir = tmp("after");
+        let (eng, ts, e) = engine(&dir, true);
+        let e2 = eng.entity().unwrap();
+        let a = Arc::new(Rec::default());
+        eng.add_change_listener(a.clone());
+        let wal = eng.oplog().unwrap().clone();
+        let _unhook = Unhook(wal.clone());
+        // 自分の 3 は割り込み点を置く前に書く (置いた後の最初の書き込みが止まる)
+        eng.tie_to_by_id(e, ts, 3u64);
+        let (hook, paused, go) = pause();
+        cell_append_hook::set(&wal, hook);
+        let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let waited = waited.clone();
+            sync_apply_wait_hook::set(&wal, move |_| waited.store(true, std::sync::atomic::Ordering::SeqCst));
+        }
+        let b: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        {
+            let (eng, b) = (eng.clone(), b.clone());
+            sync_commit_hook::set(&wal, move |_| {
+                let h = std::thread::spawn(move || eng.tie_to_by_id(e2, ts, 2u64));
+                paused.recv_timeout(Duration::from_secs(10)).expect("前提: B が自分の Commit の後に 2 を積んで当てる前に止まった");
+                *b.lock().unwrap() = Some(h);
+            });
+        }
+        eng.oplog_sync().unwrap();
+        let got = a.now();
+        let was_waiting = waited.load(std::sync::atomic::Ordering::SeqCst);
+        go.send(()).unwrap();
+        let h = b.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        h.join().unwrap();
+        eng.oplog_sync().unwrap();
+        let after = a.wait_for_value(2, Duration::from_secs(5));
+        drop(eng);
+        assert!(!was_waiting, "自分の Commit の後に積まれた書き手を待った");
+        assert_eq!(got, vec![3], "自分の commit は届き、 当てていない 2 は届かない");
+        assert_eq!(after, vec![3, 2], "当て終えた後は 2 も届く");
+    }
+}
+
+/// #991 の別の入口 (0.38 前 review C1): session の間に WAL の fsync が失敗した engine を閉じても、 「きれいに閉じた」 の印
+/// (紐名の辞書の clean) を立てない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod close_after_wal_sync_failure_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// sync する DB に 1 を書いて書き出す → WAL の fsync が失敗するようにして 2 を書く → 閉じる (consumer の最後の書き出しの
+    /// WAL の fsync が失敗し、 本体だけ書き出す) → 開き直すと 「きれいに閉じなかった」 と読む (#451 の作り直しを飛ばさない)。
+    /// 失敗させない回は 「きれいに閉じた」 と読む (対照)。
+    ///
+    /// 前は Drop が consumer の最後の書き出しの成否を見ずに印を立て、 次の open が #451 を飛ばした。 その後に電源が落ちる (失敗した
+    /// fsync の page は kernel が捨てうる) と、 本体にある値の record が WAL にも `_sync_ops` にも無いまま、 相手に配られない。
+    ///
+    /// falsify: `sync_and_mark_clean_with` の `wal_unsynced` を外すと、 失敗させた回も 「きれいに閉じた」 と読んで落ちる。
+    #[test]
+    fn a_session_whose_wal_fsync_failed_does_not_close_clean() {
+        for fault in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = Tmp(format!(
+                "{}/enchudb-review038c-close-{fault}-{}-{nanos}",
+                std::env::temp_dir().display(),
+                std::process::id()
+            ));
+            let (e, v) = {
+                let mut eng = Engine::create_with_cell_version(&dir.0, 4096).unwrap();
+                eng.define_table("t", 100).unwrap();
+                let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+                eng.enable_sync_tables().unwrap();
+                eng.flush().unwrap();
+                eng.persist_tables().unwrap();
+                let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+                let e = eng.entity_in("t").unwrap();
+                eng.try_tie_to_by_id(e, v, 1u32).unwrap();
+                eng.oplog_sync().unwrap();
+                let wal = eng.oplog().unwrap().clone();
+                wal_fsync_fault::set(&wal, fault);
+                eng.try_tie_to_by_id(e, v, 2u32).unwrap();
+                drop(eng);
+                // WAL の番地は持っている間に外す (後で同じ番地に作られた別の試験の WAL に残さない)
+                wal_fsync_fault::set(&wal, false);
+                (e, v)
+            };
+            let eng = Engine::open_concurrent_with_oplog(&dir.0, 1 << 20).unwrap();
+            let dirty = eng.himo_index_rebuilt_on_load();
+            let got = eng.get_by_id(e, v);
+            drop(eng);
+            assert_eq!(got, Some(2), "前提: 値は残っている (fsync の失敗は模しただけ、 page は届いている)");
+            assert_eq!(dirty, fault, "WAL の fsync が失敗した session か: {fault}、 開き直して 「きれいに閉じなかった」 と読んだか: {dirty}");
+        }
+    }
+
+    /// OpLog の中の書き出し (区画を移る時の古い区画の header の page、 `switch_locked` の `sync_half_header`) の失敗は OpLog の中で
+    /// 捨てられ、 engine の fsync には見えない (その後の fsync は成功する)。 その session も閉じる時に 「きれいに閉じた」 の印を立て
+    /// ない (`OpLog::sync_failed` を見る)。 失敗させない回は 「きれいに閉じた」 (対照)。
+    ///
+    /// falsify: `sync_and_mark_clean_with` で `OpLog::sync_failed` を見ないと、 失敗させた回も 「きれいに閉じた」 と読んで落ちる。
+    /// header の書き出しの失敗で印を立てないと、 前提 (`sync_failed`) で落ちる。
+    #[test]
+    fn a_failed_header_sync_inside_the_wal_does_not_close_clean() {
+        for fault in [false, true] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = Tmp(format!(
+                "{}/enchudb-review1061-switch-{fault}-{}-{nanos}",
+                std::env::temp_dir().display(),
+                std::process::id()
+            ));
+            let (e, v, last, switched, failed_inside, engine_flag) = {
+                let eng = Engine::create_concurrent_with_oplog(&dir.0, 256 << 10).unwrap();
+                eng.ensure_himo_dynamic("v", ValueType::Number64, 0).unwrap();
+                let v = eng.himo_id("v").unwrap() as u16;
+                let e = eng.entity().unwrap();
+                let wal = eng.oplog().unwrap().clone();
+                // consumer の書き出しが先に失敗を使わないよう止める (区画を移るのは書き手が積む時)
+                let hold = eng.hold_consumer();
+                let switches = wal.switches();
+                if fault {
+                    wal.fail_next_syncs(1);
+                }
+                let mut n = 0u64;
+                while wal.switches() == switches && n < 100_000 {
+                    n += 1;
+                    eng.tie_to_by_id(e, v, n);
+                    eng.oplog_commit();
+                }
+                let switched = wal.switches() != switches;
+                let failed_inside = wal.sync_failed();
+                drop(hold);
+                eng.oplog_sync().unwrap();
+                let engine_flag = eng.wal_sync_failed.load(std::sync::atomic::Ordering::Acquire);
+                drop(eng);
+                (e, v, n, switched, failed_inside, engine_flag)
+            };
+            let eng = Engine::open_concurrent_with_oplog(&dir.0, 256 << 10).unwrap();
+            let (dirty, got) = (eng.himo_index_rebuilt_on_load(), eng.get_by_id(e, v));
+            drop(eng);
+            assert!(switched, "前提: 区画を移った");
+            assert_eq!(failed_inside, fault, "前提: 区画を移る時の header の書き出しが失敗した (OpLog の印): {fault}");
+            assert!(!engine_flag, "前提: engine の fsync は失敗を見ていない (OpLog の中で捨てた)");
+            assert_eq!(got, Some(last), "前提: 値は残っている");
+            assert_eq!(dirty, fault, "OpLog の中の書き出しが失敗した session か: {fault}、 開き直して 「きれいに閉じなかった」 と読んだか: {dirty}");
+        }
+    }
+
+    /// 開いたままの DB の directory を写す (閉じる処理を通らない像)。 `oplog` (WAL) と `lock` は写さない = 本体にある値の record が
+    /// WAL にも `_sync_ops` にも無い像 (#451 の作り直しが走る)。
+    fn copy_without_wal(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let dst = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_without_wal(&e.path(), &dst);
+            } else if e.file_name() != "oplog" && e.file_name() != "lock" {
+                std::fs::copy(e.path(), &dst).unwrap();
+            }
+        }
+    }
+
+    /// 開く道 (#991 の別入口、 PR #1061 の読み): #451 の作り直しが record を積んだ後の WAL の fsync (`open_concurrent_with_oplog` と
+    /// `concurrentize_with_oplog` の再生の後) が失敗した session も、 閉じる時に 「きれいに閉じた」 の印を立てない。 前はその 4 箇所が
+    /// `wal_fsync` を通らず、 失敗が印に残らなかった (後の fsync が成功すると clean で閉じ、 次の open が作り直しを飛ばす)。
+    ///
+    /// 形: sync する DB に consumer を止めて 5 を書き、 開いたまま WAL を除いて写す (本体に値と版数があり、 record は無い) → 写しを
+    /// 開く時の最初の WAL の fsync を失敗させる → 作り直しが走ったのを確かめて閉じる → 開き直すと 「きれいに閉じなかった」 と読む。
+    /// 失敗させない回は 「きれいに閉じた」 (対照)。 開く道は `open_concurrent_with_oplog` と `open_standalone` → `concurrentize_with_oplog`。
+    ///
+    /// falsify: 開く道の fsync を素の `w.fsync()` に戻すと (失敗が印に残らない)、 失敗させた回も 「きれいに閉じた」 と読んで落ちる。
+    #[test]
+    fn a_failed_wal_fsync_after_relog_at_open_does_not_close_clean() {
+        for standalone in [false, true] {
+            for fault in [false, true] {
+                let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let base = format!(
+                    "{}/enchudb-review1061-open-{standalone}-{fault}-{}-{nanos}",
+                    std::env::temp_dir().display(),
+                    std::process::id()
+                );
+                let (live, image) = (Tmp(format!("{base}-live")), Tmp(format!("{base}-img")));
+                let (e, v) = {
+                    let mut eng = Engine::create_with_cell_version(&live.0, 4096).unwrap();
+                    eng.define_table("t", 100).unwrap();
+                    let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+                    eng.enable_sync_tables().unwrap();
+                    eng.flush().unwrap();
+                    eng.persist_tables().unwrap();
+                    let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+                    eng.set_peer_id(1);
+                    let e = eng.entity_in("t").unwrap();
+                    let hold = eng.hold_consumer();
+                    eng.try_tie_to_by_id(e, v, 5u32).unwrap();
+                    eng.oplog_commit();
+                    copy_without_wal(std::path::Path::new(&live.0), std::path::Path::new(&image.0));
+                    drop(hold);
+                    (e, v)
+                };
+                if fault {
+                    wal_fsync_fault::fail_next_on_this_thread();
+                }
+                let relogged = if standalone {
+                    let eng = Engine::open_standalone(&image.0).unwrap();
+                    let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+                    eng.unlogged_writes_relogged()
+                } else {
+                    Engine::open_concurrent_with_oplog(&image.0, 1 << 20).unwrap().unlogged_writes_relogged()
+                };
+                let left = wal_fsync_fault::take_on_this_thread();
+                let eng = Engine::open_concurrent_with_oplog(&image.0, 1 << 20).unwrap();
+                let (dirty, got) = (eng.himo_index_rebuilt_on_load(), eng.get_by_id(e, v));
+                drop(eng);
+                let tag = if standalone { "open_standalone → concurrentize" } else { "open_concurrent_with_oplog" };
+                assert!(relogged > 0 && !left, "{tag}: 前提: 開く時に作り直した ({relogged})・失敗させる fsync を通った ({})", !left);
+                assert_eq!(got, Some(5), "{tag}: 前提: 値は残っている");
+                assert_eq!(dirty, fault, "{tag}: 開く時の WAL の fsync が失敗した session か: {fault}、 開き直して 「きれいに閉じなかった」 と読んだか: {dirty}");
+            }
+        }
+    }
+}
+
+/// #1057: 書き始める前に倒す 「きれいに閉じた」 の印を disk に置けなければ、 書き始めない。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod session_dirty_mark_tests {
+    use super::*;
+
+    struct Tmp(String);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Tmp(format!("{}/enchudb-review038c-dirty-{tag}-{}-{nanos}", std::env::temp_dir().display(), std::process::id()))
+    }
+
+    /// 書く open (`open_standalone`) で印の書き出しが失敗したら Err を返す (開いた engine で書き始めない)。 断った open は何も
+    /// 書かず (`abandoned`)、 次の open は普通に開ける。
+    ///
+    /// falsify: `open_internal` の Err の道を前の形 (`let _ = eng.mark_session_dirty();`) に戻すと、 開けてしまって落ちる。
+    #[test]
+    fn an_open_that_cannot_write_the_dirty_mark_refuses() {
+        let dir = tmp("open");
+        let (e, v) = {
+            let mut eng = Engine::create_standalone(&dir.0).unwrap();
+            eng.define_himo("v", ValueType::Number, 0);
+            let v = eng.himo_id("v").unwrap() as u16;
+            let e = eng.entity().unwrap();
+            eng.tie(e, "v", 7u32);
+            eng.flush().unwrap();
+            (e, v)
+        };
+        session_dirty_fault::fail_next();
+        let refused = Engine::open_standalone(&dir.0).err();
+        let _ = session_dirty_fault::take();
+        let eng = Engine::open_standalone(&dir.0).unwrap();
+        let got = eng.get_by_id(e, v);
+        drop(eng);
+        assert!(refused.is_some(), "印を置けないまま開いた (書き始める)");
+        assert_eq!(got, Some(7), "断った open の後も開ける");
+    }
+
+    /// 並行の形にする時 (`concurrentize_with_oplog`) も、 印を置けなければ WAL の session を始めない。
+    ///
+    /// falsify: `concurrentize_with_oplog` の `?` を外すと (結果を捨てる) 並行の形になって落ちる。
+    #[test]
+    fn concurrentize_that_cannot_write_the_dirty_mark_refuses() {
+        let dir = tmp("conc");
+        let mut eng = Engine::create_standalone(&dir.0).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        eng.flush().unwrap();
+        session_dirty_fault::fail_next();
+        let r = Engine::concurrentize_with_oplog(eng, 1 << 20);
+        let _ = session_dirty_fault::take();
+        assert!(r.is_err(), "印を置けないまま WAL の session を始めた");
     }
 }
 
@@ -5857,6 +6736,66 @@ mod aggregate_fast_path_tests {
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
+/// #1023: consumer の thread が動き出す前 (`consumer_thread` に自分の id を置く前) の書き出しも、 名前の記録のまとめ直しを consumer に
+/// 任せる (書き出した thread がその場でまとめ直さない)。 consumer の thread の頭の割り込み点 (`consumer_start_hook`) で止めて書き出す。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod consumer_start_tests {
+    use super::*;
+
+    fn standalone(tag: &str) -> (String, Engine) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-consumerstart-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("t", 8).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        (path, eng)
+    }
+
+    fn cleanup(path: &str) {
+        let _ = crate::db_files::remove_db(path);
+        let _ = std::fs::remove_file(oplog_path_for(path));
+    }
+
+    #[test]
+    fn a_write_out_before_the_consumer_thread_starts_leaves_name_compaction_to_the_consumer() {
+        let (path, eng) = standalone("held");
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        consumer_start_hook::set(&path, move || {
+            started_tx.send(()).unwrap();
+            let _ = go_rx.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        started_rx.recv_timeout(std::time::Duration::from_secs(30)).expect("前提: consumer の thread が頭で止まった");
+        let not_yet = eng.consumer_thread.get().is_none();
+        // consumer の thread はまだ自分の id を置いていない (開いた直後の形)。 この間にアプリの thread が書き出す
+        let _ = consumer_start_hook::take_compactions();
+        eng.persist_tables().unwrap();
+        let ran_here = consumer_start_hook::take_compactions();
+        go_tx.send(()).unwrap();
+        drop(eng);
+        cleanup(&path);
+        assert!(not_yet, "前提: consumer の thread が自分の id を置く前に書き出した");
+        assert_eq!(ran_here, 0, "consumer の thread が動き出す前の書き出しが、 名前の記録をその場でまとめ直した (consumer の居ない engine と読んだ)");
+    }
+
+    /// 対照: consumer の居ない engine (WAL の無い並行の形) の書き出しは、 その場でまとめ直す (前と同じ)。
+    #[test]
+    fn a_write_out_without_a_consumer_compacts_in_place() {
+        let (path, eng) = standalone("none");
+        let eng = Engine::concurrentize(eng);
+        assert!(!eng.has_background_threads(), "前提: consumer の居ない engine");
+        let _ = consumer_start_hook::take_compactions();
+        eng.persist_tables().unwrap();
+        let ran_here = consumer_start_hook::take_compactions();
+        drop(eng);
+        cleanup(&path);
+        assert_eq!(ran_here, 1, "consumer の居ない engine の書き出しが、 その場でまとめ直さなかった");
     }
 }
 
@@ -7858,6 +8797,27 @@ mod reuse_order_tests {
         let _ = std::fs::remove_file(oplog_path_for(path));
     }
 
+    /// [`engine`] の、 v15 に移り終えた形 (枠 1 の表 `u` で 1 回使い回す)。 表 `t` の使い回しが移る手順を通らない (移る手順の 4. が
+    /// 払い出し位置から取った生かす前の場所を埋めない)。
+    fn engine_v15(tag: &str, cap: u32) -> (String, Arc<Engine>, u16) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-reuseorder-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_table("u", 1).unwrap();
+        eng.define_table("t", cap).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u);
+        let u2 = eng.entity_in("u").unwrap();
+        assert!(eng.generations().moved() && u2 != u, "前提: v15");
+        (path, eng, k)
+    }
+
     fn now_ms() -> u64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
     }
@@ -8147,13 +9107,21 @@ mod reuse_order_tests {
         cleanup(&path, eng);
     }
 
-    /// #883 の形 (後始末の途中で場所を取れなかった): 空きの一覧から取り出した場所が生きていないのを確かめた後・後始末の前 (割り込み点
-    /// `pop_claim_hook`) に、 払い出し位置から同じ場所を取った受信 (C の行の払い出し) が先に生かして写像を載せても、 取れなかった方は
-    /// 写像を外さず (`remove_local_unless`)、 前の宛名の覚えも残さない (`abandon_reuse`)。
+    /// #883 の形: 空きの一覧から取り出した場所が生きていないのを確かめた後・場所の行を握る前 (割り込み点 `pop_checked_hook`) に、
+    /// 払い出し位置から同じ場所を取った受信 (C の行の払い出し) が先に生かして写像を載せても、 取れなかった方 (Y) は行を握った後に
+    /// 生きているのを見て、 その場所の後始末 (`prepare_reuse`: 写像を外す・名前の記録を外す・前の宛名を覚える) をせずに飛ばす
+    /// (#1048 の読み直し [4])。 写像は残り、 前の宛名の覚えも残らない。
+    ///
+    /// 前の名前は `a_reuse_that_loses_the_slot_after_its_cleanup_leaves_the_winner_alone` (後始末の後に取られる順)。 review038 の A1 から
+    /// 払い出し位置の道も場所の行を握ってから生かすので、 その順 (Y が行を握った後に X が生かす) はもう作れない。
+    ///
+    /// falsify: 空きの一覧の道の、 行を握った後の `is_live` の見直しを外すと、 Y が X の生きている場所で後始末を走らせる
+    /// (`reuse_prepared_hook` を通る)。
     #[test]
-    fn a_reuse_that_loses_the_slot_after_its_cleanup_leaves_the_winner_alone() {
+    fn a_reuse_that_finds_the_slot_taken_before_its_row_lock_leaves_the_winner_alone() {
         use std::sync::mpsc::channel;
-        let (path, eng, k) = engine("lose", 4);
+        // v15 の DB: v14 では Y の使い回しが先に v15 に移り、 移る手順が X の生かす前の場所を埋める (X は取り直す、 読み直し 2 の (a))
+        let (path, eng, k) = engine_v15("lose", 4);
         for i in 0..3 {
             let e = eng.entity_in("t").unwrap();
             eng.tie_to(e, "t.k", i as u32);
@@ -8170,24 +9138,218 @@ mod reuse_order_tests {
         let ex = eng.clone();
         let x = std::thread::spawn(move || ex.resolve_remote_eid(world, k));
         x_at_rx.recv().unwrap();
-        // Y (アプリ): 全部なめで同じ場所を穴として拾い、 生きていないのを確かめた所で X を最後まで進める
+        // Y (アプリ): 全部なめで同じ場所を穴として拾い、 生きていないのを確かめた所 (行を握る前) で X を最後まで進める
         let x = Arc::new(Mutex::new(Some(x)));
         let got: Arc<Mutex<Option<Option<u64>>>> = Default::default();
         {
             let (x, got) = (x.clone(), got.clone());
-            pop_claim_hook::set(&wal, move |_| {
+            pop_checked_hook::set(&wal, move |_| {
                 x_go.send(()).unwrap();
                 let h = x.lock().unwrap().take().unwrap();
                 *got.lock().unwrap() = Some(h.join().unwrap());
             });
         }
+        // Y が後始末 (`prepare_reuse`) を走らせたか
+        let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p2 = prepared.clone();
+        reuse_prepared_hook::set(&wal, move |_| p2.store(true, std::sync::atomic::Ordering::SeqCst));
+        // 前の宛名の覚え (v15 に移る時の表 u の使い回しの分は bridge が進むまで残る)
+        let addresses = eng.former_addresses_len();
         let y = eng.entity_in("t").unwrap();
         let theirs = got.lock().unwrap().take().expect("前提: 割り込み点を通った").expect("前提: X に場所を払い出した");
         let slot = eng.slot_unchecked(theirs);
         assert_ne!(eng.slot_unchecked(y), slot, "同じ場所を 2 つの行に払い出した");
+        assert!(!prepared.load(std::sync::atomic::Ordering::SeqCst), "Y が、 X の生きている場所 {slot} で後始末を走らせた");
         assert_eq!(eng.resolve_remote_eid_existing(world), Some(theirs), "取れなかった後始末が、 先に取った X の写像を外した");
-        assert_eq!(eng.former_addresses_len(), 0, "取れなかった場所の前の宛名の覚えを残した");
+        assert!(eng.former_addresses_len() <= addresses, "取れなかった場所の前の宛名の覚えを残した");
         cleanup(&path, eng);
+    }
+
+    /// #1048 の読み直し [2]: 払い出し位置から場所 s を取った書き手 X が行を握る前 (`claim_gap_hook`) に、 表が枯渇して全部なめの使い回し
+    /// (Y) が s を生かし、 その行が消された (tombstone と名前の記録が s に残る)。 X は行を握った後に世代が上がったのを見て s を取り直し、
+    /// 後始末 (`prepare_reuse` / `clear_slot_versions`) を通る道で使い回す = X の行の場所に Y の削除の tombstone を残さない。 前は (master
+    /// も) そのまま次の世代で生かした。
+    ///
+    /// falsify: 行を握った後の世代の比べを外すと、 X の行の場所に Y の tombstone が残る。
+    #[test]
+    fn a_position_claim_whose_slot_lived_and_died_meanwhile_takes_the_cleanup_path() {
+        use std::sync::mpsc::channel;
+        let (path, eng, _k) = engine("liveddied", 4);
+        for i in 0..3 {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.k", i as u32);
+        }
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (x_at, x_at_rx) = channel::<()>();
+        let (x_go, x_go_rx) = channel::<()>();
+        claim_gap_hook::set(&wal, move |_| {
+            x_at.send(()).unwrap();
+            x_go_rx.recv().unwrap();
+        });
+        let ex = eng.clone();
+        let x = std::thread::spawn(move || ex.entity_in("t"));
+        x_at_rx.recv().unwrap();
+        // Y: 表は枯渇 (X が最後の場所を取った) = 全部なめで X の場所を穴として拾って生かす。 名前を付けて消す
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to(y, "t.k", 50u32);
+        eng.delete(y);
+        let s = eng.slot_unchecked(y);
+        assert_ne!(eng.tombstone_version_of(s), enchudb_oplog::Hlc::ZERO, "前提: Y の削除の tombstone が場所に残った");
+        x_go.send(()).unwrap();
+        let mine = x.join().unwrap().expect("前提: X は払い出された");
+        let slot = eng.slot_unchecked(mine);
+        let (tomb, live) = (eng.tombstone_version_of(slot), eng.is_live(mine));
+        cleanup(&path, eng);
+        assert!(live, "前提: X の行は生きている");
+        assert_eq!(tomb, enchudb_oplog::Hlc::ZERO, "X の行 {mine:#x} の場所 {slot} に、 消えた Y ({y:#x}) の tombstone が残った");
+    }
+
+    /// #1048 の読み直し 2 の (a): v15 に移る手順の 4. が払い出し位置を読んだ後・移り終える前 (`move_filled_hook`) に、 X が位置から場所 s を
+    /// 取る (4. は s を埋めない、 X が読む 「取った時の世代と死」 は (0, 死でない))。 移り終えた後、 表が枯渇して全部なめの使い回し Y が s を
+    /// 世代 0 のまま生かし、 消される (「世代 1・死」、 tombstone が残る)。 X は行を握った後、 これを移る手順の埋めと読まずに取り直す
+    /// (前は 「v14 の間に取った・(0, 死でない) → (1, 死)」 を埋めとして除き、 後始末なしで生かした = Y の tombstone が X の行の場所に残った)。
+    ///
+    /// falsify: 比べに 「移る手順の埋め」 の除きを戻すと、 X の行の場所に Y の tombstone が残る。
+    #[test]
+    fn a_position_claim_taken_during_the_move_does_not_mistake_a_reuse_for_the_fill() {
+        use std::sync::mpsc::channel;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-reuseorder-movefill-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_table("u", 1).unwrap();
+        eng.define_table("t", 4).unwrap();
+        let k = eng.define_himo_in("t", "k", ValueType::Number, 0).unwrap() as u16;
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.set_table_pk("t", k).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        eng.set_peer_id(1);
+        for i in 0..3 {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.k", i as u32);
+        }
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u); // v14 の間に消す (次の u の insert が使い回す = 移る)
+        assert!(!eng.generations().active(), "前提: v14");
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        // M: u の使い回しが移る手順の 4. の後で止まる
+        let (m_at, m_at_rx) = channel::<()>();
+        let (m_go, m_go_rx) = channel::<()>();
+        move_filled_hook::set(&wal, move |_| {
+            m_at.send(()).unwrap();
+            m_go_rx.recv().unwrap();
+        });
+        let em = eng.clone();
+        let m = std::thread::spawn(move || em.entity_in("u"));
+        m_at_rx.recv().unwrap();
+        // X: 表 t の最後の場所を位置から取り、 行を握る前で止まる
+        let (x_at, x_at_rx) = channel::<()>();
+        let (x_go, x_go_rx) = channel::<()>();
+        claim_gap_hook::set(&wal, move |_| {
+            x_at.send(()).unwrap();
+            x_go_rx.recv().unwrap();
+        });
+        let ex = eng.clone();
+        let x = std::thread::spawn(move || ex.entity_in("t"));
+        x_at_rx.recv().unwrap();
+        m_go.send(()).unwrap();
+        m.join().unwrap().expect("前提: u の使い回しで移った");
+        assert!(eng.generations().moved(), "前提: v15 に移り終えた");
+        // Y: 全部なめで X の場所を穴として拾って生かす。 名前を付けて消す
+        let y = eng.entity_in("t").unwrap();
+        eng.tie_to(y, "t.k", 50u32);
+        eng.delete(y);
+        let s = eng.slot_unchecked(y);
+        assert_eq!(eng.generations().state(s), (1, true), "前提: Y は世代 0 で生きて消えた");
+        assert_ne!(eng.tombstone_version_of(s), enchudb_oplog::Hlc::ZERO, "前提: Y の削除の tombstone が場所に残った");
+        x_go.send(()).unwrap();
+        let mine = x.join().unwrap().expect("前提: X は払い出された");
+        let slot = eng.slot_unchecked(mine);
+        let (tomb, live) = (eng.tombstone_version_of(slot), eng.is_live(mine));
+        cleanup(&path, eng);
+        assert!(live, "前提: X の行は生きている");
+        assert_eq!(tomb, enchudb_oplog::Hlc::ZERO, "X の行 {mine:#x} の場所 {slot} に、 消えた Y ({y:#x}) の tombstone が残った");
+    }
+
+    /// #1048 の読み直し (新しい腕の試験): 受信の払い出し (`nowait`) の位置の場所の行を他の書き手が握っていると、 位置を戻して `Busy` を
+    /// 返し、 `alloc_lock` を放してから待って取り直す。 戻した位置から同じ場所を取る (穴を残さない)。
+    #[test]
+    fn a_receive_whose_position_slot_is_held_waits_and_takes_the_same_slot() {
+        use std::sync::mpsc::channel;
+        let (path, eng, k) = engine("busypos", 4);
+        let first = eng.entity_in("t").unwrap();
+        let s = eng.slot_unchecked(first) + 1; // 次の位置の場所
+        let (held_tx, held_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let eh = eng.clone();
+        let holder = std::thread::spawn(move || {
+            let _w = eh.row_locks.write(s);
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        // 受信が行を握れずに断られたら (`try_write` の待ちの割り込み点) 放す
+        eng.row_locks.set_wait_hook(s, move || {
+            let _ = go_tx.send(());
+        });
+        let world = enchudb_oplog::make_eid(C, 100);
+        let got = eng.resolve_remote_eid(world, k).expect("前提: C の行に場所を払い出した");
+        holder.join().unwrap();
+        let next = eng.entity_in("t").unwrap();
+        let (got_slot, next_slot) = (eng.slot_unchecked(got), eng.slot_unchecked(next));
+        cleanup(&path, eng);
+        assert_eq!(got_slot, s, "受信が、 握られていた位置の場所を取り直さなかった");
+        assert_eq!(next_slot, s + 1, "位置に穴を残した");
+    }
+
+    /// #1048 の読み直し 2 の (b): 受信の払い出し (`nowait`) の位置の場所の行が握られていて、 位置も戻せない (取った後に別の書き手が位置を
+    /// 進めた) 時は、 場所を穴にせずに `alloc_lock` を持ったまま行を待って取る (#974 の約束の例外、 `get_or_insert_waiting` の doc)。
+    ///
+    /// falsify: この腕を `Busy` (場所を捨てて取り直す) に戻すと、 受信は次の位置を取り、 握られていた場所は穴になる。
+    #[test]
+    fn a_receive_that_cannot_put_back_its_position_waits_for_the_row_under_alloc_lock() {
+        use std::sync::mpsc::channel;
+        let (path, eng, k) = engine("heldwait", 8);
+        let first = eng.entity_in("t").unwrap();
+        let s = eng.slot_unchecked(first) + 1; // 受信の取る位置の場所
+        // H: s の行を握り、 誰かが待ち始めたら放す
+        let (held_tx, held_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let eh = eng.clone();
+        let holder = std::thread::spawn(move || {
+            let _w = eh.row_locks.write(s);
+            held_tx.send(()).unwrap();
+            let _ = go_rx.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        held_rx.recv().unwrap();
+        // R (受信): 位置から s を取り、 行を握る前で止まる
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (r_at, r_at_rx) = channel::<()>();
+        let (r_go, r_go_rx) = channel::<()>();
+        claim_gap_hook::set(&wal, move |_| {
+            r_at.send(()).unwrap();
+            r_go_rx.recv().unwrap();
+        });
+        let er = eng.clone();
+        let world = enchudb_oplog::make_eid(C, 100);
+        let r = std::thread::spawn(move || (er.resolve_remote_eid(world, k), NOWAIT_HELD_WAITS.with(|c| c.get())));
+        r_at_rx.recv().unwrap();
+        // 別の書き手が位置を進める (R は位置を戻せなくなる)
+        let passer = eng.entity_in("t").unwrap();
+        eng.row_locks.set_wait_hook(s, move || {
+            let _ = go_tx.send(());
+        });
+        r_go.send(()).unwrap();
+        let (got, waits) = r.join().unwrap();
+        holder.join().unwrap();
+        let got = got.expect("前提: C の行に場所を払い出した");
+        let next = eng.entity_in("t").unwrap();
+        let (got_slot, passer_slot, next_slot) = (eng.slot_unchecked(got), eng.slot_unchecked(passer), eng.slot_unchecked(next));
+        cleanup(&path, eng);
+        assert_eq!(passer_slot, s + 1, "前提: 別の書き手が R の後の位置を取った");
+        assert_eq!(got_slot, s, "受信が、 握られていた位置の場所を穴にして別の場所を取った");
+        assert_eq!(next_slot, s + 2, "位置に穴を残した");
+        assert_eq!(waits, 1, "R が位置を戻せずに alloc_lock の下で行を待つ腕を通らなかった");
     }
 
     /// #939 の読み直し [A1]: 名前の束ね (`bind_remote_eid_by_pk_at`、 名前 5 の行 L に peer 2 の W を束ねる) と、 別の thread の受信の
@@ -8892,6 +10054,12 @@ mod slot_claim_tests {
 
     /// #883 の逆の並び: 全部なめで穴として拾った slot を取り出した書き手 (Y) が印を立てる前に、 払い出し位置からその slot を取った
     /// 書き手 (X) が先に印を立てても、 Y は同じ slot を返さない (前は取り出す時に 「生きていない」 を確かめてから立て、 結果を見なかった)。
+    /// Y は 「生きていない」 を確かめた後・場所の行を握る前 (`pop_checked_hook`) で止める (review038 の A1 から X も行を握ってから生かす
+    /// ので、 Y が行を握った後には X が先に生かせない)。
+    ///
+    /// この DB は v14: Y の使い回しは取り出す前に v15 に移り、 移る手順の 4. が X の (生かす前の) 場所を 「世代 1・死」 に埋める。 X は
+    /// 行を握った後に世代が変わったのを見て取り直す (#1048 の読み直し 2 の (a)) ので、 X が先に生かす並びにはならない (取り直しは Y の
+    /// 握る空きの一覧を待つので、 X と Y を両方進めてから待つ)。 X が先に生かす並びは下の v15 の試験が見る。
     #[test]
     fn a_popped_slot_claimed_first_from_next_local_is_not_given_out_twice() {
         use std::sync::mpsc::channel;
@@ -8909,8 +10077,8 @@ mod slot_claim_tests {
             x_at.send(()).unwrap();
             x_go_rx.recv().unwrap();
         });
-        // Y: 全部なめで同じ slot を穴として拾って取り出し、 印を立てる前で止まる
-        pop_claim_hook::set(&wal, move |_| {
+        // Y: 全部なめで同じ slot を穴として拾って取り出し、 行を握る前で止まる
+        pop_checked_hook::set(&wal, move |_| {
             y_at.send(()).unwrap();
             y_go_rx.recv().unwrap();
         });
@@ -8920,14 +10088,15 @@ mod slot_claim_tests {
         let ey = eng.clone();
         let y = std::thread::spawn(move || ey.entity_in("t"));
         y_at_rx.recv().unwrap();
-        // X が先に印を立てる
         x_go.send(()).unwrap();
-        let mine = x.join().unwrap();
         y_go.send(()).unwrap();
+        let mine = x.join().unwrap();
         let theirs = y.join().unwrap();
-        cleanup(&path, eng);
         let (mine, theirs) = (mine.expect("前提: X は払い出された"), theirs.expect("前提: Y は払い出された"));
+        let (live_mine, live_theirs) = (eng.is_live(mine), eng.is_live(theirs));
+        cleanup(&path, eng);
         assert_ne!(mine, theirs, "最後の slot {mine:#x} を 2 つの行に払い出した");
+        assert!(live_mine && live_theirs);
     }
 
     /// PR #977 の読み直し [1]: 上の並びを v15 の DB で (先に別の表で 1 回使い回して移る)。 払い出し位置から取って生かす前の場所は
@@ -8962,7 +10131,8 @@ mod slot_claim_tests {
             x_at.send(()).unwrap();
             x_go_rx.recv().unwrap();
         });
-        pop_claim_hook::set(&wal, move |_| {
+        // 行を握る前で止める (上の試験の doc)
+        pop_checked_hook::set(&wal, move |_| {
             y_at.send(()).unwrap();
             y_go_rx.recv().unwrap();
         });
@@ -9071,6 +10241,346 @@ mod slot_claim_tests {
         cleanup(&path, eng);
         assert_eq!(revived, Some(x));
         assert_ne!(theirs.ok().map(enchudb_oplog::eid_local), Some(x), "戻している slot {x} を新しい行に払い出した");
+    }
+
+    /// review038 の A1 の割り込み点 (払い出した場所に生きている印を立てた後・eid を返す前) で、 別の thread (B) が `entities()` から
+    /// 新しい行を見つけて消す。 B が消し終えるか、 行の lock で待ち始めるまで待つ (払い出す側が行を握っていれば待つ)。
+    type Deleter = Arc<Mutex<Option<(std::thread::JoinHandle<u64>, &'static str)>>>;
+
+    fn delete_from_entities(eng: &Arc<Engine>, known: Vec<u64>, out: &Deleter) -> impl FnOnce(&enchudb_oplog::oplog::OpLog) + Send + 'static {
+        let (eng, out) = (eng.clone(), out.clone());
+        move |_| {
+            let target = eng.entities().into_iter().find(|e| !known.contains(e)).expect("前提: 生かした行が出口 (entities) に見える");
+            let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+            let waits = tx.clone();
+            eng.row_locks.set_wait_hook(eng.slot_unchecked(target), move || {
+                let _ = waits.send("B は行の lock を待った");
+            });
+            let e2 = eng.clone();
+            let h = std::thread::spawn(move || {
+                e2.delete(target);
+                let _ = tx.send("B は消し終えた");
+                target
+            });
+            let how = rx.recv().unwrap();
+            *out.lock().unwrap() = Some((h, how));
+        }
+    }
+
+    /// review038 の A1: 空きの一覧の道 (Y) が穴として拾った場所の行を握っている間 (`pop_claim_hook`)、 払い出し位置から同じ場所を取った
+    /// 書き手 (X) は生かす前に行を待つ (前は待たずに生かして返し、 Y は印を立てられずに取り直していた)。 Y がその場所を取り、 X は別の
+    /// 場所を取る。
+    #[test]
+    fn a_position_claim_waits_for_the_reuse_holding_the_slot_row() {
+        use std::sync::mpsc::channel;
+        let (path, eng) = v15_engine("a1wait");
+        let last_t = eng
+            .entities()
+            .into_iter()
+            .filter(|&e| eng.table_name_of_local(eng.slot_unchecked(e)).as_deref() == Some("t"))
+            .map(|e| eng.slot_unchecked(e))
+            .max()
+            .unwrap();
+        let slot = last_t + 1;
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let (x_at, x_at_rx) = channel::<()>();
+        let (x_go, x_go_rx) = channel::<()>();
+        claim_gap_hook::set(&wal, move |_| {
+            x_at.send(()).unwrap();
+            x_go_rx.recv().unwrap();
+        });
+        let ex = eng.clone();
+        let x = std::thread::spawn(move || ex.entity_in("t"));
+        x_at_rx.recv().unwrap();
+        // Y: 全部なめで同じ場所を穴として拾い、 行を握った所で X を進め、 X が行を待ち始めるまで待つ
+        let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (e2, w2) = (eng.clone(), waited.clone());
+        pop_claim_hook::set(&wal, move |_| {
+            let (tx, rx) = channel::<()>();
+            e2.row_locks.set_wait_hook(slot, move || {
+                let _ = tx.send(());
+            });
+            x_go.send(()).unwrap();
+            w2.store(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), std::sync::atomic::Ordering::SeqCst);
+        });
+        let theirs = eng.entity_in("t").expect("前提: Y は払い出された");
+        let mine = x.join().unwrap().expect("前提: X は払い出された");
+        let (live_mine, live_theirs) = (eng.is_live(mine), eng.is_live(theirs));
+        let slot_theirs = eng.slot_unchecked(theirs);
+        cleanup(&path, eng);
+        assert!(waited.load(std::sync::atomic::Ordering::SeqCst), "X が、 Y の握っている場所 {slot} の行を待たずに進んだ");
+        assert_eq!(slot_theirs, slot, "前提: Y は穴として拾った最後の場所を取った");
+        assert_ne!(mine, theirs, "最後の場所 {mine:#x} を 2 つの行に払い出した");
+        assert!(live_mine && live_theirs);
+    }
+
+    /// review038 の A4: anonymous の `entity()` の払い出し位置の道も、 後始末待ち (`PENDING`) と引退した場所を渡さない (表の位置の道と
+    /// 同じ、 #992 の読み直し 4 の B4)。 前は `gen_slot_ready` と死の印を落とすだけで渡し、 後始末待ちを落として生かした。
+    ///
+    /// 状態は直接作る: 開く時の突き合わせ 1. が anonymous の高水位 (entities の header の page) の先の場所の削除を完了させた
+    /// (生きている印の page だけが新しい像) 後、 開く道の後始末の書き出し (`body_msync` / 後始末待ちを落とす gen.seg の書き出し) に失敗した
+    /// session の形 = 「高水位の先の、 生きていない・死・後始末待ち (世代 2、 最後の行は 今 − 2)」。
+    ///
+    /// falsify: `entity()` の位置の道の `used_up || pending_mark` を外すと (master)、 後始末待ちの場所を世代 2 で渡す。
+    #[test]
+    fn an_anonymous_fresh_slot_waiting_for_its_cleanup_is_not_given_out() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-a4anon-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 2).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let _b = eng.entity().unwrap();
+        eng.delete(a);
+        let c = eng.entity().unwrap(); // 場所 a を使い回す = v15
+        assert!(eng.generations().moved() && c != a, "前提: v15");
+        assert_eq!(eng.grow_entity_cap(4).unwrap(), 4, "前提: 枠を 2 つ広げた");
+        // 高水位 (2) の先の場所 2: 突き合わせが完了させた削除 (世代 0 の行を 2 つ上げて死・後始末待ち)
+        let pending = eng.entities.next_eid();
+        assert_eq!(pending, 2, "前提: 高水位");
+        eng.gen_slot_ready(pending).unwrap();
+        eng.generations().kill_reconciled(pending, 2, 0, false).unwrap();
+        assert!(eng.generations().pending_mark(pending) && !eng.entities.is_live(pending), "前提: 後始末待ちの死んだ場所");
+        let got = eng.entity().unwrap();
+        let (slot_got, still_pending) = (eng.slot_unchecked(got), eng.generations().pending_mark(pending));
+        cleanup(&path, eng);
+        assert_ne!(slot_got, pending, "後始末待ちの場所 {pending} を渡した ({got:#x})");
+        assert!(still_pending, "払い出しが後始末待ちの印を落とした");
+    }
+
+    /// 別の thread が行 `slot` を握り、 誰かがその行を待ち始める (行の待ちの割り込み点) まで放さない。 握った後に返す。
+    fn hold_until_waited(eng: &Arc<Engine>, slot: u32) -> std::thread::JoinHandle<()> {
+        use std::sync::mpsc::channel;
+        let (held_tx, held_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let eh = eng.clone();
+        let h = std::thread::spawn(move || {
+            let _w = eh.row_locks.write(slot);
+            held_tx.send(()).unwrap();
+            let _ = go_rx.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        held_rx.recv().unwrap();
+        eng.row_locks.set_wait_hook(slot, move || {
+            let _ = go_tx.send(());
+        });
+        h
+    }
+
+    /// #1048 の読み直し [3]: 使い回しの無い v14 の DB で、 ユーザの行を握った thread の insert の位置の場所の行を別の書き手が握っていても、
+    /// 場所を穴にしない (待って取る)。 前は握っている thread は待たずに穴にし、 枯渇した時の全部なめがその穴を拾って v15 に移った
+    /// (1 行も消していない DB が 0.37.4 で開けなくなる)。
+    ///
+    /// falsify: 位置の道の 「ユーザの行を握っていれば穴にして次へ」 に戻すと、 枯渇した後の insert で v15 に移る。
+    #[test]
+    fn a_v14_insert_holding_a_row_leaves_no_hole_that_moves_to_v15() {
+        let (path, eng) = engine("v14hole");
+        let r0 = eng.entity_in("t").unwrap();
+        let s = eng.slot_unchecked(r0) + 1;
+        let holder = hold_until_waited(&eng, s);
+        let mine = {
+            let _r0 = eng.write_row(r0);
+            eng.entity_in("t").unwrap()
+        };
+        holder.join().unwrap();
+        // 枠 (4) を越えて足す (枯渇した時に穴を探す)
+        let more: Vec<_> = (0..4).map(|_| eng.entity_in("t").unwrap()).collect();
+        let (moved, slot) = (eng.generations().moved(), eng.slot_unchecked(mine));
+        cleanup(&path, eng);
+        assert_eq!(more.len(), 4);
+        assert!(!moved, "1 行も消していない v14 の DB が v15 に移った");
+        assert_eq!(slot, s, "握られていた位置の場所を穴にした");
+    }
+
+    /// #1048 の読み直し [3] の anonymous 版: 位置の場所の行を握れない時に穴として空きの山に積むと、 上限に達した後の `entity()` が
+    /// 空きの山から使い回そうとして v15 に移った。
+    ///
+    /// falsify: anonymous の位置の道の 「握れなければ `Fresh::Skip`」 に戻すと v15 に移る。
+    #[test]
+    fn a_v14_anonymous_entity_holding_a_row_does_not_move_to_v15() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-v14anon-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 3).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let holder = hold_until_waited(&eng, 1);
+        let mine = {
+            let _a = eng.write_row(a);
+            eng.entity().unwrap()
+        };
+        holder.join().unwrap();
+        let last = eng.entity();
+        let full = eng.entity();
+        let (moved, slot) = (eng.generations().moved(), eng.slot_unchecked(mine));
+        cleanup(&path, eng);
+        assert!(!moved, "1 行も消していない v14 の DB が v15 に移った");
+        assert_eq!(slot, 1, "握られていた位置の場所を飛ばした");
+        assert!(last.is_ok() && full.is_err(), "前提: 上限 3 まで払い出して満杯 ({last:?} / {full:?})");
+    }
+
+    /// #1048 の読み直し [1]: anonymous の `entity()` が空きの山の一番上の場所の行を握れない間の取り直しは loop (前は `entity()` を呼び直す
+    /// 再帰で、 ユーザの行を握った thread は譲るたびに 1 段深くなり、 行が長く握られると stack を使い切った)。 小さい stack の thread
+    /// (256 KiB) で、 ユーザの行を握ったまま、 別の thread が 300 ms 握る場所を待つ。
+    ///
+    /// falsify: 再帰に戻すと、 この thread の stack が溢れて process が落ちる。
+    #[test]
+    fn an_anonymous_reuse_waiting_for_a_held_row_does_not_recurse() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-anonbusy-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 2).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let b = eng.entity().unwrap();
+        eng.delete(a);
+        let c = eng.entity().unwrap(); // 場所 a を使い回す = v15
+        assert!(eng.generations().moved() && c != a, "前提: v15");
+        eng.delete(c); // 空きの山の一番上は場所 a
+        let s = eng.slot_unchecked(c);
+        let eh = eng.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _w = eh.row_locks.write(s);
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        held_rx.recv().unwrap();
+        let e2 = eng.clone();
+        let (got, retries) = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let _b = e2.write_row(b);
+                (e2.entity(), ANON_BUSY_RETRIES.with(|c| c.get()))
+            })
+            .unwrap()
+            .join()
+            .expect("entity() の thread が落ちた");
+        let got = got.expect("前提: 空きの山の場所を使い回した");
+        holder.join().unwrap();
+        let slot = eng.slot_unchecked(got);
+        cleanup(&path, eng);
+        assert_eq!(slot, s, "前提: 握られていた場所を使い回した");
+        assert!(retries >= 1, "前提: 行が握られていて取り直した");
+    }
+
+    /// v15 の DB (表 u で 1 回使い回して移る) の、 枠 4 の表 t (3 行)。
+    fn v15_engine(tag: &str) -> (String, Arc<Engine>) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-slotclaim-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_table("u", 1).unwrap();
+        eng.define_table("t", 4).unwrap();
+        eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let u = eng.entity_in("u").unwrap();
+        eng.delete(u);
+        let u2 = eng.entity_in("u").unwrap();
+        assert!(eng.generations().moved() && u2 != u, "前提: v15");
+        for _ in 0..3 {
+            eng.entity_in("t").unwrap();
+        }
+        (path, eng)
+    }
+
+    /// review038 の A1: `entity_in` の払い出し位置の道が場所に生きている印を立てた後・eid を作る前に、 別の thread が `entities()` で
+    /// その行を見つけて消しても、 返す eid は生かした行の物 (消えた行の eid) で、 次の住人の eid (消す時に上げた世代) を返さない。 前は
+    /// 行の lock なしで、 消した後の世代で eid を作り (`settle_claim` は死の印も落とした)、 表が枯渇した後の使い回しが同じ eid を別の
+    /// 行に渡した (#731 が戻る)。
+    ///
+    /// falsify: 払い出し位置の道で行を握らないと (master)、 `next == mine`。
+    #[test]
+    fn a_row_deleted_before_its_position_claim_returns_is_not_given_out_again() {
+        let (path, eng) = v15_engine("a1pos");
+        let known = eng.entities();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let deleter: Deleter = Arc::default();
+        claim_live_hook::set(&wal, delete_from_entities(&eng, known, &deleter));
+        let mine = eng.entity_in("t").unwrap();
+        let (h, how) = deleter.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        let deleted = h.join().unwrap();
+        let live_mine = eng.is_live(mine);
+        // 表 t は枯渇: 次の insert は消えた場所を使い回す
+        let next = eng.entity_in("t").unwrap();
+        let (slot_mine, slot_deleted, slot_next) = (eng.slot_unchecked(mine), eng.slot_unchecked(deleted), eng.slot_unchecked(next));
+        cleanup(&path, eng);
+        assert_eq!(slot_deleted, slot_mine, "前提: B は払い出した行を消した");
+        assert!(!live_mine, "前提: 払い出した行は消えた ({how})");
+        assert_eq!(slot_next, slot_mine, "前提: 次の insert が消えた場所を使い回した");
+        assert_ne!(next, mine, "消えた行の eid {mine:#x} を、 場所を使い回した行にもう一度渡した ({how})");
+    }
+
+    /// review038 の A1: anonymous の `entity()` が空きの山から使い回した場所でも同じ (取り出して生かした後・eid を作る前に消される)。
+    ///
+    /// falsify: 空きの山の道で行を握らないと (master)、 `next == mine`。
+    #[test]
+    fn an_anonymous_reuse_deleted_before_it_returns_is_not_given_out_again() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-a1anonreuse-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 2).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let _b = eng.entity().unwrap();
+        eng.delete(a);
+        let c = eng.entity().unwrap(); // 場所 a を使い回す = v15
+        assert!(eng.generations().moved() && c != a, "前提: v15");
+        eng.delete(c);
+        let known = eng.entities();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let deleter: Deleter = Arc::default();
+        anon_reuse_hook::set(&wal, delete_from_entities(&eng, known, &deleter));
+        let mine = eng.entity().unwrap();
+        let (h, how) = deleter.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        let deleted = h.join().unwrap();
+        let live_mine = eng.is_live(mine);
+        let next = eng.entity().unwrap();
+        let (slot_mine, slot_deleted, slot_next) = (eng.slot_unchecked(mine), eng.slot_unchecked(deleted), eng.slot_unchecked(next));
+        cleanup(&path, eng);
+        assert_eq!(slot_deleted, slot_mine, "前提: B は払い出した行を消した");
+        assert!(!live_mine, "前提: 払い出した行は消えた ({how})");
+        assert_eq!(slot_next, slot_mine, "前提: 次の entity() が消えた場所を使い回した");
+        assert_ne!(next, mine, "消えた行の eid {mine:#x} を、 場所を使い回した行にもう一度渡した ({how})");
+    }
+
+    /// review038 の A1: anonymous の `entity()` の払い出し位置の道 (v15 に移った後に枠を広げた) でも同じ。
+    ///
+    /// falsify: 払い出し位置の道で行を握らないと (master)、 `next == mine`。
+    #[test]
+    fn an_anonymous_fresh_slot_deleted_before_it_returns_is_not_given_out_again() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-a1anonfresh-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_without_cell_version(&path, 2).unwrap();
+        eng.define_himo("x", ValueType::Number, 0);
+        eng.flush().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let a = eng.entity().unwrap();
+        let _b = eng.entity().unwrap();
+        eng.delete(a);
+        let c = eng.entity().unwrap(); // 場所 a を使い回す = v15
+        assert!(eng.generations().moved() && c != a, "前提: v15");
+        assert_eq!(eng.grow_entity_cap(3).unwrap(), 3, "前提: 枠を 1 つ広げた");
+        let known = eng.entities();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let deleter: Deleter = Arc::default();
+        anon_fresh_hook::set(&wal, delete_from_entities(&eng, known, &deleter));
+        let mine = eng.entity().unwrap();
+        let (h, how) = deleter.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        let deleted = h.join().unwrap();
+        let live_mine = eng.is_live(mine);
+        // 枠は満杯: 次の entity() は空きの山 (消えた場所) から使い回す
+        let next = eng.entity().unwrap();
+        let (slot_mine, slot_deleted, slot_next) = (eng.slot_unchecked(mine), eng.slot_unchecked(deleted), eng.slot_unchecked(next));
+        cleanup(&path, eng);
+        assert_eq!((slot_deleted, slot_mine), (2, 2), "前提: B は払い出し位置から取った行 (場所 2) を消した");
+        assert!(!live_mine, "前提: 払い出した行は消えた ({how})");
+        assert_eq!(slot_next, slot_mine, "前提: 次の entity() が消えた場所を使い回した");
+        assert_ne!(next, mine, "消えた行の eid {mine:#x} を、 場所を使い回した行にもう一度渡した ({how})");
     }
 }
 
@@ -12597,6 +14107,11 @@ const WAL_ROOM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// #560: `oplog_sync()` が、 配っている最中の listener (通知係が呼んでいる) を待つ上限。 #636: Drop が、 返らない listener を待つ
 /// 上限 (listener が返るたびに数え直す)。
 const LISTENER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// #1054: listener が居る時、 `oplog_sync()` が自分の commit より前に積んで当てている途中の他の書き手を待つ上限。 越えたら今まで
+/// どおりその手前で書き出しを切って返る (自分の commit は consumer の周期の書き出しの後に通知係が配る)。
+const SYNC_APPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// #1054: そのうち、 回って待つ (`spin_loop`) 間。 その後は yield / 寝て待つ。
+const SYNC_APPLY_SPIN: std::time::Duration = std::time::Duration::from_micros(20);
 
 /// sync の DB で満杯の時に、 閉じの Commit を打ち直して畳み直す回数の上限 (`make_wal_room_inner`)。
 const WAL_ROOM_FOLD_ROUNDS: usize = 4;
@@ -14134,7 +15649,8 @@ pub struct Engine {
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// #388: WAL が満杯にぶつかった書き手が、 consumer に畳むよう頼んでいる (`wait_for_wal_room`)。
     wal_room_wanted: std::sync::atomic::AtomicBool,
-    /// #388: consumer thread の id (待ち手が consumer 自身なら待たない = 自分を待つと止まる)。
+    /// #388: consumer thread の id (待ち手が consumer 自身なら待たない = 自分を待つと止まる)。 consumer の thread が動き出してから自分で
+    /// 置く (それより前は None)。 「consumer が居るか」 には使わない (#1023、 `wal_fold_off` の [`CONSUMER_SPAWNED`])。
     consumer_thread: std::sync::OnceLock<std::thread::ThreadId>,
     /// #388: 満杯に近づいて consumer が書き出し + 畳みをした回数 (観測用)。
     wal_room_folds: std::sync::atomic::AtomicU64,
@@ -14143,7 +15659,7 @@ pub struct Engine {
     /// 試験で切った consumer の畳み (bit、 既定 0 = 全部畳む)。 [`WAL_FOLD_OFF_SWITCH`] = 書き手が区画を移った時に待たずに古い区画を
     /// 畳む (#667、 [`Self::set_wal_fold_on_switch`])、 [`WAL_FOLD_OFF_TICK`] = 周期の書き出しの後に畳む (#676、
     /// [`Self::set_wal_fold_on_tick`])。 [`CONSUMER_HELD`] / [`CONSUMER_IN_TICK`] = 試験が consumer の周期の仕事を止める
-    /// ([`Self::hold_consumer`])。 1 byte のまま (欄を足すと並びが変わる)
+    /// ([`Self::hold_consumer`])。 [`CONSUMER_SPAWNED`] = consumer の thread を作る engine (#1023)。 1 byte のまま (欄を足すと並びが変わる)
     wal_fold_off: std::sync::atomic::AtomicU8,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
@@ -14432,6 +15948,10 @@ pub struct Engine {
     /// #533: 開くのをやめた engine (open の途中で sidecar を読めなかった等)。 Drop は何も書かずに閉じる (書くと、 読めなかった
     /// sidecar を空の中身で上書きする)。
     abandoned: std::sync::atomic::AtomicBool,
+    /// #991 (C1、 0.38 前 review): この session で WAL の fsync が 1 度でも失敗した。 Drop は 「きれいに閉じた」 の印 (紐名の辞書の clean)
+    /// を立てない (次の open が #451 の作り直しを飛ばさない)。 失敗した fsync の page は kernel が捨てうる (後の fsync が成功しても
+    /// 戻らない) ので、 最後の書き出しだけでなく session の間ずっと覚える。
+    wal_sync_failed: std::sync::atomic::AtomicBool,
     /// PR #977 の読み直し 5 の値段 [7]: きれいに閉じなかった後に開いた時の、 anonymous の生きている印の最大 + 1 (0 = 無い / きれいに
     /// 閉じた後)。 開く時に 1 回だけなめて覚え、 払い出し済みの場所の上限 ([`Self::given_out_slot_end`]) が読む (前は開く時の commit・
     /// 再生の後・v15 に移る 1a のたびに予約の全部をなめた)。
@@ -14909,6 +16429,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_failed: std::sync::atomic::AtomicBool::new(false),
             anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
@@ -15403,6 +16924,16 @@ impl Engine {
         )?;
         let mut eng = Self::load_from_backing(Backing::Segments(Arc::new(set)), readonly)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // clean flag を倒して書き出す (`load_from_backing` の終わりの説明)。 #1057: 倒した印を disk に置けなければ
+        // 開かない。 Drop は何も書かない (`abandoned`、 書くと前の session の後始末をせずに 「きれいに閉じた」 の印を立てる = #991 と
+        // 同じ形)。 前は書き出しの失敗を捨てて書き始めた
+        if !readonly && let Err(e) = eng.mark_session_dirty() {
+            eng.abandoned.store(true, std::sync::atomic::Ordering::Release);
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot write the session's dirty mark, refusing to open for writing (try again): {e}"),
+            ));
+        }
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
 
@@ -15510,8 +17041,11 @@ impl Engine {
                     // 落ちる前に場所を使い回して外した写像 (`prev.seg` の記録の前の住人がこの identity): 戻さず、 記録の削除の版数を
                     // identity に退避する (下の #925 の推測より先に、 記録で決める。 面の削除の版数が無い = 削除を書き出す前の面でも
                     // 決まる)。 名前の記録は `pktombs` / `pkformer` を読んだ後に移す
-                    if let Some(t) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
-                        let tomb = tomb.max(t);
+                    if let Some(rec) = unclean.then(|| eng.prev_evicted(&prev_by_slot, local, peer, foreign_local)).flatten() {
+                        // #1035: 記録から戻した削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (自分が消した受けた行。
+                        // `restore_prev_resident` と同じ。 前はこの道で戻した削除が state にしか入らず、 差分で受ける peer に届かなかった)
+                        eng.generations().prev.note_restored_delete(rec.gone, rec.tomb);
+                        let tomb = tomb.max(rec.tomb);
                         eng.remember_foreign_tombstone(peer, foreign_local, tomb);
                         stale_mappings.push((peer, foreign_local, local, tomb));
                         continue;
@@ -16102,6 +17636,8 @@ impl Engine {
     /// native でも使える（テスト、ファイル丸読みなど）。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
+        // file の無い engine (書き出しは何もしない)
+        eng.mark_session_dirty().map_err(|e| e.to_string())?;
         // 書き出さない engine: 前の名前の identity の record を作らない (誰も取り出さずに溜まる、 review987 [5])
         *eng.pk_former.write().unwrap() = crate::pk_former::PkFormer::without_log();
         eng.finish_vocab_refs_at_open();
@@ -16635,6 +18171,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            wal_sync_failed: std::sync::atomic::AtomicBool::new(false),
             anon_live_end: std::sync::atomic::AtomicU32::new(0),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             tables_persisted: std::sync::Mutex::new(None),
@@ -16678,7 +18215,7 @@ impl Engine {
             if vocab_reclaim && !eng.attach_vocab_refs() {
                 eng.vocab_recount_pending.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            eng.mark_session_dirty();
+            // 印を倒して書き出すのは呼び手 (`mark_session_dirty`、 失敗を I/O の失敗として返すため。 ここの Err は壊れた中身の印)
         }
 
         Ok(eng)
@@ -18427,11 +19964,16 @@ impl Engine {
     /// 打たなかったのと同じで、 「打てなかった Commit」 にも警告にも入れない (満杯以外の失敗は数える)。 Commit は payload 0
     /// = 最小の record (閉じの Commit の分の空き `commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯 (`append_dead`) と同値。
     fn append_commit_marker_with(&self, wal: &enchudb_oplog::oplog::OpLog, count_full: bool) -> std::io::Result<()> {
+        self.append_commit_marker_lsn(wal, count_full).map(|_| ())
+    }
+
+    /// [`Self::append_commit_marker_with`] の、 打った Commit の LSN を返す版 (#1054: `oplog_sync` が自分の Commit の位置を引く)。
+    fn append_commit_marker_lsn(&self, wal: &enchudb_oplog::oplog::OpLog, count_full: bool) -> std::io::Result<u64> {
         use std::sync::atomic::Ordering;
         match wal.append(enchudb_oplog::oplog::Op::Commit) {
-            Ok(_) => {
+            Ok(lsn) => {
                 self.wal_append_warned.store(false, Ordering::Relaxed);
-                Ok(())
+                Ok(lsn)
             }
             Err(e) if !count_full && e.kind() == io::ErrorKind::OutOfMemory => Err(e),
             Err(e) => {
@@ -20674,7 +22216,18 @@ impl Engine {
     /// 伸ばせない時と同じ棚)。 `Err((None, why))` = 他 (表が無い・枠が尽きた・空きの不足でない I/O)。 schema の insert は前者を
     /// `SchemaError::WriteRejected(TieRejected::Fault(DiskSpace))` にする。
     pub fn try_entity_in(&self, table_name: &str) -> Result<enchudb_oplog::EntityId, (Option<FaultKind>, String)> {
-        self.entity_in_with(table_name, false).map_err(|e| match e {
+        self.try_entity_in_row(table_name).map(|(eid, _)| eid)
+    }
+
+    /// [`Self::try_entity_in`] の、 払い出した行の lock ([`Self::write_row`] と同じ) を握ったまま返す形 (review038 の A1)。 払い出しの道は
+    /// 場所の行を握ってから生かすので、 続けて行の列を書く呼び手 (schema の insert) は握り直さずにこの lock の下で書ける (握り直すまでの間に、
+    /// 出口 (`entities()`) で新しい行を見た書き手が消す窓も無い)。 予約の表 (`_` で始まる) の行は握らない (`None`、 要るなら
+    /// [`Self::write_row`])。
+    pub fn try_entity_in_row(
+        &self,
+        table_name: &str,
+    ) -> Result<(enchudb_oplog::EntityId, Option<crate::row_lock::RowWrite<'_>>), (Option<FaultKind>, String)> {
+        self.entity_in_held(table_name, false).map_err(|e| match e {
             // 待つ形 (`nowait` が偽) は返さない
             EntityInError::Busy(slot) => (None, format!("table '{table_name}': slot {slot} is held by a writer")),
             EntityInError::Space(why) => (Some(FaultKind::DiskSpace), why),
@@ -20685,6 +22238,16 @@ impl Engine {
     /// [`Self::entity_in`] の中身。 `nowait` なら、 空きの一覧の場所が全部 (行を握れずに) 握られていた時に探し直さず `Busy(場所)`
     /// を返す (#974: 受信の払い出しは `alloc_lock` を握っているので、 放してから待つ。 [`Self::wait_busy_slot`])。
     fn entity_in_with(&self, table_name: &str, nowait: bool) -> Result<enchudb_oplog::EntityId, EntityInError> {
+        self.entity_in_held(table_name, nowait).map(|(eid, _)| eid)
+    }
+
+    /// [`Self::entity_in_with`] の、 払い出した行の lock を握ったまま返す形 (review038 の A1: 払い出しの道は場所の行を握ってから生かし、
+    /// eid を作るまで握る。 予約の表の行は握らない = `None`)。
+    fn entity_in_held(
+        &self,
+        table_name: &str,
+        nowait: bool,
+    ) -> Result<(enchudb_oplog::EntityId, Option<crate::row_lock::RowWrite<'_>>), EntityInError> {
         use std::sync::atomic::Ordering;
         self.check_writable();
         if table_name.is_empty() {
@@ -20780,7 +22343,10 @@ impl Engine {
                     // 生きていない」 の読みの後・行を握る前に、 払い出し位置から同じ場所を取った書き手が生かして返し、 その行を消す
                     // 書き手が kill を書けずに覚えて空けると (消す道は行の lock の下)、 ここで今の世代のまま生かして消えた行と同じ eid を
                     // 返した。 行を握った後は消す書き手の覚えが見える (握れたのは消す書き手が lock を放した後)
-                    if row.is_some() && self.generations().withheld(g) {
+                    // #1048 の読み直し [4]: 生きているかも見直す。 上の 「生きていない」 の読みの後・行を握る前に、 払い出し位置から同じ
+                    // 場所を取った書き手が生かして返していれば (review038 の A1 から、 位置の道も行を握ってから生かす = 握った後は来ない)、
+                    // その行の場所の後始末 (`prepare_reuse` が名前の記録を外す等) をせずに飛ばす
+                    if row.is_some() && (self.generations().withheld(g) || self.entities.is_live(g)) {
                         continue;
                     }
                     #[cfg(test)]
@@ -20850,8 +22416,7 @@ impl Engine {
                     if !table.is_reserved() {
                         self.drop_leftover_cells(global, tid);
                     }
-                    drop(row);
-                    return Ok(eid);
+                    return Ok((eid, row));
                 }
                 drop(fl);
                 if no_room_only {
@@ -20885,7 +22450,7 @@ impl Engine {
         // もう一度払い出す。 その前でも、 穴の無い時に足す extent を伸びた分まで大きくした (回した回数の分の eid 空間を取る)
         let exhausted = table.global_of(table.next_local.load(Ordering::Acquire)).is_none();
         if exhausted && self.rebuild_free_locals(tid) {
-            return self.entity_in_with(table_name, nowait);
+            return self.entity_in_held(table_name, nowait);
         }
         // capacity check (= fetch_add 後の変換で extent の外なら枯渇)
         let cur = table.next_local.fetch_add(1, Ordering::AcqRel);
@@ -20902,7 +22467,7 @@ impl Engine {
                 if !exhausted && self.rebuild_free_locals(tid) {
                     // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
                     // 再構築後も枯渇なら fl が空のままなので次は grow / Err に落ちる。
-                    return self.entity_in_with(table_name, nowait);
+                    return self.entity_in_held(table_name, nowait);
                 }
                 // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
                 match self.grow_table_extent_for(tid, cur) {
@@ -20945,8 +22510,10 @@ impl Engine {
         // 渡さない (A1、 突き合わせの 2. が払い出し位置の先の世代 > 0 の場所を完了させた時。 同じ 2 B の読み。 飛ばした場所は払い出し位置の
         // 手前の穴になり、 後始末が届いた後に一覧の作り直しが拾う)
         if self.generations().used_up(global) || self.generations().pending_mark(global) {
-            return self.entity_in_with(table_name, nowait);
+            return self.entity_in_held(table_name, nowait);
         }
+        // #1048 の読み直し [2]: 取った時の場所の世代と死の印 (行を握った後に比べる)
+        let taken = self.generations().state(global);
         // #970 (案 P): 生かす前に、 場所の世代を書く gen.seg の page を commit 済みにする (普段は atomic の load 1 回、 page をまたぐ時
         // だけ伸ばす)。 commit は縮まないので、 この行を消す時の kill は空きの不足で落ちない。 できなければ払い出し位置を戻して断る
         // (#868 と同じく、 後から誰も進めていない時だけ戻せる。 戻せなければこの場所は穴 = 表が枯渇した時の全部なめが拾う)。 v15 に
@@ -20968,19 +22535,78 @@ impl Engine {
                 ),
             ));
         }
-        // #731: 落ちた後に払い出し位置が消した場所の手前に戻った時は、 その場所に 「死んでいる」 印がある (生かす前に落とす)
-        self.revive_slot(global);
         #[cfg(test)]
         if let Some(wal) = self.oplog.as_ref() {
             claim_gap_hook::call(wal);
         }
+        // review038 の A1: ユーザの表は、 場所の行を握ってから生かし、 eid を作るまで握る (空きの一覧の道の #931 と同じ形)。 生きている
+        // 印を立てた後は出口 (`entities()`) がこの行を見せるので、 握らずにいると、 その行を消す書き手 (`delete` は行の lock の下で消す) が
+        // eid を作る前に入る: 消す道が世代を上げた後に eid を作ると次の住人の世代の eid を返し (`settle_claim` は死の印も落とした)、 表が
+        // 枯渇した後の使い回しが同じ eid を別の行に渡した (#731 が戻る)。 握っていれば、 消す書き手は返した後に消す (返した eid の行が
+        // 消える = 返した後に消したのと同じ)。 握れない時は `claim_position_row`
+        let row = if table.is_reserved() {
+            None
+        } else {
+            match self.claim_position_row(global, nowait) {
+                Some(r) => Some(r),
+                // #974: `alloc_lock` を握っている受信の払い出しは待たずに返る (位置を戻して `Busy`、 呼び手は放してから待って取り直す)。
+                // 戻せない (後から位置を進めた書き手が居る) 時は、 場所を穴にせずに待って握る (#1048 の読み直し [3]: 穴は枯渇した時の
+                // 全部なめが拾い、 使い回しの無い v14 の DB を v15 に移した)。 `alloc_lock` の下で行を待つのはこの時だけ (取り合いと位置の
+                // 追い越しが重なった時。 待つ相手は新しい場所の stripe の書き手で、 ユーザの行を握ったまま `alloc_lock` を待つ書き手は
+                // 居ない = #974 の約束、 `debug_assert_no_user_row`)
+                None if table.next_local.compare_exchange(cur + 1, cur, Ordering::AcqRel, Ordering::Relaxed).is_ok() => {
+                    return Err(EntityInError::Busy(global));
+                }
+                None => {
+                    #[cfg(test)]
+                    NOWAIT_HELD_WAITS.with(|c| c.set(c.get() + 1));
+                    Some(self.row_locks.write(global))
+                }
+            }
+        };
+        // #1048 の読み直し [2]: 取った後・行を握るまでに、 全部なめの使い回し (空きの一覧の道) がこの場所を生かして消していれば (世代が
+        // 上がる)、 前の住人の後始末 (`prepare_reuse` / `clear_slot_versions` / `drop_leftover_cells`) を通る道に任せて取り直す (場所は
+        // 消した行の一覧か全部なめが拾う)。 前はそのまま次の世代で生かし、 消えた行の tombstone と名前の記録を新しい行の場所に残した。
+        // 生きていれば下の `allocate_at` が弾く。 v15 に移る手順の 4. の穴埋め (v14 の間に取った場所を 「生きていない・世代 0」 と読んで
+        // 「世代 1・死」 にした形) も同じく取り直す (#1048 の読み直し 2 の (a): 埋めだけを除くと、 4. が位置を読んだ後・移り終える前に取った
+        // 場所を移り終えた使い回しが世代 0 で生かして消した形 (同じ 「世代 1・死」) を見分けられない)。 その時 DB は v15 に移っているので、
+        // 残る穴が使い回しの無い DB を v15 に移すこと ([3]) は無い。 穴は後で後始末付きの道が拾う
+        if row.is_some() && self.generations().state(global) != taken {
+            drop(row);
+            return self.entity_in_held(table_name, nowait);
+        }
+        // #731: 落ちた後に払い出し位置が消した場所の手前に戻った時は、 その場所に 「死んでいる」 印がある (生かす前に落とす)。 行の lock の
+        // 下で (#1048 の読み直し [6]、 `revive_slot` の doc の #913 の約束)
+        self.revive_slot(global);
         // EntitySet で live mark + next_eid 前進 (CAS safe)。 #883: 前から立っていたら、 全部なめがこの slot を穴として拾って
         // 先に払い出した (払い出し位置から取った後・印を立てる前の窓)。 その slot はあちらの物なので取り直す
         if self.entities.allocate_at(global) {
-            return self.entity_in_with(table_name, nowait);
+            drop(row);
+            return self.entity_in_held(table_name, nowait);
+        }
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            claim_live_hook::call(wal);
         }
         self.settle_claim(global);
-        Ok(self.eid_of_slot(global)) // #731: 今の世代を付ける
+        let eid = self.eid_of_slot(global); // #731: 今の世代を付ける
+        Ok((eid, row))
+    }
+
+    /// review038 の A1: 払い出す場所 `slot` の行を握る (生きている印を立てる前に。 eid を作るまで握る)。 待たずに握れなければ待つ。
+    /// 受信の払い出し (`nowait`、 `alloc_lock` を握っている、 #974) は待たずに `None`。
+    ///
+    /// 普段は待たずに握れる (払い出す場所はまだ誰の行でもない。 握られているのは、 同じ stripe の別の行の書き手か、 空きの一覧の道が
+    /// 同じ場所を穴として拾った時)。 値段は書き込みのない stripe の lock の取り / 放し 1 回。 待つのは、 呼び手が払い出した直後にこの
+    /// 行を握る (schema の insert の列・engine の `tie_*`・Ref の的の行の名前) 時の待ちが前に移っただけ: この thread が別のユーザの行を
+    /// 握っていても待つ相手は同じなので、 新しい互いの待ちは作らない (#1048 の読み直し [3]: 前は握っている thread は待たずに場所を穴に
+    /// し、 使い回しの無い v14 の DB を、 枯渇した時の全部なめがその穴を拾って v15 に移した)。
+    #[inline]
+    fn claim_position_row(&self, slot: u32, nowait: bool) -> Option<crate::row_lock::RowWrite<'_>> {
+        if let Some(r) = self.row_locks.try_write(slot) {
+            return Some(r);
+        }
+        (!nowait).then(|| self.row_locks.write(slot))
     }
 
     /// 0.18.2: `free_locals` を EntitySet の liveness から再構築する（穴 = 割当済み
@@ -21835,6 +23461,8 @@ impl Engine {
     /// [`Self::compact_name_records_now`] は待たない)。
     #[cfg(not(target_arch = "wasm32"))]
     fn compact_name_records(&self, force: bool) {
+        #[cfg(test)]
+        consumer_start_hook::note_compaction();
         let addr = self as *const Engine as usize;
         if self.path.is_empty() || (!force && name_compactor::backing_off(addr)) {
             return;
@@ -21885,10 +23513,11 @@ impl Engine {
         }
     }
 
-    /// [`Self::compact_name_records`] を、 consumer の居ない engine でだけ (居れば consumer の周期に任せる)。
+    /// [`Self::compact_name_records`] を、 consumer の居ない engine でだけ (居れば consumer の周期に任せる)。 #1023: 「居る」 は consumer の
+    /// thread を作る側が作る前に立てる印で決める (thread が動き出す前の書き出しも consumer に任せる)。
     #[cfg(not(target_arch = "wasm32"))]
     fn compact_name_records_without_consumer(&self) {
-        if self.consumer_thread.get().is_none() {
+        if self.wal_fold_off.load(std::sync::atomic::Ordering::Acquire) & CONSUMER_SPAWNED == 0 {
             self.compact_name_records(false);
         }
     }
@@ -23165,95 +24794,139 @@ impl Engine {
         // 消えた行の eid (世代 0) が照合を通り、 その eid の delete が生かした場所を殺して空きの山に積み直し、 同じ eid を 2 回渡した)。
         // 上げられなければ (gen.seg を伸ばせない) 山に残して断る。 世代を持たない DB で使い回す時は、 取る前に移る (移る手順は消す
         // 書き手を待つので、 空きの山の lock の下では移れない = 残して、 移ってから取り直す)
-        #[cfg(test)]
-        if let Some(wal) = self.oplog.as_ref() {
-            anon_alloc_hook::call(wal);
-        }
-        let kept_for = std::cell::Cell::new(KeptFor::Move);
+        // #1048 の読み直し [1]: 取り直し (v15 に移った後・行が握られていた・位置の場所を飛ばした) は loop で回す (前は `entity()` を
+        // 呼び直す再帰で、 行が長く握られていると取り直しのたびに stack が 1 段深くなった)
         let gens = self.generations();
-        let alloc = self.entities.allocate_or_keep(
-            // #970 (案 P): 新しい場所も生かす前に、 世代を書く gen.seg の page を commit 済みにする (普段は atomic の load 1 回)。
-            // できなければ生かさずに断る (位置は戻す / 戻せなければ穴として空きの山に積む)。 v15 に移る手順と並んだ時は、 位置の RMW の
-            // 順で揃う (`EntitySet::allocate_or_keep` の doc)
-            |slot| {
-                if self.gen_slot_ready(slot).is_err() {
-                    return false;
-                }
-                self.revive_slot(slot);
-                true
-            },
-            |slot| {
-                if !gens.moved() && self.can_move_to_generations() {
-                    kept_for.set(KeptFor::Move);
-                    return crate::entity_set::Reuse::Keep;
-                }
-                // 世代を使い切った場所は二度と渡さない。 生きている場所 (山に積んだ穴 = 位置から取って断った場所を、 後で別の道が
-                // 生かした) も外す。 PR #977 の読み直し 5 の [D] (a): 生きているかを先に読む (消す道は kill を書けない場所を覚えてから
-                // 生きている印を下ろす = 下りた印を読んだ後に覚えを読めば、 覚えが見える。 逆の順では、 覚える前に読んで、 印が下りた
-                // 後に読んだ 「生きていない」 で取りうる)
-                // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (山から外す)。 当たるのは anonymous だけの sync しない DB で、 開く
-                // 道の後始末の書き出し (`body_msync`) か後始末待ちを落とした gen.seg の書き出しに失敗した session だけ (sync する DB は
-                // anonymous の表を閉じている)。 外した場所は山に戻らない (使わない向きの漏れ、 #992 の読み直し 5 の細かい 2)
-                if self.entities.is_live(slot) || gens.withheld(slot) {
-                    return crate::entity_set::Reuse::Discard;
-                }
-                // 世代 0 = v14 の間に消えた場所 (移る手順の穴埋めと開く時の突き合わせが上げる) か、 位置から取って断った穴
-                // (`Allocated::Refused`、 生かしていない)。 上げる (穴は上げなくてもよいが、 1 つ使うだけ)。 上げは場所の page を
-                // commit する: 払い出し済みの場所は commit 済み、 穴の page は commit の外でありうる = 空きが無ければ残して断る
-                if gens.get(slot) == 0 && !self.raise_generation(slot, 1) {
-                    kept_for.set(KeptFor::Space);
-                    return crate::entity_set::Reuse::Keep;
-                }
-                self.revive_slot(slot);
-                crate::entity_set::Reuse::Take
-            },
-        );
-        let (local, reused) = match alloc {
-            crate::entity_set::Allocated::Fresh(l) => (l, false),
-            crate::entity_set::Allocated::Reused(l) => (l, true),
-            crate::entity_set::Allocated::Kept(slot) => {
-                return match kept_for.get() {
+        loop {
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                anon_alloc_hook::call(wal);
+            }
+            let kept_for = std::cell::Cell::new(KeptFor::Move);
+            // review038 の A1: 生かす場所の行。 生きている印を立てる前に握り、 eid を作るまで握る (表の `entity_in` と同じ。 握らずにいると、
+            // 出口 (`entities()`) で生かした行を見た書き手がその行を消した後の世代で eid を作り、 空きの山の使い回しが同じ eid を別の行に
+            // 渡した)
+            let row: std::cell::Cell<Option<crate::row_lock::RowWrite<'_>>> = std::cell::Cell::new(None);
+            let alloc = self.entities.allocate_or_keep(
+                // #970 (案 P): 新しい場所も生かす前に、 世代を書く gen.seg の page を commit 済みにする (普段は atomic の load 1 回)。
+                // できなければ生かさずに断る (位置は戻す / 戻せなければ穴として空きの山に積む)。 v15 に移る手順と並んだ時は、 位置の RMW の
+                // 順で揃う (`EntitySet::allocate_or_keep` の doc)
+                |slot| {
+                    if self.gen_slot_ready(slot).is_err() {
+                        return crate::entity_set::Fresh::Refuse;
+                    }
+                    // review038 の A4: 世代を使い切った場所と後始末待ちの場所は渡さない (表の位置の道と同じ、 #992 の読み直し 4 の B4)。 位置の
+                    // 先にこれらが来るのは、 落ちた後に高水位 (entities の header の page) が生きている印より古い像で、 突き合わせ 1. がその先の
+                    // 場所の削除を完了させた時 (と、 その後に `grow_entity_cap` で枠を広げた時)。 飛ばして穴として空きの山に積む (山から取る
+                    // 時に `reuse` が見直す = 後始末が届いていれば使い回す)。 同じ 2 B の読み (`gen_slot_ready` が page を commit した後)。
+                    // 世代を持つ DB でだけ当たる (v14 の DB に穴を作らない、 #1048 の読み直し [3])
+                    if gens.used_up(slot) || gens.pending_mark(slot) {
+                        return crate::entity_set::Fresh::Skip;
+                    }
+                    // A1: 行を握る (待たずに握れなければ待つ。 空きの山の lock は持っていない。 待つ相手は、 払い出した直後に呼び手がこの行に
+                    // 書く時に待つ相手と同じ。 待たずに穴にすると、 使い回しの無い v14 の DB が空きの山の使い回しで v15 に移った、 [3])
+                    row.set(Some(self.row_locks.try_write(slot).unwrap_or_else(|| self.row_locks.write(slot))));
+                    self.revive_slot(slot);
+                    crate::entity_set::Fresh::Take
+                },
+                |slot| {
+                    if !gens.moved() && self.can_move_to_generations() {
+                        kept_for.set(KeptFor::Move);
+                        return crate::entity_set::Reuse::Keep;
+                    }
+                    // 世代を使い切った場所は二度と渡さない。 生きている場所 (山に積んだ穴 = 位置から取って断った場所を、 後で別の道が
+                    // 生かした) も外す。 PR #977 の読み直し 5 の [D] (a): 生きているかを先に読む (消す道は kill を書けない場所を覚えてから
+                    // 生きている印を下ろす = 下りた印を読んだ後に覚えを読めば、 覚えが見える。 逆の順では、 覚える前に読んで、 印が下りた
+                    // 後に読んだ 「生きていない」 で取りうる)
+                    // #992 の読み直し 4 の B4 (A1): 後始末待ちの場所も渡さない (山から外す)。 当たるのは anonymous だけの sync しない DB で、 開く
+                    // 道の後始末の書き出し (`body_msync`) か後始末待ちを落とした gen.seg の書き出しに失敗した session だけ (sync する DB は
+                    // anonymous の表を閉じている)。 外した場所は山に戻らない (使わない向きの漏れ、 #992 の読み直し 5 の細かい 2)
+                    if self.entities.is_live(slot) || gens.withheld(slot) {
+                        return crate::entity_set::Reuse::Discard;
+                    }
+                    // 世代 0 = v14 の間に消えた場所 (移る手順の穴埋めと開く時の突き合わせが上げる) か、 位置から取って断った穴
+                    // (`Allocated::Refused`、 生かしていない)。 上げる (穴は上げなくてもよいが、 1 つ使うだけ)。 上げは場所の page を
+                    // commit する: 払い出し済みの場所は commit 済み、 穴の page は commit の外でありうる = 空きが無ければ残して断る
+                    if gens.get(slot) == 0 && !self.raise_generation(slot, 1) {
+                        kept_for.set(KeptFor::Space);
+                        return crate::entity_set::Reuse::Keep;
+                    }
+                    // A1: 行を握る。 空きの山の lock の下では待たない (消す道は 行の lock → 空きの山の lock の順): 握れなければ山に残し、
+                    // 放してから待って取り直す
+                    match self.row_locks.try_write(slot) {
+                        Some(r) => row.set(Some(r)),
+                        None => {
+                            kept_for.set(KeptFor::Busy);
+                            return crate::entity_set::Reuse::Keep;
+                        }
+                    }
+                    self.revive_slot(slot);
+                    crate::entity_set::Reuse::Take
+                },
+            );
+            let (local, reused) = match alloc {
+                crate::entity_set::Allocated::Fresh(l) => (l, false),
+                crate::entity_set::Allocated::Reused(l) => (l, true),
+                crate::entity_set::Allocated::Kept(slot) => match kept_for.get() {
                     KeptFor::Move => {
                         self.move_to_generations().map_err(|e| format!("entity(): {e}"))?;
-                        self.entity()
+                        continue;
                     }
-                    KeptFor::Space => Err(format!(
-                        "entity(): the slot to reuse needs a new generation, and gen.seg cannot grow (disk space, #970) — slot \
-                         {slot} is kept for later"
-                    )),
-                };
+                    KeptFor::Space => {
+                        return Err(format!(
+                            "entity(): the slot to reuse needs a new generation, and gen.seg cannot grow (disk space, #970) — slot \
+                             {slot} is kept for later"
+                        ));
+                    }
+                    KeptFor::Busy => {
+                        // 握っている書き手が離すのを待って取り直す (握らずに待つ、 `wait_released`)
+                        #[cfg(test)]
+                        ANON_BUSY_RETRIES.with(|c| c.set(c.get() + 1));
+                        self.row_locks.wait_released(slot);
+                        continue;
+                    }
+                },
+                // A4: 位置から取った場所を飛ばした (穴として空きの山に積んだ)。 取り直す
+                crate::entity_set::Allocated::Skipped(_) => continue,
+                crate::entity_set::Allocated::Refused(slot) => {
+                    return Err(format!(
+                        "entity(): the eid generation of the next slot {slot} cannot be written (gen.seg cannot grow, disk space, \
+                         #970) — not given out"
+                    ));
+                }
+                crate::entity_set::Allocated::Full => {
+                    self.record_fault(
+                        FaultKind::EntitySpace,
+                        "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
+                    );
+                    return Err(format!(
+                        "entity space exhausted: max_entities={} and the free stack is empty — \
+                         delete entities to free slots, or recreate the DB with a larger \
+                         create_with_capacity (remaining_eid_space() で残量が見られる)",
+                        self.entities.max_entities(),
+                    ));
+                }
+            };
+            #[cfg(test)]
+            if let Some(wal) = self.oplog.as_ref() {
+                if reused {
+                    anon_reuse_hook::call(wal);
+                } else {
+                    anon_fresh_hook::call(wal);
+                }
             }
-            crate::entity_set::Allocated::Refused(slot) => {
-                return Err(format!(
-                    "entity(): the eid generation of the next slot {slot} cannot be written (gen.seg cannot grow, disk space, \
-                     #970) — not given out"
-                ));
+            if reused {
+                // #779: `entity_in` の再利用枝と同じ
+                self.remember_former_address(local, true);
+                self.clear_cell_versions(local);
+                self.drop_leftover_cells(local, ANONYMOUS_TABLE as usize);
             }
-            crate::entity_set::Allocated::Full => {
-                self.record_fault(
-                    FaultKind::EntitySpace,
-                    "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
-                );
-                return Err(format!(
-                    "entity space exhausted: max_entities={} and the free stack is empty — \
-                     delete entities to free slots, or recreate the DB with a larger \
-                     create_with_capacity (remaining_eid_space() で残量が見られる)",
-                    self.entities.max_entities(),
-                ));
-            }
-        };
-        #[cfg(test)]
-        if reused && let Some(wal) = self.oplog.as_ref() {
-            anon_reuse_hook::call(wal);
+            self.settle_claim(local);
+            // A1: eid を作ってから行を放す
+            let eid = self.eid_of_slot(local);
+            drop(row);
+            return Ok(eid);
         }
-        if reused {
-            // #779: `entity_in` の再利用枝と同じ
-            self.remember_former_address(local, true);
-            self.clear_cell_versions(local);
-            self.drop_leftover_cells(local, ANONYMOUS_TABLE as usize);
-        }
-        self.settle_claim(local);
-        Ok(self.eid_of_slot(local))
     }
 
     pub fn entities(&self) -> Vec<enchudb_oplog::EntityId> {
@@ -25234,7 +26907,7 @@ impl Engine {
     }
 
     /// `.eidmap` の写像の面 (`peer`, `foreign_local`) → 場所 `local` が、 落ちる前に場所を使い回した時に外した写像か: `prev.seg` の
-    /// 場所の記録の前の住人がその identity (翻訳した行) なら、 記録の削除の版数。 開く時 (`.eidmap` を読む所) だけ。
+    /// 場所の記録の前の住人がその identity (翻訳した行) なら、 その記録 (削除の版数と前の住人の行)。 開く時 (`.eidmap` を読む所) だけ。
     ///
     /// 記録は使い回した時にしか書かない (前の住人を消して、 写像を外して、 場所を次の行に渡した)。 記録の identity と面の identity が
     /// 同じで、 使い回しが本体に届いている (場所の最後の行が記録の行でない) なら、 面は使い回しの前の物 = 戻すと新しい住人がその
@@ -25255,7 +26928,7 @@ impl Engine {
         local: u32,
         peer: enchudb_oplog::PeerId,
         foreign_local: u32,
-    ) -> Option<enchudb_oplog::Hlc> {
+    ) -> Option<crate::prev_slots::PrevRecord> {
         let gens = self.generations();
         let mut found: Option<crate::prev_slots::PrevRecord> = None;
         let mut last: Option<u32> = None;
@@ -25269,7 +26942,7 @@ impl Engine {
                 found = Some(rec);
             }
         });
-        found.map(|r| r.tomb)
+        found
     }
 
     /// きれいに閉じなかった後に開いた時 (sidecar を読んだ後、 突き合わせと WAL の再生の前)、 `prev.seg` の記録で、 使い回しが
@@ -25713,11 +27386,10 @@ impl Engine {
         if !others.is_empty() {
             self.retreat_removed_keys(&others, rec.tomb);
         }
-        // review946c [E]: 戻した自分の行の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
-        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)
-        if rec.kind == crate::prev_slots::PrevKind::Own {
-            self.generations().prev.note_restored_own(rec.gone, rec.tomb);
-        }
+        // review946c [E]: 戻した前の住人の削除は、 WAL に無ければ #451 の作り直しが Delete を載せる (本体が WAL より先に届いた像では、
+        // 使い回しが 0 にした tomb.seg を作り直しが見ないので、 state にしか入らなかった = 差分で受ける peer に届かない)。 #1035: 翻訳した
+        // 行も (自分が消した受けた行。 作り直しは版数が自分の時計の物だけ載せ、 bridge は宛名を記録から引く)
+        self.generations().prev.note_restored_delete(rec.gone, rec.tomb);
         true
     }
 
@@ -26850,8 +28522,19 @@ impl Engine {
     ///
     /// 自分の行 (畳んで別の行に転送していない) は宛名の番号そのもの (引く時に照合した番号。 引いた後に変わっていても lock の下で
     /// 外れる)。 他の peer の行と転送した自分の行は、 引いた直後の場所の最後の行。
+    ///
+    /// #1034: 他の peer の行と転送した自分の行は、 場所の最後の行を読んだ後に、 宛名の写像がまだその場所を指すかを引き直す。 宛名を
+    /// 写像で引いた後・世代を読む前に、 その行が消えて場所が使い回されると、 読んだのは使い回した新しい行で、 lock の下の照合 (その行が
+    /// まだ場所の最後の行か) も通った (前は引き直さず、 遅れた Delete / Tie が新しい行を消した / 書き換えた)。 使い回す道は写像を外して
+    /// から場所を生かす ([`Self::prepare_reuse`]) ので、 読んだ後に写像がまだ場所を指していれば、 読んだ行は写像の行 (使い回しの前)。
+    /// 指していなければ、 どの行とも合わない番号 ([`Self::no_row`]) を返す: 呼び手は lock の下の照合で外れ、 引く前に使い回されていた
+    /// 時と同じ道 (写像の無い行) へ進む。
     #[inline]
     pub fn remote_row_of(&self, world: enchudb_oplog::EntityId, internal: enchudb_oplog::EntityId) -> u32 {
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            resolved_row_hook::call(wal);
+        }
         // 場所の bit は 1 回だけ読む (`slot_unchecked` と自分の行の照合で 2 回たどっていた、 [P])
         let r = self.generations().reader();
         let slot = r.split(enchudb_oplog::eid_local(internal)).0;
@@ -26866,7 +28549,27 @@ impl Engine {
                 return local;
             }
         }
-        self.last_local_of_slot(slot)
+        let row = self.last_local_of_slot(slot);
+        if self.world_maps_to_slot(world, slot) { row } else { Self::no_row(row) }
+    }
+
+    /// #1034: 宛名 `world` (他の peer の行は写像、 自分の行は畳んだ先) が今も場所 `slot` を指すか ([`Self::remote_row_of`] /
+    /// [`Self::try_resolve_remote_ref_value`] が場所の最後の行を読んだ後の引き直し)。
+    fn world_maps_to_slot(&self, world: enchudb_oplog::EntityId, slot: u32) -> bool {
+        let peer = enchudb_oplog::eid_peer(world);
+        let to = if peer == self.peer_id() {
+            self.own_world_to_internal(world).map(enchudb_oplog::eid_local)
+        } else {
+            self.eid_translator.get(peer, enchudb_oplog::eid_local(world))
+        };
+        to.is_some_and(|l| self.generations().split(l).0 == slot)
+    }
+
+    /// #1034: 行の番号 `row` (世代 | 場所) の場所の bit を 1 つ変えた番号。 `row` の場所の最後の行とは決して合わない (場所の bit は 24 以上)
+    /// ので、 [`Self::remote_row_of`] が 「引いた行はもう場所に居ない」 を呼び手 (lock の下の照合) に渡すのに使う。
+    #[inline]
+    fn no_row(row: u32) -> u32 {
+        row ^ 1
     }
 
     /// #917: 中の eid `internal` の場所に、 [`Self::remote_row_of`] で取った行 `row` がまだ居るか (場所の最後の行か)。 lock の外で
@@ -27843,8 +29546,10 @@ impl Engine {
     }
 
     /// 払い出しの道で生きている印を立てた後 (eid を作る前): 移る手順と重なったなら、 移り終えるのを待って死の印を落とす
-    /// (`Generations::claim_overlaps_move`、 PR #885 の読み直し 3a)。 この場所は自分の物 (eid を返す前) なので、 消す書き手は居ない。
-    /// `ensure_live_slot` (受信・束ね) は生きている印を自分で立てた時に、 行の lock を握ったまま呼ぶ (消す書き手は行の lock を待つ、 #913)。
+    /// (`Generations::claim_overlaps_move`、 PR #885 の読み直し 3a)。 この場所は自分の物 (eid を返す前) なので、 消す書き手は居ない:
+    /// 呼び手は全部、 場所の行を握ったまま呼ぶ (消す書き手は行の lock を待つ)。 `ensure_live_slot` (受信・束ね) は #913 から、 払い出しの
+    /// 道 (`entity_in` / anonymous の `entity()`) は review038 の A1 から (前は握らずに呼び、 生かした行を出口で見た書き手が間に消すと、
+    /// ここで消す道の死の印を落とし、 次の住人の世代の eid を返した)。 予約の表 (`_sync_ops` など) は握らない (アプリが消さない)。
     #[inline]
     fn settle_claim(&self, slot: u32) {
         let gens = self.generations();
@@ -28116,6 +29821,10 @@ impl Engine {
                 }
             }
         }
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            move_filled_hook::call(wal);
+        }
         // 5.
         let written = set.segment(SegmentKind::Gen).map_or(0, |m| m.committed());
         self.backing.flush_kind(SegmentKind::Gen, 0, written)?;
@@ -28206,14 +29915,24 @@ impl Engine {
     /// 行の古い eid を的にした ref、 または覚えの無い時 (開き直した後 / 上限を越えた) の、 使い回す前の行宛ての record)、 今の逆写像を
     /// 使わない: 覚えを世代で引き、 無ければ None (WAL の eid / 値のまま = 自分の世界番号で出る)。 前は今の逆写像で出し、 消えた自分の
     /// 行宛ての record や ref が、 その場所を使い回した他の peer の行に当たった
+    ///
+    /// #1036: 覚えにも無く場所の最後の行でもない行は、 `prev.seg` の記録 (場所を使い回した時の前の住人) で引く
+    /// ([`Self::bridge_row_address`] / state の #924 と同じ): 翻訳した行なら記録の identity、 自分の行なら None。 前は覚えが無いと
+    /// (bridge が使い回しの所の後ろを読んだ後 / 開き直した後) None を返し、 消えた受けた行を指す ref を自分の世界番号で配って、 受け手に
+    /// 幻の行を作った。 記録でも分からない行 (同じ場所を 2 回以上使い回した前の住人) は今まで通り None。
     fn bridge_address(&self, local: u32, hlc: enchudb_oplog::Hlc) -> Option<(enchudb_oplog::PeerId, u32)> {
         use std::sync::atomic::Ordering;
         let gens = self.generations();
         let (slot, row_gen) = gens.split(local);
         let now = self.eid_translator.reverse(slot);
         let is_last_row = || row_gen == gens.split(self.last_local_of_slot(slot)).1;
+        let recorded = || {
+            gens.prev
+                .record_of(slot, local)
+                .and_then(|r| (r.kind == crate::prev_slots::PrevKind::Translated).then_some((r.peer, r.number)))
+        };
         if !self.former_addresses_on.load(Ordering::Acquire) {
-            return now.filter(|_| is_last_row());
+            return if is_last_row() { now } else { recorded() };
         }
         let fa = self.former_addresses.lock().unwrap_or_else(|p| p.into_inner());
         let last = enchudb_oplog::Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX };
@@ -28225,8 +29944,11 @@ impl Engine {
             None if is_last_row() => return now,
             None => {}
         }
-        // 書いた時にもう場所の住人でなかった行: その行の世代の変わり目
-        fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen).and_then(|(_, v)| address(v.0))
+        // 書いた時にもう場所の住人でなかった行: その行の世代の変わり目 (覚えに無ければ記録)
+        match fa.until.range((slot, enchudb_oplog::Hlc::ZERO)..=(slot, last)).rev().find(|(_, v)| v.2 == row_gen) {
+            Some((_, v)) => address(v.0),
+            None => recorded(),
+        }
     }
 
     /// #916 (読み直し A2): bridge が自分の record の**行**の宛名を引く ([`Self::bridge_address`] と同じ引き方)。 `None` = 分からない:
@@ -28550,44 +30272,73 @@ impl Engine {
     ) -> Result<Option<u32>, RemoteApply> {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
-        // #731: 返すのは Ref の cell に置く値 = 指す行の 世代 | 場所。 段 4: wire の自分の世界番号は世代込み
-        if author_peer == self_peer {
-            // identity: 自分が author (#612: 畳んだ行は残す行へ)
-            return Ok(Some(match self.own_world_slot(foreign_value) {
-                Some(slot) => self.last_local_of_slot(self.forward_local(slot)),
-                // もう無い行 (場所を使い回した前の住人) を指す ref: その番号のまま置く = 消えた行を指す ref (読みは中身の無い行、
-                // 今の住人を指さない)
-                None => foreign_value,
-            }));
-        }
-        // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
-        // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
-        // target table を導けなければ None (caller が op を skip)。
-        self.debug_no_row_before_alloc(author_peer, foreign_value, "resolve_remote_ref_value");
-        let no_room = std::cell::Cell::new(false);
-        let slot = self.eid_translator.get_or_insert_waiting(
-            author_peer,
-            foreign_value,
-            || match self.alloc_translated_local_in_target_table(ref_himo_id) {
-                crate::eid_translator::Alloc::Got(local) => {
-                    // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
-                    // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
-                    self.restore_foreign_tombstone(author_peer, foreign_value, local);
-                    crate::eid_translator::Alloc::Got(local)
+        // #1034: 場所 (写像 / 畳んだ先) を引いた後に場所の最後の行を読む所は、 読んだ後に引き直す (`remote_row_of` と同じ)。 引いた
+        // 後・読む前に、 その行が消えて場所が使い回されると、 読んだのは使い回した新しい行。 引き直して外れていれば頭からもう一度
+        // (使い回しの後に届いた時と同じ道: 他の peer の行は写像の無い行の払い出し = 退避した削除を書き戻した死んだ場所)
+        loop {
+            // #731: 返すのは Ref の cell に置く値 = 指す行の 世代 | 場所。 段 4: wire の自分の世界番号は世代込み
+            if author_peer == self_peer {
+                // identity: 自分が author (#612: 畳んだ行は残す行へ)
+                let Some(slot) = self.own_world_slot(foreign_value) else {
+                    // もう無い行 (場所を使い回した前の住人) を指す ref: その番号のまま置く = 消えた行を指す ref (読みは中身の無い行、
+                    // 今の住人を指さない)
+                    return Ok(Some(foreign_value));
+                };
+                let to = self.forward_local(slot);
+                #[cfg(test)]
+                if let Some(wal) = self.oplog.as_ref() {
+                    resolved_row_hook::call(wal);
                 }
-                crate::eid_translator::Alloc::Retry => {
-                    no_room.set(true);
-                    crate::eid_translator::Alloc::Retry
+                if to == slot {
+                    // 畳んでいない行は確かめた番号そのもの (`own_world_slot` は場所の最後の行がこの番号の時だけ返す。 場所を読み直すと、
+                    // 確かめた後に消えて使い回した新しい行を指す)
+                    return Ok(Some(foreign_value));
                 }
-                other => other,
-            },
-            |slot| self.wait_busy_slot(slot),
-        );
-        match slot {
-            // 死んだ場所 (相手の削除を先に当てた / 作成より先に削除が届いた) は消えた行の世代 (次の住人を指さない)
-            Some(slot) => Ok(Some(self.last_local_of_slot(slot))),
-            None if no_room.get() => Err(RemoteApply::RejectedCapacity),
-            None => Ok(None),
+                let row = self.last_local_of_slot(to);
+                if self.forward_local(slot) == to {
+                    return Ok(Some(row));
+                }
+                continue;
+            }
+            // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
+            // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
+            // target table を導けなければ None (caller が op を skip)。
+            self.debug_no_row_before_alloc(author_peer, foreign_value, "resolve_remote_ref_value");
+            let no_room = std::cell::Cell::new(false);
+            let slot = self.eid_translator.get_or_insert_waiting(
+                author_peer,
+                foreign_value,
+                || match self.alloc_translated_local_in_target_table(ref_himo_id) {
+                    crate::eid_translator::Alloc::Got(local) => {
+                        // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
+                        // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
+                        self.restore_foreign_tombstone(author_peer, foreign_value, local);
+                        crate::eid_translator::Alloc::Got(local)
+                    }
+                    crate::eid_translator::Alloc::Retry => {
+                        no_room.set(true);
+                        crate::eid_translator::Alloc::Retry
+                    }
+                    other => other,
+                },
+                |slot| self.wait_busy_slot(slot),
+            );
+            return match slot {
+                // 死んだ場所 (相手の削除を先に当てた / 作成より先に削除が届いた) は消えた行の世代 (次の住人を指さない)
+                Some(slot) => {
+                    #[cfg(test)]
+                    if let Some(wal) = self.oplog.as_ref() {
+                        resolved_row_hook::call(wal);
+                    }
+                    let row = self.last_local_of_slot(slot);
+                    if self.eid_translator.get(author_peer, foreign_value) != Some(slot) {
+                        continue;
+                    }
+                    Ok(Some(row))
+                }
+                None if no_room.get() => Err(RemoteApply::RejectedCapacity),
+                None => Ok(None),
+            };
         }
     }
 
@@ -29928,44 +31679,52 @@ impl Engine {
         foreign_eid: enchudb_oplog::EntityId,
         hlc: enchudb_oplog::Hlc,
     ) -> RemoteApply {
-        if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
-            // #917: 引いた行を、 行の lock の下でもう一度確かめる。 引いた後にその行が消えて場所が使い回されていれば、 引く前に
-            // 消えていた時と同じ下の道へ: 自分の行はもう無い自分の行の削除、 他の peer の行は写像の無い行の削除 (#925 の [B3]:
-            // 使い回す道が写像を場所を生かす前に外すので、 使い回された場所の写像はもう無い。 前は何もせずに捨て、 引いた時刻で
-            // #545 の名前の削除の時刻を上げるかが変わった)
-            let row = self.remote_row_of(foreign_eid, local_eid);
-            let r = self.remote_delete_apply_at_result(local_eid, row, hlc);
-            if r != RemoteApply::Stale || self.remote_row_holds(local_eid, row) {
-                return r;
-            }
-        }
-        self.observe_remote_hlc(hlc);
-        let owner = enchudb_oplog::eid_peer(foreign_eid);
-        let lww = |applied: bool| if applied { RemoteApply::Applied } else { RemoteApply::Stale };
-        // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除。 その行は消えている。 #915: 使い回す時に移した削除の
-        // 版数より新しければ、 名前の削除の時刻を上げる
-        if owner == self.peer_id.load(std::sync::atomic::Ordering::Acquire) {
-            return lww(self.raise_gone_own_delete(enchudb_oplog::eid_local(foreign_eid), hlc));
-        }
-        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        let before = self.foreign_tombstone_of(owner, foreign_local);
-        self.debug_assert_no_user_row("remote_delete_apply_foreign");
-        match self
-            .eid_translator
-            .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
-        {
-            Ok(accepted) => {
-                // #545: 消えた行の slot を使い回して写像が外れた entity に、 より新しい削除が届いた。 その行の名前の削除の時刻を上げ、
-                // その名前を今持つ行のうち、 この削除より前にその名前になった行を消す (`remote_delete_apply` の 2 人目の削除と同じ)
-                if accepted && before.is_some_and(|t| hlc > t) {
-                    self.raise_identity_names(owner, foreign_local, hlc);
+        // #1034: 下の写像のある枝で引いた行が、 引いた後に消えて場所を使い回されていれば (`remote_row_of` が写像を引き直して外す)、
+        // 頭からもう一度 (写像の無い行の削除へ)。 回るのは、 写像を引いてから世代を読むまでの間に使い回しが重なった時だけ
+        loop {
+            if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
+                // #917: 引いた行を、 行の lock の下でもう一度確かめる。 引いた後にその行が消えて場所が使い回されていれば、 引く前に
+                // 消えていた時と同じ下の道へ: 自分の行はもう無い自分の行の削除、 他の peer の行は写像の無い行の削除 (#925 の [B3]:
+                // 使い回す道が写像を場所を生かす前に外すので、 使い回された場所の写像はもう無い。 前は何もせずに捨て、 引いた時刻で
+                // #545 の名前の削除の時刻を上げるかが変わった)
+                let row = self.remote_row_of(foreign_eid, local_eid);
+                let r = self.remote_delete_apply_at_result(local_eid, row, hlc);
+                if r != RemoteApply::Stale || self.remote_row_holds(local_eid, row) {
+                    return r;
                 }
-                lww(accepted)
             }
-            Err(local) => {
-                let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-                let local_eid = enchudb_oplog::make_eid(self_peer, local);
-                self.remote_delete_apply_at_result(local_eid, self.remote_row_of(foreign_eid, local_eid), hlc)
+            self.observe_remote_hlc(hlc);
+            let owner = enchudb_oplog::eid_peer(foreign_eid);
+            let lww = |applied: bool| if applied { RemoteApply::Applied } else { RemoteApply::Stale };
+            // #731 (段 4): もう無い自分の行 (場所を使い回した前の住人) の削除。 その行は消えている。 #915: 使い回す時に移した削除の
+            // 版数より新しければ、 名前の削除の時刻を上げる
+            if owner == self.peer_id.load(std::sync::atomic::Ordering::Acquire) {
+                return lww(self.raise_gone_own_delete(enchudb_oplog::eid_local(foreign_eid), hlc));
+            }
+            let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+            let before = self.foreign_tombstone_of(owner, foreign_local);
+            self.debug_assert_no_user_row("remote_delete_apply_foreign");
+            match self
+                .eid_translator
+                .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
+            {
+                Ok(accepted) => {
+                    // #545: 消えた行の slot を使い回して写像が外れた entity に、 より新しい削除が届いた。 その行の名前の削除の時刻を上げ、
+                    // その名前を今持つ行のうち、 この削除より前にその名前になった行を消す (`remote_delete_apply` の 2 人目の削除と同じ)
+                    if accepted && before.is_some_and(|t| hlc > t) {
+                        self.raise_identity_names(owner, foreign_local, hlc);
+                    }
+                    return lww(accepted);
+                }
+                Err(local) => {
+                    let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+                    let local_eid = enchudb_oplog::make_eid(self_peer, local);
+                    let row = self.remote_row_of(foreign_eid, local_eid);
+                    let r = self.remote_delete_apply_at_result(local_eid, row, hlc);
+                    if r != RemoteApply::Stale || self.remote_row_holds(local_eid, row) {
+                        return r;
+                    }
+                }
             }
         }
     }
@@ -31570,8 +33329,8 @@ impl Engine {
 
     /// changefeed: 記録がある時の配信 1 回分を取り出す (#636: listener は呼び手が engine の外で呼ぶ)。 listener ごとに位置から
     /// 読み、 位置は渡す前に進める (畳む側の写しが、 渡した分を 「まだ読んでいない」 と見て外さないように)。 読めない listener
-    /// は外す。
-    fn take_log_work(&self) -> LogWork {
+    /// は外す。 `until` は配りの始めに写した記録の終わり (#1055: 読み手全員がそこへ届いたら、 その配りは返る)。
+    fn take_log_work(&self, until: u64) -> LogWork {
         /// 1 回に 1 listener へ渡す量の目安。
         const CHUNK: usize = 4 << 20;
         let mut work = LogWork::default();
@@ -31597,6 +33356,9 @@ impl Engine {
                 .retain(|l| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
             self.change_listeners_detached.fetch_add(broken.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        let next = log.range().1;
+        work.caught_up = c.readers.iter().all(|(_, p)| *p >= until);
+        work.more = c.readers.iter().any(|(_, p)| *p < next);
         work
     }
 
@@ -35250,7 +37012,7 @@ impl Engine {
                 // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
                 // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
                 // #992: 書き出しが返ったら、 仕上げた場所の後始末待ちを落とす (落とした印は次の書き出しで届く)
-                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || eng.wal_fsync(&w).is_ok()) {
                     eng.settle_finished_reconcile();
                     if !eng.checkpoint_held_for_freed_slots() {
                         w.advance_checkpoint(w.head());
@@ -35280,7 +37042,7 @@ impl Engine {
                 if (relogged || eng.generations().has_finished())
                     && eng.persist_name_records().is_ok()
                     && eng.body_msync().is_ok()
-                    && w.fsync().is_ok()
+                    && eng.wal_fsync(&w).is_ok()
                 {
                     eng.settle_finished_reconcile();
                     if relogged {
@@ -35333,14 +37095,23 @@ impl Engine {
     /// と読んで、 辞書の索引の作り直し (#101) と、 本体にあって oplog に無い write の照合 (#451) を飛ばす。 立てるのは
     /// `sync_and_mark_clean_with` だけで、 紐名の辞書の印 (#451 の照合が見る方) は、 oplog 付きの engine では閉じる時だけ (#709)。 該当 page (辞書 / 紐名の data の header) だけ書き出すので
     /// 1 ms 以下。
-    fn mark_session_dirty(&self) {
+    ///
+    /// 倒した印の書き出しに失敗したら Err (#1057): 呼び手は書き始めない。 前は失敗を捨てて書き始め、 その後に本体の
+    /// 列の page だけが disk に届いて落ちると、 disk の印は前の 「きれいに閉じた」 のままで、 次の open が #451 の作り直しと突き合わせを
+    /// 飛ばした。
+    fn mark_session_dirty(&self) -> io::Result<()> {
         self.vocab.mark_index_clean(false);
         self.himo_reg.mark_index_clean(false);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = self.backing.flush_kind(SegmentKind::VocabData, 0, 16);
-            let _ = self.backing.flush_kind(SegmentKind::HimoregData, 0, 16);
+            #[cfg(test)]
+            if session_dirty_fault::take() {
+                return Err(io::Error::other("session_dirty_fault"));
+            }
+            self.backing.flush_kind(SegmentKind::VocabData, 0, 16)?;
+            self.backing.flush_kind(SegmentKind::HimoregData, 0, 16)?;
         }
+        Ok(())
     }
 
     /// #451: きれいに閉じなかった後に開く時 (oplog の再生の後、 consumer を起こす前)、 本体にあって oplog / `_sync_ops`
@@ -35504,9 +37275,9 @@ impl Engine {
                 }
             }
         }
-        // review946c [E]: 開く時に `prev.seg` の記録から戻した自分の行の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
-        // 前の住人の番号で載せる (bridge は記録から自分の世界番号と引く)
-        for (gone, h) in self.generations().prev.take_restored_own() {
+        // review946c [E]: 開く時に `prev.seg` の記録から戻した前の住人の削除 (場所はもう次の住人なので tomb.seg に版数が無い)。 Delete は
+        // 前の住人の番号で載せる (bridge は記録から自分の世界番号 / 翻訳した行の持ち主の世界番号 (#1035) と引く)
+        for (gone, h) in self.generations().prev.take_restored_deletes() {
             if unlogged(h) {
                 deletes.push((h, gone));
             }
@@ -36401,8 +38172,9 @@ impl Engine {
         let _ = std::fs::remove_file(&crc_path);
         // #451: clean flag を倒してから書き始める (writer の open と同じ)。 create → flush → ここ、 の DB は flag が立った
         // まま (倒すのは open と辞書への insert だけ) で、 辞書に書かずに落ちると次の open が 「きれいに閉じた」 と読み、
-        // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)
-        eng.mark_session_dirty();
+        // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)。 #1057: 倒した印を disk に置けなければ書き始めない
+        // (ここで返すと engine は単独の形のまま閉じる = まだ WAL の session を始めていないので、 普通の閉じ方でよい)
+        eng.mark_session_dirty()?;
         // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
         let wal = match Self::existing_wal(&oplog_path)? {
             Some(w) => {
@@ -36433,7 +38205,7 @@ impl Engine {
                 // #870: 再生した Delete の行が sidecar より先にあれば進めない (開いた直後に落ちると、 次に開く時に再生されず
                 // `next_local` が戻る)。 consumer の最初の周期が `tables` を書いてから進める
                 // #992: 書き出しが返ったら、 仕上げた場所の後始末待ちを落とす (落とした印は次の書き出しで届く)
-                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || w.fsync().is_ok()) {
+                if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && (wal_untouched || eng.wal_fsync(&w).is_ok()) {
                     eng.settle_finished_reconcile();
                     if !eng.checkpoint_held_for_freed_slots() {
                         w.advance_checkpoint(w.head());
@@ -36453,7 +38225,7 @@ impl Engine {
                 if (relogged || eng.generations().has_finished())
                     && eng.persist_name_records().is_ok()
                     && eng.body_msync().is_ok()
-                    && w.fsync().is_ok()
+                    && eng.wal_fsync(&w).is_ok()
                 {
                     eng.settle_finished_reconcile();
                     if relogged {
@@ -36520,6 +38292,7 @@ impl Engine {
                 }
             }
             out.detached.extend(std::mem::take(&mut c.log_detached));
+            out.log_end = log.range().1;
             return Some((out, true));
         }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
@@ -36535,7 +38308,10 @@ impl Engine {
         change_take_hook::call(wal);
         // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
         // 恒久 skip (listener への通知漏れ) を起こしていた。
-        let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
+        // #1053: 読むのは書き出した所 (`change_log_upto`、 記録のある道と同じ) までに閉じた group だけ。 前は Commit で閉じた group の
+        // 終わりまで上限なしで読み、 WAL を fsync していない record (書き出しの後に閉じた commit) と、 他の書き手が積んでまだ本体に
+        // 当てていない record (#850 の形) を渡した (落ちると listener の先にあって DB に無い)
+        let (recs, committed_end) = wal.iter_committed_from_with_end_upto(c.offset, self.change_log_upto(wal));
         let mut batch = std::mem::take(&mut c.committed);
         if committed_end > c.offset {
             let recs = self.keep_for_changefeed(recs, |r| &r.op);
@@ -36580,7 +38356,7 @@ impl Engine {
         if c.offset >= through {
             return Some(0);
         }
-        Some(self.move_changes_to_backlog(wal, c, Some(through)))
+        Some(self.move_changes_to_backlog(wal, c, BacklogUpto::FoldEnd(through)))
     }
 
     /// changefeed (#662): 畳む前に、 `append_lock` の外で (呼び手が `change_emit` を持って)、 listener に配っていない Commit で閉じた
@@ -36590,31 +38366,34 @@ impl Engine {
     fn move_changes_before_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, written: u64) -> usize {
         match self.change_log.get() {
             Some(log) => self.pump_change_log(wal, log, c, written, false).unwrap_or(0),
-            None => self.move_changes_to_backlog(wal, c, None),
+            // #1053: 溜めにも書き出した所までだけ (溜めは後で listener に渡す。 前は上限なしで、 書き出していない record も移した)
+            None => self.move_changes_to_backlog(wal, c, BacklogUpto::Written(written)),
         }
     }
 
     /// changefeed: cursor から先の record を溜めに移す (呼び手が `change_emit` を持って)。 Commit で閉じた分は `committed` に (前に
-    /// 閉じていなかった末尾を頭に付けて)。 `tail_upto` が Some なら、 その位置 (畳む区画の終わり) までに止めて、 閉じていない末尾も
-    /// `open_tail` に足す。 cursor は読み終えた終端に進める
+    /// 閉じていなかった末尾を頭に付けて)。 [`BacklogUpto::FoldEnd`] なら、 その位置 (畳む区画の終わり、 書き出し済み) までに止めて、
+    /// 閉じていない末尾も `open_tail` に足す。 [`BacklogUpto::Written`] なら、 その位置 (書き出した所) までに Commit で閉じた分だけ
+    /// (#1053)。 cursor は読み終えた終端に進める
     /// (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。 listener が居なければ何もしない。 戻り値は移した
     /// record の数。
     ///
     /// #560: 移すと溜めが上限 (`change_backlog_limit`) を越えるなら、 移さずに溜めごと捨て、 listener を全部外す (止まった・遅すぎる
     /// listener のために書き手を止めない・メモリを使い切らない。 前は上限が無く、 止まった listener の間は畳むたびに ring の
     /// 全部を `append_lock` の下で写して溜め続けた)。 外した listener には通知係が `on_detached` で知らせる。
-    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, tail_upto: Option<u64>) -> usize {
+    fn move_changes_to_backlog(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, upto: BacklogUpto) -> usize {
         use std::sync::atomic::Ordering;
         if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
             return 0;
         }
         #[cfg(test)]
         change_copy_hook::call(wal);
-        let (recs, committed_end, tail, end) = if let Some(upto) = tail_upto {
-            wal.iter_from_with_tail_upto(c.offset, upto)
-        } else {
-            let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
-            (recs, committed_end, Vec::new(), committed_end)
+        let (recs, committed_end, tail, end) = match upto {
+            BacklogUpto::FoldEnd(through) => wal.iter_from_with_tail_upto(c.offset, through),
+            BacklogUpto::Written(written) => {
+                let (recs, committed_end) = wal.iter_committed_from_with_end_upto(c.offset, written);
+                (recs, committed_end, Vec::new(), committed_end)
+            }
         };
         let recs = self.keep_for_changefeed(recs, |r| &r.op);
         let tail = self.keep_for_changefeed(tail, |r| &r.op);
@@ -36902,6 +38681,9 @@ impl Engine {
         eng.consumer_waker = Some(waker.clone());
         eng.shutdown_flag = Some(shutdown.clone());
 
+        // #1023: consumer の thread を作る前に 「consumer が居る」 の印を立てる (thread が動き出して `consumer_thread` を置くまでの間の
+        // 書き出しも、 名前の記録のまとめ直しを consumer の周期に任せる)
+        eng.wal_fold_off.fetch_or(CONSUMER_SPAWNED, std::sync::atomic::Ordering::AcqRel);
         let arc = Arc::new(eng);
         // ここから住所が動かない (通知係の thread がこの engine を指してよい)
         arc.pinned.store(true, std::sync::atomic::Ordering::Release);
@@ -36959,6 +38741,8 @@ impl Engine {
                 use std::time::{Duration, Instant};
                 let _poison_guard = PoisonOnPanic { flag: poisoned_for_thread };
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
+                #[cfg(test)]
+                consumer_start_hook::call(&engine.path);
                 let _ = engine.consumer_thread.set(std::thread::current().id());
                 waker.register_current();
                 let fsync_interval = Duration::from_millis(100);
@@ -37642,6 +39426,23 @@ impl Engine {
         }
     }
 
+    /// engine の WAL の fsync (開く時の再生の後 / consumer の周期 / 閉じる時 / `oplog_sync` / 空け作り)。 失敗したら覚える (#991 の
+    /// C1: 覚えた session は Drop が 「きれいに閉じた」 の印を立てない、 `wal_sync_failed`)。
+    fn wal_fsync(&self, wal: &enchudb_oplog::oplog::OpLog) -> io::Result<()> {
+        #[cfg(test)]
+        let r = if wal_fsync_fault::active(wal) || wal_fsync_fault::take_on_this_thread() {
+            Err(io::Error::other("wal_fsync_fault"))
+        } else {
+            wal.fsync()
+        };
+        #[cfg(not(test))]
+        let r = wal.fsync();
+        if r.is_err() {
+            self.wal_sync_failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        r
+    }
+
     /// checkpoint を進める前の oplog fsync + 本体の書き出し。 どちらかが失敗したら false (#317: 空き不足で
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
@@ -37649,7 +39450,7 @@ impl Engine {
         if write_out_fault::active(wal) {
             return false;
         }
-        let wal_ok = wal.fsync().is_ok();
+        let wal_ok = self.wal_fsync(wal).is_ok();
         // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
         // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
         let names_ok = !wal_ok || self.persist_name_records().is_ok();
@@ -38020,7 +39821,11 @@ impl Engine {
             // の正体だったので、 呼び出し側に伝える (死区間を除く。 下の `commit_res?`)。
             // #451 (段階 1): 配り済みの印の候補は Commit を打つ前に切る
             let cut = self.take_durable_cut(wal);
-            let commit_res = self.append_commit_marker(wal);
+            // #1054: 自分の Commit の位置を引く始まり (打つ前の書き終えた所)
+            let before_commit = wal.written_head();
+            let commit_res = self.append_commit_marker_lsn(wal, true);
+            #[cfg(test)]
+            sync_commit_hook::call(wal);
             // 満杯で打てなかったか (= その瞬間の `append_dead`) は失敗の種類で決める。 Commit は
             // 最小の record (`commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
             // `append_dead()` を読み直すと、 間に consumer が畳んで満杯が解けていれば Err を返してしまう (#407)
@@ -38030,10 +39835,16 @@ impl Engine {
             // #850: 書き手が積んだだけでまだ cell に当てていない record の手前で切る (consumer の周期と同じ)。 その書き込みは
             // まだ返っていない = この `oplog_sync` が約束する書き込みではない。 返った書き込みの cell は下の msync に入り、 record は
             // fsync に入る (checkpoint が手前に残る分は、 落ちた後に再生し直すだけ)
-            let durable_head = wal.applied_through(wal.written_head());
+            let written_head = wal.written_head();
+            // #1054: listener が居れば、 切る前に、 自分の Commit より前に積んで当てている途中の書き手が当て終えるのを少し待つ (切ると、
+            // 自分の commit も切った位置の先に入り、 下の配りが渡さない)。 Commit を打てなかった時は配る物が無いので待たない
+            if let Ok(&lsn) = commit_res.as_ref() {
+                self.wait_applied_for_changefeed(wal, written_head, before_commit, lsn);
+            }
+            let durable_head = wal.applied_through(written_head);
             let durable_lsn = wal.next_lsn().saturating_sub(1);
             // #550: 消した主キーの記録は WAL の後・本体より先に
-            let written = wal.fsync().and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
+            let written = self.wal_fsync(wal).and_then(|()| self.persist_name_records()).and_then(|()| self.body_msync());
             if let Err(e) = written {
                 // #451 (段階 1): 書き出せなかったので印は置かない (切れ目の登録だけ外す)
                 if let Some(c) = cut {
@@ -38088,6 +39899,51 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// #1054: `oplog_sync` が書き出す前に、 自分の Commit (LSN `lsn`、 `before` は打つ前の書き終えた所) より前に積まれて当てている
+    /// 途中の他の書き手が当て終えるのを待つ (上限 [`SYNC_APPLY_WAIT`])。 listener が居る時だけ (居なければ配る物が無い)。
+    ///
+    /// 書き出しは当てていない record の手前で切る (#850 / #873)。 切った位置は changefeed へ渡してよい位置でもある (#889 / #1053)
+    /// ので、 前に積んだ書き手が 1 人でも当てている途中だと、 その後ろに居る自分の commit (の group を閉じる Commit) が切った位置の
+    /// 先に入り、 `oplog_sync()` が自分の commit を配らずに返った (渡るのは次の consumer の周期)。 待つのは自分の Commit の始まりより
+    /// 前に積んだ・当てる前の書き手だけ (普段は µs)。 Commit は印を持たないので、 その前が全部当たっていれば切る位置は Commit の後ろ
+    /// になる。 後に積まれた書き手は待たない (自分の commit を配るのに関係ない。 前は `written_head` まで待ち、 同じまとめ書きの束で
+    /// 後ろに積まれた書き手まで待った)。 Commit の位置を引けなければ (区画が畳まれた等) `written_head` まで。 待つ間は lock を持たない
+    /// (その書き手は `append_lock` も行の lock もこちらに頼らない)。
+    fn wait_applied_for_changefeed(&self, wal: &enchudb_oplog::oplog::OpLog, written_head: u64, before: u64, lsn: u64) {
+        if wal.applied_before(written_head) || self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+            return;
+        }
+        let pos = wal.position_of_lsn(before, lsn).unwrap_or(written_head);
+        if wal.applied_before(pos) {
+            return;
+        }
+        #[cfg(test)]
+        sync_apply_wait_hook::call(wal);
+        // 当てる途中の書き手は普段 µs で抜けるので、 まず [`SYNC_APPLY_SPIN`] の間は回って待つ (yield は混んだ機械で自分が長く
+        // 外される)。 回数でなく時間で切る (`spin_loop` 1 回の長さは CPU で 10 倍以上違う: x86 の PAUSE は約 140 cycle)。 抜けなければ
+        // (その書き手が CPU を外されている) yield を数回、 その後は寝て待つ
+        let start = std::time::Instant::now();
+        let mut yields = 0u32;
+        while !wal.applied_before(pos) {
+            let waited = start.elapsed();
+            if waited < SYNC_APPLY_SPIN {
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+            if waited >= SYNC_APPLY_WAIT {
+                return;
+            }
+            if yields < 8 {
+                yields += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(20));
+            }
+        }
     }
 
     /// 現在耐久化されている LSN(Commit を含む最後の WAL fsync 到達位置)。
@@ -38709,7 +40565,15 @@ impl Engine {
         // #992: 配る DB で後始末待ち (tombstone と #451 の作り直しの済んでいない場所) が残る間は、 紐名の辞書の印 (= 「きれいに閉じた」) を
         // 立てない: 次の open が #451 の作り直しを飛ばさない (WAL の無い単独の session が後始末待ちを持ったまま閉じる形)
         let pending_relog = self.sync_tables_enabled() && self.generations().has_pending_marks();
-        if pending_relog {
+        // #991 (C1): この session で WAL の fsync が失敗していたら、 閉じる時も印を立てない。 閉じる時の consumer の最後の書き出しは
+        // WAL の fsync が失敗しても本体を書き出し、 ここ (Drop) は WAL を fsync しない。 印を立てると、 本体にあって WAL (と
+        // `_sync_ops`) に無い write を次の open が調べず (#451 の作り直しを飛ばす)、 相手に配らなかった
+        // OpLog の中の書き出し (区画を移る / 畳む時の header の page) の失敗も同じ (`OpLog::sync_failed`、 中で失敗を捨てても、 その後の
+        // engine の fsync が成功して見えるだけ)
+        let wal_unsynced = closing
+            && (self.wal_sync_failed.load(std::sync::atomic::Ordering::Acquire)
+                || self.oplog.as_ref().is_some_and(|w| w.sync_failed()));
+        if pending_relog || wal_unsynced {
         } else if closing && self.persist_leaf_free_list().unwrap_or(false) {
             self.himo_reg.mark_index_clean_leaf();
         } else if closing || self.oplog.is_none() {
@@ -46732,6 +48596,177 @@ mod remote_row_tests {
         assert_eq!(eng.remote_tieleaf_apply(f, n, b"f", t0), RemoteApply::Applied);
         assert!(eng.entities.is_live(slot(f)), "TieLeaf だけで届いた行が生きていない");
         assert_eq!(eng.get_text_owned(f, "t.n").as_deref(), Some(&b"f"[..]));
+    }
+
+    /// 枠 1 の表 t (列 v) と、 t を指す Ref の列 r を持つ表 s の sync の DB。
+    fn ref_engine(tag: &str) -> (Rm, Arc<Engine>, u16) {
+        let path = std::env::temp_dir()
+            .join(format!("enchudb-r038b3-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&path);
+        let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.define_table("s", 4).unwrap();
+        let r = eng.define_ref_in("s", "r", "t").unwrap() as u16;
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        (Rm(path), eng, r)
+    }
+
+    /// 0.38 前 review の B3 (Delete): peer 2 の行 F (受けて写像のある翻訳した行) を peer 2 の削除で消した後、 別の peer のより新しい
+    /// 削除 (2 人目) を当てる受信が、 写像で場所を引いた後・場所の最後の行 (世代) を読む前に、 アプリが枠の満杯な表に足して F の場所を
+    /// Y が使い回す。 Y は残る (2 人目の削除は消えた F の物)。
+    ///
+    /// 前は `remote_row_of` が使い回した後の場所の最後の行 = Y を 「その行」 として取り、 行の lock の下の照合 (Y がまだ場所の最後の行か)
+    /// も通って Y を消した (#917 / #925 の割り込み点は全部 `remote_row_of` の後で、 写像を引いてから世代を読むまでの窓が残っていた)。
+    ///
+    /// falsify: `remote_row_of` の、 世代を読んだ後に写像がまだ場所を指すかの引き直しを外すと、 Y が消える。
+    #[test]
+    fn b3_a_second_delete_resolved_before_the_slot_is_reused_does_not_delete_the_new_row() {
+        let (_rm, eng) = engine("b3del");
+        let v = eng.himo_id("t.v").unwrap() as u16;
+        let world = enchudb_oplog::make_eid(2, 100);
+        let f = eng.resolve_remote_eid(world, v).unwrap();
+        let t0 = enchudb_oplog::Hlc { wall: 1_000_000, logical: 0, peer: 2 };
+        assert!(eng.remote_tie_apply_result(f, v, 1u32, t0).applied(), "前提: F を受けた");
+        let first = enchudb_oplog::Hlc { wall: 2_000_000, logical: 0, peer: 2 };
+        assert_eq!(eng.remote_delete_apply_foreign_result(world, first), RemoteApply::Applied, "前提: F を消した");
+        assert_eq!(eng.resolve_remote_eid_existing(world), Some(f), "前提: 写像は使い回すまで残る");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(&eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            *m.lock().unwrap() = Some(y);
+        });
+        let second = enchudb_oplog::Hlc { wall: 3_000_000, logical: 0, peer: 3 };
+        let _ = eng.remote_delete_apply_foreign_result(world, second);
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(f), "前提: Y は F の場所を使い回した");
+        assert!(eng.is_live(y), "F 宛ての 2 人目の削除が、 写像を引いた後に場所を使い回した Y を消した");
+        assert_eq!(eng.get(y, "t.v"), Some(2));
+        assert!(eng.resolve_remote_eid_existing(world).is_none(), "使い回しが F の写像を外していない");
+    }
+
+    /// 0.38 前 review の B3 (Ref の値): 受信の Ref の値 (peer 2 の行 F = 消えた行を指す) を写像で引いた後・場所の最後の行を読む前に、
+    /// アプリが F の場所を Y で使い回す。 値は Y を指さない (使い回しの後に届いた時と同じく、 消えた F を指す)。
+    ///
+    /// falsify: `try_resolve_remote_ref_value` の、 世代を読んだ後に写像がまだ場所を指すかの引き直しを外すと、 値が Y になる。
+    #[test]
+    fn b3_a_ref_value_resolved_before_the_slot_is_reused_does_not_point_at_the_new_row() {
+        let (_rm, eng, r) = ref_engine("refv");
+        let v = eng.himo_id("t.v").unwrap() as u16;
+        let world = enchudb_oplog::make_eid(2, 100);
+        let f = eng.resolve_remote_eid(world, v).unwrap();
+        let t0 = enchudb_oplog::Hlc { wall: 1_000_000, logical: 0, peer: 2 };
+        assert!(eng.remote_tie_apply_result(f, v, 1u32, t0).applied(), "前提: F を受けた");
+        let gone = enchudb_oplog::Hlc { wall: 2_000_000, logical: 0, peer: 2 };
+        assert_eq!(eng.remote_delete_apply_foreign_result(world, gone), RemoteApply::Applied, "前提: F を消した");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(&eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            let y = e.entity_in("t").unwrap();
+            e.tie_to(y, "t.v", 2u32);
+            *m.lock().unwrap() = Some(y);
+        });
+        let value = eng.try_resolve_remote_ref_value(2, 100, r);
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(f), "前提: Y は F の場所を使い回した");
+        let value = value.expect("前提: 払い出せた").expect("前提: 的の表がある");
+        assert_ne!(value, enchudb_oplog::eid_local(y), "消えた F を指す Ref の値が、 写像を引いた後に場所を使い回した Y を指した");
+        assert!(!eng.is_live(enchudb_oplog::make_eid(1, value)), "Ref の値が生きた行を指した");
+    }
+
+    /// 0.38 前 review の B3 (Ref の値、 自分の行): 受信の Ref の値 (自分の行 X を指す、 世界番号は世代込み) の行を確かめた後・場所の最後の
+    /// 行を読む前に、 アプリが X を消して場所を Y で使い回す。 値は Y を指さない (確かめた X の番号)。
+    ///
+    /// falsify: 自分の行の枝で場所の最後の行を読み直すと (前の形)、 値が Y になる。
+    #[test]
+    fn b3_an_own_ref_value_checked_before_the_slot_is_reused_does_not_point_at_the_new_row() {
+        let (_rm, eng, r) = ref_engine("refown");
+        let x0 = eng.entity_in("t").unwrap();
+        eng.delete(x0);
+        let x = eng.entity_in("t").unwrap();
+        assert_ne!(x, x0, "前提: 場所を使い回して v15 に移った");
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(&eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            e.delete(x);
+            let y = e.entity_in("t").unwrap();
+            *m.lock().unwrap() = Some(y);
+        });
+        let value = eng.try_resolve_remote_ref_value(1, enchudb_oplog::eid_local(x), r);
+        let y = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(y), slot(x), "前提: Y は X の場所を使い回した");
+        assert_eq!(value, Ok(Some(enchudb_oplog::eid_local(x))), "X を指す Ref の値が、 確かめた後に場所を使い回した Y を指した");
+    }
+
+    /// `ref_engine` の DB を v15 にし、 自分の行 X を自分の行 K に畳む (#612、 X の世界番号は K の別名)。 (X, K) を返す。
+    fn folded_own_row(eng: &Arc<Engine>) -> (u64, u64) {
+        let a = eng.entity_in("t").unwrap();
+        eng.delete(a);
+        let x = eng.entity_in("t").unwrap();
+        assert_ne!(x, a, "前提: 場所を使い回して v15 に移った");
+        eng.tie_to(x, "t.v", 1u32);
+        let k = eng.entity_in("t").unwrap();
+        eng.tie_to(k, "t.v", 2u32);
+        eng.merge_entity_into(x, k).expect("前提: X を K に畳んだ");
+        (x, k)
+    }
+
+    /// 割り込み点で K を消して、 K の場所を新しい行 W (v = 7) に使い回させる (畳んだ X の場所は使い回さない)。 W の eid を返す入れ物。
+    fn reuse_fold_target_in_hook(eng: &Arc<Engine>, k: u64) -> Arc<Mutex<Option<u64>>> {
+        let made: Arc<Mutex<Option<u64>>> = Arc::default();
+        let (e, m) = (Arc::downgrade(eng), made.clone());
+        resolved_row_hook::set(eng.oplog.as_ref().unwrap(), move |_| {
+            let e = e.upgrade().unwrap();
+            e.delete(k);
+            let w = e.entity_in("t").unwrap();
+            e.tie_to(w, "t.v", 7u32);
+            *m.lock().unwrap() = Some(w);
+        });
+        made
+    }
+
+    /// #1034 の読み直し [F2] (畳んだ自分の行の枝): 受信の Delete (畳んだ自分の行 X の世界番号宛て = 畳んだ先 K に当たる) を引いた後・
+    /// 世代を読む前に、 アプリが K を消して K の場所を W が使い回す。 W は残る (`remote_row_of` の畳んだ先を読む枝の引き直し)。
+    ///
+    /// falsify: `remote_row_of` の写像 (畳んだ先) の引き直しを外すと、 W が消える。
+    #[test]
+    fn f2_a_delete_of_a_folded_own_row_resolved_before_its_target_is_reused_does_not_delete_the_new_row() {
+        let (_rm, eng, _r) = ref_engine("f2del");
+        let (x, k) = folded_own_row(&eng);
+        assert_eq!(eng.resolve_remote_eid_existing(x).map(slot), Some(slot(k)), "前提: X の世界番号は K に当たる");
+        let made = reuse_fold_target_in_hook(&eng, k);
+        let later = enchudb_oplog::Hlc { wall: eng.cell_hlc(k, eng.himo_id("t.v").unwrap() as u16).wall + 10_000_000_000, logical: 0, peer: 2 };
+        let _ = eng.remote_delete_apply_foreign_result(x, later);
+        let w = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(w), slot(k), "前提: W は K の場所を使い回した");
+        assert!(eng.is_live(w), "畳んだ X 宛ての Delete が、 畳んだ先 K の場所を使い回した W を消した");
+        assert_eq!(eng.get(w, "t.v"), Some(7));
+    }
+
+    /// #1034 の読み直し [F2] (Ref の値の畳んだ自分の行の枝): 受信の Ref の値 (畳んだ自分の行 X を指す) の畳んだ先 K を引いた後・K の場所の
+    /// 最後の行を読む前に、 アプリが K を消して K の場所を W が使い回す。 値は W を指さない。
+    ///
+    /// falsify: `try_resolve_remote_ref_value` の畳んだ先の引き直し (`forward_local(slot) == to`) を外すと、 値が W になる。
+    #[test]
+    fn f2_a_ref_value_to_a_folded_own_row_resolved_before_its_target_is_reused_does_not_point_at_the_new_row() {
+        let (_rm, eng, r) = ref_engine("f2ref");
+        let (x, k) = folded_own_row(&eng);
+        let made = reuse_fold_target_in_hook(&eng, k);
+        let value = eng.try_resolve_remote_ref_value(1, enchudb_oplog::eid_local(x), r);
+        let w = made.lock().unwrap().expect("前提: 割り込み点を通った");
+        assert_eq!(slot(w), slot(k), "前提: W は K の場所を使い回した");
+        let value = value.expect("前提: 払い出せた").expect("前提: 的の表がある");
+        assert_ne!(value, enchudb_oplog::eid_local(w), "畳んだ X を指す Ref の値が、 畳んだ先を引いた後に場所を使い回した W を指した");
     }
 }
 

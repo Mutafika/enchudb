@@ -321,6 +321,13 @@ pub(crate) fn sync_dir_plain(dir: &Path, site: &'static str) -> io::Result<()> {
     Ok(())
 }
 
+/// directory `dir` を素の `fsync` (中の rename を disk へ送る、 [`sync_dir_plain`] と同じ層の順)。 #966: ホストの client の置き場
+/// (`enchudb-transport` の `.clients`) が、 削除を忘れる前に置き場の rename を disk に届けるのに使う。 Windows は何もしない
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    sync_dir_plain(dir, "sidecar.dir_sync")
+}
+
 /// #513: sidecar に追記して書き出す (`pktombs`)。 file が無ければ Err (追記は、 先にまとめて書いた file にだけ足す)。
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn append_synced(sidecar: &Path, bytes: &[u8]) -> io::Result<()> {
