@@ -6543,6 +6543,31 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// #991 (PR #1061 の読み直しの残り): `fsync` の失敗で [`OpLog::sync_failed`] が立ち、 その後の `fsync` が成功しても倒れない
+    /// (失敗した書き出しの page は、 後の書き出しが成功しても届いているとは限らない。 engine は閉じる時にこの印を見て 「きれいに
+    /// 閉じた」 の印を立てない)。 engine の試験は失敗を `wal_fsync` (OpLog の外) か header の page の書き出しで入れるので、 `fsync` の
+    /// 道はここで見る。
+    ///
+    /// falsify: `fsync` の失敗で印を立てないと 2 つ目の assert で、 成功した `fsync` で印を倒すと最後の assert で落ちる。
+    #[test]
+    fn a_failed_fsync_sets_sync_failed_and_a_later_success_keeps_it() {
+        let p = tmp("sync-failed");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        assert!(wal.fsync().is_ok() && !wal.sync_failed(), "前提: 失敗させない書き出しは成功し、 印は立たない");
+        wal.fail_next_syncs(1);
+        let failed = wal.fsync().is_err();
+        let set = wal.sync_failed();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 2 }).unwrap();
+        let later_ok = wal.fsync().is_ok();
+        let kept = wal.sync_failed();
+        let _ = std::fs::remove_file(&p);
+        assert!(failed, "前提: 失敗させた fsync が Err を返す");
+        assert!(set, "fsync の失敗で sync_failed が立たない");
+        assert!(later_ok, "前提: 失敗させるのは 1 回だけ (次の fsync は成功する)");
+        assert!(kept, "後の fsync が成功したら sync_failed が倒れた");
+    }
+
     /// #552 の残り: 満杯で載らなかった後、 空きを見る前に他の thread が畳んで空いていたら、 書き直す (前は入口で空きを見て
     /// 「満杯でない失敗」 と読み、 落としていた。 書き手 64 本の試験で CI の debug で 1 件落ちた)。 満杯でない失敗 (fault
     /// injection) は今まで通り書き直さない。
