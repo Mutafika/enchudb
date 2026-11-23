@@ -3623,16 +3623,10 @@ fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid(
             let _ = std::fs::remove_dir_all(&img);
             continue;
         }
-        let deletes: Vec<u64> = eng
-            .audit(&enchudb_engine::AuditFilter::default())
-            .into_iter()
-            .filter_map(|r| match r.op {
-                DecodedOp::Delete { eid } => Some(eid),
-                _ => None,
-            })
-            .collect();
-        // a の Delete は前の session の record (WAL が畳まれていれば無い)。 r の Delete は作り直した物
-        let relogged: Vec<u64> = deletes.iter().copied().filter(|&d| d != a).collect();
+        // a の Delete は前の session の record (WAL が畳まれていれば無い)。 r の Delete は作り直した物 (#1047: 版数は下限、 配った版数以下
+        // なら record でなく floor を上げて state で運ぶ = `slot_deletes`)
+        let deletes: Vec<(u32, Hlc)> = slot_deletes(&eng, eng.eid_slot(r));
+        let relogged: Vec<u64> = deletes.iter().map(|&(d, _)| eid_local_eid(d)).filter(|&d| d != a).collect();
         if eng.is_live(r) {
             // WAL の header の page が古い像 (checkpoint が r の Tie の手前) では、 再生が r の Tie で r を生かし直す = 削除は 「無かった」。
             // その時は Delete を配らないこと (配ると相手でだけ消える)
@@ -3644,6 +3638,9 @@ fn a_completed_delete_without_a_tombstone_is_relogged_with_the_deleted_rows_eid(
         }
         hits += 1;
         assert_eq!(relogged, vec![r], "作り直した Delete が無い / 消えた行の世代込みの eid でない (seed {seed}: {deletes:x?})");
+        // #1047: 作り直す削除の版数 (下限) は本当の削除の版数以下 (名前の削除優先が、 本当の削除の後に同じ名前で足し直した行を消さない)
+        let at = deletes.iter().find(|&&(d, _)| eid_local_eid(d) == r).map(|&(_, h)| h).unwrap();
+        assert!(at <= deleted_at, "作り直した r の Delete の版数 {at:?} が本当の削除の版数 {deleted_at:?} より後 (seed {seed})");
         let world = enchudb_oplog::make_eid(1, eng.eid_slot(r));
         let later = Hlc { wall: u64::MAX / 4, logical: 0, peer: 2 };
         assert!(!eng.remote_tie_apply(world, hid, 9u32, later), "消えた行への相手の書き込みで行が生き返った (seed {seed})");
@@ -3816,15 +3813,21 @@ fn assert_torn_cells_dropped(eng: &Engine, what: &str) {
 
 /// 配る分 (`_sync_ops`) の、 自分 (peer 1) が author の r の場所の Delete (先に消した a の物は除く)。
 fn r_deletes(eng: &Engine, a: u64, r: u64) -> Vec<u64> {
-    let slot = eng.eid_slot(r);
-    distributed(eng)
-        .into_iter()
-        .filter(|rec| rec.author_peer == 1)
-        .filter_map(|rec| match rec.op {
-            DecodedOp::Delete { eid } if eid_local(eid) != eid_local(a) && eng.eid_slot(eid) == slot => Some(eid),
-            _ => None,
-        })
-        .collect()
+    let mut v: Vec<u64> =
+        slot_deletes(eng, eng.eid_slot(r)).into_iter().filter(|&(d, _)| d != eid_local(a)).map(|(d, _)| eid_local_eid(d)).collect();
+    if eng.oplog().is_none() && v.is_empty() {
+        // 単独で開いた engine は state を作れない (WAL が要る)。 r の tombstone (state が運ぶ版数) を floor が覆えば、 相手は state で受ける
+        let tomb = eng.tombstone_hlc(r);
+        if tomb != Hlc::ZERO && !eng.is_live(r) && floor_of(eng, 1).is_some_and(|f| tomb <= f) {
+            v.push(r);
+        }
+    }
+    v
+}
+
+/// 自分 (peer 1) の番号 `local` の eid。
+fn eid_local_eid(local: u32) -> u64 {
+    enchudb_oplog::make_eid(1, local)
 }
 
 /// 像の r の名前の cell が disk に残っているか ([`Torn992::GenPage`] / [`Torn992::OldTomb`] だけ。 削除の門を通った削除は、 名前の cell を落とした列が届き、
@@ -3843,6 +3846,18 @@ fn slot_deletes(eng: &Engine, slot: u32) -> Vec<(u32, Hlc)> {
             _ => None,
         })
         .collect();
+    // #1047 / #1046 の (2): 開く時の突き合わせが作り直す削除の版数は下限 (行の cell の版数の最大の直後 = 配った版数以下のことが多い)。
+    // #451 は record を載せずに floor を上げ、 相手は state (自分の行の削除を tombstone の版数で運ぶ、 #951) で取り直す = floor が覆う
+    // state の Delete も相手に届く
+    if let Some(floor) = floor_of(eng, 1) {
+        // 自分 (1) の state。 単独で開いた engine は WAL が無いので state を作れない (空、 `r_deletes` が tombstone と floor で見る)
+        v.extend(eng.state_records_for(1).0.into_iter().filter_map(|rec| match rec.op {
+            DecodedOp::Delete { eid } if rec.author_peer == 1 && eng.eid_slot(eid) == slot && rec.hlc <= floor => {
+                Some((eid_local(eid), rec.hlc))
+            }
+            _ => None,
+        }));
+    }
     v.sort();
     v.dedup();
     v
@@ -3869,27 +3884,30 @@ fn a_torn_delete_with_a_tag_cell_is_cleaned_up_by_one_open() {
         let hold = eng.hold_consumer();
         copy_tree(&db, &after);
         drop(hold);
+        let floor_first = floor_of(&eng, 1);
         assert_eq!(eng.generation_repairs(), (1, 0), "前提: gen.seg だけ死の場所 (r) を突き合わせが完了させた ({kind:?})");
         assert!(!eng.is_live(r), "前提: 消した record は WAL に無いが、 本体に届いた削除は完了する");
         assert_torn_delete_cleaned(&eng, a, r, torn992_named(kind), &format!("1 回の open ({kind:?})"));
         drop(eng);
         let again = Engine::open_concurrent_with_oplog(after.to_str().unwrap(), OPLOG_CAP).unwrap();
         assert_eq!(again.resumed_cleanups(), 0, "仕上げを書き出した後も後始末待ちの印が残った ({kind:?})");
-        assert_eq!(r_deletes(&again, a, r).len(), 1, "開き直した open が r の Delete をもう一度作った ({kind:?})");
+        assert_eq!(r_deletes(&again, a, r).len(), 1, "開き直した open で r の Delete が相手に届かない ({kind:?})");
+        // もう一度作ったか: #1047 から作り直す削除の版数は決まった値 (下限) で、 数え (`slot_deletes`) の dedup では見えない。 作り直しは
+        // record (配る分が増える) か floor を上げ直す (今の時刻) ので、 その 2 つで見る
+        assert_eq!(again.unlogged_writes_relogged(), 0, "開き直した open が r の Delete をもう一度作った (record) ({kind:?})");
+        assert_eq!(floor_of(&again, 1), floor_first, "開き直した open が r の Delete をもう一度作った (floor を上げ直した) ({kind:?})");
         drop(again);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
 
-/// #992 の読み直し S4 / 読み直し 2 の細かい 3: 生きている印だけ死の像 ([`Torn992::LivePage`]、 tombstone 無し) は突き合わせの 2. が削除を
-/// 完了させる。 2. の完了は tombstone を作り直さない (版数なしの削除・`merge_entity_into` の src・`Split::NoRoom` の空の行も tomb.seg に何も
-/// 置かず、 見分けられない。 作り直すと一度も配っていない削除を今の時刻で配る)。 突き合わせと仕上げの間で落ちて次の open が後始末待ちから
-/// 拾っても同じ答え (決め方は gen.seg の印から)。 cell はどちらでも落とす。 最初の head は 2. の場所を照合せず、 3. で拾うと照合した (落ちたか
-/// で答えが変わった)、 2 つ目の head は両方で作り直した。
+/// #992 の読み直し S4: 生きている印だけ死の像 ([`Torn992::LivePage`]、 tombstone 無し) は突き合わせの 2. が削除を完了させる。 突き合わせと
+/// 仕上げの間で落ちて次の open が後始末待ちから拾っても同じ答え。 cell はどちらでも落とす。
 ///
-/// **「Delete を作らない」 は受け入れた残りの形** (#992 の読み直し 3 の細かい 5): LivePage は、 OS が entities の page を先に書き、 WAL の Delete も
-/// tomb.seg も届かなかった普通の削除の像でもある (その削除は相手に配られない、 PR #1012 の残り)。 この残りを塞ぐ時は、 版数なしの削除などと
-/// 見分ける手を足して、 この試験の主張を変える。
+/// #1047 / #1046 の (2) (user の決定 11-23): 2. の完了も、 tombstone を削除の時刻の下限 (r の cell の版数の最大の直後) で置き、 その版数の
+/// Delete を配る (前は作り直さず、 r 宛ての遅い受信が r を次の世代で生き返らせ (#1046)、 state で取り直す受け手の掃除が今の時刻で r を
+/// 消した = #923 の形。 版数なしの削除などと見分けられない、 が前の理由だったが、 下限の版数なら一度も配っていない削除を配っても、 その後に
+/// 同じ名前で足し直した行を名前の削除優先が消さない)。
 #[test]
 fn an_entities_only_torn_delete_is_finished_the_same_with_or_without_a_kill() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -3927,7 +3945,13 @@ fn an_entities_only_torn_delete_is_finished_the_same_with_or_without_a_kill() {
         assert!(!eng.is_live(r));
         let what = format!("生きている印だけ死 (kill {kill})");
         assert_torn_cells_dropped(&eng, &what);
-        assert_eq!(r_deletes(&eng, a, r), Vec::<u64>::new(), "{what}: 2. の完了で r の Delete を作り直した");
+        let newest = ["notes.note", "notes.tag", "notes.body"]
+            .iter()
+            .map(|c| eng.cell_hlc(r, eng.himo_id(c).unwrap() as u16))
+            .max()
+            .unwrap();
+        let found: Vec<(u32, Hlc)> = slot_deletes(&eng, eng.eid_slot(r)).into_iter().filter(|&(d, _)| d != eid_local(a)).collect();
+        assert_eq!(found, vec![(eid_local(r), lower_bound(newest))], "{what}: 2. の完了の r の Delete が、 下限の版数で 1 つでない");
         drop(eng);
     }
 }
@@ -4134,7 +4158,7 @@ fn a_torn_delete_of_the_last_generation_keeps_the_last_row() {
     std::fs::create_dir_all(&live).unwrap();
     crashsim::start();
     let db = live.join("db");
-    let (r, prev) = {
+    let (r, prev, newest) = {
         let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
         eng.define_table("t", 1).unwrap();
         eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
@@ -4163,11 +4187,12 @@ fn a_torn_delete_of_the_last_generation_keeps_the_last_row() {
         // 削除の前 (書き出し済み) の写しに、 削除の後の gen.seg だけを置く (gen.seg だけ死 = 引退の印)
         let (before, after) = (root.join("before"), root.join("after"));
         copy_tree(&live, &before);
+        let newest = eng.cell_hlc(r, eng.himo_id("t.v").unwrap() as u16);
         eng.delete(r);
         copy_tree(&live, &after);
         copy_tree(&before, &img);
         std::fs::copy(after.join("db").join("gen.seg"), img.join("db").join("gen.seg")).unwrap();
-        (r, prev)
+        (r, prev, newest)
     };
     crashsim::stop();
     let db = img.join("db");
@@ -4190,10 +4215,123 @@ fn a_torn_delete_of_the_last_generation_keeps_the_last_row() {
     let eng = Engine::open_concurrent_with_oplog(killed.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
     assert_eq!(eng.resumed_cleanups(), 1, "前提: 後始末待ちから拾った");
     let slot = eng.eid_slot(r);
-    let deletes: Vec<u32> = slot_deletes(&eng, slot).into_iter().map(|(d, _)| d).collect();
+    let found = slot_deletes(&eng, slot);
+    let deletes: Vec<u32> = found.iter().map(|&(d, _)| d).collect();
     let count = |e: u64| deletes.iter().filter(|&&d| d == eid_local(e)).count();
     assert_eq!((count(r), count(prev)), (1, 1), "r の Delete が r の世代で 1 つでない / 前の住人宛てを作り直した ({deletes:x?}、 r {r:#x} 前 {prev:#x})");
+    // #1047: 作り直す削除の版数は下限 (r の cell の版数の最大の直後)
+    let at = found.iter().find(|&&(d, _)| d == eid_local(r)).map(|&(_, h)| h);
+    assert_eq!(at, Some(lower_bound(newest)), "1. の完了 (引退の場所) で作り直した r の Delete の版数が下限でない");
     drop(eng);
+}
+
+/// #1047 / #1046 の (2): 開く時の突き合わせが削除を完了させた行の、 削除の時刻の下限 (cell の版数の最大の直後、 peer = 自分 (1))。
+fn lower_bound(newest: Hlc) -> Hlc {
+    Hlc { wall: newest.wall, logical: newest.logical + 1, peer: 1 }
+}
+
+/// #1047 (review038 の A3): [`an_entities_only_torn_delete_is_finished_the_same_with_or_without_a_kill`] の像 (突き合わせの 2. = 生きている
+/// 印だけ死、 tombstone 無し) を、 世代を使い切る場所の最後の世代 (254) の行 r で。 2. の完了は世代を 255 (引退の印) に切る。 前は仕上げの
+/// 「最後の行の削除を完了させた場所か」 (「今 − 2」 の印か **引退**) が真になり、 2. の完了なのに r の Delete を**今の時刻で**作り直した
+/// (引退しない場所の 2. の完了は作り直さなかった)。 今は 1. も 2. も、 引退してもしなくても、 下限の版数で作り直す (user の決定 11-23)。
+///
+/// falsify: 2. の完了を前の形 (作り直さない、 引退の場所だけ今の時刻で作り直す) に戻すと、 版数が下限にならない。
+#[test]
+fn an_entities_only_torn_delete_of_the_last_generation_is_relogged_at_the_lower_bound() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("a3_retired_live_page");
+    let _rm = Torn992Root(root.clone());
+    let (live, img) = (root.join("live"), root.join("img"));
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let db = live.join("db");
+    let (r, newest) = {
+        let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+        eng.define_table("t", 1).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        eng.set_peer_id(1);
+        // 世代 = local の上 8 bit (場所の bit 24)。 いちばん上の世代 (254) の行まで使い回す
+        let mut i = 0u32;
+        let r = loop {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie_to(e, "t.v", i);
+            if eid_local(e) >> 24 == 254 {
+                break e;
+            }
+            assert!(i < 300, "前提: 枠 1 の表は場所を使い回す");
+            eng.delete(e);
+            i += 1;
+        };
+        eng.persist_tables().unwrap();
+        eng.oplog_sync().unwrap();
+        eng.oplog_sync().unwrap();
+        let _hold = eng.hold_consumer();
+        // 削除の前 (書き出し済み) の写しに、 削除の後の生きている印 (entities.seg) だけを置く (生きている印だけ死・gen.seg は生きている・
+        // tombstone 無し = 突き合わせの 2.)
+        let (before, after) = (root.join("before"), root.join("after"));
+        copy_tree(&live, &before);
+        let newest = eng.cell_hlc(r, eng.himo_id("t.v").unwrap() as u16);
+        eng.delete(r);
+        copy_tree(&live, &after);
+        copy_tree(&before, &img);
+        std::fs::copy(after.join("db").join("entities.seg"), img.join("db").join("entities.seg")).unwrap();
+        (r, newest)
+    };
+    crashsim::stop();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.generation_repairs(), (0, 1), "前提: 突き合わせの 2. が r の場所を完了させた");
+    assert!(!eng.is_live(r), "前提: r は消えた");
+    let slot = eng.eid_slot(r);
+    let deletes: Vec<(u32, Hlc)> = slot_deletes(&eng, slot).into_iter().filter(|&(d, _)| d == eid_local(r)).collect();
+    let tomb = eng.tombstone_hlc(r);
+    drop(eng);
+    assert_eq!(deletes, vec![(eid_local(r), lower_bound(newest))], "2. の完了 (引退の場所) の r の Delete が、 下限の版数で 1 つでない (r {r:#x})");
+    assert_eq!(tomb, lower_bound(newest), "r の tombstone が下限でない");
+}
+
+/// #1047 / #1046 の (2): WAL の file の無い単独の open が仕上げる時 (tombstone は置けない) に名前の削除を覚える版数と、 後の WAL 付きの
+/// open が置く tombstone の版数は、 同じ下限 (cell の版数の列は cell を落としても残る)。 前は単独の open が cell の版数の最大で仮に覚え、
+/// WAL 付きの open が今の時刻の tombstone で覚え直した。
+#[test]
+fn a_standalone_finish_and_the_later_wal_finish_agree_on_the_lower_bound() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("lb_name");
+    let _rm = Torn992Root(root.clone());
+    let (db, a, r) = torn992_image(&root, Torn992::GenPage);
+    std::fs::remove_file(db.join("oplog")).unwrap();
+    let (name_alone, lb) = {
+        let eng = Engine::open_standalone(db.to_str().unwrap()).unwrap();
+        assert_eq!(eng.generation_repairs(), (1, 0), "前提: 突き合わせが r の場所を完了させた (後始末待ち)");
+        let newest = ["notes.note", "notes.tag", "notes.body"]
+            .iter()
+            .map(|c| eng.cell_hlc(r, eng.himo_id(c).unwrap() as u16))
+            .max()
+            .unwrap();
+        assert_ne!(newest, Hlc::ZERO, "前提: r の cell の版数が残る");
+        assert_eq!(eng.tombstone_hlc(r), Hlc::ZERO, "前提: WAL の無い仕上げは tombstone を置かない");
+        let note = eng.himo_id("notes.note").unwrap() as u16;
+        (eng.deleted_name_version(note, TORN992_NAME as u64), lower_bound(newest))
+    };
+    let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.resumed_cleanups(), 1, "前提: 単独の session の後始末待ちを WAL 付きの open が拾った");
+    let note = eng.himo_id("notes.note").unwrap() as u16;
+    let (tomb, name) = (eng.tombstone_hlc(r), eng.deleted_name_version(note, TORN992_NAME as u64));
+    let deletes = r_deletes(&eng, a, r);
+    drop(eng);
+    assert_eq!(name_alone, Some(lb), "単独の open が名前の削除を下限で覚えない");
+    assert_eq!(tomb, lb, "WAL 付きの open の tombstone が下限でない");
+    assert_eq!(name, Some(lb), "名前の削除の版数が tombstone と違う");
+    assert_eq!(deletes, vec![r], "r の削除が相手に届かない");
 }
 
 /// #992 の読み直し 3 の S3 (user の決定 11-18): 世代を使い切る場所の最後の世代 (254) での使い回しの途中の像。 最後の行 (世代 253) を消して
@@ -4469,6 +4607,56 @@ fn cut_the_write_out_of_an_open(dir: &Path, out: &Path, at: Phase) {
     assert_eq!(eng.generation_repairs(), (1, 0), "前提: 開く道の突き合わせが gen.seg だけ死の場所を完了させた");
     drop(eng);
     crashsim::stop();
+}
+
+/// #1068 の読み直し F1: 開く道 (O1) の作り直し (#451) が下限の tombstone を置いて floor を上げた (下限は配った版数以下 = record を載せない)
+/// 後、 本体の書き出しの最初の削除の門 (`GateClosed` = tomb.seg は書き出した・floor を持つ `_sync_peers` の列はまだ) で電源が落ちた像を開く
+/// (O2)。 O2 は後始末待ちから拾い、 tombstone が下限と同じなら 「届いていない」 として作り直す (floor を上げ直す)。 前は tombstone を
+/// 「届いた」 と読んで作り直さず、 #451 の tomb.seg のなめも配った版数以下の下限を拾わない = r の削除はどこにも載らなかった。
+///
+/// falsify: `finish_reconcile` の 「tombstone が下限と同じなら届いていない」 を外すと、 O2 で r の削除が相手に届かない。
+#[test]
+fn a_power_loss_after_the_lower_bound_tombstone_but_before_the_floor_relogs_again() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for kind in [Torn992::GenPage, Torn992::LivePage] {
+        let root = scratch("lb_floor_cut");
+        let _rm = Torn992Root(root.clone());
+        let (_, a, r) = torn992_image(&root, kind);
+        let (img, cut) = (root.join("img"), root.join("cut"));
+        crashsim::start();
+        adopt_as_durable(&img);
+        let (armed, shot) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (a2, s2, l, i) = (armed.clone(), shot.clone(), img.clone(), cut.clone());
+        let off = HookOff;
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == Phase::OpenBeforeSettle {
+                a2.store(true, Ordering::SeqCst);
+            }
+            if p == Phase::GateClosed && a2.load(Ordering::SeqCst) && !s2.swap(true, Ordering::SeqCst) {
+                crashsim::capture(&l, &i, Mode::Lost).unwrap();
+            }
+        })));
+        let first = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        drop(off);
+        assert!(shot.load(Ordering::SeqCst), "前提: 開く道の作り直しの後の書き出しの途中で撮った ({kind:?})");
+        let lb = first.tombstone_hlc(r);
+        assert!(floor_of(&first, 1).is_some_and(|f| f >= lb), "前提: O1 は下限の削除のために floor を上げた ({kind:?})");
+        drop(first);
+        crashsim::stop();
+        let eng = Engine::open_concurrent_with_oplog(cut.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        let what = format!("下限の tombstone の後・floor の前の電源断 ({kind:?})");
+        assert!(!eng.is_live(r), "前提: {what}");
+        assert_eq!(eng.resumed_cleanups() + eng.generation_repairs().0 + eng.generation_repairs().1, 1, "前提: O2 は r の場所を拾い直す ({what})");
+        let tomb = eng.tombstone_hlc(r);
+        let deletes = r_deletes(&eng, a, r);
+        let floor = floor_of(&eng, 1);
+        drop(eng);
+        assert_eq!(tomb, lb, "{what}: r の tombstone が O1 の下限と違う");
+        assert_eq!(deletes, vec![r], "{what}: r の削除が相手に届かない (floor {floor:?}、 tombstone {tomb:?})");
+    }
 }
 
 /// #992 の読み直し 2 の B2 / 読み直し 3 の B3: 開く道 (O1) の突き合わせが gen.seg だけ死の場所を完了させ (世代を上げて死・後始末待ちの印を

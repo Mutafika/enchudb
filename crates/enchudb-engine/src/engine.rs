@@ -29521,26 +29521,26 @@ impl Engine {
     /// 再生がその行を生かし直した場所 (`replay_slot` の `restore`、 生かす道が後始末待ちも落とす) は触らない。 まだ死んでいる場所は
     /// 「消えた行の世代」 を覚え (#451 の作り直しの Delete の宛名、 gen.seg の 「今 − 2」 の印と同じ値)、 残った cell を落とす。
     ///
-    /// **tombstone を作り直すのは、 突き合わせが場所の最後の行の削除を完了させた場所 (gen.seg の 「最後の行は 今 − 2」 の印 / 引退した場所で、
-    /// 使い回しの印 (最後の行は使い回しの途中の行) の無い場所、 [`crate::generation::Generations::last_row_was_deleted`]) で、 tombstone が
-    /// 届いていない時だけ**。 使い回しの印の場所は tombstone を置かずに、 受信の書き込みを印で弾く ([`Self::slot_is_dead`])。 作り直しは新しい HLC で tombstone を
-    /// 置き、 名前の削除を覚えてから cell を落とし、 Delete を作り直して相手に配る (#992 の読み直し S1: 先に cell を落とすと名前を読めない)。
+    /// **tombstone を作り直すのは、 突き合わせが削除を完了させた場所 (1. も 2. も) のうち、 使い回しの印 (最後の行は使い回しの途中の行) の
+    /// 無い場所で、 tombstone が届いておらず、 削除の時刻の下限 ([`Self::delete_lower_bound`] = 行の cell の版数の最大の直後) がある時だけ**
+    /// (#1047 / #1046 の (2)、 user の決定 11-23)。 作り直しは下限の版数で tombstone を置き、 名前の削除を覚えてから cell を落とし、 その
+    /// 版数の Delete を #451 が作り直す (相手の cursor が越えている = 普段は、 floor を上げて state で取り直させる。 state は自分の行の削除を
+    /// tombstone の版数の Delete で運ぶ、 #951)。 下限を使うのは、 本当の削除の後に同じ名前で足し直した行 (作成の版数は本当の削除より後 ≥
+    /// 下限) を名前の削除優先が消さないため (前は 1. を今の時刻で作り直し、 その行を消しえた = #923 の形。 2. は作り直さず、 受けた書き込みが
+    /// 次の世代で生き返り (#1046)、 state で取り直す受け手の掃除が今の時刻で消した)。 削除が相手に既に届いていれば、 相手の tombstone の方が
+    /// 新しく、 下限の Delete は相手で何もしない。 1. と 2. を見分けない (前は 2. を作り直さないために見分けていて、 引退の場所で崩れた、 #1047)
     /// - 「届いていない」 = 場所の tombstone が 0 か、 場所の使い回しの記録 (`prev.seg`) の前の住人の削除の版数と同じ (使い回しが tomb.seg を
     ///   0 にした page が届かなかった、 #992 の読み直し B1)。 cell の版数では見分けない (受けた削除の前に行の cell が全部書き直されていれば、
     ///   版数の最小も削除の版数より新しい。 前は受けた削除を届いていないと読み、 自分を author とする今の時刻の Delete を配った)
-    /// - 他の完了 (2. の 「生きている印だけ死」、 1. の使い回しの途中の像) は作り直さない (#992 の読み直し 2 の細かい 3)。 2. の
-    ///   tombstone の無い像には、 版数なしの削除 (sync する DB の単独の session の削除)・`merge_entity_into` の src・`Split::NoRoom` の空の行
-    ///   (どれも tomb.seg に何も置かない) が入り、 作り直すと一度も配っていない削除が今の時刻で配られる (受け手の名前の削除優先が、
-    ///   同じ名前で足し直した行を消す = #923 の形)。 使い回しの途中の像の行は record が WAL に無い (あれば再生が生かす)。 決め方は gen.seg の
-    ///   印から = 1 回の open でも、 突き合わせと仕上げの間で落ちて 3. で拾い直しても同じ (読み直しの S4)。 引き換え: 生きている印だけが
-    ///   届いて WAL の Delete も tomb.seg も届かなかった普通の削除 (OS が entities の page を先に書いた像) は Delete を作り直さない (master と同じ)
+    /// - 使い回しの印の場所は tombstone を置かずに、 受信の書き込みを印で弾く ([`Self::slot_is_dead`]。 その行は相手に配っていない)
+    /// - 下限の無い行 (版数のある cell が 1 つも無い = WAL なしの session で作った行など、 相手に配っていない) は印を置かない
     /// - 名前の削除は、 届いている tombstone の版数で覚える (0 / 前の住人の物なら覚えない)
     ///
     /// WAL の無い仕上げ (`wal` が None = 単独の open) は覚えたままにする (後で WAL 付きで仕上げる `concurrentize_with_oplog` / 次の open が
     /// tombstone を作り直し、 #451 が Delete を作り直す。 配らない DB は cell を落とせば済む)。 cell はその場で落とす (#992 の読み直し 2 の
     /// 細かい 2: 前は tombstone を作り直す場所の cell を WAL 付きの仕上げまで残し、 WAL の file の無い DB を単独でだけ使うと毎回の session で
-    /// 消えた行の cell が値の引きに出た): 作り直す場所の名前は、 行の cell の版数の最大で仮に覚える (削除はそれより後 = 早めに覚えるのは
-    /// 名前の削除優先が消す行を減らす向き)。 WAL 付きの仕上げが置く tombstone で覚え直す (名前の記録は場所でも引ける、 版は単調な max)。
+    /// 消えた行の cell が値の引きに出た): 作り直す場所の名前は、 削除の時刻の下限で覚える。 WAL 付きの仕上げは同じ下限 (cell の版数の列は
+    /// cell を落としても残る) で tombstone を置いて覚え直す (名前の記録は場所でも引ける、 版は単調な max = 同じ値)。
     pub(crate) fn finish_reconcile(&self, wal: Option<&enchudb_oplog::oplog::OpLog>) {
         let gens = self.generations();
         let pending = gens.take_pending();
@@ -29548,13 +29548,30 @@ impl Engine {
             return;
         }
         let versioned = self.sync_tables_enabled() && self.has_cell_version();
+        // #1068 の読み直し 3 の P1: 他の行が束ねている自分の場所 (自分の行どうしの畳みの src) は 1 回だけ集める (場所ごとに束ねを全部なめると
+        // 後始末待ちの数 × 束ねの数 = まとめて消した直後に落ちた像で、 開く時間が束ねの多い DB で分単位になった)
+        let folded_own = if versioned { self.own_slots_bound_elsewhere() } else { Vec::new() };
         for (slot, row_gen) in pending {
             if self.entities.is_live(slot) {
                 continue;
             }
             let tomb = self.tombstone_version_of(slot);
-            let stale = tomb == enchudb_oplog::Hlc::ZERO || gens.prev.read(slot).is_some_and(|r| r.tomb == tomb);
-            let missing = versioned && stale && gens.last_row_was_deleted(slot);
+            // #1068 の読み直し F2: 作り直すのは自分の行の場所だけ。 翻訳した (他の peer の) 行の場所は、 2. の像に 「畳んだ翻訳した行
+            // (`merge_entity_into` の src、 `.eidmap` が本体より遅れた像)」 が入り、 作り直すと state がその行の持ち主の生きている行の
+            // Delete を自分の書き込みとして出す。 user の決定 (11-23) の 「翻訳した行の場所は今のまま」 (1. の今の時刻の作り直しもやめる)
+            // #1068 の読み直し 2 (#1071): 自分の行どうしの畳み (#612) の src も除く。 畳んだ src の場所は世代を上げない (gen.seg で死なない)
+            // ので 1. には来ないが、 別名 (`eidalias`、 本体の後に書く) が遅れた像の 2. はその場所を自分の行の死として拾う。 作り直すと
+            // (自分, src) の Delete を配り、 相手でも同じ改名で畳んでいれば相手の残す行を消した。 自分の行どうしの畳みは名前で畳む時だけで、
+            // その時必ず残す行が (自分, src) を束ねる記録 (`pkformer`、 本体より先に disk まで書く) を残す = それで見分ける
+            let own = self.eid_translator.reverse(slot).is_none() && folded_own.binary_search(&slot).is_err();
+            let lower = if versioned && own && !gens.mid_reuse(slot) { self.delete_lower_bound(slot) } else { enchudb_oplog::Hlc::ZERO };
+            // #1068 の読み直し F1: 前の open の作り直しが置いた下限の tombstone だけが disk に届き、 その floor (本体の `_sync_peers`) が
+            // 届かなかった像 (開く道の本体の書き出しの途中の電源断。 tomb.seg は列より先に書き出す) も 「届いていない」 = 作り直す
+            // (tombstone は同じ値、 floor をもう一度上げるだけ = 冪等)。 下限は配った版数以下なので、 #451 の tomb.seg のなめは拾わない
+            let stale = tomb == enchudb_oplog::Hlc::ZERO
+                || gens.prev.read(slot).is_some_and(|r| r.tomb == tomb)
+                || (lower != enchudb_oplog::Hlc::ZERO && tomb == lower);
+            let missing = stale && lower != enchudb_oplog::Hlc::ZERO;
             if missing && wal.is_some() {
                 // cell を落とし後始末待ちを落とすのは、 作り直しが tombstone を置いた後 (`relog_unlogged_writes`)
                 gens.note_relog_gen(slot, row_gen);
@@ -29562,7 +29579,7 @@ impl Engine {
                 continue;
             }
             let name_at = if missing {
-                self.newest_cell_version(slot)
+                lower
             } else if versioned && !stale {
                 tomb
             } else {
@@ -29597,16 +29614,46 @@ impl Engine {
         }
     }
 
-    /// 場所 `slot` の表の列に残った cell の版数の最大 (無ければ 0)。 tombstone を置けない仕上げが名前の削除を仮に覚える版数 (#992)。
-    fn newest_cell_version(&self, slot: u32) -> enchudb_oplog::Hlc {
+    /// #1068 の読み直し 2 (#1071): 自分の行の identity (自分, 場所) を別の行が束ねている場所 (名前の記録 `pkformer`) の並び (昇順)。 自分の行
+    /// どうしの畳み (#612) の src の印 (`merge_entity_into` が残す行に `add_bound` する。 残す行は自分の identity も束ねるので、 自分の場所を
+    /// 束ねている行は数えない)。 束ねた行が無ければ atomic 1 回。 束ねの総数に比例 (開く時に 1 回)。
+    fn own_slots_bound_elsewhere(&self) -> Vec<u32> {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+        let me = self.peer_id();
+        let f = self.pk_former.read().unwrap();
+        let mut v: Vec<u32> = f
+            .bound_slots()
+            .flat_map(|d| f.bound_of(d).iter().filter(move |((p, s), _)| *p == me && *s != d).map(|((_, s), _)| *s))
+            .collect();
+        drop(f);
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// #1047 / #1046 の (2): 開く時の突き合わせが完了させた削除の時刻の下限 = 場所 `slot` の表の列の cell の版数の最大 (値を外した cell も、
+    /// 仕上げが値を落とした後も残る) の直後 (logical + 1、 peer = 自分)。 削除はその行の最後の書き込みより後なので、 本当の削除の時刻以下。
+    /// 版数のある cell が無ければ 0 (下限なし)。 仕上げが置く tombstone の版数と、 名前の削除を覚える版数。
+    fn delete_lower_bound(&self, slot: u32) -> enchudb_oplog::Hlc {
         let Some(t) = self.table_of_slot(slot) else { return enchudb_oplog::Hlc::ZERO };
         let hids: Vec<u32> = self.tables[t].himo_ids.read().unwrap().clone();
-        hids.into_iter()
+        let newest = hids
+            .into_iter()
             .map(|h| h as usize)
-            .filter(|&h| h < self.himos.len() && self.himos[h].get_value(slot).is_some())
+            .filter(|&h| h < self.himos.len())
             .map(|h| self.version_of(slot, h as u16))
             .max()
-            .unwrap_or(enchudb_oplog::Hlc::ZERO)
+            .unwrap_or(enchudb_oplog::Hlc::ZERO);
+        if newest == enchudb_oplog::Hlc::ZERO {
+            return newest;
+        }
+        let (wall, logical) = match newest.logical.checked_add(1) {
+            Some(l) => (newest.wall, l),
+            None => (newest.wall + 1, 0),
+        };
+        enchudb_oplog::Hlc { wall, logical, peer: self.peer_id() }
     }
 
     /// #731: 開いた時の突き合わせ (`reconcile_generations`) で削除を完了させた場所の数 (gen.seg だけ死んでいた, entities だけ死んで
@@ -37665,7 +37712,7 @@ impl Engine {
             // #992: tombstone を置けない形でも、 仕上げが後に回した cell は落とす (後始末待ちの印は落とさない = 作り直せる open が拾う)。
             // 名前の削除は行の cell の版数の最大で仮に覚える (読み直し 2 の細かい 5、 作り直す open が tombstone の版数で覚え直す)
             for slot in self.generations().take_missing_tombstones() {
-                self.drop_cells_remembering_name(slot, self.newest_cell_version(slot));
+                self.drop_cells_remembering_name(slot, self.delete_lower_bound(slot));
             }
             return false;
         }
@@ -37736,17 +37783,20 @@ impl Engine {
             .unwrap_or(Hlc::ZERO);
         // 相手の cursor (自分の author) はこれを越えない (印の W は配った record 以上)
         let reached = known.iter().copied().max().unwrap_or(Hlc::ZERO).max(floor).max(w);
-        // #731 (PR #885 の読み直し Q1): 開く時の突き合わせが完了させた削除で tombstone が届いていない場所に、 配った版数より後の新しい
-        // HLC で tombstone を置く (下の削除のなめが作り直して配る)
+        // #731 (PR #885 の読み直し Q1): 開く時の突き合わせが完了させた削除で tombstone が届いていない場所に tombstone を置き、 その
+        // Delete を下で作り直す。 #1047 / #1046 の (2): 版数は削除の時刻の下限 (`delete_lower_bound`。 前は配った版数より後の新しい HLC で、
+        // 本当の削除の後に同じ名前で足し直した行を名前の削除優先が消しえた)。 下限は配った版数以下のことが多い = 下の作り直しは Delete を
+        // 載せずに floor を上げ、 相手は state (この削除を下限の版数で運ぶ) で取り直す。 配る印より前の版数なので、 tomb.seg のなめ (`unlogged`)
+        // は拾わない = ここで削除の一覧に足す
         // #992 (読み直し S1): tombstone を置いてから名前の削除を覚えて cell を落とす (仕上げは tombstone の届いていない場所の cell を落とさずに
         // 回した)。 cell の版数のなめ (下) の前に落とす (落としていないと消えた行の Tie を作り直す)
+        let mut rebuilt: Vec<(Hlc, u32)> = Vec::new();
         for slot in self.generations().take_missing_tombstones() {
-            wal.set_peer_id(me);
-            wal.observe_hlc(reached);
-            let h = wal.mint_hlc();
+            let h = self.delete_lower_bound(slot);
             self.set_tombstone_local(slot, h);
             self.drop_cells_remembering_name(slot, h);
             self.generations().note_finished(slot);
+            rebuilt.push((h, self.last_local_of_slot(slot)));
         }
         let lower = floor.max(w);
         let unlogged = |h: Hlc| h != Hlc::ZERO && h.peer == me && h > lower && !known.contains(&h);
@@ -37764,7 +37814,7 @@ impl Engine {
             }
         }
         // (削除の版数, 消えた行の番号 = 世代 | 場所)
-        let mut deletes: Vec<(Hlc, u32)> = Vec::new();
+        let mut deletes: Vec<(Hlc, u32)> = rebuilt;
         if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
             for local in 0..n {
                 let h = self.tombstone_hlc_local(local);
@@ -37805,10 +37855,12 @@ impl Engine {
         wal.set_peer_id(me);
         let mut relogged = 0u64;
         let mut fallback = deletes.iter().any(|(h, _)| *h <= reached);
+        // 新しい HLC は、 作り直す版数と配った版数より後に採番する。 #1068 の読み直し F4: floor を上げる枝でも時計に入れる (本体にだけ届いた
+        // cell の版数より前に戻った時計で、 この session の書き込み (削除) がその版数より古く採番されると、 突き合わせの下限 (行の cell の
+        // 版数の最大の直後) が本当の削除の時刻を越える)
+        let top = cells.iter().map(|c| c.0).chain(deletes.iter().map(|d| d.0)).max().unwrap_or(Hlc::ZERO);
+        wal.observe_hlc(top.max(reached));
         if !fallback {
-            // 新しい HLC は、 作り直す版数と配った版数より後に採番する
-            let top = cells.iter().map(|c| c.0).chain(deletes.iter().map(|d| d.0)).max().unwrap_or(Hlc::ZERO);
-            wal.observe_hlc(top.max(reached));
             deletes.sort_unstable();
             cells.sort_unstable();
             for (h, gone) in &deletes {
