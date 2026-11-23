@@ -998,9 +998,19 @@ fn reconcile_through_standalone_open(sync: bool) {
     assert_eq!(eng.get(b, "notes.note"), Some(7), "前提: 往復の open が WAL を再生した");
     assert!(!eng.is_live(c));
     assert!(!eng.is_live(eng.slot_eid(slot(c))), "往復の open で突き合わせが回らず、 消した行の場所が生きている (sync = {sync})");
-    let n = eng.entity_in("notes").unwrap();
-    assert_eq!(slot(n), slot(c), "前提: 消した場所を使い回す");
-    assert!(n != c && n != a);
+    // #1066: sync する DB は WAL なしで開いた engine で行を足せない。 使い回しは WAL 付きで開き直して見る
+    let reused = |eng: &Engine| {
+        let n = eng.entity_in("notes").unwrap();
+        assert_eq!(slot(n), slot(c), "前提: 消した場所を使い回す");
+        assert!(n != c && n != a);
+    };
+    if sync {
+        assert!(eng.entity_in("notes").is_err(), "WAL なしで開いた sync する DB で行を足せた (#1066)");
+        drop(eng);
+        reused(&Engine::open_concurrent_with_oplog(&img, WAL).unwrap());
+    } else {
+        reused(&eng);
+    }
 }
 
 #[test]
