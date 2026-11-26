@@ -1252,9 +1252,9 @@ mod tests {
         // デッキ
         assert_eq!(c.pull_at(199, 3000).unwrap(), vec![5]);
         assert!(c.note(5, y, Some(199), 6000, 0).unwrap());
-        let mut d = c.pull_at(199, 6000).unwrap();
-        d.sort_unstable();
-        assert_eq!(d, vec![5, y]);
+        let mut deck = c.pull_at(199, 6000).unwrap();
+        deck.sort_unstable();
+        assert_eq!(deck, vec![5, y]);
         // 繋ぎ直しても同じ
         c.relink(|e| e & 0xFFFFF).unwrap();
         assert_eq!(c.value_at(5, 5, 1005).unwrap().value, Some(90));
