@@ -1,0 +1,26 @@
+baseline: pass 63 秒 → 1 run の上限 220 秒
+  SURVIVED 64s           重複落としを外す (同じ時刻の entry を足す)
+  killed 1s              時刻を運ばない (set_cell_in の書き込みに ZERO)
+  killed 1s              外す (untie) の時刻を運ばない
+  killed 5s              削除の時刻を運ばない (削除優先の ZERO を渡す)
+  killed 15s             書き出しに入れない
+  killed 47s             再生で cell が弾いた書き込みを履歴に足さない
+  killed 26s             時刻の戻る entry を足した後に繋ぎ直さない
+  killed 8s              時刻の戻る entry: 前の値と同じでも足す
+  killed 1s              書き直し (値が変わらない) も変更として足す
+  killed 47s             開く時に cell と突き合わせない
+  killed 8s              再生の前に鎖を繋ぎ直さない
+  killed 48s             前の住人の削除を突き合わせで足さない
+  killed 3s              飛び糸で t 以前の entry まで飛び越す
+  killed 47s             デッキの差分を書き手が保たない
+  killed 71s             宣言の時の値を入れない
+  killed 2s              前の住人へ飛ばない (場所の使い回しの後に古い eid を読めない)
+  killed 68s             WAL の無い書き込みを 「遅くとも」 にする
+  killed 66s             WAL の無い書き込みの時刻を壁時計だけで (列の時計を見ない)
+  SURVIVED 70s           WAL を付ける時に WAL の時計を履歴の時計より先へ進めない
+  SURVIVED 64s           engine の中の道を 「遅くとも」 にしない (印の値をそのまま時刻に)
+killed 17 / survived 3 / その他 0
+  生き残り: 重複落としを外す (同じ時刻の entry を足す)
+  生き残り: WAL を付ける時に WAL の時計を履歴の時計より先へ進めない
+  生き残り: engine の中の道を 「遅くとも」 にしない (印の値をそのまま時刻に)
+exit 1
