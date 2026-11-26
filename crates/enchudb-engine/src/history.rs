@@ -409,6 +409,15 @@ impl HistCol {
         top
     }
 
+    /// WAL の無い session の書き込みの時刻: 壁時計の ms と、 列の時計 + 1 の大きい方 (同じ列の時刻は戻らない)。 列の時計を進める。
+    pub fn now(&self) -> u64 {
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        let wall = pack(enchudb_oplog::Hlc { wall: ms, logical: 0, peer: 0 });
+        let t = wall.max(self.clock.load(Ordering::Acquire) + 1);
+        self.clock.fetch_max(t, Ordering::AcqRel);
+        t
+    }
+
     /// 時刻の分からない entry に付ける今 (見た最大 + 1)。
     pub fn tick(&self) -> u64 {
         let t = self.clock() + 1;

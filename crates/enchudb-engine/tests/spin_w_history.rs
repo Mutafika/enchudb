@@ -259,41 +259,60 @@ fn declaration_takes_the_values_at_the_horizon() {
     assert!(matches!(eng.value_at(a, W, h0), Err(HistError::NotDeclared)));
 }
 
-/// WAL の無い session は、 履歴の列を持つ表の行に書けない (何も変えずに断る)。 履歴の無い表の行は書ける。
+/// WAL は任意: WAL の無い session (単独で開く) の書き込み・外す・削除も、 engine の時計 (壁時計の ms と列の時計の大きい方) で
+/// 印なしの entry になる。 1 ms の中に多く書いて時計が壁時計より先に出た後に WAL 付きで開いて書いても、 時刻は戻らない。
 #[test]
-fn walless_session_refuses_rows_of_history_tables() {
+fn walless_session_writes_with_engine_clock() {
     let s = Scratch::new("walless");
     let p = s.db();
-    let (a, o) = {
+    let (a, b) = {
         let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 1024).unwrap();
         eng.define_table("t", 16).unwrap();
         eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
-        eng.define_table("o", 16).unwrap();
-        eng.define_himo_in("o", "x", ValueType::Number, 0).unwrap();
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         let eng = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
         let a = eng.entity_in("t").unwrap();
-        let o = eng.entity_in("o").unwrap();
+        let b = eng.entity_in("t").unwrap();
         eng.tie_to(a, V, 1u32);
         eng.declare_history(V).unwrap();
         eng.tie_to(a, V, 2u32);
-        (a, o)
+        (a, b)
     };
-    let eng = Engine::open_standalone(p.to_str().unwrap()).unwrap();
-    assert_eq!(eng.history_declarations(), vec![V.to_string()]);
-    let hid = eng.himo_id(V).unwrap() as u16;
-    let before = eng.fault_count(FaultKind::NoWal);
-    assert!(eng.try_tie_to_by_id(a, hid, 9u32).is_err());
-    eng.untie(a, V);
-    assert!(eng.try_delete(a).is_err());
-    assert_eq!(eng.get(a, V), Some(2), "断った書き込みが cell を変えた");
-    assert_eq!(eng.history(a, V).unwrap().len(), 2);
-    assert!(eng.fault_count(FaultKind::NoWal) >= before + 3);
-    eng.tie_to(o, "o.x", 5u32);
-    assert_eq!(eng.get(o, "o.x"), Some(5), "履歴の無い表は書ける");
-    // 宣言の断り
-    assert!(eng.declare_history("o.x").is_ok());
+    let mut want: Vec<Option<u64>> = vec![Some(1), Some(2)];
+    {
+        let eng = Engine::open_standalone(p.to_str().unwrap()).unwrap();
+        assert_eq!(eng.history_declarations(), vec![V.to_string()]);
+        let before = eng.fault_count(FaultKind::NoWal);
+        // 1 ms の中に何千回も書く (列の時計が壁時計より先に出る)
+        for i in 0..5000u32 {
+            eng.tie_to(a, V, 3 + i % 2);
+            want.push(Some(u64::from(3 + i % 2)));
+        }
+        eng.untie(a, V);
+        want.push(None);
+        eng.tie_to(b, V, 7u32);
+        eng.try_delete(b).unwrap();
+        assert_eq!(eng.fault_count(FaultKind::NoWal), before, "WAL の無い書き込みを断った");
+        let h = eng.history(a, V).unwrap();
+        assert!(h.iter().all(|c| !c.observed), "WAL の無い書き込みに 「遅くとも」 の印");
+        let hb = eng.history(b, V).unwrap();
+        assert_eq!(hb.iter().map(|c| c.value).collect::<Vec<_>>(), vec![Some(7), None]);
+        assert!(hb[1].deleted && !hb[1].observed);
+    }
+    // WAL 付きで開き直して同じ行に書く: 時刻は前の entry より後
+    let eng = reopen(&p);
+    eng.tie_to(a, V, 9u32);
+    want.push(Some(9));
+    let h = eng.history(a, V).unwrap();
+    assert_eq!(h.iter().map(|c| c.value).collect::<Vec<_>>(), want, "変更の並び");
+    for w in h.windows(2) {
+        assert!(w[0].time < w[1].time, "時刻が戻った: {:?} → {:?}", w[0], w[1]);
+    }
+    for (i, c) in h.iter().enumerate() {
+        assert_eq!(eng.value_at(a, V, c.time).unwrap().value, c.value, "{i} 回目の時点の値");
+        assert_eq!(c.seq, i as u32);
+    }
 }
 
 /// 宣言の無い DB の `{db}/tables` に HIS1 は無い。 宣言を外すと消え、 file も消える。
@@ -584,6 +603,7 @@ mod power_loss {
         let mut observed = 0;
         for versions in [false, true] {
             for seed in 1..=12u64 {
+                eprintln!("nosync versions={versions} seed={seed}");
                 observed += image_without_sync(seed, versions).0;
             }
         }

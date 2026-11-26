@@ -1627,6 +1627,8 @@ impl RowHids {
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "engine_history.rs"]
 mod engine_history;
+#[cfg(not(target_arch = "wasm32"))]
+use engine_history::HIST_NO_TIME;
 
 #[cfg(test)]
 mod row_hids_tests {
@@ -23151,7 +23153,7 @@ impl Engine {
             let _row = self.row_locks.write(local);
             for hid in 0..self.himos.len() {
                 if self.himos[hid].get_value(local).is_some() {
-                    self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
+                    self.remove_cell_freeing_leaf(local, hid, HIST_NO_TIME, true);
                 }
             }
         }
@@ -24514,7 +24516,7 @@ impl Engine {
             // 行を握って消す (#349、 `read_row` に消している途中の行を見せない)。
             let _row = self.row_locks.write(local);
             for hid in 0..self.himos.len() {
-                self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
+                self.remove_cell_freeing_leaf(local, hid, HIST_NO_TIME, true);
             }
             self.live_free(local, None);
             cleared += 1;
@@ -24721,7 +24723,7 @@ impl Engine {
             let _pass = gated.then(|| self.delete_gate.enter(d));
             for hid in 0..self.himos.len() {
                 if self.himos[hid].get_value(d).is_some() && self.version_of(d, hid as u16) <= tomb {
-                    self.remove_cell_freeing_leaf(d, hid, enchudb_oplog::Hlc::ZERO, true);
+                    self.remove_cell_freeing_leaf(d, hid, HIST_NO_TIME, true);
                 }
             }
         }
@@ -30154,7 +30156,7 @@ impl Engine {
         for hid in hids {
             let hid = hid as usize;
             if hid < self.himos.len() && self.himos[hid].get_value(slot).is_some() {
-                self.remove_cell_freeing_leaf(slot, hid, enchudb_oplog::Hlc::ZERO, true);
+                self.remove_cell_freeing_leaf(slot, hid, HIST_NO_TIME, true);
             }
         }
     }
@@ -31800,7 +31802,7 @@ impl Engine {
                 if want.is_none() && !has_value && self.version_of(local, h) == enchudb_oplog::Hlc::ZERO {
                     continue;
                 }
-                self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
+                self.remove_cell_freeing_leaf(local, hid, HIST_NO_TIME, true);
                 self.reset_cell_version(local, h);
             }
         }
@@ -31985,7 +31987,7 @@ impl Engine {
                         continue;
                     }
                     if has {
-                        self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
+                        self.remove_cell_freeing_leaf(local, hid, HIST_NO_TIME, true);
                     }
                     if dead || want.is_some() {
                         self.reset_cell_version(local, h);
@@ -33028,10 +33030,6 @@ impl Engine {
     /// WAL 付きの session、 sync の表の無い DB。 開く時の修復・WAL の再生・相手から受けた書き込み (版数を持つ) は、 この入口を通らない。
     #[inline]
     fn refuses_walless_sync_write(&self, local: u32) -> bool {
-        // スピン 案 W の試作: 履歴を宣言した列を持つ表の行も、 WAL の無い session では書かない (時刻が付かない)
-        if self.refuses_walless_history_write(local) {
-            return true;
-        }
         if self.oplog.is_some() || !self.sync_tables_on() || self.tables.iter().any(|t| t.is_reserved() && t.contains(local)) {
             return false;
         }
@@ -39302,6 +39300,13 @@ impl Engine {
 
         // #833: 裏の thread を持つ engine を値で受けた = `Arc` から取り出されている (thread は前の住所を指したまま)
         assert!(!eng.moved_out_of_arc(), "{MOVED_OUT_OF_ARC}");
+
+        // スピン 案 W の試作: WAL の時計を履歴の時計より先へ (WAL の無い session が engine の時計で付けた時刻は壁時計より先に出うる。
+        // 後の WAL の書き込みの時刻が、 同じ行の前の entry より戻らないように)
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(wal) = oplog.as_ref() {
+            eng.observe_history_clock(wal);
+        }
 
         // 書き手の lock (`.db.lock`、 書き手の process は 1 つ) を持つ engine は、 WAL の flock を開いている間 1 回だけ取る
         // (record ごとの flock の lock / unlock = system call 2 回を省く)。 取れなければ今までどおり record ごとに取る

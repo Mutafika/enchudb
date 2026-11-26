@@ -2,18 +2,22 @@
 //! 断り・開く時の戻し / 繋ぎ直し / cell との突き合わせ・書き出し・読み。
 //!
 //! ## 決めたこと (時刻の分からない道)
-//! - **ユーザの書き込みは断る**: WAL の無い session (`open_standalone` / build phase / schema の `Database::open`) で、 履歴を宣言した
-//!   列を持つ表の行への書き込み (tie / untie / delete) は何も変えずに断る (`FaultKind::NoWal`、 #1066 と同じ形・同じ入口)。 時刻の
-//!   無い書き込みを履歴に入れると、 その前後の読みが嘘になる
-//! - **engine の中の道は 「遅くとも」 の印** (`OBSERVED`): 開く時の後始末 (gen.seg の突き合わせで完了させた死・前の住人の残りの cell)、
-//!   sync の畳み・改名の分け (sync する DB は宣言を断るので今は通らない)、 開く時の cell との突き合わせ。 時刻は列の時計 (見た最大
-//!   + 1) で、 本当の変更はそれ以前
+//! - **WAL の無い session のユーザの書き込みは engine の時計** (`HistCol::now`: 壁時計の ms と、 列の時計 (見た最大) + 1 の大きい方)。
+//!   WAL は任意なので、 WAL なしで開くアプリ (`open_standalone` / build phase / schema の `Database::open`) も履歴の列に書ける。
+//!   印は付けない (その書き込みの時刻として正しい)。 WAL が無いので電源断の後の足し直しは無く、 履歴は本体と同じく書き出した所まで
+//!   (開く時の cell との突き合わせは効く)。 後で WAL 付きで開いた時は WAL の時計を履歴の時計より先へ進める (`observe_history_clock`)
+//! - **engine の中の時刻の分からない道は 「遅くとも」 の印** (`OBSERVED`、 呼び手は [`HIST_NO_TIME`] を渡す): 開く時の後始末
+//!   (gen.seg の突き合わせで完了させた死・前の住人の残りの cell)、 sync の畳み・改名の分け (sync する DB は宣言を断るので今は通らない)、
+//!   開く時の cell との突き合わせ。 時刻は列の時計で、 本当の変更はそれ以前
 use super::*;
 use crate::history::{self, flag, At, Change, HistCol, HistError};
 use enchudb_oplog::Hlc;
 
 /// 突き合わせの足す entry の時刻に立てる 「遅くとも」 の bit (時刻は 2^63 未満)。
 const OBSERVED_AT: u64 = 1 << 63;
+
+/// 時刻を運べない engine の中の道が履歴に渡す印 (`ZERO` は WAL の無い session のユーザの書き込み = engine の時計)。
+pub(super) const HIST_NO_TIME: Hlc = Hlc { wall: 0, logical: 1, peer: u32::MAX };
 
 impl Engine {
     /// 書き手の道 (`live_set` / `live_remove`、 行の lock の下) から: 列 `h` の場所 `slot` の identity に 1 件足す。 `hlc` が `ZERO`
@@ -22,6 +26,9 @@ impl Engine {
         // 行の削除は場所の世代を上げる前に cell を落とす (今の住人)。 開く時の後始末 (死んだ場所の残りの cell) は最後の行
         let eid = if deleting { self.last_local_of_slot(slot) } else { self.generations().local(slot) };
         let (time, mut extra) = if hlc == Hlc::ZERO {
+            // WAL の無い session のユーザの書き込み: engine の時計 (印なし)
+            (h.now(), 0)
+        } else if hlc == HIST_NO_TIME {
             let t = h.tick();
             // 後の本当の書き込みの時刻がこれより前にならないように WAL の時計も進める
             if let Some(w) = self.oplog.as_ref() {
@@ -52,22 +59,6 @@ impl Engine {
         }
     }
 
-    /// WAL の無い session のユーザの書き込みを断るか (履歴を宣言した列を持つ表の行)。 `refuses_walless_sync_write` から呼ぶ。
-    #[inline]
-    pub(super) fn refuses_walless_history_write(&self, local: u32) -> bool {
-        if self.oplog.is_some() || !self.hist.any() {
-            return false;
-        }
-        let hit = self.hist.declared().into_iter().any(|h| self.hist_table_of(h).is_some_and(|t| t.contains(local)));
-        if hit {
-            self.record_fault(
-                FaultKind::NoWal,
-                "a table with a history column can only be written in a session with the oplog (WAL): the write has no time",
-            );
-        }
-        hit
-    }
-
     fn hist_table_of(&self, hid: u16) -> Option<&TableDef> {
         self.himo_table_get(hid as usize).filter(|&t| t != ANONYMOUS_TABLE).and_then(|t| self.tables.get(t as usize))
     }
@@ -77,7 +68,7 @@ impl Engine {
     /// あれば false。
     ///
     /// - 書き手の居ない時に呼ぶ (宣言の時の値をなめる間の書き込みは、 順序が前後しうる)
-    /// - 時刻は書き込みの WAL の record の HLC。 WAL の無い session では宣言した列を持つ表の行に書けない (`FaultKind::NoWal`)
+    /// - 時刻は書き込みの WAL の record の HLC。 WAL の無い session の書き込みは engine の時計 (壁時計の ms と列の時計の大きい方)
     /// - 断る: sync する DB (`enable_sync_tables`)・Leaf の列・語を回収する DB の Tag の列・表に属さない紐 / 予約の表の紐・
     ///   packed / memory の DB・readonly
     /// - 宣言は `{db}/tables` (`HIS1`、 ANS1 の後ろ) に保存する。 置き場は `{db}/hist/NNNN.seg` と `NNNN.head.seg`
@@ -220,9 +211,8 @@ impl Engine {
 
     /// cell (今の値) と集まりの最新を場所ごとに突き合わせる (電源断の後。 門に頼らず開く時に揃える)。 cell が正しい:
     ///
-    /// - 生きている行: 最新の entry の値 = cell の値 なら何もしない。 食い違えば、 cell の版数がある DB は 「cell の書き込みより新しい
-    ///   entry」 (cell に届かなかった書き込み) を外し (`VOID`)、 残りの最新がまだ食い違えば cell の版数の時刻で 「遅くとも」 を 1 件足す (版数と値が一緒に届いたかは分からない)。 版数の無い DB
-    ///   は cell と同じ値の一番新しい entry より新しい entry を外し、 そういう entry が無ければ 「遅くとも」 の entry を足す
+    /// - 生きている行: 最新の entry の値 = cell の値 なら何もしない。 食い違えば cell の値を 「遅くとも」 で 1 件足す。 entry は外さない
+    ///   (entry だけ届いた書き込みも手元で在った書き込み)。 時刻は cell の版数が最新の entry より後ならそれ、 でなければ時計
     /// - 死んだ場所: 最後の行の最新の entry に値が残っていれば、 削除の 「遅くとも」 の entry を足す (時刻は tombstone の版数があれば
     ///   それ)
     fn reconcile_history(&self, h: &HistCol) {
@@ -260,22 +250,16 @@ impl Engine {
                 appends.push((slot, eid, None, at, true));
                 continue;
             }
+            // 外さずに足すだけ: entry だけ届いた書き込みも手元で在った書き込み。 cell の値を 「遅くとも」 で足す (時刻は cell の版数が
+            // 最新の entry より後ならそれ、 でなければ時計)。 前は cell の版数より新しい entry / cell と同じ値より新しい entry を外していたが、
+            // 書き出しをしない像では cell の版数や値が別の書き込み (使い回しで消した版数・別の住人の値) を指すことがあり、 書き出しの済んだ
+            // entry まで外した
             let ver = if has_ver { self.version_of(slot, h.hid) } else { Hlc::ZERO };
-            if ver != Hlc::ZERO {
-                let vt = history::pack(ver);
-                let kept = h.void_newer(slot, eid, true, |_, time| time <= vt);
-                // 足す entry は 「遅くとも」: cell の版数と値が一緒に届いたかは分からない (版数だけ届いた像 #705 では、 版数は別の書き込みの物)
-                match kept {
-                    Some((v, _)) if v == want => {}
-                    Some((_, kt)) if kt == vt => appends.push((slot, eid, want, None, false)),
-                    _ => appends.push((slot, eid, want, Some(vt | OBSERVED_AT), false)),
-                }
-            } else {
-                match h.void_newer(slot, eid, false, |v, _| v == want) {
-                    Some(_) => {}
-                    None => appends.push((slot, eid, want, None, false)),
-                }
-            }
+            let at = (ver != Hlc::ZERO)
+                .then(|| history::pack(ver))
+                .filter(|&vt| top.is_none_or(|(_, tt)| vt > tt))
+                .map(|vt| vt | OBSERVED_AT);
+            appends.push((slot, eid, want, at, false));
         }
         if appends.is_empty() && !h.needs_relink() {
             return;
@@ -297,6 +281,15 @@ impl Engine {
             }
             let _ = h.note(slot, eid, value, time, extra);
         }
+    }
+
+    /// WAL を付ける時 (`spawn_consumer_with_oplog`): WAL の時計を、 宣言した列の時計 (見た最大の時刻) より先へ進める。
+    pub(super) fn observe_history_clock(&self, wal: &enchudb_oplog::oplog::OpLog) {
+        if !self.hist.any() {
+            return;
+        }
+        let top = self.hist.cols().into_iter().map(|h| h.clock()).max().unwrap_or(0);
+        wal.observe_hlc(history::unpack(top));
     }
 
     /// きれいに閉じる時 (`sync_and_mark_clean_with` の closing、 書き手の居ない所): 宣言した列ごとに場所の最新 (heads) を file に置く。

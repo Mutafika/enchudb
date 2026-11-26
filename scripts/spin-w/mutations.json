@@ -90,15 +90,33 @@
   "replace": "Ok::<bool, std::io::Error>(now == u64::MAX)"
  },
  {
-  "name": "WAL の無い session の書き込みを断らない",
-  "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "        if self.refuses_walless_history_write(local) {",
-  "replace": "        if false && self.refuses_walless_history_write(local) {"
- },
- {
   "name": "前の住人へ飛ばない (場所の使い回しの後に古い eid を読めない)",
   "file": "crates/enchudb-engine/src/history.rs",
   "find": "            let (_, first) = self.first_of(idx, e);\n            cur = self.at(first.jump);\n        }\n        None",
   "replace": "            let _ = self.first_of(idx, e);\n            cur = None;\n        }\n        None"
+ },
+ {
+  "name": "WAL の無い書き込みを 「遅くとも」 にする",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "            (h.now(), 0)\n",
+  "replace": "            (h.now(), flag::OBSERVED)\n"
+ },
+ {
+  "name": "WAL の無い書き込みの時刻を壁時計だけで (列の時計を見ない)",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        let t = wall.max(self.clock.load(Ordering::Acquire) + 1);",
+  "replace": "        let t = wall;"
+ },
+ {
+  "name": "WAL を付ける時に WAL の時計を履歴の時計より先へ進めない",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        wal.observe_hlc(history::unpack(top));",
+  "replace": "        let _ = (wal, top);"
+ },
+ {
+  "name": "engine の中の道を 「遅くとも」 にしない (印の値をそのまま時刻に)",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        } else if hlc == HIST_NO_TIME {",
+  "replace": "        } else if false && hlc == HIST_NO_TIME {"
  }
 ]
