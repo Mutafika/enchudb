@@ -91,6 +91,9 @@ pub mod transport;
 pub mod changefeed;
 // live query (クエリ購読): 条件に当てはまる entity 集合の差分を購読する。
 pub mod live;
+// スピン 案 W の試作: 宣言した列の書き込みを identity ごとに持つ履歴 (segment を足すので packed / wasm は持たない)
+#[cfg(not(target_arch = "wasm32"))]
+pub mod history;
 // 行の書き込み境界 (#206) と同じ cell への並行書き込みの直列化 (#135)。
 pub mod row_lock;
 // #419: 中身を指す cell の書き込みと本体の書き出しの順序 (中身を指す列の msync の間だけ書き手を待たせる)。

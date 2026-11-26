@@ -853,6 +853,7 @@ impl Database {
             local_only: false,
             orders: Vec::new(),
             marks: Vec::new(),
+            history: Vec::new(),
         }
     }
 
@@ -1600,6 +1601,8 @@ pub struct TableBuilder<'a> {
     orders: Vec<(String, String, Vec<i64>)>,
     /// 位置の印の宣言 (列)。 build でまとめて検査する。
     marks: Vec<String>,
+    /// 履歴の宣言 (列、 スピン 案 W の試作)。 build でまとめて検査する。
+    history: Vec<String>,
 }
 
 impl<'a> TableBuilder<'a> {
@@ -1720,8 +1723,23 @@ impl<'a> TableBuilder<'a> {
         self
     }
 
+    /// 列に履歴を持たせる ([`Engine::declare_history`]、 スピン 案 W の試作): 書き込み・外す・行の削除を、 行ごとに (時刻, 値) で
+    /// 残す。 読みは engine の `value_at` / `history` / `pull_at`。
+    ///
+    /// ```ignore
+    /// db.table("t").number("id").number("score").primary_key("id").history("score").build()?;
+    /// ```
+    ///
+    /// - 足すだけ (書かない build は宣言を外さない。 外すのは engine の `drop_history` = 履歴を捨てる)
+    /// - Leaf の列・sync する DB には付けられない。 WAL の無い session (`Database::open` / build phase) では、 履歴の列を持つ表の
+    ///   行に書けない (`WriteRejected`、 時刻が付かない)
+    pub fn history(mut self, col: &str) -> Self {
+        self.history.push(col.to_string());
+        self
+    }
+
     pub fn build(self) -> Result<Table<'a>, SchemaError> {
-        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint, local_only, orders, marks } = self;
+        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint, local_only, orders, marks, history } = self;
         let declared: Vec<(String, ColumnType)> = col_specs.iter().map(|(n, t, _)| (n.clone(), *t)).collect();
 
         // 既存 table と同名の場合 (#73 G1):
@@ -1743,16 +1761,23 @@ impl<'a> TableBuilder<'a> {
                     let marks = check_marks(&cols, &marks)?;
                     sync_marks(&db.eng, &existing, &marks)?;
                 }
+                if !history.is_empty() {
+                    let cols: Vec<(String, ColumnType)> = existing.cols.iter().map(|c| (c.name.clone(), c.ty)).collect();
+                    let history = check_history(&cols, &history)?;
+                    add_history(&db.eng, &existing, &history)?;
+                }
                 drop(existing);
                 return built_handle(db, &name);
             }
             let orders = check_orders(&declared, &orders)?;
             let marks = check_marks(&declared, &marks)?;
+            let history = check_history(&declared, &history)?;
             let inner = db.migrate_existing_table(
                 existing, &col_specs, pk.as_deref(), &relations,
             )?;
             sync_orders(&db.eng, &inner, &orders)?;
             sync_marks(&db.eng, &inner, &marks)?;
+            add_history(&db.eng, &inner, &history)?;
             drop(inner);
             return built_handle(db, &name);
         }
@@ -1790,6 +1815,7 @@ impl<'a> TableBuilder<'a> {
         // 並びの索引の検査 (engine に何か作る前に)
         let orders = check_orders(&declared, &orders)?;
         let marks = check_marks(&declared, &marks)?;
+        let history = check_history(&declared, &history)?;
 
         // 0.8.7: schema_meta_entity の eager 予約は撤去 (= `.schema` sidecar に
         // 移行したので anonymous entity を確保する必要が無くなった)。
@@ -1896,6 +1922,7 @@ impl<'a> TableBuilder<'a> {
         // engine に table が残っていた (schema の blob だけ古い) 時は、 engine が戻した並びもここで宣言に合わせる
         sync_orders(&db.eng, &inner, &orders)?;
         sync_marks(&db.eng, &inner, &marks)?;
+        add_history(&db.eng, &inner, &history)?;
         db.tables.push(inner.clone());
         // 0.8.2: build phase 中の persist_schema は finish_* に coalesce
         // (= 1 build = 1 fsync ≒ 47ms の linear scaling を解消、 issue #19)。
@@ -2011,6 +2038,34 @@ fn sync_marks(eng: &Engine, t: &TableInner, marks: &[String]) -> Result<(), Sche
             eng.declare_marks(&c.himo_name).map_err(SchemaError::BadValue)?;
         } else if !wanted && has {
             eng.drop_marks(&c.himo_name).map_err(SchemaError::Internal)?;
+        }
+    }
+    Ok(())
+}
+
+/// `history` (列の名前) を検査する: 列があること、 Leaf でないこと、 同じ列を 2 度書かないこと。
+fn check_history(cols: &[(String, ColumnType)], history: &[String]) -> Result<Vec<String>, SchemaError> {
+    let mut out: Vec<String> = Vec::with_capacity(history.len());
+    for m in history {
+        let Some((name, ty)) = cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(m)) else {
+            return Err(SchemaError::BadValue(format!("history on {m:?}: no such column")));
+        };
+        if *ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue(format!("history on {m:?}: a Leaf column does not take history")));
+        }
+        if out.iter().any(|o| o == name) {
+            return Err(SchemaError::BadValue(format!("history: column {m:?} written twice")));
+        }
+        out.push(name.clone());
+    }
+    Ok(out)
+}
+
+/// 表 `t` の、 検査済みの宣言 `history` の列に履歴を足す (足すだけ。 外すのは engine の `drop_history`)。
+fn add_history(eng: &Engine, t: &TableInner, history: &[String]) -> Result<(), SchemaError> {
+    for c in &t.cols {
+        if history.iter().any(|m| m.eq_ignore_ascii_case(&c.name)) {
+            eng.declare_history(&c.himo_name).map_err(SchemaError::BadValue)?;
         }
     }
     Ok(())

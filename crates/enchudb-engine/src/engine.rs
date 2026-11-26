@@ -1120,8 +1120,40 @@ fn serialize_tables_with(
 type OrderDecl = (u16, u16, Vec<u64>);
 /// 宣言された答え 1 つ: (名前, 形)。
 type AnswerDecl = (String, crate::live::AnswerSpec);
-/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐, 宣言された答え)。
-type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>, Vec<AnswerDecl>);
+/// 履歴の宣言 1 つ: (紐, 地平 = 宣言の時刻 (`crate::history::pack`))。
+pub(crate) type HistDecl = (u16, u64);
+/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐, 宣言された答え, 履歴の宣言)。
+type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>, Vec<AnswerDecl>, Vec<HistDecl>);
+
+/// 履歴の宣言 ([`Engine::declare_history`]、 スピン 案 W の試作)。 ANS1 の後ろ (= 書いた物の末尾)。 宣言が無ければ書かない。
+///   his_magic: "HIS1" (4)
+///   his_count: u32
+///   [(himo: u32, horizon: u64)] × his_count
+fn serialize_history_decls(decls: &[HistDecl], out: &mut Vec<u8>) {
+    if decls.is_empty() {
+        return;
+    }
+    out.extend_from_slice(b"HIS1");
+    out.extend_from_slice(&(decls.len() as u32).to_le_bytes());
+    for (h, horizon) in decls {
+        out.extend_from_slice(&u32::from(*h).to_le_bytes());
+        out.extend_from_slice(&horizon.to_le_bytes());
+    }
+}
+
+/// `HIS1` block の中身 (magic の後ろ) を読む。 途中で切れている / 番号が紐の id に入らないなら None。
+fn deserialize_history_decls(buf: &[u8]) -> Option<(Vec<HistDecl>, usize)> {
+    let count = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
+    let mut off = 4usize;
+    let mut out = Vec::with_capacity(count.min(buf.len() / 12));
+    for _ in 0..count {
+        let h = u16::try_from(u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?)).ok()?;
+        let horizon = u64::from_le_bytes(buf.get(off + 4..off + 12)?.try_into().ok()?);
+        off += 12;
+        out.push((h, horizon));
+    }
+    Some((out, off))
+}
 
 /// `ANS1` block の中身 (magic の後ろ) を読む: (宣言, 読んだ byte 数)。 途中で切れている / 名前が UTF-8 でない / 形が
 /// 読めない (`AnswerSpec::decode`) なら None。
@@ -1263,6 +1295,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
     let mut orders = Vec::new();
     let mut marks: Vec<u16> = Vec::new();
     let mut answers: Vec<AnswerDecl> = Vec::new();
+    let mut hist: Vec<HistDecl> = Vec::new();
     while off + 8 <= buf.len() {
         let magic = &buf[off..off + 4];
         if magic == b"PKS1" {
@@ -1350,11 +1383,23 @@ fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
                     break;
                 }
             }
+        } else if magic == b"HIS1" {
+            // 履歴の宣言。 壊れていたら宣言なしとして読む (履歴の file は残るが、 開かない)
+            match deserialize_history_decls(&buf[off + 4..]) {
+                Some((decls, used)) => {
+                    hist = decls;
+                    off += 4 + used;
+                }
+                None => {
+                    eprintln!("warning: tables sidecar: broken history declarations (HIS1), ignored");
+                    break;
+                }
+            }
         } else {
             break;
         }
     }
-    Ok((tables, orders, marks, answers))
+    Ok((tables, orders, marks, answers, hist))
 }
 
 /// 0.8.15 (issue #52): persist 失敗で残った `.tables.tmp` を open 時に明示削除。
@@ -1578,6 +1623,10 @@ impl RowHids {
         if self.heap.is_empty() { &self.inline[..self.len] } else { &self.heap }
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "engine_history.rs"]
+mod engine_history;
 
 #[cfg(test)]
 mod row_hids_tests {
@@ -2903,6 +2952,8 @@ pub mod write_out_hook {
         DeleteGateLeft,
         /// 0.37: `body_msync` が本体を書き出し終えた後 (書き出しが届かせた bridge の位置を置く前)
         WrittenOut,
+        /// スピン 案 W の試作: 本体の書き出しの最後、 tomb.seg の後・履歴の置き場 (`hist/`) を書き出す前
+        BeforeHistory,
         /// #731: v15 に移る時、 `gen.seg` を書き出した後 (header に場所の bit と version 15 を書く前)
         GenerationsBeforeHeader,
         /// #731: 本体の書き出しで、 生きている印 (entities) を書き出した後、 場所の世代 (`gen.seg`) を書き出す前 (#978: sync する DB では
@@ -16033,6 +16084,8 @@ pub struct Engine {
     live: std::sync::Arc<crate::live::LiveRegistry>,
     /// 宣言された答え (`declare_answer`): 名前・形・engine が持つ購読。 形は `{db}/tables` の `ANS1` に保存する。
     answers: std::sync::Mutex<Vec<AnswerEntry>>,
+    /// 履歴を宣言した列 (`declare_history`、 スピン 案 W の試作)。 宣言の無い engine は atomic 1 回で抜ける
+    hist: crate::history::Histories,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
     row_locks: crate::row_lock::RowLocks,
     /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しがその列を msync する間だけ
@@ -16678,6 +16731,7 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new_with(0, generations.clone())),
             answers: std::sync::Mutex::new(Vec::new()),
+            hist: crate::history::Histories::default(),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             delete_gate: crate::delete_gate::DeleteGate::new(),
@@ -17015,6 +17069,8 @@ impl Engine {
         let eng = eng.relog_before_standalone_session(path, wal_len)?;
         // #976 の読み直し 2 [B2]: WAL を再生しない open は、 記録から戻した所で前の住人の後始末が揃う (`prev.seg` の周期を進め始める)
         eng.finish_open_restores();
+        // スピン 案 W の試作: 再生の後に履歴の集まりを cell と揃える (この後の書き出しが届かせる)
+        eng.settle_history_at_open();
         Ok(eng)
     }
 
@@ -17307,7 +17363,7 @@ impl Engine {
         // から再合成できるので、 sidecar 破損で全 DB が unreadable になる失敗
         // モードを避ける。
         match load_tables_from_sidecar(path) {
-            Ok(Some((persisted, orders, marks, answers))) => {
+            Ok(Some((persisted, orders, marks, answers, hist))) => {
                 eng.adopt_persisted_tables(persisted);
                 // 並びの索引の宣言を戻す (table 定義の後: ref の先の表の eid の始まりを使う)。 作るのは最初に読む時
                 // (WAL の replay や Leaf の修理の後)。 作る前の書き込みは何もしないので、 replay は遅くならない
@@ -17317,6 +17373,8 @@ impl Engine {
                 // 宣言された答え: 購読の route をここで張る (WAL の再生より前 = 再生で書かれる行も購読が追う)。 種 (表の走査)
                 // は最初の poll が作るので、 開くのも再生も遅くならない
                 eng.restore_answers(answers);
+                // 履歴の宣言: 列の file を開く (きれいに閉じなかった後は、 WAL の再生の前に鎖を繋ぎ直す)
+                eng.restore_history(hist, readonly);
             }
             Ok(None) => {} // 不在: 新規 DB or v4 legacy
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -18427,6 +18485,7 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new_with(0, generations.clone())),
             answers: std::sync::Mutex::new(Vec::new()),
+            hist: crate::history::Histories::default(),
             row_locks: crate::row_lock::RowLocks::new(),
             publish_gate: crate::publish_gate::PublishGate::new(),
             delete_gate: crate::delete_gate::DeleteGate::new(),
@@ -18688,6 +18747,11 @@ impl Engine {
     /// 書けない (この build phase の残り・`open_standalone`・`concurrentize` (WAL なし)・`from_bytes` / wasm の書き込みは
     /// `FaultKind::NoWal` で断る)。 版数の無い初期の行が要るなら、 有効にする前に書く。
     pub fn enable_sync_tables(&mut self) -> Result<(), String> {
+        // スピン 案 W の試作: 履歴を宣言した DB は sync しない (次の切れ)
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.hist.any() {
+            return Err("enable_sync_tables: the DB has history columns (declare_history), which do not sync yet".into());
+        }
         self.check_writable();
 
         // _sync_ops: 未配送 op の tail。 1 row = 1 oplog record、 metadata は
@@ -23087,7 +23151,7 @@ impl Engine {
             let _row = self.row_locks.write(local);
             for hid in 0..self.himos.len() {
                 if self.himos[hid].get_value(local).is_some() {
-                    self.remove_cell_freeing_leaf(local, hid);
+                    self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
                 }
             }
         }
@@ -23970,6 +24034,9 @@ impl Engine {
             &self.answer_decls_raw(),
             pending,
         );
+        // 履歴の宣言 (`HIS1`) は ANS1 の後ろ (宣言が無ければ書かない)
+        let mut bytes = bytes;
+        serialize_history_decls(&self.hist_decls_raw(), &mut bytes);
         let mut last = self.tables_persisted.lock().unwrap_or_else(|p| p.into_inner());
         if last.as_deref() != Some(bytes.as_slice()) {
             use std::sync::atomic::Ordering;
@@ -24447,7 +24514,7 @@ impl Engine {
             // 行を握って消す (#349、 `read_row` に消している途中の行を見せない)。
             let _row = self.row_locks.write(local);
             for hid in 0..self.himos.len() {
-                self.remove_cell_freeing_leaf(local, hid);
+                self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
             }
             self.live_free(local, None);
             cleared += 1;
@@ -24654,7 +24721,7 @@ impl Engine {
             let _pass = gated.then(|| self.delete_gate.enter(d));
             for hid in 0..self.himos.len() {
                 if self.himos[hid].get_value(d).is_some() && self.version_of(d, hid as u16) <= tomb {
-                    self.remove_cell_freeing_leaf(d, hid);
+                    self.remove_cell_freeing_leaf(d, hid, enchudb_oplog::Hlc::ZERO, true);
                 }
             }
         }
@@ -26186,7 +26253,10 @@ impl Engine {
     /// #381: 回収する辞書の Tag の列なら、 新しい値の参照を取って古い値の参照を返す。 新しい値の番号が古い (回収された)
     /// なら書かずに `StaleValue` を計上して false。
     #[inline]
-    fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>) -> bool {
+    ///
+    /// 履歴 (`declare_history`) を宣言した列なら、 書けた後に `hlc` (この書き込みの WAL の時刻、 分からなければ `ZERO`) で
+    /// identity の集まりに 1 件足す (行の lock の下)。
+    fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>, hlc: enchudb_oplog::Hlc) -> bool {
         let value = value.into();
         let tracked = self.vocab_tracks(hid);
         let old = if tracked { self.himos[hid].get_value32(local) } else { None };
@@ -26204,6 +26274,9 @@ impl Engine {
             self.himos[hid].set(local, value)
         };
         if ok {
+            if let Some(h) = self.hist.get(hid) {
+                self.hist_note(h, local, Some(value), hlc, false);
+            }
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
             self.order_note(hid as u16, local);
             self.live.touch(hid as u16, local);
@@ -26500,13 +26573,18 @@ impl Engine {
 
     /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
     #[inline]
-    fn live_remove(&self, hid: usize, local: u32) {
+    ///
+    /// 履歴を宣言した列なら `hlc` で 「値が無くなった」 を足す (`deleting` = 行の削除で外した)。
+    fn live_remove(&self, hid: usize, local: u32, hlc: enchudb_oplog::Hlc, deleting: bool) {
         let old = if self.vocab_tracks(hid) {
             self.himos[hid].get_value32(local)
         } else {
             None
         };
         self.himos[hid].remove(local);
+        if let Some(h) = self.hist.get(hid) {
+            self.hist_note(h, local, None, hlc, deleting);
+        }
         self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);
         if let Some(o) = old {
@@ -26663,7 +26741,7 @@ impl Engine {
         let renamed_from = self.pk_rename_from(local, himo_id, value).map(|old| (old, self.version_of(local, himo_id)));
         // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
         // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
-        if !self.live_set(himo_id as usize, local, value) {
+        if !self.live_set(himo_id as usize, local, value, hlc) {
             self.record_fault(FaultKind::DiskSpace, "列を伸ばすディスクの空きが無い — cell も版数も書かない");
             return false;
         }
@@ -26982,7 +27060,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local).is_some()) {
             return false;
         }
-        self.live_remove(himo_id as usize, local);
+        self.live_remove(himo_id as usize, local, hlc, false);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -27004,7 +27082,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc, || self.himos[himo_id as usize].get_value(local).is_some()) {
             return false;
         }
-        self.remove_cell_freeing_leaf(local, himo_id as usize);
+        self.remove_cell_freeing_leaf(local, himo_id as usize, hlc, false);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -28734,7 +28812,7 @@ impl Engine {
                 survivor = true;
                 return;
             }
-            self.remove_cell_freeing_leaf(local, hid);
+            self.remove_cell_freeing_leaf(local, hid, hlc, true);
         };
         match valued {
             Some(v) => v.iter().for_each(|&h| each(h as usize)),
@@ -30066,7 +30144,7 @@ impl Engine {
         for hid in hids {
             let hid = hid as usize;
             if hid < self.himos.len() && self.himos[hid].get_value(slot).is_some() {
-                self.remove_cell_freeing_leaf(slot, hid);
+                self.remove_cell_freeing_leaf(slot, hid, enchudb_oplog::Hlc::ZERO, true);
             }
         }
     }
@@ -30993,9 +31071,11 @@ impl Engine {
     /// #343: **列を消してから**返す。 返してから消すと、 その間に別の行の書き込みが同じ長さの slot を
     /// best-fit で再利用し、 lock 無しの読み手が 「旧 offset → 別の行の値で gen が揃った slot → 列はまだ旧
     /// offset」 と確定して、 別の行の値を返した (#119 の書き換えと同じ順)。
-    fn remove_cell_freeing_leaf(&self, local: u32, hid: usize) {
+    ///
+    /// `hlc` / `deleting` は履歴に渡す (`live_remove`)。 時刻を運べない道 (開く時の後始末・sync の畳み) は `ZERO`。
+    fn remove_cell_freeing_leaf(&self, local: u32, hid: usize, hlc: enchudb_oplog::Hlc, deleting: bool) {
         let old = self.take_leaf_cell(local, hid);
-        self.live_remove(hid, local);
+        self.live_remove(hid, local, hlc, deleting);
         self.free_leaf_offset(hid, old);
     }
 
@@ -31710,7 +31790,7 @@ impl Engine {
                 if want.is_none() && !has_value && self.version_of(local, h) == enchudb_oplog::Hlc::ZERO {
                     continue;
                 }
-                self.remove_cell_freeing_leaf(local, hid);
+                self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
                 self.reset_cell_version(local, h);
             }
         }
@@ -31895,7 +31975,7 @@ impl Engine {
                         continue;
                     }
                     if has {
-                        self.remove_cell_freeing_leaf(local, hid);
+                        self.remove_cell_freeing_leaf(local, hid, enchudb_oplog::Hlc::ZERO, true);
                     }
                     if dead || want.is_some() {
                         self.reset_cell_version(local, h);
@@ -32543,7 +32623,7 @@ impl Engine {
                 );
                 return;
             }
-            self.live_set(hid, eid, off);
+            self.live_set(hid, eid, off, enchudb_oplog::Hlc::ZERO);
             if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
             return;
         }
@@ -32568,7 +32648,7 @@ impl Engine {
                 return;
             }
         };
-        self.live_set(hid, eid, vid);
+        self.live_set(hid, eid, vid, enchudb_oplog::Hlc::ZERO);
         self.vocab_unpin(hid, vid);
     }
 
@@ -32613,7 +32693,7 @@ impl Engine {
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: Ref himo は target_table の eid range を validate (Ref の列は u32)
         self.validate_ref_tie(hid, value as u32);
-        self.live_set(hid, eid, value);
+        self.live_set(hid, eid, value, enchudb_oplog::Hlc::ZERO);
     }
 
     pub fn tie_ref(&mut self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
@@ -32663,7 +32743,7 @@ impl Engine {
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(hid, target_eid);
-        self.live_set(hid, eid, target_eid);
+        self.live_set(hid, eid, target_eid, enchudb_oplog::Hlc::ZERO);
     }
 
     /// #59: sentinel (`u32::MAX`) は cell に入らない。 panic せず write を拒否 + 計上して
@@ -32938,6 +33018,10 @@ impl Engine {
     /// WAL 付きの session、 sync の表の無い DB。 開く時の修復・WAL の再生・相手から受けた書き込み (版数を持つ) は、 この入口を通らない。
     #[inline]
     fn refuses_walless_sync_write(&self, local: u32) -> bool {
+        // スピン 案 W の試作: 履歴を宣言した列を持つ表の行も、 WAL の無い session では書かない (時刻が付かない)
+        if self.refuses_walless_history_write(local) {
+            return true;
+        }
         if self.oplog.is_some() || !self.sync_tables_on() || self.tables.iter().any(|t| t.is_reserved() && t.contains(local)) {
             return false;
         }
@@ -37546,6 +37630,8 @@ impl Engine {
                 // 読み直し 2 [B1] / [B2] / [R2]: 再生が生かした場所の使い回しが外した別名を外し、 版数の索引を捨て、 `prev.seg` の周期を
                 // 進め始める
                 eng.finish_open_restores();
+                // スピン 案 W の試作: 再生の後に履歴の集まりを cell と揃える (この後の書き出しが届かせる)
+                eng.settle_history_at_open();
                 // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
@@ -37585,6 +37671,8 @@ impl Engine {
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();
                 eng.finish_open_restores();
+                // スピン 案 W の試作: 再生の後に履歴の集まりを cell と揃える (この後の書き出しが届かせる)
+                eng.settle_history_at_open();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
                 // #992: 仕上げた場所があれば書き出して後始末待ちを落とす
@@ -38751,6 +38839,8 @@ impl Engine {
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();
                 eng.finish_open_restores();
+                // スピン 案 W の試作: 再生の後に履歴の集まりを cell と揃える (この後の書き出しが届かせる)
+                eng.settle_history_at_open();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
                 let wal_untouched = Self::wal_untouched_by_open(records.is_empty(), dropped, relogged);
@@ -38773,6 +38863,8 @@ impl Engine {
                 eng.finish_reconcile(Some(&w));
                 eng.finish_prev_restores();
                 eng.finish_open_restores();
+                // スピン 案 W の試作: 再生の後に履歴の集まりを cell と揃える (この後の書き出しが届かせる)
+                eng.settle_history_at_open();
                 let relogged = eng.relog_unlogged_writes(&w);
                 eng.generations().forget_relog_gens();
                 // #992: 仕上げた場所があれば書き出して後始末待ちを落とす
@@ -40253,6 +40345,10 @@ impl Engine {
         }
         // tomb.seg (列の段の後に置いた tombstone と、 使い回しが 0 にした所)
         self.write_out_tombs(set, all, true)?;
+        // 履歴の置き場 (スピン 案 W の試作)。 列の後 (電源断の後の食い違いは開く時の突き合わせが揃える)
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::BeforeHistory);
+        self.write_out_history(all || catch_up)?;
         if all {
             self.columns_settled.store(true, Ordering::Release);
         }
@@ -41650,7 +41746,7 @@ mod persisted_next_local_tests {
         // sidecar を読み直しても同じ値
         ring.next_local.store(1, std::sync::atomic::Ordering::Release);
         t.next_local.store(42, std::sync::atomic::Ordering::Release);
-        let (tables, _, _, _) = deserialize_tables(&serialize_tables(&eng.tables, &[], &[], &[])).unwrap();
+        let (tables, _, _, _, _) = deserialize_tables(&serialize_tables(&eng.tables, &[], &[], &[])).unwrap();
         let read = |name: &str| tables.iter().find(|t| t.name == name).unwrap().next_local.load(std::sync::atomic::Ordering::Acquire);
         assert_eq!(read("_sync_ops"), capacity);
         assert_eq!(read("t"), 42);
@@ -48343,8 +48439,8 @@ mod order_decl_sidecar_tests {
         assert_eq!(decls.len(), 1);
         let with = serialize_tables(&eng.tables, &decls, &[], &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"DIA1", "DIA1 は一番後ろに足す");
-        let (t0, o0, _, _) = deserialize_tables(&without).unwrap();
-        let (t1, o1, _, _) = deserialize_tables(&with).unwrap();
+        let (t0, o0, _, _, _) = deserialize_tables(&without).unwrap();
+        let (t1, o1, _, _, _) = deserialize_tables(&with).unwrap();
         assert!(o0.is_empty());
         assert_eq!(o1, decls);
         assert_eq!(shape(&t0), shape(&eng.tables), "前提: 読み戻した形が元と同じ");
@@ -48352,12 +48448,12 @@ mod order_decl_sidecar_tests {
         // 古い binary の読み方 = DIA1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         old[without.len()..without.len() + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2, _, _) = deserialize_tables(&old).unwrap();
+        let (t2, o2, _, _, _) = deserialize_tables(&old).unwrap();
         assert!(o2.is_empty());
         assert_eq!(shape(&t2), shape(&t0), "古い binary に見える table / PK / extent が変わった");
         // 途中で切れた DIA1 は宣言なし (table は有効)
         for cut in [1, 4, 9, 12] {
-            let (t3, o3, _, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            let (t3, o3, _, _, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
             assert!(o3.is_empty(), "cut {cut}");
             assert_eq!(shape(&t3), shape(&t0), "cut {cut}");
         }
@@ -48437,16 +48533,16 @@ mod marks_decl_sidecar_tests {
         assert!(!without.windows(4).any(|w| w == b"MRK1"), "宣言が無ければ MRK1 を書かない");
         let with = serialize_tables(&eng.tables, &orders, &[age], &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"MRK1", "MRK1 は DIA1 の後ろに足す");
-        let (t, o, m, _) = deserialize_tables(&with).unwrap();
+        let (t, o, m, _, _) = deserialize_tables(&with).unwrap();
         assert_eq!((t.len(), o, m), (eng.tables.len(), orders.clone(), vec![age]));
         // 古い binary の読み方 = MRK1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         let at = without.len();
         old[at..at + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2, m2, _) = deserialize_tables(&old).unwrap();
+        let (t2, o2, m2, _, _) = deserialize_tables(&old).unwrap();
         assert_eq!((t2.len(), o2, m2), (eng.tables.len(), orders.clone(), vec![]));
         // 途中で切れた MRK1 は宣言なし (table と並びは有効)
-        let (t3, o3, m3, _) = deserialize_tables(&with[..with.len() - 2]).unwrap();
+        let (t3, o3, m3, _, _) = deserialize_tables(&with[..with.len() - 2]).unwrap();
         assert_eq!((t3.len(), o3, m3), (eng.tables.len(), orders, vec![]));
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
@@ -48473,12 +48569,12 @@ mod marks_decl_sidecar_tests {
         assert!(!eng.declare_marks("u.age").unwrap(), "組む前の宣言は次に組む時から (今は効いていない)");
         assert!(!eng.declare_marks("u.age").unwrap(), "2 度目は何もしない");
         eng.persist_tables().unwrap();
-        let (_, _, m, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, m, _, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert_eq!(m, vec![eng.himo_id("u.age").unwrap() as u16], "宣言は sidecar に書く");
         assert!(eng.drop_marks("u.age").unwrap());
         assert!(!eng.drop_marks("u.age").unwrap());
         eng.persist_tables().unwrap();
-        let (_, _, m, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, m, _, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert!(m.is_empty(), "外すと sidecar からも消える");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
@@ -48554,17 +48650,17 @@ mod answer_decl_sidecar_tests {
         assert!(!without.windows(4).any(|w| w == b"ANS1"), "宣言が無ければ ANS1 を書かない");
         let with = serialize_tables(&eng.tables, &orders, &[age], &answers);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"ANS1", "ANS1 は MRK1 の後ろに足す");
-        let (t, o, m, a) = deserialize_tables(&with).unwrap();
+        let (t, o, m, a, _) = deserialize_tables(&with).unwrap();
         assert_eq!((t.len(), o, m, a), (eng.tables.len(), orders.clone(), vec![age], answers.clone()));
         // 古い binary の読み方 = ANS1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         let at = without.len();
         old[at..at + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2, m2, a2) = deserialize_tables(&old).unwrap();
+        let (t2, o2, m2, a2, _) = deserialize_tables(&old).unwrap();
         assert_eq!((t2.len(), o2, m2, a2), (eng.tables.len(), orders.clone(), vec![age], vec![]));
         // 途中で切れた ANS1 は宣言なし (table / 並び / 印は有効)
         for cut in [1usize, 7, 20, with.len() - at - 5] {
-            let (t3, o3, m3, a3) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            let (t3, o3, m3, a3, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
             assert_eq!((t3.len(), o3, m3, a3), (eng.tables.len(), orders.clone(), vec![age], vec![]), "cut {cut}");
         }
         drop(eng);
@@ -48606,20 +48702,20 @@ mod answer_decl_sidecar_tests {
         assert_eq!(a.id(), b.id(), "同じ形は同じ購読");
         assert_eq!(eng.answer("adults").map(|x| x.id()), Some(a.id()));
         eng.persist_tables().unwrap();
-        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, _, stored, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert_eq!(stored, vec![("adults".to_string(), first)], "宣言は sidecar に書く");
         let second = AnswerSpec::Set { preds: vec![LivePred::Range { himo_id: age, lo: 65, hi: u64::MAX }] };
         let c = eng.declare_answer("adults", second.clone()).unwrap();
         assert_ne!(c.id(), a.id(), "違う形は置き換え");
         assert_eq!(eng.answer_spec("adults"), Some(second.clone()));
         eng.persist_tables().unwrap();
-        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, _, stored, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert_eq!(stored, vec![("adults".to_string(), second)]);
         assert!(eng.drop_answer("adults"));
         assert!(!eng.drop_answer("adults"));
         assert!(eng.answer("adults").is_none());
         eng.persist_tables().unwrap();
-        let (_, _, _, stored) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        let (_, _, _, stored, _) = load_tables_from_sidecar(&path).unwrap().unwrap();
         assert!(stored.is_empty(), "外すと sidecar からも消える");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
