@@ -445,6 +445,7 @@ impl HistCol {
     pub fn note(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32) -> io::Result<bool> {
         let v = value.unwrap_or(ABSENT);
         let head = self.head(slot);
+        let mut disordered = false;
         let latest = self.latest_of(slot, eid);
         let (prev, depth, jump, mut flags) = match latest {
             Some((li, le)) => {
@@ -455,7 +456,13 @@ impl HistCol {
                     if fl.is_some_and(|(_, f)| f.time == time && f.flags & flag::OBSERVED == 0) {
                         return Ok(false);
                     }
-                    self.disordered.store(true, Ordering::Release);
+                    // 時刻の戻る entry (再生が、 後の entry まで届いた像に前の書き込みを当て直す): その時刻の前の値と同じなら変更
+                    // ではない (書いた時も足さなかった)
+                    let before = fl.map_or(ABSENT, |(_, f)| f.value);
+                    if before == v && extra & flag::BASE == 0 {
+                        return Ok(false);
+                    }
+                    disordered = true;
                 }
                 if le.value == v && extra & flag::BASE == 0 && time >= le.time {
                     return Ok(false); // 値が変わらない (書き直し) は変更ではない
@@ -464,8 +471,8 @@ impl HistCol {
                 let jj = j.and_then(|(ji, _)| self.at(ji)).and_then(|(_, je)| self.at(je.jump)).map(|(i, e)| (i + 1, e.depth));
                 let jump = if le.depth == 0 { li + 1 } else { skew_jump(li + 1, le.depth, j, jj) };
                 if head != li + 1 {
-                    // 前の住人の entry (今の住人の後ろ): 鎖の頭にはできない。 開く道の終わりに繋ぎ直す
-                    self.disordered.store(true, Ordering::Release);
+                    // 前の住人の entry (今の住人の後ろ): 鎖の頭にはできない。 足した後にその場所を繋ぎ直す
+                    disordered = true;
                 }
                 (li + 1, le.depth + 1, jump, 0)
             }
@@ -479,10 +486,15 @@ impl HistCol {
         flags |= flag::VALID | extra;
         let idx = self.alloc()?;
         self.write(idx, &Entry { flags, depth, eid, prev, jump, time, value: v });
+        self.clock.fetch_max(time, Ordering::AcqRel);
+        if disordered {
+            // 時刻の戻る entry / 前の住人の entry: 鎖を時刻の順に繋ぎ直す (差分の並びも捨てる。 次に見た時に作り直す)
+            self.relink_slot(slot, idx)?;
+            return Ok(true);
+        }
         if latest.is_none() || latest.is_some_and(|(li, _)| head == li + 1) {
             self.set_head(slot, idx + 1)?;
         }
-        self.clock.fetch_max(time, Ordering::AcqRel);
         // 見た値の差分の並びに足す (書いた entry が見えた後で見る。 作る側は 「見た」 を立ててから entry をなめる)
         std::sync::atomic::fence(Ordering::SeqCst);
         if self.observed.load(Ordering::SeqCst) {
@@ -626,6 +638,21 @@ impl HistCol {
         self.entries.flush_pending() || self.heads.flush_pending()
     }
 
+    /// 開く時の突き合わせが使う: 場所 `slot` の住人 (新しい順) の (eid, 最新の値, 最新の時刻, 最初の時刻)。
+    pub fn residents(&self, slot: u32) -> Vec<(u32, Option<u64>, u64, u64)> {
+        let mut out = Vec::new();
+        let mut cur = self.at(self.head(slot));
+        while let Some((idx, e)) = cur {
+            let (_, first) = self.first_of(idx, e);
+            out.push((e.eid, (e.value != ABSENT).then_some(e.value), e.time, first.time));
+            cur = self.at(first.jump);
+            if out.len() > 1 << 20 {
+                break;
+            }
+        }
+        out
+    }
+
     /// 開く時の突き合わせが使う: 場所 `slot` の identity `eid` の最新の entry の (値, 時刻)。
     pub fn latest_value(&self, slot: u32, eid: u32) -> Option<(Option<u64>, u64)> {
         self.latest_of(slot, eid).map(|(_, e)| ((e.value != ABSENT).then_some(e.value), e.time))
@@ -694,13 +721,7 @@ impl HistCol {
             }
             all.push((slot_of(e.eid), e.eid, e.time, idx));
         }
-        // 場所ごと → identity ごと (最初の時刻の順) → 時刻の順
-        let mut first_time: HashMap<u32, u64> = HashMap::new();
-        for &(_, eid, t, _) in &all {
-            let f = first_time.entry(eid).or_insert(t);
-            *f = (*f).min(t);
-        }
-        all.sort_unstable_by_key(|&(s, eid, t, idx)| (s, first_time[&eid], eid, t, idx));
+        all.sort_unstable_by_key(|&(s, _, _, idx)| (s, idx));
         // heads を空にしてから置く
         let head_slots = (self.heads.committed().saturating_sub(HEADER)) / 4;
         for s in 0..head_slots as u32 {
@@ -708,64 +729,126 @@ impl HistCol {
                 self.set_head(s, NONE)?;
             }
         }
-        let mut i = 0;
         let mut rewritten = 0;
-        while i < all.len() {
-            let slot = all[i].0;
-            let mut resident_last = NONE;
-            while i < all.len() && all[i].0 == slot {
-                let eid = all[i].1;
-                // この identity の鎖: 深さ = 並びの位置。 糸 (位置 + 1) → (深さ, 飛び糸) を引く表
-                let mut chain: Vec<u32> = Vec::new(); // 深さ → 位置
-                let mut info: HashMap<u32, (u32, u32)> = HashMap::new(); // 糸 → (深さ, 飛び糸)
-                let mut last_time: Option<u64> = None;
-                while i < all.len() && all[i].0 == slot && all[i].1 == eid {
-                    let (_, _, t, idx) = all[i];
-                    i += 1;
-                    if last_time == Some(t) {
-                        self.mark_void(idx); // 同じ時刻 = 同じ書き込み
-                        continue;
-                    }
-                    last_time = Some(t);
-                    let mut e = self.valid(idx).expect("拾った entry");
-                    let depth = chain.len() as u32;
-                    let (prev, jump) = match chain.last() {
-                        None => (NONE, resident_last),
-                        Some(&pi) => {
-                            let (pd, pj) = info[&(pi + 1)];
-                            let j = (pd > 0).then(|| (pj, info[&pj].0));
-                            let jj = j.and_then(|(ji, jd)| (jd > 0).then(|| info[&ji].1)).map(|jj| (jj, info[&jj].0));
-                            (pi + 1, if pd == 0 { pi + 1 } else { skew_jump(pi + 1, pd, j, jj) })
-                        }
-                    };
-                    e.flags = (e.flags & !flag::FIRST) | if depth == 0 { flag::FIRST } else { 0 };
-                    e.depth = depth;
-                    e.prev = prev;
-                    e.jump = jump;
-                    self.write(idx, &e);
-                    chain.push(idx);
-                    info.insert(idx + 1, (depth, jump));
-                    rewritten += 1;
-                }
-                if let Some(&li) = chain.last() {
-                    resident_last = li + 1;
-                }
-            }
-            if resident_last != NONE {
-                self.set_head(slot, resident_last)?;
-            }
+        let mut clock = self.horizon;
+        for group in all.chunk_by(|a, b| a.0 == b.0) {
+            let mut items: Vec<(u32, u64, u32)> = group.iter().map(|&(_, eid, t, idx)| (eid, t, idx)).collect();
+            clock = items.iter().fold(clock, |c, x| c.max(x.1));
+            rewritten += self.link_slot(group[0].0, &mut items)?;
         }
         self.len.store(top.max(self.len()), Ordering::Release);
-        let mut clock = self.horizon;
-        for &(_, _, t, _) in &all {
-            clock = clock.max(t);
-        }
         self.clock.fetch_max(clock, Ordering::AcqRel);
         self.disordered.store(false, Ordering::Release);
         self.voided.store(false, Ordering::Release);
+        self.forget_decks();
+        Ok(rewritten)
+    }
+
+    fn forget_decks(&self) {
         self.decks.write().unwrap_or_else(|p| p.into_inner()).clear();
         self.observed.store(false, Ordering::SeqCst);
+    }
+
+    /// 場所 `slot` の entry (`items`: (eid, 時刻, 位置)、 並びは問わない) で、 その場所の鎖と heads を作り直す: identity を最初の
+    /// 時刻の順に、 identity の中は時刻の順に並べ、 同じ時刻の entry は 1 つにする (残りは `VOID`)。 繋いだ entry の数。
+    fn link_slot(&self, slot: u32, items: &mut [(u32, u64, u32)]) -> io::Result<usize> {
+        let mut first_time: HashMap<u32, u64> = HashMap::new();
+        for &(eid, t, _) in items.iter() {
+            let f = first_time.entry(eid).or_insert(t);
+            *f = (*f).min(t);
+        }
+        items.sort_unstable_by_key(|&(eid, t, idx)| (first_time[&eid], eid, t, idx));
+        let mut rewritten = 0;
+        let mut resident_last = NONE;
+        let mut i = 0;
+        while i < items.len() {
+            let eid = items[i].0;
+            // この identity の鎖: 深さ = 並びの位置。 糸 (位置 + 1) → (深さ, 飛び糸) を引く表
+            let mut chain: Vec<u32> = Vec::new(); // 深さ → 位置
+            let mut info: HashMap<u32, (u32, u32)> = HashMap::new(); // 糸 → (深さ, 飛び糸)
+            let mut last_time: Option<u64> = None;
+            while i < items.len() && items[i].0 == eid {
+                let (_, t, idx) = items[i];
+                i += 1;
+                if last_time == Some(t) {
+                    self.mark_void(idx); // 同じ時刻 = 同じ書き込み
+                    continue;
+                }
+                last_time = Some(t);
+                let mut e = self.valid(idx).expect("拾った entry");
+                let depth = chain.len() as u32;
+                let (prev, jump) = match chain.last() {
+                    None => (NONE, resident_last),
+                    Some(&pi) => {
+                        let (pd, pj) = info[&(pi + 1)];
+                        let j = (pd > 0).then(|| (pj, info[&pj].0));
+                        let jj = j.and_then(|(ji, jd)| (jd > 0).then(|| info[&ji].1)).map(|jj| (jj, info[&jj].0));
+                        (pi + 1, if pd == 0 { pi + 1 } else { skew_jump(pi + 1, pd, j, jj) })
+                    }
+                };
+                e.flags = (e.flags & !flag::FIRST) | if depth == 0 { flag::FIRST } else { 0 };
+                e.depth = depth;
+                e.prev = prev;
+                e.jump = jump;
+                self.write(idx, &e);
+                chain.push(idx);
+                info.insert(idx + 1, (depth, jump));
+                rewritten += 1;
+            }
+            if let Some(&li) = chain.last() {
+                resident_last = li + 1;
+            }
+        }
+        if resident_last != NONE || self.head(slot) != NONE {
+            self.set_head(slot, resident_last)?;
+        }
         Ok(rewritten)
+    }
+
+    /// 場所 `slot` の鎖を、 鎖でたどれる entry と `also` (鎖から届かない、 今足した entry) から繋ぎ直す (時刻の戻る entry を足した
+    /// 時、 行の lock の下)。 その間の読み手は途中の糸を見うる (開く道の再生・突き合わせだけが通る。 試作の限り)。
+    fn relink_slot(&self, slot: u32, also: u32) -> io::Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        let mut items: Vec<(u32, u64, u32)> = Vec::new();
+        fn take(seen: &mut std::collections::HashSet<u32>, idx: u32, e: &Entry, items: &mut Vec<(u32, u64, u32)>) {
+            if seen.insert(idx) && e.flags & flag::VOID == 0 {
+                items.push((e.eid, e.time, idx));
+            }
+        }
+        if let Some(e) = self.valid(also) {
+            take(&mut seen, also, &e, &mut items);
+        }
+        let mut res = self.at(self.head(slot));
+        while let Some((idx, e)) = res {
+            // この住人の entry を prev でたどる (最初の entry の飛び糸 = 前の住人)
+            let (mut ci, mut ce) = (idx, e);
+            loop {
+                take(&mut seen, ci, &ce, &mut items);
+                match self.at(ce.prev) {
+                    Some((pi, pe)) if !seen.contains(&pi) => {
+                        ci = pi;
+                        ce = pe;
+                    }
+                    _ => break,
+                }
+            }
+            res = self.at(ce.jump).filter(|(ji, _)| !seen.contains(ji));
+        }
+        // 足した entry から届く前の entry も (前の住人へ足した entry の prev)
+        if let Some(mut e) = self.valid(also) {
+            while let Some((pi, pe)) = self.at(e.prev) {
+                if !seen.insert(pi) {
+                    break;
+                }
+                if pe.flags & flag::VOID == 0 {
+                    items.push((pe.eid, pe.time, pi));
+                }
+                e = pe;
+            }
+        }
+        self.link_slot(slot, &mut items)?;
+        self.forget_decks();
+        Ok(())
     }
 
     /// 全部の valid な entry の数 (VOID を除く) と、 時刻の分からない entry の数 (試験・測り用)。

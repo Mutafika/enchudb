@@ -12,6 +12,9 @@ use super::*;
 use crate::history::{self, flag, At, Change, HistCol, HistError};
 use enchudb_oplog::Hlc;
 
+/// 突き合わせの足す entry の時刻に立てる 「遅くとも」 の bit (時刻は 2^63 未満)。
+const OBSERVED_AT: u64 = 1 << 63;
+
 impl Engine {
     /// 書き手の道 (`live_set` / `live_remove`、 行の lock の下) から: 列 `h` の場所 `slot` の identity に 1 件足す。 `hlc` が `ZERO`
     /// (時刻を運べない道) なら 「遅くとも」 の印を付けて列の時計で置く。
@@ -32,6 +35,19 @@ impl Engine {
             extra |= flag::DELETE;
         }
         if h.note(slot, eid, value, time, extra).is_err() {
+            self.record_fault(FaultKind::DiskSpace, "history: cannot grow the history segment — the change is not in the history");
+        }
+    }
+
+    /// WAL の再生から: record の identity `eid` (世代 | 場所) の書き込みを、 cell が当てたかによらず足す (cell の版数が先に届いた像では
+    /// LWW が弾くが、 書き込みは在った)。 同じ時刻の entry は重複で落ちる。
+    pub(super) fn hist_replayed(&self, slot: u32, eid: u32, hid: usize, value: Option<u64>, hlc: Hlc, deleting: bool) {
+        let Some(h) = self.hist.get(hid) else { return };
+        if hlc == Hlc::ZERO {
+            return;
+        }
+        let _row = self.row_locks.write(slot);
+        if h.note(slot, eid, value, history::pack(hlc), if deleting { flag::DELETE } else { 0 }).is_err() {
             self.record_fault(FaultKind::DiskSpace, "history: cannot grow the history segment — the change is not in the history");
         }
     }
@@ -216,6 +232,16 @@ impl Engine {
             }
             let live = self.entities.is_live(slot);
             let eid = if live { self.generations().local(slot) } else { self.last_local_of_slot(slot) };
+            // 前の住人 (今 / 最後の行より前) は消えている: 最新に値が残っていれば削除の 「遅くとも」 を足す (削除の record が再生で
+            // 当たらない像: 場所の使い回しまで届いた本体に、 前の住人の削除の entry だけ届かなかった)。 時刻は次の住人の最初の時刻
+            let res = h.residents(slot);
+            for (i, &(r, v, last, _)) in res.iter().enumerate() {
+                if r == eid || v.is_none() {
+                    continue;
+                }
+                let next_first = i.checked_sub(1).map(|j| res[j].3).filter(|&nf| nf > last);
+                appends.push((slot, r, None, next_first.map(|nf| nf | OBSERVED_AT), true));
+            }
             let want = if live { self.himos[hid].get_value(slot) } else { None };
             let top = h.latest_value(slot, eid);
             match top {
@@ -256,6 +282,7 @@ impl Engine {
         }
         for (slot, eid, value, at, deleting) in appends {
             let (time, mut extra) = match at {
+                Some(x) if x & OBSERVED_AT != 0 => (x & !OBSERVED_AT, flag::OBSERVED),
                 Some(x) => (x, 0),
                 None => (h.tick(), flag::OBSERVED),
             };

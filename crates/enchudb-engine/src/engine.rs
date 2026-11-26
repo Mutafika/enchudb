@@ -28452,7 +28452,8 @@ impl Engine {
         // 削除優先 (ユーザの決め、 2026-10-21): 削除より新しい cell も消し、 行を死なせる (消した行の eid 宛ての書き込みは、 削除より
         // 新しくても捨てる。 受け取った書き込みは `slot_is_dead` で弾く)。 前は削除より新しい cell を残し (#514)、 名前の無い塊が
         // 生きた (#547)
-        self.remove_entity_body_of(local, enchudb_oplog::Hlc::ZERO, valued, gate);
+        // 履歴には削除の時刻 `hlc` を運ぶ (cell を落とす判定は削除優先で `ZERO`)
+        self.remove_entity_body_at(local, enchudb_oplog::Hlc::ZERO, hlc, valued, gate);
         // #720: 消えた行のカードは落とす (束ねた identity ごとの値は、 生きた行を切り離す時にだけ使う。 持ち続けると `pkformer` が
         // 消した行の Leaf の中身ごと残る)。 前の名前・束ねた identity・名前の年表は残す (消えた行にも束ねる / 削除の時刻を上げる)
         self.drop_cards_of_dead_slot(local);
@@ -28785,7 +28786,7 @@ impl Engine {
     /// 行を握って消す (#349): 他の cell の書き手と同じく、 `read_row` に消している途中の行を見せない。
     /// `apply_delete_local` から来た時は入れ子で素通り。
     fn remove_entity_body(&self, local: u32, hlc: enchudb_oplog::Hlc) {
-        self.remove_entity_body_of(local, hlc, None, true);
+        self.remove_entity_body_at(local, hlc, hlc, None, true);
     }
 
     /// [`Self::remove_entity_body`] の、 値のある紐の並び (`valued`、 行の lock の下で数えた物) を渡せる版。 None なら紐を全部なめる。
@@ -28798,7 +28799,16 @@ impl Engine {
     /// `gate` = false は門を通らない (engine の内部の表 `_sync_ops` の purge、 読み直し [3]: その行は WAL に載らないので再生で生き返らず、
     /// #451 も内部の表を見ない。 落とした cell だけ届いても、 ack の walk が行を消し直す。 purge は `_sync_ops` の空きの一覧の lock を
     /// 握ったまま消すので、 門で待つと bridge の行の払い出しまで止まる)。
-    fn remove_entity_body_of(&self, local: u32, hlc: enchudb_oplog::Hlc, valued: Option<&[u16]>, gate: bool) {
+    ///
+    /// `at` は履歴 (`declare_history`) に渡す削除の時刻 (`hlc` は残す cell の判定。 削除優先の道は `ZERO` を渡すので分ける)。
+    fn remove_entity_body_at(
+        &self,
+        local: u32,
+        hlc: enchudb_oplog::Hlc,
+        at: enchudb_oplog::Hlc,
+        valued: Option<&[u16]>,
+        gate: bool,
+    ) {
         let _row = self.row_locks.write(local);
         let gated = gate && self.tomb_col.is_some();
         let _settles = gated.then(|| LocalApply::deferring_settles(self));
@@ -28812,7 +28822,7 @@ impl Engine {
                 survivor = true;
                 return;
             }
-            self.remove_cell_freeing_leaf(local, hid, hlc, true);
+            self.remove_cell_freeing_leaf(local, hid, at, true);
         };
         match valued {
             Some(v) => v.iter().for_each(|&h| each(h as usize)),
@@ -38397,6 +38407,8 @@ impl Engine {
                     // #705: 版数が同じでも値が違えば当てる。 「版数が載っている = 値も本体に届いている」 は成り立たない
                     // (版数の列だけ先にディスクに届く像がある、 `accepts_write`)
                     self.set_cell_local(local, *himo_id, value, hlc);
+                    // 履歴: cell が LWW で弾いても (cell の版数だけ先に届いた像) 書き込みは在った。 同じ時刻は重複で落ちる
+                    self.hist_replayed(local, enchudb_oplog::eid_local(*eid), hid, Some(value), hlc, false);
                 }
                 // eid 空間の整合 (live bitmap / next_local) は適用可否に依らず進める。
                 self.ensure_live_slot(local);
@@ -38407,6 +38419,7 @@ impl Engine {
                 let Some(local) = self.replay_slot(*eid, false) else { return };
                 if hid < self.himos.len() {
                     self.clear_cell_local(local, *himo_id, hlc);
+                    self.hist_replayed(local, enchudb_oplog::eid_local(*eid), hid, None, hlc, false);
                 }
             }
             DecodedOp::Delete { eid } => {
@@ -38415,6 +38428,10 @@ impl Engine {
                 // `set_tombstone_local` で弾いて本体を残していた。
                 let Some(local) = self.replay_slot(*eid, false) else { return };
                 self.apply_delete_local(local, hlc);
+                // 履歴: 本体の cell が先に落ちていた像でも削除は在った (宣言した列ごとに、 値が残っていれば 「消えた」 を足す)
+                for h in self.hist.declared() {
+                    self.hist_replayed(local, enchudb_oplog::eid_local(*eid), h as usize, None, hlc, true);
+                }
                 // #731: 消えた行の世代の次へ (v15)、 「死んでいる」 印も。 消す道の `live_free` は再生の間は上げない (本体の世代が先に
                 // 届いていると、 今の世代 + 1 では行き過ぎる。 購読には消えた行の世代を渡すので、 上げるのは消した後)。 再生の途中で
                 // 落ちた像は、 次に開く時に同じ record をもう一度再生する (checkpoint は再生を書き出した後に進む)
