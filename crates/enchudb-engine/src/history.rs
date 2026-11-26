@@ -486,7 +486,9 @@ impl HistCol {
         flags |= flag::VALID | extra;
         let idx = self.alloc()?;
         self.write(idx, &Entry { flags, depth, eid, prev, jump, time, value: v });
-        self.clock.fetch_max(time, Ordering::AcqRel);
+        // SeqCst の RMW: 下の 「見た」 の読みと、 差分の並びを作る側の 「見た」 を立てる → entry をなめる、 の間の約束 (x86 では
+        // lock 付きの命令 1 つ。 前は SeqCst の fence を別に置いていた)
+        self.clock.fetch_max(time, Ordering::SeqCst);
         if disordered {
             // 時刻の戻る entry / 前の住人の entry: 鎖を時刻の順に繋ぎ直す (差分の並びも捨てる。 次に見た時に作り直す)
             self.relink_slot(slot, idx)?;
@@ -496,7 +498,6 @@ impl HistCol {
             self.set_head(slot, idx + 1)?;
         }
         // 見た値の差分の並びに足す (書いた entry が見えた後で見る。 作る側は 「見た」 を立ててから entry をなめる)
-        std::sync::atomic::fence(Ordering::SeqCst);
         if self.observed.load(Ordering::SeqCst) {
             let old = latest.map(|(_, e)| e.value).unwrap_or(ABSENT);
             self.push_diffs(idx, eid, time, old, v);

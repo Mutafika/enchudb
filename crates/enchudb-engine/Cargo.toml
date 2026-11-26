@@ -11,6 +11,8 @@ repository = "https://github.com/mutafika/enchudb"
 [features]
 # 電源断の模擬 (テスト専用、 tests/power_loss.rs)。 enchudb-oplog の crashsim を引く。
 crashsim = ["enchudb-oplog/crashsim"]
+# スピン 案 W の試作の測り (examples/spin_w_bench.rs の hist)。 v0.38.0 と同じ example を build するために feature で分ける
+spin-w-bench = []
 # AsyncBlobStore trait + tokio-based default adapter。
 # S3 / HTTP / 遠隔ストア向け。引かない限り tokio / async-trait は依存に入らない。
 async-blob = ["dep:async-trait", "dep:tokio"]
