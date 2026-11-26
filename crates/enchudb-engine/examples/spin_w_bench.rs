@@ -188,7 +188,7 @@ fn hist(dir: &str) {
     let first = eng.pull_at("t.h", 7, clock).unwrap().len();
     let build_ms = tb.elapsed().as_secs_f64() * 1000.0;
     for v in 0..VALUES {
-        eng.pull_at("t.h", v, clock).unwrap();
+        eng.pull_at("t.h", v, h0 + 1).unwrap(); // 過去の時点 (今の時点は円柱を読むので並びを作らない)
     }
     let m = 2000;
     let t = Instant::now();
