@@ -485,6 +485,112 @@ mod power_loss {
         a
     }
 
+    /// 書き出しをせずに撮る像 (WAL も本体も OS が勝手に書いた page だけ届く): 履歴の page が WAL の record より先に届いた書き込み
+    /// (再生されない) や、 本体の cell だけ届いた書き込みを、 開く時の突き合わせが cell に揃える。
+    fn image_without_sync(seed: u64, versions: bool) -> (u64, u64) {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let s = Scratch::new(&format!("nosync_{versions}_{seed}"));
+        let db = s.db();
+        crashsim::start();
+        let _stop = Stop;
+        let eng = create(&db, versions);
+        let mut m = Model { horizon: eng.history_clock(V).unwrap(), ..Default::default() };
+        let mut rng = Rng(seed | 1);
+        for _ in 0..ROWS {
+            let e = eng.entity_in("t").unwrap();
+            m.live.insert(e);
+        }
+        let mut sure = None;
+        for i in 0..400 {
+            if i == 150 {
+                eng.oplog_sync().unwrap();
+                sure = Some(m.clone());
+            }
+            let live: Vec<EntityId> = m.live.iter().copied().collect();
+            let e = live[rng.below(live.len() as u64) as usize];
+            match rng.below(10) {
+                0 => {
+                    eng.try_delete(e).unwrap();
+                    record(&eng, &mut m, e, None);
+                    m.live.remove(&e);
+                    let n = eng.entity_in("t").unwrap();
+                    m.live.insert(n);
+                }
+                1 => {
+                    eng.untie(e, V);
+                    record(&eng, &mut m, e, None);
+                }
+                _ => {
+                    let v = rng.below(VALUES);
+                    eng.tie_to(e, V, v as u32);
+                    record(&eng, &mut m, e, Some(v));
+                }
+            }
+        }
+        let img = s.0.join("img").join("db");
+        crashsim::capture(&db, &img, Mode::Mixed { seed }).unwrap();
+        crashsim::stop();
+        let slot_of = |e: EntityId| eng.eid_slot(e);
+        // 本当に在った書き込み: (場所, 時刻, 値)
+        let real: BTreeSet<(u32, u64, Option<u64>)> =
+            m.cards.iter().flat_map(|(&e, c)| c.iter().map(move |&(t, v)| (e, t, v))).map(|(e, t, v)| (slot_of(e), t, v)).collect();
+        let slots: BTreeMap<EntityId, u32> = m.cards.keys().map(|&e| (e, slot_of(e))).collect();
+        drop(eng);
+        check_image_loose(&img, &m, sure.as_ref().unwrap(), &real, &slots)
+    }
+
+    /// 書き出しをしない像は、 場所の世代の上げが届かずに使い回した行が前の identity に見えることがある (engine の identity がそうなる)。
+    /// そこで: 「遅くとも」 でない entry は本当に在った書き込み (場所・時刻・値) であること、 時刻の順、 生きている行の最新 = cell、
+    /// 消えた行の最新に値が無いこと、 oplog を書き出した時までの変更が全部あること。
+    fn check_image_loose(
+        img: &Path,
+        m: &Model,
+        sure: &Model,
+        real: &BTreeSet<(u32, u64, Option<u64>)>,
+        slots: &BTreeMap<EntityId, u32>,
+    ) -> (u64, u64) {
+        let eng = reopen(img);
+        let mut observed = 0;
+        let mut checked = 0;
+        for (&e, _) in &m.cards {
+            let h = eng.history(e, V).unwrap();
+            observed += h.iter().filter(|c| c.observed).count() as u64;
+            for c in h.iter().filter(|c| !c.observed) {
+                assert!(real.contains(&(slots[&e], c.time, c.value)), "identity {e:#x}: entry {c:?} は在った書き込みでない");
+            }
+            for w in h.windows(2) {
+                assert!(w[0].time < w[1].time, "時刻の順");
+            }
+            if let Some(sc) = sure.cards.get(&e) {
+                let exact: Vec<(u64, Option<u64>)> = h.iter().filter(|c| !c.observed).map(|c| (c.time, c.value)).collect();
+                for x in sc {
+                    assert!(exact.contains(x), "identity {e:#x}: oplog を書き出した後の変更 {x:?} が無い (像 {exact:?})");
+                }
+            }
+            let last = h.last().and_then(|c| c.value);
+            if eng.is_live(e) {
+                assert_eq!(last, eng.get(e, V), "identity {e:#x}: 集まりの最新と cell");
+                checked += 1;
+            } else {
+                assert_eq!(last, None, "identity {e:#x}: 消えた行の最新に値が残る");
+            }
+        }
+        drop(eng);
+        (observed, checked)
+    }
+
+    #[test]
+    fn power_loss_images_without_sync_reconcile() {
+        let mut observed = 0;
+        for versions in [false, true] {
+            for seed in 1..=12u64 {
+                observed += image_without_sync(seed, versions).0;
+            }
+        }
+        // 前提: 突き合わせが 「遅くとも」 の entry を足す像があった (届いた順の食い違いを作れている)
+        assert!(observed > 0, "前提: 食い違いのある像を作れていない");
+    }
+
     #[test]
     fn power_loss_images_reconcile() {
         for versions in [false, true] {

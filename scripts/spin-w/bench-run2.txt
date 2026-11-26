@@ -1,0 +1,16 @@
+run 1 v0.38.0 base write_ns=888.2 read_ns=36.3 pull_us=12.15 open_ms=2.0
+run 1 proto   base write_ns=842.8 read_ns=26.4 pull_us=11.06 open_ms=1.7
+run 2 v0.38.0 base write_ns=825.0 read_ns=37.7 pull_us=12.40 open_ms=1.7
+run 2 proto   base write_ns=908.2 read_ns=58.3 pull_us=15.64 open_ms=2.1
+run 3 v0.38.0 base write_ns=905.4 read_ns=39.9 pull_us=11.46 open_ms=1.8
+run 3 proto   base write_ns=905.7 read_ns=37.7 pull_us=12.49 open_ms=2.1
+run 4 v0.38.0 base write_ns=895.8 read_ns=38.5 pull_us=12.68 open_ms=1.8
+run 4 proto   base write_ns=916.1 read_ns=37.1 pull_us=12.45 open_ms=2.0
+run 5 v0.38.0 base write_ns=818.6 read_ns=20.1 pull_us=10.88 open_ms=1.7
+run 5 proto   base write_ns=1030.0 read_ns=30.1 pull_us=11.55 open_ms=2.1
+run 1 proto   hist declare_ms=113 write_undeclared_ns=515.1 write_declared_ns=720.5 extra_ns=197.0 extra_after_decks_ns=752.4 value_at_ns=321 value_at_hot_ns=158 value_at_far_hot_ns=144 deck_build_ms=21.3 deck_first_len=1043 deck_us=13581.9 deck_now_us=0.8 avg_deck=1000 entries=2398610 observed=0 entry_bytes=76759616 head_bytes=32000000 bytes_per_write=32.0 open_ms=1.9
+run 2 proto   hist declare_ms=110 write_undeclared_ns=632.8 write_declared_ns=902.1 extra_ns=207.8 extra_after_decks_ns=581.0 value_at_ns=436 value_at_hot_ns=181 value_at_far_hot_ns=168 deck_build_ms=28.6 deck_first_len=1043 deck_us=11738.0 deck_now_us=0.9 avg_deck=1000 entries=2398610 observed=0 entry_bytes=76759616 head_bytes=32000000 bytes_per_write=32.0 open_ms=2.1
+run 3 proto   hist declare_ms=102 write_undeclared_ns=549.8 write_declared_ns=804.4 extra_ns=186.1 extra_after_decks_ns=496.9 value_at_ns=344 value_at_hot_ns=156 value_at_far_hot_ns=145 deck_build_ms=19.9 deck_first_len=1043 deck_us=11919.7 deck_now_us=1.0 avg_deck=999 entries=2398610 observed=0 entry_bytes=76759616 head_bytes=32000000 bytes_per_write=32.0 open_ms=2.7
+run 4 proto   hist declare_ms=102 write_undeclared_ns=447.6 write_declared_ns=770.3 extra_ns=263.6 extra_after_decks_ns=708.1 value_at_ns=387 value_at_hot_ns=159 value_at_far_hot_ns=145 deck_build_ms=22.9 deck_first_len=1043 deck_us=10785.7 deck_now_us=0.9 avg_deck=1000 entries=2398610 observed=0 entry_bytes=76759616 head_bytes=32000000 bytes_per_write=32.0 open_ms=3.3
+run 5 proto   hist declare_ms=105 write_undeclared_ns=424.5 write_declared_ns=568.6 extra_ns=179.1 extra_after_decks_ns=922.6 value_at_ns=298 value_at_hot_ns=164 value_at_far_hot_ns=145 deck_build_ms=19.0 deck_first_len=1043 deck_us=11032.9 deck_now_us=1.0 avg_deck=999 entries=2398610 observed=0 entry_bytes=76759616 head_bytes=32000000 bytes_per_write=32.0 open_ms=2.4
+exit 0

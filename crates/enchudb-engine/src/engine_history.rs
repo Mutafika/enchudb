@@ -221,7 +221,7 @@ impl Engine {
     /// cell (今の値) と集まりの最新を場所ごとに突き合わせる (電源断の後。 門に頼らず開く時に揃える)。 cell が正しい:
     ///
     /// - 生きている行: 最新の entry の値 = cell の値 なら何もしない。 食い違えば、 cell の版数がある DB は 「cell の書き込みより新しい
-    ///   entry」 (cell に届かなかった書き込み) を外し (`VOID`)、 残りの最新がまだ食い違えば cell の版数の時刻で 1 件足す。 版数の無い DB
+    ///   entry」 (cell に届かなかった書き込み) を外し (`VOID`)、 残りの最新がまだ食い違えば cell の版数の時刻で 「遅くとも」 を 1 件足す (版数と値が一緒に届いたかは分からない)。 版数の無い DB
     ///   は cell と同じ値の一番新しい entry より新しい entry を外し、 そういう entry が無ければ 「遅くとも」 の entry を足す
     /// - 死んだ場所: 最後の行の最新の entry に値が残っていれば、 削除の 「遅くとも」 の entry を足す (時刻は tombstone の版数があれば
     ///   それ)
@@ -256,7 +256,7 @@ impl Engine {
             }
             if !live {
                 let tomb = self.tombstone_version_of(slot);
-                let at = (tomb != Hlc::ZERO).then(|| history::pack(tomb)).filter(|&x| top.is_some_and(|(_, tt)| x > tt));
+                let at = (tomb != Hlc::ZERO).then(|| history::pack(tomb) | OBSERVED_AT).filter(|&x| top.is_some_and(|(_, tt)| x & !OBSERVED_AT > tt));
                 appends.push((slot, eid, None, at, true));
                 continue;
             }
@@ -264,10 +264,11 @@ impl Engine {
             if ver != Hlc::ZERO {
                 let vt = history::pack(ver);
                 let kept = h.void_newer(slot, eid, true, |_, time| time <= vt);
+                // 足す entry は 「遅くとも」: cell の版数と値が一緒に届いたかは分からない (版数だけ届いた像 #705 では、 版数は別の書き込みの物)
                 match kept {
                     Some((v, _)) if v == want => {}
                     Some((_, kt)) if kt == vt => appends.push((slot, eid, want, None, false)),
-                    _ => appends.push((slot, eid, want, Some(vt), false)),
+                    _ => appends.push((slot, eid, want, Some(vt | OBSERVED_AT), false)),
                 }
             } else {
                 match h.void_newer(slot, eid, false, |v, _| v == want) {

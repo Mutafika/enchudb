@@ -1,53 +1,104 @@
 [
- {"name": "重複落としを外す (同じ時刻の entry を足す)",
+ {
+  "name": "重複落としを外す (同じ時刻の entry を足す)",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "if fl.is_some_and(|(_, f)| f.time == time && f.flags & flag::OBSERVED == 0) {", "replace": "if false {"},
- {"name": "時刻を運ばない (set_cell_in の書き込みに ZERO)",
+  "find": "if fl.is_some_and(|(_, f)| f.time == time && f.flags & flag::OBSERVED == 0) {",
+  "replace": "if false {"
+ },
+ {
+  "name": "時刻を運ばない (set_cell_in の書き込みに ZERO)",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "if !self.live_set(himo_id as usize, local, value, hlc) {", "replace": "if !self.live_set(himo_id as usize, local, value, enchudb_oplog::Hlc::ZERO) {"},
- {"name": "外す (untie) の時刻を運ばない",
+  "find": "if !self.live_set(himo_id as usize, local, value, hlc) {",
+  "replace": "if !self.live_set(himo_id as usize, local, value, enchudb_oplog::Hlc::ZERO) {"
+ },
+ {
+  "name": "外す (untie) の時刻を運ばない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "self.remove_cell_freeing_leaf(local, himo_id as usize, hlc, false);", "replace": "self.remove_cell_freeing_leaf(local, himo_id as usize, enchudb_oplog::Hlc::ZERO, false);"},
- {"name": "削除の時刻を運ばない (削除優先の ZERO を渡す)",
+  "find": "self.remove_cell_freeing_leaf(local, himo_id as usize, hlc, false);",
+  "replace": "self.remove_cell_freeing_leaf(local, himo_id as usize, enchudb_oplog::Hlc::ZERO, false);"
+ },
+ {
+  "name": "削除の時刻を運ばない (削除優先の ZERO を渡す)",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "self.remove_cell_freeing_leaf(local, hid, at, true);", "replace": "self.remove_cell_freeing_leaf(local, hid, hlc, true);"},
- {"name": "書き出しに入れない",
+  "find": "self.remove_cell_freeing_leaf(local, hid, at, true);",
+  "replace": "self.remove_cell_freeing_leaf(local, hid, hlc, true);"
+ },
+ {
+  "name": "書き出しに入れない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "self.write_out_history(all || catch_up)?;", "replace": "let _ = catch_up;"},
- {"name": "再生で cell が弾いた書き込みを履歴に足さない",
+  "find": "self.write_out_history(all || catch_up)?;",
+  "replace": "let _ = catch_up;"
+ },
+ {
+  "name": "再生で cell が弾いた書き込みを履歴に足さない",
   "file": "crates/enchudb-engine/src/engine_history.rs",
-  "find": "if h.note(slot, eid, value, history::pack(hlc), if deleting { flag::DELETE } else { 0 }).is_err() {", "replace": "if (h, eid, value, deleting).0.is_empty() && false {"},
- {"name": "時刻の戻る entry を足した後に繋ぎ直さない",
+  "find": "if h.note(slot, eid, value, history::pack(hlc), if deleting { flag::DELETE } else { 0 }).is_err() {",
+  "replace": "if (h, eid, value, deleting).0.is_empty() && false {"
+ },
+ {
+  "name": "時刻の戻る entry を足した後に繋ぎ直さない",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "self.relink_slot(slot, idx)?;", "replace": "let _ = idx;"},
- {"name": "時刻の戻る entry: 前の値と同じでも足す",
+  "find": "self.relink_slot(slot, idx)?;",
+  "replace": "let _ = idx;"
+ },
+ {
+  "name": "時刻の戻る entry: 前の値と同じでも足す",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "if before == v && extra & flag::BASE == 0 {", "replace": "if false {"},
- {"name": "書き直し (値が変わらない) も変更として足す",
+  "find": "if before == v && extra & flag::BASE == 0 {",
+  "replace": "if false {"
+ },
+ {
+  "name": "書き直し (値が変わらない) も変更として足す",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "if le.value == v && extra & flag::BASE == 0 && time >= le.time {", "replace": "if false {"},
- {"name": "開く時に cell と突き合わせない",
+  "find": "if le.value == v && extra & flag::BASE == 0 && time >= le.time {",
+  "replace": "if false {"
+ },
+ {
+  "name": "開く時に cell と突き合わせない",
   "file": "crates/enchudb-engine/src/engine_history.rs",
-  "find": "                self.reconcile_history(h);", "replace": "                let _ = h;"},
- {"name": "再生の前に鎖を繋ぎ直さない",
+  "find": "                self.reconcile_history(h);",
+  "replace": "                let _ = h;"
+ },
+ {
+  "name": "再生の前に鎖を繋ぎ直さない",
   "file": "crates/enchudb-engine/src/engine_history.rs",
-  "find": "                    if unclean && !readonly {\n                        if let Err(e) = c.relink(", "replace": "                    if false {\n                        if let Err(e) = c.relink("},
- {"name": "前の住人の削除を突き合わせで足さない",
+  "find": "                    if (unclean || c.heads_stale()) && !readonly {",
+  "replace": "                    if false && (unclean || c.heads_stale()) && !readonly {"
+ },
+ {
+  "name": "前の住人の削除を突き合わせで足さない",
   "file": "crates/enchudb-engine/src/engine_history.rs",
-  "find": "appends.push((slot, r, None, next_first.map(|nf| nf | OBSERVED_AT), true));", "replace": "let _ = (r, next_first);"},
- {"name": "飛び糸の境目 (同じ時刻の entry を飛び越す)",
+  "find": "appends.push((slot, r, None, next_first.map(|nf| nf | OBSERVED_AT), true));",
+  "replace": "let _ = (r, next_first);"
+ },
+ {
+  "name": "飛び糸で t 以前の entry まで飛び越す",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "                && je.time > t\n", "replace": "                && je.time >= t\n"},
- {"name": "デッキの差分を書き手が保たない",
+  "find": "                && je.time > t\n",
+  "replace": "                && je.time != t\n"
+ },
+ {
+  "name": "デッキの差分を書き手が保たない",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "            self.push_diffs(idx, eid, time, old, v);", "replace": "            let _ = (old, v);"},
- {"name": "宣言の時の値を入れない",
+  "find": "            self.push_diffs(idx, eid, time, old, v);",
+  "replace": "            let _ = (old, v);"
+ },
+ {
+  "name": "宣言の時の値を入れない",
   "file": "crates/enchudb-engine/src/engine_history.rs",
-  "find": "col.note(slot, self.generations().local(slot), Some(now), horizon, flag::BASE)", "replace": "Ok::<bool, std::io::Error>(now == u64::MAX)"},
- {"name": "WAL の無い session の書き込みを断らない",
+  "find": "col.note(slot, self.generations().local(slot), Some(now), horizon, flag::BASE)",
+  "replace": "Ok::<bool, std::io::Error>(now == u64::MAX)"
+ },
+ {
+  "name": "WAL の無い session の書き込みを断らない",
   "file": "crates/enchudb-engine/src/engine.rs",
-  "find": "        if self.refuses_walless_history_write(local) {", "replace": "        if false && self.refuses_walless_history_write(local) {"},
- {"name": "前の住人へ飛ばない (場所の使い回しの後に古い eid を読めない)",
+  "find": "        if self.refuses_walless_history_write(local) {",
+  "replace": "        if false && self.refuses_walless_history_write(local) {"
+ },
+ {
+  "name": "前の住人へ飛ばない (場所の使い回しの後に古い eid を読めない)",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "            let (_, first) = self.first_of(idx, e);\n            cur = self.at(first.jump);\n        }\n        None", "replace": "            let _ = self.first_of(idx, e);\n            cur = None;\n        }\n        None"}
+  "find": "            let (_, first) = self.first_of(idx, e);\n            cur = self.at(first.jump);\n        }\n        None",
+  "replace": "            let _ = self.first_of(idx, e);\n            cur = None;\n        }\n        None"
+ }
 ]
