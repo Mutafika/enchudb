@@ -142,11 +142,134 @@ struct Diff {
     eid: u32,
 }
 
+/// heads の 1 場所 (32 B): 最新の entry の糸と写し (書き手が entry を読まずに済むように)。 読み手は糸だけを読む。
+const HEAD: usize = 32;
+const HEADS_MAGIC: &[u8; 4] = b"HIH1";
+/// heads の file の header (1 page。 中身は次の page から)
+const HEADS_HEADER: usize = 4096;
+
+/// 場所ごとの最新 (memory の上)。 msync しない (書き出しのたびに page が write-protect に戻り、 書き手が場所ごとに fault を
+/// 払うのを避ける)。 きれいに閉じる時だけ file に置き (`persist`)、 開く時は file を private に貼る (読まずに開く)。 file が
+/// 無い / 合わない (きれいに閉じなかった) 時は entry から作り直す (`HistCol::relink`)。
+struct Heads {
+    base: *mut u8,
+    len: usize,
+    /// 触った場所の上限 + 1
+    hi: AtomicU32,
+}
+
+unsafe impl Send for Heads {}
+unsafe impl Sync for Heads {}
+
+impl Heads {
+    fn anon(slots: u32) -> io::Result<Heads> {
+        let ps = crate::segment_map::runtime_page_size();
+        let len = ((slots.max(1) as usize * HEAD).div_ceil(ps)) * ps;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Heads { base: p as *mut u8, len, hi: AtomicU32::new(0) })
+    }
+
+    /// file `path` の中身を private に貼る。 header の印 `stamp` (entry の数) が合う時だけ。 貼れたら true。
+    fn load(&self, path: &Path, stamp: u64) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let Ok(f) = std::fs::File::open(path) else { return false };
+        let mut h = [0u8; 24];
+        if std::os::unix::fs::FileExt::read_exact_at(&f, &mut h, 0).is_err() || &h[0..4] != HEADS_MAGIC {
+            return false;
+        }
+        let got = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let used = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
+        let flen = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        if got != stamp || used * HEAD > self.len || HEADS_HEADER + used * HEAD > flen {
+            return false;
+        }
+        if used == 0 {
+            return true;
+        }
+        let ps = crate::segment_map::runtime_page_size();
+        let map = ((used * HEAD).div_ceil(ps) * ps).min(flen - HEADS_HEADER);
+        let p = unsafe {
+            libc::mmap(
+                self.base as *mut libc::c_void,
+                map,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                f.as_raw_fd(),
+                HEADS_HEADER as libc::off_t,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        self.hi.store(used as u32, Ordering::Release);
+        true
+    }
+
+    /// file に置く (きれいに閉じる時、 書き手の居ない所で)。 header に印 `stamp`。 page の倍数に詰める。
+    fn persist(&self, path: &Path, stamp: u64) -> io::Result<()> {
+        let used = self.hi.load(Ordering::Acquire) as usize;
+        let ps = crate::segment_map::runtime_page_size();
+        let mut head = vec![0u8; HEADS_HEADER];
+        head[0..4].copy_from_slice(HEADS_MAGIC);
+        head[8..16].copy_from_slice(&stamp.to_le_bytes());
+        head[16..24].copy_from_slice(&(used as u64).to_le_bytes());
+        let body = unsafe { std::slice::from_raw_parts(self.base, used * HEAD) };
+        let pad = vec![0u8; (used * HEAD).div_ceil(ps) * ps - used * HEAD];
+        crate::db_files::write_atomic_parts(path, &[&head, body, &pad])
+    }
+
+    #[inline]
+    fn slot_ptr(&self, slot: u32) -> Option<*mut u8> {
+        let off = slot as usize * HEAD;
+        (off + HEAD <= self.len).then(|| unsafe { self.base.add(off) })
+    }
+}
+
+impl Drop for Heads {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.len);
+        }
+    }
+}
+
+/// 差分の並びの表の hash (値は u64 そのもの。 SipHash は書き手の道に重い)。
+#[derive(Default)]
+struct U64Hash(u64);
+impl std::hash::Hasher for U64Hash {
+    fn finish(&self) -> u64 {
+        self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) | u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
 /// 宣言した列 1 本の履歴。
 pub struct HistCol {
     pub hid: u16,
     entries: SegmentMap,
-    heads: SegmentMap,
+    heads: Heads,
+    /// heads を file から戻せなかった (開いた後に entry から作り直す)
+    heads_stale: AtomicBool,
+    dir: PathBuf,
     /// 場所を取った entry の数 (書きかけを含む)
     len: AtomicU32,
     /// 地平 (宣言の時刻)
@@ -154,7 +277,7 @@ pub struct HistCol {
     /// 見た最大の時刻 (時刻の分からない entry に付ける今)
     clock: AtomicU64,
     /// 見た値の差分の並び (最初に見た時に作る)
-    decks: RwLock<HashMap<u64, Vec<Diff>>>,
+    decks: RwLock<HashMap<u64, Vec<Diff>, std::hash::BuildHasherDefault<U64Hash>>>,
     observed: AtomicBool,
     /// 同じ identity の鎖に時刻の戻る entry を足した (開く時の再生・突き合わせ)。 開く道の終わりに繋ぎ直す
     disordered: AtomicBool,
@@ -169,6 +292,18 @@ fn entry_path(dir: &Path, hid: u16) -> PathBuf {
 
 fn head_path(dir: &Path, hid: u16) -> PathBuf {
     dir.join("hist").join(format!("{hid:04}.head.seg"))
+}
+
+/// 深さ `d` (≥ 1) の entry の飛び幅: 飛び先の深さは d − 幅 (下の `skew_jump` の規則と同じ。 幅 = d を 2^k − 1 の和に大きい方から
+/// 分けた時のいちばん小さい項)。 書き手が飛び先の深さを entry を読まずに出すのに使う。
+#[inline]
+fn skip_gap(mut d: u32) -> u32 {
+    let mut w = 0;
+    while d > 0 {
+        w = ((1u64 << (63 - (u64::from(d) + 1).leading_zeros())) - 1) as u32;
+        d -= w;
+    }
+    w
 }
 
 /// skew binary の飛び糸: 親 `p` (深さ d) の子 (深さ d + 1) の飛び先。 `p` の飛び先 `j` (深さ dj) と `j` の飛び先 `jj` (深さ djj) の
@@ -188,9 +323,10 @@ impl HistCol {
         let (ep, hp) = (entry_path(dir, hid), head_path(dir, hid));
         let _ = std::fs::remove_file(&ep);
         let _ = std::fs::remove_file(&hp);
+        let _ = hp;
         let entries = SegmentMap::create(&ep, RESERVE_ENTRIES, HEADER + 64 * ENTRY)?;
-        let heads = SegmentMap::create(&hp, (slots as usize).max(1) * 4 + HEADER, 4096)?;
-        let c = HistCol::new(hid, entries, heads, horizon, false);
+        let heads = Heads::anon(slots)?;
+        let c = HistCol::new(dir, hid, entries, heads, horizon, false);
         c.write_header(0);
         c.entries.flush(0, HEADER)?;
         Ok(c)
@@ -199,7 +335,7 @@ impl HistCol {
     /// 開く。 header が読めなければ Err (呼び手は宣言を捨てる)。
     pub fn open(dir: &Path, hid: u16, slots: u32, readonly: bool) -> io::Result<Self> {
         let entries = SegmentMap::open(&entry_path(dir, hid), RESERVE_ENTRIES, readonly)?;
-        let heads = SegmentMap::open(&head_path(dir, hid), (slots as usize).max(1) * 4 + HEADER, readonly)?;
+        let heads = Heads::anon(slots)?;
         if entries.committed() < HEADER {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "hist: short header"));
         }
@@ -213,9 +349,13 @@ impl HistCol {
         }
         let len = u64::from_le_bytes(h[16..24].try_into().unwrap());
         let horizon = u64::from_le_bytes(h[24..32].try_into().unwrap());
-        let c = HistCol::new(hid, entries, heads, horizon, readonly);
+        let c = HistCol::new(dir, hid, entries, heads, horizon, readonly);
         let cap = ((c.entries.committed() - HEADER) / ENTRY) as u64;
         c.len.store(len.min(cap) as u32, Ordering::Relaxed);
+        // heads: きれいに閉じた時に置いた file (印 = entry の数) を貼る。 合わなければ開いた後に作り直す
+        if !c.heads.load(&head_path(dir, hid), len) {
+            c.heads_stale.store(true, Ordering::Release);
+        }
         // 時計は最後の entry まで (readonly でも読む)
         let n = c.len.load(Ordering::Relaxed);
         let mut top = horizon;
@@ -228,15 +368,17 @@ impl HistCol {
         Ok(c)
     }
 
-    fn new(hid: u16, entries: SegmentMap, heads: SegmentMap, horizon: u64, readonly: bool) -> Self {
+    fn new(dir: &Path, hid: u16, entries: SegmentMap, heads: Heads, horizon: u64, readonly: bool) -> Self {
         HistCol {
             hid,
             entries,
             heads,
+            heads_stale: AtomicBool::new(false),
+            dir: dir.to_path_buf(),
             len: AtomicU32::new(0),
             horizon,
             clock: AtomicU64::new(horizon),
-            decks: RwLock::new(HashMap::new()),
+            decks: RwLock::new(HashMap::default()),
             observed: AtomicBool::new(false),
             disordered: AtomicBool::new(false),
             voided: AtomicBool::new(false),
@@ -253,14 +395,25 @@ impl HistCol {
         self.horizon
     }
 
-    /// 見た最大の時刻。
+    /// 見た最大の時刻。 書き手は時計を触らない (書き込みの道の RMW を 1 つ減らす): entry は大体時刻の順に足すので、 末尾の entry の
+    /// 時刻の最大と覚えた値の大きい方。
     pub fn clock(&self) -> u64 {
-        self.clock.load(Ordering::Acquire)
+        let n = self.len();
+        let mut top = self.clock.load(Ordering::Acquire);
+        for i in n.saturating_sub(256)..n {
+            if let Some(e) = self.valid(i) {
+                top = top.max(e.time);
+            }
+        }
+        self.clock.fetch_max(top, Ordering::AcqRel);
+        top
     }
 
     /// 時刻の分からない entry に付ける今 (見た最大 + 1)。
     pub fn tick(&self) -> u64 {
-        self.clock.fetch_add(1, Ordering::AcqRel) + 1
+        let t = self.clock() + 1;
+        self.clock.fetch_max(t, Ordering::AcqRel);
+        t
     }
 
     /// 場所を取った entry の数。
@@ -274,7 +427,8 @@ impl HistCol {
 
     /// disk の大きさ (entry の segment の使った分 + heads の commit)。
     pub fn disk_bytes(&self) -> (u64, u64) {
-        ((HEADER + self.len() as usize * ENTRY) as u64, self.heads.committed() as u64)
+        let hb = std::fs::metadata(head_path(&self.dir, self.hid)).map(|m| m.len()).unwrap_or(0);
+        ((HEADER + self.len() as usize * ENTRY) as u64, hb.max((self.heads.hi.load(Ordering::Acquire) as usize * HEAD) as u64))
     }
 
     fn write_header(&self, len: u32) {
@@ -346,7 +500,8 @@ impl HistCol {
     }
 
     fn alloc(&self) -> io::Result<u32> {
-        let idx = self.len.fetch_add(1, Ordering::AcqRel);
+        // SeqCst: 差分の並びを作る側の 「見た」 を立てる → len を読む、 との約束 (`build_deck`。 x86 では lock xadd のまま)
+        let idx = self.len.fetch_add(1, Ordering::SeqCst);
         let end = HEADER + (idx as usize + 1) * ENTRY;
         if end > self.entries.committed() {
             if let Err(e) = self.entries.grow_amortized(end) {
@@ -359,21 +514,68 @@ impl HistCol {
 
     #[inline]
     fn head(&self, slot: u32) -> u32 {
-        let off = HEADER + slot as usize * 4;
-        if off + 4 > self.heads.committed() {
-            return NONE;
+        match self.heads.slot_ptr(slot) {
+            Some(p) => unsafe { AtomicU32::from_ptr(p as *mut u32) }.load(Ordering::Acquire),
+            None => NONE,
         }
-        unsafe { AtomicU32::from_ptr(self.heads.base().add(off) as *mut u32) }.load(Ordering::Acquire)
     }
 
-    fn set_head(&self, slot: u32, link: u32) -> io::Result<()> {
-        let off = HEADER + slot as usize * 4;
-        if off + 4 > self.heads.committed() {
-            self.heads.grow_amortized(off + 4)?;
+    /// heads の写し (書き手、 行の lock の下): (糸, 最新の entry (prev は 0 = 読まない))。
+    #[inline]
+    fn head_copy(&self, slot: u32) -> Option<(u32, Entry)> {
+        let p = self.heads.slot_ptr(slot)?;
+        let link = unsafe { AtomicU32::from_ptr(p as *mut u32) }.load(Ordering::Acquire);
+        if link == NONE {
+            return None;
         }
-        unsafe { AtomicU32::from_ptr(self.heads.base().add(off) as *mut u32) }.store(link, Ordering::Release);
-        self.heads.mark_dirty(off, 4);
+        unsafe {
+            let fd = std::ptr::read(p.add(8) as *const u32);
+            Some((
+                link - 1,
+                Entry {
+                    flags: fd >> 24,
+                    depth: fd & DEPTH_MASK,
+                    eid: std::ptr::read(p.add(4) as *const u32),
+                    prev: 0,
+                    jump: std::ptr::read(p.add(12) as *const u32),
+                    time: std::ptr::read(p.add(16) as *const u64),
+                    value: std::ptr::read(p.add(24) as *const u64),
+                },
+            ))
+        }
+    }
+
+    /// 場所 `slot` の最新を entry `link` (`e` はその中身、 None なら空にする) にする。
+    fn set_head(&self, slot: u32, link: u32, e: Option<&Entry>) -> io::Result<()> {
+        let Some(p) = self.heads.slot_ptr(slot) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "hist: slot beyond the heads"));
+        };
+        unsafe {
+            if let Some(e) = e {
+                std::ptr::write(p.add(4) as *mut u32, e.eid);
+                std::ptr::write(p.add(8) as *mut u32, (e.flags << 24) | (e.depth & DEPTH_MASK));
+                std::ptr::write(p.add(12) as *mut u32, e.jump);
+                std::ptr::write(p.add(16) as *mut u64, e.time);
+                std::ptr::write(p.add(24) as *mut u64, e.value);
+            }
+            AtomicU32::from_ptr(p as *mut u32).store(if e.is_some() { link } else { NONE }, Ordering::Release);
+        }
+        self.heads.hi.fetch_max(slot + 1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// heads を file から戻せなかったか (呼び手は開いた後に [`Self::relink`] する)。
+    pub fn heads_stale(&self) -> bool {
+        self.heads_stale.load(Ordering::Acquire)
+    }
+
+    /// きれいに閉じる時 (書き手の居ない所): heads を file に置く (印 = 書き出した entry の数)。
+    pub fn persist_heads(&self) -> io::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        self.write_out(false)?;
+        self.heads.persist(&head_path(&self.dir, self.hid), u64::from(self.len()))
     }
 
     /// 場所 `slot` の鎖で、 identity `eid` の最新の entry (前の住人へは最初の entry の飛び糸でたどる)。
@@ -444,15 +646,20 @@ impl HistCol {
     /// entry の時刻は呼び手が [`Self::tick`] で取る。
     pub fn note(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32) -> io::Result<bool> {
         let v = value.unwrap_or(ABSENT);
-        let head = self.head(slot);
+        let hc = self.head_copy(slot);
+        let head = hc.map_or(NONE, |(i, _)| i + 1);
         let mut disordered = false;
-        let latest = self.latest_of(slot, eid);
+        // 速い道: 場所の最新がこの identity (heads の写しだけを読む)。 でなければ鎖をたどる (前の住人 / 新しい住人)
+        let latest = match hc {
+            Some((i, e)) if e.eid == eid => Some((i, e)),
+            _ => self.latest_of(slot, eid),
+        };
         let (prev, depth, jump, mut flags) = match latest {
             Some((li, le)) => {
                 if extra & flag::OBSERVED == 0 && time <= le.time {
                     // 同じ時刻の entry があれば足さない (再生・当て直し)
                     // 時刻の分からない entry (`OBSERVED`) は時計から取った時刻なので、 同じ時刻でも別の書き込み
-                    let (fl, _) = self.floor((li, le), time);
+                    let (fl, _) = self.floor(self.at(li + 1).unwrap_or((li, le)), time);
                     if fl.is_some_and(|(_, f)| f.time == time && f.flags & flag::OBSERVED == 0) {
                         return Ok(false);
                     }
@@ -467,9 +674,17 @@ impl HistCol {
                 if le.value == v && extra & flag::BASE == 0 && time >= le.time {
                     return Ok(false); // 値が変わらない (書き直し) は変更ではない
                 }
-                let j = self.at(le.jump).map(|(i, e)| (i + 1, e.depth));
-                let jj = j.and_then(|(ji, _)| self.at(ji)).and_then(|(_, je)| self.at(je.jump)).map(|(i, e)| (i + 1, e.depth));
-                let jump = if le.depth == 0 { li + 1 } else { skew_jump(li + 1, le.depth, j, jj) };
+                // 飛び先の深さは深さだけで決まる (d − skip_gap(d))。 幅が揃う時だけ飛び先の entry を読んで、 その飛び先へ
+                let jump = if le.depth == 0 {
+                    li + 1
+                } else {
+                    let dj = le.depth - skip_gap(le.depth);
+                    let djj = if dj > 0 { dj - skip_gap(dj) } else { 0 };
+                    match self.at(le.jump) {
+                        Some((_, je)) if dj > 0 && le.depth - dj == dj - djj => je.jump,
+                        _ => li + 1,
+                    }
+                };
                 if head != li + 1 {
                     // 前の住人の entry (今の住人の後ろ): 鎖の頭にはできない。 足した後にその場所を繋ぎ直す
                     disordered = true;
@@ -485,19 +700,18 @@ impl HistCol {
         };
         flags |= flag::VALID | extra;
         let idx = self.alloc()?;
-        self.write(idx, &Entry { flags, depth, eid, prev, jump, time, value: v });
-        // SeqCst の RMW: 下の 「見た」 の読みと、 差分の並びを作る側の 「見た」 を立てる → entry をなめる、 の間の約束 (x86 では
-        // lock 付きの命令 1 つ。 前は SeqCst の fence を別に置いていた)
-        self.clock.fetch_max(time, Ordering::SeqCst);
+        let ne = Entry { flags, depth, eid, prev, jump, time, value: v };
+        self.write(idx, &ne);
         if disordered {
             // 時刻の戻る entry / 前の住人の entry: 鎖を時刻の順に繋ぎ直す (差分の並びも捨てる。 次に見た時に作り直す)
             self.relink_slot(slot, idx)?;
             return Ok(true);
         }
         if latest.is_none() || latest.is_some_and(|(li, _)| head == li + 1) {
-            self.set_head(slot, idx + 1)?;
+            self.set_head(slot, idx + 1, Some(&ne))?;
         }
-        // 見た値の差分の並びに足す (書いた entry が見えた後で見る。 作る側は 「見た」 を立ててから entry をなめる)
+        // 見た値の差分の並びに足す。 場所を取った (len の SeqCst の RMW) 後に読む: 作る側が 「見た」 を立てた後に len を読んだなら、
+        // その len より後ろの場所を取った書き手はここで 「見た」 を見る。 前の場所の entry は作る側が待って読む (`build_deck`)
         if self.observed.load(Ordering::SeqCst) {
             let old = latest.map(|(_, e)| e.value).unwrap_or(ABSENT);
             self.push_diffs(idx, eid, time, old, v);
@@ -513,6 +727,11 @@ impl HistCol {
             }
             if let Some(d) = decks.get_mut(&val) {
                 let x = Diff { time, idx_in: (idx << 1) | u32::from(inn), eid };
+                // 普通は末尾 (時刻の順に足す)。 末尾だけ見る (並び全体の二分探索は cold な memory を 10 回ほど読む)
+                if d.last().is_none_or(|y| (y.time, y.idx_in >> 1) < (time, idx)) {
+                    d.push(x);
+                    continue;
+                }
                 let pos = d.partition_point(|y| (y.time, y.idx_in >> 1) < (time, idx));
                 if d.get(pos).is_some_and(|y| y.time == time && y.idx_in >> 1 == idx) {
                     continue; // 作る時になめた entry
@@ -595,11 +814,20 @@ impl HistCol {
             return d.clone();
         }
         self.observed.store(true, Ordering::SeqCst);
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let n = self.len();
+        let n = self.len.load(Ordering::SeqCst);
         let mut d = Vec::new();
         for idx in 0..n {
-            let Some(e) = self.valid(idx) else { continue };
+            // n より前に場所を取った書き手は 「見た」 を見なかったかもしれない: その entry は書き終わるのを待って読む (場所を取って書けなかった
+            // 穴 (伸ばせなかった) は 10 ms で諦める)
+            let mut e = self.valid(idx);
+            if e.is_none() && HEADER + (idx as usize + 1) * ENTRY <= self.entries.committed() {
+                let t0 = std::time::Instant::now();
+                while e.is_none() && t0.elapsed() < std::time::Duration::from_millis(10) {
+                    std::hint::spin_loop();
+                    e = self.valid(idx);
+                }
+            }
+            let Some(e) = e else { continue };
             if e.flags & flag::VOID != 0 {
                 continue;
             }
@@ -627,16 +855,14 @@ impl HistCol {
         self.write_header(self.len());
         if all {
             self.entries.flush_all()?;
-            self.heads.flush_all()?;
         } else {
             self.entries.flush_dirty()?;
-            self.heads.flush_dirty()?;
         }
         Ok(())
     }
 
     pub fn has_dirty(&self) -> bool {
-        self.entries.flush_pending() || self.heads.flush_pending()
+        self.entries.flush_pending()
     }
 
     /// 開く時の突き合わせが使う: 場所 `slot` の住人 (新しい順) の (eid, 最新の値, 最新の時刻, 最初の時刻)。
@@ -724,10 +950,9 @@ impl HistCol {
         }
         all.sort_unstable_by_key(|&(s, _, _, idx)| (s, idx));
         // heads を空にしてから置く
-        let head_slots = (self.heads.committed().saturating_sub(HEADER)) / 4;
-        for s in 0..head_slots as u32 {
+        for s in 0..self.heads.hi.load(Ordering::Acquire) {
             if self.head(s) != NONE {
-                self.set_head(s, NONE)?;
+                self.set_head(s, NONE, None)?;
             }
         }
         let mut rewritten = 0;
@@ -741,6 +966,7 @@ impl HistCol {
         self.clock.fetch_max(clock, Ordering::AcqRel);
         self.disordered.store(false, Ordering::Release);
         self.voided.store(false, Ordering::Release);
+        self.heads_stale.store(false, Ordering::Release);
         self.forget_decks();
         Ok(rewritten)
     }
@@ -761,6 +987,7 @@ impl HistCol {
         items.sort_unstable_by_key(|&(eid, t, idx)| (first_time[&eid], eid, t, idx));
         let mut rewritten = 0;
         let mut resident_last = NONE;
+        let mut last_entry: Option<Entry> = None;
         let mut i = 0;
         while i < items.len() {
             let eid = items[i].0;
@@ -792,6 +1019,7 @@ impl HistCol {
                 e.prev = prev;
                 e.jump = jump;
                 self.write(idx, &e);
+                last_entry = Some(e);
                 chain.push(idx);
                 info.insert(idx + 1, (depth, jump));
                 rewritten += 1;
@@ -801,7 +1029,7 @@ impl HistCol {
             }
         }
         if resident_last != NONE || self.head(slot) != NONE {
-            self.set_head(slot, resident_last)?;
+            self.set_head(slot, resident_last, last_entry.as_ref().filter(|_| resident_last != NONE))?;
         }
         Ok(rewritten)
     }
@@ -880,24 +1108,30 @@ fn change(e: &Entry) -> Change {
     }
 }
 
-/// 差分の並び `d` から時点 `t` の束: 時刻 ≤ t の差分のうち、 eid ごとに最後の差分が 「入った」 の eid。
+/// 差分の並び `d` から時点 `t` の束: 時刻 ≤ t の差分のうち、 eid ごとに最後の差分が 「入った」 の eid。 後ろから読み、 初めて見た eid
+/// だけを決める (開番地の小さな表。 並べ替えない)。
 fn members(d: &[Diff], t: u64) -> Vec<u32> {
     let k = d.partition_point(|x| x.time <= t);
-    let mut v: Vec<u64> = d[..k].iter().enumerate().map(|(i, x)| (u64::from(x.eid) << 32) | i as u64).collect();
-    v.sort_unstable();
+    let cap = (k * 2).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut seen = vec![0u32; cap]; // eid + 1 (0 = 空き)
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        let eid = (v[i] >> 32) as u32;
-        let mut j = i;
-        while j + 1 < v.len() && (v[j + 1] >> 32) as u32 == eid {
-            j += 1;
+    for x in d[..k].iter().rev() {
+        let key = x.eid.wrapping_add(1);
+        let mut i = (u64::from(x.eid).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+        loop {
+            match seen[i] {
+                0 => {
+                    seen[i] = key;
+                    if x.idx_in & 1 == 1 {
+                        out.push(x.eid);
+                    }
+                    break;
+                }
+                k2 if k2 == key => break,
+                _ => i = (i + 1) & mask,
+            }
         }
-        let last = (v[j] & 0xFFFF_FFFF) as usize;
-        if d[last].idx_in & 1 == 1 {
-            out.push(eid);
-        }
-        i = j + 1;
     }
     out
 }
@@ -1018,7 +1252,9 @@ mod tests {
         // デッキ
         assert_eq!(c.pull_at(199, 3000).unwrap(), vec![5]);
         assert!(c.note(5, y, Some(199), 6000, 0).unwrap());
-        assert_eq!(c.pull_at(199, 6000).unwrap(), vec![5, y]);
+        let mut d = c.pull_at(199, 6000).unwrap();
+        d.sort_unstable();
+        assert_eq!(d, vec![5, y]);
         // 繋ぎ直しても同じ
         c.relink(|e| e & 0xFFFFF).unwrap();
         assert_eq!(c.value_at(5, 5, 1005).unwrap().value, Some(90));

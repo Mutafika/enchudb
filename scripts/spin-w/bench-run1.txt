@@ -1,0 +1,37 @@
+warning: unexpected `cfg` condition value: `spin-w-bench`
+   --> crates/enchudb-engine/examples/spin_w_bench.rs:108:7
+    |
+108 | #[cfg(feature = "spin-w-bench")]
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `async-blob` and `crashsim`
+    = help: consider adding `spin-w-bench` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: requested on the command line with `-W unexpected-cfgs`
+
+warning: unexpected `cfg` condition value: `spin-w-bench`
+   --> crates/enchudb-engine/examples/spin_w_bench.rs:221:15
+    |
+221 |         #[cfg(feature = "spin-w-bench")]
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `async-blob` and `crashsim`
+    = help: consider adding `spin-w-bench` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+run 1 v0.38.0 base write_ns=860.2 read_ns=30.3 pull_us=10.96 open_ms=1.8
+run 1 proto   base write_ns=772.9 read_ns=19.4 pull_us=9.98 open_ms=1.9
+run 2 v0.38.0 base write_ns=818.0 read_ns=18.5 pull_us=10.89 open_ms=1.7
+run 2 proto   base write_ns=899.9 read_ns=21.4 pull_us=11.87 open_ms=1.5
+run 3 v0.38.0 base write_ns=858.4 read_ns=18.2 pull_us=10.78 open_ms=1.3
+run 3 proto   base write_ns=844.7 read_ns=27.5 pull_us=11.69 open_ms=1.7
+run 4 v0.38.0 base write_ns=916.8 read_ns=45.1 pull_us=13.19 open_ms=1.7
+run 4 proto   base write_ns=691.6 read_ns=18.4 pull_us=10.91 open_ms=1.5
+run 5 v0.38.0 base write_ns=839.3 read_ns=27.7 pull_us=11.14 open_ms=2.1
+run 5 proto   base write_ns=826.1 read_ns=26.9 pull_us=11.33 open_ms=1.6
+run 1 proto   hist declare_ms=98 write_undeclared_ns=659.5 write_declared_ns=1619.9 extra_ns=960.5 write_declared_after_decks_ns=2628.7 value_at_ns=278 value_at_hot_ns=158 value_at_far_hot_ns=145 deck_build_ms=31.2 deck_first_len=1034 deck_us=30.8 deck_now_us=51.6 avg_deck=999 entries=2198767 observed=0 entry_bytes=70364640 head_bytes=4063232 bytes_per_write=32.0 open_ms=1.5
+run 2 proto   hist declare_ms=85 write_undeclared_ns=815.5 write_declared_ns=1373.8 extra_ns=558.3 write_declared_after_decks_ns=2191.4 value_at_ns=246 value_at_hot_ns=151 value_at_far_hot_ns=141 deck_build_ms=23.9 deck_first_len=1034 deck_us=30.0 deck_now_us=51.1 avg_deck=1000 entries=2198767 observed=0 entry_bytes=70364640 head_bytes=4063232 bytes_per_write=32.0 open_ms=1.6
+run 3 proto   hist declare_ms=100 write_undeclared_ns=733.0 write_declared_ns=1470.1 extra_ns=737.1 write_declared_after_decks_ns=3593.3 value_at_ns=477 value_at_hot_ns=164 value_at_far_hot_ns=142 deck_build_ms=28.3 deck_first_len=1034 deck_us=35.6 deck_now_us=53.3 avg_deck=999 entries=2198767 observed=0 entry_bytes=70364640 head_bytes=4063232 bytes_per_write=32.0 open_ms=2.1
+run 4 proto   hist declare_ms=87 write_undeclared_ns=874.5 write_declared_ns=1389.0 extra_ns=514.6 write_declared_after_decks_ns=2823.6 value_at_ns=304 value_at_hot_ns=157 value_at_far_hot_ns=139 deck_build_ms=31.3 deck_first_len=1034 deck_us=31.3 deck_now_us=52.4 avg_deck=1000 entries=2198767 observed=0 entry_bytes=70364640 head_bytes=4063232 bytes_per_write=32.0 open_ms=2.0
+run 5 proto   hist declare_ms=89 write_undeclared_ns=1083.5 write_declared_ns=1064.2 extra_ns=-19.3 write_declared_after_decks_ns=2722.4 value_at_ns=311 value_at_hot_ns=165 value_at_far_hot_ns=142 deck_build_ms=29.6 deck_first_len=1034 deck_us=32.3 deck_now_us=52.7 avg_deck=999 entries=2198767 observed=0 entry_bytes=70364640 head_bytes=4063232 bytes_per_write=32.0 open_ms=1.9
+exit 0

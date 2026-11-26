@@ -118,19 +118,30 @@ fn hist(dir: &str) {
     eng.declare_history("t.h").unwrap();
     let declare_ms = td.elapsed().as_secs_f64() * 1000.0;
     let (n0, _, eb0, _) = eng.history_stats("t.h").unwrap();
-    // 書き換えの上乗せ: 宣言なし / 宣言ありを交互に 5 回
-    let (mut wv, mut wh) = (Vec::new(), Vec::new());
-    rewrite(&eng, &rows, "t.v", 100_000, &mut rng);
-    rewrite(&eng, &rows, "t.h", 100_000, &mut rng);
-    for _ in 0..5 {
-        wv.push(rewrite(&eng, &rows, "t.v", 200_000, &mut rng));
-        wh.push(rewrite(&eng, &rows, "t.h", 200_000, &mut rng));
-    }
+    // 書き換えの上乗せ: 宣言なし / 宣言ありを 2 万回ずつ交互に 60 組。 組ごとの差の中央値 (書き出しの周期の揺れを組で消す)
     let med = |v: &mut Vec<f64>| {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    let (mv, mh) = (med(&mut wv), med(&mut wh));
+    rewrite(&eng, &rows, "t.v", 100_000, &mut rng);
+    rewrite(&eng, &rows, "t.h", 100_000, &mut rng);
+    let pairs = |eng: &Engine, rng: &mut Rng| {
+        let (mut wv, mut wh, mut d) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..60 {
+            let (a, b) = if i % 2 == 0 {
+                let a = rewrite(eng, &rows, "t.v", 20_000, rng);
+                (a, rewrite(eng, &rows, "t.h", 20_000, rng))
+            } else {
+                let b = rewrite(eng, &rows, "t.h", 20_000, rng);
+                (rewrite(eng, &rows, "t.v", 20_000, rng), b)
+            };
+            wv.push(a);
+            wh.push(b);
+            d.push(b - a);
+        }
+        (med(&mut wv), med(&mut wh), med(&mut d))
+    };
+    let (mv, mh, extra) = pairs(&eng, &mut rng);
     // 書き換えの多い行 (100 行 × 1000 回) を作る: 遠い t の 1 行
     let hot: Vec<u64> = rows[..100].to_vec();
     let hid = eng.himo_id("t.h").unwrap() as u16;
@@ -195,20 +206,15 @@ fn hist(dir: &str) {
     }
     let deck_now_us = t.elapsed().as_nanos() as f64 / m as f64 / 1000.0;
     // 書き手が保つ: デッキを見た後の書き換えの上乗せ
-    let mut ws = Vec::new();
-    for _ in 0..3 {
-        ws.push(rewrite(&eng, &rows, "t.h", 200_000, &mut rng));
-    }
-    let after_obs = med(&mut ws);
+    let (_, _, after_obs) = pairs(&eng, &mut rng);
     let per_write = (eb1 - eb0) as f64 / (n1 - n0) as f64;
     drop(eng);
     let o = open_ms(dir);
     println!(
-        "hist declare_ms={declare_ms:.0} write_undeclared_ns={mv:.1} write_declared_ns={mh:.1} extra_ns={:.1} write_declared_after_decks_ns={after_obs:.1} \
+        "hist declare_ms={declare_ms:.0} write_undeclared_ns={mv:.1} write_declared_ns={mh:.1} extra_ns={extra:.1} extra_after_decks_ns={after_obs:.1} \
          value_at_ns={row_ns:.0} value_at_hot_ns={hot_ns:.0} value_at_far_hot_ns={far_ns:.0} \
          deck_build_ms={build_ms:.1} deck_first_len={first} deck_us={deck_us:.1} deck_now_us={deck_now_us:.1} avg_deck={} \
          entries={n1} observed={obs} entry_bytes={eb1} head_bytes={hb1} bytes_per_write={per_write:.1} open_ms={o:.1}",
-        mh - mv,
         total / (2 * m)
     );
 }

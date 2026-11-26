@@ -180,7 +180,12 @@ impl Engine {
                         eprintln!("warning: history of himo {h}: the horizon in the file differs from the declaration");
                     }
                     let c = self.hist.insert(c);
-                    if unclean && !readonly {
+                    // heads を file から戻せなかった (きれいに閉じていない / 置く前に落ちた) 時も繋ぎ直す。 readonly は繋ぎ直せない
+                    // (entry を書く) ので、 その process の読みは鎖の頭を持たない (試作の限り)
+                    if readonly && c.heads_stale() {
+                        eprintln!("warning: history of himo {h}: heads were not stored at the last close; readonly reads see no history");
+                    }
+                    if (unclean || c.heads_stale()) && !readonly {
                         if let Err(e) = c.relink(|eid| self.generations().split(eid).0) {
                             eprintln!("warning: history of himo {h}: relink failed: {e}");
                         }
@@ -293,6 +298,19 @@ impl Engine {
         }
     }
 
+    /// きれいに閉じる時 (`sync_and_mark_clean_with` の closing、 書き手の居ない所): 宣言した列ごとに場所の最新 (heads) を file に置く。
+    /// 置けなければ次に開く時に entry から作り直す (遅くなるだけ)。
+    pub(super) fn persist_history_heads(&self) {
+        if !self.hist.any() || self.is_readonly() {
+            return;
+        }
+        for h in self.hist.cols() {
+            if let Err(e) = h.persist_heads() {
+                eprintln!("warning: history of himo {}: heads not stored ({e}); the next open rebuilds them", h.hid);
+            }
+        }
+    }
+
     /// 本体の書き出しの最後 (`write_out_body`): 宣言した列の置き場を書き出す (`all` = 全域)。
     pub(super) fn write_out_history(&self, all: bool) -> io::Result<()> {
         if !self.hist.any() {
@@ -333,6 +351,10 @@ impl Engine {
     /// 時点 `t` に列 `himo` が `value` だった行 (eid、 順不同)。 値ごとに、 最初に見た時に差分の並びを作り、 後は書き手が足す。
     pub fn pull_at(&self, himo: &str, value: u64, t: u64) -> Result<Vec<enchudb_oplog::EntityId>, HistError> {
         let h = self.hist_col(himo)?;
+        // 今 (列の時計) 以後の時点のデッキは今の円柱そのもの (cell = 集まりの最新)。 差分の並びを読まない
+        if t >= h.clock() && t >= h.horizon() {
+            return Ok(self.pull_raw(himo, value));
+        }
         let peer = self.peer_id();
         Ok(h.pull_at(value, t)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect())
     }

@@ -41261,6 +41261,10 @@ impl Engine {
         if let Backing::Segments(set) = &self.backing {
             set.write_manifest()?;
         }
+        // スピン 案 W の試作: 閉じる時に履歴の場所ごとの最新を置く (開く時に貼る)
+        if closing {
+            self.persist_history_heads();
+        }
         Ok(())
     }
 
