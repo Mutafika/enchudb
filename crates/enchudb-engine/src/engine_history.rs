@@ -392,6 +392,28 @@ impl Engine {
         Ok(h.observe_base(values))
     }
 
+    /// 測り用: 作ったデッキの差分の並び・控えを捨てる (memory を返す。 次に見た時に作り直す)。
+    #[doc(hidden)]
+    pub fn history_forget_decks(&self, himo: &str) -> Result<(), HistError> {
+        self.hist_col(himo)?.forget_all_decks();
+        Ok(())
+    }
+
+    /// 切り分け用: 案 E の係を止める / 動かす、 周期 (µs) と動き出す遅れ (件) を変える。
+    #[doc(hidden)]
+    pub fn history_tune_linker(&self, himo: &str, run: bool, period_us: Option<u64>, start: Option<u32>) -> Result<(), HistError> {
+        let id = self.himo_id(himo).ok_or(HistError::NotDeclared)?;
+        self.hist.get(id).ok_or(HistError::NotDeclared)?;
+        self.hist.tune_linker(id, run, period_us, start);
+        Ok(())
+    }
+
+    /// 切り分け用: 履歴の列の欄の offset。
+    #[doc(hidden)]
+    pub fn history_layout() -> Vec<(&'static str, usize)> {
+        history::HistCol::layout()
+    }
+
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {

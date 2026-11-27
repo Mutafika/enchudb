@@ -1,2 +1,8 @@
 == run 1
-card=1000 write_extra_ns before decks: random: base=263 C=46 E=335 (E lag max 4697 entries) | hot: base=69 C=47 E=304 (E lag max 10823 entries)
+card=1000 write_extra_ns before decks: random: base=280 C=53 E=102 (E lag max 7256 entries, at end 5505) | hot: base=72 C=45 E=288 (E lag max 16077 entries, at end 7896)
+card=1000 after decks: base write_extra_ns random: base=518 hot: base=253 | base first view: 1 value=167 ms, other 999 values together=1388 ms (writer stalled 261.7 ms), value_at=427 ns, far_hot=497 ns, deck=74.5 µs (77.1x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=566 hot=282 (lag max 851928, at end 9983), first view: 1 value=324 ms, other 999 values together=6867 ms (writer stalled 285.8 ms), value_at=3693 ns, far_hot=312 ns, deck=62.2 µs (4.3x cylinder, 1000 reads), decks mem=752 MB
+card=1000  E K=256: write_extra_ns random=282 hot=207 (lag max 0, at end 6723098), first view: 1 value=677 ms, other 999 values together=14806 ms (writer stalled 64.4 ms), value_at=2033 ns, far_hot=328 ns, deck=56.6 µs (5.2x cylinder, 1000 reads), decks mem=1256 MB
+card=1000  E K=4096: write_extra_ns random=235 hot=431 (lag max 1607879, at end 800256), first view: 1 value=1151 ms, other 999 values together=17101 ms (writer stalled 154.5 ms), value_at=3883 ns, far_hot=326 ns, deck=120.4 µs (12.7x cylinder, 1000 reads), decks mem=1704 MB
+card=1000 disk: entries=51348043 observed=0 entry_bytes=1648037088 head_bytes=32000000
+card=10 write_extra_ns before decks: random: base=248 C=45 E=76 (E lag max 6619 entries, at end 5068) | hot: base=61 C=44 E=299 (E lag max 18609 entries, at end 1180)

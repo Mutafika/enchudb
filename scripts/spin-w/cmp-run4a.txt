@@ -1,0 +1,36 @@
+== run 1
+card=1000 write_extra_ns before decks: random: base=286 C=48 E=222 (E lag max 7864 entries) | hot: base=72 C=48 E=340 (E lag max 11031 entries)
+card=1000 after decks: base write_extra_ns random: base=645 hot: base=318 | base first view: 1 value=212 ms, other 999 values together=1561 ms (writer stalled 279.6 ms), value_at=536 ns, far_hot=579 ns, deck=77.2 µs (71.0x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=581 hot=712 (lag max 955860), first view: 1 value=367 ms, other 999 values together=5500 ms (writer stalled 4.2 ms), value_at=3389 ns, far_hot=397 ns, deck=48.2 µs (4.7x cylinder, 1000 reads), decks mem=689 MB
+card=1000  E K=256: write_extra_ns random=515 hot=376 (lag max 0), first view: 1 value=594 ms, other 999 values together=10229 ms (writer stalled 173.0 ms), value_at=1291 ns, far_hot=328 ns, deck=52.3 µs (7.2x cylinder, 1000 reads), decks mem=1015 MB
+card=1000  E K=4096: write_extra_ns random=1117 hot=826 (lag max 0), first view: 1 value=1237 ms, other 999 values together=11219 ms (writer stalled 73.2 ms), value_at=2191 ns, far_hot=325 ns, deck=115.3 µs (10.9x cylinder, 1000 reads), decks mem=1278 MB
+card=1000 disk: entries=41034625 observed=0 entry_bytes=1318323936 head_bytes=32000000
+card=10 write_extra_ns before decks: random: base=231 C=55 E=259 (E lag max 16926 entries) | hot: base=61 C=54 E=209 (E lag max 16544 entries)
+(止めた: 次の build で係と書き手の atomic を別の line に分けた。 ここまでは分ける前)
+== run 1
+card=1000 write_extra_ns before decks: random: base=326 C=58 E=84 (E lag max 20931 entries, at end 2166) | hot: base=156 C=82 E=278 (E lag max 14464 entries, at end 5729)
+card=1000 after decks: base write_extra_ns random: base=580 hot: base=282 | base first view: 1 value=179 ms, other 999 values together=1637 ms (writer stalled 321.2 ms), value_at=433 ns, far_hot=546 ns, deck=88.1 µs (67.7x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=332 hot=463 (lag max 1893719, at end 2403956), first view: 1 value=365 ms, other 999 values together=5131 ms (writer stalled 55.4 ms), value_at=1134 ns, far_hot=320 ns, deck=54.9 µs (4.6x cylinder, 1000 reads), decks mem=622 MB
+card=1000  E K=256: write_extra_ns random=287 hot=784 (lag max 0, at end 8344435), first view: 1 value=896 ms, other 999 values together=11095 ms (writer stalled 210.9 ms), value_at=1792 ns, far_hot=318 ns, deck=55.2 µs (5.4x cylinder, 1000 reads), decks mem=1049 MB
+card=1000  E K=4096: write_extra_ns random=233 hot=818 (lag max 0, at end 9914962), first view: 1 value=1322 ms, other 999 values together=14606 ms (writer stalled 105.6 ms), value_at=2336 ns, far_hot=341 ns, deck=117.7 µs (9.9x cylinder, 1000 reads), decks mem=1369 MB
+card=1000 disk: entries=44022401 observed=0 entry_bytes=1414208864 head_bytes=32000000
+card=10 write_extra_ns before decks: random: base=308 C=64 E=94 (E lag max 6937 entries, at end 3982) | hot: base=68 C=51 E=280 (E lag max 13869 entries, at end 2746)
+(止めた: observe_e が係の lock を握ったまま並びを作っていた。 ここまでは atomic を分けた後・直す前)
+== (observe_e を lock の外で並べる直しの後、 run 1: 値 10 種の途中で memory 不足で落ちた (今の形の並び + 案 E の並び + 列 2 本分))
+card=1000 write_extra_ns before decks: random: base=327 C=59 E=126 (E lag max 10315 entries, at end 5401) | hot: base=67 C=49 E=266 (E lag max 28653 entries, at end 2852)
+card=1000 after decks: base write_extra_ns random: base=747 hot: base=414 | base first view: 1 value=203 ms, other 999 values together=1643 ms (writer stalled 329.8 ms), value_at=764 ns, far_hot=301 ns, deck=76.4 µs (64.0x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=323 hot=221 (lag max 1052347, at end 4590), first view: 1 value=490 ms, other 999 values together=8080 ms (writer stalled 130.9 ms), value_at=2105 ns, far_hot=320 ns, deck=47.5 µs (6.7x cylinder, 1000 reads), decks mem=781 MB
+card=1000  E K=256: write_extra_ns random=637 hot=617 (lag max 2297915, at end 2422090), first view: 1 value=603 ms, other 999 values together=15005 ms (writer stalled 198.9 ms), value_at=2308 ns, far_hot=326 ns, deck=56.7 µs (4.4x cylinder, 1000 reads), decks mem=1298 MB
+card=1000  E K=4096: write_extra_ns random=210 hot=694 (lag max 1488053, at end 920256), first view: 1 value=1662 ms, other 999 values together=19529 ms (writer stalled 224.3 ms), value_at=5530 ns, far_hot=318 ns, deck=128.6 µs (11.7x cylinder, 1000 reads), decks mem=1784 MB
+card=1000 disk: entries=53292195 observed=0 entry_bytes=1710451872 head_bytes=32000000
+card=10 write_extra_ns before decks: random: base=292 C=46 E=73 (E lag max 20265 entries, at end 4434) | hot: base=63 C=47 E=320 (E lag max 5036 entries, at end 5506)
+(Killed: oom, anon-rss 13.8 GB)
+== (deck を捨てる直しの後の run 1。 切り分けのために値 10 種の途中で止めた)
+== run 1
+card=1000 write_extra_ns before decks: random: base=280 C=53 E=102 (E lag max 7256 entries, at end 5505) | hot: base=72 C=45 E=288 (E lag max 16077 entries, at end 7896)
+card=1000 after decks: base write_extra_ns random: base=518 hot: base=253 | base first view: 1 value=167 ms, other 999 values together=1388 ms (writer stalled 261.7 ms), value_at=427 ns, far_hot=497 ns, deck=74.5 µs (77.1x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=566 hot=282 (lag max 851928, at end 9983), first view: 1 value=324 ms, other 999 values together=6867 ms (writer stalled 285.8 ms), value_at=3693 ns, far_hot=312 ns, deck=62.2 µs (4.3x cylinder, 1000 reads), decks mem=752 MB
+card=1000  E K=256: write_extra_ns random=282 hot=207 (lag max 0, at end 6723098), first view: 1 value=677 ms, other 999 values together=14806 ms (writer stalled 64.4 ms), value_at=2033 ns, far_hot=328 ns, deck=56.6 µs (5.2x cylinder, 1000 reads), decks mem=1256 MB
+card=1000  E K=4096: write_extra_ns random=235 hot=431 (lag max 1607879, at end 800256), first view: 1 value=1151 ms, other 999 values together=17101 ms (writer stalled 154.5 ms), value_at=3883 ns, far_hot=326 ns, deck=120.4 µs (12.7x cylinder, 1000 reads), decks mem=1704 MB
+card=1000 disk: entries=51348043 observed=0 entry_bytes=1648037088 head_bytes=32000000
+card=10 write_extra_ns before decks: random: base=248 C=45 E=76 (E lag max 6619 entries, at end 5068) | hot: base=61 C=44 E=299 (E lag max 18609 entries, at end 1180)

@@ -166,9 +166,9 @@ fn main() {
             eng.history_set_e(h, true, None).unwrap();
             let _ = eng.history_e_stats(h);
             let e = extra(&eng, set, u, h, card, &mut rng);
-            let (_, lag_max, _) = eng.history_e_stats(h).unwrap();
+            let (lag_now, lag_max, _) = eng.history_e_stats(h).unwrap();
             eng.history_set_e(h, false, None).unwrap();
-            before.push(format!("{who}: base={base:.0} C={c:.0} E={e:.0} (E lag max {lag_max} entries)"));
+            before.push(format!("{who}: base={base:.0} C={c:.0} E={e:.0} (E lag max {lag_max} entries, at end {lag_now})"));
         }
         println!("card={card} write_extra_ns before decks: {}", before.join(" | "));
         // ---- 全部見た後 ----
@@ -179,6 +179,8 @@ fn main() {
         for (who, set) in [("random", &rows[..]), ("hot", &hot[..])] {
             after.push(format!("{who}: base={:.0}", extra(&eng, set, u, h, card, &mut rng)));
         }
+        // 今の形の並びを捨てる (案 E の並びと合わせて持つと memory が足りない)
+        eng.history_forget_decks(h).unwrap();
         // 案 E: K を変えて
         let mut erows = Vec::new();
         for k in [1024usize, 256, 4096] {
@@ -189,10 +191,10 @@ fn main() {
                 .iter()
                 .map(|(who, set)| format!("{who}={:.0}", extra(&eng, set, u, h, card, &mut rng)))
                 .collect();
-            let (_, lag_max, mem) = eng.history_e_stats(h).unwrap();
+            let (lag_now, lag_max, mem) = eng.history_e_stats(h).unwrap();
             let r = reads(&eng, &rows, &hot, h, card, &mut rng);
             erows.push(format!(
-                "  E K={k}: write_extra_ns {} (lag max {lag_max}), {}, value_at={:.0} ns, far_hot={:.0} ns, deck={:.1} µs ({:.1}x cylinder, {} reads), decks mem={:.0} MB",
+                "  E K={k}: write_extra_ns {} (lag max {lag_max}, at end {lag_now}), {}, value_at={:.0} ns, far_hot={:.0} ns, deck={:.1} µs ({:.1}x cylinder, {} reads), decks mem={:.0} MB",
                 ex.join(" "),
                 obs_str(obs, card),
                 r.0,
@@ -219,6 +221,7 @@ fn main() {
         }
         let (n, obs, eb, hb) = eng.history_stats(h).unwrap();
         println!("card={card} disk: entries={n} observed={obs} entry_bytes={eb} head_bytes={hb}");
+        eng.history_forget_decks(h).unwrap();
     }
     drop(eng);
     let _ = std::fs::remove_dir_all(&dir);

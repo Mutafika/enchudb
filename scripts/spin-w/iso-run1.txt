@@ -1,0 +1,151 @@
+layout len: offset 0 (line 0)
+layout top: offset 448 (line 7)
+layout inflight: offset 320 (line 5)
+layout settled: offset 384 (line 6)
+layout clock: offset 736 (line 11)
+layout e_mode: offset 951 (line 14)
+layout lazy: offset 949 (line 14)
+layout batch: offset 947 (line 14)
+layout observed: offset 944 (line 14)
+layout e_observed: offset 952 (line 14)
+layout linked_upto: offset 64 (line 1)
+layout e_lag_max: offset 128 (line 2)
+layout linker_stop: offset 953 (line 14)
+layout linker_period_us: offset 752 (line 11)
+layout linker_start: offset 936 (line 14)
+layout apply_lock: offset 760 (line 11)
+layout e_stuck: offset 512 (line 8)
+layout entries: offset 768 (line 12)
+layout heads: offset 704 (line 11)
+layout size: offset 960 (line 15)
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+random: C=140 ns (cpu 1.00) | E-stopped=140 ns (cpu 1.57) | E-200us=161 ns (cpu 1.57) | E-5ms=136 ns (cpu 0.96)
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+measure C
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure E-stopped
+measure E-200us
+measure E-5ms
+measure C
+measure E-200us
+measure E-5ms
+measure C
+measure E-stopped
+measure E-5ms
+measure C
+measure E-stopped
+measure E-200us
+hot: C=46 ns (cpu 0.00) | E-stopped=45 ns (cpu 1.71) | E-200us=91 ns (cpu 1.54) | E-5ms=44 ns (cpu 0.00)
+exit
