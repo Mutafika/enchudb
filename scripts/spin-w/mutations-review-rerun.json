@@ -1,0 +1,38 @@
+[
+ {
+  "name": "R3 同じ時刻で値の違う書き込みを重複として捨てる",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "f.time == time && f.value == v && f.flags & flag::OBSERVED == 0",
+  "replace": "f.time == time && f.flags & flag::OBSERVED == 0"
+ },
+ {
+  "name": "R4 宣言の後の語の回収を断らない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if self.hist.declared().iter().any(|&h| self.value_types.get(h as usize) == Some(&ValueType::Tag)) {",
+  "replace": "        if false && self.hist.declared().iter().any(|&h| self.value_types.get(h as usize) == Some(&ValueType::Tag)) {"
+ },
+ {
+  "name": "R5 宣言の間に 「履歴なし」 を見た書き込みを見直さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        } else if ok && let Some(h) = self.hist.get(hid) {",
+  "replace": "        } else if false && ok && let Some(h) = self.hist.get(hid) {"
+ },
+ {
+  "name": "R5 地平より前の時刻を地平に寄せない",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        let (time, extra) = if time <= h.horizon() {",
+  "replace": "        let (time, extra) = if false && time <= h.horizon() {"
+ },
+ {
+  "name": "R6 確定の線でなく今の時計を返す",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        Ok(self.hist_col(himo)?.settled())",
+  "replace": "        Ok(self.hist_col(himo)?.clock())"
+ },
+ {
+  "name": "R6 書きかけを WAL に積む前から数えない (LocalApply で数えない)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if let Some(h) = self.eng.hist.get(hid) {\n            h.begin_write();\n            self.hist.push(h);\n        }",
+  "replace": "        let _ = hid;"
+ }
+]

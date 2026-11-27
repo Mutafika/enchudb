@@ -1821,6 +1821,10 @@ pub(crate) struct LocalApply<'a> {
     intents: Intents<'a>,
     /// `IN_LOCAL_APPLY` を上げたか
     counted: bool,
+    /// スピン 案 W の試作: 書きかけを数えている履歴の列 (WAL に積む前 = HLC を取る前から、 当て終えるまで。 確定の線
+    /// `HistCol::settled` がこの書き込みの時刻を越えない)。 宣言の無い列では空 (確保しない)
+    #[cfg(not(target_arch = "wasm32"))]
+    hist: Vec<&'a crate::history::HistCol>,
 }
 
 impl<'a> LocalApply<'a> {
@@ -1841,13 +1845,27 @@ impl<'a> LocalApply<'a> {
             t.bits += 1;
             d.set(t);
         });
-        Self { eng, mark: Some(wal.applying()), intents, counted: true }
+        Self {
+            eng,
+            mark: Some(wal.applying()),
+            intents,
+            counted: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            hist: Vec::new(),
+        }
     }
 
     /// WAL の無い engine (印も門も要らない)。
     #[inline]
     fn off(eng: &'a Engine) -> Self {
-        Self { eng, mark: None, intents: Intents::None, counted: false }
+        Self {
+            eng,
+            mark: None,
+            intents: Intents::None,
+            counted: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            hist: Vec::new(),
+        }
     }
 
     /// #978: 印も門も持たず、 辞書と Leaf の旧 slot の書き出しを落とす時まで回さないだけの物 (削除の門の中で、 本体の書き出しを
@@ -1862,7 +1880,14 @@ impl<'a> LocalApply<'a> {
             t.bits += 1;
             d.set(t);
         });
-        Self { eng, mark: None, intents: Intents::None, counted: true }
+        Self {
+            eng,
+            mark: None,
+            intents: Intents::None,
+            counted: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            hist: Vec::new(),
+        }
     }
 
     /// `Engine::append_local_op` に渡す印。
@@ -1882,9 +1907,25 @@ impl<'a> LocalApply<'a> {
     }
 }
 
+impl<'a> LocalApply<'a> {
+    /// 履歴の列 `hid` の書きかけを数え始める (落とす時に終える)。 宣言の無い列は atomic の読み 1 回。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    fn hist_begin(&mut self, hid: usize) {
+        if let Some(h) = self.eng.hist.get(hid) {
+            h.begin_write();
+            self.hist.push(h);
+        }
+    }
+}
+
 impl Drop for LocalApply<'_> {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        for h in self.hist.drain(..) {
+            h.end_write();
+        }
         // 印を外し (書き出しが覆う)、 門を出る (止める側が始められる)
         drop(self.mark.take());
         drop(std::mem::replace(&mut self.intents, Intents::None));
@@ -25847,7 +25888,12 @@ impl Engine {
     #[inline]
     fn local_apply(&self, hid: usize) -> LocalApply<'_> {
         match self.oplog.as_ref() {
-            Some(wal) => LocalApply::new(self, wal, Intents::One(self.himos[hid].write_intent())),
+            Some(wal) => {
+                let mut la = LocalApply::new(self, wal, Intents::One(self.himos[hid].write_intent()));
+                #[cfg(not(target_arch = "wasm32"))]
+                la.hist_begin(hid);
+                la
+            }
             None => LocalApply::off(self),
         }
     }
@@ -25893,7 +25939,14 @@ impl Engine {
             }
             break g;
         };
-        LocalApply::new(self, wal, Intents::Row(gates))
+        let mut la = LocalApply::new(self, wal, Intents::Row(gates));
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.hist.any() {
+            for &h in hids.as_slice() {
+                la.hist_begin(h as usize);
+            }
+        }
+        la
     }
 
     /// #553 / #554: WAL に載らなかった書き込みを断る (呼び手は本体に当てない)。 計上して返す。

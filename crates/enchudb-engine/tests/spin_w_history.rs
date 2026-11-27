@@ -466,46 +466,64 @@ fn readonly_without_heads_refuses() {
     assert_eq!(ro.history(a, V).unwrap().len(), 1, "きれいに閉じた後は読める");
 }
 
-/// レビュー 1 回目の 5: 宣言は書き手と並んでも、 宣言の後の全部の行で集まりの最新 = cell。
+/// レビュー 1 回目の 5: 宣言は書き手と並んでも、 宣言の後の全部の行で集まりの最新 = cell。 行 5 万 (宣言が書き手を止める間を
+/// 長くする) × 3 回。 止まった書き手は 「履歴なし」 を見て cell を書いた後に見直す / 地平より前の時刻を地平に寄せる、 のどちらかを通る。
 #[test]
 fn declare_while_writers_run() {
-    let s = Scratch::new("declrace");
+    for round in 0..3u64 {
+        let s = Scratch::new(&format!("declrace{round}"));
+        let p = s.db();
+        let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 65_536).unwrap();
+        eng.define_table("t", 60_000).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
+        let rows: Vec<EntityId> = (0..50_000).map(|_| eng.entity_in("t").unwrap()).collect();
+        for &e in &rows {
+            eng.tie_to(e, V, 0u32);
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hs: Vec<_> = (0..3u64)
+            .map(|k| {
+                let (eng, rows, stop) = (eng.clone(), rows.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut r = Rng(k * 7919 + round * 31 + 1);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let e = rows[r.below(rows.len() as u64) as usize];
+                        eng.tie_to(e, V, r.below(VALUES) as u32);
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        eng.declare_history(V).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        hs.into_iter().for_each(|h| h.join().unwrap());
+        for &e in &rows {
+            let h = eng.history(e, V).unwrap();
+            assert_eq!(h.last().and_then(|c| c.value), eng.get(e, V), "row {e:#x}: 集まりの最新と cell ({h:?})");
+            for w in h.windows(2) {
+                assert!(w[0].time <= w[1].time);
+            }
+        }
+    }
+}
+
+/// レビュー 1 回目の 4: 宣言の後に語の回収を有効にさせない (Tag の列の番号が使い回されると、 履歴の値が別の語を指す)。
+#[test]
+fn vocab_reclaim_after_declare_is_refused() {
+    let s = Scratch::new("reclaim");
     let p = s.db();
-    let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 4096).unwrap();
-    eng.define_table("t", 2000).unwrap();
-    eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+    let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 16).unwrap();
+    eng.define_himo_in("t", "g", ValueType::Tag, 0).unwrap();
     eng.flush().unwrap();
     eng.persist_tables().unwrap();
     let eng = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
-    let rows: Vec<EntityId> = (0..1000).map(|_| eng.entity_in("t").unwrap()).collect();
-    for &e in &rows {
-        eng.tie_to(e, V, 0u32);
-    }
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let hs: Vec<_> = (0..3u64)
-        .map(|k| {
-            let (eng, rows, stop) = (eng.clone(), rows.clone(), stop.clone());
-            std::thread::spawn(move || {
-                let mut r = Rng(k * 7919 + 1);
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let e = rows[r.below(rows.len() as u64) as usize];
-                    eng.tie_to(e, V, r.below(VALUES) as u32);
-                }
-            })
-        })
-        .collect();
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    eng.declare_history(V).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    hs.into_iter().for_each(|h| h.join().unwrap());
-    for &e in &rows {
-        let h = eng.history(e, V).unwrap();
-        assert_eq!(h.last().and_then(|c| c.value), eng.get(e, V), "row {e:#x}: 集まりの最新と cell ({h:?})");
-        for w in h.windows(2) {
-            assert!(w[0].time <= w[1].time);
-        }
-    }
+    eng.declare_history("t.g").unwrap();
+    assert!(eng.enable_vocab_reclaim().is_err(), "履歴の Tag の列があるのに語の回収を有効にした");
 }
 
 /// 並んだ書き手 (4 本、 重なる行): 終わった後に、 各行の集まりの最新 = cell、 時刻は鎖の上で増える、 時点 t のデッキは 1 行の読みと合う。
@@ -515,6 +533,25 @@ fn concurrent_writers() {
     let p = s.db();
     let eng = create(&p, false);
     let rows: Vec<EntityId> = (0..ROWS).map(|_| eng.entity_in("t").unwrap()).collect();
+    // 書いている間に 「確定の線」 の時点で読んだ答えを控え、 書き終わった後に読み直して同じこと (レビュー 1 回目の 6)
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let (eng, rows, done) = (eng.clone(), rows.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut seen: Vec<(u64, u64, BTreeSet<EntityId>, Vec<Option<u64>>)> = Vec::new();
+            let mut k = 0u64;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let c = eng.history_clock(V).unwrap();
+                let v = k % VALUES;
+                let deck: BTreeSet<EntityId> = eng.pull_at(V, v, c).unwrap().into_iter().collect();
+                let vals: Vec<Option<u64>> = rows.iter().map(|&e| eng.value_at(e, V, c).unwrap().value).collect();
+                seen.push((c, v, deck, vals));
+                k += 1;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            seen
+        })
+    };
     let hs: Vec<_> = (0..4u64)
         .map(|k| {
             let (eng, rows) = (eng.clone(), rows.clone());
@@ -532,6 +569,15 @@ fn concurrent_writers() {
         })
         .collect();
     hs.into_iter().for_each(|h| h.join().unwrap());
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let seen = sampler.join().unwrap();
+    assert!(seen.len() > 3, "前提: 書いている間に読めた");
+    for (c, v, deck, vals) in &seen {
+        let now: BTreeSet<EntityId> = eng.pull_at(V, *v, *c).unwrap().into_iter().collect();
+        assert_eq!(&now, deck, "確定の線 {c} のデッキ v = {v} が後から変わった");
+        let now_vals: Vec<Option<u64>> = rows.iter().map(|&e| eng.value_at(e, V, *c).unwrap().value).collect();
+        assert_eq!(&now_vals, vals, "確定の線 {c} の値が後から変わった");
+    }
     let mut times = Vec::new();
     for &e in &rows {
         let h = eng.history(e, V).unwrap();

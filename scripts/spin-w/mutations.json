@@ -178,5 +178,11 @@
   "file": "crates/enchudb-engine/src/engine_history.rs",
   "find": "        Ok(self.hist_col(himo)?.settled())",
   "replace": "        Ok(self.hist_col(himo)?.clock())"
+ },
+ {
+  "name": "R6 書きかけを WAL に積む前から数えない (LocalApply で数えない)",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if let Some(h) = self.eng.hist.get(hid) {\n            h.begin_write();\n            self.hist.push(h);\n        }",
+  "replace": "        let _ = hid;"
  }
 ]

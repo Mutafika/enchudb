@@ -1,0 +1,8 @@
+baseline: pass 63 秒 → 1 run の上限 220 秒
+  killed 33s             B t より後の最初の差分を位置の順で決める
+  SURVIVED 64s           B 出て戻った行を二重に数える
+  killed 14s             B 開いた末尾をなめない
+  killed 63s             B 区間の最大の時刻で飛ばしすぎる
+killed 3 / survived 1 / その他 0
+  生き残り: B 出て戻った行を二重に数える
+exit 1

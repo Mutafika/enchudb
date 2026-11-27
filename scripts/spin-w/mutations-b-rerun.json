@@ -1,0 +1,8 @@
+[
+ {
+  "name": "B 出て戻った行を二重に数える",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "!x.1 && !now.contains(e)",
+  "replace": "!x.1"
+ }
+]

@@ -1,0 +1,41 @@
+baseline: pass 78 秒 → 1 run の上限 265 秒
+  SURVIVED 62s           重複落としを外す (同じ時刻の entry を足す)
+  killed 4s              時刻を運ばない (set_cell_in の書き込みに ZERO)
+  killed 6s              外す (untie) の時刻を運ばない
+  killed 8s              削除の時刻を運ばない (削除優先の ZERO を渡す)
+  killed 17s             書き出しに入れない
+  killed 61s             再生で cell が弾いた書き込みを履歴に足さない
+  killed 12s             時刻の戻る entry を足した後に繋ぎ直さない
+  killed 8s              時刻の戻る entry: 前の値と同じでも足す
+  killed 1s              書き直し (値が変わらない) も変更として足す
+  killed 55s             開く時に cell と突き合わせない
+  killed 9s              再生の前に鎖を繋ぎ直さない
+  killed 62s             前の住人の削除を突き合わせで足さない
+  killed 2s              飛び糸で t 以前の entry まで飛び越す
+  killed 51s             デッキの差分を書き手が保たない
+  killed 74s             宣言の時の値を入れない
+  killed 2s              前の住人へ飛ばない (場所の使い回しの後に古い eid を読めない)
+  killed 62s             WAL の無い書き込みを 「遅くとも」 にする
+  killed 80s             WAL の無い書き込みの時刻を壁時計だけで (列の時計を見ない)
+  SURVIVED 85s           WAL を付ける時に WAL の時計を履歴の時計より先へ進めない
+  SURVIVED 76s           engine の中の道を 「遅くとも」 にしない (印の値をそのまま時刻に)
+  killed 57s             R1 開く時に heads を貼らない (page の大きさで貼れない形)
+  killed 79s             R2 書き手で開いた時に heads の file を外さない
+  SURVIVED 68s           R3 同じ時刻で値の違う書き込みを重複として捨てる
+  killed 86s             R4 heads の予約を宣言の時の枠だけにする
+  SURVIVED 85s           R4 宣言の後の語の回収を断らない
+  killed 52s             R5 宣言で書き手を止めない
+  SURVIVED 89s           R5 宣言の間に 「履歴なし」 を見た書き込みを見直さない
+  SURVIVED 76s           R5 地平より前の時刻を地平に寄せない
+  killed 78s             R8 readonly で heads が合わない時も答える
+  SURVIVED 77s           R6 確定の線でなく今の時計を返す
+killed 22 / survived 8 / その他 0
+  生き残り: 重複落としを外す (同じ時刻の entry を足す)
+  生き残り: WAL を付ける時に WAL の時計を履歴の時計より先へ進めない
+  生き残り: engine の中の道を 「遅くとも」 にしない (印の値をそのまま時刻に)
+  生き残り: R3 同じ時刻で値の違う書き込みを重複として捨てる
+  生き残り: R4 宣言の後の語の回収を断らない
+  生き残り: R5 宣言の間に 「履歴なし」 を見た書き込みを見直さない
+  生き残り: R5 地平より前の時刻を地平に寄せない
+  生き残り: R6 確定の線でなく今の時計を返す
+exit 1

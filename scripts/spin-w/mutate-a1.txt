@@ -1,0 +1,7 @@
+baseline: pass 84 秒 → 1 run の上限 283 秒
+  killed(timeout) 283s   A 溜めを繋がない
+  killed 2s              A 溜めを繋ぐ時に鎖の最新を読まず prev を付けない
+  killed 70s             A 書き手が見た値の差分を足さない
+  killed 21s             A 繋ぎ直しで PEND を落とさない
+killed 4 / survived 0 / その他 0
+exit 0
