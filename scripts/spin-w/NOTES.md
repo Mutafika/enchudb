@@ -1,10 +1,7 @@
 # スピン 案 W の試作 — 最初の一切れ (proto/spin-w)
 
-> **push の状態 (2026-11-26)**: このセッションからの push は全部 403 で断られる。 `git push origin HEAD:proto/spin-w` も
-> `git push origin HEAD:claude/spin-w-1` も同じ全文:
-> `remote: Claude doesn't have GitHub access to Mutafika/enchudb for your organization. An org admin can install the Claude GitHub App at https://github.com/apps/claude/installations/select_target, or reconnect GitHub from claude.ai settings (https://claude.ai/customize/connectors?auth_start=github&auth_start_force=1) to re-link an existing installation`
-> / `fatal: unable to access 'https://github.com/Mutafika/enchudb/': The requested URL returned error: 403`。
-> このセッションに割り当てられた branch は無い (起動時の clone は remote の無い `review/0.33-0.35-harness`)。 commit は手元の `proto/spin-w` にためている。
+> **push の状態**: 2026-11-26 はこのセッションからの push が 403 で断られていた (Claude の GitHub App が org に無い)。 2026-11-27 に
+> App が入り、 `proto/spin-w` に push できた (496301c..5813a28)。 以後は commit のたびに `proto/spin-w` に push する。
 
 v0.38.0 (496301cf) の上。 master / version / CHANGELOG / release には触らない。
 
