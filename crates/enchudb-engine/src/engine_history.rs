@@ -45,9 +45,14 @@ impl Engine {
         }
         // 宣言より前の時刻 (宣言が書き手を止めた時に、 WAL に積んで待っていた書き込み): 地平に寄せて 「遅くとも」 (宣言の時の値の後に並ぶ)
         let (time, extra) = if time <= h.horizon() { (h.horizon(), extra | flag::OBSERVED) } else { (time, extra) };
-        let r = match cell_old {
-            Some(old) if h.batched() => h.note_batched(slot, eid, value, time, extra, old),
-            _ => h.note(slot, eid, value, time, extra),
+        let r = if h.lazy_unlinked() {
+            // 案 C: 見られるまで繋がない
+            h.note_lazy(slot, eid, value, time, extra)
+        } else {
+            match cell_old {
+                Some(old) if h.batched() => h.note_batched(slot, eid, value, time, extra, old),
+                _ => h.note(slot, eid, value, time, extra),
+            }
         };
         if r.is_err() {
             self.record_fault(FaultKind::DiskSpace, "history: cannot grow the history segment — the change is not in the history");
@@ -61,6 +66,7 @@ impl Engine {
         if hlc == Hlc::ZERO {
             return;
         }
+        self.hist_link(h);
         let _row = self.row_locks.write(slot);
         if h.note(slot, eid, value, history::pack(hlc), if deleting { flag::DELETE } else { 0 }).is_err() {
             self.record_fault(FaultKind::DiskSpace, "history: cannot grow the history segment — the change is not in the history");
@@ -209,6 +215,7 @@ impl Engine {
         }
         let repair = self.hist.repair.swap(false, std::sync::atomic::Ordering::AcqRel);
         for h in self.hist.cols() {
+            self.hist_link(h);
             if repair {
                 self.reconcile_history(h);
             }
@@ -310,6 +317,7 @@ impl Engine {
             return;
         }
         for h in self.hist.cols() {
+            self.hist_link(h);
             if let Err(e) = h.persist_heads() {
                 eprintln!("warning: history of himo {}: heads not stored ({e}); the next open rebuilds them", h.hid);
             }
@@ -334,7 +342,32 @@ impl Engine {
         if self.is_readonly() && h.heads_stale() {
             return Err(HistError::Unavailable);
         }
+        self.hist_link(h);
         Ok(h)
+    }
+
+    /// 案 C: まだ繋いでいない列なら、 列の書き手を止めて全体を繋ぐ (最初の読み・開く道・閉じる時)。 かかった時間 (繋がなければ None)。
+    pub(super) fn hist_link(&self, h: &HistCol) -> Option<std::time::Duration> {
+        if !h.unlinked() || self.is_readonly() {
+            return None;
+        }
+        let _w = self.himos[h.hid as usize].write_guard();
+        match h.link_all(|eid| self.generations().split(eid).0) {
+            Ok((_, d)) => Some(d),
+            Err(e) => {
+                eprintln!("warning: history of himo {}: link failed: {e}", h.hid);
+                None
+            }
+        }
+    }
+
+    /// 試作の形を切り替える (案 C)。 やめる時は先に繋ぐ。 繋いだ時間を返す (繋がなければ None)。
+    #[doc(hidden)]
+    pub fn history_set_lazy(&self, himo: &str, on: bool) -> Result<Option<std::time::Duration>, HistError> {
+        let h = self.himo_id(himo).and_then(|id| self.hist.get(id)).ok_or(HistError::NotDeclared)?;
+        let d = if on { None } else { self.hist_link(h) };
+        h.set_lazy(on);
+        Ok(d)
     }
 
     /// 列 `himo` の場所ごとの最新を、 開く時に file から戻せたか (試験用: 戻せなければ entry から繋ぎ直した)。

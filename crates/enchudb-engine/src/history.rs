@@ -70,6 +70,8 @@ pub mod flag {
     pub const VOID: u32 = 0x04;
     /// 案 A (溜める): 書いたが糸をまだ繋いでいない entry (`HistCol::drain` が繋ぐ)
     pub const PEND: u32 = 0x02;
+    /// 案 C (見られるまで繋がない): 列が一度も読まれていない間に足した、 糸も heads も無い entry (最初の読みが列全体を繋ぐ)
+    pub const LAZY: u32 = 0x01;
 }
 
 /// HLC を時刻に詰める: wall ms << 20 | logical (logical は 2^20 未満に切る。 1 ms に 100 万回は書かない)。
@@ -309,6 +311,9 @@ pub struct HistCol {
     batch: AtomicBool,
     /// 案 B: デッキは値ごとの差分の並びでなく、 entry の区間ごとの控え (読みの時に値で並べる、 `pull_at_blocks`)
     blocks_mode: AtomicBool,
+    /// 案 C: 見られるまで繋がない。 `unlinked` の間、 書き手は entry を糸なし (`LAZY`) で足すだけ (`note_lazy`)
+    lazy: AtomicBool,
+    unlinked: AtomicBool,
     /// 案 A の溜め: (場所, entry の位置)。 足した順 (同じ場所は位置の順)
     pending: Mutex<Vec<(u32, u32)>>,
     pend_any: AtomicBool,
@@ -462,6 +467,8 @@ impl HistCol {
             voided: AtomicBool::new(false),
             readonly,
             batch: AtomicBool::new(default_modes().0),
+            lazy: AtomicBool::new(std::env::var("ENCHU_HIST_WRITE").is_ok_and(|v| v == "lazy")),
+            unlinked: AtomicBool::new(std::env::var("ENCHU_HIST_WRITE").is_ok_and(|v| v == "lazy")),
             blocks_mode: AtomicBool::new(default_modes().1),
             pending: Mutex::new(Vec::new()),
             pend_any: AtomicBool::new(false),
@@ -890,6 +897,52 @@ impl HistCol {
             self.forget_decks();
             *self.blocks.write().unwrap_or_else(|p| p.into_inner()) = Blocks::default();
         }
+    }
+
+    /// 案 C: 見られるまで繋がない形にする / やめる (やめる時は呼び手が先に [`Self::link_all`] で繋ぐ)。 する時は次の書き込みから
+    /// 糸なしで足す (今ある鎖はそのまま、 次の読みが全体を繋ぐ)。
+    pub fn set_lazy(&self, on: bool) {
+        self.lazy.store(on, Ordering::Release);
+        if on {
+            self.unlinked.store(true, Ordering::Release);
+        }
+    }
+
+    /// 案 C: 繋いでいない entry があるか (読む前に [`Self::link_all`] が要る)。
+    #[inline]
+    pub fn unlinked(&self) -> bool {
+        self.unlinked.load(Ordering::Acquire)
+    }
+
+    /// 案 C の書き込み (行の lock の下): entry を糸なし (`LAZY`) で足すだけ。 heads も cell の前の値も読まない。 値の変わらない書き込みも
+    /// 足す (繋ぐ時に落とす)。 足した後に 「繋いだ」 を見たら (読み手が繋いだ後に足した)、 この場所を繋ぎ直す。
+    pub fn note_lazy(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32) -> io::Result<bool> {
+        let v = value.unwrap_or(ABSENT);
+        let idx = self.alloc()?;
+        self.write(idx, &Entry { flags: flag::VALID | flag::LAZY | extra, depth: 0, eid, prev: NONE, jump: NONE, time, value: v });
+        if !self.unlinked.load(Ordering::SeqCst) {
+            self.relink_slot(slot, idx)?;
+        }
+        Ok(true)
+    }
+
+    /// 案 C: 列全体を繋ぐ (呼び手は列の書き手を止めている)。 繋いだ entry の数と、 かかった時間。
+    pub fn link_all(&self, slot_of: impl Fn(u32) -> u32) -> io::Result<(usize, std::time::Duration)> {
+        let t0 = std::time::Instant::now();
+        if !self.unlinked.load(Ordering::Acquire) {
+            return Ok((0, t0.elapsed()));
+        }
+        let n = self.relink(slot_of)?;
+        // 繋いだ後の書き込みは今の形 (か案 A) で
+        self.lazy.store(false, Ordering::Release);
+        self.unlinked.store(false, Ordering::SeqCst);
+        Ok((n, t0.elapsed()))
+    }
+
+    /// 案 C が有効で、 まだ繋いでいないか (書き手が `note_lazy` を使う)。
+    #[inline]
+    pub fn lazy_unlinked(&self) -> bool {
+        self.lazy.load(Ordering::Relaxed) && self.unlinked.load(Ordering::Acquire)
     }
 
     /// 案 A の書き込み (行の lock の下): 値が cell の前の値 `cell_old` と同じなら足さない。 entry を糸なし (`PEND`) で足して位置を溜める。
@@ -1386,15 +1439,22 @@ impl HistCol {
             let mut chain: Vec<u32> = Vec::new(); // 深さ → 位置
             let mut info: HashMap<u32, (u32, u32)> = HashMap::new(); // 糸 → (深さ, 飛び糸)
             let mut last_time: Option<u64> = None;
+            let mut last_value: Option<u64> = None;
             while i < items.len() && items[i].0 == eid {
                 let (_, t, idx) = items[i];
                 i += 1;
-                if last_time == Some(t) {
-                    self.mark_void(idx); // 同じ時刻 = 同じ書き込み
+                if last_time == Some(t) && self.valid(idx).map(|x| x.value) == last_value {
+                    self.mark_void(idx); // 同じ時刻・同じ値 = 同じ書き込み
+                    continue;
+                }
+                let mut e = self.valid(idx).expect("拾った entry");
+                // 値の変わらない entry (案 C は書き直しも足す) と、 identity の最初の 「値なし」 は変更ではない
+                if e.flags & flag::BASE == 0 && (Some(e.value) == last_value || (last_value.is_none() && e.value == ABSENT)) {
+                    self.mark_void(idx);
                     continue;
                 }
                 last_time = Some(t);
-                let mut e = self.valid(idx).expect("拾った entry");
+                last_value = Some(e.value);
                 let depth = chain.len() as u32;
                 let (prev, jump) = match chain.last() {
                     None => (NONE, resident_last),
@@ -1405,7 +1465,7 @@ impl HistCol {
                         (pi + 1, if pd == 0 { pi + 1 } else { skew_jump(pi + 1, pd, j, jj) })
                     }
                 };
-                e.flags = (e.flags & !(flag::FIRST | flag::PEND)) | if depth == 0 { flag::FIRST } else { 0 };
+                e.flags = (e.flags & !(flag::FIRST | flag::PEND | flag::LAZY)) | if depth == 0 { flag::FIRST } else { 0 };
                 e.depth = depth;
                 e.prev = prev;
                 e.jump = jump;
@@ -1620,12 +1680,13 @@ mod tests {
     /// 小さい区間 + 末尾、 案 A の溜めの上限を何度も越える)、 場所の使い回しを混ぜる。
     #[test]
     fn variants_answer_like_the_base() {
-        for (batch, blocks) in [(true, false), (false, true), (true, true)] {
-            let d = tmp(&format!("var_{batch}_{blocks}"));
+        for (batch, blocks, lazy) in [(true, false, false), (false, true, false), (true, true, false), (false, false, true)] {
+            let d = tmp(&format!("var_{batch}_{blocks}_{lazy}"));
             let base = HistCol::create(&d.join("a"), 1, 10, 4096).unwrap();
             let var = HistCol::create(&d.join("b"), 1, 10, 4096).unwrap();
             base.set_modes(false, false);
             var.set_modes(batch, blocks);
+            var.set_lazy(lazy);
             let mut cell: Vec<Option<u64>> = vec![None; 2000];
             let mut gens = vec![0u32; 2000];
             let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(batch) ^ (u64::from(blocks) << 1);
@@ -1644,7 +1705,9 @@ mod tests {
                 let eid = (gens[slot as usize] << 20) | slot;
                 let new = if r == 0 { None } else { Some(step(&mut x) % 8) };
                 for c in [&base, &var] {
-                    if c.batched() {
+                    if c.lazy_unlinked() {
+                        c.note_lazy(slot, eid, new, t, 0).unwrap();
+                    } else if c.batched() {
                         c.note_batched(slot, eid, new, t, 0, cell[slot as usize]).unwrap();
                     } else {
                         c.note(slot, eid, new, t, 0).unwrap();
@@ -1658,6 +1721,11 @@ mod tests {
                     times.push(t);
                 }
             }
+            // 案 C: 最初の読みの前に全体を繋ぐ (engine は列の書き手を止めて呼ぶ)
+            if var.unlinked() {
+                let (n, _) = var.link_all(|e| e & 0xFFFFF).unwrap();
+                assert!(n > 0);
+            }
             for &tt in &times {
                 for v in 0..8u64 {
                     let mut a = base.pull_at(v, tt).unwrap();
@@ -1667,7 +1735,7 @@ mod tests {
                     let mut b = if var.blocks_mode() { var.pull_at_blocks(v, tt, &now).unwrap() } else { var.pull_at(v, tt).unwrap() };
                     a.sort_unstable();
                     b.sort_unstable();
-                    assert_eq!(a, b, "batch={batch} blocks={blocks} t={tt} v={v}");
+                    assert_eq!(a, b, "batch={batch} blocks={blocks} lazy={lazy} t={tt} v={v}");
                 }
                 for s in (0..2000u32).step_by(37) {
                     for g in 0..=gens[s as usize] {

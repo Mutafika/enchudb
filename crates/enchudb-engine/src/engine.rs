@@ -26323,10 +26323,11 @@ impl Engine {
         // 履歴: entry を cell より先に足す (レビュー 1 回目の 6: 先に cell を書くと、 その間の読みが円柱で後の変更を見た)。 案 A は書く前の
         // cell の値で 「変わったか」 を決める (heads を読まない)
         let hist = self.hist.get(hid);
-        let cell_old = hist.map(|_| self.himos[hid].get_value(local));
         if let Some(h) = hist {
             h.begin_write();
-            self.hist_note(h, local, Some(value), hlc, false, cell_old.filter(|_| h.batched()));
+            // 案 A だけ書く前の cell の値を読む (今の形 / 案 C は読まない)
+            let cell_old = (h.batched() && !h.lazy_unlinked()).then(|| self.himos[hid].get_value(local));
+            self.hist_note(h, local, Some(value), hlc, false, cell_old);
         }
         let ok = if self.points_to_content(hid) && !self.content_is_durable(hid, value) {
             // #419: 中身を指す cell は門の中で書く (書き出しがこの列を msync する間は待つ。 中身はこの前に書いてある)。
@@ -26338,8 +26339,8 @@ impl Engine {
         };
         if let Some(h) = hist {
             if !ok {
-                // cell を書けなかった: 履歴を cell の値に戻す (「遅くとも」)
-                self.hist_note(h, local, cell_old.flatten(), HIST_NO_TIME, false, None);
+                // cell を書けなかった (cell は前の値のまま): 履歴を cell の値に戻す (「遅くとも」)
+                self.hist_note(h, local, self.himos[hid].get_value(local), HIST_NO_TIME, false, None);
             }
             h.end_write();
         } else if ok && let Some(h) = self.hist.get(hid) {
@@ -26655,7 +26656,7 @@ impl Engine {
         let hist = self.hist.get(hid);
         if let Some(h) = hist {
             h.begin_write();
-            let cell_old = h.batched().then(|| self.himos[hid].get_value(local));
+            let cell_old = (h.batched() && !h.lazy_unlinked()).then(|| self.himos[hid].get_value(local));
             self.hist_note(h, local, None, hlc, deleting, cell_old);
         }
         self.himos[hid].remove(local);
