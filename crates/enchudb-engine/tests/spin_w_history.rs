@@ -511,6 +511,48 @@ fn declare_while_writers_run() {
     }
 }
 
+/// レビュー 1 回目の 5 (WAL の無い書き手): 単独で開いた engine を書き手 3 本で共有し、 その間に宣言する。 WAL の無い書き手は 「WAL に積む前」
+/// の門を通らないので、 宣言が止める前に 「履歴なし」 を見て cell の lock で止まり、 放された後に見直して足す。
+#[test]
+fn declare_while_walless_writers_run() {
+    for round in 0..3u64 {
+        let s = Scratch::new(&format!("declrace_sa{round}"));
+        let p = s.db();
+        let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 65_536).unwrap();
+        eng.define_table("t", 60_000).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let rows: Vec<EntityId> = (0..50_000).map(|_| eng.entity_in("t").unwrap()).collect();
+        for &e in &rows {
+            eng.tie_to(e, V, 0u32);
+        }
+        let eng = Arc::new(eng);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hs: Vec<_> = (0..3u64)
+            .map(|k| {
+                let (eng, rows, stop) = (eng.clone(), rows.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut r = Rng(k * 7919 + round * 31 + 5);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let e = rows[r.below(rows.len() as u64) as usize];
+                        eng.tie_to(e, V, r.below(VALUES) as u32);
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        eng.declare_history(V).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        hs.into_iter().for_each(|h| h.join().unwrap());
+        for &e in &rows {
+            let h = eng.history(e, V).unwrap();
+            assert_eq!(h.last().and_then(|c| c.value), eng.get(e, V), "row {e:#x}: 集まりの最新と cell ({h:?})");
+        }
+    }
+}
+
 /// レビュー 1 回目の 4: 宣言の後に語の回収を有効にさせない (Tag の列の番号が使い回されると、 履歴の値が別の語を指す)。
 #[test]
 fn vocab_reclaim_after_declare_is_refused() {

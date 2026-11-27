@@ -1,0 +1,4 @@
+baseline: pass 145 秒 → 1 run の上限 466 秒
+  killed 12s             B 出て戻った行を二重に数える
+killed 1 / survived 0 / その他 0
+exit 0
