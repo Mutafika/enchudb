@@ -1,0 +1,27 @@
+== run 1
+card=1000 rows=random write_extra_ns: base=627 A=503 C=396 | C link=1650 ms for 4669028 entries, writer stalled 1650 ms
+card=1000 rows=hot write_extra_ns: base=282 A=320 C=265 | C link=2755 ms for 8269081 entries, writer stalled 2755 ms
+card=1000 deck base: first=464 ms, median=143294.7 µs (25576.7x of the cylinder read), reads=19, avg_deck=986
+card=1000 deck B: first=1293 ms, median=350.5 µs (622.3x of the cylinder read), reads=1000, avg_deck=1000
+card=1000 deck D: first=154 ms, median=17940.9 µs (3408.8x of the cylinder read), reads=155, avg_deck=1002, snaps=16 (449 MB)
+card=1000 disk: entries=8269081 observed=0 entry_bytes=265805760 head_bytes=32000000
+card=10 rows=random write_extra_ns: base=563 A=437 C=367 | C link=1442 ms for 4303325 entries, writer stalled 1442 ms
+card=10 rows=hot write_extra_ns: base=282 A=316 C=260 | C link=2469 ms for 7545420 entries, writer stalled 2470 ms
+card=10 deck base: first=545 ms, median=497.6 µs (8.4x of the cylinder read), reads=440, avg_deck=99998
+card=10 deck B: first=1783 ms, median=721536.5 µs (4166.4x of the cylinder read), reads=7, avg_deck=100030
+card=10 deck D: first=46 ms, median=1821.3 µs (25.0x of the cylinder read), reads=403, avg_deck=99996, snaps=16 (448 MB)
+card=10 disk: entries=7545420 observed=0 entry_bytes=249736064 head_bytes=32000000
+== run 2
+card=1000 rows=random write_extra_ns: base=532 A=421 C=361 | C link=1591 ms for 4658318 entries, writer stalled 1592 ms
+card=1000 rows=hot write_extra_ns: base=285 A=322 C=272 | C link=2474 ms for 8258052 entries, writer stalled 2474 ms
+card=1000 deck base: first=413 ms, median=107055.8 µs (21152.1x of the cylinder read), reads=26, avg_deck=995
+card=1000 deck B: first=1241 ms, median=331.7 µs (572.8x of the cylinder read), reads=1000, avg_deck=1000
+card=1000 deck D: first=164 ms, median=20893.6 µs (2893.4x of the cylinder read), reads=132, avg_deck=1002, snaps=16 (449 MB)
+card=1000 disk: entries=8258052 observed=0 entry_bytes=265624896 head_bytes=32000000
+card=10 rows=random write_extra_ns: base=598 A=485 C=398 | C link=1532 ms for 4260089 entries, writer stalled 1532 ms
+card=10 rows=hot write_extra_ns: base=286 A=468 C=267 | C link=2721 ms for 7503468 entries, writer stalled 2721 ms
+card=10 deck base: first=595 ms, median=809.7 µs (7.4x of the cylinder read), reads=286, avg_deck=99992
+card=10 deck B: first=2087 ms, median=986310.2 µs (5083.6x of the cylinder read), reads=4, avg_deck=100000
+card=10 deck D: first=58 ms, median=1878.2 µs (15.4x of the cylinder read), reads=304, avg_deck=99993, snaps=16 (448 MB)
+card=10 disk: entries=7503468 observed=0 entry_bytes=248229856 head_bytes=32000000
+exit

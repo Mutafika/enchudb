@@ -1,0 +1,26 @@
+[
+ {
+  "name": "D 境目の後の entry を当てない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        let mut idx = end;\n        while idx < n {",
+  "replace": "        let mut idx = n;\n        while idx < n {"
+ },
+ {
+  "name": "D 区間の時刻の最小で飛ばしすぎる (時刻の最大で飛ばす)",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "            if blk < metas.len() && metas[blk].0 > t {",
+  "replace": "            if blk < metas.len() && metas[blk].1 > t {"
+ },
+ {
+  "name": "D 控えの場所の状態を時刻でなく位置の順で決める",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "            if cur.2 == ABSENT && cur.1 == 0 || e.time >= cur.1 {",
+  "replace": "            if true {"
+ },
+ {
+  "name": "D 境目を時刻の最大でなく位置で決める (t を越える区間まで控えに入れる)",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "            if top > t {\n                break;\n            }",
+  "replace": "            if top > t && false {\n                break;\n            }"
+ }
+]

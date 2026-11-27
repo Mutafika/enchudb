@@ -328,6 +328,8 @@ pub struct HistCol {
     inflight: AtomicU32,
     /// 確定の線: 書きかけが 0 に戻った時の時計。 この時刻以下の時点の読みは後から変わらない
     settled: AtomicU64,
+    /// 書いた entry の時刻の最大 (書き手が RMW なしで上げる。 時計の読みは末尾をなめない)
+    top: AtomicU64,
 }
 
 /// 案 A の溜めの上限 (これだけ溜まったら書き手が当てる)。
@@ -512,6 +514,7 @@ impl HistCol {
             snaps: Mutex::new(Snaps::default()),
             inflight: AtomicU32::new(0),
             settled: AtomicU64::new(horizon),
+            top: AtomicU64::new(horizon),
         }
     }
 
@@ -527,15 +530,8 @@ impl HistCol {
     /// 見た最大の時刻。 書き手は時計を触らない (書き込みの道の RMW を 1 つ減らす): entry は大体時刻の順に足すので、 末尾の entry の
     /// 時刻の最大と覚えた値の大きい方。
     pub fn clock(&self) -> u64 {
-        let n = self.len();
-        let mut top = self.clock.load(Ordering::Acquire);
-        for i in n.saturating_sub(256)..n {
-            if let Some(e) = self.valid(i) {
-                top = top.max(e.time);
-            }
-        }
-        self.clock.fetch_max(top, Ordering::AcqRel);
-        top
+        // 書き手は entry を書く時に `top` を (RMW でなく) 上げる。 並んだ書き手の間で少し低く残ることはある (確定の線は低い側 = 安全)
+        self.clock.load(Ordering::Acquire).max(self.top.load(Ordering::Acquire))
     }
 
     /// WAL の無い session の書き込みの時刻: 壁時計の ms と、 列の時計 + 1 の大きい方 (同じ列の時刻は戻らない)。 列の時計を進める。
@@ -654,6 +650,9 @@ impl HistCol {
     }
 
     fn write(&self, idx: u32, e: &Entry) {
+        if e.time > self.top.load(Ordering::Relaxed) {
+            self.top.store(e.time, Ordering::Release);
+        }
         let p = self.ptr(idx);
         unsafe {
             std::ptr::write(p.add(4) as *mut u32, e.eid);

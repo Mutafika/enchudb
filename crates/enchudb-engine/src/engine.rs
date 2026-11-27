@@ -26323,8 +26323,12 @@ impl Engine {
         // 履歴: entry を cell より先に足す (レビュー 1 回目の 6: 先に cell を書くと、 その間の読みが円柱で後の変更を見た)。 案 A は書く前の
         // cell の値で 「変わったか」 を決める (heads を読まない)
         let hist = self.hist.get(hid);
+        // 書きかけは WAL の書き手なら `LocalApply` が数える (HLC を取る前から)。 WAL の無い書き手はここで
+        let count_here = self.oplog.is_none();
         if let Some(h) = hist {
-            h.begin_write();
+            if count_here {
+                h.begin_write();
+            }
             // 案 A だけ書く前の cell の値を読む (今の形 / 案 C は読まない)
             let cell_old = (h.batched() && !h.lazy_unlinked()).then(|| self.himos[hid].get_value(local));
             self.hist_note(h, local, Some(value), hlc, false, cell_old);
@@ -26342,7 +26346,9 @@ impl Engine {
                 // cell を書けなかった (cell は前の値のまま): 履歴を cell の値に戻す (「遅くとも」)
                 self.hist_note(h, local, self.himos[hid].get_value(local), HIST_NO_TIME, false, None);
             }
-            h.end_write();
+            if count_here {
+                h.end_write();
+            }
         } else if ok && let Some(h) = self.hist.get(hid) {
             // 宣言が書き手を止めている間に 「履歴なし」 を見た書き込み: cell を書いた後に見直して足す (`declare_history`)
             self.hist_note(h, local, Some(value), hlc, false, None);
@@ -26654,14 +26660,19 @@ impl Engine {
         };
         // 履歴: entry を cell より先に足す (`live_set` と同じ)
         let hist = self.hist.get(hid);
+        let count_here = self.oplog.is_none();
         if let Some(h) = hist {
-            h.begin_write();
+            if count_here {
+                h.begin_write();
+            }
             let cell_old = (h.batched() && !h.lazy_unlinked()).then(|| self.himos[hid].get_value(local));
             self.hist_note(h, local, None, hlc, deleting, cell_old);
         }
         self.himos[hid].remove(local);
         if let Some(h) = hist {
-            h.end_write();
+            if count_here {
+                h.end_write();
+            }
         } else if let Some(h) = self.hist.get(hid) {
             self.hist_note(h, local, None, hlc, deleting, None);
         }
