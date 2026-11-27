@@ -26260,6 +26260,8 @@ impl Engine {
     /// identity の集まりに 1 件足す (行の lock の下)。
     fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>, hlc: enchudb_oplog::Hlc) -> bool {
         let value = value.into();
+        // 案 A (溜める) は書く前の cell の値で 「変わったか」 を決める (heads を読まない。 cell の line はこの後書くので cache に入る)
+        let hist_old = self.hist.get(hid).filter(|h| h.batched()).map(|_| self.himos[hid].get_value(local));
         let tracked = self.vocab_tracks(hid);
         let old = if tracked { self.himos[hid].get_value32(local) } else { None };
         let changed = tracked && old != Some(value as u32);
@@ -26277,7 +26279,7 @@ impl Engine {
         };
         if ok {
             if let Some(h) = self.hist.get(hid) {
-                self.hist_note(h, local, Some(value), hlc, false);
+                self.hist_note(h, local, Some(value), hlc, false, hist_old);
             }
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
             self.order_note(hid as u16, local);
@@ -26583,9 +26585,10 @@ impl Engine {
         } else {
             None
         };
+        let hist_old = self.hist.get(hid).filter(|h| h.batched()).map(|_| self.himos[hid].get_value(local));
         self.himos[hid].remove(local);
         if let Some(h) = self.hist.get(hid) {
-            self.hist_note(h, local, None, hlc, deleting);
+            self.hist_note(h, local, None, hlc, deleting, hist_old);
         }
         self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);

@@ -22,7 +22,9 @@ pub(super) const HIST_NO_TIME: Hlc = Hlc { wall: 0, logical: 1, peer: u32::MAX }
 impl Engine {
     /// 書き手の道 (`live_set` / `live_remove`、 行の lock の下) から: 列 `h` の場所 `slot` の identity に 1 件足す。 `hlc` が `ZERO`
     /// (時刻を運べない道) なら 「遅くとも」 の印を付けて列の時計で置く。
-    pub(super) fn hist_note(&self, h: &HistCol, slot: u32, value: Option<u64>, hlc: Hlc, deleting: bool) {
+    ///
+    /// `cell_old` = 書く前の cell の値 (案 A が使う。 案 A でない時は None で読まない)。
+    pub(super) fn hist_note(&self, h: &HistCol, slot: u32, value: Option<u64>, hlc: Hlc, deleting: bool, cell_old: Option<Option<u64>>) {
         // 行の削除は場所の世代を上げる前に cell を落とす (今の住人)。 開く時の後始末 (死んだ場所の残りの cell) は最後の行
         let eid = if deleting { self.last_local_of_slot(slot) } else { self.generations().local(slot) };
         let (time, mut extra) = if hlc == Hlc::ZERO {
@@ -41,7 +43,11 @@ impl Engine {
         if deleting {
             extra |= flag::DELETE;
         }
-        if h.note(slot, eid, value, time, extra).is_err() {
+        let r = match cell_old {
+            Some(old) if h.batched() => h.note_batched(slot, eid, value, time, extra, old),
+            _ => h.note(slot, eid, value, time, extra),
+        };
+        if r.is_err() {
             self.record_fault(FaultKind::DiskSpace, "history: cannot grow the history segment — the change is not in the history");
         }
     }
@@ -346,11 +352,24 @@ impl Engine {
     pub fn pull_at(&self, himo: &str, value: u64, t: u64) -> Result<Vec<enchudb_oplog::EntityId>, HistError> {
         let h = self.hist_col(himo)?;
         // 今 (列の時計) 以後の時点のデッキは今の円柱そのもの (cell = 集まりの最新)。 差分の並びを読まない
+        h.drain();
         if t >= h.clock() && t >= h.horizon() {
             return Ok(self.pull_raw(himo, value));
         }
         let peer = self.peer_id();
+        if h.blocks_mode() {
+            // 案 B: 今の円柱から、 t より後の差分を戻す
+            let now: Vec<u32> = self.pull_raw(himo, value).into_iter().map(enchudb_oplog::eid_local).collect();
+            return Ok(h.pull_at_blocks(value, t, &now)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect());
+        }
         Ok(h.pull_at(value, t)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect())
+    }
+
+    /// 試作の形を切り替える (測りの交互の回し用): `batch` = 案 A (溜めてまとめて繋ぐ)、 `blocks` = 案 B (区間ごとの控え)。
+    #[doc(hidden)]
+    pub fn history_set_modes(&self, himo: &str, batch: bool, blocks: bool) -> Result<(), HistError> {
+        self.hist_col(himo)?.set_modes(batch, blocks);
+        Ok(())
     }
 
     /// 列 `himo` の履歴の時計 (見た最大の時刻)。 「今」 の時点として読みに渡せる。
