@@ -1,0 +1,14 @@
+[
+ {
+  "name": "C 繋いだ後に糸なしで足した場所を繋ぎ直さない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        if !self.unlinked.load(Ordering::SeqCst) {\n            self.relink_slot(slot, idx)?;\n        }",
+  "replace": "        let _ = slot;"
+ },
+ {
+  "name": "C 繋ぐ間に書き手を止めない",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        let _w = self.himos[h.hid as usize].write_guard();\n        match h.link_all",
+  "replace": "        let _w = ();\n        match h.link_all"
+ }
+]

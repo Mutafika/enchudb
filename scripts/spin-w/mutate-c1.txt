@@ -1,0 +1,8 @@
+baseline: pass 134 秒 → 1 run の上限 431 秒
+  killed 76s             C 最初の読みで繋がない
+  killed 66s             C 繋ぐ時に値の変わらない entry を落とさない
+  SURVIVED 154s          C 繋いだ後に糸なしで足した場所を繋ぎ直さない
+  SURVIVED 147s          C 繋ぐ間に書き手を止めない
+killed 2 / survived 2 / その他 0
+  生き残り: C 繋いだ後に糸なしで足した場所を繋ぎ直さない
+  生き残り: C 繋ぐ間に書き手を止めない

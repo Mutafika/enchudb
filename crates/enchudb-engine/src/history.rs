@@ -1853,6 +1853,8 @@ mod tests {
             let base = HistCol::create(&d.join("a"), 1, 10, 4096).unwrap();
             let var = HistCol::create(&d.join("b"), 1, 10, 4096).unwrap();
             base.set_modes(false, false);
+            base.set_lazy(false);
+            base.set_snaps(false);
             var.set_modes(batch, blocks);
             var.set_lazy(lazy);
             var.set_snaps(snaps);
@@ -1922,6 +1924,32 @@ mod tests {
             assert_eq!(base.counts(), var.counts());
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    /// 案 D: 控えの場所の状態は時刻で決める (再生は前の時刻の entry を末尾に足すので、 位置の順の最後が最新とは限らない)。
+    #[test]
+    fn snaps_follow_time_not_position() {
+        let d = tmp("snaps_order");
+        let c = HistCol::create(&d, 4, 1, 1 << 16).unwrap();
+        c.set_snaps(true);
+        let slot_of = |e: u32| e & 0xFFFFF;
+        c.note(7, 7, Some(1), 10, 0).unwrap();
+        let mut t = 20;
+        for i in 0..5000u32 {
+            c.note(100 + i, 100 + i, Some(9), t, 0).unwrap();
+            t += 1;
+        }
+        c.note(7, 7, Some(2), 100_000, 0).unwrap();
+        // 再生の形: 前の時刻の書き込みを末尾に足す (場所を繋ぎ直す)
+        c.note(7, 7, Some(3), 12, 0).unwrap();
+        for i in 0..9000u32 {
+            c.note(20_000 + i, 20_000 + i, Some(9), 200_000 + u64::from(i), 0).unwrap();
+        }
+        let big = 10_000_000;
+        assert_eq!(c.value_at(7, 7, big).unwrap().value, Some(2), "前提: 時刻の最新は 2");
+        assert!(c.pull_at_snaps(2, big, slot_of).unwrap().contains(&7), "時刻の最新 (2) で束に居ない");
+        assert!(!c.pull_at_snaps(3, big, slot_of).unwrap().contains(&7), "位置の最後 (3) の束に居る");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// レビュー 1 回目の 3: 時刻を詰める所で logical が切れて同じ時刻になった、 値の違う書き込みは両方残り、 後の方が勝つ。

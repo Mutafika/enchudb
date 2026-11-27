@@ -1,0 +1,8 @@
+baseline: pass 118 秒 → 1 run の上限 384 秒
+  killed 58s             D 境目の後の entry を当てない
+  killed 58s             D 区間の時刻の最小で飛ばしすぎる (時刻の最大で飛ばす)
+  SURVIVED 129s          D 控えの場所の状態を時刻でなく位置の順で決める
+  killed 59s             D 境目を時刻の最大でなく位置で決める (t を越える区間まで控えに入れる)
+killed 3 / survived 1 / その他 0
+  生き残り: D 控えの場所の状態を時刻でなく位置の順で決める
+exit 1

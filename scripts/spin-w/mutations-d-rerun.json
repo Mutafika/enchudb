@@ -1,0 +1,8 @@
+[
+ {
+  "name": "D 控えの場所の状態を時刻でなく位置の順で決める",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "            if cur.2 == ABSENT && cur.1 == 0 || e.time >= cur.1 {",
+  "replace": "            if true {"
+ }
+]
