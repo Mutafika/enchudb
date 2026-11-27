@@ -1,0 +1,10 @@
+== run 1
+card=1000 write_extra_ns before decks: random: base=344 C=66 E=122 (E lag max/at end per round 6531/2202 7438/2843 10573/2006 16641/2376) | hot: base=91 C=44 E=77 (E lag max/at end per round 212683/3284 8364/673 7284/3471 5334/1192)
+card=1000 after decks: base write_extra_ns random: base=1219 hot: base=415 | base first view: 1 value=601 ms, other 999 values together=2522 ms (writer stalled 413.9 ms), value_at=1062 ns, far_hot=331 ns, deck=160.2 µs (117.0x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=241 hot=324 (lag max 12492, at end 10549), first view: 1 value=616 ms, other 999 values together=8514 ms (writer stalled 214.5 ms), value_at=3550 ns, far_hot=336 ns, deck=49.5 µs (4.5x cylinder, 1000 reads), decks mem=982 MB
+card=1000  E K=256: write_extra_ns random=258 hot=189 (lag max 13982, at end 10834), first view: 1 value=936 ms, other 999 values together=12653 ms (writer stalled 118.1 ms), value_at=4114 ns, far_hot=942 ns, deck=52.6 µs (5.2x cylinder, 1000 reads), decks mem=1417 MB
+card=1000  E K=4096: write_extra_ns random=253 hot=258 (lag max 25235, at end 3854), first view: 1 value=1047 ms, other 999 values together=15303 ms (writer stalled 220.5 ms), value_at=4602 ns, far_hot=778 ns, deck=127.7 µs (9.9x cylinder, 1000 reads), decks mem=1655 MB
+card=1000 disk: entries=49318759 observed=0 entry_bytes=1585742528 head_bytes=32000000
+card=10 write_extra_ns before decks: random: base=423 C=75 E=129 (E lag max/at end per round 4702/2879 13086/3215 12559/1318 8405/1786) | hot: base=79 C=43 E=76 (E lag max/at end per round 5169/1694 9879/2107 5275/2381 25363/2251)
+/bin/bash: line 2: 24005 Killed                  timeout 5400 $CARGO_TARGET_DIR/release/examples/spin_w_cmp3 /home/user/swcmp3.db 2>&1
+== run 2

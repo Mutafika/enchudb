@@ -1,0 +1,88 @@
+== run 1
+rss 69 MB: card=1000 start
+card=1000 write_extra_ns before decks: random: base=504 C=100 E=145 (E lag max/at end per round 4909/1994 20256/3944 7518/851 12454/1358) | hot: base=87 C=73 E=107 (E lag max/at end per round 9617/3869 5701/2636 5062/4071 7916/2121)
+rss 69 MB: before base observe
+rss 801 MB: after base observe
+rss 81 MB: E K=1024 before observe
+rss 1118 MB: E K=1024 after observe (decks 900 MB)
+rss 1203 MB: E K=1024 after reads
+rss 113 MB: E K=256 before observe
+rss 1403 MB: E K=256 after observe (decks 1287 MB)
+rss 1536 MB: E K=256 after reads
+rss 84 MB: E K=4096 before observe
+rss 2006 MB: E K=4096 after observe (decks 1508 MB)
+rss 2068 MB: E K=4096 after reads
+card=1000 after decks: base write_extra_ns random: base=796 hot: base=703 | base first view: 1 value=835 ms, other 999 values together=3051 ms (writer stalled 584.8 ms), value_at=905 ns, far_hot=383 ns, deck=171.8 µs (105.4x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=459 hot=317 (lag max 11777, at end 579), first view: 1 value=919 ms, other 999 values together=9913 ms (writer stalled 49.3 ms), value_at=3285 ns, far_hot=360 ns, deck=56.6 µs (2.6x cylinder, 1000 reads), decks mem=1019 MB
+card=1000  E K=256: write_extra_ns random=266 hot=474 (lag max 20981, at end 2384), first view: 1 value=1564 ms, other 999 values together=14240 ms (writer stalled 115.7 ms), value_at=3310 ns, far_hot=394 ns, deck=67.1 µs (3.7x cylinder, 1000 reads), decks mem=1456 MB
+card=1000  E K=4096: write_extra_ns random=570 hot=304 (lag max 24496, at end 3182), first view: 1 value=1341 ms, other 999 values together=16637 ms (writer stalled 165.1 ms), value_at=6203 ns, far_hot=378 ns, deck=116.1 µs (7.2x cylinder, 1000 reads), decks mem=1647 MB
+card=1000 disk: entries=49065296 observed=0 entry_bytes=1576748032 head_bytes=32000000
+rss 92 MB: card=10 start
+card=10 write_extra_ns before decks: random: base=464 C=84 E=138 (E lag max/at end per round 4663/2727 11150/318 11808/2891 11159/1607) | hot: base=87 C=48 E=85 (E lag max/at end per round 5684/1571 5633/729 5801/2730 8459/2718)
+rss 92 MB: before base observe
+rss 543 MB: after base observe
+rss 118 MB: E K=1024 before observe
+rss 2006 MB: E K=1024 after observe (decks 1869 MB)
+  value 0: diffs 9332542 (cap 12676820), snaps 100 (9428658 eids)
+  value 1: diffs 9336376 (cap 15613160), snaps 99 (9336538 eids)
+  value 2: diffs 9325530 (cap 15602572), snaps 100 (9418058 eids)
+  value 3: diffs 9328721 (cap 15610404), snaps 100 (9424448 eids)
+  value 4: diffs 9332470 (cap 15608300), snaps 100 (9430368 eids)
+  value 5: diffs 9333967 (cap 15620024), snaps 99 (9333526 eids)
+  value 6: diffs 9331132 (cap 15615140), snaps 100 (9430572 eids)
+  value 7: diffs 9335774 (cap 15619836), snaps 100 (9432906 eids)
+  value 8: diffs 9332216 (cap 15622196), snaps 99 (9336082 eids)
+  value 9: diffs 9333308 (cap 15623024), snaps 100 (9430508 eids)
+  entries 104174275
+rss 4330 MB: E K=1024 after reads
+card=10 after decks: base write_extra_ns random: base=633 hot: base=234 | base first view: 1 value=1086 ms, other 9 values together=1997 ms (writer stalled 359.2 ms), value_at=896 ns, far_hot=362 ns, deck=841.3 µs (9.6x cylinder, 419 reads)
+card=10  E K=1024: write_extra_ns random=253 hot=179 (lag max 100256, at end 126250), first view: 1 value=6004 ms, other 9 values together=134815 ms (writer stalled 334.2 ms), value_at=7060 ns, far_hot=362 ns, deck=37055.1 µs (57.3x cylinder, 84 reads), decks mem=4187 MB
+card=10 disk: entries=105254022 observed=0 entry_bytes=3721191904 head_bytes=32000000
+== run 2
+rss 69 MB: card=1000 start
+card=1000 write_extra_ns before decks: random: base=510 C=136 E=149 (E lag max/at end per round 11962/2871 14806/2028 6731/2357 7019/3612) | hot: base=78 C=46 E=94 (E lag max/at end per round 9419/1791 6317/1718 5174/256 8420/2636)
+rss 69 MB: before base observe
+rss 763 MB: after base observe
+rss 81 MB: E K=1024 before observe
+rss 1092 MB: E K=1024 after observe (decks 884 MB)
+rss 1194 MB: E K=1024 after reads
+rss 83 MB: E K=256 before observe
+rss 1404 MB: E K=256 after observe (decks 1325 MB)
+rss 1575 MB: E K=256 after reads
+rss 82 MB: E K=4096 before observe
+rss 2105 MB: E K=4096 after observe (decks 1641 MB)
+rss 2183 MB: E K=4096 after reads
+card=1000 after decks: base write_extra_ns random: base=706 hot: base=315 | base first view: 1 value=708 ms, other 999 values together=2830 ms (writer stalled 475.5 ms), value_at=726 ns, far_hot=537 ns, deck=155.0 µs (135.4x cylinder, 1000 reads)
+card=1000  E K=1024: write_extra_ns random=205 hot=198 (lag max 13720, at end 3089), first view: 1 value=806 ms, other 999 values together=9024 ms (writer stalled 143.3 ms), value_at=4524 ns, far_hot=596 ns, deck=56.3 µs (4.4x cylinder, 1000 reads), decks mem=1027 MB
+card=1000  E K=256: write_extra_ns random=261 hot=219 (lag max 22064, at end 256), first view: 1 value=907 ms, other 999 values together=13931 ms (writer stalled 177.4 ms), value_at=5090 ns, far_hot=369 ns, deck=52.1 µs (3.9x cylinder, 1000 reads), decks mem=1505 MB
+card=1000  E K=4096: write_extra_ns random=194 hot=499 (lag max 8934, at end 522), first view: 1 value=1475 ms, other 999 values together=19221 ms (writer stalled 205.0 ms), value_at=5333 ns, far_hot=392 ns, deck=116.3 µs (11.6x cylinder, 1000 reads), decks mem=1795 MB
+card=1000 disk: entries=53413867 observed=0 entry_bytes=1716392544 head_bytes=32000000
+rss 94 MB: card=10 start
+card=10 write_extra_ns before decks: random: base=509 C=83 E=135 (E lag max/at end per round 9735/2341 7092/2024 10019/584 10512/2459) | hot: base=75 C=44 E=96 (E lag max/at end per round 17349/1486 9468/3170 8021/3592 12066/4020)
+rss 94 MB: before base observe
+rss 540 MB: after base observe
+rss 102 MB: E K=1024 before observe
+rss 2095 MB: E K=1024 after observe (decks 1907 MB)
+  value 0: diffs 9529765 (cap 12567360), snaps 102 (9628154 eids)
+  value 1: diffs 9533621 (cap 15359560), snaps 101 (9536392 eids)
+  value 2: diffs 9522981 (cap 15347544), snaps 102 (9618664 eids)
+  value 3: diffs 9525333 (cap 15356960), snaps 102 (9624460 eids)
+  value 4: diffs 9528961 (cap 15354496), snaps 101 (9531396 eids)
+  value 5: diffs 9530714 (cap 15363156), snaps 101 (9533154 eids)
+  value 6: diffs 9528571 (cap 15361412), snaps 101 (9531384 eids)
+  value 7: diffs 9532010 (cap 15364920), snaps 101 (9532574 eids)
+  value 8: diffs 9528763 (cap 15366572), snaps 101 (9536728 eids)
+  value 9: diffs 9530295 (cap 15368404), snaps 101 (9530576 eids)
+  entries 109775719
+rss 4542 MB: E K=1024 after reads
+card=10 after decks: base write_extra_ns random: base=583 hot: base=127 | base first view: 1 value=931 ms, other 9 values together=2081 ms (writer stalled 316.8 ms), value_at=1426 ns, far_hot=403 ns, deck=846.6 µs (10.0x cylinder, 411 reads)
+card=10  E K=1024: write_extra_ns random=198 hot=129 (lag max 160256, at end 225379), first view: 1 value=5257 ms, other 9 values together=135214 ms (writer stalled 218.1 ms), value_at=2892 ns, far_hot=329 ns, deck=36904.0 µs (322.5x cylinder, 85 reads), decks mem=4408 MB
+card=10 disk: entries=110855787 observed=0 entry_bytes=3920953024 head_bytes=32000000
+== stall control
+base: writes=6521265 worst=17.0 ms
+E: writes=7706522 worst=13.5 ms
+base: writes=5119180 worst=12.2 ms
+E: writes=7467503 worst=44.7 ms
+base: writes=5641750 worst=8.4 ms
+E: writes=7222243 worst=6.0 ms
+exit

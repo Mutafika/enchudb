@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 const ROWS: u32 = 1_000_000;
 const CAP: usize = 256 * 1024 * 1024;
 const N: usize = 20_000;
-const PAIRS: usize = 60;
+const PAIRS: usize = 30;
 const READ_BUDGET: Duration = Duration::from_secs(3);
 
 struct Rng(u64);
@@ -37,6 +37,47 @@ fn med(v: &mut [f64]) -> f64 {
     v[v.len() / 2]
 }
 
+fn cpu_ticks() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let rest = &s[s.rfind(')').unwrap() + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+fn dirty_kb() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("Dirty:") || l.starts_with("Writeback:"))
+        .map(|l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap())
+        .sum()
+}
+
+/// 裏 (書き出しの msync・係) が静まるまで待つ (CPU と Dirty + Writeback、 60 秒まで)。 形を切り替えた (全体を繋いだ) 後の書き出しが
+/// 次の段の測りに重ならないように (`iso-run1.txt` の切り分け)。
+fn quiesce() {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        let c0 = cpu_ticks();
+        std::thread::sleep(Duration::from_millis(200));
+        if ((cpu_ticks() - c0) as f64 / 100.0) / 0.2 < 0.15 && dirty_kb() < 32 * 1024 {
+            return;
+        }
+    }
+}
+
+/// /proc/self/status の RssAnon (MB、 file を貼った page は数えない)。 先に malloc の手元に残った空きを OS に返す (段の memory を前の段の残りと分けて見る)。
+fn rss_mb() -> u64 {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("RssAnon:"))
+        .map_or(0, |l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024)
+}
+
 fn rewrite(eng: &Engine, rows: &[u64], hid: u16, card: u64, rng: &mut Rng) -> f64 {
     let t = Instant::now();
     for _ in 0..N {
@@ -49,10 +90,13 @@ fn rewrite(eng: &Engine, rows: &[u64], hid: u16, card: u64, rng: &mut Rng) -> f6
 /// 宣言なしの列との差の中央値 (形は呼ぶ前に決める)。
 fn extra(eng: &Engine, rows: &[u64], u: &str, h: &str, card: u64, rng: &mut Rng) -> f64 {
     let (uh, hh) = (eng.himo_id(u).unwrap() as u16, eng.himo_id(h).unwrap() as u16);
+    quiesce();
+    rewrite(eng, rows, uh, card, rng);
     let mut d = Vec::new();
     for _ in 0..PAIRS {
         let b = rewrite(eng, rows, uh, card, rng);
-        d.push(rewrite(eng, rows, hh, card, rng) - b);
+        let x = rewrite(eng, rows, hh, card, rng);
+        d.push(x - (b + rewrite(eng, rows, uh, card, rng)) / 2.0);
     }
     med(&mut d)
 }
@@ -155,25 +199,52 @@ fn main() {
     eng.declare_history("t.h10").unwrap();
     let hot: Vec<u64> = rows[..100].to_vec();
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let only: Option<u64> = std::env::var("CMP3_CARD").ok().map(|s| s.parse().unwrap());
     for (card, u, h) in [(1000u64, "t.u1000", "t.h1000"), (10, "t.u10", "t.h10")] {
+        if only.is_some_and(|o| o != card) {
+            continue;
+        }
+        eprintln!("rss {} MB: card={card} start", rss_mb());
         // ---- 見る前 ----
         let mut before = Vec::new();
         for (who, set) in [("random", &rows[..]), ("hot", &hot[..])] {
-            let base = extra(&eng, set, u, h, card, &mut rng);
-            eng.history_set_lazy(h, true).unwrap();
-            let c = extra(&eng, set, u, h, card, &mut rng);
-            eng.history_set_lazy(h, false).unwrap(); // 繋ぐ
-            eng.history_set_e(h, true, None).unwrap();
-            let _ = eng.history_e_stats(h);
-            let e = extra(&eng, set, u, h, card, &mut rng);
-            let (lag_now, lag_max, _) = eng.history_e_stats(h).unwrap();
-            eng.history_set_e(h, false, None).unwrap();
-            before.push(format!("{who}: base={base:.0} C={c:.0} E={e:.0} (E lag max {lag_max} entries, at end {lag_now})"));
+            // 今の形 / C / E を 4 組、 組ごとに順を回す (各段の前に静める)
+            let (mut vb, mut vc, mut ve, mut lags) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for r in 0..4 {
+                for k in 0..3 {
+                    match (k + r) % 3 {
+                        0 => vb.push(extra(&eng, set, u, h, card, &mut rng)),
+                        1 => {
+                            eng.history_set_lazy(h, true).unwrap();
+                            vc.push(extra(&eng, set, u, h, card, &mut rng));
+                            eng.history_set_lazy(h, false).unwrap(); // 繋ぐ
+                        }
+                        _ => {
+                            eng.history_set_e(h, true, None).unwrap();
+                            std::thread::sleep(Duration::from_millis(20));
+                            let _ = eng.history_e_stats(h);
+                            ve.push(extra(&eng, set, u, h, card, &mut rng));
+                            let (now, max, _) = eng.history_e_stats(h).unwrap();
+                            lags.push(format!("{max}/{now}"));
+                            eng.history_set_e(h, false, None).unwrap();
+                        }
+                    }
+                }
+            }
+            before.push(format!(
+                "{who}: base={:.0} C={:.0} E={:.0} (E lag max/at end per round {})",
+                med(&mut vb),
+                med(&mut vc),
+                med(&mut ve),
+                lags.join(" ")
+            ));
         }
         println!("card={card} write_extra_ns before decks: {}", before.join(" | "));
         // ---- 全部見た後 ----
         // 今の形: 全部の値の並びを作る (書き手が保つ)
+        eprintln!("rss {} MB: before base observe", rss_mb());
         let base_obs = observe_all(&eng, &rows, h, card);
+        eprintln!("rss {} MB: after base observe", rss_mb());
         let mut after = Vec::new();
         let rb = reads(&eng, &rows, &hot, h, card, &mut rng);
         for (who, set) in [("random", &rows[..]), ("hot", &hot[..])] {
@@ -183,9 +254,19 @@ fn main() {
         eng.history_forget_decks(h).unwrap();
         // 案 E: K を変えて
         let mut erows = Vec::new();
-        for k in [1024usize, 256, 4096] {
+        // 値 10 種は束が 10 万なので控えの間隔は K でなく束の大きさで決まる (K を変えても控えは変わらない)。 K=1024 だけ
+        let ks: &[usize] = if card <= 10 { &[1024] } else { &[1024, 256, 4096] };
+        for &k in ks {
             eng.history_set_e(h, true, Some(k)).unwrap();
+            eprintln!("rss {} MB: E K={k} before observe", rss_mb());
             let obs = observe_all(&eng, &rows, h, card);
+            eprintln!("rss {} MB: E K={k} after observe (decks {} MB)", rss_mb(), eng.history_e_stats(h).unwrap().2 / 1_000_000);
+            if card <= 10 {
+                for (v, n, cap, ns, nm) in eng.history_e_deck_detail(h).unwrap() {
+                    eprintln!("  value {v}: diffs {n} (cap {cap}), snaps {ns} ({nm} eids)");
+                }
+                eprintln!("  entries {}", eng.history_stats(h).unwrap().0);
+            }
             let _ = eng.history_e_stats(h);
             let ex: Vec<String> = [("random", &rows[..]), ("hot", &hot[..])]
                 .iter()
@@ -193,6 +274,7 @@ fn main() {
                 .collect();
             let (lag_now, lag_max, mem) = eng.history_e_stats(h).unwrap();
             let r = reads(&eng, &rows, &hot, h, card, &mut rng);
+            eprintln!("rss {} MB: E K={k} after reads", rss_mb());
             erows.push(format!(
                 "  E K={k}: write_extra_ns {} (lag max {lag_max}, at end {lag_now}), {}, value_at={:.0} ns, far_hot={:.0} ns, deck={:.1} µs ({:.1}x cylinder, {} reads), decks mem={:.0} MB",
                 ex.join(" "),
