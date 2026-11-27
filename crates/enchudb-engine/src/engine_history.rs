@@ -414,6 +414,12 @@ impl Engine {
         history::HistCol::layout()
     }
 
+    /// 測り用: 案 E の値ごとの (値, 差分の数, 差分の容量, 控えの数, 控えの eid の数の合計)。
+    #[doc(hidden)]
+    pub fn history_e_deck_detail(&self, himo: &str) -> Result<Vec<(u64, usize, usize, usize, usize)>, HistError> {
+        Ok(self.hist_col(himo)?.e_deck_detail())
+    }
+
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {

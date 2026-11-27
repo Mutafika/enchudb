@@ -344,6 +344,9 @@ pub struct HistCol {
     linker: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 係の遅れの最大 (len − 繋いだ所、 測り用)
     e_lag_max: Pad<AtomicU32>,
+    /// 試験用: 最初の並びの走査と lock の間で係を動かす (その間に繋いだ entry を並びが拾うかを見る)
+    #[cfg(test)]
+    test_link_mid: AtomicBool,
     /// 案 A の溜め: (場所, entry の位置)。 足した順 (同じ場所は位置の順)
     pending: Mutex<Vec<(u32, u32)>>,
     pend_any: AtomicBool,
@@ -395,6 +398,8 @@ struct Blocks {
 /// 読み手は末尾まで自分で繋ぐ。
 const LINKER_START: u32 = 4096;
 const LINKER_GAP: u32 = 256;
+/// 案 E の係が lock を握ったまま繋ぐ件数の上限 (読み手を待たせる長さ)。
+const LINK_CHUNK: u32 = 256;
 
 /// 案 E の値ごとの差分の並び: 差分 (時刻の順) と、 差分の位置 i の時点の束 (eid の昇順) の控え。
 #[derive(Default)]
@@ -439,6 +444,31 @@ impl EDeck {
             m.sort_unstable();
             self.snaps.push((self.diffs.len(), m));
         }
+    }
+
+    /// 時刻の順に並べた差分 `diffs` から作る (`push` を 1 つずつ呼んだのと同じ控え)。 差分は写さず、 控えは 1 回なめる間に今の束を
+    /// 保って置く (`push` は控えのたびに手前の控えから数え直す)。
+    fn from_sorted(mut diffs: Vec<Diff>, kmin: usize) -> Self {
+        diffs.shrink_to_fit();
+        let mut snaps: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut now: std::collections::HashSet<u32, std::hash::BuildHasherDefault<U64Hash>> = Default::default();
+        let (mut last_i, mut last_n) = (0usize, 0usize);
+        for (i, d) in diffs.iter().enumerate() {
+            if d.idx_in & 1 == 1 {
+                now.insert(d.eid);
+            } else {
+                now.remove(&d.eid);
+            }
+            let n = i + 1;
+            if n - last_i >= kmin.max(last_n) {
+                let mut m: Vec<u32> = now.iter().copied().collect();
+                m.sort_unstable();
+                last_i = n;
+                last_n = m.len();
+                snaps.push((n, m));
+            }
+        }
+        EDeck { diffs, snaps }
     }
 
     fn bytes(&self) -> usize {
@@ -601,6 +631,8 @@ impl HistCol {
             linker_start: AtomicU32::new(LINKER_START),
             linker: Mutex::new(None),
             e_lag_max: Pad(AtomicU32::new(0)),
+            #[cfg(test)]
+            test_link_mid: AtomicBool::new(false),
             unlinked: AtomicBool::new(std::env::var("ENCHU_HIST_WRITE").is_ok_and(|v| v == "lazy")),
             blocks_mode: AtomicBool::new(default_modes().1),
             pending: Mutex::new(Vec::new()),
@@ -1148,6 +1180,17 @@ impl HistCol {
         (lag, self.e_lag_max.swap(0, Ordering::AcqRel), b)
     }
 
+    /// 測り用: 案 E の値ごとの (値, 差分の数, 差分の容量, 控えの数, 控えの eid の数の合計)。
+    pub fn e_deck_detail(&self) -> Vec<(u64, usize, usize, usize, usize)> {
+        let decks = self.edecks.read().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<_> = decks
+            .iter()
+            .map(|(&k, d)| (k, d.diffs.len(), d.diffs.capacity(), d.snaps.len(), d.snaps.iter().map(|(_, m)| m.len()).sum()))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// 案 E の書き込み (行の lock の下): entry を糸なし (`LAZY`) で足すだけ。 場所は `jump` に置く (繋ぐ時に使う)。
     pub fn note_raw(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32) -> io::Result<bool> {
         let v = value.unwrap_or(ABSENT);
@@ -1173,32 +1216,46 @@ impl HistCol {
         if n - from < start.max(1) {
             return 0;
         }
-        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut i = self.linked_upto.load(Ordering::Acquire);
+        // lock は LINK_CHUNK 件ごとに放す (読み手は末尾を繋ぐのに同じ lock を取る: 係の一続きの間ずっと待たせない)。 繋いだ所も
+        // 区切りごとに見せる
         let n = self.len.load(Ordering::SeqCst).saturating_sub(gap);
-        let start = i;
-        while i < n {
-            let Some(e) = self.valid(i) else {
-                // 書き終わっていない: 待つ。 長く止まったら場所を取って書けなかった穴として飛ばす
-                let mut st = self.e_stuck.lock().unwrap_or_else(|p| p.into_inner());
-                match *st {
-                    Some((at, since)) if at == i && since.elapsed() > std::time::Duration::from_millis(200) => {
-                        *st = None;
-                        i += 1;
-                        continue;
-                    }
-                    Some((at, _)) if at == i => {}
-                    _ => *st = Some((i, std::time::Instant::now())),
-                }
-                break;
-            };
-            if e.flags & flag::LAZY != 0 && e.flags & flag::VOID == 0 {
-                let _ = self.apply_e(i, e);
+        let mut done = 0usize;
+        loop {
+            let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut i = self.linked_upto.load(Ordering::Acquire);
+            if i >= n {
+                return done;
             }
-            i += 1;
+            let stop = n.min(i.saturating_add(LINK_CHUNK));
+            let start = i;
+            let mut stuck = false;
+            while i < stop {
+                let Some(e) = self.valid(i) else {
+                    // 書き終わっていない: 待つ。 長く止まったら場所を取って書けなかった穴として飛ばす
+                    let mut st = self.e_stuck.lock().unwrap_or_else(|p| p.into_inner());
+                    match *st {
+                        Some((at, since)) if at == i && since.elapsed() > std::time::Duration::from_millis(200) => {
+                            *st = None;
+                            i += 1;
+                            continue;
+                        }
+                        Some((at, _)) if at == i => {}
+                        _ => *st = Some((i, std::time::Instant::now())),
+                    }
+                    stuck = true;
+                    break;
+                };
+                if e.flags & flag::LAZY != 0 && e.flags & flag::VOID == 0 {
+                    let _ = self.apply_e(i, e);
+                }
+                i += 1;
+            }
+            self.linked_upto.store(i, Ordering::Release);
+            done += (i - start) as usize;
+            if stuck || i >= n {
+                return done;
+            }
         }
-        self.linked_upto.store(i, Ordering::Release);
-        (i - start) as usize
     }
 
     /// 案 E: 糸なしの entry `idx` を繋ぎ、 見た値の差分の並びに足す。
@@ -1277,13 +1334,13 @@ impl HistCol {
             .into_iter()
             .map(|mut r| {
                 r.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
-                let mut d = EDeck::default();
-                for x in r {
-                    d.push(x, kmin);
-                }
-                d
+                EDeck::from_sorted(r, kmin)
             })
             .collect();
+        #[cfg(test)]
+        if self.test_link_mid.load(Ordering::Relaxed) {
+            self.catch_up();
+        }
         // 係を止めて [n0, 繋いだ所) を足してから入れる (入れた後に繋いだ entry は係が足す)
         let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
         let n1 = self.linked_upto.load(Ordering::Acquire);
@@ -2471,6 +2528,93 @@ mod tests {
     }
 
     /// レビュー 1 回目の 3: 時刻を詰める所で logical が切れて同じ時刻になった、 値の違う書き込みは両方残り、 後の方が勝つ。
+    /// 案 E の値の並び: 差分が時刻の順でなく届く (控えより前に入る) 時も、 時点ごとの束が素直に数えた物と同じ。
+    #[test]
+    fn edeck_out_of_order_diffs() {
+        let mut x = 0x1234_5678_9ABC_DEF0u64;
+        let mut step = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..20 {
+            let mut d = EDeck::default();
+            let mut all: Vec<Diff> = Vec::new();
+            let mut inside = std::collections::HashSet::new();
+            for i in 0..3000u32 {
+                let eid = (step() % 200) as u32;
+                // 時刻はおおむね増えるが、 時々 (1/8) かなり前の時刻で届く
+                let time = if step() % 8 == 0 { u64::from(i).saturating_sub(step() % 500) } else { u64::from(i) };
+                let inn = !inside.contains(&eid);
+                if inn {
+                    inside.insert(eid);
+                } else {
+                    inside.remove(&eid);
+                }
+                let df = Diff { time, idx_in: (i << 1) | u32::from(inn), eid };
+                all.push(df);
+                d.push(df, 4 + round);
+            }
+            // 素直に: (時刻, 位置) の順に当てる
+            let mut sorted = all.clone();
+            sorted.sort_unstable_by_key(|y| (y.time, y.idx_in >> 1));
+            for t in (0..3000u64).step_by(37) {
+                let mut want = std::collections::HashSet::new();
+                for y in sorted.iter().take_while(|y| y.time <= t) {
+                    if y.idx_in & 1 == 1 {
+                        want.insert(y.eid);
+                    } else {
+                        want.remove(&y.eid);
+                    }
+                }
+                let mut want: Vec<u32> = want.into_iter().collect();
+                want.sort_unstable();
+                let mut got = d.members_upto(d.diffs.partition_point(|y| y.time <= t));
+                got.sort_unstable();
+                assert_eq!(got, want, "round {round} t {t}");
+            }
+            // 並べてから作った物も同じ控え・答え
+            let e = EDeck::from_sorted(sorted.clone(), 4 + round as usize);
+            for t in (0..3000u64).step_by(53) {
+                let mut a = d.members_upto(d.diffs.partition_point(|y| y.time <= t));
+                let mut b = e.members_upto(e.diffs.partition_point(|y| y.time <= t));
+                a.sort_unstable();
+                b.sort_unstable();
+                assert_eq!(a, b, "from_sorted round {round} t {t}");
+            }
+        }
+    }
+
+    /// 案 E の最初の並び: 走査の後・lock の前に係が繋いだ entry も並びに入る。
+    #[test]
+    fn edeck_observe_picks_up_links_during_scan() {
+        let d = tmp("e_observe_mid");
+        let c = HistCol::create(&d.join("a"), 1, 10, 4096).unwrap();
+        c.set_e(true);
+        let mut t = 100u64;
+        let mut cell = vec![None::<u64>; 50];
+        for i in 0..4000u32 {
+            let slot = i % 50;
+            let v = u64::from(i / 50 % 3);
+            t += 1;
+            c.note_raw(slot, slot, Some(v), t, 0).unwrap();
+            cell[slot as usize] = Some(v);
+            if i == 2000 {
+                c.catch_up(); // 前半だけ繋ぐ: 後半は並びを作る途中で係が繋ぐ
+            }
+        }
+        c.test_link_mid.store(true, Ordering::Relaxed);
+        assert_eq!(c.observe_e(&[0, 1, 2]), 3);
+        c.test_link_mid.store(false, Ordering::Relaxed);
+        for v in 0..3u64 {
+            let mut got = c.pull_at_e(v, t).unwrap();
+            got.sort_unstable();
+            let want: Vec<u32> = (0..50u32).filter(|&s| cell[s as usize] == Some(v)).collect();
+            assert_eq!(got, want, "value {v}");
+        }
+    }
+
     #[test]
     fn same_time_different_values() {
         let d = tmp("sametime");

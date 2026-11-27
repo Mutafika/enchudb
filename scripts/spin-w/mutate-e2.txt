@@ -1,0 +1,4 @@
+baseline: pass 178 秒 → 1 run の上限 564 秒
+  killed 72s             E 控えより前に入った差分で控えを捨てない
+  killed 75s             E 最初の並びで [n0, 繋いだ所) をなめない
+killed 2 / survived 0 / その他 0

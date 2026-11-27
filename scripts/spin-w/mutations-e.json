@@ -8,8 +8,8 @@
  {
   "name": "E 書き終わっていない entry で止まらずに飛ばす",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "            let Some(e) = self.valid(i) else {\n                // 書き終わっていない: 待つ。",
-  "replace": "            let Some(e) = self.valid(i) else {\n                i += 1;\n                continue;\n                // 書き終わっていない: 待つ。"
+  "find": "                let Some(e) = self.valid(i) else {\n                    // 書き終わっていない: 待つ。",
+  "replace": "                let Some(e) = self.valid(i) else {\n                    i += 1;\n                    continue;\n                    // 書き終わっていない: 待つ。"
  },
  {
   "name": "E 係が見た値の差分を足さない",
@@ -34,5 +34,29 @@
   "file": "crates/enchudb-engine/src/history.rs",
   "find": "                if le.value == v && extra & flag::BASE == 0 && time >= le.time {",
   "replace": "                if false && le.value == v && extra & flag::BASE == 0 && time >= le.time {"
+ },
+ {
+  "name": "E 最初の並びで [n0, 繋いだ所) をなめない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        self.scan_decks(&want, n0, n1, &mut tail, false);",
+  "replace": "        self.scan_decks(&want, n1, n1, &mut tail, false);"
+ },
+ {
+  "name": "E 並びから作る控えで出た eid を外さない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "                now.remove(&d.eid);",
+  "replace": "                let _ = d.eid;"
+ },
+ {
+  "name": "E 係・読み手が区切り 1 つで止まる (末尾まで繋がない)",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "            if stuck || i >= n {\n                return done;",
+  "replace": "            if true || stuck || i >= n {\n                return done;"
+ },
+ {
+  "name": "まとめて作る時に値を取り違える (いつも最初の値)",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "vs.binary_search(&x).ok()",
+  "replace": "vs.binary_search(&x).ok().map(|_| 0)"
  }
 ]

@@ -3,7 +3,7 @@
 > **push の状態**: 2026-11-26 はこのセッションからの push が 403 で断られていた (Claude の GitHub App が org に無い)。 2026-11-27 に
 > App が入り、 `proto/spin-w` に push できた (496301c..5813a28)。 以後は commit のたびに `proto/spin-w` に push する。
 
-> **今の状態 (2026-11-27)**: 案 E の測りの表 (下の 「案 E の表」、 `cmp-run5.txt`) を入れた。 変異 (`mutations-e.json`、 10 個) を回している。
+> **今の状態 (2026-11-27)**: 案 E の測りの表 (下の 「案 E の表」、 `cmp-run5.txt`) と変異 (10 個、 全部殺した) を入れた。
 > 案 E は 「値の種類が多い列」 ではデッキが速いが、 値 10 種ではデッキ・最初の並び・係の追いつきが悪い (表)。
 
 v0.38.0 (496301cf) の上。 master / version / CHANGELOG / release には触らない。
@@ -444,3 +444,18 @@ Dirty + Writeback が 32 MB を切るまで待つ。 行 100 万、 値 1000 種
 - 最初の並びは係の lock の外で走査・並べ替え・控え作り (lock の中は [n0, 繋いだ所) の走査と差し込みだけ)。 並べた差分から控えを 1 回の
   走査で作る (`EDeck::from_sorted`)。 値いくつもを 1 回の走査で (`history_observe`)
 - 係・読み手は lock を 256 件ごとに放す
+
+### 案 E の変異 (`mutations-e.json`、 `mutate-e1.txt` / `mutate-e2.txt`、 ENCHU_HIST_WRITE=e、 lib の history:: + spin_w_history)
+
+| 変異 | 1 回目 | 試験を足した後 |
+|---|---|---|
+| E 読み手が末尾を繋がない | killed 62s | |
+| E 書き終わっていない entry で止まらずに飛ばす | killed 177s | |
+| E 係が見た値の差分を足さない | killed 66s | |
+| E 控えより前に入った差分で控えを捨てない | **survived** | killed 72s (`edeck_out_of_order_diffs`: 時刻の戻る差分を並びに入れ、 素直に数えた束と比べる) |
+| E 控えの後の差分を当てない | killed 67s | |
+| E 値の変わらない entry を繋ぐ時に落とさない | killed 9s | |
+| E 最初の並びで [n0, 繋いだ所) をなめない | (変異が build を通らず 「killed 3s」 と数えた: 数えない) | 書き直して killed 75s (`edeck_observe_picks_up_links_during_scan`: 走査と lock の間に係を動かす試験用の印) |
+| E 並びから作る控えで出た eid を外さない | killed 67s | |
+| E 係・読み手が区切り 1 つで止まる | killed 195s | |
+| まとめて作る時に値を取り違える | killed 5s | |
