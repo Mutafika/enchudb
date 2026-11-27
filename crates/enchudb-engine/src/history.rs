@@ -314,6 +314,20 @@ pub struct HistCol {
     /// 案 C: 見られるまで繋がない。 `unlinked` の間、 書き手は entry を糸なし (`LAZY`) で足すだけ (`note_lazy`)
     lazy: AtomicBool,
     unlinked: AtomicBool,
+    /// 案 E: 書き手はいつも糸なしで足すだけ (`note_raw`、 場所は `jump` に置く)。 裏の係 (`catch_up`) が [繋いだ所, len) を位置の順に繋ぎ、
+    /// 見た値の差分の並び (K 差分ごとの束の控え付き) も足す。 読み手は末尾を繋いでから読む (係を手伝う)
+    e_mode: AtomicBool,
+    linked_upto: AtomicU32,
+    edecks: RwLock<HashMap<u64, EDeck, std::hash::BuildHasherDefault<U64Hash>>>,
+    e_observed: AtomicBool,
+    /// 控えの間隔の下限 (差分の数)。 間隔は max(これ, 前の控えの束の大きさ) = 控えは 1 差分あたり 4 B 以下
+    e_kmin: std::sync::atomic::AtomicUsize,
+    /// 書き終わっていない entry で止まった (位置, いつから)。 長く止まったら (場所を取って書けなかった穴) 飛ばす
+    e_stuck: Mutex<Option<(u32, std::time::Instant)>>,
+    linker_stop: AtomicBool,
+    linker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 係の遅れの最大 (len − 繋いだ所、 測り用)
+    e_lag_max: AtomicU32,
     /// 案 A の溜め: (場所, entry の位置)。 足した順 (同じ場所は位置の順)
     pending: Mutex<Vec<(u32, u32)>>,
     pend_any: AtomicBool,
@@ -359,6 +373,56 @@ struct Blocks {
     big: Vec<Arc<Block>>,
     /// 大きい区間の後ろの小さい区間 (big.len()*BIG から)
     small: Vec<Arc<Block>>,
+}
+
+/// 案 E の値ごとの差分の並び: 差分 (時刻の順) と、 差分の位置 i の時点の束 (eid の昇順) の控え。
+#[derive(Default)]
+struct EDeck {
+    diffs: Vec<Diff>,
+    snaps: Vec<(usize, Vec<u32>)>,
+}
+
+impl EDeck {
+    /// 差分 [0, k) を当てた束 (手前の控え + 控えより後の差分)。
+    fn members_upto(&self, k: usize) -> Vec<u32> {
+        let si = self.snaps.partition_point(|(i, _)| *i <= k);
+        let (from, base): (usize, &[u32]) = if si == 0 { (0, &[]) } else { (self.snaps[si - 1].0, &self.snaps[si - 1].1) };
+        let mut last: HashMap<u32, bool, std::hash::BuildHasherDefault<U64Hash>> = HashMap::default();
+        for d in &self.diffs[from..k] {
+            last.insert(d.eid, d.idx_in & 1 == 1);
+        }
+        let mut out: Vec<u32> = base.iter().copied().filter(|e| last.get(e).is_none_or(|&inn| inn)).collect();
+        out.extend(last.iter().filter(|&(e, &inn)| inn && base.binary_search(e).is_err()).map(|(&e, _)| e));
+        out
+    }
+
+    /// 差分を 1 つ足す (時刻の順の位置に。 普通は末尾)。 控えより前に入ったら、 そこより後の控えを捨てる。 間隔が来たら控えを置く。
+    fn push(&mut self, x: Diff, kmin: usize) {
+        let key = (x.time, x.idx_in >> 1);
+        let pos = if self.diffs.last().is_none_or(|y| (y.time, y.idx_in >> 1) < key) {
+            self.diffs.len()
+        } else {
+            let p = self.diffs.partition_point(|y| (y.time, y.idx_in >> 1) < key);
+            if self.diffs.get(p).is_some_and(|y| (y.time, y.idx_in) == (x.time, x.idx_in)) {
+                return;
+            }
+            p
+        };
+        self.diffs.insert(pos, x);
+        if self.snaps.last().is_some_and(|(i, _)| *i > pos) {
+            self.snaps.retain(|(i, _)| *i <= pos);
+        }
+        let (last_i, last_n) = self.snaps.last().map_or((0, 0), |(i, m)| (*i, m.len()));
+        if self.diffs.len() - last_i >= kmin.max(last_n) {
+            let mut m = self.members_upto(self.diffs.len());
+            m.sort_unstable();
+            self.snaps.push((self.diffs.len(), m));
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.diffs.len() * std::mem::size_of::<Diff>() + self.snaps.iter().map(|(_, m)| m.len() * 4 + 32).sum::<usize>()
+    }
 }
 
 /// 案 D の区間 (entry の数)。
@@ -468,6 +532,7 @@ impl HistCol {
         let c = HistCol::new(dir, hid, entries, heads, horizon, readonly);
         let cap = ((c.entries.committed() - HEADER) / ENTRY) as u64;
         c.len.store(len.min(cap) as u32, Ordering::Relaxed);
+        c.linked_upto.store(len.min(cap) as u32, Ordering::Relaxed);
         // heads: きれいに閉じた時に置いた file (印 = entry の数) を貼る。 合わなければ開いた後に作り直す
         if c.heads.load(&head_path(dir, hid), len) {
             c.heads_loaded.store(true, Ordering::Release);
@@ -504,6 +569,15 @@ impl HistCol {
             readonly,
             batch: AtomicBool::new(default_modes().0),
             lazy: AtomicBool::new(std::env::var("ENCHU_HIST_WRITE").is_ok_and(|v| v == "lazy")),
+            e_mode: AtomicBool::new(std::env::var("ENCHU_HIST_WRITE").is_ok_and(|v| v == "e")),
+            linked_upto: AtomicU32::new(0),
+            edecks: RwLock::new(HashMap::default()),
+            e_observed: AtomicBool::new(false),
+            e_kmin: std::sync::atomic::AtomicUsize::new(1024),
+            e_stuck: Mutex::new(None),
+            linker_stop: AtomicBool::new(false),
+            linker: Mutex::new(None),
+            e_lag_max: AtomicU32::new(0),
             unlinked: AtomicBool::new(std::env::var("ENCHU_HIST_WRITE").is_ok_and(|v| v == "lazy")),
             blocks_mode: AtomicBool::new(default_modes().1),
             pending: Mutex::new(Vec::new()),
@@ -951,11 +1025,19 @@ impl HistCol {
 
     /// 案 C の書き込み (行の lock の下): entry を糸なし (`LAZY`) で足すだけ。 heads も cell の前の値も読まない。 値の変わらない書き込みも
     /// 足す (繋ぐ時に落とす)。 足した後に 「繋いだ」 を見たら (読み手が繋いだ後に足した)、 この場所を繋ぎ直す。
-    pub fn note_lazy(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32) -> io::Result<bool> {
+    ///
+    /// `fence`: WAL の無い書き手 (繋ぐ側の書き手を止める門を通らない) は、 見直しの前に SeqCst の fence を置く: 見直しで 「まだ繋いでいない」
+    /// を見たなら、 繋ぐ側は 「繋いだ」 を立てた後にこの entry を読む ([`Self::link_all`])。 WAL の書き手は門で止まるので要らない。
+    pub fn note_lazy(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32, fence: bool) -> io::Result<bool> {
         let v = value.unwrap_or(ABSENT);
         let idx = self.alloc()?;
         self.write(idx, &Entry { flags: flag::VALID | flag::LAZY | extra, depth: 0, eid, prev: NONE, jump: NONE, time, value: v });
+        if fence {
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
         if !self.unlinked.load(Ordering::SeqCst) {
+            // 繋ぐ側が 「繋いだ」 を立てた後に足した: 繋ぎ終えるのを待って、 この場所を繋ぎ直す
+            let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
             self.relink_slot(slot, idx)?;
         }
         Ok(true)
@@ -967,17 +1049,190 @@ impl HistCol {
         if !self.unlinked.load(Ordering::Acquire) {
             return Ok((0, t0.elapsed()));
         }
-        let n = self.relink(slot_of)?;
-        // 繋いだ後の書き込みは今の形 (か案 A) で
-        self.lazy.store(false, Ordering::Release);
+        // 先に 「繋いだ」 を立てる (この後に足す書き手は自分で場所を繋ぎ直す)。 その時の len より前の entry が書き終わるのを待って、 そこまでを
+        // 繋ぐ。 前は全体を繋いだ後に立てていて、 繋ぐ走査がその場所を過ぎた後・印を立てる前に見直した書き手の entry は、 どちらからも繋がれなかった
+        // 案 E の列は裏の係がいつも繋ぐ: 末尾を繋ぐだけ
+        if self.e_mode() {
+            self.unlinked.store(false, Ordering::SeqCst);
+            self.lazy.store(false, Ordering::Release);
+            let n = self.catch_up();
+            return Ok((n, t0.elapsed()));
+        }
+        // lock は 「繋いだ」 を立てる前から繋ぎ終えるまで握る: 立てた後に足した書き手は、 この lock を待ってから自分の場所を繋ぎ直す。 前は
+        // 立ててから lock を取るまで (書き終わりを待つ間) に書き手が先に lock を取り、 heads の空の所に繋いだ後で、 繋ぎ直しが heads を作り直して落とした
+        self.drain();
+        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.unlinked.store(false, Ordering::SeqCst);
+        // 既に繋いだ所 (案 A / E の係) より前は全部この繋ぎ直しで作り直す
+        let n0 = self.len.load(Ordering::SeqCst).max(self.linked_upto.load(Ordering::Acquire));
+        for idx in 0..n0 {
+            if self.valid(idx).is_none() && HEADER + (idx as usize + 1) * ENTRY <= self.entries.committed() {
+                let w = std::time::Instant::now();
+                while self.valid(idx).is_none() && w.elapsed() < std::time::Duration::from_millis(10) {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        let n = self.relink_locked(slot_of, Some(n0))?;
+        // 案 C をやめるのは繋ぎ終えた後 (それまでの書き手は糸なしで足して見直す道 = 繋ぎ終えるのを待って自分の場所を繋ぎ直す)。 前は
+        // 「繋いだ」 と一緒に立て、 その後の書き手が今の形 (heads を読む) で、 繋ぎ直しの途中の heads に書いた (繋ぎ直しが heads を作り直して落ちた)
+        self.lazy.store(false, Ordering::Release);
         Ok((n, t0.elapsed()))
     }
 
-    /// 案 C が有効で、 まだ繋いでいないか (書き手が `note_lazy` を使う)。
+    /// 調べ用: identity `eid` の entry を位置の順に全部 (位置, 印, 深さ, prev, 時刻, 値)。
+    #[doc(hidden)]
+    pub fn raw_entries(&self, eid: u32) -> Vec<(u32, u32, u32, u32, u64, u64)> {
+        (0..self.len()).filter_map(|i| self.valid(i).filter(|e| e.eid == eid).map(|e| (i, e.flags, e.depth, e.prev, e.time, e.value))).collect()
+    }
+
+    /// 案 E が有効か。
+    #[inline]
+    pub fn e_mode(&self) -> bool {
+        self.e_mode.load(Ordering::Relaxed)
+    }
+
+    /// 案 E を切り替える (呼び手は裏の係を `Histories::set_e` で起こす / 止める)。 やめる時は末尾を繋いでから。
+    pub fn set_e(&self, on: bool) {
+        if !on {
+            self.catch_up();
+        } else {
+            self.linked_upto.fetch_max(self.len.load(Ordering::SeqCst).min(self.linked_upto.load(Ordering::Acquire)), Ordering::AcqRel);
+        }
+        self.e_mode.store(on, Ordering::Release);
+        if !on {
+            self.edecks.write().unwrap_or_else(|p| p.into_inner()).clear();
+            self.e_observed.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// 案 E の控えの間隔の下限。
+    pub fn set_e_kmin(&self, k: usize) {
+        self.e_kmin.store(k.max(1), Ordering::Release);
+        self.edecks.write().unwrap_or_else(|p| p.into_inner()).clear();
+        self.e_observed.store(false, Ordering::SeqCst);
+    }
+
+    /// 案 E: (係の今の遅れ, 遅れの最大, 差分の並びの memory)。
+    pub fn e_stats(&self) -> (u32, u32, usize) {
+        let lag = self.len().saturating_sub(self.linked_upto.load(Ordering::Acquire));
+        let b = self.edecks.read().unwrap_or_else(|p| p.into_inner()).values().map(|d| d.bytes()).sum();
+        (lag, self.e_lag_max.swap(0, Ordering::AcqRel), b)
+    }
+
+    /// 案 E の書き込み (行の lock の下): entry を糸なし (`LAZY`) で足すだけ。 場所は `jump` に置く (繋ぐ時に使う)。
+    pub fn note_raw(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32) -> io::Result<bool> {
+        let v = value.unwrap_or(ABSENT);
+        let idx = self.alloc()?;
+        self.write(idx, &Entry { flags: flag::VALID | flag::LAZY | extra, depth: 0, eid, prev: NONE, jump: slot, time, value: v });
+        Ok(true)
+    }
+
+    /// 案 E の係: [繋いだ所, len) を位置の順に繋ぐ (書き終わっていない entry の手前で止まる)。 繋いだ数。 読み手も呼ぶ (手伝う)。
+    pub fn catch_up(&self) -> usize {
+        let n = self.len.load(Ordering::SeqCst);
+        let from = self.linked_upto.load(Ordering::Acquire);
+        if from >= n {
+            return 0;
+        }
+        self.e_lag_max.fetch_max(n - from, Ordering::Relaxed);
+        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut i = self.linked_upto.load(Ordering::Acquire);
+        let n = self.len.load(Ordering::SeqCst);
+        let start = i;
+        while i < n {
+            let Some(e) = self.valid(i) else {
+                // 書き終わっていない: 待つ。 長く止まったら場所を取って書けなかった穴として飛ばす
+                let mut st = self.e_stuck.lock().unwrap_or_else(|p| p.into_inner());
+                match *st {
+                    Some((at, since)) if at == i && since.elapsed() > std::time::Duration::from_millis(200) => {
+                        *st = None;
+                        i += 1;
+                        continue;
+                    }
+                    Some((at, _)) if at == i => {}
+                    _ => *st = Some((i, std::time::Instant::now())),
+                }
+                break;
+            };
+            if e.flags & flag::LAZY != 0 && e.flags & flag::VOID == 0 {
+                let _ = self.apply_e(i, e);
+            }
+            i += 1;
+        }
+        self.linked_upto.store(i, Ordering::Release);
+        (i - start) as usize
+    }
+
+    /// 案 E: 糸なしの entry `idx` を繋ぎ、 見た値の差分の並びに足す。
+    fn apply_e(&self, idx: u32, mut e: Entry) -> io::Result<()> {
+        let slot = e.jump;
+        let extra = e.flags & (flag::OBSERVED | flag::DELETE | flag::BASE);
+        let Some(pl) = self.plan(slot, e.eid, e.value, e.time, extra, e.value == ABSENT) else {
+            let c = self.flags_cell(idx);
+            c.store((c.load(Ordering::Acquire) | (flag::VOID << 24)) & !(flag::LAZY << 24), Ordering::Release);
+            self.entries.mark_dirty(HEADER + idx as usize * ENTRY, ENTRY);
+            return Ok(());
+        };
+        e.flags = pl.flags;
+        e.depth = pl.depth;
+        e.prev = pl.prev;
+        e.jump = pl.jump;
+        self.write(idx, &e);
+        if pl.disordered {
+            self.relink_slot(slot, idx)?;
+        } else if pl.to_head {
+            self.set_head(slot, idx + 1, Some(&e))?;
+        }
+        if self.e_observed.load(Ordering::Acquire) && pl.old != e.value {
+            let kmin = self.e_kmin.load(Ordering::Relaxed);
+            let mut decks = self.edecks.write().unwrap_or_else(|p| p.into_inner());
+            for (val, inn) in [(pl.old, false), (e.value, true)] {
+                if val != ABSENT
+                    && let Some(d) = decks.get_mut(&val)
+                {
+                    d.push(Diff { time: e.time, idx_in: (idx << 1) | u32::from(inn), eid: e.eid }, kmin);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 案 E: 時点 `t` に値 `v` だった eid。 末尾を繋いでから、 値の差分の並び (無ければ係を止めて作る。 書き手は止めない) の手前の控え
+    /// + K 以内の差分。
+    pub fn pull_at_e(&self, v: u64, t: u64) -> Result<Vec<u32>, TooOld> {
+        if t < self.horizon {
+            return Err(TooOld { horizon: self.horizon });
+        }
+        self.drain();
+        {
+            let decks = self.edecks.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(d) = decks.get(&v) {
+                return Ok(d.members_upto(d.diffs.partition_point(|x| x.time <= t)));
+            }
+        }
+        // 最初に見た値: 係を止めて (apply_lock)、 繋いだ所までをなめて作る。 その後の差分は係が足す
+        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let upto = self.linked_upto.load(Ordering::Acquire);
+        self.e_observed.store(true, Ordering::SeqCst);
+        let mut raw = Vec::new();
+        self.scan_deck(v, 0, upto, &mut raw, false);
+        raw.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
+        let kmin = self.e_kmin.load(Ordering::Relaxed);
+        let mut d = EDeck::default();
+        for x in raw {
+            d.push(x, kmin);
+        }
+        let out = d.members_upto(d.diffs.partition_point(|x| x.time <= t));
+        self.edecks.write().unwrap_or_else(|p| p.into_inner()).insert(v, d);
+        Ok(out)
+    }
+
+    /// 案 C が有効か (書き手が `note_lazy` を使う)。 繋いでいる最中も真 (繋ぎ終えてから倒す): その間の書き手は糸なしで足し、 見直しで
+    /// 「繋いだ」 を見たら繋ぎ終えるのを待って自分の場所を繋ぎ直す。
     #[inline]
     pub fn lazy_unlinked(&self) -> bool {
-        self.lazy.load(Ordering::Relaxed) && self.unlinked.load(Ordering::Acquire)
+        self.lazy.load(Ordering::Acquire)
     }
 
     /// 案 A の書き込み (行の lock の下): 値が cell の前の値 `cell_old` と同じなら足さない。 entry を糸なし (`PEND`) で足して位置を溜める。
@@ -1007,6 +1262,10 @@ impl HistCol {
 
     /// 案 A の溜めを繋ぐ (溜めが無ければ atomic 1 回)。 読み手・開く道・書き出し (閉じる時) の前に呼ぶ。
     pub fn drain(&self) {
+        // 案 E: 末尾を繋ぐ (係を手伝う)
+        if self.e_mode.load(Ordering::Relaxed) {
+            self.catch_up();
+        }
         if !self.pend_any.load(Ordering::Acquire) {
             return;
         }
@@ -1538,9 +1797,22 @@ impl HistCol {
     /// (書き出した len の後に OS が書いた entry)。 同じ identity の同じ時刻の entry は 1 つにする。 `slot_of` は eid → 場所。
     /// 作り直した entry の数を返す。
     pub fn relink(&self, slot_of: impl Fn(u32) -> u32) -> io::Result<usize> {
+        self.relink_upto(slot_of, None)
+    }
+
+    /// [`Self::relink`] の、 拾う範囲を [0, `upto`) にする形 (None = commit 済みの全域、 開く道)。 書き手が並ぶ時 (案 C の最初の読み) は
+    /// `upto` まで。 その後ろは書き手 (案 C) か裏の係 (案 E) が繋ぐ。
+    fn relink_upto(&self, slot_of: impl Fn(u32) -> u32, upto: Option<u32>) -> io::Result<usize> {
         self.drain();
+        // 案 A / E の繋ぐ係と並ばない (どちらも鎖を書き換える)
+        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.relink_locked(slot_of, upto)
+    }
+
+    /// [`Self::relink_upto`] の本体 (呼び手が `apply_lock` を握っている)。
+    fn relink_locked(&self, slot_of: impl Fn(u32) -> u32, upto: Option<u32>) -> io::Result<usize> {
         // 拾う範囲: commit 済みの全域 (flags の無い所は飛ばす)
-        let cap = ((self.entries.committed().saturating_sub(HEADER)) / ENTRY) as u32;
+        let cap = upto.unwrap_or(((self.entries.committed().saturating_sub(HEADER)) / ENTRY) as u32);
         let mut all: Vec<(u32, u32, u64, u32)> = Vec::new(); // (場所, eid, 時刻, 位置)
         let mut top = 0u32;
         for idx in 0..cap {
@@ -1566,6 +1838,7 @@ impl HistCol {
             rewritten += self.link_slot(group[0].0, &mut items)?;
         }
         self.len.store(top.max(self.len()), Ordering::Release);
+        self.linked_upto.store(upto.unwrap_or(self.len()), Ordering::Release);
         self.clock.fetch_max(clock, Ordering::AcqRel);
         self.disordered.store(false, Ordering::Release);
         self.voided.store(false, Ordering::Release);
@@ -1761,6 +2034,14 @@ pub struct Histories {
     pub repair: AtomicBool,
 }
 
+impl Drop for Histories {
+    fn drop(&mut self) {
+        for c in self.owned.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            Self::stop_linker(c);
+        }
+    }
+}
+
 impl Default for Histories {
     fn default() -> Self {
         Histories { any: AtomicBool::new(false), table: OnceLock::new(), owned: Mutex::new(Vec::new()), repair: AtomicBool::new(false) }
@@ -1787,9 +2068,52 @@ impl Histories {
         self.any.load(Ordering::Acquire)
     }
 
+    /// 案 E の裏の係を起こす / 止める。
+    pub fn set_e(&self, hid: usize, on: bool) {
+        let Some(a) = self.owned.lock().unwrap_or_else(|p| p.into_inner()).iter().rev().find(|c| c.hid as usize == hid).cloned() else {
+            return;
+        };
+        if on {
+            a.set_e(true);
+            Self::start_linker(&a);
+        } else {
+            Self::stop_linker(&a);
+            a.set_e(false);
+        }
+    }
+
+    fn start_linker(a: &Arc<HistCol>) {
+        let mut g = a.linker.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_some() {
+            return;
+        }
+        a.linker_stop.store(false, Ordering::Release);
+        let c = a.clone();
+        *g = std::thread::Builder::new()
+            .name("enchudb-hist-link".into())
+            .spawn(move || {
+                while !c.linker_stop.load(Ordering::Acquire) {
+                    if c.catch_up() == 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                }
+            })
+            .ok();
+    }
+
+    fn stop_linker(a: &HistCol) {
+        a.linker_stop.store(true, Ordering::Release);
+        if let Some(h) = a.linker.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = h.join();
+        }
+    }
+
     pub fn insert(&self, col: HistCol) -> &HistCol {
         let hid = col.hid as usize;
         let a = Arc::new(col);
+        if a.e_mode() {
+            Self::start_linker(&a);
+        }
         let p = Arc::as_ptr(&a) as *mut HistCol;
         self.owned.lock().unwrap_or_else(|p| p.into_inner()).push(a);
         let t = self.table.get_or_init(|| (0..=u16::MAX as usize).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect());
@@ -1842,14 +2166,15 @@ mod tests {
     /// 小さい区間 + 末尾、 案 A の溜めの上限を何度も越える)、 場所の使い回しを混ぜる。
     #[test]
     fn variants_answer_like_the_base() {
-        for (batch, blocks, lazy, snaps) in [
-            (true, false, false, false),
-            (false, true, false, false),
-            (true, true, false, false),
-            (false, false, true, false),
-            (false, false, false, true),
+        for (batch, blocks, lazy, snaps, e) in [
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (true, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
         ] {
-            let d = tmp(&format!("var_{batch}_{blocks}_{lazy}_{snaps}"));
+            let d = tmp(&format!("var_{batch}_{blocks}_{lazy}_{snaps}_{e}"));
             let base = HistCol::create(&d.join("a"), 1, 10, 4096).unwrap();
             let var = HistCol::create(&d.join("b"), 1, 10, 4096).unwrap();
             base.set_modes(false, false);
@@ -1858,6 +2183,11 @@ mod tests {
             var.set_modes(batch, blocks);
             var.set_lazy(lazy);
             var.set_snaps(snaps);
+            var.set_e(e);
+            base.set_e(false);
+            if e {
+                var.set_e_kmin(64); // 控えの道を何度も通す
+            }
             let mut cell: Vec<Option<u64>> = vec![None; 2000];
             let mut gens = vec![0u32; 2000];
             let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(batch) ^ (u64::from(blocks) << 1);
@@ -1876,8 +2206,14 @@ mod tests {
                 let eid = (gens[slot as usize] << 20) | slot;
                 let new = if r == 0 { None } else { Some(step(&mut x) % 8) };
                 for c in [&base, &var] {
-                    if c.lazy_unlinked() {
-                        c.note_lazy(slot, eid, new, t, 0).unwrap();
+                    if c.e_mode() {
+                        c.note_raw(slot, eid, new, t, 0).unwrap();
+                        // 係の代わりに時々繋ぐ (末尾の長さを変える)
+                        if step(&mut x) % 97 == 0 {
+                            c.catch_up();
+                        }
+                    } else if c.lazy_unlinked() {
+                        c.note_lazy(slot, eid, new, t, 0, false).unwrap();
                     } else if c.batched() {
                         c.note_batched(slot, eid, new, t, 0, cell[slot as usize]).unwrap();
                     } else {
@@ -1891,6 +2227,12 @@ mod tests {
                 if i % 4999 == 0 {
                     times.push(t);
                 }
+                // 案 E: 半分書いた所で全部の値を見る (以後は係が差分の並びと控えを保つ)
+                if i == 75_000 && var.e_mode() {
+                    for v in 0..8u64 {
+                        var.pull_at_e(v, t).unwrap();
+                    }
+                }
             }
             // 案 C: 最初の読みの前に全体を繋ぐ (engine は列の書き手を止めて呼ぶ)
             if var.unlinked() {
@@ -1903,7 +2245,9 @@ mod tests {
                     // 案 B は今の円柱が要る: 今の値 v の identity
                     let now: Vec<u32> =
                         (0..2000u32).filter(|&s| cell[s as usize] == Some(v)).map(|s| (gens[s as usize] << 20) | s).collect();
-                    let mut b = if var.snaps_mode() {
+                    let mut b = if var.e_mode() {
+                        var.pull_at_e(v, tt).unwrap()
+                    } else if var.snaps_mode() {
                         var.pull_at_snaps(v, tt, |e| e & 0xFFFFF).unwrap()
                     } else if var.blocks_mode() {
                         var.pull_at_blocks(v, tt, &now).unwrap()
@@ -1912,7 +2256,7 @@ mod tests {
                     };
                     a.sort_unstable();
                     b.sort_unstable();
-                    assert_eq!(a, b, "batch={batch} blocks={blocks} lazy={lazy} snaps={snaps} t={tt} v={v}");
+                    assert_eq!(a, b, "batch={batch} blocks={blocks} lazy={lazy} snaps={snaps} e={e} t={tt} v={v}");
                 }
                 for s in (0..2000u32).step_by(37) {
                     for g in 0..=gens[s as usize] {

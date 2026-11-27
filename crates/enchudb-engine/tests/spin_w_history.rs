@@ -84,6 +84,8 @@ struct Model {
     times: Vec<u64>,
     /// identity ごとに、 v への最後の書き込みが変更だったか (同じ値の書き直しなら false: cell の版数は進むが entry は増えない)
     last_changed: BTreeMap<EntityId, bool>,
+    /// 値の変わらない書き込みで時計が進んだ時の (identity, 時刻, 値) (案 E は書き直しも entry を足す。 像で前の entry が消えると残りうる)
+    rewrites: Vec<(EntityId, u64, Option<u64>)>,
 }
 
 impl Model {
@@ -104,7 +106,11 @@ fn record(eng: &Engine, m: &mut Model, e: EntityId, new: Option<u64>) {
     let last = m.times.last().copied().unwrap_or(m.horizon);
     m.last_changed.insert(e, m.cur(e) != new);
     if m.cur(e) == new {
-        assert_eq!(clock, last, "変更でない書き込みで時計が進んだ");
+        // 変更でない書き込み: 今の形は entry を足さないので時計は動かない。 案 E は足して繋ぐ時に落とすので時計は進みうる (戻らない)
+        assert!(clock >= last, "時計が戻った");
+        if clock > last {
+            m.rewrites.push((e, clock, new));
+        }
         return;
     }
     assert!(clock > last, "変更の時刻が進まない ({clock} <= {last})");
@@ -589,6 +595,9 @@ fn first_read_links_while_walless_writers_run() {
         hs.into_iter().for_each(|h| h.join().unwrap());
         for &e in &rows {
             let h = eng.history(e, V).unwrap();
+            if h.last().and_then(|c| c.value) != eng.get(e, V) {
+                eprintln!("RAW {e:#x}: {:?}", eng.history_raw(e, V));
+            }
             assert_eq!(h.last().and_then(|c| c.value), eng.get(e, V), "row {e:#x}: 集まりの最新と cell ({h:?})");
             for w in h.windows(2) {
                 assert!(w[0].time < w[1].time, "row {e:#x}: 時刻の順");
@@ -900,8 +909,9 @@ mod power_loss {
         crashsim::stop();
         let slot_of = |e: EntityId| eng.eid_slot(e);
         // 本当に在った書き込み: (場所, 時刻, 値)
-        let real: BTreeSet<(u32, u64, Option<u64>)> =
+        let mut real: BTreeSet<(u32, u64, Option<u64>)> =
             m.cards.iter().flat_map(|(&e, c)| c.iter().map(move |&(t, v)| (e, t, v))).map(|(e, t, v)| (slot_of(e), t, v)).collect();
+        real.extend(m.rewrites.iter().map(|&(e, t, v)| (slot_of(e), t, v)));
         let slots: BTreeMap<EntityId, u32> = m.cards.keys().map(|&e| (e, slot_of(e))).collect();
         drop(eng);
         check_image_loose(&img, &m, sure.as_ref().unwrap(), &real, &slots)

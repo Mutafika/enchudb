@@ -45,9 +45,12 @@ impl Engine {
         }
         // 宣言より前の時刻 (宣言が書き手を止めた時に、 WAL に積んで待っていた書き込み): 地平に寄せて 「遅くとも」 (宣言の時の値の後に並ぶ)
         let (time, extra) = if time <= h.horizon() { (h.horizon(), extra | flag::OBSERVED) } else { (time, extra) };
-        let r = if h.lazy_unlinked() {
+        let r = if h.e_mode() {
+            // 案 E: いつも糸なしで足すだけ (裏の係が繋ぐ)
+            h.note_raw(slot, eid, value, time, extra)
+        } else if h.lazy_unlinked() {
             // 案 C: 見られるまで繋がない
-            h.note_lazy(slot, eid, value, time, extra)
+            h.note_lazy(slot, eid, value, time, extra, self.oplog.is_none())
         } else {
             match cell_old {
                 Some(old) if h.batched() => h.note_batched(slot, eid, value, time, extra, old),
@@ -361,6 +364,33 @@ impl Engine {
         }
     }
 
+    /// 試作の形を切り替える (案 E: 書き手は足すだけ、 裏の係が繋ぐ)。 `kmin` = 控えの間隔の下限 (None なら変えない)。
+    #[doc(hidden)]
+    pub fn history_set_e(&self, himo: &str, on: bool, kmin: Option<usize>) -> Result<(), HistError> {
+        let id = self.himo_id(himo).ok_or(HistError::NotDeclared)?;
+        let h = self.hist.get(id).ok_or(HistError::NotDeclared)?;
+        self.hist_link(h);
+        if let Some(k) = kmin {
+            h.set_e_kmin(k);
+        }
+        self.hist.set_e(id, on);
+        Ok(())
+    }
+
+    /// 調べ用: 行 `eid` の entry を位置の順に全部。
+    #[doc(hidden)]
+    pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {
+        let h = self.himo_id(himo).and_then(|id| self.hist.get(id)).unwrap();
+        h.raw_entries(enchudb_oplog::eid_local(eid))
+    }
+
+    /// 案 E: (係の今の遅れ, 前に聞いてからの遅れの最大, 差分の並びの memory)。
+    #[doc(hidden)]
+    pub fn history_e_stats(&self, himo: &str) -> Result<(u32, u32, usize), HistError> {
+        let h = self.himo_id(himo).and_then(|id| self.hist.get(id)).ok_or(HistError::NotDeclared)?;
+        Ok(h.e_stats())
+    }
+
     /// 試作の形を切り替える (案 D)。
     #[doc(hidden)]
     pub fn history_set_snaps(&self, himo: &str, on: bool) -> Result<(), HistError> {
@@ -417,6 +447,9 @@ impl Engine {
         // 今の円柱の近道 (t ≥ 時計) は外した: cell を書いた後・entry を足す前に読むと後の変更を含み、 entry が足された後は消えた (レビュー
         // 1 回目の 6)。 今は entry を cell より先に足し、 確定の線 (`history_clock`) 以下の時点の答えは後から変わらない
         let peer = self.peer_id();
+        if h.e_mode() {
+            return Ok(h.pull_at_e(value, t)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect());
+        }
         if h.snaps_mode() {
             // 案 D: 区間の終わりの時点の控え + 区間 1 つ分
             return Ok(h
