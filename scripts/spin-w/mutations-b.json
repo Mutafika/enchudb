@@ -1,0 +1,26 @@
+[
+ {
+  "name": "B t より後の最初の差分を位置の順で決める",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": ".and_modify(|x| if k < x.0 { *x = (k, inn) })",
+  "replace": ".and_modify(|_| ())"
+ },
+ {
+  "name": "B 出て戻った行を二重に数える",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "!x.1 && !now.contains(e)",
+  "replace": "!x.1"
+ },
+ {
+  "name": "B 開いた末尾をなめない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        for idx in covered..n {",
+  "replace": "        for idx in n..n {"
+ },
+ {
+  "name": "B 区間の最大の時刻で飛ばしすぎる",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "            if b.max_time <= t {",
+  "replace": "            if b.max_time <= t || b.max_time > 0 {"
+ }
+]

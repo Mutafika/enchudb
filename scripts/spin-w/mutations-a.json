@@ -1,0 +1,26 @@
+[
+ {
+  "name": "A 溜めを繋がない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "    pub fn drain(&self) {\n        if !self.pend_any.load(Ordering::Acquire) {",
+  "replace": "    pub fn drain(&self) {\n        if true || !self.pend_any.load(Ordering::Acquire) {"
+ },
+ {
+  "name": "A 溜めを繋ぐ時に鎖の最新を読まず prev を付けない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        e.flags = pl.flags;\n        e.depth = pl.depth;\n        e.prev = pl.prev;",
+  "replace": "        e.flags = pl.flags;\n        e.depth = pl.depth;\n        e.prev = 0;"
+ },
+ {
+  "name": "A 書き手が見た値の差分を足さない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "            self.push_diffs(idx, eid, time, cell_old.unwrap_or(ABSENT), v);",
+  "replace": "            let _ = cell_old;"
+ },
+ {
+  "name": "A 繋ぎ直しで PEND を落とさない",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "e.flags = (e.flags & !(flag::FIRST | flag::PEND))",
+  "replace": "e.flags = (e.flags & !flag::FIRST)"
+ }
+]

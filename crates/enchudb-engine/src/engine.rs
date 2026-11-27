@@ -26260,14 +26260,20 @@ impl Engine {
     /// identity の集まりに 1 件足す (行の lock の下)。
     fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>, hlc: enchudb_oplog::Hlc) -> bool {
         let value = value.into();
-        // 案 A (溜める) は書く前の cell の値で 「変わったか」 を決める (heads を読まない。 cell の line はこの後書くので cache に入る)
-        let hist_old = self.hist.get(hid).filter(|h| h.batched()).map(|_| self.himos[hid].get_value(local));
         let tracked = self.vocab_tracks(hid);
         let old = if tracked { self.himos[hid].get_value32(local) } else { None };
         let changed = tracked && old != Some(value as u32);
         if changed && !self.vocab.acquire(value as u32) {
             self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
             return false;
+        }
+        // 履歴: entry を cell より先に足す (レビュー 1 回目の 6: 先に cell を書くと、 その間の読みが円柱で後の変更を見た)。 案 A は書く前の
+        // cell の値で 「変わったか」 を決める (heads を読まない)
+        let hist = self.hist.get(hid);
+        let cell_old = hist.map(|_| self.himos[hid].get_value(local));
+        if let Some(h) = hist {
+            h.begin_write();
+            self.hist_note(h, local, Some(value), hlc, false, cell_old.filter(|_| h.batched()));
         }
         let ok = if self.points_to_content(hid) && !self.content_is_durable(hid, value) {
             // #419: 中身を指す cell は門の中で書く (書き出しがこの列を msync する間は待つ。 中身はこの前に書いてある)。
@@ -26277,10 +26283,17 @@ impl Engine {
         } else {
             self.himos[hid].set(local, value)
         };
-        if ok {
-            if let Some(h) = self.hist.get(hid) {
-                self.hist_note(h, local, Some(value), hlc, false, hist_old);
+        if let Some(h) = hist {
+            if !ok {
+                // cell を書けなかった: 履歴を cell の値に戻す (「遅くとも」)
+                self.hist_note(h, local, cell_old.flatten(), HIST_NO_TIME, false, None);
             }
+            h.end_write();
+        } else if ok && let Some(h) = self.hist.get(hid) {
+            // 宣言が書き手を止めている間に 「履歴なし」 を見た書き込み: cell を書いた後に見直して足す (`declare_history`)
+            self.hist_note(h, local, Some(value), hlc, false, None);
+        }
+        if ok {
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
             self.order_note(hid as u16, local);
             self.live.touch(hid as u16, local);
@@ -26585,10 +26598,18 @@ impl Engine {
         } else {
             None
         };
-        let hist_old = self.hist.get(hid).filter(|h| h.batched()).map(|_| self.himos[hid].get_value(local));
+        // 履歴: entry を cell より先に足す (`live_set` と同じ)
+        let hist = self.hist.get(hid);
+        if let Some(h) = hist {
+            h.begin_write();
+            let cell_old = h.batched().then(|| self.himos[hid].get_value(local));
+            self.hist_note(h, local, None, hlc, deleting, cell_old);
+        }
         self.himos[hid].remove(local);
-        if let Some(h) = self.hist.get(hid) {
-            self.hist_note(h, local, None, hlc, deleting, hist_old);
+        if let Some(h) = hist {
+            h.end_write();
+        } else if let Some(h) = self.hist.get(hid) {
+            self.hist_note(h, local, None, hlc, deleting, None);
         }
         self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);
@@ -40862,6 +40883,14 @@ impl Engine {
     pub fn enable_vocab_reclaim(&self) -> io::Result<()> {
         if self.is_readonly() {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "enable_vocab_reclaim: readonly open"));
+        }
+        // スピン 案 W の試作: 履歴を宣言した Tag の列があれば断る (語の番号が使い回されると、 履歴の値が別の語を指す。 宣言の時と同じ)
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.hist.declared().iter().any(|&h| self.value_types.get(h as usize) == Some(&ValueType::Tag)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "enable_vocab_reclaim: a Tag column has history (declare_history); word ids must not be reused",
+            ));
         }
         let header_size = self.layout.read().unwrap().header_size;
         {

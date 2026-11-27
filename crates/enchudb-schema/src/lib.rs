@@ -1731,8 +1731,8 @@ impl<'a> TableBuilder<'a> {
     /// ```
     ///
     /// - 足すだけ (書かない build は宣言を外さない。 外すのは engine の `drop_history` = 履歴を捨てる)
-    /// - Leaf の列・sync する DB には付けられない。 WAL の無い session (`Database::open` / build phase) では、 履歴の列を持つ表の
-    ///   行に書けない (`WriteRejected`、 時刻が付かない)
+    /// - Leaf の列・sync する DB には付けられない。 WAL の無い session (`Database::open` / build phase) の書き込みは engine の時計
+    ///   (壁時計の ms と列の時計の大きい方) で残る
     pub fn history(mut self, col: &str) -> Self {
         self.history.push(col.to_string());
         self

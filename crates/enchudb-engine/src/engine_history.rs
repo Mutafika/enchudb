@@ -43,6 +43,8 @@ impl Engine {
         if deleting {
             extra |= flag::DELETE;
         }
+        // 宣言より前の時刻 (宣言が書き手を止めた時に、 WAL に積んで待っていた書き込み): 地平に寄せて 「遅くとも」 (宣言の時の値の後に並ぶ)
+        let (time, extra) = if time <= h.horizon() { (h.horizon(), extra | flag::OBSERVED) } else { (time, extra) };
         let r = match cell_old {
             Some(old) if h.batched() => h.note_batched(slot, eid, value, time, extra, old),
             _ => h.note(slot, eid, value, time, extra),
@@ -116,22 +118,21 @@ impl Engine {
             }
         };
         let col = HistCol::create(set.dir(), id as u16, horizon, self.max_entities()).map_err(|e| format!("declare_history: {e}"))?;
-        // 宣言の時の値 (地平の entry)
-        let mut cells = Vec::new();
-        self.himos[id].for_each_set_cell(|slot, v| cells.push((slot, v)));
-        for (slot, v) in cells {
-            if !self.entities.is_live(slot) {
-                continue;
+        {
+            // 列の書き手を止める (レビュー 1 回目の 5: 前は書き手と並んで走り、 走査の後・登録の前の書き込みを落とした)。 止めている間に
+            // 宣言の時の値を入れて登録する。 止める前に 「履歴なし」 を見て止まった書き手は、 cell を書いた後に見直して足す (`live_set`)
+            let _w = self.himos[id].write_guard();
+            let mut cells = Vec::new();
+            self.himos[id].for_each_set_cell(|slot, v| cells.push((slot, v)));
+            for (slot, v) in cells {
+                if !self.entities.is_live(slot) {
+                    continue;
+                }
+                col.note(slot, self.generations().local(slot), Some(v), horizon, flag::BASE).map_err(|e| format!("declare_history: {e}"))?;
             }
-            let _row = self.row_locks.write(slot);
-            if let Some(now) = self.himos[id].get_value(slot) {
-                let _ = v;
-                col.note(slot, self.generations().local(slot), Some(now), horizon, flag::BASE)
-                    .map_err(|e| format!("declare_history: {e}"))?;
-            }
+            col.write_out(true).map_err(|e| format!("declare_history: {e}"))?;
+            self.hist.insert(col);
         }
-        col.write_out(true).map_err(|e| format!("declare_history: {e}"))?;
-        self.hist.insert(col);
         self.try_persist_tables();
         Ok(true)
     }
@@ -177,6 +178,10 @@ impl Engine {
                         eprintln!("warning: history of himo {h}: the horizon in the file differs from the declaration");
                     }
                     let c = self.hist.insert(c);
+                    // 書き手で開いた: heads の file を外す (閉じる時に置き直す。 レビュー 1 回目の 2)
+                    if !readonly {
+                        let _ = remove_sidecar(&c.unlink_heads_file());
+                    }
                     // heads を file から戻せなかった (きれいに閉じていない / 置く前に落ちた) 時も繋ぎ直す。 readonly は繋ぎ直せない
                     // (entry を書く) ので、 その process の読みは鎖の頭を持たない (試作の限り)
                     if readonly && c.heads_stale() {
@@ -325,7 +330,17 @@ impl Engine {
     }
 
     fn hist_col(&self, himo: &str) -> Result<&HistCol, HistError> {
-        self.himo_id(himo).and_then(|id| self.hist.get(id)).ok_or(HistError::NotDeclared)
+        let h = self.himo_id(himo).and_then(|id| self.hist.get(id)).ok_or(HistError::NotDeclared)?;
+        if self.is_readonly() && h.heads_stale() {
+            return Err(HistError::Unavailable);
+        }
+        Ok(h)
+    }
+
+    /// 列 `himo` の場所ごとの最新を、 開く時に file から戻せたか (試験用: 戻せなければ entry から繋ぎ直した)。
+    #[doc(hidden)]
+    pub fn history_heads_loaded(&self, himo: &str) -> Result<bool, HistError> {
+        Ok(self.hist_col(himo)?.heads_loaded())
     }
 
     /// 行 `eid` (世代 | 場所) の列 `himo` の、 時点 `t` (`history::pack` した HLC) の値。 地平より前は `TooOld`。 場所が使い回された後も、
@@ -353,9 +368,8 @@ impl Engine {
         let h = self.hist_col(himo)?;
         // 今 (列の時計) 以後の時点のデッキは今の円柱そのもの (cell = 集まりの最新)。 差分の並びを読まない
         h.drain();
-        if t >= h.clock() && t >= h.horizon() {
-            return Ok(self.pull_raw(himo, value));
-        }
+        // 今の円柱の近道 (t ≥ 時計) は外した: cell を書いた後・entry を足す前に読むと後の変更を含み、 entry が足された後は消えた (レビュー
+        // 1 回目の 6)。 今は entry を cell より先に足し、 確定の線 (`history_clock`) 以下の時点の答えは後から変わらない
         let peer = self.peer_id();
         if h.blocks_mode() {
             // 案 B: 今の円柱から、 t より後の差分を戻す
@@ -372,9 +386,10 @@ impl Engine {
         Ok(())
     }
 
-    /// 列 `himo` の履歴の時計 (見た最大の時刻)。 「今」 の時点として読みに渡せる。
+    /// 列 `himo` の確定の線: この時刻以下の時点の読み (`value_at` / `pull_at`) は後から変わらない。 書きかけが無ければ見た最大の時刻
+    /// (= 今)。 書き手が並んで書き続ける間は遅れうる。
     pub fn history_clock(&self, himo: &str) -> Result<u64, HistError> {
-        Ok(self.hist_col(himo)?.clock())
+        Ok(self.hist_col(himo)?.settled())
     }
 
     /// 列 `himo` の履歴の大きさ: (entry の数 (外した物を除く), 「遅くとも」 の entry の数, entry の segment の byte, heads の byte)。

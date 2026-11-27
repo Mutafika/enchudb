@@ -82,6 +82,8 @@ struct Model {
     live: BTreeSet<EntityId>,
     /// 全部の変更の時刻 (全体の順)
     times: Vec<u64>,
+    /// identity ごとに、 v への最後の書き込みが変更だったか (同じ値の書き直しなら false: cell の版数は進むが entry は増えない)
+    last_changed: BTreeMap<EntityId, bool>,
 }
 
 impl Model {
@@ -100,6 +102,7 @@ impl Model {
 fn record(eng: &Engine, m: &mut Model, e: EntityId, new: Option<u64>) {
     let clock = eng.history_clock(V).unwrap();
     let last = m.times.last().copied().unwrap_or(m.horizon);
+    m.last_changed.insert(e, m.cur(e) != new);
     if m.cur(e) == new {
         assert_eq!(clock, last, "変更でない書き込みで時計が進んだ");
         return;
@@ -131,9 +134,26 @@ fn check(eng: &Engine, m: &Model, rng: &mut Rng) {
             }
         }
     }
-    // 生きている行の最新 = cell
+    // 生きている行の最新 = cell。 版数のある DB は、 最新の entry の時刻 = cell の版数 (WAL の record の HLC を詰めた物。 時刻を
+    // 時計から独立に確かめる)
+    let hid = eng.himo_id(V).unwrap() as u16;
     for &e in &m.live {
         assert_eq!(eng.get(e, V), m.cur(e), "cell と模型");
+        let ver = eng.cell_hlc(e, hid);
+        if ver != enchudb_oplog::Hlc::ZERO
+            && let Some(last) = m.cards.get(&e).and_then(|c| c.last())
+        {
+            let pv = enchudb_engine::history::pack(ver);
+            assert!(last.0 <= pv, "identity {e:#x}: 最新の entry の時刻が cell の版数より後");
+            if m.last_changed.get(&e) == Some(&true) {
+                assert_eq!(
+                pv,
+                last.0,
+                "identity {e:#x}: 最新の entry の時刻と cell の版数 {ver:?} (履歴 {:?})",
+                eng.history(e, V).unwrap()
+                );
+            }
+        }
     }
     // 時点 t のデッキ (時刻を少し選ぶ + 今)
     let mut ts: Vec<u64> = (0..6).filter_map(|_| (!m.times.is_empty()).then(|| m.times[rng.below(m.times.len() as u64) as usize])).collect();
@@ -189,7 +209,12 @@ fn run(seed: u64, n: usize, versions: bool) {
                 if let Some(e) = pick(&m, &mut rng) {
                     eng.tie_to(e, W, rng.below(100) as u32);
                     let cur = m.cur(e);
+                    let lc = m.last_changed.get(&e).copied();
                     record(&eng, &mut m, e, cur); // 履歴の無い列: 変更なし
+                    match lc {
+                        Some(x) => m.last_changed.insert(e, x),
+                        None => m.last_changed.remove(&e),
+                    };
                 }
             }
             78..=88 => {
@@ -204,6 +229,8 @@ fn run(seed: u64, n: usize, versions: bool) {
                 drop(eng);
                 eng = reopen(&db);
                 assert_eq!(eng.history_declarations(), vec![V.to_string()]);
+                // きれいに閉じた後は場所ごとの最新を file から貼る (繋ぎ直さない。 レビュー 1 回目の 1: page の大きさで貼れないと毎回繋ぎ直す)
+                assert_eq!(eng.history_heads_loaded(V), Ok(true), "きれいに閉じた後に heads を貼れていない");
                 check(&eng, &m, &mut rng);
             }
         }
@@ -360,6 +387,171 @@ fn declarations_that_are_refused() {
     assert!(e2.declare_history(V).is_err(), "sync する DB は宣言できない");
 }
 
+/// レビュー 1 回目の 2: WAL の無い session の途中の flush は 「きれいに閉じた」 の印を立てる。 その後に書いて (閉じずに) 落ちても、
+/// 次に開く時に前の heads を貼らない (書き手で開いた時に heads の file を外す)。
+#[test]
+fn standalone_flush_then_crash_keeps_history() {
+    // 子 process: 単独で開いて flush した後に書き、 閉じずに落ちる (abort)
+    if let Ok(dir) = std::env::var("SPINW_FLUSHCRASH_CHILD") {
+        let a: EntityId = std::env::var("SPINW_ROW").unwrap().parse().unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
+        eng.flush().unwrap();
+        eng.tie_to(a, V, 2u32);
+        eng.tie_to(a, V, 3u32);
+        std::process::abort();
+    }
+    let s = Scratch::new("flushcrash");
+    let p = s.db();
+    let a = {
+        let eng = create(&p, false);
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, V, 1u32);
+        a
+    };
+    let st = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "standalone_flush_then_crash_keeps_history", "--nocapture", "--test-threads", "1"])
+        .env("SPINW_FLUSHCRASH_CHILD", p.to_str().unwrap())
+        .env("SPINW_ROW", a.to_string())
+        .status()
+        .unwrap();
+    assert!(!st.success(), "前提: 子が落ちた");
+    let eng = Engine::open_standalone(p.to_str().unwrap()).unwrap();
+    assert_eq!(eng.get(a, V), Some(3), "前提: 子の書き込みが cell に在る");
+    assert_eq!(eng.history_heads_loaded(V), Ok(false), "落ちた後に前の heads を貼った");
+    let vals: Vec<Option<u64>> = eng.history(a, V).unwrap().iter().map(|c| c.value).collect();
+    assert_eq!(vals, vec![Some(1), Some(2), Some(3)]);
+    assert_eq!(eng.value_at(a, V, u64::MAX >> 1).unwrap().value, Some(3));
+}
+
+/// レビュー 1 回目の 4: 宣言の後に engine の枠を伸ばしても、 伸ばした場所の行の履歴が読める。
+#[test]
+fn grow_after_declare() {
+    let s = Scratch::new("grow");
+    let p = s.db();
+    let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 64).unwrap();
+    eng.define_table("t", 32).unwrap();
+    eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
+    eng.declare_history(V).unwrap();
+    eng.grow_entity_cap(100_000).unwrap();
+    let mut last = None;
+    for _ in 0..5000 {
+        let e = eng.entity_in("t").unwrap();
+        eng.tie_to(e, V, 4u32);
+        last = Some(e);
+    }
+    let e = last.unwrap();
+    assert!(eng.eid_slot(e) >= 64, "前提: 伸ばした場所の行");
+    assert_eq!(eng.history(e, V).unwrap().len(), 1);
+    assert_eq!(eng.value_at(e, V, eng.history_clock(V).unwrap()).unwrap().value, Some(4));
+    assert_eq!(eng.fault_count(FaultKind::DiskSpace), 0);
+}
+
+/// レビュー 1 回目の 8: readonly で開いた process は、 書き手が開いている (heads の file が無い) 間は答えない。
+#[test]
+fn readonly_without_heads_refuses() {
+    let s = Scratch::new("ro");
+    let p = s.db();
+    let eng = create(&p, false);
+    let a = eng.entity_in("t").unwrap();
+    eng.tie_to(a, V, 1u32);
+    eng.oplog_sync().unwrap();
+    let ro = Engine::open_readonly(p.to_str().unwrap()).unwrap();
+    assert_eq!(ro.history(a, V), Err(HistError::Unavailable));
+    drop(ro);
+    drop(eng);
+    let ro = Engine::open_readonly(p.to_str().unwrap()).unwrap();
+    assert_eq!(ro.history(a, V).unwrap().len(), 1, "きれいに閉じた後は読める");
+}
+
+/// レビュー 1 回目の 5: 宣言は書き手と並んでも、 宣言の後の全部の行で集まりの最新 = cell。
+#[test]
+fn declare_while_writers_run() {
+    let s = Scratch::new("declrace");
+    let p = s.db();
+    let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 4096).unwrap();
+    eng.define_table("t", 2000).unwrap();
+    eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
+    let rows: Vec<EntityId> = (0..1000).map(|_| eng.entity_in("t").unwrap()).collect();
+    for &e in &rows {
+        eng.tie_to(e, V, 0u32);
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hs: Vec<_> = (0..3u64)
+        .map(|k| {
+            let (eng, rows, stop) = (eng.clone(), rows.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut r = Rng(k * 7919 + 1);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let e = rows[r.below(rows.len() as u64) as usize];
+                    eng.tie_to(e, V, r.below(VALUES) as u32);
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    eng.declare_history(V).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    hs.into_iter().for_each(|h| h.join().unwrap());
+    for &e in &rows {
+        let h = eng.history(e, V).unwrap();
+        assert_eq!(h.last().and_then(|c| c.value), eng.get(e, V), "row {e:#x}: 集まりの最新と cell ({h:?})");
+        for w in h.windows(2) {
+            assert!(w[0].time <= w[1].time);
+        }
+    }
+}
+
+/// 並んだ書き手 (4 本、 重なる行): 終わった後に、 各行の集まりの最新 = cell、 時刻は鎖の上で増える、 時点 t のデッキは 1 行の読みと合う。
+#[test]
+fn concurrent_writers() {
+    let s = Scratch::new("conc");
+    let p = s.db();
+    let eng = create(&p, false);
+    let rows: Vec<EntityId> = (0..ROWS).map(|_| eng.entity_in("t").unwrap()).collect();
+    let hs: Vec<_> = (0..4u64)
+        .map(|k| {
+            let (eng, rows) = (eng.clone(), rows.clone());
+            std::thread::spawn(move || {
+                let mut r = Rng(k * 104_729 + 3);
+                for i in 0..20_000 {
+                    let e = rows[r.below(rows.len() as u64) as usize];
+                    if i % 17 == 0 {
+                        eng.untie(e, V);
+                    } else {
+                        eng.tie_to(e, V, r.below(VALUES) as u32);
+                    }
+                }
+            })
+        })
+        .collect();
+    hs.into_iter().for_each(|h| h.join().unwrap());
+    let mut times = Vec::new();
+    for &e in &rows {
+        let h = eng.history(e, V).unwrap();
+        assert_eq!(h.last().and_then(|c| c.value), eng.get(e, V));
+        for w in h.windows(2) {
+            assert!(w[0].time < w[1].time, "row {e:#x}: 時刻の順");
+            assert_ne!(w[0].value, w[1].value, "row {e:#x}: 値の変わらない entry");
+        }
+        times.extend(h.iter().map(|c| c.time));
+    }
+    times.sort_unstable();
+    for t in times.iter().step_by(times.len() / 50 + 1) {
+        for v in 0..VALUES {
+            let got: BTreeSet<EntityId> = eng.pull_at(V, v, *t).unwrap().into_iter().collect();
+            let want: BTreeSet<EntityId> = rows.iter().copied().filter(|&e| eng.value_at(e, V, *t).unwrap().value == Some(v)).collect();
+            assert_eq!(got, want, "時点 {t} v = {v}");
+        }
+    }
+}
+
 // ─────────────────────────── 電源断 ───────────────────────────
 
 #[cfg(all(feature = "crashsim", unix))]
@@ -417,12 +609,36 @@ mod power_loss {
                 assert_eq!(last, None, "identity {e:#x}: 消えた行の最新に値が残る");
             }
         }
-        // 開き直した後に書いても揃う
-        let (n, obs, _, _) = eng.history_stats(V).unwrap();
-        assert_eq!(obs, observed.min(obs).max(obs));
-        let _ = n;
+        let (_, obs, _, _) = eng.history_stats(V).unwrap();
+        assert!(obs >= observed, "列の 「遅くとも」 の数 {obs} < identity ごとの和 {observed}");
+        deck_agrees(&eng, m);
+        deck_agrees(&eng, m);
         drop(eng);
         (observed, checked)
+    }
+
+    /// 像を開いた engine で、 時点 t のデッキが各 identity の時点 t の値と合う (デッキと 1 行の読みが同じ履歴を見ている)。
+    fn deck_agrees(eng: &Engine, m: &Model) {
+        let mut ts: Vec<u64> = m.times.iter().step_by(37).copied().collect();
+        ts.push(eng.history_clock(V).unwrap());
+        for t in ts {
+            for v in 0..VALUES {
+                let got: BTreeSet<EntityId> = eng.pull_at(V, v, t).unwrap().into_iter().collect();
+                let want: BTreeSet<EntityId> =
+                    m.cards.keys().copied().filter(|&e| eng.value_at(e, V, t).unwrap().value == Some(v)).collect();
+                if got != want {
+                    for e in got.symmetric_difference(&want) {
+                        eprintln!(
+                            "diff {e:#x}: live={} cell={:?} hist={:?}",
+                            eng.is_live(*e),
+                            eng.get(*e, V),
+                            eng.history(*e, V).unwrap()
+                        );
+                    }
+                }
+                assert_eq!(got, want, "像: 時点 {t} のデッキ v = {v} と 1 行の読み");
+            }
+        }
     }
 
     /// 書く → oplog を書き出す (sure) → 書く → 書き出しの `phase` で像を撮る、 を `mode` で。

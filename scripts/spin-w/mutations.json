@@ -2,7 +2,7 @@
  {
   "name": "重複落としを外す (同じ時刻の entry を足す)",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "if fl.is_some_and(|(_, f)| f.time == time && f.flags & flag::OBSERVED == 0) {",
+  "find": "if fl.is_some_and(|(_, f)| f.time == time && f.value == v && f.flags & flag::OBSERVED == 0) {",
   "replace": "if false {"
  },
  {
@@ -80,14 +80,14 @@
  {
   "name": "デッキの差分を書き手が保たない",
   "file": "crates/enchudb-engine/src/history.rs",
-  "find": "            self.push_diffs(idx, eid, time, old, v);",
-  "replace": "            let _ = (old, v);"
+  "find": "            self.push_diffs(idx, eid, time, pl.old, v);",
+  "replace": "            let _ = pl.old;"
  },
  {
   "name": "宣言の時の値を入れない",
   "file": "crates/enchudb-engine/src/engine_history.rs",
-  "find": "col.note(slot, self.generations().local(slot), Some(now), horizon, flag::BASE)",
-  "replace": "Ok::<bool, std::io::Error>(now == u64::MAX)"
+  "find": "                col.note(slot, self.generations().local(slot), Some(v), horizon, flag::BASE)",
+  "replace": "                Ok::<bool, std::io::Error>(v == u64::MAX)"
  },
  {
   "name": "前の住人へ飛ばない (場所の使い回しの後に古い eid を読めない)",
@@ -118,5 +118,65 @@
   "file": "crates/enchudb-engine/src/engine_history.rs",
   "find": "        } else if hlc == HIST_NO_TIME {",
   "replace": "        } else if false && hlc == HIST_NO_TIME {"
+ },
+ {
+  "name": "R1 開く時に heads を貼らない (page の大きさで貼れない形)",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        if c.heads.load(&head_path(dir, hid), len) {",
+  "replace": "        if false && c.heads.load(&head_path(dir, hid), len) {"
+ },
+ {
+  "name": "R2 書き手で開いた時に heads の file を外さない",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "                        let _ = remove_sidecar(&c.unlink_heads_file());",
+  "replace": "                        let _ = c.unlink_heads_file();"
+ },
+ {
+  "name": "R3 同じ時刻で値の違う書き込みを重複として捨てる",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "f.time == time && f.value == v && f.flags & flag::OBSERVED == 0",
+  "replace": "f.time == time && f.flags & flag::OBSERVED == 0"
+ },
+ {
+  "name": "R4 heads の予約を宣言の時の枠だけにする",
+  "file": "crates/enchudb-engine/src/history.rs",
+  "find": "        let _ = slots;\n        let heads = Heads::anon(u32::MAX)?;\n        let c = HistCol::new(dir, hid, entries, heads, horizon, false);",
+  "replace": "        let heads = Heads::anon(slots)?;\n        let c = HistCol::new(dir, hid, entries, heads, horizon, false);"
+ },
+ {
+  "name": "R4 宣言の後の語の回収を断らない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        if self.hist.declared().iter().any(|&h| self.value_types.get(h as usize) == Some(&ValueType::Tag)) {",
+  "replace": "        if false && self.hist.declared().iter().any(|&h| self.value_types.get(h as usize) == Some(&ValueType::Tag)) {"
+ },
+ {
+  "name": "R5 宣言で書き手を止めない",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "            let _w = self.himos[id].write_guard();",
+  "replace": "            let _w = ();"
+ },
+ {
+  "name": "R5 宣言の間に 「履歴なし」 を見た書き込みを見直さない",
+  "file": "crates/enchudb-engine/src/engine.rs",
+  "find": "        } else if ok && let Some(h) = self.hist.get(hid) {",
+  "replace": "        } else if false && ok && let Some(h) = self.hist.get(hid) {"
+ },
+ {
+  "name": "R5 地平より前の時刻を地平に寄せない",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        let (time, extra) = if time <= h.horizon() {",
+  "replace": "        let (time, extra) = if false && time <= h.horizon() {"
+ },
+ {
+  "name": "R8 readonly で heads が合わない時も答える",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        if self.is_readonly() && h.heads_stale() {",
+  "replace": "        if false && self.is_readonly() && h.heads_stale() {"
+ },
+ {
+  "name": "R6 確定の線でなく今の時計を返す",
+  "file": "crates/enchudb-engine/src/engine_history.rs",
+  "find": "        Ok(self.hist_col(himo)?.settled())",
+  "replace": "        Ok(self.hist_col(himo)?.clock())"
  }
 ]

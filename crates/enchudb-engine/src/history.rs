@@ -17,7 +17,7 @@
 //! ## 時刻の分からない entry (`OBSERVED`)
 //! 時刻を運べない道 (開く時の突き合わせ・gen.seg の死の完了・WAL の無い内部の書き込み) の entry は 「遅くともこの時刻には
 //! こうなっていた」 の印を付け、 時刻は今の時計 (それまでに見た最大 + 1)。 本当の変更はそれ以前のどこか。 読みはこの entry の
-//! 前の区間の答えに `uncertain` を立てる。 ユーザの書き込みで時刻が無い (WAL の無い session) ものは engine が断る
+//! 前の区間の答えに `uncertain` を立てる。 WAL の無い session のユーザの書き込みは engine の時計で、 印は付けない
 //! (`Engine::declare_history` の説明)。
 //!
 //! ## 順序
@@ -46,8 +46,8 @@ pub const ENTRY: usize = 32;
 const HEADER: usize = 4096;
 const MAGIC: &[u8; 4] = b"HIS1";
 const VERSION: u32 = 1;
-/// 予約する仮想アドレス (entry は 2^32 件まで = 128 GiB)。
-const RESERVE_ENTRIES: usize = 1 << 40;
+/// 予約する仮想アドレス (byte): header + entry 2^32 件 (= 128 GiB + 1 page)。 位置は u32 (糸は位置 + 1 なので、 最後の 1 件は使わない)
+const RESERVE_ENTRIES: usize = HEADER + (1usize << 32) * ENTRY;
 /// 糸の終わり (糸は entry の位置 + 1)。
 const NONE: u32 = 0;
 /// 値の無い entry (untie / 削除) の値。
@@ -89,6 +89,9 @@ pub enum HistError {
     NotDeclared,
     /// 時点が地平 (宣言の時刻) より前
     TooOld { horizon: u64 },
+    /// readonly で開いた process で、 場所ごとの最新を戻せなかった (書き手が開いている / きれいに閉じていない)。 繋ぎ直せない (entry を
+    /// 書く) ので答えない (前は 「値なし」 を Ok で返した)
+    Unavailable,
 }
 
 impl From<TooOld> for HistError {
@@ -147,8 +150,9 @@ struct Diff {
 /// heads の 1 場所 (32 B): 最新の entry の糸と写し (書き手が entry を読まずに済むように)。 読み手は糸だけを読む。
 const HEAD: usize = 32;
 const HEADS_MAGIC: &[u8; 4] = b"HIH1";
-/// heads の file の header (1 page。 中身は次の page から)
-const HEADS_HEADER: usize = 4096;
+/// heads の file の header。 中身は header の後ろから private に貼る (mmap の offset は page の倍数: page は 4 KiB / 16 KiB (Apple
+/// Silicon) / 64 KiB (一部の arm64 Linux) なので、 その全部の倍数の 64 KiB。 前は 4096 で、 16 KiB の page の機械で貼れずに毎回繋ぎ直していた)
+const HEADS_HEADER: usize = 64 * 1024;
 
 /// 場所ごとの最新 (memory の上)。 msync しない (書き出しのたびに page が write-protect に戻り、 書き手が場所ごとに fault を
 /// 払うのを避ける)。 きれいに閉じる時だけ file に置き (`persist`)、 開く時は file を private に貼る (読まずに開く)。 file が
@@ -284,6 +288,8 @@ pub struct HistCol {
     heads: Heads,
     /// heads を file から戻せなかった (開いた後に entry から作り直す)
     heads_stale: AtomicBool,
+    /// 開く時に heads を file から貼れた
+    heads_loaded: AtomicBool,
     dir: PathBuf,
     /// 場所を取った entry の数 (書きかけを含む)
     len: AtomicU32,
@@ -310,6 +316,10 @@ pub struct HistCol {
     apply_lock: Mutex<()>,
     /// 案 B の控え
     blocks: RwLock<Blocks>,
+    /// 書きかけ (entry を足してから cell を書き終えるまで) の書き手の数
+    inflight: AtomicU32,
+    /// 確定の線: 書きかけが 0 に戻った時の時計。 この時刻以下の時点の読みは後から変わらない
+    settled: AtomicU64,
 }
 
 /// 案 A の溜めの上限 (これだけ溜まったら書き手が当てる)。
@@ -387,7 +397,9 @@ impl HistCol {
         let _ = std::fs::remove_file(&hp);
         let _ = hp;
         let entries = SegmentMap::create(&ep, RESERVE_ENTRIES, HEADER + 64 * ENTRY)?;
-        let heads = Heads::anon(slots)?;
+        // heads は場所の全部 (u32) を予約する (NORESERVE、 触った所だけ memory)。 宣言の後に engine の枠が伸びても (`grow_entity_cap`) 足りる
+        let _ = slots;
+        let heads = Heads::anon(u32::MAX)?;
         let c = HistCol::new(dir, hid, entries, heads, horizon, false);
         c.write_header(0);
         c.entries.flush(0, HEADER)?;
@@ -397,7 +409,8 @@ impl HistCol {
     /// 開く。 header が読めなければ Err (呼び手は宣言を捨てる)。
     pub fn open(dir: &Path, hid: u16, slots: u32, readonly: bool) -> io::Result<Self> {
         let entries = SegmentMap::open(&entry_path(dir, hid), RESERVE_ENTRIES, readonly)?;
-        let heads = Heads::anon(slots)?;
+        let _ = slots;
+        let heads = Heads::anon(u32::MAX)?;
         if entries.committed() < HEADER {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "hist: short header"));
         }
@@ -415,7 +428,9 @@ impl HistCol {
         let cap = ((c.entries.committed() - HEADER) / ENTRY) as u64;
         c.len.store(len.min(cap) as u32, Ordering::Relaxed);
         // heads: きれいに閉じた時に置いた file (印 = entry の数) を貼る。 合わなければ開いた後に作り直す
-        if !c.heads.load(&head_path(dir, hid), len) {
+        if c.heads.load(&head_path(dir, hid), len) {
+            c.heads_loaded.store(true, Ordering::Release);
+        } else {
             c.heads_stale.store(true, Ordering::Release);
         }
         // 時計は最後の entry まで (readonly でも読む)
@@ -436,6 +451,7 @@ impl HistCol {
             entries,
             heads,
             heads_stale: AtomicBool::new(false),
+            heads_loaded: AtomicBool::new(false),
             dir: dir.to_path_buf(),
             len: AtomicU32::new(0),
             horizon,
@@ -451,6 +467,8 @@ impl HistCol {
             pend_any: AtomicBool::new(false),
             apply_lock: Mutex::new(()),
             blocks: RwLock::new(Blocks::default()),
+            inflight: AtomicU32::new(0),
+            settled: AtomicU64::new(horizon),
         }
     }
 
@@ -484,6 +502,35 @@ impl HistCol {
         let t = wall.max(self.clock.load(Ordering::Acquire) + 1);
         self.clock.fetch_max(t, Ordering::AcqRel);
         t
+    }
+
+    /// 書きかけを始める (entry を足す前、 行の lock の下)。
+    pub fn begin_write(&self) {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 書きかけを終える (cell を書いた後)。 0 に戻ったら確定の線を今の時計まで進める。
+    pub fn end_write(&self) {
+        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let c = self.clock();
+            // 0 に戻った後に別の書き手が始めていても、 その entry の時刻は今の時計より後 (時刻は増える) なので線は越えない
+            self.settled.fetch_max(c, Ordering::AcqRel);
+        }
+    }
+
+    /// 確定の線 (この時刻以下の時点の読みは後から変わらない)。 書きかけが無ければ今の時計。
+    pub fn settled(&self) -> u64 {
+        if self.inflight.load(Ordering::Acquire) == 0 {
+            let c = self.clock();
+            self.settled.fetch_max(c, Ordering::AcqRel);
+        }
+        self.settled.load(Ordering::Acquire)
+    }
+
+    /// 書き手で開いた時: heads の file を外す (貼った中身は private の写しに残る)。 閉じる時に置き直す。 置いたまま書き始めると、 途中の
+    /// flush が 「きれいに閉じた」 の印を立てた後に落ちた時、 次に開く process が古い heads を印の合う物として貼る
+    pub fn unlink_heads_file(&self) -> PathBuf {
+        head_path(&self.dir, self.hid)
     }
 
     /// 時刻の分からない entry に付ける今 (見た最大 + 1)。
@@ -579,6 +626,11 @@ impl HistCol {
     fn alloc(&self) -> io::Result<u32> {
         // SeqCst: 差分の並びを作る側の 「見た」 を立てる → len を読む、 との約束 (`build_deck`。 x86 では lock xadd のまま)
         let idx = self.len.fetch_add(1, Ordering::SeqCst);
+        if idx >= u32::MAX - 1 {
+            // 位置が u32 を一周すると糸 0 (= 糸なし) と重なる。 足さない
+            self.len.store(u32::MAX - 1, Ordering::SeqCst);
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "hist: 2^32 entries"));
+        }
         let end = HEADER + (idx as usize + 1) * ENTRY;
         if end > self.entries.committed() {
             if let Err(e) = self.entries.grow_amortized(end) {
@@ -642,6 +694,10 @@ impl HistCol {
     }
 
     /// heads を file から戻せなかったか (呼び手は開いた後に [`Self::relink`] する)。
+    pub fn heads_loaded(&self) -> bool {
+        self.heads_loaded.load(Ordering::Acquire)
+    }
+
     pub fn heads_stale(&self) -> bool {
         self.heads_stale.load(Ordering::Acquire)
     }
@@ -758,10 +814,10 @@ impl HistCol {
         let (prev, depth, jump, flags) = match latest {
             Some((li, le)) => {
                 if extra & flag::OBSERVED == 0 && time <= le.time {
-                    // 同じ時刻の entry があれば足さない (再生・当て直し)
-                    // 時刻の分からない entry (`OBSERVED`) は時計から取った時刻なので、 同じ時刻でも別の書き込み
+                    // 同じ時刻・同じ値の entry があれば足さない (再生・当て直し)。 時刻だけ同じで値が違うのは別の書き込み: 時刻を詰める
+                    // 所で logical を切った (壁時計が戻っていた間、 HLC は wall を止めて logical を増やす) / 時計の entry (`OBSERVED`)
                     let (fl, _) = self.floor(self.at(li + 1).unwrap_or((li, le)), time);
-                    if fl.is_some_and(|(_, f)| f.time == time && f.flags & flag::OBSERVED == 0) {
+                    if fl.is_some_and(|(_, f)| f.time == time && f.value == v && f.flags & flag::OBSERVED == 0) {
                         return None;
                     }
                     // 時刻の戻る entry (再生が、 後の entry まで届いた像に前の書き込みを当て直す): その時刻の前の値と同じなら変更
@@ -770,7 +826,8 @@ impl HistCol {
                     if before == v && extra & flag::BASE == 0 {
                         return None;
                     }
-                    disordered = true;
+                    // 最新と同じ時刻で値の違う書き込みは、 順に足す (鎖の上で後の entry が勝つ = 書いた順)
+                    disordered = time < le.time;
                 }
                 if le.value == v && extra & flag::BASE == 0 && time >= le.time {
                     return None; // 値が変わらない (書き直し) は変更ではない
@@ -894,7 +951,7 @@ impl HistCol {
         let Some(pl) = self.plan(slot, e.eid, e.value, e.time, extra, e.value == ABSENT) else {
             // 繋がない entry (鎖の最新と同じ値・同じ時刻): 外す (鎖から届かない。 繋ぎ直しも拾わない)
             let c = self.flags_cell(idx);
-            c.store(c.load(Ordering::Acquire) | (flag::VOID << 24), Ordering::Release);
+            c.store((c.load(Ordering::Acquire) | (flag::VOID << 24)) & !(flag::PEND << 24), Ordering::Release);
             self.entries.mark_dirty(HEADER + idx as usize * ENTRY, ENTRY);
             return Ok(());
         };
@@ -1006,16 +1063,38 @@ impl HistCol {
 
     /// 値 `v` の差分の並びを作る (entry を全部なめる)。 作った物の写しを返す。
     fn build_deck(&self, v: u64) -> Vec<Diff> {
-        let mut decks = self.decks.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(d) = decks.get(&v) {
-            return d.clone();
+        // entry をなめる間は lock を握らない (握ると、 デッキを見た列の書き手全部が `push_diffs` で行の lock を持ったまま待つ)。 「見た」 を
+        // 立ててから n を読み、 [0, n) を lock の外で、 [n, 今) を lock の中でなめてから入れる。 その間に足して push した書き手の差分は
+        // まだ表に無い値には入らない (入れる前) か、 入れた後なら (時刻, 位置) で重複を落とす
+        {
+            let decks = self.decks.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(d) = decks.get(&v) {
+                return d.clone();
+            }
         }
         self.observed.store(true, Ordering::SeqCst);
         let n = self.len.load(Ordering::SeqCst);
         let mut d = Vec::new();
-        for idx in 0..n {
-            // n より前に場所を取った書き手は 「見た」 を見なかったかもしれない: その entry は書き終わるのを待って読む (場所を取って書けなかった
-            // 穴 (伸ばせなかった) は 10 ms で諦める)
+        self.scan_deck(v, 0, n, &mut d, true);
+        let mut decks = self.decks.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(have) = decks.get(&v) {
+            return have.clone();
+        }
+        let n2 = self.len.load(Ordering::SeqCst);
+        // [n, 今) の溜めた (`PEND`) entry は、 書き手が 「見た」 を見て自分で差分を足す (場所を取った後に読むので)
+        self.scan_deck(v, n, n2, &mut d, false);
+        d.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
+        d.dedup_by_key(|x| (x.time, x.idx_in));
+        decks.insert(v, d.clone());
+        d
+    }
+
+    /// entry [lo, hi) の、 値 `v` の差分を `d` に足す。
+    ///
+    /// `drain`: 溜めた (`PEND`) entry は溜めを繋いでから読む (lock の外の走査だけ。 案 A の書き手は 「見た」 を見なかったかもしれない)。
+    fn scan_deck(&self, v: u64, lo: u32, hi: u32, d: &mut Vec<Diff>, drain: bool) {
+        for idx in lo..hi {
+            // 場所を取って書き終わっていない entry は書き終わるのを待って読む (場所を取って書けなかった穴 (伸ばせなかった) は 10 ms で諦める)
             let mut e = self.valid(idx);
             if e.is_none() && HEADER + (idx as usize + 1) * ENTRY <= self.entries.committed() {
                 let t0 = std::time::Instant::now();
@@ -1024,8 +1103,23 @@ impl HistCol {
                     e = self.valid(idx);
                 }
             }
-            let Some(e) = e else { continue };
+            let Some(mut e) = e else { continue };
             if e.flags & flag::VOID != 0 {
+                continue;
+            }
+            if drain && e.flags & flag::PEND != 0 {
+                // 書き手が溜めに入れるのは entry を書いた後: 入るのを待って繋ぐ
+                let t0 = std::time::Instant::now();
+                while e.flags & flag::PEND != 0 && t0.elapsed() < std::time::Duration::from_millis(10) {
+                    self.drain();
+                    std::hint::spin_loop();
+                    match self.valid(idx) {
+                        Some(x) => e = x,
+                        None => break,
+                    }
+                }
+            }
+            if e.flags & (flag::VOID | flag::PEND) != 0 {
                 continue;
             }
             let old = if e.depth == 0 { ABSENT } else { self.at(e.prev).map_or(ABSENT, |(_, p)| p.value) };
@@ -1039,9 +1133,6 @@ impl HistCol {
                 d.push(Diff { time: e.time, idx_in: (idx << 1) | 1, eid: e.eid });
             }
         }
-        d.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
-        decks.insert(v, d.clone());
-        d
     }
 
     /// 案 B: 時点 `t` に値 `v` だった eid の束。 `current` = 今その値の eid (円柱)。 t より後の差分を、 閉じた区間ごとの控え (読みの時に
@@ -1055,28 +1146,34 @@ impl HistCol {
         let n = self.len.load(Ordering::SeqCst);
         let (big, small) = self.closed_blocks(n);
         let covered = (big.len() as u32) * BIG + (small.len() as u32) * SMALL;
-        // eid → t より後の最初の差分が 「入った」 か
-        let mut first: HashMap<u32, bool, std::hash::BuildHasherDefault<U64Hash>> = HashMap::default();
+        // eid → t より後の最初の差分 ((時刻, 位置), 入ったか)。 最初は時刻で決める: 位置の順は時刻の順とは限らない (電源断の後の再生は前の
+        // 時刻の entry を末尾に足す)
+        let mut first: HashMap<u32, ((u64, u32), bool), std::hash::BuildHasherDefault<U64Hash>> = HashMap::default();
+        let mut take = |d: &BlockDiff| {
+            let k = (d.time, d.idx_in >> 1);
+            let inn = d.idx_in & 1 == 1;
+            first.entry(d.eid).and_modify(|x| if k < x.0 { *x = (k, inn) }).or_insert((k, inn));
+        };
         for b in big.iter().chain(small.iter()) {
             if b.max_time <= t {
                 continue;
             }
             let lo = b.diffs.partition_point(|d| (d.value, d.time) <= (v, t));
             for d in b.diffs[lo..].iter().take_while(|d| d.value == v) {
-                first.entry(d.eid).or_insert(d.idx_in & 1 == 1);
+                take(d);
             }
         }
         for idx in covered..n {
             for d in self.diffs_of(idx) {
                 if d.value == v && d.time > t {
-                    first.entry(d.eid).or_insert(d.idx_in & 1 == 1);
+                    take(&d);
                 }
             }
         }
         // 今の束に居て t より後の最初が 「出た」 (出て戻った) 行は、 今の束の側で数える (二重にしない)
-        let mut out: Vec<u32> = current.iter().copied().filter(|e| first.get(e) != Some(&true)).collect();
+        let mut out: Vec<u32> = current.iter().copied().filter(|e| first.get(e).is_none_or(|x| !x.1)).collect();
         let now: std::collections::HashSet<u32, std::hash::BuildHasherDefault<U64Hash>> = current.iter().copied().collect();
-        out.extend(first.iter().filter(|&(e, &inn)| !inn && !now.contains(e)).map(|(&e, _)| e));
+        out.extend(first.iter().filter(|&(e, x)| !x.1 && !now.contains(e)).map(|(&e, _)| e));
         Ok(out)
     }
 
@@ -1582,6 +1679,21 @@ mod tests {
             assert_eq!(base.counts(), var.counts());
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    /// レビュー 1 回目の 3: 時刻を詰める所で logical が切れて同じ時刻になった、 値の違う書き込みは両方残り、 後の方が勝つ。
+    #[test]
+    fn same_time_different_values() {
+        let d = tmp("sametime");
+        let c = HistCol::create(&d, 2, 10, 64).unwrap();
+        let t = pack(enchudb_oplog::Hlc { wall: 5, logical: u32::MAX, peer: 0 });
+        assert_eq!(t, pack(enchudb_oplog::Hlc { wall: 5, logical: (1 << 20) + 7, peer: 0 }), "前提: 切れて同じ時刻");
+        assert!(c.note(3, 3, Some(1), t, 0).unwrap());
+        assert!(c.note(3, 3, Some(2), t, 0).unwrap(), "同じ時刻で値の違う書き込みを重複として捨てた");
+        assert!(!c.note(3, 3, Some(2), t, 0).unwrap(), "同じ時刻・同じ値は重複");
+        assert_eq!(c.value_at(3, 3, t).unwrap().value, Some(2));
+        assert_eq!(c.history(3, 3).iter().map(|x| x.value).collect::<Vec<_>>(), vec![Some(1), Some(2)]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
