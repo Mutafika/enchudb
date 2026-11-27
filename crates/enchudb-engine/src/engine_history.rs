@@ -361,6 +361,19 @@ impl Engine {
         }
     }
 
+    /// 試作の形を切り替える (案 D)。
+    #[doc(hidden)]
+    pub fn history_set_snaps(&self, himo: &str, on: bool) -> Result<(), HistError> {
+        self.hist_col(himo)?.set_snaps(on);
+        Ok(())
+    }
+
+    /// 案 D の控えの (数, memory の byte)。
+    #[doc(hidden)]
+    pub fn history_snaps_bytes(&self, himo: &str) -> Result<(usize, usize), HistError> {
+        Ok(self.hist_col(himo)?.snaps_bytes())
+    }
+
     /// 試作の形を切り替える (案 C)。 やめる時は先に繋ぐ。 繋いだ時間を返す (繋がなければ None)。
     #[doc(hidden)]
     pub fn history_set_lazy(&self, himo: &str, on: bool) -> Result<Option<std::time::Duration>, HistError> {
@@ -404,6 +417,14 @@ impl Engine {
         // 今の円柱の近道 (t ≥ 時計) は外した: cell を書いた後・entry を足す前に読むと後の変更を含み、 entry が足された後は消えた (レビュー
         // 1 回目の 6)。 今は entry を cell より先に足し、 確定の線 (`history_clock`) 以下の時点の答えは後から変わらない
         let peer = self.peer_id();
+        if h.snaps_mode() {
+            // 案 D: 区間の終わりの時点の控え + 区間 1 つ分
+            return Ok(h
+                .pull_at_snaps(value, t, |eid| self.generations().split(eid).0)?
+                .into_iter()
+                .map(|l| enchudb_oplog::make_eid(peer, l))
+                .collect());
+        }
         if h.blocks_mode() {
             // 案 B: 今の円柱から、 t より後の差分を戻す
             let now: Vec<u32> = self.pull_raw(himo, value).into_iter().map(enchudb_oplog::eid_local).collect();

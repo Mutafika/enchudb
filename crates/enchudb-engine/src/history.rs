@@ -321,6 +321,9 @@ pub struct HistCol {
     apply_lock: Mutex<()>,
     /// 案 B の控え
     blocks: RwLock<Blocks>,
+    /// 案 D: デッキは区間の終わりの時点の 「値 → 束」 の控え + 区間 1 つ分の差分 (`pull_at_snaps`)
+    snaps_mode: AtomicBool,
+    snaps: Mutex<Snaps>,
     /// 書きかけ (entry を足してから cell を書き終えるまで) の書き手の数
     inflight: AtomicU32,
     /// 確定の線: 書きかけが 0 に戻った時の時計。 この時刻以下の時点の読みは後から変わらない
@@ -354,6 +357,37 @@ struct Blocks {
     big: Vec<Arc<Block>>,
     /// 大きい区間の後ろの小さい区間 (big.len()*BIG から)
     small: Vec<Arc<Block>>,
+}
+
+/// 案 D の区間 (entry の数)。
+const DBLOCK: u32 = 4096;
+/// 案 D の控えの数の上限 (使っていない物から捨てる)。
+const MAX_SNAPS: usize = 16;
+
+/// 案 D: 境目 `end` (entry の位置) までの entry を当てた時点の状態。 時刻は [0, end) の entry の時刻の最大。
+struct Snap {
+    end: u32,
+    time: u64,
+    /// 場所 → (eid, 時刻, 値)。 値の無い場所は (0, 0, ABSENT)
+    state: Vec<(u32, u64, u64)>,
+    /// 値 → その値の eid (順不同)
+    decks: HashMap<u64, Vec<u32>, std::hash::BuildHasherDefault<U64Hash>>,
+    /// 最後に使った時 (捨てる順)
+    used: AtomicU64,
+}
+
+#[derive(Default)]
+struct Snaps {
+    list: Vec<Arc<Snap>>,
+    /// 閉じた区間ごとの (時刻の最小, 最大)
+    meta: Vec<(u64, u64)>,
+    tick: u64,
+}
+
+impl Snap {
+    fn bytes(&self) -> usize {
+        self.state.len() * 24 + self.decks.values().map(|d| d.len() * 4 + 32).sum::<usize>()
+    }
 }
 
 /// 試作の既定の形 (環境変数、 列を作る / 開く時に読む): ENCHU_HIST_WRITE=batch (案 A)、 ENCHU_HIST_DECK=blocks (案 B)。
@@ -474,6 +508,8 @@ impl HistCol {
             pend_any: AtomicBool::new(false),
             apply_lock: Mutex::new(()),
             blocks: RwLock::new(Blocks::default()),
+            snaps_mode: AtomicBool::new(std::env::var("ENCHU_HIST_DECK").is_ok_and(|v| v == "snaps")),
+            snaps: Mutex::new(Snaps::default()),
             inflight: AtomicU32::new(0),
             settled: AtomicU64::new(horizon),
         }
@@ -1230,6 +1266,132 @@ impl HistCol {
         Ok(out)
     }
 
+    /// 案 D が有効か。
+    pub fn snaps_mode(&self) -> bool {
+        self.snaps_mode.load(Ordering::Relaxed)
+    }
+
+    /// 案 D を切り替える (控えは捨てる)。
+    pub fn set_snaps(&self, on: bool) {
+        self.snaps_mode.store(on, Ordering::Release);
+        *self.snaps.lock().unwrap_or_else(|p| p.into_inner()) = Snaps::default();
+    }
+
+    /// 案 D の控えの (数, memory の byte)。
+    pub fn snaps_bytes(&self) -> (usize, usize) {
+        let g = self.snaps.lock().unwrap_or_else(|p| p.into_inner());
+        (g.list.len(), g.list.iter().map(|s| s.bytes()).sum())
+    }
+
+    /// 案 D: 時点 `t` に値 `v` だった eid。 「時刻 ≤ t の entry だけで終わる最後の区間の境目」 の控え (無ければ一番近い前の控えから作る)
+    /// に、 その境目より後の時刻 ≤ t の entry を当てる (区間の時刻の最小で、 当てる区間を選ぶ = 再生で順の崩れた区間も拾う)。 書き手は何も
+    /// しない。 `slot_of` は eid → 場所。
+    pub fn pull_at_snaps(&self, v: u64, t: u64, slot_of: impl Fn(u32) -> u32) -> Result<Vec<u32>, TooOld> {
+        if t < self.horizon {
+            return Err(TooOld { horizon: self.horizon });
+        }
+        self.drain();
+        let n = self.len.load(Ordering::SeqCst);
+        let closed = n / DBLOCK;
+        let mut g = self.snaps.lock().unwrap_or_else(|p| p.into_inner());
+        // 閉じた区間の時刻の幅 (読んだ時に控える。 閉じた区間は変わらない、 繋ぎ直しは控えを捨てる)
+        while (g.meta.len() as u32) < closed {
+            let b = g.meta.len() as u32;
+            let mut mm = (u64::MAX, 0u64);
+            for idx in b * DBLOCK..(b + 1) * DBLOCK {
+                if let Some(e) = self.valid(idx)
+                    && e.flags & flag::VOID == 0
+                {
+                    mm = (mm.0.min(e.time), mm.1.max(e.time));
+                }
+            }
+            g.meta.push(mm);
+        }
+        // 境目: [0, b*DBLOCK) の時刻の最大 ≤ t の最大の b
+        let mut b = 0u32;
+        let mut top = 0u64;
+        for (i, &(_, mx)) in g.meta.iter().enumerate() {
+            top = top.max(mx);
+            if top > t {
+                break;
+            }
+            b = i as u32 + 1;
+        }
+        let end = b * DBLOCK;
+        let snap = self.snap_at(&mut g, end, &slot_of);
+        let metas = g.meta.clone();
+        drop(g);
+        // 境目より後で時刻 ≤ t の entry: eid → ((時刻, 位置), 値) の新しい方
+        let mut touched: HashMap<u32, ((u64, u32), u64), std::hash::BuildHasherDefault<U64Hash>> = HashMap::default();
+        let mut idx = end;
+        while idx < n {
+            let blk = (idx / DBLOCK) as usize;
+            if blk < metas.len() && metas[blk].0 > t {
+                idx = (blk as u32 + 1) * DBLOCK;
+                continue;
+            }
+            if let Some(e) = self.valid(idx)
+                && e.flags & flag::VOID == 0
+                && e.time <= t
+            {
+                let k = (e.time, idx);
+                touched.entry(e.eid).and_modify(|x| if k > x.0 { *x = (k, e.value) }).or_insert((k, e.value));
+            }
+            idx += 1;
+        }
+        // 控えの束から、 触った eid を今の値で入れ替える。 場所が使い回されて前の住人が束に居る時は、 その場所の新しい住人の entry が前の住人を
+        // 消す (前の住人は場所を離れる前に消えている = 「値なし」 の entry がある)
+        let mut out: Vec<u32> = snap.decks.get(&v).map_or_else(Vec::new, |d| d.iter().copied().filter(|e| !touched.contains_key(e)).collect());
+        out.extend(touched.iter().filter(|(_, x)| x.1 == v).map(|(&e, _)| e));
+        let _ = &slot_of;
+        Ok(out)
+    }
+
+    /// 案 D: 境目 `end` の控え (無ければ一番近い前の控えから entry を当てて作る)。
+    fn snap_at(&self, g: &mut Snaps, end: u32, slot_of: &impl Fn(u32) -> u32) -> Arc<Snap> {
+        g.tick += 1;
+        let tick = g.tick;
+        if let Some(sn) = g.list.iter().find(|s| s.end == end) {
+            sn.used.store(tick, Ordering::Relaxed);
+            return sn.clone();
+        }
+        let base = g.list.iter().filter(|s| s.end <= end).max_by_key(|s| s.end).cloned();
+        let (mut state, from, mut time) = match &base {
+            Some(b) => (b.state.clone(), b.end, b.time),
+            None => (Vec::new(), 0, 0),
+        };
+        for idx in from..end {
+            let Some(e) = self.valid(idx) else { continue };
+            if e.flags & flag::VOID != 0 {
+                continue;
+            }
+            time = time.max(e.time);
+            let s = slot_of(e.eid) as usize;
+            if state.len() <= s {
+                state.resize(s + 1, (0, 0, ABSENT));
+            }
+            let cur = state[s];
+            // 場所ごとに時刻の新しい entry (同じ時刻なら位置の後)。 前の住人の entry が新しい住人の後に並んでいても時刻で決まる
+            if cur.2 == ABSENT && cur.1 == 0 || e.time >= cur.1 {
+                state[s] = (e.eid, e.time, e.value);
+            }
+        }
+        let mut decks: HashMap<u64, Vec<u32>, std::hash::BuildHasherDefault<U64Hash>> = HashMap::default();
+        for &(eid, _, val) in &state {
+            if val != ABSENT {
+                decks.entry(val).or_default().push(eid);
+            }
+        }
+        let sn = Arc::new(Snap { end, time, state, decks, used: AtomicU64::new(tick) });
+        g.list.push(sn.clone());
+        if g.list.len() > MAX_SNAPS {
+            // 使っていない物から捨てる
+            let (i, _) = g.list.iter().enumerate().min_by_key(|(_, s)| s.used.load(Ordering::Relaxed)).unwrap();
+            g.list.remove(i);
+        }
+        sn
+    }
+
     /// entry `idx` の差分 (古い値から出た / 新しい値に入った)。 繋いでいない / 外した entry は無し。
     fn diffs_of(&self, idx: u32) -> impl Iterator<Item = BlockDiff> {
         let mut out = [None, None];
@@ -1418,6 +1580,7 @@ impl HistCol {
         self.observed.store(false, Ordering::SeqCst);
         // 案 B の控えも (糸を書き換えると、 控えの 「前の値」 が変わりうる)
         *self.blocks.write().unwrap_or_else(|p| p.into_inner()) = Blocks::default();
+        *self.snaps.lock().unwrap_or_else(|p| p.into_inner()) = Snaps::default();
     }
 
     /// 場所 `slot` の entry (`items`: (eid, 時刻, 位置)、 並びは問わない) で、 その場所の鎖と heads を作り直す: identity を最初の
@@ -1680,13 +1843,20 @@ mod tests {
     /// 小さい区間 + 末尾、 案 A の溜めの上限を何度も越える)、 場所の使い回しを混ぜる。
     #[test]
     fn variants_answer_like_the_base() {
-        for (batch, blocks, lazy) in [(true, false, false), (false, true, false), (true, true, false), (false, false, true)] {
-            let d = tmp(&format!("var_{batch}_{blocks}_{lazy}"));
+        for (batch, blocks, lazy, snaps) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let d = tmp(&format!("var_{batch}_{blocks}_{lazy}_{snaps}"));
             let base = HistCol::create(&d.join("a"), 1, 10, 4096).unwrap();
             let var = HistCol::create(&d.join("b"), 1, 10, 4096).unwrap();
             base.set_modes(false, false);
             var.set_modes(batch, blocks);
             var.set_lazy(lazy);
+            var.set_snaps(snaps);
             let mut cell: Vec<Option<u64>> = vec![None; 2000];
             let mut gens = vec![0u32; 2000];
             let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(batch) ^ (u64::from(blocks) << 1);
@@ -1732,10 +1902,16 @@ mod tests {
                     // 案 B は今の円柱が要る: 今の値 v の identity
                     let now: Vec<u32> =
                         (0..2000u32).filter(|&s| cell[s as usize] == Some(v)).map(|s| (gens[s as usize] << 20) | s).collect();
-                    let mut b = if var.blocks_mode() { var.pull_at_blocks(v, tt, &now).unwrap() } else { var.pull_at(v, tt).unwrap() };
+                    let mut b = if var.snaps_mode() {
+                        var.pull_at_snaps(v, tt, |e| e & 0xFFFFF).unwrap()
+                    } else if var.blocks_mode() {
+                        var.pull_at_blocks(v, tt, &now).unwrap()
+                    } else {
+                        var.pull_at(v, tt).unwrap()
+                    };
                     a.sort_unstable();
                     b.sort_unstable();
-                    assert_eq!(a, b, "batch={batch} blocks={blocks} lazy={lazy} t={tt} v={v}");
+                    assert_eq!(a, b, "batch={batch} blocks={blocks} lazy={lazy} snaps={snaps} t={tt} v={v}");
                 }
                 for s in (0..2000u32).step_by(37) {
                     for g in 0..=gens[s as usize] {
