@@ -377,6 +377,21 @@ impl Engine {
         Ok(())
     }
 
+    /// 値 `values` のデッキの差分の並びを 1 回の走査でまとめて作る (最初に見る値がいくつもある時に、 値ごとに全部をなめずに済む)。
+    /// 今の形と案 E だけ (他の形では何もしない)。 作った数を返す。
+    #[doc(hidden)]
+    pub fn history_observe(&self, himo: &str, values: &[u64]) -> Result<usize, HistError> {
+        let h = self.hist_col(himo)?;
+        h.drain();
+        if h.e_mode() {
+            return Ok(h.observe_e(values));
+        }
+        if h.snaps_mode() || h.blocks_mode() {
+            return Ok(0);
+        }
+        Ok(h.observe_base(values))
+    }
+
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {

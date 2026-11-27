@@ -93,12 +93,10 @@ fn reads(eng: &Engine, rows: &[u64], hot: &[u64], h: &str, card: u64, rng: &mut 
     (row, far, med(&mut us), med(&mut ratio), cnt)
 }
 
-/// 書き手と並べて全部の値を見る時間の上限 (越えた分は書き手を止めてから見る)
-const OBSERVE_BUDGET: Duration = Duration::from_secs(60);
-
-/// 全部の値を見る (最初に見た値の並びを作る)。 並べた書き手 1 本の書き込み 1 回の最長も。
-/// (書き手と並べて見た値の数, その時間 ms, 書き手の最長 ms, 残りを書き手なしで見た時間 ms)
-fn observe_all(eng: &Arc<Engine>, rows: &[u64], h: &str, card: u64) -> (u64, f64, f64, f64) {
+/// 全部の値を見る (最初に見た値の並びを作る)。 書き手 1 本を並べ、 その書き込み 1 回の最長 (止まり) も。
+/// 値 0 は 1 つだけで読み (1 値の最初の読み)、 残りはまとめて作る (`history_observe`: 1 回の走査で全部)。
+/// (1 値の最初の読み ms, 残り全部をまとめて作る ms, 書き手の最長 ms)
+fn observe_all(eng: &Arc<Engine>, rows: &[u64], h: &str, card: u64) -> (f64, f64, f64) {
     let hh = eng.himo_id(h).unwrap() as u16;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let w = {
@@ -115,32 +113,23 @@ fn observe_all(eng: &Arc<Engine>, rows: &[u64], h: &str, card: u64) -> (u64, f64
             worst
         })
     };
+    std::thread::sleep(Duration::from_millis(20));
     let clock = eng.history_clock(h).unwrap();
     let a = Instant::now();
-    let mut v = 0;
-    while v < card && a.elapsed() < OBSERVE_BUDGET {
-        eng.pull_at(h, v, clock - 1).unwrap();
-        v += 1;
-    }
-    let ms = a.elapsed().as_secs_f64() * 1000.0;
+    eng.pull_at(h, 0, clock - 1).unwrap();
+    let one = a.elapsed().as_secs_f64() * 1000.0;
+    let a = Instant::now();
+    let rest: Vec<u64> = (1..card).collect();
+    eng.history_observe(h, &rest).unwrap();
+    let all = a.elapsed().as_secs_f64() * 1000.0;
+    std::thread::sleep(Duration::from_millis(20));
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let worst = w.join().unwrap();
-    let b = Instant::now();
-    for x in v..card {
-        eng.pull_at(h, x, clock - 1).unwrap();
-    }
-    (v, ms, worst as f64 / 1e6, b.elapsed().as_secs_f64() * 1000.0)
+    (one, all, worst as f64 / 1e6)
 }
 
-fn obs_str(o: (u64, f64, f64, f64), card: u64) -> String {
-    if o.0 == card {
-        format!("first view all={:.0} ms (writer stalled {:.1} ms)", o.1, o.2)
-    } else {
-        format!(
-            "first view {} of {card} values in {:.0} ms with writer (writer stalled {:.1} ms), rest {:.0} ms without writer",
-            o.0, o.1, o.2, o.3
-        )
-    }
+fn obs_str(o: (f64, f64, f64), card: u64) -> String {
+    format!("first view: 1 value={:.0} ms, other {} values together={:.0} ms (writer stalled {:.1} ms)", o.0, card - 1, o.1, o.2)
 }
 
 fn main() {

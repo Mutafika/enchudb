@@ -1205,27 +1205,54 @@ impl HistCol {
             return Err(TooOld { horizon: self.horizon });
         }
         self.drain();
-        {
-            let decks = self.edecks.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(d) = decks.get(&v) {
-                return Ok(d.members_upto(d.diffs.partition_point(|x| x.time <= t)));
+        loop {
+            {
+                let decks = self.edecks.read().unwrap_or_else(|p| p.into_inner());
+                if let Some(d) = decks.get(&v) {
+                    return Ok(d.members_upto(d.diffs.partition_point(|x| x.time <= t)));
+                }
             }
+            // 最初に見た値: 作る (書き手も係も止めない)。 作った後に形の切り替えで捨てられたら作り直す
+            self.observe_e(&[v]);
         }
-        // 最初に見た値: 係を止めて (apply_lock)、 繋いだ所までをなめて作る。 その後の差分は係が足す
-        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let upto = self.linked_upto.load(Ordering::Acquire);
+    }
+
+    /// 案 E: 値 `vs` (まだ並びの無い物) の差分の並びを 1 回の走査で作る。 作った数を返す。 書き手も係も止めない: 繋いだ所 n0 までを lock の
+    /// 外でなめ、 係を止めて (apply_lock) [n0, 繋いだ所) をなめてから入れる (入れた後に繋いだ entry は係が足す)。
+    pub fn observe_e(&self, vs: &[u64]) -> usize {
+        let want: Vec<u64> = {
+            let decks = self.edecks.read().unwrap_or_else(|p| p.into_inner());
+            let mut w: Vec<u64> = vs.iter().copied().filter(|v| !decks.contains_key(v)).collect();
+            w.sort_unstable();
+            w.dedup();
+            w
+        };
+        if want.is_empty() {
+            return 0;
+        }
         self.e_observed.store(true, Ordering::SeqCst);
-        let mut raw = Vec::new();
-        self.scan_deck(v, 0, upto, &mut raw, false);
-        raw.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
+        let n0 = self.linked_upto.load(Ordering::Acquire);
+        let mut raw = vec![Vec::new(); want.len()];
+        self.scan_decks(&want, 0, n0, &mut raw, false);
+        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let n1 = self.linked_upto.load(Ordering::Acquire);
+        self.scan_decks(&want, n0, n1, &mut raw, false);
         let kmin = self.e_kmin.load(Ordering::Relaxed);
-        let mut d = EDeck::default();
-        for x in raw {
-            d.push(x, kmin);
+        let mut decks = self.edecks.write().unwrap_or_else(|p| p.into_inner());
+        let mut made = 0;
+        for (v, mut r) in want.into_iter().zip(raw) {
+            if decks.contains_key(&v) {
+                continue;
+            }
+            r.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
+            let mut d = EDeck::default();
+            for x in r {
+                d.push(x, kmin);
+            }
+            decks.insert(v, d);
+            made += 1;
         }
-        let out = d.members_upto(d.diffs.partition_point(|x| x.time <= t));
-        self.edecks.write().unwrap_or_else(|p| p.into_inner()).insert(v, d);
-        Ok(out)
+        made
     }
 
     /// 案 C が有効か (書き手が `note_lazy` を使う)。 繋いでいる最中も真 (繋ぎ終えてから倒す): その間の書き手は糸なしで足し、 見直しで
@@ -1408,6 +1435,39 @@ impl HistCol {
         Ok(members(&d, t))
     }
 
+    /// 今の形: 値 `vs` (まだ並びの無い物) の差分の並びを 1 回の走査で作る (取り方は [`Self::build_deck`] と同じ)。 作った数を返す。
+    pub fn observe_base(&self, vs: &[u64]) -> usize {
+        self.drain();
+        let want: Vec<u64> = {
+            let decks = self.decks.read().unwrap_or_else(|p| p.into_inner());
+            let mut w: Vec<u64> = vs.iter().copied().filter(|v| !decks.contains_key(v)).collect();
+            w.sort_unstable();
+            w.dedup();
+            w
+        };
+        if want.is_empty() {
+            return 0;
+        }
+        self.observed.store(true, Ordering::SeqCst);
+        let n = self.len.load(Ordering::SeqCst);
+        let mut raw = vec![Vec::new(); want.len()];
+        self.scan_decks(&want, 0, n, &mut raw, true);
+        let mut decks = self.decks.write().unwrap_or_else(|p| p.into_inner());
+        let n2 = self.len.load(Ordering::SeqCst);
+        self.scan_decks(&want, n, n2, &mut raw, false);
+        let mut made = 0;
+        for (v, mut d) in want.into_iter().zip(raw) {
+            if decks.contains_key(&v) {
+                continue;
+            }
+            d.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
+            d.dedup_by_key(|x| (x.time, x.idx_in));
+            decks.insert(v, d);
+            made += 1;
+        }
+        made
+    }
+
     /// 値 `v` の差分の並びを作る (entry を全部なめる)。 作った物の写しを返す。
     fn build_deck(&self, v: u64) -> Vec<Diff> {
         // entry をなめる間は lock を握らない (握ると、 デッキを見た列の書き手全部が `push_diffs` で行の lock を持ったまま待つ)。 「見た」 を
@@ -1440,6 +1500,12 @@ impl HistCol {
     ///
     /// `drain`: 溜めた (`PEND`) entry は溜めを繋いでから読む (lock の外の走査だけ。 案 A の書き手は 「見た」 を見なかったかもしれない)。
     fn scan_deck(&self, v: u64, lo: u32, hi: u32, d: &mut Vec<Diff>, drain: bool) {
+        self.scan_decks(&[v], lo, hi, std::slice::from_mut(d), drain);
+    }
+
+    /// [`Self::scan_deck`] の値をいくつも (`vs` は昇順)。 値 `vs[i]` の差分を `out[i]` に。
+    fn scan_decks(&self, vs: &[u64], lo: u32, hi: u32, out: &mut [Vec<Diff>], drain: bool) {
+        let pick = |x: u64| if vs.len() == 1 { (vs[0] == x).then_some(0) } else { vs.binary_search(&x).ok() };
         for idx in lo..hi {
             // 場所を取って書き終わっていない entry は書き終わるのを待って読む (場所を取って書けなかった穴 (伸ばせなかった) は 10 ms で諦める)
             let mut e = self.valid(idx);
@@ -1473,11 +1539,11 @@ impl HistCol {
             if old == e.value {
                 continue;
             }
-            if old == v {
-                d.push(Diff { time: e.time, idx_in: idx << 1, eid: e.eid });
+            if let Some(i) = pick(old) {
+                out[i].push(Diff { time: e.time, idx_in: idx << 1, eid: e.eid });
             }
-            if e.value == v {
-                d.push(Diff { time: e.time, idx_in: (idx << 1) | 1, eid: e.eid });
+            if let Some(i) = pick(e.value) {
+                out[i].push(Diff { time: e.time, idx_in: (idx << 1) | 1, eid: e.eid });
             }
         }
     }
@@ -2228,10 +2294,15 @@ mod tests {
                     times.push(t);
                 }
                 // 案 E: 半分書いた所で全部の値を見る (以後は係が差分の並びと控えを保つ)
+                // 値の半分は 1 つずつ読んで、 残りはまとめて (`observe_e`)。 今の形も半分をまとめて作る (以後は書き手が保つ)
                 if i == 75_000 && var.e_mode() {
-                    for v in 0..8u64 {
+                    for v in 0..4u64 {
                         var.pull_at_e(v, t).unwrap();
                     }
+                    assert_eq!(var.observe_e(&[7, 4, 5, 6, 4, 0]), 4);
+                }
+                if i == 75_000 {
+                    assert_eq!(base.observe_base(&[1, 3, 5, 3]), 3);
                 }
             }
             // 案 C: 最初の読みの前に全体を繋ぐ (engine は列の書き手を止めて呼ぶ)

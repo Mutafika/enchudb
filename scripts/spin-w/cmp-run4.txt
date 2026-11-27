@@ -1,0 +1,2 @@
+== run 1
+card=1000 write_extra_ns before decks: random: base=263 C=46 E=335 (E lag max 4697 entries) | hot: base=69 C=47 E=304 (E lag max 10823 entries)
