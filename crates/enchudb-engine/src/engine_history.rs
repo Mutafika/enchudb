@@ -21,10 +21,8 @@ pub(super) const HIST_NO_TIME: Hlc = Hlc { wall: 0, logical: 1, peer: u32::MAX }
 
 impl Engine {
     /// 書き手の道 (`live_set` / `live_remove`、 行の lock の下) から: 列 `h` の場所 `slot` の identity に 1 件足す。 `hlc` が `ZERO`
-    /// (時刻を運べない道) なら 「遅くとも」 の印を付けて列の時計で置く。
-    ///
-    /// `cell_old` = 書く前の cell の値 (案 A が使う。 案 A でない時は None で読まない)。
-    pub(super) fn hist_note(&self, h: &HistCol, slot: u32, value: Option<u64>, hlc: Hlc, deleting: bool, cell_old: Option<Option<u64>>) {
+    /// (時刻を運べない道) なら 「遅くとも」 の印を付けて列の時計で置く。 書き手は糸なしで足すだけ (裏の係と読み手が繋ぐ)。
+    pub(super) fn hist_note(&self, h: &HistCol, slot: u32, value: Option<u64>, hlc: Hlc, deleting: bool) {
         // 行の削除は場所の世代を上げる前に cell を落とす (今の住人)。 開く時の後始末 (死んだ場所の残りの cell) は最後の行
         let eid = if deleting { self.last_local_of_slot(slot) } else { self.generations().local(slot) };
         let (time, mut extra) = if hlc == Hlc::ZERO {
@@ -45,19 +43,7 @@ impl Engine {
         }
         // 宣言より前の時刻 (宣言が書き手を止めた時に、 WAL に積んで待っていた書き込み): 地平に寄せて 「遅くとも」 (宣言の時の値の後に並ぶ)
         let (time, extra) = if time <= h.horizon() { (h.horizon(), extra | flag::OBSERVED) } else { (time, extra) };
-        let r = if h.e_mode() {
-            // 案 E: いつも糸なしで足すだけ (裏の係が繋ぐ)
-            h.note_raw(slot, eid, value, time, extra)
-        } else if h.lazy_unlinked() {
-            // 案 C: 見られるまで繋がない
-            h.note_lazy(slot, eid, value, time, extra, self.oplog.is_none())
-        } else {
-            match cell_old {
-                Some(old) if h.batched() => h.note_batched(slot, eid, value, time, extra, old),
-                _ => h.note(slot, eid, value, time, extra),
-            }
-        };
-        if r.is_err() {
+        if h.note_raw(slot, eid, value, time, extra).is_err() {
             self.record_fault(FaultKind::DiskSpace, "history: cannot grow the history segment — the change is not in the history");
         }
     }
@@ -69,9 +55,8 @@ impl Engine {
         if hlc == Hlc::ZERO {
             return;
         }
-        self.hist_link(h);
         let _row = self.row_locks.write(slot);
-        if h.note(slot, eid, value, history::pack(hlc), if deleting { flag::DELETE } else { 0 }).is_err() {
+        if h.note_raw(slot, eid, value, history::pack(hlc), if deleting { flag::DELETE } else { 0 }).is_err() {
             self.record_fault(FaultKind::DiskSpace, "history: cannot grow the history segment — the change is not in the history");
         }
     }
@@ -137,8 +122,10 @@ impl Engine {
                 if !self.entities.is_live(slot) {
                     continue;
                 }
-                col.note(slot, self.generations().local(slot), Some(v), horizon, flag::BASE).map_err(|e| format!("declare_history: {e}"))?;
+                col.note_raw(slot, self.generations().local(slot), Some(v), horizon, flag::BASE).map_err(|e| format!("declare_history: {e}"))?;
             }
+            // 宣言の時の値を繋いでから登録する (係は登録で動き出す)
+            col.catch_up();
             col.write_out(true).map_err(|e| format!("declare_history: {e}"))?;
             self.hist.insert(col);
         }
@@ -218,7 +205,8 @@ impl Engine {
         }
         let repair = self.hist.repair.swap(false, std::sync::atomic::Ordering::AcqRel);
         for h in self.hist.cols() {
-            self.hist_link(h);
+            // 再生で足した entry を繋ぐ
+            h.catch_up();
             if repair {
                 self.reconcile_history(h);
             }
@@ -300,8 +288,9 @@ impl Engine {
             if deleting {
                 extra |= flag::DELETE;
             }
-            let _ = h.note(slot, eid, value, time, extra);
+            let _ = h.note_raw(slot, eid, value, time, extra);
         }
+        h.catch_up();
     }
 
     /// WAL を付ける時 (`spawn_consumer_with_oplog`): WAL の時計を、 宣言した列の時計 (見た最大の時刻) より先へ進める。
@@ -320,7 +309,8 @@ impl Engine {
             return;
         }
         for h in self.hist.cols() {
-            self.hist_link(h);
+            // 場所ごとの最新を置く前に末尾まで繋ぐ
+            h.catch_up();
             if let Err(e) = h.persist_heads() {
                 eprintln!("warning: history of himo {}: heads not stored ({e}); the next open rebuilds them", h.hid);
             }
@@ -345,51 +335,23 @@ impl Engine {
         if self.is_readonly() && h.heads_stale() {
             return Err(HistError::Unavailable);
         }
-        self.hist_link(h);
         Ok(h)
     }
 
-    /// 案 C: まだ繋いでいない列なら、 列の書き手を止めて全体を繋ぐ (最初の読み・開く道・閉じる時)。 かかった時間 (繋がなければ None)。
-    pub(super) fn hist_link(&self, h: &HistCol) -> Option<std::time::Duration> {
-        if !h.unlinked() || self.is_readonly() {
-            return None;
-        }
-        let _w = self.himos[h.hid as usize].write_guard();
-        match h.link_all(|eid| self.generations().split(eid).0) {
-            Ok((_, d)) => Some(d),
-            Err(e) => {
-                eprintln!("warning: history of himo {}: link failed: {e}", h.hid);
-                None
-            }
-        }
-    }
-
-    /// 試作の形を切り替える (案 E: 書き手は足すだけ、 裏の係が繋ぐ)。 `kmin` = 控えの間隔の下限 (None なら変えない)。
+    /// 控えの間隔の下限 K (差分の数、 測り用。 既定 1024)。 作った並びは今の K のまま (次に作る並びから効く)。
     #[doc(hidden)]
-    pub fn history_set_e(&self, himo: &str, on: bool, kmin: Option<usize>) -> Result<(), HistError> {
-        let id = self.himo_id(himo).ok_or(HistError::NotDeclared)?;
-        let h = self.hist.get(id).ok_or(HistError::NotDeclared)?;
-        self.hist_link(h);
-        if let Some(k) = kmin {
-            h.set_e_kmin(k);
-        }
-        self.hist.set_e(id, on);
+    pub fn history_set_kmin(&self, himo: &str, kmin: usize) -> Result<(), HistError> {
+        self.hist_col(himo)?.set_e_kmin(kmin);
         Ok(())
     }
 
     /// 値 `values` のデッキの差分の並びを 1 回の走査でまとめて作る (最初に見る値がいくつもある時に、 値ごとに全部をなめずに済む)。
-    /// 今の形と案 E だけ (他の形では何もしない)。 作った数を返す。
+    /// 作った数を返す。
     #[doc(hidden)]
     pub fn history_observe(&self, himo: &str, values: &[u64]) -> Result<usize, HistError> {
         let h = self.hist_col(himo)?;
         h.drain();
-        if h.e_mode() {
-            return Ok(h.observe_e(values));
-        }
-        if h.snaps_mode() || h.blocks_mode() {
-            return Ok(0);
-        }
-        Ok(h.observe_base(values))
+        Ok(h.observe_e(values))
     }
 
     /// 測り用: 作ったデッキの差分の並び・控えを捨てる (memory を返す。 次に見た時に作り直す)。
@@ -420,19 +382,6 @@ impl Engine {
         Ok(self.hist_col(himo)?.e_deck_detail())
     }
 
-    /// 試作の形を切り替える (案 F: 案 E の上で、 束の大きい値 (控え 1 つ ≥ K 差分) は控えを持たず差分を戻して読む)。 並びは作り直し。
-    #[doc(hidden)]
-    pub fn history_set_f(&self, himo: &str, on: bool) -> Result<(), HistError> {
-        self.hist_col(himo)?.set_f(on);
-        Ok(())
-    }
-
-    /// 測り用: 案 F の値 `v` の並びが控えを持たない形か。
-    #[doc(hidden)]
-    pub fn history_e_deck_big(&self, himo: &str, v: u64) -> Result<bool, HistError> {
-        Ok(self.hist_col(himo)?.e_deck_big(v))
-    }
-
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {
@@ -440,33 +389,11 @@ impl Engine {
         h.raw_entries(enchudb_oplog::eid_local(eid))
     }
 
-    /// 案 E: (係の今の遅れ, 前に聞いてからの遅れの最大, 差分の並びの memory)。
+    /// (係の今の遅れ, 前に聞いてからの遅れの最大, 差分の並びの memory)。
     #[doc(hidden)]
     pub fn history_e_stats(&self, himo: &str) -> Result<(u32, u32, usize), HistError> {
         let h = self.himo_id(himo).and_then(|id| self.hist.get(id)).ok_or(HistError::NotDeclared)?;
         Ok(h.e_stats())
-    }
-
-    /// 試作の形を切り替える (案 D)。
-    #[doc(hidden)]
-    pub fn history_set_snaps(&self, himo: &str, on: bool) -> Result<(), HistError> {
-        self.hist_col(himo)?.set_snaps(on);
-        Ok(())
-    }
-
-    /// 案 D の控えの (数, memory の byte)。
-    #[doc(hidden)]
-    pub fn history_snaps_bytes(&self, himo: &str) -> Result<(usize, usize), HistError> {
-        Ok(self.hist_col(himo)?.snaps_bytes())
-    }
-
-    /// 試作の形を切り替える (案 C)。 やめる時は先に繋ぐ。 繋いだ時間を返す (繋がなければ None)。
-    #[doc(hidden)]
-    pub fn history_set_lazy(&self, himo: &str, on: bool) -> Result<Option<std::time::Duration>, HistError> {
-        let h = self.himo_id(himo).and_then(|id| self.hist.get(id)).ok_or(HistError::NotDeclared)?;
-        let d = if on { None } else { self.hist_link(h) };
-        h.set_lazy(on);
-        Ok(d)
     }
 
     /// 列 `himo` の場所ごとの最新を、 開く時に file から戻せたか (試験用: 戻せなければ entry から繋ぎ直した)。
@@ -495,7 +422,7 @@ impl Engine {
         Ok(h.history(self.slot_unchecked(eid), enchudb_oplog::eid_local(eid)))
     }
 
-    /// 時点 `t` に列 `himo` が `value` だった行 (eid、 順不同)。 値ごとに、 最初に見た時に差分の並びを作り、 後は書き手が足す。
+    /// 時点 `t` に列 `himo` が `value` だった行 (eid、 順不同)。 値ごとに、 最初に見た時に差分の並びを作り、 後は裏の係が足す。
     pub fn pull_at(&self, himo: &str, value: u64, t: u64) -> Result<Vec<enchudb_oplog::EntityId>, HistError> {
         let h = self.hist_col(himo)?;
         // 今 (列の時計) 以後の時点のデッキは今の円柱そのもの (cell = 集まりの最新)。 差分の並びを読まない
@@ -503,30 +430,7 @@ impl Engine {
         // 今の円柱の近道 (t ≥ 時計) は外した: cell を書いた後・entry を足す前に読むと後の変更を含み、 entry が足された後は消えた (レビュー
         // 1 回目の 6)。 今は entry を cell より先に足し、 確定の線 (`history_clock`) 以下の時点の答えは後から変わらない
         let peer = self.peer_id();
-        if h.e_mode() {
-            return Ok(h.pull_at_e(value, t)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect());
-        }
-        if h.snaps_mode() {
-            // 案 D: 区間の終わりの時点の控え + 区間 1 つ分
-            return Ok(h
-                .pull_at_snaps(value, t, |eid| self.generations().split(eid).0)?
-                .into_iter()
-                .map(|l| enchudb_oplog::make_eid(peer, l))
-                .collect());
-        }
-        if h.blocks_mode() {
-            // 案 B: 今の円柱から、 t より後の差分を戻す
-            let now: Vec<u32> = self.pull_raw(himo, value).into_iter().map(enchudb_oplog::eid_local).collect();
-            return Ok(h.pull_at_blocks(value, t, &now)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect());
-        }
-        Ok(h.pull_at(value, t)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect())
-    }
-
-    /// 試作の形を切り替える (測りの交互の回し用): `batch` = 案 A (溜めてまとめて繋ぐ)、 `blocks` = 案 B (区間ごとの控え)。
-    #[doc(hidden)]
-    pub fn history_set_modes(&self, himo: &str, batch: bool, blocks: bool) -> Result<(), HistError> {
-        self.hist_col(himo)?.set_modes(batch, blocks);
-        Ok(())
+        Ok(h.pull_at_e(value, t)?.into_iter().map(|l| enchudb_oplog::make_eid(peer, l)).collect())
     }
 
     /// 列 `himo` の確定の線: この時刻以下の時点の読み (`value_at` / `pull_at`) は後から変わらない。 書きかけが無ければ見た最大の時刻

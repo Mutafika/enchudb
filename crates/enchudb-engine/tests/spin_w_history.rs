@@ -84,7 +84,7 @@ struct Model {
     times: Vec<u64>,
     /// identity ごとに、 v への最後の書き込みが変更だったか (同じ値の書き直しなら false: cell の版数は進むが entry は増えない)
     last_changed: BTreeMap<EntityId, bool>,
-    /// 値の変わらない書き込みで時計が進んだ時の (identity, 時刻, 値) (案 E は書き直しも entry を足す。 像で前の entry が消えると残りうる)
+    /// 値の変わらない書き込みで時計が進んだ時の (identity, 時刻, 値) (書き手は書き直しも entry を足す。 像で前の entry が消えると残りうる)
     rewrites: Vec<(EntityId, u64, Option<u64>)>,
 }
 
@@ -106,7 +106,7 @@ fn record(eng: &Engine, m: &mut Model, e: EntityId, new: Option<u64>) {
     let last = m.times.last().copied().unwrap_or(m.horizon);
     m.last_changed.insert(e, m.cur(e) != new);
     if m.cur(e) == new {
-        // 変更でない書き込み: 今の形は entry を足さないので時計は動かない。 案 E は足して繋ぐ時に落とすので時計は進みうる (戻らない)
+        // 変更でない書き込み: 書き手は足して、 繋ぐ時に落とすので時計は進みうる (戻らない)
         assert!(clock >= last, "時計が戻った");
         if clock > last {
             m.rewrites.push((e, clock, new));
@@ -559,10 +559,10 @@ fn declare_while_walless_writers_run() {
     }
 }
 
-/// 案 C (見られるまで繋がない) で、 WAL の無い書き手 3 本が書いている間に最初の読みが列を繋ぐ。 書き終えた後、 各行の集まりの最新 = cell、
-/// 時刻は増え、 値の変わらない entry は無い。 案 C でない形でも同じことを確かめる。
+/// WAL の無い書き手 3 本が書いている間に読み手が末尾を繋ぐ (裏の係と並ぶ)。 書き終えた後、 各行の集まりの最新 = cell、 時刻は増え、
+/// 値の変わらない entry は無い。
 #[test]
-fn first_read_links_while_walless_writers_run() {
+fn reads_link_while_walless_writers_run() {
     for round in 0..3u64 {
         let s = Scratch::new(&format!("lazyrace{round}"));
         let p = s.db();
@@ -574,7 +574,6 @@ fn first_read_links_while_walless_writers_run() {
         let rows: Vec<EntityId> = (0..20_000).map(|_| eng.entity_in("t").unwrap()).collect();
         eng.declare_history(V).unwrap();
         let eng = Arc::new(eng);
-        let _ = eng.history_set_lazy(V, true);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hs: Vec<_> = (0..3u64)
             .map(|k| {
@@ -589,7 +588,7 @@ fn first_read_links_while_walless_writers_run() {
             })
             .collect();
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let _ = eng.history(rows[0], V).unwrap(); // 最初の読み = 列全体を繋ぐ
+        let _ = eng.history(rows[0], V).unwrap(); // 読み = 末尾を繋ぐ (係と並ぶ)
         std::thread::sleep(std::time::Duration::from_millis(30));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         hs.into_iter().for_each(|h| h.join().unwrap());

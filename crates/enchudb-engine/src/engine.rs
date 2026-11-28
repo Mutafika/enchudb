@@ -26320,8 +26320,7 @@ impl Engine {
             self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
             return false;
         }
-        // 履歴: entry を cell より先に足す (レビュー 1 回目の 6: 先に cell を書くと、 その間の読みが円柱で後の変更を見た)。 案 A は書く前の
-        // cell の値で 「変わったか」 を決める (heads を読まない)
+        // 履歴: entry を cell より先に足す (レビュー 1 回目の 6: 先に cell を書くと、 その間の読みが円柱で後の変更を見た)
         let hist = self.hist.get(hid);
         // 書きかけは WAL の書き手なら `LocalApply` が数える (HLC を取る前から)。 WAL の無い書き手はここで
         let count_here = self.oplog.is_none();
@@ -26329,9 +26328,7 @@ impl Engine {
             if count_here {
                 h.begin_write();
             }
-            // 案 A だけ書く前の cell の値を読む (今の形 / 案 C は読まない)
-            let cell_old = (h.batched() && !h.lazy_unlinked()).then(|| self.himos[hid].get_value(local));
-            self.hist_note(h, local, Some(value), hlc, false, cell_old);
+            self.hist_note(h, local, Some(value), hlc, false);
         }
         let ok = if self.points_to_content(hid) && !self.content_is_durable(hid, value) {
             // #419: 中身を指す cell は門の中で書く (書き出しがこの列を msync する間は待つ。 中身はこの前に書いてある)。
@@ -26344,14 +26341,14 @@ impl Engine {
         if let Some(h) = hist {
             if !ok {
                 // cell を書けなかった (cell は前の値のまま): 履歴を cell の値に戻す (「遅くとも」)
-                self.hist_note(h, local, self.himos[hid].get_value(local), HIST_NO_TIME, false, None);
+                self.hist_note(h, local, self.himos[hid].get_value(local), HIST_NO_TIME, false);
             }
             if count_here {
                 h.end_write();
             }
         } else if ok && let Some(h) = self.hist.get(hid) {
             // 宣言が書き手を止めている間に 「履歴なし」 を見た書き込み: cell を書いた後に見直して足す (`declare_history`)
-            self.hist_note(h, local, Some(value), hlc, false, None);
+            self.hist_note(h, local, Some(value), hlc, false);
         }
         if ok {
             // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
@@ -26665,8 +26662,7 @@ impl Engine {
             if count_here {
                 h.begin_write();
             }
-            let cell_old = (h.batched() && !h.lazy_unlinked()).then(|| self.himos[hid].get_value(local));
-            self.hist_note(h, local, None, hlc, deleting, cell_old);
+            self.hist_note(h, local, None, hlc, deleting);
         }
         self.himos[hid].remove(local);
         if let Some(h) = hist {
@@ -26674,7 +26670,7 @@ impl Engine {
                 h.end_write();
             }
         } else if let Some(h) = self.hist.get(hid) {
-            self.hist_note(h, local, None, hlc, deleting, None);
+            self.hist_note(h, local, None, hlc, deleting);
         }
         self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);
