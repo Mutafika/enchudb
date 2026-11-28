@@ -877,9 +877,12 @@ impl HistCol {
                 return (None, Some(e));
             }
             // 飛び先も t より後なら飛ぶ (飛ばした entry のうち一番古い物が 「次」 の候補 = 飛び先の 1 つ後。 飛び先の後は
-            // 飛ばした区間の中なので、 次は prev で 1 つずつ戻った時に決める)
-            if e.jump != e.prev
-                && let Some((ji, je)) = self.at(e.jump)
+            // 飛ばした区間の中なので、 次は prev で 1 つずつ戻った時に決める)。 飛び先と prev は互いに依らない場所なので両方を先に
+            // 読む (2 つの外れの待ちが重なる。 飛ばない時に飛び先を読んだ待ちが prev の待ちに足されない。 深い履歴で 1 回の読みが
+            // 飛び先の読み損 ~1.5 回分の外れを払っていた)
+            let jumped = if e.jump != e.prev { self.at(e.jump) } else { None };
+            let back = self.at(e.prev);
+            if let Some((ji, je)) = jumped
                 && je.time > t
             {
                 idx = ji;
@@ -887,7 +890,7 @@ impl HistCol {
                 next = None;
                 continue;
             }
-            match self.at(e.prev) {
+            match back {
                 Some((pi, pe)) => {
                     next = Some(e);
                     idx = pi;

@@ -1,0 +1,7 @@
+== 50 changes per row (bulk 100 s)
+card=1000 per_row=50 before view: write random=142 hot=77 ns (lag max 4944), entries=51349870 (1645 MB), dependent random entry read=295 ns
+card=1000 per_row=50 view=1: first view 1968 ms (writer worst 3.3 ms), write after random=139 hot=83 ns (lag max 10553), deck=18.2 µs (45.8x cylinder, 500 reads), decks 2 MB | value_at S1 held=1274 forgot=1256 / S2 forgot=1399 held=1210 ns, far_hot=384 ns | hops/read=8.9 (floor 5.6), reader locks=0 linked=0 | hops/read=8.9 (floor 5.6), reader locks=0 linked=0
+card=1000 per_row=50 view=10: first view 4559 ms (writer worst 19.2 ms), write after random=198 hot=139 ns (lag max 17352), deck=24.0 µs (50.0x cylinder, 500 reads), decks 23 MB | value_at S1 held=1364 forgot=1335 / S2 forgot=1403 held=1370 ns, far_hot=370 ns | hops/read=10.7 (floor 6.6), reader locks=0 linked=0 | hops/read=10.7 (floor 6.5), reader locks=0 linked=0
+card=10 per_row=50 before view: write random=128 hot=67 ns (lag max 4935), entries=46360485 (1645 MB), dependent random entry read=272 ns
+card=10 per_row=50 view=1: first view 2941 ms (writer worst 98.7 ms), write after random=113 hot=91 ns (lag max 17880), deck=1995.1 µs (41.2x cylinder, 500 reads), decks 194 MB | value_at S1 held=1814 forgot=1694 / S2 forgot=1804 held=1807 ns, far_hot=326 ns | hops/read=15.1 (floor 9.0), reader locks=0 linked=0 | hops/read=15.1 (floor 9.0), reader locks=0 linked=0
+exit 0
