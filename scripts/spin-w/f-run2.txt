@@ -1,0 +1,14 @@
+== 10 changes per row (bulk 30 s, rss_anon 69 MB)
+== 50 changes per row (bulk 125 s, rss_anon 69 MB)
+card=1000 per_row=50 before view: | random: base=678 C=NaN E=113 (lag max 199798) | hot: base=244 C=NaN E=110 (lag max 199806)
+card=1000 per_row=50 view=1 base: first view 2557 ms (writer worst 81.6 ms), write after random=704 hot=129 ns (lag max 0), value_at=2551 ns far_hot=295 ns, deck=1010.8 µs (635.4x cylinder, 500 reads), mem +2 MB (decks 0 MB)
+card=1000 per_row=50 view=1 E: first view 3407 ms (writer worst 6.8 ms), write after random=531 hot=209 ns (lag max 19085), value_at=3685 ns far_hot=510 ns, deck=50.7 µs (106.2x cylinder, 500 reads), mem +12 MB (decks 2 MB) | value_at held=3685 forgot=2241 as_base=2077 ns
+card=1000 per_row=50 view=1 F: first view 3605 ms (writer worst 20.6 ms), write after random=359 hot=451 ns (lag max 16393), value_at=3628 ns far_hot=400 ns, deck=55.1 µs (104.2x cylinder, 500 reads), mem +2 MB (decks 2 MB) | value_at held=3628 forgot=2151 as_base=2358 ns
+card=1000 per_row=50 view=10 base: first view 7372 ms (writer worst 280.8 ms), write after random=737 hot=237 ns (lag max 0), value_at=3241 ns far_hot=321 ns, deck=1167.8 µs (326.9x cylinder, 500 reads), mem +18 MB (decks 0 MB)
+card=1000 per_row=50 view=10 E: first view 8270 ms (writer worst 33.1 ms), write after random=304 hot=472 ns (lag max 15032), value_at=3595 ns far_hot=354 ns, deck=63.6 µs (108.3x cylinder, 500 reads), mem +24 MB (decks 27 MB) | value_at held=3595 forgot=2605 as_base=2552 ns
+card=1000 per_row=50 view=10 F: first view 8949 ms (writer worst 33.4 ms), write after random=478 hot=331 ns (lag max 11304), value_at=4358 ns far_hot=401 ns, deck=68.1 µs (116.2x cylinder, 500 reads), mem +35 MB (decks 29 MB) | value_at held=4358 forgot=2692 as_base=2648 ns
+card=10 per_row=50 before view: | random: base=646 C=NaN E=104 (lag max 179904) | hot: base=88 C=NaN E=107 (lag max 180064)
+card=10 per_row=50 view=1 base: first view 3038 ms (writer worst 172.8 ms), write after random=802 hot=162 ns (lag max 0), value_at=3842 ns far_hot=304 ns, deck=139570.9 µs (967.6x cylinder, 17 reads), mem +147 MB (decks 0 MB)
+card=10 per_row=50 view=1 E: first view 21038 ms (writer worst 73.2 ms), write after random=390 hot=103 ns (lag max 77274), value_at=3690 ns far_hot=318 ns, deck=75841.6 µs (708.1x cylinder, 28 reads), mem +231 MB (decks 246 MB) | value_at held=3690 forgot=2697 as_base=2685 ns
+card=10 per_row=50 view=1 F: first view 4492 ms (writer worst 88.1 ms), write after random=205 hot=218 ns (lag max 24151), value_at=3884 ns far_hot=342 ns, deck=244786.2 µs (1287.2x cylinder, 11 reads), mem +239 MB (decks 206 MB) | value_at held=3884 forgot=2916 as_base=2787 ns
+exit 0

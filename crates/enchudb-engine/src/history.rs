@@ -258,7 +258,14 @@ impl Drop for Heads {
 struct U64Hash(u64);
 impl std::hash::Hasher for U64Hash {
     fn finish(&self) -> u64 {
-        self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        // 下の bit も混ぜる (hashbrown は下の bit で場所、 上の 7 bit で印を取る)
+        let h = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^ (h >> 32)
+    }
+    // u32 の鍵 (eid) を byte ごとの `write` に落とすと byte の順が逆になり、 小さい eid の下 8 bit がいつも 0 になって場所が重なっていた
+    // (案 F の今の束の HashSet で 1 差分 ~850 ns)
+    fn write_u32(&mut self, v: u32) {
+        self.0 = u64::from(v);
     }
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
@@ -410,6 +417,8 @@ struct EDeck {
     snaps: Vec<(usize, Vec<u32>)>,
     /// 案 F: 束が大きい (控え 1 つ (4 B × 束) が K 差分 (16 B × K) 以上) ので控えを持たず、 差分を後ろから戻して読む (今の形の `members`)
     big: bool,
+    /// 案 F の大きい束: 差分を全部当てた今の束 (係が足すたびに保つ)。 時点 t が新しい時は、 ここから t より後の差分を戻して読む
+    now: std::collections::HashSet<u32, std::hash::BuildHasherDefault<U64Hash>>,
 }
 
 /// 案 F の大きい束: 控え 1 つの大きさ (4 B × 束) が K 差分 (16 B × K) 以上。
@@ -422,7 +431,50 @@ impl EDeck {
     /// 時点 `t` の束。
     fn at(&self, t: u64) -> Vec<u32> {
         if self.big {
-            members(&self.diffs, t)
+            let k = self.diffs.partition_point(|x| x.time <= t);
+            if k * 2 <= self.diffs.len() {
+                // t が古い: t 以前の差分を後ろからなめる (今の形の読み)
+                return members(&self.diffs, t);
+            }
+            // t が新しい: 今の束から、 t より後の差分を戻す。 eid ごとに t より後の最初の差分で t の時を決める (入った → t には居ない、
+            // 出た → 居た)
+            // 表は `members` と同じ開いた番地 (標準の HashMap は 1 差分 ~850 ns だった: 値 10 種・差分 95 万で 812 ms)
+            let tail = &self.diffs[k..];
+            let cap = (tail.len() * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            let mut keys = vec![0u32; cap]; // eid + 1 (0 = 空き)
+            let mut inn = vec![false; cap];
+            let slot_of = |keys: &[u32], e: u32| -> (usize, bool) {
+                let key = e.wrapping_add(1);
+                let mut i = (u64::from(e).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+                loop {
+                    match keys[i] {
+                        0 => return (i, false),
+                        k2 if k2 == key => return (i, true),
+                        _ => i = (i + 1) & mask,
+                    }
+                }
+            };
+            let mut firsts = Vec::new();
+            for d in tail {
+                let (i, found) = slot_of(&keys, d.eid);
+                if !found {
+                    keys[i] = d.eid.wrapping_add(1);
+                    inn[i] = d.idx_in & 1 == 1;
+                    firsts.push(i);
+                }
+            }
+            let mut out: Vec<u32> = self
+                .now
+                .iter()
+                .copied()
+                .filter(|&e| {
+                    let (i, found) = slot_of(&keys, e);
+                    !found || !inn[i]
+                })
+                .collect();
+            out.extend(firsts.into_iter().filter(|&i| !inn[i]).map(|i| keys[i] - 1).filter(|e| !self.now.contains(e)));
+            out
         } else {
             self.members_upto(self.diffs.partition_point(|x| x.time <= t))
         }
@@ -457,6 +509,21 @@ impl EDeck {
         };
         self.diffs.insert(pos, x);
         if self.big {
+            if pos + 1 == self.diffs.len() {
+                if x.idx_in & 1 == 1 {
+                    self.now.insert(x.eid);
+                } else {
+                    self.now.remove(&x.eid);
+                }
+            } else {
+                // 時刻の前に入った: その eid の今は、 時刻の順で最後の差分で決まる
+                let last = self.diffs.iter().rev().find(|y| y.eid == x.eid).map(|y| y.idx_in & 1 == 1);
+                if last == Some(true) {
+                    self.now.insert(x.eid);
+                } else {
+                    self.now.remove(&x.eid);
+                }
+            }
             return;
         }
         if self.snaps.last().is_some_and(|(i, _)| *i > pos) {
@@ -468,6 +535,7 @@ impl EDeck {
             if f && f_big(m.len(), kmin) {
                 self.big = true;
                 self.snaps = Vec::new();
+                self.now = self.members_upto(self.diffs.len()).into_iter().collect();
                 return;
             }
             m.sort_unstable();
@@ -491,7 +559,15 @@ impl EDeck {
             let n = i + 1;
             if n - last_i >= kmin.max(last_n) {
                 if f && f_big(now.len(), kmin) {
-                    return EDeck { diffs, snaps: Vec::new(), big: true };
+                    // 残りの差分を当てて今の束にする
+                    for d in &diffs[n..] {
+                        if d.idx_in & 1 == 1 {
+                            now.insert(d.eid);
+                        } else {
+                            now.remove(&d.eid);
+                        }
+                    }
+                    return EDeck { diffs, snaps: Vec::new(), big: true, now };
                 }
                 let mut m: Vec<u32> = now.iter().copied().collect();
                 m.sort_unstable();
@@ -500,7 +576,7 @@ impl EDeck {
                 snaps.push((n, m));
             }
         }
-        EDeck { diffs, snaps, big: false }
+        EDeck { diffs, snaps, big: false, now: Default::default() }
     }
 
     fn bytes(&self) -> usize {
@@ -2595,7 +2671,10 @@ mod tests {
             x ^= x << 17;
             x
         };
-        for round in 0..20 {
+        for round in 0..40 {
+            // 後半は案 F (束 ~100 が控えの大きさの線 4 × K を越える: 控えを持たず、 今の束から戻す / 前からなめるの両方の向き)
+            let f = round >= 20;
+            let round = if f { round % 10 } else { round % 20 };
             let mut d = EDeck::default();
             let mut all: Vec<Diff> = Vec::new();
             let mut inside = std::collections::HashSet::new();
@@ -2611,7 +2690,7 @@ mod tests {
                 }
                 let df = Diff { time, idx_in: (i << 1) | u32::from(inn), eid };
                 all.push(df);
-                d.push(df, 4 + round, false);
+                d.push(df, 4 + round, f);
             }
             // 素直に: (時刻, 位置) の順に当てる
             let mut sorted = all.clone();
@@ -2632,7 +2711,10 @@ mod tests {
                 assert_eq!(got, want, "round {round} t {t}");
             }
             // 並べてから作った物も同じ控え・答え
-            let e = EDeck::from_sorted(sorted.clone(), 4 + round as usize, false);
+            let e = EDeck::from_sorted(sorted.clone(), 4 + round as usize, f);
+            if f {
+                assert!(d.big && e.big, "案 F の束が大きい道を通っていない");
+            }
             for t in (0..3000u64).step_by(53) {
                 let mut a = d.members_upto(d.diffs.partition_point(|y| y.time <= t));
                 let mut b = e.members_upto(e.diffs.partition_point(|y| y.time <= t));

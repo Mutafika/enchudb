@@ -427,6 +427,12 @@ impl Engine {
         Ok(())
     }
 
+    /// 測り用: 案 F の値 `v` の並びが控えを持たない形か。
+    #[doc(hidden)]
+    pub fn history_e_deck_big(&self, himo: &str, v: u64) -> Result<bool, HistError> {
+        Ok(self.hist_col(himo)?.e_deck_big(v))
+    }
+
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {

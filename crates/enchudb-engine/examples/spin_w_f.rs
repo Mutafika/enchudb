@@ -224,7 +224,12 @@ fn main() {
         if !stages.contains(&per_row) {
             continue;
         }
+        let only_card: Option<u64> = std::env::var("F_CARD").ok().map(|x| x.parse().unwrap());
+        let modes: Vec<usize> = std::env::var("F_MODES").map_or(vec![0, 1, 2], |x| x.split(',').map(|y| y.parse().unwrap()).collect());
         for (card, u, h, views) in [(1000u64, "t.u1000", "t.h1000", &[1usize, 10][..]), (10, "t.u10", "t.h10", &[1][..])] {
+            if only_card.is_some_and(|c| c != card) {
+                continue;
+            }
             // ---- 見る前: 今の形 / C / E (F の書き手は E と同じ)、 2 組で順を回す ----
             let mut s = String::new();
             for (who, set) in [("random", &rows[..]), ("hot", &hot[..])] {
@@ -264,7 +269,7 @@ fn main() {
             // ---- 見た後 ----
             for &nv in views {
                 let vals: Vec<u64> = (0..nv as u64).collect();
-                for m in 0..3 {
+                for &m in &modes {
                     set_mode(&eng, h, m);
                     let m0 = rss_anon_mb();
                     let (obs_ms, stall) = first_view(&eng, &rows, h, card, &vals);

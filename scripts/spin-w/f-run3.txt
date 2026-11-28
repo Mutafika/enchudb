@@ -1,0 +1,5 @@
+== 10 changes per row (bulk 33 s, rss_anon 69 MB)
+card=10 per_row=10 before view: | random: base=461 C=128 E=218 (lag max 4829) | hot: base=82 C=116 E=124 (lag max 4922)
+card=10 per_row=10 view=1 base: first view 791 ms (writer worst 26.6 ms), write after random=343 hot=90 ns (lag max 0), value_at=1454 ns far_hot=1255 ns, deck=32660.2 µs (316.8x cylinder, 57 reads), mem +37 MB (decks 0 MB)
+card=10 per_row=10 view=1 F: first view 4011 ms (writer worst 13.2 ms), write after random=244 hot=155 ns (lag max 10976), value_at=1062 ns far_hot=308 ns, deck=702812.4 µs (340.8x cylinder, 3 reads), mem +79 MB (decks 48 MB) | value_at held=1062 forgot=932 as_base=907 ns
+exit 143
