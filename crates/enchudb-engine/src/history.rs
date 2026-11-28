@@ -277,6 +277,40 @@ impl std::hash::Hasher for U64Hash {
     }
 }
 
+/// 測り用の数え口 (`--features spin-w-bench` の build だけ)。 thread ごとに数える (裏の係の分は入らない)。
+#[cfg(feature = "spin-w-bench")]
+pub mod probe {
+    use std::cell::Cell;
+    thread_local! {
+        /// 糸をたどって読んだ entry の数 (`HistCol::at`)
+        pub static HOPS: Cell<u64> = const { Cell::new(0) };
+        /// そのうち時点の床を探す道 (`floor`) の分
+        pub static FLOOR_HOPS: Cell<u64> = const { Cell::new(0) };
+        /// 読み手が末尾を繋ぐのに係の lock を取った回数と、 繋いだ entry の数
+        pub static LOCKS: Cell<u64> = const { Cell::new(0) };
+        pub static LINKED: Cell<u64> = const { Cell::new(0) };
+    }
+    /// (HOPS, FLOOR_HOPS, LOCKS, LINKED) を読んで 0 に戻す。
+    pub fn take() -> (u64, u64, u64, u64) {
+        (HOPS.with(|c| c.replace(0)), FLOOR_HOPS.with(|c| c.replace(0)), LOCKS.with(|c| c.replace(0)), LINKED.with(|c| c.replace(0)))
+    }
+    #[inline]
+    pub(super) fn bump(c: &'static std::thread::LocalKey<Cell<u64>>, n: u64) {
+        c.with(|x| x.set(x.get() + n));
+    }
+}
+
+#[cfg(feature = "spin-w-bench")]
+macro_rules! probe {
+    ($c:ident, $n:expr) => {
+        probe::bump(&probe::$c, $n)
+    };
+}
+#[cfg(not(feature = "spin-w-bench"))]
+macro_rules! probe {
+    ($c:ident, $n:expr) => {};
+}
+
 /// [`HistCol::plan`] の答え: 足す entry の糸と印。
 struct Plan {
     prev: u32,
@@ -687,6 +721,7 @@ impl HistCol {
         if link == NONE {
             return None;
         }
+        probe!(HOPS, 1);
         self.valid(link - 1).map(|e| (link - 1, e))
     }
 
@@ -834,6 +869,7 @@ impl HistCol {
         let (mut idx, mut e) = from;
         let mut next: Option<Entry> = None;
         loop {
+            probe!(FLOOR_HOPS, 1);
             if e.time <= t {
                 return (Some((idx, e)), next);
             }
@@ -959,6 +995,25 @@ impl HistCol {
         v
     }
 
+    /// 測り用: entry の file の random な場所を `n` 回、 前の読みの値で次の場所を決めて読む (糸をたどるのと同じ、 待ちが重ならない読み)。
+    /// 1 回の ns。
+    #[cfg(feature = "spin-w-bench")]
+    pub fn probe_dependent_reads(&self, n: u32) -> f64 {
+        let len = self.len().max(1);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let idx = (x % u64::from(len)) as u32;
+            if let Some(e) = self.valid(idx) {
+                x ^= e.time; // 次の場所が今の読みに依る
+            }
+        }
+        t.elapsed().as_nanos() as f64 / f64::from(n)
+    }
+
     /// 試験用: 足して繋ぐ。 entry が鎖に残ったら true (同じ書き込み・値の変わらない書き込みは繋ぐ時に落ちる)。
     #[cfg(test)]
     pub fn note(&self, slot: u32, eid: u32, value: Option<u64>, time: u64, extra: u32) -> io::Result<bool> {
@@ -998,6 +1053,7 @@ impl HistCol {
         let n = self.len.load(Ordering::SeqCst).saturating_sub(gap);
         let mut done = 0usize;
         loop {
+            probe!(LOCKS, 1);
             let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
             let mut i = self.linked_upto.load(Ordering::Acquire);
             if i >= n {
@@ -1029,6 +1085,7 @@ impl HistCol {
             }
             self.linked_upto.store(i, Ordering::Release);
             done += (i - start) as usize;
+            probe!(LINKED, u64::from(i - start));
             if stuck || i >= n {
                 return done;
             }

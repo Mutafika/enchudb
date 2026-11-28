@@ -382,6 +382,13 @@ impl Engine {
         Ok(self.hist_col(himo)?.e_deck_detail())
     }
 
+    /// 測り用: entry の file の待ちの重ならない random な読み 1 回の ns (`HistCol::probe_dependent_reads`)。
+    #[cfg(feature = "spin-w-bench")]
+    #[doc(hidden)]
+    pub fn history_probe_dependent_reads(&self, himo: &str, n: u32) -> Result<f64, HistError> {
+        Ok(self.hist_col(himo)?.probe_dependent_reads(n))
+    }
+
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {
