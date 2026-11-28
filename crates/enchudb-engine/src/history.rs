@@ -335,6 +335,8 @@ pub struct HistCol {
     e_observed: AtomicBool,
     /// 控えの間隔の下限 (差分の数)。 間隔は max(これ, 前の控えの束の大きさ) = 控えは 1 差分あたり 4 B 以下
     e_kmin: std::sync::atomic::AtomicUsize,
+    /// 案 F: 案 E のまま、 束の大きい値は控えを持たず差分を戻して読む
+    e_f: AtomicBool,
     /// 書き終わっていない entry で止まった (位置, いつから)。 長く止まったら (場所を取って書けなかった穴) 飛ばす
     e_stuck: Mutex<Option<(u32, std::time::Instant)>>,
     linker_stop: AtomicBool,
@@ -406,9 +408,26 @@ const LINK_CHUNK: u32 = 256;
 struct EDeck {
     diffs: Vec<Diff>,
     snaps: Vec<(usize, Vec<u32>)>,
+    /// 案 F: 束が大きい (控え 1 つ (4 B × 束) が K 差分 (16 B × K) 以上) ので控えを持たず、 差分を後ろから戻して読む (今の形の `members`)
+    big: bool,
+}
+
+/// 案 F の大きい束: 控え 1 つの大きさ (4 B × 束) が K 差分 (16 B × K) 以上。
+#[inline]
+fn f_big(members: usize, kmin: usize) -> bool {
+    members >= kmin.saturating_mul(4)
 }
 
 impl EDeck {
+    /// 時点 `t` の束。
+    fn at(&self, t: u64) -> Vec<u32> {
+        if self.big {
+            members(&self.diffs, t)
+        } else {
+            self.members_upto(self.diffs.partition_point(|x| x.time <= t))
+        }
+    }
+
     /// 差分 [0, k) を当てた束 (手前の控え + 控えより後の差分)。
     fn members_upto(&self, k: usize) -> Vec<u32> {
         let si = self.snaps.partition_point(|(i, _)| *i <= k);
@@ -423,7 +442,9 @@ impl EDeck {
     }
 
     /// 差分を 1 つ足す (時刻の順の位置に。 普通は末尾)。 控えより前に入ったら、 そこより後の控えを捨てる。 間隔が来たら控えを置く。
-    fn push(&mut self, x: Diff, kmin: usize) {
+    ///
+    /// `f` (案 F): 控えを置く時に束が大きければ、 控えを捨てて以後は置かない (`big`)。
+    fn push(&mut self, x: Diff, kmin: usize, f: bool) {
         let key = (x.time, x.idx_in >> 1);
         let pos = if self.diffs.last().is_none_or(|y| (y.time, y.idx_in >> 1) < key) {
             self.diffs.len()
@@ -435,12 +456,20 @@ impl EDeck {
             p
         };
         self.diffs.insert(pos, x);
+        if self.big {
+            return;
+        }
         if self.snaps.last().is_some_and(|(i, _)| *i > pos) {
             self.snaps.retain(|(i, _)| *i <= pos);
         }
         let (last_i, last_n) = self.snaps.last().map_or((0, 0), |(i, m)| (*i, m.len()));
         if self.diffs.len() - last_i >= kmin.max(last_n) {
             let mut m = self.members_upto(self.diffs.len());
+            if f && f_big(m.len(), kmin) {
+                self.big = true;
+                self.snaps = Vec::new();
+                return;
+            }
             m.sort_unstable();
             self.snaps.push((self.diffs.len(), m));
         }
@@ -448,7 +477,7 @@ impl EDeck {
 
     /// 時刻の順に並べた差分 `diffs` から作る (`push` を 1 つずつ呼んだのと同じ控え)。 差分は写さず、 控えは 1 回なめる間に今の束を
     /// 保って置く (`push` は控えのたびに手前の控えから数え直す)。
-    fn from_sorted(mut diffs: Vec<Diff>, kmin: usize) -> Self {
+    fn from_sorted(mut diffs: Vec<Diff>, kmin: usize, f: bool) -> Self {
         diffs.shrink_to_fit();
         let mut snaps: Vec<(usize, Vec<u32>)> = Vec::new();
         let mut now: std::collections::HashSet<u32, std::hash::BuildHasherDefault<U64Hash>> = Default::default();
@@ -461,6 +490,9 @@ impl EDeck {
             }
             let n = i + 1;
             if n - last_i >= kmin.max(last_n) {
+                if f && f_big(now.len(), kmin) {
+                    return EDeck { diffs, snaps: Vec::new(), big: true };
+                }
                 let mut m: Vec<u32> = now.iter().copied().collect();
                 m.sort_unstable();
                 last_i = n;
@@ -468,7 +500,7 @@ impl EDeck {
                 snaps.push((n, m));
             }
         }
-        EDeck { diffs, snaps }
+        EDeck { diffs, snaps, big: false }
     }
 
     fn bytes(&self) -> usize {
@@ -625,6 +657,7 @@ impl HistCol {
             edecks: RwLock::new(HashMap::default()),
             e_observed: AtomicBool::new(false),
             e_kmin: std::sync::atomic::AtomicUsize::new(1024),
+            e_f: AtomicBool::new(false),
             e_stuck: Mutex::new(None),
             linker_stop: AtomicBool::new(false),
             linker_period_us: std::sync::atomic::AtomicU64::new(200),
@@ -1166,6 +1199,14 @@ impl HistCol {
         }
     }
 
+    /// 案 F (案 E の上で、 束の大きい値は控えを持たない)。 切り替えたら並びを作り直す。
+    pub fn set_f(&self, on: bool) {
+        let _one = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.e_f.store(on, Ordering::Release);
+        self.edecks.write().unwrap_or_else(|p| p.into_inner()).clear();
+        self.e_observed.store(false, Ordering::SeqCst);
+    }
+
     /// 案 E の控えの間隔の下限。
     pub fn set_e_kmin(&self, k: usize) {
         self.e_kmin.store(k.max(1), Ordering::Release);
@@ -1178,6 +1219,11 @@ impl HistCol {
         let lag = self.len().saturating_sub(self.linked_upto.load(Ordering::Acquire));
         let b = self.edecks.read().unwrap_or_else(|p| p.into_inner()).values().map(|d| d.bytes()).sum();
         (lag, self.e_lag_max.swap(0, Ordering::AcqRel), b)
+    }
+
+    /// 案 F: 値 `v` の並びが控えを持たない形か。
+    pub fn e_deck_big(&self, v: u64) -> bool {
+        self.edecks.read().unwrap_or_else(|p| p.into_inner()).get(&v).is_some_and(|d| d.big)
     }
 
     /// 測り用: 案 E の値ごとの (値, 差分の数, 差分の容量, 控えの数, 控えの eid の数の合計)。
@@ -1280,12 +1326,13 @@ impl HistCol {
         }
         if self.e_observed.load(Ordering::Acquire) && pl.old != e.value {
             let kmin = self.e_kmin.load(Ordering::Relaxed);
+            let f = self.e_f.load(Ordering::Acquire);
             let mut decks = self.edecks.write().unwrap_or_else(|p| p.into_inner());
             for (val, inn) in [(pl.old, false), (e.value, true)] {
                 if val != ABSENT
                     && let Some(d) = decks.get_mut(&val)
                 {
-                    d.push(Diff { time: e.time, idx_in: (idx << 1) | u32::from(inn), eid: e.eid }, kmin);
+                    d.push(Diff { time: e.time, idx_in: (idx << 1) | u32::from(inn), eid: e.eid }, kmin, f);
                 }
             }
         }
@@ -1303,7 +1350,7 @@ impl HistCol {
             {
                 let decks = self.edecks.read().unwrap_or_else(|p| p.into_inner());
                 if let Some(d) = decks.get(&v) {
-                    return Ok(d.members_upto(d.diffs.partition_point(|x| x.time <= t)));
+                    return Ok(d.at(t));
                 }
             }
             // 最初に見た値: 作る (書き手も係も止めない)。 作った後に形の切り替えで捨てられたら作り直す
@@ -1330,11 +1377,12 @@ impl HistCol {
         self.scan_decks(&want, 0, n0, &mut raw, false);
         // 並べて控えを作るのも lock の外 (値 10 種 × 束 10 万だと秒の桁: 係を止めない)
         let kmin = self.e_kmin.load(Ordering::Relaxed);
+        let f = self.e_f.load(Ordering::Acquire);
         let mut built: Vec<EDeck> = raw
             .into_iter()
             .map(|mut r| {
                 r.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
-                EDeck::from_sorted(r, kmin)
+                EDeck::from_sorted(r, kmin, f)
             })
             .collect();
         #[cfg(test)]
@@ -1354,7 +1402,7 @@ impl HistCol {
             }
             t.sort_unstable_by_key(|x| (x.time, x.idx_in >> 1));
             for x in t {
-                d.push(x, kmin);
+                d.push(x, kmin, f);
             }
             decks.insert(v, d);
             made += 1;
@@ -2392,15 +2440,16 @@ mod tests {
     /// 小さい区間 + 末尾、 案 A の溜めの上限を何度も越える)、 場所の使い回しを混ぜる。
     #[test]
     fn variants_answer_like_the_base() {
-        for (batch, blocks, lazy, snaps, e) in [
-            (true, false, false, false, false),
-            (false, true, false, false, false),
-            (true, true, false, false, false),
-            (false, false, true, false, false),
-            (false, false, false, true, false),
-            (false, false, false, false, true),
+        for (batch, blocks, lazy, snaps, e, f) in [
+            (true, false, false, false, false, false),
+            (false, true, false, false, false, false),
+            (true, true, false, false, false, false),
+            (false, false, true, false, false, false),
+            (false, false, false, true, false, false),
+            (false, false, false, false, true, false),
+            (false, false, false, false, true, true),
         ] {
-            let d = tmp(&format!("var_{batch}_{blocks}_{lazy}_{snaps}_{e}"));
+            let d = tmp(&format!("var_{batch}_{blocks}_{lazy}_{snaps}_{e}_{f}"));
             let base = HistCol::create(&d.join("a"), 1, 10, 4096).unwrap();
             let var = HistCol::create(&d.join("b"), 1, 10, 4096).unwrap();
             base.set_modes(false, false);
@@ -2413,6 +2462,11 @@ mod tests {
             base.set_e(false);
             if e {
                 var.set_e_kmin(64); // 控えの道を何度も通す
+            }
+            if f {
+                // 案 F: K=32 → 束 128 以上は控えなし。 値 8 種 × 場所 2000 なので束 ~240: 全部の値が大きい束の道 (小さい束の道は案 E と同じ)
+                var.set_e_kmin(32);
+                var.set_f(true);
             }
             let mut cell: Vec<Option<u64>> = vec![None; 2000];
             let mut gens = vec![0u32; 2000];
@@ -2460,6 +2514,9 @@ mod tests {
                         var.pull_at_e(v, t).unwrap();
                     }
                     assert_eq!(var.observe_e(&[7, 4, 5, 6, 4, 0]), 4);
+                    if f {
+                        assert!(var.e_deck_big(1), "案 F の大きい束が控えを持っている");
+                    }
                 }
                 if i == 75_000 {
                     assert_eq!(base.observe_base(&[1, 3, 5, 3]), 3);
@@ -2554,7 +2611,7 @@ mod tests {
                 }
                 let df = Diff { time, idx_in: (i << 1) | u32::from(inn), eid };
                 all.push(df);
-                d.push(df, 4 + round);
+                d.push(df, 4 + round, false);
             }
             // 素直に: (時刻, 位置) の順に当てる
             let mut sorted = all.clone();
@@ -2575,7 +2632,7 @@ mod tests {
                 assert_eq!(got, want, "round {round} t {t}");
             }
             // 並べてから作った物も同じ控え・答え
-            let e = EDeck::from_sorted(sorted.clone(), 4 + round as usize);
+            let e = EDeck::from_sorted(sorted.clone(), 4 + round as usize, false);
             for t in (0..3000u64).step_by(53) {
                 let mut a = d.members_upto(d.diffs.partition_point(|y| y.time <= t));
                 let mut b = e.members_upto(e.diffs.partition_point(|y| y.time <= t));

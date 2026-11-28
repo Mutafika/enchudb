@@ -420,6 +420,13 @@ impl Engine {
         Ok(self.hist_col(himo)?.e_deck_detail())
     }
 
+    /// 試作の形を切り替える (案 F: 案 E の上で、 束の大きい値 (控え 1 つ ≥ K 差分) は控えを持たず差分を戻して読む)。 並びは作り直し。
+    #[doc(hidden)]
+    pub fn history_set_f(&self, himo: &str, on: bool) -> Result<(), HistError> {
+        self.hist_col(himo)?.set_f(on);
+        Ok(())
+    }
+
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {

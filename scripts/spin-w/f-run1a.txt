@@ -1,0 +1,15 @@
+== 10 changes per row (bulk 28 s, rss_anon 69 MB)
+card=1000 per_row=10 before view: | random: base=516 C=249 E=127 (lag max 4756) | hot: base=172 C=90 E=93 (lag max 5594)
+card=1000 per_row=10 view=1 base: first view 726 ms (writer worst 42.1 ms), write after random=477 hot=107 ns (lag max 0), value_at=1859 ns far_hot=313 ns, deck=240.6 µs (435.2x cylinder, 500 reads), mem +1 MB (decks 0 MB)
+card=1000 per_row=10 view=1 E: first view 584 ms (writer worst 1.2 ms), write after random=247 hot=190 ns (lag max 4959), value_at=640 ns far_hot=1821 ns, deck=25.7 µs (43.4x cylinder, 500 reads), mem +8 MB (decks 0 MB) | value_at held=640 forgot=923 as_base=879 ns
+card=1000 per_row=10 view=1 F: first view 646 ms (writer worst 1.0 ms), write after random=500 hot=172 ns (lag max 8349), value_at=827 ns far_hot=1671 ns, deck=27.1 µs (40.5x cylinder, 500 reads), mem +2 MB (decks 0 MB) | value_at held=827 forgot=743 as_base=696 ns
+card=1000 per_row=10 view=10 base: first view 1373 ms (writer worst 39.4 ms), write after random=689 hot=171 ns (lag max 0), value_at=1941 ns far_hot=292 ns, deck=280.5 µs (184.4x cylinder, 500 reads), mem +6 MB (decks 0 MB)
+card=1000 per_row=10 view=10 E: first view 1568 ms (writer worst 4.2 ms), write after random=221 hot=143 ns (lag max 9459), value_at=1011 ns far_hot=342 ns, deck=39.2 µs (65.6x cylinder, 500 reads), mem +7 MB (decks 6 MB) | value_at held=1011 forgot=1515 as_base=788 ns
+card=1000 per_row=10 view=10 F: first view 1829 ms (writer worst 13.0 ms), write after random=381 hot=300 ns (lag max 6635), value_at=903 ns far_hot=1558 ns, deck=39.1 µs (68.2x cylinder, 500 reads), mem +8 MB (decks 7 MB) | value_at held=903 forgot=1024 as_base=947 ns
+card=10 per_row=10 before view: | random: base=476 C=103 E=142 (lag max 4849) | hot: base=68 C=54 E=84 (lag max 5578)
+card=10 per_row=10 view=1 base: first view 579 ms (writer worst 115.2 ms), write after random=570 hot=114 ns (lag max 0), value_at=653 ns far_hot=284 ns, deck=25349.4 µs (200.8x cylinder, 70 reads), mem +36 MB (decks 0 MB)
+card=10 per_row=10 view=1 E: first view 4234 ms (writer worst 81.9 ms), write after random=192 hot=121 ns (lag max 51038), value_at=1377 ns far_hot=309 ns, deck=72649.4 µs (469.3x cylinder, 39 reads), mem +91 MB (decks 61 MB) | value_at held=1377 forgot=899 as_base=865 ns
+card=10 per_row=10 view=1 F: first view 964 ms (writer worst 3.4 ms), write after random=183 hot=122 ns (lag max 7015), value_at=1170 ns far_hot=327 ns, deck=26460.1 µs (172.7x cylinder, 58 reads), mem +64 MB (decks 52 MB) | value_at held=1170 forgot=909 as_base=964 ns
+== 50 changes per row (bulk 129 s, rss_anon 101 MB)
+exit 143
+(止めた: 50 回 / 行の段の 「見る前」 で案 C の後片付け (history_set_lazy(false) → link_all → link_slot) が 30 分を越えて終わらなかった。 gdb で link_slot の中)
