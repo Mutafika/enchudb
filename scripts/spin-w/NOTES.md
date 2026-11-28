@@ -5,7 +5,7 @@
 
 > **今の状態 (2026-11-28)**: 形を案 E に一本化した (fcb988c)。 書き手・WAL の再生・宣言の時の値・開く時の突き合わせは全部糸なしで
 > 足し、 裏の係と読み手が繋ぐ。 見た値の並びは係が足す (控え + 差分)。 外した形と理由は下の 「一本化」。 案 E の数は下の 「案 E (一本化の
-> 後)」 (`e-run1.txt` / `e-run2.txt`、 `examples/spin_w_e.rs`)。 変異 (`mutations-final.json`、 40 個) を回している。 手元の M4 Max で
+> 後)」 (`e-run1.txt` / `e-run2.txt`、 `examples/spin_w_e.rs`)。 変異 (`mutations-final.json`、 40 個) は 38 個殺した (下の 「変異 (一本化の後)」)。 手元の M4 Max で
 > 測る手順は 「M4 Max で 1 回」。 前の節 (案 A〜F の比べ) の数は外した形の物で、 案 E のデッキ・最初の並び・係の遅れは hash の壊れを
 > 含む (bcbfb58 より前)。
 
@@ -600,3 +600,18 @@ cargo build --release -p enchudb-engine --features spin-w-bench --example spin_w
 - 宣言の無い DB の v0.38.0 との比べは `BASE=<v0.38.0 の worktree> scripts/spin-w/bench.sh 1` (`spin_w_bench`、 x86 Linux で作った
   script。 macOS でも回るはずだが確かめていない)
 - 確かめていない所: heads の 32 B × 2^32 の場所の anon NORESERVE map が macOS で通るか (通らなければ宣言で失敗する)
+
+## 変異 (一本化の後、 `mutations-final.json`、 `mutate-final1.txt` / `-short.txt` / `mutate-final2.txt`)
+
+案 E の 10 個 + 書き出し・電源断・宣言・確定の線・時刻・heads の 30 個 (`mutations.json` から: 「デッキの差分を書き手が保たない」 は書き手が並びを
+保たなくなったので外し、 E の 「係が見た値の差分を足さない」 が代わる)。 試験は lib の `history::` + `spin_w_history` (crashsim)。
+1 回目は 36 殺 / 4 生き残り。 60 秒より短く殺した 18 個は手で入れ直して build が通り試験が落ちるのを確かめた (`-short.txt`: 17 個は試験が
+落ちる。 「R5 地平より前の時刻を地平に寄せない」 は入れ直すと落ちない = 1 回目の殺しは競りの運)。
+
+| 生き残り | 見立て | 手当て |
+|---|---|---|
+| 重複落としを外す (同じ時刻の entry を足す) | 同値: 同じ時刻の entry は必ず 「時刻の戻る entry」 の道に入り、 場所の繋ぎ直し (`link_slot`) が同じ時刻・同じ値を 1 つにする | なし (今の形では書き手が繋ぎ直さずに足したので試験が見えた) |
+| 時刻の戻る entry: 前の値と同じでも足す | 同値: 同じく繋ぎ直しが値の変わらない entry を落とす | なし |
+| WAL を付ける時に WAL の時計を履歴の時計より先へ進めない | 試験の穴: 「1 ms に何千回も書いて列の時計を壁時計より先に出す」 の前提が立たない (時刻は ms << 20 なので 1 ms = 100 万 logical) | engine の時計を先に出す試験用の口 (crashsim の build だけ、 `history_test_skew_clock`) と試験 `wal_clock_moves_past_a_history_clock_ahead_of_the_wall` → **殺した** (115 s) |
+| engine の中の道を 「遅くとも」 にしない (印の値をそのまま時刻に) | 試験の穴: この印を使う道は開く時の後始末 (死んだ場所に残った cell)・cell を書けなかった時の戻し・sync / 表の予約 (宣言が断る) だけで、 試験が通らない。 違いは途中の時点の読みだけ (開く時の突き合わせが最新を揃える) | 残す (後始末の道を通す電源断の像が要る) |
+| R5 地平より前の時刻を地平に寄せない | 試験が競りでしか見えない (3 回に 1 回殺す): 宣言の前に WAL の時刻を取った書き込みが宣言の後に履歴に届く順を作れない | 残す (書き手を時刻を取った後・門の前で止める口が要る) |

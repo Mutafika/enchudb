@@ -389,6 +389,14 @@ impl Engine {
         Ok(self.hist_col(himo)?.probe_dependent_reads(n))
     }
 
+    /// 試験用 (crashsim の build だけ): 列 `himo` の engine の時計 (WAL の無い書き込みの時刻) を壁時計より `ms` 先に出す。
+    #[cfg(feature = "crashsim")]
+    #[doc(hidden)]
+    pub fn history_test_skew_clock(&self, himo: &str, ms: u64) -> Result<(), HistError> {
+        self.hist_col(himo)?.test_skew_clock(ms);
+        Ok(())
+    }
+
     /// 調べ用: 行 `eid` の entry を位置の順に全部。
     #[doc(hidden)]
     pub fn history_raw(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Vec<(u32, u32, u32, u32, u64, u64)> {

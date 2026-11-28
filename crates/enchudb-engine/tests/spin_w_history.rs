@@ -348,6 +348,40 @@ fn walless_session_writes_with_engine_clock() {
     }
 }
 
+/// WAL の無い session の書き込みの時刻 (engine の時計) が壁時計より先に出ていても、 後で WAL 付きで開いて書いた時刻はそれより後
+/// (`observe_history_clock` が WAL の時計を履歴の時計より先へ進める)。 engine の時計を 60 秒先に出して作る (crashsim の build だけ)。
+#[test]
+fn wal_clock_moves_past_a_history_clock_ahead_of_the_wall() {
+    let s = Scratch::new("skew");
+    let p = s.db();
+    let a = {
+        let mut eng = Engine::create_with_capacity(p.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 16).unwrap();
+        eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
+        let a = eng.entity_in("t").unwrap();
+        eng.tie_to(a, V, 1u32);
+        eng.declare_history(V).unwrap();
+        a
+    };
+    {
+        let eng = Engine::open_standalone(p.to_str().unwrap()).unwrap();
+        eng.history_test_skew_clock(V, 60_000).unwrap();
+        eng.tie_to(a, V, 2u32);
+        eng.tie_to(a, V, 3u32);
+    }
+    let eng = reopen(&p);
+    eng.tie_to(a, V, 4u32);
+    let h = eng.history(a, V).unwrap();
+    assert_eq!(h.iter().map(|c| c.value).collect::<Vec<_>>(), vec![Some(1), Some(2), Some(3), Some(4)], "変更の並び");
+    for w in h.windows(2) {
+        assert!(w[0].time < w[1].time, "時刻が戻った: {:?} → {:?}", w[0], w[1]);
+    }
+    assert_eq!(eng.value_at(a, V, eng.history_clock(V).unwrap()).unwrap().value, Some(4));
+}
+
 /// 宣言の無い DB の `{db}/tables` に HIS1 は無い。 宣言を外すと消え、 file も消える。
 #[test]
 fn tables_file_carries_his1_only_when_declared() {

@@ -375,6 +375,9 @@ pub struct HistCol {
     /// 試験用: 最初の並びの走査と lock の間で係を動かす (その間に繋いだ entry を並びが拾うかを見る)
     #[cfg(test)]
     test_link_mid: AtomicBool,
+    /// 試験用 (crashsim の build だけ): engine の時計 (`now`) を壁時計より先に出す ms (列の時計が WAL の時計より先に出た所を作る)
+    #[cfg(feature = "crashsim")]
+    test_skew_ms: AtomicU64,
     /// 繋ぐのは 1 本ずつ (裏の係・読み手・繋ぎ直し。 同じ場所の entry を順に繋ぐ)
     apply_lock: Mutex<()>,
     /// 書きかけ (entry を足してから cell を書き終えるまで) の書き手の数
@@ -586,6 +589,8 @@ impl HistCol {
             e_lag_max: Pad(AtomicU32::new(0)),
             #[cfg(test)]
             test_link_mid: AtomicBool::new(false),
+            #[cfg(feature = "crashsim")]
+            test_skew_ms: AtomicU64::new(0),
             apply_lock: Mutex::new(()),
             inflight: Pad(AtomicU32::new(0)),
             settled: Pad(AtomicU64::new(horizon)),
@@ -612,6 +617,8 @@ impl HistCol {
     /// WAL の無い session の書き込みの時刻: 壁時計の ms と、 列の時計 + 1 の大きい方 (同じ列の時刻は戻らない)。 列の時計を進める。
     pub fn now(&self) -> u64 {
         let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        #[cfg(feature = "crashsim")]
+        let ms = ms + self.test_skew_ms.load(Ordering::Relaxed);
         let wall = pack(enchudb_oplog::Hlc { wall: ms, logical: 0, peer: 0 });
         let t = wall.max(self.clock.load(Ordering::Acquire) + 1);
         self.clock.fetch_max(t, Ordering::AcqRel);
@@ -1015,6 +1022,12 @@ impl HistCol {
             }
         }
         t.elapsed().as_nanos() as f64 / f64::from(n)
+    }
+
+    /// 試験用 (crashsim の build だけ): engine の時計を壁時計より `ms` 先に出す。
+    #[cfg(feature = "crashsim")]
+    pub fn test_skew_clock(&self, ms: u64) {
+        self.test_skew_ms.store(ms, Ordering::Relaxed);
     }
 
     /// 試験用: 足して繋ぐ。 entry が鎖に残ったら true (同じ書き込み・値の変わらない書き込みは繋ぐ時に落ちる)。
